@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - '*'
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --group dev --group lint
+
+      - name: Lint with ruff
+        run: |
+          uv run ruff check src/
+          uv run ruff format --check src/
+
+      - name: Type check with mypy
+        run: uv run mypy src/
+
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.12', '3.13', '3.14']
+        surrealdb-version: ['v2.6.0']
+
+    steps:
+      - name: Start SurrealDB ${{ matrix.surrealdb-version }}
+        run: |
+          docker run -d \
+            --name surreal \
+            -p 8000:8000 \
+            surrealdb/surrealdb:${{ matrix.surrealdb-version }} \
+            start --user root --pass root
+
+          echo "Waiting for SurrealDB to be healthy..."
+          for i in {1..15}; do
+            if curl -s http://localhost:8000/health | grep -q "OK"; then
+              echo "SurrealDB is up!"
+              break
+            fi
+            echo "SurrealDB not up yet. Retrying..."
+            sleep 2
+          done
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run all tests
+        env:
+          SURREALDB_HOST: localhost
+          SURREALDB_PORT: 8000
+        run: uv run pytest tests/ -v --cov=src.surreal_orm_lite --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        if: matrix.python-version == '3.14'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+          fail_ci_if_error: false
+
+  ci-success:
+    name: CI Success
+    needs: [lint, tests]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check all jobs passed
+        run: |
+          if [ "${{ needs.lint.result }}" != "success" ]; then
+            echo "Lint failed"
+            exit 1
+          fi
+          if [ "${{ needs.tests.result }}" != "success" ]; then
+            echo "Tests failed"
+            exit 1
+          fi
+          echo "All checks passed!"
