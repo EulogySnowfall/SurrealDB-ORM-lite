@@ -49,13 +49,11 @@ jobs:
           name: dist
           path: dist/
 
-      - name: Publish to PyPI
+      - name: Publish to PyPI (trusted publishing)
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          user: __token__
-          password: ${{ secrets.PYPI_TOKEN }}
           attestations: true
-        # Uses API token stored in environment secret PYPI_TOKEN
+        # Uses OIDC trusted publishing. No PyPI token required.
 
   github-release:
     name: Create GitHub Release
