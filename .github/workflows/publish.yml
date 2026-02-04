@@ -51,8 +51,11 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        # Uses trusted publishing - no API token needed
-        # Configure at: https://pypi.org/manage/project/surreal-orm-lite/settings/publishing/
+        with:
+          user: __token__
+          password: ${{ secrets.PYPI_TOKEN }}
+          attestations: true
+        # Uses API token stored in environment secret PYPI_TOKEN
 
   github-release:
     name: Create GitHub Release
