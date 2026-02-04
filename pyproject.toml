@@ -1,0 +1,99 @@
+[project]
+name = "surreal-orm-lite"
+version = "0.2.0"
+description = "Lightweight Django-style ORM for SurrealDB using the official Python SDK. Async support with Pydantic validation."
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+authors = [
+    { name = "Yannick Croteau", email = "croteau.yannick@gmail.com" }
+]
+keywords = ["surrealdb", "orm", "database", "async", "pydantic"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "License :: OSI Approved :: MIT License",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Operating System :: OS Independent",
+    "Framework :: Pydantic :: 2",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "pydantic>=2.12.5",
+    "surrealdb>=1.0.8",
+]
+
+[project.urls]
+Homepage = "https://github.com/EulogySnowfall/surreal-orm-lite"
+Documentation = "https://github.com/EulogySnowfall/surreal-orm-lite"
+Repository = "https://github.com/EulogySnowfall/surreal-orm-lite.git"
+Issues = "https://github.com/EulogySnowfall/surreal-orm-lite/issues"
+Changelog = "https://github.com/EulogySnowfall/surreal-orm-lite/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+packages = ["src/surreal_orm_lite"]
+
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 128
+target-version = "py311"
+exclude = ["examples"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+check_untyped_defs = true
+exclude = "^(tests|examples)/"
+
+[[tool.mypy.overrides]]
+module = ["surrealdb.*"]
+ignore_missing_imports = true
+no_implicit_reexport = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-ra -q --cov=src.surreal_orm_lite --cov-branch --cov-report=xml --cov-report=html --cov-report=term-missing --cov-fail-under=70 --cov-context=test"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "module"
+
+[tool.pyright]
+include = ["src"]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.1.0",
+    "mypy>=1.19.1",
+    "pytest>=8.3.4",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.0.0",
+    "pydantic>=2.12.5",
+    "docker>=7.1.0",
+    "python-dotenv>=1.2.1",
+]
+lint = [
+    "ruff>=0.8.4",
+]
+
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/surreal_orm_lite"]
+
+[tool.hatch.build.targets.sdist]
+include = ["README.md", "CHANGELOG.md", "Makefile", "/src"]
