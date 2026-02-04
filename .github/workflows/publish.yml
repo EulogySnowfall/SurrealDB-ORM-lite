@@ -4,6 +4,13 @@ on:
   push:
     tags:
       - 'v*'  # Trigger on version tags (v0.2.0, v1.0.0, etc.)
+  pull_request:
+    paths:
+      - 'pyproject.toml'
+      - 'src/**'
+      - 'tests/**'
+      - '.github/workflows/publish.yml'
+  workflow_dispatch:
 
 jobs:
   build:
@@ -41,6 +48,8 @@ jobs:
     environment: pypi
     permissions:
       id-token: write  # Required for trusted publishing
+    # Only publish when pushing a version tag (not on PRs or manual runs)
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
 
     steps:
       - name: Download build artifacts
