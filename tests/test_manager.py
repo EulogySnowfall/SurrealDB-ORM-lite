@@ -1,9 +1,13 @@
+import os
+
 import pytest
 from typing import AsyncGenerator, Any
 from src.surreal_orm_lite import SurrealDBConnectionManager
 from src.surreal_orm_lite.exceptions import SurrealDbConnectionError
 
-SURREALDB_URL = "http://localhost:8000"
+SURREALDB_HOST = os.environ.get("SURREALDB_HOST", "localhost")
+SURREALDB_PORT = os.environ.get("SURREALDB_PORT", "8000")
+SURREALDB_URL = f"http://{SURREALDB_HOST}:{SURREALDB_PORT}"
 SURREALDB_USER = "root"
 SURREALDB_PASS = "root"
 SURREALDB_NAMESPACE = "ns"

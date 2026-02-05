@@ -39,9 +39,7 @@ class SurrealDBConnectionManager:
     @classmethod
     async def unset_connection(cls) -> None:
         """
-        Set the connection kwargs for the SurrealDB instance.
-
-        :param kwargs: The connection kwargs for the SurrealDB instance.
+        Clear all connection settings and close the connection.
         """
         cls.__url = None
         cls.__user = None
@@ -80,7 +78,7 @@ class SurrealDBConnectionManager:
         assert cls.__user is not None
         assert cls.__password is not None
 
-        # Établir la connexion
+        # Establish the connection
         try:
             url = cls.__url
             _client = AsyncSurreal(url)
@@ -107,8 +105,6 @@ class SurrealDBConnectionManager:
         """
         Close the connection to the SurrealDB instance.
         """
-        # Fermer la connexion
-
         if cls.__client is None:
             return
 
@@ -121,9 +117,7 @@ class SurrealDBConnectionManager:
         """
         Reconnect to the SurrealDB instance.
         """
-        # Fermer la connexion
         await cls.close_connection()
-        # Établir la connexion
         return await cls.get_client()
 
     @classmethod
@@ -133,7 +127,6 @@ class SurrealDBConnectionManager:
 
         :return: True if the connection is valid, False otherwise.
         """
-        # Valider la connexion
         try:
             await cls.reconnect()
             return True
@@ -296,9 +289,9 @@ class SurrealDBConnectionManager:
     @classmethod
     def is_password_set(cls) -> bool:
         """
-        Get the database to use.
+        Check if the password is set.
 
-        :return: The database to use.
+        :return: True if the password is set, False otherwise.
         """
         return cls.__password is not None
 

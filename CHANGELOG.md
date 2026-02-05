@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-02-04
+
+### Fixed
+
+- Fixed `refresh()` method not updating the model instance
+- Fixed `refresh()` not handling SDK 1.0.8 list responses
+- Fixed `save()` not updating instance with auto-generated ID
+- Fixed SQL query order: `ORDER BY` now comes before `LIMIT/START` (SurrealDB requirement)
+- Fixed `set_data` validator not always returning data
+- Fixed typo in error message: `primirary_key` → `primary_key`
+- Removed ineffective `del self` in `delete()` method
+- Fixed dead test `failed_model_validation` that was never executed
+
+### Changed
+
+- `SurrealDbNotFoundError` now inherits from `SurrealDbError` for backward compatibility
+- Test database connection now configurable via `SURREALDB_HOST` and `SURREALDB_PORT` environment variables
+- Improved docstrings for `unset_connection()` and `is_password_set()`
+- Translated French comments to English in `connection_manager.py`
+- Renamed variable `test` → `result` in `update()` method
+
+### Added
+
+- Added `codecov.yml` configuration (disabled patch coverage check)
+- Added test for `save()` with auto-generated ID
+- Added test for `contains` lookup operator
+
 ## [0.2.0] - 2026-02-02
 
 ### Added
