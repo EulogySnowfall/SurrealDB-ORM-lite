@@ -96,6 +96,12 @@ class BaseSurrealModel(BaseModel):
         if record is None:
             raise SurrealDbError("Can't refresh data, no record found.")  # pragma: no cover
 
+        # SDK 1.0.8 returns a list even for single record select
+        if isinstance(record, list):
+            if len(record) == 0:
+                raise SurrealDbError("Can't refresh data, no record found.")  # pragma: no cover
+            record = record[0]
+
         # Update current instance with refreshed data
         if isinstance(record, dict):
             for key, value in record.items():
