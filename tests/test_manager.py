@@ -1,7 +1,9 @@
 import os
+from collections.abc import AsyncGenerator
+from typing import Any
 
 import pytest
-from typing import AsyncGenerator, Any
+
 from src.surreal_orm_lite import SurrealDBConnectionManager
 from src.surreal_orm_lite.exceptions import SurrealDbConnectionError
 

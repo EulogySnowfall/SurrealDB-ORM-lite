@@ -2,10 +2,10 @@ import os
 
 import pytest
 from pydantic import Field
-from src import surreal_orm_lite
 from surrealdb import RecordID
-from src.surreal_orm_lite.exceptions import SurrealDbError, SurrealDbNotFoundError
 
+from src import surreal_orm_lite
+from src.surreal_orm_lite.exceptions import SurrealDbError, SurrealDbNotFoundError
 
 SURREALDB_HOST = os.environ.get("SURREALDB_HOST", "localhost")
 SURREALDB_PORT = os.environ.get("SURREALDB_PORT", "8000")
@@ -102,12 +102,10 @@ async def test_update_model() -> None:
 
 async def test_first_model() -> None:
     model = await ModelTest.objects().filter(name="Test Man").first()
-    if isinstance(model, ModelTest):
-        assert model.name == "Test Man"
-        assert model.age == 25
-        assert model.id == "1"
-    else:
-        assert False
+    assert isinstance(model, ModelTest), "Expected ModelTest instance"
+    assert model.name == "Test Man"
+    assert model.age == 25
+    assert model.id == "1"
 
     with pytest.raises(SurrealDbNotFoundError) as exc1:
         await ModelTest.objects().filter(name="NotExist").first()
@@ -248,12 +246,10 @@ async def test_with_primary_key() -> None:
 
     # Use backticks to escape special characters in ID for get()
     fletch = await ModelTest2.objects().get("`test@test.com`")
-    if isinstance(fletch, ModelTest2):
-        assert fletch.name == "Test"
-        assert fletch.age == 32
-        assert fletch.email == "test@test.com"
-    else:
-        assert False
+    assert isinstance(fletch, ModelTest2), "Expected ModelTest2 instance"
+    assert fletch.name == "Test"
+    assert fletch.age == 32
+    assert fletch.email == "test@test.com"
 
     deleted = await ModelTest2.objects().delete_table()
     assert deleted is True

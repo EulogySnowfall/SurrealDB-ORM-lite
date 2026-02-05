@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-02-05
+
+### Added
+
+- **Aggregation Functions**: New aggregation classes for database calculations
+  - `Count()` - Count records
+  - `Sum(field)` - Sum numeric field values
+  - `Avg(field)` - Calculate average of numeric field
+  - `Min(field)` - Find minimum value
+  - `Max(field)` - Find maximum value
+
+- **QuerySet Aggregation Methods**: Shortcut methods for common aggregations
+  - `count()` - Returns count as integer directly
+  - `sum(field)` - Returns sum as float/int
+  - `avg(field)` - Returns average as float
+  - `min(field)` - Returns minimum value
+  - `max(field)` - Returns maximum value
+
+- **GROUP BY Support**: Django-style grouping with annotations
+  - `values(*fields)` - Specify fields for GROUP BY
+  - `annotate(**aggregations)` - Add aggregation annotations
+
+- **exists() Method**: Efficiently check if records exist
+
+- **raw_query() Class Method**: Execute arbitrary SurrealQL queries with variables
+
+- New test file `tests/test_aggregations.py` with comprehensive unit and e2e tests
+
+### Changed
+
+- QuerySet now tracks `_group_by_fields` and `_annotations` for GROUP BY queries
+- `exec()` method now handles GROUP BY queries differently, returning dicts instead of model instances
+
 ## [0.2.2] - 2026-02-05
 
 ### Fixed

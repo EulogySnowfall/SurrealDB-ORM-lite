@@ -1,8 +1,9 @@
 import pytest
 from pydantic import Field
+
+from src.surreal_orm_lite.exceptions import SurrealDbError
 from src.surreal_orm_lite.model_base import BaseSurrealModel, SurrealConfigDict
 from src.surreal_orm_lite.query_set import QuerySet
-from src.surreal_orm_lite.exceptions import SurrealDbError
 
 
 class ModelTest(BaseSurrealModel):
@@ -66,7 +67,7 @@ def test_getattr(model_test: ModelTest) -> None:
     assert model_test.id == "1"
 
     with pytest.raises(AttributeError) as exc:
-        model_test.no_attribut  # type: ignore
+        _ = model_test.no_attribut  # type: ignore
 
     assert str(exc.value) == "'ModelTest' object has no attribute 'no_attribut'"
 
@@ -83,11 +84,7 @@ async def test_failed_model_validation() -> None:
     with pytest.raises(SurrealDbError) as exc:
         ModelTestInvalide(name="Test", age=45)
 
-    assert (
-        str(exc.value)
-        == "Can't create model, the model needs either 'id' field "
-        + "or primary_key in 'model_config'."
-    )
+    assert str(exc.value) == "Can't create model, the model needs either 'id' field " + "or primary_key in 'model_config'."
 
 
 def test_class_with_key_specify() -> None:

@@ -224,3 +224,62 @@ class BaseSurrealModel(BaseModel):
         from .query_set import QuerySet
 
         return QuerySet(cls)
+
+    @classmethod
+    async def raw_query(
+        cls,
+        query: str,
+        variables: dict[str, Any] | None = None,
+    ) -> list[Self] | list[dict[str, Any]]:
+        """
+        Execute a raw SurrealQL query and return the results.
+
+        This method allows executing arbitrary SurrealQL queries directly against
+        the database. It's useful for complex queries that can't be expressed
+        using the QuerySet API.
+
+        Args:
+            query: The SurrealQL query string to execute.
+            variables: Optional dictionary of variables to substitute into the query.
+                      Use $variable_name syntax in the query string.
+
+        Returns:
+            list[Self] | list[dict]: A list of model instances if the results match
+            the model schema, otherwise a list of dictionaries.
+
+        Example:
+            ```python
+            # Simple query
+            users = await User.raw_query("SELECT * FROM User WHERE age > 21")
+
+            # With variables (safe from injection)
+            users = await User.raw_query(
+                "SELECT * FROM User WHERE status = $status AND age > $min_age",
+                variables={"status": "active", "min_age": 18}
+            )
+
+            # Complex graph query
+            results = await User.raw_query('''
+                SELECT *, ->purchased->Product AS products
+                FROM User
+                WHERE id = $user_id
+            ''', variables={"user_id": "user:123"})
+            ```
+        """
+        from .utils import remove_quotes_for_variables
+
+        client = await SurrealDBConnectionManager.get_client()
+        results = await client.query(
+            remove_quotes_for_variables(query),
+            variables or {},
+        )
+
+        # SDK 1.0.8 returns list directly from query()
+        if isinstance(results, list):
+            try:
+                return cls.from_db(results)  # type: ignore
+            except Exception:
+                # If validation fails, return raw dicts
+                return results
+
+        return []
