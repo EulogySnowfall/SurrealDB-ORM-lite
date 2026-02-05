@@ -30,11 +30,11 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/EulogySnowfall/surreal-orm-lite"
-Documentation = "https://github.com/EulogySnowfall/surreal-orm-lite"
-Repository = "https://github.com/EulogySnowfall/surreal-orm-lite.git"
-Issues = "https://github.com/EulogySnowfall/surreal-orm-lite/issues"
-Changelog = "https://github.com/EulogySnowfall/surreal-orm-lite/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite"
+Documentation = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite"
+Repository = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite.git"
+Issues = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues"
+Changelog = "https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/CHANGELOG.md"
 
 [tool.setuptools]
 packages = ["src/surreal_orm_lite"]
