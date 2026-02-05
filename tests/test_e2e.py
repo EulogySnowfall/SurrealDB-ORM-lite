@@ -2,10 +2,10 @@ import pytest
 from pydantic import Field
 from src import surreal_orm_lite
 from surrealdb import RecordID
-from src.surreal_orm_lite.exceptions import SurrealDbError, SurrealDbConnectionError
+from src.surreal_orm_lite.exceptions import SurrealDbError, SurrealDbConnectionError, SurrealDbNotFoundError
 
 
-SURREALDB_URL = "http://localhost:8000"
+SURREALDB_URL = "http://localhost:18000"
 SURREALDB_USER = "root"
 SURREALDB_PASS = "root"
 SURREALDB_NAMESPACE = "ns"
@@ -105,7 +105,7 @@ async def test_first_model() -> None:
     else:
         assert False
 
-    with pytest.raises(SurrealDbError) as exc1:
+    with pytest.raises(SurrealDbNotFoundError) as exc1:
         await ModelTest.objects().filter(name="NotExist").first()
 
     assert str(exc1.value) == "No result found."
@@ -217,7 +217,7 @@ async def test_error_on_get_multi() -> None:
 
     assert str(exc1.value) == "More than one result found."
 
-    with pytest.raises(SurrealDbError) as exc2:
+    with pytest.raises(SurrealDbNotFoundError) as exc2:
         await ModelTestEmpty.objects().get()
 
     assert str(exc2.value) == "No result found."

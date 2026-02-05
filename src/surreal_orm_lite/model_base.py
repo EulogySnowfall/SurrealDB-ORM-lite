@@ -76,12 +76,12 @@ class BaseSurrealModel(BaseModel):
     @classmethod
     def set_data(cls, data: Any) -> Any:
         """
-        Set the ID of the model instance.
+        Pre-process data before model validation.
+        Extracts the ID from RecordID if present.
         """
-        if isinstance(data, dict):  # pragma: no cover
-            if "id" in data and isinstance(data["id"], RecordID):
-                data["id"] = str(data["id"]).split(":")[1]
-            return data
+        if isinstance(data, dict) and "id" in data and isinstance(data["id"], RecordID):
+            data["id"] = str(data["id"]).split(":")[1]
+        return data
 
     async def refresh(self) -> None:
         """
@@ -96,8 +96,13 @@ class BaseSurrealModel(BaseModel):
         if record is None:
             raise SurrealDbError("Can't refresh data, no record found.")  # pragma: no cover
 
-        self.from_db(record)
-        return None
+        # Update current instance with refreshed data
+        if isinstance(record, dict):
+            for key, value in record.items():
+                if key == "id" and isinstance(value, RecordID):
+                    value = str(value).split(":")[1]
+                if hasattr(self, key):
+                    object.__setattr__(self, key, value)
 
     async def save(self) -> Self:
         """
@@ -131,9 +136,13 @@ class BaseSurrealModel(BaseModel):
         if record is None:
             raise SurrealDbError("Can't save data, no record returned.")  # pragma: no cover
 
-        obj = self.from_db(record)
-        if isinstance(obj, type(self)):
-            self = obj
+        # Update current instance with the auto-generated ID
+        if isinstance(record, dict):
+            for key, value in record.items():
+                if key == "id" and isinstance(value, RecordID):
+                    value = str(value).split(":")[1]
+                if hasattr(self, key):
+                    object.__setattr__(self, key, value)
             return self
 
         raise SurrealDbError("Can't save data, no record returned.")  # pragma: no cover
@@ -148,8 +157,8 @@ class BaseSurrealModel(BaseModel):
         id = self.get_id()
         if id is not None:
             thing = f"{self.__class__.__name__}:{id}"
-            test = await client.update(thing, data)
-            return test
+            result = await client.update(thing, data)
+            return result
         raise SurrealDbError("Can't update data, no id found.")
 
     async def merge(self, **data: Any) -> Any:
@@ -187,7 +196,6 @@ class BaseSurrealModel(BaseModel):
             raise SurrealDbError(f"Can't delete Record id -> '{id}' not found!")
 
         logger.info(f"Record deleted -> {deleted}.")
-        del self
 
     @model_validator(mode="after")
     def check_config(self) -> Self:
@@ -197,7 +205,7 @@ class BaseSurrealModel(BaseModel):
 
         if not self.get_index_primary_key() and not hasattr(self, "id"):
             raise SurrealDbError(  # pragma: no cover
-                "Can't create model, the model need either 'id' field or primirary_key in 'model_config'."
+                "Can't create model, the model needs either 'id' field or primary_key in 'model_config'."
             )
 
         return self

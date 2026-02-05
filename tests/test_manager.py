@@ -3,7 +3,7 @@ from typing import AsyncGenerator, Any
 from src.surreal_orm_lite import SurrealDBConnectionManager
 from src.surreal_orm_lite.exceptions import SurrealDbConnectionError
 
-SURREALDB_URL = "http://localhost:8000"
+SURREALDB_URL = "http://localhost:18000"
 SURREALDB_USER = "root"
 SURREALDB_PASS = "root"
 SURREALDB_NAMESPACE = "ns"

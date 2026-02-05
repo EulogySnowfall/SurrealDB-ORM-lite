@@ -6,7 +6,7 @@ from pydantic_core import ValidationError
 from . import BaseSurrealModel, SurrealDBConnectionManager
 from .constants import LOOKUP_OPERATORS
 from .enum import OrderBy
-from .exceptions import SurrealDbError
+from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .utils import remove_quotes_for_variables
 
 logger = logging.getLogger(__name__)
@@ -261,6 +261,10 @@ class QuerySet:
         if where_clauses:
             query += " WHERE " + " AND ".join(where_clauses)
 
+        # Append ORDER BY if set (must come before LIMIT/START in SurrealDB)
+        if self._order_by:
+            query += f" ORDER BY {self._order_by}"
+
         # Append LIMIT if set
         if self._limit is not None:
             query += f" LIMIT {self._limit}"
@@ -268,10 +272,6 @@ class QuerySet:
         # Append OFFSET (START) if set
         if self._offset is not None:
             query += f" START {self._offset}"
-
-        # Append ORDER BY if set
-        if self._order_by:
-            query += f" ORDER BY {self._order_by}"
 
         query += ";"
         return query
@@ -333,7 +333,7 @@ class QuerySet:
         if results:
             return results[0]
 
-        raise SurrealDbError("No result found.")
+        raise SurrealDbNotFoundError("No result found.")
 
     async def get(self, id_item: Any = None) -> Any:
         """
@@ -363,7 +363,7 @@ class QuerySet:
             # SDK 1.0.8 returns a list even for single record select
             if isinstance(data, list):
                 if len(data) == 0:
-                    raise SurrealDbError("No result found.")
+                    raise SurrealDbNotFoundError("No result found.")
                 data = data[0]
             return self.model.from_db(data)
         else:
@@ -372,7 +372,7 @@ class QuerySet:
                 raise SurrealDbError("More than one result found.")
 
             if len(result) == 0:
-                raise SurrealDbError("No result found.")
+                raise SurrealDbNotFoundError("No result found.")
             return result[0]
 
     async def all(self) -> Any:
