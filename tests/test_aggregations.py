@@ -75,6 +75,12 @@ class TestAggregationClasses:
             Sum("")  # type: ignore
         assert "Sum requires a field name" in str(exc.value)
 
+    def test_sum_rejects_whitespace_field(self) -> None:
+        """Sum should reject whitespace-only field names."""
+        with pytest.raises(ValueError) as exc:
+            Sum("   ")  # type: ignore
+        assert "Sum requires a field name" in str(exc.value)
+
     def test_sum_to_sql(self) -> None:
         """Sum should generate math::sum(field)."""
         agg = Sum("amount")
@@ -85,6 +91,12 @@ class TestAggregationClasses:
         """Avg should require a field name."""
         with pytest.raises(ValueError) as exc:
             Avg("")  # type: ignore
+        assert "Avg requires a field name" in str(exc.value)
+
+    def test_avg_rejects_whitespace_field(self) -> None:
+        """Avg should reject whitespace-only field names."""
+        with pytest.raises(ValueError) as exc:
+            Avg("   ")  # type: ignore
         assert "Avg requires a field name" in str(exc.value)
 
     def test_avg_to_sql(self) -> None:
@@ -99,6 +111,12 @@ class TestAggregationClasses:
             Min("")  # type: ignore
         assert "Min requires a field name" in str(exc.value)
 
+    def test_min_rejects_whitespace_field(self) -> None:
+        """Min should reject whitespace-only field names."""
+        with pytest.raises(ValueError) as exc:
+            Min("   ")  # type: ignore
+        assert "Min requires a field name" in str(exc.value)
+
     def test_min_to_sql(self) -> None:
         """Min should generate math::min(field)."""
         agg = Min("price")
@@ -109,6 +127,12 @@ class TestAggregationClasses:
         """Max should require a field name."""
         with pytest.raises(ValueError) as exc:
             Max("")  # type: ignore
+        assert "Max requires a field name" in str(exc.value)
+
+    def test_max_rejects_whitespace_field(self) -> None:
+        """Max should reject whitespace-only field names."""
+        with pytest.raises(ValueError) as exc:
+            Max("   ")  # type: ignore
         assert "Max requires a field name" in str(exc.value)
 
     def test_max_to_sql(self) -> None:

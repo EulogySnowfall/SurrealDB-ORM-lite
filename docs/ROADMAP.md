@@ -41,9 +41,9 @@ min_price = await Product.objects().min("price")
 
 **Fichiers à créer/modifier**:
 
-- [ ] `src/surreal_orm_lite/aggregations.py` - Classes Count, Sum, Avg, Min, Max
-- [ ] `src/surreal_orm_lite/query_set.py` - Méthodes count(), sum(), avg(), min(), max()
-- [ ] `tests/test_aggregations.py` - Tests unitaires et e2e
+- [x] `src/surreal_orm_lite/aggregations.py` - Classes Count, Sum, Avg, Min, Max
+- [x] `src/surreal_orm_lite/query_set.py` - Méthodes count(), sum(), avg(), min(), max()
+- [x] `tests/test_aggregations.py` - Tests unitaires et e2e
 
 **Implémentation technique**:
 
@@ -68,7 +68,7 @@ results = await Order.objects().values("customer_id").annotate(
 
 **Fichiers à modifier**:
 
-- [ ] `src/surreal_orm_lite/query_set.py` - Méthodes values(), annotate()
+- [x] `src/surreal_orm_lite/query_set.py` - Méthodes values(), annotate()
 
 #### 3. raw_query() class method (Priorité: Haute)
 
@@ -89,7 +89,7 @@ results = await User.raw_query("""
 
 **Fichiers à modifier**:
 
-- [ ] `src/surreal_orm_lite/model_base.py` - Ajouter classmethod raw_query()
+- [x] `src/surreal_orm_lite/model_base.py` - Ajouter classmethod raw_query()
 
 #### 4. exists() method (Priorité: Basse)
 
@@ -100,14 +100,14 @@ has_admins = await User.objects().filter(role="admin").exists()
 
 **Fichiers à modifier**:
 
-- [ ] `src/surreal_orm_lite/query_set.py` - Méthode exists()
+- [x] `src/surreal_orm_lite/query_set.py` - Méthode exists()
 
 ### Critères de complétion v0.3.0
 
-- [ ] Tous les tests passent
-- [ ] Coverage >= 70%
-- [ ] Documentation mise à jour
-- [ ] CHANGELOG mis à jour
+- [x] Tous les tests passent
+- [x] Coverage >= 70% (94% atteint)
+- [x] Documentation mise à jour
+- [x] CHANGELOG mis à jour
 
 ---
 

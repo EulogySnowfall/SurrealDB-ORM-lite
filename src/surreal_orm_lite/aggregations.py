@@ -134,7 +134,7 @@ class Sum(Aggregation):
             field: The numeric field to sum.
             alias: Optional alias for the result.
         """
-        if not field:
+        if not field or not field.strip():
             raise ValueError("Sum requires a field name")
         super().__init__(field, alias)
 
@@ -175,7 +175,7 @@ class Avg(Aggregation):
             field: The numeric field to average.
             alias: Optional alias for the result.
         """
-        if not field:
+        if not field or not field.strip():
             raise ValueError("Avg requires a field name")
         super().__init__(field, alias)
 
@@ -216,7 +216,7 @@ class Min(Aggregation):
             field: The field to find the minimum value of.
             alias: Optional alias for the result.
         """
-        if not field:
+        if not field or not field.strip():
             raise ValueError("Min requires a field name")
         super().__init__(field, alias)
 
@@ -257,7 +257,7 @@ class Max(Aggregation):
             field: The field to find the maximum value of.
             alias: Optional alias for the result.
         """
-        if not field:
+        if not field or not field.strip():
             raise ValueError("Max requires a field name")
         super().__init__(field, alias)
 
