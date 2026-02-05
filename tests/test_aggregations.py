@@ -135,6 +135,24 @@ class TestAggregationClasses:
             Max("   ")  # type: ignore
         assert "Max requires a field name" in str(exc.value)
 
+    def test_sum_rejects_sql_injection(self) -> None:
+        """Sum should reject SQL injection attempts."""
+        with pytest.raises(ValueError) as exc:
+            Sum("amount); DROP TABLE--")
+        assert "Invalid" in str(exc.value)
+
+    def test_avg_rejects_sql_injection(self) -> None:
+        """Avg should reject SQL injection attempts."""
+        with pytest.raises(ValueError) as exc:
+            Avg("price); DELETE FROM--")
+        assert "Invalid" in str(exc.value)
+
+    def test_count_rejects_sql_injection(self) -> None:
+        """Count with field should reject SQL injection attempts."""
+        with pytest.raises(ValueError) as exc:
+            Count("id; DROP TABLE--")
+        assert "Invalid" in str(exc.value)
+
     def test_max_to_sql(self) -> None:
         """Max should generate math::max(field)."""
         agg = Max("price")
@@ -161,31 +179,49 @@ class TestQuerySetAggregationMethods:
         """sum() should raise ValueError for empty field name."""
         with pytest.raises(ValueError) as exc:
             await Product.objects().sum("")
-        assert "requires a valid field name" in str(exc.value)
+        assert "cannot be empty" in str(exc.value)
 
     async def test_sum_requires_non_whitespace_field(self) -> None:
         """sum() should raise ValueError for whitespace-only field name."""
         with pytest.raises(ValueError) as exc:
             await Product.objects().sum("   ")
-        assert "requires a valid field name" in str(exc.value)
+        assert "cannot be empty" in str(exc.value)
+
+    async def test_sum_rejects_invalid_field_name(self) -> None:
+        """sum() should reject SQL injection attempts."""
+        with pytest.raises(ValueError) as exc:
+            await Product.objects().sum("amount); DROP TABLE--")
+        assert "Invalid" in str(exc.value)
 
     async def test_avg_requires_valid_field(self) -> None:
         """avg() should raise ValueError for empty field name."""
         with pytest.raises(ValueError) as exc:
             await Product.objects().avg("")
-        assert "requires a valid field name" in str(exc.value)
+        assert "cannot be empty" in str(exc.value)
 
     async def test_min_requires_valid_field(self) -> None:
         """min() should raise ValueError for empty field name."""
         with pytest.raises(ValueError) as exc:
             await Product.objects().min("")
-        assert "requires a valid field name" in str(exc.value)
+        assert "cannot be empty" in str(exc.value)
 
     async def test_max_requires_valid_field(self) -> None:
         """max() should raise ValueError for empty field name."""
         with pytest.raises(ValueError) as exc:
             await Product.objects().max("")
-        assert "requires a valid field name" in str(exc.value)
+        assert "cannot be empty" in str(exc.value)
+
+    def test_values_rejects_invalid_field_name(self) -> None:
+        """values() should reject SQL injection attempts."""
+        with pytest.raises(ValueError) as exc:
+            Product.objects().values("status; DROP TABLE--")
+        assert "Invalid" in str(exc.value)
+
+    def test_annotate_rejects_invalid_alias(self) -> None:
+        """annotate() should reject invalid alias names."""
+        with pytest.raises(ValueError) as exc:
+            Product.objects().values("category").annotate(**{"count; DROP": Count()})
+        assert "Invalid alias" in str(exc.value)
 
     def test_values_multiple_fields(self) -> None:
         """values() with multiple fields."""

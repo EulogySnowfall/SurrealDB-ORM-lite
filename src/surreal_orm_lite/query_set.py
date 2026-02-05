@@ -7,7 +7,7 @@ from . import BaseSurrealModel, SurrealDBConnectionManager
 from .constants import LOOKUP_OPERATORS
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
-from .utils import remove_quotes_for_variables
+from .utils import remove_quotes_for_variables, validate_alias_name, validate_field_name
 
 if TYPE_CHECKING:
     from .aggregations import Aggregation
@@ -228,6 +228,23 @@ class QuerySet:
         self._order_by = f"{field_name} {type}"
         return self
 
+    def _build_where_clauses(self) -> list[str]:
+        """
+        Build WHERE clause conditions from the current filters.
+
+        Returns:
+            list[str]: A list of WHERE clause condition strings.
+        """
+        where_clauses = []
+        for field_name, lookup_name, value in self._filters:
+            op = LOOKUP_OPERATORS.get(lookup_name, "=")
+            if lookup_name == "in":
+                formatted_values = ", ".join(repr(v) for v in value)
+                where_clauses.append(f"{field_name} {op} [{formatted_values}]")
+            else:
+                where_clauses.append(f"{field_name} {op} {repr(value)}")
+        return where_clauses
+
     def _compile_query(self) -> str:
         """
         Compile the QuerySet parameters into a SQL query string.
@@ -245,15 +262,7 @@ class QuerySet:
             # "SELECT id, name FROM users WHERE age > 21 AND status = 'active' ORDER BY name ASC LIMIT 10 START 20;"
             ```
         """
-        where_clauses = []
-        for field_name, lookup_name, value in self._filters:
-            op = LOOKUP_OPERATORS.get(lookup_name, "=")
-            if lookup_name == "in":
-                # Assuming value is iterable for 'IN' operations
-                formatted_values = ", ".join(repr(v) for v in value)
-                where_clauses.append(f"{field_name} {op} [{formatted_values}]")
-            else:
-                where_clauses.append(f"{field_name} {op} {repr(value)}")
+        where_clauses = self._build_where_clauses()
 
         # Construct the SELECT clause
         if self.select_item:
@@ -509,6 +518,8 @@ class QuerySet:
             # Returns: [{"status": "active", "count": 42}, {"status": "inactive", "count": 8}]
             ```
         """
+        for field in fields:
+            validate_field_name(field, "GROUP BY field")
         self._group_by_fields = list(fields)
         return self
 
@@ -547,6 +558,7 @@ class QuerySet:
         from .aggregations import Aggregation as AggregationClass
 
         for alias, agg in annotations.items():
+            validate_alias_name(alias)
             if not isinstance(agg, AggregationClass):
                 raise TypeError(f"annotate() argument '{alias}' must be an Aggregation instance, got {type(agg).__name__}")
         self._annotations = annotations
@@ -603,8 +615,7 @@ class QuerySet:
             completed_total = await Order.objects().filter(status="completed").sum("amount")
             ```
         """
-        if not field or not field.strip():
-            raise ValueError("sum() requires a valid field name")
+        validate_field_name(field, "sum() field")
         query = self._compile_aggregation_query(f"math::sum({field})", alias="sum")
         results = await self._execute_query(query)
 
@@ -638,8 +649,7 @@ class QuerySet:
             avg_active = await User.objects().filter(status="active").avg("age")
             ```
         """
-        if not field or not field.strip():
-            raise ValueError("avg() requires a valid field name")
+        validate_field_name(field, "avg() field")
         query = self._compile_aggregation_query(f"math::mean({field})", alias="avg")
         results = await self._execute_query(query)
 
@@ -673,8 +683,7 @@ class QuerySet:
             min_active = await Product.objects().filter(active=True).min("price")
             ```
         """
-        if not field or not field.strip():
-            raise ValueError("min() requires a valid field name")
+        validate_field_name(field, "min() field")
         query = self._compile_aggregation_query(f"math::min({field})", alias="min")
         results = await self._execute_query(query)
 
@@ -707,8 +716,7 @@ class QuerySet:
             max_active = await Product.objects().filter(active=True).max("price")
             ```
         """
-        if not field or not field.strip():
-            raise ValueError("max() requires a valid field name")
+        validate_field_name(field, "max() field")
         query = self._compile_aggregation_query(f"math::max({field})", alias="max")
         results = await self._execute_query(query)
 
@@ -764,14 +772,7 @@ class QuerySet:
         Returns:
             str: The compiled SQL query string.
         """
-        where_clauses = []
-        for field_name, lookup_name, value in self._filters:
-            op = LOOKUP_OPERATORS.get(lookup_name, "=")
-            if lookup_name == "in":
-                formatted_values = ", ".join(repr(v) for v in value)
-                where_clauses.append(f"{field_name} {op} [{formatted_values}]")
-            else:
-                where_clauses.append(f"{field_name} {op} {repr(value)}")
+        where_clauses = self._build_where_clauses()
 
         # Build SELECT clause with aggregation
         if alias:
@@ -798,14 +799,7 @@ class QuerySet:
         Returns:
             str: The compiled SQL query string.
         """
-        where_clauses = []
-        for field_name, lookup_name, value in self._filters:
-            op = LOOKUP_OPERATORS.get(lookup_name, "=")
-            if lookup_name == "in":
-                formatted_values = ", ".join(repr(v) for v in value)
-                where_clauses.append(f"{field_name} {op} [{formatted_values}]")
-            else:
-                where_clauses.append(f"{field_name} {op} {repr(value)}")
+        where_clauses = self._build_where_clauses()
 
         # Build SELECT clause with group fields and annotations
         select_parts = list(self._group_by_fields)

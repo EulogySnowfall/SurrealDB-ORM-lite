@@ -2,6 +2,7 @@ import logging
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic_core import ValidationError
 from surrealdb import RecordID
 
 from .connection_manager import SurrealDBConnectionManager
@@ -278,7 +279,7 @@ class BaseSurrealModel(BaseModel):
         if isinstance(results, list):
             try:
                 return cls.from_db(results)  # type: ignore
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, ValidationError):
                 # If validation fails, return raw dicts
                 return results
 

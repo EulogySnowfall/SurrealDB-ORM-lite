@@ -19,6 +19,8 @@ Example:
 
 from abc import ABC, abstractmethod
 
+from .utils import validate_field_name
+
 
 class Aggregation(ABC):
     """
@@ -93,6 +95,8 @@ class Count(Aggregation):
             field: Optional field name. If not provided, counts all records.
             alias: Optional alias for the result.
         """
+        if field is not None:
+            validate_field_name(field, "Count field")
         super().__init__(field, alias)
 
     def to_sql(self) -> str:
@@ -136,6 +140,7 @@ class Sum(Aggregation):
         """
         if not field or not field.strip():
             raise ValueError("Sum requires a field name")
+        validate_field_name(field, "Sum field")
         super().__init__(field, alias)
 
     def to_sql(self) -> str:
@@ -177,6 +182,7 @@ class Avg(Aggregation):
         """
         if not field or not field.strip():
             raise ValueError("Avg requires a field name")
+        validate_field_name(field, "Avg field")
         super().__init__(field, alias)
 
     def to_sql(self) -> str:
@@ -218,6 +224,7 @@ class Min(Aggregation):
         """
         if not field or not field.strip():
             raise ValueError("Min requires a field name")
+        validate_field_name(field, "Min field")
         super().__init__(field, alias)
 
     def to_sql(self) -> str:
@@ -259,6 +266,7 @@ class Max(Aggregation):
         """
         if not field or not field.strip():
             raise ValueError("Max requires a field name")
+        validate_field_name(field, "Max field")
         super().__init__(field, alias)
 
     def to_sql(self) -> str:
