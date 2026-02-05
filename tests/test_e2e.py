@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from pydantic import Field
 from src import surreal_orm_lite
@@ -5,7 +7,9 @@ from surrealdb import RecordID
 from src.surreal_orm_lite.exceptions import SurrealDbError, SurrealDbConnectionError, SurrealDbNotFoundError
 
 
-SURREALDB_URL = "http://localhost:18000"
+SURREALDB_HOST = os.environ.get("SURREALDB_HOST", "localhost")
+SURREALDB_PORT = os.environ.get("SURREALDB_PORT", "8000")
+SURREALDB_URL = f"http://{SURREALDB_HOST}:{SURREALDB_PORT}"
 SURREALDB_USER = "root"
 SURREALDB_PASS = "root"
 SURREALDB_NAMESPACE = "ns"
