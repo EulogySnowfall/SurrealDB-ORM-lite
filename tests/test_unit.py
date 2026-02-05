@@ -75,19 +75,18 @@ def test_str_dunnder(model_test: ModelTest) -> None:
     assert str(model_test) == "id='1' name='Test' age=45"
 
 
-async def failed_model_validation() -> None:
+async def test_failed_model_validation() -> None:
     class ModelTestInvalide(BaseSurrealModel):
         name: str = Field(..., max_length=100)
         age: int = Field(..., ge=0, le=125)
 
     with pytest.raises(SurrealDbError) as exc:
-        model = ModelTestInvalide(name="Test", age=45)
-        await model.save()
+        ModelTestInvalide(name="Test", age=45)
 
     assert (
         str(exc.value)
-        == "Can't create model, the model need either 'id' field "
-        + "or primirary_key in 'model_config'."  # test check config with error
+        == "Can't create model, the model needs either 'id' field "
+        + "or primary_key in 'model_config'."
     )
 
 
