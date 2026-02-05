@@ -126,6 +126,43 @@ class TestQuerySetAggregationMethods:
         qs = Product.objects().values("category")
         assert qs._group_by_fields == ["category"]
 
+    def test_annotate_validates_aggregation_type(self) -> None:
+        """annotate() should raise TypeError for non-Aggregation values."""
+        with pytest.raises(TypeError) as exc:
+            Product.objects().values("category").annotate(count="not_an_aggregation")  # type: ignore
+        assert "must be an Aggregation instance" in str(exc.value)
+        assert "count" in str(exc.value)
+
+    async def test_sum_requires_valid_field(self) -> None:
+        """sum() should raise ValueError for empty field name."""
+        with pytest.raises(ValueError) as exc:
+            await Product.objects().sum("")
+        assert "requires a valid field name" in str(exc.value)
+
+    async def test_sum_requires_non_whitespace_field(self) -> None:
+        """sum() should raise ValueError for whitespace-only field name."""
+        with pytest.raises(ValueError) as exc:
+            await Product.objects().sum("   ")
+        assert "requires a valid field name" in str(exc.value)
+
+    async def test_avg_requires_valid_field(self) -> None:
+        """avg() should raise ValueError for empty field name."""
+        with pytest.raises(ValueError) as exc:
+            await Product.objects().avg("")
+        assert "requires a valid field name" in str(exc.value)
+
+    async def test_min_requires_valid_field(self) -> None:
+        """min() should raise ValueError for empty field name."""
+        with pytest.raises(ValueError) as exc:
+            await Product.objects().min("")
+        assert "requires a valid field name" in str(exc.value)
+
+    async def test_max_requires_valid_field(self) -> None:
+        """max() should raise ValueError for empty field name."""
+        with pytest.raises(ValueError) as exc:
+            await Product.objects().max("")
+        assert "requires a valid field name" in str(exc.value)
+
     def test_values_multiple_fields(self) -> None:
         """values() with multiple fields."""
         qs = Product.objects().values("category", "in_stock")

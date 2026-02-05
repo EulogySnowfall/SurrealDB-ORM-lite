@@ -11,7 +11,7 @@
 | Version | Thème                              | Statut       |
 | ------- | ---------------------------------- | ------------ |
 | v0.2.x  | Core ORM (CRUD, QuerySet, Filters) | ✅ Complété  |
-| v0.3.0  | Aggregations & Utilities           | 🎯 Prochaine |
+| v0.3.0  | Aggregations & Utilities           | ✅ Complété  |
 | v0.4.0  | Model Signals                      | 📋 Planifié  |
 | v0.5.0  | Bulk Operations                    | 📋 Planifié  |
 | v0.6.0  | Relations & Graph                  | 📋 Planifié  |

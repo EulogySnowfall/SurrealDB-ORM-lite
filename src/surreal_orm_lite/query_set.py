@@ -526,6 +526,9 @@ class QuerySet:
         Returns:
             Self: The current QuerySet instance for method chaining.
 
+        Raises:
+            TypeError: If any annotation value is not an Aggregation instance.
+
         Example:
             ```python
             from surreal_orm_lite import Count, Sum, Avg
@@ -541,6 +544,11 @@ class QuerySet:
             ).exec()
             ```
         """
+        from .aggregations import Aggregation as AggregationClass
+
+        for alias, agg in annotations.items():
+            if not isinstance(agg, AggregationClass):
+                raise TypeError(f"annotate() argument '{alias}' must be an Aggregation instance, got {type(agg).__name__}")
         self._annotations = annotations
         return self
 
@@ -583,6 +591,9 @@ class QuerySet:
         Returns:
             float | int: The sum of the field values, or 0 if no records match.
 
+        Raises:
+            ValueError: If field name is empty or invalid.
+
         Example:
             ```python
             # Sum of all order amounts
@@ -592,6 +603,8 @@ class QuerySet:
             completed_total = await Order.objects().filter(status="completed").sum("amount")
             ```
         """
+        if not field or not field.strip():
+            raise ValueError("sum() requires a valid field name")
         query = self._compile_aggregation_query(f"math::sum({field})", alias="sum")
         results = await self._execute_query(query)
 
@@ -613,6 +626,9 @@ class QuerySet:
         Returns:
             float: The average of the field values, or 0.0 if no records match.
 
+        Raises:
+            ValueError: If field name is empty or invalid.
+
         Example:
             ```python
             # Average age of all users
@@ -622,6 +638,8 @@ class QuerySet:
             avg_active = await User.objects().filter(status="active").avg("age")
             ```
         """
+        if not field or not field.strip():
+            raise ValueError("avg() requires a valid field name")
         query = self._compile_aggregation_query(f"math::mean({field})", alias="avg")
         results = await self._execute_query(query)
 
@@ -643,6 +661,9 @@ class QuerySet:
         Returns:
             Any: The minimum value, or None if no records match.
 
+        Raises:
+            ValueError: If field name is empty or invalid.
+
         Example:
             ```python
             # Minimum price
@@ -652,6 +673,8 @@ class QuerySet:
             min_active = await Product.objects().filter(active=True).min("price")
             ```
         """
+        if not field or not field.strip():
+            raise ValueError("min() requires a valid field name")
         query = self._compile_aggregation_query(f"math::min({field})", alias="min")
         results = await self._execute_query(query)
 
@@ -672,6 +695,9 @@ class QuerySet:
         Returns:
             Any: The maximum value, or None if no records match.
 
+        Raises:
+            ValueError: If field name is empty or invalid.
+
         Example:
             ```python
             # Maximum price
@@ -681,6 +707,8 @@ class QuerySet:
             max_active = await Product.objects().filter(active=True).max("price")
             ```
         """
+        if not field or not field.strip():
+            raise ValueError("max() requires a valid field name")
         query = self._compile_aggregation_query(f"math::max({field})", alias="max")
         results = await self._execute_query(query)
 
@@ -710,14 +738,18 @@ class QuerySet:
             user_exists = await User.objects().filter(email="alice@example.com").exists()
             ```
         """
-        # Use LIMIT 1 for efficiency
-        self._limit = 1
-        query = self._compile_query()
-        results = await self._execute_query(query)
+        # Use LIMIT 1 for efficiency without permanently mutating the QuerySet
+        original_limit = self._limit
+        try:
+            self._limit = 1
+            query = self._compile_query()
+            results = await self._execute_query(query)
 
-        if isinstance(results, list):
-            return len(results) > 0
-        return False
+            if isinstance(results, list):
+                return len(results) > 0
+            return False
+        finally:
+            self._limit = original_limit
 
     def _compile_aggregation_query(self, aggregation_expr: str, alias: str | None = None) -> str:
         """

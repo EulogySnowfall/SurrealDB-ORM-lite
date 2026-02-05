@@ -278,7 +278,7 @@ class BaseSurrealModel(BaseModel):
         if isinstance(results, list):
             try:
                 return cls.from_db(results)  # type: ignore
-            except Exception:
+            except (ValueError, TypeError):
                 # If validation fails, return raw dicts
                 return results
 
