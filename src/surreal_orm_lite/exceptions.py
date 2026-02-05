@@ -44,11 +44,12 @@ class SurrealDbValidationError(SurrealORMError):
     pass
 
 
-class SurrealDbNotFoundError(SurrealORMError):
+class SurrealDbNotFoundError(SurrealDbError):
     """
     Not found error.
 
     Raised when a requested record or resource is not found.
+    Inherits from SurrealDbError for backward compatibility.
     """
 
     pass

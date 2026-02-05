@@ -4,7 +4,7 @@ import pytest
 from pydantic import Field
 from src import surreal_orm_lite
 from surrealdb import RecordID
-from src.surreal_orm_lite.exceptions import SurrealDbError, SurrealDbConnectionError, SurrealDbNotFoundError
+from src.surreal_orm_lite.exceptions import SurrealDbError, SurrealDbNotFoundError
 
 
 SURREALDB_HOST = os.environ.get("SURREALDB_HOST", "localhost")
