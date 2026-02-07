@@ -1,7 +1,9 @@
 import os
+from collections.abc import AsyncGenerator
+from typing import Any
 
 import pytest
-from typing import AsyncGenerator, Any
+
 from src.surreal_orm_lite import SurrealDBConnectionManager
 from src.surreal_orm_lite.exceptions import SurrealDbConnectionError
 
@@ -79,7 +81,9 @@ async def test_set_url(setup_connection_manager: AsyncGenerator[Any, Any]) -> No
     new_url = "http://localhost:8001"
     assert await SurrealDBConnectionManager.set_url(new_url) is True
     assert SurrealDBConnectionManager.get_url() == new_url
-    assert await SurrealDBConnectionManager.set_url(new_url, True) is False  # Cover validate_connection to False
+    # Use a port that is guaranteed to have no SurrealDB running
+    bad_url = "http://localhost:19999"
+    assert await SurrealDBConnectionManager.set_url(bad_url, True) is False  # Cover validate_connection to False
 
     await SurrealDBConnectionManager.unset_connection()
     with pytest.raises(ValueError) as exc:
