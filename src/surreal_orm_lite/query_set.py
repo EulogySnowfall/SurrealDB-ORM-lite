@@ -561,7 +561,7 @@ class QuerySet:
             validate_alias_name(alias)
             if not isinstance(agg, AggregationClass):
                 raise TypeError(f"annotate() argument '{alias}' must be an Aggregation instance, got {type(agg).__name__}")
-        self._annotations = annotations
+        self._annotations.update(annotations)
         return self
 
     async def count(self) -> int:

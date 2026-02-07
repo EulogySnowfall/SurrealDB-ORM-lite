@@ -153,6 +153,18 @@ class TestAggregationClasses:
             Count("id; DROP TABLE--")
         assert "Invalid" in str(exc.value)
 
+    def test_min_rejects_sql_injection(self) -> None:
+        """Min should reject SQL injection attempts."""
+        with pytest.raises(ValueError) as exc:
+            Min("price); DROP TABLE--")
+        assert "Invalid" in str(exc.value)
+
+    def test_max_rejects_sql_injection(self) -> None:
+        """Max should reject SQL injection attempts."""
+        with pytest.raises(ValueError) as exc:
+            Max("price); DROP TABLE--")
+        assert "Invalid" in str(exc.value)
+
     def test_max_to_sql(self) -> None:
         """Max should generate math::max(field)."""
         agg = Max("price")
@@ -249,6 +261,18 @@ class TestQuerySetAggregationMethods:
         assert "count" in qs._annotations
         assert "avg_price" in qs._annotations
         assert "max_price" in qs._annotations
+
+    def test_annotate_accumulates_across_calls(self) -> None:
+        """Multiple annotate() calls should accumulate annotations (Django-style)."""
+        qs = (
+            Product.objects()
+            .values("category")
+            .annotate(count=Count())
+            .annotate(avg_price=Avg("price"))
+        )
+        assert len(qs._annotations) == 2
+        assert "count" in qs._annotations
+        assert "avg_price" in qs._annotations
 
     def test_compile_aggregation_query(self) -> None:
         """_compile_aggregation_query should generate correct SQL."""
