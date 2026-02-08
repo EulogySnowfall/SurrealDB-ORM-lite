@@ -12,7 +12,7 @@
 | ------- | ---------------------------------- | ------------ |
 | v0.2.x  | Core ORM (CRUD, QuerySet, Filters) | ✅ Complété  |
 | v0.3.0  | Aggregations & Utilities           | ✅ Complété  |
-| v0.4.0  | Model Signals                      | 📋 Planifié  |
+| v0.4.0  | Model Signals                      | ✅ Complété  |
 | v0.5.0  | Bulk Operations                    | 📋 Planifié  |
 | v0.6.0  | Relations & Graph                  | 📋 Planifié  |
 | v0.7.0  | Transactions ORM                   | 📋 Planifié  |
@@ -153,10 +153,10 @@ async def on_user_deleted(sender, instance, **kwargs):
 
 **Fichiers à créer/modifier**:
 
-- [ ] `src/surreal_orm_lite/signals.py` - Classes Signal, pre_save, post_save, etc.
-- [ ] `src/surreal_orm_lite/model_base.py` - Intégrer les signaux dans CRUD
-- [ ] `src/surreal_orm_lite/__init__.py` - Exporter les signaux
-- [ ] `tests/test_signals.py` - Tests
+- [x] `src/surreal_orm_lite/signals.py` - Classes Signal, pre_save, post_save, etc.
+- [x] `src/surreal_orm_lite/model_base.py` - Intégrer les signaux dans CRUD
+- [x] `src/surreal_orm_lite/__init__.py` - Exporter les signaux
+- [x] `tests/test_signals.py` - Tests
 
 #### 2. Around Signals (Priorité: Moyenne)
 
@@ -177,13 +177,13 @@ async def time_user_save(sender, instance, created, **kwargs):
 
 **Fichiers à créer/modifier**:
 
-- [ ] `src/surreal_orm_lite/signals.py` - AroundSignal class
+- [x] `src/surreal_orm_lite/signals.py` - AroundSignal class
 
 ### Critères de complétion v0.4.0
 
-- [ ] Tous les signaux fonctionnent
-- [ ] Tests de régression CRUD
-- [ ] Documentation avec exemples
+- [x] Tous les signaux fonctionnent
+- [x] Tests de régression CRUD
+- [x] Documentation avec exemples
 
 ---
 

@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-02-07
+
+### Added
+
+- **Model Signals**: Django-style event system for model lifecycle
+  - `Signal` class for pre/post event handlers
+  - `AroundSignal` class for context manager-style wrapping signals with `yield`
+  - `pre_save` / `post_save` - Fired before/after `save()` operations
+  - `pre_update` / `post_update` - Fired before/after `update()` and `merge()` operations
+  - `pre_delete` / `post_delete` - Fired before/after `delete()` operations
+  - `around_save` / `around_update` / `around_delete` - Wrap operations for timing, logging, etc.
+  - `connect(model_class)` decorator for registering handlers
+  - `disconnect(handler, model_class)` for removing handlers
+  - `clear()` for removing all handlers
+  - `has_handlers()` for checking if handlers are registered
+
+- `post_save` signal includes `created` flag to distinguish new records
+- `pre_update` / `post_update` signals include `update_fields` list
+- New test file `tests/test_signals.py` with unit and e2e tests
+
+### Changed
+
+- `save()`, `update()`, `merge()`, `delete()` now emit signals when handlers are registered
+- Internal `_do_save()` method extracted from `save()` for signal integration
+
 ## [0.3.0] - 2026-02-05
 
 ### Added
