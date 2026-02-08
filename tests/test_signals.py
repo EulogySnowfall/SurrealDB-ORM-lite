@@ -368,15 +368,16 @@ class TestAroundSignalClass:
         @sig.connect(SignalUser)
         async def no_yield_handler(sender, **kwargs):  # type: ignore
             order.append("no_yield")
-            # Async generator that returns without yielding
+            # Async generator that returns before yielding; pre-yield side effects still run
             return
             yield  # type: ignore  # noqa: B901  # makes it an async generator
 
         async with sig.wrap(SignalUser, instance="test"):
             order.append("during")
 
-        # The handler's pre-yield code never ran because it returned before yield
-        assert "during" in order
+        # The handler's pre-yield code ran, but it returned before yielding, so
+        # wrap() skipped it for the "after" phase.
+        assert order == ["no_yield", "during"]
 
         # Cleanup
         sig.clear()

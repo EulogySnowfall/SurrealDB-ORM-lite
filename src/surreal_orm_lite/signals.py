@@ -87,6 +87,8 @@ class Signal:
         handlers = self._handlers.get(model_class, [])
         if handler in handlers:
             handlers.remove(handler)
+            if not handlers:
+                self._handlers.pop(model_class, None)
             return True
         return False
 
@@ -174,6 +176,8 @@ class AroundSignal:
         handlers = self._handlers.get(model_class, [])
         if handler in handlers:
             handlers.remove(handler)
+            if not handlers:
+                self._handlers.pop(model_class, None)
             return True
         return False
 
@@ -191,7 +195,7 @@ class AroundSignal:
             **kwargs: Additional keyword arguments passed to handlers.
         """
         handlers = self._handlers.get(sender, [])
-        generators: list[AsyncGenerator[None, None]] = []
+        active: list[tuple[AsyncGenerator[None, None], AroundHandler]] = []
 
         # Start all generators (run pre-yield code)
         try:
@@ -208,10 +212,10 @@ class AroundSignal:
                     with contextlib.suppress(Exception):
                         await gen.aclose()
                     continue
-                generators.append(gen)
+                active.append((gen, handler))
         except Exception:
             # If startup fails, close any already-started generators in LIFO order
-            for gen in reversed(generators):
+            for gen, _ in reversed(active):
                 with contextlib.suppress(Exception):
                     await gen.aclose()
             raise
@@ -219,15 +223,24 @@ class AroundSignal:
         try:
             yield
         finally:
-            # Complete all generators (run post-yield code) in reverse (LIFO) order
-            for gen in reversed(generators):
+            # Complete all generators (run post-yield code) in reverse (LIFO) order.
+            # Post-yield handler errors are logged and suppressed so they don't
+            # mask an exception raised by the wrapped operation.
+            for gen, handler in reversed(active):
                 try:
                     await gen.__anext__()
                 except StopAsyncIteration:
                     continue
+                except Exception:
+                    logger.exception(
+                        "AroundSignal handler %r for sender %r raised during post-yield cleanup.",
+                        handler,
+                        sender,
+                    )
                 else:
                     logger.warning(
-                        "AroundSignal handler for sender %r yielded more than once; handlers must yield exactly once.",
+                        "AroundSignal handler %r for sender %r yielded more than once; handlers must yield exactly once.",
+                        handler,
                         sender,
                     )
                     with contextlib.suppress(Exception):

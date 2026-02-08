@@ -173,6 +173,11 @@ class BaseSurrealModel(BaseModel):
         Emits pre_save, post_save, and around_save signals.
         """
         sender = self.__class__
+        has_signals = pre_save.has_handlers(sender) or post_save.has_handlers(sender) or around_save.has_handlers(sender)
+
+        if not has_signals:
+            result, created = await self._do_save()
+            return result
 
         await pre_save.send(sender, instance=self)
 
@@ -195,12 +200,18 @@ class BaseSurrealModel(BaseModel):
         data = self.model_dump(exclude={"id"})
         id = self.get_id()
         if id is not None:
+            thing = f"{self.__class__.__name__}:{id}"
             update_fields = list(data.keys())
+            has_signals = (
+                pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
+            )
+
+            if not has_signals:
+                return await client.update(thing, data)
 
             await pre_update.send(sender, instance=self, update_fields=update_fields)
 
             async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-                thing = f"{self.__class__.__name__}:{id}"
                 result = await client.update(thing, data)
 
             await post_update.send(sender, instance=self, update_fields=update_fields)
@@ -221,12 +232,20 @@ class BaseSurrealModel(BaseModel):
 
         id = self.get_id()
         if id is not None:
+            thing = f"{self.get_table_name()}:{id}"
             update_fields = list(data_set.keys())
+            has_signals = (
+                pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
+            )
+
+            if not has_signals:
+                await client.merge(thing, data_set)
+                await self.refresh()
+                return
 
             await pre_update.send(sender, instance=self, update_fields=update_fields)
 
             async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-                thing = f"{self.get_table_name()}:{id}"
                 await client.merge(thing, data_set)
                 await self.refresh()
 
@@ -250,10 +269,19 @@ class BaseSurrealModel(BaseModel):
         if id is None:
             raise SurrealDbError("Can't delete data, no id found.")
 
+        thing = f"{self.get_table_name()}:{id}"
+        has_signals = pre_delete.has_handlers(sender) or post_delete.has_handlers(sender) or around_delete.has_handlers(sender)
+
+        if not has_signals:
+            deleted = await client.delete(thing)
+            if not deleted:
+                raise SurrealDbError(f"Can't delete Record id -> '{id}' not found!")
+            logger.info(f"Record deleted -> {deleted}.")
+            return
+
         await pre_delete.send(sender, instance=self)
 
         async with around_delete.wrap(sender, instance=self):
-            thing = f"{self.get_table_name()}:{id}"
             deleted = await client.delete(thing)
 
             if not deleted:
