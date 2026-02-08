@@ -7,6 +7,17 @@ from surrealdb import RecordID
 
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
+from .signals import (
+    around_delete,
+    around_save,
+    around_update,
+    post_delete,
+    post_save,
+    post_update,
+    pre_delete,
+    pre_save,
+    pre_update,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,9 +122,10 @@ class BaseSurrealModel(BaseModel):
                 if hasattr(self, key):
                     object.__setattr__(self, key, value)
 
-    async def save(self) -> Self:
+    async def _do_save(self) -> tuple[Self, bool]:
         """
-        Save the model instance to the database.
+        Internal save logic. Returns (self, created) where created indicates
+        whether a new record was created (always True for save).
         """
         client = await SurrealDBConnectionManager.get_client()
         data = self.model_dump(exclude={"id"})
@@ -128,7 +140,7 @@ class BaseSurrealModel(BaseModel):
             # SDK 1.0.8 returns error message as string instead of raising exception
             if isinstance(result, str) and "already exists" in result:
                 raise SurrealDbError(f"There was a problem with the database: {result}")
-            return self
+            return self, True
 
         # Auto-generate the ID
         record = await client.create(table, data)  # pragma: no cover
@@ -150,38 +162,76 @@ class BaseSurrealModel(BaseModel):
                     value = str(value).split(":")[1]
                 if hasattr(self, key):
                     object.__setattr__(self, key, value)
-            return self
+            return self, True
 
         raise SurrealDbError("Can't save data, no record returned.")  # pragma: no cover
+
+    async def save(self) -> Self:
+        """
+        Save the model instance to the database.
+
+        Emits pre_save, post_save, and around_save signals.
+        """
+        sender = self.__class__
+
+        await pre_save.send(sender, instance=self)
+
+        async with around_save.wrap(sender, instance=self):
+            result, created = await self._do_save()
+
+        await post_save.send(sender, instance=self, created=created)
+
+        return result
 
     async def update(self) -> Any:
         """
         Update the model instance to the database.
+
+        Emits pre_update, post_update, and around_update signals.
         """
         client = await SurrealDBConnectionManager.get_client()
+        sender = self.__class__
 
         data = self.model_dump(exclude={"id"})
         id = self.get_id()
         if id is not None:
-            thing = f"{self.__class__.__name__}:{id}"
-            result = await client.update(thing, data)
+            update_fields = list(data.keys())
+
+            await pre_update.send(sender, instance=self, update_fields=update_fields)
+
+            async with around_update.wrap(sender, instance=self, update_fields=update_fields):
+                thing = f"{self.__class__.__name__}:{id}"
+                result = await client.update(thing, data)
+
+            await post_update.send(sender, instance=self, update_fields=update_fields)
+
             return result
         raise SurrealDbError("Can't update data, no id found.")
 
     async def merge(self, **data: Any) -> Any:
         """
-        Update the model instance to the database.
+        Partial update of the model instance in the database.
+
+        Emits pre_update, post_update, and around_update signals.
         """
 
         client = await SurrealDBConnectionManager.get_client()
+        sender = self.__class__
         data_set = dict(data.items())
 
         id = self.get_id()
         if id:
-            thing = f"{self.get_table_name()}:{id}"
+            update_fields = list(data_set.keys())
 
-            await client.merge(thing, data_set)
-            await self.refresh()
+            await pre_update.send(sender, instance=self, update_fields=update_fields)
+
+            async with around_update.wrap(sender, instance=self, update_fields=update_fields):
+                thing = f"{self.get_table_name()}:{id}"
+                await client.merge(thing, data_set)
+                await self.refresh()
+
+            await post_update.send(sender, instance=self, update_fields=update_fields)
+
             return
 
         raise SurrealDbError(f"No Id for the data to merge: {data}")
@@ -189,18 +239,25 @@ class BaseSurrealModel(BaseModel):
     async def delete(self) -> None:
         """
         Delete the model instance from the database.
+
+        Emits pre_delete, post_delete, and around_delete signals.
         """
 
         client = await SurrealDBConnectionManager.get_client()
+        sender = self.__class__
 
         id = self.get_id()
 
-        thing = f"{self.get_table_name()}:{id}"
+        await pre_delete.send(sender, instance=self)
 
-        deleted = await client.delete(thing)
+        async with around_delete.wrap(sender, instance=self):
+            thing = f"{self.get_table_name()}:{id}"
+            deleted = await client.delete(thing)
 
-        if not deleted:
-            raise SurrealDbError(f"Can't delete Record id -> '{id}' not found!")
+            if not deleted:
+                raise SurrealDbError(f"Can't delete Record id -> '{id}' not found!")
+
+        await post_delete.send(sender, instance=self)
 
         logger.info(f"Record deleted -> {deleted}.")
 

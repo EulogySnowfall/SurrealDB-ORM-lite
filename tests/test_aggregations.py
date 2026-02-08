@@ -264,12 +264,7 @@ class TestQuerySetAggregationMethods:
 
     def test_annotate_accumulates_across_calls(self) -> None:
         """Multiple annotate() calls should accumulate annotations (Django-style)."""
-        qs = (
-            Product.objects()
-            .values("category")
-            .annotate(count=Count())
-            .annotate(avg_price=Avg("price"))
-        )
+        qs = Product.objects().values("category").annotate(count=Count()).annotate(avg_price=Avg("price"))
         assert len(qs._annotations) == 2
         assert "count" in qs._annotations
         assert "avg_price" in qs._annotations

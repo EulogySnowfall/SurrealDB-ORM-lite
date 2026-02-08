@@ -1,4 +1,4 @@
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
 from .connection_manager import SurrealDBConnectionManager
@@ -12,6 +12,19 @@ from .exceptions import (
 )
 from .model_base import BaseSurrealModel, SurrealConfigDict
 from .query_set import QuerySet
+from .signals import (
+    AroundSignal,
+    Signal,
+    around_delete,
+    around_save,
+    around_update,
+    post_delete,
+    post_save,
+    post_update,
+    pre_delete,
+    pre_save,
+    pre_update,
+)
 
 __all__ = [
     "__version__",
@@ -30,6 +43,18 @@ __all__ = [
     "Avg",
     "Min",
     "Max",
+    # Signals
+    "Signal",
+    "AroundSignal",
+    "pre_save",
+    "post_save",
+    "pre_update",
+    "post_update",
+    "pre_delete",
+    "post_delete",
+    "around_save",
+    "around_update",
+    "around_delete",
     # Exceptions
     "SurrealORMError",
     "SurrealDbError",

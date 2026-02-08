@@ -141,6 +141,9 @@ results = await User.objects().query(
 | Custom primary keys   | ✅     |
 | HTTP connections      | ✅     |
 | WebSocket connections | ✅     |
+| Aggregations          | ✅     |
+| GROUP BY              | ✅     |
+| Model Signals         | ✅     |
 
 ### Supported Filter Lookups
 
@@ -150,6 +153,78 @@ results = await User.objects().query(
 - `contains`, `icontains`
 - `startswith`, `istartswith`
 - `endswith`, `iendswith`
+
+### 5. Aggregations
+
+```python
+from surreal_orm_lite import Count, Sum, Avg, Min, Max
+
+# Simple aggregations
+count = await User.objects().count()
+total = await Order.objects().sum("amount")
+avg_age = await User.objects().avg("age")
+max_price = await Product.objects().max("price")
+min_price = await Product.objects().min("price")
+
+# Check existence
+has_admins = await User.objects().filter(role="admin").exists()
+
+# GROUP BY with annotations
+results = await User.objects().values("status").annotate(count=Count()).exec()
+# [{"status": "active", "count": 42}, {"status": "inactive", "count": 8}]
+
+# Raw SurrealQL queries
+results = await User.raw_query(
+    "SELECT * FROM User WHERE age > $min_age",
+    variables={"min_age": 18}
+)
+```
+
+### 6. Model Signals
+
+```python
+from surreal_orm_lite import pre_save, post_save, pre_delete, post_delete
+
+@post_save.connect(User)
+async def on_user_saved(sender, instance, created, **kwargs):
+    """Called after every User save."""
+    if created:
+        await send_welcome_email(instance.email)
+    await invalidate_cache(f"user:{instance.id}")
+
+@pre_delete.connect(User)
+async def on_user_deleting(sender, instance, **kwargs):
+    """Called before User deletion."""
+    await archive_user_data(instance.id)
+```
+
+**Available signals:**
+
+| Signal          | When                        | Extra kwargs     |
+| --------------- | --------------------------- | ---------------- |
+| `pre_save`      | Before `save()`             |                  |
+| `post_save`     | After `save()`              | `created`        |
+| `pre_update`    | Before `update()`/`merge()` | `update_fields`  |
+| `post_update`   | After `update()`/`merge()`  | `update_fields`  |
+| `pre_delete`    | Before `delete()`           |                  |
+| `post_delete`   | After `delete()`            |                  |
+| `around_save`   | Wraps `save()`              |                  |
+| `around_update` | Wraps `update()`/`merge()`  | `update_fields`  |
+| `around_delete` | Wraps `delete()`            |                  |
+
+**Around signals** use async generators to wrap operations:
+
+```python
+from surreal_orm_lite import around_save
+
+@around_save.connect(User)
+async def time_user_save(sender, instance, **kwargs):
+    import time
+    start = time.time()
+    yield  # save() executes here
+    duration = time.time() - start
+    print(f"Save took {duration:.3f}s")
+```
 
 ---
 
