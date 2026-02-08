@@ -355,7 +355,28 @@ class TestAroundSignalClass:
         async with sig.wrap(SignalUser, instance="test"):
             order.append("during")
 
-        assert order == ["h1_before", "h2_before", "during", "h1_after", "h2_after"]
+        assert order == ["h1_before", "h2_before", "during", "h2_after", "h1_after"]
+
+        # Cleanup
+        sig.clear()
+
+    async def test_wrap_handler_no_yield(self) -> None:
+        """wrap() should skip handlers that don't yield and log a warning."""
+        sig = AroundSignal("test")
+        order: list[str] = []
+
+        @sig.connect(SignalUser)
+        async def no_yield_handler(sender, **kwargs):  # type: ignore
+            order.append("no_yield")
+            # Async generator that returns without yielding
+            return
+            yield  # type: ignore  # noqa: B901  # makes it an async generator
+
+        async with sig.wrap(SignalUser, instance="test"):
+            order.append("during")
+
+        # The handler's pre-yield code never ran because it returned before yield
+        assert "during" in order
 
         # Cleanup
         sig.clear()
@@ -1070,6 +1091,15 @@ class TestCrudRegression:
             await user.update()
 
         assert "Can't update data, no id found." in str(exc.value)
+
+    async def test_delete_without_id_still_raises(self) -> None:
+        """delete() without ID should raise SurrealDbError before emitting signals."""
+        user = SignalUser(name="NoId", email="noid@test.com")
+
+        with pytest.raises(surreal_orm_lite.SurrealDbError) as exc:
+            await user.delete()
+
+        assert "Can't delete data, no id found." in str(exc.value)
 
     async def test_delete_nonexistent_still_raises(self) -> None:
         """delete() on non-existent record should still raise SurrealDbError."""

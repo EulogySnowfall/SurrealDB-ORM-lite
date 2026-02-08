@@ -27,7 +27,6 @@ import contextlib
 import logging
 from collections import defaultdict
 from collections.abc import AsyncGenerator, Callable, Coroutine
-from contextlib import asynccontextmanager
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -178,13 +177,14 @@ class AroundSignal:
             return True
         return False
 
-    @asynccontextmanager
+    @contextlib.asynccontextmanager
     async def wrap(self, sender: type, **kwargs: Any) -> AsyncGenerator[None, None]:
         """
         Context manager that runs all around handlers for the sender class.
 
         The handlers' pre-yield code runs before yielding,
-        and their post-yield code runs after.
+        and their post-yield code runs after in reverse (LIFO) order,
+        similar to nested context managers.
 
         Args:
             sender: The model class that is sending the signal.
@@ -194,18 +194,44 @@ class AroundSignal:
         generators: list[AsyncGenerator[None, None]] = []
 
         # Start all generators (run pre-yield code)
-        for handler in handlers:
-            gen = handler(sender=sender, **kwargs)
-            await gen.__anext__()
-            generators.append(gen)
+        try:
+            for handler in handlers:
+                gen = handler(sender=sender, **kwargs)
+                try:
+                    await gen.__anext__()
+                except StopAsyncIteration:
+                    logger.warning(
+                        "AroundSignal handler %r for sender %r did not yield; it must yield exactly once.",
+                        handler,
+                        sender,
+                    )
+                    with contextlib.suppress(Exception):
+                        await gen.aclose()
+                    continue
+                generators.append(gen)
+        except Exception:
+            # If startup fails, close any already-started generators in LIFO order
+            for gen in reversed(generators):
+                with contextlib.suppress(Exception):
+                    await gen.aclose()
+            raise
 
         try:
             yield
         finally:
-            # Complete all generators (run post-yield code)
-            for gen in generators:
-                with contextlib.suppress(StopAsyncIteration):
+            # Complete all generators (run post-yield code) in reverse (LIFO) order
+            for gen in reversed(generators):
+                try:
                     await gen.__anext__()
+                except StopAsyncIteration:
+                    continue
+                else:
+                    logger.warning(
+                        "AroundSignal handler for sender %r yielded more than once; handlers must yield exactly once.",
+                        sender,
+                    )
+                    with contextlib.suppress(Exception):
+                        await gen.aclose()
 
     def has_handlers(self, model_class: type) -> bool:
         """Check if any handlers are registered for the given model class."""

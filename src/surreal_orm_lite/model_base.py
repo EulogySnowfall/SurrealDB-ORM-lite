@@ -220,7 +220,7 @@ class BaseSurrealModel(BaseModel):
         data_set = dict(data.items())
 
         id = self.get_id()
-        if id:
+        if id is not None:
             update_fields = list(data_set.keys())
 
             await pre_update.send(sender, instance=self, update_fields=update_fields)
@@ -247,6 +247,8 @@ class BaseSurrealModel(BaseModel):
         sender = self.__class__
 
         id = self.get_id()
+        if id is None:
+            raise SurrealDbError("Can't delete data, no id found.")
 
         await pre_delete.send(sender, instance=self)
 
