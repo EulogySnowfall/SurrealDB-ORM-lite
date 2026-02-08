@@ -134,7 +134,7 @@ class BaseSurrealModel(BaseModel):
 
         if id is not None:
             # Escape special characters in ID
-            escaped_id = f"`{id}`" if any(c in str(id) for c in "@#$%^&*()") else id
+            escaped_id = f"`{id}`" if any(c in str(id) for c in "@#$%^&*()-+=/\\! ") else id
             thing = f"{table}:{escaped_id}"
             result = await client.create(thing, data)
             # SDK 1.0.8 returns error message as string instead of raising exception
