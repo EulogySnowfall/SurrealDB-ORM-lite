@@ -334,7 +334,7 @@ def setup_surrealdb() -> None:
 
 
 @pytest.fixture
-async def product_data() -> None:
+async def product_data():  # type: ignore[misc]
     """Create test product data."""
     # Clean up first
     await Product.objects().delete_table()
@@ -353,7 +353,7 @@ async def product_data() -> None:
 
 
 @pytest.fixture
-async def order_data() -> None:
+async def order_data():  # type: ignore[misc]
     """Create test order data."""
     # Clean up first
     await Order.objects().delete_table()
@@ -563,6 +563,7 @@ class TestRawQueryE2E:
         results = await Product.raw_query("SELECT * FROM Product WHERE category = 'Electronics'")
         assert len(results) == 3
         for r in results:
+            assert isinstance(r, Product)
             assert r.category == "Electronics"
 
     async def test_raw_query_with_variables(self, product_data: None) -> None:
@@ -573,12 +574,14 @@ class TestRawQueryE2E:
         )
         assert len(results) == 3  # Laptop, Desk, Chair
         for r in results:
+            assert isinstance(r, Product)
             assert r.price > 100
 
     async def test_raw_query_aggregation(self, product_data: None) -> None:
         """Execute a raw aggregation query."""
         results = await Product.raw_query("SELECT count() FROM Product GROUP ALL")
         assert len(results) == 1
+        assert isinstance(results[0], dict)
         assert results[0]["count"] == 5
 
     async def test_raw_query_complex(self, order_data: None) -> None:

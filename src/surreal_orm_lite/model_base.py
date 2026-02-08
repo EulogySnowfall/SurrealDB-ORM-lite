@@ -63,7 +63,7 @@ class BaseSurrealModel(BaseModel):
         Get the ID of the model instance.
         """
         if hasattr(self, "id"):
-            id_value = self.id
+            id_value = self.id  # type: ignore[attr-defined]
             return str(id_value) if id_value is not None else None
 
         if hasattr(self, "model_config"):
