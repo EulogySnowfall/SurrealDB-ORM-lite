@@ -144,6 +144,7 @@ results = await User.objects().query(
 | Aggregations          | ✅     |
 | GROUP BY              | ✅     |
 | Model Signals         | ✅     |
+| Raw SurrealQL queries | ✅     |
 
 ### Supported Filter Lookups
 
@@ -153,6 +154,9 @@ results = await User.objects().query(
 - `contains`, `icontains`
 - `startswith`, `istartswith`
 - `endswith`, `iendswith`
+- `like`, `ilike`
+- `match`, `regex`, `iregex`
+- `isnull`
 
 ### 5. Aggregations
 
@@ -276,16 +280,59 @@ Contributions are welcome! Please:
 
 ---
 
-## Advanced Features?
+## Roadmap
 
-This project prioritizes **stability and compatibility** with the official SurrealDB Python SDK. Due to current SDK limitations, some advanced features cannot be implemented here.
+| Version | Theme                         | Status      |
+| ------- | ----------------------------- | ----------- |
+| v0.2.x  | Core ORM (CRUD, QuerySet)     | ✅ Released |
+| v0.3.0  | Aggregations & Utilities      | ✅ Released |
+| v0.4.0  | Model Signals                 | ✅ Released |
+| v0.5.0  | Bulk Operations & Q Objects   | 📋 Next    |
+| v0.6.0  | Relations & Graph             | 📋 Planned |
+| v0.7.0  | Transactions ORM              | 📋 Planned |
+| v0.8.0  | SurrealFunc & Computed Fields | 📋 Planned |
+| v0.9.0  | Field Aliases & DX            | 📋 Planned |
+| v1.0.0  | Production Ready              | 📋 Planned |
 
-For a feature-rich ORM with relations, transactions, and more, see:
+### v0.5.0 Preview
 
-- **GitHub**: [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/)
-- **PyPI**: [surrealdb-orm](https://pypi.org/project/surrealdb-orm/)
+- **Q Objects** — Complex queries with `Q(a=1) | Q(b=2)`, `~Q(status="banned")`
+- **Parameterized filters** — All filter values as `$_fN` variables (SQL injection prevention)
+- **Bulk operations** — `bulk_create()`, `bulk_update()`, `bulk_delete()`
+- **New lookups** — `not_in`, `not_contains`, `containsall`, `containsany`
+- **`-field` ordering** — Shorthand for `order_by("-created_at")`
 
-When the official SDK supports additional features, they will be incorporated into this lite version.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for full details.
+
+---
+
+## SurrealDB-ORM-lite vs SurrealDB-ORM
+
+This project prioritizes **stability and compatibility** with the official SurrealDB Python SDK. The full [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/) uses a custom SDK for advanced features.
+
+| Feature                  | ORM-lite (official SDK) | ORM (custom SDK) |
+| ------------------------ | ----------------------- | ---------------- |
+| CRUD & QuerySet          | ✅                      | ✅               |
+| Aggregations & GROUP BY  | ✅                      | ✅               |
+| Model Signals            | ✅                      | ✅               |
+| Bulk Operations          | v0.5.0                  | ✅               |
+| Q Objects (OR/AND/NOT)   | v0.5.0                  | ✅               |
+| Relations & Graph        | v0.6.0                  | ✅               |
+| Transactions             | v0.7.0                  | ✅               |
+| Live Models / CDC        | -                       | ✅               |
+| Vector / Full-Text Search| -                       | ✅               |
+| Migrations & CLI         | -                       | ✅               |
+| JWT Authentication       | -                       | ✅               |
+| Schema Introspection     | -                       | ✅               |
+| Connection Pool          | -                       | ✅               |
+| CBOR Protocol            | -                       | ✅               |
+
+**Choose ORM-lite** if you want the official SDK, minimal dependencies, and core ORM features.
+
+**Choose ORM** if you need live queries, migrations, authentication, vector search, or advanced features.
+
+- **SurrealDB-ORM GitHub**: [github.com/EulogySnowfall/SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/)
+- **SurrealDB-ORM PyPI**: [surrealdb-orm](https://pypi.org/project/surrealdb-orm/)
 
 ---
 
@@ -306,3 +353,4 @@ GitHub: [@EulogySnowfall](https://github.com/EulogySnowfall)
 
 - [SurrealDB](https://surrealdb.com/) - The database
 - [surrealdb.py](https://github.com/surrealdb/surrealdb.py) - Official Python SDK
+- [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/) - Full-featured ORM with custom SDK

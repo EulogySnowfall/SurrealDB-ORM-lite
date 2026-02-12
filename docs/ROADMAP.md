@@ -13,187 +13,188 @@
 | v0.2.x  | Core ORM (CRUD, QuerySet, Filters) | ✅ Complété  |
 | v0.3.0  | Aggregations & Utilities           | ✅ Complété  |
 | v0.4.0  | Model Signals                      | ✅ Complété  |
-| v0.5.0  | Bulk Operations                    | 📋 Planifié  |
+| v0.5.0  | Bulk Operations & Q Objects        | 📋 Planifié  |
 | v0.6.0  | Relations & Graph                  | 📋 Planifié  |
 | v0.7.0  | Transactions ORM                   | 📋 Planifié  |
+| v0.8.0  | SurrealFunc & Computed Fields      | 📋 Planifié  |
+| v0.9.0  | FETCH, Field Aliases & DX          | 📋 Planifié  |
 | v1.0.0  | Production Ready                   | 📋 Planifié  |
 
 ---
 
-## Version 0.3.0 - Aggregations & Utilities
+## Comparaison SurrealDB-ORM vs SurrealDB-ORM-lite
 
-**Objectif**: Ajouter les fonctions d'agrégation et améliorer l'API QuerySet
+### Features implémentables dans Lite (SDK officiel)
+
+| Feature                       | ORM (full) | ORM-lite   | Version cible |
+| ----------------------------- | ---------- | ---------- | ------------- |
+| CRUD (save, update, merge)    | ✅ v0.2+   | ✅ v0.2.0  | -             |
+| QuerySet & Filters            | ✅ v0.2+   | ✅ v0.2.0  | -             |
+| Aggregations & GROUP BY       | ✅ v0.3+   | ✅ v0.3.0  | -             |
+| raw_query()                   | ✅ v0.5.4  | ✅ v0.3.0  | -             |
+| Model Signals (pre/post)      | ✅ v0.5.7  | ✅ v0.4.0  | -             |
+| Around Signals                | ✅ v0.5.8  | ✅ v0.4.0  | -             |
+| Bulk Operations               | ✅ v0.4+   | ❌         | v0.5.0        |
+| Q Objects (OR/AND/NOT)        | ✅ v0.6.0  | ❌         | v0.5.0        |
+| Lookups supplémentaires       | ✅ v0.5.9  | ❌         | v0.5.0        |
+| Filtres paramétrés ($vars)    | ✅ v0.6.0  | ❌         | v0.5.0        |
+| `-field` ordering (DESC)      | ✅ v0.6.0  | ❌         | v0.5.0        |
+| Relations & Graph (relate)    | ✅ v0.4.0  | ❌         | v0.6.0        |
+| get_related() / traverse()    | ✅ v0.4.0  | ❌         | v0.6.0        |
+| FETCH clause                  | ✅ v0.7.0  | ❌         | v0.6.0        |
+| remove_all_relations()        | ✅ v0.6.0  | ❌         | v0.6.0        |
+| Transactions ORM (tx=)        | ✅ v0.6+   | ❌         | v0.7.0        |
+| SurrealFunc (time::now())     | ✅ v0.6.0  | ❌         | v0.8.0        |
+| Computed Fields               | ✅ v0.8.0  | ❌         | v0.8.0        |
+| server_values sur save()      | ✅ v0.7.0  | ❌         | v0.8.0        |
+| Field Aliases                 | ✅ v0.5.5  | ❌         | v0.9.0        |
+| call_function()               | ✅ v0.7.0  | ❌         | v0.9.0        |
+| Retry, Logging, Métriques     | ✅ v0.7+   | ❌         | v1.0.0        |
+
+### Features exclusives à SurrealDB-ORM (SDK custom requis)
+
+Ces features ne peuvent **pas** être implémentées avec le SDK officiel actuel et resteront exclusives au ORM complet:
+
+| Feature                          | ORM (full) | Raison                                  |
+| -------------------------------- | ---------- | --------------------------------------- |
+| SDK custom (`surreal_sdk`)       | ✅         | Architecture fondamentale               |
+| CBOR Protocol                    | ✅ v0.5.5  | SDK officiel gère en interne            |
+| Connection Pool                  | ✅ v0.5+   | Pas dans le SDK officiel                |
+| Live Models (ORM-level)         | ✅ v0.9.0  | Nécessite gestion WebSocket avancée     |
+| Auto-Resubscribe                 | ✅ v0.9.0  | Gestion reconnexion WebSocket custom    |
+| Change Feeds (CDC)               | ✅ v0.9.0  | Nécessite polling + cursor tracking     |
+| Schema Introspection             | ✅ v0.10.0 | Système complet inspectdb/schemadiff    |
+| Multi-Database Support           | ✅ v0.10.0 | Registre de connexions nommées          |
+| Migrations (makemigrations)      | ✅ v0.10.0 | Système Django-style complet            |
+| CLI (`surreal-orm` commands)     | ✅ v0.10.0 | Shell, migrate, inspectdb               |
+| Subqueries                       | ✅ v0.11.0 | QuerySet imbriqués                      |
+| Query Cache (TTL)                | ✅ v0.11.0 | Cache avec invalidation automatique     |
+| Vector Search (KNN/HNSW)        | ✅ v0.12.0 | VectorField + similar_to()              |
+| Full-Text Search (BM25)         | ✅ v0.12.0 | search() + SearchScore/Highlight        |
+| Hybrid Search (RRF)             | ✅ v0.12.0 | Combinaison vector + FTS               |
+| DEFINE EVENT                     | ✅ v0.13.0 | Triggers serveur dans migrations        |
+| Geospatial Fields                | ✅ v0.13.0 | PointField, PolygonField, nearby()      |
+| Materialized Views               | ✅ v0.13.0 | DEFINE TABLE ... AS SELECT              |
+| TYPE RELATION                    | ✅ v0.13.0 | Contraintes graph dans migrations       |
+| JWT Authentication               | ✅ v0.8.0  | AuthenticatedUserMixin, signup/signin   |
+| Test Fixtures & Factories        | ✅ v0.14.0 | SurrealFixture, ModelFactory            |
+| QueryLogger (debug)              | ✅ v0.14.0 | Profiling des requêtes ORM              |
+| Atomic Array Operations          | ✅ v0.5.9  | atomic_append/remove/set_add            |
+| Retry on Conflict                | ✅ v0.5.9  | retry_on_conflict() decorator           |
+
+---
+
+## Versions complétées
+
+### Version 0.2.x - Core ORM ✅
+
+- Django-style ORM avec `BaseSurrealModel`
+- `QuerySet` avec fluent builder
+- CRUD: `save()`, `update()`, `merge()`, `delete()`, `refresh()`
+- Filter lookups: `exact`, `gt`, `gte`, `lt`, `lte`, `in`, `contains`, `icontains`, `startswith`, `istartswith`, `endswith`, `iendswith`, `like`, `ilike`, `match`, `regex`, `iregex`, `isnull`
+- `SurrealDBConnectionManager` (HTTP + WebSocket)
+- Custom primary keys via `SurrealConfigDict`
+- Validation Pydantic 2.x
+- Coverage 97%+
+
+### Version 0.3.0 - Aggregations & Utilities ✅
+
+- Classes d'agrégation: `Count`, `Sum`, `Avg`, `Min`, `Max`
+- Méthodes QuerySet: `count()`, `sum()`, `avg()`, `min()`, `max()`
+- GROUP BY: `values()` + `annotate()`
+- `exists()` pour vérifier l'existence
+- `raw_query()` class method pour SurrealQL arbitraire
+- Coverage 94%+
+
+### Version 0.4.0 - Model Signals ✅
+
+- `Signal` class: `pre_save`, `post_save`, `pre_update`, `post_update`, `pre_delete`, `post_delete`
+- `AroundSignal` class: `around_save`, `around_update`, `around_delete`
+- `connect()` / `disconnect()` / `clear()` / `has_handlers()`
+- Flag `created` sur `post_save`
+- `update_fields` sur `pre_update` / `post_update`
+
+---
+
+## Version 0.5.0 - Bulk Operations & Q Objects
+
+**Objectif**: Opérations en masse et requêtes complexes
 
 ### Features
 
-#### 1. Aggregations (Priorité: Haute)
+#### 1. Q Objects pour requêtes complexes (Priorité: Haute)
+
+Support des opérateurs OR, AND, NOT pour combiner des filtres de manière flexible.
 
 ```python
-# API proposée
-count = await User.objects().count()
-count = await User.objects().filter(status="active").count()
+from surreal_orm_lite import Q
 
-total = await Order.objects().sum("amount")
-avg_age = await User.objects().avg("age")
-max_price = await Product.objects().max("price")
-min_price = await Product.objects().min("price")
+# OR query
+users = await User.objects().filter(
+    Q(name__contains="alice") | Q(email__contains="alice"),
+).exec()
+
+# NOT query
+users = await User.objects().filter(
+    ~Q(status="banned"),
+    role="admin",
+).exec()
+
+# AND combiné avec OR
+users = await User.objects().filter(
+    Q(age__gte=18) & Q(age__lte=65),
+    Q(role="admin") | Q(role="moderator"),
+).exec()
 ```
-
-**Fichiers à créer/modifier**:
-
-- [x] `src/surreal_orm_lite/aggregations.py` - Classes Count, Sum, Avg, Min, Max
-- [x] `src/surreal_orm_lite/query_set.py` - Méthodes count(), sum(), avg(), min(), max()
-- [x] `tests/test_aggregations.py` - Tests unitaires et e2e
 
 **Implémentation technique**:
 
 ```python
-# Génère: SELECT count() FROM User GROUP ALL
-# Génère: SELECT math::sum(amount) FROM Order GROUP ALL
-```
+class Q:
+    """Composable query expression."""
+    AND = "AND"
+    OR = "OR"
 
-#### 2. GROUP BY avec values() et annotate() (Priorité: Moyenne)
+    def __init__(self, **kwargs):
+        self.filters = kwargs
+        self.children = []
+        self.connector = self.AND
+        self.negated = False
 
-```python
-# Grouper par status et compter
-results = await User.objects().values("status").annotate(count=Count()).exec()
-# [{"status": "active", "count": 42}, {"status": "inactive", "count": 8}]
+    def __or__(self, other): ...
+    def __and__(self, other): ...
+    def __invert__(self): ...
 
-# Grouper et calculer des agrégats
-results = await Order.objects().values("customer_id").annotate(
-    total=Sum("amount"),
-    avg_order=Avg("amount")
-).exec()
-```
-
-**Fichiers à modifier**:
-
-- [x] `src/surreal_orm_lite/query_set.py` - Méthodes values(), annotate()
-
-#### 3. raw_query() class method (Priorité: Haute)
-
-```python
-# Requête SurrealQL directe avec variables
-results = await User.raw_query(
-    "SELECT * FROM User WHERE age > $min_age AND status = $status",
-    variables={"min_age": 18, "status": "active"}
-)
-
-# Requêtes complexes
-results = await User.raw_query("""
-    SELECT *, ->purchased->Product AS products
-    FROM User
-    WHERE id = $user_id
-""", variables={"user_id": "user:123"})
-```
-
-**Fichiers à modifier**:
-
-- [x] `src/surreal_orm_lite/model_base.py` - Ajouter classmethod raw_query()
-
-#### 4. exists() method (Priorité: Basse)
-
-```python
-# Vérifier si des enregistrements existent
-has_admins = await User.objects().filter(role="admin").exists()
-```
-
-**Fichiers à modifier**:
-
-- [x] `src/surreal_orm_lite/query_set.py` - Méthode exists()
-
-### Critères de complétion v0.3.0
-
-- [x] Tous les tests passent
-- [x] Coverage >= 70% (94% atteint)
-- [x] Documentation mise à jour
-- [x] CHANGELOG mis à jour
-
----
-
-## Version 0.4.0 - Model Signals
-
-**Objectif**: Système d'événements Django-style pour le cycle de vie des modèles
-
-### Features
-
-#### 1. Pre/Post Signals (Priorité: Haute)
-
-```python
-from surreal_orm_lite import pre_save, post_save, pre_delete, post_delete
-
-@post_save.connect(User)
-async def on_user_saved(sender, instance, created, **kwargs):
-    """Appelé après chaque sauvegarde de User."""
-    if created:
-        await send_welcome_email(instance.email)
-    await invalidate_cache(f"user:{instance.id}")
-
-@pre_delete.connect(User)
-async def on_user_deleting(sender, instance, **kwargs):
-    """Appelé avant la suppression de User."""
-    await archive_user_data(instance.id)
-
-@post_delete.connect(User)
-async def on_user_deleted(sender, instance, **kwargs):
-    """Appelé après la suppression de User."""
-    await cleanup_user_files(instance.id)
-```
-
-**Types de signaux**:
-
-| Signal        | Quand          | Arguments                       |
-| ------------- | -------------- | ------------------------------- |
-| `pre_save`    | Avant save()   | sender, instance                |
-| `post_save`   | Après save()   | sender, instance, created       |
-| `pre_update`  | Avant update() | sender, instance, update_fields |
-| `post_update` | Après update() | sender, instance, update_fields |
-| `pre_delete`  | Avant delete() | sender, instance                |
-| `post_delete` | Après delete() | sender, instance                |
-
-**Fichiers à créer/modifier**:
-
-- [x] `src/surreal_orm_lite/signals.py` - Classes Signal, pre_save, post_save, etc.
-- [x] `src/surreal_orm_lite/model_base.py` - Intégrer les signaux dans CRUD
-- [x] `src/surreal_orm_lite/__init__.py` - Exporter les signaux
-- [x] `tests/test_signals.py` - Tests
-
-#### 2. Around Signals (Priorité: Moyenne)
-
-```python
-from surreal_orm_lite import around_save
-
-@around_save.connect(User)
-async def time_user_save(sender, instance, created, **kwargs):
-    """Wrapper autour de save() avec état partagé."""
-    import time
-    start = time.time()
-
-    yield  # <-- save() s'exécute ici
-
-    duration = time.time() - start
-    await log_metric(f"user_save_duration", duration)
+    def to_sql(self, table_name: str) -> tuple[str, dict]:
+        """Génère la clause WHERE avec variables paramétrées."""
 ```
 
 **Fichiers à créer/modifier**:
 
-- [x] `src/surreal_orm_lite/signals.py` - AroundSignal class
+- [ ] `src/surreal_orm_lite/q.py` - Classe Q
+- [ ] `src/surreal_orm_lite/query_set.py` - Support Q dans filter()
+- [ ] `src/surreal_orm_lite/__init__.py` - Exporter Q
+- [ ] `tests/test_q_objects.py` - Tests
 
-### Critères de complétion v0.4.0
+#### 2. Filtres paramétrés - Sécurité (Priorité: Haute)
 
-- [x] Tous les signaux fonctionnent
-- [x] Tests de régression CRUD
-- [x] Documentation avec exemples
+Toutes les valeurs de filtre sont maintenant des variables paramétrées (`$_fN`) au lieu d'être
+interpolées dans la requête. Prévient l'injection SQL.
 
----
+```python
+# Avant (interpolation directe - risque injection)
+# SELECT * FROM User WHERE name = 'Alice'
 
-## Version 0.5.0 - Bulk Operations
+# Après (variables paramétrées)
+# SELECT * FROM User WHERE name = $_f0  {_f0: "Alice"}
+```
 
-**Objectif**: Opérations en masse performantes
+**Fichiers à modifier**:
 
-### Features
+- [ ] `src/surreal_orm_lite/query_set.py` - Refactorer _build_where() pour utiliser des variables
+- [ ] `tests/test_e2e.py` - Vérifier que les filtres paramétrés fonctionnent
 
-#### 1. bulk_create() (Priorité: Haute)
+#### 3. bulk_create() (Priorité: Haute)
 
 ```python
 users = [
@@ -202,17 +203,14 @@ users = [
     User(name="Charlie", email="charlie@example.com"),
 ]
 
-# Création en masse (une seule requête)
+# Création en masse (une seule requête INSERT)
 created_users = await User.objects().bulk_create(users)
-
-# Avec option atomique (transaction)
-created_users = await User.objects().bulk_create(users, atomic=True)
 ```
 
 **Implémentation technique**:
 
 ```sql
--- Génère une seule requête INSERT
+-- Utilise INSERT INTO (supporté par le SDK via query())
 INSERT INTO User [
     { name: "Alice", email: "alice@example.com" },
     { name: "Bob", email: "bob@example.com" },
@@ -220,14 +218,19 @@ INSERT INTO User [
 ];
 ```
 
-#### 2. bulk_update() (Priorité: Moyenne)
+**Fichiers à modifier**:
+
+- [ ] `src/surreal_orm_lite/query_set.py` - Méthode bulk_create()
+- [ ] `tests/test_bulk.py` - Tests
+
+#### 4. bulk_update() (Priorité: Moyenne)
 
 ```python
 # Mettre à jour tous les utilisateurs filtrés
-await User.objects().filter(status="pending").bulk_update(status="active")
+count = await User.objects().filter(status="pending").bulk_update(status="active")
 
 # Avec plusieurs champs
-await User.objects().filter(role="guest").bulk_update(
+count = await User.objects().filter(role="guest").bulk_update(
     role="member",
     updated_at=datetime.now()
 )
@@ -237,37 +240,89 @@ await User.objects().filter(role="guest").bulk_update(
 
 ```sql
 -- Génère UPDATE avec WHERE
-UPDATE User SET status = "active" WHERE status = "pending";
+UPDATE User SET status = $_v0 WHERE status = $_f0;
 ```
 
-#### 3. bulk_delete() (Priorité: Moyenne)
+**Fichiers à modifier**:
+
+- [ ] `src/surreal_orm_lite/query_set.py` - Méthode bulk_update()
+- [ ] `tests/test_bulk.py` - Tests
+
+#### 5. bulk_delete() (Priorité: Moyenne)
 
 ```python
-# Supprimer tous les utilisateurs inactifs
+# Supprimer tous les utilisateurs filtrés
 deleted_count = await User.objects().filter(status="inactive").bulk_delete()
-
-# Avec condition complexe
-deleted_count = await User.objects().filter(
-    last_login__lt=datetime(2024, 1, 1)
-).bulk_delete()
 ```
 
-**Fichiers à créer/modifier**:
+**Implémentation technique**:
 
-- [ ] `src/surreal_orm_lite/query_set.py` - bulk_create(), bulk_update(), bulk_delete()
-- [ ] `tests/test_bulk_operations.py` - Tests de performance et atomicité
+```sql
+-- Génère DELETE avec WHERE
+DELETE User WHERE status = $_f0;
+```
+
+**Fichiers à modifier**:
+
+- [ ] `src/surreal_orm_lite/query_set.py` - Méthode bulk_delete()
+- [ ] `tests/test_bulk.py` - Tests
+
+#### 6. Lookups supplémentaires (Priorité: Moyenne)
+
+Nouveaux opérateurs de filtre pour compléter la couverture.
+
+```python
+# NOT IN
+users = await User.objects().filter(status__not_in=["banned", "deleted"]).exec()
+
+# CONTAINSNOT
+events = await Event.objects().filter(tags__not_contains="spam").exec()
+
+# CONTAINSALL
+posts = await Post.objects().filter(tags__containsall=["python", "surreal"]).exec()
+
+# CONTAINSANY
+posts = await Post.objects().filter(tags__containsany=["python", "rust"]).exec()
+```
+
+**Fichiers à modifier**:
+
+- [ ] `src/surreal_orm_lite/constants.py` - Ajouter les opérateurs
+- [ ] `tests/test_e2e.py` - Tests des nouveaux lookups
+
+#### 7. `-field` ordering shorthand (Priorité: Basse)
+
+```python
+# Raccourci pour DESC ordering
+users = await User.objects().order_by("-created_at").exec()
+
+# Équivalent à
+users = await User.objects().order_by("created_at", OrderBy.DESC).exec()
+
+# Multiples colonnes
+users = await User.objects().order_by("-age", "name").exec()
+```
+
+**Fichiers à modifier**:
+
+- [ ] `src/surreal_orm_lite/query_set.py` - Améliorer order_by()
+- [ ] `tests/test_e2e.py` - Tests
 
 ### Critères de complétion v0.5.0
 
-- [ ] Opérations bulk fonctionnelles
-- [ ] Tests de performance (> 100 records)
-- [ ] Option atomic testée
+- [ ] Q Objects fonctionnels avec OR/AND/NOT
+- [ ] Filtres paramétrés sur tous les QuerySet
+- [ ] Opérations bulk (create, update, delete) fonctionnelles
+- [ ] Nouveaux lookups (not_in, not_contains, containsall, containsany)
+- [ ] `-field` ordering shorthand
+- [ ] Tests de performance bulk (> 100 records)
+- [ ] Coverage >= 70%
 
 ---
 
 ## Version 0.6.0 - Relations & Graph
 
-**Objectif**: Support basique des relations SurrealDB
+**Objectif**: Support des relations SurrealDB et traversée de graph
 
 ### Features
 
@@ -278,19 +333,24 @@ deleted_count = await User.objects().filter(
 await user.relate("follows", other_user)
 await post.relate("authored_by", user)
 
+# Avec données sur la relation
+await user.relate("purchased", product, data={"quantity": 2, "price": 29.99})
+
 # Supprimer une relation
 await user.remove_relation("follows", other_user)
 await user.remove_relation("follows", "users:other_id")  # Par ID
+
+# Supprimer toutes les relations d'un type
+await user.remove_all_relations("follows", direction="out")
 ```
 
 **Implémentation technique**:
 
 ```sql
--- RELATE crée un edge dans le graph
 RELATE users:alice->follows->users:bob;
-
--- DELETE supprime la relation
+RELATE users:alice->purchased->products:widget SET quantity = 2, price = 29.99;
 DELETE follows WHERE in = users:alice AND out = users:bob;
+DELETE follows WHERE in = users:alice;
 ```
 
 #### 2. get_related() (Priorité: Haute)
@@ -301,61 +361,32 @@ following = await user.get_related("follows", direction="out", model_class=User)
 
 # Récupérer les followers
 followers = await user.get_related("follows", direction="in", model_class=User)
-
-# Récupérer les posts d'un utilisateur
-posts = await user.get_related("authored", direction="out", model_class=Post)
 ```
 
-**Implémentation technique**:
-
-```sql
--- Direction OUT
-SELECT VALUE out.* FROM follows WHERE in = users:alice;
-
--- Direction IN
-SELECT VALUE in.* FROM follows WHERE out = users:alice;
-```
-
-#### 3. Graph Traversal basique (Priorité: Moyenne)
+#### 3. FETCH clause (Priorité: Haute)
 
 ```python
-# Traverser le graph avec syntaxe SurrealDB
+# Résoudre les record links inline (évite N+1)
+posts = await Post.objects().fetch("author", "tags").exec()
+# Génère: SELECT * FROM posts FETCH author, tags;
+```
+
+#### 4. Graph Traversal basique (Priorité: Moyenne)
+
+```python
 friends_of_friends = await user.traverse("->follows->User->follows->User")
-
-# Avec filtre
-active_followers = await user.traverse(
-    "<-follows<-User",
-    where="status = 'active'"
-)
-```
-
-#### 4. select_related() / prefetch_related() (Priorité: Basse)
-
-```python
-# Charger les relations en une seule requête (FETCH)
-users = await User.objects().select_related("profile", "settings").exec()
-
-# Précharger pour éviter N+1
-posts = await Post.objects().prefetch_related("author", "comments").exec()
-```
-
-**Implémentation technique**:
-
-```sql
--- Utilise FETCH de SurrealDB
-SELECT *, author.* AS author FROM posts FETCH author;
 ```
 
 **Fichiers à créer/modifier**:
 
-- [ ] `src/surreal_orm_lite/relations.py` - RelationManager, RelationQuerySet
-- [ ] `src/surreal_orm_lite/model_base.py` - relate(), remove_relation(), get_related()
-- [ ] `src/surreal_orm_lite/query_set.py` - select_related(), prefetch_related()
+- [ ] `src/surreal_orm_lite/model_base.py` - relate(), remove_relation(), get_related(), remove_all_relations()
+- [ ] `src/surreal_orm_lite/query_set.py` - fetch()
 - [ ] `tests/test_relations.py` - Tests
 
 ### Critères de complétion v0.6.0
 
 - [ ] Relations CRUD fonctionnelles
+- [ ] FETCH clause
 - [ ] Graph traversal basique
 - [ ] Tests avec modèles liés
 
@@ -370,38 +401,29 @@ SELECT *, author.* AS author FROM posts FETCH author;
 #### 1. Transaction Context Manager (Priorité: Haute)
 
 ```python
-from surreal_orm_lite import transaction
+from surreal_orm_lite import SurrealDBConnectionManager
 
-async with transaction() as tx:
+async with SurrealDBConnectionManager.transaction() as tx:
     user = User(name="Alice", email="alice@example.com")
     await user.save(tx=tx)
 
     order = Order(user_id=user.id, total=100)
     await order.save(tx=tx)
-
     # Auto-commit si pas d'exception
     # Auto-rollback si exception
-
-# Équivalent avec Model.transaction()
-async with User.transaction() as tx:
-    await user.save(tx=tx)
-    await order.save(tx=tx)
 ```
 
 #### 2. Paramètre tx= sur toutes les opérations (Priorité: Haute)
 
 ```python
-async with transaction() as tx:
-    # CRUD avec transaction
+async with SurrealDBConnectionManager.transaction() as tx:
     await user.save(tx=tx)
-    await user.update(tx=tx)
     await user.merge(age=30, tx=tx)
     await user.delete(tx=tx)
-
-    # QuerySet avec transaction
     users = await User.objects(tx=tx).filter(status="active").exec()
-    await User.objects(tx=tx).filter(status="old").bulk_delete()
 ```
+
+**Note**: Implémentation via `BEGIN TRANSACTION` / `COMMIT` / `CANCEL` en SurrealQL, compatible avec le SDK officiel via `query()`.
 
 **Fichiers à créer/modifier**:
 
@@ -410,11 +432,92 @@ async with transaction() as tx:
 - [ ] `src/surreal_orm_lite/query_set.py` - Paramètre tx= sur QuerySet
 - [ ] `tests/test_transactions.py` - Tests atomicité
 
-### Note sur le SDK officiel
+---
 
-Le support des transactions dépend des capacités du SDK officiel `surrealdb>=1.0.8`.
-Si le SDK ne supporte pas les transactions, cette feature sera reportée ou implémentée
-via des requêtes SurrealQL `BEGIN TRANSACTION` / `COMMIT` / `CANCEL`.
+## Version 0.8.0 - SurrealFunc & Computed Fields
+
+**Objectif**: Fonctions serveur et champs calculés
+
+### Features
+
+#### 1. SurrealFunc (Priorité: Haute)
+
+```python
+from surreal_orm_lite import SurrealFunc
+
+# Utiliser des fonctions SurrealDB dans save/merge
+await player.save(server_values={"joined_at": SurrealFunc("time::now()")})
+await player.merge(last_ping=SurrealFunc("time::now()"))
+
+# Avec variables supplémentaires
+await user.save(
+    server_values={"password_hash": SurrealFunc("crypto::argon2::generate($password)")},
+    extra_vars={"password": raw_password},
+)
+```
+
+#### 2. Computed Fields (Priorité: Moyenne)
+
+```python
+from surreal_orm_lite import Computed
+
+class User(BaseSurrealModel):
+    first_name: str
+    last_name: str
+    full_name: Computed[str] = Computed("string::concat(first_name, ' ', last_name)")
+
+class Order(BaseSurrealModel):
+    items: list[dict]
+    subtotal: Computed[float] = Computed("math::sum(items.*.price * items.*.qty)")
+```
+
+#### 3. call_function() (Priorité: Moyenne)
+
+```python
+# Appeler des fonctions SurrealDB custom
+result = await SurrealDBConnectionManager.call_function(
+    "acquire_game_lock", params={"table_id": tid, "pod_id": pid},
+)
+```
+
+**Fichiers à créer/modifier**:
+
+- [ ] `src/surreal_orm_lite/functions.py` - SurrealFunc, Computed, call_function()
+- [ ] `src/surreal_orm_lite/model_base.py` - server_values, extra_vars
+- [ ] `tests/test_functions.py` - Tests
+
+---
+
+## Version 0.9.0 - FETCH, Field Aliases & DX
+
+**Objectif**: Améliorations de l'expérience développeur
+
+### Features
+
+#### 1. Field Aliases (Priorité: Moyenne)
+
+```python
+from pydantic import Field
+
+class User(BaseSurrealModel):
+    password: str = Field(alias="password_hash")
+```
+
+#### 2. server_fields config (Priorité: Moyenne)
+
+```python
+class User(BaseSurrealModel):
+    model_config = SurrealConfigDict(
+        server_fields=["created_at", "updated_at"],  # Exclus du save()
+    )
+```
+
+#### 3. merge(refresh=False) (Priorité: Basse)
+
+```python
+# Skip le SELECT de rafraîchissement pour fire-and-forget
+await user.merge(last_seen=SurrealFunc("time::now()"), refresh=False)
+```
 
 ---
 
@@ -424,65 +527,52 @@ via des requêtes SurrealQL `BEGIN TRANSACTION` / `COMMIT` / `CANCEL`.
 
 ### Features
 
-#### 1. Améliorations de stabilité
-
 - [ ] Gestion robuste des erreurs
 - [ ] Retry automatique sur déconnexion
 - [ ] Logging configurable
 - [ ] Métriques de performance
-
-#### 2. Configuration avancée
-
-```python
-class User(BaseSurrealModel):
-    model_config = SurrealConfigDict(
-        table_name="users",           # Nom de table custom
-        primary_key="email",          # Clé primaire custom
-        server_fields=["created_at", "updated_at"],  # Champs serveur
-        strict_mode=True,             # Validation stricte
-    )
-```
-
-#### 3. Field Aliases (Priorité: Moyenne)
-
-```python
-from pydantic import Field
-
-class User(BaseSurrealModel):
-    # Python 'password' -> DB 'password_hash'
-    password: str = Field(alias="password_hash")
-```
-
-#### 4. Documentation complète
-
-- [ ] Docstrings sur toutes les classes/méthodes publiques
-- [ ] README avec tous les exemples
-- [ ] Changelog complet
-- [ ] Guide de migration depuis v0.x
+- [ ] Documentation complète (docstrings, README, guide migration)
+- [ ] Performance benchmarks
 
 ### Critères de complétion v1.0.0
 
 - [ ] Coverage >= 80%
 - [ ] Tous les tests e2e passent
 - [ ] Documentation complète
-- [ ] Pas de breaking changes depuis v0.7.0
+- [ ] Pas de breaking changes depuis v0.9.0
 - [ ] Performance benchmarks documentés
 
 ---
 
-## Features hors scope (SDK custom requis)
+## Features exclusives à SurrealDB-ORM (hors scope)
 
-Ces features ne peuvent pas être implémentées avec le SDK officiel actuel:
+Ces features ne seront **pas** implémentées dans ORM-lite et nécessitent le [ORM complet](https://github.com/EulogySnowfall/SurrealDB-ORM):
 
-| Feature            | Raison                             |
-| ------------------ | ---------------------------------- |
-| CBOR Protocol      | SDK officiel utilise JSON          |
-| LiveSelectStream   | Nécessite gestion WebSocket custom |
-| Auto-Resubscribe   | Gestion reconnexion WebSocket      |
-| Connection Pool    | Pas dans le SDK officiel           |
-| Change Feeds (CDC) | Pas supporté par le SDK            |
-
-Ces features sont disponibles dans [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM).
+| Feature                          | Raison                                            |
+| -------------------------------- | ------------------------------------------------- |
+| SDK custom (`surreal_sdk`)       | Architecture fondamentale de l'ORM complet        |
+| CBOR Protocol                    | SDK officiel gère le protocole en interne          |
+| Connection Pool                  | Non supporté par le SDK officiel                  |
+| Live Models (ORM-level)         | Nécessite gestion WebSocket avancée               |
+| Auto-Resubscribe                 | Reconnexion WebSocket custom                      |
+| Change Feeds (CDC)               | Polling + cursor tracking complexe                |
+| Schema Introspection             | Système complet inspectdb/schemadiff              |
+| Multi-Database Support           | Registre de connexions nommées + contextvars      |
+| Migrations système               | makemigrations/migrate/rollback Django-style      |
+| CLI commands                     | Shell interactif, commandes admin                 |
+| Subqueries                       | QuerySet imbriqués dans des filtres               |
+| Query Cache (TTL)                | Cache avec invalidation automatique               |
+| Vector Search (KNN/HNSW)        | VectorField + similar_to() + indexes              |
+| Full-Text Search (BM25)         | search() + SearchScore/Highlight                  |
+| Hybrid Search (RRF)             | Combinaison vector + FTS                          |
+| DEFINE EVENT                     | Triggers serveur dans migrations                  |
+| Geospatial Fields                | PointField, PolygonField, nearby()                |
+| Materialized Views               | DEFINE TABLE ... AS SELECT (read-only models)     |
+| TYPE RELATION enforcement        | Contraintes graph dans migrations                 |
+| JWT Authentication               | AuthenticatedUserMixin, signup/signin             |
+| Test Fixtures & Factories        | SurrealFixture, ModelFactory, QueryLogger         |
+| Atomic Array Operations          | atomic_append/remove/set_add (concurrent safety)  |
+| Retry on Conflict                | retry_on_conflict() decorator                     |
 
 ---
 
