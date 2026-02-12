@@ -1,4 +1,7 @@
 import re
+from typing import Any
+
+from .constants import LOOKUP_OPERATORS
 
 # Pattern for valid field names: alphanumeric, underscores, dots (for nested fields)
 # Must start with a letter or underscore
@@ -51,3 +54,61 @@ def validate_alias_name(alias: str) -> None:
             f"Invalid alias name '{alias}': must contain only alphanumeric characters "
             "and underscores, and start with a letter or underscore"
         )
+
+
+def parse_lookup(key: str) -> tuple[str, str]:
+    """
+    Parse a filter key into field name and lookup type.
+
+    Args:
+        key: The filter key in the format ``field__lookup`` or just ``field``.
+
+    Returns:
+        A tuple of (field_name, lookup_type). Defaults to ``"exact"`` if no lookup is specified.
+    """
+    if "__" in key:
+        field_name, lookup_name = key.split("__", 1)
+    else:
+        field_name, lookup_name = key, "exact"
+    return field_name, lookup_name
+
+
+def build_filter_condition(field: str, lookup: str, value: Any, counter: int) -> tuple[str, dict[str, Any], int]:
+    """
+    Build a single parameterized filter condition.
+
+    Args:
+        field: The field name.
+        lookup: The lookup type (e.g. ``"exact"``, ``"gt"``, ``"in"``).
+        value: The filter value.
+        counter: The current variable counter for unique naming.
+
+    Returns:
+        A tuple of (sql_fragment, variables_dict, next_counter).
+
+    Raises:
+        ValueError: If the lookup type is not supported or the field name is invalid.
+    """
+    validate_field_name(field, "filter field")
+    op = LOOKUP_OPERATORS.get(lookup)
+    if op is None:
+        raise ValueError(f"Unsupported lookup type: '{lookup}'")
+
+    var_name = f"_f{counter}"
+
+    if lookup == "isnull":
+        if not isinstance(value, bool):
+            raise ValueError(f"isnull lookup requires a boolean value, got {type(value).__name__}")
+        if value:
+            return f"{field} IS NULL", {}, counter
+        else:
+            return f"{field} IS NOT NULL", {}, counter
+    elif lookup in ("in", "not_in", "containsall", "containsany"):
+        if isinstance(value, (str, dict)) or not hasattr(value, "__iter__"):
+            raise ValueError(f"'{lookup}' lookup requires an iterable (list, tuple, or set), got {type(value).__name__}")
+        return f"{field} {op} ${var_name}", {var_name: list(value)}, counter + 1
+    elif isinstance(value, str) and value.startswith("$"):
+        # Backward compat: string values starting with $ are variable references
+        return f"{field} {op} {value}", {}, counter
+    else:
+        return f"{field} {op} ${var_name}", {var_name: value}, counter + 1

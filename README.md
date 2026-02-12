@@ -104,9 +104,9 @@ users = await User.objects().filter(
     name__startswith="A"
 ).exec()
 
-# Ordering
+# Ordering (with -field shorthand for DESC)
 users = await User.objects().order_by("name").exec()
-users = await User.objects().order_by("age", OrderBy.DESC).exec()
+users = await User.objects().order_by("-age", "name").exec()
 
 # Pagination
 users = await User.objects().limit(10).offset(20).exec()
@@ -131,30 +131,76 @@ results = await User.objects().query(
 
 ## Features
 
-| Feature               | Status |
-| --------------------- | ------ |
-| Async/await support   | ✅     |
-| Pydantic validation   | ✅     |
-| CRUD operations       | ✅     |
-| QuerySet with filters | ✅     |
-| Django-style lookups  | ✅     |
-| Custom primary keys   | ✅     |
-| HTTP connections      | ✅     |
-| WebSocket connections | ✅     |
-| Aggregations          | ✅     |
-| GROUP BY              | ✅     |
-| Model Signals         | ✅     |
+| Feature                | Status |
+| ---------------------- | ------ |
+| Async/await support    | ✅     |
+| Pydantic validation    | ✅     |
+| CRUD operations        | ✅     |
+| QuerySet with filters  | ✅     |
+| Django-style lookups   | ✅     |
+| Custom primary keys    | ✅     |
+| HTTP connections       | ✅     |
+| WebSocket connections  | ✅     |
+| Aggregations           | ✅     |
+| GROUP BY               | ✅     |
+| Model Signals          | ✅     |
+| Raw SurrealQL queries  | ✅     |
+| Q Objects (OR/AND/NOT) | ✅     |
+| Parameterized filters  | ✅     |
+| Bulk operations        | ✅     |
+| `-field` ordering      | ✅     |
 
 ### Supported Filter Lookups
 
 - `exact` (default)
 - `gt`, `gte`, `lt`, `lte`
-- `in`
-- `contains`, `icontains`
+- `in`, `not_in`
+- `contains`, `icontains`, `not_contains`
+- `containsall`, `containsany`
 - `startswith`, `istartswith`
 - `endswith`, `iendswith`
+- `like`, `ilike`
+- `match`, `regex`, `iregex`
+- `isnull`
 
-### 5. Aggregations
+### 5. Q Objects (Complex Queries)
+
+```python
+from surreal_orm_lite import Q
+
+# OR queries
+users = await User.objects().filter(Q(name="Alice") | Q(name="Bob")).exec()
+
+# NOT queries
+active = await User.objects().filter(~Q(status="banned")).exec()
+
+# Complex combinations
+results = await User.objects().filter(
+    Q(age__gte=18) & (Q(role="admin") | Q(role="mod"))
+).exec()
+
+# Mix Q objects with keyword filters
+results = await User.objects().filter(
+    Q(role="admin") | Q(role="mod"),
+    age__gte=25
+).exec()
+```
+
+### 6. Bulk Operations
+
+```python
+# Bulk create
+users = [User(name="Alice", age=30), User(name="Bob", age=25)]
+created = await User.objects().bulk_create(users)
+
+# Bulk update (returns count of updated records)
+count = await User.objects().filter(status="pending").bulk_update(status="active")
+
+# Bulk delete (returns count of deleted records)
+count = await User.objects().filter(status="inactive").bulk_delete()
+```
+
+### 7. Aggregations
 
 ```python
 from surreal_orm_lite import Count, Sum, Avg, Min, Max
@@ -180,7 +226,7 @@ results = await User.raw_query(
 )
 ```
 
-### 6. Model Signals
+### 8. Model Signals
 
 ```python
 from surreal_orm_lite import pre_save, post_save, pre_delete, post_delete
@@ -200,17 +246,17 @@ async def on_user_deleting(sender, instance, **kwargs):
 
 **Available signals:**
 
-| Signal          | When                        | Extra kwargs     |
-| --------------- | --------------------------- | ---------------- |
-| `pre_save`      | Before `save()`             |                  |
-| `post_save`     | After `save()`              | `created`        |
-| `pre_update`    | Before `update()`/`merge()` | `update_fields`  |
-| `post_update`   | After `update()`/`merge()`  | `update_fields`  |
-| `pre_delete`    | Before `delete()`           |                  |
-| `post_delete`   | After `delete()`            |                  |
-| `around_save`   | Wraps `save()`              |                  |
-| `around_update` | Wraps `update()`/`merge()`  | `update_fields`  |
-| `around_delete` | Wraps `delete()`            |                  |
+| Signal          | When                        | Extra kwargs    |
+| --------------- | --------------------------- | --------------- |
+| `pre_save`      | Before `save()`             |                 |
+| `post_save`     | After `save()`              | `created`       |
+| `pre_update`    | Before `update()`/`merge()` | `update_fields` |
+| `post_update`   | After `update()`/`merge()`  | `update_fields` |
+| `pre_delete`    | Before `delete()`           |                 |
+| `post_delete`   | After `delete()`            |                 |
+| `around_save`   | Wraps `save()`              |                 |
+| `around_update` | Wraps `update()`/`merge()`  | `update_fields` |
+| `around_delete` | Wraps `delete()`            |                 |
 
 **Around signals** use async generators to wrap operations:
 
@@ -276,16 +322,62 @@ Contributions are welcome! Please:
 
 ---
 
-## Advanced Features?
+## Roadmap
 
-This project prioritizes **stability and compatibility** with the official SurrealDB Python SDK. Due to current SDK limitations, some advanced features cannot be implemented here.
+| Version | Theme                         | Status      |
+| ------- | ----------------------------- | ----------- |
+| v0.2.x  | Core ORM (CRUD, QuerySet)     | ✅ Released |
+| v0.3.0  | Aggregations & Utilities      | ✅ Released |
+| v0.4.0  | Model Signals                 | ✅ Released |
+| v0.5.0  | Bulk Operations & Q Objects   | ✅ Released |
+| v0.6.0  | Relations & Graph             | 📋 Next     |
+| v0.7.0  | Transactions ORM              | 📋 Planned  |
+| v0.8.0  | SurrealFunc & Computed Fields | 📋 Planned  |
+| v0.9.0  | Field Aliases & DX            | 📋 Planned  |
+| v1.0.0  | Production Ready              | 📋 Planned  |
 
-For a feature-rich ORM with relations, transactions, and more, see:
+See [docs/ROADMAP.md](docs/ROADMAP.md) for full details.
 
-- **GitHub**: [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/)
-- **PyPI**: [surrealdb-orm](https://pypi.org/project/surrealdb-orm/)
+---
 
-When the official SDK supports additional features, they will be incorporated into this lite version.
+## SurrealDB-ORM-lite vs SurrealDB-ORM
+
+This project prioritizes **stability and compatibility** with the official SurrealDB Python SDK. The full [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/) uses a custom SDK for advanced features.
+
+| Feature                   | ORM-lite (official SDK) | ORM (custom SDK) |
+| ------------------------- | ----------------------- | ---------------- |
+| CRUD & QuerySet           | ✅                      | ✅               |
+| Aggregations & GROUP BY   | ✅                      | ✅               |
+| Model Signals             | ✅                      | ✅               |
+| Bulk Operations           | ✅                      | ✅               |
+| Q Objects (OR/AND/NOT)    | ✅                      | ✅               |
+| Parameterized Filters     | ✅                      | ✅               |
+| Relations & Graph         | v0.6.0                  | ✅               |
+| FETCH clause              | v0.6.0                  | ✅               |
+| Transactions (tx=)        | v0.7.0                  | ✅               |
+| SurrealFunc & Computed    | v0.8.0                  | ✅               |
+| Field Aliases             | v0.9.0                  | ✅               |
+| Retry, Logging, Metrics   | v0.10.0                 | ✅               |
+| Live Models / CDC         | ❌                      | ✅               |
+| Vector / Full-Text Search | ❌                      | ✅               |
+| Hybrid Search (RRF)       | ❌                      | ✅               |
+| Migrations & CLI          | ❌                      | ✅               |
+| JWT Authentication        | ❌                      | ✅               |
+| Schema Introspection      | ❌                      | ✅               |
+| Connection Pool           | ❌                      | ✅               |
+| CBOR Protocol             | ❌                      | ✅               |
+| Subqueries & Query Cache  | ❌                      | ✅               |
+| Geospatial Fields         | ❌                      | ✅               |
+| DEFINE EVENT              | ❌                      | ✅               |
+| Test Fixtures & Factories | ❌                      | ✅               |
+| Atomic Array Operations   | ❌                      | ✅               |
+
+**Choose ORM-lite** if you want the official SDK, minimal dependencies, and core ORM features.
+
+**Choose ORM** if you need live queries, migrations, authentication, vector search, or advanced features.
+
+- **SurrealDB-ORM GitHub**: [github.com/EulogySnowfall/SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/)
+- **SurrealDB-ORM PyPI**: [surrealdb-orm](https://pypi.org/project/surrealdb-orm/)
 
 ---
 
@@ -306,3 +398,4 @@ GitHub: [@EulogySnowfall](https://github.com/EulogySnowfall)
 
 - [SurrealDB](https://surrealdb.com/) - The database
 - [surrealdb.py](https://github.com/surrealdb/surrealdb.py) - Official Python SDK
+- [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/) - Full-featured ORM with custom SDK
