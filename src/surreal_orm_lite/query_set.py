@@ -239,7 +239,7 @@ class QuerySet:
             query += f" START {self._offset}"
 
         query += ";"
-        all_variables = {**where_vars, **self._variables}
+        all_variables = {**self._variables, **where_vars}
         return query, all_variables
 
     def _compile_aggregation_query(self, aggregation_expr: str, alias: str | None = None) -> tuple[str, dict[str, Any]]:
@@ -263,7 +263,7 @@ class QuerySet:
         query += where_clause
         query += " GROUP ALL;"
 
-        all_variables = {**where_vars, **self._variables}
+        all_variables = {**self._variables, **where_vars}
         return query, all_variables
 
     def _compile_group_by_query(self) -> tuple[str, dict[str, Any]]:
@@ -297,7 +297,7 @@ class QuerySet:
             query += f" START {self._offset}"
 
         query += ";"
-        all_variables = {**where_vars, **self._variables}
+        all_variables = {**self._variables, **where_vars}
         return query, all_variables
 
     # ==================== Query execution ====================
@@ -632,7 +632,7 @@ class QuerySet:
         set_clause = ", ".join(set_parts)
         query = f"UPDATE {self._model_table} SET {set_clause}{where_clause};"
 
-        all_vars = {**where_vars, **set_vars, **self._variables}
+        all_vars = {**self._variables, **where_vars, **set_vars}
         results = await self._execute_query(query, all_vars)
 
         if isinstance(results, list):
@@ -653,7 +653,7 @@ class QuerySet:
         where_clause, where_vars = self._build_where()
         query = f"DELETE {self._model_table}{where_clause} RETURN BEFORE;"
 
-        all_vars = {**where_vars, **self._variables}
+        all_vars = {**self._variables, **where_vars}
         results = await self._execute_query(query, all_vars)
 
         if isinstance(results, list):

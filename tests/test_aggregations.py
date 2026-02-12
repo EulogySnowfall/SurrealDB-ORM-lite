@@ -275,6 +275,7 @@ class TestQuerySetAggregationMethods:
         query, variables = qs._compile_aggregation_query("count()")
         assert "SELECT count() FROM Product" in query
         assert "GROUP ALL" in query
+        assert variables == {}
 
     def test_compile_aggregation_query_with_filter(self) -> None:
         """_compile_aggregation_query with filters."""
@@ -290,6 +291,7 @@ class TestQuerySetAggregationMethods:
         query, variables = qs._compile_group_by_query()
         assert "SELECT category, count() AS count FROM Product" in query
         assert "GROUP BY category" in query
+        assert variables == {}
 
     def test_compile_group_by_query_multiple_fields(self) -> None:
         """_compile_group_by_query with multiple group fields and annotations."""
@@ -307,6 +309,7 @@ class TestQuerySetAggregationMethods:
         assert "count() AS count" in query
         assert "math::mean(price) AS avg_price" in query
         assert "GROUP BY category, in_stock" in query
+        assert variables == {}
 
 
 # =============================================================================
