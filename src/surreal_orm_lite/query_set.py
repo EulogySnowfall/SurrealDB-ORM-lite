@@ -161,6 +161,11 @@ class QuerySet:
         order_parts: list[str] = []
         i = 0
         while i < len(fields):
+            if isinstance(fields[i], OrderBy):
+                raise TypeError(
+                    f"order_by() expected a field name at position {i + 1}, but got an OrderBy value. "
+                    'Pass the direction after a field name, e.g. order_by("field", OrderBy.DESC).'
+                )
             field = str(fields[i])
             # Backward compat: check if next arg is an OrderBy direction
             if i + 1 < len(fields) and str(fields[i + 1]) in ("ASC", "DESC"):
@@ -673,8 +678,8 @@ class QuerySet:
         Returns:
             The result of the query, typically model instances.
         """
-        if f"FROM {self.model.__name__}" not in query:
-            raise SurrealDbError(f"The query must include 'FROM {self.model.__name__}' to reference the correct table.")
+        if f"FROM {self._model_table}" not in query:
+            raise SurrealDbError(f"The query must include 'FROM {self._model_table}' to reference the correct table.")
         client = await SurrealDBConnectionManager.get_client()
         results = await client.query(remove_quotes_for_variables(query), variables or {})
         if isinstance(results, list):

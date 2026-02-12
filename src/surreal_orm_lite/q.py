@@ -34,12 +34,16 @@ class Q:
         self.negated: bool = False
 
     def __or__(self, other: Q) -> Q:
+        if not isinstance(other, Q):
+            return NotImplemented
         node = Q()
         node.children = [self, other]
         node.connector = self.OR
         return node
 
     def __and__(self, other: Q) -> Q:
+        if not isinstance(other, Q):
+            return NotImplemented
         node = Q()
         node.children = [self, other]
         node.connector = self.AND
