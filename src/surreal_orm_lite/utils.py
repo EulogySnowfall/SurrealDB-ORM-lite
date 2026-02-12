@@ -105,10 +105,7 @@ def build_filter_condition(field: str, lookup: str, value: Any, counter: int) ->
             return f"{field} IS NOT NULL", {}, counter
     elif lookup in ("in", "not_in", "containsall", "containsany"):
         if isinstance(value, str) or not hasattr(value, "__iter__"):
-            raise ValueError(
-                f"'{lookup}' lookup requires a non-string iterable (list, tuple, set), "
-                f"got {type(value).__name__}"
-            )
+            raise ValueError(f"'{lookup}' lookup requires a non-string iterable (list, tuple, set), got {type(value).__name__}")
         return f"{field} {op} ${var_name}", {var_name: list(value)}, counter + 1
     elif isinstance(value, str) and value.startswith("$"):
         # Backward compat: string values starting with $ are variable references
