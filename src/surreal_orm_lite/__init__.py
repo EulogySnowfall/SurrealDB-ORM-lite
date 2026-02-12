@@ -1,4 +1,4 @@
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
 from .connection_manager import SurrealDBConnectionManager
@@ -11,6 +11,7 @@ from .exceptions import (
     SurrealORMError,
 )
 from .model_base import BaseSurrealModel, SurrealConfigDict
+from .q import Q
 from .query_set import QuerySet
 from .signals import (
     AroundSignal,
@@ -35,6 +36,7 @@ __all__ = [
     "SurrealConfigDict",
     # QuerySet
     "QuerySet",
+    "Q",
     "OrderBy",
     # Aggregations
     "Aggregation",

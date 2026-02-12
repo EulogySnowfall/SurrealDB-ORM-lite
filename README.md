@@ -104,9 +104,9 @@ users = await User.objects().filter(
     name__startswith="A"
 ).exec()
 
-# Ordering
+# Ordering (with -field shorthand for DESC)
 users = await User.objects().order_by("name").exec()
-users = await User.objects().order_by("age", OrderBy.DESC).exec()
+users = await User.objects().order_by("-age", "name").exec()
 
 # Pagination
 users = await User.objects().limit(10).offset(20).exec()
@@ -131,34 +131,76 @@ results = await User.objects().query(
 
 ## Features
 
-| Feature               | Status |
-| --------------------- | ------ |
-| Async/await support   | ✅     |
-| Pydantic validation   | ✅     |
-| CRUD operations       | ✅     |
-| QuerySet with filters | ✅     |
-| Django-style lookups  | ✅     |
-| Custom primary keys   | ✅     |
-| HTTP connections      | ✅     |
-| WebSocket connections | ✅     |
-| Aggregations          | ✅     |
-| GROUP BY              | ✅     |
-| Model Signals         | ✅     |
-| Raw SurrealQL queries | ✅     |
+| Feature                | Status |
+| ---------------------- | ------ |
+| Async/await support    | ✅     |
+| Pydantic validation    | ✅     |
+| CRUD operations        | ✅     |
+| QuerySet with filters  | ✅     |
+| Django-style lookups   | ✅     |
+| Custom primary keys    | ✅     |
+| HTTP connections       | ✅     |
+| WebSocket connections  | ✅     |
+| Aggregations           | ✅     |
+| GROUP BY               | ✅     |
+| Model Signals          | ✅     |
+| Raw SurrealQL queries  | ✅     |
+| Q Objects (OR/AND/NOT) | ✅     |
+| Parameterized filters  | ✅     |
+| Bulk operations        | ✅     |
+| `-field` ordering      | ✅     |
 
 ### Supported Filter Lookups
 
 - `exact` (default)
 - `gt`, `gte`, `lt`, `lte`
-- `in`
-- `contains`, `icontains`
+- `in`, `not_in`
+- `contains`, `icontains`, `not_contains`
+- `containsall`, `containsany`
 - `startswith`, `istartswith`
 - `endswith`, `iendswith`
 - `like`, `ilike`
 - `match`, `regex`, `iregex`
 - `isnull`
 
-### 5. Aggregations
+### 5. Q Objects (Complex Queries)
+
+```python
+from surreal_orm_lite import Q
+
+# OR queries
+users = await User.objects().filter(Q(name="Alice") | Q(name="Bob")).exec()
+
+# NOT queries
+active = await User.objects().filter(~Q(status="banned")).exec()
+
+# Complex combinations
+results = await User.objects().filter(
+    Q(age__gte=18) & (Q(role="admin") | Q(role="mod"))
+).exec()
+
+# Mix Q objects with keyword filters
+results = await User.objects().filter(
+    Q(role="admin") | Q(role="mod"),
+    age__gte=25
+).exec()
+```
+
+### 6. Bulk Operations
+
+```python
+# Bulk create
+users = [User(name="Alice", age=30), User(name="Bob", age=25)]
+created = await User.objects().bulk_create(users)
+
+# Bulk update (returns count of updated records)
+count = await User.objects().filter(status="pending").bulk_update(status="active")
+
+# Bulk delete (returns count of deleted records)
+count = await User.objects().filter(status="inactive").bulk_delete()
+```
+
+### 7. Aggregations
 
 ```python
 from surreal_orm_lite import Count, Sum, Avg, Min, Max
@@ -184,7 +226,7 @@ results = await User.raw_query(
 )
 ```
 
-### 6. Model Signals
+### 8. Model Signals
 
 ```python
 from surreal_orm_lite import pre_save, post_save, pre_delete, post_delete
@@ -204,17 +246,17 @@ async def on_user_deleting(sender, instance, **kwargs):
 
 **Available signals:**
 
-| Signal          | When                        | Extra kwargs     |
-| --------------- | --------------------------- | ---------------- |
-| `pre_save`      | Before `save()`             |                  |
-| `post_save`     | After `save()`              | `created`        |
-| `pre_update`    | Before `update()`/`merge()` | `update_fields`  |
-| `post_update`   | After `update()`/`merge()`  | `update_fields`  |
-| `pre_delete`    | Before `delete()`           |                  |
-| `post_delete`   | After `delete()`            |                  |
-| `around_save`   | Wraps `save()`              |                  |
-| `around_update` | Wraps `update()`/`merge()`  | `update_fields`  |
-| `around_delete` | Wraps `delete()`            |                  |
+| Signal          | When                        | Extra kwargs    |
+| --------------- | --------------------------- | --------------- |
+| `pre_save`      | Before `save()`             |                 |
+| `post_save`     | After `save()`              | `created`       |
+| `pre_update`    | Before `update()`/`merge()` | `update_fields` |
+| `post_update`   | After `update()`/`merge()`  | `update_fields` |
+| `pre_delete`    | Before `delete()`           |                 |
+| `post_delete`   | After `delete()`            |                 |
+| `around_save`   | Wraps `save()`              |                 |
+| `around_update` | Wraps `update()`/`merge()`  | `update_fields` |
+| `around_delete` | Wraps `delete()`            |                 |
 
 **Around signals** use async generators to wrap operations:
 
@@ -287,20 +329,12 @@ Contributions are welcome! Please:
 | v0.2.x  | Core ORM (CRUD, QuerySet)     | ✅ Released |
 | v0.3.0  | Aggregations & Utilities      | ✅ Released |
 | v0.4.0  | Model Signals                 | ✅ Released |
-| v0.5.0  | Bulk Operations & Q Objects   | 📋 Next    |
-| v0.6.0  | Relations & Graph             | 📋 Planned |
-| v0.7.0  | Transactions ORM              | 📋 Planned |
-| v0.8.0  | SurrealFunc & Computed Fields | 📋 Planned |
-| v0.9.0  | Field Aliases & DX            | 📋 Planned |
-| v1.0.0  | Production Ready              | 📋 Planned |
-
-### v0.5.0 Preview
-
-- **Q Objects** — Complex queries with `Q(a=1) | Q(b=2)`, `~Q(status="banned")`
-- **Parameterized filters** — All filter values as `$_fN` variables (SQL injection prevention)
-- **Bulk operations** — `bulk_create()`, `bulk_update()`, `bulk_delete()`
-- **New lookups** — `not_in`, `not_contains`, `containsall`, `containsany`
-- **`-field` ordering** — Shorthand for `order_by("-created_at")`
+| v0.5.0  | Bulk Operations & Q Objects   | ✅ Released |
+| v0.6.0  | Relations & Graph             | 📋 Next     |
+| v0.7.0  | Transactions ORM              | 📋 Planned  |
+| v0.8.0  | SurrealFunc & Computed Fields | 📋 Planned  |
+| v0.9.0  | Field Aliases & DX            | 📋 Planned  |
+| v1.0.0  | Production Ready              | 📋 Planned  |
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for full details.
 
@@ -310,22 +344,33 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for full details.
 
 This project prioritizes **stability and compatibility** with the official SurrealDB Python SDK. The full [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/) uses a custom SDK for advanced features.
 
-| Feature                  | ORM-lite (official SDK) | ORM (custom SDK) |
-| ------------------------ | ----------------------- | ---------------- |
-| CRUD & QuerySet          | ✅                      | ✅               |
-| Aggregations & GROUP BY  | ✅                      | ✅               |
-| Model Signals            | ✅                      | ✅               |
-| Bulk Operations          | v0.5.0                  | ✅               |
-| Q Objects (OR/AND/NOT)   | v0.5.0                  | ✅               |
-| Relations & Graph        | v0.6.0                  | ✅               |
-| Transactions             | v0.7.0                  | ✅               |
-| Live Models / CDC        | -                       | ✅               |
-| Vector / Full-Text Search| -                       | ✅               |
-| Migrations & CLI         | -                       | ✅               |
-| JWT Authentication       | -                       | ✅               |
-| Schema Introspection     | -                       | ✅               |
-| Connection Pool          | -                       | ✅               |
-| CBOR Protocol            | -                       | ✅               |
+| Feature                   | ORM-lite (official SDK) | ORM (custom SDK) |
+| ------------------------- | ----------------------- | ---------------- |
+| CRUD & QuerySet           | ✅                      | ✅               |
+| Aggregations & GROUP BY   | ✅                      | ✅               |
+| Model Signals             | ✅                      | ✅               |
+| Bulk Operations           | ✅                      | ✅               |
+| Q Objects (OR/AND/NOT)    | ✅                      | ✅               |
+| Parameterized Filters     | ✅                      | ✅               |
+| Relations & Graph         | v0.6.0                  | ✅               |
+| FETCH clause              | v0.6.0                  | ✅               |
+| Transactions (tx=)        | v0.7.0                  | ✅               |
+| SurrealFunc & Computed    | v0.8.0                  | ✅               |
+| Field Aliases             | v0.9.0                  | ✅               |
+| Retry, Logging, Metrics   | v0.10.0                 | ✅               |
+| Live Models / CDC         | ❌                      | ✅               |
+| Vector / Full-Text Search | ❌                      | ✅               |
+| Hybrid Search (RRF)       | ❌                      | ✅               |
+| Migrations & CLI          | ❌                      | ✅               |
+| JWT Authentication        | ❌                      | ✅               |
+| Schema Introspection      | ❌                      | ✅               |
+| Connection Pool           | ❌                      | ✅               |
+| CBOR Protocol             | ❌                      | ✅               |
+| Subqueries & Query Cache  | ❌                      | ✅               |
+| Geospatial Fields         | ❌                      | ✅               |
+| DEFINE EVENT              | ❌                      | ✅               |
+| Test Fixtures & Factories | ❌                      | ✅               |
+| Atomic Array Operations   | ❌                      | ✅               |
 
 **Choose ORM-lite** if you want the official SDK, minimal dependencies, and core ORM features.
 

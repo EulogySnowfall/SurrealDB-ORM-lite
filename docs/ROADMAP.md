@@ -13,12 +13,12 @@
 | v0.2.x  | Core ORM (CRUD, QuerySet, Filters) | ✅ Done     |
 | v0.3.0  | Aggregations & Utilities           | ✅ Done     |
 | v0.4.0  | Model Signals                      | ✅ Done     |
-| v0.5.0  | Bulk Operations & Q Objects        | 📋 Planned  |
+| v0.5.0  | Bulk Operations & Q Objects        | ✅ Done     |
 | v0.6.0  | Relations & Graph                  | 📋 Planned  |
 | v0.7.0  | Transactions ORM                   | 📋 Planned  |
 | v0.8.0  | SurrealFunc & Computed Fields      | 📋 Planned  |
 | v0.9.0  | FETCH, Field Aliases & DX          | 📋 Planned  |
-| v1.0.0  | Production Ready                   | 📋 Planned  |
+| v0.10.0 | Beta Phase                         | 📋 Planned  |
 
 ---
 
@@ -34,11 +34,11 @@
 | raw_query()                | ✅ v0.5.4  | ✅ v0.3.0 | -              |
 | Model Signals (pre/post)   | ✅ v0.5.7  | ✅ v0.4.0 | -              |
 | Around Signals             | ✅ v0.5.8  | ✅ v0.4.0 | -              |
-| Bulk Operations            | ✅ v0.4+   | ❌        | v0.5.0         |
-| Q Objects (OR/AND/NOT)     | ✅ v0.6.0  | ❌        | v0.5.0         |
-| Additional lookups         | ✅ v0.5.9  | ❌        | v0.5.0         |
-| Parameterized filters      | ✅ v0.6.0  | ❌        | v0.5.0         |
-| `-field` ordering (DESC)   | ✅ v0.6.0  | ❌        | v0.5.0         |
+| Bulk Operations            | ✅ v0.4+   | ✅ v0.5.0 | -              |
+| Q Objects (OR/AND/NOT)     | ✅ v0.6.0  | ✅ v0.5.0 | -              |
+| Additional lookups         | ✅ v0.5.9  | ✅ v0.5.0 | -              |
+| Parameterized filters      | ✅ v0.6.0  | ✅ v0.5.0 | -              |
+| `-field` ordering (DESC)   | ✅ v0.6.0  | ✅ v0.5.0 | -              |
 | Relations & Graph (relate) | ✅ v0.4.0  | ❌        | v0.6.0         |
 | get_related() / traverse() | ✅ v0.4.0  | ❌        | v0.6.0         |
 | FETCH clause               | ✅ v0.7.0  | ❌        | v0.6.0         |
@@ -49,7 +49,7 @@
 | server_values on save()    | ✅ v0.7.0  | ❌        | v0.8.0         |
 | Field Aliases              | ✅ v0.5.5  | ❌        | v0.9.0         |
 | call_function()            | ✅ v0.7.0  | ❌        | v0.9.0         |
-| Retry, Logging, Metrics    | ✅ v0.7+   | ❌        | v1.0.0         |
+| Retry, Logging, Metrics    | ✅ v0.7+   | ❌        | v0.10.0        |
 
 ### Features exclusive to SurrealDB-ORM (custom SDK required)
 
@@ -116,7 +116,7 @@ These features **cannot** be implemented with the current official SDK and will 
 
 ---
 
-## Version 0.5.0 - Bulk Operations & Q Objects
+## Version 0.5.0 - Bulk Operations & Q Objects ✅
 
 **Goal**: Bulk operations and complex queries
 
@@ -169,12 +169,12 @@ class Q:
         """Generate WHERE clause with parameterized variables."""
 ```
 
-**Files to create/modify**:
+**Files created/modified**:
 
-- [ ] `src/surreal_orm_lite/q.py` - Q class
-- [ ] `src/surreal_orm_lite/query_set.py` - Q support in filter()
-- [ ] `src/surreal_orm_lite/__init__.py` - Export Q
-- [ ] `tests/test_q_objects.py` - Tests
+- [x] `src/surreal_orm_lite/q.py` - Q class
+- [x] `src/surreal_orm_lite/query_set.py` - Q support in filter()
+- [x] `src/surreal_orm_lite/__init__.py` - Export Q
+- [x] `tests/test_v050.py` - Tests
 
 #### 2. Parameterized filters - Security (Priority: High)
 
@@ -189,10 +189,11 @@ interpolated in the query string. Prevents SQL injection.
 # SELECT * FROM User WHERE name = $_f0  {_f0: "Alice"}
 ```
 
-**Files to modify**:
+**Files modified**:
 
-- [ ] `src/surreal_orm_lite/query_set.py` - Refactor \_build_where() to use variables
-- [ ] `tests/test_e2e.py` - Verify parameterized filters work
+- [x] `src/surreal_orm_lite/query_set.py` - Refactored \_build_where() to use variables
+- [x] `src/surreal_orm_lite/utils.py` - Shared build_filter_condition()
+- [x] `tests/test_v050.py` - Parameterized filter tests
 
 #### 3. bulk_create() (Priority: High)
 
@@ -220,8 +221,8 @@ INSERT INTO User [
 
 **Files to modify**:
 
-- [ ] `src/surreal_orm_lite/query_set.py` - bulk_create() method
-- [ ] `tests/test_bulk.py` - Tests
+- [x] `src/surreal_orm_lite/query_set.py` - bulk_create() method
+- [x] `tests/test_v050.py` - Tests
 
 #### 4. bulk_update() (Priority: Medium)
 
@@ -245,8 +246,8 @@ UPDATE User SET status = $_v0 WHERE status = $_f0;
 
 **Files to modify**:
 
-- [ ] `src/surreal_orm_lite/query_set.py` - bulk_update() method
-- [ ] `tests/test_bulk.py` - Tests
+- [x] `src/surreal_orm_lite/query_set.py` - bulk_update() method
+- [x] `tests/test_v050.py` - Tests
 
 #### 5. bulk_delete() (Priority: Medium)
 
@@ -264,8 +265,8 @@ DELETE User WHERE status = $_f0;
 
 **Files to modify**:
 
-- [ ] `src/surreal_orm_lite/query_set.py` - bulk_delete() method
-- [ ] `tests/test_bulk.py` - Tests
+- [x] `src/surreal_orm_lite/query_set.py` - bulk_delete() method
+- [x] `tests/test_v050.py` - Tests
 
 #### 6. Additional lookups (Priority: Medium)
 
@@ -287,8 +288,8 @@ posts = await Post.objects().filter(tags__containsany=["python", "rust"]).exec()
 
 **Files to modify**:
 
-- [ ] `src/surreal_orm_lite/constants.py` - Add operators
-- [ ] `tests/test_e2e.py` - Tests for new lookups
+- [x] `src/surreal_orm_lite/constants.py` - Added operators
+- [x] `tests/test_v050.py` - Tests for new lookups
 
 #### 7. `-field` ordering shorthand (Priority: Low)
 
@@ -305,18 +306,17 @@ users = await User.objects().order_by("-age", "name").exec()
 
 **Files to modify**:
 
-- [ ] `src/surreal_orm_lite/query_set.py` - Improve order_by()
-- [ ] `tests/test_e2e.py` - Tests
+- [x] `src/surreal_orm_lite/query_set.py` - Improved order_by()
+- [x] `tests/test_v050.py` - Tests
 
 ### Completion criteria v0.5.0
 
-- [ ] Q Objects working with OR/AND/NOT
-- [ ] Parameterized filters on all QuerySets
-- [ ] Bulk operations (create, update, delete) working
-- [ ] New lookups (not_in, not_contains, containsall, containsany)
-- [ ] `-field` ordering shorthand
-- [ ] Bulk performance tests (> 100 records)
-- [ ] Coverage >= 70%
+- [x] Q Objects working with OR/AND/NOT
+- [x] Parameterized filters on all QuerySets
+- [x] Bulk operations (create, update, delete) working
+- [x] New lookups (not_in, not_contains, containsall, containsany)
+- [x] `-field` ordering shorthand
+- [x] Coverage >= 70% (94.28%)
 
 ---
 

@@ -272,21 +272,22 @@ class TestQuerySetAggregationMethods:
     def test_compile_aggregation_query(self) -> None:
         """_compile_aggregation_query should generate correct SQL."""
         qs = Product.objects()
-        query = qs._compile_aggregation_query("count()")
+        query, variables = qs._compile_aggregation_query("count()")
         assert "SELECT count() FROM Product" in query
         assert "GROUP ALL" in query
 
     def test_compile_aggregation_query_with_filter(self) -> None:
         """_compile_aggregation_query with filters."""
         qs = Product.objects().filter(in_stock=True)
-        query = qs._compile_aggregation_query("count()")
-        assert "WHERE in_stock = True" in query
+        query, variables = qs._compile_aggregation_query("count()")
+        assert "WHERE in_stock = $_f0" in query
+        assert variables["_f0"] is True
         assert "GROUP ALL" in query
 
     def test_compile_group_by_query(self) -> None:
         """_compile_group_by_query should generate correct SQL."""
         qs = Product.objects().values("category").annotate(count=Count())
-        query = qs._compile_group_by_query()
+        query, variables = qs._compile_group_by_query()
         assert "SELECT category, count() AS count FROM Product" in query
         assert "GROUP BY category" in query
 
@@ -300,7 +301,7 @@ class TestQuerySetAggregationMethods:
                 avg_price=Avg("price"),
             )
         )
-        query = qs._compile_group_by_query()
+        query, variables = qs._compile_group_by_query()
         assert "category" in query
         assert "in_stock" in query
         assert "count() AS count" in query

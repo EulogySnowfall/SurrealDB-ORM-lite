@@ -5,6 +5,47 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-02-11
+
+### Added
+
+- **Q Objects**: Django-style composable query expressions for complex filters
+  - `Q(field=value)` for basic conditions
+  - `Q(...) | Q(...)` for OR queries
+  - `Q(...) & Q(...)` for AND queries
+  - `~Q(...)` for NOT queries
+  - Nested combinations: `Q(age__gte=18) & (Q(role="admin") | Q(role="mod"))`
+
+- **Parameterized Filters**: All filter values now use parameterized variables (`$_fN`) instead of string interpolation, preventing SQL injection
+
+- **New Lookup Operators**:
+  - `not_in` - NOT IN operator
+  - `not_contains` - CONTAINSNOT operator
+  - `containsall` - CONTAINSALL operator
+  - `containsany` - CONTAINSANY operator
+
+- **`-field` Ordering Shorthand**: Prefix field with `-` for descending order
+  - `order_by("-created_at")` instead of `order_by("created_at", OrderBy.DESC)`
+  - Multi-field ordering: `order_by("-age", "name")`
+
+- **Bulk Operations**:
+  - `bulk_create(models)` - Create multiple records via SDK's `insert()`
+  - `bulk_update(**kwargs)` - Update all matching records with parameterized SET clause
+  - `bulk_delete()` - Delete all matching records, returns count
+
+- New `Q` class exported from `surreal_orm_lite`
+- New test file `tests/test_v050.py` for all v0.5.0 features
+
+### Changed
+
+- `_compile_query()`, `_compile_aggregation_query()`, `_compile_group_by_query()` now return `tuple[str, dict]` with parameterized variables
+- `_execute_query()` now accepts optional `variables` parameter
+- `filter()` now accepts `*args: Q` positional arguments alongside keyword filters
+- `order_by()` now accepts multiple fields with `-field` prefix support
+- `_build_where()` replaces `_build_where_clauses()` and returns parameterized WHERE clause
+- Shared `parse_lookup()` and `build_filter_condition()` functions moved to `utils.py`
+- Fixed `isnull` lookup: now correctly generates `IS NULL`/`IS NOT NULL`
+
 ## [0.4.0] - 2026-02-07
 
 ### Added
