@@ -81,6 +81,18 @@ class TestGraphPathValidation:
         with pytest.raises(ValueError, match="Invalid graph path"):
             validate_graph_path("->follows; DROP TABLE users--")
 
+    def test_invalid_path_no_arrow_prefix(self) -> None:
+        with pytest.raises(ValueError, match="Invalid graph path"):
+            validate_graph_path("follows->User")
+
+    def test_invalid_path_arbitrary_chars(self) -> None:
+        with pytest.raises(ValueError, match="Invalid graph path"):
+            validate_graph_path(">>>>>")
+
+    def test_invalid_path_double_dash(self) -> None:
+        with pytest.raises(ValueError, match="Invalid graph path"):
+            validate_graph_path("---<><>")
+
 
 # =============================================================================
 # Unit Tests - Model Method Validation
@@ -109,8 +121,12 @@ class TestRelateValidation:
         assert result == "Person:bob"
 
     def test_resolve_target_thing_invalid_string(self) -> None:
-        with pytest.raises(SurrealDbError, match="table:id"):
+        with pytest.raises(ValueError, match="record identifier"):
             Person._resolve_target_thing("just_an_id")
+
+    def test_resolve_target_thing_injection(self) -> None:
+        with pytest.raises(ValueError, match="record identifier"):
+            Person._resolve_target_thing("User:alice; DELETE User WHERE true--")
 
     def test_resolve_target_thing_invalid_type(self) -> None:
         with pytest.raises(TypeError, match="BaseSurrealModel instance"):

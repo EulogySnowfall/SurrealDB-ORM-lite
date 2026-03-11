@@ -77,7 +77,7 @@ class QuerySet:
         Returns:
             Self: The current instance for method chaining.
         """
-        self._variables = dict(kwargs.items())
+        self._variables.update(kwargs)
         return self
 
     def filter(self, *args: Q, **kwargs: Any) -> Self:
@@ -205,7 +205,7 @@ class QuerySet:
         """
         for field in fields:
             validate_field_name(field, "FETCH field")
-        self._fetch_fields = list(fields)
+        self._fetch_fields.extend(fields)
         return self
 
     # ==================== Internal query building ====================

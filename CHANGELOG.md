@@ -21,9 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Validation Utilities**: New security validators in `utils.py`
   - `validate_edge_name()` — Validates edge/relation table names
-  - `validate_graph_path()` — Validates graph traversal paths
+  - `validate_graph_path()` — Validates graph traversal paths (strict arrow-segment structure)
+  - `validate_thing()` — Validates `table:id` record identifiers against injection
 
-- New test file `tests/test_relations.py` with 33 unit + E2E tests
+- New test file `tests/test_relations.py` with unit + E2E tests
 
 - **CI/CD Workflows**:
   - `.surrealdb-version` file to pin the tested SurrealDB version (2.6.0)
@@ -33,7 +34,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `QuerySet._compile_query()` now appends `FETCH` clause when `fetch()` is used
+- `QuerySet.fetch()` now accumulates fields across chained calls instead of overwriting
+- `QuerySet.variables()` now merges variables across chained calls instead of overwriting
 - Coverage: 92.80%
+
+### Fixed
+
+- **Security**: `_resolve_target_thing()` now validates string targets with `validate_thing()` to prevent SurrealQL injection
+- **Security**: `_get_thing()` now validates the generated `table:id` string to prevent injection via malicious model IDs
+- **Security**: `get_related()` now validates RecordIDs with `validate_thing()` before interpolation
+- **Security**: `$` variable references in filters are now validated against `^\$[a-zA-Z_][a-zA-Z0-9_]*$` pattern
+- **Security**: `validate_graph_path()` regex tightened to require arrow-separated segments (`->` or `<-`) — rejects arbitrary `<>-` combinations
+- Removed misleading case-insensitive lookup aliases (`icontains`, `istartswith`, `iendswith`, `iregex`) that were mapped to case-sensitive SurrealDB operators
 
 ## [0.5.0] - 2026-02-11
 

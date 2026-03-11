@@ -18,7 +18,7 @@ from .signals import (
     pre_save,
     pre_update,
 )
-from .utils import validate_edge_name, validate_field_name, validate_graph_path
+from .utils import remove_quotes_for_variables, validate_edge_name, validate_field_name, validate_graph_path, validate_thing
 
 logger = logging.getLogger(__name__)
 
@@ -312,14 +312,15 @@ class BaseSurrealModel(BaseModel):
         id_val = self.get_id()
         if id_val is None:
             raise SurrealDbError("Cannot use relations on an unsaved model (no id).")
-        return f"{self.get_table_name()}:{id_val}"
+        thing = f"{self.get_table_name()}:{id_val}"
+        validate_thing(thing)
+        return thing
 
     @staticmethod
     def _resolve_target_thing(target: "BaseSurrealModel | str") -> str:
         """Resolve a target to ``table:id`` string."""
         if isinstance(target, str):
-            if ":" not in target:
-                raise SurrealDbError(f"String target must be in 'table:id' format, got '{target}'")
+            validate_thing(target)
             return target
         if isinstance(target, BaseSurrealModel):
             return target._get_thing()
@@ -367,8 +368,6 @@ class BaseSurrealModel(BaseModel):
             query = f"RELATE {source}->{edge}->{target_thing};"
 
         client = await SurrealDBConnectionManager.get_client()
-        from .utils import remove_quotes_for_variables
-
         result = await client.query(remove_quotes_for_variables(query), variables)
         return result if isinstance(result, list) else []
 
@@ -479,7 +478,12 @@ class BaseSurrealModel(BaseModel):
         if model_class is not None:
             # If results are RecordIDs, we need to SELECT them
             if records and isinstance(records[0], RecordID):
-                ids = [str(r) for r in records]
+                # RecordIDs come from the database, validate each one before interpolation
+                ids = []
+                for r in records:
+                    rid = str(r)
+                    validate_thing(rid)
+                    ids.append(rid)
                 placeholders = ", ".join(ids)
                 fetch_query = f"SELECT * FROM {placeholders};"
                 records = await client.query(fetch_query, {})

@@ -11,6 +11,17 @@ VALID_FIELD_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9
 # Must start with a letter or underscore (like Python identifiers)
 VALID_ALIAS_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
+# Pattern for valid graph traversal paths: arrow-separated segments
+# e.g. ->follows->User, <-follows<-User, ->follows->User->likes->Post
+VALID_GRAPH_PATH_PATTERN = re.compile(r"^(<-|->)[a-zA-Z_][a-zA-Z0-9_]*((<-|->)[a-zA-Z_][a-zA-Z0-9_]*)*$")
+
+# Pattern for valid record thing strings: table:id where both parts are safe
+# ID part allows alphanumeric, underscores, and hyphens
+VALID_THING_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*:[a-zA-Z0-9_`-]+$")
+
+# Pattern for valid SurrealQL variable references: $variable_name
+VALID_VARIABLE_REF_PATTERN = re.compile(r"^\$[a-zA-Z_][a-zA-Z0-9_]*$")
+
 
 def remove_quotes_for_variables(query: str) -> str:
     # Regex to remove single quotes around variables ($)
@@ -86,16 +97,32 @@ def validate_graph_path(path: str) -> None:
         path: The graph traversal path to validate.
 
     Raises:
-        ValueError: If the path contains invalid characters.
+        ValueError: If the path contains invalid characters or structure.
     """
     if not path or not path.strip():
         raise ValueError("graph path cannot be empty")
-    # Allow alphanumeric, underscores, arrows (->  <-), and dots
-    valid_path = re.compile(r"^[-<>a-zA-Z0-9_.]+$")
-    if not valid_path.match(path):
+    if not VALID_GRAPH_PATH_PATTERN.match(path):
         raise ValueError(
-            f"Invalid graph path '{path}': must contain only alphanumeric characters, "
-            "underscores, dots, and arrow operators (-> <-)"
+            f"Invalid graph path '{path}': must be arrow-separated segments starting with -> or <- (e.g. '->follows->User')"
+        )
+
+
+def validate_thing(thing: str) -> None:
+    """
+    Validate a ``table:id`` record identifier to prevent injection.
+
+    Args:
+        thing: The record identifier in ``table:id`` format.
+
+    Raises:
+        ValueError: If the thing string is not a valid ``table:id`` format.
+    """
+    if not thing or not thing.strip():
+        raise ValueError("record identifier cannot be empty")
+    if not VALID_THING_PATTERN.match(thing):
+        raise ValueError(
+            f"Invalid record identifier '{thing}': must be in 'table:id' format "
+            "with only alphanumeric characters, underscores, and hyphens"
         )
 
 
@@ -152,6 +179,8 @@ def build_filter_condition(field: str, lookup: str, value: Any, counter: int) ->
         return f"{field} {op} ${var_name}", {var_name: list(value)}, counter + 1
     elif isinstance(value, str) and value.startswith("$"):
         # Backward compat: string values starting with $ are variable references
+        if not VALID_VARIABLE_REF_PATTERN.match(value):
+            raise ValueError(f"Invalid variable reference '{value}': must match $variable_name pattern")
         return f"{field} {op} {value}", {}, counter
     else:
         return f"{field} {op} ${var_name}", {var_name: value}, counter + 1

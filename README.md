@@ -159,12 +159,11 @@ results = await User.objects().query(
 - `exact` (default)
 - `gt`, `gte`, `lt`, `lte`
 - `in`, `not_in`
-- `contains`, `icontains`, `not_contains`
+- `contains`, `not_contains`
 - `containsall`, `containsany`
-- `startswith`, `istartswith`
-- `endswith`, `iendswith`
+- `startswith`, `endswith`
 - `like`, `ilike`
-- `match`, `regex`, `iregex`
+- `match`, `regex`
 - `isnull`
 
 ### 5. Q Objects (Complex Queries)
