@@ -56,6 +56,49 @@ def validate_alias_name(alias: str) -> None:
         )
 
 
+def validate_edge_name(edge: str) -> None:
+    """
+    Validate an edge (relation table) name to prevent injection.
+
+    Args:
+        edge: The edge/relation name to validate.
+
+    Raises:
+        ValueError: If the edge name contains invalid characters.
+    """
+    if not edge or not edge.strip():
+        raise ValueError("edge name cannot be empty")
+    if not VALID_ALIAS_PATTERN.match(edge):
+        raise ValueError(
+            f"Invalid edge name '{edge}': must contain only alphanumeric characters "
+            "and underscores, and start with a letter or underscore"
+        )
+
+
+def validate_graph_path(path: str) -> None:
+    """
+    Validate a graph traversal path to prevent injection.
+
+    Accepts paths like ``->follows->User``, ``<-follows<-User``,
+    or mixed ``->follows->User->likes->Post``.
+
+    Args:
+        path: The graph traversal path to validate.
+
+    Raises:
+        ValueError: If the path contains invalid characters.
+    """
+    if not path or not path.strip():
+        raise ValueError("graph path cannot be empty")
+    # Allow alphanumeric, underscores, arrows (->  <-), and dots
+    valid_path = re.compile(r"^[-<>a-zA-Z0-9_.]+$")
+    if not valid_path.match(path):
+        raise ValueError(
+            f"Invalid graph path '{path}': must contain only alphanumeric characters, "
+            "underscores, dots, and arrow operators (-> <-)"
+        )
+
+
 def parse_lookup(key: str) -> tuple[str, str]:
     """
     Parse a filter key into field name and lookup type.
