@@ -18,6 +18,7 @@ from .signals import (
     pre_save,
     pre_update,
 )
+from .utils import remove_quotes_for_variables, validate_edge_name, validate_field_name, validate_graph_path, validate_thing
 
 logger = logging.getLogger(__name__)
 
@@ -303,6 +304,224 @@ class BaseSurrealModel(BaseModel):
             )
 
         return self
+
+    # ==================== Relations & Graph ====================
+
+    def _get_thing(self) -> str:
+        """Return ``table:id`` string for this instance."""
+        id_val = self.get_id()
+        if id_val is None:
+            raise SurrealDbError("Cannot use relations on an unsaved model (no id).")
+        thing = f"{self.get_table_name()}:{id_val}"
+        validate_thing(thing)
+        return thing
+
+    @staticmethod
+    def _resolve_target_thing(target: "BaseSurrealModel | str") -> str:
+        """Resolve a target to ``table:id`` string."""
+        if isinstance(target, str):
+            validate_thing(target)
+            return target
+        if isinstance(target, BaseSurrealModel):
+            return target._get_thing()
+        raise TypeError(f"target must be a BaseSurrealModel instance or 'table:id' string, got {type(target).__name__}")
+
+    async def relate(
+        self,
+        edge: str,
+        target: "BaseSurrealModel | str",
+        *,
+        data: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Create a graph relation from this record to the target.
+
+        Args:
+            edge: The relation/edge table name (e.g. ``"follows"``).
+            target: The target model instance or ``"table:id"`` string.
+            data: Optional data to store on the relation edge.
+
+        Returns:
+            The created relation record(s) as returned by the database.
+
+        Example::
+
+            await user.relate("follows", other_user)
+            await user.relate("purchased", product, data={"quantity": 2})
+        """
+        validate_edge_name(edge)
+        source = self._get_thing()
+        target_thing = self._resolve_target_thing(target)
+
+        if data:
+            set_parts: list[str] = []
+            variables: dict[str, Any] = {}
+            for i, (key, value) in enumerate(data.items()):
+                validate_field_name(key, "relation data field")
+                var_name = f"_rd{i}"
+                set_parts.append(f"{key} = ${var_name}")
+                variables[var_name] = value
+            set_clause = " SET " + ", ".join(set_parts)
+            query = f"RELATE {source}->{edge}->{target_thing}{set_clause};"
+        else:
+            variables = {}
+            query = f"RELATE {source}->{edge}->{target_thing};"
+
+        client = await SurrealDBConnectionManager.get_client()
+        result = await client.query(remove_quotes_for_variables(query), variables)
+        return result if isinstance(result, list) else []
+
+    async def remove_relation(
+        self,
+        edge: str,
+        target: "BaseSurrealModel | str",
+    ) -> None:
+        """
+        Remove a specific relation between this record and the target.
+
+        Args:
+            edge: The relation/edge table name.
+            target: The target model instance or ``"table:id"`` string.
+
+        Example::
+
+            await user.remove_relation("follows", other_user)
+            await user.remove_relation("follows", "User:bob")
+        """
+        validate_edge_name(edge)
+        source = self._get_thing()
+        target_thing = self._resolve_target_thing(target)
+
+        query = f"DELETE {edge} WHERE in = {source} AND out = {target_thing};"
+        client = await SurrealDBConnectionManager.get_client()
+        await client.query(query, {})
+
+    async def remove_all_relations(
+        self,
+        edge: str,
+        *,
+        direction: str = "out",
+    ) -> None:
+        """
+        Remove all relations of a given type from or to this record.
+
+        Args:
+            edge: The relation/edge table name.
+            direction: ``"out"`` removes outgoing relations (default),
+                       ``"in"`` removes incoming relations,
+                       ``"both"`` removes all relations involving this record.
+
+        Example::
+
+            await user.remove_all_relations("follows", direction="out")
+            await user.remove_all_relations("follows", direction="both")
+        """
+        validate_edge_name(edge)
+        thing = self._get_thing()
+
+        if direction == "out":
+            query = f"DELETE {edge} WHERE in = {thing};"
+        elif direction == "in":
+            query = f"DELETE {edge} WHERE out = {thing};"
+        elif direction == "both":
+            query = f"DELETE {edge} WHERE in = {thing} OR out = {thing};"
+        else:
+            raise ValueError(f"direction must be 'out', 'in', or 'both', got '{direction}'")
+
+        client = await SurrealDBConnectionManager.get_client()
+        await client.query(query, {})
+
+    async def get_related(
+        self,
+        edge: str,
+        *,
+        direction: str = "out",
+        model_class: type["BaseSurrealModel"] | None = None,
+    ) -> list[Any]:
+        """
+        Get related records through a relation edge.
+
+        Args:
+            edge: The relation/edge table name.
+            direction: ``"out"`` for outgoing relations (default),
+                       ``"in"`` for incoming relations.
+            model_class: Optional model class to deserialize results into.
+
+        Returns:
+            A list of related records (model instances if model_class is provided,
+            otherwise raw dicts/values).
+
+        Example::
+
+            following = await user.get_related("follows", direction="out", model_class=User)
+            followers = await user.get_related("follows", direction="in", model_class=User)
+        """
+        validate_edge_name(edge)
+        thing = self._get_thing()
+
+        if direction == "out":
+            query = f"SELECT VALUE ->{edge}->? FROM ONLY {thing};"
+        elif direction == "in":
+            query = f"SELECT VALUE <-{edge}<-? FROM ONLY {thing};"
+        else:
+            raise ValueError(f"direction must be 'out' or 'in', got '{direction}'")
+
+        client = await SurrealDBConnectionManager.get_client()
+        results = await client.query(query, {})
+
+        if not isinstance(results, list) or len(results) == 0:
+            return []
+
+        # Results from SELECT VALUE ->edge->? are a flat list of record IDs/objects
+        records = results
+
+        if model_class is not None:
+            # If results are RecordIDs, we need to SELECT them
+            if records and isinstance(records[0], RecordID):
+                # RecordIDs come from the database, validate each one before interpolation
+                ids = []
+                for r in records:
+                    rid = str(r)
+                    validate_thing(rid)
+                    ids.append(rid)
+                placeholders = ", ".join(ids)
+                fetch_query = f"SELECT * FROM {placeholders};"
+                records = await client.query(fetch_query, {})
+                if not isinstance(records, list):
+                    return []
+
+            try:
+                return model_class.from_db(records)  # type: ignore
+            except (ValueError, TypeError):
+                return records
+
+        return records
+
+    async def traverse(self, path: str) -> list[Any]:
+        """
+        Execute a graph traversal from this record.
+
+        Args:
+            path: A SurrealQL graph traversal path starting with ``->`` or ``<-``.
+
+        Returns:
+            A list of records found by the traversal.
+
+        Example::
+
+            # Friends of friends
+            fof = await user.traverse("->follows->User->follows->User")
+        """
+        validate_graph_path(path)
+        thing = self._get_thing()
+
+        query = f"SELECT VALUE {path} FROM ONLY {thing};"
+        client = await SurrealDBConnectionManager.get_client()
+        results = await client.query(query, {})
+
+        if isinstance(results, list):
+            return results
+        return []
 
     @classmethod
     def objects(cls) -> Any:

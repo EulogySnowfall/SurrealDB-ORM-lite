@@ -14,7 +14,7 @@
 | v0.3.0  | Aggregations & Utilities           | ✅ Done     |
 | v0.4.0  | Model Signals                      | ✅ Done     |
 | v0.5.0  | Bulk Operations & Q Objects        | ✅ Done     |
-| v0.6.0  | Relations & Graph                  | 📋 Planned  |
+| v0.6.0  | Relations & Graph                  | ✅ Done     |
 | v0.7.0  | Transactions ORM                   | 📋 Planned  |
 | v0.8.0  | SurrealFunc & Computed Fields      | 📋 Planned  |
 | v0.9.0  | FETCH, Field Aliases & DX          | 📋 Planned  |
@@ -39,10 +39,10 @@
 | Additional lookups         | ✅ v0.5.9  | ✅ v0.5.0 | -              |
 | Parameterized filters      | ✅ v0.6.0  | ✅ v0.5.0 | -              |
 | `-field` ordering (DESC)   | ✅ v0.6.0  | ✅ v0.5.0 | -              |
-| Relations & Graph (relate) | ✅ v0.4.0  | ❌        | v0.6.0         |
-| get_related() / traverse() | ✅ v0.4.0  | ❌        | v0.6.0         |
-| FETCH clause               | ✅ v0.7.0  | ❌        | v0.6.0         |
-| remove_all_relations()     | ✅ v0.6.0  | ❌        | v0.6.0         |
+| Relations & Graph (relate) | ✅ v0.4.0  | ✅ v0.6.0 | -              |
+| get_related() / traverse() | ✅ v0.4.0  | ✅ v0.6.0 | -              |
+| FETCH clause               | ✅ v0.7.0  | ✅ v0.6.0 | -              |
+| remove_all_relations()     | ✅ v0.6.0  | ✅ v0.6.0 | -              |
 | Transactions ORM (tx=)     | ✅ v0.6+   | ❌        | v0.7.0         |
 | SurrealFunc (time::now())  | ✅ v0.6.0  | ❌        | v0.8.0         |
 | Computed Fields            | ✅ v0.8.0  | ❌        | v0.8.0         |
@@ -377,18 +377,20 @@ posts = await Post.objects().fetch("author", "tags").exec()
 friends_of_friends = await user.traverse("->follows->User->follows->User")
 ```
 
-**Files to create/modify**:
+**Files created/modified**:
 
-- [ ] `src/surreal_orm_lite/model_base.py` - relate(), remove_relation(), get_related(), remove_all_relations()
-- [ ] `src/surreal_orm_lite/query_set.py` - fetch()
-- [ ] `tests/test_relations.py` - Tests
+- [x] `src/surreal_orm_lite/model_base.py` - relate(), remove_relation(), get_related(), remove_all_relations(), traverse()
+- [x] `src/surreal_orm_lite/query_set.py` - fetch()
+- [x] `src/surreal_orm_lite/utils.py` - validate_edge_name(), validate_graph_path()
+- [x] `tests/test_relations.py` - Unit + E2E tests
 
 ### Completion criteria v0.6.0
 
-- [ ] Relation CRUD working
-- [ ] FETCH clause
-- [ ] Basic graph traversal
-- [ ] Tests with linked models
+- [x] Relation CRUD working
+- [x] FETCH clause
+- [x] Basic graph traversal
+- [x] Tests with linked models
+- [x] Coverage >= 70% (92.87%)
 
 ---
 

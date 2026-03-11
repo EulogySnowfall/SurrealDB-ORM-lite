@@ -45,6 +45,7 @@ class QuerySet:
         self._order_by: str | None = None
         self._model_table: str = getattr(model, "_table_name", model.__name__)
         self._variables: dict = {}
+        self._fetch_fields: list[str] = []
         self._group_by_fields: list[str] = []
         self._annotations: dict[str, Aggregation] = {}
 
@@ -76,7 +77,7 @@ class QuerySet:
         Returns:
             Self: The current instance for method chaining.
         """
-        self._variables = dict(kwargs.items())
+        self._variables.update(kwargs)
         return self
 
     def filter(self, *args: Q, **kwargs: Any) -> Self:
@@ -185,6 +186,28 @@ class QuerySet:
         self._order_by = ", ".join(order_parts)
         return self
 
+    def fetch(self, *fields: str) -> Self:
+        """
+        Add a FETCH clause to resolve record links inline.
+
+        This prevents N+1 queries by fetching linked records in a single query.
+
+        Args:
+            *fields: Field names to fetch/resolve.
+
+        Returns:
+            Self: The current instance for method chaining.
+
+        Example::
+
+            posts = await Post.objects().fetch("author", "tags").exec()
+            # Generates: SELECT * FROM Post FETCH author, tags;
+        """
+        for field in fields:
+            validate_field_name(field, "FETCH field")
+        self._fetch_fields.extend(fields)
+        return self
+
     # ==================== Internal query building ====================
 
     def _build_where(self) -> tuple[str, dict[str, Any]]:
@@ -242,6 +265,9 @@ class QuerySet:
 
         if self._offset is not None:
             query += f" START {self._offset}"
+
+        if self._fetch_fields:
+            query += f" FETCH {', '.join(self._fetch_fields)}"
 
         query += ";"
         all_variables = {**self._variables, **where_vars}

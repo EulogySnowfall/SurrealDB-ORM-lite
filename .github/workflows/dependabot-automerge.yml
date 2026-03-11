@@ -1,0 +1,250 @@
+# Auto-merge Dependabot PRs after successful tests
+# Bumps the patch (3rd) digit for security updates: x.y.z -> x.y.(z+1)
+# Versioning: X=LTS/breaking, Y=features, Z=security patches
+
+name: Dependabot Auto-merge
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  SURREALDB_HOST: localhost
+  SURREALDB_PORT: 8000
+
+jobs:
+  # =============================================================================
+  # Check if this is a Dependabot PR
+  # =============================================================================
+  check-dependabot:
+    name: Check Dependabot PR
+    runs-on: ubuntu-latest
+    outputs:
+      is-dependabot: ${{ steps.check.outputs.is-dependabot }}
+    steps:
+      - name: Check if Dependabot PR
+        id: check
+        run: |
+          IS_DEPENDABOT="false"
+          if [[ "${{ github.actor }}" == "dependabot[bot]" ]]; then
+            IS_DEPENDABOT="true"
+          fi
+          echo "is-dependabot=$IS_DEPENDABOT" >> $GITHUB_OUTPUT
+
+  # =============================================================================
+  # Run full test suite for Dependabot PRs
+  # =============================================================================
+  test-dependabot:
+    name: Test Dependabot Changes
+    needs: check-dependabot
+    if: needs.check-dependabot.outputs.is-dependabot == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      tests-passed: ${{ steps.test-result.outputs.passed }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install dependencies
+        run: uv sync --group dev --group lint
+
+      - name: Run linting
+        run: |
+          uv run ruff format --check src/
+          uv run ruff check src/
+
+      - name: Run type checking
+        run: uv run mypy src/
+
+      - name: Start SurrealDB
+        run: |
+          SURREALDB_VERSION=$(cat .surrealdb-version | tr -d '[:space:]')
+          docker run -d \
+            --name surrealdb-test \
+            -p 8000:8000 \
+            "surrealdb/surrealdb:v${SURREALDB_VERSION}" \
+            start --user root --pass root
+
+          echo "Waiting for SurrealDB to be healthy..."
+          for i in {1..15}; do
+            if curl -s http://localhost:8000/health | grep -q "OK"; then
+              echo "SurrealDB is up!"
+              break
+            fi
+            echo "SurrealDB not up yet. Retrying..."
+            sleep 2
+          done
+
+      - name: Run all tests
+        run: |
+          uv run pytest tests/ -v \
+            --cov=src.surreal_orm_lite \
+            --cov-branch \
+            --cov-report=xml
+
+      - name: Stop SurrealDB
+        if: always()
+        run: docker stop surrealdb-test && docker rm surrealdb-test || true
+
+      - name: Set test result
+        id: test-result
+        if: success()
+        run: echo "passed=true" >> $GITHUB_OUTPUT
+
+  # =============================================================================
+  # Auto-merge and create patch version tag
+  # =============================================================================
+  automerge:
+    name: Auto-merge & Tag
+    needs: [check-dependabot, test-dependabot]
+    if: |
+      needs.check-dependabot.outputs.is-dependabot == 'true' &&
+      needs.test-dependabot.outputs.tests-passed == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get Dependabot metadata
+        id: dependabot-metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Calculate next security patch version
+        id: version
+        run: |
+          # Get current version from pyproject.toml
+          CURRENT_VERSION=$(grep -E '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          echo "Current version: $CURRENT_VERSION"
+
+          MAJOR=$(echo "$CURRENT_VERSION" | cut -d. -f1)
+          MINOR=$(echo "$CURRENT_VERSION" | cut -d. -f2)
+          PATCH=$(echo "$CURRENT_VERSION" | cut -d. -f3)
+
+          NEXT_PATCH=$((PATCH + 1))
+          NEW_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
+          NEW_TAG="v${NEW_VERSION}"
+
+          echo "New version: $NEW_VERSION"
+          echo "New tag: $NEW_TAG"
+
+          echo "current-version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "new-tag=$NEW_TAG" >> $GITHUB_OUTPUT
+          echo "new-version=$NEW_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Enable auto-merge
+        run: gh pr merge --auto --squash "${{ github.event.pull_request.number }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Wait for merge
+        id: wait-merge
+        run: |
+          MAX_ATTEMPTS=30
+          ATTEMPT=0
+
+          while [[ $ATTEMPT -lt $MAX_ATTEMPTS ]]; do
+            STATE=$(gh pr view "${{ github.event.pull_request.number }}" --json state -q '.state')
+
+            if [[ "$STATE" == "MERGED" ]]; then
+              echo "PR merged successfully"
+              echo "merged=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            echo "Waiting for PR to merge... (attempt $((ATTEMPT + 1))/$MAX_ATTEMPTS)"
+            sleep 10
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+
+          echo "PR did not merge in time"
+          echo "merged=false" >> $GITHUB_OUTPUT
+          exit 1
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout main after merge
+        if: steps.wait-merge.outputs.merged == 'true'
+        run: |
+          git fetch origin main
+          git checkout main
+          git pull origin main
+
+      - name: Configure Git
+        if: steps.wait-merge.outputs.merged == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update version files and create tag
+        if: steps.wait-merge.outputs.merged == 'true'
+        run: |
+          NEW_TAG="${{ steps.version.outputs.new-tag }}"
+          NEW_VERSION="${{ steps.version.outputs.new-version }}"
+
+          echo "Updating version to: $NEW_VERSION"
+          echo "Creating tag: $NEW_TAG"
+
+          # Update pyproject.toml
+          sed -i "s/^version = \".*\"/version = \"$NEW_VERSION\"/" pyproject.toml
+
+          # Update src/surreal_orm_lite/__init__.py
+          sed -i "s/__version__ = \".*\"/__version__ = \"$NEW_VERSION\"/" src/surreal_orm_lite/__init__.py
+
+          # Commit version bump
+          git add pyproject.toml src/surreal_orm_lite/__init__.py
+          git commit -m "chore(release): bump version to $NEW_VERSION [skip ci]"
+          git push origin main
+
+          # Create and push tag
+          git tag -a "$NEW_TAG" -m "Security patch: ${{ steps.dependabot-metadata.outputs.dependency-names }}"
+          git push origin "$NEW_TAG"
+
+          echo "Created tag: $NEW_TAG"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create GitHub Release
+        if: steps.wait-merge.outputs.merged == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.new-tag }}
+          name: "Security Patch ${{ steps.version.outputs.new-tag }}"
+          body: |
+            ## Security Patch Release
+
+            This is an automated security patch release.
+
+            ### Updated Dependencies
+            - **Package:** ${{ steps.dependabot-metadata.outputs.dependency-names }}
+            - **Update type:** ${{ steps.dependabot-metadata.outputs.update-type }}
+
+            ### What's Changed
+            ${{ github.event.pull_request.title }}
+
+            ---
+            *This release was automatically created by the Dependabot auto-merge workflow.*
+          prerelease: false
+          generate_release_notes: false

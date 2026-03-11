@@ -1,7 +1,7 @@
 # Surreal ORM Lite
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![SurrealDB](https://img.shields.io/badge/SurrealDB-2.6.0-purple)
+![SurrealDB](https://img.shields.io/badge/SurrealDB-2.6.3-purple)
 ![SDK](https://img.shields.io/badge/SDK-Official%201.0.8-green)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![codecov](https://codecov.io/gh/EulogySnowfall/SurrealDB-ORM-lite/graph/badge.svg)](https://codecov.io/gh/EulogySnowfall/SurrealDB-ORM-lite)
@@ -24,9 +24,11 @@ This ORM is designed to:
 | Dependency   | Version          |
 | ------------ | ---------------- |
 | Python       | 3.11+            |
-| SurrealDB    | 2.6.0+           |
+| SurrealDB    | >=2.6.x, <3.0    |
 | Official SDK | surrealdb>=1.0.8 |
 | Pydantic     | >=2.12.5         |
+
+> **Note**: The official SurrealDB Python SDK (`surrealdb>=1.0.8`) only supports SurrealDB 2.X. For SurrealDB 3.X support, use the full [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/) (v0.30.0+).
 
 ---
 
@@ -149,18 +151,19 @@ results = await User.objects().query(
 | Parameterized filters  | ✅     |
 | Bulk operations        | ✅     |
 | `-field` ordering      | ✅     |
+| Relations & Graph      | ✅     |
+| FETCH clause           | ✅     |
 
 ### Supported Filter Lookups
 
 - `exact` (default)
 - `gt`, `gte`, `lt`, `lte`
 - `in`, `not_in`
-- `contains`, `icontains`, `not_contains`
+- `contains`, `not_contains`
 - `containsall`, `containsany`
-- `startswith`, `istartswith`
-- `endswith`, `iendswith`
+- `startswith`, `endswith`
 - `like`, `ilike`
-- `match`, `regex`, `iregex`
+- `match`, `regex`
 - `isnull`
 
 ### 5. Q Objects (Complex Queries)
@@ -200,7 +203,40 @@ count = await User.objects().filter(status="pending").bulk_update(status="active
 count = await User.objects().filter(status="inactive").bulk_delete()
 ```
 
-### 7. Aggregations
+### 7. Relations & Graph
+
+```python
+# Create a relation
+await user.relate("follows", other_user)
+
+# With data on the edge
+await user.relate("purchased", product, data={"quantity": 2, "price": 29.99})
+
+# Get related records (outgoing)
+following = await user.get_related("follows", direction="out", model_class=User)
+
+# Get related records (incoming)
+followers = await user.get_related("follows", direction="in", model_class=User)
+
+# Remove a specific relation
+await user.remove_relation("follows", other_user)
+
+# Remove all outgoing relations of a type
+await user.remove_all_relations("follows", direction="out")
+
+# Graph traversal
+friends_of_friends = await user.traverse("->follows->User->follows->User")
+```
+
+### 8. FETCH Clause
+
+```python
+# Resolve record links inline (prevents N+1 queries)
+posts = await Post.objects().fetch("author", "tags").exec()
+# Generates: SELECT * FROM Post FETCH author, tags;
+```
+
+### 9. Aggregations
 
 ```python
 from surreal_orm_lite import Count, Sum, Avg, Min, Max
@@ -226,7 +262,7 @@ results = await User.raw_query(
 )
 ```
 
-### 8. Model Signals
+### 10. Model Signals
 
 ```python
 from surreal_orm_lite import pre_save, post_save, pre_delete, post_delete
@@ -301,12 +337,14 @@ async with SurrealDBConnectionManager():
 
 ## Compatibility
 
-This ORM is tested and compatible with:
+This ORM is tested and compatible with SurrealDB 2.X only (SDK limitation). For SurrealDB 3.X, use [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/) v0.30.0+.
 
-| SurrealDB Version | SDK Version | Status        |
-| ----------------- | ----------- | ------------- |
-| 2.6.0             | 1.0.8       | ✅ Tested     |
-| 2.5.x             | 1.0.8       | ✅ Compatible |
+| SurrealDB Version | SDK Version | Status             |
+| ----------------- | ----------- | ------------------ |
+| 2.6.3             | 1.0.8       | ✅ Tested          |
+| 2.6.x             | 1.0.8       | ✅ Compatible      |
+| 2.5.x             | 1.0.8       | ✅ Compatible      |
+| 3.x               | —           | ❌ Not supported   |
 
 ---
 
@@ -330,7 +368,7 @@ Contributions are welcome! Please:
 | v0.3.0  | Aggregations & Utilities      | ✅ Released |
 | v0.4.0  | Model Signals                 | ✅ Released |
 | v0.5.0  | Bulk Operations & Q Objects   | ✅ Released |
-| v0.6.0  | Relations & Graph             | 📋 Next     |
+| v0.6.0  | Relations & Graph             | ✅ Released |
 | v0.7.0  | Transactions ORM              | 📋 Planned  |
 | v0.8.0  | SurrealFunc & Computed Fields | 📋 Planned  |
 | v0.9.0  | Field Aliases & DX            | 📋 Planned  |
@@ -352,8 +390,8 @@ This project prioritizes **stability and compatibility** with the official Surre
 | Bulk Operations           | ✅                      | ✅               |
 | Q Objects (OR/AND/NOT)    | ✅                      | ✅               |
 | Parameterized Filters     | ✅                      | ✅               |
-| Relations & Graph         | v0.6.0                  | ✅               |
-| FETCH clause              | v0.6.0                  | ✅               |
+| Relations & Graph         | ✅                      | ✅               |
+| FETCH clause              | ✅                      | ✅               |
 | Transactions (tx=)        | v0.7.0                  | ✅               |
 | SurrealFunc & Computed    | v0.8.0                  | ✅               |
 | Field Aliases             | v0.9.0                  | ✅               |
