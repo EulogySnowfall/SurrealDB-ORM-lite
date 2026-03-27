@@ -44,5 +44,13 @@ test-all-python:
 html: test-all-python
 	uv run coverage html -d htmlcov
 
+.PHONY: sync-version  # Fix all version references to match pyproject.toml
+sync-version:
+	uv run python scripts/sync_version.py --fix
+
+.PHONY: check-version  # Check that all version references are in sync
+check-version:
+	uv run python scripts/sync_version.py
+
 .PHONY: all
 all: format mypy lint typecheck test-all-python

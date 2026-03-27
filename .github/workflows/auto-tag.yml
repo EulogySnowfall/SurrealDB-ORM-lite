@@ -1,0 +1,48 @@
+# Create a git tag when a version bump PR is merged
+# This triggers the publish.yml workflow (PyPI + GitHub Release)
+
+name: Auto Tag
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+jobs:
+  create-tag:
+    name: Create Version Tag
+    if: >
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.title, 'chore(release): bump version to ')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Extract version and create tag
+        run: |
+          VERSION=$(grep -E '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          TAG="v${VERSION}"
+
+          echo "Version: $VERSION"
+          echo "Tag: $TAG"
+
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists, skipping"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
+
+          echo "Created and pushed tag: $TAG"

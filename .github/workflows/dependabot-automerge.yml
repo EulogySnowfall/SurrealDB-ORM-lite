@@ -108,10 +108,10 @@ jobs:
         run: echo "passed=true" >> $GITHUB_OUTPUT
 
   # =============================================================================
-  # Auto-merge and create patch version tag
+  # Auto-merge and create version bump PR
   # =============================================================================
   automerge:
-    name: Auto-merge & Tag
+    name: Auto-merge & Version Bump PR
     needs: [check-dependabot, test-dependabot]
     if: |
       needs.check-dependabot.outputs.is-dependabot == 'true' &&
@@ -135,7 +135,6 @@ jobs:
       - name: Calculate next security patch version
         id: version
         run: |
-          # Get current version from pyproject.toml
           CURRENT_VERSION=$(grep -E '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           echo "Current version: $CURRENT_VERSION"
 
@@ -192,59 +191,56 @@ jobs:
           git checkout main
           git pull origin main
 
+      - name: Install uv
+        if: steps.wait-merge.outputs.merged == 'true'
+        uses: astral-sh/setup-uv@v7
+
       - name: Configure Git
         if: steps.wait-merge.outputs.merged == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Update version files and create tag
+      - name: Create version bump PR
         if: steps.wait-merge.outputs.merged == 'true'
         run: |
-          NEW_TAG="${{ steps.version.outputs.new-tag }}"
           NEW_VERSION="${{ steps.version.outputs.new-version }}"
+          NEW_TAG="${{ steps.version.outputs.new-tag }}"
+          BRANCH="chore/release-${NEW_TAG}"
+          CURRENT_VERSION="${{ steps.version.outputs.current-version }}"
 
-          echo "Updating version to: $NEW_VERSION"
-          echo "Creating tag: $NEW_TAG"
+          echo "Creating version bump PR: $CURRENT_VERSION -> $NEW_VERSION"
 
-          # Update pyproject.toml
+          git checkout -b "$BRANCH"
+
+          # Update pyproject.toml (source of truth)
           sed -i "s/^version = \".*\"/version = \"$NEW_VERSION\"/" pyproject.toml
 
-          # Update src/surreal_orm_lite/__init__.py
-          sed -i "s/__version__ = \".*\"/__version__ = \"$NEW_VERSION\"/" src/surreal_orm_lite/__init__.py
+          # Sync all other version references
+          python scripts/sync_version.py --fix
 
-          # Commit version bump
-          git add pyproject.toml src/surreal_orm_lite/__init__.py
-          git commit -m "chore(release): bump version to $NEW_VERSION [skip ci]"
-          git push origin main
+          # Regenerate lockfile
+          uv lock
 
-          # Create and push tag
-          git tag -a "$NEW_TAG" -m "Security patch: ${{ steps.dependabot-metadata.outputs.dependency-names }}"
-          git push origin "$NEW_TAG"
+          git add pyproject.toml src/surreal_orm_lite/__init__.py tests/test_v050.py uv.lock
+          git commit -m "chore(release): bump version to $NEW_VERSION"
+          git push origin "$BRANCH"
 
-          echo "Created tag: $NEW_TAG"
+          gh pr create \
+            --title "chore(release): bump version to $NEW_VERSION" \
+            --body "## Version Bump
+
+          Automated version bump after merging dependabot PR #${{ github.event.pull_request.number }}.
+
+          ### Updated Dependencies
+          - **Package:** ${{ steps.dependabot-metadata.outputs.dependency-names }}
+          - **Update type:** ${{ steps.dependabot-metadata.outputs.update-type }}
+
+          ---
+          *This PR was automatically created by the Dependabot auto-merge workflow.*" \
+            --base main \
+            --head "$BRANCH"
+
+          gh pr merge --auto --squash "$BRANCH"
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Create GitHub Release
-        if: steps.wait-merge.outputs.merged == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.new-tag }}
-          name: "Security Patch ${{ steps.version.outputs.new-tag }}"
-          body: |
-            ## Security Patch Release
-
-            This is an automated security patch release.
-
-            ### Updated Dependencies
-            - **Package:** ${{ steps.dependabot-metadata.outputs.dependency-names }}
-            - **Update type:** ${{ steps.dependabot-metadata.outputs.update-type }}
-
-            ### What's Changed
-            ${{ github.event.pull_request.title }}
-
-            ---
-            *This release was automatically created by the Dependabot auto-merge workflow.*
-          prerelease: false
-          generate_release_notes: false
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
