@@ -1,6 +1,6 @@
 [project]
 name = "surreal-orm-lite"
-version = "0.6.5"
+version = "0.6.6"
 description = "Lightweight Django-style ORM for SurrealDB using the official Python SDK. Async support with Pydantic validation."
 readme = "README.md"
 requires-python = ">=3.11"
