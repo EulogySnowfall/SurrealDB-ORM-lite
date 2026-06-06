@@ -308,6 +308,22 @@ async def time_user_save(sender, instance, **kwargs):
     print(f"Save took {duration:.3f}s")
 ```
 
+### 11. Transactions (atomic, all-or-nothing)
+
+```python
+from surreal_orm_lite import SurrealDBConnectionManager
+
+# All operations commit together, or none do.
+async with SurrealDBConnectionManager.transaction() as tx:
+    await User(id="alice", name="Alice").save(tx=tx)
+    await Order(id="o1", user="User:alice", total=100).save(tx=tx)
+    # Auto-commit on success; auto-rollback if the block raises.
+```
+
+Inside a transaction, operations are buffered and flushed as one
+`BEGIN TRANSACTION; …; COMMIT TRANSACTION;` query. `save(tx=tx)` requires an explicit `id`.
+Reads inside a transaction arrive in v0.9.0.
+
 ---
 
 ## Configuration Options

@@ -4,6 +4,13 @@ import pytest
 from surreal_orm_lite.transaction import Transaction
 
 
+def test_transaction_is_exported() -> None:
+    import surreal_orm_lite
+
+    assert surreal_orm_lite.Transaction is Transaction
+    assert "Transaction" in surreal_orm_lite.__all__
+
+
 def test_add_namespaces_variables() -> None:
     tx = Transaction()
     tx.add("CREATE User:a CONTENT $data;", {"data": {"n": 1}})
@@ -20,7 +27,10 @@ def test_build_query_wraps_in_transaction() -> None:
     tx = Transaction()
     tx.add("CREATE User:a CONTENT $data;", {"data": {"n": 1}})
     query = tx.build_query()
-    assert query == "BEGIN TRANSACTION;\nCREATE User:a CONTENT $t0_data;\nCOMMIT TRANSACTION;"
+    assert (
+        query
+        == "BEGIN TRANSACTION;\nCREATE User:a CONTENT $t0_data;\nCOMMIT TRANSACTION;"
+    )
 
 
 def test_build_query_empty_raises() -> None:

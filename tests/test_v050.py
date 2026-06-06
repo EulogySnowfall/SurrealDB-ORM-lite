@@ -332,8 +332,8 @@ class TestExports:
         assert surreal_orm_lite.Q is Q
 
     def test_version_bumped(self) -> None:
-        """Version is 0.7.0."""
-        assert surreal_orm_lite.__version__ == "0.7.0"
+        """Version is 0.8.0."""
+        assert surreal_orm_lite.__version__ == "0.8.0"
 
 
 # =============================================================================
