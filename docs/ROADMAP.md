@@ -23,6 +23,36 @@
 
 ---
 
+## 🆕 Newly unlocked by the official SDK 2.0 (since v0.7.0)
+
+The migration to `surrealdb[pydantic]>=2.0.0,<3.0.0` exposes connection methods and
+native types that were **not available with SDK 1.0.8**. Several features previously
+considered exclusive to the full ORM ("custom SDK required") are now implementable in
+ORM-lite using only the official SDK. These are **candidates** for the roadmap below.
+
+| Feature (candidate)              | SDK 2.0 primitive(s)                                   | Was                       | Candidate version |
+| -------------------------------- | ------------------------------------------------------ | ------------------------- | ----------------- |
+| Native transactions (`tx=`)      | `begin()` / `commit()` / `cancel()`, `new_session()`, `txn_id=` on ops | planned (raw SurrealQL)   | v0.8.0            |
+| `upsert()` / `update_or_create()`| `upsert()`                                             | new                       | v0.8.0            |
+| JWT / scope auth                 | `signup()→Tokens`, `signin()`, `authenticate()`, `invalidate()`, `info()` | full-ORM only             | v0.9.0            |
+| Atomic field/array ops           | `patch()` (JSON Patch)                                 | full-ORM only             | v0.9.0            |
+| Live Models / Live Queries       | `live()`, `subscribe_live()` (async gen), `kill()`     | full-ORM only (WS)        | v0.10.0           |
+| Change Feeds / Auto-Resubscribe  | live queries + reconnect logic                         | full-ORM only             | v0.10.0           |
+| Geospatial fields (`nearby()`)   | native `Geometry` (Point/Line/Polygon/Multi*)          | full-ORM only             | future            |
+| Rich field types                 | native `Datetime`, `Duration`, `Range`, `Decimal`      | strings only              | future            |
+| Embedded / in-memory test engine | `AsyncEmbeddedSurrealConnection`, `mem://` / `surrealkv://` | not available             | tooling           |
+| Versioned storage (time-travel)  | `surrealkv+versioned://`                               | not available             | future            |
+| Native typed relations           | `insert_relation()`                                    | RELATE query strings      | future            |
+
+**Still NOT unlocked by SDK 2.0** (remain out of scope or full-ORM only):
+
+- **Connection Pool** — the official SDK 2.0 is still single-connection (no pool).
+- **Custom SDK / CBOR internals** — handled internally by the official SDK.
+- Vector/FTS/Hybrid search, migrations, CLI, schema introspection, subqueries, query cache —
+  these are ORM-architecture features (not blocked by the SDK; scoped out by choice).
+
+---
+
 ## SurrealDB-ORM vs SurrealDB-ORM-lite Comparison
 
 ### Features implementable in Lite (official SDK)
