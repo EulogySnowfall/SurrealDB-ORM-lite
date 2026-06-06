@@ -352,6 +352,14 @@ class TestRelationsE2E:
         # Clean up
         await client.query("DELETE Post;", {})
 
+    async def test_remove_relation_missing_is_noop(self) -> None:
+        alice = Person(id="rm_alice", name="Alice", age=30)
+        await alice.save()
+        # 'never_edge' relation table does not exist -> must be a silent no-op.
+        await alice.remove_relation("never_edge", "Person:rm_bob")
+        await alice.remove_all_relations("never_edge", direction="both")
+        await alice.delete()
+
     async def test_remove_all_relations_both(self) -> None:
         """Remove all relations in both directions."""
         client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()

@@ -1,9 +1,11 @@
+import contextlib
 import logging
 from typing import TYPE_CHECKING, Any, Self, cast
 
 from pydantic_core import ValidationError
 
 from . import BaseSurrealModel, SurrealDBConnectionManager
+from ._sdk import NotFoundError, RecordID
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .q import Q
@@ -400,11 +402,21 @@ class QuerySet:
         """
         if id_item:
             client = await SurrealDBConnectionManager.get_client()
-            data = await client.select(f"{self._model_table}:{id_item}")
+            if isinstance(id_item, RecordID):
+                record_id = id_item
+            else:
+                # Strip SurrealQL backtick escaping if present (e.g. "`test@test.com`")
+                raw = str(id_item)
+                if raw.startswith("`") and raw.endswith("`"):
+                    raw = raw[1:-1]
+                record_id = RecordID(self._model_table, raw)
+            data = await client.select(record_id)
             if isinstance(data, list):
                 if len(data) == 0:
                     raise SurrealDbNotFoundError("No result found.")
                 data = data[0]
+            if data is None:
+                raise SurrealDbNotFoundError("No result found.")
             return self.model.from_db(data)
         else:
             result = await self.exec()
@@ -430,11 +442,13 @@ class QuerySet:
         """
         Delete the associated table from the SurrealDB database.
 
-        Returns:
-            True if the table was successfully deleted.
+        Returns True. A missing table is treated as already-absent (no-op),
+        so this is safe for idempotent cleanup on SurrealDB 3.x (which raises
+        NotFoundError) as well as 2.x (which is a no-op).
         """
         client = await SurrealDBConnectionManager.get_client()
-        await client.delete(self._model_table)
+        with contextlib.suppress(NotFoundError):
+            await client.delete(self._model_table)
         return True
 
     # ==================== Aggregation Methods ====================

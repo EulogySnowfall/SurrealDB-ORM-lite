@@ -325,6 +325,26 @@ async def test_loaded_record_keeps_native_recordid() -> None:
     await loaded.delete()
 
 
+async def test_delete_table_missing_is_noop() -> None:
+    class NeverCreated(surreal_orm_lite.BaseSurrealModel):
+        id: str | RecordID | None = None
+        name: str
+
+    # Table was never created; delete_table must not raise on 3.x.
+    assert await NeverCreated.objects().delete_table() is True
+
+
+async def test_queryset_get_by_id_returns_native_recordid() -> None:
+    class GetRid(surreal_orm_lite.BaseSurrealModel):
+        id: str | RecordID | None = None
+        name: str
+
+    await GetRid(id="g1", name="G").save()
+    obj = await GetRid.objects().get("g1")
+    assert isinstance(obj.id, RecordID)
+    await obj.delete()
+
+
 async def test_update_merge_delete_with_recordid_roundtrip() -> None:
     class RidCrud(surreal_orm_lite.BaseSurrealModel):
         id: str | RecordID | None = None

@@ -1,3 +1,4 @@
+import contextlib
 import logging
 import typing
 from typing import Any, Self
@@ -421,7 +422,8 @@ class BaseSurrealModel(BaseModel):
 
         query = f"DELETE {edge} WHERE in = {source} AND out = {target_thing};"
         client = await SurrealDBConnectionManager.get_client()
-        await client.query(query, {})
+        with contextlib.suppress(NotFoundError):
+            await client.query(query, {})
 
     async def remove_all_relations(
         self,
@@ -456,7 +458,8 @@ class BaseSurrealModel(BaseModel):
             raise ValueError(f"direction must be 'out', 'in', or 'both', got '{direction}'")
 
         client = await SurrealDBConnectionManager.get_client()
-        await client.query(query, {})
+        with contextlib.suppress(NotFoundError):
+            await client.query(query, {})
 
     async def get_related(
         self,
