@@ -197,11 +197,12 @@ SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/test_sdk_probe.
 
 Expected: PASS, and the `print(...)` lines reveal the shapes. Record the answers here:
 
-- `select(record_id)` single returns: **dict** / list-of-dict → `____`
-- `select("table")` returns: list → `____`
-- `query("SELECT ...")` returns: list-of-rows / `[{"result": [...]}]` → `____`
-- `single["id"]` type: **RecordID** → `____`
-- duplicate `create` raises `AlreadyExistsError`: **yes/no** → `____`
+- `select(record_id)` single returns: **list of one dict** (NOT a bare dict — defensive list guards MUST stay) → CONFIRMED
+- `select("table")` returns: **list of dicts** → CONFIRMED
+- `query("SELECT ...")` returns: **list of row dicts directly** (NOT wrapped in `[{"result": [...]}]`; keep the `data.get("result")` fallback defensively) → CONFIRMED
+- row `["id"]` type: **`RecordID`** (attributes `.id` and `.table_name`; `str(rid) == "table:id"`; numeric ids stay `int`) → CONFIRMED
+- duplicate `create` raises **`AlreadyExistsError`** (message: `Database record \`probe:alice\` already exists`) → CONFIRMED
+- note: `client.close()` raises `NotImplementedError` on HTTP connections (already suppressed in `connection_manager`).
 
 > If `select(record_id)` returns a dict (not a list), the SDK-1.0.8 "always a list" workarounds in `refresh()` and `QuerySet.get()` are no longer needed but the defensive `isinstance(record, list)` guards remain harmless — keep them per the spec.
 
