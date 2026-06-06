@@ -87,8 +87,8 @@ class SurrealDBConnectionManager:
             if url.startswith(("ws://", "wss://")):
                 await _client.connect(url)
 
-            await _client.use(cls.__namespace, cls.__database)
             await _client.signin({"username": cls.__user, "password": cls.__password})
+            await _client.use(cls.__namespace, cls.__database)
 
             cls.__client = _client
             return cls.__client
