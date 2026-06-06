@@ -9,6 +9,7 @@ from surreal_orm_lite import (
     SurrealDBConnectionManager,
 )
 from surreal_orm_lite.exceptions import SurrealDbError
+from surreal_orm_lite.signals import post_delete, post_save
 from surreal_orm_lite.transaction import Transaction
 
 
@@ -89,6 +90,33 @@ def test_raise_for_status_raises_root_cause() -> None:
     }
     with pytest.raises(SurrealDbError, match="already exists"):
         Transaction.raise_for_status(raw)
+
+
+def test_raise_for_status_rejects_unrecognized_shape() -> None:
+    # Defensive: a response missing "result" (or where "result" isn't a list) must NOT
+    # be treated as success — that would silently report a failed transaction as
+    # committed if a server version ever returned a top-level error envelope.
+    with pytest.raises(SurrealDbError, match="unrecognized"):
+        Transaction.raise_for_status({"error": {"message": "auth failed"}})
+    with pytest.raises(SurrealDbError, match="unrecognized"):
+        Transaction.raise_for_status({"result": None})
+    with pytest.raises(SurrealDbError, match="unrecognized"):
+        Transaction.raise_for_status(None)
+
+
+@pytest.mark.asyncio
+async def test_fire_post_commit_runs_callbacks_in_order() -> None:
+    tx = Transaction()
+    seen: list[int] = []
+
+    async def cb(n: int) -> None:
+        seen.append(n)
+
+    tx.enqueue_post_commit(lambda: cb(1))
+    tx.enqueue_post_commit(lambda: cb(2))
+    tx.enqueue_post_commit(lambda: cb(3))
+    await tx.fire_post_commit()
+    assert seen == [1, 2, 3]
 
 
 def test_add_namespacing_respects_word_boundary() -> None:
@@ -250,3 +278,135 @@ async def test_refresh_with_tx_raises() -> None:
     u = TxUser(id="ivy", name="Ivy")
     with pytest.raises(SurrealDbError, match="not supported inside a transaction"):
         await u.refresh(tx=Transaction())
+
+
+class TxSignalUser(BaseSurrealModel):
+    """Separate model so signal handlers in these tests don't leak into TxUser tests."""
+
+    model_config = SurrealConfigDict(primary_key="id")
+    id: str | None = None
+    name: str
+
+
+class TestTransactionSignalsE2E:
+    @pytest.mark.asyncio
+    async def test_post_save_fires_once_after_successful_commit(self) -> None:
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        with contextlib.suppress(Exception):
+            await client.query("DELETE TxSignalUser;", {})
+
+        seen: list[tuple[str, bool]] = []
+
+        @post_save.connect(TxSignalUser)
+        async def _on_save(sender, instance, created) -> None:  # type: ignore[no-untyped-def]
+            seen.append((str(instance.id), created))
+
+        try:
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await TxSignalUser(id="sig1", name="A").save(tx=tx)
+                await TxSignalUser(id="sig2", name="B").save(tx=tx)
+                # No signals must have fired yet — writes are still buffered.
+                assert seen == []
+            # Commit succeeded → both post_save fire exactly once, in buffer order.
+            # In tx mode the instance keeps the raw id string it was constructed with
+            # (no post-commit refresh), hence "sig1"/"sig2" instead of "TxSignalUser:sig1".
+            assert seen == [("sig1", True), ("sig2", True)]
+        finally:
+            post_save.disconnect(_on_save, TxSignalUser)
+            await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_post_save_does_not_fire_on_rollback_from_body_exception(self) -> None:
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        with contextlib.suppress(Exception):
+            await client.query("DELETE TxSignalUser;", {})
+
+        seen: list[str] = []
+
+        @post_save.connect(TxSignalUser)
+        async def _on_save(sender, instance, created) -> None:  # type: ignore[no-untyped-def]
+            seen.append(str(instance.id))
+
+        try:
+            with pytest.raises(RuntimeError):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxSignalUser(id="rb1", name="A").save(tx=tx)
+                    raise RuntimeError("boom")
+            # Body raised before commit → buffer discarded, no post_save fired.
+            assert seen == []
+        finally:
+            post_save.disconnect(_on_save, TxSignalUser)
+            await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_post_save_does_not_fire_on_server_rollback(self) -> None:
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        with contextlib.suppress(Exception):
+            await client.query("DELETE TxSignalUser;", {})
+
+        seen: list[str] = []
+
+        @post_save.connect(TxSignalUser)
+        async def _on_save(sender, instance, created) -> None:  # type: ignore[no-untyped-def]
+            seen.append(str(instance.id))
+
+        try:
+            # Two creates with the same id inside one tx → server rolls back the batch.
+            with pytest.raises(SurrealDbError, match="rolled back"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxSignalUser(id="dupSig", name="A").save(tx=tx)
+                    await TxSignalUser(id="dupSig", name="B").save(tx=tx)
+            # Commit failed → no post_save fired (key regression: was firing pre-fix).
+            assert seen == []
+        finally:
+            post_save.disconnect(_on_save, TxSignalUser)
+            await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_post_delete_does_not_fire_on_rollback(self) -> None:
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        with contextlib.suppress(Exception):
+            await client.query("DELETE TxSignalUser;", {})
+        await TxSignalUser(id="killme", name="X").save()
+
+        seen: list[str] = []
+
+        @post_delete.connect(TxSignalUser)
+        async def _on_delete(sender, instance) -> None:  # type: ignore[no-untyped-def]
+            seen.append(str(instance.id))
+
+        try:
+            with pytest.raises(RuntimeError):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxSignalUser(id="killme", name="X").delete(tx=tx)
+                    raise RuntimeError("rollback")
+            assert seen == []
+        finally:
+            post_delete.disconnect(_on_delete, TxSignalUser)
+            await SurrealDBConnectionManager.close_connection()
+
+
+class TestMergeTxSync:
+    @pytest.mark.asyncio
+    async def test_merge_in_tx_applies_data_to_instance_at_buffer(self) -> None:
+        # The non-tx path calls refresh() to resync; the tx path can't (no reads inside
+        # a tx + buffered write), so it applies the merged fields to self at buffer time.
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        await TxUser(id="sync", name="Old").save()
+
+        u = TxUser(id="sync", name="Old")
+        async with SurrealDBConnectionManager.transaction() as tx:
+            await u.merge(tx=tx, name="NewName")
+            # Instance reflects the buffered merge immediately.
+            assert u.name == "NewName"
+        # After commit, instance and DB agree.
+        assert u.name == "NewName"
+        rows = await client.query("SELECT name FROM TxUser:sync;", {})
+        assert rows[0]["name"] == "NewName"
+        await SurrealDBConnectionManager.close_connection()

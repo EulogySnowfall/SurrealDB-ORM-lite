@@ -141,6 +141,10 @@ class SurrealDBConnectionManager:
                 # gives per-statement status, which raise_for_status inspects.
                 raw = await client.query_raw(tx.build_query(), tx.variables)
                 tx.raise_for_status(raw)
+                # Commit succeeded → fire deferred post_* signals so handlers see only
+                # durable writes. Any callback exception surfaces here (does not undo
+                # the commit).
+                await tx.fire_post_commit()
 
     @classmethod
     async def reconnect(cls) -> Any:

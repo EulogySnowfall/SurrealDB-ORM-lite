@@ -220,7 +220,9 @@ class BaseSurrealModel(BaseModel):
 
         Emits pre_save and post_save signals. ``around_save`` wraps the actual write,
         so in a transaction (``tx`` provided) it is NOT emitted — the write happens at
-        commit, not here — consistent with update/merge/delete in tx mode.
+        commit, not here — consistent with update/merge/delete in tx mode. ``post_save``
+        is deferred until the transaction commits successfully; if the tx rolls back,
+        ``post_save`` is NOT emitted (the write never happened).
         """
         sender = self.__class__
         has_signals = pre_save.has_handlers(sender) or post_save.has_handlers(sender) or around_save.has_handlers(sender)
@@ -233,11 +235,14 @@ class BaseSurrealModel(BaseModel):
 
         if tx is not None:
             # Buffered op: there is no actual write to wrap here, so around_save is
-            # skipped (the write happens at commit). pre_save/post_save still fire.
+            # skipped (the write happens at commit). post_save is deferred to post-commit
+            # so handlers only run when the write is durable.
             result, created = await self._do_save(tx=tx)
-        else:
-            async with around_save.wrap(sender, instance=self):
-                result, created = await self._do_save(tx=tx)
+            tx.enqueue_post_commit(lambda: post_save.send(sender, instance=self, created=created))
+            return result
+
+        async with around_save.wrap(sender, instance=self):
+            result, created = await self._do_save(tx=tx)
 
         await post_save.send(sender, instance=self, created=created)
 
@@ -250,7 +255,9 @@ class BaseSurrealModel(BaseModel):
         When ``tx`` is provided, the UPDATE statement is buffered onto the
         transaction instead of being executed immediately.
 
-        Emits pre_update, post_update, and around_update signals.
+        Emits pre_update, post_update, and around_update signals. In tx mode,
+        ``around_update`` is skipped (the write is deferred to commit) and
+        ``post_update`` only fires after a successful commit.
         """
         sender = self.__class__
         data = self.model_dump(exclude={"id"})
@@ -262,7 +269,7 @@ class BaseSurrealModel(BaseModel):
             update_fields = list(data.keys())
             await pre_update.send(sender, instance=self, update_fields=update_fields)
             tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
-            await post_update.send(sender, instance=self, update_fields=update_fields)
+            tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
             return None
 
         client = await SurrealDBConnectionManager.get_client()
@@ -292,7 +299,14 @@ class BaseSurrealModel(BaseModel):
         literally named ``tx`` cannot be merged by keyword; use a dict-unpacking
         workaround if needed (no realistic SurrealDB column is named ``tx``).
 
-        Emits pre_update, post_update, and around_update signals.
+        Emits pre_update, post_update, and around_update signals. In tx mode,
+        ``around_update`` is skipped (the write is deferred to commit) and
+        ``post_update`` only fires after a successful commit. The non-tx path calls
+        ``refresh()`` to resync the instance with the server; the tx path cannot
+        (reads inside a tx are not supported and the write is buffered), so
+        ``data`` is applied to ``self`` directly at buffer time. A rollback will
+        therefore leave the instance ahead of the database — caller must treat the
+        instance as stale after a failed tx.
         """
         sender = self.__class__
         data_set = dict(data.items())
@@ -305,7 +319,13 @@ class BaseSurrealModel(BaseModel):
             update_fields = list(data_set.keys())
             await pre_update.send(sender, instance=self, update_fields=update_fields)
             tx.add(f"UPDATE {record_id} MERGE $data;", {"data": data_set})
-            await post_update.send(sender, instance=self, update_fields=update_fields)
+            # Apply merged fields to the in-memory instance so it reflects the
+            # buffered write — the tx path has no post-commit refresh() to fall
+            # back on.
+            for key, value in data_set.items():
+                if hasattr(self, key):
+                    object.__setattr__(self, key, value)
+            tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
             return None
 
         client = await SurrealDBConnectionManager.get_client()
@@ -332,7 +352,9 @@ class BaseSurrealModel(BaseModel):
         When ``tx`` is provided, the DELETE statement is buffered onto the
         transaction instead of being executed immediately.
 
-        Emits pre_delete, post_delete, and around_delete signals.
+        Emits pre_delete, post_delete, and around_delete signals. In tx mode,
+        ``around_delete`` is skipped (the write is deferred to commit) and
+        ``post_delete`` only fires after a successful commit.
         """
         sender = self.__class__
         record_id = self._record_id()
@@ -342,7 +364,7 @@ class BaseSurrealModel(BaseModel):
         if tx is not None:
             await pre_delete.send(sender, instance=self)
             tx.add(f"DELETE {record_id};", None)
-            await post_delete.send(sender, instance=self)
+            tx.enqueue_post_commit(lambda: post_delete.send(sender, instance=self))
             return None
 
         client = await SurrealDBConnectionManager.get_client()
