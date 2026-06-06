@@ -20,6 +20,7 @@ from .signals import (
     pre_save,
     pre_update,
 )
+from .transaction import Transaction
 from .utils import remove_quotes_for_variables, validate_edge_name, validate_field_name, validate_graph_path, validate_thing
 
 logger = logging.getLogger(__name__)
@@ -131,10 +132,13 @@ class BaseSurrealModel(BaseModel):
                 data["id"] = str(data["id"].id)
         return data
 
-    async def refresh(self) -> None:
+    async def refresh(self, tx: Transaction | None = None) -> None:
+        """Refresh the model instance from the database.
+
+        Reads inside a transaction are not supported in v0.8.0 (planned for v0.9.0).
         """
-        Refresh the model instance from the database.
-        """
+        if tx is not None:
+            raise SurrealDbError("refresh() is a read and is not supported inside a transaction (planned for v0.9.0).")
         if not self.get_id():
             raise SurrealDbError("Can't refresh data, not recorded yet.")  # pragma: no cover
 
@@ -156,15 +160,24 @@ class BaseSurrealModel(BaseModel):
                 if hasattr(self, key):
                     object.__setattr__(self, key, value)
 
-    async def _do_save(self) -> tuple[Self, bool]:
+    async def _do_save(self, tx: Transaction | None = None) -> tuple[Self, bool]:
+        """Internal save logic. Returns (self, created).
+
+        When ``tx`` is provided the CREATE statement is buffered (deferred to commit)
+        and the in-memory instance is returned as-is. Buffered creates require an
+        explicit record id.
         """
-        Internal save logic. Returns (self, created) where created indicates
-        whether a new record was created (always True for save).
-        """
-        client = await SurrealDBConnectionManager.get_client()
-        data = self.model_dump(exclude={"id"})
         record_id = self._record_id()
+        data = self.model_dump(exclude={"id"})
         table = self.get_table_name()
+
+        if tx is not None:
+            if record_id is None:
+                raise SurrealDbError("save(tx=...) requires an explicit id (auto-id is not supported inside a transaction).")
+            tx.add(f"CREATE {record_id} CONTENT $data;", {"data": data})
+            return self, True
+
+        client = await SurrealDBConnectionManager.get_client()
 
         if record_id is not None:
             # SDK 2.0 raises a structured exception instead of returning a string.
@@ -198,108 +211,178 @@ class BaseSurrealModel(BaseModel):
 
         raise SurrealDbError("Can't save data, no record returned.")  # pragma: no cover
 
-    async def save(self) -> Self:
+    async def save(self, tx: Transaction | None = None) -> Self:
         """
         Save the model instance to the database.
 
-        Emits pre_save, post_save, and around_save signals.
+        When ``tx`` is provided, the CREATE statement is buffered onto the
+        transaction instead of being executed immediately.
+
+        Emits pre_save and post_save signals. ``around_save`` wraps the actual write,
+        so in a transaction (``tx`` provided) it is NOT emitted — the write happens at
+        commit, not here — consistent with update/merge/delete in tx mode. ``post_save``
+        is deferred until the transaction commits successfully; if the tx rolls back,
+        ``post_save`` is NOT emitted (the write never happened).
         """
         sender = self.__class__
         has_signals = pre_save.has_handlers(sender) or post_save.has_handlers(sender) or around_save.has_handlers(sender)
 
         if not has_signals:
-            result, created = await self._do_save()
+            result, created = await self._do_save(tx=tx)
             return result
 
         await pre_save.send(sender, instance=self)
 
+        if tx is not None:
+            # Buffered op: there is no actual write to wrap here, so around_save is
+            # skipped (the write happens at commit). post_save is deferred to post-commit
+            # so handlers only run when the write is durable.
+            result, created = await self._do_save(tx=tx)
+            tx.enqueue_post_commit(lambda: post_save.send(sender, instance=self, created=created))
+            return result
+
         async with around_save.wrap(sender, instance=self):
-            result, created = await self._do_save()
+            result, created = await self._do_save(tx=tx)
 
         await post_save.send(sender, instance=self, created=created)
 
         return result
 
-    async def update(self) -> Any:
+    async def update(self, tx: Transaction | None = None) -> Any:
         """
         Update the model instance to the database.
 
-        Emits pre_update, post_update, and around_update signals.
-        """
-        client = await SurrealDBConnectionManager.get_client()
-        sender = self.__class__
+        When ``tx`` is provided, the UPDATE statement is buffered onto the
+        transaction instead of being executed immediately.
 
+        Emits pre_update, post_update, and around_update signals. In tx mode,
+        ``around_update`` is skipped (the write is deferred to commit) and
+        ``post_update`` only fires after a successful commit.
+        """
+        sender = self.__class__
         data = self.model_dump(exclude={"id"})
         record_id = self._record_id()
-        if record_id is not None:
-            update_fields = list(data.keys())
-            has_signals = (
-                pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
-            )
+        if record_id is None:
+            raise SurrealDbError("Can't update data, no id found.")
 
+        has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
+
+        if tx is not None:
             if not has_signals:
-                return await client.update(record_id, data)
-
+                tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
+                return None
+            update_fields = list(data.keys())
             await pre_update.send(sender, instance=self, update_fields=update_fields)
+            tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
+            tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
+            return None
 
-            async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-                result = await client.update(record_id, data)
+        client = await SurrealDBConnectionManager.get_client()
 
-            await post_update.send(sender, instance=self, update_fields=update_fields)
+        if not has_signals:
+            return await client.update(record_id, data)
 
-            return result
-        raise SurrealDbError("Can't update data, no id found.")
+        update_fields = list(data.keys())
+        await pre_update.send(sender, instance=self, update_fields=update_fields)
 
-    async def merge(self, **data: Any) -> Any:
+        async with around_update.wrap(sender, instance=self, update_fields=update_fields):
+            result = await client.update(record_id, data)
+
+        await post_update.send(sender, instance=self, update_fields=update_fields)
+
+        return result
+
+    async def merge(self, tx: Transaction | None = None, **data: Any) -> Any:
         """
         Partial update of the model instance in the database.
 
-        Emits pre_update, post_update, and around_update signals.
-        """
+        When ``tx`` is provided, the UPDATE…MERGE statement is buffered onto the
+        transaction instead of being executed immediately.
 
-        client = await SurrealDBConnectionManager.get_client()
+        Note: ``tx`` is a reserved keyword argument for this method. A model field
+        literally named ``tx`` cannot be merged by keyword; use a dict-unpacking
+        workaround if needed (no realistic SurrealDB column is named ``tx``).
+
+        Emits pre_update, post_update, and around_update signals. In tx mode,
+        ``around_update`` is skipped (the write is deferred to commit) and
+        ``post_update`` only fires after a successful commit. The non-tx path calls
+        ``refresh()`` to resync the instance with the server; the tx path cannot
+        (reads inside a tx are not supported and the write is buffered), so
+        ``data`` is applied to ``self`` directly at buffer time. A rollback will
+        therefore leave the instance ahead of the database — caller must treat the
+        instance as stale after a failed tx.
+        """
         sender = self.__class__
         data_set = dict(data.items())
-
         record_id = self._record_id()
-        if record_id is not None:
+
+        if record_id is None:
+            raise SurrealDbError(f"No Id for the data to merge: {data}")
+
+        has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
+
+        if tx is not None:
             update_fields = list(data_set.keys())
-            has_signals = (
-                pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
-            )
+            # pre_update sees the instance BEFORE merged fields are applied
+            # (matches the non-tx path, where client.merge has not run yet at this
+            # point).
+            if has_signals:
+                await pre_update.send(sender, instance=self, update_fields=update_fields)
+            tx.add(f"UPDATE {record_id} MERGE $data;", {"data": data_set})
+            # Apply merged fields to the in-memory instance so it reflects the
+            # buffered write — the tx path has no post-commit refresh() to fall
+            # back on. Happens regardless of signals.
+            for key, value in data_set.items():
+                if hasattr(self, key):
+                    object.__setattr__(self, key, value)
+            if has_signals:
+                tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
+            return None
 
-            if not has_signals:
-                await client.merge(record_id, data_set)
-                await self.refresh()
-                return
+        client = await SurrealDBConnectionManager.get_client()
 
-            await pre_update.send(sender, instance=self, update_fields=update_fields)
-
-            async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-                await client.merge(record_id, data_set)
-                await self.refresh()
-
-            await post_update.send(sender, instance=self, update_fields=update_fields)
-
+        if not has_signals:
+            await client.merge(record_id, data_set)
+            await self.refresh()
             return
 
-        raise SurrealDbError(f"No Id for the data to merge: {data}")
+        update_fields = list(data_set.keys())
+        await pre_update.send(sender, instance=self, update_fields=update_fields)
 
-    async def delete(self) -> None:
+        async with around_update.wrap(sender, instance=self, update_fields=update_fields):
+            await client.merge(record_id, data_set)
+            await self.refresh()
+
+        await post_update.send(sender, instance=self, update_fields=update_fields)
+
+    async def delete(self, tx: Transaction | None = None) -> None:
         """
         Delete the model instance from the database.
 
-        Emits pre_delete, post_delete, and around_delete signals.
+        When ``tx`` is provided, the DELETE statement is buffered onto the
+        transaction instead of being executed immediately.
+
+        Emits pre_delete, post_delete, and around_delete signals. In tx mode,
+        ``around_delete`` is skipped (the write is deferred to commit) and
+        ``post_delete`` only fires after a successful commit.
         """
-
-        client = await SurrealDBConnectionManager.get_client()
         sender = self.__class__
-
         record_id = self._record_id()
         if record_id is None:
             raise SurrealDbError("Can't delete data, no id found.")
 
         has_signals = pre_delete.has_handlers(sender) or post_delete.has_handlers(sender) or around_delete.has_handlers(sender)
+
+        if tx is not None:
+            if not has_signals:
+                tx.add(f"DELETE {record_id};", None)
+                return None
+            await pre_delete.send(sender, instance=self)
+            tx.add(f"DELETE {record_id};", None)
+            tx.enqueue_post_commit(lambda: post_delete.send(sender, instance=self))
+            return None
+
+        client = await SurrealDBConnectionManager.get_client()
 
         # Record delete() is STRICT: a missing record is an error on every server
         # version. SurrealDB 2.x returns falsy; 3.x raises NotFoundError. Both map

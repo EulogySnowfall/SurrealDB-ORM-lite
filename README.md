@@ -21,12 +21,12 @@ This ORM is designed to:
 
 ## Requirements
 
-| Dependency   | Version                            |
-| ------------ | ---------------------------------- |
-| Python       | 3.11+                              |
-| SurrealDB    | 2.6.x or 3.1.x                     |
-| Official SDK | surrealdb[pydantic]>=2.0.0,<3.0.0  |
-| Pydantic     | >=2.13.4                           |
+| Dependency   | Version                           |
+| ------------ | --------------------------------- |
+| Python       | 3.11+                             |
+| SurrealDB    | 2.6.x or 3.1.x                    |
+| Official SDK | surrealdb[pydantic]>=2.0.0,<3.0.0 |
+| Pydantic     | >=2.13.4                          |
 
 > **Note**: As of v0.7.0, Surreal ORM Lite targets the SurrealDB Python SDK 2.x (`surrealdb[pydantic]>=2.0.0,<3.0.0`), which supports the SurrealDB 3.x protocol. It is tested against SurrealDB **v2.6.5** and **v3.1.3**.
 
@@ -153,6 +153,7 @@ results = await User.objects().query(
 | `-field` ordering      | ✅     |
 | Relations & Graph      | ✅     |
 | FETCH clause           | ✅     |
+| Transactions (`tx=`)   | ✅     |
 
 ### Supported Filter Lookups
 
@@ -308,6 +309,22 @@ async def time_user_save(sender, instance, **kwargs):
     print(f"Save took {duration:.3f}s")
 ```
 
+### 11. Transactions (atomic, all-or-nothing)
+
+```python
+from surreal_orm_lite import SurrealDBConnectionManager
+
+# All operations commit together, or none do.
+async with SurrealDBConnectionManager.transaction() as tx:
+    await User(id="alice", name="Alice").save(tx=tx)
+    await Order(id="o1", user="User:alice", total=100).save(tx=tx)
+    # Auto-commit on success; auto-rollback if the block raises.
+```
+
+Inside a transaction, operations are buffered and flushed as one
+`BEGIN TRANSACTION; …; COMMIT TRANSACTION;` query. `save(tx=tx)` requires an explicit `id`.
+Reads inside a transaction arrive in v0.9.0.
+
 ---
 
 ## Configuration Options
@@ -339,12 +356,14 @@ async with SurrealDBConnectionManager():
 
 As of v0.7.0, Surreal ORM Lite uses `surrealdb[pydantic]>=2.0.0,<3.0.0` (SurrealDB 3.x protocol) and is tested against both major SurrealDB release lines.
 
-| SurrealDB Version | SDK Version | Status             |
-| ----------------- | ----------- | ------------------ |
-| 3.1.3             | 2.0         | ✅ Tested          |
-| 2.6.5             | 2.0         | ✅ Tested          |
-| 2.6.x             | 2.0         | ✅ Compatible      |
-| < 2.6 or > 3.1    | —           | ⚠️ Not guaranteed  |
+**Compatibility advantage over the full ORM**: ORM-lite runs on **both** SurrealDB **2.6.x and 3.1**, while the full [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/) (custom SDK) targets **3.x only**. Lite stays usable on existing 2.6.x deployments without forcing a server upgrade.
+
+| SurrealDB Version | SDK Version | Status            |
+| ----------------- | ----------- | ----------------- |
+| 3.1.3             | 2.0         | ✅ Tested         |
+| 2.6.5             | 2.0         | ✅ Tested         |
+| 2.6.x             | 2.0         | ✅ Compatible     |
+| < 2.6 or > 3.1    | —           | ⚠️ Not guaranteed |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
 
@@ -364,19 +383,19 @@ Contributions are welcome! Please:
 
 ## Roadmap
 
-| Version | Theme                              | Status      |
-| ------- | ---------------------------------- | ----------- |
-| v0.2.x  | Core ORM (CRUD, QuerySet)          | ✅ Released |
-| v0.3.0  | Aggregations & Utilities           | ✅ Released |
-| v0.4.0  | Model Signals                      | ✅ Released |
-| v0.5.0  | Bulk Operations & Q Objects        | ✅ Released |
-| v0.6.0  | Relations & Graph                  | ✅ Released |
-| v0.7.0  | SDK 2.0 / SurrealDB 3.x migration  | ✅ Released |
-| v0.8.0  | Transactions ORM                   | 📋 Planned  |
-| v0.9.0  | SurrealFunc & Computed Fields      | 📋 Planned  |
-| v0.10.0 | FETCH, Field Aliases & DX          | 📋 Planned  |
-| v0.11.0 | Beta Phase                         | 📋 Planned  |
-| v1.0.0  | Production Ready                   | 📋 Planned  |
+| Version           | Theme                                            | Status      |
+| ----------------- | ------------------------------------------------ | ----------- |
+| v0.2.x – v0.7.0   | Core ORM → SDK 2.0 / SurrealDB 3.x migration     | ✅ Released |
+| v0.8.0            | Transactions ORM (`tx=`)                         | ✅ Released |
+| v0.9.0 – v0.22.0  | Tier 1 — Core (auth, live, relations, …)         | 📋 Planned  |
+| v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)  | 📋 Planned  |
+| v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI) | 📋 Planned  |
+| v0.40.0           | Beta Phase (API freeze, hardening)               | 📋 Planned  |
+| v2.0.0            | Production / GA (aligned with SDK 2.0)           | 📋 Planned  |
+
+> Every roadmap feature is implementable with the **official SDK 2.0** (native methods or
+> `query()` SurrealQL) — no custom SDK. GA is numbered **v2.0.0** to mirror SDK 2.0; the `1.x`
+> line is intentionally skipped.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for full details.
 
@@ -386,37 +405,51 @@ See [docs/ROADMAP.md](docs/ROADMAP.md) for full details.
 
 This project prioritizes **stability and compatibility** with the official SurrealDB Python SDK. The full [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/) uses a custom SDK for advanced features.
 
-| Feature                   | ORM-lite (official SDK) | ORM (custom SDK) |
-| ------------------------- | ----------------------- | ---------------- |
-| CRUD & QuerySet           | ✅                      | ✅               |
-| Aggregations & GROUP BY   | ✅                      | ✅               |
-| Model Signals             | ✅                      | ✅               |
-| Bulk Operations           | ✅                      | ✅               |
-| Q Objects (OR/AND/NOT)    | ✅                      | ✅               |
-| Parameterized Filters     | ✅                      | ✅               |
-| Relations & Graph         | ✅                      | ✅               |
-| FETCH clause              | ✅                      | ✅               |
-| Transactions (tx=)        | v0.8.0                  | ✅               |
-| SurrealFunc & Computed    | v0.9.0                  | ✅               |
-| Field Aliases             | v0.10.0                 | ✅               |
-| Retry, Logging, Metrics   | v0.11.0                 | ✅               |
-| Live Models / CDC         | ❌                      | ✅               |
-| Vector / Full-Text Search | ❌                      | ✅               |
-| Hybrid Search (RRF)       | ❌                      | ✅               |
-| Migrations & CLI          | ❌                      | ✅               |
-| JWT Authentication        | ❌                      | ✅               |
-| Schema Introspection      | ❌                      | ✅               |
-| Connection Pool           | ❌                      | ✅               |
-| CBOR Protocol             | ❌                      | ✅               |
-| Subqueries & Query Cache  | ❌                      | ✅               |
-| Geospatial Fields         | ❌                      | ✅               |
-| DEFINE EVENT              | ❌                      | ✅               |
-| Test Fixtures & Factories | ❌                      | ✅               |
-| Atomic Array Operations   | ❌                      | ✅               |
+Both projects target the same feature set; the difference is **how** (official SDK vs custom
+SDK) and **server support**. Everything below is on the lite roadmap via the official SDK 2.0
+— only the custom-SDK internals stay exclusive to the full ORM.
 
-**Choose ORM-lite** if you want the official SDK, minimal dependencies, and core ORM features.
+| Feature                       | ORM-lite (official SDK) | ORM (custom SDK) |
+| ----------------------------- | ----------------------- | ---------------- |
+| Supported SurrealDB           | **2.6.x + 3.1**         | 3.x only         |
+| CRUD & QuerySet               | ✅                      | ✅               |
+| Aggregations & GROUP BY       | ✅                      | ✅               |
+| Model Signals                 | ✅                      | ✅               |
+| Bulk Operations               | ✅                      | ✅               |
+| Q Objects (OR/AND/NOT)        | ✅                      | ✅               |
+| Parameterized Filters         | ✅                      | ✅               |
+| Relations & Graph             | ✅                      | ✅               |
+| FETCH clause                  | ✅                      | ✅               |
+| Transactions (tx=)            | ✅ v0.8 (core), v0.9 QS | ✅               |
+| upsert / update_or_create     | v0.10.0                 | ✅               |
+| Atomic field/array operations | v0.11.0                 | ✅               |
+| Retry on conflict             | v0.12.0                 | ✅               |
+| SurrealFunc & Computed        | v0.13 – v0.14           | ✅               |
+| JWT Authentication            | v0.16 – v0.17           | ✅               |
+| Field Aliases & DX            | v0.18.0                 | ✅               |
+| Live Models / CDC             | v0.19 – v0.21           | ✅               |
+| Native typed relations        | v0.22.0                 | ✅               |
+| Rich field types              | v0.23.0                 | ✅               |
+| Geospatial Fields             | v0.24.0                 | ✅               |
+| Subqueries & Query Cache      | v0.27 – v0.28           | ✅               |
+| Multi-database                | v0.29.0                 | ✅               |
+| Schema Introspection          | v0.30.0                 | ✅               |
+| DEFINE EVENT                  | v0.31.0                 | ✅               |
+| Materialized views            | v0.32.0                 | ✅               |
+| Full-Text Search              | v0.34.0                 | ✅               |
+| Vector Search (KNN/HNSW)      | v0.35.0                 | ✅               |
+| Hybrid Search (RRF)           | v0.36.0                 | ✅               |
+| Migrations & CLI              | v0.37 – v0.38           | ✅               |
+| Test Fixtures & Factories     | v0.39.0                 | ✅               |
+| Retry, Logging, Metrics       | v0.40.0                 | ✅               |
+| Connection Pool               | post-GA (tentative)     | ✅               |
+| Custom SDK / CBOR Protocol    | ❌ never                | ✅               |
 
-**Choose ORM** if you need live queries, migrations, authentication, vector search, or advanced features.
+**Choose ORM-lite** if you want the official SDK, minimal dependencies, support for SurrealDB
+2.6.x **and** 3.1, and a full feature roadmap built entirely on the official SDK.
+
+**Choose ORM** if you need the custom-SDK internals (CBOR protocol, native connection pool)
+or those features available today rather than on the roadmap.
 
 - **SurrealDB-ORM GitHub**: [github.com/EulogySnowfall/SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/)
 - **SurrealDB-ORM PyPI**: [surrealdb-orm](https://pypi.org/project/surrealdb-orm/)

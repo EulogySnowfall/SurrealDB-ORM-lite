@@ -411,5 +411,5 @@ async def test_update_merge_delete_with_recordid_roundtrip() -> None:
     assert again.name == "B"
 
     await again.delete()
-    with pytest.raises(Exception):
+    with pytest.raises(SurrealDbNotFoundError):
         await RidCrud.objects().get("rid_crud")

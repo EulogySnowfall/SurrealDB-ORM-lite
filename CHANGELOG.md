@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-06-06
+
+### Added
+
+- **Transactions ORM (core)**: `async with SurrealDBConnectionManager.transaction() as tx:`
+  context manager plus a `tx=` parameter on `save()`, `update()`, `merge()`, and `delete()`.
+  Operations are buffered and committed atomically as a single
+  `BEGIN TRANSACTION; … COMMIT TRANSACTION;` query; an exception in the block rolls
+  everything back.
+- Exported `Transaction`.
+
+### Notes
+
+- Inside a transaction, `save()` requires an explicit record id (auto-generated ids are not
+  buffered in this release). Reads/`refresh()` inside a transaction raise a clear error and
+  are planned for v0.9.0 (QuerySet `objects(tx=)` + savepoints).
+
 ## [0.7.0] - 2026-06-06
 
 ### Added
