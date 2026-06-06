@@ -1,9 +1,12 @@
+import contextlib
 import logging
+import math
 from typing import TYPE_CHECKING, Any, Self, cast
 
 from pydantic_core import ValidationError
 
 from . import BaseSurrealModel, SurrealDBConnectionManager
+from ._sdk import NotFoundError, RecordID
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .q import Q
@@ -346,7 +349,14 @@ class QuerySet:
         """
         client = await SurrealDBConnectionManager.get_client()
         vars_ = variables if variables is not None else self._variables
-        return await client.query(remove_quotes_for_variables(query), vars_)  # type: ignore
+        try:
+            return await client.query(remove_quotes_for_variables(query), vars_)  # type: ignore
+        except NotFoundError:
+            # SurrealDB 3.x raises NotFoundError for a SELECT on a table that was
+            # never created (tables are materialized on first write). The ORM
+            # contract treats a missing table as empty, so callers (get/first/
+            # count/exists/aggregations) get the same result as an empty table.
+            return []
 
     async def exec(self) -> Any:
         """
@@ -400,11 +410,26 @@ class QuerySet:
         """
         if id_item:
             client = await SurrealDBConnectionManager.get_client()
-            data = await client.select(f"{self._model_table}:{id_item}")
+            if isinstance(id_item, RecordID):
+                record_id = id_item
+            else:
+                # Strip SurrealQL backtick escaping if present (e.g. "`test@test.com`")
+                raw = str(id_item)
+                if raw.startswith("`") and raw.endswith("`"):
+                    raw = raw[1:-1]
+                record_id = RecordID(self._model_table, raw)
+            try:
+                data = await client.select(record_id)
+            except NotFoundError:
+                # SurrealDB 3.x: selecting from a never-created table raises
+                # instead of returning nothing. Treat as "no result".
+                raise SurrealDbNotFoundError("No result found.") from None
             if isinstance(data, list):
                 if len(data) == 0:
                     raise SurrealDbNotFoundError("No result found.")
                 data = data[0]
+            if data is None:
+                raise SurrealDbNotFoundError("No result found.")
             return self.model.from_db(data)
         else:
             result = await self.exec()
@@ -423,18 +448,25 @@ class QuerySet:
             A list of model instances representing all records.
         """
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.select(self._model_table)
+        try:
+            results = await client.select(self._model_table)
+        except NotFoundError:
+            # SurrealDB 3.x raises for a never-created table; the ORM contract
+            # treats a missing table as empty.
+            return self.model.from_db([])
         return self.model.from_db(results)
 
     async def delete_table(self) -> bool:
         """
         Delete the associated table from the SurrealDB database.
 
-        Returns:
-            True if the table was successfully deleted.
+        Returns True. A missing table is treated as already-absent (no-op),
+        so this is safe for idempotent cleanup on SurrealDB 3.x (which raises
+        NotFoundError) as well as 2.x (which is a no-op).
         """
         client = await SurrealDBConnectionManager.get_client()
-        await client.delete(self._model_table)
+        with contextlib.suppress(NotFoundError):
+            await client.delete(self._model_table)
         return True
 
     # ==================== Aggregation Methods ====================
@@ -529,10 +561,12 @@ class QuerySet:
 
         if isinstance(results, list) and len(results) > 0:
             result = results[0]
-            if isinstance(result, dict):
-                value = result.get("avg", 0.0)
-                return float(value) if value is not None else 0.0
-            return float(result) if result is not None else 0.0
+            value = result.get("avg", 0.0) if isinstance(result, dict) else result
+            # SurrealDB 3.x returns NaN for math::mean over an empty set; the ORM
+            # contract is 0.0 for "no records".
+            if value is None or (isinstance(value, float) and math.isnan(value)):
+                return 0.0
+            return float(value)
         return 0.0
 
     async def min(self, field: str) -> Any:
@@ -551,9 +585,12 @@ class QuerySet:
 
         if isinstance(results, list) and len(results) > 0:
             result = results[0]
-            if isinstance(result, dict):
-                return result.get("min")
-            return result
+            value = result.get("min") if isinstance(result, dict) else result
+            # SurrealDB 3.x returns +inf for math::min over an empty set; the ORM
+            # contract is None for "no records".
+            if value is None or (isinstance(value, float) and (math.isinf(value) or math.isnan(value))):
+                return None
+            return value
         return None
 
     async def max(self, field: str) -> Any:
@@ -572,9 +609,12 @@ class QuerySet:
 
         if isinstance(results, list) and len(results) > 0:
             result = results[0]
-            if isinstance(result, dict):
-                return result.get("max")
-            return result
+            value = result.get("max") if isinstance(result, dict) else result
+            # SurrealDB 3.x returns -inf for math::max over an empty set; the ORM
+            # contract is None for "no records".
+            if value is None or (isinstance(value, float) and (math.isinf(value) or math.isnan(value))):
+                return None
+            return value
         return None
 
     async def exists(self) -> bool:
@@ -707,7 +747,12 @@ class QuerySet:
         if f"FROM {self._model_table}" not in query:
             raise SurrealDbError(f"The query must include 'FROM {self._model_table}' to reference the correct table.")
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.query(remove_quotes_for_variables(query), variables or {})
+        try:
+            results = await client.query(remove_quotes_for_variables(query), variables or {})
+        except NotFoundError:
+            # SurrealDB 3.x raises for a never-created table; the ORM contract
+            # treats a missing table as empty.
+            return self.model.from_db([])
         if isinstance(results, list):
             return self.model.from_db(results)
         data = cast(dict, results[0])

@@ -1,10 +1,12 @@
+import contextlib
 import logging
+import typing
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic_core import ValidationError
-from surrealdb import RecordID
 
+from ._sdk import NotFoundError, RecordID, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
 from .signals import (
@@ -61,19 +63,40 @@ class BaseSurrealModel(BaseModel):
 
     def get_id(self) -> None | str | RecordID:
         """
-        Get the ID of the model instance.
+        Get the raw ID of the model instance.
+
+        Returns the value as stored: a native ``RecordID`` for records loaded
+        from the database, or the raw value for in-memory instances.
         """
         if hasattr(self, "id"):
             id_value = self.id  # type: ignore[attr-defined]
-            return str(id_value) if id_value is not None else None
+            return id_value if id_value is not None else None
 
         if hasattr(self, "model_config"):
             primary_key = self.model_config.get("primary_key", None)
             if isinstance(primary_key, str) and hasattr(self, primary_key):
                 primary_key_value = getattr(self, primary_key)
-                return str(primary_key_value) if primary_key_value is not None else None
+                return primary_key_value if primary_key_value is not None else None
 
         return None  # pragma: no cover
+
+    def get_raw_id(self) -> str | None:
+        """Return the bare identifier portion (without the table prefix)."""
+        id_value = self.get_id()
+        if id_value is None:
+            return None
+        if isinstance(id_value, RecordID):
+            return str(id_value.id)
+        return str(id_value)
+
+    def _record_id(self) -> RecordID | None:
+        """Return a ``RecordID`` suitable for passing to SDK 2.0 methods."""
+        id_value = self.get_id()
+        if id_value is None:
+            return None
+        if isinstance(id_value, RecordID):
+            return id_value
+        return RecordID(self.get_table_name(), id_value)
 
     @classmethod
     def from_db(cls, record: dict | list) -> Self | list[Self]:
@@ -90,10 +113,22 @@ class BaseSurrealModel(BaseModel):
     def set_data(cls, data: Any) -> Any:
         """
         Pre-process data before model validation.
-        Extracts the ID from RecordID if present.
+        Extracts the ID from RecordID if present, unless the field accepts RecordID natively.
         """
         if isinstance(data, dict) and "id" in data and isinstance(data["id"], RecordID):
-            data["id"] = str(data["id"]).split(":")[1]
+            # Only convert to plain string when the id field does not accept RecordID.
+            id_field = cls.model_fields.get("id")
+            if id_field is not None:
+                annotation = id_field.annotation
+                args = typing.get_args(annotation)
+                field_accepts_record_id = RecordID in (args if args else (annotation,))
+            else:
+                field_accepts_record_id = False
+            if not field_accepts_record_id:
+                # Use the RecordID's raw identifier directly. Avoid str(rid).split(":")
+                # which yields the SurrealQL-escaped form (e.g. "⟨1⟩") for numeric-looking
+                # or special string ids.
+                data["id"] = str(data["id"].id)
         return data
 
     async def refresh(self) -> None:
@@ -104,22 +139,20 @@ class BaseSurrealModel(BaseModel):
             raise SurrealDbError("Can't refresh data, not recorded yet.")  # pragma: no cover
 
         client = await SurrealDBConnectionManager.get_client()
-        record = await client.select(f"{self.get_table_name()}:{self.get_id()}")
+        record = await client.select(self._record_id())
 
         if record is None:
             raise SurrealDbError("Can't refresh data, no record found.")  # pragma: no cover
 
-        # SDK 1.0.8 returns a list even for single record select
+        # SDK 2.0 returns a list even for single record select
         if isinstance(record, list):
             if len(record) == 0:
                 raise SurrealDbError("Can't refresh data, no record found.")  # pragma: no cover
             record = record[0]
 
-        # Update current instance with refreshed data
+        # Update current instance with refreshed data (keep native RecordID for id)
         if isinstance(record, dict):
             for key, value in record.items():
-                if key == "id" and isinstance(value, RecordID):
-                    value = str(value).split(":")[1]
                 if hasattr(self, key):
                     object.__setattr__(self, key, value)
 
@@ -130,25 +163,25 @@ class BaseSurrealModel(BaseModel):
         """
         client = await SurrealDBConnectionManager.get_client()
         data = self.model_dump(exclude={"id"})
-        id = self.get_id()
+        record_id = self._record_id()
         table = self.get_table_name()
 
-        if id is not None:
-            # Escape special characters in ID
-            escaped_id = f"`{id}`" if any(c in str(id) for c in "@#$%^&*()-+=/\\! ") else id
-            thing = f"{table}:{escaped_id}"
-            result = await client.create(thing, data)
-            # SDK 1.0.8 returns error message as string instead of raising exception
-            if isinstance(result, str) and "already exists" in result:
-                raise SurrealDbError(f"There was a problem with the database: {result}")
+        if record_id is not None:
+            # SDK 2.0 raises a structured exception instead of returning a string.
+            # The "already exists" error maps to AlreadyExistsError on SurrealDB 3.x
+            # but to InternalError on 2.x (no structured kind) — both subclass
+            # ServerError, so catch the base and match on the message to stay
+            # faithful to the original "already exists" contract across versions.
+            try:
+                await client.create(record_id, data)
+            except ServerError as e:
+                if "already exists" in str(e).lower():
+                    raise SurrealDbError(f"There was a problem with the database: {e}") from e
+                raise
             return self, True
 
         # Auto-generate the ID
         record = await client.create(table, data)  # pragma: no cover
-
-        # SDK 1.0.8 returns error message as string
-        if isinstance(record, str):
-            raise SurrealDbError(f"Can't save data: {record}")  # pragma: no cover
 
         if isinstance(record, list):
             raise SurrealDbError("Can't save data, multiple records returned.")  # pragma: no cover
@@ -156,11 +189,9 @@ class BaseSurrealModel(BaseModel):
         if record is None:
             raise SurrealDbError("Can't save data, no record returned.")  # pragma: no cover
 
-        # Update current instance with the auto-generated ID
+        # Update current instance with the auto-generated ID (kept as native RecordID)
         if isinstance(record, dict):
             for key, value in record.items():
-                if key == "id" and isinstance(value, RecordID):
-                    value = str(value).split(":")[1]
                 if hasattr(self, key):
                     object.__setattr__(self, key, value)
             return self, True
@@ -199,21 +230,20 @@ class BaseSurrealModel(BaseModel):
         sender = self.__class__
 
         data = self.model_dump(exclude={"id"})
-        id = self.get_id()
-        if id is not None:
-            thing = f"{self.__class__.__name__}:{id}"
+        record_id = self._record_id()
+        if record_id is not None:
             update_fields = list(data.keys())
             has_signals = (
                 pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
             )
 
             if not has_signals:
-                return await client.update(thing, data)
+                return await client.update(record_id, data)
 
             await pre_update.send(sender, instance=self, update_fields=update_fields)
 
             async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-                result = await client.update(thing, data)
+                result = await client.update(record_id, data)
 
             await post_update.send(sender, instance=self, update_fields=update_fields)
 
@@ -231,23 +261,22 @@ class BaseSurrealModel(BaseModel):
         sender = self.__class__
         data_set = dict(data.items())
 
-        id = self.get_id()
-        if id is not None:
-            thing = f"{self.get_table_name()}:{id}"
+        record_id = self._record_id()
+        if record_id is not None:
             update_fields = list(data_set.keys())
             has_signals = (
                 pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
             )
 
             if not has_signals:
-                await client.merge(thing, data_set)
+                await client.merge(record_id, data_set)
                 await self.refresh()
                 return
 
             await pre_update.send(sender, instance=self, update_fields=update_fields)
 
             async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-                await client.merge(thing, data_set)
+                await client.merge(record_id, data_set)
                 await self.refresh()
 
             await post_update.send(sender, instance=self, update_fields=update_fields)
@@ -266,27 +295,35 @@ class BaseSurrealModel(BaseModel):
         client = await SurrealDBConnectionManager.get_client()
         sender = self.__class__
 
-        id = self.get_id()
-        if id is None:
+        record_id = self._record_id()
+        if record_id is None:
             raise SurrealDbError("Can't delete data, no id found.")
 
-        thing = f"{self.get_table_name()}:{id}"
         has_signals = pre_delete.has_handlers(sender) or post_delete.has_handlers(sender) or around_delete.has_handlers(sender)
 
+        # Record delete() is STRICT: a missing record is an error on every server
+        # version. SurrealDB 2.x returns falsy; 3.x raises NotFoundError. Both map
+        # to SurrealDbError (preserves the existing "not found" contract).
         if not has_signals:
-            deleted = await client.delete(thing)
+            try:
+                deleted = await client.delete(record_id)
+            except NotFoundError as e:
+                raise SurrealDbError(f"Can't delete Record id -> '{record_id}' not found!") from e
             if not deleted:
-                raise SurrealDbError(f"Can't delete Record id -> '{id}' not found!")
+                raise SurrealDbError(f"Can't delete Record id -> '{record_id}' not found!")
             logger.info(f"Record deleted -> {deleted}.")
             return
 
         await pre_delete.send(sender, instance=self)
 
         async with around_delete.wrap(sender, instance=self):
-            deleted = await client.delete(thing)
+            try:
+                deleted = await client.delete(record_id)
+            except NotFoundError as e:
+                raise SurrealDbError(f"Can't delete Record id -> '{record_id}' not found!") from e
 
             if not deleted:
-                raise SurrealDbError(f"Can't delete Record id -> '{id}' not found!")
+                raise SurrealDbError(f"Can't delete Record id -> '{record_id}' not found!")
 
         await post_delete.send(sender, instance=self)
 
@@ -312,6 +349,11 @@ class BaseSurrealModel(BaseModel):
         id_val = self.get_id()
         if id_val is None:
             raise SurrealDbError("Cannot use relations on an unsaved model (no id).")
+        if isinstance(id_val, RecordID):
+            # A RecordID from the DB is already typed/trusted; its string form may
+            # contain SurrealQL escaping (e.g. "Table:⟨1⟩") which validate_thing
+            # intentionally rejects. Skip validation for trusted RecordID values.
+            return str(id_val)
         thing = f"{self.get_table_name()}:{id_val}"
         validate_thing(thing)
         return thing
@@ -394,7 +436,8 @@ class BaseSurrealModel(BaseModel):
 
         query = f"DELETE {edge} WHERE in = {source} AND out = {target_thing};"
         client = await SurrealDBConnectionManager.get_client()
-        await client.query(query, {})
+        with contextlib.suppress(NotFoundError):
+            await client.query(query, {})
 
     async def remove_all_relations(
         self,
@@ -429,7 +472,8 @@ class BaseSurrealModel(BaseModel):
             raise ValueError(f"direction must be 'out', 'in', or 'both', got '{direction}'")
 
         client = await SurrealDBConnectionManager.get_client()
-        await client.query(query, {})
+        with contextlib.suppress(NotFoundError):
+            await client.query(query, {})
 
     async def get_related(
         self,
@@ -478,15 +522,12 @@ class BaseSurrealModel(BaseModel):
         if model_class is not None:
             # If results are RecordIDs, we need to SELECT them
             if records and isinstance(records[0], RecordID):
-                # RecordIDs come from the database, validate each one before interpolation
-                ids = []
-                for r in records:
-                    rid = str(r)
-                    validate_thing(rid)
-                    ids.append(rid)
-                placeholders = ", ".join(ids)
-                fetch_query = f"SELECT * FROM {placeholders};"
-                records = await client.query(fetch_query, {})
+                # RecordIDs come from the database (typed/trusted) — bind them as a
+                # query variable instead of string-interpolating, which both avoids
+                # injection risk and the SurrealQL-escaped string form (e.g. "Table:⟨1⟩")
+                # that validate_thing would reject.
+                fetch_query = "SELECT * FROM $ids;"
+                records = await client.query(fetch_query, {"ids": list(records)})
                 if not isinstance(records, list):
                     return []
 
@@ -581,7 +622,7 @@ class BaseSurrealModel(BaseModel):
             variables or {},
         )
 
-        # SDK 1.0.8 returns list directly from query()
+        # SDK 2.0 returns the rows list directly from query()
         if isinstance(results, list):
             try:
                 return cls.from_db(results)  # type: ignore

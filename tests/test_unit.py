@@ -1,6 +1,7 @@
 import pytest
 from pydantic import Field
 
+from src.surreal_orm_lite._sdk import RecordID
 from src.surreal_orm_lite.exceptions import SurrealDbError
 from src.surreal_orm_lite.model_base import BaseSurrealModel, SurrealConfigDict
 from src.surreal_orm_lite.query_set import QuerySet
@@ -97,3 +98,30 @@ def test_class_with_key_specify() -> None:
     model = ModelTest3(name="Test", age=45, email="test@test.com")  # type: ignore
 
     assert model.get_id() == "test@test.com"  # type: ignore
+
+
+def test_record_id_helper_from_string_id() -> None:
+    m = ModelTest(id="1", name="Test", age=45)
+    rid = m._record_id()
+    assert isinstance(rid, RecordID)
+    assert rid.table_name == "ModelTest"
+    assert str(rid.id) == "1"
+
+
+def test_record_id_helper_preserves_recordid() -> None:
+    class RidModel(BaseSurrealModel):
+        id: str | RecordID | None = None
+        name: str
+
+    existing = RecordID("RidModel", "abc")
+    m = RidModel(id=existing, name="x")
+    assert m._record_id() is existing
+
+
+def test_get_raw_id_from_recordid() -> None:
+    class RidModel2(BaseSurrealModel):
+        id: str | RecordID | None = None
+        name: str
+
+    m = RidModel2(id=RecordID("RidModel2", "abc"), name="x")
+    assert m.get_raw_id() == "abc"

@@ -28,6 +28,19 @@ class ModelTestEmpty(surreal_orm_lite.BaseSurrealModel):
     age: int = Field(..., ge=0, le=125)
 
 
+class ModelNeverCreated(surreal_orm_lite.BaseSurrealModel):
+    """Used only for read queries so its table is never created in the DB.
+
+    SurrealDB 3.x raises NotFoundError ("table does not exist") for reads on a
+    table that was never written to, whereas the ORM contract treats a missing
+    table as empty. This model guards that contract.
+    """
+
+    id: str | RecordID | None = Field(default=None)
+    name: str = Field(..., max_length=100)
+    age: int = Field(..., ge=0, le=125)
+
+
 @pytest.fixture(scope="module", autouse=True)
 def setup_surrealdb() -> None:
     # Initialiser SurrealDB
@@ -47,7 +60,7 @@ async def test_save_model() -> None:
     # Vérification de l'insertion
     client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
     result = await client.select("ModelTest")
-    test_id = RecordID(table_name="ModelTest", identifier=1)
+    test_id = RecordID(table_name="ModelTest", identifier="1")
     assert len(result) == 1
 
     assert result[0] == {"id": test_id, "name": "Test Man", "age": 42}
@@ -65,7 +78,7 @@ async def test_merge_model() -> None:
     item2 = await ModelTest.objects().filter(name="Test Man").get()
     assert item2.age == 32
     assert item2.name == "Test Man"
-    assert item2.id == "1"
+    assert item2.get_raw_id() == "1"
 
 
 async def test_update_model() -> None:
@@ -80,7 +93,7 @@ async def test_update_model() -> None:
     item2 = await ModelTest.objects().filter(name="Test Man").get()
     assert item2.age == 25
     assert item2.name == "Test Man"
-    assert item2.id == "1"
+    assert item2.get_raw_id() == "1"
 
     item3 = ModelTest(name="TestNone", age=17)
 
@@ -105,7 +118,7 @@ async def test_first_model() -> None:
     assert isinstance(model, ModelTest), "Expected ModelTest instance"
     assert model.name == "Test Man"
     assert model.age == 25
-    assert model.id == "1"
+    assert model.get_raw_id() == "1"
 
     with pytest.raises(SurrealDbNotFoundError) as exc1:
         await ModelTest.objects().filter(name="NotExist").first()
@@ -147,7 +160,7 @@ async def test_delete_model() -> None:
     with pytest.raises(SurrealDbError) as exc1:
         await model2.delete()  # Test delete() without saved()
 
-    assert str(exc1.value) == "Can't delete Record id -> '345' not found!"
+    assert "not found" in str(exc1.value)
 
 
 async def test_query_model() -> None:
@@ -225,6 +238,34 @@ async def test_error_on_get_multi() -> None:
     assert str(exc2.value) == "No result found."
 
 
+async def test_read_on_never_created_table_is_empty() -> None:
+    """Reads on a table that was never created honor the empty-result contract.
+
+    Regression for SurrealDB 3.x raising NotFoundError instead of returning an
+    empty result set (the table is auto-created on first write only).
+    """
+    qs = ModelNeverCreated.objects
+
+    with pytest.raises(SurrealDbNotFoundError):
+        await qs().get()
+
+    with pytest.raises(SurrealDbNotFoundError):
+        await qs().first()
+
+    with pytest.raises(SurrealDbNotFoundError):
+        await qs().get("does-not-exist")
+
+    assert await qs().count() == 0
+    assert await qs().exists() is False
+    assert await qs().all() == []
+    assert await qs().filter(age__gt=1).exec() == []
+    assert await qs().sum("age") == 0
+    assert await qs().avg("age") == 0.0
+    assert await qs().min("age") is None
+    assert await qs().max("age") is None
+    assert await qs().query("SELECT * FROM ModelNeverCreated") == []
+
+
 async def test_with_primary_key() -> None:
     class ModelTest2(surreal_orm_lite.BaseSurrealModel):
         model_config = surreal_orm_lite.SurrealConfigDict(primary_key="email")
@@ -293,7 +334,82 @@ async def test_filter_contains() -> None:
     await ModelTest.objects().delete_table()
 
 
+async def test_duplicate_save_raises_surreal_error() -> None:
+    import contextlib
+
+    from src.surreal_orm_lite.exceptions import SurrealDbError
+
+    class DupModel(surreal_orm_lite.BaseSurrealModel):
+        id: str | RecordID | None = None
+        name: str
+
+    # Ensure a clean slate so the test is idempotent across reruns/servers.
+    await DupModel.objects().delete_table()
+
+    await DupModel(id="dup_x", name="first").save()
+    with pytest.raises(SurrealDbError):
+        await DupModel(id="dup_x", name="second").save()
+    with contextlib.suppress(SurrealDbError):
+        await DupModel(id="dup_x", name="first").delete()
+
+
 async def test_delete_table() -> None:
     # Suppression de la table via test_model
     result = await ModelTest.objects().delete_table()
     assert result is True
+
+
+async def test_loaded_record_keeps_native_recordid() -> None:
+    class RidUser(surreal_orm_lite.BaseSurrealModel):
+        id: str | RecordID | None = None
+        name: str
+
+    await RidUser(id="rid_keep", name="Keep").save()
+    loaded = await RidUser.objects().get("rid_keep")
+    assert isinstance(loaded.id, RecordID)
+    assert loaded.id.table_name == "RidUser"
+    assert str(loaded.id.id) == "rid_keep"
+    await loaded.delete()
+
+
+async def test_delete_table_missing_is_noop() -> None:
+    class NeverCreated(surreal_orm_lite.BaseSurrealModel):
+        id: str | RecordID | None = None
+        name: str
+
+    # Table was never created; delete_table must not raise on 3.x.
+    assert await NeverCreated.objects().delete_table() is True
+
+
+async def test_queryset_get_by_id_returns_native_recordid() -> None:
+    class GetRid(surreal_orm_lite.BaseSurrealModel):
+        id: str | RecordID | None = None
+        name: str
+
+    await GetRid(id="g1", name="G").save()
+    obj = await GetRid.objects().get("g1")
+    assert isinstance(obj.id, RecordID)
+    await obj.delete()
+
+
+async def test_update_merge_delete_with_recordid_roundtrip() -> None:
+    class RidCrud(surreal_orm_lite.BaseSurrealModel):
+        id: str | RecordID | None = None
+        name: str
+        age: int = 0
+
+    obj = RidCrud(id="rid_crud", name="A", age=1)
+    await obj.save()
+
+    loaded = await RidCrud.objects().get("rid_crud")  # id is a RecordID here
+    loaded.age = 2
+    await loaded.update()
+    await loaded.merge(name="B")
+
+    again = await RidCrud.objects().get("rid_crud")
+    assert again.age == 2
+    assert again.name == "B"
+
+    await again.delete()
+    with pytest.raises(Exception):
+        await RidCrud.objects().get("rid_crud")

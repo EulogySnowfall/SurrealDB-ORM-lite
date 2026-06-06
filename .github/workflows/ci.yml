@@ -41,7 +41,7 @@ jobs:
     strategy:
       matrix:
         python-version: ['3.11', '3.12', '3.13', '3.14']
-        surrealdb-version: ['v2.6.3']
+        surrealdb-version: ['v2.6.5', 'v3.1.3']
 
     steps:
       - name: Start SurrealDB ${{ matrix.surrealdb-version }}

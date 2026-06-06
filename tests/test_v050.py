@@ -4,6 +4,7 @@ Tests for v0.5.0 features: Q objects, parameterized filters, new lookups,
 """
 
 import os
+from collections.abc import AsyncGenerator
 
 import pytest
 from pydantic import Field
@@ -173,12 +174,16 @@ class TestBuildFilterCondition:
         assert vars_ == {}
 
     def test_containsall(self) -> None:
-        sql, vars_, counter = build_filter_condition("tags", "containsall", ["a", "b"], 0)
+        sql, vars_, counter = build_filter_condition(
+            "tags", "containsall", ["a", "b"], 0
+        )
         assert sql == "tags CONTAINSALL $_f0"
         assert vars_ == {"_f0": ["a", "b"]}
 
     def test_containsany(self) -> None:
-        sql, vars_, counter = build_filter_condition("tags", "containsany", ["a", "b"], 0)
+        sql, vars_, counter = build_filter_condition(
+            "tags", "containsany", ["a", "b"], 0
+        )
         assert sql == "tags CONTAINSANY $_f0"
         assert vars_ == {"_f0": ["a", "b"]}
 
@@ -327,8 +332,8 @@ class TestExports:
         assert surreal_orm_lite.Q is Q
 
     def test_version_bumped(self) -> None:
-        """Version is 0.6.2."""
-        assert surreal_orm_lite.__version__ == "0.6.17"
+        """Version is 0.7.0."""
+        assert surreal_orm_lite.__version__ == "0.7.0"
 
 
 # =============================================================================
@@ -356,15 +361,40 @@ def setup_surrealdb() -> None:
 
 
 @pytest.fixture
-async def user_data():  # type: ignore[misc]
+async def user_data() -> AsyncGenerator[None, None]:
     """Create test user data."""
     await User.objects().delete_table()
 
-    await User(id="u1", name="Alice", age=30, role="admin", email="alice@test.com", tags=["python", "rust"]).save()
-    await User(id="u2", name="Bob", age=25, role="mod", email="bob@test.com", tags=["python"]).save()
-    await User(id="u3", name="Charlie", age=35, role="user", email="charlie@test.com", tags=["rust", "go"]).save()
-    await User(id="u4", name="Diana", age=22, role="user", email="diana@test.com", tags=["python", "go"]).save()
-    await User(id="u5", name="Eve", age=28, role="admin", email="eve@test.com", tags=["rust"]).save()
+    await User(
+        id="u1",
+        name="Alice",
+        age=30,
+        role="admin",
+        email="alice@test.com",
+        tags=["python", "rust"],
+    ).save()
+    await User(
+        id="u2", name="Bob", age=25, role="mod", email="bob@test.com", tags=["python"]
+    ).save()
+    await User(
+        id="u3",
+        name="Charlie",
+        age=35,
+        role="user",
+        email="charlie@test.com",
+        tags=["rust", "go"],
+    ).save()
+    await User(
+        id="u4",
+        name="Diana",
+        age=22,
+        role="user",
+        email="diana@test.com",
+        tags=["python", "go"],
+    ).save()
+    await User(
+        id="u5", name="Eve", age=28, role="admin", email="eve@test.com", tags=["rust"]
+    ).save()
 
     yield
 
@@ -397,14 +427,22 @@ class TestQObjectE2E:
     async def test_q_complex(self, user_data: None) -> None:
         """Complex Q expression works correctly."""
         # admins OR (users older than 25)
-        results = await User.objects().filter(Q(role="admin") | (Q(role="user") & Q(age__gt=25))).exec()
+        results = (
+            await User.objects()
+            .filter(Q(role="admin") | (Q(role="user") & Q(age__gt=25)))
+            .exec()
+        )
         assert len(results) == 3  # Alice(admin), Eve(admin), Charlie(user,35)
         names = {r.name for r in results}
         assert names == {"Alice", "Eve", "Charlie"}
 
     async def test_q_mixed_with_kwargs(self, user_data: None) -> None:
         """Q objects mixed with kwargs."""
-        results = await User.objects().filter(Q(role="admin") | Q(role="mod"), age__gte=25).exec()
+        results = (
+            await User.objects()
+            .filter(Q(role="admin") | Q(role="mod"), age__gte=25)
+            .exec()
+        )
         assert len(results) == 3  # Alice(admin,30), Bob(mod,25), Eve(admin,28)
         names = {r.name for r in results}
         assert names == {"Alice", "Bob", "Eve"}
@@ -422,7 +460,9 @@ class TestNewLookupsE2E:
 
     async def test_containsall(self, user_data: None) -> None:
         """CONTAINSALL lookup."""
-        results = await User.objects().filter(tags__containsall=["python", "rust"]).exec()
+        results = (
+            await User.objects().filter(tags__containsall=["python", "rust"]).exec()
+        )
         assert len(results) == 1
         assert results[0].name == "Alice"
 

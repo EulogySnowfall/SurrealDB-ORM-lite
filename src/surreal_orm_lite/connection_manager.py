@@ -2,8 +2,7 @@ import contextlib
 import logging
 from typing import Any
 
-from surrealdb import AsyncSurreal
-
+from ._sdk import AsyncSurreal
 from .exceptions import SurrealDbConnectionError
 
 logger = logging.getLogger(__name__)
@@ -87,8 +86,8 @@ class SurrealDBConnectionManager:
             if url.startswith(("ws://", "wss://")):
                 await _client.connect(url)
 
-            await _client.use(cls.__namespace, cls.__database)
             await _client.signin({"username": cls.__user, "password": cls.__password})
+            await _client.use(cls.__namespace, cls.__database)
 
             cls.__client = _client
             return cls.__client
