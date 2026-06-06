@@ -62,17 +62,19 @@ CI currently uses server `v2.6.3` (not v2.6.0). The health check greps `http://l
 
 ## Prerequisites
 
+> **Port note:** Another project already runs a `surrealdb-dbg` container (v3.0.5) on host port **8000**. Do **not** touch it and do **not** test against it (wrong version). This plan's test DB runs in a dedicated container `surreal-ormlite-test` on host port **8001** (mapped to container 8000), and all test commands pass `SURREALDB_PORT=8001`. Before starting, confirm 8001 is free: `curl -s -o /dev/null -w '%{http_code}\n' http://localhost:8001/health` should print `000`.
+
 Start SurrealDB 3.1.3 locally (the default target for development):
 
 ```bash
-docker run -d --name surreal -p 8000:8000 surrealdb/surrealdb:v3.1.3 start --user root --pass root
-for i in {1..15}; do curl -s http://localhost:8000/health | grep -q OK && break; sleep 2; done
+docker run -d --name surreal-ormlite-test -p 8001:8000 surrealdb/surrealdb:v3.1.3 start --user root --pass root
+for i in {1..15}; do curl -s http://localhost:8001/health | grep -q OK && break; sleep 2; done
 ```
 
 Test command used throughout (matches CI env vars):
 
 ```bash
-SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/ -v
+SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/ -v
 ```
 
 ---
@@ -190,7 +192,7 @@ async def test_probe_shapes(db) -> None:
 Run:
 
 ```bash
-SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/test_sdk_probe.py -v -s
+SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/test_sdk_probe.py -v -s
 ```
 
 Expected: PASS, and the `print(...)` lines reveal the shapes. Record the answers here:
@@ -351,7 +353,7 @@ async def test_duplicate_save_raises_surreal_error() -> None:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/test_e2e.py::test_duplicate_save_raises_surreal_error -v`
+Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/test_e2e.py::test_duplicate_save_raises_surreal_error -v`
 Expected: FAIL — under SDK 2.0 the SDK raises `AlreadyExistsError`, which currently propagates as the SDK type (not `SurrealDbError`), or the old `isinstance(result, str)` branch never triggers.
 
 - [ ] **Step 3: Rewrite `_do_save`**
@@ -402,7 +404,7 @@ Replace the body of `_do_save` (lines 126-168) with:
 
 The duplicate-save test depends on `_record_id()` (Task 6). Proceed to Task 6, then run:
 
-`SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/test_e2e.py::test_duplicate_save_raises_surreal_error -v`
+`SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/test_e2e.py::test_duplicate_save_raises_surreal_error -v`
 Expected: PASS.
 
 - [ ] **Step 5: Commit (after Task 6 passes)**
@@ -517,7 +519,7 @@ Expected: PASS (`get_id() == "1"` for the in-memory string id).
 
 - [ ] **Step 6: Run the deferred duplicate-save test from Task 5**
 
-Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/test_e2e.py::test_duplicate_save_raises_surreal_error -v`
+Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/test_e2e.py::test_duplicate_save_raises_surreal_error -v`
 Expected: PASS.
 
 - [ ] **Step 7: Commit**
@@ -556,7 +558,7 @@ async def test_loaded_record_keeps_native_recordid() -> None:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/test_e2e.py::test_loaded_record_keeps_native_recordid -v`
+Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/test_e2e.py::test_loaded_record_keeps_native_recordid -v`
 Expected: FAIL — `set_data` currently converts `id` to a plain string, so `isinstance(loaded.id, RecordID)` is False.
 
 - [ ] **Step 3: Update `set_data` to keep the RecordID**
@@ -596,7 +598,7 @@ Also update the select call on line 107 to use the RecordID:
 
 - [ ] **Step 5: Run the test to verify it passes**
 
-Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/test_e2e.py::test_loaded_record_keeps_native_recordid -v`
+Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/test_e2e.py::test_loaded_record_keeps_native_recordid -v`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -644,7 +646,7 @@ async def test_update_merge_delete_with_recordid_roundtrip() -> None:
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/test_e2e.py::test_update_merge_delete_with_recordid_roundtrip -v`
+Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/test_e2e.py::test_update_merge_delete_with_recordid_roundtrip -v`
 Expected: FAIL — the current methods build `f"{table}:{id}"` from a `RecordID`, producing the doubled `RidCrud:RidCrud:rid_crud`.
 
 - [ ] **Step 3: Update `update` to use `_record_id()`**
@@ -755,12 +757,12 @@ Replace `_get_thing` (lines 310-317):
 
 - [ ] **Step 7: Run the roundtrip test**
 
-Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/test_e2e.py::test_update_merge_delete_with_recordid_roundtrip -v`
+Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/test_e2e.py::test_update_merge_delete_with_recordid_roundtrip -v`
 Expected: PASS.
 
 - [ ] **Step 8: Run the relations tests (depend on `_get_thing`)**
 
-Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/test_relations.py -v`
+Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/test_relations.py -v`
 Expected: PASS.
 
 - [ ] **Step 9: Commit**
@@ -796,7 +798,7 @@ async def test_queryset_get_by_id_returns_native_recordid() -> None:
 
 - [ ] **Step 2: Run test to verify it fails or passes**
 
-Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/test_e2e.py::test_queryset_get_by_id_returns_native_recordid -v`
+Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/test_e2e.py::test_queryset_get_by_id_returns_native_recordid -v`
 Expected: After Task 7 this may already PASS (id kept native). If it PASSES, still apply Step 3 for clarity/robustness, then re-run. If it FAILS, Step 3 fixes it.
 
 - [ ] **Step 3: Update `get()` to build a RecordID**
@@ -819,7 +821,7 @@ In `query_set.py`, add `from ._sdk import RecordID` to the imports, then replace
 
 - [ ] **Step 4: Run the test to verify it passes**
 
-Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/test_e2e.py::test_queryset_get_by_id_returns_native_recordid -v`
+Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/test_e2e.py::test_queryset_get_by_id_returns_native_recordid -v`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -859,7 +861,7 @@ Search `query_set.py` for any `SDK 1.0.8` / `result` wrapping comments and updat
 
 - [ ] **Step 3: Run the full suite against 3.1.3**
 
-Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/ -v`
+Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/ -v`
 Expected: all collection/aggregation/query tests PASS (the comment edits are no-ops behaviorally). Any failure here is a real shape difference — fix by adjusting the specific branch the probe (Task 2) flagged, not by broad rewrites.
 
 - [ ] **Step 4: Commit**
@@ -901,12 +903,12 @@ assert loaded.id == RecordID("User", "alice")
 
 - [ ] **Step 2: Run the full suite against 3.1.3**
 
-Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/ -v`
+Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/ -v`
 Expected: PASS.
 
 - [ ] **Step 3: Verify coverage threshold**
 
-Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/ --cov=src.surreal_orm_lite --cov-fail-under=70`
+Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/ --cov=src.surreal_orm_lite --cov-fail-under=70`
 Expected: PASS (coverage ≥ 70%).
 
 - [ ] **Step 4: Commit**
@@ -991,14 +993,14 @@ git commit -m "ci: run integration tests against SurrealDB v2.6.3 and v3.1.3"
 Run:
 
 ```bash
-docker rm -f surreal
-docker run -d --name surreal -p 8000:8000 surrealdb/surrealdb:v2.6.3 start --user root --pass root
-for i in {1..15}; do curl -s http://localhost:8000/health | grep -q OK && break; sleep 2; done
+docker rm -f surreal-ormlite-test
+docker run -d --name surreal-ormlite-test -p 8001:8000 surrealdb/surrealdb:v2.6.3 start --user root --pass root
+for i in {1..15}; do curl -s http://localhost:8001/health | grep -q OK && break; sleep 2; done
 ```
 
 - [ ] **Step 2: Run the full suite against v2.6.3**
 
-Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/ -v`
+Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/ -v`
 Expected: PASS. If a test fails only on 2.6.3, it indicates a server-version-specific behavior — fix the affected branch so both versions pass, then re-run on both.
 
 - [ ] **Step 3: Restore the 3.1.3 dev DB**
@@ -1006,9 +1008,9 @@ Expected: PASS. If a test fails only on 2.6.3, it indicates a server-version-spe
 Run:
 
 ```bash
-docker rm -f surreal
-docker run -d --name surreal -p 8000:8000 surrealdb/surrealdb:v3.1.3 start --user root --pass root
-for i in {1..15}; do curl -s http://localhost:8000/health | grep -q OK && break; sleep 2; done
+docker rm -f surreal-ormlite-test
+docker run -d --name surreal-ormlite-test -p 8001:8000 surrealdb/surrealdb:v3.1.3 start --user root --pass root
+for i in {1..15}; do curl -s http://localhost:8001/health | grep -q OK && break; sleep 2; done
 ```
 
 - [ ] **Step 4: No commit (verification only)**
@@ -1165,7 +1167,7 @@ Expected: all pass.
 
 - [ ] **Step 2: Full suite on 3.1.3 with coverage gate**
 
-Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8000 uv run pytest tests/ -v --cov=src.surreal_orm_lite --cov-fail-under=70`
+Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/ -v --cov=src.surreal_orm_lite --cov-fail-under=70`
 Expected: PASS, coverage ≥ 70%.
 
 - [ ] **Step 3: Full suite on 2.6.3 (repeat Task 14 swap), then restore 3.1.3**
@@ -1198,6 +1200,14 @@ Expected: clean (all work committed).
 
 ---
 
-## Versioning decision (open — for ROADMAP review)
+## Versioning decision (CONFIRMED)
 
-The roadmap currently assigns **v0.7.0 = Transactions ORM**. This migration is a breaking change needing its own bump. Default chosen by this plan: **migration = v0.7.0**, shifting Transactions → v0.8.0 and the rest down by one minor. Confirm or override before Task 15.
+Confirmed with the user: **migration = v0.7.0**, and the previously-planned themes shift down by one minor:
+
+- v0.7.0 → SDK 2.0 / SurrealDB 3.x migration (this work)
+- v0.8.0 → Transactions ORM (was v0.7.0)
+- v0.9.0 → SurrealFunc & Computed Fields (was v0.8.0)
+- v0.10.0 → FETCH, Field Aliases & DX (was v0.9.0)
+- v0.11.0 → Beta Phase (was v0.10.0)
+
+Task 18 applies this renumbering to `docs/ROADMAP.md`.
