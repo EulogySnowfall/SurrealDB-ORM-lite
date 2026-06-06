@@ -1,10 +1,11 @@
 import logging
+import typing
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic_core import ValidationError
 
-from ._sdk import RecordID
+from ._sdk import AlreadyExistsError, RecordID
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
 from .signals import (
@@ -61,19 +62,40 @@ class BaseSurrealModel(BaseModel):
 
     def get_id(self) -> None | str | RecordID:
         """
-        Get the ID of the model instance.
+        Get the raw ID of the model instance.
+
+        Returns the value as stored: a native ``RecordID`` for records loaded
+        from the database, or the raw value for in-memory instances.
         """
         if hasattr(self, "id"):
             id_value = self.id  # type: ignore[attr-defined]
-            return str(id_value) if id_value is not None else None
+            return id_value if id_value is not None else None
 
         if hasattr(self, "model_config"):
             primary_key = self.model_config.get("primary_key", None)
             if isinstance(primary_key, str) and hasattr(self, primary_key):
                 primary_key_value = getattr(self, primary_key)
-                return str(primary_key_value) if primary_key_value is not None else None
+                return primary_key_value if primary_key_value is not None else None
 
         return None  # pragma: no cover
+
+    def get_raw_id(self) -> str | None:
+        """Return the bare identifier portion (without the table prefix)."""
+        id_value = self.get_id()
+        if id_value is None:
+            return None
+        if isinstance(id_value, RecordID):
+            return str(id_value.id)
+        return str(id_value)
+
+    def _record_id(self) -> RecordID | None:
+        """Return a ``RecordID`` suitable for passing to SDK 2.0 methods."""
+        id_value = self.get_id()
+        if id_value is None:
+            return None
+        if isinstance(id_value, RecordID):
+            return id_value
+        return RecordID(self.get_table_name(), id_value)
 
     @classmethod
     def from_db(cls, record: dict | list) -> Self | list[Self]:
@@ -90,10 +112,19 @@ class BaseSurrealModel(BaseModel):
     def set_data(cls, data: Any) -> Any:
         """
         Pre-process data before model validation.
-        Extracts the ID from RecordID if present.
+        Extracts the ID from RecordID if present, unless the field accepts RecordID natively.
         """
         if isinstance(data, dict) and "id" in data and isinstance(data["id"], RecordID):
-            data["id"] = str(data["id"]).split(":")[1]
+            # Only convert to plain string when the id field does not accept RecordID.
+            id_field = cls.model_fields.get("id")
+            if id_field is not None:
+                annotation = id_field.annotation
+                args = typing.get_args(annotation)
+                field_accepts_record_id = RecordID in (args if args else (annotation,))
+            else:
+                field_accepts_record_id = False
+            if not field_accepts_record_id:
+                data["id"] = str(data["id"]).split(":")[1]
         return data
 
     async def refresh(self) -> None:
@@ -130,25 +161,19 @@ class BaseSurrealModel(BaseModel):
         """
         client = await SurrealDBConnectionManager.get_client()
         data = self.model_dump(exclude={"id"})
-        id = self.get_id()
+        record_id = self._record_id()
         table = self.get_table_name()
 
-        if id is not None:
-            # Escape special characters in ID
-            escaped_id = f"`{id}`" if any(c in str(id) for c in "@#$%^&*()-+=/\\! ") else id
-            thing = f"{table}:{escaped_id}"
-            result = await client.create(thing, data)
-            # SDK 1.0.8 returns error message as string instead of raising exception
-            if isinstance(result, str) and "already exists" in result:
-                raise SurrealDbError(f"There was a problem with the database: {result}")
+        if record_id is not None:
+            # SDK 2.0 raises AlreadyExistsError instead of returning a string.
+            try:
+                await client.create(record_id, data)
+            except AlreadyExistsError as e:
+                raise SurrealDbError(f"There was a problem with the database: {e}") from e
             return self, True
 
         # Auto-generate the ID
         record = await client.create(table, data)  # pragma: no cover
-
-        # SDK 1.0.8 returns error message as string
-        if isinstance(record, str):
-            raise SurrealDbError(f"Can't save data: {record}")  # pragma: no cover
 
         if isinstance(record, list):
             raise SurrealDbError("Can't save data, multiple records returned.")  # pragma: no cover
@@ -156,11 +181,9 @@ class BaseSurrealModel(BaseModel):
         if record is None:
             raise SurrealDbError("Can't save data, no record returned.")  # pragma: no cover
 
-        # Update current instance with the auto-generated ID
+        # Update current instance with the auto-generated ID (kept as native RecordID)
         if isinstance(record, dict):
             for key, value in record.items():
-                if key == "id" and isinstance(value, RecordID):
-                    value = str(value).split(":")[1]
                 if hasattr(self, key):
                     object.__setattr__(self, key, value)
             return self, True
