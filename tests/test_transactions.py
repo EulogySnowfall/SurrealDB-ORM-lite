@@ -1,6 +1,14 @@
-# tests/test_transactions.py
+import contextlib
+import os
+
 import pytest
 
+from surreal_orm_lite import (
+    BaseSurrealModel,
+    SurrealConfigDict,
+    SurrealDBConnectionManager,
+)
+from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.transaction import Transaction
 
 
@@ -27,10 +35,7 @@ def test_build_query_wraps_in_transaction() -> None:
     tx = Transaction()
     tx.add("CREATE User:a CONTENT $data;", {"data": {"n": 1}})
     query = tx.build_query()
-    assert (
-        query
-        == "BEGIN TRANSACTION;\nCREATE User:a CONTENT $t0_data;\nCOMMIT TRANSACTION;"
-    )
+    assert query == "BEGIN TRANSACTION;\nCREATE User:a CONTENT $t0_data;\nCOMMIT TRANSACTION;"
 
 
 def test_build_query_empty_raises() -> None:
@@ -59,8 +64,6 @@ def test_raise_for_status_ok_does_nothing() -> None:
 
 
 def test_raise_for_status_raises_root_cause() -> None:
-    from surreal_orm_lite.exceptions import SurrealDbError
-
     # Shape captured from query_raw() on a failed transaction (duplicate create).
     raw = {
         "result": [
@@ -84,17 +87,6 @@ def test_raise_for_status_raises_root_cause() -> None:
     }
     with pytest.raises(SurrealDbError, match="already exists"):
         Transaction.raise_for_status(raw)
-
-
-# Append to tests/test_transactions.py
-import contextlib
-import os
-
-from surreal_orm_lite import (
-    BaseSurrealModel,
-    SurrealDBConnectionManager,
-    SurrealConfigDict,
-)
 
 
 def _connect() -> None:
@@ -159,8 +151,6 @@ class TestTransactionE2E:
     @pytest.mark.asyncio
     async def test_save_in_tx_without_id_raises(self) -> None:
         _connect()
-        from surreal_orm_lite.exceptions import SurrealDbError
-
         with pytest.raises(SurrealDbError, match="explicit id"):
             async with SurrealDBConnectionManager.transaction() as tx:
                 await TxUser(name="NoId").save(tx=tx)
@@ -169,8 +159,6 @@ class TestTransactionE2E:
     @pytest.mark.asyncio
     async def test_failed_transaction_raises_and_rolls_back(self) -> None:
         _connect()
-        from surreal_orm_lite.exceptions import SurrealDbError
-
         client = await SurrealDBConnectionManager.get_client()
         await _clear(client)
         # Two creates with the same id inside one tx → second fails → whole tx rolls back.
@@ -249,8 +237,6 @@ class TestTransactionE2E:
 
 @pytest.mark.asyncio
 async def test_refresh_with_tx_raises() -> None:
-    from surreal_orm_lite.transaction import Transaction as _Tx
-
     u = TxUser(id="ivy", name="Ivy")
-    with pytest.raises(Exception, match="not supported inside a transaction"):
-        await u.refresh(tx=_Tx())
+    with pytest.raises(SurrealDbError, match="not supported inside a transaction"):
+        await u.refresh(tx=Transaction())

@@ -29,8 +29,8 @@ jobs:
 
       - name: Lint with ruff
         run: |
-          uv run ruff check src/
-          uv run ruff format --check src/
+          uv run ruff check src/ tests/
+          uv run ruff format --check src/ tests/
 
       - name: Type check with mypy
         run: uv run mypy src/
