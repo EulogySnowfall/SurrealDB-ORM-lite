@@ -37,6 +37,7 @@ Méthodes client : `connect`, `signin`, `use`, `query`, `select`, `create`, `upd
 `merge`, `delete`, `insert`, `close`.
 
 Le code actuel contient de nombreux contournements explicites du SDK 1.0.8 :
+
 - « SDK 1.0.8 returns a list even for single record select »
 - « SDK 1.0.8 returns error message as string instead of raising exception »
 - « SDK 1.0.8 returns list directly from query() »
@@ -137,6 +138,15 @@ Avant toute correction, **mesurer** le comportement réel du SDK 2.0 contre Surr
 | Rupture `id` chez les utilisateurs | Documentée au CHANGELOG ; bump mineur 0.7.0 ; README mis à jour. |
 | Classe d'exception SDK inconnue | Confirmée empiriquement (§2) ; import isolé dans un module. |
 | Régression rétrocompat serveur 2.6.0 | Matrice CI 2.6.0 + 3.1.3. |
+
+## Addendum — découvertes empiriques (2026-06-06)
+
+L'étape empirique a révélé que **SurrealDB 3.1.3 est nettement plus strict que 2.6.5**, ce qui élargit le périmètre au-delà de la simple API SDK :
+
+1. **Ordre de connexion** : il faut `signin()` **avant** `use()`. En 3.x, `use()` avant authentification ne crée plus le namespace → `NotFoundError` à la première écriture. Corrigé dans `connection_manager` (sûr sur 2.6.5 et 3.1.3).
+2. **Suppressions strictes** : en 3.x, supprimer une table/relation inexistante lève `NotFoundError` (no-op en 2.x). Politique retenue (validée) : `delete_table()`, `remove_relation()`, `remove_all_relations()` tolèrent l'absence (no-op) ; `record.delete()` reste strict (lève `SurrealDbError`).
+3. **Formes de retour 2.0** : `select(record_id)` unique retourne une **liste** (gardes défensives conservées) ; `query()` retourne la liste de lignes directement ; `id` est un `RecordID` natif.
+4. **Exceptions** : `AlreadyExistsError` / `NotFoundError` du SDK converties vers les exceptions de l'ORM.
 
 ## Critères de succès
 

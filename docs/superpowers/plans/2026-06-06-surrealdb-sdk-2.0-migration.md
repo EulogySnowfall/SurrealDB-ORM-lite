@@ -31,7 +31,26 @@ Importable symbols from `surrealdb`: `AsyncSurreal`, `Surreal`, `RecordID`, `Tab
 
 `RecordID` API: `RecordID(table_name, id)`, attributes `.table_name` and `.id`, `str(rid) == "table:id"`, `RecordID.parse("t:x")`.
 
-CI currently uses server `v2.6.5`; this migration moves the 2.x matrix entry to `v2.6.5` (latest 2.x). The health check greps `http://localhost:8000/health` for `OK`.
+CI currently uses server `v2.6.3`; this migration moves the 2.x matrix entry to `v2.6.5` (latest 2.x). The health check greps `http://localhost:8000/health` for `OK`.
+
+### SurrealDB 3.x strictness findings (Task 2 — CONFIRMED empirically)
+
+SurrealDB **3.1.3 is stricter than 2.6.5**. Verified differences:
+
+| Behavior | 2.6.5 | 3.1.3 |
+| --- | --- | --- |
+| `use(ns,db)` **before** `signin()` then write | OK (auto-creates ns) | **NotFoundError** "namespace does not exist" |
+| `signin()` **before** `use(ns,db)` then write | OK | OK |
+| `client.delete("MissingTable")` | no-op | **NotFoundError** "table does not exist" |
+| `client.query("DELETE missing_tbl;")` | no-op | **NotFoundError** |
+
+Consequences (drive the new tasks below):
+
+1. **Connection order** — `connection_manager.get_client()` must `signin()` **before** `use()`. ✅ **DONE** during empirical phase (commit "fix: sign in before use()"). Works on both server versions.
+2. **Tolerate-NotFound policy (user-approved):** cleanup/remove ops become silent no-ops when the target is missing — `QuerySet.delete_table()`, `BaseSurrealModel.remove_relation()`, `BaseSurrealModel.remove_all_relations()`. Record `delete()` stays **strict** (raises `SurrealDbError` when the record does not exist — preserves the existing contract and `test_delete_nonexistent_still_raises`).
+3. **Test cleanup** — several tests do raw `client.query("DELETE <edge>;")` for setup cleanup, which now raises on 3.x. Those must be made tolerant (Task 11).
+
+Baseline before fixes: 47 failed / 57 errors. After the connection-order fix alone: **17 failed / 51 errors / 207 passed** — the remainder is the NotFound-tolerance work (Tasks 5, 8, 8b, 11).
 
 ---
 
@@ -309,7 +328,7 @@ from ._sdk import AsyncSurreal
 Replace line 6 (`from surrealdb import RecordID`) with:
 
 ```python
-from ._sdk import AlreadyExistsError, RecordID
+from ._sdk import AlreadyExistsError, NotFoundError, RecordID
 ```
 
 - [ ] **Step 3: Run the unit tests (no DB needed)**
@@ -718,8 +737,14 @@ In `delete`, replace the id/thing logic (the lines computing `id`, the `raise` g
 
         has_signals = pre_delete.has_handlers(sender) or post_delete.has_handlers(sender) or around_delete.has_handlers(sender)
 
+        # Record delete() is STRICT: a missing record is an error on every server
+        # version. SurrealDB 2.x returns falsy; 3.x raises NotFoundError. Both map
+        # to SurrealDbError (preserves the existing "not found" contract).
         if not has_signals:
-            deleted = await client.delete(record_id)
+            try:
+                deleted = await client.delete(record_id)
+            except NotFoundError as e:
+                raise SurrealDbError(f"Can't delete Record id -> '{record_id}' not found!") from e
             if not deleted:
                 raise SurrealDbError(f"Can't delete Record id -> '{record_id}' not found!")
             logger.info(f"Record deleted -> {deleted}.")
@@ -728,7 +753,10 @@ In `delete`, replace the id/thing logic (the lines computing `id`, the `raise` g
         await pre_delete.send(sender, instance=self)
 
         async with around_delete.wrap(sender, instance=self):
-            deleted = await client.delete(record_id)
+            try:
+                deleted = await client.delete(record_id)
+            except NotFoundError as e:
+                raise SurrealDbError(f"Can't delete Record id -> '{record_id}' not found!") from e
 
             if not deleted:
                 raise SurrealDbError(f"Can't delete Record id -> '{record_id}' not found!")
@@ -737,6 +765,8 @@ In `delete`, replace the id/thing logic (the lines computing `id`, the `raise` g
 
         logger.info(f"Record deleted -> {deleted}.")
 ```
+
+> Requires `NotFoundError` in the `model_base` import from `._sdk` (add it to the Task 4 import line: `from ._sdk import AlreadyExistsError, NotFoundError, RecordID`).
 
 - [ ] **Step 6: Make `_get_thing` RecordID-safe**
 
@@ -771,6 +801,119 @@ Expected: PASS.
 ```bash
 git add src/surreal_orm_lite/model_base.py tests/test_e2e.py
 git commit -m "feat: pass native RecordID to update/merge/delete and guard _get_thing"
+```
+
+---
+
+### Task 8b: Tolerate NotFoundError on cleanup/remove operations
+
+**Goal:** Per the user-approved policy, `delete_table()`, `remove_relation()`, and `remove_all_relations()` become silent no-ops when the target table/relation does not exist (matches SurrealDB 2.x; required because 3.x raises `NotFoundError`). Record `delete()` stays strict (handled in Task 8).
+
+**Files:**
+- Modify: `src/surreal_orm_lite/query_set.py` (`delete_table` ~429-438, add `from ._sdk import NotFoundError`)
+- Modify: `src/surreal_orm_lite/model_base.py` (`remove_relation` ~374-397, `remove_all_relations` ~399-432)
+- Test: `tests/test_e2e.py`, `tests/test_relations.py`
+
+- [ ] **Step 1: Write the failing tests**
+
+Add to `tests/test_e2e.py`:
+
+```python
+async def test_delete_table_missing_is_noop() -> None:
+    class NeverCreated(BaseSurrealModel):
+        id: str | RecordID | None = None
+        name: str
+
+    # Table was never created; delete_table must not raise on 3.x.
+    assert await NeverCreated.objects().delete_table() is True
+```
+
+Add to `tests/test_relations.py` (inside `TestRelationsE2E`, which has a live connection):
+
+```python
+async def test_remove_relation_missing_is_noop(self) -> None:
+    alice = Person(id="rm_alice", name="Alice", age=30)
+    await alice.save()
+    # 'never_edge' relation table does not exist -> must be a silent no-op.
+    await alice.remove_relation("never_edge", "Person:rm_bob")
+    await alice.remove_all_relations("never_edge", direction="both")
+    await alice.delete()
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/test_e2e.py::test_delete_table_missing_is_noop "tests/test_relations.py::TestRelationsE2E::test_remove_relation_missing_is_noop" -v`
+Expected: FAIL with `surrealdb.errors.NotFoundError`.
+
+- [ ] **Step 3: Make `delete_table()` tolerant**
+
+In `query_set.py`, add `from ._sdk import NotFoundError` to imports and replace `delete_table` (lines 429-438):
+
+```python
+    async def delete_table(self) -> bool:
+        """
+        Delete the associated table from the SurrealDB database.
+
+        Returns True. A missing table is treated as already-absent (no-op),
+        so this is safe to call for idempotent cleanup on SurrealDB 3.x
+        (which raises NotFoundError) as well as 2.x (which is a no-op).
+        """
+        client = await SurrealDBConnectionManager.get_client()
+        with contextlib.suppress(NotFoundError):
+            await client.delete(self._model_table)
+        return True
+```
+
+Add `import contextlib` at the top of `query_set.py` if not already present.
+
+- [ ] **Step 4: Make `remove_relation()` and `remove_all_relations()` tolerant**
+
+In `model_base.py`, the two methods run `await client.query("DELETE ...")`. Wrap those calls so a missing edge table is a no-op:
+
+In `remove_relation` replace:
+
+```python
+        query = f"DELETE {edge} WHERE in = {source} AND out = {target_thing};"
+        client = await SurrealDBConnectionManager.get_client()
+        await client.query(query, {})
+```
+
+with:
+
+```python
+        query = f"DELETE {edge} WHERE in = {source} AND out = {target_thing};"
+        client = await SurrealDBConnectionManager.get_client()
+        with contextlib.suppress(NotFoundError):
+            await client.query(query, {})
+```
+
+In `remove_all_relations` replace the final two lines:
+
+```python
+        client = await SurrealDBConnectionManager.get_client()
+        await client.query(query, {})
+```
+
+with:
+
+```python
+        client = await SurrealDBConnectionManager.get_client()
+        with contextlib.suppress(NotFoundError):
+            await client.query(query, {})
+```
+
+`model_base.py` already imports `contextlib`? It does not — add `import contextlib` at the top.
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/test_e2e.py::test_delete_table_missing_is_noop "tests/test_relations.py::TestRelationsE2E::test_remove_relation_missing_is_noop" -v`
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/surreal_orm_lite/query_set.py src/surreal_orm_lite/model_base.py tests/test_e2e.py tests/test_relations.py
+git commit -m "feat: tolerate NotFoundError on delete_table/remove_relation (SurrealDB 3.x)"
 ```
 
 ---
@@ -876,10 +1019,32 @@ git commit -m "docs: update SDK comments to 2.0 semantics"
 
 ## Phase 4 — Update existing tests for RecordID
 
-### Task 11: Make DB-loaded id assertions RecordID-aware
+### Task 11: Make DB-loaded id assertions RecordID-aware and cleanup robust
 
 **Files:**
 - Modify: `tests/test_e2e.py`, `tests/test_signals.py`, `tests/test_relations.py`, `tests/test_aggregations.py`, `tests/test_v050.py`
+
+**Two kinds of update in this task:**
+
+(a) **id assertions** — records loaded from the DB now expose a native `RecordID` (see Steps 1-2).
+
+(b) **robust cleanup** — several tests do raw `await client.query("DELETE <edge>;", {})` or similar for fixture cleanup. On SurrealDB 3.x this raises `NotFoundError` when the table does not exist yet. Find them and make them tolerant:
+
+```bash
+grep -rn 'query("DELETE\|query(f"DELETE\|DELETE follows' tests/
+```
+
+Wrap each raw cleanup delete so a missing table is ignored, e.g.:
+
+```python
+import contextlib
+from surrealdb import NotFoundError
+...
+    with contextlib.suppress(NotFoundError):
+        await client.query("DELETE follows;", {})
+```
+
+(Fixtures that clean up via `Model.objects().delete_table()` are already tolerant after Task 8b and need no change.)
 
 - [ ] **Step 1: Find string-id assertions on loaded records**
 
