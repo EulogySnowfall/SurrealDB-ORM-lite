@@ -153,6 +153,7 @@ results = await User.objects().query(
 | `-field` ordering      | ✅     |
 | Relations & Graph      | ✅     |
 | FETCH clause           | ✅     |
+| Transactions (`tx=`)   | ✅     |
 
 ### Supported Filter Lookups
 
@@ -382,14 +383,15 @@ Contributions are welcome! Please:
 
 ## Roadmap
 
-| Version           | Theme                                               | Status      |
-| ----------------- | --------------------------------------------------- | ----------- |
-| v0.2.x – v0.7.0   | Core ORM → SDK 2.0 / SurrealDB 3.x migration        | ✅ Released |
-| v0.8.0 – v0.22.0  | Tier 1 — Core (transactions, auth, live, relations) | 📋 Planned  |
-| v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)     | 📋 Planned  |
-| v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)    | 📋 Planned  |
-| v0.40.0           | Beta Phase (API freeze, hardening)                  | 📋 Planned  |
-| v2.0.0            | Production / GA (aligned with SDK 2.0)              | 📋 Planned  |
+| Version           | Theme                                            | Status      |
+| ----------------- | ------------------------------------------------ | ----------- |
+| v0.2.x – v0.7.0   | Core ORM → SDK 2.0 / SurrealDB 3.x migration     | ✅ Released |
+| v0.8.0            | Transactions ORM (`tx=`)                         | ✅ Released |
+| v0.9.0 – v0.22.0  | Tier 1 — Core (auth, live, relations, …)         | 📋 Planned  |
+| v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)  | 📋 Planned  |
+| v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI) | 📋 Planned  |
+| v0.40.0           | Beta Phase (API freeze, hardening)               | 📋 Planned  |
+| v2.0.0            | Production / GA (aligned with SDK 2.0)           | 📋 Planned  |
 
 > Every roadmap feature is implementable with the **official SDK 2.0** (native methods or
 > `query()` SurrealQL) — no custom SDK. GA is numbered **v2.0.0** to mirror SDK 2.0; the `1.x`
@@ -418,7 +420,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Parameterized Filters         | ✅                      | ✅               |
 | Relations & Graph             | ✅                      | ✅               |
 | FETCH clause                  | ✅                      | ✅               |
-| Transactions (tx=)            | v0.8 – v0.9             | ✅               |
+| Transactions (tx=)            | ✅ v0.8 (core), v0.9 QS | ✅               |
 | upsert / update_or_create     | v0.10.0                 | ✅               |
 | Atomic field/array operations | v0.11.0                 | ✅               |
 | Retry on conflict             | v0.12.0                 | ✅               |

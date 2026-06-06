@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Transactions ORM (core)**: `async with SurrealDBConnectionManager.transaction() as tx:`
   context manager plus a `tx=` parameter on `save()`, `update()`, `merge()`, and `delete()`.
-  Operations are buffered and committed atomically as a single `BEGIN TRANSACTION; …;
-COMMIT TRANSACTION;` query; an exception in the block rolls everything back.
+  Operations are buffered and committed atomically as a single
+  `BEGIN TRANSACTION; … COMMIT TRANSACTION;` query; an exception in the block rolls
+  everything back.
 - Exported `Transaction`.
 
 ### Notes
