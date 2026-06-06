@@ -611,7 +611,7 @@ class BaseSurrealModel(BaseModel):
             variables or {},
         )
 
-        # SDK 1.0.8 returns list directly from query()
+        # SDK 2.0 returns the rows list directly from query()
         if isinstance(results, list):
             try:
                 return cls.from_db(results)  # type: ignore
