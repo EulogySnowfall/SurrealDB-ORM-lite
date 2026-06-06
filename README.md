@@ -26,7 +26,7 @@ This ORM is designed to:
 | Python       | 3.11+                              |
 | SurrealDB    | 2.6.x or 3.1.x                     |
 | Official SDK | surrealdb[pydantic]>=2.0.0,<3.0.0  |
-| Pydantic     | >=2.12.5                           |
+| Pydantic     | >=2.13.4                           |
 
 > **Note**: As of v0.7.0, Surreal ORM Lite targets the SurrealDB Python SDK 2.x (`surrealdb[pydantic]>=2.0.0,<3.0.0`), which supports the SurrealDB 3.x protocol. It is tested against SurrealDB **v2.6.5** and **v3.1.3**.
 
