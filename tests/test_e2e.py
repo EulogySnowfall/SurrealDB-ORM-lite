@@ -28,6 +28,19 @@ class ModelTestEmpty(surreal_orm_lite.BaseSurrealModel):
     age: int = Field(..., ge=0, le=125)
 
 
+class ModelNeverCreated(surreal_orm_lite.BaseSurrealModel):
+    """Used only for read queries so its table is never created in the DB.
+
+    SurrealDB 3.x raises NotFoundError ("table does not exist") for reads on a
+    table that was never written to, whereas the ORM contract treats a missing
+    table as empty. This model guards that contract.
+    """
+
+    id: str | RecordID | None = Field(default=None)
+    name: str = Field(..., max_length=100)
+    age: int = Field(..., ge=0, le=125)
+
+
 @pytest.fixture(scope="module", autouse=True)
 def setup_surrealdb() -> None:
     # Initialiser SurrealDB
@@ -223,6 +236,34 @@ async def test_error_on_get_multi() -> None:
         await ModelTestEmpty.objects().get()
 
     assert str(exc2.value) == "No result found."
+
+
+async def test_read_on_never_created_table_is_empty() -> None:
+    """Reads on a table that was never created honor the empty-result contract.
+
+    Regression for SurrealDB 3.x raising NotFoundError instead of returning an
+    empty result set (the table is auto-created on first write only).
+    """
+    qs = ModelNeverCreated.objects
+
+    with pytest.raises(SurrealDbNotFoundError):
+        await qs().get()
+
+    with pytest.raises(SurrealDbNotFoundError):
+        await qs().first()
+
+    with pytest.raises(SurrealDbNotFoundError):
+        await qs().get("does-not-exist")
+
+    assert await qs().count() == 0
+    assert await qs().exists() is False
+    assert await qs().all() == []
+    assert await qs().filter(age__gt=1).exec() == []
+    assert await qs().sum("age") == 0
+    assert await qs().avg("age") == 0.0
+    assert await qs().min("age") is None
+    assert await qs().max("age") is None
+    assert await qs().query("SELECT * FROM ModelNeverCreated") == []
 
 
 async def test_with_primary_key() -> None:

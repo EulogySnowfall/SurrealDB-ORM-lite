@@ -349,7 +349,14 @@ class QuerySet:
         """
         client = await SurrealDBConnectionManager.get_client()
         vars_ = variables if variables is not None else self._variables
-        return await client.query(remove_quotes_for_variables(query), vars_)  # type: ignore
+        try:
+            return await client.query(remove_quotes_for_variables(query), vars_)  # type: ignore
+        except NotFoundError:
+            # SurrealDB 3.x raises NotFoundError for a SELECT on a table that was
+            # never created (tables are materialized on first write). The ORM
+            # contract treats a missing table as empty, so callers (get/first/
+            # count/exists/aggregations) get the same result as an empty table.
+            return []
 
     async def exec(self) -> Any:
         """
@@ -411,7 +418,12 @@ class QuerySet:
                 if raw.startswith("`") and raw.endswith("`"):
                     raw = raw[1:-1]
                 record_id = RecordID(self._model_table, raw)
-            data = await client.select(record_id)
+            try:
+                data = await client.select(record_id)
+            except NotFoundError:
+                # SurrealDB 3.x: selecting from a never-created table raises
+                # instead of returning nothing. Treat as "no result".
+                raise SurrealDbNotFoundError("No result found.") from None
             if isinstance(data, list):
                 if len(data) == 0:
                     raise SurrealDbNotFoundError("No result found.")
@@ -436,7 +448,12 @@ class QuerySet:
             A list of model instances representing all records.
         """
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.select(self._model_table)
+        try:
+            results = await client.select(self._model_table)
+        except NotFoundError:
+            # SurrealDB 3.x raises for a never-created table; the ORM contract
+            # treats a missing table as empty.
+            return self.model.from_db([])
         return self.model.from_db(results)
 
     async def delete_table(self) -> bool:
@@ -730,7 +747,12 @@ class QuerySet:
         if f"FROM {self._model_table}" not in query:
             raise SurrealDbError(f"The query must include 'FROM {self._model_table}' to reference the correct table.")
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.query(remove_quotes_for_variables(query), variables or {})
+        try:
+            results = await client.query(remove_quotes_for_variables(query), variables or {})
+        except NotFoundError:
+            # SurrealDB 3.x raises for a never-created table; the ORM contract
+            # treats a missing table as empty.
+            return self.model.from_db([])
         if isinstance(results, list):
             return self.model.from_db(results)
         data = cast(dict, results[0])
