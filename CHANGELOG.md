@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Aggregation edge-case normalisation**: `avg()`/`min()`/`max()` over an empty set still return `0.0`/`None`/`None`; SurrealDB 3.x `NaN`/`+inf`/`-inf` responses are normalised to these values.
 - **Connection sign-in ordering**: The connection manager now signs in before selecting the namespace/database to comply with SurrealDB 3.x strictness (3.x no longer auto-creates the namespace on a pre-auth `use()`).
 
+### Fixed
+
+- **Reads on never-created tables**: SurrealDB 3.x raises `NotFoundError` ("table does not exist") for a `SELECT`/`select` on a table that was never written to, instead of returning an empty result set as SDK 1.x did. All read paths now honour the ORM's "missing table = empty" contract: `get()`/`first()` raise `SurrealDbNotFoundError` ("No result found."), `count()` returns `0`, `exists()` returns `False`, and `all()`/`exec()`/`query()` return `[]`.
+
 ## [0.6.0] - 2026-03-10
 
 ### Added
