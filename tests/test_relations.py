@@ -386,3 +386,33 @@ class TestRelationsE2E:
         followers = await alice.get_related("follows", direction="in", model_class=Person)
         assert len(following) == 0
         assert len(followers) == 0
+
+    async def test_relations_with_numeric_string_ids(self) -> None:
+        """Relations must work on DB-loaded records whose id is numeric-looking.
+
+        Regression: a loaded record's id is a native RecordID whose string form is
+        SurrealQL-escaped (e.g. ``Person:⟨100⟩``). _get_thing()/get_related() must
+        not reject that via validate_thing.
+        """
+        client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
+        await Person.objects().delete_table()
+        with contextlib.suppress(NotFoundError):
+            await client.query("DELETE follows;", {})
+
+        await Person(id="100", name="Hundred", age=10).save()
+        await Person(id="200", name="TwoHundred", age=20).save()
+
+        # Reload so ids are native RecordIDs with the escaped string form.
+        p100 = await Person.objects().get("100")
+        p200 = await Person.objects().get("200")
+        assert isinstance(p100.id, RecordID)
+
+        # relate / get_related / remove_relation must not raise on numeric ids.
+        await p100.relate("follows", p200)
+        following = await p100.get_related("follows", direction="out", model_class=Person)
+        assert len(following) == 1
+        assert following[0].get_raw_id() == "200"
+
+        await p100.remove_relation("follows", p200)
+        following_after = await p100.get_related("follows", direction="out", model_class=Person)
+        assert len(following_after) == 0

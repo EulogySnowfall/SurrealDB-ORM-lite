@@ -125,7 +125,10 @@ class BaseSurrealModel(BaseModel):
             else:
                 field_accepts_record_id = False
             if not field_accepts_record_id:
-                data["id"] = str(data["id"]).split(":")[1]
+                # Use the RecordID's raw identifier directly. Avoid str(rid).split(":")
+                # which yields the SurrealQL-escaped form (e.g. "⟨1⟩") for numeric-looking
+                # or special string ids.
+                data["id"] = str(data["id"].id)
         return data
 
     async def refresh(self) -> None:
@@ -346,7 +349,12 @@ class BaseSurrealModel(BaseModel):
         id_val = self.get_id()
         if id_val is None:
             raise SurrealDbError("Cannot use relations on an unsaved model (no id).")
-        thing = str(id_val) if isinstance(id_val, RecordID) else f"{self.get_table_name()}:{id_val}"
+        if isinstance(id_val, RecordID):
+            # A RecordID from the DB is already typed/trusted; its string form may
+            # contain SurrealQL escaping (e.g. "Table:⟨1⟩") which validate_thing
+            # intentionally rejects. Skip validation for trusted RecordID values.
+            return str(id_val)
+        thing = f"{self.get_table_name()}:{id_val}"
         validate_thing(thing)
         return thing
 
@@ -514,15 +522,12 @@ class BaseSurrealModel(BaseModel):
         if model_class is not None:
             # If results are RecordIDs, we need to SELECT them
             if records and isinstance(records[0], RecordID):
-                # RecordIDs come from the database, validate each one before interpolation
-                ids = []
-                for r in records:
-                    rid = str(r)
-                    validate_thing(rid)
-                    ids.append(rid)
-                placeholders = ", ".join(ids)
-                fetch_query = f"SELECT * FROM {placeholders};"
-                records = await client.query(fetch_query, {})
+                # RecordIDs come from the database (typed/trusted) — bind them as a
+                # query variable instead of string-interpolating, which both avoids
+                # injection risk and the SurrealQL-escaped string form (e.g. "Table:⟨1⟩")
+                # that validate_thing would reject.
+                fetch_query = "SELECT * FROM $ids;"
+                records = await client.query(fetch_query, {"ids": list(records)})
                 if not isinstance(records, list):
                     return []
 
