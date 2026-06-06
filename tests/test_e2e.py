@@ -310,3 +310,39 @@ async def test_delete_table() -> None:
     # Suppression de la table via test_model
     result = await ModelTest.objects().delete_table()
     assert result is True
+
+
+async def test_loaded_record_keeps_native_recordid() -> None:
+    class RidUser(surreal_orm_lite.BaseSurrealModel):
+        id: str | RecordID | None = None
+        name: str
+
+    await RidUser(id="rid_keep", name="Keep").save()
+    loaded = await RidUser.objects().get("rid_keep")
+    assert isinstance(loaded.id, RecordID)
+    assert loaded.id.table_name == "RidUser"
+    assert str(loaded.id.id) == "rid_keep"
+    await loaded.delete()
+
+
+async def test_update_merge_delete_with_recordid_roundtrip() -> None:
+    class RidCrud(surreal_orm_lite.BaseSurrealModel):
+        id: str | RecordID | None = None
+        name: str
+        age: int = 0
+
+    obj = RidCrud(id="rid_crud", name="A", age=1)
+    await obj.save()
+
+    loaded = await RidCrud.objects().get("rid_crud")  # id is a RecordID here
+    loaded.age = 2
+    await loaded.update()
+    await loaded.merge(name="B")
+
+    again = await RidCrud.objects().get("rid_crud")
+    assert again.age == 2
+    assert again.name == "B"
+
+    await again.delete()
+    with pytest.raises(Exception):
+        await RidCrud.objects().get("rid_crud")

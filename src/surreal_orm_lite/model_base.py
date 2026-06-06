@@ -5,7 +5,7 @@ from typing import Any, Self
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic_core import ValidationError
 
-from ._sdk import AlreadyExistsError, RecordID
+from ._sdk import AlreadyExistsError, NotFoundError, RecordID
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
 from .signals import (
@@ -135,22 +135,20 @@ class BaseSurrealModel(BaseModel):
             raise SurrealDbError("Can't refresh data, not recorded yet.")  # pragma: no cover
 
         client = await SurrealDBConnectionManager.get_client()
-        record = await client.select(f"{self.get_table_name()}:{self.get_id()}")
+        record = await client.select(self._record_id())
 
         if record is None:
             raise SurrealDbError("Can't refresh data, no record found.")  # pragma: no cover
 
-        # SDK 1.0.8 returns a list even for single record select
+        # SDK 2.0 returns a list even for single record select
         if isinstance(record, list):
             if len(record) == 0:
                 raise SurrealDbError("Can't refresh data, no record found.")  # pragma: no cover
             record = record[0]
 
-        # Update current instance with refreshed data
+        # Update current instance with refreshed data (keep native RecordID for id)
         if isinstance(record, dict):
             for key, value in record.items():
-                if key == "id" and isinstance(value, RecordID):
-                    value = str(value).split(":")[1]
                 if hasattr(self, key):
                     object.__setattr__(self, key, value)
 
@@ -222,21 +220,20 @@ class BaseSurrealModel(BaseModel):
         sender = self.__class__
 
         data = self.model_dump(exclude={"id"})
-        id = self.get_id()
-        if id is not None:
-            thing = f"{self.__class__.__name__}:{id}"
+        record_id = self._record_id()
+        if record_id is not None:
             update_fields = list(data.keys())
             has_signals = (
                 pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
             )
 
             if not has_signals:
-                return await client.update(thing, data)
+                return await client.update(record_id, data)
 
             await pre_update.send(sender, instance=self, update_fields=update_fields)
 
             async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-                result = await client.update(thing, data)
+                result = await client.update(record_id, data)
 
             await post_update.send(sender, instance=self, update_fields=update_fields)
 
@@ -254,23 +251,22 @@ class BaseSurrealModel(BaseModel):
         sender = self.__class__
         data_set = dict(data.items())
 
-        id = self.get_id()
-        if id is not None:
-            thing = f"{self.get_table_name()}:{id}"
+        record_id = self._record_id()
+        if record_id is not None:
             update_fields = list(data_set.keys())
             has_signals = (
                 pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
             )
 
             if not has_signals:
-                await client.merge(thing, data_set)
+                await client.merge(record_id, data_set)
                 await self.refresh()
                 return
 
             await pre_update.send(sender, instance=self, update_fields=update_fields)
 
             async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-                await client.merge(thing, data_set)
+                await client.merge(record_id, data_set)
                 await self.refresh()
 
             await post_update.send(sender, instance=self, update_fields=update_fields)
@@ -289,27 +285,35 @@ class BaseSurrealModel(BaseModel):
         client = await SurrealDBConnectionManager.get_client()
         sender = self.__class__
 
-        id = self.get_id()
-        if id is None:
+        record_id = self._record_id()
+        if record_id is None:
             raise SurrealDbError("Can't delete data, no id found.")
 
-        thing = f"{self.get_table_name()}:{id}"
         has_signals = pre_delete.has_handlers(sender) or post_delete.has_handlers(sender) or around_delete.has_handlers(sender)
 
+        # Record delete() is STRICT: a missing record is an error on every server
+        # version. SurrealDB 2.x returns falsy; 3.x raises NotFoundError. Both map
+        # to SurrealDbError (preserves the existing "not found" contract).
         if not has_signals:
-            deleted = await client.delete(thing)
+            try:
+                deleted = await client.delete(record_id)
+            except NotFoundError as e:
+                raise SurrealDbError(f"Can't delete Record id -> '{record_id}' not found!") from e
             if not deleted:
-                raise SurrealDbError(f"Can't delete Record id -> '{id}' not found!")
+                raise SurrealDbError(f"Can't delete Record id -> '{record_id}' not found!")
             logger.info(f"Record deleted -> {deleted}.")
             return
 
         await pre_delete.send(sender, instance=self)
 
         async with around_delete.wrap(sender, instance=self):
-            deleted = await client.delete(thing)
+            try:
+                deleted = await client.delete(record_id)
+            except NotFoundError as e:
+                raise SurrealDbError(f"Can't delete Record id -> '{record_id}' not found!") from e
 
             if not deleted:
-                raise SurrealDbError(f"Can't delete Record id -> '{id}' not found!")
+                raise SurrealDbError(f"Can't delete Record id -> '{record_id}' not found!")
 
         await post_delete.send(sender, instance=self)
 
@@ -335,7 +339,7 @@ class BaseSurrealModel(BaseModel):
         id_val = self.get_id()
         if id_val is None:
             raise SurrealDbError("Cannot use relations on an unsaved model (no id).")
-        thing = f"{self.get_table_name()}:{id_val}"
+        thing = str(id_val) if isinstance(id_val, RecordID) else f"{self.get_table_name()}:{id_val}"
         validate_thing(thing)
         return thing
 
