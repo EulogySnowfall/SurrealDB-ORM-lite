@@ -163,3 +163,18 @@ class TestTransactionE2E:
         rows = await client.query("SELECT * FROM TxUser WHERE id = TxUser:dup;", {})
         assert not rows  # nothing persisted
         await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_update_in_tx_commits(self) -> None:
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        await TxUser(id="dave", name="Dave").save()
+
+        u = TxUser(id="dave", name="David")
+        async with SurrealDBConnectionManager.transaction() as tx:
+            await u.update(tx=tx)
+
+        rows = await client.query("SELECT name FROM TxUser:dave;", {})
+        assert rows[0]["name"] == "David"
+        await SurrealDBConnectionManager.close_connection()

@@ -233,35 +233,43 @@ class BaseSurrealModel(BaseModel):
 
         return result
 
-    async def update(self) -> Any:
+    async def update(self, tx: Transaction | None = None) -> Any:
         """
         Update the model instance to the database.
 
+        When ``tx`` is provided, the UPDATE statement is buffered onto the
+        transaction instead of being executed immediately.
+
         Emits pre_update, post_update, and around_update signals.
         """
-        client = await SurrealDBConnectionManager.get_client()
         sender = self.__class__
-
         data = self.model_dump(exclude={"id"})
         record_id = self._record_id()
-        if record_id is not None:
+        if record_id is None:
+            raise SurrealDbError("Can't update data, no id found.")
+
+        if tx is not None:
             update_fields = list(data.keys())
-            has_signals = (
-                pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
-            )
-
-            if not has_signals:
-                return await client.update(record_id, data)
-
             await pre_update.send(sender, instance=self, update_fields=update_fields)
-
-            async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-                result = await client.update(record_id, data)
-
+            tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
             await post_update.send(sender, instance=self, update_fields=update_fields)
+            return None
 
-            return result
-        raise SurrealDbError("Can't update data, no id found.")
+        client = await SurrealDBConnectionManager.get_client()
+        update_fields = list(data.keys())
+        has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
+
+        if not has_signals:
+            return await client.update(record_id, data)
+
+        await pre_update.send(sender, instance=self, update_fields=update_fields)
+
+        async with around_update.wrap(sender, instance=self, update_fields=update_fields):
+            result = await client.update(record_id, data)
+
+        await post_update.send(sender, instance=self, update_fields=update_fields)
+
+        return result
 
     async def merge(self, **data: Any) -> Any:
         """
