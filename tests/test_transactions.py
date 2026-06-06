@@ -70,3 +70,45 @@ def test_raise_for_status_raises_root_cause() -> None:
     }
     with pytest.raises(SurrealDbError, match="already exists"):
         Transaction.raise_for_status(raw)
+
+
+# Append to tests/test_transactions.py
+import contextlib
+import os
+
+from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager, SurrealConfigDict
+
+
+def _connect() -> None:
+    SurrealDBConnectionManager.set_connection(
+        url=f"ws://{os.environ.get('SURREALDB_HOST', 'localhost')}:{os.environ.get('SURREALDB_PORT', '8000')}/rpc",
+        user="root",
+        password="root",
+        namespace="ns",
+        database="db",
+    )
+
+
+async def _clear(client) -> None:
+    """Delete all TxUser rows, tolerating a never-created table.
+
+    On SurrealDB 3.x, DELETE on a table that does not exist yet raises NotFoundError;
+    suppress it so test setup is idempotent across server versions.
+    """
+    with contextlib.suppress(Exception):
+        await client.query("DELETE TxUser;", {})
+
+
+class TxUser(BaseSurrealModel):
+    model_config = SurrealConfigDict(primary_key="id")
+    id: str | None = None
+    name: str
+
+
+class TestTransactionE2E:
+    @pytest.mark.asyncio
+    async def test_empty_transaction_is_noop(self) -> None:
+        _connect()
+        async with SurrealDBConnectionManager.transaction():
+            pass  # nothing buffered → no query sent, no error
+        await SurrealDBConnectionManager.close_connection()
