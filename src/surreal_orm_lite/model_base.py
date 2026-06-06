@@ -6,7 +6,7 @@ from typing import Any, Self
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic_core import ValidationError
 
-from ._sdk import AlreadyExistsError, NotFoundError, RecordID
+from ._sdk import NotFoundError, RecordID, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
 from .signals import (
@@ -164,11 +164,17 @@ class BaseSurrealModel(BaseModel):
         table = self.get_table_name()
 
         if record_id is not None:
-            # SDK 2.0 raises AlreadyExistsError instead of returning a string.
+            # SDK 2.0 raises a structured exception instead of returning a string.
+            # The "already exists" error maps to AlreadyExistsError on SurrealDB 3.x
+            # but to InternalError on 2.x (no structured kind) — both subclass
+            # ServerError, so catch the base and match on the message to stay
+            # faithful to the original "already exists" contract across versions.
             try:
                 await client.create(record_id, data)
-            except AlreadyExistsError as e:
-                raise SurrealDbError(f"There was a problem with the database: {e}") from e
+            except ServerError as e:
+                if "already exists" in str(e).lower():
+                    raise SurrealDbError(f"There was a problem with the database: {e}") from e
+                raise
             return self, True
 
         # Auto-generate the ID

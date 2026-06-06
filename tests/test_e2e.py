@@ -294,16 +294,22 @@ async def test_filter_contains() -> None:
 
 
 async def test_duplicate_save_raises_surreal_error() -> None:
+    import contextlib
+
     from src.surreal_orm_lite.exceptions import SurrealDbError
 
     class DupModel(surreal_orm_lite.BaseSurrealModel):
         id: str | RecordID | None = None
         name: str
 
+    # Ensure a clean slate so the test is idempotent across reruns/servers.
+    await DupModel.objects().delete_table()
+
     await DupModel(id="dup_x", name="first").save()
     with pytest.raises(SurrealDbError):
         await DupModel(id="dup_x", name="second").save()
-    await DupModel(id="dup_x", name="first").delete()
+    with contextlib.suppress(SurrealDbError):
+        await DupModel(id="dup_x", name="first").delete()
 
 
 async def test_delete_table() -> None:
