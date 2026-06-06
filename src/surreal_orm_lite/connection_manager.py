@@ -2,8 +2,7 @@ import contextlib
 import logging
 from typing import Any
 
-from surrealdb import AsyncSurreal
-
+from ._sdk import AsyncSurreal
 from .exceptions import SurrealDbConnectionError
 
 logger = logging.getLogger(__name__)

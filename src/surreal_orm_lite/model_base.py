@@ -3,8 +3,8 @@ from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic_core import ValidationError
-from surrealdb import RecordID
 
+from ._sdk import RecordID
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
 from .signals import (
