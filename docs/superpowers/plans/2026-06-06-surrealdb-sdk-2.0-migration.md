@@ -6,7 +6,7 @@
 
 **Architecture:** Adapt the thin SDK-facing layer (`connection_manager.py`, the CRUD methods of `model_base.py`, and the result-handling code of `query_set.py`) to SDK 2.0 semantics: errors are raised as `surrealdb` exceptions (no more error strings), `id` is kept as a native `RecordID` after loading from the DB, and SDK calls receive `RecordID` objects instead of hand-built `table:id` strings. Defensive result handling is preserved and only simplified where the empirical probe (Task 1) proves the 2.0 shape deterministic.
 
-**Tech Stack:** Python 3.11+, `surrealdb[pydantic]>=2.0.0,<3.0.0`, Pydantic 2.x, pytest + pytest-asyncio, uv, Docker (SurrealDB v2.6.3 and v3.1.3), ruff, mypy.
+**Tech Stack:** Python 3.11+, `surrealdb[pydantic]>=2.0.0,<3.0.0`, Pydantic 2.x, pytest + pytest-asyncio, uv, Docker (SurrealDB v2.6.5 and v3.1.3), ruff, mypy.
 
 ---
 
@@ -31,7 +31,7 @@ Importable symbols from `surrealdb`: `AsyncSurreal`, `Surreal`, `RecordID`, `Tab
 
 `RecordID` API: `RecordID(table_name, id)`, attributes `.table_name` and `.id`, `str(rid) == "table:id"`, `RecordID.parse("t:x")`.
 
-CI currently uses server `v2.6.3` (not v2.6.0). The health check greps `http://localhost:8000/health` for `OK`.
+CI currently uses server `v2.6.5`; this migration moves the 2.x matrix entry to `v2.6.5` (latest 2.x). The health check greps `http://localhost:8000/health` for `OK`.
 
 ---
 
@@ -950,7 +950,7 @@ git commit -m "style: ruff format after SDK 2.0 migration"
 
 ## Phase 5 — CI, versioning, docs
 
-### Task 13: Add the server-version matrix (v2.6.3 + v3.1.3) to CI
+### Task 13: Add the server-version matrix (v2.6.5 + v3.1.3) to CI
 
 **Files:**
 - Modify: `.github/workflows/ci.yml:44`
@@ -960,7 +960,7 @@ git commit -m "style: ruff format after SDK 2.0 migration"
 Replace line 44:
 
 ```yaml
-        surrealdb-version: ['v2.6.3', 'v3.1.3']
+        surrealdb-version: ['v2.6.5', 'v3.1.3']
 ```
 
 (The job already templatizes the Docker image with `${{ matrix.surrealdb-version }}` on line 52, and the Codecov upload is already gated on `python-version == '3.14'` only — no change needed there. The matrix now runs integration tests against both 2.6.x and 3.1.x for every Python version.)
@@ -979,26 +979,26 @@ Expected: prints `ok`.
 
 ```bash
 git add .github/workflows/ci.yml
-git commit -m "ci: run integration tests against SurrealDB v2.6.3 and v3.1.3"
+git commit -m "ci: run integration tests against SurrealDB v2.6.5 and v3.1.3"
 ```
 
 ---
 
-### Task 14: Run the full suite against SurrealDB v2.6.3 (back-compat gate)
+### Task 14: Run the full suite against SurrealDB v2.6.5 (back-compat gate)
 
 **Files:** none (verification task)
 
-- [ ] **Step 1: Swap the local DB to v2.6.3**
+- [ ] **Step 1: Swap the local DB to v2.6.5**
 
 Run:
 
 ```bash
 docker rm -f surreal-ormlite-test
-docker run -d --name surreal-ormlite-test -p 8001:8000 surrealdb/surrealdb:v2.6.3 start --user root --pass root
+docker run -d --name surreal-ormlite-test -p 8001:8000 surrealdb/surrealdb:v2.6.5 start --user root --pass root
 for i in {1..15}; do curl -s http://localhost:8001/health | grep -q OK && break; sleep 2; done
 ```
 
-- [ ] **Step 2: Run the full suite against v2.6.3**
+- [ ] **Step 2: Run the full suite against v2.6.5**
 
 Run: `SURREALDB_HOST=localhost SURREALDB_PORT=8001 uv run pytest tests/ -v`
 Expected: PASS. If a test fails only on 2.6.3, it indicates a server-version-specific behavior — fix the affected branch so both versions pass, then re-run on both.
@@ -1078,7 +1078,7 @@ Insert at the top of the entries, matching the existing format:
   exceptions such as `AlreadyExistsError` instead of returning error strings).
 
 ### Added
-- CI integration-test matrix against SurrealDB **v2.6.3** and **v3.1.3**.
+- CI integration-test matrix against SurrealDB **v2.6.5** and **v3.1.3**.
 - `BaseSurrealModel.get_raw_id()` helper.
 ```
 
