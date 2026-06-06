@@ -12,6 +12,7 @@ fails, so commits must use ``query_raw()`` and inspect every statement's ``statu
 ``raise_for_status()``.
 """
 
+import re
 from typing import Any
 
 from .exceptions import SurrealDbError
@@ -33,13 +34,14 @@ class Transaction:
         """Append a statement, renaming its ``$vars`` with a per-statement prefix.
 
         Each variable ``$name`` becomes ``$t<N>_name`` to avoid collisions across
-        buffered operations.
+        buffered operations. The rename matches ``$name`` only at a word boundary, so a
+        name that is a prefix of another (e.g. ``$id`` vs ``$identity``) is not corrupted.
         """
         prefix = f"t{self._counter}_"
         renamed = statement
         if variables:
             for name, value in variables.items():
-                renamed = renamed.replace(f"${name}", f"${prefix}{name}")
+                renamed = re.sub(rf"\${re.escape(name)}\b", f"${prefix}{name}", renamed)
                 self.variables[f"{prefix}{name}"] = value
         self.statements.append(renamed)
         self._counter += 1

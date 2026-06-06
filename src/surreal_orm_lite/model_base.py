@@ -218,7 +218,9 @@ class BaseSurrealModel(BaseModel):
         When ``tx`` is provided, the CREATE statement is buffered onto the
         transaction instead of being executed immediately.
 
-        Emits pre_save, post_save, and around_save signals.
+        Emits pre_save and post_save signals. ``around_save`` wraps the actual write,
+        so in a transaction (``tx`` provided) it is NOT emitted — the write happens at
+        commit, not here — consistent with update/merge/delete in tx mode.
         """
         sender = self.__class__
         has_signals = pre_save.has_handlers(sender) or post_save.has_handlers(sender) or around_save.has_handlers(sender)
@@ -229,8 +231,13 @@ class BaseSurrealModel(BaseModel):
 
         await pre_save.send(sender, instance=self)
 
-        async with around_save.wrap(sender, instance=self):
+        if tx is not None:
+            # Buffered op: there is no actual write to wrap here, so around_save is
+            # skipped (the write happens at commit). pre_save/post_save still fire.
             result, created = await self._do_save(tx=tx)
+        else:
+            async with around_save.wrap(sender, instance=self):
+                result, created = await self._do_save(tx=tx)
 
         await post_save.send(sender, instance=self, created=created)
 

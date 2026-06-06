@@ -74,7 +74,9 @@ def test_raise_for_status_raises_root_cause() -> None:
                 "status": "ERR",
             },
             {
-                "details": {"kind": "AlreadyExists"},
+                # Real SurrealDB 3.1.3 shape: kind at top level, details.kind == "Record".
+                "kind": "AlreadyExists",
+                "details": {"kind": "Record", "details": {"id": "probe:c"}},
                 "result": "Database record `probe:c` already exists",
                 "status": "ERR",
             },
@@ -87,6 +89,14 @@ def test_raise_for_status_raises_root_cause() -> None:
     }
     with pytest.raises(SurrealDbError, match="already exists"):
         Transaction.raise_for_status(raw)
+
+
+def test_add_namespacing_respects_word_boundary() -> None:
+    # A var name that is a prefix of another must not be corrupted by the rename.
+    tx = Transaction()
+    tx.add("UPDATE t SET a = $id, b = $identity;", {"id": 1, "identity": 2})
+    assert tx.statements == ["UPDATE t SET a = $t0_id, b = $t0_identity;"]
+    assert tx.variables == {"t0_id": 1, "t0_identity": 2}
 
 
 def _connect() -> None:
