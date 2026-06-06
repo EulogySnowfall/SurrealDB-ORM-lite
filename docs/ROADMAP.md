@@ -2,7 +2,7 @@
 
 > Feature implementation roadmap inspired by [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM)
 >
-> **Main constraint**: All features must be compatible with the official SDK `surrealdb>=1.0.8`
+> **Main constraint**: All features must be compatible with the official SDK `surrealdb[pydantic]>=2.0.0,<3.0.0` (SurrealDB 3.x protocol)
 
 ---
 
@@ -15,10 +15,11 @@
 | v0.4.0  | Model Signals                      | ✅ Done     |
 | v0.5.0  | Bulk Operations & Q Objects        | ✅ Done     |
 | v0.6.0  | Relations & Graph                  | ✅ Done     |
-| v0.7.0  | Transactions ORM                   | 📋 Planned  |
-| v0.8.0  | SurrealFunc & Computed Fields      | 📋 Planned  |
-| v0.9.0  | FETCH, Field Aliases & DX          | 📋 Planned  |
-| v0.10.0 | Beta Phase                         | 📋 Planned  |
+| v0.7.0  | SDK 2.0 / SurrealDB 3.x migration  | ✅ Done     |
+| v0.8.0  | Transactions ORM                   | 📋 Planned  |
+| v0.9.0  | SurrealFunc & Computed Fields      | 📋 Planned  |
+| v0.10.0 | FETCH, Field Aliases & DX          | 📋 Planned  |
+| v0.11.0 | Beta Phase                         | 📋 Planned  |
 
 ---
 
@@ -43,13 +44,13 @@
 | get_related() / traverse() | ✅ v0.4.0  | ✅ v0.6.0 | -              |
 | FETCH clause               | ✅ v0.7.0  | ✅ v0.6.0 | -              |
 | remove_all_relations()     | ✅ v0.6.0  | ✅ v0.6.0 | -              |
-| Transactions ORM (tx=)     | ✅ v0.6+   | ❌        | v0.7.0         |
-| SurrealFunc (time::now())  | ✅ v0.6.0  | ❌        | v0.8.0         |
-| Computed Fields            | ✅ v0.8.0  | ❌        | v0.8.0         |
-| server_values on save()    | ✅ v0.7.0  | ❌        | v0.8.0         |
-| Field Aliases              | ✅ v0.5.5  | ❌        | v0.9.0         |
-| call_function()            | ✅ v0.7.0  | ❌        | v0.9.0         |
-| Retry, Logging, Metrics    | ✅ v0.7+   | ❌        | v0.10.0        |
+| Transactions ORM (tx=)     | ✅ v0.6+   | ❌        | v0.8.0         |
+| SurrealFunc (time::now())  | ✅ v0.6.0  | ❌        | v0.9.0         |
+| Computed Fields            | ✅ v0.8.0  | ❌        | v0.9.0         |
+| server_values on save()    | ✅ v0.7.0  | ❌        | v0.9.0         |
+| Field Aliases              | ✅ v0.5.5  | ❌        | v0.10.0        |
+| call_function()            | ✅ v0.7.0  | ❌        | v0.10.0        |
+| Retry, Logging, Metrics    | ✅ v0.7+   | ❌        | v0.11.0        |
 
 ### Features exclusive to SurrealDB-ORM (custom SDK required)
 
@@ -394,7 +395,7 @@ friends_of_friends = await user.traverse("->follows->User->follows->User")
 
 ---
 
-## Version 0.7.0 - Transactions ORM
+## Version 0.8.0 - Transactions ORM
 
 **Goal**: ORM-level transaction support
 
@@ -436,7 +437,7 @@ async with SurrealDBConnectionManager.transaction() as tx:
 
 ---
 
-## Version 0.8.0 - SurrealFunc & Computed Fields
+## Version 0.9.0 - SurrealFunc & Computed Fields
 
 **Goal**: Server-side functions and computed fields
 
@@ -490,7 +491,7 @@ result = await SurrealDBConnectionManager.call_function(
 
 ---
 
-## Version 0.9.0 - FETCH, Field Aliases & DX
+## Version 0.10.0 - FETCH, Field Aliases & DX
 
 **Goal**: Developer experience improvements
 

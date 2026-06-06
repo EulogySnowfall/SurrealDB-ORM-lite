@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-06-06
+
+### Added
+
+- **`BaseSurrealModel.get_raw_id()` helper**: Returns the bare identifier string (e.g. `"alice"`) extracted from the native `RecordID` stored in `model.id`. Use this when you need a plain string instead of a `RecordID` object.
+
+  ```python
+  user = await User.objects().get("alice")
+  user.get_raw_id()  # → "alice"
+  user.id            # → RecordID("User", "alice")
+  ```
+
+- **CI matrix expanded**: Integration tests now run against SurrealDB **v2.6.5** and **v3.1.3** across Python 3.11–3.14.
+
+### Changed
+
+- **BREAKING — Dependency updated**: Replaced `surrealdb>=1.0.8` with `surrealdb[pydantic]>=2.0.0,<3.0.0` (SurrealDB 3.x protocol). Upgrade your environment with `pip install "surrealdb[pydantic]>=2.0.0,<3.0.0"`.
+- **BREAKING — Native `RecordID` on loaded records**: A record fetched from the database now has its `id` field set to a native `surrealdb.RecordID` object (e.g. `RecordID("User", "alice")`) instead of a bare string. Update comparisons to use `model.get_raw_id() == "alice"` or `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you pass in.
+- **Structured errors from SDK**: SurrealDB SDK 2.x raises structured exceptions (e.g. `AlreadyExistsError` on 3.x, `InternalError` on 2.x) instead of returning error strings. The ORM converts the "already exists" case to `SurrealDbError` automatically.
+- **Not-found-tolerant cleanup operations**: `QuerySet.delete_table()`, `BaseSurrealModel.remove_relation()`, and `remove_all_relations()` are now silent no-ops when the target does not exist (consistent with SurrealDB 2.x behaviour; SurrealDB 3.x would otherwise raise). Note: `record.delete()` on a missing record still raises `SurrealDbError`.
+- **Aggregation edge-case normalisation**: `avg()`/`min()`/`max()` over an empty set still return `0.0`/`None`/`None`; SurrealDB 3.x `NaN`/`+inf`/`-inf` responses are normalised to these values.
+- **Connection sign-in ordering**: The connection manager now signs in before selecting the namespace/database to comply with SurrealDB 3.x strictness (3.x no longer auto-creates the namespace on a pre-auth `use()`).
+
 ## [0.6.0] - 2026-03-10
 
 ### Added

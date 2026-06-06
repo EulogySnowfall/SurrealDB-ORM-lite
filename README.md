@@ -1,8 +1,8 @@
 # Surreal ORM Lite
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![SurrealDB](https://img.shields.io/badge/SurrealDB-2.6.3-purple)
-![SDK](https://img.shields.io/badge/SDK-Official%201.0.8-green)
+![SurrealDB](https://img.shields.io/badge/SurrealDB-2.6.5%20%7C%203.1.3-purple)
+![SDK](https://img.shields.io/badge/SDK-Official%202.0-green)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![codecov](https://codecov.io/gh/EulogySnowfall/SurrealDB-ORM-lite/graph/badge.svg)](https://codecov.io/gh/EulogySnowfall/SurrealDB-ORM-lite)
 
@@ -12,7 +12,7 @@
 
 This ORM is designed to:
 
-- Use the **official SurrealDB SDK** (`surrealdb>=1.0.8`) for maximum compatibility
+- Use the **official SurrealDB SDK** (`surrealdb[pydantic]>=2.0.0,<3.0.0`) for maximum compatibility
 - Stay **lightweight** with minimal dependencies
 - Keep **up-to-date** with SurrealDB and SDK releases
 - Provide **Django-style** query syntax that developers love
@@ -21,14 +21,14 @@ This ORM is designed to:
 
 ## Requirements
 
-| Dependency   | Version          |
-| ------------ | ---------------- |
-| Python       | 3.11+            |
-| SurrealDB    | >=2.6.x, <3.0    |
-| Official SDK | surrealdb>=1.0.8 |
-| Pydantic     | >=2.12.5         |
+| Dependency   | Version                            |
+| ------------ | ---------------------------------- |
+| Python       | 3.11+                              |
+| SurrealDB    | 2.6.x or 3.1.x                     |
+| Official SDK | surrealdb[pydantic]>=2.0.0,<3.0.0  |
+| Pydantic     | >=2.12.5                           |
 
-> **Note**: The official SurrealDB Python SDK (`surrealdb>=1.0.8`) only supports SurrealDB 2.X. For SurrealDB 3.X support, use the full [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/) (v0.30.0+).
+> **Note**: As of v0.7.0, Surreal ORM Lite targets the SurrealDB Python SDK 2.x (`surrealdb[pydantic]>=2.0.0,<3.0.0`), which supports the SurrealDB 3.x protocol. It is tested against SurrealDB **v2.6.5** and **v3.1.3**.
 
 ---
 
@@ -337,14 +337,16 @@ async with SurrealDBConnectionManager():
 
 ## Compatibility
 
-This ORM is tested and compatible with SurrealDB 2.X only (SDK limitation). For SurrealDB 3.X, use [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/) v0.30.0+.
+As of v0.7.0, Surreal ORM Lite uses `surrealdb[pydantic]>=2.0.0,<3.0.0` (SurrealDB 3.x protocol) and is tested against both major SurrealDB release lines.
 
 | SurrealDB Version | SDK Version | Status             |
 | ----------------- | ----------- | ------------------ |
-| 2.6.3             | 1.0.8       | ✅ Tested          |
-| 2.6.x             | 1.0.8       | ✅ Compatible      |
-| 2.5.x             | 1.0.8       | ✅ Compatible      |
-| 3.x               | —           | ❌ Not supported   |
+| 3.1.3             | 2.0         | ✅ Tested          |
+| 2.6.5             | 2.0         | ✅ Tested          |
+| 2.6.x             | 2.0         | ✅ Compatible      |
+| < 2.6 or > 3.1    | —           | ⚠️ Not guaranteed  |
+
+> **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
 
 ---
 
@@ -362,17 +364,19 @@ Contributions are welcome! Please:
 
 ## Roadmap
 
-| Version | Theme                         | Status      |
-| ------- | ----------------------------- | ----------- |
-| v0.2.x  | Core ORM (CRUD, QuerySet)     | ✅ Released |
-| v0.3.0  | Aggregations & Utilities      | ✅ Released |
-| v0.4.0  | Model Signals                 | ✅ Released |
-| v0.5.0  | Bulk Operations & Q Objects   | ✅ Released |
-| v0.6.0  | Relations & Graph             | ✅ Released |
-| v0.7.0  | Transactions ORM              | 📋 Planned  |
-| v0.8.0  | SurrealFunc & Computed Fields | 📋 Planned  |
-| v0.9.0  | Field Aliases & DX            | 📋 Planned  |
-| v1.0.0  | Production Ready              | 📋 Planned  |
+| Version | Theme                              | Status      |
+| ------- | ---------------------------------- | ----------- |
+| v0.2.x  | Core ORM (CRUD, QuerySet)          | ✅ Released |
+| v0.3.0  | Aggregations & Utilities           | ✅ Released |
+| v0.4.0  | Model Signals                      | ✅ Released |
+| v0.5.0  | Bulk Operations & Q Objects        | ✅ Released |
+| v0.6.0  | Relations & Graph                  | ✅ Released |
+| v0.7.0  | SDK 2.0 / SurrealDB 3.x migration  | ✅ Released |
+| v0.8.0  | Transactions ORM                   | 📋 Planned  |
+| v0.9.0  | SurrealFunc & Computed Fields      | 📋 Planned  |
+| v0.10.0 | FETCH, Field Aliases & DX          | 📋 Planned  |
+| v0.11.0 | Beta Phase                         | 📋 Planned  |
+| v1.0.0  | Production Ready                   | 📋 Planned  |
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for full details.
 
@@ -392,10 +396,10 @@ This project prioritizes **stability and compatibility** with the official Surre
 | Parameterized Filters     | ✅                      | ✅               |
 | Relations & Graph         | ✅                      | ✅               |
 | FETCH clause              | ✅                      | ✅               |
-| Transactions (tx=)        | v0.7.0                  | ✅               |
-| SurrealFunc & Computed    | v0.8.0                  | ✅               |
-| Field Aliases             | v0.9.0                  | ✅               |
-| Retry, Logging, Metrics   | v0.10.0                 | ✅               |
+| Transactions (tx=)        | v0.8.0                  | ✅               |
+| SurrealFunc & Computed    | v0.9.0                  | ✅               |
+| Field Aliases             | v0.10.0                 | ✅               |
+| Retry, Logging, Metrics   | v0.11.0                 | ✅               |
 | Live Models / CDC         | ❌                      | ✅               |
 | Vector / Full-Text Search | ❌                      | ✅               |
 | Hybrid Search (RRF)       | ❌                      | ✅               |
