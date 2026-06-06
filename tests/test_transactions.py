@@ -119,6 +119,28 @@ async def test_fire_post_commit_runs_callbacks_in_order() -> None:
     assert seen == [1, 2, 3]
 
 
+@pytest.mark.asyncio
+async def test_fire_post_commit_first_raise_skips_rest() -> None:
+    # Documented contract: the first callback that raises propagates the exception;
+    # remaining callbacks are NOT invoked. The commit is already durable at this point
+    # — we don't try to keep going on partial state.
+    tx = Transaction()
+    seen: list[int] = []
+
+    async def cb(n: int) -> None:
+        seen.append(n)
+
+    async def boom() -> None:
+        raise RuntimeError("handler crashed")
+
+    tx.enqueue_post_commit(lambda: cb(1))
+    tx.enqueue_post_commit(boom)
+    tx.enqueue_post_commit(lambda: cb(3))  # must NOT run
+    with pytest.raises(RuntimeError, match="handler crashed"):
+        await tx.fire_post_commit()
+    assert seen == [1]
+
+
 def test_add_namespacing_respects_word_boundary() -> None:
     # A var name that is a prefix of another must not be corrupted by the rename.
     tx = Transaction()

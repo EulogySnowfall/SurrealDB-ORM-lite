@@ -71,10 +71,19 @@ class Transaction:
     async def fire_post_commit(self) -> None:
         """Invoke every enqueued post-commit callback in insertion order.
 
-        The first callback that raises propagates the exception; remaining callbacks
-        are not invoked. Errors from a handler do NOT undo the commit (the write is
-        already durable); they surface as a normal exception from the ``async with``
-        block so the caller can react.
+        Contract — IMPORTANT for callers:
+
+        - Callbacks run in the order they were enqueued (FIFO).
+        - The first callback that raises **propagates** the exception; remaining
+          callbacks are NOT invoked. Callers that need every handler to run must
+          isolate their own errors inside the handler.
+        - A raised exception does **NOT** undo the commit. The write is already
+          durable on the server; an exception from this method surfaces from
+          ``connection_manager.transaction()``'s ``async with`` block AFTER commit,
+          so catching it does not equal "the transaction rolled back". Use
+          ``raise_for_status``-derived ``SurrealDbError`` to detect actual rollback;
+          treat any other exception out of the block as "commit succeeded, a
+          post-commit handler failed".
         """
         for cb in self._post_commit:
             await cb()

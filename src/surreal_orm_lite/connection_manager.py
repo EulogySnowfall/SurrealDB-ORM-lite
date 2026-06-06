@@ -121,6 +121,18 @@ class SurrealDBConnectionManager:
         flushed as a single batched query (atomic server-side). If the body raises, the
         buffer is discarded and nothing is sent (rollback).
 
+        Exception semantics (read carefully):
+
+        - Any exception raised **inside the ``async with`` body** discards the buffer;
+          nothing is sent to the server (free rollback).
+        - A server-side rollback surfaces as a ``SurrealDbError`` raised by
+          ``raise_for_status`` BEFORE deferred ``post_*`` signals fire.
+        - An exception raised by a deferred ``post_*`` handler (i.e. by
+          ``fire_post_commit``) surfaces from this ``async with`` block AFTER the
+          commit is durable. Catching it does NOT equal "the transaction rolled back" —
+          the writes are persisted. To distinguish, match on ``SurrealDbError`` for
+          rollback vs anything else for post-commit handler failures.
+
         Example::
 
             async with SurrealDBConnectionManager.transaction() as tx:

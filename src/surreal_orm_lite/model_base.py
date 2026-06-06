@@ -265,7 +265,12 @@ class BaseSurrealModel(BaseModel):
         if record_id is None:
             raise SurrealDbError("Can't update data, no id found.")
 
+        has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
+
         if tx is not None:
+            if not has_signals:
+                tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
+                return None
             update_fields = list(data.keys())
             await pre_update.send(sender, instance=self, update_fields=update_fields)
             tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
@@ -273,12 +278,11 @@ class BaseSurrealModel(BaseModel):
             return None
 
         client = await SurrealDBConnectionManager.get_client()
-        update_fields = list(data.keys())
-        has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
 
         if not has_signals:
             return await client.update(record_id, data)
 
+        update_fields = list(data.keys())
         await pre_update.send(sender, instance=self, update_fields=update_fields)
 
         async with around_update.wrap(sender, instance=self, update_fields=update_fields):
@@ -315,28 +319,34 @@ class BaseSurrealModel(BaseModel):
         if record_id is None:
             raise SurrealDbError(f"No Id for the data to merge: {data}")
 
+        has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
+
         if tx is not None:
             update_fields = list(data_set.keys())
-            await pre_update.send(sender, instance=self, update_fields=update_fields)
+            # pre_update sees the instance BEFORE merged fields are applied
+            # (matches the non-tx path, where client.merge has not run yet at this
+            # point).
+            if has_signals:
+                await pre_update.send(sender, instance=self, update_fields=update_fields)
             tx.add(f"UPDATE {record_id} MERGE $data;", {"data": data_set})
             # Apply merged fields to the in-memory instance so it reflects the
             # buffered write — the tx path has no post-commit refresh() to fall
-            # back on.
+            # back on. Happens regardless of signals.
             for key, value in data_set.items():
                 if hasattr(self, key):
                     object.__setattr__(self, key, value)
-            tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
+            if has_signals:
+                tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
             return None
 
         client = await SurrealDBConnectionManager.get_client()
-        update_fields = list(data_set.keys())
-        has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
 
         if not has_signals:
             await client.merge(record_id, data_set)
             await self.refresh()
             return
 
+        update_fields = list(data_set.keys())
         await pre_update.send(sender, instance=self, update_fields=update_fields)
 
         async with around_update.wrap(sender, instance=self, update_fields=update_fields):
@@ -361,14 +371,18 @@ class BaseSurrealModel(BaseModel):
         if record_id is None:
             raise SurrealDbError("Can't delete data, no id found.")
 
+        has_signals = pre_delete.has_handlers(sender) or post_delete.has_handlers(sender) or around_delete.has_handlers(sender)
+
         if tx is not None:
+            if not has_signals:
+                tx.add(f"DELETE {record_id};", None)
+                return None
             await pre_delete.send(sender, instance=self)
             tx.add(f"DELETE {record_id};", None)
             tx.enqueue_post_commit(lambda: post_delete.send(sender, instance=self))
             return None
 
         client = await SurrealDBConnectionManager.get_client()
-        has_signals = pre_delete.has_handlers(sender) or post_delete.has_handlers(sender) or around_delete.has_handlers(sender)
 
         # Record delete() is STRICT: a missing record is an error on every server
         # version. SurrealDB 2.x returns falsy; 3.x raises NotFoundError. Both map
