@@ -20,6 +20,7 @@ from .signals import (
     pre_save,
     pre_update,
 )
+from .transaction import Transaction
 from .utils import remove_quotes_for_variables, validate_edge_name, validate_field_name, validate_graph_path, validate_thing
 
 logger = logging.getLogger(__name__)
@@ -156,15 +157,24 @@ class BaseSurrealModel(BaseModel):
                 if hasattr(self, key):
                     object.__setattr__(self, key, value)
 
-    async def _do_save(self) -> tuple[Self, bool]:
+    async def _do_save(self, tx: Transaction | None = None) -> tuple[Self, bool]:
+        """Internal save logic. Returns (self, created).
+
+        When ``tx`` is provided the CREATE statement is buffered (deferred to commit)
+        and the in-memory instance is returned as-is. Buffered creates require an
+        explicit record id.
         """
-        Internal save logic. Returns (self, created) where created indicates
-        whether a new record was created (always True for save).
-        """
-        client = await SurrealDBConnectionManager.get_client()
-        data = self.model_dump(exclude={"id"})
         record_id = self._record_id()
+        data = self.model_dump(exclude={"id"})
         table = self.get_table_name()
+
+        if tx is not None:
+            if record_id is None:
+                raise SurrealDbError("save(tx=...) requires an explicit id (auto-id is not supported inside a transaction).")
+            tx.add(f"CREATE {record_id} CONTENT $data;", {"data": data})
+            return self, True
+
+        client = await SurrealDBConnectionManager.get_client()
 
         if record_id is not None:
             # SDK 2.0 raises a structured exception instead of returning a string.
@@ -198,9 +208,12 @@ class BaseSurrealModel(BaseModel):
 
         raise SurrealDbError("Can't save data, no record returned.")  # pragma: no cover
 
-    async def save(self) -> Self:
+    async def save(self, tx: Transaction | None = None) -> Self:
         """
         Save the model instance to the database.
+
+        When ``tx`` is provided, the CREATE statement is buffered onto the
+        transaction instead of being executed immediately.
 
         Emits pre_save, post_save, and around_save signals.
         """
@@ -208,13 +221,13 @@ class BaseSurrealModel(BaseModel):
         has_signals = pre_save.has_handlers(sender) or post_save.has_handlers(sender) or around_save.has_handlers(sender)
 
         if not has_signals:
-            result, created = await self._do_save()
+            result, created = await self._do_save(tx=tx)
             return result
 
         await pre_save.send(sender, instance=self)
 
         async with around_save.wrap(sender, instance=self):
-            result, created = await self._do_save()
+            result, created = await self._do_save(tx=tx)
 
         await post_save.send(sender, instance=self, created=created)
 

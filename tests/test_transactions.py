@@ -112,3 +112,54 @@ class TestTransactionE2E:
         async with SurrealDBConnectionManager.transaction():
             pass  # nothing buffered → no query sent, no error
         await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_commit_persists_saves(self) -> None:
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        async with SurrealDBConnectionManager.transaction() as tx:
+            await TxUser(id="alice", name="Alice").save(tx=tx)
+            await TxUser(id="bob", name="Bob").save(tx=tx)
+        rows = await client.query("SELECT * FROM TxUser;", {})
+        assert len(rows) == 2
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_exception_rolls_back_saves(self) -> None:
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        with pytest.raises(RuntimeError):
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await TxUser(id="carol", name="Carol").save(tx=tx)
+                raise RuntimeError("boom")
+        rows = await client.query("SELECT * FROM TxUser;", {})
+        assert len(rows) == 0  # nothing persisted
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_save_in_tx_without_id_raises(self) -> None:
+        _connect()
+        from surreal_orm_lite.exceptions import SurrealDbError
+
+        with pytest.raises(SurrealDbError, match="explicit id"):
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await TxUser(name="NoId").save(tx=tx)
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_failed_transaction_raises_and_rolls_back(self) -> None:
+        _connect()
+        from surreal_orm_lite.exceptions import SurrealDbError
+
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        # Two creates with the same id inside one tx → second fails → whole tx rolls back.
+        with pytest.raises(SurrealDbError, match="rolled back"):
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await TxUser(id="dup", name="A").save(tx=tx)
+                await TxUser(id="dup", name="B").save(tx=tx)
+        rows = await client.query("SELECT * FROM TxUser WHERE id = TxUser:dup;", {})
+        assert not rows  # nothing persisted
+        await SurrealDBConnectionManager.close_connection()
