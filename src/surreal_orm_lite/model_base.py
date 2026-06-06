@@ -271,40 +271,49 @@ class BaseSurrealModel(BaseModel):
 
         return result
 
-    async def merge(self, **data: Any) -> Any:
+    async def merge(self, tx: Transaction | None = None, **data: Any) -> Any:
         """
         Partial update of the model instance in the database.
 
+        When ``tx`` is provided, the UPDATE…MERGE statement is buffered onto the
+        transaction instead of being executed immediately.
+
+        Note: ``tx`` is a reserved keyword argument for this method. A model field
+        literally named ``tx`` cannot be merged by keyword; use a dict-unpacking
+        workaround if needed (no realistic SurrealDB column is named ``tx``).
+
         Emits pre_update, post_update, and around_update signals.
         """
-
-        client = await SurrealDBConnectionManager.get_client()
         sender = self.__class__
         data_set = dict(data.items())
-
         record_id = self._record_id()
-        if record_id is not None:
+
+        if record_id is None:
+            raise SurrealDbError(f"No Id for the data to merge: {data}")
+
+        if tx is not None:
             update_fields = list(data_set.keys())
-            has_signals = (
-                pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
-            )
-
-            if not has_signals:
-                await client.merge(record_id, data_set)
-                await self.refresh()
-                return
-
             await pre_update.send(sender, instance=self, update_fields=update_fields)
-
-            async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-                await client.merge(record_id, data_set)
-                await self.refresh()
-
+            tx.add(f"UPDATE {record_id} MERGE $data;", {"data": data_set})
             await post_update.send(sender, instance=self, update_fields=update_fields)
+            return None
 
+        client = await SurrealDBConnectionManager.get_client()
+        update_fields = list(data_set.keys())
+        has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
+
+        if not has_signals:
+            await client.merge(record_id, data_set)
+            await self.refresh()
             return
 
-        raise SurrealDbError(f"No Id for the data to merge: {data}")
+        await pre_update.send(sender, instance=self, update_fields=update_fields)
+
+        async with around_update.wrap(sender, instance=self, update_fields=update_fields):
+            await client.merge(record_id, data_set)
+            await self.refresh()
+
+        await post_update.send(sender, instance=self, update_fields=update_fields)
 
     async def delete(self) -> None:
         """

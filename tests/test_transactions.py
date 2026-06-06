@@ -178,3 +178,18 @@ class TestTransactionE2E:
         rows = await client.query("SELECT name FROM TxUser:dave;", {})
         assert rows[0]["name"] == "David"
         await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_merge_in_tx_commits(self) -> None:
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        await TxUser(id="erin", name="Erin").save()
+
+        erin = TxUser(id="erin", name="Erin")
+        async with SurrealDBConnectionManager.transaction() as tx:
+            await erin.merge(tx=tx, name="Erin Updated")
+
+        rows = await client.query("SELECT name FROM TxUser:erin;", {})
+        assert rows[0]["name"] == "Erin Updated"
+        await SurrealDBConnectionManager.close_connection()
