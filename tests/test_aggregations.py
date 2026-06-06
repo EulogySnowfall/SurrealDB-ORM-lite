@@ -10,7 +10,6 @@ end-to-end tests (require a running SurrealDB instance) for:
 - raw_query() class method
 """
 
-import math
 import os
 
 import pytest
@@ -433,9 +432,9 @@ class TestAvgE2E:
         assert avg == 150.0  # (100 + 200) / 2
 
     async def test_avg_empty_result(self, order_data: None) -> None:
-        """Avg should return 0.0 or NaN for no matching records (SurrealDB 3.x returns NaN)."""
+        """Avg should return 0.0 for no matching records (normalized from SurrealDB 3.x NaN)."""
         avg = await Order.objects().filter(status="cancelled").avg("amount")
-        assert avg == 0.0 or (isinstance(avg, float) and math.isnan(avg))
+        assert avg == 0.0
 
 
 class TestMinMaxE2E:
@@ -462,14 +461,14 @@ class TestMinMaxE2E:
         assert max_price == 299.99
 
     async def test_min_empty_result(self, product_data: None) -> None:
-        """Min should return None or inf for no matching records (SurrealDB 3.x returns inf)."""
+        """Min should return None for no matching records (normalized from SurrealDB 3.x inf)."""
         min_price = await Product.objects().filter(category="NonExistent").min("price")
-        assert min_price is None or (isinstance(min_price, float) and math.isinf(min_price))
+        assert min_price is None
 
     async def test_max_empty_result(self, product_data: None) -> None:
-        """Max should return None or -inf for no matching records (SurrealDB 3.x returns -inf)."""
+        """Max should return None for no matching records (normalized from SurrealDB 3.x -inf)."""
         max_price = await Product.objects().filter(category="NonExistent").max("price")
-        assert max_price is None or (isinstance(max_price, float) and math.isinf(max_price))
+        assert max_price is None
 
 
 class TestGroupByE2E:

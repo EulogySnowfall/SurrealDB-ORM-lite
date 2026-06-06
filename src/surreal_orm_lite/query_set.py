@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import math
 from typing import TYPE_CHECKING, Any, Self, cast
 
 from pydantic_core import ValidationError
@@ -543,10 +544,12 @@ class QuerySet:
 
         if isinstance(results, list) and len(results) > 0:
             result = results[0]
-            if isinstance(result, dict):
-                value = result.get("avg", 0.0)
-                return float(value) if value is not None else 0.0
-            return float(result) if result is not None else 0.0
+            value = result.get("avg", 0.0) if isinstance(result, dict) else result
+            # SurrealDB 3.x returns NaN for math::mean over an empty set; the ORM
+            # contract is 0.0 for "no records".
+            if value is None or (isinstance(value, float) and math.isnan(value)):
+                return 0.0
+            return float(value)
         return 0.0
 
     async def min(self, field: str) -> Any:
@@ -565,9 +568,12 @@ class QuerySet:
 
         if isinstance(results, list) and len(results) > 0:
             result = results[0]
-            if isinstance(result, dict):
-                return result.get("min")
-            return result
+            value = result.get("min") if isinstance(result, dict) else result
+            # SurrealDB 3.x returns +inf for math::min over an empty set; the ORM
+            # contract is None for "no records".
+            if value is None or (isinstance(value, float) and (math.isinf(value) or math.isnan(value))):
+                return None
+            return value
         return None
 
     async def max(self, field: str) -> Any:
@@ -586,9 +592,12 @@ class QuerySet:
 
         if isinstance(results, list) and len(results) > 0:
             result = results[0]
-            if isinstance(result, dict):
-                return result.get("max")
-            return result
+            value = result.get("max") if isinstance(result, dict) else result
+            # SurrealDB 3.x returns -inf for math::max over an empty set; the ORM
+            # contract is None for "no records".
+            if value is None or (isinstance(value, float) and (math.isinf(value) or math.isnan(value))):
+                return None
+            return value
         return None
 
     async def exists(self) -> bool:
