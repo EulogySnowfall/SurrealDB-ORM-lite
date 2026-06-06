@@ -193,3 +193,37 @@ class TestTransactionE2E:
         rows = await client.query("SELECT name FROM TxUser:erin;", {})
         assert rows[0]["name"] == "Erin Updated"
         await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_delete_in_tx_commits(self) -> None:
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        await TxUser(id="frank", name="Frank").save()
+
+        frank = TxUser(id="frank", name="Frank")
+        async with SurrealDBConnectionManager.transaction() as tx:
+            await frank.delete(tx=tx)
+
+        rows = await client.query("SELECT * FROM TxUser:frank;", {})
+        assert len(rows) == 0
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_mixed_ops_atomic(self) -> None:
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        await TxUser(id="gina", name="Gina").save()
+
+        with pytest.raises(RuntimeError):
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await TxUser(id="hank", name="Hank").save(tx=tx)
+                await TxUser(id="gina", name="Gina").delete(tx=tx)
+                raise RuntimeError("rollback everything")
+
+        rows = await client.query("SELECT id FROM TxUser;", {})
+        ids = {str(r["id"]) for r in rows}
+        assert "TxUser:gina" in ids  # delete rolled back
+        assert "TxUser:hank" not in ids  # create rolled back
+        await SurrealDBConnectionManager.close_connection()

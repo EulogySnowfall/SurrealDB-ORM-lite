@@ -315,20 +315,27 @@ class BaseSurrealModel(BaseModel):
 
         await post_update.send(sender, instance=self, update_fields=update_fields)
 
-    async def delete(self) -> None:
+    async def delete(self, tx: Transaction | None = None) -> None:
         """
         Delete the model instance from the database.
 
+        When ``tx`` is provided, the DELETE statement is buffered onto the
+        transaction instead of being executed immediately.
+
         Emits pre_delete, post_delete, and around_delete signals.
         """
-
-        client = await SurrealDBConnectionManager.get_client()
         sender = self.__class__
-
         record_id = self._record_id()
         if record_id is None:
             raise SurrealDbError("Can't delete data, no id found.")
 
+        if tx is not None:
+            await pre_delete.send(sender, instance=self)
+            tx.add(f"DELETE {record_id};", None)
+            await post_delete.send(sender, instance=self)
+            return None
+
+        client = await SurrealDBConnectionManager.get_client()
         has_signals = pre_delete.has_handlers(sender) or post_delete.has_handlers(sender) or around_delete.has_handlers(sender)
 
         # Record delete() is STRICT: a missing record is an error on every server
