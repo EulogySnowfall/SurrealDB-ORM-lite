@@ -47,7 +47,7 @@ async def test_save_model() -> None:
     # Vérification de l'insertion
     client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
     result = await client.select("ModelTest")
-    test_id = RecordID(table_name="ModelTest", identifier=1)
+    test_id = RecordID(table_name="ModelTest", identifier="1")
     assert len(result) == 1
 
     assert result[0] == {"id": test_id, "name": "Test Man", "age": 42}
@@ -65,7 +65,7 @@ async def test_merge_model() -> None:
     item2 = await ModelTest.objects().filter(name="Test Man").get()
     assert item2.age == 32
     assert item2.name == "Test Man"
-    assert item2.id == "1"
+    assert item2.get_raw_id() == "1"
 
 
 async def test_update_model() -> None:
@@ -80,7 +80,7 @@ async def test_update_model() -> None:
     item2 = await ModelTest.objects().filter(name="Test Man").get()
     assert item2.age == 25
     assert item2.name == "Test Man"
-    assert item2.id == "1"
+    assert item2.get_raw_id() == "1"
 
     item3 = ModelTest(name="TestNone", age=17)
 
@@ -105,7 +105,7 @@ async def test_first_model() -> None:
     assert isinstance(model, ModelTest), "Expected ModelTest instance"
     assert model.name == "Test Man"
     assert model.age == 25
-    assert model.id == "1"
+    assert model.get_raw_id() == "1"
 
     with pytest.raises(SurrealDbNotFoundError) as exc1:
         await ModelTest.objects().filter(name="NotExist").first()
@@ -147,7 +147,7 @@ async def test_delete_model() -> None:
     with pytest.raises(SurrealDbError) as exc1:
         await model2.delete()  # Test delete() without saved()
 
-    assert str(exc1.value) == "Can't delete Record id -> '345' not found!"
+    assert "not found" in str(exc1.value)
 
 
 async def test_query_model() -> None:

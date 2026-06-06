@@ -3,11 +3,12 @@ Tests for v0.6.0 features: Relations & Graph (relate, remove_relation,
 get_related, remove_all_relations, traverse, FETCH clause).
 """
 
+import contextlib
 import os
 
 import pytest
 from pydantic import Field
-from surrealdb import RecordID
+from surrealdb import NotFoundError, RecordID
 
 from src import surreal_orm_lite
 from src.surreal_orm_lite.exceptions import SurrealDbError
@@ -199,7 +200,8 @@ class TestRelationsE2E:
         # Clean up
         await Person.objects().delete_table()
         client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
-        await client.query("DELETE follows;", {})
+        with contextlib.suppress(NotFoundError):
+            await client.query("DELETE follows;", {})
 
         alice = Person(id="alice", name="Alice", age=30)
         await alice.save()
@@ -213,7 +215,8 @@ class TestRelationsE2E:
     async def test_relate_with_data(self) -> None:
         """Create a relation with data on the edge."""
         client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
-        await client.query("DELETE purchased;", {})
+        with contextlib.suppress(NotFoundError):
+            await client.query("DELETE purchased;", {})
 
         await Product.objects().delete_table()
         product = Product(id="widget", name="Widget", price=29.99)
@@ -305,7 +308,8 @@ class TestRelationsE2E:
     async def test_traverse(self) -> None:
         """Basic graph traversal."""
         client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
-        await client.query("DELETE follows;", {})
+        with contextlib.suppress(NotFoundError):
+            await client.query("DELETE follows;", {})
 
         alice = await Person.objects().get("alice")
         bob = await Person.objects().get("bob")
@@ -332,7 +336,8 @@ class TestRelationsE2E:
         client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
 
         # Create a post-like structure using raw queries
-        await client.query("DELETE Post;", {})
+        with contextlib.suppress(NotFoundError):
+            await client.query("DELETE Post;", {})
         await client.query(
             "CREATE Post:1 SET title = 'Hello', author = Person:alice;",
             {},
@@ -350,7 +355,8 @@ class TestRelationsE2E:
         assert post["author"]["name"] == "Alice"
 
         # Clean up
-        await client.query("DELETE Post;", {})
+        with contextlib.suppress(NotFoundError):
+            await client.query("DELETE Post;", {})
 
     async def test_remove_relation_missing_is_noop(self) -> None:
         alice = Person(id="rm_alice", name="Alice", age=30)
@@ -363,7 +369,8 @@ class TestRelationsE2E:
     async def test_remove_all_relations_both(self) -> None:
         """Remove all relations in both directions."""
         client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
-        await client.query("DELETE follows;", {})
+        with contextlib.suppress(NotFoundError):
+            await client.query("DELETE follows;", {})
 
         alice = await Person.objects().get("alice")
         bob = await Person.objects().get("bob")
