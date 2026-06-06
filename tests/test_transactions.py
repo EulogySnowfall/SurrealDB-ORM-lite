@@ -60,7 +60,11 @@ def test_raise_for_status_raises_root_cause() -> None:
                 "result": "The query was not executed due to a failed transaction",
                 "status": "ERR",
             },
-            {"details": {"kind": "AlreadyExists"}, "result": "Database record `probe:c` already exists", "status": "ERR"},
+            {
+                "details": {"kind": "AlreadyExists"},
+                "result": "Database record `probe:c` already exists",
+                "status": "ERR",
+            },
             {
                 "details": {"kind": "NotExecuted"},
                 "result": "Cannot COMMIT: the transaction was aborted due to a prior error",
@@ -76,7 +80,11 @@ def test_raise_for_status_raises_root_cause() -> None:
 import contextlib
 import os
 
-from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager, SurrealConfigDict
+from surreal_orm_lite import (
+    BaseSurrealModel,
+    SurrealDBConnectionManager,
+    SurrealConfigDict,
+)
 
 
 def _connect() -> None:
@@ -227,3 +235,12 @@ class TestTransactionE2E:
         assert "TxUser:gina" in ids  # delete rolled back
         assert "TxUser:hank" not in ids  # create rolled back
         await SurrealDBConnectionManager.close_connection()
+
+
+@pytest.mark.asyncio
+async def test_refresh_with_tx_raises() -> None:
+    from surreal_orm_lite.transaction import Transaction as _Tx
+
+    u = TxUser(id="ivy", name="Ivy")
+    with pytest.raises(Exception, match="not supported inside a transaction"):
+        await u.refresh(tx=_Tx())

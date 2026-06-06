@@ -132,10 +132,13 @@ class BaseSurrealModel(BaseModel):
                 data["id"] = str(data["id"].id)
         return data
 
-    async def refresh(self) -> None:
+    async def refresh(self, tx: Transaction | None = None) -> None:
+        """Refresh the model instance from the database.
+
+        Reads inside a transaction are not supported in v0.8.0 (planned for v0.9.0).
         """
-        Refresh the model instance from the database.
-        """
+        if tx is not None:
+            raise SurrealDbError("refresh() is a read and is not supported inside a transaction (planned for v0.9.0).")
         if not self.get_id():
             raise SurrealDbError("Can't refresh data, not recorded yet.")  # pragma: no cover
 
