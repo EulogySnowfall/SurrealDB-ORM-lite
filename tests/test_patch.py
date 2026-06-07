@@ -233,3 +233,46 @@ class TestQuerySetPatchE2E:
         with pytest.raises(ValueError):
             await PatchUser.objects().patch([])
         await SurrealDBConnectionManager.close_connection()
+
+
+class TestPatchTxE2E:
+    @pytest.mark.asyncio
+    async def test_patch_and_atomic_in_tx_commit(self) -> None:
+        client = await _setup()
+        p = PatchUser(id="t1", age=1, score=0.0)
+        await p.save()
+        async with SurrealDBConnectionManager.transaction() as tx:
+            await p.patch([{"op": "replace", "path": "/age", "value": 7}], tx=tx)
+            await p.atomic_increment("score", 2.0, tx=tx)
+        rows = await client.query("SELECT age, score FROM PatchUser:t1;", {})
+        assert rows[0]["age"] == 7
+        assert rows[0]["score"] == 2.0
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_patch_in_tx_rolls_back(self) -> None:
+        client = await _setup()
+        p = PatchUser(id="t2", age=1)
+        await p.save()
+        with pytest.raises(RuntimeError):
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await p.patch([{"op": "replace", "path": "/age", "value": 99}], tx=tx)
+                raise RuntimeError("boom")
+        rows = await client.query("SELECT age FROM PatchUser:t2;", {})
+        assert rows[0]["age"] == 1  # rolled back
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_patch_interactive_tx_syncs_self(self) -> None:
+        client = await _setup()
+        if not await _native_txn_supported():
+            await SurrealDBConnectionManager.close_connection()
+            pytest.skip("requires SurrealDB 3.x (interactive transactions)")
+        p = PatchUser(id="t3", age=1)
+        await p.save()
+        async with SurrealDBConnectionManager.transaction() as tx:
+            await p.patch([{"op": "replace", "path": "/age", "value": 42}], tx=tx)
+            assert p.age == 42  # interactive tx applies the returned row to self
+        rows = await client.query("SELECT age FROM PatchUser:t3;", {})
+        assert rows[0]["age"] == 42
+        await SurrealDBConnectionManager.close_connection()
