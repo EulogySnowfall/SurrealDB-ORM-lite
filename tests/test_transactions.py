@@ -634,6 +634,63 @@ async def _native_txn_supported() -> bool:
     return True
 
 
+class TestQuerySetTxE2E:
+    @pytest.mark.asyncio
+    async def test_interactive_bulk_update_in_tx_commits(self) -> None:
+        _connect()
+        if not await _native_txn_supported():
+            await SurrealDBConnectionManager.close_connection()
+            pytest.skip("requires SurrealDB 3.x")
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        await TxUser(id="a", name="guest").save()
+        await TxUser(id="b", name="guest").save()
+        async with SurrealDBConnectionManager.transaction() as tx:
+            n = await TxUser.objects(tx=tx).filter(name="guest").bulk_update(name="member")
+            assert n == 2
+        rows = await client.query("SELECT name FROM TxUser;", {})
+        assert all(r["name"] == "member" for r in rows)
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_interactive_bulk_delete_rolls_back(self) -> None:
+        _connect()
+        if not await _native_txn_supported():
+            await SurrealDBConnectionManager.close_connection()
+            pytest.skip("requires SurrealDB 3.x")
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        await TxUser(id="d1", name="x").save()
+        with pytest.raises(RuntimeError):
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await TxUser.objects(tx=tx).filter(name="x").bulk_delete()
+                raise RuntimeError("rollback")
+        assert len(await client.query("SELECT * FROM TxUser;", {})) == 1
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_http_bulk_update_in_tx_commits(self) -> None:
+        _connect_http()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        await TxUser(id="h1", name="guest").save()
+        async with SurrealDBConnectionManager.transaction() as tx:
+            await TxUser.objects(tx=tx).filter(name="guest").bulk_update(name="member")
+        rows = await client.query("SELECT name FROM TxUser;", {})
+        assert rows[0]["name"] == "member"
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_http_read_in_tx_raises(self) -> None:
+        _connect_http()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        async with SurrealDBConnectionManager.transaction() as tx:
+            with pytest.raises(SurrealDbError, match="3.x"):
+                await TxUser.objects(tx=tx).filter(name="x").exec()
+        await SurrealDBConnectionManager.close_connection()
+
+
 class TestNativeTxSpikeE2E:
     """Valide l'API de transaction NATIVE du SDK officiel sur le serveur courant.
 

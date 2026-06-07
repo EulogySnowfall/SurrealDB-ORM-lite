@@ -51,6 +51,7 @@ class QuerySet:
         self._fetch_fields: list[str] = []
         self._group_by_fields: list[str] = []
         self._annotations: dict[str, Aggregation] = {}
+        self._tx: Any = None
 
     def select(self, *fields: str) -> Self:
         """
@@ -338,24 +339,21 @@ class QuerySet:
 
     async def _execute_query(self, query: str, variables: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """
-        Execute the given SQL query using the SurrealDB client.
-
-        Args:
-            query: The SQL query string to execute.
-            variables: Optional variables dict. Falls back to self._variables if not provided.
-
-        Returns:
-            The raw query results from the database.
+        Execute a read query. Routes through the transaction when one is attached
+        (``objects(tx=)``), so reads participate in the transaction and see its
+        uncommitted writes (interactive, 3.x). On a buffered tx, ``run_read`` raises.
         """
-        client = await SurrealDBConnectionManager.get_client()
         vars_ = variables if variables is not None else self._variables
+        compiled = remove_quotes_for_variables(query)
+        if self._tx is not None:
+            try:
+                return await self._tx.run_read(compiled, vars_)  # type: ignore[no-any-return]
+            except NotFoundError:
+                return []
+        client = await SurrealDBConnectionManager.get_client()
         try:
-            return await client.query(remove_quotes_for_variables(query), vars_)  # type: ignore
+            return await client.query(compiled, vars_)  # type: ignore
         except NotFoundError:
-            # SurrealDB 3.x raises NotFoundError for a SELECT on a table that was
-            # never created (tables are materialized on first write). The ORM
-            # contract treats a missing table as empty, so callers (get/first/
-            # count/exists/aggregations) get the same result as an empty table.
             return []
 
     async def exec(self) -> Any:
@@ -409,20 +407,25 @@ class QuerySet:
             The retrieved model instance or dictionary.
         """
         if id_item:
-            client = await SurrealDBConnectionManager.get_client()
             if isinstance(id_item, RecordID):
                 record_id = id_item
             else:
-                # Strip SurrealQL backtick escaping if present (e.g. "`test@test.com`")
                 raw = str(id_item)
                 if raw.startswith("`") and raw.endswith("`"):
                     raw = raw[1:-1]
                 record_id = RecordID(self._model_table, raw)
+
+            if self._tx is not None:
+                rows = await self._tx.run_read("SELECT * FROM $rid;", {"rid": record_id})
+                data = rows[0] if isinstance(rows, list) and rows else rows
+                if not data:
+                    raise SurrealDbNotFoundError("No result found.")
+                return self.model.from_db(data)
+
+            client = await SurrealDBConnectionManager.get_client()
             try:
                 data = await client.select(record_id)
             except NotFoundError:
-                # SurrealDB 3.x: selecting from a never-created table raises
-                # instead of returning nothing. Treat as "no result".
                 raise SurrealDbNotFoundError("No result found.") from None
             if isinstance(data, list):
                 if len(data) == 0:
@@ -443,16 +446,18 @@ class QuerySet:
     async def all(self) -> Any:
         """
         Fetch all records from the associated table.
-
-        Returns:
-            A list of model instances representing all records.
         """
+        if self._tx is not None:
+            try:
+                rows = await self._tx.run_read(f"SELECT * FROM {self._model_table};", {})
+            except NotFoundError:
+                return self.model.from_db([])
+            return self.model.from_db(rows if isinstance(rows, list) else [])
+
         client = await SurrealDBConnectionManager.get_client()
         try:
             results = await client.select(self._model_table)
         except NotFoundError:
-            # SurrealDB 3.x raises for a never-created table; the ORM contract
-            # treats a missing table as empty.
             return self.model.from_db([])
         return self.model.from_db(results)
 
@@ -666,6 +671,12 @@ class QuerySet:
                 data["id"] = model_id
             data_list.append(data)
 
+        if self._tx is not None:
+            rows = await self._tx.add(f"INSERT INTO {self._model_table} $data;", {"data": data_list})
+            if self._tx.is_interactive and isinstance(rows, list):
+                return self.model.from_db(rows)  # type: ignore
+            return models  # buffered: not executed until commit; return inputs
+
         client = await SurrealDBConnectionManager.get_client()
         results = await client.insert(self._model_table, data_list)
 
@@ -704,8 +715,10 @@ class QuerySet:
         query = f"UPDATE {self._model_table} SET {set_clause}{where_clause};"
 
         all_vars = {**self._variables, **where_vars, **set_vars}
+        if self._tx is not None:
+            rows = await self._tx.add(query, all_vars)
+            return len(rows) if isinstance(rows, list) else 0
         results = await self._execute_query(query, all_vars)
-
         if isinstance(results, list):
             return len(results)
         return 0
@@ -723,10 +736,11 @@ class QuerySet:
         """
         where_clause, where_vars = self._build_where()
         query = f"DELETE {self._model_table}{where_clause} RETURN BEFORE;"
-
         all_vars = {**self._variables, **where_vars}
+        if self._tx is not None:
+            rows = await self._tx.add(query, all_vars)
+            return len(rows) if isinstance(rows, list) else 0
         results = await self._execute_query(query, all_vars)
-
         if isinstance(results, list):
             return len(results)
         return 0
