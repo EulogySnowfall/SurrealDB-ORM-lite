@@ -111,7 +111,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | Parameterized filters         | yes        | v0.5.0           |
 | Relations & Graph             | yes        | v0.6.0           |
 | FETCH clause                  | yes        | v0.6.0           |
-| Transactions (`tx=`)          | yes        | ✅ v0.8, v0.9 QS |
+| Transactions (`tx=`)          | yes        | ✅ v0.8 core, v0.9 QuerySet |
 | `upsert` / `update_or_create` | yes        | v0.10.0          |
 | Atomic field/array ops        | yes        | v0.11.0          |
 | Retry on conflict             | yes        | v0.12.0          |
@@ -185,6 +185,15 @@ v0.25.0/v0.26.0 are reclassified to Future.
 - Exported `Transaction`; failure detection via `query_raw` status inspection
 - Note: QuerySet reads under `tx`, savepoints, and auto-id in tx are deferred to v0.9.0
 
+### Version 0.9.0 — Transactions ORM (QuerySet)
+
+- `objects(tx=)`: QuerySet reads, bulk_update/bulk_delete/bulk_create participate in a transaction
+- Interactive transactions via the SDK's native API (`begin()`/`commit`/`cancel` + `txn_id`),
+  **SurrealDB 3.x only**: reads see uncommitted writes, auto-id `save(tx=)`, working `refresh(tx=)`
+- HTTP and SurrealDB 2.6.x keep the v0.8.0 buffered model (writes batched; reads in tx raise)
+- Savepoints / nested transactions: NOT supported (SurrealDB only has flat BEGIN/COMMIT/CANCEL);
+  nested `transaction()` opens independent transactions
+
 ---
 
 ## Planned — Tier 1: Core (SDK 2.0 strict)
@@ -198,7 +207,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | Version   | Theme                                                                    | SDK 2.0 primitive         |
 | --------- | ------------------------------------------------------------------------ | ------------------------- |
 | ✅ v0.8.0 | Transactions ORM (core): `transaction()` ctx manager + `tx=` on CRUD     | `BEGIN`/`COMMIT`/`CANCEL` |
-| v0.9.0    | Transactions ORM (QuerySet): `objects(tx=)`, bulk under `tx`, savepoints | idem                      |
+| ✅ v0.9.0 | Transactions ORM (QuerySet): `objects(tx=)`, bulk under `tx`, no savepoints (SurrealDB) | idem                      |
 | v0.10.0   | `upsert()` + `update_or_create()` / `get_or_create()`                    | `upsert()`                |
 | v0.11.0   | `patch()` & atomic field/array ops (append/remove/set_add/increment)     | `patch()` (JSON Patch)    |
 | v0.12.0   | `retry_on_conflict` & optimistic concurrency                             | transactions + retry      |

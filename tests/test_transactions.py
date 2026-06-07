@@ -21,6 +21,14 @@ def test_transaction_is_exported() -> None:
     assert "Transaction" in surreal_orm_lite.__all__
 
 
+def test_tx_subclasses_exported() -> None:
+    import surreal_orm_lite
+
+    assert surreal_orm_lite.BufferedTransaction is BufferedTransaction
+    assert surreal_orm_lite.InteractiveTransaction is InteractiveTransaction
+    assert surreal_orm_lite.__version__ == "0.9.0"
+
+
 @pytest.mark.asyncio
 async def test_add_namespaces_variables() -> None:
     tx = BufferedTransaction()
