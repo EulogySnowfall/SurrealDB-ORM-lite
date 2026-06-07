@@ -159,3 +159,42 @@ class BufferedTransaction(Transaction):
         # Nothing was sent (statements buffered) → rollback is free.
         self.statements = []
         self.variables = {}
+
+
+class InteractiveTransaction(Transaction):
+    """WebSocket / SurrealDB 3.x strategy using the SDK's native transaction API.
+
+    Built with ``(client, txn_id)`` where ``txn_id`` comes from ``client.begin()``
+    (done by the connection manager). Every operation passes ``txn_id=`` so it joins the
+    server-side transaction; reads see uncommitted writes and are isolated from other
+    operations on the same connection.
+    """
+
+    def __init__(self, client: Any, txn_id: Any) -> None:
+        super().__init__()
+        self._client = client
+        self._txn_id = txn_id
+
+    @property
+    def is_interactive(self) -> bool:
+        return True
+
+    async def add(self, statement: str, variables: dict[str, Any] | None = None) -> Any:
+        """Run a write inside the transaction; inspect status; return its rows."""
+        raw = await self._client.query_raw(statement, variables or {}, txn_id=self._txn_id)
+        self.raise_for_status(raw)
+        statements = raw["result"]
+        return statements[-1]["result"] if statements else []
+
+    async def run_read(self, statement: str, variables: dict[str, Any] | None = None) -> Any:
+        """Run a read inside the transaction and return rows directly."""
+        return await self._client.query(statement, variables or {}, txn_id=self._txn_id)
+
+    async def commit(self) -> None:
+        await self._client.commit(self._txn_id)
+
+    async def cancel(self) -> None:
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            await self._client.cancel(self._txn_id)

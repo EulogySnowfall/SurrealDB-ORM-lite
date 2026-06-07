@@ -1,5 +1,6 @@
 import contextlib
 import os
+from typing import Any
 
 import pytest
 
@@ -10,7 +11,7 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.signals import post_delete, post_save
-from surreal_orm_lite.transaction import BufferedTransaction, Transaction
+from surreal_orm_lite.transaction import BufferedTransaction, InteractiveTransaction, Transaction
 
 
 def test_transaction_is_exported() -> None:
@@ -159,6 +160,75 @@ async def test_buffered_run_read_raises() -> None:
     assert tx.is_interactive is False
     with pytest.raises(SurrealDbError, match="3.x"):
         await tx.run_read("SELECT * FROM User;", {})
+
+
+class _FakeTxnClient:
+    """Async client double for InteractiveTransaction (records txn_id usage)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+        self.read_rows: list[Any] = [{"id": "User:1", "name": "x"}]
+        self.write_envelope: dict[str, Any] = {"result": [{"status": "OK", "result": [{"id": "User:1"}]}]}
+        self.err_envelope: dict[str, Any] | None = None
+
+    async def query_raw(self, sql: str, params: Any = None, session_id: Any = None, txn_id: Any = None) -> dict[str, Any]:
+        self.calls.append(("query_raw", txn_id))
+        if self.err_envelope is not None and "CREATE" in sql:
+            return self.err_envelope
+        return self.write_envelope
+
+    async def query(self, sql: str, vars: Any = None, session_id: Any = None, txn_id: Any = None) -> Any:
+        self.calls.append(("query", txn_id))
+        return self.read_rows
+
+    async def commit(self, txn_id: Any, session_id: Any = None) -> None:
+        self.calls.append(("commit", txn_id))
+
+    async def cancel(self, txn_id: Any, session_id: Any = None) -> None:
+        self.calls.append(("cancel", txn_id))
+
+
+@pytest.mark.asyncio
+async def test_interactive_is_interactive() -> None:
+    tx = InteractiveTransaction(_FakeTxnClient(), "TXN")
+    assert tx.is_interactive is True
+
+
+@pytest.mark.asyncio
+async def test_interactive_add_passes_txn_id_and_returns_rows() -> None:
+    c = _FakeTxnClient()
+    tx = InteractiveTransaction(c, "TXN")
+    rows = await tx.add("CREATE User:1 CONTENT $data;", {"data": {"name": "x"}})
+    assert rows == [{"id": "User:1"}]
+    assert ("query_raw", "TXN") in c.calls
+
+
+@pytest.mark.asyncio
+async def test_interactive_add_raises_on_err() -> None:
+    c = _FakeTxnClient()
+    c.err_envelope = {"result": [{"status": "ERR", "result": "boom"}]}
+    tx = InteractiveTransaction(c, "TXN")
+    with pytest.raises(SurrealDbError, match="rolled back"):
+        await tx.add("CREATE User:1 CONTENT $data;", {"data": {}})
+
+
+@pytest.mark.asyncio
+async def test_interactive_run_read_passes_txn_id() -> None:
+    c = _FakeTxnClient()
+    tx = InteractiveTransaction(c, "TXN")
+    rows = await tx.run_read("SELECT * FROM User;", {})
+    assert rows == [{"id": "User:1", "name": "x"}]
+    assert ("query", "TXN") in c.calls
+
+
+@pytest.mark.asyncio
+async def test_interactive_commit_and_cancel_use_txn_id() -> None:
+    c = _FakeTxnClient()
+    await InteractiveTransaction(c, "TXN").commit()
+    assert ("commit", "TXN") in c.calls
+    c2 = _FakeTxnClient()
+    await InteractiveTransaction(c2, "TXN2").cancel()
+    assert ("cancel", "TXN2") in c2.calls
 
 
 def _connect() -> None:
