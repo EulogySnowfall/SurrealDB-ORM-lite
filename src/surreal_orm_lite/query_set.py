@@ -16,6 +16,7 @@ from .utils import (
     remove_quotes_for_variables,
     validate_alias_name,
     validate_field_name,
+    validate_patch_operations,
 )
 
 if TYPE_CHECKING:
@@ -740,6 +741,32 @@ class QuerySet:
         where_clause, where_vars = self._build_where()
         query = f"DELETE {self._model_table}{where_clause} RETURN BEFORE;"
         all_vars = {**self._variables, **where_vars}
+        if self._tx is not None:
+            rows = await self._tx.add(query, all_vars)
+            return len(rows) if isinstance(rows, list) else 0
+        results = await self._execute_query(query, all_vars)
+        if isinstance(results, list):
+            return len(results)
+        return 0
+
+    async def patch(self, operations: list[dict[str, Any]]) -> int:
+        """
+        Apply a JSON Patch (RFC 6902) to every row matching the current filters.
+
+        Whole table if unfiltered. Returns the number of affected rows. Participates in
+        ``objects(tx=)`` like the other bulk operations. ``operations`` is validated then bound
+        as ``$_ops`` (never string-interpolated). Emits no signals.
+
+        Example::
+
+            n = await User.objects().filter(status="trial").patch(
+                [{"op": "replace", "path": "/plan", "value": "free"}]
+            )
+        """
+        validate_patch_operations(operations)
+        where_clause, where_vars = self._build_where()
+        query = f"UPDATE {self._model_table} PATCH $_ops{where_clause};"
+        all_vars = {**self._variables, **where_vars, "_ops": operations}
         if self._tx is not None:
             rows = await self._tx.add(query, all_vars)
             return len(rows) if isinstance(rows, list) else 0

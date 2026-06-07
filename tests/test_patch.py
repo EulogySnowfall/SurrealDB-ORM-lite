@@ -200,3 +200,36 @@ class TestAtomicSetAddIncrementE2E:
         rows = await client.query("SELECT views FROM PatchUser:i1;", {})
         assert rows[0]["views"] == 10
         await SurrealDBConnectionManager.close_connection()
+
+
+class TestQuerySetPatchE2E:
+    @pytest.mark.asyncio
+    async def test_patch_filtered_set(self) -> None:
+        client = await _setup()
+        await PatchUser(id="q1", name="A", age=1).save()
+        await PatchUser(id="q2", name="A", age=1).save()
+        await PatchUser(id="q3", name="B", age=1).save()
+        n = await PatchUser.objects().filter(name="A").patch([{"op": "replace", "path": "/age", "value": 99}])
+        assert n == 2
+        rows = await client.query("SELECT id, age FROM PatchUser ORDER BY id;", {})
+        by_age = {str(r["id"].id): r["age"] for r in rows}
+        assert by_age == {"q1": 99, "q2": 99, "q3": 1}
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_patch_whole_table(self) -> None:
+        client = await _setup()
+        await PatchUser(id="w1", age=1).save()
+        await PatchUser(id="w2", age=2).save()
+        n = await PatchUser.objects().patch([{"op": "replace", "path": "/age", "value": 0}])
+        assert n == 2
+        rows = await client.query("SELECT age FROM PatchUser;", {})
+        assert all(r["age"] == 0 for r in rows)
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_queryset_patch_invalid_ops_raise(self) -> None:
+        _connect()
+        with pytest.raises(ValueError):
+            await PatchUser.objects().patch([])
+        await SurrealDBConnectionManager.close_connection()
