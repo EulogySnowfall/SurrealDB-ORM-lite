@@ -4,7 +4,7 @@ from typing import Any
 
 from ._sdk import AsyncSurreal
 from .exceptions import SurrealDbConnectionError
-from .transaction import Transaction
+from .transaction import BufferedTransaction
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +139,7 @@ class SurrealDBConnectionManager:
                 await user.save(tx=tx)
                 await order.save(tx=tx)
         """
-        tx = Transaction()
+        tx = BufferedTransaction()
         try:
             yield tx
         except Exception:

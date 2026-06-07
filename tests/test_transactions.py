@@ -10,7 +10,7 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.signals import post_delete, post_save
-from surreal_orm_lite.transaction import Transaction
+from surreal_orm_lite.transaction import BufferedTransaction, Transaction
 
 
 def test_transaction_is_exported() -> None:
@@ -20,10 +20,11 @@ def test_transaction_is_exported() -> None:
     assert "Transaction" in surreal_orm_lite.__all__
 
 
-def test_add_namespaces_variables() -> None:
-    tx = Transaction()
-    tx.add("CREATE User:a CONTENT $data;", {"data": {"n": 1}})
-    tx.add("UPDATE User:b MERGE $data;", {"data": {"n": 2}})
+@pytest.mark.asyncio
+async def test_add_namespaces_variables() -> None:
+    tx = BufferedTransaction()
+    await tx.add("CREATE User:a CONTENT $data;", {"data": {"n": 1}})
+    await tx.add("UPDATE User:b MERGE $data;", {"data": {"n": 2}})
     # Each call's vars are renamed with a per-statement prefix to avoid collisions.
     assert tx.variables == {"t0_data": {"n": 1}, "t1_data": {"n": 2}}
     assert tx.statements == [
@@ -32,23 +33,25 @@ def test_add_namespaces_variables() -> None:
     ]
 
 
-def test_build_query_wraps_in_transaction() -> None:
-    tx = Transaction()
-    tx.add("CREATE User:a CONTENT $data;", {"data": {"n": 1}})
+@pytest.mark.asyncio
+async def test_build_query_wraps_in_transaction() -> None:
+    tx = BufferedTransaction()
+    await tx.add("CREATE User:a CONTENT $data;", {"data": {"n": 1}})
     query = tx.build_query()
     assert query == "BEGIN TRANSACTION;\nCREATE User:a CONTENT $t0_data;\nCOMMIT TRANSACTION;"
 
 
 def test_build_query_empty_raises() -> None:
-    tx = Transaction()
+    tx = BufferedTransaction()
     with pytest.raises(ValueError, match="empty transaction"):
         tx.build_query()
 
 
-def test_is_empty() -> None:
-    tx = Transaction()
+@pytest.mark.asyncio
+async def test_is_empty() -> None:
+    tx = BufferedTransaction()
     assert tx.is_empty is True
-    tx.add("DELETE User:a;", None)
+    await tx.add("DELETE User:a;", None)
     assert tx.is_empty is False
 
 
@@ -106,7 +109,7 @@ def test_raise_for_status_rejects_unrecognized_shape() -> None:
 
 @pytest.mark.asyncio
 async def test_fire_post_commit_runs_callbacks_in_order() -> None:
-    tx = Transaction()
+    tx = BufferedTransaction()
     seen: list[int] = []
 
     async def cb(n: int) -> None:
@@ -124,7 +127,7 @@ async def test_fire_post_commit_first_raise_skips_rest() -> None:
     # Documented contract: the first callback that raises propagates the exception;
     # remaining callbacks are NOT invoked. The commit is already durable at this point
     # — we don't try to keep going on partial state.
-    tx = Transaction()
+    tx = BufferedTransaction()
     seen: list[int] = []
 
     async def cb(n: int) -> None:
@@ -141,12 +144,21 @@ async def test_fire_post_commit_first_raise_skips_rest() -> None:
     assert seen == [1]
 
 
-def test_add_namespacing_respects_word_boundary() -> None:
+@pytest.mark.asyncio
+async def test_add_namespacing_respects_word_boundary() -> None:
     # A var name that is a prefix of another must not be corrupted by the rename.
-    tx = Transaction()
-    tx.add("UPDATE t SET a = $id, b = $identity;", {"id": 1, "identity": 2})
+    tx = BufferedTransaction()
+    await tx.add("UPDATE t SET a = $id, b = $identity;", {"id": 1, "identity": 2})
     assert tx.statements == ["UPDATE t SET a = $t0_id, b = $t0_identity;"]
     assert tx.variables == {"t0_id": 1, "t0_identity": 2}
+
+
+@pytest.mark.asyncio
+async def test_buffered_run_read_raises() -> None:
+    tx = BufferedTransaction()
+    assert tx.is_interactive is False
+    with pytest.raises(SurrealDbError, match="3.x"):
+        await tx.run_read("SELECT * FROM User;", {})
 
 
 def _connect() -> None:
@@ -299,7 +311,7 @@ class TestTransactionE2E:
 async def test_refresh_with_tx_raises() -> None:
     u = TxUser(id="ivy", name="Ivy")
     with pytest.raises(SurrealDbError, match="not supported inside a transaction"):
-        await u.refresh(tx=Transaction())
+        await u.refresh(tx=BufferedTransaction())
 
 
 class TxSignalUser(BaseSurrealModel):

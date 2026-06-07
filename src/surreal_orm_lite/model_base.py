@@ -174,7 +174,7 @@ class BaseSurrealModel(BaseModel):
         if tx is not None:
             if record_id is None:
                 raise SurrealDbError("save(tx=...) requires an explicit id (auto-id is not supported inside a transaction).")
-            tx.add(f"CREATE {record_id} CONTENT $data;", {"data": data})
+            await tx.add(f"CREATE {record_id} CONTENT $data;", {"data": data})
             return self, True
 
         client = await SurrealDBConnectionManager.get_client()
@@ -269,11 +269,11 @@ class BaseSurrealModel(BaseModel):
 
         if tx is not None:
             if not has_signals:
-                tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
+                await tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
                 return None
             update_fields = list(data.keys())
             await pre_update.send(sender, instance=self, update_fields=update_fields)
-            tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
+            await tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
             tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
             return None
 
@@ -328,7 +328,7 @@ class BaseSurrealModel(BaseModel):
             # point).
             if has_signals:
                 await pre_update.send(sender, instance=self, update_fields=update_fields)
-            tx.add(f"UPDATE {record_id} MERGE $data;", {"data": data_set})
+            await tx.add(f"UPDATE {record_id} MERGE $data;", {"data": data_set})
             # Apply merged fields to the in-memory instance so it reflects the
             # buffered write — the tx path has no post-commit refresh() to fall
             # back on. Happens regardless of signals.
@@ -375,10 +375,10 @@ class BaseSurrealModel(BaseModel):
 
         if tx is not None:
             if not has_signals:
-                tx.add(f"DELETE {record_id};", None)
+                await tx.add(f"DELETE {record_id};", None)
                 return None
             await pre_delete.send(sender, instance=self)
-            tx.add(f"DELETE {record_id};", None)
+            await tx.add(f"DELETE {record_id};", None)
             tx.enqueue_post_commit(lambda: post_delete.send(sender, instance=self))
             return None
 
