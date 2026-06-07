@@ -291,14 +291,6 @@ class TestTransactionE2E:
         await SurrealDBConnectionManager.close_connection()
 
     @pytest.mark.asyncio
-    async def test_save_in_tx_without_id_raises(self) -> None:
-        _connect()
-        with pytest.raises(SurrealDbError, match="explicit id"):
-            async with SurrealDBConnectionManager.transaction() as tx:
-                await TxUser(name="NoId").save(tx=tx)
-        await SurrealDBConnectionManager.close_connection()
-
-    @pytest.mark.asyncio
     async def test_failed_transaction_raises_and_rolls_back(self) -> None:
         _connect()
         client = await SurrealDBConnectionManager.get_client()
@@ -377,11 +369,70 @@ class TestTransactionE2E:
         await SurrealDBConnectionManager.close_connection()
 
 
+class TestSaveTxAutoId:
+    @pytest.mark.asyncio
+    async def test_interactive_save_autoid_assigns_id(self) -> None:
+        _connect()
+        if not await _native_txn_supported():
+            await SurrealDBConnectionManager.close_connection()
+            pytest.skip("requires SurrealDB 3.x")
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        u = TxUser(name="AutoWS")  # pas d'id
+        async with SurrealDBConnectionManager.transaction() as tx:
+            await u.save(tx=tx)
+        assert u.id is not None
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_http_save_without_id_raises(self) -> None:
+        _connect_http()
+        with pytest.raises(SurrealDbError, match="explicit id"):
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await TxUser(name="NoId").save(tx=tx)
+        await SurrealDBConnectionManager.close_connection()
+
+
 @pytest.mark.asyncio
-async def test_refresh_with_tx_raises() -> None:
-    u = TxUser(id="ivy", name="Ivy")
-    with pytest.raises(SurrealDbError, match="not supported inside a transaction"):
-        await u.refresh(tx=BufferedTransaction())
+async def test_refresh_tx_works_in_interactive() -> None:
+    _connect()
+    if not await _native_txn_supported():
+        await SurrealDBConnectionManager.close_connection()
+        pytest.skip("requires SurrealDB 3.x")
+    client = await SurrealDBConnectionManager.get_client()
+    await _clear(client)
+    await TxUser(id="ref1", name="Before").save()
+    await client.query("UPDATE TxUser:ref1 SET name = 'After';", {})
+    u = TxUser(id="ref1", name="Before")
+    async with SurrealDBConnectionManager.transaction() as tx:
+        await u.refresh(tx=tx)
+    assert u.name == "After"
+    await SurrealDBConnectionManager.close_connection()
+
+
+@pytest.mark.asyncio
+async def test_refresh_tx_raises_when_buffered() -> None:
+    _connect_http()
+    u = TxUser(id="x", name="x")
+    async with SurrealDBConnectionManager.transaction() as tx:
+        with pytest.raises(SurrealDbError, match="3.x"):
+            await u.refresh(tx=tx)
+    await SurrealDBConnectionManager.close_connection()
+
+
+@pytest.mark.asyncio
+async def test_interactive_read_sees_uncommitted_write() -> None:
+    _connect()
+    if not await _native_txn_supported():
+        await SurrealDBConnectionManager.close_connection()
+        pytest.skip("requires SurrealDB 3.x")
+    client = await SurrealDBConnectionManager.get_client()
+    await _clear(client)
+    async with SurrealDBConnectionManager.transaction() as tx:
+        await TxUser(id="u1", name="InTx").save(tx=tx)
+        found = await TxUser.objects(tx=tx).filter(name="InTx").exec()
+        assert len(found) == 1
+    await SurrealDBConnectionManager.close_connection()
 
 
 class TxSignalUser(BaseSurrealModel):
