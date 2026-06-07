@@ -58,3 +58,28 @@ class TestUpsertE2E:
         with pytest.raises(SurrealDbError, match="explicit id"):
             await UpUser(name="NoId").upsert()
         await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_upsert_in_tx_commits(self) -> None:
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client, "UpUser")
+        async with SurrealDBConnectionManager.transaction() as tx:
+            await UpUser(id="txu", name="Tx").upsert(tx=tx)
+        rows = await client.query("SELECT * FROM UpUser WHERE id = UpUser:txu;", {})
+        assert len(rows) == 1
+        assert rows[0]["name"] == "Tx"
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_upsert_in_tx_rolls_back(self) -> None:
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client, "UpUser")
+        with pytest.raises(RuntimeError):
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await UpUser(id="txr", name="TxR").upsert(tx=tx)
+                raise RuntimeError("boom")
+        rows = await client.query("SELECT * FROM UpUser WHERE id = UpUser:txr;", {})
+        assert not rows
+        await SurrealDBConnectionManager.close_connection()
