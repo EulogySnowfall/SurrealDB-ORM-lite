@@ -432,3 +432,27 @@ class TestMergeTxSync:
         rows = await client.query("SELECT name FROM TxUser:sync;", {})
         assert rows[0]["name"] == "NewName"
         await SurrealDBConnectionManager.close_connection()
+
+
+class TestInteractiveTxSpikeE2E:
+    """Valide l'hypothèse fondatrice : sur une connexion WS, l'état de transaction
+    persiste entre des appels query() successifs (BEGIN ... ops ... COMMIT/CANCEL)."""
+
+    @pytest.mark.asyncio
+    async def test_ws_transaction_state_persists_across_queries(self) -> None:
+        _connect()  # ws://...
+        client = await SurrealDBConnectionManager.get_client()
+        with contextlib.suppress(Exception):
+            await client.query("DELETE TxSpike;", {})
+
+        await client.query("BEGIN TRANSACTION;", {})
+        await client.query("CREATE TxSpike:s1 CONTENT { name: 'x' };", {})
+        # La lecture dans la même transaction DOIT voir l'écriture non-committée.
+        seen = await client.query("SELECT * FROM TxSpike;", {})
+        assert isinstance(seen, list) and len(seen) == 1
+        await client.query("CANCEL TRANSACTION;", {})
+
+        # Après CANCEL, l'écriture a disparu (rollback effectif).
+        after = await client.query("SELECT * FROM TxSpike;", {})
+        assert after == [] or len(after) == 0
+        await SurrealDBConnectionManager.close_connection()
