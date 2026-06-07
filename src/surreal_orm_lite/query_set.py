@@ -748,6 +748,65 @@ class QuerySet:
             return len(results)
         return 0
 
+    # ==================== Upsert / get_or_create ====================
+
+    async def _lookup_matches(self, criteria: dict[str, Any]) -> list[Any]:
+        """Return the records matching ``criteria`` (equality on each field).
+
+        Reuses the parameterized WHERE builder (anti-injection) by routing through a
+        throwaway QuerySet's ``filter(**criteria)``. Returns raw row dicts.
+        """
+        probe = QuerySet(self.model)
+        probe.filter(**criteria)
+        where_clause, where_vars = probe._build_where()
+        query = f"SELECT * FROM {self._model_table}{where_clause};"
+        client = await SurrealDBConnectionManager.get_client()
+        try:
+            rows = await client.query(remove_quotes_for_variables(query), where_vars)
+        except NotFoundError:
+            return []
+        return rows if isinstance(rows, list) else []
+
+    async def update_or_create(
+        self,
+        defaults: dict[str, Any] | None = None,
+        **criteria: Any,
+    ) -> tuple[Any, bool]:
+        """Look up a record by ``criteria``; create it or update it; return ``(obj, created)``.
+
+        Django-style: ``criteria`` are equality filters used to find the record;
+        ``defaults`` are extra field values. On both create and update the record is
+        written with ``criteria`` merged with ``defaults`` (``defaults`` win on conflict).
+
+        - 0 matches → CREATE (auto id) → ``created=True``.
+        - 1 match → UPDATE that record (by id) → ``created=False``.
+        - >1 matches → ``SurrealDbError`` (the criteria are not unique).
+
+        Note: the lookup and the write are two round-trips (no server-side locking on
+        SurrealDB 2.6.x), so under concurrent writers a small race window exists — the same
+        non-atomic fallback Django documents. ``criteria`` must be non-empty.
+        """
+        if not criteria:
+            raise SurrealDbError("update_or_create() requires at least one lookup criteria.")
+        defaults = defaults or {}
+        matches = await self._lookup_matches(criteria)
+        if len(matches) > 1:
+            raise SurrealDbError(
+                f"update_or_create() matched multiple records ({len(matches)}); the lookup criteria are not unique."
+            )
+        payload = {**criteria, **defaults}
+        client = await SurrealDBConnectionManager.get_client()
+        if not matches:
+            record = await client.create(self._model_table, payload)
+            created = True
+        else:
+            record_id = matches[0].get("id") if isinstance(matches[0], dict) else None
+            record = await client.update(record_id, payload)
+            created = False
+        if isinstance(record, list):
+            record = record[0] if record else {}
+        return self.model.from_db(record), created
+
     # ==================== Custom Query ====================
 
     async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
