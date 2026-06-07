@@ -155,6 +155,7 @@ results = await User.objects().query(
 | FETCH clause           | ✅     |
 | Transactions (`tx=`)   | ✅     |
 | upsert / get_or_create | ✅     |
+| patch / atomic ops     | ✅     |
 
 ### Supported Filter Lookups
 
@@ -377,6 +378,44 @@ but are not written to the record. Without a transaction the behaviour is identi
 SurrealDB 2.6.x and 3.x; under `objects(tx=)` they participate in the transaction on 3.x,
 while a buffered 2.6.x transaction raises on the lookup (see the behaviour table).
 
+### 13. Patch & atomic field/array operations
+
+Mutate a record granularly — server-side — without reading and rewriting the whole document.
+
+```python
+# JSON Patch (RFC 6902) on a single record (native SDK patch()). Requires an explicit id.
+await user.patch([
+    {"op": "replace", "path": "/age", "value": 26},
+    {"op": "add", "path": "/tags/-", "value": "premium"},
+    {"op": "remove", "path": "/settings/notifications"},
+])
+
+# Ergonomic atomic helpers — each is one atomic UPDATE … SET, safe under concurrency:
+await post.atomic_append("tags", "python")     # array::append — duplicates allowed
+await post.atomic_set_add("editors", "alice")  # array::add     — added only if absent (set)
+await post.atomic_remove("tags", "spam")       # array::complement — removes ALL "spam"
+await counter.atomic_increment("views")        # += 1 (default); pass a negative to decrement
+await counter.atomic_increment("score", 5)     # += 5
+
+# Patch a filtered set (or the whole table if unfiltered); returns the affected count.
+n = await User.objects().filter(status="trial").patch(
+    [{"op": "replace", "path": "/plan", "value": "free"}]
+)
+
+# All of the above accept tx= and participate in a transaction:
+async with SurrealDBConnectionManager.transaction() as tx:
+    await counter.atomic_increment("views", tx=tx)
+    await user.patch([{"op": "replace", "path": "/age", "value": 27}], tx=tx)
+```
+
+These atomic ops behave **identically on SurrealDB 2.6.x and 3.x by design**: they use the
+version-portable functions `array::append` / `array::add` / `array::complement` (and numeric
+`+=`) rather than the bare `+=` / `-=` array operators, whose semantics differ between server
+lines. `patch()` and the atomic helpers emit **no signals** (use `merge()` / `save()` if you
+need lifecycle hooks). On a non-transactional or interactive (3.x) call the instance is synced
+with the server's returned row; in a buffered 2.6.x transaction the result is unknown until
+commit, so `refresh()` the instance if you need it (same caveat as `merge(tx=)`).
+
 ---
 
 ## Configuration Options
@@ -423,18 +462,19 @@ Surreal ORM Lite runs on both lines; some capabilities differ because they rely 
 features introduced in SurrealDB 3.x. On 2.6.x the ORM degrades gracefully. Capabilities not
 listed behave the same on both lines.
 
-| ORM capability | SurrealDB 2.6.x | SurrealDB 3.x (3.1.3) | Since |
-| -------------- | --------------- | --------------------- | ----- |
-| Transaction strategy auto-selected by `transaction()` | buffered batch (`BEGIN…COMMIT`) | native interactive on WebSocket | v0.9.0 |
-| Reads inside a transaction (`objects(tx=)`) | raise (buffered cannot read) | see uncommitted writes | v0.9.0 |
-| `save(tx=)` with an auto-generated id | raises — explicit id required | supported | v0.9.0 |
-| `refresh(tx=)` inside a transaction | raises | works | v0.9.0 |
-| `bulk_update` / `bulk_delete` row count inside a tx | returns `0` (not knowable pre-commit) | real count | v0.9.0 |
-| "Already exists" error on create | normalised to `SurrealDbError` | normalised to `SurrealDbError` | v0.7.0 |
-| Cleanup on a missing target (`delete_table`, `remove_relation`) | native no-op | ORM makes it a silent no-op | v0.7.0 |
-| Aggregation over an empty set (`NaN` / `±inf`) | returns `0.0` / `None` | ORM normalises to `0.0` / `None` | v0.7.0 |
-| Namespace/db selection (`use()` ordering) | lenient (auto-creates) | strict — ORM signs in before `use()` | v0.7.0 |
-| `upsert()` / `update_or_create()` / `get_or_create()` | same on both lines | same on both lines | v0.10.0 |
+| ORM capability                                                                        | SurrealDB 2.6.x                                                              | SurrealDB 3.x (3.1.3)                | Since   |
+| ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------ | ------- |
+| Transaction strategy auto-selected by `transaction()`                                 | buffered batch (`BEGIN…COMMIT`)                                              | native interactive on WebSocket      | v0.9.0  |
+| Reads inside a transaction (`objects(tx=)`)                                           | raise (buffered cannot read)                                                 | see uncommitted writes               | v0.9.0  |
+| `save(tx=)` with an auto-generated id                                                 | raises — explicit id required                                                | supported                            | v0.9.0  |
+| `refresh(tx=)` inside a transaction                                                   | raises                                                                       | works                                | v0.9.0  |
+| `bulk_update` / `bulk_delete` row count inside a tx                                   | returns `0` (not knowable pre-commit)                                        | real count                           | v0.9.0  |
+| "Already exists" error on create                                                      | normalised to `SurrealDbError`                                               | normalised to `SurrealDbError`       | v0.7.0  |
+| Cleanup on a missing target (`delete_table`, `remove_relation`)                       | native no-op                                                                 | ORM makes it a silent no-op          | v0.7.0  |
+| Aggregation over an empty set (`NaN` / `±inf`)                                        | returns `0.0` / `None`                                                       | ORM normalises to `0.0` / `None`     | v0.7.0  |
+| Namespace/db selection (`use()` ordering)                                             | lenient (auto-creates)                                                       | strict — ORM signs in before `use()` | v0.7.0  |
+| `upsert()` / `update_or_create()` / `get_or_create()`                                 | same on both lines                                                           | same on both lines                   | v0.10.0 |
+| `patch()` / `atomic_append` / `atomic_set_add` / `atomic_remove` / `atomic_increment` | same on both lines (portable `array::*` fns chosen over divergent `+=`/`-=`) | same on both lines                   | v0.11.0 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
 
@@ -460,7 +500,8 @@ Contributions are welcome! Please:
 | v0.8.0            | Transactions ORM (`tx=`)                         | ✅ Released |
 | v0.9.0            | Transactions — QuerySet & interactive (3.x)      | ✅ Released |
 | v0.10.0           | upsert / update_or_create / get_or_create        | ✅ Released |
-| v0.11.0 – v0.22.0 | Tier 1 — Core (auth, live, relations, …)         | 📋 Planned  |
+| v0.11.0           | patch / atomic field & array ops                 | ✅ Released |
+| v0.12.0 – v0.22.0 | Tier 1 — Core (auth, live, relations, …)         | 📋 Planned  |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)  | 📋 Planned  |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI) | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)               | 📋 Planned  |
@@ -496,7 +537,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Transactions (tx=)            | ✅ v0.8 (core), v0.9 QS | ✅               |
 | Interactive tx (3.x native)   | ✅ v0.9                 | ✅               |
 | upsert / update_or_create     | ✅ v0.10.0              | ✅               |
-| Atomic field/array operations | v0.11.0                 | ✅               |
+| Atomic field/array operations | ✅ v0.11.0              | ✅               |
 | Retry on conflict             | v0.12.0                 | ✅               |
 | SurrealFunc & Computed        | v0.13 – v0.14           | ✅               |
 | JWT Authentication            | v0.16 – v0.17           | ✅               |
