@@ -275,6 +275,81 @@ class BaseSurrealModel(BaseModel):
 
         return result
 
+    async def _do_upsert(self, tx: Transaction | None = None) -> tuple[Self, bool]:
+        """Internal upsert logic. Returns (self, created).
+
+        Uses the SDK's native ``upsert()`` which runs ``UPSERT $record CONTENT $data`` —
+        a full REPLACE: the record is created if absent, or entirely replaced if present
+        (fields omitted from the model are dropped). An explicit id is required (there is
+        nothing to match without one). ``created`` cannot be told apart from the native
+        call, so it is reported best-effort as ``True``; use ``update_or_create`` when the
+        precise ``created`` flag matters.
+
+        When ``tx`` is provided the ``UPSERT`` statement is buffered (deferred to commit);
+        on an interactive transaction the returned row is applied to ``self``.
+        """
+        record_id = self._record_id()
+        if record_id is None:
+            raise SurrealDbError(
+                "upsert() requires an explicit id (there is nothing to match without one); "
+                "use save() to create a record with an auto-generated id."
+            )
+        data = self.model_dump(exclude={"id"})
+
+        if tx is not None:
+            rows = await tx.add(f"UPSERT {record_id} CONTENT $data;", {"data": data})
+            record = rows[0] if isinstance(rows, list) and rows else rows
+            if isinstance(record, dict):
+                for key, value in record.items():
+                    if hasattr(self, key):
+                        object.__setattr__(self, key, value)
+            return self, True
+
+        client = await SurrealDBConnectionManager.get_client()
+        record = await client.upsert(record_id, data)
+        if isinstance(record, list):
+            record = record[0] if record else None
+        if isinstance(record, dict):
+            for key, value in record.items():
+                if hasattr(self, key):
+                    object.__setattr__(self, key, value)
+        return self, True
+
+    async def upsert(self, tx: Transaction | None = None) -> Self:
+        """
+        Insert the model instance, or fully replace it if a record with the same id exists.
+
+        Backed by the SDK's native ``upsert()`` (``UPSERT $record CONTENT $data``): this is
+        REPLACE semantics, so any field omitted from the model is removed from the stored
+        record. For a partial update use ``merge()`` instead. An explicit id is required.
+
+        When ``tx`` is provided, the ``UPSERT`` is buffered onto the transaction.
+
+        Emits the same signals as ``save()`` (``pre_save``/``around_save``/``post_save``);
+        in a transaction ``around_save`` is skipped and ``post_save`` is deferred to a
+        successful commit (consistent with ``save(tx=)``).
+        """
+        sender = self.__class__
+        has_signals = pre_save.has_handlers(sender) or post_save.has_handlers(sender) or around_save.has_handlers(sender)
+
+        if not has_signals:
+            result, created = await self._do_upsert(tx=tx)
+            return result
+
+        await pre_save.send(sender, instance=self)
+
+        if tx is not None:
+            result, created = await self._do_upsert(tx=tx)
+            tx.enqueue_post_commit(lambda: post_save.send(sender, instance=self, created=created))
+            return result
+
+        async with around_save.wrap(sender, instance=self):
+            result, created = await self._do_upsert(tx=tx)
+
+        await post_save.send(sender, instance=self, created=created)
+
+        return result
+
     async def update(self, tx: Transaction | None = None) -> Any:
         """
         Update the model instance to the database.
