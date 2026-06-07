@@ -510,6 +510,43 @@ class BaseSurrealModel(BaseModel):
         self._apply_record(rows)
         return self
 
+    async def atomic_append(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
+        """Atomically append ``value`` to an array ``field`` (duplicates allowed).
+
+        Compiled to ``array::append`` — identical on SurrealDB 2.6.x and 3.x. For set
+        semantics (skip if already present) use :meth:`atomic_set_add`. Emits no signals.
+        """
+        validate_field_name(field, "atomic field")
+        return await self._atomic_update(f"{field} = array::append({field}, $value)", {"value": value}, tx)
+
+    async def atomic_remove(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
+        """Atomically remove ALL occurrences of ``value`` from an array ``field``.
+
+        Compiled to ``array::complement`` — removes every occurrence, identical on 2.6.x and
+        3.x. (The ``-=`` operator is deliberately NOT used: it removes all occurrences on 3.x
+        but only the first on 2.6.x.) Emits no signals.
+        """
+        validate_field_name(field, "atomic field")
+        return await self._atomic_update(f"{field} = array::complement({field}, [$value])", {"value": value}, tx)
+
+    async def atomic_set_add(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
+        """Atomically add ``value`` to an array ``field`` only if not already present.
+
+        Compiled to ``array::add`` (set semantics) — identical on 2.6.x and 3.x. (NOT the
+        ``+=`` operator, which appends duplicates on both server lines.) Emits no signals.
+        """
+        validate_field_name(field, "atomic field")
+        return await self._atomic_update(f"{field} = array::add({field}, $value)", {"value": value}, tx)
+
+    async def atomic_increment(self, field: str, amount: int | float = 1, tx: Transaction | None = None) -> Self:
+        """Atomically add ``amount`` (default 1) to a numeric ``field``.
+
+        Compiled to ``{field} += $amount`` — identical on 2.6.x and 3.x. Pass a negative
+        ``amount`` to decrement. Emits no signals.
+        """
+        validate_field_name(field, "atomic field")
+        return await self._atomic_update(f"{field} += $amount", {"amount": amount}, tx)
+
     async def delete(self, tx: Transaction | None = None) -> None:
         """
         Delete the model instance from the database.

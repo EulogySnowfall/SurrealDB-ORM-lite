@@ -137,3 +137,66 @@ class TestPatchE2E:
         with pytest.raises(ValueError):
             await PatchUser(id="p2", name="x").patch([])
         await SurrealDBConnectionManager.close_connection()
+
+
+class TestAtomicArrayE2E:
+    @pytest.mark.asyncio
+    async def test_atomic_append_allows_duplicates(self) -> None:
+        client = await _setup()
+        p = PatchUser(id="a1", tags=["x"])
+        await p.save()
+        await p.atomic_append("tags", "x")  # duplicate allowed
+        await p.atomic_append("tags", "y")
+        assert p.tags == ["x", "x", "y"]
+        rows = await client.query("SELECT tags FROM PatchUser:a1;", {})
+        assert rows[0]["tags"] == ["x", "x", "y"]
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_atomic_remove_removes_all_occurrences(self) -> None:
+        """Portability: must remove ALL occurrences on BOTH 2.6.x and 3.x."""
+        client = await _setup()
+        p = PatchUser(id="a2", tags=["x", "y", "x", "x"])
+        await p.save()
+        await p.atomic_remove("tags", "x")
+        assert p.tags == ["y"]  # every x gone, identical on both DB lines
+        rows = await client.query("SELECT tags FROM PatchUser:a2;", {})
+        assert rows[0]["tags"] == ["y"]
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_atomic_invalid_field_raises(self) -> None:
+        _connect()
+        with pytest.raises(ValueError):
+            await PatchUser(id="a3").atomic_append("tags; DROP", "x")
+        await SurrealDBConnectionManager.close_connection()
+
+
+class TestAtomicSetAddIncrementE2E:
+    @pytest.mark.asyncio
+    async def test_atomic_set_add_no_duplicate(self) -> None:
+        client = await _setup()
+        p = PatchUser(id="s1", tags=["x"])
+        await p.save()
+        await p.atomic_set_add("tags", "x")  # already present → unchanged
+        assert p.tags == ["x"]
+        await p.atomic_set_add("tags", "z")  # absent → added
+        assert p.tags == ["x", "z"]
+        rows = await client.query("SELECT tags FROM PatchUser:s1;", {})
+        assert rows[0]["tags"] == ["x", "z"]
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_atomic_increment_default_amount_and_negative(self) -> None:
+        client = await _setup()
+        p = PatchUser(id="i1", views=10)
+        await p.save()
+        await p.atomic_increment("views")  # +1 default
+        assert p.views == 11
+        await p.atomic_increment("views", 5)  # +5
+        assert p.views == 16
+        await p.atomic_increment("views", -6)  # decrement
+        assert p.views == 10
+        rows = await client.query("SELECT views FROM PatchUser:i1;", {})
+        assert rows[0]["views"] == 10
+        await SurrealDBConnectionManager.close_connection()
