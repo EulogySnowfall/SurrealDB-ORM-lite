@@ -434,25 +434,53 @@ class TestMergeTxSync:
         await SurrealDBConnectionManager.close_connection()
 
 
-class TestInteractiveTxSpikeE2E:
-    """Valide l'hypothèse fondatrice : sur une connexion WS, l'état de transaction
-    persiste entre des appels query() successifs (BEGIN ... ops ... COMMIT/CANCEL)."""
+async def _native_txn_supported() -> bool:
+    """True if the server exposes the SDK's native transaction RPC (SurrealDB 3.x)."""
+    import contextlib
+
+    client = await SurrealDBConnectionManager.get_client()
+    try:
+        txn = await client.begin()
+    except Exception:
+        return False
+    with contextlib.suppress(Exception):
+        await client.cancel(txn)
+    return True
+
+
+class TestNativeTxSpikeE2E:
+    """Valide l'API de transaction NATIVE du SDK officiel sur le serveur courant.
+
+    Sur SurrealDB 3.x : begin()/txn_id/commit/cancel fonctionnent, les lectures avec
+    txn_id voient les écritures non-committées, et l'isolation est réelle. Sur 2.6.x,
+    begin() lève NotFoundError → le test est skippé (le fallback buffering est testé
+    ailleurs)."""
 
     @pytest.mark.asyncio
-    async def test_ws_transaction_state_persists_across_queries(self) -> None:
-        _connect()  # ws://...
+    async def test_native_interactive_transaction(self) -> None:
+        _connect()  # ws://
         client = await SurrealDBConnectionManager.get_client()
+        if not await _native_txn_supported():
+            await SurrealDBConnectionManager.close_connection()
+            pytest.skip("native interactive transactions require SurrealDB 3.x")
+
         with contextlib.suppress(Exception):
             await client.query("DELETE TxSpike;", {})
 
-        await client.query("BEGIN TRANSACTION;", {})
-        await client.query("CREATE TxSpike:s1 CONTENT { name: 'x' };", {})
-        # La lecture dans la même transaction DOIT voir l'écriture non-committée.
-        seen = await client.query("SELECT * FROM TxSpike;", {})
-        assert isinstance(seen, list) and len(seen) == 1
-        await client.query("CANCEL TRANSACTION;", {})
-
-        # Après CANCEL, l'écriture a disparu (rollback effectif).
+        txn = await client.begin()
+        await client.query("CREATE TxSpike:s1 CONTENT { name: 'x' };", {}, txn_id=txn)
+        inside = await client.query("SELECT * FROM TxSpike;", {}, txn_id=txn)
+        outside = await client.query("SELECT * FROM TxSpike;", {})
+        assert len(inside) == 1   # voit l'écriture non-committée
+        assert len(outside) == 0  # isolation : invisible hors txn
+        await client.cancel(txn)
         after = await client.query("SELECT * FROM TxSpike;", {})
-        assert after == [] or len(after) == 0
+        assert len(after) == 0    # rollback effectif
+
+        txn2 = await client.begin()
+        await client.query("CREATE TxSpike:s2 CONTENT { name: 'y' };", {}, txn_id=txn2)
+        await client.commit(txn2)
+        final = await client.query("SELECT * FROM TxSpike;", {})
+        assert len(final) == 1    # commit persiste
+        await client.query("DELETE TxSpike;", {})
         await SurrealDBConnectionManager.close_connection()
