@@ -22,7 +22,14 @@ from .signals import (
     pre_update,
 )
 from .transaction import Transaction
-from .utils import remove_quotes_for_variables, validate_edge_name, validate_field_name, validate_graph_path, validate_thing
+from .utils import (
+    remove_quotes_for_variables,
+    validate_edge_name,
+    validate_field_name,
+    validate_graph_path,
+    validate_patch_operations,
+    validate_thing,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -450,6 +457,58 @@ class BaseSurrealModel(BaseModel):
             await self.refresh()
 
         await post_update.send(sender, instance=self, update_fields=update_fields)
+
+    # ==================== Patch & atomic operations ====================
+
+    async def patch(self, operations: list[dict[str, Any]], tx: Transaction | None = None) -> Self:
+        """Apply a JSON Patch (RFC 6902) to this record.
+
+        Backed by the SDK's native ``patch()`` (``UPDATE rid PATCH $data``). ``operations`` is
+        a list of op dicts, e.g. ``{"op": "replace", "path": "/age", "value": 26}``. Requires
+        an explicit id.
+
+        Non-transactional and interactive-tx (3.x) calls apply the server's returned row to
+        ``self``. In a buffered transaction (HTTP / SurrealDB 2.6.x) the result is unknown
+        until commit, so ``self`` is left stale — treat the instance as needing ``refresh()``
+        (same caveat as ``merge(tx=)``).
+
+        Unlike ``merge``/``save`` this emits NO signals: it is a low-level atomic primitive.
+        ``operations`` is validated then bound as data, never string-interpolated.
+        """
+        validate_patch_operations(operations)
+        record_id = self._record_id()
+        if record_id is None:
+            raise SurrealDbError("patch() requires an explicit id (there is nothing to patch without one).")
+        if tx is not None:
+            rows = await tx.add("UPDATE $rid PATCH $data;", {"rid": record_id, "data": operations})
+            self._apply_record(rows)  # interactive: applies; buffered: add() returns None → no-op (stale)
+            return self
+        client = await SurrealDBConnectionManager.get_client()
+        record = await client.patch(record_id, operations)
+        self._apply_record(record)
+        return self
+
+    async def _atomic_update(self, set_expr: str, variables: dict[str, Any], tx: Transaction | None) -> Self:
+        """Run ``UPDATE $rid SET <set_expr>`` atomically and sync ``self`` with the result.
+
+        Shared by the atomic helpers. ``$rid`` and every value in ``variables`` are bound
+        (robust for any id type; anti-injection); only the validated ``set_expr`` is inlined.
+        Non-tx and interactive-tx apply the returned row to ``self``; a buffered tx leaves
+        ``self`` stale (the new value is computed server-side, unknown until commit).
+        """
+        record_id = self._record_id()
+        if record_id is None:
+            raise SurrealDbError("atomic operations require an explicit id.")
+        vars_: dict[str, Any] = {"rid": record_id, **variables}
+        statement = f"UPDATE $rid SET {set_expr};"
+        if tx is not None:
+            rows = await tx.add(statement, vars_)
+            self._apply_record(rows)
+            return self
+        client = await SurrealDBConnectionManager.get_client()
+        rows = await client.query(statement, vars_)
+        self._apply_record(rows)
+        return self
 
     async def delete(self, tx: Transaction | None = None) -> None:
         """

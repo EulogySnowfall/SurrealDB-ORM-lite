@@ -103,3 +103,37 @@ class TestPatchValidators:
 
     def test_remove_needs_only_path(self) -> None:
         validate_patch_operations([{"op": "remove", "path": "/x"}])
+
+
+class TestPatchE2E:
+    @pytest.mark.asyncio
+    async def test_patch_replace_add_remove_and_syncs_self(self) -> None:
+        client = await _setup()
+        u = PatchUser(id="p1", name="Al", age=20, tags=["a"])
+        await u.save()
+        await u.patch(
+            [
+                {"op": "replace", "path": "/age", "value": 26},
+                {"op": "add", "path": "/tags/-", "value": "premium"},
+            ]
+        )
+        assert u.age == 26  # non-tx applies the returned row to self
+        assert u.tags == ["a", "premium"]
+        rows = await client.query("SELECT * FROM PatchUser:p1;", {})
+        assert rows[0]["age"] == 26
+        assert rows[0]["tags"] == ["a", "premium"]
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_patch_requires_id(self) -> None:
+        _connect()
+        with pytest.raises(SurrealDbError, match="explicit id"):
+            await PatchUser(name="NoId").patch([{"op": "replace", "path": "/age", "value": 1}])
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_patch_invalid_ops_raise_before_io(self) -> None:
+        _connect()
+        with pytest.raises(ValueError):
+            await PatchUser(id="p2", name="x").patch([])
+        await SurrealDBConnectionManager.close_connection()
