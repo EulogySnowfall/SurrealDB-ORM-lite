@@ -1,4 +1,4 @@
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
 from .connection_manager import SurrealDBConnectionManager
@@ -26,13 +26,15 @@ from .signals import (
     pre_save,
     pre_update,
 )
-from .transaction import Transaction
+from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
 
 __all__ = [
     "__version__",
     # Connection
     "SurrealDBConnectionManager",
     "Transaction",
+    "BufferedTransaction",
+    "InteractiveTransaction",
     # Model
     "BaseSurrealModel",
     "SurrealConfigDict",

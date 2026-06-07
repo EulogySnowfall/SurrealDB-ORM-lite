@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-06-07
+
+### Added
+
+- **Transactions ORM — QuerySet & interactive strategy**: `objects(tx=)` plumbing routes
+  `QuerySet` reads (`get`, `first`, `all`, `exec`, `count`, `exists`, aggregations) and bulk
+  operations (`bulk_create`, `bulk_update`, `bulk_delete`) through the transaction.
+  Example:
+
+  ```python
+  async with SurrealDBConnectionManager.transaction() as tx:
+      users = await User.objects(tx=tx).filter(status="active").exec()
+      await User.objects(tx=tx).filter(role="guest").bulk_update(role="member")
+  ```
+
+- **Two transaction strategies** (auto-selected by `transaction()` based on URL + server):
+
+  - `InteractiveTransaction` (WebSocket + SurrealDB 3.x): uses the SDK's native
+    `begin()`/`commit()`/`cancel()` API tagged by `txn_id`. Reads inside the transaction
+    see uncommitted writes; `save(tx=)` now supports **auto-generated ids** and `refresh(tx=)`
+    works.
+  - `BufferedTransaction` (HTTP, or WebSocket on SurrealDB 2.6.x): preserves the v0.8.0
+    `BEGIN…COMMIT` batching semantics. Reads inside the transaction still raise.
+
+- Exported `BufferedTransaction` and `InteractiveTransaction` (in addition to the `Transaction`
+  base type) for typing and inspection.
+
+### Changed
+
+- `transaction()` now **cancels** on a commit failure (e.g. server-side rollback surfacing at
+  `COMMIT`), so an interactive transaction never leaves the shared connection half-open.
+
+### Fixed
+
+- `QuerySet.get(id)` inside an interactive transaction now normalises the SDK's
+  `NotFoundError` to `SurrealDbNotFoundError`, matching the non-tx path.
+
+### Notes
+
+- `bulk_update()`/`bulk_delete()` return `0` on the buffered strategy (the affected-row
+  count is not knowable before commit). On the interactive strategy they return the real
+  count.
+
 ## [0.8.0] - 2026-06-06
 
 ### Added

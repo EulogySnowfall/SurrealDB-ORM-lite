@@ -1,114 +1,86 @@
 # src/surreal_orm_lite/transaction.py
 """ORM-level transactions for the official SurrealDB SDK 2.0.
 
-The official SDK is single-connection and exposes no transaction object, so a
-``Transaction`` buffers each operation's SurrealQL statement (with namespaced bound
-variables) and flushes them as a single ``BEGIN TRANSACTION; …; COMMIT TRANSACTION;``
-query. A failing statement rolls back the whole batch (verified empirically on
-SurrealDB 2.6.x and 3.1); an exception before flush sends nothing at all.
+Two strategies share one public interface:
 
-IMPORTANT: the SDK's ``query()`` returns ``None`` (does NOT raise) when a transaction
-fails, so commits must use ``query_raw()`` and inspect every statement's ``status`` via
-``raise_for_status()``.
+- ``BufferedTransaction`` (HTTP, and WebSocket on SurrealDB 2.6.x): buffers each
+  operation's SurrealQL statement and flushes them as a single ``BEGIN … COMMIT`` query
+  at commit. Reads inside the transaction are impossible and raise. This is the v0.8.0
+  model.
+- ``InteractiveTransaction`` (WebSocket on SurrealDB 3.x): uses the SDK's NATIVE
+  transaction API (``client.begin() -> txn_id``, then ``txn_id=`` on every operation,
+  then ``client.commit(txn_id)`` / ``client.cancel(txn_id)``). Reads see uncommitted
+  writes; the ``txn_id`` isolates the transaction on the shared connection.
+
+``connection_manager.transaction()`` probes ``client.begin()`` to pick the strategy.
 """
 
+import contextlib
 import re
+from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .exceptions import SurrealDbError
 
 
-class Transaction:
-    """Buffers SurrealQL statements to be committed atomically as one query.
+class Transaction(ABC):
+    """Base transaction: shared post-commit machinery + the call-site interface.
 
-    Record ids (e.g. ``CREATE {record_id} CONTENT $data``) are interpolated into
-    statements via ``str(record_id)``; only the data payload is bound through
-    ``$vars``. Caller-supplied ids are therefore trusted to be either a native
-    ``RecordID`` (whose ``__str__`` produces SurrealQL-escaped ``Table:⟨…⟩``) or
-    an already-validated string. This matches the non-tx path, which passes the
-    same ``RecordID`` object straight to the SDK.
+    Call sites use ``await tx.add(sql, vars)`` for writes and
+    ``await tx.run_read(sql, vars)`` for reads, and never care which concrete strategy
+    is in use. ``is_interactive`` lets the few read-dependent paths (auto-id save, merge
+    refresh, refresh) adapt.
     """
 
     def __init__(self) -> None:
-        self.statements: list[str] = []
-        self.variables: dict[str, Any] = {}
-        self._counter: int = 0
         self._post_commit: list[Callable[[], Awaitable[None]]] = []
 
     @property
-    def is_empty(self) -> bool:
-        return not self.statements
+    @abstractmethod
+    def is_interactive(self) -> bool:
+        """True for the native interactive strategy (reads supported)."""
+        ...
 
-    def add(self, statement: str, variables: dict[str, Any] | None = None) -> None:
-        """Append a statement, renaming its ``$vars`` with a per-statement prefix.
+    @abstractmethod
+    async def add(self, statement: str, variables: dict[str, Any] | None = None) -> Any:
+        """Register a write. Buffered: queue (returns None). Interactive: run now
+        (returns the statement's result rows)."""
+        ...
 
-        Each variable ``$name`` becomes ``$t<N>_name`` to avoid collisions across
-        buffered operations. The rename matches ``$name`` only at a word boundary, so a
-        name that is a prefix of another (e.g. ``$id`` vs ``$identity``) is not corrupted.
+    @abstractmethod
+    async def run_read(self, statement: str, variables: dict[str, Any] | None = None) -> Any:
+        """Run a read and return rows. Buffered: raises (reads need WS + SurrealDB 3.x)."""
+        ...
 
-        Note: only the ``variables`` payload is bound through ``$vars``; any record id
-        inlined into ``statement`` is the caller's responsibility (see class docstring).
-        """
-        prefix = f"t{self._counter}_"
-        renamed = statement
-        if variables:
-            for name, value in variables.items():
-                renamed = re.sub(rf"\${re.escape(name)}\b", f"${prefix}{name}", renamed)
-                self.variables[f"{prefix}{name}"] = value
-        self.statements.append(renamed)
-        self._counter += 1
+    @abstractmethod
+    async def commit(self) -> None: ...
+
+    @abstractmethod
+    async def cancel(self) -> None: ...
 
     def enqueue_post_commit(self, callback: Callable[[], Awaitable[None]]) -> None:
-        """Enqueue an async callback to run after a successful commit.
-
-        Used by model_base to defer ``post_*`` signals so they only fire when the
-        write is actually durable. If the tx body raises, or the commit itself
-        rolls back, queued callbacks are discarded.
-        """
+        """Enqueue an async callback to run after a successful commit (deferred signals)."""
         self._post_commit.append(callback)
 
     async def fire_post_commit(self) -> None:
-        """Invoke every enqueued post-commit callback in insertion order.
+        """Invoke every enqueued post-commit callback in insertion order (FIFO).
 
-        Contract — IMPORTANT for callers:
-
-        - Callbacks run in the order they were enqueued (FIFO).
-        - The first callback that raises **propagates** the exception; remaining
-          callbacks are NOT invoked. Callers that need every handler to run must
-          isolate their own errors inside the handler.
-        - A raised exception does **NOT** undo the commit. The write is already
-          durable on the server; an exception from this method surfaces from
-          ``connection_manager.transaction()``'s ``async with`` block AFTER commit,
-          so catching it does not equal "the transaction rolled back". Use
-          ``raise_for_status``-derived ``SurrealDbError`` to detect actual rollback;
-          treat any other exception out of the block as "commit succeeded, a
-          post-commit handler failed".
+        The first callback that raises propagates; the rest are NOT invoked. A raised
+        exception does NOT undo the commit (the write is already durable).
         """
         for cb in self._post_commit:
             await cb()
 
-    def build_query(self) -> str:
-        """Return the batched ``BEGIN … COMMIT`` query string."""
-        if self.is_empty:
-            raise ValueError("Cannot commit an empty transaction.")
-        body = "\n".join(self.statements)
-        return f"BEGIN TRANSACTION;\n{body}\nCOMMIT TRANSACTION;"
-
     @staticmethod
     def raise_for_status(raw: Any) -> None:
-        """Inspect a ``query_raw()`` response and raise if the transaction failed.
+        """Inspect a ``query_raw()`` response and raise if any statement failed.
 
-        The SDK's ``query()`` silently returns ``None`` on a failed transaction, so the
-        commit path uses ``query_raw()`` (full per-statement response) and calls this.
-        Any statement with ``status == "ERR"`` means the transaction rolled back. The
-        raised message prefers the root cause (the first ERR whose ``details.kind`` is
-        not ``"NotExecuted"``), falling back to the first ERR otherwise.
+        ``query()`` silently returns ``None`` on a failed transaction, so the
+        commit/write paths use ``query_raw()`` and call this. Any statement with
+        ``status == "ERR"`` means the transaction rolled back. Prefers the root cause
+        (the first ERR whose ``details.kind`` is not ``"NotExecuted"``).
         """
-        # Defensive: refuse to declare success on a response shape we don't recognise.
-        # If query_raw ever returns an envelope without "result" (e.g. a top-level error
-        # on a server version we haven't tested), treating "no errors found" as success
-        # would silently report a failed tx as committed.
         if not isinstance(raw, dict) or not isinstance(raw.get("result"), list):
             raise SurrealDbError(f"Transaction failed: unrecognized query_raw() response shape: {raw!r}")
         statements = raw["result"]
@@ -121,3 +93,107 @@ class Transaction:
         )
         message = root.get("result") or "transaction failed"
         raise SurrealDbError(f"Transaction failed and rolled back: {message}")
+
+
+class BufferedTransaction(Transaction):
+    """HTTP / WS-2.6.x strategy (v0.8.0): buffer statements, flush as one BEGIN…COMMIT.
+
+    Requires a shared client at commit time, injected by the connection manager. Record
+    ids inlined into statements are the caller's responsibility (see save()).
+    """
+
+    def __init__(self, client: Any = None) -> None:
+        super().__init__()
+        self._client = client
+        self.statements: list[str] = []
+        self.variables: dict[str, Any] = {}
+        self._counter: int = 0
+
+    @property
+    def is_interactive(self) -> bool:
+        return False
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.statements
+
+    async def add(self, statement: str, variables: dict[str, Any] | None = None) -> None:
+        """Append a statement, renaming its ``$vars`` with a per-statement prefix.
+
+        Each ``$name`` becomes ``$t<N>_name`` (matched at a word boundary so a name that
+        is a prefix of another is not corrupted). Returns None: nothing executes until
+        commit, so buffered writes cannot return rows.
+        """
+        prefix = f"t{self._counter}_"
+        renamed = statement
+        if variables:
+            for name, value in variables.items():
+                renamed = re.sub(rf"\${re.escape(name)}\b", f"${prefix}{name}", renamed)
+                self.variables[f"{prefix}{name}"] = value
+        self.statements.append(renamed)
+        self._counter += 1
+        return None
+
+    async def run_read(self, statement: str, variables: dict[str, Any] | None = None) -> Any:
+        raise SurrealDbError(
+            "Reads inside a transaction require a WebSocket connection to SurrealDB 3.x "
+            "(native interactive transactions); the current transaction is buffered "
+            "(HTTP or SurrealDB 2.6.x)."
+        )
+
+    def build_query(self) -> str:
+        """Return the batched ``BEGIN … COMMIT`` query string."""
+        if self.is_empty:
+            raise ValueError("Cannot commit an empty transaction.")
+        body = "\n".join(self.statements)
+        return f"BEGIN TRANSACTION;\n{body}\nCOMMIT TRANSACTION;"
+
+    async def commit(self) -> None:
+        if self.is_empty:
+            return
+        # query_raw (NOT query): query() returns None on a failed tx; query_raw gives
+        # per-statement status for raise_for_status.
+        raw = await self._client.query_raw(self.build_query(), self.variables)
+        self.raise_for_status(raw)
+
+    async def cancel(self) -> None:
+        # Nothing was sent (statements buffered) → rollback is free.
+        self.statements = []
+        self.variables = {}
+
+
+class InteractiveTransaction(Transaction):
+    """WebSocket / SurrealDB 3.x strategy using the SDK's native transaction API.
+
+    Built with ``(client, txn_id)`` where ``txn_id`` comes from ``client.begin()``
+    (done by the connection manager). Every operation passes ``txn_id=`` so it joins the
+    server-side transaction; reads see uncommitted writes and are isolated from other
+    operations on the same connection.
+    """
+
+    def __init__(self, client: Any, txn_id: Any) -> None:
+        super().__init__()
+        self._client = client
+        self._txn_id = txn_id
+
+    @property
+    def is_interactive(self) -> bool:
+        return True
+
+    async def add(self, statement: str, variables: dict[str, Any] | None = None) -> Any:
+        """Run a write inside the transaction; inspect status; return its rows."""
+        raw = await self._client.query_raw(statement, variables or {}, txn_id=self._txn_id)
+        self.raise_for_status(raw)
+        statements = raw["result"]
+        return statements[-1]["result"] if statements else []
+
+    async def run_read(self, statement: str, variables: dict[str, Any] | None = None) -> Any:
+        """Run a read inside the transaction and return rows directly."""
+        return await self._client.query(statement, variables or {}, txn_id=self._txn_id)
+
+    async def commit(self) -> None:
+        await self._client.commit(self._txn_id)
+
+    async def cancel(self) -> None:
+        with contextlib.suppress(Exception):
+            await self._client.cancel(self._txn_id)

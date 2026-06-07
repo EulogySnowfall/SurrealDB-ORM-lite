@@ -318,12 +318,22 @@ from surreal_orm_lite import SurrealDBConnectionManager
 async with SurrealDBConnectionManager.transaction() as tx:
     await User(id="alice", name="Alice").save(tx=tx)
     await Order(id="o1", user="User:alice", total=100).save(tx=tx)
+
+    # v0.9.0: QuerySet reads & bulk ops participate in the transaction.
+    actives = await User.objects(tx=tx).filter(status="active").exec()
+    await User.objects(tx=tx).filter(role="guest").bulk_update(role="member")
     # Auto-commit on success; auto-rollback if the block raises.
 ```
 
-Inside a transaction, operations are buffered and flushed as one
-`BEGIN TRANSACTION; …; COMMIT TRANSACTION;` query. `save(tx=tx)` requires an explicit `id`.
-Reads inside a transaction arrive in v0.9.0.
+`transaction()` picks the strategy automatically based on the connection:
+
+- **WebSocket + SurrealDB 3.x** → `InteractiveTransaction` (native `begin()`/`commit()`/`cancel()`).
+  Reads inside the tx see uncommitted writes; `save(tx=)` supports auto-generated ids;
+  `refresh(tx=)` and `QuerySet.objects(tx=)` reads work.
+- **HTTP, or WebSocket on SurrealDB 2.6.x** → `BufferedTransaction`. Writes are buffered and
+  flushed as one `BEGIN TRANSACTION; …; COMMIT TRANSACTION;` query at commit; reads inside the
+  tx raise; `save(tx=)` requires an explicit `id`. `bulk_update`/`bulk_delete` return `0`
+  (the row count is not knowable before commit).
 
 ---
 
@@ -387,7 +397,8 @@ Contributions are welcome! Please:
 | ----------------- | ------------------------------------------------ | ----------- |
 | v0.2.x – v0.7.0   | Core ORM → SDK 2.0 / SurrealDB 3.x migration     | ✅ Released |
 | v0.8.0            | Transactions ORM (`tx=`)                         | ✅ Released |
-| v0.9.0 – v0.22.0  | Tier 1 — Core (auth, live, relations, …)         | 📋 Planned  |
+| v0.9.0            | Transactions — QuerySet & interactive (3.x)      | ✅ Released |
+| v0.10.0 – v0.22.0 | Tier 1 — Core (auth, live, relations, …)         | 📋 Planned  |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)  | 📋 Planned  |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI) | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)               | 📋 Planned  |
@@ -421,6 +432,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Relations & Graph             | ✅                      | ✅               |
 | FETCH clause                  | ✅                      | ✅               |
 | Transactions (tx=)            | ✅ v0.8 (core), v0.9 QS | ✅               |
+| Interactive tx (3.x native)   | ✅ v0.9                 | ✅               |
 | upsert / update_or_create     | v0.10.0                 | ✅               |
 | Atomic field/array operations | v0.11.0                 | ✅               |
 | Retry on conflict             | v0.12.0                 | ✅               |

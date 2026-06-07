@@ -2,9 +2,9 @@ import contextlib
 import logging
 from typing import Any
 
-from ._sdk import AsyncSurreal
+from ._sdk import AsyncSurreal, NotFoundError
 from .exceptions import SurrealDbConnectionError
-from .transaction import Transaction
+from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
 
 logger = logging.getLogger(__name__)
 
@@ -115,48 +115,57 @@ class SurrealDBConnectionManager:
     @classmethod
     @contextlib.asynccontextmanager
     async def transaction(cls) -> Any:
-        """Atomic transaction: buffer operations, flush as one BEGIN…COMMIT query.
+        """Atomic transaction. Strategy depends on server capability:
 
-        Operations called with ``tx=tx`` are buffered. On a clean exit the buffer is
-        flushed as a single batched query (atomic server-side). If the body raises, the
-        buffer is discarded and nothing is sent (rollback).
+        - WebSocket + SurrealDB 3.x (native ``begin()`` available) →
+          ``InteractiveTransaction``: operations run immediately inside the server-side
+          transaction (tagged by ``txn_id``); reads inside the transaction see
+          uncommitted writes.
+        - HTTP, or WebSocket on SurrealDB 2.6.x (native ``begin()`` absent) →
+          ``BufferedTransaction``: writes are buffered and flushed as one BEGIN…COMMIT at
+          commit (v0.8.0); reads inside the transaction raise.
 
-        Exception semantics (read carefully):
+        Exception semantics: an exception in the body triggers ``cancel()`` and re-raises
+        (rollback). A server-side rollback surfaces as ``SurrealDbError`` from
+        ``commit()`` BEFORE deferred ``post_*`` signals fire. An exception from a deferred
+        handler surfaces AFTER a durable commit (not a rollback).
 
-        - Any exception raised **inside the ``async with`` body** discards the buffer;
-          nothing is sent to the server (free rollback).
-        - A server-side rollback surfaces as a ``SurrealDbError`` raised by
-          ``raise_for_status`` BEFORE deferred ``post_*`` signals fire.
-        - An exception raised by a deferred ``post_*`` handler (i.e. by
-          ``fire_post_commit``) surfaces from this ``async with`` block AFTER the
-          commit is durable. Catching it does NOT equal "the transaction rolled back" —
-          the writes are persisted. To distinguish, match on ``SurrealDbError`` for
-          rollback vs anything else for post-commit handler failures.
+        SurrealDB has no savepoints/nested transactions; nested ``transaction()`` calls
+        open INDEPENDENT transactions, not savepoints.
 
         Example::
 
             async with SurrealDBConnectionManager.transaction() as tx:
-                await user.save(tx=tx)
-                await order.save(tx=tx)
+                users = await User.objects(tx=tx).filter(status="active").exec()
+                await User.objects(tx=tx).filter(role="guest").bulk_update(role="member")
         """
-        tx = Transaction()
+        client = await cls.get_client()
+        url = cls.__url or ""
+        tx: Transaction
+        if url.startswith(("ws://", "wss://")):
+            try:
+                txn_id = await client.begin()
+            except NotFoundError:
+                txn_id = None
+            tx = InteractiveTransaction(client, txn_id) if txn_id is not None else BufferedTransaction(client)
+        else:
+            tx = BufferedTransaction(client)
+
         try:
             yield tx
         except Exception:
-            # Nothing was sent to the DB (statements are buffered) → rollback is free.
+            await tx.cancel()
             raise
         else:
-            if not tx.is_empty:
-                client = await cls.get_client()
-                # Use query_raw, NOT query: query() returns None (does not raise) when a
-                # transaction fails, so a rolled-back batch would look successful. query_raw
-                # gives per-statement status, which raise_for_status inspects.
-                raw = await client.query_raw(tx.build_query(), tx.variables)
-                tx.raise_for_status(raw)
-                # Commit succeeded → fire deferred post_* signals so handlers see only
-                # durable writes. Any callback exception surfaces here (does not undo
-                # the commit).
-                await tx.fire_post_commit()
+            # A commit failure (e.g. a server-side conflict surfacing at COMMIT) must also
+            # cancel: on the interactive strategy the txn rides the shared connection, so we
+            # never leave it half-open. cancel() is best-effort/idempotent on both strategies.
+            try:
+                await tx.commit()
+            except Exception:
+                await tx.cancel()
+                raise
+            await tx.fire_post_commit()
 
     @classmethod
     async def reconnect(cls) -> Any:

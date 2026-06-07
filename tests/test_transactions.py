@@ -1,5 +1,6 @@
 import contextlib
 import os
+from typing import Any
 
 import pytest
 
@@ -10,7 +11,7 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.signals import post_delete, post_save
-from surreal_orm_lite.transaction import Transaction
+from surreal_orm_lite.transaction import BufferedTransaction, InteractiveTransaction, Transaction
 
 
 def test_transaction_is_exported() -> None:
@@ -20,10 +21,19 @@ def test_transaction_is_exported() -> None:
     assert "Transaction" in surreal_orm_lite.__all__
 
 
-def test_add_namespaces_variables() -> None:
-    tx = Transaction()
-    tx.add("CREATE User:a CONTENT $data;", {"data": {"n": 1}})
-    tx.add("UPDATE User:b MERGE $data;", {"data": {"n": 2}})
+def test_tx_subclasses_exported() -> None:
+    import surreal_orm_lite
+
+    assert surreal_orm_lite.BufferedTransaction is BufferedTransaction
+    assert surreal_orm_lite.InteractiveTransaction is InteractiveTransaction
+    assert surreal_orm_lite.__version__ == "0.9.0"
+
+
+@pytest.mark.asyncio
+async def test_add_namespaces_variables() -> None:
+    tx = BufferedTransaction()
+    await tx.add("CREATE User:a CONTENT $data;", {"data": {"n": 1}})
+    await tx.add("UPDATE User:b MERGE $data;", {"data": {"n": 2}})
     # Each call's vars are renamed with a per-statement prefix to avoid collisions.
     assert tx.variables == {"t0_data": {"n": 1}, "t1_data": {"n": 2}}
     assert tx.statements == [
@@ -32,23 +42,25 @@ def test_add_namespaces_variables() -> None:
     ]
 
 
-def test_build_query_wraps_in_transaction() -> None:
-    tx = Transaction()
-    tx.add("CREATE User:a CONTENT $data;", {"data": {"n": 1}})
+@pytest.mark.asyncio
+async def test_build_query_wraps_in_transaction() -> None:
+    tx = BufferedTransaction()
+    await tx.add("CREATE User:a CONTENT $data;", {"data": {"n": 1}})
     query = tx.build_query()
     assert query == "BEGIN TRANSACTION;\nCREATE User:a CONTENT $t0_data;\nCOMMIT TRANSACTION;"
 
 
 def test_build_query_empty_raises() -> None:
-    tx = Transaction()
+    tx = BufferedTransaction()
     with pytest.raises(ValueError, match="empty transaction"):
         tx.build_query()
 
 
-def test_is_empty() -> None:
-    tx = Transaction()
+@pytest.mark.asyncio
+async def test_is_empty() -> None:
+    tx = BufferedTransaction()
     assert tx.is_empty is True
-    tx.add("DELETE User:a;", None)
+    await tx.add("DELETE User:a;", None)
     assert tx.is_empty is False
 
 
@@ -106,7 +118,7 @@ def test_raise_for_status_rejects_unrecognized_shape() -> None:
 
 @pytest.mark.asyncio
 async def test_fire_post_commit_runs_callbacks_in_order() -> None:
-    tx = Transaction()
+    tx = BufferedTransaction()
     seen: list[int] = []
 
     async def cb(n: int) -> None:
@@ -124,7 +136,7 @@ async def test_fire_post_commit_first_raise_skips_rest() -> None:
     # Documented contract: the first callback that raises propagates the exception;
     # remaining callbacks are NOT invoked. The commit is already durable at this point
     # — we don't try to keep going on partial state.
-    tx = Transaction()
+    tx = BufferedTransaction()
     seen: list[int] = []
 
     async def cb(n: int) -> None:
@@ -141,12 +153,90 @@ async def test_fire_post_commit_first_raise_skips_rest() -> None:
     assert seen == [1]
 
 
-def test_add_namespacing_respects_word_boundary() -> None:
+@pytest.mark.asyncio
+async def test_add_namespacing_respects_word_boundary() -> None:
     # A var name that is a prefix of another must not be corrupted by the rename.
-    tx = Transaction()
-    tx.add("UPDATE t SET a = $id, b = $identity;", {"id": 1, "identity": 2})
+    tx = BufferedTransaction()
+    await tx.add("UPDATE t SET a = $id, b = $identity;", {"id": 1, "identity": 2})
     assert tx.statements == ["UPDATE t SET a = $t0_id, b = $t0_identity;"]
     assert tx.variables == {"t0_id": 1, "t0_identity": 2}
+
+
+@pytest.mark.asyncio
+async def test_buffered_run_read_raises() -> None:
+    tx = BufferedTransaction()
+    assert tx.is_interactive is False
+    with pytest.raises(SurrealDbError, match="3.x"):
+        await tx.run_read("SELECT * FROM User;", {})
+
+
+class _FakeTxnClient:
+    """Async client double for InteractiveTransaction (records txn_id usage)."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Any]] = []
+        self.read_rows: list[Any] = [{"id": "User:1", "name": "x"}]
+        self.write_envelope: dict[str, Any] = {"result": [{"status": "OK", "result": [{"id": "User:1"}]}]}
+        self.err_envelope: dict[str, Any] | None = None
+
+    async def query_raw(self, sql: str, params: Any = None, session_id: Any = None, txn_id: Any = None) -> dict[str, Any]:
+        self.calls.append(("query_raw", txn_id))
+        if self.err_envelope is not None and "CREATE" in sql:
+            return self.err_envelope
+        return self.write_envelope
+
+    async def query(self, sql: str, vars: Any = None, session_id: Any = None, txn_id: Any = None) -> Any:
+        self.calls.append(("query", txn_id))
+        return self.read_rows
+
+    async def commit(self, txn_id: Any, session_id: Any = None) -> None:
+        self.calls.append(("commit", txn_id))
+
+    async def cancel(self, txn_id: Any, session_id: Any = None) -> None:
+        self.calls.append(("cancel", txn_id))
+
+
+@pytest.mark.asyncio
+async def test_interactive_is_interactive() -> None:
+    tx = InteractiveTransaction(_FakeTxnClient(), "TXN")
+    assert tx.is_interactive is True
+
+
+@pytest.mark.asyncio
+async def test_interactive_add_passes_txn_id_and_returns_rows() -> None:
+    c = _FakeTxnClient()
+    tx = InteractiveTransaction(c, "TXN")
+    rows = await tx.add("CREATE User:1 CONTENT $data;", {"data": {"name": "x"}})
+    assert rows == [{"id": "User:1"}]
+    assert ("query_raw", "TXN") in c.calls
+
+
+@pytest.mark.asyncio
+async def test_interactive_add_raises_on_err() -> None:
+    c = _FakeTxnClient()
+    c.err_envelope = {"result": [{"status": "ERR", "result": "boom"}]}
+    tx = InteractiveTransaction(c, "TXN")
+    with pytest.raises(SurrealDbError, match="rolled back"):
+        await tx.add("CREATE User:1 CONTENT $data;", {"data": {}})
+
+
+@pytest.mark.asyncio
+async def test_interactive_run_read_passes_txn_id() -> None:
+    c = _FakeTxnClient()
+    tx = InteractiveTransaction(c, "TXN")
+    rows = await tx.run_read("SELECT * FROM User;", {})
+    assert rows == [{"id": "User:1", "name": "x"}]
+    assert ("query", "TXN") in c.calls
+
+
+@pytest.mark.asyncio
+async def test_interactive_commit_and_cancel_use_txn_id() -> None:
+    c = _FakeTxnClient()
+    await InteractiveTransaction(c, "TXN").commit()
+    assert ("commit", "TXN") in c.calls
+    c2 = _FakeTxnClient()
+    await InteractiveTransaction(c2, "TXN2").cancel()
+    assert ("cancel", "TXN2") in c2.calls
 
 
 def _connect() -> None:
@@ -206,14 +296,6 @@ class TestTransactionE2E:
                 raise RuntimeError("boom")
         rows = await client.query("SELECT * FROM TxUser;", {})
         assert len(rows) == 0  # nothing persisted
-        await SurrealDBConnectionManager.close_connection()
-
-    @pytest.mark.asyncio
-    async def test_save_in_tx_without_id_raises(self) -> None:
-        _connect()
-        with pytest.raises(SurrealDbError, match="explicit id"):
-            async with SurrealDBConnectionManager.transaction() as tx:
-                await TxUser(name="NoId").save(tx=tx)
         await SurrealDBConnectionManager.close_connection()
 
     @pytest.mark.asyncio
@@ -295,11 +377,70 @@ class TestTransactionE2E:
         await SurrealDBConnectionManager.close_connection()
 
 
+class TestSaveTxAutoId:
+    @pytest.mark.asyncio
+    async def test_interactive_save_autoid_assigns_id(self) -> None:
+        _connect()
+        if not await _native_txn_supported():
+            await SurrealDBConnectionManager.close_connection()
+            pytest.skip("requires SurrealDB 3.x")
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        u = TxUser(name="AutoWS")  # pas d'id
+        async with SurrealDBConnectionManager.transaction() as tx:
+            await u.save(tx=tx)
+        assert u.id is not None
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_http_save_without_id_raises(self) -> None:
+        _connect_http()
+        with pytest.raises(SurrealDbError, match="explicit id"):
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await TxUser(name="NoId").save(tx=tx)
+        await SurrealDBConnectionManager.close_connection()
+
+
 @pytest.mark.asyncio
-async def test_refresh_with_tx_raises() -> None:
-    u = TxUser(id="ivy", name="Ivy")
-    with pytest.raises(SurrealDbError, match="not supported inside a transaction"):
-        await u.refresh(tx=Transaction())
+async def test_refresh_tx_works_in_interactive() -> None:
+    _connect()
+    if not await _native_txn_supported():
+        await SurrealDBConnectionManager.close_connection()
+        pytest.skip("requires SurrealDB 3.x")
+    client = await SurrealDBConnectionManager.get_client()
+    await _clear(client)
+    await TxUser(id="ref1", name="Before").save()
+    await client.query("UPDATE TxUser:ref1 SET name = 'After';", {})
+    u = TxUser(id="ref1", name="Before")
+    async with SurrealDBConnectionManager.transaction() as tx:
+        await u.refresh(tx=tx)
+    assert u.name == "After"
+    await SurrealDBConnectionManager.close_connection()
+
+
+@pytest.mark.asyncio
+async def test_refresh_tx_raises_when_buffered() -> None:
+    _connect_http()
+    u = TxUser(id="x", name="x")
+    async with SurrealDBConnectionManager.transaction() as tx:
+        with pytest.raises(SurrealDbError, match="3.x"):
+            await u.refresh(tx=tx)
+    await SurrealDBConnectionManager.close_connection()
+
+
+@pytest.mark.asyncio
+async def test_interactive_read_sees_uncommitted_write() -> None:
+    _connect()
+    if not await _native_txn_supported():
+        await SurrealDBConnectionManager.close_connection()
+        pytest.skip("requires SurrealDB 3.x")
+    client = await SurrealDBConnectionManager.get_client()
+    await _clear(client)
+    async with SurrealDBConnectionManager.transaction() as tx:
+        await TxUser(id="u1", name="InTx").save(tx=tx)
+        found = await TxUser.objects(tx=tx).filter(name="InTx").exec()
+        assert len(found) == 1
+    await SurrealDBConnectionManager.close_connection()
 
 
 class TxSignalUser(BaseSurrealModel):
@@ -432,3 +573,384 @@ class TestMergeTxSync:
         rows = await client.query("SELECT name FROM TxUser:sync;", {})
         assert rows[0]["name"] == "NewName"
         await SurrealDBConnectionManager.close_connection()
+
+
+def _connect_http() -> None:
+    SurrealDBConnectionManager.set_connection(
+        url=f"http://{os.environ.get('SURREALDB_HOST', 'localhost')}:{os.environ.get('SURREALDB_PORT', '8000')}",
+        user="root",
+        password="root",
+        namespace="ns",
+        database="db",
+    )
+
+
+class TestTransactionDispatchE2E:
+    @pytest.mark.asyncio
+    async def test_ws_interactive_when_supported(self) -> None:
+        _connect()  # ws://
+        if not await _native_txn_supported():
+            await SurrealDBConnectionManager.close_connection()
+            pytest.skip("requires SurrealDB 3.x")
+        async with SurrealDBConnectionManager.transaction() as tx:
+            assert tx.is_interactive is True
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_http_uses_buffered_and_commits(self) -> None:
+        _connect_http()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        async with SurrealDBConnectionManager.transaction() as tx:
+            assert tx.is_interactive is False
+            await TxUser(id="http1", name="H").save(tx=tx)
+        rows = await client.query("SELECT * FROM TxUser;", {})
+        assert len(rows) == 1
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_interactive_commit_and_rollback(self) -> None:
+        _connect()
+        if not await _native_txn_supported():
+            await SurrealDBConnectionManager.close_connection()
+            pytest.skip("requires SurrealDB 3.x")
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        async with SurrealDBConnectionManager.transaction() as tx:
+            await TxUser(id="w1", name="W").save(tx=tx)
+        assert len(await client.query("SELECT * FROM TxUser;", {})) == 1
+        await _clear(client)
+        with pytest.raises(RuntimeError):
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await TxUser(id="w2", name="W2").save(tx=tx)
+                raise RuntimeError("boom")
+        assert len(await client.query("SELECT * FROM TxUser;", {})) == 0
+        await SurrealDBConnectionManager.close_connection()
+
+
+async def _native_txn_supported() -> bool:
+    """True if the server exposes the SDK's native transaction RPC (SurrealDB 3.x)."""
+    import contextlib
+
+    client = await SurrealDBConnectionManager.get_client()
+    try:
+        txn = await client.begin()
+    except Exception:
+        return False
+    with contextlib.suppress(Exception):
+        await client.cancel(txn)
+    return True
+
+
+class TestQuerySetTxE2E:
+    @pytest.mark.asyncio
+    async def test_interactive_bulk_update_in_tx_commits(self) -> None:
+        _connect()
+        if not await _native_txn_supported():
+            await SurrealDBConnectionManager.close_connection()
+            pytest.skip("requires SurrealDB 3.x")
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        await TxUser(id="a", name="guest").save()
+        await TxUser(id="b", name="guest").save()
+        async with SurrealDBConnectionManager.transaction() as tx:
+            n = await TxUser.objects(tx=tx).filter(name="guest").bulk_update(name="member")
+            assert n == 2
+        rows = await client.query("SELECT name FROM TxUser;", {})
+        assert all(r["name"] == "member" for r in rows)
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_interactive_bulk_delete_rolls_back(self) -> None:
+        _connect()
+        if not await _native_txn_supported():
+            await SurrealDBConnectionManager.close_connection()
+            pytest.skip("requires SurrealDB 3.x")
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        await TxUser(id="d1", name="x").save()
+        with pytest.raises(RuntimeError):
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await TxUser.objects(tx=tx).filter(name="x").bulk_delete()
+                raise RuntimeError("rollback")
+        assert len(await client.query("SELECT * FROM TxUser;", {})) == 1
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_http_bulk_update_in_tx_commits(self) -> None:
+        _connect_http()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        await TxUser(id="h1", name="guest").save()
+        async with SurrealDBConnectionManager.transaction() as tx:
+            await TxUser.objects(tx=tx).filter(name="guest").bulk_update(name="member")
+        rows = await client.query("SELECT name FROM TxUser;", {})
+        assert rows[0]["name"] == "member"
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_http_read_in_tx_raises(self) -> None:
+        _connect_http()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        async with SurrealDBConnectionManager.transaction() as tx:
+            with pytest.raises(SurrealDbError, match="3.x"):
+                await TxUser.objects(tx=tx).filter(name="x").exec()
+        await SurrealDBConnectionManager.close_connection()
+
+
+class TestNativeTxSpikeE2E:
+    """Valide l'API de transaction NATIVE du SDK officiel sur le serveur courant.
+
+    Sur SurrealDB 3.x : begin()/txn_id/commit/cancel fonctionnent, les lectures avec
+    txn_id voient les écritures non-committées, et l'isolation est réelle. Sur 2.6.x,
+    begin() lève NotFoundError → le test est skippé (le fallback buffering est testé
+    ailleurs)."""
+
+    @pytest.mark.asyncio
+    async def test_native_interactive_transaction(self) -> None:
+        from surreal_orm_lite._sdk import NotFoundError
+
+        _connect()  # ws://
+        client = await SurrealDBConnectionManager.get_client()
+        if not await _native_txn_supported():
+            await SurrealDBConnectionManager.close_connection()
+            pytest.skip("native interactive transactions require SurrealDB 3.x")
+
+        with contextlib.suppress(Exception):
+            await client.query("DELETE TxSpike;", {})
+
+        async def _select_outside() -> list:
+            # SurrealDB 3.x raises NotFoundError for a SELECT on a never-materialized
+            # table; the isolation contract treats that as "0 rows visible".
+            try:
+                return await client.query("SELECT * FROM TxSpike;", {})
+            except NotFoundError:
+                return []
+
+        txn = await client.begin()
+        await client.query("CREATE TxSpike:s1 CONTENT { name: 'x' };", {}, txn_id=txn)
+        inside = await client.query("SELECT * FROM TxSpike;", {}, txn_id=txn)
+        outside = await _select_outside()
+        assert len(inside) == 1  # voit l'écriture non-committée
+        assert len(outside) == 0  # isolation : invisible hors txn
+        await client.cancel(txn)
+        after = await _select_outside()
+        assert len(after) == 0  # rollback effectif
+
+        txn2 = await client.begin()
+        await client.query("CREATE TxSpike:s2 CONTENT { name: 'y' };", {}, txn_id=txn2)
+        await client.commit(txn2)
+        final = await client.query("SELECT * FROM TxSpike;", {})
+        assert len(final) == 1  # commit persiste
+        await client.query("DELETE TxSpike;", {})
+        await SurrealDBConnectionManager.close_connection()
+
+
+# =============================================================================
+# Unit tests with fakes — exercise the tx-routed paths in QuerySet / BaseModel
+# without requiring a SurrealDB server. These keep patch coverage above 90% on
+# CI matrix cells that don't expose those branches naturally.
+# =============================================================================
+
+
+class _FakeTx:
+    """Minimal Transaction double honoring the ABC's call-site interface.
+
+    Stores every add()/run_read() call, returns canned values. ``is_interactive``
+    is configurable to exercise both strategy branches in model_base / query_set.
+    """
+
+    def __init__(self, interactive: bool = True, read_rows: Any = None, add_rows: Any = None) -> None:
+        self.interactive = interactive
+        self.read_rows = read_rows
+        self.add_rows = add_rows
+        self.read_calls: list[tuple[str, dict[str, Any]]] = []
+        self.add_calls: list[tuple[str, dict[str, Any] | None]] = []
+        self.post_commit: list[Any] = []
+
+    @property
+    def is_interactive(self) -> bool:
+        return self.interactive
+
+    async def run_read(self, sql: str, variables: dict[str, Any] | None = None) -> Any:
+        self.read_calls.append((sql, variables or {}))
+        if isinstance(self.read_rows, Exception):
+            raise self.read_rows
+        return self.read_rows
+
+    async def add(self, sql: str, variables: dict[str, Any] | None = None) -> Any:
+        self.add_calls.append((sql, variables))
+        return self.add_rows
+
+    def enqueue_post_commit(self, cb: Any) -> None:
+        self.post_commit.append(cb)
+
+
+class TestTxRoutedQuerySetUnits:
+    @pytest.mark.asyncio
+    async def test_execute_query_tx_run_read_notfound_returns_empty(self) -> None:
+        # query_set.py: _execute_query NotFoundError branch on the tx path.
+        from surreal_orm_lite._sdk import NotFoundError
+
+        qs = TxUser.objects(tx=_FakeTx(read_rows=NotFoundError("NotFound", "nope")))
+        rows = await qs._execute_query("SELECT * FROM TxUser;", {})
+        assert rows == []
+
+    @pytest.mark.asyncio
+    async def test_get_tx_returns_record(self) -> None:
+        tx = _FakeTx(read_rows=[{"id": "TxUser:a", "name": "A"}])
+        u = await TxUser.objects(tx=tx).get("a")
+        assert u.name == "A"
+        # The SELECT used the parametrized $rid form, not interpolation.
+        assert tx.read_calls[0][0] == "SELECT * FROM $rid;"
+
+    @pytest.mark.asyncio
+    async def test_get_tx_empty_rows_raises(self) -> None:
+        from surreal_orm_lite.exceptions import SurrealDbNotFoundError
+
+        tx = _FakeTx(read_rows=[])
+        with pytest.raises(SurrealDbNotFoundError):
+            await TxUser.objects(tx=tx).get("missing")
+
+    @pytest.mark.asyncio
+    async def test_get_tx_run_read_notfound_normalized(self) -> None:
+        # Review Fix #1: NotFoundError from the SDK is normalized to the ORM type.
+        from surreal_orm_lite._sdk import NotFoundError
+        from surreal_orm_lite.exceptions import SurrealDbNotFoundError
+
+        tx = _FakeTx(read_rows=NotFoundError("NotFound", "missing table"))
+        with pytest.raises(SurrealDbNotFoundError):
+            await TxUser.objects(tx=tx).get("a")
+
+    @pytest.mark.asyncio
+    async def test_all_tx_returns_rows(self) -> None:
+        tx = _FakeTx(read_rows=[{"id": "TxUser:a", "name": "A"}, {"id": "TxUser:b", "name": "B"}])
+        rows = await TxUser.objects(tx=tx).all()
+        assert len(rows) == 2
+
+    @pytest.mark.asyncio
+    async def test_all_tx_notfound_returns_empty_list(self) -> None:
+        from surreal_orm_lite._sdk import NotFoundError
+
+        tx = _FakeTx(read_rows=NotFoundError("NotFound", "table missing"))
+        rows = await TxUser.objects(tx=tx).all()
+        assert rows == []
+
+    @pytest.mark.asyncio
+    async def test_bulk_create_tx_buffered_returns_inputs(self) -> None:
+        # Buffered: add() returns None, bulk_create returns the input models unchanged.
+        tx = _FakeTx(interactive=False, add_rows=None)
+        models = [TxUser(id="x", name="X"), TxUser(id="y", name="Y")]
+        out = await TxUser.objects(tx=tx).bulk_create(models)
+        assert out is models
+        assert tx.add_calls[0][0].startswith("INSERT INTO TxUser")
+
+    @pytest.mark.asyncio
+    async def test_bulk_create_tx_interactive_returns_db_rows(self) -> None:
+        # Interactive: add() returns rows, bulk_create rehydrates models from them.
+        tx = _FakeTx(interactive=True, add_rows=[{"id": "TxUser:a", "name": "A"}])
+        out = await TxUser.objects(tx=tx).bulk_create([TxUser(id="a", name="A")])
+        assert len(out) == 1
+        assert out[0].name == "A"
+
+    @pytest.mark.asyncio
+    async def test_bulk_update_tx_buffered_returns_zero(self) -> None:
+        # Buffered add() returns None → bulk_update reports 0 (not knowable until commit).
+        tx = _FakeTx(interactive=False, add_rows=None)
+        n = await TxUser.objects(tx=tx).filter(name="x").bulk_update(name="y")
+        assert n == 0
+
+    @pytest.mark.asyncio
+    async def test_bulk_delete_tx_buffered_returns_zero(self) -> None:
+        tx = _FakeTx(interactive=False, add_rows=None)
+        n = await TxUser.objects(tx=tx).filter(name="x").bulk_delete()
+        assert n == 0
+
+
+class TestTxRoutedModelUnits:
+    @pytest.mark.asyncio
+    async def test_refresh_tx_interactive_no_id_raises(self) -> None:
+        u = TxUser(name="NoId")  # no id
+        tx = _FakeTx(interactive=True, read_rows=[])
+        with pytest.raises(SurrealDbError, match="not recorded yet"):
+            await u.refresh(tx=tx)
+
+    @pytest.mark.asyncio
+    async def test_refresh_tx_interactive_no_dict_raises(self) -> None:
+        # run_read returns no dict-shaped row → "no record found".
+        u = TxUser(id="ghost", name="x")
+        tx = _FakeTx(interactive=True, read_rows=[])
+        with pytest.raises(SurrealDbError, match="no record found"):
+            await u.refresh(tx=tx)
+
+    @pytest.mark.asyncio
+    async def test_save_tx_interactive_autoid_applies_returned_fields(self) -> None:
+        # save(tx=) auto-id on an interactive tx: rows returned by add() are merged into self.
+        tx = _FakeTx(interactive=True, add_rows=[{"id": "TxUser:auto", "name": "Auto"}])
+        u = TxUser(name="Auto")  # no id → triggers auto-id branch
+        await u.save(tx=tx)
+        assert u.id == "TxUser:auto"
+
+    @pytest.mark.asyncio
+    async def test_update_tx_with_signals_enqueues_post_commit(self) -> None:
+        # update() tx + signals branch: pre_update fires inline, post_update is enqueued.
+        from surreal_orm_lite.signals import post_update, pre_update
+
+        seen_pre: list[Any] = []
+        seen_post: list[Any] = []
+
+        async def on_pre(sender: Any, instance: Any, update_fields: Any) -> None:
+            seen_pre.append(update_fields)
+
+        async def on_post(sender: Any, instance: Any, update_fields: Any) -> None:
+            seen_post.append(update_fields)
+
+        pre_update.connect(TxUser)(on_pre)
+        post_update.connect(TxUser)(on_post)
+        try:
+            tx = _FakeTx(interactive=False, add_rows=None)
+            u = TxUser(id="u1", name="N")
+            await u.update(tx=tx)
+            assert seen_pre and not seen_post  # pre fired, post deferred
+            for cb in tx.post_commit:
+                await cb()
+            assert seen_post  # post fired after we drained the queue
+        finally:
+            pre_update.disconnect(on_pre, TxUser)
+            post_update.disconnect(on_post, TxUser)
+
+    @pytest.mark.asyncio
+    async def test_merge_tx_buffered_with_signals_applies_to_instance(self) -> None:
+        # merge(tx=) buffered + signals: pre_update fires, fields applied in-memory, post_update deferred.
+        from surreal_orm_lite.signals import post_update, pre_update
+
+        fired_pre: list[Any] = []
+        fired_post: list[Any] = []
+
+        async def on_pre(sender: Any, instance: Any, update_fields: Any) -> None:
+            fired_pre.append(update_fields)
+
+        async def on_post(sender: Any, instance: Any, update_fields: Any) -> None:
+            fired_post.append(update_fields)
+
+        pre_update.connect(TxUser)(on_pre)
+        post_update.connect(TxUser)(on_post)
+        try:
+            tx = _FakeTx(interactive=False, add_rows=None)
+            u = TxUser(id="u2", name="Before")
+            await u.merge(tx=tx, name="After")
+            assert u.name == "After"  # buffered: applied in-memory at buffer time
+            assert fired_pre and not fired_post
+            for cb in tx.post_commit:
+                await cb()
+            assert fired_post
+        finally:
+            pre_update.disconnect(on_pre, TxUser)
+            post_update.disconnect(on_post, TxUser)
+
+    @pytest.mark.asyncio
+    async def test_objects_tx_attaches_tx_to_queryset(self) -> None:
+        tx = _FakeTx()
+        qs = TxUser.objects(tx=tx)
+        assert qs._tx is tx

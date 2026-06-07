@@ -135,10 +135,26 @@ class BaseSurrealModel(BaseModel):
     async def refresh(self, tx: Transaction | None = None) -> None:
         """Refresh the model instance from the database.
 
-        Reads inside a transaction are not supported in v0.8.0 (planned for v0.9.0).
+        When ``tx`` is provided, the read participates in the transaction. This requires an
+        ``InteractiveTransaction`` (WebSocket + SurrealDB 3.x); on a ``BufferedTransaction``
+        (HTTP or SurrealDB 2.6.x) reads are not supported and this raises ``SurrealDbError``.
         """
         if tx is not None:
-            raise SurrealDbError("refresh() is a read and is not supported inside a transaction (planned for v0.9.0).")
+            if not tx.is_interactive:
+                raise SurrealDbError(
+                    "refresh() is a read; it requires a WebSocket connection to SurrealDB 3.x "
+                    "(native interactive transactions)."
+                )
+            if not self.get_id():
+                raise SurrealDbError("Can't refresh data, not recorded yet.")
+            rows = await tx.run_read("SELECT * FROM $rid;", {"rid": self._record_id()})
+            record = rows[0] if isinstance(rows, list) and rows else rows
+            if not isinstance(record, dict):
+                raise SurrealDbError("Can't refresh data, no record found.")
+            for key, value in record.items():
+                if hasattr(self, key):
+                    object.__setattr__(self, key, value)
+            return
         if not self.get_id():
             raise SurrealDbError("Can't refresh data, not recorded yet.")  # pragma: no cover
 
@@ -172,9 +188,20 @@ class BaseSurrealModel(BaseModel):
         table = self.get_table_name()
 
         if tx is not None:
-            if record_id is None:
-                raise SurrealDbError("save(tx=...) requires an explicit id (auto-id is not supported inside a transaction).")
-            tx.add(f"CREATE {record_id} CONTENT $data;", {"data": data})
+            if record_id is not None:
+                await tx.add(f"CREATE {record_id} CONTENT $data;", {"data": data})
+                return self, True
+            if not tx.is_interactive:
+                raise SurrealDbError(
+                    "save(tx=...) requires an explicit id on a buffered transaction "
+                    "(auto-id requires a WebSocket connection to SurrealDB 3.x)."
+                )
+            rows = await tx.add(f"CREATE {table} CONTENT $data;", {"data": data})
+            record = rows[0] if isinstance(rows, list) and rows else rows
+            if isinstance(record, dict):
+                for key, value in record.items():
+                    if hasattr(self, key):
+                        object.__setattr__(self, key, value)
             return self, True
 
         client = await SurrealDBConnectionManager.get_client()
@@ -269,11 +296,11 @@ class BaseSurrealModel(BaseModel):
 
         if tx is not None:
             if not has_signals:
-                tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
+                await tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
                 return None
             update_fields = list(data.keys())
             await pre_update.send(sender, instance=self, update_fields=update_fields)
-            tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
+            await tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
             tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
             return None
 
@@ -323,18 +350,15 @@ class BaseSurrealModel(BaseModel):
 
         if tx is not None:
             update_fields = list(data_set.keys())
-            # pre_update sees the instance BEFORE merged fields are applied
-            # (matches the non-tx path, where client.merge has not run yet at this
-            # point).
             if has_signals:
                 await pre_update.send(sender, instance=self, update_fields=update_fields)
-            tx.add(f"UPDATE {record_id} MERGE $data;", {"data": data_set})
-            # Apply merged fields to the in-memory instance so it reflects the
-            # buffered write — the tx path has no post-commit refresh() to fall
-            # back on. Happens regardless of signals.
-            for key, value in data_set.items():
-                if hasattr(self, key):
-                    object.__setattr__(self, key, value)
+            await tx.add(f"UPDATE {record_id} MERGE $data;", {"data": data_set})
+            if tx.is_interactive:
+                await self.refresh(tx=tx)
+            else:
+                for key, value in data_set.items():
+                    if hasattr(self, key):
+                        object.__setattr__(self, key, value)
             if has_signals:
                 tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
             return None
@@ -375,10 +399,10 @@ class BaseSurrealModel(BaseModel):
 
         if tx is not None:
             if not has_signals:
-                tx.add(f"DELETE {record_id};", None)
+                await tx.add(f"DELETE {record_id};", None)
                 return None
             await pre_delete.send(sender, instance=self)
-            tx.add(f"DELETE {record_id};", None)
+            await tx.add(f"DELETE {record_id};", None)
             tx.enqueue_post_commit(lambda: post_delete.send(sender, instance=self))
             return None
 
@@ -648,13 +672,19 @@ class BaseSurrealModel(BaseModel):
         return []
 
     @classmethod
-    def objects(cls) -> Any:
+    def objects(cls, tx: Transaction | None = None) -> Any:
         """
         Return a QuerySet for the model class.
+
+        When ``tx`` is provided, the QuerySet's reads and bulk operations participate in
+        that transaction (reads require an interactive transaction — WS + SurrealDB 3.x).
         """
         from .query_set import QuerySet
 
-        return QuerySet(cls)
+        qs = QuerySet(cls)
+        if tx is not None:
+            qs._tx = tx
+        return qs
 
     @classmethod
     async def raw_query(
