@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-06-07
+
+### Added
+
+- **`model.upsert()`** — insert-or-replace by explicit id, backed by the SDK's native
+  `upsert()` (`UPSERT $record CONTENT $data`, full REPLACE). Supports `tx=` (buffered onto
+  the transaction).
+
+  ```python
+  user = User(id="alice", name="Alice", status="active")
+  await user.upsert()  # CREATE if absent, full REPLACE if present
+  ```
+
+- **`QuerySet.update_or_create()` / `QuerySet.get_or_create()`** — Django-style
+  criteria-based create-or-update returning `(instance, created)`. A SELECT-guard raises an
+  explicit `SurrealDbError` when the criteria match more than one record.
+
+  ```python
+  user, created = await User.objects().update_or_create(
+      email="alice@example.com", defaults={"name": "Alice"}
+  )
+  user, created = await User.objects().get_or_create(
+      email="bob@example.com", defaults={"name": "Bob"}
+  )
+  ```
+
+### Notes
+
+- Behaviour is **identical on SurrealDB 2.6.x and 3.x** (no 3.x-only primitive): the native
+  `upsert()` call and the SELECT-guard work the same on both lines (verified by spike).
+- `upsert()` is REPLACE, not merge: fields omitted from the model are dropped. Use `merge()`
+  for partial updates.
+- `update_or_create` / `get_or_create` do the lookup and the write in two round-trips
+  (SurrealDB 2.6.x exposes no row-locking primitive here), so a small race window exists
+  under concurrent writers — the same non-atomic fallback Django documents.
+
 ## [0.9.0] - 2026-06-07
 
 ### Added
