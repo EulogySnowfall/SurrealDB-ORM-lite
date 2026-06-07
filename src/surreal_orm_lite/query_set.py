@@ -416,7 +416,10 @@ class QuerySet:
                 record_id = RecordID(self._model_table, raw)
 
             if self._tx is not None:
-                rows = await self._tx.run_read("SELECT * FROM $rid;", {"rid": record_id})
+                try:
+                    rows = await self._tx.run_read("SELECT * FROM $rid;", {"rid": record_id})
+                except NotFoundError:
+                    raise SurrealDbNotFoundError("No result found.") from None
                 data = rows[0] if isinstance(rows, list) and rows else rows
                 if not data:
                     raise SurrealDbNotFoundError("No result found.")

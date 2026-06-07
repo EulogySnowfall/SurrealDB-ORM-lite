@@ -135,7 +135,9 @@ class BaseSurrealModel(BaseModel):
     async def refresh(self, tx: Transaction | None = None) -> None:
         """Refresh the model instance from the database.
 
-        Reads inside a transaction are not supported in v0.8.0 (planned for v0.9.0).
+        When ``tx`` is provided, the read participates in the transaction. This requires an
+        ``InteractiveTransaction`` (WebSocket + SurrealDB 3.x); on a ``BufferedTransaction``
+        (HTTP or SurrealDB 2.6.x) reads are not supported and this raises ``SurrealDbError``.
         """
         if tx is not None:
             if not tx.is_interactive:

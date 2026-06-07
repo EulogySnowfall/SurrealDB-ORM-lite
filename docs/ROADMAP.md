@@ -19,7 +19,8 @@
 | v0.6.0            | Relations & Graph                                    | Done    |
 | v0.7.0            | SDK 2.0 / SurrealDB 3.x migration                    | Done    |
 | v0.8.0            | Transactions ORM (core, `tx=`)                       | Done    |
-| v0.9.0 – v0.22.0  | Tier 1 — Core (auth, live, relations, …)             | Planned |
+| v0.9.0            | Transactions ORM (QuerySet) + interactive (3.x)      | Done    |
+| v0.10.0 – v0.22.0 | Tier 1 — Core (auth, live, relations, …)             | Planned |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 7 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
