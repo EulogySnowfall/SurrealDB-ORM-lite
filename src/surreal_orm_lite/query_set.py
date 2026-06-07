@@ -805,15 +805,16 @@ class QuerySet:
         write are two round-trips (no server-side locking on SurrealDB 2.6.x), so a small race
         window exists, the same non-atomic fallback Django documents. ``criteria`` must be
         non-empty.
+
+        Create builds ``self.model(**payload)``: keys not declared on the model are dropped by
+        Pydantic, and a missing required field raises ``ValidationError`` at construction.
         """
         if not criteria:
             raise SurrealDbError("update_or_create() requires at least one lookup criteria.")
         defaults = defaults or {}
         matches = await self._lookup_matches(criteria)
         if len(matches) > 1:
-            raise SurrealDbError(
-                f"update_or_create() matched multiple records ({len(matches)}); the lookup criteria are not unique."
-            )
+            raise SurrealDbError("update_or_create() matched multiple records; the lookup criteria are not unique.")
         payload = {**self._criteria_payload(criteria), **defaults}
         if not matches:
             obj: Any = self.model(**payload)
@@ -840,15 +841,16 @@ class QuerySet:
         The create goes through ``save()`` (signals, error normalisation, PK identity, and
         ``objects(tx=)`` participation); the lookup routes through the transaction too.
         ``criteria`` must be non-empty.
+
+        Create builds ``self.model(**payload)``: keys not declared on the model are dropped by
+        Pydantic, and a missing required field raises ``ValidationError`` at construction.
         """
         if not criteria:
             raise SurrealDbError("get_or_create() requires at least one lookup criteria.")
         defaults = defaults or {}
         matches = await self._lookup_matches(criteria)
         if len(matches) > 1:
-            raise SurrealDbError(
-                f"get_or_create() matched multiple records ({len(matches)}); the lookup criteria are not unique."
-            )
+            raise SurrealDbError("get_or_create() matched multiple records; the lookup criteria are not unique.")
         if matches:
             return self.model.from_db(matches[0]), False
         payload = {**self._criteria_payload(criteria), **defaults}
