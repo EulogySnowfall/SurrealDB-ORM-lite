@@ -516,6 +516,59 @@ class TestMergeTxSync:
         await SurrealDBConnectionManager.close_connection()
 
 
+def _connect_http() -> None:
+    SurrealDBConnectionManager.set_connection(
+        url=f"http://{os.environ.get('SURREALDB_HOST', 'localhost')}:{os.environ.get('SURREALDB_PORT', '8000')}",
+        user="root",
+        password="root",
+        namespace="ns",
+        database="db",
+    )
+
+
+class TestTransactionDispatchE2E:
+    @pytest.mark.asyncio
+    async def test_ws_interactive_when_supported(self) -> None:
+        _connect()  # ws://
+        if not await _native_txn_supported():
+            await SurrealDBConnectionManager.close_connection()
+            pytest.skip("requires SurrealDB 3.x")
+        async with SurrealDBConnectionManager.transaction() as tx:
+            assert tx.is_interactive is True
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_http_uses_buffered_and_commits(self) -> None:
+        _connect_http()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        async with SurrealDBConnectionManager.transaction() as tx:
+            assert tx.is_interactive is False
+            await TxUser(id="http1", name="H").save(tx=tx)
+        rows = await client.query("SELECT * FROM TxUser;", {})
+        assert len(rows) == 1
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_interactive_commit_and_rollback(self) -> None:
+        _connect()
+        if not await _native_txn_supported():
+            await SurrealDBConnectionManager.close_connection()
+            pytest.skip("requires SurrealDB 3.x")
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client)
+        async with SurrealDBConnectionManager.transaction() as tx:
+            await TxUser(id="w1", name="W").save(tx=tx)
+        assert len(await client.query("SELECT * FROM TxUser;", {})) == 1
+        await _clear(client)
+        with pytest.raises(RuntimeError):
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await TxUser(id="w2", name="W2").save(tx=tx)
+                raise RuntimeError("boom")
+        assert len(await client.query("SELECT * FROM TxUser;", {})) == 0
+        await SurrealDBConnectionManager.close_connection()
+
+
 async def _native_txn_supported() -> bool:
     """True if the server exposes the SDK's native transaction RPC (SurrealDB 3.x)."""
     import contextlib
