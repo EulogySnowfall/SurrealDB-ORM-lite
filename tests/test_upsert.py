@@ -131,3 +131,50 @@ class TestUpdateOrCreateE2E:
         with pytest.raises(SurrealDbError, match="criteria"):
             await UpUser.objects().update_or_create(defaults={"age": 1})
         await SurrealDBConnectionManager.close_connection()
+
+
+class TestGetOrCreateE2E:
+    @pytest.mark.asyncio
+    async def test_creates_when_absent(self) -> None:
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client, "UpUser")
+        obj, created = await UpUser.objects().get_or_create(name="Zoe", defaults={"age": 5})
+        assert created is True
+        assert obj.name == "Zoe"
+        assert obj.age == 5
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_returns_existing_without_writing(self) -> None:
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client, "UpUser")
+        first, c1 = await UpUser.objects().get_or_create(name="Yan", defaults={"age": 7})
+        assert c1 is True
+        # defaults differ, but the existing record must NOT be overwritten
+        second, c2 = await UpUser.objects().get_or_create(name="Yan", defaults={"age": 99})
+        assert c2 is False
+        assert second.age == 7  # unchanged
+        rows = await client.query("SELECT * FROM UpUser;", {})
+        assert len(rows) == 1
+        assert rows[0]["age"] == 7
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_raises_on_multiple_matches(self) -> None:
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        await _clear(client, "UpUser")
+        await UpUser(id="g1", name="DupG", age=1).save()
+        await UpUser(id="g2", name="DupG", age=2).save()
+        with pytest.raises(SurrealDbError, match="multiple"):
+            await UpUser.objects().get_or_create(name="DupG")
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_requires_criteria(self) -> None:
+        _connect()
+        with pytest.raises(SurrealDbError, match="criteria"):
+            await UpUser.objects().get_or_create(defaults={"age": 1})
+        await SurrealDBConnectionManager.close_connection()

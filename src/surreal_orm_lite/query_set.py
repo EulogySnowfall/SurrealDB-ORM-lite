@@ -807,6 +807,39 @@ class QuerySet:
             record = record[0] if record else {}
         return self.model.from_db(record), created
 
+    async def get_or_create(
+        self,
+        defaults: dict[str, Any] | None = None,
+        **criteria: Any,
+    ) -> tuple[Any, bool]:
+        """Look up a record by ``criteria``; return it, or create it; return ``(obj, created)``.
+
+        Django-style: ``criteria`` are equality filters. Unlike ``update_or_create``,
+        ``defaults`` are applied ONLY when creating; an existing match is returned
+        untouched.
+
+        - 0 matches → CREATE with ``criteria`` merged with ``defaults`` → ``created=True``.
+        - 1 match → returned as-is (no write) → ``created=False``.
+        - >1 matches → ``SurrealDbError`` (the criteria are not unique).
+
+        ``criteria`` must be non-empty.
+        """
+        if not criteria:
+            raise SurrealDbError("get_or_create() requires at least one lookup criteria.")
+        defaults = defaults or {}
+        matches = await self._lookup_matches(criteria)
+        if len(matches) > 1:
+            raise SurrealDbError(
+                f"get_or_create() matched multiple records ({len(matches)}); the lookup criteria are not unique."
+            )
+        if matches:
+            return self.model.from_db(matches[0]), False
+        client = await SurrealDBConnectionManager.get_client()
+        record = await client.create(self._model_table, {**criteria, **defaults})
+        if isinstance(record, list):
+            record = record[0] if record else {}
+        return self.model.from_db(record), True
+
     # ==================== Custom Query ====================
 
     async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
