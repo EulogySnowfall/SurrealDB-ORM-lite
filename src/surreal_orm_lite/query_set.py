@@ -748,6 +748,116 @@ class QuerySet:
             return len(results)
         return 0
 
+    # ==================== Upsert / get_or_create ====================
+
+    @staticmethod
+    def _criteria_payload(criteria: dict[str, Any]) -> dict[str, Any]:
+        """Field=value pairs usable as a WRITE payload, taken from EQUALITY criteria only.
+
+        ``criteria`` keys are filter lookups (``field`` or ``field__lookup``). A literal raw
+        key like ``name__contains`` must never be written as a column, so only ``exact``
+        lookups contribute to the payload (their base field name → value). Non-``exact``
+        lookups (``gt``/``contains``/``in``/…) still drive the lookup but cannot be written,
+        so they are excluded here — mirroring Django, which only writes exact lookups on
+        create.
+        """
+        payload: dict[str, Any] = {}
+        for key, value in criteria.items():
+            field_name, lookup = parse_lookup(key)
+            if lookup == "exact":
+                payload[field_name] = value
+        return payload
+
+    async def _lookup_matches(self, criteria: dict[str, Any]) -> list[Any]:
+        """Return rows matching ``criteria``, routed through the transaction when attached.
+
+        Reuses the parameterized WHERE builder (anti-injection) via a throwaway QuerySet's
+        ``filter(**criteria)``, then runs through ``_execute_query`` so the read participates
+        in ``self._tx`` (``objects(tx=)``) — seeing the tx's uncommitted writes on an
+        interactive transaction, and raising on a buffered one (consistent with every other
+        read). ``LIMIT 2`` is enough to distinguish 0 / 1 / >1.
+        """
+        probe = QuerySet(self.model)
+        probe.filter(**criteria)
+        where_clause, where_vars = probe._build_where()
+        query = f"SELECT * FROM {self._model_table}{where_clause} LIMIT 2;"
+        rows = await self._execute_query(query, where_vars)
+        return rows if isinstance(rows, list) else []
+
+    async def update_or_create(
+        self,
+        defaults: dict[str, Any] | None = None,
+        **criteria: Any,
+    ) -> tuple[Any, bool]:
+        """Look up a record by ``criteria``; create it or update it; return ``(obj, created)``.
+
+        Django-style: ``criteria`` are filters used to find the record; ``defaults`` are extra
+        field values (they win on conflict). The write payload is built from the EQUALITY
+        criteria fields plus ``defaults`` (non-``exact`` lookups drive the lookup only).
+
+        - 0 matches → CREATE via ``save()`` → ``created=True``.
+        - 1 match → partial UPDATE via ``merge()`` (untouched fields preserved) → ``created=False``.
+        - >1 matches → ``SurrealDbError`` (the criteria are not unique).
+
+        Writes go through ``save()``/``merge()``, so lifecycle signals fire, SDK errors are
+        normalised to ``SurrealDbError``, the primary key anchors identity, and — under
+        ``objects(tx=)`` — the operation participates in the transaction. The lookup and the
+        write are two round-trips (no server-side locking on SurrealDB 2.6.x), so a small race
+        window exists, the same non-atomic fallback Django documents. ``criteria`` must be
+        non-empty.
+
+        Create builds ``self.model(**payload)``: keys not declared on the model are dropped by
+        Pydantic, and a missing required field raises ``ValidationError`` at construction.
+        """
+        if not criteria:
+            raise SurrealDbError("update_or_create() requires at least one lookup criteria.")
+        defaults = defaults or {}
+        matches = await self._lookup_matches(criteria)
+        if len(matches) > 1:
+            raise SurrealDbError("update_or_create() matched multiple records; the lookup criteria are not unique.")
+        payload = {**self._criteria_payload(criteria), **defaults}
+        if not matches:
+            obj: Any = self.model(**payload)
+            await obj.save(tx=self._tx)
+            return obj, True
+        obj = self.model.from_db(matches[0])
+        await obj.merge(tx=self._tx, **payload)
+        return obj, False
+
+    async def get_or_create(
+        self,
+        defaults: dict[str, Any] | None = None,
+        **criteria: Any,
+    ) -> tuple[Any, bool]:
+        """Look up a record by ``criteria``; return it, or create it; return ``(obj, created)``.
+
+        Django-style: ``criteria`` are filters. Unlike ``update_or_create``, ``defaults`` are
+        applied ONLY when creating; an existing match is returned untouched.
+
+        - 0 matches → CREATE (equality criteria + ``defaults``) via ``save()`` → ``created=True``.
+        - 1 match → returned as-is (no write) → ``created=False``.
+        - >1 matches → ``SurrealDbError`` (the criteria are not unique).
+
+        The create goes through ``save()`` (signals, error normalisation, PK identity, and
+        ``objects(tx=)`` participation); the lookup routes through the transaction too.
+        ``criteria`` must be non-empty.
+
+        Create builds ``self.model(**payload)``: keys not declared on the model are dropped by
+        Pydantic, and a missing required field raises ``ValidationError`` at construction.
+        """
+        if not criteria:
+            raise SurrealDbError("get_or_create() requires at least one lookup criteria.")
+        defaults = defaults or {}
+        matches = await self._lookup_matches(criteria)
+        if len(matches) > 1:
+            raise SurrealDbError("get_or_create() matched multiple records; the lookup criteria are not unique.")
+        if matches:
+            return self.model.from_db(matches[0]), False
+        payload = {**self._criteria_payload(criteria), **defaults}
+        obj = self.model(**payload)
+        await obj.save(tx=self._tx)
+        return obj, True
+
     # ==================== Custom Query ====================
 
     async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:

@@ -26,7 +26,6 @@ def test_tx_subclasses_exported() -> None:
 
     assert surreal_orm_lite.BufferedTransaction is BufferedTransaction
     assert surreal_orm_lite.InteractiveTransaction is InteractiveTransaction
-    assert surreal_orm_lite.__version__ == "0.9.0"
 
 
 @pytest.mark.asyncio

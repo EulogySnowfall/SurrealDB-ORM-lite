@@ -154,6 +154,7 @@ results = await User.objects().query(
 | Relations & Graph      | ✅     |
 | FETCH clause           | ✅     |
 | Transactions (`tx=`)   | ✅     |
+| upsert / get_or_create | ✅     |
 
 ### Supported Filter Lookups
 
@@ -335,6 +336,47 @@ async with SurrealDBConnectionManager.transaction() as tx:
   tx raise; `save(tx=)` requires an explicit `id`. `bulk_update`/`bulk_delete` return `0`
   (the row count is not knowable before commit).
 
+### 12. Upsert & get_or_create / update_or_create
+
+```python
+from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict
+
+
+class User(BaseSurrealModel):
+    model_config = SurrealConfigDict(primary_key="id")
+    id: str | None = None
+    name: str
+    email: str
+
+
+# Insert-or-replace by explicit id (full REPLACE — omitted fields are dropped).
+# Use merge() instead if you only want a partial update.
+await User(id="alice", name="Alice", email="alice@example.com").upsert()
+
+# Criteria-based, Django-style; returns (instance, created).
+# update_or_create: on create, writes criteria + defaults; on update, MERGEs them (a partial
+# update — fields outside the criteria/defaults are preserved). Lifecycle signals fire on both
+# paths, and the primary key anchors the record identity.
+user, created = await User.objects().update_or_create(
+    email="alice@example.com", defaults={"name": "Alice"}
+)
+
+# get_or_create writes the defaults ONLY when creating; an existing match is returned as-is:
+user, created = await User.objects().get_or_create(
+    email="bob@example.com", defaults={"name": "Bob"}
+)
+
+# Both participate in a transaction via objects(tx=) (interactive on SurrealDB 3.x):
+async with SurrealDBConnectionManager.transaction() as tx:
+    user, created = await User.objects(tx=tx).get_or_create(email="z@x.io", defaults={"name": "Z"})
+```
+
+If the lookup criteria match more than one record, both methods raise `SurrealDbError`
+(the criteria are not unique). Non-`exact` lookups (e.g. `name__contains`) drive the lookup
+but are not written to the record. Without a transaction the behaviour is identical on
+SurrealDB 2.6.x and 3.x; under `objects(tx=)` they participate in the transaction on 3.x,
+while a buffered 2.6.x transaction raises on the lookup (see the behaviour table).
+
 ---
 
 ## Configuration Options
@@ -375,6 +417,25 @@ As of v0.7.0, Surreal ORM Lite uses `surrealdb[pydantic]>=2.0.0,<3.0.0` (Surreal
 | 2.6.x             | 2.0         | ✅ Compatible     |
 | < 2.6 or > 3.1    | —           | ⚠️ Not guaranteed |
 
+### ORM behaviour: SurrealDB 2.6.x vs 3.x
+
+Surreal ORM Lite runs on both lines; some capabilities differ because they rely on server
+features introduced in SurrealDB 3.x. On 2.6.x the ORM degrades gracefully. Capabilities not
+listed behave the same on both lines.
+
+| ORM capability | SurrealDB 2.6.x | SurrealDB 3.x (3.1.3) | Since |
+| -------------- | --------------- | --------------------- | ----- |
+| Transaction strategy auto-selected by `transaction()` | buffered batch (`BEGIN…COMMIT`) | native interactive on WebSocket | v0.9.0 |
+| Reads inside a transaction (`objects(tx=)`) | raise (buffered cannot read) | see uncommitted writes | v0.9.0 |
+| `save(tx=)` with an auto-generated id | raises — explicit id required | supported | v0.9.0 |
+| `refresh(tx=)` inside a transaction | raises | works | v0.9.0 |
+| `bulk_update` / `bulk_delete` row count inside a tx | returns `0` (not knowable pre-commit) | real count | v0.9.0 |
+| "Already exists" error on create | normalised to `SurrealDbError` | normalised to `SurrealDbError` | v0.7.0 |
+| Cleanup on a missing target (`delete_table`, `remove_relation`) | native no-op | ORM makes it a silent no-op | v0.7.0 |
+| Aggregation over an empty set (`NaN` / `±inf`) | returns `0.0` / `None` | ORM normalises to `0.0` / `None` | v0.7.0 |
+| Namespace/db selection (`use()` ordering) | lenient (auto-creates) | strict — ORM signs in before `use()` | v0.7.0 |
+| `upsert()` / `update_or_create()` / `get_or_create()` | same on both lines | same on both lines | v0.10.0 |
+
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
 
 ---
@@ -398,7 +459,8 @@ Contributions are welcome! Please:
 | v0.2.x – v0.7.0   | Core ORM → SDK 2.0 / SurrealDB 3.x migration     | ✅ Released |
 | v0.8.0            | Transactions ORM (`tx=`)                         | ✅ Released |
 | v0.9.0            | Transactions — QuerySet & interactive (3.x)      | ✅ Released |
-| v0.10.0 – v0.22.0 | Tier 1 — Core (auth, live, relations, …)         | 📋 Planned  |
+| v0.10.0           | upsert / update_or_create / get_or_create        | ✅ Released |
+| v0.11.0 – v0.22.0 | Tier 1 — Core (auth, live, relations, …)         | 📋 Planned  |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)  | 📋 Planned  |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI) | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)               | 📋 Planned  |
@@ -433,7 +495,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | FETCH clause                  | ✅                      | ✅               |
 | Transactions (tx=)            | ✅ v0.8 (core), v0.9 QS | ✅               |
 | Interactive tx (3.x native)   | ✅ v0.9                 | ✅               |
-| upsert / update_or_create     | v0.10.0                 | ✅               |
+| upsert / update_or_create     | ✅ v0.10.0              | ✅               |
 | Atomic field/array operations | v0.11.0                 | ✅               |
 | Retry on conflict             | v0.12.0                 | ✅               |
 | SurrealFunc & Computed        | v0.13 – v0.14           | ✅               |

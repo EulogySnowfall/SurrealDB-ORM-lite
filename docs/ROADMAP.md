@@ -113,7 +113,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | Relations & Graph             | yes        | v0.6.0           |
 | FETCH clause                  | yes        | v0.6.0           |
 | Transactions (`tx=`)          | yes        | ✅ v0.8 core, v0.9 QuerySet |
-| `upsert` / `update_or_create` | yes        | v0.10.0          |
+| `upsert` / `update_or_create` | yes        | ✅ v0.10.0       |
 | Atomic field/array ops        | yes        | v0.11.0          |
 | Retry on conflict             | yes        | v0.12.0          |
 | SurrealFunc & Computed        | yes        | v0.13 – v0.14    |
@@ -195,6 +195,14 @@ v0.25.0/v0.26.0 are reclassified to Future.
 - Savepoints / nested transactions: NOT supported (SurrealDB only has flat BEGIN/COMMIT/CANCEL);
   nested `transaction()` opens independent transactions
 
+### Version 0.10.0 — upsert / update_or_create / get_or_create
+
+- `model.upsert()`: insert-or-replace by explicit id (native SDK `upsert()`, full REPLACE);
+  supports `tx=`
+- `QuerySet.update_or_create(defaults=, **criteria)` and `get_or_create(defaults=, **criteria)`:
+  Django-style, return `(instance, created)`; raise on >1 match (criteria not unique)
+- **Identical on SurrealDB 2.6.x and 3.x** — no 3.x-only primitive
+
 ---
 
 ## Planned — Tier 1: Core (SDK 2.0 strict)
@@ -209,7 +217,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | --------- | ------------------------------------------------------------------------ | ------------------------- |
 | ✅ v0.8.0 | Transactions ORM (core): `transaction()` ctx manager + `tx=` on CRUD     | `BEGIN`/`COMMIT`/`CANCEL` |
 | ✅ v0.9.0 | Transactions ORM (QuerySet): `objects(tx=)`, bulk under `tx`, no savepoints (SurrealDB) | idem                      |
-| v0.10.0   | `upsert()` + `update_or_create()` / `get_or_create()`                    | `upsert()`                |
+| ✅ v0.10.0 | `upsert()` + `update_or_create()` / `get_or_create()`                    | `upsert()`                |
 | v0.11.0   | `patch()` & atomic field/array ops (append/remove/set_add/increment)     | `patch()` (JSON Patch)    |
 | v0.12.0   | `retry_on_conflict` & optimistic concurrency                             | transactions + retry      |
 
