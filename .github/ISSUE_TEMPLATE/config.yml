@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://github.com/EulogySnowfall/SurrealDB-ORM-lite#readme
+    about: Read the README for usage, supported versions, and examples before opening an issue.
+  - name: Security vulnerability
+    url: https://github.com/EulogySnowfall/SurrealDB-ORM-lite/blob/main/SECURITY.md
+    about: Please report security issues privately following the security policy — do not open a public issue.
