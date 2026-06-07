@@ -48,6 +48,7 @@ class PatchUser(BaseSurrealModel):
     tags: list[str] = []
     views: int = 0
     score: float = 0.0
+    counters: dict[str, int] = {}
 
 
 class TestPatchValidators:
@@ -201,6 +202,24 @@ class TestAtomicSetAddIncrementE2E:
         assert rows[0]["views"] == 10
         await SurrealDBConnectionManager.close_connection()
 
+    @pytest.mark.asyncio
+    async def test_atomic_increment_nested_field(self) -> None:
+        client = await _setup()
+        p = PatchUser(id="n1", counters={"views": 10})
+        await p.save()
+        await p.atomic_increment("counters.views", 5)  # dotted nested path
+        assert p.counters["views"] == 15
+        rows = await client.query("SELECT counters FROM PatchUser:n1;", {})
+        assert rows[0]["counters"]["views"] == 15
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_atomic_requires_id(self) -> None:
+        _connect()
+        with pytest.raises(SurrealDbError, match="explicit id"):
+            await PatchUser().atomic_increment("views")
+        await SurrealDBConnectionManager.close_connection()
+
 
 class TestQuerySetPatchE2E:
     @pytest.mark.asyncio
@@ -232,6 +251,35 @@ class TestQuerySetPatchE2E:
         _connect()
         with pytest.raises(ValueError):
             await PatchUser.objects().patch([])
+        await SurrealDBConnectionManager.close_connection()
+
+
+class TestQuerySetPatchTxE2E:
+    @pytest.mark.asyncio
+    async def test_queryset_patch_in_tx_commits(self) -> None:
+        client = await _setup()
+        await PatchUser(id="qt1", name="A", age=1).save()
+        await PatchUser(id="qt2", name="A", age=1).save()
+        interactive = await _native_txn_supported()
+        async with SurrealDBConnectionManager.transaction() as tx:
+            n = await PatchUser.objects(tx=tx).filter(name="A").patch([{"op": "replace", "path": "/age", "value": 5}])
+            # Real affected count on the interactive (3.x) strategy; the buffered (2.6.x / HTTP)
+            # strategy cannot know it before commit and reports 0 — same contract as bulk_update.
+            assert n == 2 if interactive else n == 0
+        rows = await client.query("SELECT age FROM PatchUser WHERE name = 'A';", {})
+        assert all(r["age"] == 5 for r in rows)  # persisted on both lines
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_queryset_patch_in_tx_rolls_back(self) -> None:
+        client = await _setup()
+        await PatchUser(id="qt3", name="B", age=1).save()
+        with pytest.raises(RuntimeError):
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await PatchUser.objects(tx=tx).filter(name="B").patch([{"op": "replace", "path": "/age", "value": 9}])
+                raise RuntimeError("boom")
+        rows = await client.query("SELECT age FROM PatchUser WHERE name = 'B';", {})
+        assert rows[0]["age"] == 1  # rolled back
         await SurrealDBConnectionManager.close_connection()
 
 
