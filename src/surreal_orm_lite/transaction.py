@@ -15,6 +15,7 @@ Two strategies share one public interface:
 ``connection_manager.transaction()`` probes ``client.begin()`` to pick the strategy.
 """
 
+import contextlib
 import re
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
@@ -194,7 +195,5 @@ class InteractiveTransaction(Transaction):
         await self._client.commit(self._txn_id)
 
     async def cancel(self) -> None:
-        import contextlib
-
         with contextlib.suppress(Exception):
             await self._client.cancel(self._txn_id)

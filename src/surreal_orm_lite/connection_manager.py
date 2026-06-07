@@ -157,7 +157,14 @@ class SurrealDBConnectionManager:
             await tx.cancel()
             raise
         else:
-            await tx.commit()
+            # A commit failure (e.g. a server-side conflict surfacing at COMMIT) must also
+            # cancel: on the interactive strategy the txn rides the shared connection, so we
+            # never leave it half-open. cancel() is best-effort/idempotent on both strategies.
+            try:
+                await tx.commit()
+            except Exception:
+                await tx.cancel()
+                raise
             await tx.fire_post_commit()
 
     @classmethod
