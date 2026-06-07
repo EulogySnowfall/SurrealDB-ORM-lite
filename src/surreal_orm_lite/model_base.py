@@ -1,6 +1,7 @@
 import contextlib
 import logging
 import typing
+from collections.abc import Awaitable, Callable
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -251,28 +252,52 @@ class BaseSurrealModel(BaseModel):
         is deferred until the transaction commits successfully; if the tx rolls back,
         ``post_save`` is NOT emitted (the write never happened).
         """
+        return await self._save_with_signals(self._do_save, tx)
+
+    def _apply_record(self, record: Any) -> None:
+        """Copy a returned DB row's fields onto this instance (id kept as native ``RecordID``).
+
+        Accepts the raw SDK result (a row dict, a single-element list, or ``None``) and applies
+        only attributes the model actually declares. Shared by ``_do_save``/``_do_upsert`` so
+        the "apply the row the server gave back" step lives in one place.
+        """
+        if isinstance(record, list):
+            record = record[0] if record else None
+        if isinstance(record, dict):
+            for key, value in record.items():
+                if hasattr(self, key):
+                    object.__setattr__(self, key, value)
+
+    async def _save_with_signals(
+        self,
+        do_op: Callable[..., Awaitable[tuple[Self, bool]]],
+        tx: Transaction | None,
+    ) -> Self:
+        """Shared ``save``/``upsert`` signal envelope around the concrete write ``do_op``.
+
+        Emits ``pre_save`` → (``around_save`` wrap) → ``post_save``. In a transaction the write
+        is buffered, so ``around_save`` is skipped and ``post_save`` is deferred to a
+        successful commit — identical for both ``save()`` (``do_op=_do_save``) and ``upsert()``
+        (``do_op=_do_upsert``), so the contract can't drift between them.
+        """
         sender = self.__class__
         has_signals = pre_save.has_handlers(sender) or post_save.has_handlers(sender) or around_save.has_handlers(sender)
 
         if not has_signals:
-            result, created = await self._do_save(tx=tx)
+            result, _created = await do_op(tx=tx)
             return result
 
         await pre_save.send(sender, instance=self)
 
         if tx is not None:
-            # Buffered op: there is no actual write to wrap here, so around_save is
-            # skipped (the write happens at commit). post_save is deferred to post-commit
-            # so handlers only run when the write is durable.
-            result, created = await self._do_save(tx=tx)
+            result, created = await do_op(tx=tx)
             tx.enqueue_post_commit(lambda: post_save.send(sender, instance=self, created=created))
             return result
 
         async with around_save.wrap(sender, instance=self):
-            result, created = await self._do_save(tx=tx)
+            result, created = await do_op(tx=tx)
 
         await post_save.send(sender, instance=self, created=created)
-
         return result
 
     async def _do_upsert(self, tx: Transaction | None = None) -> tuple[Self, bool]:
@@ -298,21 +323,12 @@ class BaseSurrealModel(BaseModel):
 
         if tx is not None:
             rows = await tx.add(f"UPSERT {record_id} CONTENT $data;", {"data": data})
-            record = rows[0] if isinstance(rows, list) and rows else rows
-            if isinstance(record, dict):
-                for key, value in record.items():
-                    if hasattr(self, key):
-                        object.__setattr__(self, key, value)
+            self._apply_record(rows)
             return self, True
 
         client = await SurrealDBConnectionManager.get_client()
         record = await client.upsert(record_id, data)
-        if isinstance(record, list):
-            record = record[0] if record else None
-        if isinstance(record, dict):
-            for key, value in record.items():
-                if hasattr(self, key):
-                    object.__setattr__(self, key, value)
+        self._apply_record(record)
         return self, True
 
     async def upsert(self, tx: Transaction | None = None) -> Self:
@@ -329,26 +345,7 @@ class BaseSurrealModel(BaseModel):
         in a transaction ``around_save`` is skipped and ``post_save`` is deferred to a
         successful commit (consistent with ``save(tx=)``).
         """
-        sender = self.__class__
-        has_signals = pre_save.has_handlers(sender) or post_save.has_handlers(sender) or around_save.has_handlers(sender)
-
-        if not has_signals:
-            result, created = await self._do_upsert(tx=tx)
-            return result
-
-        await pre_save.send(sender, instance=self)
-
-        if tx is not None:
-            result, created = await self._do_upsert(tx=tx)
-            tx.enqueue_post_commit(lambda: post_save.send(sender, instance=self, created=created))
-            return result
-
-        async with around_save.wrap(sender, instance=self):
-            result, created = await self._do_upsert(tx=tx)
-
-        await post_save.send(sender, instance=self, created=created)
-
-        return result
+        return await self._save_with_signals(self._do_upsert, tx)
 
     async def update(self, tx: Transaction | None = None) -> Any:
         """

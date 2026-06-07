@@ -19,8 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ```
 
 - **`QuerySet.update_or_create()` / `QuerySet.get_or_create()`** — Django-style
-  criteria-based create-or-update returning `(instance, created)`. A SELECT-guard raises an
-  explicit `SurrealDbError` when the criteria match more than one record.
+  criteria-based create-or-update returning `(instance, created)`. Writes route through
+  `save()` / `merge()`, so lifecycle signals fire, SDK errors normalise to `SurrealDbError`,
+  and the primary key anchors record identity. `update_or_create` does a **partial merge** on
+  update — fields outside the criteria/defaults are preserved — while `get_or_create` returns
+  an existing match untouched. Non-`exact` lookups (e.g. `name__contains`) drive the lookup
+  but are not written. A SELECT-guard raises an explicit `SurrealDbError` when the criteria
+  match more than one record.
 
   ```python
   user, created = await User.objects().update_or_create(
@@ -40,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `update_or_create` / `get_or_create` do the lookup and the write in two round-trips
   (SurrealDB 2.6.x exposes no row-locking primitive here), so a small race window exists
   under concurrent writers — the same non-atomic fallback Django documents.
+- Under `objects(tx=)`, `update_or_create` / `get_or_create` participate in the transaction on
+  SurrealDB 3.x (interactive); a buffered 2.6.x transaction raises on their lookup read
+  (reads inside a buffered transaction are unsupported — consistent with other QuerySet reads).
 
 ## [0.9.0] - 2026-06-07
 

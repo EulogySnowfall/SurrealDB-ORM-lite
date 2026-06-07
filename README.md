@@ -354,7 +354,9 @@ class User(BaseSurrealModel):
 await User(id="alice", name="Alice", email="alice@example.com").upsert()
 
 # Criteria-based, Django-style; returns (instance, created).
-# update_or_create writes the defaults on BOTH create and update:
+# update_or_create: on create, writes criteria + defaults; on update, MERGEs them (a partial
+# update — fields outside the criteria/defaults are preserved). Lifecycle signals fire on both
+# paths, and the primary key anchors the record identity.
 user, created = await User.objects().update_or_create(
     email="alice@example.com", defaults={"name": "Alice"}
 )
@@ -363,10 +365,17 @@ user, created = await User.objects().update_or_create(
 user, created = await User.objects().get_or_create(
     email="bob@example.com", defaults={"name": "Bob"}
 )
+
+# Both participate in a transaction via objects(tx=) (interactive on SurrealDB 3.x):
+async with SurrealDBConnectionManager.transaction() as tx:
+    user, created = await User.objects(tx=tx).get_or_create(email="z@x.io", defaults={"name": "Z"})
 ```
 
 If the lookup criteria match more than one record, both methods raise `SurrealDbError`
-(the criteria are not unique). Behaviour is identical on SurrealDB 2.6.x and 3.x.
+(the criteria are not unique). Non-`exact` lookups (e.g. `name__contains`) drive the lookup
+but are not written to the record. Without a transaction the behaviour is identical on
+SurrealDB 2.6.x and 3.x; under `objects(tx=)` they participate in the transaction on 3.x,
+while a buffered 2.6.x transaction raises on the lookup (see the behaviour table).
 
 ---
 
