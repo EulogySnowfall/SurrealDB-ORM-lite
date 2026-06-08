@@ -87,6 +87,7 @@ dev = [
     "docker>=7.1.0",
     "python-dotenv>=1.2.1",
     "ruff>=0.15.16",
+    "nbconvert>=7.16",
 ]
 lint = [
     "ruff>=0.15.16",
