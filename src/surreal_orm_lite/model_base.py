@@ -550,6 +550,49 @@ class BaseSurrealModel(BaseModel):
         validate_field_name(field, "atomic field")
         return await self._atomic_update(f"{field} += $amount", {"amount": amount}, tx)
 
+    @staticmethod
+    def _as_value_list(values: Any) -> list[Any]:
+        """Coerce a ``*_many`` argument to a list, rejecting scalars (incl. str) with a clear error."""
+        if isinstance(values, list):
+            return values
+        if isinstance(values, tuple):
+            return list(values)
+        raise ValueError(f"values must be a list of items, got {type(values).__name__}")
+
+    async def atomic_append_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
+        """Atomically append every element of ``values`` to an array ``field`` (duplicates allowed).
+
+        The list-valued counterpart of :meth:`atomic_append` — one round-trip instead of N.
+        Compiled to ``array::concat`` (NOT ``array::append``, which would nest the list as a
+        single element) — identical on 2.6.x and 3.x. An empty ``values`` is a safe no-op.
+        Emits no signals.
+        """
+        validate_field_name(field, "atomic field")
+        return await self._atomic_update(
+            f"{field} = array::concat({field}, $values)", {"values": self._as_value_list(values)}, tx
+        )
+
+    async def atomic_set_add_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
+        """Atomically add every element of ``values`` to an array ``field``, skipping any already present.
+
+        The list-valued counterpart of :meth:`atomic_set_add` (set semantics; duplicates in
+        ``values`` are also collapsed). Compiled to ``array::add`` — identical on 2.6.x and 3.x.
+        An empty ``values`` is a safe no-op. Emits no signals.
+        """
+        validate_field_name(field, "atomic field")
+        return await self._atomic_update(f"{field} = array::add({field}, $values)", {"values": self._as_value_list(values)}, tx)
+
+    async def atomic_remove_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
+        """Atomically remove ALL occurrences of every element of ``values`` from an array ``field``.
+
+        The list-valued counterpart of :meth:`atomic_remove`. Compiled to ``array::complement``
+        — identical on 2.6.x and 3.x. An empty ``values`` is a safe no-op. Emits no signals.
+        """
+        validate_field_name(field, "atomic field")
+        return await self._atomic_update(
+            f"{field} = array::complement({field}, $values)", {"values": self._as_value_list(values)}, tx
+        )
+
     async def delete(self, tx: Transaction | None = None) -> None:
         """
         Delete the model instance from the database.

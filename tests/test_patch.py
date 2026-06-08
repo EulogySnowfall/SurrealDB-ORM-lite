@@ -281,6 +281,73 @@ class TestAtomicSetAddIncrementE2E:
         assert rows[0]["balance"] == Decimal("12.75")
         await SurrealDBConnectionManager.close_connection()
 
+
+class TestAtomicManyE2E:
+    @pytest.mark.asyncio
+    async def test_atomic_append_many_allows_duplicates(self) -> None:
+        client = await _setup()
+        p = PatchUser(id="m1", tags=["a", "b"])
+        await p.save()
+        await p.atomic_append_many("tags", ["c", "d", "a"])  # all appended, dup 'a' kept
+        assert p.tags == ["a", "b", "c", "d", "a"]
+        rows = await client.query("SELECT tags FROM PatchUser:m1;", {})
+        assert rows[0]["tags"] == ["a", "b", "c", "d", "a"]
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_atomic_set_add_many_no_duplicates(self) -> None:
+        client = await _setup()
+        p = PatchUser(id="m2", tags=["x"])
+        await p.save()
+        await p.atomic_set_add_many("tags", ["x", "z", "z"])  # 'x' present, 'z' deduped
+        assert p.tags == ["x", "z"]
+        rows = await client.query("SELECT tags FROM PatchUser:m2;", {})
+        assert rows[0]["tags"] == ["x", "z"]
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_atomic_remove_many_removes_all_occurrences(self) -> None:
+        """Removes ALL occurrences of every listed value; non-listed multiplicity preserved."""
+        client = await _setup()
+        p = PatchUser(id="m3", tags=["x", "y", "x", "z", "y"])
+        await p.save()
+        await p.atomic_remove_many("tags", ["x", "z"])
+        assert p.tags == ["y", "y"]  # both x and z gone, both y kept; identical on both lines
+        rows = await client.query("SELECT tags FROM PatchUser:m3;", {})
+        assert rows[0]["tags"] == ["y", "y"]
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_atomic_many_empty_list_is_noop(self) -> None:
+        client = await _setup()
+        p = PatchUser(id="m4", tags=["a", "b"])
+        await p.save()
+        await p.atomic_append_many("tags", [])
+        await p.atomic_set_add_many("tags", [])
+        await p.atomic_remove_many("tags", [])
+        assert p.tags == ["a", "b"]
+        rows = await client.query("SELECT tags FROM PatchUser:m4;", {})
+        assert rows[0]["tags"] == ["a", "b"]
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_atomic_many_rejects_scalar(self) -> None:
+        _connect()
+        with pytest.raises(ValueError, match="values must be a list"):
+            await PatchUser(id="m5").atomic_append_many("tags", "x")  # type: ignore[arg-type]
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_atomic_append_many_in_tx_commits(self) -> None:
+        client = await _setup()
+        p = PatchUser(id="m6", tags=["a"])
+        await p.save()
+        async with SurrealDBConnectionManager.transaction() as tx:
+            await p.atomic_append_many("tags", ["b", "c"], tx=tx)
+        rows = await client.query("SELECT tags FROM PatchUser:m6;", {})
+        assert rows[0]["tags"] == ["a", "b", "c"]
+        await SurrealDBConnectionManager.close_connection()
+
     @pytest.mark.asyncio
     async def test_atomic_requires_id(self) -> None:
         _connect()

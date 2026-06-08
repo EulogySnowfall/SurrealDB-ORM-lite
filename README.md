@@ -401,6 +401,11 @@ await post.atomic_remove("tags", "spam")       # array::complement — removes A
 await counter.atomic_increment("views")        # += 1 (default); pass a negative to decrement
 await counter.atomic_increment("score", 5)     # += 5
 
+# List-valued variants — apply many in ONE round-trip instead of N:
+await post.atomic_append_many("tags", ["python", "orm"])   # array::concat — all, dups allowed
+await post.atomic_set_add_many("editors", ["alice", "bob"])  # array::add — only those absent
+await post.atomic_remove_many("tags", ["spam", "draft"])     # array::complement — all matches
+
 # Patch a filtered set (or the whole table if unfiltered); returns the affected count.
 n = await User.objects().filter(status="trial").patch(
     [{"op": "replace", "path": "/plan", "value": "free"}]

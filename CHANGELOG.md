@@ -30,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   await counter.atomic_increment("views")        # += 1 (default); negative to decrement
   ```
 
+- **List-valued atomic helpers** — `atomic_append_many` / `atomic_set_add_many` /
+  `atomic_remove_many` apply many values in one round-trip (compiled to `array::concat` /
+  `array::add` / `array::complement`; an empty list is a safe no-op). All support `tx=`.
+
+  ```python
+  await post.atomic_append_many("tags", ["python", "orm"])
+  await post.atomic_set_add_many("editors", ["alice", "bob"])
+  await post.atomic_remove_many("tags", ["spam", "draft"])
+  ```
+
 - **`QuerySet.patch()`** — apply a JSON Patch to every row matching the filters (whole table if
   unfiltered); returns the affected count. Participates in `objects(tx=)`.
 
