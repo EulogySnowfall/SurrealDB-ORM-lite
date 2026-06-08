@@ -220,6 +220,23 @@ class TestAtomicSetAddIncrementE2E:
             await PatchUser().atomic_increment("views")
         await SurrealDBConnectionManager.close_connection()
 
+    @pytest.mark.asyncio
+    async def test_atomic_on_missing_id_is_noop(self) -> None:
+        """An atomic op on an id that does not exist is a silent no-op on BOTH lines.
+
+        ``UPDATE specific:id SET …`` against a non-existent record neither raises nor
+        creates the row (unlike ``upsert``); the empty result leaves ``self`` unchanged.
+        Identical on 2.6.5 and 3.1.3.
+        """
+        client = await _setup()
+        await PatchUser(id="real", views=1).save()  # materialise the table
+        ghost = PatchUser(id="ghost", views=5)
+        await ghost.atomic_increment("views", 3)  # no raise
+        assert ghost.views == 5  # untouched: nothing came back to apply
+        rows = await client.query("SELECT id FROM PatchUser;", {})
+        assert {str(r["id"].id) for r in rows} == {"real"}  # ghost was NOT created
+        await SurrealDBConnectionManager.close_connection()
+
 
 class TestQuerySetPatchE2E:
     @pytest.mark.asyncio
@@ -323,4 +340,19 @@ class TestPatchTxE2E:
             assert p.age == 42  # interactive tx applies the returned row to self
         rows = await client.query("SELECT age FROM PatchUser:t3;", {})
         assert rows[0]["age"] == 42
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_atomic_increment_interactive_tx_syncs_self(self) -> None:
+        client = await _setup()
+        if not await _native_txn_supported():
+            await SurrealDBConnectionManager.close_connection()
+            pytest.skip("requires SurrealDB 3.x (interactive transactions)")
+        p = PatchUser(id="t4", views=10)
+        await p.save()
+        async with SurrealDBConnectionManager.transaction() as tx:
+            await p.atomic_increment("views", 5, tx=tx)
+            assert p.views == 15  # interactive tx applies the server-computed row to self
+        rows = await client.query("SELECT views FROM PatchUser:t4;", {})
+        assert rows[0]["views"] == 15
         await SurrealDBConnectionManager.close_connection()
