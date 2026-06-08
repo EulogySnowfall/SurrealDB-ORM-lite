@@ -1,7 +1,11 @@
 import contextlib
 import os
+from decimal import Decimal
+from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
+from surrealdb import ServerError
 
 from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager
 from surreal_orm_lite.exceptions import SurrealDbError
@@ -49,6 +53,8 @@ class PatchUser(BaseSurrealModel):
     views: int = 0
     score: float = 0.0
     counters: dict[str, int] = {}
+    balance: Decimal = Decimal("0")
+    meta: dict[str, Any] = {}
 
 
 class TestPatchValidators:
@@ -139,6 +145,44 @@ class TestPatchE2E:
             await PatchUser(id="p2", name="x").patch([])
         await SurrealDBConnectionManager.close_connection()
 
+    @pytest.mark.asyncio
+    async def test_patch_test_op_success_applies(self) -> None:
+        """A JSON Patch ``test`` op that matches lets the rest of the patch apply (RFC 6902)."""
+        client = await _setup()
+        p = PatchUser(id="te1", age=20, name="x")
+        await p.save()
+        await p.patch(
+            [
+                {"op": "test", "path": "/age", "value": 20},  # matches → proceed
+                {"op": "replace", "path": "/name", "value": "ok"},
+            ]
+        )
+        assert p.name == "ok"
+        rows = await client.query("SELECT name FROM PatchUser:te1;", {})
+        assert rows[0]["name"] == "ok"
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_patch_test_op_failure_aborts_whole_patch(self) -> None:
+        """A failed ``test`` op aborts the ENTIRE patch and raises — optimistic concurrency.
+
+        Identical on SurrealDB 2.6.x and 3.x: the server rejects the whole document patch, so
+        the later ``replace`` never applies. The SDK surfaces it as a ``ServerError``.
+        """
+        client = await _setup()
+        p = PatchUser(id="te2", age=20, name="x")
+        await p.save()
+        with pytest.raises(ServerError, match="test operation failed"):
+            await p.patch(
+                [
+                    {"op": "test", "path": "/age", "value": 999},  # WRONG → abort
+                    {"op": "replace", "path": "/name", "value": "CHANGED"},
+                ]
+            )
+        rows = await client.query("SELECT name FROM PatchUser:te2;", {})
+        assert rows[0]["name"] == "x"  # untouched: the replace never applied
+        await SurrealDBConnectionManager.close_connection()
+
 
 class TestAtomicArrayE2E:
     @pytest.mark.asyncio
@@ -211,6 +255,30 @@ class TestAtomicSetAddIncrementE2E:
         assert p.counters["views"] == 15
         rows = await client.query("SELECT counters FROM PatchUser:n1;", {})
         assert rows[0]["counters"]["views"] == 15
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_atomic_increment_deeply_nested_field(self) -> None:
+        """A 2+ level dotted path (``meta.stats.hits``) maps through to SurrealQL on both lines."""
+        client = await _setup()
+        p = PatchUser(id="n2", meta={"stats": {"hits": 1}})
+        await p.save()
+        await p.atomic_increment("meta.stats.hits", 4)
+        assert p.meta["stats"]["hits"] == 5
+        rows = await client.query("SELECT meta FROM PatchUser:n2;", {})
+        assert rows[0]["meta"]["stats"]["hits"] == 5
+        await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_atomic_increment_accepts_decimal(self) -> None:
+        """``amount`` may be a Decimal — exact arithmetic, identical on 2.6.x and 3.x."""
+        client = await _setup()
+        p = PatchUser(id="d1", balance=Decimal("10.50"))
+        await p.save()
+        await p.atomic_increment("balance", Decimal("2.25"))
+        assert p.balance == Decimal("12.75")
+        rows = await client.query("SELECT balance FROM PatchUser:d1;", {})
+        assert rows[0]["balance"] == Decimal("12.75")
         await SurrealDBConnectionManager.close_connection()
 
     @pytest.mark.asyncio
@@ -356,3 +424,13 @@ class TestPatchTxE2E:
         rows = await client.query("SELECT views FROM PatchUser:t4;", {})
         assert rows[0]["views"] == 15
         await SurrealDBConnectionManager.close_connection()
+
+
+class TestQuerySetPatchUnit:
+    @pytest.mark.asyncio
+    async def test_patch_nonlist_result_returns_zero(self) -> None:
+        """The defensive ``return 0`` when the driver returns a non-list (no DB / mock-only path)."""
+        qs = PatchUser.objects()
+        qs._execute_query = AsyncMock(return_value={"not": "a list"})  # type: ignore[method-assign]
+        n = await qs.patch([{"op": "replace", "path": "/age", "value": 1}])
+        assert n == 0

@@ -410,6 +410,19 @@ n = await User.objects().filter(status="trial").patch(
 async with SurrealDBConnectionManager.transaction() as tx:
     await counter.atomic_increment("views", tx=tx)
     await user.patch([{"op": "replace", "path": "/age", "value": 27}], tx=tx)
+
+# atomic_increment accepts a Decimal for exact arithmetic (e.g. money):
+from decimal import Decimal
+
+await account.atomic_increment("balance", Decimal("2.25"))
+
+# Optimistic concurrency with a JSON Patch `test` op: if the test fails, the WHOLE patch is
+# aborted server-side (no op applies) and a ServerError is raised — RFC 6902 semantics.
+await order.patch([
+    {"op": "test", "path": "/version", "value": 7},  # only proceed if version is still 7
+    {"op": "replace", "path": "/status", "value": "shipped"},
+    {"op": "replace", "path": "/version", "value": 8},
+])
 ```
 
 These atomic ops behave **identically on SurrealDB 2.6.x and 3.x by design**: they use the
@@ -419,6 +432,10 @@ lines. `patch()` and the atomic helpers emit **no signals** (use `merge()` / `sa
 need lifecycle hooks). On a non-transactional or interactive (3.x) call the instance is synced
 with the server's returned row; in a buffered 2.6.x transaction the result is unknown until
 commit, so `refresh()` the instance if you need it (same caveat as `merge(tx=)`).
+
+A failed JSON Patch `test` op aborts the entire patch and raises the SDK's `ServerError`
+(message: `Given test operation failed…`) — none of the other ops in the list are applied.
+This gives you compare-and-set / optimistic-concurrency without a transaction.
 
 ---
 

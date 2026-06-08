@@ -2,6 +2,7 @@ import contextlib
 import logging
 import typing
 from collections.abc import Awaitable, Callable
+from decimal import Decimal
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -538,11 +539,13 @@ class BaseSurrealModel(BaseModel):
         validate_field_name(field, "atomic field")
         return await self._atomic_update(f"{field} = array::add({field}, $value)", {"value": value}, tx)
 
-    async def atomic_increment(self, field: str, amount: int | float = 1, tx: Transaction | None = None) -> Self:
+    async def atomic_increment(self, field: str, amount: Decimal | int | float = 1, tx: Transaction | None = None) -> Self:
         """Atomically add ``amount`` (default 1) to a numeric ``field``.
 
         Compiled to ``{field} += $amount`` — identical on 2.6.x and 3.x. Pass a negative
-        ``amount`` to decrement. Emits no signals.
+        ``amount`` to decrement. ``amount`` may be a ``decimal.Decimal`` for exact arithmetic
+        (the value is bound, not interpolated); adding a ``Decimal`` to an int/float field
+        coerces the stored field to SurrealDB ``decimal``. Emits no signals.
         """
         validate_field_name(field, "atomic field")
         return await self._atomic_update(f"{field} += $amount", {"amount": amount}, tx)

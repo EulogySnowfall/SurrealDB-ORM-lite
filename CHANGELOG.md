@@ -57,6 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so the instance is left stale — `refresh()` it if needed (same caveat as `merge(tx=)`).
 - Operations are bound as query data (never string-interpolated); atomic-op field names are
   validated. JSON Patch validation is for clear errors, not the injection boundary.
+- `atomic_increment` accepts a `decimal.Decimal` amount for exact arithmetic (e.g. money);
+  adding a `Decimal` to an int/float field coerces the stored field to SurrealDB `decimal`.
+- A failed JSON Patch `test` op aborts the **whole** patch server-side (no op applies) and
+  raises the SDK's `ServerError` — RFC 6902 compare-and-set / optimistic concurrency without a
+  transaction. Identical on 2.6.x and 3.x.
 
 ## [0.10.0] - 2026-06-07
 
