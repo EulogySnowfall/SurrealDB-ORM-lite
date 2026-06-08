@@ -382,6 +382,10 @@ while a buffered 2.6.x transaction raises on the lookup (see the behaviour table
 
 Mutate a record granularly — server-side — without reading and rewriting the whole document.
 
+> **No signals.** `patch()` and the atomic helpers are low-level primitives and emit **no**
+> `pre_*`/`post_*`/`around_*` lifecycle signals. If you rely on signals (audit, cache
+> invalidation, …), use `merge()` / `save()` instead.
+
 ```python
 # JSON Patch (RFC 6902) on a single record (native SDK patch()). Requires an explicit id.
 await user.patch([

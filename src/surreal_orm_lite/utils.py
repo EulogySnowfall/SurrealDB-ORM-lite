@@ -218,6 +218,9 @@ def validate_patch_operations(operations: Any) -> None:
     Checks that ``op`` is a known kind, ``path`` is present and a valid JSON Pointer, ``value``
     is present for add/replace/test/change, and ``from`` is present and valid for move/copy.
 
+    Accepts the six RFC 6902 ops (add/remove/replace/move/copy/test) plus ``change`` — a
+    SurrealDB-specific string-diff extension, not part of RFC 6902.
+
     The operations are bound as query data (never string-interpolated into SurrealQL), so this
     validation exists for fast, clear errors — not as the injection boundary.
 
