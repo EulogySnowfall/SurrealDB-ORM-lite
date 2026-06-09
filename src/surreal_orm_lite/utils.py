@@ -184,3 +184,66 @@ def build_filter_condition(field: str, lookup: str, value: Any, counter: int) ->
         return f"{field} {op} {value}", {}, counter
     else:
         return f"{field} {op} ${var_name}", {var_name: value}, counter + 1
+
+
+# JSON Patch (RFC 6902) operation kinds. SurrealDB also accepts ``change`` (string diff).
+_JSON_PATCH_OPS = frozenset({"add", "remove", "replace", "move", "copy", "test", "change"})
+_OPS_REQUIRING_VALUE = frozenset({"add", "replace", "test", "change"})
+_OPS_REQUIRING_FROM = frozenset({"move", "copy"})
+
+
+def validate_json_pointer(pointer: Any, context: str = "path") -> None:
+    """
+    Validate an RFC 6901 JSON Pointer.
+
+    Accepts the empty string (the whole document) or a string starting with ``/``.
+
+    Args:
+        pointer: The JSON Pointer to validate.
+        context: Description of where the pointer is used (for error messages).
+
+    Raises:
+        ValueError: If the pointer is not a string, or a non-empty string not starting with ``/``.
+    """
+    if not isinstance(pointer, str):
+        raise ValueError(f"{context} must be a string JSON Pointer, got {type(pointer).__name__}")
+    if pointer and not pointer.startswith("/"):
+        raise ValueError(f"Invalid {context} '{pointer}': a JSON Pointer must be empty or start with '/'")
+
+
+def validate_patch_operations(operations: Any) -> None:
+    """
+    Validate a JSON Patch (RFC 6902) document: a non-empty list of operation dicts.
+
+    Checks that ``op`` is a known kind, ``path`` is present and a valid JSON Pointer, ``value``
+    is present for add/replace/test/change, and ``from`` is present and valid for move/copy.
+
+    Accepts the six RFC 6902 ops (add/remove/replace/move/copy/test) plus ``change`` — a
+    SurrealDB-specific string-diff extension, not part of RFC 6902.
+
+    The operations are bound as query data (never string-interpolated into SurrealQL), so this
+    validation exists for fast, clear errors — not as the injection boundary.
+
+    Args:
+        operations: The JSON Patch document to validate.
+
+    Raises:
+        ValueError: If the document or any operation is malformed.
+    """
+    if not isinstance(operations, list) or not operations:
+        raise ValueError("patch operations must be a non-empty list of operation dicts")
+    for i, op in enumerate(operations):
+        if not isinstance(op, dict):
+            raise ValueError(f"patch operation #{i} must be a dict, got {type(op).__name__}")
+        kind = op.get("op")
+        if kind not in _JSON_PATCH_OPS:
+            raise ValueError(f"patch operation #{i} has invalid op {kind!r}; expected one of {sorted(_JSON_PATCH_OPS)}")
+        if "path" not in op:
+            raise ValueError(f"patch operation #{i} ({kind!r}) is missing required 'path'")
+        validate_json_pointer(op["path"], f"operation #{i} path")
+        if kind in _OPS_REQUIRING_VALUE and "value" not in op:
+            raise ValueError(f"patch operation #{i} ({kind!r}) is missing required 'value'")
+        if kind in _OPS_REQUIRING_FROM:
+            if "from" not in op:
+                raise ValueError(f"patch operation #{i} ({kind!r}) is missing required 'from'")
+            validate_json_pointer(op["from"], f"operation #{i} from")

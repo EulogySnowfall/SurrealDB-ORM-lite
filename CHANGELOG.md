@@ -5,6 +5,74 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-06-07
+
+### Added
+
+- **`model.patch()`** — apply a JSON Patch (RFC 6902) to a single record, backed by the SDK's
+  native `patch()` (`UPDATE rid PATCH $data`). Requires an explicit id; supports `tx=`.
+
+  ```python
+  await user.patch([
+      {"op": "replace", "path": "/age", "value": 26},
+      {"op": "add", "path": "/tags/-", "value": "premium"},
+      {"op": "remove", "path": "/settings/notifications"},
+  ])
+  ```
+
+- **Atomic field/array helpers** on the model instance — each compiled to one atomic
+  server-side `UPDATE … SET`, so concurrent callers don't clobber each other. All support `tx=`:
+
+  ```python
+  await post.atomic_append("tags", "python")    # array::append — duplicates allowed
+  await post.atomic_set_add("editors", "alice")  # array::add     — no duplicate (set)
+  await post.atomic_remove("tags", "spam")       # array::complement — removes ALL "spam"
+  await counter.atomic_increment("views")        # += 1 (default); negative to decrement
+  ```
+
+- **List-valued atomic helpers** — `atomic_append_many` / `atomic_set_add_many` /
+  `atomic_remove_many` apply many values in one round-trip (compiled to `array::concat` /
+  `array::add` / `array::complement`; an empty list is a safe no-op). All support `tx=`.
+
+  ```python
+  await post.atomic_append_many("tags", ["python", "orm"])
+  await post.atomic_set_add_many("editors", ["alice", "bob"])
+  await post.atomic_remove_many("tags", ["spam", "draft"])
+  ```
+
+- **`QuerySet.patch()`** — apply a JSON Patch to every row matching the filters (whole table if
+  unfiltered); returns the affected count. Participates in `objects(tx=)`.
+
+  ```python
+  n = await User.objects().filter(status="trial").patch(
+      [{"op": "replace", "path": "/plan", "value": "free"}]
+  )
+  ```
+
+- **JSON Patch / JSON Pointer validators** in `utils.py` (`validate_patch_operations`,
+  `validate_json_pointer`) for fast, clear errors.
+
+### Notes
+
+- **Identical on SurrealDB 2.6.x and 3.x — by design.** The atomic helpers deliberately use the
+  version-portable SurrealQL **functions** `array::append` / `array::add` / `array::complement`
+  (and numeric `+=`) rather than the bare `+=` / `-=` array operators, whose semantics diverge
+  between server lines (`arr -= v` removes _all_ occurrences on 3.x but only the _first_ on
+  2.6.x; array `+=` appends _with_ duplicates on both, so it is not set-add). Verified
+  empirically on 2.6.5 and 3.1.3.
+- `patch()` and the atomic helpers emit **no signals** (unlike `merge`/`save`) — they are
+  low-level atomic primitives. Use `merge()` / `save()` when you need lifecycle hooks.
+- Self-sync: non-transactional and interactive (3.x) calls apply the server's returned row to
+  the instance; in a **buffered** transaction (HTTP / 2.6.x) the result is unknown until commit,
+  so the instance is left stale — `refresh()` it if needed (same caveat as `merge(tx=)`).
+- Operations are bound as query data (never string-interpolated); atomic-op field names are
+  validated. JSON Patch validation is for clear errors, not the injection boundary.
+- `atomic_increment` accepts a `decimal.Decimal` amount for exact arithmetic (e.g. money);
+  adding a `Decimal` to an int/float field coerces the stored field to SurrealDB `decimal`.
+- A failed JSON Patch `test` op aborts the **whole** patch server-side (no op applies) and
+  raises the SDK's `ServerError` — RFC 6902 compare-and-set / optimistic concurrency without a
+  transaction. Identical on 2.6.x and 3.x.
+
 ## [0.10.0] - 2026-06-07
 
 ### Added
@@ -65,7 +133,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ```
 
 - **Two transaction strategies** (auto-selected by `transaction()` based on URL + server):
-
   - `InteractiveTransaction` (WebSocket + SurrealDB 3.x): uses the SDK's native
     `begin()`/`commit()`/`cancel()` API tagged by `txn_id`. Reads inside the transaction
     see uncommitted writes; `save(tx=)` now supports **auto-generated ids** and `refresh(tx=)`

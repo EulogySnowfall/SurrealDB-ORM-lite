@@ -101,45 +101,45 @@ v0.25.0/v0.26.0 are reclassified to Future.
 
 ## SurrealDB-ORM vs SurrealDB-ORM-lite Comparison
 
-| Feature                       | ORM (full) | ORM-lite         |
-| ----------------------------- | ---------- | ---------------- |
-| Supported SurrealDB           | 3.x only   | **2.6.x + 3.1**  |
-| CRUD & QuerySet               | yes        | v0.2.0           |
-| Aggregations & GROUP BY       | yes        | v0.3.0           |
-| Model Signals                 | yes        | v0.4.0           |
-| Bulk Operations               | yes        | v0.5.0           |
-| Q Objects (OR/AND/NOT)        | yes        | v0.5.0           |
-| Parameterized filters         | yes        | v0.5.0           |
-| Relations & Graph             | yes        | v0.6.0           |
-| FETCH clause                  | yes        | v0.6.0           |
+| Feature                       | ORM (full) | ORM-lite                    |
+| ----------------------------- | ---------- | --------------------------- |
+| Supported SurrealDB           | 3.x only   | **2.6.x + 3.1**             |
+| CRUD & QuerySet               | yes        | v0.2.0                      |
+| Aggregations & GROUP BY       | yes        | v0.3.0                      |
+| Model Signals                 | yes        | v0.4.0                      |
+| Bulk Operations               | yes        | v0.5.0                      |
+| Q Objects (OR/AND/NOT)        | yes        | v0.5.0                      |
+| Parameterized filters         | yes        | v0.5.0                      |
+| Relations & Graph             | yes        | v0.6.0                      |
+| FETCH clause                  | yes        | v0.6.0                      |
 | Transactions (`tx=`)          | yes        | ✅ v0.8 core, v0.9 QuerySet |
-| `upsert` / `update_or_create` | yes        | ✅ v0.10.0       |
-| Atomic field/array ops        | yes        | v0.11.0          |
-| Retry on conflict             | yes        | v0.12.0          |
-| SurrealFunc & Computed        | yes        | v0.13 – v0.14    |
-| `call_function()`             | yes        | v0.15.0          |
-| JWT Authentication            | yes        | v0.16 – v0.17    |
-| Field aliases & DX            | yes        | v0.18.0          |
-| Live Models / CDC             | yes        | v0.19 – v0.21    |
-| Native typed relations        | yes        | v0.22.0          |
-| Rich field types              | yes        | v0.23.0          |
-| Geospatial fields             | yes        | v0.24.0          |
-| Embedded / versioned engine   | yes        | v0.25 – v0.26    |
-| Subqueries                    | yes        | v0.27.0          |
-| Query cache (TTL)             | yes        | v0.28.0          |
-| Multi-database                | yes        | v0.29.0          |
-| Schema introspection          | yes        | v0.30.0          |
-| DEFINE EVENT                  | yes        | v0.31.0          |
-| Materialized views            | yes        | v0.32.0          |
-| TYPE RELATION enforcement     | yes        | v0.33.0          |
-| Full-Text Search (BM25)       | yes        | v0.34.0          |
-| Vector Search (KNN/HNSW)      | yes        | v0.35.0          |
-| Hybrid Search (RRF)           | yes        | v0.36.0          |
-| Migrations & CLI              | yes        | v0.37 – v0.38    |
-| Test fixtures & factories     | yes        | v0.39.0          |
-| QueryLogger / profiling       | yes        | v0.40.0          |
-| Custom SDK (`surreal_sdk`)    | yes        | never            |
-| CBOR protocol internals       | yes        | never            |
+| `upsert` / `update_or_create` | yes        | ✅ v0.10.0                  |
+| Atomic field/array ops        | yes        | ✅ v0.11.0                  |
+| Retry on conflict             | yes        | v0.12.0                     |
+| SurrealFunc & Computed        | yes        | v0.13 – v0.14               |
+| `call_function()`             | yes        | v0.15.0                     |
+| JWT Authentication            | yes        | v0.16 – v0.17               |
+| Field aliases & DX            | yes        | v0.18.0                     |
+| Live Models / CDC             | yes        | v0.19 – v0.21               |
+| Native typed relations        | yes        | v0.22.0                     |
+| Rich field types              | yes        | v0.23.0                     |
+| Geospatial fields             | yes        | v0.24.0                     |
+| Embedded / versioned engine   | yes        | v0.25 – v0.26               |
+| Subqueries                    | yes        | v0.27.0                     |
+| Query cache (TTL)             | yes        | v0.28.0                     |
+| Multi-database                | yes        | v0.29.0                     |
+| Schema introspection          | yes        | v0.30.0                     |
+| DEFINE EVENT                  | yes        | v0.31.0                     |
+| Materialized views            | yes        | v0.32.0                     |
+| TYPE RELATION enforcement     | yes        | v0.33.0                     |
+| Full-Text Search (BM25)       | yes        | v0.34.0                     |
+| Vector Search (KNN/HNSW)      | yes        | v0.35.0                     |
+| Hybrid Search (RRF)           | yes        | v0.36.0                     |
+| Migrations & CLI              | yes        | v0.37 – v0.38               |
+| Test fixtures & factories     | yes        | v0.39.0                     |
+| QueryLogger / profiling       | yes        | v0.40.0                     |
+| Custom SDK (`surreal_sdk`)    | yes        | never                       |
+| CBOR protocol internals       | yes        | never                       |
 
 ---
 
@@ -203,6 +203,17 @@ v0.25.0/v0.26.0 are reclassified to Future.
   Django-style, return `(instance, created)`; raise on >1 match (criteria not unique)
 - **Identical on SurrealDB 2.6.x and 3.x** — no 3.x-only primitive
 
+### Version 0.11.0 — patch / atomic field & array ops
+
+- `model.patch()` and `QuerySet.patch()`: JSON Patch (RFC 6902) on a single record or a
+  filtered set / whole table (native SDK `patch()` / `UPDATE … PATCH`); supports `tx=`
+- Atomic helpers `atomic_append` / `atomic_set_add` / `atomic_remove` / `atomic_increment`,
+  each one atomic server-side `UPDATE … SET`; support `tx=`
+- **Identical on SurrealDB 2.6.x and 3.x — by design**: uses the version-portable functions
+  `array::append` / `array::add` / `array::complement` (and numeric `+=`) instead of the bare
+  `+=` / `-=` array operators, whose semantics differ between server lines
+- These primitives emit no signals (use `merge()` / `save()` for lifecycle hooks)
+
 ---
 
 ## Planned — Tier 1: Core (SDK 2.0 strict)
@@ -213,13 +224,13 @@ v0.25.0/v0.26.0 are reclassified to Future.
 
 ### 🔵 Phase A — Write-path & atomicity
 
-| Version   | Theme                                                                    | SDK 2.0 primitive         |
-| --------- | ------------------------------------------------------------------------ | ------------------------- |
-| ✅ v0.8.0 | Transactions ORM (core): `transaction()` ctx manager + `tx=` on CRUD     | `BEGIN`/`COMMIT`/`CANCEL` |
-| ✅ v0.9.0 | Transactions ORM (QuerySet): `objects(tx=)`, bulk under `tx`, no savepoints (SurrealDB) | idem                      |
-| ✅ v0.10.0 | `upsert()` + `update_or_create()` / `get_or_create()`                    | `upsert()`                |
-| v0.11.0   | `patch()` & atomic field/array ops (append/remove/set_add/increment)     | `patch()` (JSON Patch)    |
-| v0.12.0   | `retry_on_conflict` & optimistic concurrency                             | transactions + retry      |
+| Version    | Theme                                                                                   | SDK 2.0 primitive         |
+| ---------- | --------------------------------------------------------------------------------------- | ------------------------- |
+| ✅ v0.8.0  | Transactions ORM (core): `transaction()` ctx manager + `tx=` on CRUD                    | `BEGIN`/`COMMIT`/`CANCEL` |
+| ✅ v0.9.0  | Transactions ORM (QuerySet): `objects(tx=)`, bulk under `tx`, no savepoints (SurrealDB) | idem                      |
+| ✅ v0.10.0 | `upsert()` + `update_or_create()` / `get_or_create()`                                   | `upsert()`                |
+| ✅ v0.11.0 | `patch()` & atomic field/array ops (append/remove/set_add/increment)                    | `patch()` (JSON Patch)    |
+| v0.12.0    | `retry_on_conflict` & optimistic concurrency                                            | transactions + retry      |
 
 ### 🟢 Phase B — Server-side computation
 

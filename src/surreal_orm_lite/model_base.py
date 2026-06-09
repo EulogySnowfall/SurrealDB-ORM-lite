@@ -2,6 +2,7 @@ import contextlib
 import logging
 import typing
 from collections.abc import Awaitable, Callable
+from decimal import Decimal
 from typing import Any, Self
 
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -22,7 +23,14 @@ from .signals import (
     pre_update,
 )
 from .transaction import Transaction
-from .utils import remove_quotes_for_variables, validate_edge_name, validate_field_name, validate_graph_path, validate_thing
+from .utils import (
+    remove_quotes_for_variables,
+    validate_edge_name,
+    validate_field_name,
+    validate_graph_path,
+    validate_patch_operations,
+    validate_thing,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -450,6 +458,140 @@ class BaseSurrealModel(BaseModel):
             await self.refresh()
 
         await post_update.send(sender, instance=self, update_fields=update_fields)
+
+    # ==================== Patch & atomic operations ====================
+
+    async def patch(self, operations: list[dict[str, Any]], tx: Transaction | None = None) -> Self:
+        """Apply a JSON Patch (RFC 6902) to this record.
+
+        Backed by the SDK's native ``patch()`` (``UPDATE rid PATCH $data``). ``operations`` is
+        a list of op dicts, e.g. ``{"op": "replace", "path": "/age", "value": 26}``. Requires
+        an explicit id.
+
+        Non-transactional and interactive-tx (3.x) calls apply the server's returned row to
+        ``self``. In a buffered transaction (HTTP / SurrealDB 2.6.x) the result is unknown
+        until commit, so ``self`` is left stale — treat the instance as needing ``refresh()``
+        (same caveat as ``merge(tx=)``).
+
+        Unlike ``merge``/``save`` this emits NO signals: it is a low-level atomic primitive.
+        ``operations`` is validated then bound as data, never string-interpolated.
+        """
+        validate_patch_operations(operations)
+        record_id = self._record_id()
+        if record_id is None:
+            raise SurrealDbError("patch() requires an explicit id (there is nothing to patch without one).")
+        if tx is not None:
+            rows = await tx.add("UPDATE $rid PATCH $data;", {"rid": record_id, "data": operations})
+            self._apply_record(rows)  # interactive: applies; buffered: add() returns None → no-op (stale)
+            return self
+        client = await SurrealDBConnectionManager.get_client()
+        record = await client.patch(record_id, operations)
+        self._apply_record(record)
+        return self
+
+    async def _atomic_update(self, set_expr: str, variables: dict[str, Any], tx: Transaction | None) -> Self:
+        """Run ``UPDATE $rid SET <set_expr>`` atomically and sync ``self`` with the result.
+
+        Shared by the atomic helpers. ``$rid`` and every value in ``variables`` are bound
+        (robust for any id type; anti-injection); only the validated ``set_expr`` is inlined.
+        Non-tx and interactive-tx apply the returned row to ``self``; a buffered tx leaves
+        ``self`` stale (the new value is computed server-side, unknown until commit).
+        """
+        record_id = self._record_id()
+        if record_id is None:
+            raise SurrealDbError("atomic operations require an explicit id.")
+        vars_: dict[str, Any] = {"rid": record_id, **variables}
+        statement = f"UPDATE $rid SET {set_expr};"
+        if tx is not None:
+            rows = await tx.add(statement, vars_)
+            self._apply_record(rows)
+            return self
+        client = await SurrealDBConnectionManager.get_client()
+        rows = await client.query(statement, vars_)
+        self._apply_record(rows)
+        return self
+
+    async def atomic_append(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
+        """Atomically append ``value`` to an array ``field`` (duplicates allowed).
+
+        Compiled to ``array::append`` — identical on SurrealDB 2.6.x and 3.x. For set
+        semantics (skip if already present) use :meth:`atomic_set_add`. Emits no signals.
+        """
+        validate_field_name(field, "atomic field")
+        return await self._atomic_update(f"{field} = array::append({field}, $value)", {"value": value}, tx)
+
+    async def atomic_remove(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
+        """Atomically remove ALL occurrences of ``value`` from an array ``field``.
+
+        Compiled to ``array::complement`` — removes every occurrence, identical on 2.6.x and
+        3.x. (The ``-=`` operator is deliberately NOT used: it removes all occurrences on 3.x
+        but only the first on 2.6.x.) Emits no signals.
+        """
+        validate_field_name(field, "atomic field")
+        return await self._atomic_update(f"{field} = array::complement({field}, [$value])", {"value": value}, tx)
+
+    async def atomic_set_add(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
+        """Atomically add ``value`` to an array ``field`` only if not already present.
+
+        Compiled to ``array::add`` (set semantics) — identical on 2.6.x and 3.x. (NOT the
+        ``+=`` operator, which appends duplicates on both server lines.) Emits no signals.
+        """
+        validate_field_name(field, "atomic field")
+        return await self._atomic_update(f"{field} = array::add({field}, $value)", {"value": value}, tx)
+
+    async def atomic_increment(self, field: str, amount: Decimal | int | float = 1, tx: Transaction | None = None) -> Self:
+        """Atomically add ``amount`` (default 1) to a numeric ``field``.
+
+        Compiled to ``{field} += $amount`` — identical on 2.6.x and 3.x. Pass a negative
+        ``amount`` to decrement. ``amount`` may be a ``decimal.Decimal`` for exact arithmetic
+        (the value is bound, not interpolated); adding a ``Decimal`` to an int/float field
+        coerces the stored field to SurrealDB ``decimal``. Emits no signals.
+        """
+        validate_field_name(field, "atomic field")
+        return await self._atomic_update(f"{field} += $amount", {"amount": amount}, tx)
+
+    @staticmethod
+    def _as_value_list(values: Any) -> list[Any]:
+        """Coerce a ``*_many`` argument to a list, rejecting scalars (incl. str) with a clear error."""
+        if isinstance(values, list):
+            return values
+        if isinstance(values, tuple):
+            return list(values)
+        raise ValueError(f"values must be a list of items, got {type(values).__name__}")
+
+    async def atomic_append_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
+        """Atomically append every element of ``values`` to an array ``field`` (duplicates allowed).
+
+        The list-valued counterpart of :meth:`atomic_append` — one round-trip instead of N.
+        Compiled to ``array::concat`` (NOT ``array::append``, which would nest the list as a
+        single element) — identical on 2.6.x and 3.x. An empty ``values`` is a safe no-op.
+        Emits no signals.
+        """
+        validate_field_name(field, "atomic field")
+        return await self._atomic_update(
+            f"{field} = array::concat({field}, $values)", {"values": self._as_value_list(values)}, tx
+        )
+
+    async def atomic_set_add_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
+        """Atomically add every element of ``values`` to an array ``field``, skipping any already present.
+
+        The list-valued counterpart of :meth:`atomic_set_add` (set semantics; duplicates in
+        ``values`` are also collapsed). Compiled to ``array::add`` — identical on 2.6.x and 3.x.
+        An empty ``values`` is a safe no-op. Emits no signals.
+        """
+        validate_field_name(field, "atomic field")
+        return await self._atomic_update(f"{field} = array::add({field}, $values)", {"values": self._as_value_list(values)}, tx)
+
+    async def atomic_remove_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
+        """Atomically remove ALL occurrences of every element of ``values`` from an array ``field``.
+
+        The list-valued counterpart of :meth:`atomic_remove`. Compiled to ``array::complement``
+        — identical on 2.6.x and 3.x. An empty ``values`` is a safe no-op. Emits no signals.
+        """
+        validate_field_name(field, "atomic field")
+        return await self._atomic_update(
+            f"{field} = array::complement({field}, $values)", {"values": self._as_value_list(values)}, tx
+        )
 
     async def delete(self, tx: Transaction | None = None) -> None:
         """
