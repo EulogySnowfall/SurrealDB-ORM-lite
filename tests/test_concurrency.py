@@ -1,10 +1,21 @@
 """Tests for v0.12.0 optimistic concurrency: SurrealDbConflictError,
 is_conflict_error, and the retry_on_conflict decorator."""
 
+import asyncio
+import contextlib
+import os
+
 import pytest
 
+from surreal_orm_lite import (
+    BaseSurrealModel,
+    SurrealConfigDict,
+    SurrealDBConnectionManager,
+)
+from surreal_orm_lite._sdk import AsyncSurreal
 from surreal_orm_lite.concurrency import is_conflict_error, retry_on_conflict
 from surreal_orm_lite.exceptions import SurrealDbConflictError, SurrealDbError
+from surreal_orm_lite.transaction import InteractiveTransaction, Transaction
 
 # Verbatim server messages captured on :8001 (3.1.3) and :8002 (2.6.5).
 CONFLICT_3X = "Transaction conflict: Write conflict, retry the transaction. This transaction can be retried"
@@ -140,3 +151,133 @@ def test_public_exports() -> None:
     assert m.SurrealDbConflictError is sdce
     for name in ("retry_on_conflict", "is_conflict_error", "SurrealDbConflictError"):
         assert name in m.__all__
+
+
+# --------------------------------------------------------------------------- #
+# E2E: real conflicts against a live SurrealDB (8001 = 3.1.3, 8002 = 2.6.5)
+# --------------------------------------------------------------------------- #
+
+
+def _url() -> str:
+    host = os.environ.get("SURREALDB_HOST", "localhost")
+    port = os.environ.get("SURREALDB_PORT", "8000")
+    return f"ws://{host}:{port}/rpc"
+
+
+async def _raw_client():
+    """A standalone SDK connection (NOT the ORM singleton) for interleaving txns."""
+    db = AsyncSurreal(_url())
+    await db.connect(_url())
+    await db.signin({"username": "root", "password": "root"})
+    await db.use("ns", "db")
+    return db
+
+
+async def _supports_interactive(client) -> bool:
+    try:
+        txn = await client.begin()
+    except Exception:
+        return False
+    with contextlib.suppress(Exception):
+        await client.cancel(txn)
+    return True
+
+
+def _connect() -> None:
+    SurrealDBConnectionManager.set_connection(
+        url=_url(),
+        user="root",
+        password="root",
+        namespace="ns",
+        database="db",
+    )
+
+
+class OccUser(BaseSurrealModel):
+    model_config = SurrealConfigDict(primary_key="id")
+    id: str | None = None
+    name: str
+
+
+class TestConflictE2E:
+    @pytest.mark.asyncio
+    async def test_interactive_conflict_is_typed(self) -> None:
+        c0 = await _raw_client()
+        if not await _supports_interactive(c0):
+            await c0.close()
+            pytest.skip("native interactive transactions require SurrealDB 3.x")
+        with contextlib.suppress(Exception):
+            await c0.query("DELETE counter:occ;")
+        await c0.query("CREATE counter:occ SET n = 0;")
+        c1 = await _raw_client()
+        c2 = await _raw_client()
+        try:
+            t1 = await c1.begin()
+            t2 = await c2.begin()
+            tx1 = InteractiveTransaction(c1, t1)
+            tx2 = InteractiveTransaction(c2, t2)
+            # read-then-write the same key in both → write/write conflict at commit
+            await tx1.run_read("SELECT * FROM counter:occ;", {})
+            await tx2.run_read("SELECT * FROM counter:occ;", {})
+            await tx1.add("UPDATE counter:occ SET n = 11;", {})
+            await tx2.add("UPDATE counter:occ SET n = 22;", {})
+            await tx1.commit()  # wins
+            with pytest.raises(SurrealDbConflictError):
+                await tx2.commit()  # loses → typed conflict
+        finally:
+            for c in (c0, c1, c2):
+                with contextlib.suppress(Exception):
+                    await c.close()
+
+    @pytest.mark.asyncio
+    async def test_buffered_conflict_raise_for_status(self) -> None:
+        # Force a conflict with several interleaved BEGIN..COMMIT batches; feed a
+        # failing raw response through raise_for_status. Skip if none reproduced
+        # (2.6.x serialises more, so a small race may not always conflict).
+        seed = await _raw_client()
+        with contextlib.suppress(Exception):
+            await seed.query("DELETE counter:occb;")
+        await seed.query("CREATE counter:occb SET n = 0;")
+        clients = [await _raw_client() for _ in range(8)]
+        q = (
+            "BEGIN TRANSACTION;\n"
+            "LET $v = (SELECT n FROM counter:occb)[0].n;\n"
+            "UPDATE counter:occb SET n = $v + 1;\n"
+            "COMMIT TRANSACTION;"
+        )
+        results = await asyncio.gather(*[c.query_raw(q) for c in clients], return_exceptions=True)
+        failed = next(
+            (
+                r
+                for r in results
+                if isinstance(r, dict) and any(isinstance(s, dict) and s.get("status") == "ERR" for s in r.get("result", []))
+            ),
+            None,
+        )
+        for c in (seed, *clients):
+            with contextlib.suppress(Exception):
+                await c.close()
+        if failed is None:
+            pytest.skip("no transaction conflict reproduced on this server/run")
+        with pytest.raises(SurrealDbConflictError, match="can be retried"):
+            Transaction.raise_for_status(failed)
+
+    @pytest.mark.asyncio
+    async def test_retry_on_conflict_wraps_live_transaction(self) -> None:
+        # The decorator composes with a real transaction() on both DB lines: the
+        # happy path commits and returns its value (no conflict needed here).
+        _connect()
+        client = await SurrealDBConnectionManager.get_client()
+        with contextlib.suppress(Exception):
+            await client.query("DELETE OccUser;", {})
+
+        @retry_on_conflict(max_retries=2, base_delay=0.01, jitter=False)
+        async def create_user() -> str:
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await OccUser(id="zoe", name="Zoe").save(tx=tx)
+            return "done"
+
+        assert await create_user() == "done"
+        rows = await client.query("SELECT * FROM OccUser;", {})
+        assert len(rows) == 1
+        await SurrealDBConnectionManager.close_connection()
