@@ -111,6 +111,8 @@ def retry_on_conflict(
                 try:
                     return await func(*args, **kwargs)
                 except Exception as exc:
+                    # Catch Exception (not BaseException): never retry/swallow
+                    # KeyboardInterrupt / CancelledError. Non-conflicts re-raise below.
                     if not is_conflict_error(exc):
                         raise
                     last_error = exc

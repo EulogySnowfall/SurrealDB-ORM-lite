@@ -108,12 +108,19 @@ class Transaction(ABC):
         errors = [s for s in statements if isinstance(s, dict) and s.get("status") == "ERR"]
         if not errors:
             return
-        # Prefer a real error (kind != NotExecuted); else the first ERR whose message
-        # is not the generic "not executed" filler (the real cause is sometimes a later
-        # NotExecuted statement, e.g. "Cannot COMMIT: Transaction conflict ..."); else
-        # the first ERR.
+        # Prefer a real error (kind != NotExecuted, and not the generic "not executed"
+        # filler); else the first ERR whose message is not that filler (the real cause is
+        # sometimes a NotExecuted statement, e.g. "Cannot COMMIT: Transaction conflict ...",
+        # and some servers omit `details` on filler statements); else the first ERR.
         root = (
-            next((e for e in errors if (e.get("details") or {}).get("kind") != "NotExecuted"), None)
+            next(
+                (
+                    e
+                    for e in errors
+                    if (e.get("details") or {}).get("kind") != "NotExecuted" and not _is_pure_filler(e.get("result"))
+                ),
+                None,
+            )
             or next((e for e in errors if not _is_pure_filler(e.get("result"))), None)
             or errors[0]
         )

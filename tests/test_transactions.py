@@ -142,6 +142,34 @@ def test_raise_for_status_types_conflict() -> None:
         Transaction.raise_for_status(raw)
 
 
+def test_raise_for_status_bare_filler_without_details_surfaces_cause() -> None:
+    # Defensive: if a server ever drops `details` on filler statements, the selector
+    # must still skip the bare filler and surface the substantive cause.
+    raw = {
+        "result": [
+            {"result": "The query was not executed due to a failed transaction", "status": "ERR"},
+            {"result": "Cannot COMMIT: a concrete server error", "status": "ERR"},
+        ]
+    }
+    with pytest.raises(SurrealDbError, match="a concrete server error"):
+        Transaction.raise_for_status(raw)
+
+
+def test_raise_for_status_types_single_err_conflict_26() -> None:
+    # Real 2.6.5 shape: a single ERR statement (no `details`) whose message prefixes the
+    # filler then appends the retryable cause. Must be typed as a conflict.
+    raw = {
+        "result": [
+            {
+                "result": "The query was not executed due to a failed transaction. Failed to commit transaction due to a read or write conflict. This transaction can be retried",
+                "status": "ERR",
+            }
+        ]
+    }
+    with pytest.raises(SurrealDbConflictError, match="can be retried"):
+        Transaction.raise_for_status(raw)
+
+
 def test_raise_for_status_surfaces_cause_not_filler() -> None:
     # Even for a non-conflict failure where the real cause is a later NotExecuted
     # statement, surface the cause, not the generic filler.
