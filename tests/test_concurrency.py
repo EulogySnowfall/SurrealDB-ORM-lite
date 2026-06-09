@@ -123,3 +123,20 @@ def test_retry_param_validation() -> None:
         retry_on_conflict(max_delay=0)
     with pytest.raises(ValueError, match="backoff_factor"):
         retry_on_conflict(backoff_factor=0)
+
+
+def test_public_exports() -> None:
+    import surreal_orm_lite as m
+    from surreal_orm_lite.concurrency import (
+        is_conflict_error as ice,
+    )
+    from surreal_orm_lite.concurrency import (
+        retry_on_conflict as roc,
+    )
+    from surreal_orm_lite.exceptions import SurrealDbConflictError as sdce
+
+    assert m.retry_on_conflict is roc
+    assert m.is_conflict_error is ice
+    assert m.SurrealDbConflictError is sdce
+    for name in ("retry_on_conflict", "is_conflict_error", "SurrealDbConflictError"):
+        assert name in m.__all__
