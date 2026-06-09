@@ -156,6 +156,7 @@ results = await User.objects().query(
 | Transactions (`tx=`)   | ✅     |
 | upsert / get_or_create | ✅     |
 | patch / atomic ops     | ✅     |
+| Retry on conflict      | ✅     |
 
 ### Supported Filter Lookups
 
@@ -442,6 +443,46 @@ A failed JSON Patch `test` op aborts the entire patch and raises the SDK's `Serv
 (message: `Given test operation failed…`) — none of the other ops in the list are applied.
 This gives you compare-and-set / optimistic-concurrency without a transaction.
 
+### 14. Optimistic concurrency: `retry_on_conflict`
+
+Under SurrealDB's optimistic concurrency, a transaction is rolled back with a **retryable**
+conflict when a concurrent writer changed the same data. `retry_on_conflict` re-runs the whole
+function (a fresh transaction per attempt) with exponential backoff + jitter, but **only** on a
+real conflict — any other error propagates immediately.
+
+```python
+from surreal_orm_lite import retry_on_conflict, SurrealDBConnectionManager
+
+@retry_on_conflict(max_retries=3, base_delay=0.05, max_delay=2.0, backoff_factor=2.0)
+async def transfer(src_id, dst_id, amount):
+    async with SurrealDBConnectionManager.transaction() as tx:
+        src = await Account.objects(tx=tx).get(src_id)
+        dst = await Account.objects(tx=tx).get(dst_id)
+        await src.merge(tx=tx, balance=src.balance - amount)
+        await dst.merge(tx=tx, balance=dst.balance + amount)
+
+await transfer("acc:a", "acc:b", 100)  # retries automatically on a version conflict
+```
+
+A conflict is exposed as `SurrealDbConflictError` (a subclass of `SurrealDbError`) on **both**
+SurrealDB lines, so you can catch it yourself or test any exception with `is_conflict_error()`:
+
+```python
+from surreal_orm_lite import SurrealDbConflictError, is_conflict_error
+
+try:
+    await transfer("acc:a", "acc:b", 100)
+except SurrealDbConflictError:
+    ...  # still conflicting after every retry
+```
+
+- Total attempts = `max_retries + 1`; after they are exhausted the conflict is re-raised as
+  `SurrealDbConflictError`. The numeric parameters are validated at decoration time.
+- Detection anchors on SurrealDB's own retryable marker ("This transaction can be retried"), so
+  a non-retryable failure (e.g. a duplicate-key error) is **not** retried.
+- The exception type is identical on 2.6.x and 3.x; conflicts simply arise more often on 3.x
+  (optimistic MVCC) than on 2.6.x (see the behaviour table).
+
 ---
 
 ## Configuration Options
@@ -488,19 +529,20 @@ Surreal ORM Lite runs on both lines; some capabilities differ because they rely 
 features introduced in SurrealDB 3.x. On 2.6.x the ORM degrades gracefully. Capabilities not
 listed behave the same on both lines.
 
-| ORM capability                                                                        | SurrealDB 2.6.x                                                              | SurrealDB 3.x (3.1.3)                | Since   |
-| ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------ | ------- |
-| Transaction strategy auto-selected by `transaction()`                                 | buffered batch (`BEGIN…COMMIT`)                                              | native interactive on WebSocket      | v0.9.0  |
-| Reads inside a transaction (`objects(tx=)`)                                           | raise (buffered cannot read)                                                 | see uncommitted writes               | v0.9.0  |
-| `save(tx=)` with an auto-generated id                                                 | raises — explicit id required                                                | supported                            | v0.9.0  |
-| `refresh(tx=)` inside a transaction                                                   | raises                                                                       | works                                | v0.9.0  |
-| `bulk_update` / `bulk_delete` / `QuerySet.patch` row count inside a tx                | returns `0` (not knowable pre-commit)                                        | real count                           | v0.9.0  |
-| "Already exists" error on create                                                      | normalised to `SurrealDbError`                                               | normalised to `SurrealDbError`       | v0.7.0  |
-| Cleanup on a missing target (`delete_table`, `remove_relation`)                       | native no-op                                                                 | ORM makes it a silent no-op          | v0.7.0  |
-| Aggregation over an empty set (`NaN` / `±inf`)                                        | returns `0.0` / `None`                                                       | ORM normalises to `0.0` / `None`     | v0.7.0  |
-| Namespace/db selection (`use()` ordering)                                             | lenient (auto-creates)                                                       | strict — ORM signs in before `use()` | v0.7.0  |
-| `upsert()` / `update_or_create()` / `get_or_create()`                                 | same on both lines                                                           | same on both lines                   | v0.10.0 |
-| `patch()` / `atomic_append` / `atomic_set_add` / `atomic_remove` / `atomic_increment` | same on both lines (portable `array::*` fns chosen over divergent `+=`/`-=`) | same on both lines                   | v0.11.0 |
+| ORM capability                                                                        | SurrealDB 2.6.x                                                              | SurrealDB 3.x (3.1.3)                                                   | Since   |
+| ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------- | ------- |
+| Transaction strategy auto-selected by `transaction()`                                 | buffered batch (`BEGIN…COMMIT`)                                              | native interactive on WebSocket                                         | v0.9.0  |
+| Reads inside a transaction (`objects(tx=)`)                                           | raise (buffered cannot read)                                                 | see uncommitted writes                                                  | v0.9.0  |
+| `save(tx=)` with an auto-generated id                                                 | raises — explicit id required                                                | supported                                                               | v0.9.0  |
+| `refresh(tx=)` inside a transaction                                                   | raises                                                                       | works                                                                   | v0.9.0  |
+| `bulk_update` / `bulk_delete` / `QuerySet.patch` row count inside a tx                | returns `0` (not knowable pre-commit)                                        | real count                                                              | v0.9.0  |
+| "Already exists" error on create                                                      | normalised to `SurrealDbError`                                               | normalised to `SurrealDbError`                                          | v0.7.0  |
+| Cleanup on a missing target (`delete_table`, `remove_relation`)                       | native no-op                                                                 | ORM makes it a silent no-op                                             | v0.7.0  |
+| Aggregation over an empty set (`NaN` / `±inf`)                                        | returns `0.0` / `None`                                                       | ORM normalises to `0.0` / `None`                                        | v0.7.0  |
+| Namespace/db selection (`use()` ordering)                                             | lenient (auto-creates)                                                       | strict — ORM signs in before `use()`                                    | v0.7.0  |
+| `upsert()` / `update_or_create()` / `get_or_create()`                                 | same on both lines                                                           | same on both lines                                                      | v0.10.0 |
+| `patch()` / `atomic_append` / `atomic_set_add` / `atomic_remove` / `atomic_increment` | same on both lines (portable `array::*` fns chosen over divergent `+=`/`-=`) | same on both lines                                                      | v0.11.0 |
+| `retry_on_conflict` / `SurrealDbConflictError` (retryable conflict)                   | same type + decorator; conflicts rarer (engine serialises more)              | same type + decorator; conflicts are the normal optimistic-MVCC failure | v0.12.0 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
 
@@ -527,7 +569,8 @@ Contributions are welcome! Please:
 | v0.9.0            | Transactions — QuerySet & interactive (3.x)      | ✅ Released |
 | v0.10.0           | upsert / update_or_create / get_or_create        | ✅ Released |
 | v0.11.0           | patch / atomic field & array ops                 | ✅ Released |
-| v0.12.0 – v0.22.0 | Tier 1 — Core (auth, live, relations, …)         | 📋 Planned  |
+| v0.12.0           | retry_on_conflict & optimistic concurrency       | ✅ Released |
+| v0.13.0 – v0.22.0 | Tier 1 — Core (auth, live, relations, …)         | 📋 Planned  |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)  | 📋 Planned  |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI) | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)               | 📋 Planned  |
@@ -564,7 +607,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Interactive tx (3.x native)   | ✅ v0.9                 | ✅               |
 | upsert / update_or_create     | ✅ v0.10.0              | ✅               |
 | Atomic field/array operations | ✅ v0.11.0              | ✅               |
-| Retry on conflict             | v0.12.0                 | ✅               |
+| Retry on conflict             | ✅ v0.12.0              | ✅               |
 | SurrealFunc & Computed        | v0.13 – v0.14           | ✅               |
 | JWT Authentication            | v0.16 – v0.17           | ✅               |
 | Field Aliases & DX            | v0.18.0                 | ✅               |
