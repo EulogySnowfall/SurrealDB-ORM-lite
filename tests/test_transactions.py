@@ -196,9 +196,7 @@ def test_raise_for_status_surfaces_cause_not_filler() -> None:
 async def test_interactive_commit_wraps_conflict() -> None:
     class _ConflictOnCommit:
         async def commit(self, txn_id: Any) -> None:
-            raise RuntimeError(
-                "Transaction conflict: Write conflict, retry the transaction. This transaction can be retried"
-            )
+            raise RuntimeError("Transaction conflict: Write conflict, retry the transaction. This transaction can be retried")
 
         async def cancel(self, txn_id: Any) -> None:
             return None
