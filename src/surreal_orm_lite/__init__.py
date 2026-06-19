@@ -1,4 +1,4 @@
-__version__ = "0.11.5"
+__version__ = "0.11.6"
 
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
 from .connection_manager import SurrealDBConnectionManager
