@@ -20,7 +20,8 @@
 | v0.7.0            | SDK 2.0 / SurrealDB 3.x migration                    | Done    |
 | v0.8.0            | Transactions ORM (core, `tx=`)                       | Done    |
 | v0.9.0            | Transactions ORM (QuerySet) + interactive (3.x)      | Done    |
-| v0.10.0 – v0.22.0 | Tier 1 — Core (auth, live, relations, …)             | Planned |
+| v0.10.0 – v0.12.0 | Tier 1 — Core write-path (upsert, patch, retry)      | Done    |
+| v0.13.0 – v0.22.0 | Tier 1 — Core (auth, live, relations, …)             | Planned |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 7 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
@@ -115,7 +116,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | Transactions (`tx=`)          | yes        | ✅ v0.8 core, v0.9 QuerySet |
 | `upsert` / `update_or_create` | yes        | ✅ v0.10.0                  |
 | Atomic field/array ops        | yes        | ✅ v0.11.0                  |
-| Retry on conflict             | yes        | v0.12.0                     |
+| Retry on conflict             | yes        | ✅ v0.12.0                  |
 | SurrealFunc & Computed        | yes        | v0.13 – v0.14               |
 | `call_function()`             | yes        | v0.15.0                     |
 | JWT Authentication            | yes        | v0.16 – v0.17               |
@@ -214,6 +215,21 @@ v0.25.0/v0.26.0 are reclassified to Future.
   `+=` / `-=` array operators, whose semantics differ between server lines
 - These primitives emit no signals (use `merge()` / `save()` for lifecycle hooks)
 
+### Version 0.12.0 — retry_on_conflict & optimistic concurrency
+
+- `retry_on_conflict(max_retries=3, base_delay=0.05, max_delay=2.0, backoff_factor=2.0,
+jitter=True)`: async decorator that re-runs a function on a retryable transaction conflict
+  with exponential backoff + jitter; retries only conflicts, re-raises everything else, and
+  re-raises a `SurrealDbConflictError` after exhaustion
+- New `SurrealDbConflictError` (subclass of `SurrealDbError`) + public `is_conflict_error()`
+  predicate; a conflict is normalised to this one type on both transaction strategies
+- `Transaction.raise_for_status()` now surfaces the real root cause (not the `NotExecuted`
+  filler) and types retryable conflicts
+- **Same exception type on SurrealDB 2.6.x and 3.x**; conflicts arise more often on 3.x
+  (optimistic MVCC) than on 2.6.x (engine serialises more). Detection anchors on SurrealDB's
+  own "This transaction can be retried" marker — deliberately narrower than the full ORM so a
+  duplicate-key failure is not retried
+
 ---
 
 ## Planned — Tier 1: Core (SDK 2.0 strict)
@@ -230,7 +246,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | ✅ v0.9.0  | Transactions ORM (QuerySet): `objects(tx=)`, bulk under `tx`, no savepoints (SurrealDB) | idem                      |
 | ✅ v0.10.0 | `upsert()` + `update_or_create()` / `get_or_create()`                                   | `upsert()`                |
 | ✅ v0.11.0 | `patch()` & atomic field/array ops (append/remove/set_add/increment)                    | `patch()` (JSON Patch)    |
-| v0.12.0    | `retry_on_conflict` & optimistic concurrency                                            | transactions + retry      |
+| ✅ v0.12.0 | `retry_on_conflict` & optimistic concurrency                                            | transactions + retry      |
 
 ### 🟢 Phase B — Server-side computation
 

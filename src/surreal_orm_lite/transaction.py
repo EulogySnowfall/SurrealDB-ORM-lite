@@ -21,7 +21,28 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .exceptions import SurrealDbError
+from .exceptions import SurrealDbConflictError, SurrealDbError
+
+_NOT_EXECUTED_FILLER = "The query was not executed due to a failed transaction"
+
+
+def _is_pure_filler(result: Any) -> bool:
+    """True if a statement's message is ONLY the generic 'not executed' filler.
+
+    On a failed transaction SurrealDB tags every skipped statement with this
+    message; the real cause is a different statement. A 2.6.x conflict, by
+    contrast, appends the cause to the same string, so it is NOT pure filler.
+    """
+    return str(result or "").strip().rstrip(".") == _NOT_EXECUTED_FILLER
+
+
+def _as_conflict(exc: Exception) -> Exception:
+    """Return a SurrealDbConflictError if exc is a retryable conflict, else exc itself."""
+    from .concurrency import is_conflict_error
+
+    if is_conflict_error(exc):
+        return SurrealDbConflictError(str(exc))
+    return exc
 
 
 class Transaction(ABC):
@@ -87,12 +108,28 @@ class Transaction(ABC):
         errors = [s for s in statements if isinstance(s, dict) and s.get("status") == "ERR"]
         if not errors:
             return
-        root = next(
-            (e for e in errors if (e.get("details") or {}).get("kind") != "NotExecuted"),
-            errors[0],
+        # Prefer a real error (kind != NotExecuted, and not the generic "not executed"
+        # filler); else the first ERR whose message is not that filler (the real cause is
+        # sometimes a NotExecuted statement, e.g. "Cannot COMMIT: Transaction conflict ...",
+        # and some servers omit `details` on filler statements); else the first ERR.
+        root = (
+            next(
+                (
+                    e
+                    for e in errors
+                    if (e.get("details") or {}).get("kind") != "NotExecuted" and not _is_pure_filler(e.get("result"))
+                ),
+                None,
+            )
+            or next((e for e in errors if not _is_pure_filler(e.get("result"))), None)
+            or errors[0]
         )
         message = root.get("result") or "transaction failed"
-        raise SurrealDbError(f"Transaction failed and rolled back: {message}")
+        full = f"Transaction failed and rolled back: {message}"
+        # Type retryable conflicts so callers / retry_on_conflict can catch them.
+        if isinstance(_as_conflict(SurrealDbError(full)), SurrealDbConflictError):
+            raise SurrealDbConflictError(full)
+        raise SurrealDbError(full)
 
 
 class BufferedTransaction(Transaction):
@@ -182,17 +219,26 @@ class InteractiveTransaction(Transaction):
 
     async def add(self, statement: str, variables: dict[str, Any] | None = None) -> Any:
         """Run a write inside the transaction; inspect status; return its rows."""
-        raw = await self._client.query_raw(statement, variables or {}, txn_id=self._txn_id)
+        try:
+            raw = await self._client.query_raw(statement, variables or {}, txn_id=self._txn_id)
+        except Exception as exc:
+            raise _as_conflict(exc) from exc
         self.raise_for_status(raw)
         statements = raw["result"]
         return statements[-1]["result"] if statements else []
 
     async def run_read(self, statement: str, variables: dict[str, Any] | None = None) -> Any:
         """Run a read inside the transaction and return rows directly."""
-        return await self._client.query(statement, variables or {}, txn_id=self._txn_id)
+        try:
+            return await self._client.query(statement, variables or {}, txn_id=self._txn_id)
+        except Exception as exc:
+            raise _as_conflict(exc) from exc
 
     async def commit(self) -> None:
-        await self._client.commit(self._txn_id)
+        try:
+            await self._client.commit(self._txn_id)
+        except Exception as exc:
+            raise _as_conflict(exc) from exc
 
     async def cancel(self) -> None:
         with contextlib.suppress(Exception):

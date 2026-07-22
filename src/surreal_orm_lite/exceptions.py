@@ -53,3 +53,19 @@ class SurrealDbNotFoundError(SurrealDbError):
     """
 
     pass
+
+
+class SurrealDbConflictError(SurrealDbError):
+    """
+    Retryable transaction conflict.
+
+    Raised when a transaction is rolled back by SurrealDB because a concurrent
+    writer modified the same data (optimistic-concurrency / version conflict).
+    SurrealDB marks these as retryable ("This transaction can be retried");
+    ``retry_on_conflict`` re-runs the transaction when it sees this error.
+
+    Inherits from SurrealDbError, so existing ``except SurrealDbError`` handlers
+    continue to catch it.
+    """
+
+    pass

@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-06-09
+
+### Added
+
+- **`retry_on_conflict(...)`** — an async decorator that re-runs a function on a retryable
+  SurrealDB transaction conflict, with exponential backoff + jitter. Retries **only** real
+  conflicts; any other exception propagates immediately. Total attempts = `max_retries + 1`;
+  after exhaustion the conflict is re-raised. Mirrors the full ORM's signature.
+
+  ```python
+  from surreal_orm_lite import retry_on_conflict, SurrealDBConnectionManager
+
+  @retry_on_conflict(max_retries=3, base_delay=0.05, max_delay=2.0, backoff_factor=2.0)
+  async def transfer(src_id, dst_id, amount):
+      async with SurrealDBConnectionManager.transaction() as tx:
+          src = await Account.objects(tx=tx).get(src_id)
+          dst = await Account.objects(tx=tx).get(dst_id)
+          await src.merge(tx=tx, balance=src.balance - amount)
+          await dst.merge(tx=tx, balance=dst.balance + amount)
+  ```
+
+- **`SurrealDbConflictError`** — a `SurrealDbError` subclass representing a retryable
+  transaction conflict. A conflict now surfaces as this single type on **both** transaction
+  strategies (buffered and interactive), so it can be caught uniformly.
+
+- **`is_conflict_error(exc)`** — the public predicate `retry_on_conflict` uses; returns `True`
+  for a retryable conflict (walking the exception's `__cause__` / `__context__` chain),
+  exported for callers who want their own retry loop.
+
+### Changed
+
+- **`Transaction.raise_for_status`** now surfaces the real root cause of a failed transaction
+  instead of the generic "The query was not executed due to a failed transaction" filler (on
+  SurrealDB 3.x every rolled-back statement is tagged `NotExecuted`, so the real cause is a
+  sibling statement), and raises `SurrealDbConflictError` when that cause is a retryable
+  conflict. The pre-existing `already exists` / generic-rollback behaviour is unchanged.
+
+### Notes
+
+- **Conflict detection is anchored on SurrealDB's own retryable marker** — the phrase
+  "This transaction can be retried" (present on both 2.6.5 and 3.1.3). It is deliberately
+  **narrower** than the full ORM (which also matches `"failed transaction"` / bare `"conflict"`):
+  those over-match the non-retryable "not executed due to a failed transaction" filler and would
+  cause a duplicate-key failure inside a transaction to be retried pointlessly.
+- **Same exception type on both DB lines, different conflict frequency.** A conflict is a
+  `SurrealDbConflictError` on 2.6.x and 3.x alike. On 3.x (optimistic MVCC) conflicts are the
+  normal failure mode; on 2.6.x the engine serialises more, so conflicts are rarer (reproducible
+  under high concurrency). Verified empirically on 2.6.5 and 3.1.3.
+- `retry_on_conflict` decorates **async** functions only. The `jitter` flag (default `True`,
+  set `False` for deterministic tests) is the only addition to the full ORM's signature.
+
 ## [0.11.0] - 2026-06-07
 
 ### Added

@@ -1,9 +1,11 @@
-__version__ = "0.11.15"
+__version__ = "0.12.0"
 
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
+from .concurrency import is_conflict_error, retry_on_conflict
 from .connection_manager import SurrealDBConnectionManager
 from .enum import OrderBy
 from .exceptions import (
+    SurrealDbConflictError,
     SurrealDbConnectionError,
     SurrealDbError,
     SurrealDbNotFoundError,
@@ -61,9 +63,13 @@ __all__ = [
     "around_save",
     "around_update",
     "around_delete",
+    # Concurrency
+    "retry_on_conflict",
+    "is_conflict_error",
     # Exceptions
     "SurrealORMError",
     "SurrealDbError",
+    "SurrealDbConflictError",
     "SurrealDbConnectionError",
     "SurrealDbValidationError",
     "SurrealDbNotFoundError",

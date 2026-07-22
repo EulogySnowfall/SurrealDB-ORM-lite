@@ -9,7 +9,7 @@ from surreal_orm_lite import (
     SurrealConfigDict,
     SurrealDBConnectionManager,
 )
-from surreal_orm_lite.exceptions import SurrealDbError
+from surreal_orm_lite.exceptions import SurrealDbConflictError, SurrealDbError
 from surreal_orm_lite.signals import post_delete, post_save
 from surreal_orm_lite.transaction import BufferedTransaction, InteractiveTransaction, Transaction
 
@@ -113,6 +113,109 @@ def test_raise_for_status_rejects_unrecognized_shape() -> None:
         Transaction.raise_for_status({"result": None})
     with pytest.raises(SurrealDbError, match="unrecognized"):
         Transaction.raise_for_status(None)
+
+
+def test_raise_for_status_types_conflict() -> None:
+    # Real 3.x buffered conflict shape: ALL ERR statements are NotExecuted, the
+    # real cause ("Cannot COMMIT: Transaction conflict ... can be retried") is last.
+    raw = {
+        "result": [
+            {"result": None, "status": "OK"},
+            {
+                "details": {"kind": "NotExecuted"},
+                "result": "The query was not executed due to a failed transaction",
+                "status": "ERR",
+            },
+            {
+                "details": {"kind": "NotExecuted"},
+                "result": "The query was not executed due to a failed transaction",
+                "status": "ERR",
+            },
+            {
+                "details": {"kind": "NotExecuted"},
+                "result": "Cannot COMMIT: Transaction conflict: Write conflict, retry the transaction. This transaction can be retried",
+                "status": "ERR",
+            },
+        ]
+    }
+    with pytest.raises(SurrealDbConflictError, match="can be retried"):
+        Transaction.raise_for_status(raw)
+
+
+def test_raise_for_status_bare_filler_without_details_surfaces_cause() -> None:
+    # Defensive: if a server ever drops `details` on filler statements, the selector
+    # must still skip the bare filler and surface the substantive cause.
+    raw = {
+        "result": [
+            {"result": "The query was not executed due to a failed transaction", "status": "ERR"},
+            {"result": "Cannot COMMIT: a concrete server error", "status": "ERR"},
+        ]
+    }
+    with pytest.raises(SurrealDbError, match="a concrete server error"):
+        Transaction.raise_for_status(raw)
+
+
+def test_raise_for_status_types_single_err_conflict_26() -> None:
+    # Real 2.6.5 shape: a single ERR statement (no `details`) whose message prefixes the
+    # filler then appends the retryable cause. Must be typed as a conflict.
+    raw = {
+        "result": [
+            {
+                "result": "The query was not executed due to a failed transaction. Failed to commit transaction due to a read or write conflict. This transaction can be retried",
+                "status": "ERR",
+            }
+        ]
+    }
+    with pytest.raises(SurrealDbConflictError, match="can be retried"):
+        Transaction.raise_for_status(raw)
+
+
+def test_raise_for_status_surfaces_cause_not_filler() -> None:
+    # Even for a non-conflict failure where the real cause is a later NotExecuted
+    # statement, surface the cause, not the generic filler.
+    raw = {
+        "result": [
+            {
+                "details": {"kind": "NotExecuted"},
+                "result": "The query was not executed due to a failed transaction",
+                "status": "ERR",
+            },
+            {
+                "details": {"kind": "NotExecuted"},
+                "result": "Cannot COMMIT: some other server error",
+                "status": "ERR",
+            },
+        ]
+    }
+    with pytest.raises(SurrealDbError, match="some other server error") as ei:
+        Transaction.raise_for_status(raw)
+    assert not isinstance(ei.value, SurrealDbConflictError)  # not a conflict
+
+
+@pytest.mark.asyncio
+async def test_interactive_commit_wraps_conflict() -> None:
+    class _ConflictOnCommit:
+        async def commit(self, txn_id: Any) -> None:
+            raise RuntimeError("Transaction conflict: Write conflict, retry the transaction. This transaction can be retried")
+
+        async def cancel(self, txn_id: Any) -> None:
+            return None
+
+    with pytest.raises(SurrealDbConflictError):
+        await InteractiveTransaction(_ConflictOnCommit(), "TXN").commit()
+
+
+@pytest.mark.asyncio
+async def test_interactive_commit_passes_non_conflict_through() -> None:
+    class _BoomOnCommit:
+        async def commit(self, txn_id: Any) -> None:
+            raise RuntimeError("disk on fire")
+
+        async def cancel(self, txn_id: Any) -> None:
+            return None
+
+    with pytest.raises(RuntimeError, match="disk on fire"):
+        await InteractiveTransaction(_BoomOnCommit(), "TXN").commit()
 
 
 @pytest.mark.asyncio
