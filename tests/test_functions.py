@@ -484,6 +484,82 @@ class TestMergeServerValuesE2E:
             post_update.clear(SvUser)
 
 
+class TestServerValuesTransactionE2E:
+    """Transaction semantics are inherited from v0.9.0, not introduced here.
+
+    Both strategies commit the same DB state; they differ only in when the instance can
+    know a server-computed value (interactive: at ``add()`` time — buffered: not before
+    commit). Each test asserts the shared contract on both lines and gates only the
+    strategy-specific half.
+    """
+
+    @pytest.mark.asyncio
+    async def test_save_in_transaction_commits_computed_value(self) -> None:
+        async with sv_client() as client:
+            async with SurrealDBConnectionManager.transaction() as tx:
+                user = SvUser(id="txa", name="TxA")
+                await user.save(tx=tx, server_values={"joined_at": SurrealFunc("time::now()")})
+                interactive = tx.is_interactive
+                if interactive:
+                    # Interactive: the row comes back from add(), so the instance knows it.
+                    assert isinstance(user.joined_at, datetime)
+                else:
+                    # Buffered: the statement has not run yet — the field stays stale.
+                    assert user.joined_at is None
+
+            rows = await client.query("SELECT * FROM SvUser:txa;", {})
+            assert isinstance(rows[0]["joined_at"], datetime)  # same DB state either way
+            assert rows[0]["name"] == "TxA"
+
+    @pytest.mark.asyncio
+    async def test_rollback_leaves_no_record(self) -> None:
+        async with sv_client():
+            with contextlib.suppress(RuntimeError):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await SvUser(id="txroll", name="Rollback").save(
+                        tx=tx, server_values={"joined_at": SurrealFunc("time::now()")}
+                    )
+                    raise RuntimeError("abort the transaction")
+
+            # Read through the ORM: it honours the "missing table = empty" contract, which a
+            # raw SELECT does not on SurrealDB 3.x (it raises NotFound instead).
+            assert await SvUser.objects().count() == 0
+
+    @pytest.mark.asyncio
+    async def test_merge_in_transaction(self) -> None:
+        async with sv_client() as client:
+            user = SvUser(id="txm", name="TxM", plan="free")
+            await user.save()
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await user.merge(tx=tx, plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
+                # The literal kwarg is applied to the instance immediately on both strategies.
+                assert user.plan == "pro"
+                if not tx.is_interactive:
+                    assert user.updated_at is None  # computed value unknown until commit
+
+            rows = await client.query("SELECT * FROM SvUser:txm;", {})
+            assert rows[0]["plan"] == "pro"
+            assert isinstance(rows[0]["updated_at"], datetime)
+            assert rows[0]["name"] == "TxM"  # untouched field preserved
+
+    @pytest.mark.asyncio
+    async def test_auto_id_in_transaction_matches_strategy(self) -> None:
+        async with sv_client() as client:
+            async with SurrealDBConnectionManager.transaction() as tx:
+                user = SvUser(name="TxAuto")
+                if tx.is_interactive:
+                    await user.save(tx=tx, server_values={"joined_at": SurrealFunc("time::now()")})
+                    assert user.id is not None
+                else:
+                    # Buffered transactions cannot allocate an id before commit (v0.8.0 rule).
+                    with pytest.raises(SurrealDbError, match="explicit id"):
+                        await user.save(tx=tx, server_values={"joined_at": SurrealFunc("time::now()")})
+
+            rows = await client.query("SELECT * FROM SvUser WHERE name = 'TxAuto';", {})
+            assert len(rows) == (1 if user.id is not None else 0)
+
+
 class TestServerValuesValidation:
     @pytest.mark.asyncio
     async def test_non_surrealfunc_value_raises_type_error(self) -> None:
