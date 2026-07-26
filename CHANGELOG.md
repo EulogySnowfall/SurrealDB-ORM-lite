@@ -5,6 +5,72 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-07-22
+
+### Added
+
+- **`SurrealFunc`** — a marker wrapping a raw SurrealQL expression so a value is computed
+  **by the server** instead of in Python, plus `SurrealFunc.call(fn, *args)` to build a call
+  from a function name and raw argument fragments.
+
+  ```python
+  from surreal_orm_lite import SurrealFunc, SurrealTimeFunction
+
+  SurrealFunc("time::now()")
+  SurrealFunc.call(SurrealTimeFunction.NOW)  # → SurrealFunc("time::now()")
+  ```
+
+- **`server_values=` / `extra_vars=` on `save()` and `merge()`** — `server_values` maps field
+  names to `SurrealFunc`s (evaluated server-side); `extra_vars` binds the query variables those
+  expressions reference, so user input stays a parameter and never touches the query text.
+  The write is compiled to `CREATE $rid SET …` / `UPDATE $rid SET …` and the returned row syncs
+  the instance, so a server-computed value is readable right after the call.
+
+  ```python
+  await player.save(server_values={"joined_at": SurrealFunc("time::now()")})
+
+  await user.save(
+      server_values={"password_hash": SurrealFunc("crypto::argon2::generate($password)")},
+      extra_vars={"password": raw_password},
+  )
+
+  # merge() stays a partial update; a server value overrides a same-named keyword
+  await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
+  ```
+
+- **Curated function-name enums** — `SurrealTimeFunction`, `SurrealMathFunction`,
+  `SurrealStringFunction`, `SurrealArrayFunction`, `SurrealCryptoFunction`,
+  `SurrealRandFunction` (and the `SurrealFunction` `StrEnum` base to define your own).
+  **Every catalogued member is executed against both SurrealDB 2.6.5 and 3.1.3 by the test
+  suite**, so autocompletion only offers names that work on both lines.
+
+- **`build_set_clause()` / `merge_extra_vars()`** in `utils.py` — the pure compilers behind the
+  feature (functions inlined, all other values bound as `$_sv_<field>`, `extra_vars` collision
+  detection), unit-testable without a database.
+
+### Notes
+
+- **Identical on SurrealDB 2.6.x and 3.x — by design.** The feature compiles to portable
+  SurrealQL and uses only functions verified on both lines. Names that diverge between the
+  lines are deliberately excluded from the enums (`rand::guid` is 2.6-only; `type::is::*` was
+  renamed `type::is_*` in 3.x) — pass those as a plain string if you target a single line.
+- **`CONTENT $data SET …` is not valid SurrealQL** (verified on both 2.6.5 and 3.1.3), so a
+  save carrying `server_values` compiles the _whole_ write as one `SET` clause rather than
+  mixing the native SDK data path with an expression.
+- **Security**: the `SurrealFunc` expression is inlined verbatim — build it only from
+  developer-controlled text. Field values and `extra_vars` are always bound parameters (the
+  injection boundary); `server_values` keys are validated as identifiers. `SurrealFunc` rejects
+  `;` as a guard against accidental statement chaining, which is not a sanitizer.
+- **In a transaction**: on the interactive strategy (WebSocket + 3.x) the returned row is
+  applied immediately, so the instance sees the computed value inside the block. On a buffered
+  transaction (HTTP / 2.6.x) the statement runs at commit, so the instance keeps its previous
+  value for computed fields until you `refresh()` — the same caveat as `merge(tx=)`. Auto-id
+  `save(tx=)` still requires the interactive strategy (unchanged v0.8.0 rule).
+- Signals are unchanged: `save(server_values=)` emits `pre_save`/`around_save`/`post_save`, and
+  `merge(server_values=)` emits `pre_update`/`around_update`/`post_update` with `update_fields`
+  listing both the literal and the computed fields.
+- `server_values` and `extra_vars` join `tx` as reserved keyword names on `merge()`.
+
 ## [0.12.0] - 2026-06-09
 
 ### Added

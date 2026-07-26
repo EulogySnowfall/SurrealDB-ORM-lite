@@ -157,6 +157,7 @@ results = await User.objects().query(
 | upsert / get_or_create | ✅     |
 | patch / atomic ops     | ✅     |
 | Retry on conflict      | ✅     |
+| Server-side functions  | ✅     |
 
 ### Supported Filter Lookups
 
@@ -483,6 +484,70 @@ except SurrealDbConflictError:
 - The exception type is identical on 2.6.x and 3.x; conflicts simply arise more often on 3.x
   (optimistic MVCC) than on 2.6.x (see the behaviour table).
 
+### 15. Server-side values: `SurrealFunc` + `server_values=`
+
+Some values belong to the server, not to your process: a creation timestamp should come from the
+DB clock, a password hash from the DB's own crypto. Pass them as `server_values=` on `save()` or
+`merge()` and the ORM compiles a `SET` clause where the expression is evaluated **by SurrealDB**:
+
+```python
+from surreal_orm_lite import SurrealFunc
+
+await player.save(server_values={"joined_at": SurrealFunc("time::now()")})
+# CREATE $rid SET seat = $_sv_seat, joined_at = time::now();
+```
+
+The instance is synced with the row the server returns, so `player.joined_at` is a real
+`datetime` right after the call — no extra `refresh()`.
+
+**User input never goes into the expression.** Reference a bound parameter and supply it through
+`extra_vars=`, which is bound like any other value:
+
+```python
+from surreal_orm_lite import SurrealFunc, SurrealCryptoFunction
+
+await user.save(
+    server_values={"password_hash": SurrealFunc.call(SurrealCryptoFunction.ARGON2_GENERATE, "$password")},
+    extra_vars={"password": raw_password},   # bound — never interpolated
+)
+```
+
+`merge()` takes the same two arguments and stays a **partial** update (unlisted fields are
+untouched); a `server_values` entry overrides a keyword of the same name:
+
+```python
+from surreal_orm_lite import SurrealTimeFunction
+
+await user.merge(plan="pro", server_values={"updated_at": SurrealFunc.call(SurrealTimeFunction.NOW)})
+```
+
+`SurrealFunc.call(fn, *args)` builds `fn(arg, …)` from a function name — a plain string or a
+member of the shipped enums, which give you autocompletion over a **curated catalog whose every
+member is tested against both SurrealDB 2.6.5 and 3.1.3**:
+
+| Enum                    | Covers                                                           |
+| ----------------------- | ---------------------------------------------------------------- |
+| `SurrealTimeFunction`   | `time::now`, `time::floor`, `time::unix`, `time::year`, …        |
+| `SurrealMathFunction`   | `math::abs`, `math::pow`, `math::mean`, `math::fixed`, …         |
+| `SurrealStringFunction` | `string::concat`, `string::slug`, `string::replace`, …           |
+| `SurrealArrayFunction`  | `array::append`, `array::add`, `array::distinct`, …              |
+| `SurrealCryptoFunction` | `crypto::argon2::generate` / `::compare`, `crypto::bcrypt::*`, … |
+| `SurrealRandFunction`   | `rand`, `rand::uuid::v7`, `rand::ulid`, `rand::enum`, …          |
+
+Functions whose name differs between the two server lines are deliberately excluded from the
+catalog (`rand::guid` is 2.6-only; `type::is::*` became `type::is_*` in 3.x) — pass those as a
+plain string if you target one line. The enums are convenience, not a gate: `SurrealFunc` accepts
+any expression.
+
+> **Security**: the `SurrealFunc` expression is inserted verbatim into the query, so build it
+> only from developer-controlled text. Field values and `extra_vars` are always bound parameters
+> — that is the injection boundary. `SurrealFunc` rejects `;` as a guard against accidental
+> statement chaining, but that is not a sanitizer.
+
+Both calls behave **identically on SurrealDB 2.6.x and 3.x**. Inside a transaction the usual
+v0.9.0 rules apply: on a buffered transaction (HTTP / 2.6.x) the computed value is unknown until
+commit, so the instance keeps its previous value for that field until you `refresh()`.
+
 ---
 
 ## Configuration Options
@@ -543,6 +608,9 @@ listed behave the same on both lines.
 | `upsert()` / `update_or_create()` / `get_or_create()`                                 | same on both lines                                                           | same on both lines                                                      | v0.10.0 |
 | `patch()` / `atomic_append` / `atomic_set_add` / `atomic_remove` / `atomic_increment` | same on both lines (portable `array::*` fns chosen over divergent `+=`/`-=`) | same on both lines                                                      | v0.11.0 |
 | `retry_on_conflict` / `SurrealDbConflictError` (retryable conflict)                   | same type + decorator; conflicts rarer (engine serialises more)              | same type + decorator; conflicts are the normal optimistic-MVCC failure | v0.12.0 |
+| `SurrealFunc` / `server_values=` / `extra_vars=` on `save`/`merge`                    | same on both lines (compiled to portable `CREATE`/`UPDATE … SET`)            | same on both lines                                                      | v0.13.0 |
+| Shipped function-name enums (`SurrealTimeFunction`, `SurrealCryptoFunction`, …)       | every catalogued member verified on 2.6.5                                    | every catalogued member verified on 3.1.3                               | v0.13.0 |
+| `server_values` inside a transaction — when the instance sees the computed value      | only after commit (buffered; `refresh()` to read it)                         | immediately (interactive returns the row)                               | v0.13.0 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
 
@@ -570,7 +638,8 @@ Contributions are welcome! Please:
 | v0.10.0           | upsert / update_or_create / get_or_create        | ✅ Released |
 | v0.11.0           | patch / atomic field & array ops                 | ✅ Released |
 | v0.12.0           | retry_on_conflict & optimistic concurrency       | ✅ Released |
-| v0.13.0 – v0.22.0 | Tier 1 — Core (auth, live, relations, …)         | 📋 Planned  |
+| v0.13.0           | SurrealFunc & server-side values                 | ✅ Released |
+| v0.14.0 – v0.22.0 | Tier 1 — Core (computed, auth, live, relations)  | 📋 Planned  |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)  | 📋 Planned  |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI) | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)               | 📋 Planned  |
@@ -608,7 +677,8 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | upsert / update_or_create     | ✅ v0.10.0              | ✅               |
 | Atomic field/array operations | ✅ v0.11.0              | ✅               |
 | Retry on conflict             | ✅ v0.12.0              | ✅               |
-| SurrealFunc & Computed        | v0.13 – v0.14           | ✅               |
+| SurrealFunc & server values   | ✅ v0.13.0              | ✅               |
+| Computed fields               | v0.14.0                 | ✅               |
 | JWT Authentication            | v0.16 – v0.17           | ✅               |
 | Field Aliases & DX            | v0.18.0                 | ✅               |
 | Live Models / CDC             | v0.19 – v0.21           | ✅               |
