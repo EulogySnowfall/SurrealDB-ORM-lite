@@ -13,7 +13,9 @@ from surreal_orm_lite import (
     SurrealConfigDict,
     SurrealDBConnectionManager,
     post_save,
+    post_update,
     pre_save,
+    pre_update,
 )
 from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.functions import (
@@ -398,18 +400,121 @@ class TestSaveServerValuesE2E:
             post_save.clear(SvUser)
 
 
+class TestMergeServerValuesE2E:
+    @pytest.mark.asyncio
+    async def test_merge_is_partial_and_syncs_instance(self) -> None:
+        async with sv_client() as client:
+            user = SvUser(id="carol", name="Carol", plan="free", bio="hello")
+            await user.save()
+
+            await user.merge(plan="pro", server_values={"updated_at": SurrealFunc.call(SurrealTimeFunction.NOW)})
+
+            # Listed fields changed (bound + server-computed), instance synced without refresh()…
+            assert user.plan == "pro"
+            assert isinstance(user.updated_at, datetime)
+            # …and the unlisted field survived (MERGE semantics, not REPLACE).
+            rows = await client.query("SELECT * FROM SvUser:carol;", {})
+            assert rows[0]["plan"] == "pro"
+            assert rows[0]["bio"] == "hello"
+            assert rows[0]["name"] == "Carol"
+            assert isinstance(rows[0]["updated_at"], datetime)
+
+    @pytest.mark.asyncio
+    async def test_server_value_overrides_same_named_kwarg(self) -> None:
+        async with sv_client() as client:
+            user = SvUser(id="dave", name="Dave")
+            await user.save()
+
+            await user.merge(
+                updated_at="literal-string",
+                server_values={"updated_at": SurrealFunc("time::now()")},
+            )
+            rows = await client.query("SELECT * FROM SvUser:dave;", {})
+            assert isinstance(rows[0]["updated_at"], datetime)  # the func won
+
+    @pytest.mark.asyncio
+    async def test_merge_with_only_server_values(self) -> None:
+        async with sv_client() as client:
+            user = SvUser(id="erin", name="Erin")
+            await user.save()
+
+            await user.merge(server_values={"updated_at": SurrealFunc("time::now()")})
+            rows = await client.query("SELECT * FROM SvUser:erin;", {})
+            assert isinstance(rows[0]["updated_at"], datetime)
+            assert rows[0]["name"] == "Erin"
+
+    @pytest.mark.asyncio
+    async def test_merge_extra_vars_are_bound(self) -> None:
+        async with sv_client() as client:
+            user = SvUser(id="frank", name="Frank")
+            await user.save()
+
+            raw_password = "p@ssw0rd-merge"
+            await user.merge(
+                server_values={"password_hash": SurrealFunc.call(SurrealCryptoFunction.ARGON2_GENERATE, "$password")},
+                extra_vars={"password": raw_password},
+            )
+            assert user.password_hash.startswith("$argon2")
+            ok = await client.query(
+                "RETURN crypto::argon2::compare($h, $p);",
+                {"h": user.password_hash, "p": raw_password},
+            )
+            assert ok is True
+
+    @pytest.mark.asyncio
+    async def test_update_signals_carry_all_merged_fields(self) -> None:
+        seen: list[list[str]] = []
+
+        @pre_update.connect(SvUser)
+        async def _pre(sender, instance, update_fields=None, **kw) -> None:
+            seen.append(sorted(update_fields or []))
+
+        @post_update.connect(SvUser)
+        async def _post(sender, instance, update_fields=None, **kw) -> None:
+            seen.append(sorted(update_fields or []))
+
+        try:
+            async with sv_client():
+                user = SvUser(id="gina", name="Gina")
+                await user.save()
+                await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
+            assert seen == [["plan", "updated_at"], ["plan", "updated_at"]]
+        finally:
+            pre_update.clear(SvUser)
+            post_update.clear(SvUser)
+
+
 class TestServerValuesValidation:
     @pytest.mark.asyncio
     async def test_non_surrealfunc_value_raises_type_error(self) -> None:
         with pytest.raises(TypeError, match="SurrealFunc"):
             await SvUser(id="x", name="X").save(server_values={"joined_at": "time::now()"})  # type: ignore[dict-item]
+        with pytest.raises(TypeError, match="SurrealFunc"):
+            await SvUser(id="x", name="X").merge(server_values={"updated_at": 42})  # type: ignore[dict-item]
 
     @pytest.mark.asyncio
     async def test_extra_vars_without_server_values_raises(self) -> None:
         with pytest.raises(ValueError, match="extra_vars"):
             await SvUser(id="x", name="X").save(extra_vars={"password": "p"})
+        with pytest.raises(ValueError, match="extra_vars"):
+            await SvUser(id="x", name="X").merge(plan="pro", extra_vars={"password": "p"})
 
     @pytest.mark.asyncio
     async def test_invalid_server_values_key_raises(self) -> None:
         with pytest.raises(ValueError):
             await SvUser(id="x", name="X").save(server_values={"bad key": SurrealFunc("time::now()")})
+        with pytest.raises(ValueError):
+            await SvUser(id="x", name="X").merge(server_values={"bad key": SurrealFunc("time::now()")})
+
+    @pytest.mark.asyncio
+    async def test_extra_vars_colliding_with_internal_binding_raises(self) -> None:
+        with pytest.raises(ValueError, match="collide"):
+            await SvUser(id="x", name="X").save(
+                server_values={"joined_at": SurrealFunc("time::now()")},
+                extra_vars={"rid": "boom"},
+            )
+        with pytest.raises(ValueError, match="collide"):
+            await SvUser(id="x", name="X").save(
+                server_values={"joined_at": SurrealFunc("time::now()")},
+                extra_vars={"_sv_name": "boom"},
+            )

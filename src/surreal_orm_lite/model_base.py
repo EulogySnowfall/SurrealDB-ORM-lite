@@ -504,16 +504,81 @@ class BaseSurrealModel(BaseModel):
 
         return result
 
-    async def merge(self, tx: Transaction | None = None, **data: Any) -> Any:
+    async def _merge_server(
+        self,
+        tx: Transaction | None,
+        server_values: Mapping[str, SurrealFunc],
+        extra_vars: Mapping[str, Any] | None,
+        data: dict[str, Any],
+    ) -> Any:
+        """Partial update routed through ``UPDATE … SET`` so server functions are evaluated.
+
+        ``UPDATE … SET`` only touches the listed fields, so this keeps ``merge``'s partial
+        semantics while letting SurrealDB compute values. The statement returns the updated
+        row (``RETURN AFTER`` by default), which replaces the ``refresh()`` round-trip the
+        native MERGE path needs.
+        """
+        sender = self.__class__
+        record_id = self._record_id()
+        if record_id is None:
+            raise SurrealDbError(f"No Id for the data to merge: {data}")
+
+        merged: dict[str, Any] = {**data, **server_values}
+        clause, variables = build_set_clause(merged)
+        variables["rid"] = record_id
+        variables = merge_extra_vars(variables, extra_vars)
+        statement = f"UPDATE $rid SET {clause};"
+        update_fields = list(merged.keys())
+
+        has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
+
+        if tx is not None:
+            if has_signals:
+                await pre_update.send(sender, instance=self, update_fields=update_fields)
+            rows = await tx.add(statement, variables)
+            if tx.is_interactive:
+                self._apply_record(rows)
+            else:
+                # Buffered: the server-computed values are unknown until commit, so only
+                # the literal kwargs can be applied — func fields stay stale.
+                for key, value in data.items():
+                    if hasattr(self, key):
+                        object.__setattr__(self, key, value)
+            if has_signals:
+                tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
+            return None
+
+        client = await SurrealDBConnectionManager.get_client()
+
+        if not has_signals:
+            rows = await client.query(statement, variables)
+            self._apply_record(rows)
+            return None
+
+        await pre_update.send(sender, instance=self, update_fields=update_fields)
+        async with around_update.wrap(sender, instance=self, update_fields=update_fields):
+            rows = await client.query(statement, variables)
+            self._apply_record(rows)
+        await post_update.send(sender, instance=self, update_fields=update_fields)
+        return None
+
+    async def merge(
+        self,
+        tx: Transaction | None = None,
+        server_values: Mapping[str, SurrealFunc] | None = None,
+        extra_vars: Mapping[str, Any] | None = None,
+        **data: Any,
+    ) -> Any:
         """
         Partial update of the model instance in the database.
 
         When ``tx`` is provided, the UPDATE…MERGE statement is buffered onto the
         transaction instead of being executed immediately.
 
-        Note: ``tx`` is a reserved keyword argument for this method. A model field
-        literally named ``tx`` cannot be merged by keyword; use a dict-unpacking
-        workaround if needed (no realistic SurrealDB column is named ``tx``).
+        Note: ``tx``, ``server_values`` and ``extra_vars`` are reserved keyword arguments
+        for this method. A model field literally named like one of them cannot be merged
+        by keyword; use a dict-unpacking workaround if needed (no realistic SurrealDB
+        column carries those names).
 
         Emits pre_update, post_update, and around_update signals. In tx mode,
         ``around_update`` is skipped (the write is deferred to commit) and
@@ -523,7 +588,24 @@ class BaseSurrealModel(BaseModel):
         ``data`` is applied to ``self`` directly at buffer time. A rollback will
         therefore leave the instance ahead of the database — caller must treat the
         instance as stale after a failed tx.
+
+        Args:
+            tx: Optional transaction the statement is buffered onto.
+            server_values: Field name → :class:`~surreal_orm_lite.functions.SurrealFunc`,
+                evaluated **by the server**. A server value overrides a ``data`` keyword
+                of the same name. Providing it compiles the update as ``UPDATE … SET``
+                (still a partial update: unlisted fields are untouched) and the returned
+                row syncs the instance, so no extra ``refresh()`` round-trip is needed.
+            extra_vars: Extra query variables the expressions reference, bound (never
+                interpolated). Requires ``server_values``.
+
+        Example:
+            >>> await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
         """
+        self._validate_server_values(server_values, extra_vars)
+        if server_values:
+            return await self._merge_server(tx, server_values, extra_vars, data)
+
         sender = self.__class__
         data_set = dict(data.items())
         record_id = self._record_id()
