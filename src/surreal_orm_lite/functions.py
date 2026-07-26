@@ -12,8 +12,14 @@ from enum import StrEnum
 from typing import Any
 
 __all__ = [
+    "SurrealArrayFunction",
+    "SurrealCryptoFunction",
     "SurrealFunc",
     "SurrealFunction",
+    "SurrealMathFunction",
+    "SurrealRandFunction",
+    "SurrealStringFunction",
+    "SurrealTimeFunction",
 ]
 
 
@@ -95,4 +101,125 @@ class SurrealFunction(StrEnum):
     Members are plain strings (the function name, e.g. ``"time::now"``), so they can be
     passed straight to :meth:`SurrealFunc.call` or interpolated into an expression.
     Subclass it to catalog functions the shipped enums don't cover.
+
+    Every member of the shipped subclasses is **verified to resolve on both SurrealDB
+    2.6.x and 3.x** by an E2E test that calls each one on both server lines. Functions
+    whose name differs between the lines are deliberately left out (``rand::guid`` is
+    2.6-only; ``type::is::*`` was renamed to ``type::is_*`` in 3.x) — pass those as a
+    plain string if you target a single line. The enums are DX, not a gate:
+    :class:`SurrealFunc` accepts any expression.
     """
+
+
+class SurrealTimeFunction(SurrealFunction):
+    """``time::*`` functions (https://surrealdb.com/docs/surrealql/functions/database/time)."""
+
+    NOW = "time::now"
+    CEIL = "time::ceil"
+    FLOOR = "time::floor"
+    ROUND = "time::round"
+    GROUP = "time::group"
+    UNIX = "time::unix"
+    DAY = "time::day"
+    MONTH = "time::month"
+    YEAR = "time::year"
+    HOUR = "time::hour"
+    MINUTE = "time::minute"
+    SECOND = "time::second"
+    WDAY = "time::wday"
+    WEEK = "time::week"
+    YDAY = "time::yday"
+    MIN = "time::min"
+    MAX = "time::max"
+
+
+class SurrealMathFunction(SurrealFunction):
+    """``math::*`` functions (https://surrealdb.com/docs/surrealql/functions/database/math)."""
+
+    ABS = "math::abs"
+    CEIL = "math::ceil"
+    FLOOR = "math::floor"
+    ROUND = "math::round"
+    SQRT = "math::sqrt"
+    POW = "math::pow"
+    MEAN = "math::mean"
+    MEDIAN = "math::median"
+    SUM = "math::sum"
+    PRODUCT = "math::product"
+    MIN = "math::min"
+    MAX = "math::max"
+    FIXED = "math::fixed"
+    STDDEV = "math::stddev"
+    VARIANCE = "math::variance"
+
+
+class SurrealStringFunction(SurrealFunction):
+    """``string::*`` functions (https://surrealdb.com/docs/surrealql/functions/database/string)."""
+
+    CONCAT = "string::concat"
+    LOWERCASE = "string::lowercase"
+    UPPERCASE = "string::uppercase"
+    TRIM = "string::trim"
+    LEN = "string::len"
+    SLUG = "string::slug"
+    REPLACE = "string::replace"
+    REVERSE = "string::reverse"
+    SPLIT = "string::split"
+    JOIN = "string::join"
+    STARTS_WITH = "string::starts_with"
+    ENDS_WITH = "string::ends_with"
+    CONTAINS = "string::contains"
+    REPEAT = "string::repeat"
+
+
+class SurrealArrayFunction(SurrealFunction):
+    """``array::*`` functions (https://surrealdb.com/docs/surrealql/functions/database/array)."""
+
+    APPEND = "array::append"
+    CONCAT = "array::concat"
+    ADD = "array::add"
+    COMPLEMENT = "array::complement"
+    DISTINCT = "array::distinct"
+    LEN = "array::len"
+    REVERSE = "array::reverse"
+    SORT = "array::sort"
+    FLATTEN = "array::flatten"
+    FIRST = "array::first"
+    LAST = "array::last"
+    MIN = "array::min"
+    MAX = "array::max"
+
+
+class SurrealCryptoFunction(SurrealFunction):
+    """``crypto::*`` functions (https://surrealdb.com/docs/surrealql/functions/database/crypto).
+
+    The ``*_GENERATE`` / ``*_COMPARE`` pairs are the reason ``extra_vars`` exists: hash a
+    password server-side without the raw value ever being interpolated into the query.
+    """
+
+    ARGON2_GENERATE = "crypto::argon2::generate"
+    ARGON2_COMPARE = "crypto::argon2::compare"
+    BCRYPT_GENERATE = "crypto::bcrypt::generate"
+    BCRYPT_COMPARE = "crypto::bcrypt::compare"
+    SHA256 = "crypto::sha256"
+    SHA512 = "crypto::sha512"
+    MD5 = "crypto::md5"
+
+
+class SurrealRandFunction(SurrealFunction):
+    """``rand::*`` functions (https://surrealdb.com/docs/surrealql/functions/database/rand).
+
+    ``RAND`` is the bare ``rand()`` function; the rest live under the ``rand::`` namespace.
+    """
+
+    RAND = "rand"
+    UUID = "rand::uuid"
+    UUID_V4 = "rand::uuid::v4"
+    UUID_V7 = "rand::uuid::v7"
+    ULID = "rand::ulid"
+    BOOL = "rand::bool"
+    FLOAT = "rand::float"
+    INT = "rand::int"
+    STRING = "rand::string"
+    TIME = "rand::time"
+    ENUM = "rand::enum"
