@@ -1,7 +1,8 @@
 import contextlib
+import functools
 import logging
 import typing
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from decimal import Decimal
 from typing import Any, Self
 
@@ -11,6 +12,7 @@ from pydantic_core import ValidationError
 from ._sdk import NotFoundError, RecordID, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
+from .functions import SurrealFunc
 from .signals import (
     around_delete,
     around_save,
@@ -24,6 +26,8 @@ from .signals import (
 )
 from .transaction import Transaction
 from .utils import (
+    build_set_clause,
+    merge_extra_vars,
     remove_quotes_for_variables,
     validate_edge_name,
     validate_field_name,
@@ -247,7 +251,82 @@ class BaseSurrealModel(BaseModel):
 
         raise SurrealDbError("Can't save data, no record returned.")  # pragma: no cover
 
-    async def save(self, tx: Transaction | None = None) -> Self:
+    @staticmethod
+    def _validate_server_values(
+        server_values: Mapping[str, Any] | None,
+        extra_vars: Mapping[str, Any] | None,
+    ) -> None:
+        """Validate the ``server_values`` / ``extra_vars`` pair before compiling a statement.
+
+        Key syntax is checked later by :func:`build_set_clause`; what must be caught here
+        is (a) a non-``SurrealFunc`` server value — once merged with the field data the
+        two are indistinguishable, so it would silently be bound as a literal string
+        instead of evaluated — and (b) ``extra_vars`` with nothing to reference them.
+        """
+        if extra_vars and not server_values:
+            raise ValueError("extra_vars requires server_values: no SurrealFunc expression could reference them.")
+        for key, value in (server_values or {}).items():
+            if not isinstance(value, SurrealFunc):
+                raise TypeError(
+                    f"server_values[{key!r}] must be a SurrealFunc, got {type(value).__name__!r}. "
+                    "Wrap the expression: SurrealFunc('time::now()')."
+                )
+
+    async def _do_save_server(
+        self,
+        tx: Transaction | None = None,
+        server_values: Mapping[str, SurrealFunc] | None = None,
+        extra_vars: Mapping[str, Any] | None = None,
+    ) -> tuple[Self, bool]:
+        """Internal save routed through ``CREATE … SET`` so server functions are evaluated.
+
+        The native SDK ``create()`` sends data as values, so a ``SurrealFunc`` would be
+        stored as its literal text. This path compiles one ``SET`` clause instead —
+        functions inlined, every other value bound — which SurrealDB evaluates
+        server-side. ``CONTENT $data SET …`` is not valid SurrealQL (verified on 2.6.5
+        and 3.1.3), hence the full clause rather than a hybrid.
+        """
+        record_id = self._record_id()
+        merged: dict[str, Any] = {**self.model_dump(exclude={"id"}), **(server_values or {})}
+        clause, variables = build_set_clause(merged)
+
+        if record_id is not None:
+            variables["rid"] = record_id
+            statement = f"CREATE $rid SET {clause};"
+        else:
+            if tx is not None and not tx.is_interactive:
+                raise SurrealDbError(
+                    "save(tx=...) requires an explicit id on a buffered transaction "
+                    "(auto-id requires a WebSocket connection to SurrealDB 3.x)."
+                )
+            table = self.get_table_name()
+            validate_field_name(table, "table")
+            statement = f"CREATE {table} SET {clause};"
+
+        variables = merge_extra_vars(variables, extra_vars)
+
+        if tx is not None:
+            rows = await tx.add(statement, variables)
+            self._apply_record(rows)  # interactive: applies; buffered: None → stale until commit
+            return self, True
+
+        client = await SurrealDBConnectionManager.get_client()
+        try:
+            rows = await client.query(statement, variables)
+        except ServerError as e:
+            # Same normalisation as the native path: "already exists" is an ORM error.
+            if "already exists" in str(e).lower():
+                raise SurrealDbError(f"There was a problem with the database: {e}") from e
+            raise
+        self._apply_record(rows)
+        return self, True
+
+    async def save(
+        self,
+        tx: Transaction | None = None,
+        server_values: Mapping[str, SurrealFunc] | None = None,
+        extra_vars: Mapping[str, Any] | None = None,
+    ) -> Self:
         """
         Save the model instance to the database.
 
@@ -259,7 +338,33 @@ class BaseSurrealModel(BaseModel):
         commit, not here — consistent with update/merge/delete in tx mode. ``post_save``
         is deferred until the transaction commits successfully; if the tx rolls back,
         ``post_save`` is NOT emitted (the write never happened).
+
+        Args:
+            tx: Optional transaction the CREATE is buffered onto.
+            server_values: Field name → :class:`~surreal_orm_lite.functions.SurrealFunc`,
+                evaluated **by the server** (``time::now()``, ``rand::uuid::v7()``, …)
+                rather than in Python. A server value overrides a model field of the same
+                name. Providing it routes the write through ``CREATE … SET``.
+            extra_vars: Extra query variables the expressions reference, bound (never
+                interpolated) — this is how user input reaches a function safely. Requires
+                ``server_values``; a key colliding with an internal binding raises.
+
+        Example:
+            >>> await player.save(server_values={"joined_at": SurrealFunc("time::now()")})
+            >>> await user.save(
+            ...     server_values={"pwd": SurrealFunc("crypto::argon2::generate($password)")},
+            ...     extra_vars={"password": raw_password},
+            ... )
+
+        Note:
+            In a **buffered** transaction (HTTP or SurrealDB 2.6.x) the server-computed
+            values are unknown until commit, so the instance keeps its pre-save values for
+            those fields — ``refresh()`` after commit if you need them.
         """
+        self._validate_server_values(server_values, extra_vars)
+        if server_values:
+            do_op = functools.partial(self._do_save_server, server_values=server_values, extra_vars=extra_vars)
+            return await self._save_with_signals(do_op, tx)
         return await self._save_with_signals(self._do_save, tx)
 
     def _apply_record(self, record: Any) -> None:

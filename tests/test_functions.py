@@ -1,11 +1,21 @@
 """Tests for v0.13.0 server-side computation: SurrealFunc, the curated function-name
 enums, the SET-clause compiler, and ``server_values=`` / ``extra_vars=`` on save/merge."""
 
+import contextlib
 import os
+from datetime import datetime
+from typing import Any
 
 import pytest
 
-from surreal_orm_lite import SurrealDBConnectionManager
+from surreal_orm_lite import (
+    BaseSurrealModel,
+    SurrealConfigDict,
+    SurrealDBConnectionManager,
+    post_save,
+    pre_save,
+)
+from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.functions import (
     SurrealArrayFunction,
     SurrealCryptoFunction,
@@ -269,3 +279,137 @@ class TestFunctionEnumsE2E:
                 await client.query(f"RETURN {expr};", {})
         finally:
             await SurrealDBConnectionManager.close_connection()
+
+
+# --------------------------------------------------------------------------- #
+# server_values= / extra_vars= on save() and merge()
+# --------------------------------------------------------------------------- #
+
+
+class SvUser(BaseSurrealModel):
+    model_config = SurrealConfigDict(primary_key="id")
+    id: str | None = None
+    name: str = ""
+    plan: str = "free"
+    bio: str = ""
+    joined_at: Any = None
+    updated_at: Any = None
+    password_hash: str = ""
+
+
+@contextlib.asynccontextmanager
+async def sv_client():
+    """Connected ORM client with the SvUser table cleared before and after.
+
+    An async context manager rather than a pytest fixture: the SDK's WebSocket client is
+    bound to the event loop that created it, and fixtures run in the module-scoped loop
+    while tests get their own — so the client must be opened inside the test's loop.
+    """
+    _connect()
+    client = await SurrealDBConnectionManager.get_client()
+    with contextlib.suppress(Exception):
+        await client.query("REMOVE TABLE SvUser;", {})
+    try:
+        yield client
+    finally:
+        with contextlib.suppress(Exception):
+            await client.query("REMOVE TABLE SvUser;", {})
+        await SurrealDBConnectionManager.close_connection()
+
+
+class TestSaveServerValuesE2E:
+    @pytest.mark.asyncio
+    async def test_server_function_is_evaluated_server_side(self) -> None:
+        async with sv_client() as client:
+            user = SvUser(id="alice", name="Alice")
+            await user.save(server_values={"joined_at": SurrealFunc.call(SurrealTimeFunction.NOW)})
+
+            # The instance is synced with the row the server returned…
+            assert isinstance(user.joined_at, datetime)
+            # …and the stored value is a real datetime, not the literal expression string.
+            rows = await client.query("SELECT * FROM SvUser:alice;", {})
+            assert isinstance(rows[0]["joined_at"], datetime)
+            assert rows[0]["name"] == "Alice"
+
+    @pytest.mark.asyncio
+    async def test_duplicate_id_raises_already_exists(self) -> None:
+        async with sv_client():
+            await SvUser(id="dup", name="A").save(server_values={"joined_at": SurrealFunc("time::now()")})
+            with pytest.raises(SurrealDbError, match="already exists"):
+                await SvUser(id="dup", name="B").save(server_values={"joined_at": SurrealFunc("time::now()")})
+
+    @pytest.mark.asyncio
+    async def test_auto_generated_id_with_server_values(self) -> None:
+        async with sv_client():
+            user = SvUser(name="NoId")
+            await user.save(server_values={"joined_at": SurrealFunc("time::now()")})
+            assert user.id is not None
+            assert isinstance(user.joined_at, datetime)
+
+    @pytest.mark.asyncio
+    async def test_extra_vars_are_bound_not_interpolated(self) -> None:
+        async with sv_client() as client:
+            raw_password = "hunter2-s3cret"
+            user = SvUser(id="bob", name="Bob")
+            await user.save(
+                server_values={"password_hash": SurrealFunc.call(SurrealCryptoFunction.ARGON2_GENERATE, "$password")},
+                extra_vars={"password": raw_password},
+            )
+            assert user.password_hash.startswith("$argon2")
+
+            # The hash verifies server-side against the original password…
+            ok = await client.query(
+                "RETURN crypto::argon2::compare($h, $p);",
+                {"h": user.password_hash, "p": raw_password},
+            )
+            assert ok is True
+            # …and the raw password was never stored.
+            rows = await client.query("SELECT * FROM SvUser:bob;", {})
+            assert raw_password not in str(rows[0])
+
+    @pytest.mark.asyncio
+    async def test_injection_shaped_field_value_stays_literal(self) -> None:
+        async with sv_client() as client:
+            evil = "'; REMOVE TABLE SvUser; --"
+            user = SvUser(id="evil", name="E", bio=evil)
+            await user.save(server_values={"joined_at": SurrealFunc("time::now()")})
+
+            rows = await client.query("SELECT * FROM SvUser:evil;", {})
+            assert rows[0]["bio"] == evil  # stored verbatim, table intact
+
+    @pytest.mark.asyncio
+    async def test_signals_fire_around_server_values_save(self) -> None:
+        seen: list[str] = []
+
+        @pre_save.connect(SvUser)
+        async def _pre(sender, instance, **kw) -> None:
+            seen.append("pre")
+
+        @post_save.connect(SvUser)
+        async def _post(sender, instance, **kw) -> None:
+            seen.append("post")
+
+        try:
+            async with sv_client():
+                await SvUser(id="sig", name="S").save(server_values={"joined_at": SurrealFunc("time::now()")})
+            assert seen == ["pre", "post"]
+        finally:
+            pre_save.clear(SvUser)
+            post_save.clear(SvUser)
+
+
+class TestServerValuesValidation:
+    @pytest.mark.asyncio
+    async def test_non_surrealfunc_value_raises_type_error(self) -> None:
+        with pytest.raises(TypeError, match="SurrealFunc"):
+            await SvUser(id="x", name="X").save(server_values={"joined_at": "time::now()"})  # type: ignore[dict-item]
+
+    @pytest.mark.asyncio
+    async def test_extra_vars_without_server_values_raises(self) -> None:
+        with pytest.raises(ValueError, match="extra_vars"):
+            await SvUser(id="x", name="X").save(extra_vars={"password": "p"})
+
+    @pytest.mark.asyncio
+    async def test_invalid_server_values_key_raises(self) -> None:
+        with pytest.raises(ValueError):
+            await SvUser(id="x", name="X").save(server_values={"bad key": SurrealFunc("time::now()")})
