@@ -178,6 +178,25 @@ class TestSurrealFunc:
         assert (a == "time::now()") is False
 
 
+def test_public_exports() -> None:
+    import surreal_orm_lite as m
+
+    for name in (
+        "SurrealFunc",
+        "SurrealFunction",
+        "SurrealTimeFunction",
+        "SurrealMathFunction",
+        "SurrealStringFunction",
+        "SurrealArrayFunction",
+        "SurrealCryptoFunction",
+        "SurrealRandFunction",
+    ):
+        assert name in m.__all__, f"{name} missing from __all__"
+        assert hasattr(m, name), f"{name} not importable from the package root"
+    assert m.SurrealFunc is SurrealFunc
+    assert m.SurrealTimeFunction is SurrealTimeFunction
+
+
 class TestFunctionEnums:
     def test_members_are_plain_function_names(self) -> None:
         assert SurrealTimeFunction.NOW == "time::now"

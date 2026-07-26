@@ -12,6 +12,16 @@ from .exceptions import (
     SurrealDbValidationError,
     SurrealORMError,
 )
+from .functions import (
+    SurrealArrayFunction,
+    SurrealCryptoFunction,
+    SurrealFunc,
+    SurrealFunction,
+    SurrealMathFunction,
+    SurrealRandFunction,
+    SurrealStringFunction,
+    SurrealTimeFunction,
+)
 from .model_base import BaseSurrealModel, SurrealConfigDict
 from .q import Q
 from .query_set import QuerySet
@@ -66,6 +76,15 @@ __all__ = [
     # Concurrency
     "retry_on_conflict",
     "is_conflict_error",
+    # Server-side functions
+    "SurrealFunc",
+    "SurrealFunction",
+    "SurrealTimeFunction",
+    "SurrealMathFunction",
+    "SurrealStringFunction",
+    "SurrealArrayFunction",
+    "SurrealCryptoFunction",
+    "SurrealRandFunction",
     # Exceptions
     "SurrealORMError",
     "SurrealDbError",
