@@ -1,7 +1,9 @@
 import re
+from collections.abc import Mapping
 from typing import Any
 
 from .constants import LOOKUP_OPERATORS
+from .functions import SurrealFunc
 
 # Pattern for valid field names: alphanumeric, underscores, dots (for nested fields)
 # Must start with a letter or underscore
@@ -46,6 +48,65 @@ def validate_field_name(field: str, context: str = "field") -> None:
             f"Invalid {context} name '{field}': must contain only alphanumeric characters, "
             "underscores, and dots (for nested fields), and start with a letter or underscore"
         )
+
+
+def build_set_clause(merged: Mapping[str, Any], param_prefix: str = "_sv_") -> tuple[str, dict[str, Any]]:
+    """Compile a ``SET field = value, …`` clause from a field mapping (v0.13.0).
+
+    A :class:`~surreal_orm_lite.functions.SurrealFunc` value is **inlined** as a raw
+    SurrealQL expression so the server evaluates it; every other value is **bound** to a
+    ``$<param_prefix><field>`` query variable, which is the injection boundary::
+
+        build_set_clause({"name": "Alice", "joined": SurrealFunc("time::now()")})
+        # ("name = $_sv_name, joined = time::now()", {"_sv_name": "Alice"})
+
+    Field names are validated as plain identifiers before being interpolated (a dotted
+    nested path is rejected here: it would need a different binding strategy).
+
+    Returns:
+        The clause text and the variables to bind alongside it.
+
+    Raises:
+        ValueError: If a field name is not a plain identifier.
+    """
+    parts: list[str] = []
+    variables: dict[str, Any] = {}
+    for field, value in merged.items():
+        validate_alias_name(field)
+        if isinstance(value, SurrealFunc):
+            parts.append(f"{field} = {value.expression}")
+        else:
+            var_name = f"{param_prefix}{field}"
+            parts.append(f"{field} = ${var_name}")
+            variables[var_name] = value
+    return ", ".join(parts), variables
+
+
+def merge_extra_vars(variables: dict[str, Any], extra_vars: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Merge caller-supplied ``extra_vars`` into a statement's bindings (v0.13.0).
+
+    ``extra_vars`` carries the values a ``SurrealFunc`` expression references (e.g.
+    ``crypto::argon2::generate($password)`` with ``extra_vars={"password": raw}``), so
+    user input stays a bound parameter instead of being formatted into the query.
+
+    A key that would shadow an internal binding (the record id, or a ``$_sv_*`` field
+    parameter produced by :func:`build_set_clause`) is rejected rather than silently
+    overwriting it.
+
+    Returns:
+        A new dict with both sets of bindings (``variables`` is left unmodified).
+
+    Raises:
+        ValueError: If any ``extra_vars`` key collides with an internal binding.
+    """
+    if not extra_vars:
+        return dict(variables)
+    conflicting = sorted(set(variables) & set(extra_vars))
+    if conflicting:
+        raise ValueError(
+            f"extra_vars keys collide with internal query bindings: {conflicting}. Rename them (e.g. add a suffix)."
+        )
+    return {**variables, **extra_vars}
 
 
 def validate_alias_name(alias: str) -> None:

@@ -16,6 +16,7 @@ from surreal_orm_lite.functions import (
     SurrealStringFunction,
     SurrealTimeFunction,
 )
+from surreal_orm_lite.utils import build_set_clause, merge_extra_vars
 
 ALL_FUNCTION_ENUMS: list[type[SurrealFunction]] = [
     SurrealTimeFunction,
@@ -197,6 +198,57 @@ class TestFunctionEnums:
         values = {str(m) for e in ALL_FUNCTION_ENUMS for m in e}
         assert "rand::guid" not in values
         assert not any(v.startswith("type::is") for v in values)
+
+
+class TestBuildSetClause:
+    def test_binds_values_and_inlines_funcs(self) -> None:
+        clause, variables = build_set_clause({"name": "Alice", "joined": SurrealFunc("time::now()")})
+        assert clause == "name = $_sv_name, joined = time::now()"
+        assert variables == {"_sv_name": "Alice"}
+
+    def test_injection_shaped_value_stays_bound(self) -> None:
+        evil = "x; REMOVE TABLE User;"
+        clause, variables = build_set_clause({"bio": evil})
+        assert clause == "bio = $_sv_bio"
+        assert evil not in clause
+        assert variables == {"_sv_bio": evil}
+
+    def test_empty_mapping_yields_empty_clause(self) -> None:
+        assert build_set_clause({}) == ("", {})
+
+    def test_invalid_key_raises(self) -> None:
+        for bad in ("a b", "a;b", "a.b", "1a", "", "a-b"):
+            with pytest.raises(ValueError):
+                build_set_clause({bad: 1})
+
+    def test_custom_prefix(self) -> None:
+        clause, variables = build_set_clause({"n": 1}, param_prefix="_x_")
+        assert clause == "n = $_x_n"
+        assert variables == {"_x_n": 1}
+
+
+class TestMergeExtraVars:
+    def test_merges_extra_vars(self) -> None:
+        variables = {"_sv_name": "A", "rid": "r"}
+        merged = merge_extra_vars(variables, {"password": "s3cret"})
+        assert merged["password"] == "s3cret"
+        assert merged["_sv_name"] == "A"
+
+    def test_collision_with_internal_binding_raises(self) -> None:
+        variables = {"_sv_name": "A", "rid": "r"}
+        with pytest.raises(ValueError, match="rid"):
+            merge_extra_vars(variables, {"rid": "boom"})
+        with pytest.raises(ValueError, match="_sv_name"):
+            merge_extra_vars(variables, {"_sv_name": "boom"})
+
+    def test_collision_message_lists_all_offenders(self) -> None:
+        with pytest.raises(ValueError, match="_sv_name.*rid|rid.*_sv_name"):
+            merge_extra_vars({"_sv_name": "A", "rid": "r"}, {"rid": 1, "_sv_name": 2})
+
+    def test_none_or_empty_is_a_no_op(self) -> None:
+        variables = {"_sv_name": "A"}
+        assert merge_extra_vars(variables, None) == {"_sv_name": "A"}
+        assert merge_extra_vars(variables, {}) == {"_sv_name": "A"}
 
 
 class TestFunctionEnumsE2E:
