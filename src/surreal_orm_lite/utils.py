@@ -1,5 +1,5 @@
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any
 
 from .constants import LOOKUP_OPERATORS
@@ -67,8 +67,11 @@ def build_set_clause(merged: Mapping[str, Any], param_prefix: str = "_sv_") -> t
         The clause text and the variables to bind alongside it.
 
     Raises:
-        ValueError: If a field name is not a plain identifier.
+        ValueError: If ``merged`` is empty (``SET`` with no assignment is a parse error on
+            both server lines), or if a field name is not a plain identifier.
     """
+    if not merged:
+        raise ValueError("build_set_clause() needs at least one field: an empty SET clause is invalid SurrealQL.")
     parts: list[str] = []
     variables: dict[str, Any] = {}
     for field, value in merged.items():
@@ -82,7 +85,11 @@ def build_set_clause(merged: Mapping[str, Any], param_prefix: str = "_sv_") -> t
     return ", ".join(parts), variables
 
 
-def merge_extra_vars(variables: dict[str, Any], extra_vars: Mapping[str, Any] | None) -> dict[str, Any]:
+def merge_extra_vars(
+    variables: dict[str, Any],
+    extra_vars: Mapping[str, Any] | None,
+    reserved: Iterable[str] = (),
+) -> dict[str, Any]:
     """Merge caller-supplied ``extra_vars`` into a statement's bindings (v0.13.0).
 
     ``extra_vars`` carries the values a ``SurrealFunc`` expression references (e.g.
@@ -91,17 +98,18 @@ def merge_extra_vars(variables: dict[str, Any], extra_vars: Mapping[str, Any] | 
 
     A key that would shadow an internal binding (the record id, or a ``$_sv_*`` field
     parameter produced by :func:`build_set_clause`) is rejected rather than silently
-    overwriting it.
+    overwriting it. ``reserved`` additionally rejects names the statement owns but may not
+    have bound on this particular branch, so validation does not vary by code path.
 
     Returns:
         A new dict with both sets of bindings (``variables`` is left unmodified).
 
     Raises:
-        ValueError: If any ``extra_vars`` key collides with an internal binding.
+        ValueError: If any ``extra_vars`` key collides with an internal or reserved binding.
     """
     if not extra_vars:
         return dict(variables)
-    conflicting = sorted(set(variables) & set(extra_vars))
+    conflicting = sorted((set(variables) | set(reserved)) & set(extra_vars))
     if conflicting:
         raise ValueError(
             f"extra_vars keys collide with internal query bindings: {conflicting}. Rename them (e.g. add a suffix)."

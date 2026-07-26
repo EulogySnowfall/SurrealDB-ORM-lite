@@ -9,7 +9,6 @@ This module deliberately imports nothing from the rest of the package (``utils``
 """
 
 from enum import StrEnum
-from typing import Any
 
 __all__ = [
     "SurrealArrayFunction",
@@ -67,7 +66,7 @@ class SurrealFunc:
         self.expression = stripped
 
     @classmethod
-    def call(cls, fn: "str | SurrealFunction", *args: Any) -> "SurrealFunc":
+    def call(cls, fn: "str | SurrealFunction", *args: str) -> "SurrealFunc":
         """Build ``fn(arg, ...)`` from a function name and raw SurrealQL argument fragments.
 
         ``fn`` is a plain string or any :class:`SurrealFunction` member (its value is the
@@ -76,9 +75,12 @@ class SurrealFunc:
             SurrealFunc.call(SurrealTimeFunction.NOW)                      # time::now()
             SurrealFunc.call(SurrealCryptoFunction.ARGON2_GENERATE, "$pw")  # crypto::argon2::generate($pw)
 
-        Each argument is a **raw SurrealQL fragment** (a bound-parameter reference like
-        ``"$password"``, a field name, or a literal such as ``"'a'"`` / ``"1w"``) and
-        carries the same developer-controlled trust model as the expression itself.
+        Each argument is a **raw SurrealQL fragment**, not a value: a bound-parameter
+        reference like ``"$password"``, a field name, or a literal written as it appears in
+        the query (``"'a'"`` for a string, ``"1w"`` for a duration). Passing a bare Python
+        value would render it unquoted — route values through ``extra_vars`` and reference
+        them by name instead. Arguments carry the same developer-controlled trust model as
+        the expression itself.
         """
         rendered = ", ".join(str(arg) for arg in args)
         return cls(f"{fn}({rendered})")

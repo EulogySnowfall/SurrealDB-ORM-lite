@@ -29,6 +29,7 @@ from .utils import (
     build_set_clause,
     merge_extra_vars,
     remove_quotes_for_variables,
+    validate_alias_name,
     validate_edge_name,
     validate_field_name,
     validate_graph_path,
@@ -300,10 +301,12 @@ class BaseSurrealModel(BaseModel):
                     "(auto-id requires a WebSocket connection to SurrealDB 3.x)."
                 )
             table = self.get_table_name()
-            validate_field_name(table, "table")
+            validate_alias_name(table)
             statement = f"CREATE {table} SET {clause};"
 
-        variables = merge_extra_vars(variables, extra_vars)
+        # `rid` is reserved on both branches (it is only *bound* on the explicit-id one), so
+        # extra_vars validation behaves identically either way.
+        variables = merge_extra_vars(variables, extra_vars, reserved=("rid",))
 
         if tx is not None:
             rows = await tx.add(statement, variables)
@@ -318,6 +321,8 @@ class BaseSurrealModel(BaseModel):
             if "already exists" in str(e).lower():
                 raise SurrealDbError(f"There was a problem with the database: {e}") from e
             raise
+        if not rows:
+            raise SurrealDbError("Can't save data, no record returned.")
         self._apply_record(rows)
         return self, True
 
@@ -371,8 +376,10 @@ class BaseSurrealModel(BaseModel):
         """Copy a returned DB row's fields onto this instance (id kept as native ``RecordID``).
 
         Accepts the raw SDK result (a row dict, a single-element list, or ``None``) and applies
-        only attributes the model actually declares. Shared by ``_do_save``/``_do_upsert`` so
-        the "apply the row the server gave back" step lives in one place.
+        only attributes the model actually declares. Shared by every write path that gets a row
+        back (``_do_upsert``, ``patch``, the atomic helpers, the ``server_values`` paths) so the
+        "apply the row the server gave back" step lives in one place. A ``None``/empty result is
+        a no-op — callers that must distinguish "no row" from "nothing to apply" check first.
         """
         if isinstance(record, list):
             record = record[0] if record else None
@@ -380,6 +387,26 @@ class BaseSurrealModel(BaseModel):
             for key, value in record.items():
                 if hasattr(self, key):
                     object.__setattr__(self, key, value)
+
+    async def _run_update_returning_row(self, statement: str, variables: dict[str, Any]) -> None:
+        """Run an ``UPDATE`` and apply its row, raising a uniform error when it matched nothing.
+
+        Two server behaviours are normalised here, so ``merge(server_values=)`` fails the same
+        way as the native ``merge()`` path (whose follow-up ``refresh()`` raises) on both DB
+        lines:
+
+        - a missing **record** returns no rows on 2.6.x and 3.x alike;
+        - a missing **table** returns no rows on 2.6.x but raises ``NotFoundError`` on 3.x
+          (same divergence the read paths normalise since v0.7.0).
+        """
+        client = await SurrealDBConnectionManager.get_client()
+        try:
+            rows = await client.query(statement, variables)
+        except NotFoundError as e:
+            raise SurrealDbError("Can't merge data, no record found.") from e
+        if not rows:
+            raise SurrealDbError("Can't merge data, no record found.")
+        self._apply_record(rows)
 
     async def _save_with_signals(
         self,
@@ -540,25 +567,23 @@ class BaseSurrealModel(BaseModel):
                 self._apply_record(rows)
             else:
                 # Buffered: the server-computed values are unknown until commit, so only
-                # the literal kwargs can be applied — func fields stay stale.
+                # the literal kwargs can be applied — func fields stay stale. A kwarg that
+                # `server_values` overrode is skipped: writing it would leave the instance
+                # holding a value that never reaches the database.
                 for key, value in data.items():
-                    if hasattr(self, key):
+                    if key not in server_values and hasattr(self, key):
                         object.__setattr__(self, key, value)
             if has_signals:
                 tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
             return None
 
-        client = await SurrealDBConnectionManager.get_client()
-
         if not has_signals:
-            rows = await client.query(statement, variables)
-            self._apply_record(rows)
+            await self._run_update_returning_row(statement, variables)
             return None
 
         await pre_update.send(sender, instance=self, update_fields=update_fields)
         async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-            rows = await client.query(statement, variables)
-            self._apply_record(rows)
+            await self._run_update_returning_row(statement, variables)
         await post_update.send(sender, instance=self, update_fields=update_fields)
         return None
 

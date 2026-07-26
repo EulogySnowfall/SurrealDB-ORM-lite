@@ -66,6 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transaction (HTTP / 2.6.x) the statement runs at commit, so the instance keeps its previous
   value for computed fields until you `refresh()` — the same caveat as `merge(tx=)`. Auto-id
   `save(tx=)` still requires the interactive strategy (unchanged v0.8.0 rule).
+- **`merge(server_values=)` on a record that does not exist raises `SurrealDbError`** ("Can't
+  merge data, no record found."), matching the native `merge()` path — server-side an `UPDATE`
+  matching nothing is not an error, and the two DB lines even disagree on the missing-table case
+  (SurrealDB 3.x raises `NotFound`, 2.6.x returns no rows), so both are normalised to that one
+  ORM error.
 - Signals are unchanged: `save(server_values=)` emits `pre_save`/`around_save`/`post_save`, and
   `merge(server_values=)` emits `pre_update`/`around_update`/`post_update` with `update_fields`
   listing both the literal and the computed fields.

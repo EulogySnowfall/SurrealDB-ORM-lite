@@ -12,6 +12,8 @@ from surreal_orm_lite import (
     BaseSurrealModel,
     SurrealConfigDict,
     SurrealDBConnectionManager,
+    around_save,
+    around_update,
     post_save,
     post_update,
     pre_save,
@@ -244,8 +246,11 @@ class TestBuildSetClause:
         assert evil not in clause
         assert variables == {"_sv_bio": evil}
 
-    def test_empty_mapping_yields_empty_clause(self) -> None:
-        assert build_set_clause({}) == ("", {})
+    def test_empty_mapping_raises(self) -> None:
+        # "SET" with no assignment is a parse error on both server lines, so the compiler
+        # refuses to build one rather than relying on every caller to pre-check.
+        with pytest.raises(ValueError, match="at least one field"):
+            build_set_clause({})
 
     def test_invalid_key_raises(self) -> None:
         for bad in ("a b", "a;b", "a.b", "1a", "", "a-b"):
@@ -280,6 +285,13 @@ class TestMergeExtraVars:
         variables = {"_sv_name": "A"}
         assert merge_extra_vars(variables, None) == {"_sv_name": "A"}
         assert merge_extra_vars(variables, {}) == {"_sv_name": "A"}
+
+    def test_reserved_names_are_rejected_even_when_unbound(self) -> None:
+        # A statement may own a name without binding it on this branch (auto-id save never
+        # binds `rid`); validation must not vary by code path.
+        with pytest.raises(ValueError, match="rid"):
+            merge_extra_vars({"_sv_name": "A"}, {"rid": "boom"}, reserved=("rid",))
+        assert merge_extra_vars({"_sv_name": "A"}, {"pw": "x"}, reserved=("rid",))["pw"] == "x"
 
 
 class TestFunctionEnumsE2E:
@@ -410,13 +422,21 @@ class TestSaveServerValuesE2E:
         async def _post(sender, instance, **kw) -> None:
             seen.append("post")
 
+        @around_save.connect(SvUser)
+        async def _around(sender, instance, **kw):
+            seen.append("around-enter")
+            yield
+            seen.append("around-exit")
+
         try:
             async with sv_client():
                 await SvUser(id="sig", name="S").save(server_values={"joined_at": SurrealFunc("time::now()")})
-            assert seen == ["pre", "post"]
+            # around_save wraps the actual write, between pre and post.
+            assert seen == ["pre", "around-enter", "around-exit", "post"]
         finally:
             pre_save.clear(SvUser)
             post_save.clear(SvUser)
+            around_save.clear(SvUser)
 
 
 class TestMergeServerValuesE2E:
@@ -481,26 +501,55 @@ class TestMergeServerValuesE2E:
             assert ok is True
 
     @pytest.mark.asyncio
+    async def test_merge_on_missing_record_raises(self) -> None:
+        # UPDATE matching nothing is not a server-side error (it returns no rows), but the
+        # native merge() path surfaces it via refresh() — the server_values path must match,
+        # or the same public method would silently no-op for one caller and raise for another.
+        # Both "table never created" and "table exists, record absent" are covered because the
+        # server lines disagree on the first: 3.x raises NotFound where 2.6.x returns no rows.
+        async with sv_client():
+            ghost = SvUser(id="never-created", name="Ghost")
+            with pytest.raises(SurrealDbError, match="no record found"):
+                await ghost.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
+
+            await SvUser(id="real", name="Real").save()  # table now exists
+            with pytest.raises(SurrealDbError, match="no record found"):
+                await ghost.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
+
+    @pytest.mark.asyncio
     async def test_update_signals_carry_all_merged_fields(self) -> None:
-        seen: list[list[str]] = []
+        seen: list[Any] = []
 
         @pre_update.connect(SvUser)
         async def _pre(sender, instance, update_fields=None, **kw) -> None:
-            seen.append(sorted(update_fields or []))
+            seen.append(("pre", sorted(update_fields or [])))
+
+        @around_update.connect(SvUser)
+        async def _around(sender, instance, update_fields=None, **kw):
+            seen.append(("around-enter", sorted(update_fields or [])))
+            yield
+            seen.append(("around-exit", sorted(update_fields or [])))
 
         @post_update.connect(SvUser)
         async def _post(sender, instance, update_fields=None, **kw) -> None:
-            seen.append(sorted(update_fields or []))
+            seen.append(("post", sorted(update_fields or [])))
 
         try:
             async with sv_client():
                 user = SvUser(id="gina", name="Gina")
                 await user.save()
                 await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
-            assert seen == [["plan", "updated_at"], ["plan", "updated_at"]]
+            fields = ["plan", "updated_at"]  # both the literal and the computed field
+            assert seen == [
+                ("pre", fields),
+                ("around-enter", fields),
+                ("around-exit", fields),
+                ("post", fields),
+            ]
         finally:
             pre_update.clear(SvUser)
             post_update.clear(SvUser)
+            around_update.clear(SvUser)
 
 
 class TestServerValuesTransactionE2E:
@@ -563,6 +612,47 @@ class TestServerValuesTransactionE2E:
             assert rows[0]["name"] == "TxM"  # untouched field preserved
 
     @pytest.mark.asyncio
+    async def test_buffered_merge_does_not_apply_an_overridden_kwarg(self) -> None:
+        async with sv_client() as client:
+            user = SvUser(id="txov", name="TxOv")
+            await user.save()
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await user.merge(
+                    tx=tx,
+                    updated_at="literal-never-written",
+                    server_values={"updated_at": SurrealFunc("time::now()")},
+                )
+                if not tx.is_interactive:
+                    # The kwarg was overridden by the server value, so it never reaches the
+                    # database — applying it would leave the instance holding a value that
+                    # exists nowhere. Stale (None) is correct; "literal-never-written" is not.
+                    assert user.updated_at is None
+
+            rows = await client.query("SELECT * FROM SvUser:txov;", {})
+            assert isinstance(rows[0]["updated_at"], datetime)
+
+    @pytest.mark.asyncio
+    async def test_rollback_does_not_emit_post_save(self) -> None:
+        fired: list[str] = []
+
+        @post_save.connect(SvUser)
+        async def _post(sender, instance, **kw) -> None:
+            fired.append("post_save")
+
+        try:
+            async with sv_client():
+                with contextlib.suppress(RuntimeError):
+                    async with SurrealDBConnectionManager.transaction() as tx:
+                        await SvUser(id="txsig", name="NoSignal").save(
+                            tx=tx, server_values={"joined_at": SurrealFunc("time::now()")}
+                        )
+                        raise RuntimeError("abort")
+            assert fired == []  # the write never happened → no post_save
+        finally:
+            post_save.clear(SvUser)
+
+    @pytest.mark.asyncio
     async def test_auto_id_in_transaction_matches_strategy(self) -> None:
         async with sv_client() as client:
             async with SurrealDBConnectionManager.transaction() as tx:
@@ -602,6 +692,11 @@ class TestServerValuesValidation:
             await SvUser(id="x", name="X").merge(server_values={"bad key": SurrealFunc("time::now()")})
 
     @pytest.mark.asyncio
+    async def test_merge_without_id_raises(self) -> None:
+        with pytest.raises(SurrealDbError, match="No Id"):
+            await SvUser(name="NoId").merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
+
+    @pytest.mark.asyncio
     async def test_extra_vars_colliding_with_internal_binding_raises(self) -> None:
         with pytest.raises(ValueError, match="collide"):
             await SvUser(id="x", name="X").save(
@@ -612,4 +707,11 @@ class TestServerValuesValidation:
             await SvUser(id="x", name="X").save(
                 server_values={"joined_at": SurrealFunc("time::now()")},
                 extra_vars={"_sv_name": "boom"},
+            )
+        # `rid` is reserved on the auto-id path too, where it is never bound — validation
+        # must not depend on which branch the statement took.
+        with pytest.raises(ValueError, match="rid"):
+            await SvUser(name="NoId").save(
+                server_values={"joined_at": SurrealFunc("time::now()")},
+                extra_vars={"rid": "boom"},
             )
