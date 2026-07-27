@@ -480,7 +480,12 @@ jobs:
   create-failure-issue:
     name: Create Failure Issue
     needs: [check-release, test-new-version]
+    # A status-check function is required: without one GitHub implicitly ANDs
+    # `success()` into the condition, so this job — which by definition only runs
+    # when `test-new-version` failed — was always skipped. `!cancelled()` rather
+    # than `always()`, so cancelling a run does not file a bogus failure issue.
     if: |
+      !cancelled() &&
       needs.check-release.outputs.has-update == 'true' &&
       needs.test-new-version.result == 'failure'
     runs-on: ubuntu-latest
