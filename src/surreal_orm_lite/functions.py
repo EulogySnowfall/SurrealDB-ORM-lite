@@ -1,16 +1,22 @@
-"""Server-side computation helpers (v0.13.0).
+"""Server-side computation helpers (v0.13.0, v0.14.0).
 
 ``SurrealFunc`` marks a value as a **raw SurrealQL expression** to be evaluated by the
 server instead of being sent as data. It is the building block of ``server_values=`` on
 :meth:`BaseSurrealModel.save` / :meth:`BaseSurrealModel.merge`.
+
+``Computed`` (v0.14.0) attaches such an expression to the **schema** instead of to a single
+write: the field is declared with ``DEFINE FIELD … VALUE`` and recomputed by the server on
+every write to the table. It reuses ``SurrealFunc`` for expression validation.
 
 This module deliberately imports nothing from the rest of the package (``utils`` imports
 *it*), so it stays cycle-free.
 """
 
 from enum import StrEnum
+from typing import Annotated, Any
 
 __all__ = [
+    "Computed",
     "SurrealArrayFunction",
     "SurrealCryptoFunction",
     "SurrealFunc",
@@ -95,6 +101,89 @@ class SurrealFunc:
 
     def __hash__(self) -> int:
         return hash(self.expression)
+
+
+class _ComputedMarker:
+    """Annotation marker identifying a computed field and carrying its inner type.
+
+    Lives inside ``Annotated[T | None, _ComputedMarker(T)]``. Pydantic ignores metadata it
+    does not recognise, so this is inert at validation time — it exists so tooling (and a
+    reader) can tell a computed field from an ordinary optional one.
+    """
+
+    __slots__ = ("inner_type",)
+
+    def __init__(self, inner_type: Any) -> None:
+        self.inner_type = inner_type
+
+    def __repr__(self) -> str:
+        return f"_ComputedMarker({self.inner_type!r})"
+
+
+class _ComputedDefault:
+    """Sentinel default produced by ``Computed("expr")``.
+
+    ``BaseSurrealModel.__init_subclass__`` collects these from the class body and replaces
+    each with ``None`` before Pydantic processes the fields, so the model ends up with a
+    plain nullable field plus a recorded expression.
+    """
+
+    __slots__ = ("expression",)
+
+    def __init__(self, expression: str) -> None:
+        self.expression = expression
+
+    def __repr__(self) -> str:
+        return f"Computed({self.expression!r})"
+
+
+class Computed:
+    """A field whose value SurrealDB computes on **every write**, via ``DEFINE FIELD … VALUE``.
+
+    Dual-use, and both halves belong on the same line:
+
+    - ``Computed[T]`` — the annotation, resolving to ``Annotated[T | None, _ComputedMarker(T)]``.
+      The field is nullable and defaults to ``None`` so an instance is constructible before the
+      server has ever computed it.
+    - ``Computed("expr")`` — the default, carrying the SurrealQL expression::
+
+        class Player(BaseSurrealModel):
+            id: str
+            first_name: str
+            last_name: str
+            full_name: Computed[str] = Computed("string::concat(first_name, ' ', last_name)")
+
+        await Player.define_computed_fields()   # DEFINE FIELD OVERWRITE … VALUE …
+
+    The ORM then excludes ``full_name`` from every write payload and hydrates it from the row
+    the server returns. Naming it in ``merge()``, ``bulk_update()`` or an ``atomic_*`` helper
+    raises ``ValueError`` — the server would discard the write anyway.
+
+    Where :class:`SurrealFunc` evaluates an expression for **one** write, ``Computed`` attaches
+    it to the **schema**: it applies to every write on the table, including ones the ORM never
+    sees. That makes it a server-enforced invariant rather than a convention.
+
+    Note:
+        SurrealDB evaluates computed fields in **alphabetical field-name order**, not
+        declaration order. A computed field reading another must sort after it: ``subtotal``
+        → ``total`` resolves, but ``z_sub`` → ``a_total`` fails at write time.
+
+    Warning:
+        The expression is inlined **verbatim** into DDL and cannot reference bound parameters.
+        Build it only from developer-controlled text, never from user input — the same trust
+        model as :class:`SurrealFunc`, whose validation it reuses.
+    """
+
+    __slots__ = ()
+
+    def __class_getitem__(cls, inner_type: Any) -> Any:
+        """``Computed[str]`` → ``Annotated[str | None, _ComputedMarker(str)]``."""
+        return Annotated[inner_type | None, _ComputedMarker(inner_type)]
+
+    def __new__(cls, expression: "str | SurrealFunc") -> "_ComputedDefault":  # type: ignore[misc]
+        """``Computed("expr")`` → ``_ComputedDefault("expr")``, validated via ``SurrealFunc``."""
+        func = expression if isinstance(expression, SurrealFunc) else SurrealFunc(expression)
+        return _ComputedDefault(func.expression)
 
 
 class SurrealFunction(StrEnum):
