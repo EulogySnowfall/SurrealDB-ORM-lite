@@ -812,6 +812,18 @@ class QuerySet:
         rows = await self._execute_query(query, where_vars)
         return rows if isinstance(rows, list) else []
 
+    def _writable_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Drop computed fields from a ``*_or_create`` write payload.
+
+        Filtering by a computed field is legitimate (it is an ordinary column to read), so a
+        computed name can legitimately appear in ``criteria``. But it is server-owned and must
+        not be *written*. Without this, the same call would succeed on the create path (where
+        ``_write_payload`` silently drops it) and raise on the update path (where ``merge()``
+        guards) — an outcome that depends only on whether the row already existed.
+        """
+        computed = self.model.get_computed_fields()
+        return {key: value for key, value in payload.items() if key not in computed}
+
     async def update_or_create(
         self,
         defaults: dict[str, Any] | None = None,
@@ -843,7 +855,7 @@ class QuerySet:
         matches = await self._lookup_matches(criteria)
         if len(matches) > 1:
             raise SurrealDbError("update_or_create() matched multiple records; the lookup criteria are not unique.")
-        payload = {**self._criteria_payload(criteria), **defaults}
+        payload = self._writable_payload({**self._criteria_payload(criteria), **defaults})
         if not matches:
             obj: Any = self.model(**payload)
             await obj.save(tx=self._tx)
@@ -881,7 +893,7 @@ class QuerySet:
             raise SurrealDbError("get_or_create() matched multiple records; the lookup criteria are not unique.")
         if matches:
             return self.model.from_db(matches[0]), False
-        payload = {**self._criteria_payload(criteria), **defaults}
+        payload = self._writable_payload({**self._criteria_payload(criteria), **defaults})
         obj = self.model(**payload)
         await obj.save(tx=self._tx)
         return obj, True

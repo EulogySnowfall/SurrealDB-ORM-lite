@@ -3,9 +3,11 @@ write exclusion, and the write guards."""
 
 import contextlib
 import os
+import warnings
 from typing import Annotated, Any, get_args, get_origin
 
 import pytest
+from pydantic import BaseModel as PydanticBaseModel
 
 from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
 from surreal_orm_lite.exceptions import SurrealDbError
@@ -454,3 +456,120 @@ class TestComputedTransactionE2E:
                 await CfPlayer(id="ada", first_name="Ada", last_name="Lovelace").save(tx=tx)
             stored = await CfPlayer.objects().filter(first_name="Ada").exec()
             assert stored[0].full_name == "Ada Lovelace"
+
+
+class Nested(PydanticBaseModel):
+    city: str = ""
+
+
+class CfNested(BaseSurrealModel):
+    id: str
+    name: str = ""
+    addr: Nested = Nested()
+    shout: Computed[str] = Computed("string::uppercase(name)")
+
+
+class CfPlainNested(BaseSurrealModel):
+    """Same shape, but with no computed field at all."""
+
+    id: str
+    name: str = ""
+    addr: Nested = Nested()
+
+
+class TestSaveDoesNotDowngradeNestedModels:
+    """save() must not replace a nested Pydantic model with the raw dict from the server.
+
+    ``_apply_record`` writes with ``object.__setattr__`` (no validation), so applying a whole
+    returned row would turn ``addr`` into a ``dict`` — breaking attribute access and the next
+    ``model_dump()``. Only server-owned computed fields may be re-applied.
+    """
+
+    @pytest.mark.asyncio
+    async def test_nested_model_survives_save_on_a_computed_model(self) -> None:
+        async with cf_client("CfNested"):
+            await CfNested.define_computed_fields()
+            obj = await CfNested(id="n1", name="ada", addr=Nested(city="Quebec")).save()
+            assert obj.shout == "ADA"  # computed field still synced
+            assert isinstance(obj.addr, Nested)
+            assert obj.addr.city == "Quebec"
+
+    @pytest.mark.asyncio
+    async def test_nested_model_survives_save_without_computed_fields(self) -> None:
+        async with cf_client("CfPlainNested"):
+            obj = await CfPlainNested(id="n1", name="ada", addr=Nested(city="Quebec")).save()
+            assert isinstance(obj.addr, Nested)
+            assert obj.addr.city == "Quebec"
+
+    @pytest.mark.asyncio
+    async def test_instance_is_still_serialisable_after_save(self) -> None:
+        async with cf_client("CfNested"):
+            await CfNested.define_computed_fields()
+            obj = await CfNested(id="n1", name="ada", addr=Nested(city="Quebec")).save()
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")  # a serializer warning must not appear
+                assert obj.model_dump()["addr"] == {"city": "Quebec"}
+
+
+class ComputedParent(BaseSurrealModel):
+    id: str
+    a: str = ""
+    c1: Computed[str] = Computed("string::uppercase(a)")
+
+
+class OverridingChild(ComputedParent):
+    id: str
+    c1: Computed[str] = Computed("string::lowercase(a)")
+
+
+class DemotingChild(ComputedParent):
+    id: str
+    c1: str = "local"
+
+
+class TestComputedInheritanceOverrides:
+    def test_subclass_can_override_the_expression(self) -> None:
+        assert OverridingChild.get_computed_fields()["c1"] == "string::lowercase(a)"
+        assert ComputedParent.get_computed_fields()["c1"] == "string::uppercase(a)"
+
+    def test_subclass_can_demote_a_computed_field_to_an_ordinary_one(self) -> None:
+        assert "c1" not in DemotingChild.get_computed_fields()
+
+    def test_a_demoted_field_is_writable_again(self) -> None:
+        obj = DemotingChild(id="x", c1="hello")
+        assert obj._write_payload()["c1"] == "hello"
+        DemotingChild._reject_computed_writes(["c1"], "merge()")  # must not raise
+
+
+class TestOrCreateWithComputedCriteria:
+    """A computed field is filterable, so it can appear in `criteria` — but never be written.
+
+    Without stripping it from the write payload, the same call would succeed when creating and
+    raise ValueError when updating, i.e. depend on whether the row already existed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_update_or_create_is_symmetric_for_a_computed_criterion(self) -> None:
+        async with cf_client():
+            await CfPlayer.define_computed_fields()
+            await CfPlayer(id="a", first_name="Ada", last_name="L").save()
+
+            obj, created = await CfPlayer.objects().update_or_create(defaults={"last_name": "Byron"}, full_name="Ada L")
+            assert created is False
+            assert obj.full_name == "Ada Byron"
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_accepts_a_computed_criterion_when_creating(self) -> None:
+        async with cf_client():
+            await CfPlayer.define_computed_fields()
+            obj, created = await CfPlayer.objects().get_or_create(
+                defaults={"id": "grace", "first_name": "Grace", "last_name": "H"}, full_name="Grace H"
+            )
+            assert created is True
+            assert obj.full_name == "Grace H"
+
+
+class TestComputedForwardReference:
+    def test_subscript_accepts_a_forward_reference(self) -> None:
+        """Computed["Foo"] must not raise — "Foo" | None would be a TypeError."""
+        assert get_origin(Computed["SomeLaterType"]) is Annotated

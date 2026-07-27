@@ -13,7 +13,7 @@ This module deliberately imports nothing from the rest of the package (``utils``
 """
 
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated, Any, Optional
 
 __all__ = [
     "Computed",
@@ -163,10 +163,17 @@ class Computed:
     it to the **schema**: it applies to every write on the table, including ones the ORM never
     sees. That makes it a server-enforced invariant rather than a convention.
 
+    A subclass may redeclare an inherited computed field with a new expression, or demote it to
+    an ordinary writable field by redeclaring it without ``Computed(...)``.
+
     Note:
         SurrealDB evaluates computed fields in **alphabetical field-name order**, not
         declaration order. A computed field reading another must sort after it: ``subtotal``
         → ``total`` resolves, but ``z_sub`` → ``a_total`` fails at write time.
+
+    Note:
+        The annotation is mandatory — a bare ``full_name = Computed("…")`` is rejected by
+        Pydantic itself, before the ORM ever sees it.
 
     Warning:
         The expression is inlined **verbatim** into DDL and cannot reference bound parameters.
@@ -177,8 +184,13 @@ class Computed:
     __slots__ = ()
 
     def __class_getitem__(cls, inner_type: Any) -> Any:
-        """``Computed[str]`` → ``Annotated[str | None, _ComputedMarker(str)]``."""
-        return Annotated[inner_type | None, _ComputedMarker(inner_type)]
+        """``Computed[str]`` → ``Annotated[str | None, _ComputedMarker(str)]``.
+
+        ``Optional[...]`` rather than ``... | None`` so a forward reference
+        (``Computed["Order"]``) works too — ``"Order" | None`` would raise ``TypeError``.
+        The two spellings are equal for real types.
+        """
+        return Annotated[Optional[inner_type], _ComputedMarker(inner_type)]  # noqa: UP045
 
     def __new__(cls, expression: "str | SurrealFunc") -> "_ComputedDefault":  # type: ignore[misc]
         """``Computed("expr")`` → ``_ComputedDefault("expr")``, validated via ``SurrealFunc``."""

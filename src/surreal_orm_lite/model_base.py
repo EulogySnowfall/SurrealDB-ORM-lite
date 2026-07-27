@@ -65,12 +65,21 @@ class BaseSurrealModel(BaseModel):
 
         Runs inside ``type.__new__``, i.e. before Pydantic's ``ModelMetaclass`` finishes
         collecting fields — so replacing each sentinel with ``None`` here is what turns the
-        attribute into an ordinary nullable field with a ``None`` default. Parent expressions
-        are merged first, so a subclass inherits them and may override by redeclaring.
+        attribute into an ordinary nullable field with a ``None`` default.
+
+        Inherited expressions are merged first (bases in reverse MRO), then **this** class body
+        decides every name it re-annotates: redeclaring a field with a new ``Computed(...)``
+        overrides the parent's expression, and redeclaring it as an ordinary field demotes it
+        back to a normal writable column. Without that second rule the field would keep being
+        stripped from write payloads and rejected by the write guards, silently discarding the
+        subclass's data.
         """
         collected: dict[str, str] = {}
         for base in reversed(cls.__mro__[1:]):
             collected.update(getattr(base, "__surreal_computed__", None) or {})
+        # A name this class re-annotates is re-decided below; drop the inherited verdict first.
+        for name in vars(cls).get("__annotations__", {}):
+            collected.pop(name, None)
         for name, value in list(vars(cls).items()):
             if isinstance(value, _ComputedDefault):
                 collected[name] = value.expression
@@ -370,11 +379,12 @@ class BaseSurrealModel(BaseModel):
                 if "already exists" in str(e).lower():
                     raise SurrealDbError(f"There was a problem with the database: {e}") from e
                 raise
-            # Sync with what the server actually stored, so values it owns — computed fields
-            # (DEFINE FIELD … VALUE), DEFAULT clauses — reach the instance. ``id`` is left
-            # alone: the caller chose it, and the auto-id branch below is the only place the
-            # server's native RecordID should replace it.
-            self._apply_record(record, skip_id=True)
+            # Pull back the fields the SERVER owns — computed fields (DEFINE FIELD … VALUE) —
+            # so they are readable straight after save(). Deliberately narrow: applying the
+            # whole row here would bypass Pydantic validation for every field (see
+            # _apply_record), turning nested models into plain dicts. A model with no computed
+            # fields is untouched, exactly as before v0.14.0.
+            self._apply_record(record, only=self.get_computed_fields())
             return self, True
 
         # Auto-generate the ID
@@ -516,7 +526,7 @@ class BaseSurrealModel(BaseModel):
             return await self._save_with_signals(do_op, tx)
         return await self._save_with_signals(self._do_save, tx)
 
-    def _apply_record(self, record: Any, skip_id: bool = False) -> None:
+    def _apply_record(self, record: Any, only: Iterable[str] | None = None) -> None:
         """Copy a returned DB row's fields onto this instance (id kept as native ``RecordID``).
 
         Accepts the raw SDK result (a row dict, a single-element list, or ``None``) and applies
@@ -526,19 +536,25 @@ class BaseSurrealModel(BaseModel):
         ``None``/empty result is a no-op — callers that must distinguish "no row" from "nothing
         to apply" check first.
 
+        Values are written with ``object.__setattr__``, i.e. **without** Pydantic validation, so
+        a nested model arrives as the raw ``dict`` the server sent. That is why ``only`` exists:
+        a caller that needs just a few known-scalar fields should say so rather than re-applying
+        the whole row.
+
         Args:
-            skip_id: leave ``id`` untouched. Used when the caller supplied the id explicitly, so
-                the instance keeps the type it was built with instead of being switched to the
-                server's native ``RecordID``.
+            only: restrict the copy to these field names. ``None`` (default) applies every field
+                in the row.
         """
         if isinstance(record, list):
             record = record[0] if record else None
-        if isinstance(record, dict):
-            for key, value in record.items():
-                if skip_id and key == "id":
-                    continue
-                if hasattr(self, key):
-                    object.__setattr__(self, key, value)
+        if not isinstance(record, dict):
+            return
+        allowed = None if only is None else set(only)
+        for key, value in record.items():
+            if allowed is not None and key not in allowed:
+                continue
+            if hasattr(self, key):
+                object.__setattr__(self, key, value)
 
     async def _run_update_returning_row(self, statement: str, variables: dict[str, Any]) -> None:
         """Run an ``UPDATE`` and apply its row, raising a uniform error when it matched nothing.
