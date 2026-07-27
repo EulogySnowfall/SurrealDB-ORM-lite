@@ -118,6 +118,49 @@ class BaseSurrealModel(BaseModel):
         return statements
 
     @classmethod
+    async def define_computed_fields(
+        cls,
+        overwrite: bool = True,
+        tx: Transaction | None = None,
+    ) -> list[str]:
+        """Apply this model's computed-field definitions to the database.
+
+        Runs the statements from :meth:`computed_field_ddl` and returns them. Safe to call at
+        application start-up: with the default ``overwrite=True`` it is idempotent and
+        converges the database onto the model. A model with no computed fields is a no-op
+        returning ``[]``.
+
+        Statements are executed one per call so a failure can name the offending field. The
+        two server lines raise different SDK exceptions for a bad expression
+        (``InternalError`` on 2.6.x, ``ValidationError`` on 3.x — both ``ServerError``), so
+        both are normalised to :class:`SurrealDbError`.
+
+        Args:
+            overwrite: see :meth:`computed_field_ddl`.
+            tx: optional transaction the DDL is run in. On a buffered transaction (HTTP or
+                SurrealDB 2.6.x) the statements are deferred to commit, so an invalid
+                expression surfaces there rather than here.
+
+        Example:
+            >>> await Player.define_computed_fields()
+            ["DEFINE FIELD OVERWRITE full_name ON Player VALUE string::concat(...);"]
+        """
+        statements = cls.computed_field_ddl(overwrite=overwrite)
+        if not statements:
+            return []
+        # Cheap even inside a transaction: get_client() returns the already-connected client.
+        client = await SurrealDBConnectionManager.get_client()
+        for statement in statements:
+            try:
+                if tx is not None:
+                    await tx.add(statement, None)
+                else:
+                    await client.query(statement, {})
+            except ServerError as e:
+                raise SurrealDbError(f"Can't apply computed field definition: {statement} -> {e}") from e
+        return statements
+
+    @classmethod
     def get_table_name(cls) -> str:
         """
         Get the table name for the model.
@@ -287,11 +330,16 @@ class BaseSurrealModel(BaseModel):
             # ServerError, so catch the base and match on the message to stay
             # faithful to the original "already exists" contract across versions.
             try:
-                await client.create(record_id, data)
+                record = await client.create(record_id, data)
             except ServerError as e:
                 if "already exists" in str(e).lower():
                     raise SurrealDbError(f"There was a problem with the database: {e}") from e
                 raise
+            # Sync with what the server actually stored, so values it owns — computed fields
+            # (DEFINE FIELD … VALUE), DEFAULT clauses — reach the instance. ``id`` is left
+            # alone: the caller chose it, and the auto-id branch below is the only place the
+            # server's native RecordID should replace it.
+            self._apply_record(record, skip_id=True)
             return self, True
 
         # Auto-generate the ID
@@ -432,19 +480,27 @@ class BaseSurrealModel(BaseModel):
             return await self._save_with_signals(do_op, tx)
         return await self._save_with_signals(self._do_save, tx)
 
-    def _apply_record(self, record: Any) -> None:
+    def _apply_record(self, record: Any, skip_id: bool = False) -> None:
         """Copy a returned DB row's fields onto this instance (id kept as native ``RecordID``).
 
         Accepts the raw SDK result (a row dict, a single-element list, or ``None``) and applies
         only attributes the model actually declares. Shared by every write path that gets a row
-        back (``_do_upsert``, ``patch``, the atomic helpers, the ``server_values`` paths) so the
-        "apply the row the server gave back" step lives in one place. A ``None``/empty result is
-        a no-op — callers that must distinguish "no row" from "nothing to apply" check first.
+        back (``_do_save``, ``_do_upsert``, ``patch``, the atomic helpers, the ``server_values``
+        paths) so the "apply the row the server gave back" step lives in one place. A
+        ``None``/empty result is a no-op — callers that must distinguish "no row" from "nothing
+        to apply" check first.
+
+        Args:
+            skip_id: leave ``id`` untouched. Used when the caller supplied the id explicitly, so
+                the instance keeps the type it was built with instead of being switched to the
+                server's native ``RecordID``.
         """
         if isinstance(record, list):
             record = record[0] if record else None
         if isinstance(record, dict):
             for key, value in record.items():
+                if skip_id and key == "id":
+                    continue
                 if hasattr(self, key):
                     object.__setattr__(self, key, value)
 

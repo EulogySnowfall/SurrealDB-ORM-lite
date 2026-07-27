@@ -1,11 +1,14 @@
 """Tests for v0.14.0 computed fields: the ``Computed`` type, DDL emission/application,
 write exclusion, and the write guards."""
 
-from typing import Annotated, get_args, get_origin
+import contextlib
+import os
+from typing import Annotated, Any, get_args, get_origin
 
 import pytest
 
-from surreal_orm_lite import BaseSurrealModel
+from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
+from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.functions import Computed, SurrealFunc, _ComputedDefault, _ComputedMarker
 
 
@@ -140,3 +143,117 @@ class TestComputedFieldDDL:
 
     def test_is_pure_and_repeatable(self) -> None:
         assert Person.computed_field_ddl() == Person.computed_field_ddl()
+
+
+def _url() -> str:
+    host = os.environ.get("SURREALDB_HOST", "localhost")
+    port = os.environ.get("SURREALDB_PORT", "8000")
+    return f"ws://{host}:{port}/rpc"
+
+
+def _connect() -> None:
+    SurrealDBConnectionManager.set_connection(url=_url(), user="root", password="root", namespace="ns", database="db")
+
+
+class CfPlayer(BaseSurrealModel):
+    id: str
+    first_name: str = ""
+    last_name: str = ""
+    full_name: Computed[str] = Computed("string::concat(first_name, ' ', last_name)")
+
+
+@contextlib.asynccontextmanager
+async def cf_client(*tables: str):
+    """Connected ORM client with the given tables dropped before and after.
+
+    An async context manager rather than a pytest fixture: the SDK's WebSocket client is
+    bound to the event loop that created it, and fixtures run in the module-scoped loop
+    while tests get their own — so the client must be opened inside the test's loop.
+    Dropping the table also drops its field definitions, which is what isolates DDL tests.
+    """
+    tables = tables or ("CfPlayer",)
+    _connect()
+    client = await SurrealDBConnectionManager.get_client()
+    for table in tables:
+        with contextlib.suppress(Exception):
+            await client.query(f"REMOVE TABLE {table};", {})
+    try:
+        yield client
+    finally:
+        for table in tables:
+            with contextlib.suppress(Exception):
+                await client.query(f"REMOVE TABLE {table};", {})
+        await SurrealDBConnectionManager.close_connection()
+
+
+async def _field_definitions(client: Any, table: str) -> dict[str, str]:
+    info = await client.query(f"INFO FOR TABLE {table};", {})
+    return dict(info["fields"]) if isinstance(info, dict) else {}
+
+
+class TestDefineComputedFieldsE2E:
+    @pytest.mark.asyncio
+    async def test_defines_the_field_on_the_server(self) -> None:
+        async with cf_client() as client:
+            statements = await CfPlayer.define_computed_fields()
+            assert statements == CfPlayer.computed_field_ddl()
+            definitions = await _field_definitions(client, "CfPlayer")
+            assert "full_name" in definitions
+            assert "string::concat(first_name, ' ', last_name)" in definitions["full_name"]
+
+    @pytest.mark.asyncio
+    async def test_is_idempotent(self) -> None:
+        async with cf_client():
+            await CfPlayer.define_computed_fields()
+            await CfPlayer.define_computed_fields()
+            await CfPlayer.define_computed_fields()
+            player = await CfPlayer(id="a", first_name="Ada", last_name="L").save()
+            assert player.full_name == "Ada L"
+
+    @pytest.mark.asyncio
+    async def test_overwrite_replaces_an_existing_definition(self) -> None:
+        async with cf_client() as client:
+            await client.query("DEFINE FIELD full_name ON CfPlayer VALUE 'stale';", {})
+            await CfPlayer.define_computed_fields(overwrite=True)
+            player = await CfPlayer(id="a", first_name="Ada", last_name="L").save()
+            assert player.full_name == "Ada L"
+
+    @pytest.mark.asyncio
+    async def test_if_not_exists_keeps_an_existing_definition(self) -> None:
+        async with cf_client() as client:
+            await client.query("DEFINE FIELD full_name ON CfPlayer VALUE 'kept';", {})
+            await CfPlayer.define_computed_fields(overwrite=False)
+            player = await CfPlayer(id="a", first_name="Ada", last_name="L").save()
+            assert player.full_name == "kept"
+
+    @pytest.mark.asyncio
+    async def test_model_without_computed_fields_is_a_no_op(self) -> None:
+        async with cf_client("CfNoComputed"):
+
+            class CfNoComputed(BaseSurrealModel):
+                id: str
+                name: str = ""
+
+            assert await CfNoComputed.define_computed_fields() == []
+
+    @pytest.mark.asyncio
+    async def test_invalid_expression_raises_one_orm_error_on_both_lines(self) -> None:
+        """2.6.5 raises InternalError, 3.1.3 raises ValidationError — both normalised here."""
+        async with cf_client("CfBroken"):
+
+            class CfBroken(BaseSurrealModel):
+                id: str
+                oops: Computed[str] = Computed("nope::missing(x)")
+
+            with pytest.raises(SurrealDbError, match="DEFINE FIELD"):
+                await CfBroken.define_computed_fields()
+
+    @pytest.mark.asyncio
+    async def test_save_syncs_the_server_row_without_retyping_an_explicit_id(self) -> None:
+        """save() applies what the server stored, but leaves an explicitly-chosen id alone."""
+        async with cf_client():
+            await CfPlayer.define_computed_fields()
+            player = await CfPlayer(id="ada", first_name="Ada", last_name="Lovelace").save()
+            assert player.full_name == "Ada Lovelace"
+            assert player.id == "ada"
+            assert isinstance(player.id, str)
