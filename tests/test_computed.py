@@ -342,3 +342,85 @@ class TestComputedLifecycleE2E:
             player = await CfPlayer(id="ada", first_name="Ada", last_name="Lovelace").save()
             await player.refresh()
             assert player.full_name is None
+
+
+class CfGuard(BaseSurrealModel):
+    id: str
+    first_name: str = ""
+    last_name: str = ""
+    tags: list[str] = []
+    score: int = 0
+    full_name: Computed[str] = Computed("string::concat(first_name, ' ', last_name)")
+    tag_count: Computed[int] = Computed("array::len(tags)")
+
+
+class TestComputedWriteGuards:
+    @pytest.mark.asyncio
+    async def test_merge_rejects_a_computed_field(self) -> None:
+        guard = CfGuard(id="a", first_name="Ada")
+        with pytest.raises(ValueError, match="full_name"):
+            await guard.merge(full_name="Ada Byron")
+
+    @pytest.mark.asyncio
+    async def test_merge_reports_every_offender(self) -> None:
+        guard = CfGuard(id="a")
+        with pytest.raises(ValueError, match="full_name.*tag_count|tag_count.*full_name"):
+            await guard.merge(full_name="x", tag_count=3)
+
+    def test_guard_ignores_ordinary_fields(self) -> None:
+        """The guard must not fire for a normal field (asserted without a DB round-trip)."""
+        CfGuard._reject_computed_writes(["first_name", "last_name", "tags"], "merge()")
+
+    @pytest.mark.asyncio
+    async def test_server_values_rejects_a_computed_field(self) -> None:
+        guard = CfGuard(id="a")
+        with pytest.raises(ValueError, match="full_name"):
+            await guard.save(server_values={"full_name": SurrealFunc("time::now()")})
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "method,args",
+        [
+            ("atomic_append", ("tag_count", "x")),
+            ("atomic_remove", ("tag_count", "x")),
+            ("atomic_set_add", ("tag_count", "x")),
+            ("atomic_increment", ("tag_count", 1)),
+            ("atomic_append_many", ("tag_count", ["x"])),
+            ("atomic_set_add_many", ("tag_count", ["x"])),
+            ("atomic_remove_many", ("tag_count", ["x"])),
+        ],
+    )
+    async def test_atomic_helpers_reject_a_computed_field(self, method: str, args: tuple) -> None:
+        guard = CfGuard(id="a")
+        with pytest.raises(ValueError, match="tag_count"):
+            await getattr(guard, method)(*args)
+
+    @pytest.mark.asyncio
+    async def test_bulk_update_rejects_a_computed_field(self) -> None:
+        with pytest.raises(ValueError, match="full_name"):
+            await CfGuard.objects().filter(id="a").bulk_update(full_name="x")
+
+    def test_plain_model_is_unaffected(self) -> None:
+        Plain._reject_computed_writes(["name", "anything"], "merge()")
+
+
+class TestComputedGuardsE2E:
+    @pytest.mark.asyncio
+    async def test_ordinary_writes_still_work_end_to_end(self) -> None:
+        async with cf_client("CfGuard"):
+            await CfGuard.define_computed_fields()
+            guard = await CfGuard(id="a", first_name="Ada", last_name="L", tags=["x"]).save()
+            assert guard.full_name == "Ada L"
+            assert guard.tag_count == 1
+
+            await guard.atomic_append("tags", "y")
+            assert guard.tag_count == 2
+
+            await guard.atomic_increment("score", 5)
+            assert guard.score == 5
+
+            # Filter on an ordinary field: `id` holds a RecordID server-side, so comparing it
+            # to the bare string "a" matches nothing (unrelated to computed fields).
+            assert await CfGuard.objects().filter(first_name="Ada").bulk_update(last_name="Byron") == 1
+            await guard.refresh()
+            assert guard.full_name == "Ada Byron"

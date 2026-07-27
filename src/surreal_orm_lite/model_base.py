@@ -2,7 +2,7 @@ import contextlib
 import functools
 import logging
 import typing
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from decimal import Decimal
 from typing import Any, Self
 
@@ -304,6 +304,30 @@ class BaseSurrealModel(BaseModel):
         """
         return self.model_dump(exclude={"id", *self.get_computed_fields()})
 
+    @classmethod
+    def _reject_computed_writes(cls, fields: Iterable[str], context: str) -> None:
+        """Raise if ``fields`` names a computed field.
+
+        A computed field is set by ``DEFINE FIELD … VALUE``, and the server discards whatever a
+        client sends for it — so such a write is an invisible no-op. Raising turns it into an
+        error at the call site instead. Update the fields the expression reads.
+        """
+        computed = cls.get_computed_fields()
+        offenders = sorted(field for field in fields if field in computed)
+        if offenders:
+            raise ValueError(
+                f"{context}: {', '.join(offenders)} "
+                f"{'is a computed field' if len(offenders) == 1 else 'are computed fields'} "
+                f"on {cls.__name__}, set server-side by DEFINE FIELD … VALUE and not writable. "
+                "Update the fields the expression reads instead."
+            )
+
+    @classmethod
+    def _validate_atomic_field(cls, field: str) -> None:
+        """Validate an atomic-op target: a plain identifier, and not a computed field."""
+        validate_field_name(field, "atomic field")
+        cls._reject_computed_writes([field], "atomic operation")
+
     async def _do_save(self, tx: Transaction | None = None) -> tuple[Self, bool]:
         """Internal save logic. Returns (self, created).
 
@@ -487,6 +511,7 @@ class BaseSurrealModel(BaseModel):
         """
         self._validate_server_values(server_values, extra_vars)
         if server_values:
+            self._reject_computed_writes(server_values, "save(server_values=)")
             do_op = functools.partial(self._do_save_server, server_values=server_values, extra_vars=extra_vars)
             return await self._save_with_signals(do_op, tx)
         return await self._save_with_signals(self._do_save, tx)
@@ -761,8 +786,10 @@ class BaseSurrealModel(BaseModel):
         Example:
             >>> await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
         """
+        self._reject_computed_writes(data, "merge()")
         self._validate_server_values(server_values, extra_vars)
         if server_values:
+            self._reject_computed_writes(server_values, "merge(server_values=)")
             return await self._merge_server(tx, server_values, extra_vars, data)
 
         sender = self.__class__
@@ -863,7 +890,7 @@ class BaseSurrealModel(BaseModel):
         Compiled to ``array::append`` — identical on SurrealDB 2.6.x and 3.x. For set
         semantics (skip if already present) use :meth:`atomic_set_add`. Emits no signals.
         """
-        validate_field_name(field, "atomic field")
+        self._validate_atomic_field(field)
         return await self._atomic_update(f"{field} = array::append({field}, $value)", {"value": value}, tx)
 
     async def atomic_remove(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
@@ -873,7 +900,7 @@ class BaseSurrealModel(BaseModel):
         3.x. (The ``-=`` operator is deliberately NOT used: it removes all occurrences on 3.x
         but only the first on 2.6.x.) Emits no signals.
         """
-        validate_field_name(field, "atomic field")
+        self._validate_atomic_field(field)
         return await self._atomic_update(f"{field} = array::complement({field}, [$value])", {"value": value}, tx)
 
     async def atomic_set_add(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
@@ -882,7 +909,7 @@ class BaseSurrealModel(BaseModel):
         Compiled to ``array::add`` (set semantics) — identical on 2.6.x and 3.x. (NOT the
         ``+=`` operator, which appends duplicates on both server lines.) Emits no signals.
         """
-        validate_field_name(field, "atomic field")
+        self._validate_atomic_field(field)
         return await self._atomic_update(f"{field} = array::add({field}, $value)", {"value": value}, tx)
 
     async def atomic_increment(self, field: str, amount: Decimal | int | float = 1, tx: Transaction | None = None) -> Self:
@@ -893,7 +920,7 @@ class BaseSurrealModel(BaseModel):
         (the value is bound, not interpolated); adding a ``Decimal`` to an int/float field
         coerces the stored field to SurrealDB ``decimal``. Emits no signals.
         """
-        validate_field_name(field, "atomic field")
+        self._validate_atomic_field(field)
         return await self._atomic_update(f"{field} += $amount", {"amount": amount}, tx)
 
     @staticmethod
@@ -913,7 +940,7 @@ class BaseSurrealModel(BaseModel):
         single element) — identical on 2.6.x and 3.x. An empty ``values`` is a safe no-op.
         Emits no signals.
         """
-        validate_field_name(field, "atomic field")
+        self._validate_atomic_field(field)
         return await self._atomic_update(
             f"{field} = array::concat({field}, $values)", {"values": self._as_value_list(values)}, tx
         )
@@ -925,7 +952,7 @@ class BaseSurrealModel(BaseModel):
         ``values`` are also collapsed). Compiled to ``array::add`` — identical on 2.6.x and 3.x.
         An empty ``values`` is a safe no-op. Emits no signals.
         """
-        validate_field_name(field, "atomic field")
+        self._validate_atomic_field(field)
         return await self._atomic_update(f"{field} = array::add({field}, $values)", {"values": self._as_value_list(values)}, tx)
 
     async def atomic_remove_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
@@ -934,7 +961,7 @@ class BaseSurrealModel(BaseModel):
         The list-valued counterpart of :meth:`atomic_remove`. Compiled to ``array::complement``
         — identical on 2.6.x and 3.x. An empty ``values`` is a safe no-op. Emits no signals.
         """
-        validate_field_name(field, "atomic field")
+        self._validate_atomic_field(field)
         return await self._atomic_update(
             f"{field} = array::complement({field}, $values)", {"values": self._as_value_list(values)}, tx
         )

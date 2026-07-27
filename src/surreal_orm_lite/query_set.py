@@ -704,6 +704,7 @@ class QuerySet:
         """
         if not kwargs:
             return 0
+        self.model._reject_computed_writes(kwargs, "bulk_update()")
 
         where_clause, where_vars = self._build_where()
 
