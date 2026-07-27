@@ -13,6 +13,7 @@ from .exceptions import (
     SurrealORMError,
 )
 from .functions import (
+    Computed,
     SurrealArrayFunction,
     SurrealCryptoFunction,
     SurrealFunc,
@@ -77,6 +78,7 @@ __all__ = [
     "retry_on_conflict",
     "is_conflict_error",
     # Server-side functions
+    "Computed",
     "SurrealFunc",
     "SurrealFunction",
     "SurrealTimeFunction",

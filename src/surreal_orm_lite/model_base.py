@@ -12,7 +12,7 @@ from pydantic_core import ValidationError
 from ._sdk import NotFoundError, RecordID, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
-from .functions import SurrealFunc
+from .functions import SurrealFunc, _ComputedDefault
 from .signals import (
     around_delete,
     around_save,
@@ -56,6 +56,36 @@ class BaseSurrealModel(BaseModel):
     """
     Base class for models interacting with SurrealDB.
     """
+
+    __surreal_computed__: typing.ClassVar[dict[str, str]] = {}
+    """Computed field name → SurrealQL expression, collected by ``__init_subclass__``."""
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Collect ``Computed(...)`` defaults before Pydantic builds the model.
+
+        Runs inside ``type.__new__``, i.e. before Pydantic's ``ModelMetaclass`` finishes
+        collecting fields — so replacing each sentinel with ``None`` here is what turns the
+        attribute into an ordinary nullable field with a ``None`` default. Parent expressions
+        are merged first, so a subclass inherits them and may override by redeclaring.
+        """
+        collected: dict[str, str] = {}
+        for base in reversed(cls.__mro__[1:]):
+            collected.update(getattr(base, "__surreal_computed__", None) or {})
+        for name, value in list(vars(cls).items()):
+            if isinstance(value, _ComputedDefault):
+                collected[name] = value.expression
+                setattr(cls, name, None)
+        cls.__surreal_computed__ = collected
+        super().__init_subclass__(**kwargs)
+
+    @classmethod
+    def get_computed_fields(cls) -> dict[str, str]:
+        """Return ``{field_name: SurrealQL expression}`` for this model's computed fields.
+
+        Declaration order, inherited fields first. Returns a copy — this is the single source
+        of truth every write path consults. ``{}`` for a model with no computed fields.
+        """
+        return dict(cls.__surreal_computed__)
 
     @classmethod
     def get_table_name(cls) -> str:
