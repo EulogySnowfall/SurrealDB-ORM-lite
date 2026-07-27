@@ -669,7 +669,7 @@ class QuerySet:
 
         data_list = []
         for model in models:
-            data = model.model_dump(exclude={"id"})
+            data = model._write_payload()
             model_id = model.get_id()
             if model_id is not None:
                 data["id"] = model_id

@@ -293,6 +293,17 @@ class BaseSurrealModel(BaseModel):
                 if hasattr(self, key):
                     object.__setattr__(self, key, value)
 
+    def _write_payload(self) -> dict[str, Any]:
+        """Return this instance's data for a write: no ``id``, no computed fields.
+
+        Computed fields are owned by the server (``DEFINE FIELD … VALUE``), so sending one is
+        at best wasted bytes: SurrealDB discards it in favour of the expression. It is worse
+        than wasted if the definition has not been applied yet — the value, typically ``None``,
+        would land and null the column. Every write path funnels through here so the exclusion
+        cannot drift between them.
+        """
+        return self.model_dump(exclude={"id", *self.get_computed_fields()})
+
     async def _do_save(self, tx: Transaction | None = None) -> tuple[Self, bool]:
         """Internal save logic. Returns (self, created).
 
@@ -301,7 +312,7 @@ class BaseSurrealModel(BaseModel):
         explicit record id.
         """
         record_id = self._record_id()
-        data = self.model_dump(exclude={"id"})
+        data = self._write_payload()
         table = self.get_table_name()
 
         if tx is not None:
@@ -396,7 +407,7 @@ class BaseSurrealModel(BaseModel):
         and 3.1.3), hence the full clause rather than a hybrid.
         """
         record_id = self._record_id()
-        merged: dict[str, Any] = {**self.model_dump(exclude={"id"}), **(server_values or {})}
+        merged: dict[str, Any] = {**self._write_payload(), **(server_values or {})}
         clause, variables = build_set_clause(merged)
 
         if record_id is not None:
@@ -575,7 +586,7 @@ class BaseSurrealModel(BaseModel):
                 "upsert() requires an explicit id (there is nothing to match without one); "
                 "use save() to create a record with an auto-generated id."
             )
-        data = self.model_dump(exclude={"id"})
+        data = self._write_payload()
 
         if tx is not None:
             rows = await tx.add(f"UPSERT {record_id} CONTENT $data;", {"data": data})
@@ -615,7 +626,7 @@ class BaseSurrealModel(BaseModel):
         ``post_update`` only fires after a successful commit.
         """
         sender = self.__class__
-        data = self.model_dump(exclude={"id"})
+        data = self._write_payload()
         record_id = self._record_id()
         if record_id is None:
             raise SurrealDbError("Can't update data, no id found.")

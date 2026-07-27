@@ -257,3 +257,88 @@ class TestDefineComputedFieldsE2E:
             assert player.full_name == "Ada Lovelace"
             assert player.id == "ada"
             assert isinstance(player.id, str)
+
+
+class TestWritePayload:
+    def test_drops_id_and_computed_fields(self) -> None:
+        person = Person(id="ada", first_name="Ada", last_name="Lovelace")
+        assert person._write_payload() == {"first_name": "Ada", "last_name": "Lovelace"}
+
+    def test_drops_computed_even_when_locally_set(self) -> None:
+        person = Person(id="ada", first_name="Ada", last_name="L", full_name="STALE")
+        assert "full_name" not in person._write_payload()
+
+    def test_plain_model_keeps_everything_but_id(self) -> None:
+        assert Plain(id="x", name="n")._write_payload() == {"name": "n"}
+
+
+class TestComputedLifecycleE2E:
+    @pytest.mark.asyncio
+    async def test_save_hydrates_the_computed_value(self) -> None:
+        async with cf_client():
+            await CfPlayer.define_computed_fields()
+            player = await CfPlayer(id="ada", first_name="Ada", last_name="Lovelace").save()
+            assert player.full_name == "Ada Lovelace"
+
+    @pytest.mark.asyncio
+    async def test_recomputed_by_merge_update_upsert_and_patch(self) -> None:
+        async with cf_client():
+            await CfPlayer.define_computed_fields()
+            player = await CfPlayer(id="ada", first_name="Ada", last_name="Lovelace").save()
+
+            await player.merge(last_name="Byron")
+            assert player.full_name == "Ada Byron"
+
+            player.last_name = "King"
+            await player.update()
+            await player.refresh()
+            assert player.full_name == "Ada King"
+
+            player.last_name = "Noel"
+            await player.upsert()
+            assert player.full_name == "Ada Noel"
+
+            await player.patch([{"op": "replace", "path": "/last_name", "value": "Gordon"}])
+            assert player.full_name == "Ada Gordon"
+
+    @pytest.mark.asyncio
+    async def test_queryset_can_filter_and_order_on_a_computed_field(self) -> None:
+        async with cf_client():
+            await CfPlayer.define_computed_fields()
+            await CfPlayer(id="a", first_name="Ada", last_name="L").save()
+            await CfPlayer(id="b", first_name="Bob", last_name="M").save()
+
+            found = await CfPlayer.objects().filter(full_name="Ada L").exec()
+            assert [p.id for p in found] == ["a"]
+
+            ordered = await CfPlayer.objects().order_by("-full_name").exec()
+            assert [p.full_name for p in ordered] == ["Bob M", "Ada L"]
+
+    @pytest.mark.asyncio
+    async def test_bulk_create_excludes_computed_fields(self) -> None:
+        async with cf_client():
+            await CfPlayer.define_computed_fields()
+            created = await CfPlayer.objects().bulk_create(
+                [
+                    CfPlayer(id="a", first_name="Ada", last_name="L"),
+                    CfPlayer(id="b", first_name="Bob", last_name="M"),
+                ]
+            )
+            assert sorted(p.full_name for p in created) == ["Ada L", "Bob M"]
+
+    @pytest.mark.asyncio
+    async def test_the_server_wins_over_a_hostile_client_value(self) -> None:
+        """A write that bypasses the ORM's exclusion still cannot override the expression."""
+        async with cf_client() as client:
+            await CfPlayer.define_computed_fields()
+            await client.query("CREATE CfPlayer:evil CONTENT {first_name: 'Cy', last_name: 'N', full_name: 'HACKED'};", {})
+            rows = await client.query("SELECT * FROM CfPlayer:evil;", {})
+            assert rows[0]["full_name"] == "Cy N"
+
+    @pytest.mark.asyncio
+    async def test_value_is_null_before_the_ddl_is_applied(self) -> None:
+        """Without define_computed_fields() the column is simply never written."""
+        async with cf_client():
+            player = await CfPlayer(id="ada", first_name="Ada", last_name="Lovelace").save()
+            await player.refresh()
+            assert player.full_name is None
