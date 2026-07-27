@@ -111,3 +111,32 @@ class TestGetComputedFields:
 
         assert surreal_orm_lite.Computed is Computed
         assert "Computed" in surreal_orm_lite.__all__
+
+
+class TestComputedFieldDDL:
+    def test_plain_model_yields_no_statements(self) -> None:
+        assert Plain.computed_field_ddl() == []
+
+    def test_renders_overwrite_by_default(self) -> None:
+        assert Person.computed_field_ddl()[0] == (
+            "DEFINE FIELD OVERWRITE full_name ON Person VALUE string::concat(first_name, ' ', last_name);"
+        )
+
+    def test_renders_if_not_exists_when_asked(self) -> None:
+        assert Person.computed_field_ddl(overwrite=False)[0] == (
+            "DEFINE FIELD IF NOT EXISTS full_name ON Person VALUE string::concat(first_name, ' ', last_name);"
+        )
+
+    def test_one_statement_per_computed_field_in_order(self) -> None:
+        statements = Person.computed_field_ddl()
+        assert len(statements) == 3
+        assert [s.split()[3] for s in statements] == ["full_name", "name_len", "plain_style"]
+
+    def test_uses_the_model_table_name(self) -> None:
+        assert all(" ON Person " in s for s in Person.computed_field_ddl())
+
+    def test_subclass_renders_its_own_table(self) -> None:
+        assert all(" ON PersonChild " in s for s in PersonChild.computed_field_ddl())
+
+    def test_is_pure_and_repeatable(self) -> None:
+        assert Person.computed_field_ddl() == Person.computed_field_ddl()

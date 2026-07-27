@@ -88,6 +88,36 @@ class BaseSurrealModel(BaseModel):
         return dict(cls.__surreal_computed__)
 
     @classmethod
+    def computed_field_ddl(cls, overwrite: bool = True) -> list[str]:
+        """Render the ``DEFINE FIELD … VALUE`` statements for this model's computed fields.
+
+        Pure: builds the SurrealQL and returns it without touching the database, so it can be
+        printed, diffed, or fed into a migration. One statement per computed field, in
+        declaration order; ``[]`` when the model has none.
+
+        Args:
+            overwrite: ``True`` (default) emits ``DEFINE FIELD OVERWRITE …`` — the model is the
+                source of truth, so re-running converges the database onto the code and an
+                edited expression takes effect. ``False`` emits ``DEFINE FIELD IF NOT EXISTS …``,
+                which never disturbs an existing definition.
+
+        Note:
+            No ``TYPE`` clause is emitted: SurrealDB infers an optional type from the
+            expression on both 2.6.x and 3.x. Explicit field types are a later roadmap item.
+        """
+        computed = cls.get_computed_fields()
+        if not computed:
+            return []
+        table = cls.get_table_name()
+        validate_alias_name(table)
+        clause = "OVERWRITE" if overwrite else "IF NOT EXISTS"
+        statements: list[str] = []
+        for name, expression in computed.items():
+            validate_alias_name(name)
+            statements.append(f"DEFINE FIELD {clause} {name} ON {table} VALUE {expression};")
+        return statements
+
+    @classmethod
     def get_table_name(cls) -> str:
         """
         Get the table name for the model.
