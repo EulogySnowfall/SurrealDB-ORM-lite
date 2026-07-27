@@ -70,7 +70,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   merge data, no record found."), matching the native `merge()` path — server-side an `UPDATE`
   matching nothing is not an error, and the two DB lines even disagree on the missing-table case
   (SurrealDB 3.x raises `NotFound`, 2.6.x returns no rows), so both are normalised to that one
-  ORM error.
+  ORM error. Inside an interactive transaction the statement runs at `merge()` time, so the same
+  error is raised there (and rolls the transaction back); a buffered transaction runs nothing
+  before commit, so the miss is not knowable and the statement simply matches no record.
 - Signals are unchanged: `save(server_values=)` emits `pre_save`/`around_save`/`post_save`, and
   `merge(server_values=)` emits `pre_update`/`around_update`/`post_update` with `update_fields`
   listing both the literal and the computed fields.

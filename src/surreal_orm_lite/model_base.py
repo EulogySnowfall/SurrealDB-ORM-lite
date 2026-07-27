@@ -543,7 +543,9 @@ class BaseSurrealModel(BaseModel):
         ``UPDATE … SET`` only touches the listed fields, so this keeps ``merge``'s partial
         semantics while letting SurrealDB compute values. The statement returns the updated
         row (``RETURN AFTER`` by default), which replaces the ``refresh()`` round-trip the
-        native MERGE path needs.
+        native MERGE path needs — and its emptiness is how a missing record is detected,
+        both here (interactive tx) and in :meth:`_run_update_returning_row` (no tx). Only a
+        buffered tx cannot tell: nothing runs before commit.
         """
         sender = self.__class__
         record_id = self._record_id()
@@ -564,6 +566,11 @@ class BaseSurrealModel(BaseModel):
                 await pre_update.send(sender, instance=self, update_fields=update_fields)
             rows = await tx.add(statement, variables)
             if tx.is_interactive:
+                # An UPDATE matching nothing is not a server error — it returns no rows. The
+                # native merge(tx=) path surfaces that through refresh(), which raises, so
+                # raise here too (aborting the tx) instead of silently no-opping.
+                if not rows:
+                    raise SurrealDbError("Can't merge data, no record found.")
                 self._apply_record(rows)
             else:
                 # Buffered: the server-computed values are unknown until commit, so only

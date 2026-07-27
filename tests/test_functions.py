@@ -633,6 +633,56 @@ class TestServerValuesTransactionE2E:
             assert isinstance(rows[0]["updated_at"], datetime)
 
     @pytest.mark.asyncio
+    async def test_merge_in_transaction_on_missing_record(self) -> None:
+        # The tx counterpart of test_merge_on_missing_record_raises: an interactive tx runs
+        # the UPDATE at add() time and gets no rows back, so it must raise exactly like the
+        # native merge(tx=) path (which surfaces the miss through refresh()). A buffered tx
+        # runs nothing before commit, so the miss is simply not knowable — it no-ops.
+        async with sv_client():
+            await SvUser(id="txreal", name="Real").save()  # the table exists
+            ghost = SvUser(id="txghost", name="Ghost")
+
+            interactive = False
+            error: Exception | None = None
+            try:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    interactive = tx.is_interactive
+                    await ghost.merge(tx=tx, plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
+            except SurrealDbError as exc:
+                error = exc
+
+            if interactive:
+                assert error is not None
+                assert "no record found" in str(error)
+            else:
+                assert error is None
+
+            assert await SvUser.objects().count() == 1  # the ghost was never created
+
+    @pytest.mark.asyncio
+    async def test_extra_vars_inside_a_transaction(self) -> None:
+        # A buffered transaction rewrites every `$var` of a statement with a per-statement
+        # prefix, and the SurrealFunc expression is inlined *into* that statement — so the
+        # rewrite has to reach the `$password` reference sitting inside the expression too.
+        async with sv_client() as client:
+            raw_password = "tx-p@ssw0rd"
+            async with SurrealDBConnectionManager.transaction() as tx:
+                user = SvUser(id="txev", name="TxEv")
+                await user.save(
+                    tx=tx,
+                    server_values={"password_hash": SurrealFunc.call(SurrealCryptoFunction.ARGON2_GENERATE, "$password")},
+                    extra_vars={"password": raw_password},
+                )
+
+            rows = await client.query("SELECT * FROM SvUser:txev;", {})
+            assert rows[0]["password_hash"].startswith("$argon2")
+            ok = await client.query(
+                "RETURN crypto::argon2::compare($h, $p);",
+                {"h": rows[0]["password_hash"], "p": raw_password},
+            )
+            assert ok is True
+
+    @pytest.mark.asyncio
     async def test_rollback_does_not_emit_post_save(self) -> None:
         fired: list[str] = []
 
