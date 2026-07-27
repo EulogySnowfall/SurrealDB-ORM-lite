@@ -40,10 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bulk_create`) — the server owns the value.
 - Naming a computed field in `merge()`, `save(server_values=)`, `QuerySet.bulk_update()` or any
   `atomic_*` helper now raises `ValueError` instead of being silently discarded by the server.
-- **`save()` with an explicit id now syncs the instance with the row the server returned**
-  (leaving `id` itself untouched, so an explicitly-chosen id keeps its original type). It
-  previously discarded that row, unlike every other write path — so any server-owned value
-  (a computed field, a `DEFAULT` clause) never reached the instance.
+- **`save()` with an explicit id now reads back the model's computed fields** from the row the
+  server returned; it previously discarded that row entirely, so a computed value never reached
+  the instance. The sync is deliberately limited to computed fields — a model that declares none
+  behaves exactly as it did in v0.13.0.
 
 ### Notes
 
