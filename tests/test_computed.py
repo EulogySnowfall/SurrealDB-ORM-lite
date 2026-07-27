@@ -424,3 +424,33 @@ class TestComputedGuardsE2E:
             assert await CfGuard.objects().filter(first_name="Ada").bulk_update(last_name="Byron") == 1
             await guard.refresh()
             assert guard.full_name == "Ada Byron"
+
+
+class TestComputedTransactionE2E:
+    @pytest.mark.asyncio
+    async def test_ddl_applied_inside_a_transaction_takes_effect(self) -> None:
+        async with cf_client():
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await CfPlayer.define_computed_fields(tx=tx)
+            player = await CfPlayer(id="ada", first_name="Ada", last_name="Lovelace").save()
+            assert player.full_name == "Ada Lovelace"
+
+    @pytest.mark.asyncio
+    async def test_rolled_back_ddl_leaves_no_definition(self) -> None:
+        async with cf_client():
+            with contextlib.suppress(RuntimeError):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await CfPlayer.define_computed_fields(tx=tx)
+                    raise RuntimeError("abort")
+            player = await CfPlayer(id="ada", first_name="Ada", last_name="Lovelace").save()
+            await player.refresh()
+            assert player.full_name is None
+
+    @pytest.mark.asyncio
+    async def test_writes_in_a_transaction_still_exclude_computed_fields(self) -> None:
+        async with cf_client():
+            await CfPlayer.define_computed_fields()
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await CfPlayer(id="ada", first_name="Ada", last_name="Lovelace").save(tx=tx)
+            stored = await CfPlayer.objects().filter(first_name="Ada").exec()
+            assert stored[0].full_name == "Ada Lovelace"
