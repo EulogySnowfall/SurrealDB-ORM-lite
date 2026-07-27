@@ -40,6 +40,23 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+def _own_annotation_names(cls: type) -> set[str]:
+    """Return the names annotated in **this** class's body, ignoring inherited ones.
+
+    Python 3.14 (PEP 649) evaluates annotations lazily, so they are no longer stored in
+    ``cls.__dict__["__annotations__"]`` by the time ``__init_subclass__`` runs — only an
+    ``__annotate_func__`` is. Reading the old location there silently yields ``{}``, which
+    would quietly disable any logic built on it. ``annotationlib`` is the supported accessor;
+    its ``STRING`` format returns the annotations unevaluated, so a forward reference can't
+    raise here.
+    """
+    try:
+        import annotationlib  # type: ignore[import-not-found]
+    except ImportError:  # Python < 3.14
+        return set(cls.__dict__.get("__annotations__", {}))
+    return set(annotationlib.get_annotations(cls, format=annotationlib.Format.STRING))
+
+
 class SurrealConfigDict(ConfigDict):
     """
     SurrealConfigDict is a configuration dictionary for SurrealDB models.
@@ -78,7 +95,7 @@ class BaseSurrealModel(BaseModel):
         for base in reversed(cls.__mro__[1:]):
             collected.update(getattr(base, "__surreal_computed__", None) or {})
         # A name this class re-annotates is re-decided below; drop the inherited verdict first.
-        for name in vars(cls).get("__annotations__", {}):
+        for name in _own_annotation_names(cls):
             collected.pop(name, None)
         for name, value in list(vars(cls).items()):
             if isinstance(value, _ComputedDefault):
