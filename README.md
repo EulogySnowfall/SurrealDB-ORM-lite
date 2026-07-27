@@ -158,6 +158,7 @@ results = await User.objects().query(
 | patch / atomic ops     | ✅     |
 | Retry on conflict      | ✅     |
 | Server-side functions  | ✅     |
+| Computed fields        | ✅     |
 
 ### Supported Filter Lookups
 
@@ -550,6 +551,66 @@ commit, so the instance keeps its previous value for that field until you `refre
 
 ---
 
+### 16. Computed fields: `Computed[...]` → `DEFINE FIELD … VALUE`
+
+`server_values=` computes a value for **one write**. A `Computed` field attaches the expression
+to the **schema** instead, so SurrealDB recomputes it on _every_ write to the table — including
+writes that never go through the ORM:
+
+```python
+from surreal_orm_lite import BaseSurrealModel, Computed
+
+class Player(BaseSurrealModel):
+    id: str
+    first_name: str
+    last_name: str
+    full_name: Computed[str] = Computed("string::concat(first_name, ' ', last_name)")
+    initials: Computed[str] = Computed("string::uppercase(string::slice(first_name, 0, 1))")
+
+await Player.define_computed_fields()   # DEFINE FIELD OVERWRITE full_name ON Player VALUE …
+
+player = await Player(id="ada", first_name="Ada", last_name="Lovelace").save()
+player.full_name        # "Ada Lovelace" — computed by the server, not by Python
+```
+
+`Computed[T]` makes the field `T | None` defaulting to `None`, so an instance is constructible
+before the server has ever computed it. The expression may be a plain string or a `SurrealFunc`.
+
+**Applying the schema.** `define_computed_fields()` is idempotent — call it at start-up:
+
+```python
+Player.computed_field_ddl()             # the statements, without touching the DB
+await Player.define_computed_fields()                  # DEFINE FIELD OVERWRITE … (default)
+await Player.define_computed_fields(overwrite=False)   # DEFINE FIELD IF NOT EXISTS …
+```
+
+The default `OVERWRITE` treats the model as the source of truth, so editing an expression and
+redeploying takes effect. `overwrite=False` never disturbs a definition that already exists.
+
+**The field is server-owned.** It is dropped from every write payload, and naming it in a write
+raises rather than being silently discarded:
+
+```python
+await player.merge(last_name="Byron")       # ✅ full_name recomputes to "Ada Byron"
+await player.merge(full_name="whatever")    # ❌ ValueError: full_name is a computed field …
+```
+
+The same guard applies to `save(server_values=)`, `QuerySet.bulk_update()` and the `atomic_*`
+helpers. This is genuinely enforced by SurrealDB, not just by the ORM — a client that bypasses
+ORM-lite entirely and writes `full_name` directly still gets the expression's result.
+
+> **Ordering caveat**: SurrealDB evaluates computed fields in **alphabetical field-name order**,
+> not declaration order. A computed field that reads another must sort after it — `subtotal` →
+> `total` works, but `z_sub` → `a_total` fails at write time.
+>
+> **Security**: like `SurrealFunc`, the expression is inlined verbatim into DDL and cannot
+> reference bound parameters. Build it only from developer-controlled text, never user input.
+
+No `TYPE` clause is emitted — SurrealDB infers an optional type on both server lines. Behaviour
+is **identical on SurrealDB 2.6.x and 3.x**.
+
+---
+
 ## Configuration Options
 
 ### Custom Primary Key
@@ -612,6 +673,10 @@ listed behave the same on both lines.
 | Shipped function-name enums (`SurrealTimeFunction`, `SurrealCryptoFunction`, …)       | every catalogued member verified on 2.6.5                                    | every catalogued member verified on 3.1.3                                | v0.13.0 |
 | `server_values` inside a transaction — when the instance sees the computed value      | only after commit (buffered; `refresh()` to read it)                         | immediately (interactive returns the row)                                | v0.13.0 |
 | `merge(server_values=)` on a missing record / never-created table                     | server returns no rows → ORM raises `SurrealDbError`                         | server raises `NotFound` for a missing table → ORM raises the same error | v0.13.0 |
+| Computed fields (`Computed[...]` → `DEFINE FIELD … VALUE`)                            | same on both lines (DDL, recompute triggers, precedence over client data)    | same on both lines                                                       | v0.14.0 |
+| DDL run inside a transaction, then rolled back                                        | definition rolled back with the transaction                                  | same on both lines                                                       | v0.14.0 |
+| Invalid computed-field expression — raw SDK exception                                 | `InternalError`                                                              | `ValidationError`                                                        | v0.14.0 |
+| Invalid computed-field expression — through the ORM                                   | `SurrealDbError` (normalised)                                                | `SurrealDbError` (normalised)                                            | v0.14.0 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
 
@@ -640,7 +705,8 @@ Contributions are welcome! Please:
 | v0.11.0           | patch / atomic field & array ops                 | ✅ Released |
 | v0.12.0           | retry_on_conflict & optimistic concurrency       | ✅ Released |
 | v0.13.0           | SurrealFunc & server-side values                 | ✅ Released |
-| v0.14.0 – v0.22.0 | Tier 1 — Core (computed, auth, live, relations)  | 📋 Planned  |
+| v0.14.0           | Computed fields (`DEFINE FIELD … VALUE`)         | ✅ Released |
+| v0.15.0 – v0.22.0 | Tier 1 — Core (auth, live, relations)            | 📋 Planned  |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)  | 📋 Planned  |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI) | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)               | 📋 Planned  |
@@ -679,7 +745,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Atomic field/array operations | ✅ v0.11.0              | ✅               |
 | Retry on conflict             | ✅ v0.12.0              | ✅               |
 | SurrealFunc & server values   | ✅ v0.13.0              | ✅               |
-| Computed fields               | v0.14.0                 | ✅               |
+| Computed fields               | ✅ v0.14.0              | ✅               |
 | JWT Authentication            | v0.16 – v0.17           | ✅               |
 | Field Aliases & DX            | v0.18.0                 | ✅               |
 | Live Models / CDC             | v0.19 – v0.21           | ✅               |

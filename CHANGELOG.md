@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-07-26
+
+### Added
+
+- **Computed fields — `Computed[...]` → `DEFINE FIELD … VALUE`**: declare a field SurrealDB
+  derives from other fields on **every** write. Where `SurrealFunc` (v0.13.0) evaluates an
+  expression for one write, `Computed` attaches it to the schema, so it applies to every write
+  on the table — including ones the ORM never sees.
+
+  ```python
+  from surreal_orm_lite import BaseSurrealModel, Computed
+
+  class Player(BaseSurrealModel):
+      id: str
+      first_name: str
+      last_name: str
+      full_name: Computed[str] = Computed("string::concat(first_name, ' ', last_name)")
+
+  await Player.define_computed_fields()
+  player = await Player(id="ada", first_name="Ada", last_name="Lovelace").save()
+  player.full_name  # "Ada Lovelace" — computed by the server
+  ```
+
+- `Model.get_computed_fields()` — `{field: expression}` for the model, inherited fields included.
+- `Model.computed_field_ddl(overwrite=True)` — render the `DEFINE FIELD` statements without
+  touching the database (printable, diffable, pipeable into a migration).
+- `Model.define_computed_fields(overwrite=True, tx=None)` — apply them; idempotent, so it is
+  safe to call at application start-up.
+
+### Changed
+
+- Computed fields are excluded from every write payload (`save`, `upsert`, `update`, `merge`,
+  `bulk_create`) — the server owns the value.
+- Naming a computed field in `merge()`, `save(server_values=)`, `QuerySet.bulk_update()` or any
+  `atomic_*` helper now raises `ValueError` instead of being silently discarded by the server.
+- **`save()` with an explicit id now syncs the instance with the row the server returned**
+  (leaving `id` itself untouched, so an explicitly-chosen id keeps its original type). It
+  previously discarded that row, unlike every other write path — so any server-owned value
+  (a computed field, a `DEFAULT` clause) never reached the instance.
+
+### Notes
+
+- **Identical on SurrealDB 2.6.x and 3.x** — no 3.x-only primitive and no capability gate, so
+  no test in this feature skips on either line. The DDL syntax, the recompute triggers, the
+  precedence over client-sent data and the rollback of DDL in a cancelled transaction all
+  matched exactly. The only divergence is the raw SDK exception for an invalid expression
+  (`InternalError` on 2.6.x, `ValidationError` on 3.x); both are normalised to `SurrealDbError`.
+- SurrealDB evaluates computed fields in **alphabetical field-name order**, not declaration
+  order: a computed field reading another must sort after it (`subtotal` → `total` works,
+  `z_sub` → `a_total` fails at write time).
+- A computed field is a **server-enforced** invariant: a client that sends its own value for one
+  cannot override the expression, even bypassing the ORM entirely.
+- No `TYPE` clause is emitted — SurrealDB infers an optional type. Explicit field types remain a
+  later roadmap item.
+- `patch()` is deliberately not guarded: JSON Pointers are opaque paths, and the server
+  recomputes regardless.
+- Expressions are inlined into DDL and cannot reference bound parameters. Build them only from
+  developer-controlled text — the `SurrealFunc` trust model, whose validation they reuse.
+
 ## [0.13.0] - 2026-07-26
 
 ### Added

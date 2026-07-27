@@ -22,7 +22,8 @@
 | v0.9.0            | Transactions ORM (QuerySet) + interactive (3.x)      | Done    |
 | v0.10.0 – v0.12.0 | Tier 1 — Core write-path (upsert, patch, retry)      | Done    |
 | v0.13.0           | Tier 1 — SurrealFunc & server-side values            | Done    |
-| v0.14.0 – v0.22.0 | Tier 1 — Core (computed, auth, live, relations)      | Planned |
+| v0.14.0           | Tier 1 — Computed Fields                             | Done    |
+| v0.15.0 – v0.22.0 | Tier 1 — Core (call_function, auth, live, relations) | Planned |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 7 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
@@ -63,7 +64,7 @@ pieces stay out.
 | Atomic field/array ops              | `patch()` (JSON Patch RFC 6902)                       | v0.11.0        |
 | Retry on conflict                   | transactions + retry logic                            | v0.12.0        |
 | SurrealFunc & server values         | `query()` + native fns (`CREATE`/`UPDATE … SET`)      | ✅ v0.13.0     |
-| Computed fields                     | `DEFINE FIELD … VALUE` via `query()`                  | v0.14.0        |
+| Computed fields                     | `DEFINE FIELD … VALUE` via `query()`                  | ✅ v0.14.0     |
 | `call_function()`                   | RPC `run()` / `RETURN fn::…`                          | v0.15.0        |
 | JWT / scope auth                    | `signup`/`signin`/`authenticate`/`invalidate`/`info`  | v0.16 – v0.17  |
 | Field aliases & DX                  | Pydantic `Field(alias=)` + config                     | v0.18.0        |
@@ -120,7 +121,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | Atomic field/array ops        | yes        | ✅ v0.11.0                  |
 | Retry on conflict             | yes        | ✅ v0.12.0                  |
 | SurrealFunc & server values   | yes        | ✅ v0.13.0                  |
-| Computed fields               | yes        | v0.14.0                     |
+| Computed fields               | yes        | ✅ v0.14.0                  |
 | `call_function()`             | yes        | v0.15.0                     |
 | JWT Authentication            | yes        | v0.16 – v0.17               |
 | Field aliases & DX            | yes        | v0.18.0                     |
@@ -249,6 +250,26 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - Security: expressions are developer-controlled and inlined; user input goes through
   `extra_vars` and is always bound (the injection boundary)
 
+### Version 0.14.0 — Computed fields
+
+- `Computed[T] = Computed("<expr>")` declares a field SurrealDB derives from other fields on
+  **every** write, via `DEFINE FIELD … VALUE`. Where v0.13.0's `SurrealFunc` evaluates an
+  expression for one write, `Computed` attaches it to the **schema** — so it applies to writes
+  the ORM never sees, making it a server-enforced invariant rather than a convention
+- `computed_field_ddl(overwrite=True)` renders the statements without touching the database;
+  `define_computed_fields(overwrite=True, tx=)` applies them and is idempotent (safe at start-up)
+- Computed fields are excluded from every write payload; naming one in `merge()`,
+  `save(server_values=)`, `bulk_update()` or an `atomic_*` helper raises `ValueError`
+- `save()` with an explicit id now syncs the row the server returned (it previously discarded
+  it, unlike every other write path), which is what lets server-owned values reach the instance
+- **Identical on SurrealDB 2.6.x and 3.x** — no capability gate, no skipped tests. Only the raw
+  SDK exception for an invalid expression differs (`InternalError` vs `ValidationError`, both
+  `ServerError`), normalised to `SurrealDbError`
+- Caveat: SurrealDB evaluates computed fields in **alphabetical field-name order**, not
+  declaration order — a computed field reading another must sort after it
+- No `TYPE` clause is emitted (the server infers an optional type); explicit field types stay
+  a later roadmap item
+
 ---
 
 ## Planned — Tier 1: Core (SDK 2.0 strict)
@@ -272,7 +293,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 | Version    | Theme                                                        | SDK 2.0 primitive      |
 | ---------- | ------------------------------------------------------------ | ---------------------- |
 | ✅ v0.13.0 | SurrealFunc + `server_values=` / `extra_vars=` on save/merge | `query()` + native fns |
-| v0.14.0    | Computed Fields (`Computed[...]` → `DEFINE FIELD … VALUE`)   | `DEFINE FIELD`         |
+| ✅ v0.14.0 | Computed Fields (`Computed[...]` → `DEFINE FIELD … VALUE`)   | `DEFINE FIELD`         |
 | v0.15.0    | `call_function()` (call defined SurrealDB functions)         | RPC `run()`            |
 
 ### 🟣 Phase C — Auth & DX
