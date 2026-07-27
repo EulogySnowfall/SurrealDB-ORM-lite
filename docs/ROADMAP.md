@@ -21,7 +21,8 @@
 | v0.8.0            | Transactions ORM (core, `tx=`)                       | Done    |
 | v0.9.0            | Transactions ORM (QuerySet) + interactive (3.x)      | Done    |
 | v0.10.0 – v0.12.0 | Tier 1 — Core write-path (upsert, patch, retry)      | Done    |
-| v0.13.0 – v0.22.0 | Tier 1 — Core (auth, live, relations, …)             | Planned |
+| v0.13.0           | Tier 1 — SurrealFunc & server-side values            | Done    |
+| v0.14.0 – v0.22.0 | Tier 1 — Core (computed, auth, live, relations)      | Planned |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 7 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
@@ -61,7 +62,8 @@ pieces stay out.
 | `upsert()` / `update_or_create()`   | `upsert()`                                            | v0.10.0        |
 | Atomic field/array ops              | `patch()` (JSON Patch RFC 6902)                       | v0.11.0        |
 | Retry on conflict                   | transactions + retry logic                            | v0.12.0        |
-| SurrealFunc & computed fields       | `query()` + `DEFINE FIELD … VALUE`                    | v0.13 – v0.14  |
+| SurrealFunc & server values         | `query()` + native fns (`CREATE`/`UPDATE … SET`)      | ✅ v0.13.0     |
+| Computed fields                     | `DEFINE FIELD … VALUE` via `query()`                  | v0.14.0        |
 | `call_function()`                   | RPC `run()` / `RETURN fn::…`                          | v0.15.0        |
 | JWT / scope auth                    | `signup`/`signin`/`authenticate`/`invalidate`/`info`  | v0.16 – v0.17  |
 | Field aliases & DX                  | Pydantic `Field(alias=)` + config                     | v0.18.0        |
@@ -117,7 +119,8 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | `upsert` / `update_or_create` | yes        | ✅ v0.10.0                  |
 | Atomic field/array ops        | yes        | ✅ v0.11.0                  |
 | Retry on conflict             | yes        | ✅ v0.12.0                  |
-| SurrealFunc & Computed        | yes        | v0.13 – v0.14               |
+| SurrealFunc & server values   | yes        | ✅ v0.13.0                  |
+| Computed fields               | yes        | v0.14.0                     |
 | `call_function()`             | yes        | v0.15.0                     |
 | JWT Authentication            | yes        | v0.16 – v0.17               |
 | Field aliases & DX            | yes        | v0.18.0                     |
@@ -230,6 +233,22 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   own "This transaction can be retried" marker — deliberately narrower than the full ORM so a
   duplicate-key failure is not retried
 
+### Version 0.13.0 — SurrealFunc & server-side values
+
+- `SurrealFunc("time::now()")` marks a raw SurrealQL expression to be evaluated **server-side**;
+  `SurrealFunc.call(fn, *args)` builds the call from a function name and raw argument fragments
+- `server_values=` / `extra_vars=` on `save()` and `merge()`: the write compiles to
+  `CREATE $rid SET …` / `UPDATE $rid SET …` (functions inlined, every other value bound), and
+  the returned row syncs the instance — `merge()` stays a partial update
+- Six curated function-name enums (`SurrealTimeFunction`, `SurrealMathFunction`,
+  `SurrealStringFunction`, `SurrealArrayFunction`, `SurrealCryptoFunction`,
+  `SurrealRandFunction`) — **every member is executed against 2.6.5 AND 3.1.3 by the suite**;
+  names diverging between the lines (`rand::guid`, `type::is::*`) are excluded on purpose
+- **Identical on SurrealDB 2.6.x and 3.x** — no 3.x-only primitive. Only the inherited v0.9.0
+  transaction rule differs: on a buffered tx the computed value reaches the instance at commit
+- Security: expressions are developer-controlled and inlined; user input goes through
+  `extra_vars` and is always bound (the injection boundary)
+
 ---
 
 ## Planned — Tier 1: Core (SDK 2.0 strict)
@@ -250,11 +269,11 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 ### 🟢 Phase B — Server-side computation
 
-| Version | Theme                                                        | SDK 2.0 primitive      |
-| ------- | ------------------------------------------------------------ | ---------------------- |
-| v0.13.0 | SurrealFunc + `server_values=` / `extra_vars=` on save/merge | `query()` + native fns |
-| v0.14.0 | Computed Fields (`Computed[...]` → `DEFINE FIELD … VALUE`)   | `DEFINE FIELD`         |
-| v0.15.0 | `call_function()` (call defined SurrealDB functions)         | RPC `run()`            |
+| Version    | Theme                                                        | SDK 2.0 primitive      |
+| ---------- | ------------------------------------------------------------ | ---------------------- |
+| ✅ v0.13.0 | SurrealFunc + `server_values=` / `extra_vars=` on save/merge | `query()` + native fns |
+| v0.14.0    | Computed Fields (`Computed[...]` → `DEFINE FIELD … VALUE`)   | `DEFINE FIELD`         |
+| v0.15.0    | `call_function()` (call defined SurrealDB functions)         | RPC `run()`            |
 
 ### 🟣 Phase C — Auth & DX
 

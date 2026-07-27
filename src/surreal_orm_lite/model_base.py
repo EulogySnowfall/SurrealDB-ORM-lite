@@ -1,7 +1,8 @@
 import contextlib
+import functools
 import logging
 import typing
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from decimal import Decimal
 from typing import Any, Self
 
@@ -11,6 +12,7 @@ from pydantic_core import ValidationError
 from ._sdk import NotFoundError, RecordID, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
+from .functions import SurrealFunc
 from .signals import (
     around_delete,
     around_save,
@@ -24,7 +26,10 @@ from .signals import (
 )
 from .transaction import Transaction
 from .utils import (
+    build_set_clause,
+    merge_extra_vars,
     remove_quotes_for_variables,
+    validate_alias_name,
     validate_edge_name,
     validate_field_name,
     validate_graph_path,
@@ -247,7 +252,86 @@ class BaseSurrealModel(BaseModel):
 
         raise SurrealDbError("Can't save data, no record returned.")  # pragma: no cover
 
-    async def save(self, tx: Transaction | None = None) -> Self:
+    @staticmethod
+    def _validate_server_values(
+        server_values: Mapping[str, Any] | None,
+        extra_vars: Mapping[str, Any] | None,
+    ) -> None:
+        """Validate the ``server_values`` / ``extra_vars`` pair before compiling a statement.
+
+        Key syntax is checked later by :func:`build_set_clause`; what must be caught here
+        is (a) a non-``SurrealFunc`` server value — once merged with the field data the
+        two are indistinguishable, so it would silently be bound as a literal string
+        instead of evaluated — and (b) ``extra_vars`` with nothing to reference them.
+        """
+        if extra_vars and not server_values:
+            raise ValueError("extra_vars requires server_values: no SurrealFunc expression could reference them.")
+        for key, value in (server_values or {}).items():
+            if not isinstance(value, SurrealFunc):
+                raise TypeError(
+                    f"server_values[{key!r}] must be a SurrealFunc, got {type(value).__name__!r}. "
+                    "Wrap the expression: SurrealFunc('time::now()')."
+                )
+
+    async def _do_save_server(
+        self,
+        tx: Transaction | None = None,
+        server_values: Mapping[str, SurrealFunc] | None = None,
+        extra_vars: Mapping[str, Any] | None = None,
+    ) -> tuple[Self, bool]:
+        """Internal save routed through ``CREATE … SET`` so server functions are evaluated.
+
+        The native SDK ``create()`` sends data as values, so a ``SurrealFunc`` would be
+        stored as its literal text. This path compiles one ``SET`` clause instead —
+        functions inlined, every other value bound — which SurrealDB evaluates
+        server-side. ``CONTENT $data SET …`` is not valid SurrealQL (verified on 2.6.5
+        and 3.1.3), hence the full clause rather than a hybrid.
+        """
+        record_id = self._record_id()
+        merged: dict[str, Any] = {**self.model_dump(exclude={"id"}), **(server_values or {})}
+        clause, variables = build_set_clause(merged)
+
+        if record_id is not None:
+            variables["rid"] = record_id
+            statement = f"CREATE $rid SET {clause};"
+        else:
+            if tx is not None and not tx.is_interactive:
+                raise SurrealDbError(
+                    "save(tx=...) requires an explicit id on a buffered transaction "
+                    "(auto-id requires a WebSocket connection to SurrealDB 3.x)."
+                )
+            table = self.get_table_name()
+            validate_alias_name(table)
+            statement = f"CREATE {table} SET {clause};"
+
+        # `rid` is reserved on both branches (it is only *bound* on the explicit-id one), so
+        # extra_vars validation behaves identically either way.
+        variables = merge_extra_vars(variables, extra_vars, reserved=("rid",))
+
+        if tx is not None:
+            rows = await tx.add(statement, variables)
+            self._apply_record(rows)  # interactive: applies; buffered: None → stale until commit
+            return self, True
+
+        client = await SurrealDBConnectionManager.get_client()
+        try:
+            rows = await client.query(statement, variables)
+        except ServerError as e:
+            # Same normalisation as the native path: "already exists" is an ORM error.
+            if "already exists" in str(e).lower():
+                raise SurrealDbError(f"There was a problem with the database: {e}") from e
+            raise
+        if not rows:
+            raise SurrealDbError("Can't save data, no record returned.")
+        self._apply_record(rows)
+        return self, True
+
+    async def save(
+        self,
+        tx: Transaction | None = None,
+        server_values: Mapping[str, SurrealFunc] | None = None,
+        extra_vars: Mapping[str, Any] | None = None,
+    ) -> Self:
         """
         Save the model instance to the database.
 
@@ -259,15 +343,43 @@ class BaseSurrealModel(BaseModel):
         commit, not here — consistent with update/merge/delete in tx mode. ``post_save``
         is deferred until the transaction commits successfully; if the tx rolls back,
         ``post_save`` is NOT emitted (the write never happened).
+
+        Args:
+            tx: Optional transaction the CREATE is buffered onto.
+            server_values: Field name → :class:`~surreal_orm_lite.functions.SurrealFunc`,
+                evaluated **by the server** (``time::now()``, ``rand::uuid::v7()``, …)
+                rather than in Python. A server value overrides a model field of the same
+                name. Providing it routes the write through ``CREATE … SET``.
+            extra_vars: Extra query variables the expressions reference, bound (never
+                interpolated) — this is how user input reaches a function safely. Requires
+                ``server_values``; a key colliding with an internal binding raises.
+
+        Example:
+            >>> await player.save(server_values={"joined_at": SurrealFunc("time::now()")})
+            >>> await user.save(
+            ...     server_values={"pwd": SurrealFunc("crypto::argon2::generate($password)")},
+            ...     extra_vars={"password": raw_password},
+            ... )
+
+        Note:
+            In a **buffered** transaction (HTTP or SurrealDB 2.6.x) the server-computed
+            values are unknown until commit, so the instance keeps its pre-save values for
+            those fields — ``refresh()`` after commit if you need them.
         """
+        self._validate_server_values(server_values, extra_vars)
+        if server_values:
+            do_op = functools.partial(self._do_save_server, server_values=server_values, extra_vars=extra_vars)
+            return await self._save_with_signals(do_op, tx)
         return await self._save_with_signals(self._do_save, tx)
 
     def _apply_record(self, record: Any) -> None:
         """Copy a returned DB row's fields onto this instance (id kept as native ``RecordID``).
 
         Accepts the raw SDK result (a row dict, a single-element list, or ``None``) and applies
-        only attributes the model actually declares. Shared by ``_do_save``/``_do_upsert`` so
-        the "apply the row the server gave back" step lives in one place.
+        only attributes the model actually declares. Shared by every write path that gets a row
+        back (``_do_upsert``, ``patch``, the atomic helpers, the ``server_values`` paths) so the
+        "apply the row the server gave back" step lives in one place. A ``None``/empty result is
+        a no-op — callers that must distinguish "no row" from "nothing to apply" check first.
         """
         if isinstance(record, list):
             record = record[0] if record else None
@@ -275,6 +387,26 @@ class BaseSurrealModel(BaseModel):
             for key, value in record.items():
                 if hasattr(self, key):
                     object.__setattr__(self, key, value)
+
+    async def _run_update_returning_row(self, statement: str, variables: dict[str, Any]) -> None:
+        """Run an ``UPDATE`` and apply its row, raising a uniform error when it matched nothing.
+
+        Two server behaviours are normalised here, so ``merge(server_values=)`` fails the same
+        way as the native ``merge()`` path (whose follow-up ``refresh()`` raises) on both DB
+        lines:
+
+        - a missing **record** returns no rows on 2.6.x and 3.x alike;
+        - a missing **table** returns no rows on 2.6.x but raises ``NotFoundError`` on 3.x
+          (same divergence the read paths normalise since v0.7.0).
+        """
+        client = await SurrealDBConnectionManager.get_client()
+        try:
+            rows = await client.query(statement, variables)
+        except NotFoundError as e:
+            raise SurrealDbError("Can't merge data, no record found.") from e
+        if not rows:
+            raise SurrealDbError("Can't merge data, no record found.")
+        self._apply_record(rows)
 
     async def _save_with_signals(
         self,
@@ -399,16 +531,86 @@ class BaseSurrealModel(BaseModel):
 
         return result
 
-    async def merge(self, tx: Transaction | None = None, **data: Any) -> Any:
+    async def _merge_server(
+        self,
+        tx: Transaction | None,
+        server_values: Mapping[str, SurrealFunc],
+        extra_vars: Mapping[str, Any] | None,
+        data: dict[str, Any],
+    ) -> Any:
+        """Partial update routed through ``UPDATE … SET`` so server functions are evaluated.
+
+        ``UPDATE … SET`` only touches the listed fields, so this keeps ``merge``'s partial
+        semantics while letting SurrealDB compute values. The statement returns the updated
+        row (``RETURN AFTER`` by default), which replaces the ``refresh()`` round-trip the
+        native MERGE path needs — and its emptiness is how a missing record is detected,
+        both here (interactive tx) and in :meth:`_run_update_returning_row` (no tx). Only a
+        buffered tx cannot tell: nothing runs before commit.
+        """
+        sender = self.__class__
+        record_id = self._record_id()
+        if record_id is None:
+            raise SurrealDbError(f"No Id for the data to merge: {data}")
+
+        merged: dict[str, Any] = {**data, **server_values}
+        clause, variables = build_set_clause(merged)
+        variables["rid"] = record_id
+        variables = merge_extra_vars(variables, extra_vars)
+        statement = f"UPDATE $rid SET {clause};"
+        update_fields = list(merged.keys())
+
+        has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
+
+        if tx is not None:
+            if has_signals:
+                await pre_update.send(sender, instance=self, update_fields=update_fields)
+            rows = await tx.add(statement, variables)
+            if tx.is_interactive:
+                # An UPDATE matching nothing is not a server error — it returns no rows. The
+                # native merge(tx=) path surfaces that through refresh(), which raises, so
+                # raise here too (aborting the tx) instead of silently no-opping.
+                if not rows:
+                    raise SurrealDbError("Can't merge data, no record found.")
+                self._apply_record(rows)
+            else:
+                # Buffered: the server-computed values are unknown until commit, so only
+                # the literal kwargs can be applied — func fields stay stale. A kwarg that
+                # `server_values` overrode is skipped: writing it would leave the instance
+                # holding a value that never reaches the database.
+                for key, value in data.items():
+                    if key not in server_values and hasattr(self, key):
+                        object.__setattr__(self, key, value)
+            if has_signals:
+                tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
+            return None
+
+        if not has_signals:
+            await self._run_update_returning_row(statement, variables)
+            return None
+
+        await pre_update.send(sender, instance=self, update_fields=update_fields)
+        async with around_update.wrap(sender, instance=self, update_fields=update_fields):
+            await self._run_update_returning_row(statement, variables)
+        await post_update.send(sender, instance=self, update_fields=update_fields)
+        return None
+
+    async def merge(
+        self,
+        tx: Transaction | None = None,
+        server_values: Mapping[str, SurrealFunc] | None = None,
+        extra_vars: Mapping[str, Any] | None = None,
+        **data: Any,
+    ) -> Any:
         """
         Partial update of the model instance in the database.
 
         When ``tx`` is provided, the UPDATE…MERGE statement is buffered onto the
         transaction instead of being executed immediately.
 
-        Note: ``tx`` is a reserved keyword argument for this method. A model field
-        literally named ``tx`` cannot be merged by keyword; use a dict-unpacking
-        workaround if needed (no realistic SurrealDB column is named ``tx``).
+        Note: ``tx``, ``server_values`` and ``extra_vars`` are reserved keyword arguments
+        for this method. A model field literally named like one of them cannot be merged
+        by keyword; use a dict-unpacking workaround if needed (no realistic SurrealDB
+        column carries those names).
 
         Emits pre_update, post_update, and around_update signals. In tx mode,
         ``around_update`` is skipped (the write is deferred to commit) and
@@ -418,7 +620,24 @@ class BaseSurrealModel(BaseModel):
         ``data`` is applied to ``self`` directly at buffer time. A rollback will
         therefore leave the instance ahead of the database — caller must treat the
         instance as stale after a failed tx.
+
+        Args:
+            tx: Optional transaction the statement is buffered onto.
+            server_values: Field name → :class:`~surreal_orm_lite.functions.SurrealFunc`,
+                evaluated **by the server**. A server value overrides a ``data`` keyword
+                of the same name. Providing it compiles the update as ``UPDATE … SET``
+                (still a partial update: unlisted fields are untouched) and the returned
+                row syncs the instance, so no extra ``refresh()`` round-trip is needed.
+            extra_vars: Extra query variables the expressions reference, bound (never
+                interpolated). Requires ``server_values``.
+
+        Example:
+            >>> await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
         """
+        self._validate_server_values(server_values, extra_vars)
+        if server_values:
+            return await self._merge_server(tx, server_values, extra_vars, data)
+
         sender = self.__class__
         data_set = dict(data.items())
         record_id = self._record_id()
