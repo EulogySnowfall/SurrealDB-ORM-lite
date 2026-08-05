@@ -329,7 +329,7 @@ class TestExports:
 
     def test_version_bumped(self) -> None:
         """Version is 0.9.0."""
-        assert surreal_orm_lite.__version__ == "0.13.1"
+        assert surreal_orm_lite.__version__ == "0.13.2"
 
 
 # =============================================================================
