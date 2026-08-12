@@ -1,7 +1,8 @@
 # SurrealDB 2.X Version Monitor
 #
 # Flow:
-#   1. Compare .surrealdb-version against latest v2.x GitHub release
+#   1. Compare .surrealdb-version2x against latest v2.x GitHub release
+#      (.surrealdb-version pins the primary/latest line, 3.x — not this monitor's business)
 #   2. If same version -> skip (no wasted CI minutes)
 #   3. If new version -> run tests against it
 #   4. If tests pass -> create PR with version update
@@ -83,8 +84,8 @@ jobs:
           fi
 
           # --- Read current pinned version ---
-          if [[ -f ".surrealdb-version" ]]; then
-            CURRENT_VERSION=$(cat .surrealdb-version | tr -d '[:space:]')
+          if [[ -f ".surrealdb-version2x" ]]; then
+            CURRENT_VERSION=$(cat .surrealdb-version2x | tr -d '[:space:]')
           else
             CURRENT_VERSION="unknown"
           fi
@@ -96,9 +97,22 @@ jobs:
           echo "Docker:  $DOCKER_TAG"
 
           # --- Compare: skip if already up to date ---
+          # Version-aware, not a plain string inequality: a monitor must never emit a
+          # downgrade. If the pin is somehow ahead of the latest release (wrong line in
+          # the pin file, release yanked), do nothing rather than propose going back.
           HAS_UPDATE="false"
-          if [[ "$CURRENT_VERSION" != "$LATEST_VERSION" ]]; then
+          if [[ "$CURRENT_VERSION" == "unknown" ]]; then
+            # No pin file at all — sort -V would rank "unknown" above any number and
+            # silently block forever, so treat it as "adopt the latest".
             HAS_UPDATE="true"
+          elif [[ "$CURRENT_VERSION" != "$LATEST_VERSION" ]]; then
+            NEWEST=$(printf '%s\n%s\n' "$CURRENT_VERSION" "$LATEST_VERSION" | sort -V | tail -1)
+            if [[ "$NEWEST" == "$LATEST_VERSION" ]]; then
+              HAS_UPDATE="true"
+            else
+              echo "Pinned version $CURRENT_VERSION is newer than the latest release" \
+                   "$LATEST_VERSION — refusing to downgrade."
+            fi
           fi
 
           # Force update overrides the check
@@ -237,7 +251,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Update .surrealdb-version and CI matrix
+      - name: Update .surrealdb-version2x and CI matrix
         env:
           NEW_VERSION: ${{ needs.check-release.outputs.latest-version }}
           DOCKER_TAG: ${{ needs.check-release.outputs.docker-tag }}
@@ -248,13 +262,21 @@ jobs:
 
           git checkout -b "$BRANCH"
 
-          # Update .surrealdb-version
-          echo "$NEW_VERSION" > .surrealdb-version
+          # .surrealdb-version2x is the 2.x pin; the primary line is pinned in
+          # .surrealdb-version and is not this monitor's business.
+          echo "$NEW_VERSION" > .surrealdb-version2x
 
-          # Update CI matrix surrealdb-version
-          sed -i "s/surrealdb-version: \['v[0-9.]*'\]/surrealdb-version: ['${DOCKER_TAG}']/" .github/workflows/ci.yml
+          # Update the 2.x entry of the CI matrix. The matrix holds one entry per supported
+          # line, so replace ONLY the 'v2.*' element — the previous pattern assumed a
+          # single-element list and silently matched nothing once 3.x was added.
+          if ! grep -qE "'v2\.[0-9]+\.[0-9]+'" .github/workflows/ci.yml; then
+            echo "ERROR: no 'v2.x.y' entry found in the ci.yml matrix — refusing to" >&2
+            echo "commit a partial update. Check the matrix format." >&2
+            exit 1
+          fi
+          sed -i -E "s/'v2\.[0-9]+\.[0-9]+'/'${DOCKER_TAG}'/" .github/workflows/ci.yml
 
-          git add .surrealdb-version .github/workflows/ci.yml
+          git add .surrealdb-version2x .github/workflows/ci.yml
 
           if git diff --staged --quiet; then
             echo "No changes to commit"
@@ -294,6 +316,27 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           IS_SECURITY: ${{ needs.check-release.outputs.is-security-patch }}
         run: |
+          # The branch is rebuilt from main on every run, so a leftover remote branch
+          # (PR creation failed, PR closed without deleting the branch, ...) makes a
+          # plain push fail non-fast-forward and wedges every future run — that is how
+          # the monitor stayed red for 7 weeks (#135). Reuse the branch while a PR is
+          # still open, otherwise drop the stale one and push fresh.
+          EXISTING_PR=$(gh pr list --repo "$GITHUB_REPOSITORY" \
+            --head "$BRANCH" --state open --json number -q '.[0].number')
+
+          if [[ -n "$EXISTING_PR" ]]; then
+            git fetch origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"
+            git push --force-with-lease="refs/heads/${BRANCH}" -u origin "$BRANCH"
+            echo "Updated existing PR #${EXISTING_PR} on $BRANCH"
+            gh pr merge "$EXISTING_PR" --auto --squash || true
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Removing stale remote branch $BRANCH (no open PR attached)"
+            git push origin --delete "$BRANCH"
+          fi
+
           git push -u origin "$BRANCH"
 
           TITLE="chore(deps): update SurrealDB to v${NEW_VERSION}"
