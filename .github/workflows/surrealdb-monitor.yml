@@ -82,19 +82,26 @@ jobs:
           if [[ -n "$REQUESTED_VERSION" ]]; then
             LATEST_VERSION="$REQUESTED_VERSION"
 
-            MAJOR="${LATEST_VERSION%%.*}"
-            if [[ "$MAJOR" != "$LINE" ]]; then
-              echo "ERROR: $LATEST_VERSION is not a ${LINE}.X version." >&2
-              echo "Dispatch the monitor for the ${MAJOR}.x line instead." >&2
+            # Full X.Y.Z, not just a matching major. A bare "3" would sail through a
+            # major-only check and then be written into the pin file and the ci.yml matrix
+            # as the floating tag `v3`, which no longer matches the 'vX.Y.Z' guard — every
+            # later run would refuse to touch the matrix, permanently.
+            if [[ ! "$LATEST_VERSION" =~ ^${LINE}\.[0-9]+\.[0-9]+$ ]]; then
+              echo "ERROR: '$LATEST_VERSION' is not a ${LINE}.X.Y version." >&2
+              echo "Give a full patch version on this line, e.g. ${LINE}.2.4." >&2
               exit 1
             fi
           elif [[ "$VERSION_SOURCE" == "github-releases" ]]; then
+            # `|| true`: an API hiccup or an empty result must fall through to the explicit
+            # "nothing found" branch below, not abort the job under `set -e` — an aborted
+            # check-release leaves has-update empty, which also skips create-failure-issue,
+            # so the monitor would go red with nothing reported.
             LATEST_VERSION=$(gh api "repos/surrealdb/surrealdb/releases?per_page=100" \
               --jq "[.[] | select(.tag_name | startswith(\"v${LINE}.\"))
                         | select(.prerelease == false)
                         | select(.draft == false)
                         | .tag_name | ltrimstr(\"v\")]
-                    | .[0] // empty")
+                    | .[0] // empty" 2>/dev/null || true)
           elif [[ "$VERSION_SOURCE" == "dockerhub" ]]; then
             # The 3.x line is published as Docker images WITHOUT a matching GitHub release:
             # as of 2026-08, releases stop at v3.2.0 while Docker Hub carries v3.2.4. Asking
@@ -102,12 +109,23 @@ jobs:
             # downgrade guard below would put the monitor to sleep forever. Docker Hub is also
             # what CI actually consumes, so it is the honest source of truth.
             #
-            # Keep only bare vX.Y.Z tags: drop -dev/-beta/-rc builds and the floating vX.Y
-            # alias, then take the highest by version order rather than by publish date.
-            LATEST_VERSION=$(curl -sSf \
-              "https://hub.docker.com/v2/repositories/surrealdb/surrealdb/tags?page_size=100&name=v${LINE}." \
-              | jq -r '.results[].name' \
-              | grep -E "^v${LINE}\.[0-9]+\.[0-9]+$" \
+            # Page through the tag list instead of reading page 1 only: `name=` is a substring
+            # filter and the results are ordered by last_updated, so -dev/-beta builds crowd
+            # the first page and the newest stable tag can fall off it. Keep only bare vX.Y.Z
+            # tags — dropping -dev/-beta/-rc and the floating vX.Y alias — and take the
+            # highest by version order rather than by publish date.
+            TAGS=""
+            URL="https://hub.docker.com/v2/repositories/surrealdb/surrealdb/tags?page_size=100&name=v${LINE}."
+            for _ in $(seq 1 10); do
+              PAGE=$(curl -sSf --max-time 30 "$URL" || true)
+              [[ -z "$PAGE" ]] && break
+              TAGS+=$(printf '%s\n' "$(echo "$PAGE" | jq -r '.results[].name')")$'\n'
+              URL=$(echo "$PAGE" | jq -r '.next // empty')
+              [[ -z "$URL" ]] && break
+            done
+
+            LATEST_VERSION=$(printf '%s' "$TAGS" \
+              | { grep -E "^v${LINE}\.[0-9]+\.[0-9]+$" || true; } \
               | sed 's/^v//' \
               | sort -V \
               | tail -1)
@@ -172,7 +190,10 @@ jobs:
           if [[ "$HAS_UPDATE" == "true" ]]; then
             RELEASE=$(gh api "repos/surrealdb/surrealdb/releases/tags/v${LATEST_VERSION}" \
               --jq '{name, body}' 2>/dev/null || echo '{}')
-            RELEASE_TEXT=$(echo "$RELEASE" | jq -r '((.name // "") + " " + (.body // ""))' | head -c 5000)
+            RELEASE_TEXT=$(echo "$RELEASE" | jq -r '((.name // "") + " " + (.body // ""))' || true)
+            # Bash substring, not `head -c`: under `pipefail`, head closing the pipe early on
+            # a long release body SIGPIPEs jq (exit 141) and aborts the whole job.
+            RELEASE_TEXT="${RELEASE_TEXT:0:5000}"
 
             if echo "$RELEASE_TEXT" | grep -iqE "(security|vulnerability|CVE-[0-9]|critical.*(fix|patch)|exploit|injection|xss|csrf|hotfix)"; then
               IS_SECURITY_PATCH="true"
@@ -328,7 +349,11 @@ jobs:
           git add "$PIN_FILE" .github/workflows/ci.yml
 
           if git diff --staged --quiet; then
-            echo "No changes to commit"
+            # Reachable with force-update on an already-current pin. `exit 0` ends only this
+            # step, so flag it for the next one — otherwise it pushes a commit-less branch
+            # and `gh pr create` fails with "no commits between main and ...".
+            echo "No changes to commit — nothing to open a PR for."
+            echo "SKIP_PR=true" >> $GITHUB_ENV
             exit 0
           fi
 
@@ -339,6 +364,7 @@ jobs:
 
       - name: Push branch and create PR
         id: deps-pr
+        if: env.SKIP_PR != 'true'
         env:
           # PAT, not GITHUB_TOKEN: a PR opened by GITHUB_TOKEN does not trigger workflow
           # runs, so ci.yml would never run on it and auto-merge would wait forever on the
@@ -358,8 +384,12 @@ jobs:
             --head "$BRANCH" --state open --json number -q '.[0].number')
 
           if [[ -n "$EXISTING_PR" ]]; then
-            git fetch origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"
-            git push --force-with-lease="refs/heads/${BRANCH}" -u origin "$BRANCH"
+            # Pin the lease to the SHA observed right now. Fetching first and then leasing on
+            # the ref name would make the lease compare the remote against the ref we just
+            # fetched — always equal, so it degrades to a plain --force and silently discards
+            # any commit someone pushed onto the open monitor PR.
+            REMOTE_SHA=$(git ls-remote origin "refs/heads/${BRANCH}" | cut -f1)
+            git push --force-with-lease="refs/heads/${BRANCH}:${REMOTE_SHA}" -u origin "$BRANCH"
             echo "Updated existing PR #${EXISTING_PR} on $BRANCH"
             gh pr merge "$EXISTING_PR" --auto --squash || true
             echo "pr-number=${EXISTING_PR}" >> $GITHUB_OUTPUT
