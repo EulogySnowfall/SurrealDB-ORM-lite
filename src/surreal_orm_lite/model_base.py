@@ -2,7 +2,7 @@ import contextlib
 import functools
 import logging
 import typing
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from decimal import Decimal
 from typing import Any, Self
 
@@ -12,7 +12,7 @@ from pydantic_core import ValidationError
 from ._sdk import NotFoundError, RecordID, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
-from .functions import SurrealFunc
+from .functions import SurrealFunc, _ComputedDefault
 from .signals import (
     around_delete,
     around_save,
@@ -40,6 +40,23 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+def _own_annotation_names(cls: type) -> set[str]:
+    """Return the names annotated in **this** class's body, ignoring inherited ones.
+
+    Python 3.14 (PEP 649) evaluates annotations lazily, so they are no longer stored in
+    ``cls.__dict__["__annotations__"]`` by the time ``__init_subclass__`` runs — only an
+    ``__annotate_func__`` is. Reading the old location there silently yields ``{}``, which
+    would quietly disable any logic built on it. ``annotationlib`` is the supported accessor;
+    its ``STRING`` format returns the annotations unevaluated, so a forward reference can't
+    raise here.
+    """
+    try:
+        import annotationlib  # type: ignore[import-not-found]
+    except ImportError:  # Python < 3.14
+        return set(cls.__dict__.get("__annotations__", {}))
+    return set(annotationlib.get_annotations(cls, format=annotationlib.Format.STRING))
+
+
 class SurrealConfigDict(ConfigDict):
     """
     SurrealConfigDict is a configuration dictionary for SurrealDB models.
@@ -56,6 +73,131 @@ class BaseSurrealModel(BaseModel):
     """
     Base class for models interacting with SurrealDB.
     """
+
+    __surreal_computed__: typing.ClassVar[dict[str, str]] = {}
+    """Computed field name → SurrealQL expression, collected by ``__init_subclass__``."""
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        """Collect ``Computed(...)`` defaults before Pydantic builds the model.
+
+        Runs inside ``type.__new__``, i.e. before Pydantic's ``ModelMetaclass`` finishes
+        collecting fields — so replacing each sentinel with ``None`` here is what turns the
+        attribute into an ordinary nullable field with a ``None`` default.
+
+        Inherited expressions are merged first (bases in reverse MRO), then **this** class body
+        decides every name it re-annotates: redeclaring a field with a new ``Computed(...)``
+        overrides the parent's expression, and redeclaring it as an ordinary field demotes it
+        back to a normal writable column. Without that second rule the field would keep being
+        stripped from write payloads and rejected by the write guards, silently discarding the
+        subclass's data.
+        """
+        collected: dict[str, str] = {}
+        for base in reversed(cls.__mro__[1:]):
+            # Same rule as for this class body below, applied to every base: a base that
+            # re-annotates a name re-decides it. Merging the bases' verdicts alone would let
+            # an *ordinary* redeclaration in a sibling base be ignored — with
+            # ``class C(B, A)`` where ``B.x: str`` and ``A.x: Computed[str]``, Pydantic builds
+            # a writable ``x`` while the verdict still called it computed, so ``x`` was
+            # stripped from writes and ``merge(x=…)`` raised on a field the user owns.
+            for name in _own_annotation_names(base):
+                collected.pop(name, None)
+            collected.update(getattr(base, "__surreal_computed__", None) or {})
+        # A name this class re-annotates is re-decided below; drop the inherited verdict first.
+        for name in _own_annotation_names(cls):
+            collected.pop(name, None)
+        for name, value in list(vars(cls).items()):
+            if isinstance(value, _ComputedDefault):
+                collected[name] = value.expression
+                setattr(cls, name, None)
+        cls.__surreal_computed__ = collected
+        super().__init_subclass__(**kwargs)
+
+    @classmethod
+    def get_computed_fields(cls) -> dict[str, str]:
+        """Return ``{field_name: SurrealQL expression}`` for this model's computed fields.
+
+        Declaration order, inherited fields first — except a field a subclass *redeclares*,
+        which moves to the end (it is re-decided by the subclass body). Order only affects the
+        sequence of generated DDL statements, never evaluation: SurrealDB evaluates computed
+        fields alphabetically.
+
+        Returns a copy — this is the single source of truth every write path consults. ``{}``
+        for a model with no computed fields.
+        """
+        return dict(cls.__surreal_computed__)
+
+    @classmethod
+    def computed_field_ddl(cls, overwrite: bool = True) -> list[str]:
+        """Render the ``DEFINE FIELD … VALUE`` statements for this model's computed fields.
+
+        Pure: builds the SurrealQL and returns it without touching the database, so it can be
+        printed, diffed, or fed into a migration. One statement per computed field, in
+        declaration order; ``[]`` when the model has none.
+
+        Args:
+            overwrite: ``True`` (default) emits ``DEFINE FIELD OVERWRITE …`` — the model is the
+                source of truth, so re-running converges the database onto the code and an
+                edited expression takes effect. ``False`` emits ``DEFINE FIELD IF NOT EXISTS …``,
+                which never disturbs an existing definition.
+
+        Note:
+            No ``TYPE`` clause is emitted: SurrealDB infers an optional type from the
+            expression on both 2.6.x and 3.x. Explicit field types are a later roadmap item.
+        """
+        computed = cls.get_computed_fields()
+        if not computed:
+            return []
+        table = cls.get_table_name()
+        validate_alias_name(table)
+        clause = "OVERWRITE" if overwrite else "IF NOT EXISTS"
+        statements: list[str] = []
+        for name, expression in computed.items():
+            validate_alias_name(name)
+            statements.append(f"DEFINE FIELD {clause} {name} ON {table} VALUE {expression};")
+        return statements
+
+    @classmethod
+    async def define_computed_fields(
+        cls,
+        overwrite: bool = True,
+        tx: Transaction | None = None,
+    ) -> list[str]:
+        """Apply this model's computed-field definitions to the database.
+
+        Runs the statements from :meth:`computed_field_ddl` and returns them. Safe to call at
+        application start-up: with the default ``overwrite=True`` it is idempotent and
+        converges the database onto the model. A model with no computed fields is a no-op
+        returning ``[]``.
+
+        Statements are executed one per call so a failure can name the offending field. The
+        two server lines raise different SDK exceptions for a bad expression
+        (``InternalError`` on 2.6.x, ``ValidationError`` on 3.x — both ``ServerError``), so
+        both are normalised to :class:`SurrealDbError`.
+
+        Args:
+            overwrite: see :meth:`computed_field_ddl`.
+            tx: optional transaction the DDL is run in. On a buffered transaction (HTTP or
+                SurrealDB 2.6.x) the statements are deferred to commit, so an invalid
+                expression surfaces there rather than here.
+
+        Example:
+            >>> await Player.define_computed_fields()
+            ["DEFINE FIELD OVERWRITE full_name ON Player VALUE string::concat(...);"]
+        """
+        statements = cls.computed_field_ddl(overwrite=overwrite)
+        if not statements:
+            return []
+        # Cheap even inside a transaction: get_client() returns the already-connected client.
+        client = await SurrealDBConnectionManager.get_client()
+        for statement in statements:
+            try:
+                if tx is not None:
+                    await tx.add(statement, None)
+                else:
+                    await client.query(statement, {})
+            except ServerError as e:
+                raise SurrealDbError(f"Can't apply computed field definition: {statement} -> {e}") from e
+        return statements
 
     @classmethod
     def get_table_name(cls) -> str:
@@ -190,6 +332,86 @@ class BaseSurrealModel(BaseModel):
                 if hasattr(self, key):
                     object.__setattr__(self, key, value)
 
+    def _write_payload(self) -> dict[str, Any]:
+        """Return this instance's data for a write: no ``id``, no computed fields.
+
+        Computed fields are owned by the server (``DEFINE FIELD … VALUE``), so sending one is
+        at best wasted bytes: SurrealDB discards it in favour of the expression. It is worse
+        than wasted if the definition has not been applied yet — the value, typically ``None``,
+        would land and null the column. Every write path funnels through here so the exclusion
+        cannot drift between them.
+        """
+        return self.model_dump(exclude={"id", *self.get_computed_fields()})
+
+    @classmethod
+    def _reject_computed_writes(cls, fields: Iterable[str], context: str) -> None:
+        """Raise if ``fields`` names a computed field.
+
+        A computed field is set by ``DEFINE FIELD … VALUE``, and the server discards whatever a
+        client sends for it — so such a write is an invisible no-op. Raising turns it into an
+        error at the call site instead. Update the fields the expression reads.
+        """
+        computed = cls.get_computed_fields()
+        offenders = sorted(field for field in fields if field in computed)
+        if offenders:
+            raise ValueError(
+                f"{context}: {', '.join(offenders)} "
+                f"{'is a computed field' if len(offenders) == 1 else 'are computed fields'} "
+                f"on {cls.__name__}, set server-side by DEFINE FIELD … VALUE and not writable. "
+                "Update the fields the expression reads instead."
+            )
+
+    @classmethod
+    def _validate_atomic_field(cls, field: str) -> None:
+        """Validate an atomic-op target: a valid name, and not a computed field.
+
+        Dotted paths are legal here (``validate_field_name`` allows them for nested fields),
+        so the guard compares the **first** segment: a computed field is server-owned in full,
+        making ``tag_count.items`` no more writable than ``tag_count`` — the same rule the
+        patch guard applies to ``/tag_count/0``.
+        """
+        validate_field_name(field, "atomic field")
+        cls._reject_computed_writes([field.split(".", 1)[0]], "atomic operation")
+
+    @classmethod
+    def _reject_computed_patch(cls, operations: list[dict[str, Any]], context: str) -> None:
+        """Raise if a JSON Patch document writes a computed field.
+
+        ``patch()`` is a write like any other, so it gets the same guard as ``merge()`` —
+        without it, ``{"op": "replace", "path": "/full_name", …}`` would be accepted here and
+        silently dropped by the server, which is the exact invisible no-op this guard exists to
+        prevent.
+
+        Only the **top-level** pointer segment is checked: a computed field is server-owned in
+        full, so writing ``/full_name/0`` is no more legal than writing ``/full_name``. Both
+        ``path`` and — for ``move``, which removes its source — ``from`` count as writes;
+        ``copy`` only reads its ``from``.
+
+        The empty pointer ``""`` is RFC 6901's **whole document**, so it writes every field at
+        once and cannot be judged on its segment. It is judged on the keys of its ``value``
+        instead — replacing the document with an object that omits the computed fields is a
+        legitimate write, naming one is not.
+
+        Call **after** :func:`validate_patch_operations`, which guarantees the shape relied on
+        here.
+        """
+        targets: list[str] = []
+        for op in operations:
+            pointers = [op["path"]]
+            if op.get("op") == "move":
+                pointers.append(op["from"])
+            for pointer in pointers:
+                if pointer == "":
+                    value = op.get("value")
+                    # No inspectable value (e.g. ``remove`` on the whole document) — treat it
+                    # as touching everything the server owns.
+                    targets.extend([str(key) for key in value] if isinstance(value, dict) else cls.get_computed_fields())
+                    continue
+                segment = pointer.split("/")[1] if "/" in pointer else ""
+                # RFC 6901 escapes; field names never contain them, but decode before comparing.
+                targets.append(segment.replace("~1", "/").replace("~0", "~"))
+        cls._reject_computed_writes(targets, context)
+
     async def _do_save(self, tx: Transaction | None = None) -> tuple[Self, bool]:
         """Internal save logic. Returns (self, created).
 
@@ -198,12 +420,19 @@ class BaseSurrealModel(BaseModel):
         explicit record id.
         """
         record_id = self._record_id()
-        data = self.model_dump(exclude={"id"})
+        data = self._write_payload()
         table = self.get_table_name()
 
         if tx is not None:
             if record_id is not None:
-                await tx.add(f"CREATE {record_id} CONTENT $data;", {"data": data})
+                rows = await tx.add(f"CREATE {record_id} CONTENT $data;", {"data": data})
+                # An interactive transaction (3.x/WebSocket) answers with the created row, so
+                # hydrate the server-owned fields exactly as the non-tx path does. A buffered
+                # transaction defers the statement and has nothing to return yet — its
+                # computed fields stay None until the instance is refreshed after commit.
+                record = rows[0] if isinstance(rows, list) and rows else rows
+                if isinstance(record, dict):
+                    self._apply_record(record, only=self.get_computed_fields())
                 return self, True
             if not tx.is_interactive:
                 raise SurrealDbError(
@@ -227,11 +456,17 @@ class BaseSurrealModel(BaseModel):
             # ServerError, so catch the base and match on the message to stay
             # faithful to the original "already exists" contract across versions.
             try:
-                await client.create(record_id, data)
+                record = await client.create(record_id, data)
             except ServerError as e:
                 if "already exists" in str(e).lower():
                     raise SurrealDbError(f"There was a problem with the database: {e}") from e
                 raise
+            # Pull back the fields the SERVER owns — computed fields (DEFINE FIELD … VALUE) —
+            # so they are readable straight after save(). Deliberately narrow: applying the
+            # whole row here would bypass Pydantic validation for every field (see
+            # _apply_record), turning nested models into plain dicts. A model with no computed
+            # fields is untouched, exactly as before v0.14.0.
+            self._apply_record(record, only=self.get_computed_fields())
             return self, True
 
         # Auto-generate the ID
@@ -288,7 +523,7 @@ class BaseSurrealModel(BaseModel):
         and 3.1.3), hence the full clause rather than a hybrid.
         """
         record_id = self._record_id()
-        merged: dict[str, Any] = {**self.model_dump(exclude={"id"}), **(server_values or {})}
+        merged: dict[str, Any] = {**self._write_payload(), **(server_values or {})}
         clause, variables = build_set_clause(merged)
 
         if record_id is not None:
@@ -368,25 +603,40 @@ class BaseSurrealModel(BaseModel):
         """
         self._validate_server_values(server_values, extra_vars)
         if server_values:
+            self._reject_computed_writes(server_values, "save(server_values=)")
             do_op = functools.partial(self._do_save_server, server_values=server_values, extra_vars=extra_vars)
             return await self._save_with_signals(do_op, tx)
         return await self._save_with_signals(self._do_save, tx)
 
-    def _apply_record(self, record: Any) -> None:
+    def _apply_record(self, record: Any, only: Iterable[str] | None = None) -> None:
         """Copy a returned DB row's fields onto this instance (id kept as native ``RecordID``).
 
         Accepts the raw SDK result (a row dict, a single-element list, or ``None``) and applies
         only attributes the model actually declares. Shared by every write path that gets a row
-        back (``_do_upsert``, ``patch``, the atomic helpers, the ``server_values`` paths) so the
-        "apply the row the server gave back" step lives in one place. A ``None``/empty result is
-        a no-op — callers that must distinguish "no row" from "nothing to apply" check first.
+        back (``_do_save``, ``_do_upsert``, ``patch``, the atomic helpers, the ``server_values``
+        paths) so the "apply the row the server gave back" step lives in one place. A
+        ``None``/empty result is a no-op — callers that must distinguish "no row" from "nothing
+        to apply" check first.
+
+        Values are written with ``object.__setattr__``, i.e. **without** Pydantic validation, so
+        a nested model arrives as the raw ``dict`` the server sent. That is why ``only`` exists:
+        a caller that needs just a few known-scalar fields should say so rather than re-applying
+        the whole row.
+
+        Args:
+            only: restrict the copy to these field names. ``None`` (default) applies every field
+                in the row.
         """
         if isinstance(record, list):
             record = record[0] if record else None
-        if isinstance(record, dict):
-            for key, value in record.items():
-                if hasattr(self, key):
-                    object.__setattr__(self, key, value)
+        if not isinstance(record, dict):
+            return
+        allowed = None if only is None else set(only)
+        for key, value in record.items():
+            if allowed is not None and key not in allowed:
+                continue
+            if hasattr(self, key):
+                object.__setattr__(self, key, value)
 
     async def _run_update_returning_row(self, statement: str, variables: dict[str, Any]) -> None:
         """Run an ``UPDATE`` and apply its row, raising a uniform error when it matched nothing.
@@ -459,7 +709,7 @@ class BaseSurrealModel(BaseModel):
                 "upsert() requires an explicit id (there is nothing to match without one); "
                 "use save() to create a record with an auto-generated id."
             )
-        data = self.model_dump(exclude={"id"})
+        data = self._write_payload()
 
         if tx is not None:
             rows = await tx.add(f"UPSERT {record_id} CONTENT $data;", {"data": data})
@@ -499,7 +749,7 @@ class BaseSurrealModel(BaseModel):
         ``post_update`` only fires after a successful commit.
         """
         sender = self.__class__
-        data = self.model_dump(exclude={"id"})
+        data = self._write_payload()
         record_id = self._record_id()
         if record_id is None:
             raise SurrealDbError("Can't update data, no id found.")
@@ -634,8 +884,10 @@ class BaseSurrealModel(BaseModel):
         Example:
             >>> await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
         """
+        self._reject_computed_writes(data, "merge()")
         self._validate_server_values(server_values, extra_vars)
         if server_values:
+            self._reject_computed_writes(server_values, "merge(server_values=)")
             return await self._merge_server(tx, server_values, extra_vars, data)
 
         sender = self.__class__
@@ -696,6 +948,7 @@ class BaseSurrealModel(BaseModel):
         ``operations`` is validated then bound as data, never string-interpolated.
         """
         validate_patch_operations(operations)
+        self._reject_computed_patch(operations, "patch()")
         record_id = self._record_id()
         if record_id is None:
             raise SurrealDbError("patch() requires an explicit id (there is nothing to patch without one).")
@@ -736,7 +989,7 @@ class BaseSurrealModel(BaseModel):
         Compiled to ``array::append`` — identical on SurrealDB 2.6.x and 3.x. For set
         semantics (skip if already present) use :meth:`atomic_set_add`. Emits no signals.
         """
-        validate_field_name(field, "atomic field")
+        self._validate_atomic_field(field)
         return await self._atomic_update(f"{field} = array::append({field}, $value)", {"value": value}, tx)
 
     async def atomic_remove(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
@@ -746,7 +999,7 @@ class BaseSurrealModel(BaseModel):
         3.x. (The ``-=`` operator is deliberately NOT used: it removes all occurrences on 3.x
         but only the first on 2.6.x.) Emits no signals.
         """
-        validate_field_name(field, "atomic field")
+        self._validate_atomic_field(field)
         return await self._atomic_update(f"{field} = array::complement({field}, [$value])", {"value": value}, tx)
 
     async def atomic_set_add(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
@@ -755,7 +1008,7 @@ class BaseSurrealModel(BaseModel):
         Compiled to ``array::add`` (set semantics) — identical on 2.6.x and 3.x. (NOT the
         ``+=`` operator, which appends duplicates on both server lines.) Emits no signals.
         """
-        validate_field_name(field, "atomic field")
+        self._validate_atomic_field(field)
         return await self._atomic_update(f"{field} = array::add({field}, $value)", {"value": value}, tx)
 
     async def atomic_increment(self, field: str, amount: Decimal | int | float = 1, tx: Transaction | None = None) -> Self:
@@ -766,7 +1019,7 @@ class BaseSurrealModel(BaseModel):
         (the value is bound, not interpolated); adding a ``Decimal`` to an int/float field
         coerces the stored field to SurrealDB ``decimal``. Emits no signals.
         """
-        validate_field_name(field, "atomic field")
+        self._validate_atomic_field(field)
         return await self._atomic_update(f"{field} += $amount", {"amount": amount}, tx)
 
     @staticmethod
@@ -786,7 +1039,7 @@ class BaseSurrealModel(BaseModel):
         single element) — identical on 2.6.x and 3.x. An empty ``values`` is a safe no-op.
         Emits no signals.
         """
-        validate_field_name(field, "atomic field")
+        self._validate_atomic_field(field)
         return await self._atomic_update(
             f"{field} = array::concat({field}, $values)", {"values": self._as_value_list(values)}, tx
         )
@@ -798,7 +1051,7 @@ class BaseSurrealModel(BaseModel):
         ``values`` are also collapsed). Compiled to ``array::add`` — identical on 2.6.x and 3.x.
         An empty ``values`` is a safe no-op. Emits no signals.
         """
-        validate_field_name(field, "atomic field")
+        self._validate_atomic_field(field)
         return await self._atomic_update(f"{field} = array::add({field}, $values)", {"values": self._as_value_list(values)}, tx)
 
     async def atomic_remove_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
@@ -807,7 +1060,7 @@ class BaseSurrealModel(BaseModel):
         The list-valued counterpart of :meth:`atomic_remove`. Compiled to ``array::complement``
         — identical on 2.6.x and 3.x. An empty ``values`` is a safe no-op. Emits no signals.
         """
-        validate_field_name(field, "atomic field")
+        self._validate_atomic_field(field)
         return await self._atomic_update(
             f"{field} = array::complement({field}, $values)", {"values": self._as_value_list(values)}, tx
         )

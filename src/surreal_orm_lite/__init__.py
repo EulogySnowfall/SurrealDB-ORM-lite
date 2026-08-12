@@ -1,4 +1,4 @@
-__version__ = "0.13.3"
+__version__ = "0.14.0"
 
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
 from .concurrency import is_conflict_error, retry_on_conflict
@@ -13,6 +13,7 @@ from .exceptions import (
     SurrealORMError,
 )
 from .functions import (
+    Computed,
     SurrealArrayFunction,
     SurrealCryptoFunction,
     SurrealFunc,
@@ -21,6 +22,7 @@ from .functions import (
     SurrealRandFunction,
     SurrealStringFunction,
     SurrealTimeFunction,
+    computed,
 )
 from .model_base import BaseSurrealModel, SurrealConfigDict
 from .q import Q
@@ -77,6 +79,8 @@ __all__ = [
     "retry_on_conflict",
     "is_conflict_error",
     # Server-side functions
+    "Computed",
+    "computed",
     "SurrealFunc",
     "SurrealFunction",
     "SurrealTimeFunction",

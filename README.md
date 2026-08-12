@@ -1,7 +1,7 @@
 # Surreal ORM Lite
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![SurrealDB](https://img.shields.io/badge/SurrealDB-2.6.5%20%7C%203.1.3-purple)
+![SurrealDB](https://img.shields.io/badge/SurrealDB-2.6.5%20%7C%203.2.3-purple)
 ![SDK](https://img.shields.io/badge/SDK-Official%202.0-green)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![codecov](https://codecov.io/gh/EulogySnowfall/SurrealDB-ORM-lite/graph/badge.svg)](https://codecov.io/gh/EulogySnowfall/SurrealDB-ORM-lite)
@@ -24,11 +24,11 @@ This ORM is designed to:
 | Dependency   | Version                           |
 | ------------ | --------------------------------- |
 | Python       | 3.11+                             |
-| SurrealDB    | 2.6.x or 3.1.x                    |
+| SurrealDB    | 2.6.x or 3.2.x                    |
 | Official SDK | surrealdb[pydantic]>=2.0.0,<3.0.0 |
 | Pydantic     | >=2.13.4                          |
 
-> **Note**: As of v0.7.0, Surreal ORM Lite targets the SurrealDB Python SDK 2.x (`surrealdb[pydantic]>=2.0.0,<3.0.0`), which supports the SurrealDB 3.x protocol. It is tested against SurrealDB **v2.6.5** and **v3.1.3**.
+> **Note**: As of v0.7.0, Surreal ORM Lite targets the SurrealDB Python SDK 2.x (`surrealdb[pydantic]>=2.0.0,<3.0.0`), which supports the SurrealDB 3.x protocol. It is tested against SurrealDB **v2.6.5** and **v3.2.3**. SurrealDB 3.1.x is no longer a supported line as of v0.14.0 — the suite is still run against 3.1.5 as a backward-compatibility check, but a regression there does not block a release.
 
 ---
 
@@ -158,6 +158,7 @@ results = await User.objects().query(
 | patch / atomic ops     | ✅     |
 | Retry on conflict      | ✅     |
 | Server-side functions  | ✅     |
+| Computed fields        | ✅     |
 
 ### Supported Filter Lookups
 
@@ -523,7 +524,7 @@ await user.merge(plan="pro", server_values={"updated_at": SurrealFunc.call(Surre
 
 `SurrealFunc.call(fn, *args)` builds `fn(arg, …)` from a function name — a plain string or a
 member of the shipped enums, which give you autocompletion over a **curated catalog whose every
-member is tested against both SurrealDB 2.6.5 and 3.1.3**:
+member is tested against SurrealDB 2.6.5 and 3.2.3**:
 
 | Enum                    | Covers                                                           |
 | ----------------------- | ---------------------------------------------------------------- |
@@ -547,6 +548,70 @@ any expression.
 Both calls behave **identically on SurrealDB 2.6.x and 3.x**. Inside a transaction the usual
 v0.9.0 rules apply: on a buffered transaction (HTTP / 2.6.x) the computed value is unknown until
 commit, so the instance keeps its previous value for that field until you `refresh()`.
+
+---
+
+### 16. Computed fields: `Computed[...]` → `DEFINE FIELD … VALUE`
+
+`server_values=` computes a value for **one write**. A `Computed` field attaches the expression
+to the **schema** instead, so SurrealDB recomputes it on _every_ write to the table — including
+writes that never go through the ORM:
+
+```python
+from surreal_orm_lite import BaseSurrealModel, Computed, computed
+
+class Player(BaseSurrealModel):
+    id: str
+    first_name: str
+    last_name: str
+    full_name: Computed[str] = computed("string::concat(first_name, ' ', last_name)")
+    initials: Computed[str] = computed("string::uppercase(string::slice(first_name, 0, 1))")
+
+await Player.define_computed_fields()   # DEFINE FIELD OVERWRITE full_name ON Player VALUE …
+
+player = await Player(id="ada", first_name="Ada", last_name="Lovelace").save()
+player.full_name        # "Ada Lovelace" — computed by the server, not by Python
+```
+
+`Computed[T]` is the annotation and makes the field `T | None` defaulting to `None`, so an
+instance is constructible before the server has ever computed it; `computed("<expr>")` is the
+default and carries the expression, which may be a plain string or a `SurrealFunc`. The two are
+split — rather than one dual-use name — so that `player.full_name` resolves to `str | None`
+under mypy and pyright, the same shape as SQLAlchemy's `Mapped[T] = mapped_column(...)`.
+
+**Applying the schema.** `define_computed_fields()` is idempotent — call it at start-up:
+
+```python
+Player.computed_field_ddl()             # the statements, without touching the DB
+await Player.define_computed_fields()                  # DEFINE FIELD OVERWRITE … (default)
+await Player.define_computed_fields(overwrite=False)   # DEFINE FIELD IF NOT EXISTS …
+```
+
+The default `OVERWRITE` treats the model as the source of truth, so editing an expression and
+redeploying takes effect. `overwrite=False` never disturbs a definition that already exists.
+
+**The field is server-owned.** It is dropped from every write payload, and naming it in a write
+raises rather than being silently discarded:
+
+```python
+await player.merge(last_name="Byron")       # ✅ full_name recomputes to "Ada Byron"
+await player.merge(full_name="whatever")    # ❌ ValueError: full_name is a computed field …
+```
+
+The same guard applies to `save(server_values=)`, `patch()`, `QuerySet.patch()`,
+`QuerySet.bulk_update()` and the `atomic_*` helpers. A JSON Patch is checked on its top-level
+pointer segment, so `/full_name` and `/full_name/0` are both refused. This is genuinely enforced by SurrealDB, not just by the ORM — a client that bypasses
+ORM-lite entirely and writes `full_name` directly still gets the expression's result.
+
+> **Ordering caveat**: SurrealDB evaluates computed fields in **alphabetical field-name order**,
+> not declaration order. A computed field that reads another must sort after it — `subtotal` →
+> `total` works, but `z_sub` → `a_total` fails at write time.
+>
+> **Security**: like `SurrealFunc`, the expression is inlined verbatim into DDL and cannot
+> reference bound parameters. Build it only from developer-controlled text, never user input.
+
+No `TYPE` clause is emitted — SurrealDB infers an optional type on both server lines. Behaviour
+is **identical on SurrealDB 2.6.x and 3.x**.
 
 ---
 
@@ -579,14 +644,15 @@ async with SurrealDBConnectionManager():
 
 As of v0.7.0, Surreal ORM Lite uses `surrealdb[pydantic]>=2.0.0,<3.0.0` (SurrealDB 3.x protocol) and is tested against both major SurrealDB release lines.
 
-**Compatibility advantage over the full ORM**: ORM-lite runs on **both** SurrealDB **2.6.x and 3.1**, while the full [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/) (custom SDK) targets **3.x only**. Lite stays usable on existing 2.6.x deployments without forcing a server upgrade.
+**Compatibility advantage over the full ORM**: ORM-lite runs on **both** SurrealDB **2.6.x and 3.2.x**, while the full [SurrealDB-ORM](https://github.com/EulogySnowfall/SurrealDB-ORM/) (custom SDK) targets **3.x only**. Lite stays usable on existing 2.6.x deployments without forcing a server upgrade.
 
-| SurrealDB Version | SDK Version | Status            |
-| ----------------- | ----------- | ----------------- |
-| 3.1.3             | 2.0         | ✅ Tested         |
-| 2.6.5             | 2.0         | ✅ Tested         |
-| 2.6.x             | 2.0         | ✅ Compatible     |
-| < 2.6 or > 3.1    | —           | ⚠️ Not guaranteed |
+| SurrealDB Version | SDK Version | Status                  |
+| ----------------- | ----------- | ----------------------- |
+| 3.2.3             | 2.0         | ✅ Tested               |
+| 2.6.5             | 2.0         | ✅ Tested               |
+| 3.2.x / 2.6.x     | 2.0         | ✅ Compatible           |
+| 3.1.5             | 2.0         | ⚠️ Backward-compat only |
+| < 2.6 or > 3.2    | —           | ⚠️ Not guaranteed       |
 
 ### ORM behaviour: SurrealDB 2.6.x vs 3.x
 
@@ -594,7 +660,7 @@ Surreal ORM Lite runs on both lines; some capabilities differ because they rely 
 features introduced in SurrealDB 3.x. On 2.6.x the ORM degrades gracefully. Capabilities not
 listed behave the same on both lines.
 
-| ORM capability                                                                        | SurrealDB 2.6.x                                                              | SurrealDB 3.x (3.1.3)                                                    | Since   |
+| ORM capability                                                                        | SurrealDB 2.6.x                                                              | SurrealDB 3.2.x                                                          | Since   |
 | ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------ | ------- |
 | Transaction strategy auto-selected by `transaction()`                                 | buffered batch (`BEGIN…COMMIT`)                                              | native interactive on WebSocket                                          | v0.9.0  |
 | Reads inside a transaction (`objects(tx=)`)                                           | raise (buffered cannot read)                                                 | see uncommitted writes                                                   | v0.9.0  |
@@ -609,9 +675,13 @@ listed behave the same on both lines.
 | `patch()` / `atomic_append` / `atomic_set_add` / `atomic_remove` / `atomic_increment` | same on both lines (portable `array::*` fns chosen over divergent `+=`/`-=`) | same on both lines                                                       | v0.11.0 |
 | `retry_on_conflict` / `SurrealDbConflictError` (retryable conflict)                   | same type + decorator; conflicts rarer (engine serialises more)              | same type + decorator; conflicts are the normal optimistic-MVCC failure  | v0.12.0 |
 | `SurrealFunc` / `server_values=` / `extra_vars=` on `save`/`merge`                    | same on both lines (compiled to portable `CREATE`/`UPDATE … SET`)            | same on both lines                                                       | v0.13.0 |
-| Shipped function-name enums (`SurrealTimeFunction`, `SurrealCryptoFunction`, …)       | every catalogued member verified on 2.6.5                                    | every catalogued member verified on 3.1.3                                | v0.13.0 |
+| Shipped function-name enums (`SurrealTimeFunction`, `SurrealCryptoFunction`, …)       | every catalogued member verified on 2.6.5                                    | every catalogued member verified on 3.2.3                                | v0.13.0 |
 | `server_values` inside a transaction — when the instance sees the computed value      | only after commit (buffered; `refresh()` to read it)                         | immediately (interactive returns the row)                                | v0.13.0 |
 | `merge(server_values=)` on a missing record / never-created table                     | server returns no rows → ORM raises `SurrealDbError`                         | server raises `NotFound` for a missing table → ORM raises the same error | v0.13.0 |
+| Computed fields (`Computed[...]` → `DEFINE FIELD … VALUE`)                            | same on both lines (DDL, recompute triggers, precedence over client data)    | same on both lines                                                       | v0.14.0 |
+| DDL run inside a transaction, then rolled back                                        | definition rolled back with the transaction                                  | same on both lines                                                       | v0.14.0 |
+| Invalid computed-field expression — raw SDK exception                                 | `InternalError`                                                              | `ValidationError`                                                        | v0.14.0 |
+| Invalid computed-field expression — through the ORM                                   | `SurrealDbError` (normalised)                                                | `SurrealDbError` (normalised)                                            | v0.14.0 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
 
@@ -640,7 +710,8 @@ Contributions are welcome! Please:
 | v0.11.0           | patch / atomic field & array ops                 | ✅ Released |
 | v0.12.0           | retry_on_conflict & optimistic concurrency       | ✅ Released |
 | v0.13.0           | SurrealFunc & server-side values                 | ✅ Released |
-| v0.14.0 – v0.22.0 | Tier 1 — Core (computed, auth, live, relations)  | 📋 Planned  |
+| v0.14.0           | Computed fields (`DEFINE FIELD … VALUE`)         | ✅ Released |
+| v0.15.0 – v0.22.0 | Tier 1 — Core (auth, live, relations)            | 📋 Planned  |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)  | 📋 Planned  |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI) | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)               | 📋 Planned  |
@@ -664,7 +735,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 
 | Feature                       | ORM-lite (official SDK) | ORM (custom SDK) |
 | ----------------------------- | ----------------------- | ---------------- |
-| Supported SurrealDB           | **2.6.x + 3.1**         | 3.x only         |
+| Supported SurrealDB           | **2.6.x + 3.2.x**       | 3.x only         |
 | CRUD & QuerySet               | ✅                      | ✅               |
 | Aggregations & GROUP BY       | ✅                      | ✅               |
 | Model Signals                 | ✅                      | ✅               |
@@ -679,7 +750,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Atomic field/array operations | ✅ v0.11.0              | ✅               |
 | Retry on conflict             | ✅ v0.12.0              | ✅               |
 | SurrealFunc & server values   | ✅ v0.13.0              | ✅               |
-| Computed fields               | v0.14.0                 | ✅               |
+| Computed fields               | ✅ v0.14.0              | ✅               |
 | JWT Authentication            | v0.16 – v0.17           | ✅               |
 | Field Aliases & DX            | v0.18.0                 | ✅               |
 | Live Models / CDC             | v0.19 – v0.21           | ✅               |
@@ -701,7 +772,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Custom SDK / CBOR Protocol    | ❌ never                | ✅               |
 
 **Choose ORM-lite** if you want the official SDK, minimal dependencies, support for SurrealDB
-2.6.x **and** 3.1, and a full feature roadmap built entirely on the official SDK.
+2.6.x **and** 3.2.x, and a full feature roadmap built entirely on the official SDK.
 
 **Choose ORM** if you need the custom-SDK internals (CBOR protocol, native connection pool)
 or those features available today rather than on the roadmap.
