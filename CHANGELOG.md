@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **SurrealDB pinned to 3.2.4** (was 3.2.3) on the primary line; the CI matrix now runs
+  `v2.6.5` and `v3.2.4`. Detected and validated by the new 3.x version monitor rather than by
+  hand — the full suite passes against 3.2.4 on Python 3.11 → 3.14.
+
+### Fixed
+
+- **The SurrealDB version monitors work again, and now cover both lines.** The 2.x monitor had
+  failed on every scheduled run for seven weeks: it read the primary pin, compared it to the
+  latest 2.x release, and so proposed a downgrade every day — wedging permanently on the
+  branch left behind by the first attempt. It now reads `.surrealdb-version2x`, compares
+  version-aware, refuses to emit a downgrade, and recovers from a stale branch.
+- **Security patches can actually be released.** The ORM version bump rode in the same PR as
+  the SurrealDB update, so the squash landed under a `security(deps):` title and `auto-tag`
+  never fired — the bump reached `main` and was never published. It is now a separate
+  `chore(release):` PR, as the Dependabot flow already did.
+- **The 3.x line is monitored at all.** Only the legacy 2.x line was watched, so 3.2.1 through
+  3.2.4 shipped unnoticed. The new monitor resolves from Docker Hub, because SurrealDB
+  publishes 3.x patches as images without a matching GitHub release (the releases API stops at
+  v3.2.0 while Docker Hub carries v3.2.4).
+
 ## [0.14.0] - 2026-07-26
 
 ### Added

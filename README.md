@@ -1,7 +1,7 @@
 # Surreal ORM Lite
 
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
-![SurrealDB](https://img.shields.io/badge/SurrealDB-2.6.5%20%7C%203.2.3-purple)
+![SurrealDB](https://img.shields.io/badge/SurrealDB-2.6.5%20%7C%203.2.4-purple)
 ![SDK](https://img.shields.io/badge/SDK-Official%202.0-green)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![codecov](https://codecov.io/gh/EulogySnowfall/SurrealDB-ORM-lite/graph/badge.svg)](https://codecov.io/gh/EulogySnowfall/SurrealDB-ORM-lite)
@@ -28,7 +28,7 @@ This ORM is designed to:
 | Official SDK | surrealdb[pydantic]>=2.0.0,<3.0.0 |
 | Pydantic     | >=2.13.4                          |
 
-> **Note**: As of v0.7.0, Surreal ORM Lite targets the SurrealDB Python SDK 2.x (`surrealdb[pydantic]>=2.0.0,<3.0.0`), which supports the SurrealDB 3.x protocol. It is tested against SurrealDB **v2.6.5** and **v3.2.3**. SurrealDB 3.1.x is no longer a supported line as of v0.14.0 — the suite is still run against 3.1.5 as a backward-compatibility check, but a regression there does not block a release.
+> **Note**: As of v0.7.0, Surreal ORM Lite targets the SurrealDB Python SDK 2.x (`surrealdb[pydantic]>=2.0.0,<3.0.0`), which supports the SurrealDB 3.x protocol. It is tested against SurrealDB **v2.6.5** and **v3.2.4**. SurrealDB 3.1.x is no longer a supported line as of v0.14.0 — the suite is still run against 3.1.5 as a backward-compatibility check, but a regression there does not block a release.
 
 ---
 
@@ -524,7 +524,7 @@ await user.merge(plan="pro", server_values={"updated_at": SurrealFunc.call(Surre
 
 `SurrealFunc.call(fn, *args)` builds `fn(arg, …)` from a function name — a plain string or a
 member of the shipped enums, which give you autocompletion over a **curated catalog whose every
-member is tested against SurrealDB 2.6.5 and 3.2.3**:
+member is tested against SurrealDB 2.6.5 and 3.2.4**:
 
 | Enum                    | Covers                                                           |
 | ----------------------- | ---------------------------------------------------------------- |
@@ -648,7 +648,7 @@ As of v0.7.0, Surreal ORM Lite uses `surrealdb[pydantic]>=2.0.0,<3.0.0` (Surreal
 
 | SurrealDB Version | SDK Version | Status                  |
 | ----------------- | ----------- | ----------------------- |
-| 3.2.3             | 2.0         | ✅ Tested               |
+| 3.2.4             | 2.0         | ✅ Tested               |
 | 2.6.5             | 2.0         | ✅ Tested               |
 | 3.2.x / 2.6.x     | 2.0         | ✅ Compatible           |
 | 3.1.5             | 2.0         | ⚠️ Backward-compat only |
@@ -675,7 +675,7 @@ listed behave the same on both lines.
 | `patch()` / `atomic_append` / `atomic_set_add` / `atomic_remove` / `atomic_increment` | same on both lines (portable `array::*` fns chosen over divergent `+=`/`-=`) | same on both lines                                                       | v0.11.0 |
 | `retry_on_conflict` / `SurrealDbConflictError` (retryable conflict)                   | same type + decorator; conflicts rarer (engine serialises more)              | same type + decorator; conflicts are the normal optimistic-MVCC failure  | v0.12.0 |
 | `SurrealFunc` / `server_values=` / `extra_vars=` on `save`/`merge`                    | same on both lines (compiled to portable `CREATE`/`UPDATE … SET`)            | same on both lines                                                       | v0.13.0 |
-| Shipped function-name enums (`SurrealTimeFunction`, `SurrealCryptoFunction`, …)       | every catalogued member verified on 2.6.5                                    | every catalogued member verified on 3.2.3                                | v0.13.0 |
+| Shipped function-name enums (`SurrealTimeFunction`, `SurrealCryptoFunction`, …)       | every catalogued member verified on 2.6.5                                    | every catalogued member verified on 3.2.4                                | v0.13.0 |
 | `server_values` inside a transaction — when the instance sees the computed value      | only after commit (buffered; `refresh()` to read it)                         | immediately (interactive returns the row)                                | v0.13.0 |
 | `merge(server_values=)` on a missing record / never-created table                     | server returns no rows → ORM raises `SurrealDbError`                         | server raises `NotFound` for a missing table → ORM raises the same error | v0.13.0 |
 | Computed fields (`Computed[...]` → `DEFINE FIELD … VALUE`)                            | same on both lines (DDL, recompute triggers, precedence over client data)    | same on both lines                                                       | v0.14.0 |
