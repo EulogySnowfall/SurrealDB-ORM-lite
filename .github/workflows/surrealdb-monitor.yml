@@ -44,6 +44,14 @@ on:
         type: boolean
         default: false
 
+# One monitor at a time, across both lines. Each line's auto-update branches off main and
+# rewrites the SAME ci.yml matrix line, so a 2.x and a 3.x update in flight together produce
+# two PRs that conflict on merge — and auto-merge then wedges on both. Serialising the whole
+# monitor is enough: the second line simply picks up the first's result on its next run.
+concurrency:
+  group: surrealdb-monitor
+  cancel-in-progress: false
+
 env:
   SURREALDB_HOST: localhost
   SURREALDB_PORT: 8000
@@ -115,14 +123,25 @@ jobs:
             # tags — dropping -dev/-beta/-rc and the floating vX.Y alias — and take the
             # highest by version order rather than by publish date.
             TAGS=""
+            PAGES_OK=0
             URL="https://hub.docker.com/v2/repositories/surrealdb/surrealdb/tags?page_size=100&name=v${LINE}."
             for _ in $(seq 1 10); do
               PAGE=$(curl -sSf --max-time 30 "$URL" || true)
               [[ -z "$PAGE" ]] && break
+              PAGES_OK=$((PAGES_OK + 1))
               TAGS+=$(printf '%s\n' "$(echo "$PAGE" | jq -r '.results[].name')")$'\n'
               URL=$(echo "$PAGE" | jq -r '.next // empty')
               [[ -z "$URL" ]] && break
             done
+
+            # Never let an unreachable registry look like "you are up to date". Resolving to
+            # nothing would set has-update=false and end the run green, and the primary line
+            # would quietly stop being monitored — the exact silent-failure mode this whole
+            # workflow exists to prevent. Fail visibly instead.
+            if [[ "$PAGES_OK" -eq 0 ]]; then
+              echo "ERROR: could not reach Docker Hub — no tag page was retrieved." >&2
+              exit 1
+            fi
 
             LATEST_VERSION=$(printf '%s' "$TAGS" \
               | { grep -E "^v${LINE}\.[0-9]+\.[0-9]+$" || true; } \
@@ -384,12 +403,20 @@ jobs:
             --head "$BRANCH" --state open --json number -q '.[0].number')
 
           if [[ -n "$EXISTING_PR" ]]; then
-            # Pin the lease to the SHA observed right now. Fetching first and then leasing on
-            # the ref name would make the lease compare the remote against the ref we just
-            # fetched — always equal, so it degrades to a plain --force and silently discards
-            # any commit someone pushed onto the open monitor PR.
-            REMOTE_SHA=$(git ls-remote origin "refs/heads/${BRANCH}" | cut -f1)
-            git push --force-with-lease="refs/heads/${BRANCH}:${REMOTE_SHA}" -u origin "$BRANCH"
+            # No lease can help here: the branch is rebuilt from main every run, so its
+            # remote tip is always "unexpected" and any lease read moments before the push
+            # is trivially satisfied. Check ownership instead — if the tip is not a monitor
+            # commit, a human has pushed onto the PR and force-pushing would destroy it.
+            git fetch origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"
+            TIP_AUTHOR=$(git log -1 --format='%ae' "refs/remotes/origin/${BRANCH}")
+
+            if [[ "$TIP_AUTHOR" != "github-actions[bot]@users.noreply.github.com" ]]; then
+              echo "PR #${EXISTING_PR} carries a commit by ${TIP_AUTHOR} — refusing to" >&2
+              echo "force-push over it. Resolve that PR, then re-run the monitor." >&2
+              exit 1
+            fi
+
+            git push --force origin "$BRANCH"
             echo "Updated existing PR #${EXISTING_PR} on $BRANCH"
             gh pr merge "$EXISTING_PR" --auto --squash || true
             echo "pr-number=${EXISTING_PR}" >> $GITHUB_OUTPUT
@@ -464,7 +491,10 @@ jobs:
             exit 0
           fi
 
-          for _ in $(seq 1 30); do
+          # 60 minutes. The full CI matrix is 8 jobs plus CodeQL, and auto-merge only fires
+          # once every required check reports; a timeout here means the security bump PR is
+          # never opened, so the patch never gets tagged or published.
+          for _ in $(seq 1 60); do
             STATE=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state -q '.state')
             if [[ "$STATE" == "MERGED" ]]; then
               echo "PR #${PR_NUMBER} merged."
@@ -480,8 +510,12 @@ jobs:
             sleep 60
           done
 
-          echo "PR #${PR_NUMBER} did not merge in time — release skipped."
+          # Fail rather than end green: a security patch sitting on main un-released is
+          # exactly the state nobody notices.
+          echo "ERROR: PR #${PR_NUMBER} did not merge within 60 minutes." >&2
+          echo "The security bump was NOT opened — merge that PR, then re-run this job." >&2
           echo "merged=false" >> $GITHUB_OUTPUT
+          exit 1
 
       - name: Checkout main after merge
         if: steps.wait-merge.outputs.merged == 'true'

@@ -1,8 +1,11 @@
 # SurrealDB 3.X Version Monitor — the primary supported line.
 #
 # Pinned in .surrealdb-version. Until now only the legacy 2.x line was watched, so every 3.x
-# patch went unnoticed: 3.2.1 through 3.2.4 shipped while the repo stayed on 3.2.3 with no
-# signal at all.
+# patch went unnoticed — 3.2.1 through 3.2.4 all shipped without a single signal.
+#
+# Its first run will therefore propose a jump of several versions at once, not the usual
+# single patch. Check that README's compatibility table and CHANGELOG follow that PR; the
+# monitor updates the pin and the CI matrix, nothing else.
 #
 # Resolves versions from Docker Hub rather than GitHub releases, because SurrealDB publishes
 # 3.x patches as images WITHOUT a matching release — as of 2026-08 the releases API stops at
