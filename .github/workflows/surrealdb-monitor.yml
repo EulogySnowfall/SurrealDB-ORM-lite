@@ -365,7 +365,14 @@ jobs:
           fi
           sed -i -E "s/'v${LINE}\.[0-9]+\.[0-9]+'/'${DOCKER_TAG}'/" .github/workflows/ci.yml
 
-          git add "$PIN_FILE" .github/workflows/ci.yml
+          # Carry the prose along. Without this the README kept advertising the previous
+          # version after every unattended bump — the badge is the first thing a reader sees,
+          # and the PR auto-merges, so nobody catches it. ci.yml lints this, so a drifted PR
+          # would fail its own CI and never merge anyway.
+          # python3, not python: this job has no setup-python. The script is stdlib-only.
+          python3 scripts/sync_surrealdb_pins.py --fix
+
+          git add "$PIN_FILE" .github/workflows/ci.yml README.md docs/ROADMAP.md
 
           if git diff --staged --quiet; then
             # Reachable with force-update on an already-current pin. `exit 0` ends only this

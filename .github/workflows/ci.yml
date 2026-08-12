@@ -39,6 +39,11 @@ jobs:
           # makes mypy resolve two modules to the same name.
           uv run mypy tests/typing_examples.py
 
+      # The version monitors bump the pin files unattended and auto-merge, but only ever touch
+      # the pin and the matrix — so the prose drifts silently on every bump. This catches it.
+      - name: Check the docs match the SurrealDB pins
+        run: uv run python scripts/sync_surrealdb_pins.py
+
   tests:
     name: Tests
     runs-on: ubuntu-latest
