@@ -6,7 +6,8 @@
 #   2. If same version -> skip (no wasted CI minutes)
 #   3. If new version -> run tests against it
 #   4. If tests pass -> create PR with version update
-#   5. If security patch -> also bump ORM-lite version in the same PR
+#   5. If security patch -> once that PR merges, open a SEPARATE
+#      "chore(release): bump version to X" PR so auto-tag publishes the release
 #   6. If tests fail -> create GitHub issue for investigation
 
 name: SurrealDB Version Monitor
@@ -237,6 +238,8 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    outputs:
+      pr-number: ${{ steps.deps-pr.outputs.pr-number }}
 
     steps:
       - name: Checkout code
@@ -244,7 +247,7 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.PAT_TOKEN }}
 
       - name: Configure Git
         run: |
@@ -288,32 +291,13 @@ jobs:
           Tests passed against SurrealDB v${NEW_VERSION}.
           Previous version: v${{ needs.check-release.outputs.current-version }}"
 
-      # --- Security patches also bump the ORM-lite version ---
-      - name: Bump ORM-lite version (security patches only)
-        if: needs.check-release.outputs.is-security-patch == 'true'
-        run: |
-          CURRENT_VERSION=$(grep -E '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
-
-          MAJOR=$(echo "$CURRENT_VERSION" | cut -d. -f1)
-          MINOR=$(echo "$CURRENT_VERSION" | cut -d. -f2)
-          PATCH=$(echo "$CURRENT_VERSION" | cut -d. -f3)
-
-          NEXT_PATCH=$((PATCH + 1))
-          NEW_ORM_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}"
-
-          echo "Bumping ORM-lite version: $CURRENT_VERSION -> $NEW_ORM_VERSION"
-          echo "NEW_ORM_VERSION=$NEW_ORM_VERSION" >> $GITHUB_ENV
-
-          # Update version files
-          sed -i "s/^version = \".*\"/version = \"$NEW_ORM_VERSION\"/" pyproject.toml
-          sed -i "s/__version__ = \".*\"/__version__ = \"$NEW_ORM_VERSION\"/" src/surreal_orm_lite/__init__.py
-
-          git add pyproject.toml src/surreal_orm_lite/__init__.py
-          git commit -m "chore(release): bump version to $NEW_ORM_VERSION (SurrealDB security update)"
-
       - name: Push branch and create PR
+        id: deps-pr
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PAT, not GITHUB_TOKEN: a PR opened by GITHUB_TOKEN does not trigger
+          # workflow runs, so ci.yml would never run on it and auto-merge would wait
+          # forever on the required "CI Success" check.
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           IS_SECURITY: ${{ needs.check-release.outputs.is-security-patch }}
         run: |
           # The branch is rebuilt from main on every run, so a leftover remote branch
@@ -329,6 +313,7 @@ jobs:
             git push --force-with-lease="refs/heads/${BRANCH}" -u origin "$BRANCH"
             echo "Updated existing PR #${EXISTING_PR} on $BRANCH"
             gh pr merge "$EXISTING_PR" --auto --squash || true
+            echo "pr-number=${EXISTING_PR}" >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -366,9 +351,128 @@ jobs:
 
           echo "PR_URL=$PR_URL" >> $GITHUB_ENV
           echo "Created PR: $PR_URL"
+          echo "pr-number=${PR_URL##*/}" >> $GITHUB_OUTPUT
 
           # Enable auto-merge
           gh pr merge "$PR_URL" --auto --squash
+
+  # =============================================================================
+  # Step 3b: Security patch -> release it, as a SEPARATE version-bump PR
+  #
+  # The bump cannot ride along in the SurrealDB PR above. The repo squashes with
+  # squash_merge_commit_title = COMMIT_OR_PR_TITLE, so a two-commit PR lands on main
+  # under the *PR title* ("security(deps): ..."), while ci.yml's auto-tag job only
+  # fires on a head commit starting with "chore(release): bump version to ". The bump
+  # would reach main and never be tagged or published. Same split dependabot-automerge
+  # already uses.
+  # =============================================================================
+  release-security-patch:
+    name: Release Security Patch
+    needs: [check-release, auto-update]
+    if: needs.check-release.outputs.is-security-patch == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Wait for the SurrealDB PR to merge
+        id: wait-merge
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          PR_NUMBER: ${{ needs.auto-update.outputs.pr-number }}
+        run: |
+          if [[ -z "$PR_NUMBER" ]]; then
+            echo "No PR to wait for (nothing was committed) — nothing to release."
+            echo "merged=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          for _ in $(seq 1 30); do
+            STATE=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state -q '.state')
+            if [[ "$STATE" == "MERGED" ]]; then
+              echo "PR #${PR_NUMBER} merged."
+              echo "merged=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            if [[ "$STATE" == "CLOSED" ]]; then
+              echo "PR #${PR_NUMBER} was closed without merging — not releasing."
+              echo "merged=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "PR #${PR_NUMBER} is $STATE, waiting..."
+            sleep 60
+          done
+
+          echo "PR #${PR_NUMBER} did not merge in time — release skipped."
+          echo "merged=false" >> $GITHUB_OUTPUT
+
+      - name: Checkout main after merge
+        if: steps.wait-merge.outputs.merged == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Install uv
+        if: steps.wait-merge.outputs.merged == 'true'
+        uses: astral-sh/setup-uv@v7
+
+      - name: Create version bump PR
+        if: steps.wait-merge.outputs.merged == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          SURREALDB_VERSION: ${{ needs.check-release.outputs.latest-version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          CURRENT_VERSION=$(grep -E '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          MAJOR=$(echo "$CURRENT_VERSION" | cut -d. -f1)
+          MINOR=$(echo "$CURRENT_VERSION" | cut -d. -f2)
+          PATCH=$(echo "$CURRENT_VERSION" | cut -d. -f3)
+          NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          BRANCH="chore/release-v${NEW_VERSION}"
+
+          echo "Releasing security patch: $CURRENT_VERSION -> $NEW_VERSION"
+
+          git checkout -b "$BRANCH"
+
+          # pyproject.toml is the source of truth; sync_version.py propagates it to
+          # __init__.py AND tests/test_v050.py, which asserts the version — updating
+          # only the first two would land a PR that fails its own test suite.
+          sed -i "s/^version = \".*\"/version = \"$NEW_VERSION\"/" pyproject.toml
+          python scripts/sync_version.py --fix
+          uv lock
+
+          git add pyproject.toml src/surreal_orm_lite/__init__.py tests/test_v050.py uv.lock
+          git commit -m "chore(release): bump version to $NEW_VERSION"
+          git push origin "$BRANCH"
+
+          # The title must stay exactly "chore(release): bump version to X" — with a
+          # single commit the squash title comes from the commit, but auto-tag matches
+          # on it either way, so keep the two identical.
+          gh pr create \
+            --title "chore(release): bump version to $NEW_VERSION" \
+            --body "$(cat <<EOF
+          ## Security Release
+
+          SurrealDB **v${SURREALDB_VERSION}** was flagged as a security patch and has been
+          merged into \`main\`. This bumps ORM-lite \`${CURRENT_VERSION}\` -> \`${NEW_VERSION}\`
+          so the update is actually tagged and published.
+
+          Kept separate from the SurrealDB PR on purpose: a multi-commit PR squashes under
+          the PR title, and \`auto-tag\` only fires on \`chore(release): bump version to \`.
+
+          ---
+          *Automatically created by the SurrealDB version monitor.*
+          EOF
+          )" \
+            --base main \
+            --head "$BRANCH"
+
+          gh pr merge --auto --squash "$BRANCH"
 
   # =============================================================================
   # Step 4: Tests failed -> create GitHub issue
