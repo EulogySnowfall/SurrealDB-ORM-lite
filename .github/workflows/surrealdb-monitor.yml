@@ -1,0 +1,640 @@
+# Reusable SurrealDB version monitor — one supported server line per caller.
+#
+# The project supports two lines at once (2.6.x and 3.2.x), each with its own pin file and
+# its own upstream source of truth. Rather than duplicating ~400 lines of monitor logic per
+# line — and every future fix to it — the callers are thin and this file holds the flow:
+#
+#   1. Resolve the latest version of the caller's line, compare it to the caller's pin
+#   2. Same version -> skip (no wasted CI minutes)
+#   3. Newer version -> run lint, types and the full suite against it
+#   4. Tests pass -> PR updating the pin and the matching ci.yml matrix entry, auto-merged
+#   5. Security patch -> once that PR merges, a SEPARATE
+#      "chore(release): bump version to X" PR, so ci.yml's auto-tag publishes the release
+#   6. Tests fail -> GitHub issue for investigation
+#
+# Callers: surrealdb-security.yml (2.x), surrealdb-3x-monitor.yml (3.x).
+
+name: SurrealDB Version Monitor (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      line:
+        description: 'Major version line this run monitors ("2" or "3")'
+        required: true
+        type: string
+      pin-file:
+        description: 'File holding the pinned version for this line'
+        required: true
+        type: string
+      version-source:
+        description: >-
+          Where the latest version of this line comes from: "github-releases" or "dockerhub".
+          They are NOT interchangeable — see the resolution step for why.
+        required: true
+        type: string
+      requested-version:
+        description: 'Explicit version to test instead of the latest (optional)'
+        required: false
+        type: string
+        default: ''
+      force-update:
+        description: 'Act even if the pinned version already matches'
+        required: false
+        type: boolean
+        default: false
+
+# One monitor at a time, across both lines. Each line's auto-update branches off main and
+# rewrites the SAME ci.yml matrix line, so a 2.x and a 3.x update in flight together produce
+# two PRs that conflict on merge — and auto-merge then wedges on both. Serialising the whole
+# monitor is enough: the second line simply picks up the first's result on its next run.
+concurrency:
+  group: surrealdb-monitor
+  cancel-in-progress: false
+
+env:
+  SURREALDB_HOST: localhost
+  SURREALDB_PORT: 8000
+
+jobs:
+  # =============================================================================
+  # Step 1: Is there a newer release on this line?
+  # =============================================================================
+  check-release:
+    name: Check SurrealDB ${{ inputs.line }}.X Release
+    runs-on: ubuntu-latest
+    outputs:
+      latest-version: ${{ steps.check.outputs.latest-version }}
+      current-version: ${{ steps.check.outputs.current-version }}
+      has-update: ${{ steps.check.outputs.has-update }}
+      is-security-patch: ${{ steps.check.outputs.is-security-patch }}
+      docker-tag: ${{ steps.check.outputs.docker-tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Compare versions
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LINE: ${{ inputs.line }}
+          PIN_FILE: ${{ inputs.pin-file }}
+          VERSION_SOURCE: ${{ inputs.version-source }}
+          REQUESTED_VERSION: ${{ inputs.requested-version }}
+          FORCE_UPDATE: ${{ inputs.force-update }}
+        run: |
+          set -euo pipefail
+
+          # --- Resolve the latest version on this line ---
+          if [[ -n "$REQUESTED_VERSION" ]]; then
+            LATEST_VERSION="$REQUESTED_VERSION"
+
+            # Full X.Y.Z, not just a matching major. A bare "3" would sail through a
+            # major-only check and then be written into the pin file and the ci.yml matrix
+            # as the floating tag `v3`, which no longer matches the 'vX.Y.Z' guard — every
+            # later run would refuse to touch the matrix, permanently.
+            if [[ ! "$LATEST_VERSION" =~ ^${LINE}\.[0-9]+\.[0-9]+$ ]]; then
+              echo "ERROR: '$LATEST_VERSION' is not a ${LINE}.X.Y version." >&2
+              echo "Give a full patch version on this line, e.g. ${LINE}.2.4." >&2
+              exit 1
+            fi
+          elif [[ "$VERSION_SOURCE" == "github-releases" ]]; then
+            # `|| true`: an API hiccup or an empty result must fall through to the explicit
+            # "nothing found" branch below, not abort the job under `set -e` — an aborted
+            # check-release leaves has-update empty, which also skips create-failure-issue,
+            # so the monitor would go red with nothing reported.
+            LATEST_VERSION=$(gh api "repos/surrealdb/surrealdb/releases?per_page=100" \
+              --jq "[.[] | select(.tag_name | startswith(\"v${LINE}.\"))
+                        | select(.prerelease == false)
+                        | select(.draft == false)
+                        | .tag_name | ltrimstr(\"v\")]
+                    | .[0] // empty" 2>/dev/null || true)
+          elif [[ "$VERSION_SOURCE" == "dockerhub" ]]; then
+            # The 3.x line is published as Docker images WITHOUT a matching GitHub release:
+            # as of 2026-08, releases stop at v3.2.0 while Docker Hub carries v3.2.4. Asking
+            # the releases API for 3.x therefore returns a version OLDER than the pin, and the
+            # downgrade guard below would put the monitor to sleep forever. Docker Hub is also
+            # what CI actually consumes, so it is the honest source of truth.
+            #
+            # Page through the tag list instead of reading page 1 only: `name=` is a substring
+            # filter and the results are ordered by last_updated, so -dev/-beta builds crowd
+            # the first page and the newest stable tag can fall off it. Keep only bare vX.Y.Z
+            # tags — dropping -dev/-beta/-rc and the floating vX.Y alias — and take the
+            # highest by version order rather than by publish date.
+            TAGS=""
+            PAGES_OK=0
+            URL="https://hub.docker.com/v2/repositories/surrealdb/surrealdb/tags?page_size=100&name=v${LINE}."
+            for _ in $(seq 1 10); do
+              PAGE=$(curl -sSf --max-time 30 "$URL" || true)
+              [[ -z "$PAGE" ]] && break
+              PAGES_OK=$((PAGES_OK + 1))
+              TAGS+=$(printf '%s\n' "$(echo "$PAGE" | jq -r '.results[].name')")$'\n'
+              URL=$(echo "$PAGE" | jq -r '.next // empty')
+              [[ -z "$URL" ]] && break
+            done
+
+            # Never let an unreachable registry look like "you are up to date". Resolving to
+            # nothing would set has-update=false and end the run green, and the primary line
+            # would quietly stop being monitored — the exact silent-failure mode this whole
+            # workflow exists to prevent. Fail visibly instead.
+            if [[ "$PAGES_OK" -eq 0 ]]; then
+              echo "ERROR: could not reach Docker Hub — no tag page was retrieved." >&2
+              exit 1
+            fi
+
+            LATEST_VERSION=$(printf '%s' "$TAGS" \
+              | { grep -E "^v${LINE}\.[0-9]+\.[0-9]+$" || true; } \
+              | sed 's/^v//' \
+              | sort -V \
+              | tail -1)
+          else
+            echo "ERROR: unknown version-source '$VERSION_SOURCE'." >&2
+            exit 1
+          fi
+
+          if [[ -z "${LATEST_VERSION:-}" || "$LATEST_VERSION" == "null" ]]; then
+            echo "No SurrealDB ${LINE}.X version found — nothing to do."
+            echo "has-update=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # --- Read the pinned version ---
+          if [[ -f "$PIN_FILE" ]]; then
+            CURRENT_VERSION=$(tr -d '[:space:]' < "$PIN_FILE")
+          else
+            CURRENT_VERSION="unknown"
+          fi
+
+          DOCKER_TAG="v${LATEST_VERSION}"
+
+          echo "Line:    ${LINE}.x"
+          echo "Pin:     $PIN_FILE"
+          echo "Current: $CURRENT_VERSION"
+          echo "Latest:  $LATEST_VERSION  (source: $VERSION_SOURCE)"
+          echo "Docker:  $DOCKER_TAG"
+
+          # --- Compare ---
+          # Version-aware, not a plain string inequality: a monitor must never emit a
+          # downgrade. If the pin is somehow ahead of the latest release (wrong line in the
+          # pin file, release yanked), do nothing rather than propose going back.
+          HAS_UPDATE="false"
+          if [[ "$CURRENT_VERSION" == "unknown" ]]; then
+            # No pin file at all — sort -V would rank "unknown" above any number and
+            # silently block forever, so treat it as "adopt the latest".
+            HAS_UPDATE="true"
+          elif [[ "$CURRENT_VERSION" != "$LATEST_VERSION" ]]; then
+            NEWEST=$(printf '%s\n%s\n' "$CURRENT_VERSION" "$LATEST_VERSION" | sort -V | tail -1)
+            if [[ "$NEWEST" == "$LATEST_VERSION" ]]; then
+              HAS_UPDATE="true"
+            else
+              echo "Pinned version $CURRENT_VERSION is newer than the latest available" \
+                   "$LATEST_VERSION — refusing to downgrade."
+            fi
+          fi
+
+          if [[ "$FORCE_UPDATE" == "true" ]]; then
+            HAS_UPDATE="true"
+          fi
+
+          if [[ "$HAS_UPDATE" == "false" ]]; then
+            echo "Already on the latest ${LINE}.X version ($CURRENT_VERSION) — nothing to do."
+          fi
+
+          # --- Security patch? ---
+          # Read from the GitHub release notes for this exact tag. A line published without
+          # GitHub releases (see the dockerhub branch above) simply never flags one; that
+          # under-reports rather than mis-reports, and the version still gets tested.
+          IS_SECURITY_PATCH="false"
+          if [[ "$HAS_UPDATE" == "true" ]]; then
+            RELEASE=$(gh api "repos/surrealdb/surrealdb/releases/tags/v${LATEST_VERSION}" \
+              --jq '{name, body}' 2>/dev/null || echo '{}')
+            RELEASE_TEXT=$(echo "$RELEASE" | jq -r '((.name // "") + " " + (.body // ""))' || true)
+            # Bash substring, not `head -c`: under `pipefail`, head closing the pipe early on
+            # a long release body SIGPIPEs jq (exit 141) and aborts the whole job.
+            RELEASE_TEXT="${RELEASE_TEXT:0:5000}"
+
+            if echo "$RELEASE_TEXT" | grep -iqE "(security|vulnerability|CVE-[0-9]|critical.*(fix|patch)|exploit|injection|xss|csrf|hotfix)"; then
+              IS_SECURITY_PATCH="true"
+            fi
+          fi
+
+          echo "Has update: $HAS_UPDATE"
+          echo "Is security patch: $IS_SECURITY_PATCH"
+
+          {
+            echo "latest-version=$LATEST_VERSION"
+            echo "current-version=$CURRENT_VERSION"
+            echo "has-update=$HAS_UPDATE"
+            echo "is-security-patch=$IS_SECURITY_PATCH"
+            echo "docker-tag=$DOCKER_TAG"
+          } >> $GITHUB_OUTPUT
+
+  # =============================================================================
+  # Step 2: Run the suite against the new version
+  # =============================================================================
+  test-new-version:
+    name: Test SurrealDB ${{ needs.check-release.outputs.latest-version }}
+    needs: check-release
+    if: needs.check-release.outputs.has-update == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      tests-passed: ${{ steps.test-result.outputs.passed }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install dependencies
+        run: uv sync --group dev --group lint
+
+      - name: Run linting
+        run: |
+          uv run ruff format --check src/
+          uv run ruff check src/
+
+      - name: Run type checking
+        run: uv run mypy src/
+
+      - name: Start SurrealDB ${{ needs.check-release.outputs.docker-tag }}
+        env:
+          DOCKER_TAG: ${{ needs.check-release.outputs.docker-tag }}
+        run: |
+          echo "Testing with SurrealDB Docker tag: $DOCKER_TAG"
+
+          docker run -d \
+            --name surrealdb-test \
+            -p 8000:8000 \
+            "surrealdb/surrealdb:${DOCKER_TAG}" \
+            start --user root --pass root
+
+          # Poll on the HTTP status, not the body: /health answers 200 with an EMPTY body,
+          # so the old `curl -s ... | grep -q OK` never matched and the loop just burned its
+          # full timeout before continuing anyway.
+          echo "Waiting for SurrealDB to be healthy..."
+          for _ in $(seq 1 30); do
+            if curl -sf -o /dev/null http://localhost:8000/health; then
+              echo "SurrealDB is up!"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "SurrealDB ${DOCKER_TAG} never became healthy" >&2
+          docker logs surrealdb-test || true
+          exit 1
+
+      - name: Run all tests
+        run: |
+          uv run pytest tests/ -v \
+            --cov=src.surreal_orm_lite \
+            --cov-branch \
+            --cov-report=xml
+
+      - name: Stop SurrealDB
+        if: always()
+        run: docker rm -f surrealdb-test || true
+
+      - name: Set test result
+        id: test-result
+        if: success()
+        run: echo "passed=true" >> $GITHUB_OUTPUT
+
+  # =============================================================================
+  # Step 3: Tests passed -> PR updating the pin
+  # =============================================================================
+  auto-update:
+    name: Update SurrealDB Version
+    needs: [check-release, test-new-version]
+    if: |
+      needs.check-release.outputs.has-update == 'true' &&
+      needs.test-new-version.outputs.tests-passed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      pr-number: ${{ steps.deps-pr.outputs.pr-number }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Update the pin and the CI matrix
+        env:
+          NEW_VERSION: ${{ needs.check-release.outputs.latest-version }}
+          DOCKER_TAG: ${{ needs.check-release.outputs.docker-tag }}
+          LINE: ${{ inputs.line }}
+          PIN_FILE: ${{ inputs.pin-file }}
+        run: |
+          set -euo pipefail
+
+          BRANCH="chore/surrealdb-${NEW_VERSION}"
+          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
+          echo "NEW_VERSION=$NEW_VERSION" >> $GITHUB_ENV
+
+          git checkout -b "$BRANCH"
+
+          echo "$NEW_VERSION" > "$PIN_FILE"
+
+          # The matrix holds one entry per supported line, so replace ONLY this line's
+          # element. Fail loudly rather than commit a half-update: the original pattern
+          # assumed a single-element list and silently matched nothing once a second line
+          # was added, which is how a "version update" reached main as a no-op.
+          if ! grep -qE "'v${LINE}\.[0-9]+\.[0-9]+'" .github/workflows/ci.yml; then
+            echo "ERROR: no 'v${LINE}.x.y' entry found in the ci.yml matrix — refusing to" >&2
+            echo "commit a partial update. Check the matrix format." >&2
+            exit 1
+          fi
+          sed -i -E "s/'v${LINE}\.[0-9]+\.[0-9]+'/'${DOCKER_TAG}'/" .github/workflows/ci.yml
+
+          git add "$PIN_FILE" .github/workflows/ci.yml
+
+          if git diff --staged --quiet; then
+            # Reachable with force-update on an already-current pin. `exit 0` ends only this
+            # step, so flag it for the next one — otherwise it pushes a commit-less branch
+            # and `gh pr create` fails with "no commits between main and ...".
+            echo "No changes to commit — nothing to open a PR for."
+            echo "SKIP_PR=true" >> $GITHUB_ENV
+            exit 0
+          fi
+
+          git commit -m "chore(deps): update SurrealDB to v${NEW_VERSION}
+
+          Tests passed against SurrealDB v${NEW_VERSION}.
+          Previous version: v${{ needs.check-release.outputs.current-version }}"
+
+      - name: Push branch and create PR
+        id: deps-pr
+        if: env.SKIP_PR != 'true'
+        env:
+          # PAT, not GITHUB_TOKEN: a PR opened by GITHUB_TOKEN does not trigger workflow
+          # runs, so ci.yml would never run on it and auto-merge would wait forever on the
+          # required "CI Success" check.
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          IS_SECURITY: ${{ needs.check-release.outputs.is-security-patch }}
+          LINE: ${{ inputs.line }}
+        run: |
+          set -euo pipefail
+
+          # The branch is rebuilt from main on every run, so a leftover remote branch (PR
+          # creation failed, PR closed without deleting the branch, ...) makes a plain push
+          # fail non-fast-forward and wedges every future run — that is how the 2.x monitor
+          # stayed red for seven weeks (#135). Reuse the branch while its PR is open,
+          # otherwise drop the stale one and push fresh.
+          EXISTING_PR=$(gh pr list --repo "$GITHUB_REPOSITORY" \
+            --head "$BRANCH" --state open --json number -q '.[0].number')
+
+          if [[ -n "$EXISTING_PR" ]]; then
+            # No lease can help here: the branch is rebuilt from main every run, so its
+            # remote tip is always "unexpected" and any lease read moments before the push
+            # is trivially satisfied. Check ownership instead — if the tip is not a monitor
+            # commit, a human has pushed onto the PR and force-pushing would destroy it.
+            git fetch origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}"
+            TIP_AUTHOR=$(git log -1 --format='%ae' "refs/remotes/origin/${BRANCH}")
+
+            if [[ "$TIP_AUTHOR" != "github-actions[bot]@users.noreply.github.com" ]]; then
+              echo "PR #${EXISTING_PR} carries a commit by ${TIP_AUTHOR} — refusing to" >&2
+              echo "force-push over it. Resolve that PR, then re-run the monitor." >&2
+              exit 1
+            fi
+
+            git push --force origin "$BRANCH"
+            echo "Updated existing PR #${EXISTING_PR} on $BRANCH"
+            gh pr merge "$EXISTING_PR" --auto --squash || true
+            echo "pr-number=${EXISTING_PR}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Removing stale remote branch $BRANCH (no open PR attached)"
+            git push origin --delete "$BRANCH"
+          fi
+
+          git push -u origin "$BRANCH"
+
+          TITLE="chore(deps): update SurrealDB to v${NEW_VERSION}"
+          if [[ "$IS_SECURITY" == "true" ]]; then
+            TITLE="security(deps): update SurrealDB to v${NEW_VERSION}"
+          fi
+
+          PR_URL=$(gh pr create \
+            --title "$TITLE" \
+            --body "$(cat <<EOF
+          ## SurrealDB ${LINE}.x Version Update
+
+          | Field | Value |
+          |---|---|
+          | Previous | v${{ needs.check-release.outputs.current-version }} |
+          | New | v${NEW_VERSION} |
+          | Security patch | ${IS_SECURITY} |
+
+          Tests already passed against this version in the [monitor workflow](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+
+          ---
+          *Automatically created by the SurrealDB ${LINE}.x version monitor.*
+          EOF
+          )" \
+            --base main \
+            --head "$BRANCH")
+
+          echo "Created PR: $PR_URL"
+          echo "pr-number=${PR_URL##*/}" >> $GITHUB_OUTPUT
+
+          gh pr merge "$PR_URL" --auto --squash
+
+  # =============================================================================
+  # Step 3b: Security patch -> release it, as a SEPARATE version-bump PR
+  #
+  # The bump cannot ride along in the PR above. The repo squashes with
+  # squash_merge_commit_title = COMMIT_OR_PR_TITLE, so a two-commit PR lands on main under
+  # the *PR title* ("security(deps): ..."), while ci.yml's auto-tag job only fires on a head
+  # commit starting with "chore(release): bump version to ". The bump would reach main and
+  # never be tagged or published. Same split dependabot-automerge already uses.
+  # =============================================================================
+  release-security-patch:
+    name: Release Security Patch
+    needs: [check-release, auto-update]
+    if: needs.check-release.outputs.is-security-patch == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Wait for the SurrealDB PR to merge
+        id: wait-merge
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          PR_NUMBER: ${{ needs.auto-update.outputs.pr-number }}
+        run: |
+          if [[ -z "$PR_NUMBER" ]]; then
+            echo "No PR to wait for (nothing was committed) — nothing to release."
+            echo "merged=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 60 minutes. The full CI matrix is 8 jobs plus CodeQL, and auto-merge only fires
+          # once every required check reports; a timeout here means the security bump PR is
+          # never opened, so the patch never gets tagged or published.
+          for _ in $(seq 1 60); do
+            STATE=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json state -q '.state')
+            if [[ "$STATE" == "MERGED" ]]; then
+              echo "PR #${PR_NUMBER} merged."
+              echo "merged=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            if [[ "$STATE" == "CLOSED" ]]; then
+              echo "PR #${PR_NUMBER} was closed without merging — not releasing."
+              echo "merged=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "PR #${PR_NUMBER} is $STATE, waiting..."
+            sleep 60
+          done
+
+          # Fail rather than end green: a security patch sitting on main un-released is
+          # exactly the state nobody notices.
+          echo "ERROR: PR #${PR_NUMBER} did not merge within 60 minutes." >&2
+          echo "The security bump was NOT opened — merge that PR, then re-run this job." >&2
+          echo "merged=false" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Checkout main after merge
+        if: steps.wait-merge.outputs.merged == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Install uv
+        if: steps.wait-merge.outputs.merged == 'true'
+        uses: astral-sh/setup-uv@v7
+
+      - name: Create version bump PR
+        if: steps.wait-merge.outputs.merged == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+          SURREALDB_VERSION: ${{ needs.check-release.outputs.latest-version }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          CURRENT_VERSION=$(grep -E '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          MAJOR=$(echo "$CURRENT_VERSION" | cut -d. -f1)
+          MINOR=$(echo "$CURRENT_VERSION" | cut -d. -f2)
+          PATCH=$(echo "$CURRENT_VERSION" | cut -d. -f3)
+          NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          BRANCH="chore/release-v${NEW_VERSION}"
+
+          echo "Releasing security patch: $CURRENT_VERSION -> $NEW_VERSION"
+
+          git checkout -b "$BRANCH"
+
+          # pyproject.toml is the source of truth; sync_version.py propagates it to
+          # __init__.py AND tests/test_v050.py, which asserts the version — updating only
+          # the first two would land a PR that fails its own test suite.
+          sed -i "s/^version = \".*\"/version = \"$NEW_VERSION\"/" pyproject.toml
+          python scripts/sync_version.py --fix
+          uv lock
+
+          git add pyproject.toml src/surreal_orm_lite/__init__.py tests/test_v050.py uv.lock
+          git commit -m "chore(release): bump version to $NEW_VERSION"
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --title "chore(release): bump version to $NEW_VERSION" \
+            --body "$(cat <<EOF
+          ## Security Release
+
+          SurrealDB **v${SURREALDB_VERSION}** was flagged as a security patch and has been
+          merged into \`main\`. This bumps ORM-lite \`${CURRENT_VERSION}\` -> \`${NEW_VERSION}\`
+          so the update is actually tagged and published.
+
+          Kept separate from the SurrealDB PR on purpose: a multi-commit PR squashes under the
+          PR title, and \`auto-tag\` only fires on \`chore(release): bump version to \`.
+
+          ---
+          *Automatically created by the SurrealDB version monitor.*
+          EOF
+          )" \
+            --base main \
+            --head "$BRANCH"
+
+          gh pr merge --auto --squash "$BRANCH"
+
+  # =============================================================================
+  # Step 4: Tests failed -> GitHub issue
+  # =============================================================================
+  create-failure-issue:
+    name: Create Failure Issue
+    needs: [check-release, test-new-version]
+    # A status-check function is required: without one GitHub implicitly ANDs `success()`
+    # into the condition, so this job — which by definition only runs when
+    # `test-new-version` failed — was always skipped. `!cancelled()` rather than `always()`,
+    # so cancelling a run does not file a bogus failure issue.
+    if: |
+      !cancelled() &&
+      needs.check-release.outputs.has-update == 'true' &&
+      needs.test-new-version.result == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+
+    steps:
+      - name: Create issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LINE: ${{ inputs.line }}
+        run: |
+          ISSUE_TITLE="SurrealDB v${{ needs.check-release.outputs.latest-version }} — tests failed"
+
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "$ISSUE_TITLE" --json number -q '.[0].number')
+          if [[ -n "$EXISTING" ]]; then
+            echo "Issue #$EXISTING already exists — skipping"
+            exit 0
+          fi
+
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "$ISSUE_TITLE" \
+            --label "bug,surrealdb,needs-investigation" \
+            --body "$(cat <<EOF
+          ## SurrealDB Compatibility Issue
+
+          Tests failed with SurrealDB v${{ needs.check-release.outputs.latest-version }} on the
+          ${LINE}.x line.
+
+          | Field | Value |
+          |---|---|
+          | Pinned version | v${{ needs.check-release.outputs.current-version }} |
+          | New version | v${{ needs.check-release.outputs.latest-version }} |
+          | Security patch | ${{ needs.check-release.outputs.is-security-patch }} |
+
+          ### Workflow Run
+          [View logs](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+          ---
+          *Automatically created by the SurrealDB ${LINE}.x version monitor.*
+          EOF
+          )"

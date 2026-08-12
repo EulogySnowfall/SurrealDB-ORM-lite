@@ -1,0 +1,52 @@
+# SurrealDB 3.X Version Monitor — the primary supported line.
+#
+# Pinned in .surrealdb-version. Until now only the legacy 2.x line was watched, so every 3.x
+# patch went unnoticed — 3.2.1 through 3.2.4 all shipped without a single signal.
+#
+# Its first run will therefore propose a jump of several versions at once, not the usual
+# single patch. Check that README's compatibility table and CHANGELOG follow that PR; the
+# monitor updates the pin and the CI matrix, nothing else.
+#
+# Resolves versions from Docker Hub rather than GitHub releases, because SurrealDB publishes
+# 3.x patches as images WITHOUT a matching release — as of 2026-08 the releases API stops at
+# v3.2.0 while Docker Hub carries v3.2.4. See surrealdb-monitor.yml, which holds the flow.
+
+name: SurrealDB 3.X Version Monitor
+
+on:
+  schedule:
+    # Daily at 7:30 AM Montreal time (UTC-5 -> 12:30 UTC), half an hour after the 2.x
+    # monitor so the two never contend for the same branch or PR.
+    - cron: '30 12 * * *'
+  workflow_dispatch:
+    inputs:
+      surrealdb_version:
+        description: 'SurrealDB 3.X version to test (e.g. 3.2.4, leave empty for latest v3.x)'
+        required: false
+        type: string
+      force_update:
+        description: 'Force update even if version matches'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  monitor:
+    name: SurrealDB 3.X
+    uses: ./.github/workflows/surrealdb-monitor.yml
+    secrets: inherit
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    with:
+      line: '3'
+      pin-file: .surrealdb-version
+      version-source: dockerhub
+      requested-version: ${{ inputs.surrealdb_version || '' }}
+      force-update: ${{ inputs.force_update || false }}
