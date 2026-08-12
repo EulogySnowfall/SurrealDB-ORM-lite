@@ -215,13 +215,17 @@ await user.save(
 #### v0.14.0 — Computed Fields
 
 ```python
-from surreal_orm_lite import Computed
+from surreal_orm_lite import Computed, computed
 
 class User(BaseSurrealModel):
     first_name: str
     last_name: str
-    full_name: Computed[str] = Computed("string::concat(first_name, ' ', last_name)")
+    full_name: Computed[str] = computed("string::concat(first_name, ' ', last_name)")
 ```
+
+> Livré en v0.14.0 avec l'annotation et la fabrique séparées — `Computed[T]` annote,
+> `computed("expr")` porte l'expression. Un `Computed` à double usage ne pouvait pas être
+> suivi par mypy/pyright, qui résolvaient l'attribut en `Any`.
 
 - **Primitive** : `DEFINE FIELD … VALUE <expr>` via `query()` (champ en lecture seule).
 - **Fichiers** : `functions.py` (`Computed`), `model_base.py` (exclusion du save, hydratation en lecture).
