@@ -33,7 +33,11 @@ jobs:
           uv run ruff format --check src/ tests/
 
       - name: Type check with mypy
-        run: uv run mypy src/
+        run: |
+          uv run mypy src/
+          # Separate invocation: tests/ has no __init__.py, so passing both at once
+          # makes mypy resolve two modules to the same name.
+          uv run mypy tests/typing_examples.py
 
   tests:
     name: Tests
@@ -41,7 +45,11 @@ jobs:
     strategy:
       matrix:
         python-version: ['3.11', '3.12', '3.13', '3.14']
-        surrealdb-version: ['v2.6.5', 'v3.1.3']
+        # The two supported server lines. 3.1.x was dropped in v0.14.0 in favour of 3.2.x —
+        # 3.2 is its own line, not a drop-in for 3.1 (SurrealDB 3.2.0 regressed uncorrelated
+        # sub-SELECTs combining ORDER BY and LIMIT, EulogySnowfall/SurrealDB-ORM#147), so it
+        # is tested directly rather than assumed equivalent.
+        surrealdb-version: ['v2.6.5', 'v3.2.3']
 
     steps:
       - name: Start SurrealDB ${{ matrix.surrealdb-version }}

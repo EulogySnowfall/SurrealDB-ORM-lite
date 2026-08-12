@@ -72,35 +72,51 @@ jobs:
       - name: Run type checking
         run: uv run mypy src/
 
-      - name: Start SurrealDB
+      # Both supported lines. .surrealdb-version pins the primary (latest) line, currently
+      # 3.2.x; .surrealdb-version2x pins the legacy 2.6.x line.
+      - name: Start SurrealDB (both supported lines)
         run: |
-          SURREALDB_VERSION=$(cat .surrealdb-version | tr -d '[:space:]')
-          docker run -d \
-            --name surrealdb-test \
-            -p 8000:8000 \
-            "surrealdb/surrealdb:v${SURREALDB_VERSION}" \
-            start --user root --pass root
+          start_one() {
+            local name="$1" tag="$2" port="$3"
+            docker run -d --name "$name" -p "${port}:8000" \
+              "surrealdb/surrealdb:v${tag}" start --user root --pass root
 
-          echo "Waiting for SurrealDB to be healthy..."
-          for i in {1..15}; do
-            if curl -s http://localhost:8000/health | grep -q "OK"; then
-              echo "SurrealDB is up!"
-              break
-            fi
-            echo "SurrealDB not up yet. Retrying..."
-            sleep 2
-          done
+            echo "Waiting for SurrealDB v${tag} on :${port}..."
+            for i in {1..30}; do
+              if curl -s "http://localhost:${port}/health" | grep -q "OK"; then
+                echo "SurrealDB v${tag} is up!"
+                return 0
+              fi
+              sleep 2
+            done
+            echo "SurrealDB v${tag} did not become healthy" >&2
+            return 1
+          }
 
-      - name: Run all tests
+          start_one surrealdb-3x "$(tr -d '[:space:]' < .surrealdb-version)"   8000
+          start_one surrealdb-2x "$(tr -d '[:space:]' < .surrealdb-version2x)" 8001
+
+      # Primary line carries coverage, as the 3.x paths (interactive transactions) are the
+      # ones the 2.x run self-skips.
+      - name: Run all tests (primary line, 3.x)
+        env:
+          SURREALDB_HOST: localhost
+          SURREALDB_PORT: 8000
         run: |
           uv run pytest tests/ -v \
             --cov=src.surreal_orm_lite \
             --cov-branch \
             --cov-report=xml
 
+      - name: Run all tests (legacy line, 2.6.x)
+        env:
+          SURREALDB_HOST: localhost
+          SURREALDB_PORT: 8001
+        run: uv run pytest tests/ -v --no-cov
+
       - name: Stop SurrealDB
         if: always()
-        run: docker stop surrealdb-test && docker rm surrealdb-test || true
+        run: docker rm -f surrealdb-2x surrealdb-3x || true
 
       - name: Set test result
         id: test-result
