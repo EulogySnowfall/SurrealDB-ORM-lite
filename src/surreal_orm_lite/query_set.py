@@ -765,6 +765,7 @@ class QuerySet:
             )
         """
         validate_patch_operations(operations)
+        self.model._reject_computed_patch(operations, "patch()")
         where_clause, where_vars = self._build_where()
         query = f"UPDATE {self._model_table} PATCH $_ops{where_clause};"
         all_vars = {**self._variables, **where_vars, "_ops": operations}

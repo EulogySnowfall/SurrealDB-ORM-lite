@@ -22,6 +22,7 @@ from .functions import (
     SurrealRandFunction,
     SurrealStringFunction,
     SurrealTimeFunction,
+    computed,
 )
 from .model_base import BaseSurrealModel, SurrealConfigDict
 from .q import Q
@@ -79,6 +80,7 @@ __all__ = [
     "is_conflict_error",
     # Server-side functions
     "Computed",
+    "computed",
     "SurrealFunc",
     "SurrealFunction",
     "SurrealTimeFunction",

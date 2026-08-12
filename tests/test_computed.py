@@ -11,7 +11,7 @@ from pydantic import BaseModel as PydanticBaseModel
 
 from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
 from surreal_orm_lite.exceptions import SurrealDbError
-from surreal_orm_lite.functions import Computed, SurrealFunc, _ComputedDefault, _ComputedMarker
+from surreal_orm_lite.functions import Computed, SurrealFunc, _ComputedDefault, _ComputedMarker, computed
 
 
 class TestComputedType:
@@ -21,36 +21,39 @@ class TestComputedType:
         args = get_args(annotation)
         assert args[0] == (str | None)
         assert isinstance(args[1], _ComputedMarker)
-        assert args[1].inner_type is str
 
-    def test_each_subscript_gets_its_own_marker(self) -> None:
-        assert get_args(Computed[str])[1] is not get_args(Computed[int])[1]
+    def test_every_subscript_shares_the_one_marker(self) -> None:
+        """``Computed`` is a generic alias, so its metadata is fixed once, not per subscript."""
+        assert get_args(Computed[str])[1] is get_args(Computed[int])[1]
+
+    def test_subscript_substitutes_the_inner_type(self) -> None:
+        assert get_args(Computed[int])[0] == (int | None)
 
     def test_call_builds_sentinel_from_string(self) -> None:
-        default = Computed("string::concat(first_name, ' ', last_name)")
+        default = computed("string::concat(first_name, ' ', last_name)")
         assert isinstance(default, _ComputedDefault)
         assert default.expression == "string::concat(first_name, ' ', last_name)"
 
     def test_call_accepts_a_surreal_func(self) -> None:
-        assert Computed(SurrealFunc("time::now()")).expression == "time::now()"
+        assert computed(SurrealFunc("time::now()")).expression == "time::now()"
 
     def test_expression_is_stripped(self) -> None:
-        assert Computed("  time::now()  ").expression == "time::now()"
+        assert computed("  time::now()  ").expression == "time::now()"
 
     def test_rejects_empty_expression(self) -> None:
         with pytest.raises(ValueError, match="empty"):
-            Computed("")
+            computed("")
 
     def test_rejects_statement_terminator(self) -> None:
         with pytest.raises(ValueError, match="';'"):
-            Computed("time::now(); REMOVE TABLE User")
+            computed("time::now(); REMOVE TABLE User")
 
     def test_rejects_non_string_expression(self) -> None:
         with pytest.raises(TypeError):
-            Computed(42)  # type: ignore[arg-type]
+            computed(42)  # type: ignore[arg-type]
 
     def test_repr_round_trips(self) -> None:
-        assert repr(Computed("time::now()")) == "Computed('time::now()')"
+        assert repr(computed("time::now()")) == "computed('time::now()')"
 
 
 class Plain(BaseSurrealModel):
@@ -62,15 +65,15 @@ class Person(BaseSurrealModel):
     id: str
     first_name: str = ""
     last_name: str = ""
-    full_name: Computed[str] = Computed("string::concat(first_name, ' ', last_name)")
-    name_len: Computed[int] = Computed(SurrealFunc("string::len(full_name)"))
-    plain_style: str | None = Computed("string::uppercase(first_name)")
+    full_name: Computed[str] = computed("string::concat(first_name, ' ', last_name)")
+    name_len: Computed[int] = computed(SurrealFunc("string::len(full_name)"))
+    plain_style: str | None = computed("string::uppercase(first_name)")
 
 
 class PersonChild(Person):
     id: str
     nickname: str = ""
-    shout: Computed[str] = Computed("string::uppercase(nickname)")
+    shout: Computed[str] = computed("string::uppercase(nickname)")
 
 
 class TestGetComputedFields:
@@ -81,10 +84,10 @@ class TestGetComputedFields:
         assert list(Person.get_computed_fields()) == ["full_name", "name_len", "plain_style"]
 
     def test_records_expressions(self) -> None:
-        computed = Person.get_computed_fields()
-        assert computed["full_name"] == "string::concat(first_name, ' ', last_name)"
-        assert computed["name_len"] == "string::len(full_name)"
-        assert computed["plain_style"] == "string::uppercase(first_name)"
+        expressions = Person.get_computed_fields()
+        assert expressions["full_name"] == "string::concat(first_name, ' ', last_name)"
+        assert expressions["name_len"] == "string::len(full_name)"
+        assert expressions["plain_style"] == "string::uppercase(first_name)"
 
     def test_returns_a_copy(self) -> None:
         Person.get_computed_fields()["injected"] = "boom"
@@ -115,7 +118,9 @@ class TestGetComputedFields:
         import surreal_orm_lite
 
         assert surreal_orm_lite.Computed is Computed
+        assert surreal_orm_lite.computed is computed
         assert "Computed" in surreal_orm_lite.__all__
+        assert "computed" in surreal_orm_lite.__all__
 
 
 class TestComputedFieldDDL:
@@ -161,7 +166,7 @@ class CfPlayer(BaseSurrealModel):
     id: str
     first_name: str = ""
     last_name: str = ""
-    full_name: Computed[str] = Computed("string::concat(first_name, ' ', last_name)")
+    full_name: Computed[str] = computed("string::concat(first_name, ' ', last_name)")
 
 
 @contextlib.asynccontextmanager
@@ -245,7 +250,7 @@ class TestDefineComputedFieldsE2E:
 
             class CfBroken(BaseSurrealModel):
                 id: str
-                oops: Computed[str] = Computed("nope::missing(x)")
+                oops: Computed[str] = computed("nope::missing(x)")
 
             with pytest.raises(SurrealDbError, match="DEFINE FIELD"):
                 await CfBroken.define_computed_fields()
@@ -352,8 +357,8 @@ class CfGuard(BaseSurrealModel):
     last_name: str = ""
     tags: list[str] = []
     score: int = 0
-    full_name: Computed[str] = Computed("string::concat(first_name, ' ', last_name)")
-    tag_count: Computed[int] = Computed("array::len(tags)")
+    full_name: Computed[str] = computed("string::concat(first_name, ' ', last_name)")
+    tag_count: Computed[int] = computed("array::len(tags)")
 
 
 class TestComputedWriteGuards:
@@ -401,6 +406,42 @@ class TestComputedWriteGuards:
     async def test_bulk_update_rejects_a_computed_field(self) -> None:
         with pytest.raises(ValueError, match="full_name"):
             await CfGuard.objects().filter(id="a").bulk_update(full_name="x")
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_a_computed_field(self) -> None:
+        guard = CfGuard(id="a")
+        with pytest.raises(ValueError, match="full_name"):
+            await guard.patch([{"op": "replace", "path": "/full_name", "value": "x"}])
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_a_nested_path_into_a_computed_field(self) -> None:
+        """A computed field is server-owned in full: ``/tag_count/0`` is no more writable."""
+        guard = CfGuard(id="a")
+        with pytest.raises(ValueError, match="tag_count"):
+            await guard.patch([{"op": "add", "path": "/tag_count/0", "value": "x"}])
+
+    @pytest.mark.asyncio
+    async def test_patch_rejects_a_move_out_of_a_computed_field(self) -> None:
+        """``move`` removes its source, so ``from`` is a write too — unlike ``copy``."""
+        guard = CfGuard(id="a")
+        with pytest.raises(ValueError, match="full_name"):
+            await guard.patch([{"op": "move", "from": "/full_name", "path": "/last_name"}])
+
+    @pytest.mark.asyncio
+    async def test_queryset_patch_rejects_a_computed_field(self) -> None:
+        with pytest.raises(ValueError, match="full_name"):
+            await CfGuard.objects().filter(id="a").patch([{"op": "replace", "path": "/full_name", "value": "x"}])
+
+    def test_patch_guard_ignores_ordinary_paths(self) -> None:
+        """No DB round-trip: the guard alone must pass an ordinary patch through."""
+        CfGuard._reject_computed_patch(
+            [
+                {"op": "replace", "path": "/first_name", "value": "Ada"},
+                {"op": "add", "path": "/tags/0", "value": "x"},
+                {"op": "copy", "from": "/full_name", "path": "/last_name"},
+            ],
+            "patch()",
+        )
 
     def test_plain_model_is_unaffected(self) -> None:
         Plain._reject_computed_writes(["name", "anything"], "merge()")
@@ -466,7 +507,7 @@ class CfNested(BaseSurrealModel):
     id: str
     name: str = ""
     addr: Nested = Nested()
-    shout: Computed[str] = Computed("string::uppercase(name)")
+    shout: Computed[str] = computed("string::uppercase(name)")
 
 
 class CfPlainNested(BaseSurrealModel):
@@ -477,7 +518,7 @@ class CfPlainNested(BaseSurrealModel):
     addr: Nested = Nested()
 
 
-class TestSaveDoesNotDowngradeNestedModels:
+class TestSaveDoesNotDowngradeNestedModelsE2E:
     """save() must not replace a nested Pydantic model with the raw dict from the server.
 
     ``_apply_record`` writes with ``object.__setattr__`` (no validation), so applying a whole
@@ -514,12 +555,12 @@ class TestSaveDoesNotDowngradeNestedModels:
 class ComputedParent(BaseSurrealModel):
     id: str
     a: str = ""
-    c1: Computed[str] = Computed("string::uppercase(a)")
+    c1: Computed[str] = computed("string::uppercase(a)")
 
 
 class OverridingChild(ComputedParent):
     id: str
-    c1: Computed[str] = Computed("string::lowercase(a)")
+    c1: Computed[str] = computed("string::lowercase(a)")
 
 
 class DemotingChild(ComputedParent):
@@ -541,7 +582,7 @@ class TestComputedInheritanceOverrides:
         DemotingChild._reject_computed_writes(["c1"], "merge()")  # must not raise
 
 
-class TestOrCreateWithComputedCriteria:
+class TestOrCreateWithComputedCriteriaE2E:
     """A computed field is filterable, so it can appear in `criteria` — but never be written.
 
     Without stripping it from the write payload, the same call would succeed when creating and

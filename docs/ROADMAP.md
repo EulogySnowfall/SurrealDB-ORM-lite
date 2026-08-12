@@ -44,7 +44,7 @@ A key advantage of ORM-lite: it runs on **both** major SurrealDB lines, while th
 
 | Project                               | Supported SurrealDB versions |
 | ------------------------------------- | ---------------------------- |
-| **SurrealDB-ORM-lite** (official SDK) | **2.6.x and 3.1**            |
+| **SurrealDB-ORM-lite** (official SDK) | **2.6.x and 3.2.x**          |
 | **SurrealDB-ORM** (custom SDK)        | **3.x only**                 |
 
 ---
@@ -107,7 +107,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 
 | Feature                       | ORM (full) | ORM-lite                    |
 | ----------------------------- | ---------- | --------------------------- |
-| Supported SurrealDB           | 3.x only   | **2.6.x + 3.1**             |
+| Supported SurrealDB           | 3.x only   | **2.6.x + 3.2.x**           |
 | CRUD & QuerySet               | yes        | v0.2.0                      |
 | Aggregations & GROUP BY       | yes        | v0.3.0                      |
 | Model Signals                 | yes        | v0.4.0                      |
@@ -181,7 +181,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 
 - Dependency `surrealdb[pydantic]>=2.0.0,<3.0.0`
 - Native `RecordID`, structured SDK exceptions, signin-before-use ordering
-- CI matrix tested on SurrealDB **v2.6.0 and v3.1.3**
+- CI matrix tested on SurrealDB **v2.6.5 and v3.2.3**
 
 ### Version 0.8.0 — Transactions ORM (core)
 
@@ -243,7 +243,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   the returned row syncs the instance — `merge()` stays a partial update
 - Six curated function-name enums (`SurrealTimeFunction`, `SurrealMathFunction`,
   `SurrealStringFunction`, `SurrealArrayFunction`, `SurrealCryptoFunction`,
-  `SurrealRandFunction`) — **every member is executed against 2.6.5 AND 3.1.3 by the suite**;
+  `SurrealRandFunction`) — **every member is executed against 2.6.5 AND 3.2.3 by the suite**;
   names diverging between the lines (`rand::guid`, `type::is::*`) are excluded on purpose
 - **Identical on SurrealDB 2.6.x and 3.x** — no 3.x-only primitive. Only the inherited v0.9.0
   transaction rule differs: on a buffered tx the computed value reaches the instance at commit
@@ -252,7 +252,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 ### Version 0.14.0 — Computed fields
 
-- `Computed[T] = Computed("<expr>")` declares a field SurrealDB derives from other fields on
+- `Computed[T] = computed("<expr>")` declares a field SurrealDB derives from other fields on
   **every** write, via `DEFINE FIELD … VALUE`. Where v0.13.0's `SurrealFunc` evaluates an
   expression for one write, `Computed` attaches it to the **schema** — so it applies to writes
   the ORM never sees, making it a server-enforced invariant rather than a convention
@@ -276,7 +276,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 > Per-version detail and acceptance criteria live in the design spec:
 > [`docs/superpowers/specs/2026-06-06-roadmap-sdk-2.0-design.md`](superpowers/specs/2026-06-06-roadmap-sdk-2.0-design.md).
-> Every version keeps coverage ≥ 70 %, green `ruff`/`mypy`, and E2E green on 2.6.x + 3.1.
+> Every version keeps coverage ≥ 70 %, green `ruff`/`mypy`, and E2E green on 2.6.x + 3.2.x.
 
 ### 🔵 Phase A — Write-path & atomicity
 
@@ -342,7 +342,7 @@ unavailable on PyPI.
 ## Planned — Tier 3: Advanced (search, schema & DDL, migrations, CLI)
 
 > All implementable via `query()` (SurrealQL DDL + operators). Committed to the plan per the
-> 2026-06-06 decision. Index availability validated on both 2.6.x and 3.1.
+> 2026-06-06 decision. Index availability validated on both 2.6.x and 3.1 (the then-supported 3.x line).
 
 ### 🔴 Phase F — Schema & DDL
 
@@ -382,7 +382,7 @@ unavailable on PyPI.
 - Complete documentation (docstrings, migration guide, examples)
 - **Public API freeze** — no breaking changes until GA
 
-**Completion criteria**: E2E green on 2.6.x + 3.1, coverage ≥ 75 %, full API docs, API-freeze
+**Completion criteria**: E2E green on 2.6.x + 3.2.x, coverage ≥ 75 %, full API docs, API-freeze
 changelog published, no regression since v0.39.0.
 
 ### Version 2.0.0 — Production / GA

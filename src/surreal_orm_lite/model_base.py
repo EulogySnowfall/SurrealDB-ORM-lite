@@ -108,8 +108,13 @@ class BaseSurrealModel(BaseModel):
     def get_computed_fields(cls) -> dict[str, str]:
         """Return ``{field_name: SurrealQL expression}`` for this model's computed fields.
 
-        Declaration order, inherited fields first. Returns a copy — this is the single source
-        of truth every write path consults. ``{}`` for a model with no computed fields.
+        Declaration order, inherited fields first — except a field a subclass *redeclares*,
+        which moves to the end (it is re-decided by the subclass body). Order only affects the
+        sequence of generated DDL statements, never evaluation: SurrealDB evaluates computed
+        fields alphabetically.
+
+        Returns a copy — this is the single source of truth every write path consults. ``{}``
+        for a model with no computed fields.
         """
         return dict(cls.__surreal_computed__)
 
@@ -353,6 +358,34 @@ class BaseSurrealModel(BaseModel):
         """Validate an atomic-op target: a plain identifier, and not a computed field."""
         validate_field_name(field, "atomic field")
         cls._reject_computed_writes([field], "atomic operation")
+
+    @classmethod
+    def _reject_computed_patch(cls, operations: list[dict[str, Any]], context: str) -> None:
+        """Raise if a JSON Patch document writes a computed field.
+
+        ``patch()`` is a write like any other, so it gets the same guard as ``merge()`` —
+        without it, ``{"op": "replace", "path": "/full_name", …}`` would be accepted here and
+        silently dropped by the server, which is the exact invisible no-op this guard exists to
+        prevent.
+
+        Only the **top-level** pointer segment is checked: a computed field is server-owned in
+        full, so writing ``/full_name/0`` is no more legal than writing ``/full_name``. Both
+        ``path`` and — for ``move``, which removes its source — ``from`` count as writes;
+        ``copy`` only reads its ``from``.
+
+        Call **after** :func:`validate_patch_operations`, which guarantees the shape relied on
+        here.
+        """
+        targets: list[str] = []
+        for op in operations:
+            pointers = [op["path"]]
+            if op.get("op") == "move":
+                pointers.append(op["from"])
+            for pointer in pointers:
+                segment = pointer.split("/")[1] if "/" in pointer else ""
+                # RFC 6901 escapes; field names never contain them, but decode before comparing.
+                targets.append(segment.replace("~1", "/").replace("~0", "~"))
+        cls._reject_computed_writes(targets, context)
 
     async def _do_save(self, tx: Transaction | None = None) -> tuple[Self, bool]:
         """Internal save logic. Returns (self, created).
@@ -883,6 +916,7 @@ class BaseSurrealModel(BaseModel):
         ``operations`` is validated then bound as data, never string-interpolated.
         """
         validate_patch_operations(operations)
+        self._reject_computed_patch(operations, "patch()")
         record_id = self._record_id()
         if record_id is None:
             raise SurrealDbError("patch() requires an explicit id (there is nothing to patch without one).")

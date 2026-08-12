@@ -11,17 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Computed fields — `Computed[...]` → `DEFINE FIELD … VALUE`**: declare a field SurrealDB
   derives from other fields on **every** write. Where `SurrealFunc` (v0.13.0) evaluates an
-  expression for one write, `Computed` attaches it to the schema, so it applies to every write
-  on the table — including ones the ORM never sees.
+  expression for one write, a computed field attaches it to the schema, so it applies to every
+  write on the table — including ones the ORM never sees. `Computed[T]` is the annotation and
+  `computed("<expr>")` the default; splitting them keeps the field statically typed as
+  `T | None` under mypy and pyright.
 
   ```python
-  from surreal_orm_lite import BaseSurrealModel, Computed
+  from surreal_orm_lite import BaseSurrealModel, Computed, computed
 
   class Player(BaseSurrealModel):
       id: str
       first_name: str
       last_name: str
-      full_name: Computed[str] = Computed("string::concat(first_name, ' ', last_name)")
+      full_name: Computed[str] = computed("string::concat(first_name, ' ', last_name)")
 
   await Player.define_computed_fields()
   player = await Player(id="ada", first_name="Ada", last_name="Lovelace").save()
@@ -38,8 +40,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Computed fields are excluded from every write payload (`save`, `upsert`, `update`, `merge`,
   `bulk_create`) — the server owns the value.
-- Naming a computed field in `merge()`, `save(server_values=)`, `QuerySet.bulk_update()` or any
-  `atomic_*` helper now raises `ValueError` instead of being silently discarded by the server.
+- Naming a computed field in `merge()`, `save(server_values=)`, `patch()`, `QuerySet.patch()`,
+  `QuerySet.bulk_update()` or any `atomic_*` helper now raises `ValueError` instead of being
+  silently discarded by the server. JSON Patch documents are checked on the top-level pointer
+  segment, and on `from` as well for `move`, which removes its source.
+- **Supported SurrealDB lines are now 2.6.x and 3.2.x** — 3.1.x is dropped. The CI matrix runs
+  `v2.6.5` and `v3.2.3` (was `v2.6.5` + `v3.1.3`). 3.2 is covered directly rather than assumed
+  equivalent to 3.1, because SurrealDB 3.2.0 regressed uncorrelated sub-SELECTs combining
+  `ORDER BY` and `LIMIT` ([SurrealDB-ORM#147](https://github.com/EulogySnowfall/SurrealDB-ORM/issues/147));
+  ORM-lite never emits that shape. The suite is still run against 3.1.5 locally as a
+  backward-compatibility check (`RETRO=1`), but a regression there no longer blocks a release.
+- **One version pin per supported line.** `.surrealdb-version` now pins the primary (latest)
+  line — `3.2.3` — and the new `.surrealdb-version2x` pins the legacy 2.x line (`2.6.5`). The
+  single file could not serve both consumers: the 2.x version monitor reads and writes it (and
+  saw a permanent phantom update while it held a 3.x value), while the Dependabot gate uses it
+  to pick a test container. Dependabot now tests **both** lines, and the monitor's `sed` on the
+  CI matrix targets only the `v2.*` entry — it assumed a single-element list and had silently
+  matched nothing since the matrix gained a second line.
 - **`save()` with an explicit id now reads back the model's computed fields** from the row the
   server returned; it previously discarded that row entirely, so a computed value never reached
   the instance. The sync is deliberately limited to computed fields — a model that declares none
@@ -47,10 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Notes
 
-- **Identical on SurrealDB 2.6.x and 3.x** — no 3.x-only primitive and no capability gate, so
-  no test in this feature skips on either line. The DDL syntax, the recompute triggers, the
-  precedence over client-sent data and the rollback of DDL in a cancelled transaction all
-  matched exactly. The only divergence is the raw SDK exception for an invalid expression
+- **Identical on SurrealDB 2.6.x and 3.x** — verified on 2.6.5 and 3.2.3 (and on 3.1.5 as a
+  backward-compatibility check). No 3.x-only primitive and no capability gate, so no test in
+  this feature skips on any line. The DDL syntax, the recompute triggers, the precedence over
+  client-sent data and the rollback of DDL in a cancelled transaction all matched exactly. The only divergence is the raw SDK exception for an invalid expression
   (`InternalError` on 2.6.x, `ValidationError` on 3.x); both are normalised to `SurrealDbError`.
 - SurrealDB evaluates computed fields in **alphabetical field-name order**, not declaration
   order: a computed field reading another must sort after it (`subtotal` → `total` works,
@@ -59,10 +76,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot override the expression, even bypassing the ORM entirely.
 - No `TYPE` clause is emitted — SurrealDB infers an optional type. Explicit field types remain a
   later roadmap item.
-- `patch()` is deliberately not guarded: JSON Pointers are opaque paths, and the server
-  recomputes regardless.
 - Expressions are inlined into DDL and cannot reference bound parameters. Build them only from
   developer-controlled text — the `SurrealFunc` trust model, whose validation they reuse.
+- **`tests/typing_examples.py`** is type-checked in CI as its own mypy invocation, so the public
+  API is verified to type-check from a _user's_ side — `mypy src/` alone cannot catch that, since
+  no model in `src/` declares a computed field.
 
 ## [0.13.0] - 2026-07-26
 
