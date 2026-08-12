@@ -443,8 +443,63 @@ class TestComputedWriteGuards:
             "patch()",
         )
 
+    @pytest.mark.asyncio
+    async def test_patch_rejects_a_whole_document_replace(self) -> None:
+        """RFC 6901's empty pointer targets the whole document, computed fields included."""
+        guard = CfGuard(id="a")
+        with pytest.raises(ValueError, match="full_name"):
+            await guard.patch([{"op": "replace", "path": "", "value": {"first_name": "Ada", "full_name": "x"}}])
+
+    def test_whole_document_replace_without_computed_keys_passes(self) -> None:
+        """Replacing the document with a value that omits them is a legitimate write."""
+        CfGuard._reject_computed_patch(
+            [{"op": "replace", "path": "", "value": {"first_name": "Ada"}}],
+            "patch()",
+        )
+
+    @pytest.mark.asyncio
+    async def test_atomic_helpers_reject_a_path_into_a_computed_field(self) -> None:
+        """``tag_count.items`` is as server-owned as ``tag_count`` — cf. ``/tag_count/0``."""
+        guard = CfGuard(id="a")
+        with pytest.raises(ValueError, match="tag_count"):
+            await guard.atomic_append("tag_count.items", "x")
+
     def test_plain_model_is_unaffected(self) -> None:
         Plain._reject_computed_writes(["name", "anything"], "merge()")
+
+
+class TestComputedSiblingBases:
+    """Demotion must work from a sibling base, not just from the subclass body."""
+
+    def test_ordinary_redeclaration_in_a_sibling_base_demotes(self) -> None:
+        class HasComputed(BaseSurrealModel):
+            id: str
+            label: Computed[str] = computed("string::uppercase(id)")
+
+        class Ordinary(BaseSurrealModel):
+            label: str = ""
+
+        class Combined(Ordinary, HasComputed):
+            pass
+
+        # Ordinary precedes HasComputed in the MRO, so its plain `label` wins — and Pydantic
+        # builds it as a writable field. The verdict must agree, or `label` is stripped from
+        # every write payload and merge(label=...) raises on a field the user owns.
+        assert "label" not in Combined.get_computed_fields()
+        Combined._reject_computed_writes(["label"], "merge()")
+
+    def test_computed_base_still_wins_when_it_precedes(self) -> None:
+        class HasComputed(BaseSurrealModel):
+            id: str
+            label: Computed[str] = computed("string::uppercase(id)")
+
+        class Ordinary(BaseSurrealModel):
+            label: str = ""
+
+        class Combined(HasComputed, Ordinary):
+            pass
+
+        assert Combined.get_computed_fields() == {"label": "string::uppercase(id)"}
 
 
 class TestComputedGuardsE2E:

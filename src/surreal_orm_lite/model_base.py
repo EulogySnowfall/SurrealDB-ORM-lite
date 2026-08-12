@@ -93,6 +93,14 @@ class BaseSurrealModel(BaseModel):
         """
         collected: dict[str, str] = {}
         for base in reversed(cls.__mro__[1:]):
+            # Same rule as for this class body below, applied to every base: a base that
+            # re-annotates a name re-decides it. Merging the bases' verdicts alone would let
+            # an *ordinary* redeclaration in a sibling base be ignored — with
+            # ``class C(B, A)`` where ``B.x: str`` and ``A.x: Computed[str]``, Pydantic builds
+            # a writable ``x`` while the verdict still called it computed, so ``x`` was
+            # stripped from writes and ``merge(x=…)`` raised on a field the user owns.
+            for name in _own_annotation_names(base):
+                collected.pop(name, None)
             collected.update(getattr(base, "__surreal_computed__", None) or {})
         # A name this class re-annotates is re-decided below; drop the inherited verdict first.
         for name in _own_annotation_names(cls):
@@ -355,9 +363,15 @@ class BaseSurrealModel(BaseModel):
 
     @classmethod
     def _validate_atomic_field(cls, field: str) -> None:
-        """Validate an atomic-op target: a plain identifier, and not a computed field."""
+        """Validate an atomic-op target: a valid name, and not a computed field.
+
+        Dotted paths are legal here (``validate_field_name`` allows them for nested fields),
+        so the guard compares the **first** segment: a computed field is server-owned in full,
+        making ``tag_count.items`` no more writable than ``tag_count`` — the same rule the
+        patch guard applies to ``/tag_count/0``.
+        """
         validate_field_name(field, "atomic field")
-        cls._reject_computed_writes([field], "atomic operation")
+        cls._reject_computed_writes([field.split(".", 1)[0]], "atomic operation")
 
     @classmethod
     def _reject_computed_patch(cls, operations: list[dict[str, Any]], context: str) -> None:
@@ -373,6 +387,11 @@ class BaseSurrealModel(BaseModel):
         ``path`` and — for ``move``, which removes its source — ``from`` count as writes;
         ``copy`` only reads its ``from``.
 
+        The empty pointer ``""`` is RFC 6901's **whole document**, so it writes every field at
+        once and cannot be judged on its segment. It is judged on the keys of its ``value``
+        instead — replacing the document with an object that omits the computed fields is a
+        legitimate write, naming one is not.
+
         Call **after** :func:`validate_patch_operations`, which guarantees the shape relied on
         here.
         """
@@ -382,6 +401,12 @@ class BaseSurrealModel(BaseModel):
             if op.get("op") == "move":
                 pointers.append(op["from"])
             for pointer in pointers:
+                if pointer == "":
+                    value = op.get("value")
+                    # No inspectable value (e.g. ``remove`` on the whole document) — treat it
+                    # as touching everything the server owns.
+                    targets.extend([str(key) for key in value] if isinstance(value, dict) else cls.get_computed_fields())
+                    continue
                 segment = pointer.split("/")[1] if "/" in pointer else ""
                 # RFC 6901 escapes; field names never contain them, but decode before comparing.
                 targets.append(segment.replace("~1", "/").replace("~0", "~"))
@@ -400,7 +425,14 @@ class BaseSurrealModel(BaseModel):
 
         if tx is not None:
             if record_id is not None:
-                await tx.add(f"CREATE {record_id} CONTENT $data;", {"data": data})
+                rows = await tx.add(f"CREATE {record_id} CONTENT $data;", {"data": data})
+                # An interactive transaction (3.x/WebSocket) answers with the created row, so
+                # hydrate the server-owned fields exactly as the non-tx path does. A buffered
+                # transaction defers the statement and has nothing to return yet — its
+                # computed fields stay None until the instance is refreshed after commit.
+                record = rows[0] if isinstance(rows, list) and rows else rows
+                if isinstance(record, dict):
+                    self._apply_record(record, only=self.get_computed_fields())
                 return self, True
             if not tx.is_interactive:
                 raise SurrealDbError(
