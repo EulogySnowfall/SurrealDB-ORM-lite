@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Dependabot PRs can be tested again.** The readiness probe piped SurrealDB's `/health` into
+  `grep -q "OK"`, but that endpoint answers `200` with an *empty body* — the match could never
+  succeed, so every probe ran its full retry budget and then declared a server that had been up
+  for a minute unhealthy. Nothing acted on the verdict, so it stayed invisible: `ci.yml` merely
+  `break`-ed and ran the suite anyway (passing, against the server it had just given up on), at a
+  cost of ~30s on each of the eight matrix jobs. #134 then wrapped the same loop in `start_one`,
+  which *returns 1* on timeout — turning the latent bug into a hard failure on the next Dependabot
+  PR (#150) and stalling the auto-merge chain. Both probes now key on the status code (`curl -sf`,
+  matching `devops/wait-for-healthy.sh` in the full ORM), dump `docker logs` when a server really
+  does not come up, and fail the step instead of falling through. Guarded by
+  `tests/test_workflow_health_probe.py`.
 - **The SurrealDB version monitors work again, and now cover both lines.** The 2.x monitor had
   failed on every scheduled run for seven weeks: it read the primary pin, compared it to the
   latest 2.x release, and so proposed a downgrade every day — wedging permanently on the

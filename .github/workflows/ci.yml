@@ -66,14 +66,19 @@ jobs:
             start --user root --pass root
 
           echo "Waiting for SurrealDB to be healthy..."
-          for i in {1..15}; do
-            if curl -s http://localhost:8000/health | grep -q "OK"; then
-              echo "SurrealDB is up!"
-              break
+          for i in {1..30}; do
+            # /health answers 200 with an empty body, so the status code is the whole
+            # signal. Grepping the body for "OK" never matched, so this loop ran its
+            # full budget on every job and then fell through to the tests regardless.
+            if curl -sf http://localhost:8000/health >/dev/null; then
+              echo "SurrealDB is up! (attempt ${i})"
+              exit 0
             fi
-            echo "SurrealDB not up yet. Retrying..."
             sleep 2
           done
+          echo "SurrealDB did not become healthy" >&2
+          docker logs surreal >&2 || true
+          exit 1
 
       - name: Checkout code
         uses: actions/checkout@v7
