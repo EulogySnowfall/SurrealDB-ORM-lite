@@ -1,9 +1,10 @@
 import re
+import warnings
 from collections.abc import Iterable, Mapping
 from typing import Any
 
 from .constants import LOOKUP_OPERATORS
-from .functions import SurrealFunc
+from .functions import SurrealFunc, Var
 
 # Pattern for valid field names: alphanumeric, underscores, dots (for nested fields)
 # Must start with a letter or underscore
@@ -21,6 +22,10 @@ VALID_GRAPH_PATH_PATTERN = re.compile(r"^(<-|->)[a-zA-Z_][a-zA-Z0-9_]*((<-|->)[a
 # ID part allows alphanumeric, underscores, and hyphens
 VALID_THING_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*:[a-zA-Z0-9_`-]+$")
 
+# A record id that SurrealQL reads as a bare identifier. Anything else (a digit run, a
+# hyphen, punctuation) must be backtick-quoted to keep its string form.
+BARE_RECORD_ID = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
 # Pattern for valid SurrealQL variable references: $variable_name
 VALID_VARIABLE_REF_PATTERN = re.compile(r"^\$[a-zA-Z_][a-zA-Z0-9_]*$")
 
@@ -28,6 +33,85 @@ VALID_VARIABLE_REF_PATTERN = re.compile(r"^\$[a-zA-Z_][a-zA-Z0-9_]*$")
 def remove_quotes_for_variables(query: str) -> str:
     # Regex to remove single quotes around variables ($)
     return re.sub(r"'(\$[a-zA-Z_]\w*)'", r"\1", query)
+
+
+def split_statements(query: str) -> list[str]:
+    """Split SurrealQL on the statement separator, ignoring ``;`` inside strings and comments.
+
+    Deliberately a scanner and not a parser: it only needs to tell "one statement" from
+    "several", and the string/comment forms below are the ones that can hide a semicolon.
+    Single quotes, double quotes (with backslash escapes), ``--`` / ``#`` line comments and
+    ``/* … */`` block comments are honoured; anything else is ordinary text.
+    """
+    statements: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    index = 0
+    length = len(query)
+
+    while index < length:
+        char = query[index]
+
+        if quote is not None:
+            current.append(char)
+            if char == "\\" and index + 1 < length:
+                current.append(query[index + 1])
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+
+        if char in "'\"":
+            quote = char
+            current.append(char)
+            index += 1
+            continue
+
+        if query.startswith("/*", index):
+            end = query.find("*/", index + 2)
+            end = length if end == -1 else end + 2
+            current.append(query[index:end])
+            index = end
+            continue
+
+        if query.startswith("--", index) or char == "#":
+            end = query.find("\n", index)
+            end = length if end == -1 else end
+            current.append(query[index:end])
+            index = end
+            continue
+
+        if char == ";":
+            statements.append("".join(current))
+            current = []
+            index += 1
+            continue
+
+        current.append(char)
+        index += 1
+
+    statements.append("".join(current))
+    return [statement for statement in statements if statement.strip()]
+
+
+def warn_on_multiple_statements(query: str) -> None:
+    """Warn when a raw query carries more than one statement.
+
+    The SDK returns the result set of the **first** statement only, and says nothing about
+    the rest, so a two-statement query silently loses half its output (issue #156). Run one
+    statement per call, or use ``transaction()`` when they must be atomic.
+    """
+    count = len(split_statements(query))
+    if count > 1:
+        warnings.warn(
+            f"The query carries {count} statements but only the first one's results are "
+            "returned by the SurrealDB SDK; run one statement per call, or use "
+            "transaction() if they must be atomic.",
+            UserWarning,
+            stacklevel=3,
+        )
 
 
 def validate_field_name(field: str, context: str = "field") -> None:
@@ -246,10 +330,29 @@ def build_filter_condition(field: str, lookup: str, value: Any, counter: int) ->
         if isinstance(value, (str, dict)) or not hasattr(value, "__iter__"):
             raise ValueError(f"'{lookup}' lookup requires an iterable (list, tuple, or set), got {type(value).__name__}")
         return f"{field} {op} ${var_name}", {var_name: list(value)}, counter + 1
+    elif isinstance(value, Var):
+        # The explicit, unambiguous form (v0.14.3).
+        return f"{field} {op} {value.reference}", {}, counter
+    elif isinstance(value, str) and value.startswith("$$"):
+        # "$$x" escapes to the literal "$x" — the only way to filter on a value that
+        # really does start with a dollar sign (issue #156).
+        return f"{field} {op} ${var_name}", {var_name: value[1:]}, counter + 1
     elif isinstance(value, str) and value.startswith("$"):
-        # Backward compat: string values starting with $ are variable references
+        # Backward compat: string values starting with $ are variable references. This is
+        # a trap for user-supplied data — a literal "$admin" silently matches nothing — so
+        # it is deprecated in favour of Var("admin"), with "$$admin" for the literal.
         if not VALID_VARIABLE_REF_PATTERN.match(value):
-            raise ValueError(f"Invalid variable reference '{value}': must match $variable_name pattern")
+            raise ValueError(
+                f"Invalid variable reference '{value}': must match $variable_name pattern. "
+                f"To filter on the literal string, escape the dollar sign: '${value}'."
+            )
+        warnings.warn(
+            f"Passing '{value}' as a filter value is interpreted as a reference to the query "
+            f"variable {value} and is deprecated; use Var({value[1:]!r}) to reference a "
+            f"variable, or '${value}' to match the literal string.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return f"{field} {op} {value}", {}, counter
     else:
         return f"{field} {op} ${var_name}", {var_name: value}, counter + 1

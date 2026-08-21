@@ -22,6 +22,7 @@ from .functions import (
     SurrealRandFunction,
     SurrealStringFunction,
     SurrealTimeFunction,
+    Var,
     computed,
 )
 from .model_base import BaseSurrealModel, SurrealConfigDict
@@ -89,6 +90,8 @@ __all__ = [
     "SurrealArrayFunction",
     "SurrealCryptoFunction",
     "SurrealRandFunction",
+    # Query variables
+    "Var",
     # Exceptions
     "SurrealORMError",
     "SurrealDbError",

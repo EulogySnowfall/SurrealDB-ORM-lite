@@ -26,6 +26,7 @@ from .signals import (
 )
 from .transaction import Transaction
 from .utils import (
+    BARE_RECORD_ID,
     build_set_clause,
     merge_extra_vars,
     remove_quotes_for_variables,
@@ -35,6 +36,7 @@ from .utils import (
     validate_graph_path,
     validate_patch_operations,
     validate_thing,
+    warn_on_multiple_statements,
 )
 
 logger = logging.getLogger(__name__)
@@ -696,9 +698,9 @@ class BaseSurrealModel(BaseModel):
         Uses the SDK's native ``upsert()`` which runs ``UPSERT $record CONTENT $data`` —
         a full REPLACE: the record is created if absent, or entirely replaced if present
         (fields omitted from the model are dropped). An explicit id is required (there is
-        nothing to match without one). ``created`` cannot be told apart from the native
-        call, so it is reported best-effort as ``True``; use ``update_or_create`` when the
-        precise ``created`` flag matters.
+        nothing to match without one). ``created`` is read from the statement's ``$before``
+        (``None`` → the row did not exist), so the ``post_save`` signal reports it truthfully
+        — at no extra round-trip.
 
         When ``tx`` is provided the ``UPSERT`` statement is buffered (deferred to commit);
         on an interactive transaction the returned row is applied to ``self``.
@@ -711,15 +713,35 @@ class BaseSurrealModel(BaseModel):
             )
         data = self._write_payload()
 
+        # RETURN $before, $after reports both states of the row in a single statement, so
+        # `created` is the truth rather than an assumption (issue #156). Verified on
+        # SurrealDB 2.6.x and 3.x alike.
+        statement = f"UPSERT {record_id} CONTENT $data RETURN $before AS before, $after AS after;"
+
         if tx is not None:
-            rows = await tx.add(f"UPSERT {record_id} CONTENT $data;", {"data": data})
-            self._apply_record(rows)
-            return self, True
+            rows = await tx.add(statement, {"data": data})
+            before, after = self._split_upsert_result(rows)
+            self._apply_record(after if after is not None else rows)
+            return self, before is None
 
         client = await SurrealDBConnectionManager.get_client()
-        record = await client.upsert(record_id, data)
-        self._apply_record(record)
-        return self, True
+        rows = await client.query(statement, {"data": data})
+        before, after = self._split_upsert_result(rows)
+        self._apply_record(after if after is not None else rows)
+        return self, before is None
+
+    @staticmethod
+    def _split_upsert_result(rows: Any) -> tuple[Any, Any]:
+        """Unwrap ``[{"before": …, "after": …}]`` into ``(before, after)``.
+
+        A buffered transaction returns nothing at ``add()`` time, and a server that answers
+        in an unexpected shape must not crash the write, so anything unrecognised degrades
+        to ``(None, None)`` — the caller then reports ``created=True``, the pre-0.14.3
+        behaviour.
+        """
+        if isinstance(rows, list) and rows and isinstance(rows[0], dict) and "after" in rows[0]:
+            return rows[0].get("before"), rows[0].get("after")
+        return None, None
 
     async def upsert(self, tx: Transaction | None = None) -> Self:
         """
@@ -1149,6 +1171,12 @@ class BaseSurrealModel(BaseModel):
             return str(id_val)
         thing = f"{self.get_table_name()}:{id_val}"
         validate_thing(thing)
+        if not BARE_RECORD_ID.match(str(id_val)):
+            # save() stores a str id as a *string* record id, but an unquoted digit run in
+            # SurrealQL is an integer one — so `M:1` addressed a record the ORM never wrote,
+            # and every relation built from this thing silently pointed at nothing. Backticks
+            # keep the string form the record actually has (found while fixing issue #156).
+            thing = f"{self.get_table_name()}:`{id_val}`"
         return thing
 
     @staticmethod
@@ -1296,10 +1324,15 @@ class BaseSurrealModel(BaseModel):
         validate_edge_name(edge)
         thing = self._get_thing()
 
+        # With a model class the caller wants whole records, so project them in the traversal
+        # itself (``->edge->?.*``) instead of fetching ids and then selecting them: same
+        # result, one round-trip instead of two (issue #156). Verified on 2.6.x and 3.x.
+        projection = "?.*" if model_class is not None else "?"
+
         if direction == "out":
-            query = f"SELECT VALUE ->{edge}->? FROM ONLY {thing};"
+            query = f"SELECT VALUE ->{edge}->{projection} FROM ONLY {thing};"
         elif direction == "in":
-            query = f"SELECT VALUE <-{edge}<-? FROM ONLY {thing};"
+            query = f"SELECT VALUE <-{edge}<-{projection} FROM ONLY {thing};"
         else:
             raise ValueError(f"direction must be 'out' or 'in', got '{direction}'")
 
@@ -1413,13 +1446,12 @@ class BaseSurrealModel(BaseModel):
             ''', variables={"user_id": "user:123"})
             ```
         """
-        from .utils import remove_quotes_for_variables
+        warn_on_multiple_statements(query)
 
+        # Sent verbatim: this is the caller's own SurrealQL, so the ORM does not rewrite it
+        # (unquoting "$word" occurrences used to corrupt string literals — issue #156).
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.query(
-            remove_quotes_for_variables(query),
-            variables or {},
-        )
+        results = await client.query(query, variables or {})
 
         # SDK 2.0 returns the rows list directly from query()
         if isinstance(results, list):

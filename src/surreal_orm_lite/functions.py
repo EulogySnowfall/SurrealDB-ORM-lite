@@ -12,11 +12,16 @@ This module deliberately imports nothing from the rest of the package (``utils``
 *it*), so it stays cycle-free.
 """
 
+import re
 from enum import StrEnum
 from typing import Annotated, Any, Optional, TypeAlias, TypeVar
 
+# A SurrealQL variable name: the ``$`` is the sigil, the name itself is an identifier.
+VALID_VARIABLE_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
 __all__ = [
     "Computed",
+    "Var",
     "SurrealArrayFunction",
     "SurrealCryptoFunction",
     "SurrealFunc",
@@ -220,6 +225,48 @@ def computed(expression: "str | SurrealFunc") -> Any:
     """
     func = expression if isinstance(expression, SurrealFunc) else SurrealFunc(expression)
     return _ComputedDefault(func.expression)
+
+
+class Var:
+    """An explicit reference to a **bound query variable** in a filter (v0.14.3).
+
+    ``filter()`` has always read a string starting with ``$`` as a variable reference, which
+    makes a literal value like ``"$admin"`` impossible to express and turns any user-supplied
+    string into an accidental reference. ``Var`` states the intent instead of inferring it::
+
+        from surreal_orm_lite import Var
+
+        qs = User.objects().filter(age__gte=Var("min_age"))     # … WHERE age >= $min_age
+
+    The variable itself is supplied at execution time, exactly as before. Plain strings
+    beginning with ``$`` still work but are deprecated; write ``"$$admin"`` to filter on a
+    literal that starts with a dollar sign.
+    """
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        candidate = name[1:] if name.startswith("$") else name
+        if not VALID_VARIABLE_NAME.match(candidate):
+            raise ValueError(
+                f"Invalid variable name '{name}': a variable name must start with a letter or "
+                "underscore and contain only letters, digits and underscores"
+            )
+        self.name = candidate
+
+    @property
+    def reference(self) -> str:
+        """The SurrealQL form of the reference, e.g. ``$min_age``."""
+        return f"${self.name}"
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"Var({self.name!r})"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Var) and other.name == self.name
+
+    def __hash__(self) -> int:
+        return hash((Var, self.name))
 
 
 class SurrealFunction(StrEnum):
