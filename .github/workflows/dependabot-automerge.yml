@@ -83,13 +83,17 @@ jobs:
 
             echo "Waiting for SurrealDB v${tag} on :${port}..."
             for i in {1..30}; do
-              if curl -s "http://localhost:${port}/health" | grep -q "OK"; then
-                echo "SurrealDB v${tag} is up!"
+              # /health answers 200 with an empty body, so the status code is the whole
+              # signal. Grepping the body for "OK" never matched, which burned the full
+              # retry budget and then failed on a server that had been up for a minute.
+              if curl -sf "http://localhost:${port}/health" >/dev/null; then
+                echo "SurrealDB v${tag} is up! (attempt ${i})"
                 return 0
               fi
               sleep 2
             done
             echo "SurrealDB v${tag} did not become healthy" >&2
+            docker logs "$name" >&2 || true
             return 1
           }
 
