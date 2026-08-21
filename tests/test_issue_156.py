@@ -280,3 +280,26 @@ class TestNumericStringIdE2E:
         await source.relate("Issue156Edge", "Issue156Model:`2`")
         related = await source.get_related("Issue156Edge", model_class=Issue156Model)
         assert [row.name for row in related] == ["b"]
+
+
+class TestUpsertSignalE2E:
+    """``created`` is only visible to users through ``post_save`` — assert that surface too."""
+
+    async def test_post_save_reports_created_truthfully(self) -> None:
+        client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
+        with contextlib.suppress(Exception):
+            await client.query("REMOVE TABLE Issue156Model;")
+
+        seen: list[tuple[str, bool]] = []
+
+        @surreal_orm_lite.post_save.connect(Issue156Model)
+        async def _record(sender, instance, created, **kwargs):  # type: ignore[no-untyped-def]
+            seen.append((instance.name, created))
+
+        try:
+            await Issue156Model(id="tim", name="a", age=1).upsert()
+            await Issue156Model(id="tim", name="b", age=2).upsert()
+        finally:
+            surreal_orm_lite.post_save.clear(Issue156Model)
+
+        assert seen == [("a", True), ("b", False)]
