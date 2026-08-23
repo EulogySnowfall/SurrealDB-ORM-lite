@@ -1,5 +1,7 @@
+import asyncio
 import contextlib
 import logging
+import weakref
 from typing import Any
 
 from ._sdk import AsyncSurreal, NotFoundError
@@ -15,7 +17,14 @@ class SurrealDBConnectionManager:
     __password: str | None = None
     __namespace: str | None = None
     __database: str | None = None
-    __client: Any = None
+
+    # One client per event loop, never one client shared between loops. A WebSocket client
+    # is bound to the loop it connected on, and handing it to another loop fails with
+    # "got Future attached to a different loop" — or, worse, hangs (issue #163). Two
+    # successive asyncio.run() calls were enough to hit it. A WeakKeyDictionary means a loop
+    # that is garbage-collected takes its entry with it; loops that are merely closed are
+    # pruned on the next get_client().
+    __clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any]" = weakref.WeakKeyDictionary()
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         await SurrealDBConnectionManager.close_connection()
@@ -46,7 +55,7 @@ class SurrealDBConnectionManager:
         cls.__password = None
         cls.__namespace = None
         cls.__database = None
-        await cls.close_connection()
+        await cls.close_all_connections()
 
     @classmethod
     def is_connection_set(cls) -> bool:
@@ -58,15 +67,34 @@ class SurrealDBConnectionManager:
         return all([cls.__url, cls.__user, cls.__password, cls.__namespace, cls.__database])
 
     @classmethod
+    def __prune_dead_loops(cls) -> None:
+        """Drop cached clients whose loop is closed.
+
+        The client cannot be closed from here — ``close()`` would have to be awaited on the
+        loop that is already gone — so the reference is dropped and the socket released when
+        the loop is finalised.
+        """
+        dead = [loop for loop in list(cls.__clients) if loop.is_closed()]
+        for loop in dead:
+            cls.__clients.pop(loop, None)
+            logger.debug("Dropped the cached SurrealDB client of a closed event loop.")
+
+    @classmethod
     async def get_client(cls) -> Any:
         """
-        Connect to the SurrealDB instance.
+        Connect to the SurrealDB instance, reusing this event loop's client.
+
+        Each event loop gets its own connection: a client belongs to the loop it was created
+        on, so a cached one is only ever handed back to that same loop (issue #163).
 
         :return: The SurrealDB instance.
         """
+        loop = asyncio.get_running_loop()
+        cls.__prune_dead_loops()
 
-        if cls.__client is not None:
-            return cls.__client
+        existing = cls.__clients.get(loop)
+        if existing is not None:
+            return existing
 
         if not cls.is_connection_set():
             raise ValueError("Connection not been set.")
@@ -90,27 +118,48 @@ class SurrealDBConnectionManager:
             await _client.signin({"username": cls.__user, "password": cls.__password})
             await _client.use(cls.__namespace, cls.__database)
 
-            cls.__client = _client
-            return cls.__client
+            cls.__clients[loop] = _client
+            return _client
         except Exception as e:
             logger.warning(f"Can't get connection: {e}")
-            if cls.__client is not None:  # pragma: no cover
+            stale = cls.__clients.pop(loop, None)
+            if stale is not None:  # pragma: no cover
                 with contextlib.suppress(NotImplementedError):
-                    await cls.__client.close()
-                cls.__client = None
+                    await stale.close()
             raise SurrealDbConnectionError("Can't connect to the database.") from None
 
     @classmethod
     async def close_connection(cls) -> None:
         """
-        Close the connection to the SurrealDB instance.
+        Close this event loop's connection to the SurrealDB instance.
+
+        Only the running loop's client is closed: another loop may still be using its own,
+        and closing that one from here is both impossible and wrong. Use
+        :meth:`close_all_connections` to tear everything down.
         """
-        if cls.__client is None:
+        cls.__prune_dead_loops()
+        client = cls.__clients.pop(asyncio.get_running_loop(), None)
+        if client is None:
             return
 
         with contextlib.suppress(NotImplementedError):
-            await cls.__client.close()
-        cls.__client = None
+            await client.close()
+
+    @classmethod
+    async def close_all_connections(cls) -> None:
+        """
+        Close every cached connection, whatever loop created it.
+
+        A client belonging to another *live* loop cannot be closed from here, so it is
+        dropped rather than awaited — the socket is released when that loop is finalised.
+        Only the running loop's client is closed properly.
+        """
+        loop = asyncio.get_running_loop()
+        client = cls.__clients.pop(loop, None)
+        if client is not None:
+            with contextlib.suppress(NotImplementedError):
+                await client.close()
+        cls.__clients.clear()
 
     @classmethod
     @contextlib.asynccontextmanager
@@ -353,9 +402,18 @@ class SurrealDBConnectionManager:
     @classmethod
     def is_connected(cls) -> bool:
         """
-        Check if the connection to the SurrealDB instance is established.
+        Check whether a connection to the SurrealDB instance is established.
+
+        Connections are per event loop (issue #163), so "connected" is answered for the loop
+        asking: inside a running loop this reports *that* loop's client, and outside one it
+        reports whether any loop still holds a client.
 
         :return: True if the connection is established, False otherwise.
         """
+        cls.__prune_dead_loops()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return len(cls.__clients) > 0
 
-        return cls.__client is not None
+        return cls.__clients.get(loop) is not None
