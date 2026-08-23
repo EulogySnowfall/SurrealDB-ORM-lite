@@ -272,6 +272,23 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 ---
 
+### Version 0.14.3 — Correctness release (issue #156)
+
+- Eight findings closed: `first()` no longer leaves `LIMIT 1` on the queryset;
+  `update_or_create`/`get_or_create` refuse undeclared keys on **both** paths (they used to be
+  dropped on create and written to the row on update); user-authored SurrealQL is sent verbatim;
+  `upsert()` reports `created` from `UPSERT … RETURN $before`; a numeric-looking string id is
+  backtick-quoted so relations reach it (an `id: int` keeps its integer record id, and a
+  `"table:id"` relation target is quoted by the same rule); `get_related(model_class=)` is one
+  round-trip; `raw_query()` **and `objects().query()`** warn on multi-statement queries; the
+  `"$$literal"` escape round-trips through `get_or_create`/`update_or_create`; warnings report
+  the caller's frame, not one inside the ORM
+- New: `Var("name")` for an explicit query-variable reference in a filter, plus the `"$$literal"`
+  escape. The bare `"$x"` string form is deprecated — **flipping the default so strings are
+  always literals is planned for a later minor**, and the deprecation warning is the runway
+- Every finding reproduced on live SurrealDB 3.2.4 **and** 2.6.5 before the fix, and verified on
+  both afterwards; no line-specific behaviour
+
 ## Planned — Tier 1: Core (SDK 2.0 strict)
 
 > Per-version detail and acceptance criteria live in the design spec:

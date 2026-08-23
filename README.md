@@ -172,6 +172,24 @@ results = await User.objects().query(
 - `match`, `regex`
 - `isnull`
 
+#### Filter values that start with `$`
+
+A filter value beginning with `$` is read as a reference to a **query variable**, not as data.
+Use `Var(...)` to say so explicitly, and `$$` to escape a value that genuinely starts with a
+dollar sign:
+
+```python
+from surreal_orm_lite import Var
+
+await User.objects().filter(age__gte=Var("min_age")).exec()   # … WHERE age >= $min_age
+await User.objects().filter(name="$$admin").exec()            # matches the literal "$admin"
+await User.objects().filter(name="$admin").exec()             # deprecated: reads as $admin
+```
+
+The bare `"$admin"` form still works for backward compatibility but emits a `DeprecationWarning`:
+it silently matches nothing when the value is really meant as data, which is a trap for
+user-supplied strings. Prefer `Var(...)` in new code.
+
 ### 5. Q Objects (Complex Queries)
 
 ```python
@@ -660,28 +678,29 @@ Surreal ORM Lite runs on both lines; some capabilities differ because they rely 
 features introduced in SurrealDB 3.x. On 2.6.x the ORM degrades gracefully. Capabilities not
 listed behave the same on both lines.
 
-| ORM capability                                                                        | SurrealDB 2.6.x                                                              | SurrealDB 3.2.x                                                          | Since   |
-| ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------ | ------- |
-| Transaction strategy auto-selected by `transaction()`                                 | buffered batch (`BEGIN…COMMIT`)                                              | native interactive on WebSocket                                          | v0.9.0  |
-| Reads inside a transaction (`objects(tx=)`)                                           | raise (buffered cannot read)                                                 | see uncommitted writes                                                   | v0.9.0  |
-| `save(tx=)` with an auto-generated id                                                 | raises — explicit id required                                                | supported                                                                | v0.9.0  |
-| `refresh(tx=)` inside a transaction                                                   | raises                                                                       | works                                                                    | v0.9.0  |
-| `bulk_update` / `bulk_delete` / `QuerySet.patch` row count inside a tx                | returns `0` (not knowable pre-commit)                                        | real count                                                               | v0.9.0  |
-| "Already exists" error on create                                                      | normalised to `SurrealDbError`                                               | normalised to `SurrealDbError`                                           | v0.7.0  |
-| Cleanup on a missing target (`delete_table`, `remove_relation`)                       | native no-op                                                                 | ORM makes it a silent no-op                                              | v0.7.0  |
-| Aggregation over an empty set (`NaN` / `±inf`)                                        | returns `0.0` / `None`                                                       | ORM normalises to `0.0` / `None`                                         | v0.7.0  |
-| Namespace/db selection (`use()` ordering)                                             | lenient (auto-creates)                                                       | strict — ORM signs in before `use()`                                     | v0.7.0  |
-| `upsert()` / `update_or_create()` / `get_or_create()`                                 | same on both lines                                                           | same on both lines                                                       | v0.10.0 |
-| `patch()` / `atomic_append` / `atomic_set_add` / `atomic_remove` / `atomic_increment` | same on both lines (portable `array::*` fns chosen over divergent `+=`/`-=`) | same on both lines                                                       | v0.11.0 |
-| `retry_on_conflict` / `SurrealDbConflictError` (retryable conflict)                   | same type + decorator; conflicts rarer (engine serialises more)              | same type + decorator; conflicts are the normal optimistic-MVCC failure  | v0.12.0 |
-| `SurrealFunc` / `server_values=` / `extra_vars=` on `save`/`merge`                    | same on both lines (compiled to portable `CREATE`/`UPDATE … SET`)            | same on both lines                                                       | v0.13.0 |
-| Shipped function-name enums (`SurrealTimeFunction`, `SurrealCryptoFunction`, …)       | every catalogued member verified on 2.6.5                                    | every catalogued member verified on 3.2.4                                | v0.13.0 |
-| `server_values` inside a transaction — when the instance sees the computed value      | only after commit (buffered; `refresh()` to read it)                         | immediately (interactive returns the row)                                | v0.13.0 |
-| `merge(server_values=)` on a missing record / never-created table                     | server returns no rows → ORM raises `SurrealDbError`                         | server raises `NotFound` for a missing table → ORM raises the same error | v0.13.0 |
-| Computed fields (`Computed[...]` → `DEFINE FIELD … VALUE`)                            | same on both lines (DDL, recompute triggers, precedence over client data)    | same on both lines                                                       | v0.14.0 |
-| DDL run inside a transaction, then rolled back                                        | definition rolled back with the transaction                                  | same on both lines                                                       | v0.14.0 |
-| Invalid computed-field expression — raw SDK exception                                 | `InternalError`                                                              | `ValidationError`                                                        | v0.14.0 |
-| Invalid computed-field expression — through the ORM                                   | `SurrealDbError` (normalised)                                                | `SurrealDbError` (normalised)                                            | v0.14.0 |
+| ORM capability                                                                                                                         | SurrealDB 2.6.x                                                              | SurrealDB 3.2.x                                                          | Since   |
+| -------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------ | ------- |
+| Transaction strategy auto-selected by `transaction()`                                                                                  | buffered batch (`BEGIN…COMMIT`)                                              | native interactive on WebSocket                                          | v0.9.0  |
+| Reads inside a transaction (`objects(tx=)`)                                                                                            | raise (buffered cannot read)                                                 | see uncommitted writes                                                   | v0.9.0  |
+| `save(tx=)` with an auto-generated id                                                                                                  | raises — explicit id required                                                | supported                                                                | v0.9.0  |
+| `refresh(tx=)` inside a transaction                                                                                                    | raises                                                                       | works                                                                    | v0.9.0  |
+| `bulk_update` / `bulk_delete` / `QuerySet.patch` row count inside a tx                                                                 | returns `0` (not knowable pre-commit)                                        | real count                                                               | v0.9.0  |
+| "Already exists" error on create                                                                                                       | normalised to `SurrealDbError`                                               | normalised to `SurrealDbError`                                           | v0.7.0  |
+| Cleanup on a missing target (`delete_table`, `remove_relation`)                                                                        | native no-op                                                                 | ORM makes it a silent no-op                                              | v0.7.0  |
+| Aggregation over an empty set (`NaN` / `±inf`)                                                                                         | returns `0.0` / `None`                                                       | ORM normalises to `0.0` / `None`                                         | v0.7.0  |
+| Namespace/db selection (`use()` ordering)                                                                                              | lenient (auto-creates)                                                       | strict — ORM signs in before `use()`                                     | v0.7.0  |
+| `upsert()` / `update_or_create()` / `get_or_create()`                                                                                  | same on both lines                                                           | same on both lines                                                       | v0.10.0 |
+| `patch()` / `atomic_append` / `atomic_set_add` / `atomic_remove` / `atomic_increment`                                                  | same on both lines (portable `array::*` fns chosen over divergent `+=`/`-=`) | same on both lines                                                       | v0.11.0 |
+| `retry_on_conflict` / `SurrealDbConflictError` (retryable conflict)                                                                    | same type + decorator; conflicts rarer (engine serialises more)              | same type + decorator; conflicts are the normal optimistic-MVCC failure  | v0.12.0 |
+| `SurrealFunc` / `server_values=` / `extra_vars=` on `save`/`merge`                                                                     | same on both lines (compiled to portable `CREATE`/`UPDATE … SET`)            | same on both lines                                                       | v0.13.0 |
+| Shipped function-name enums (`SurrealTimeFunction`, `SurrealCryptoFunction`, …)                                                        | every catalogued member verified on 2.6.5                                    | every catalogued member verified on 3.2.4                                | v0.13.0 |
+| `server_values` inside a transaction — when the instance sees the computed value                                                       | only after commit (buffered; `refresh()` to read it)                         | immediately (interactive returns the row)                                | v0.13.0 |
+| `merge(server_values=)` on a missing record / never-created table                                                                      | server returns no rows → ORM raises `SurrealDbError`                         | server raises `NotFound` for a missing table → ORM raises the same error | v0.13.0 |
+| Computed fields (`Computed[...]` → `DEFINE FIELD … VALUE`)                                                                             | same on both lines (DDL, recompute triggers, precedence over client data)    | same on both lines                                                       | v0.14.0 |
+| DDL run inside a transaction, then rolled back                                                                                         | definition rolled back with the transaction                                  | same on both lines                                                       | v0.14.0 |
+| Invalid computed-field expression — raw SDK exception                                                                                  | `InternalError`                                                              | `ValidationError`                                                        | v0.14.0 |
+| Invalid computed-field expression — through the ORM                                                                                    | `SurrealDbError` (normalised)                                                | `SurrealDbError` (normalised)                                            | v0.14.0 |
+| Issue #156 correctness fixes (`Var`/`$$`, `first()`, `*_or_create` strictness, `created` on upsert, quoted ids, one-hop `get_related`) | same on both lines (each fix reproduced and verified on 2.6.5)               | same on both lines (verified on 3.2.4)                                   | v0.14.3 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
 

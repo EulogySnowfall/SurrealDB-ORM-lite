@@ -5,7 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.14.3] - 2026-08-21
+
+Correctness release: the eight findings of [issue #156](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/156)
+(seven reported, an eighth found while fixing the seventh). Every one was reproduced against a
+live SurrealDB **3.2.4 and 2.6.5** before a line of the fix was written, and behaves identically
+on both lines afterwards. No documented behaviour was removed.
+
+### Added
+
+- **`Var("name")` — an explicit reference to a bound query variable in a filter**, and the
+  **`"$$literal"` escape**. `filter(name="$admin")` used to compile to `name = $admin`, an
+  unbound reference that matched nothing and said nothing, which made a literal starting with
+  `$` impossible to express and turned any user-supplied string into an accidental variable
+  reference. Write `Var("min_age")` to reference a variable and `"$$admin"` to match the
+  literal `"$admin"`. The bare `"$x"` form still works and now raises a `DeprecationWarning`,
+  so the default can be flipped (strings always literal) in a later minor.
 
 ### Changed
 
@@ -15,13 +30,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`first()` no longer mutates the queryset.** It set `self._limit = 1` and never restored it,
+  so every later use of that queryset — including a plain re-`exec()` — silently returned at
+  most one row. It now saves and restores the limit exactly as `exists()` already did: a
+  terminal operation never changes the queryset it was called on.
+- **`update_or_create()` / `get_or_create()` no longer write undeclared keys.** A key absent
+  from the model was dropped by Pydantic on the _create_ path but written straight into the row
+  by `merge()` on the _update_ path, so one call produced two different stored schemas depending
+  on whether the record happened to exist. Both paths now raise `SurrealDbError` naming the
+  offending keys, before any write. Models that opt in with
+  `model_config = ConfigDict(extra="allow")` keep them, on both paths.
+- **User-authored SurrealQL is sent verbatim.** `raw_query()` and `objects().query()` piped the
+  caller's query through a helper that rewrote `'$word'` → `$word` _anywhere_ in the text,
+  including inside the caller's own string literals: `WHERE name = '$admin'` became a reference
+  to an unbound variable and returned nothing. The helper now runs only on ORM-compiled queries,
+  where every value is bound and no user data reaches the text.
+- **`upsert()` reports `created` truthfully.** It was hardcoded to `True`, so the `post_save`
+  signal claimed a creation on every replacement. The statement now returns both row states
+  (`UPSERT … RETURN $before AS before, $after AS after`) and `created` is read from `$before` —
+  same single round-trip, on 2.6.x and 3.x alike. REPLACE semantics are unchanged.
+- **A record id that looks numeric is reachable again.** `save(id="1")` stores the _string_
+  record id `"1"`, but an unquoted `Model:1` is the _integer_ one in SurrealQL — so `relate()`,
+  `get_related()`, `traverse()` and `remove_relation()` addressed a record the ORM had never
+  written and silently traversed nothing. Such ids are now backtick-quoted (`` Model:`1` ``).
+  The quoting keys off the id's **Python type**, not its textual shape, so a model with
+  `id: int` keeps the integer record id `Model:5` that `save()` actually wrote. A `"table:id"`
+  string passed as a relation target is quoted by the same rule, so `a.relate(edge, "M:1")`
+  and `M(id="1")` name the same record; pass a `RecordID` (or the model instance) to target an
+  integer record id, and an id written with backticks is kept verbatim. A backtick inside an id
+  is now rejected instead of producing malformed SurrealQL.
+- **`get_related(model_class=)` costs one round-trip instead of two.** It fetched record ids and
+  then issued a second `SELECT * FROM $ids`; the records are now projected in the traversal
+  itself (`->edge->?.*`). Same results, verified on both lines.
+- **`raw_query()` and `objects().query()` warn on a multi-statement query.** The SDK returns
+  only the first statement's rows and says nothing about the rest, so half the output vanished
+  silently. Detection is quote- and comment-aware (`--`, `//`, `#` and `/* … */`), so a `;`
+  inside a string literal or a comment is not mistaken for a separator, and a trailing comment
+  does not count as a statement of its own.
+- **The `"$$literal"` escape round-trips through `get_or_create()` / `update_or_create()`.** The
+  escape was decoded only when compiling the `WHERE` clause, so `get_or_create(name="$$admin")`
+  looked for `"$admin"` but stored `"$$admin"` — it never converged and created a duplicate row
+  on every call. The create payload now reads values exactly as the lookup does. A query-variable
+  reference (`Var(...)` or `"$x"`) as an equality criterion raises `SurrealDbError` instead of a
+  Pydantic error: its value lives on the server and cannot be written back — pass the literal in
+  `defaults=`.
+- **Warnings point at the caller.** The `DeprecationWarning` on `"$x"` filter values and the
+  multi-statement warning reported a frame inside the ORM, and Python's default filters only
+  surface a `DeprecationWarning` raised from `__main__` — so the deprecation runway reached
+  nobody. The reported frame is now the first one outside the package.
+
 - **Dependabot PRs can be tested again.** The readiness probe piped SurrealDB's `/health` into
-  `grep -q "OK"`, but that endpoint answers `200` with an *empty body* — the match could never
+  `grep -q "OK"`, but that endpoint answers `200` with an _empty body_ — the match could never
   succeed, so every probe ran its full retry budget and then declared a server that had been up
   for a minute unhealthy. Nothing acted on the verdict, so it stayed invisible: `ci.yml` merely
   `break`-ed and ran the suite anyway (passing, against the server it had just given up on), at a
   cost of ~30s on each of the eight matrix jobs. #134 then wrapped the same loop in `start_one`,
-  which *returns 1* on timeout — turning the latent bug into a hard failure on the next Dependabot
+  which _returns 1_ on timeout — turning the latent bug into a hard failure on the next Dependabot
   PR (#150) and stalling the auto-merge chain. Both probes now key on the status code (`curl -sf`,
   matching `devops/wait-for-healthy.sh` in the full ORM), dump `docker logs` when a server really
   does not come up, and fail the step instead of falling through. Guarded by

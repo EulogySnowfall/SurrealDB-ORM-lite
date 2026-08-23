@@ -9,6 +9,7 @@ from . import BaseSurrealModel, SurrealDBConnectionManager
 from ._sdk import NotFoundError, RecordID
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
+from .functions import Var
 from .q import Q
 from .utils import (
     build_filter_condition,
@@ -17,6 +18,7 @@ from .utils import (
     validate_alias_name,
     validate_field_name,
     validate_patch_operations,
+    warn_on_multiple_statements,
 )
 
 if TYPE_CHECKING:
@@ -387,11 +389,20 @@ class QuerySet:
         """
         Execute the query and return the first result.
 
+        The queryset is left untouched: the ``LIMIT 1`` applies to this call only, so the
+        same queryset can be reused (or re-executed) afterwards and still yields every
+        matching row.
+
         Returns:
             The first model instance, or raises SurrealDbNotFoundError if no results.
         """
-        self._limit = 1
-        results = await self.exec()
+        original_limit = self._limit
+        try:
+            self._limit = 1
+            results = await self.exec()
+        finally:
+            self._limit = original_limit
+
         if results:
             return results[0]
 
@@ -789,12 +800,27 @@ class QuerySet:
         lookups (``gt``/``contains``/``in``/…) still drive the lookup but cannot be written,
         so they are excluded here — mirroring Django, which only writes exact lookups on
         create.
+
+        Values go through the same interpretation the WHERE builder applies, so the row that
+        gets created is the row the next lookup finds: ``"$$literal"`` is un-escaped to
+        ``"$literal"`` (otherwise ``get_or_create(name="$$admin")`` filtered on ``"$admin"``
+        but stored ``"$$admin"``, never converging and creating a duplicate on every call),
+        and a query-variable reference is refused outright — its value lives on the server,
+        so it cannot be written back (issue #156 follow-up).
         """
         payload: dict[str, Any] = {}
         for key, value in criteria.items():
             field_name, lookup = parse_lookup(key)
-            if lookup == "exact":
-                payload[field_name] = value
+            if lookup != "exact":
+                continue
+            if isinstance(value, Var) or (isinstance(value, str) and value.startswith("$") and value[1:2] != "$"):
+                raise SurrealDbError(
+                    f"Cannot create a record from the query-variable reference given for '{field_name}': "
+                    "its value is only known to the database. Pass the literal value in defaults=."
+                )
+            if isinstance(value, str) and value.startswith("$$"):
+                value = value[1:]
+            payload[field_name] = value
         return payload
 
     async def _lookup_matches(self, criteria: dict[str, Any]) -> list[Any]:
@@ -814,16 +840,37 @@ class QuerySet:
         return rows if isinstance(rows, list) else []
 
     def _writable_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """Drop computed fields from a ``*_or_create`` write payload.
+        """Vet a ``*_or_create`` write payload: drop computed fields, reject undeclared ones.
 
         Filtering by a computed field is legitimate (it is an ordinary column to read), so a
         computed name can legitimately appear in ``criteria``. But it is server-owned and must
         not be *written*. Without this, the same call would succeed on the create path (where
         ``_write_payload`` silently drops it) and raise on the update path (where ``merge()``
         guards) — an outcome that depends only on whether the row already existed.
+
+        A key the model does not declare used to diverge the same way, in the opposite
+        direction (issue #156): Pydantic dropped it when constructing the model on the create
+        path, while ``merge()`` wrote it straight to the row on the update path — so one call
+        produced two different stored schemas depending on whether the record happened to
+        exist. Both paths now refuse it up front, because a caller who mistypes a field name
+        wants to hear about it rather than lose the value. Models that opt into extra fields
+        (``model_config = ConfigDict(extra="allow")``) keep them, on both paths.
         """
         computed = self.model.get_computed_fields()
-        return {key: value for key, value in payload.items() if key not in computed}
+        vetted = {key: value for key, value in payload.items() if key not in computed}
+
+        if self.model.model_config.get("extra") == "allow":
+            return vetted
+
+        declared = set(self.model.model_fields)
+        undeclared = sorted(key for key in vetted if key not in declared)
+        if undeclared:
+            raise SurrealDbError(
+                f"{self.model.__name__} does not declare {', '.join(undeclared)}; "
+                "remove the key, add the field to the model, or set "
+                'model_config = ConfigDict(extra="allow") to store undeclared fields.'
+            )
+        return vetted
 
     async def update_or_create(
         self,
@@ -847,8 +894,9 @@ class QuerySet:
         window exists, the same non-atomic fallback Django documents. ``criteria`` must be
         non-empty.
 
-        Create builds ``self.model(**payload)``: keys not declared on the model are dropped by
-        Pydantic, and a missing required field raises ``ValidationError`` at construction.
+        Create builds ``self.model(**payload)``: a key the model does not declare raises
+        ``SurrealDbError`` (unless the model sets ``extra="allow"``), and a missing required
+        field raises ``ValidationError`` at construction.
         """
         if not criteria:
             raise SurrealDbError("update_or_create() requires at least one lookup criteria.")
@@ -883,8 +931,9 @@ class QuerySet:
         ``objects(tx=)`` participation); the lookup routes through the transaction too.
         ``criteria`` must be non-empty.
 
-        Create builds ``self.model(**payload)``: keys not declared on the model are dropped by
-        Pydantic, and a missing required field raises ``ValidationError`` at construction.
+        Create builds ``self.model(**payload)``: a key the model does not declare raises
+        ``SurrealDbError`` (unless the model sets ``extra="allow"``), and a missing required
+        field raises ``ValidationError`` at construction.
         """
         if not criteria:
             raise SurrealDbError("get_or_create() requires at least one lookup criteria.")
@@ -914,9 +963,15 @@ class QuerySet:
         """
         if f"FROM {self._model_table}" not in query:
             raise SurrealDbError(f"The query must include 'FROM {self._model_table}' to reference the correct table.")
+        # Same silent truncation raw_query() warns about: only the first statement's results
+        # come back from the SDK (issue #156).
+        warn_on_multiple_statements(query)
         client = await SurrealDBConnectionManager.get_client()
         try:
-            results = await client.query(remove_quotes_for_variables(query), variables or {})
+            # User-authored SurrealQL is sent verbatim: the caller owns that string and
+            # binds their own variables, so rewriting quoted "$word" occurrences inside it
+            # would corrupt their string literals (issue #156).
+            results = await client.query(query, variables or {})
         except NotFoundError:
             # SurrealDB 3.x raises for a never-created table; the ORM contract
             # treats a missing table as empty.

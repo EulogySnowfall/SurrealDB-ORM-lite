@@ -1,4 +1,4 @@
-__version__ = "0.14.2"
+__version__ = "0.14.3"
 
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
 from .concurrency import is_conflict_error, retry_on_conflict
@@ -22,6 +22,7 @@ from .functions import (
     SurrealRandFunction,
     SurrealStringFunction,
     SurrealTimeFunction,
+    Var,
     computed,
 )
 from .model_base import BaseSurrealModel, SurrealConfigDict
@@ -89,6 +90,8 @@ __all__ = [
     "SurrealArrayFunction",
     "SurrealCryptoFunction",
     "SurrealRandFunction",
+    # Query variables
+    "Var",
     # Exceptions
     "SurrealORMError",
     "SurrealDbError",
