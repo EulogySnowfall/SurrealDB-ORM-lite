@@ -277,7 +277,9 @@ class TestNumericStringIdE2E:
 
         assert source._get_thing() == "Issue156Model:`1`"
 
-        await source.relate("Issue156Edge", "Issue156Model:`2`")
+        # A plain "table:id" string must resolve to the same record as the model's own
+        # _get_thing(): no hand-written backticks required (review follow-up).
+        await source.relate("Issue156Edge", "Issue156Model:2")
         related = await source.get_related("Issue156Edge", model_class=Issue156Model)
         assert [row.name for row in related] == ["b"]
 
@@ -303,3 +305,110 @@ class TestUpsertSignalE2E:
             surreal_orm_lite.post_save.clear(Issue156Model)
 
         assert seen == [("a", True), ("b", False)]
+
+
+# ==================== Review follow-ups on the #156 fixes ====================
+
+
+class TestRecordIdQuoting:
+    """The backtick quoting of #7 must key off the id's Python *type*, not its text shape."""
+
+    def test_integer_id_stays_an_integer_record_id(self) -> None:
+        class IntIdModel(surreal_orm_lite.BaseSurrealModel):
+            id: int
+            name: str = "x"
+
+        model = IntIdModel(id=5)
+        # Quoting a genuine int id would send relations to a record save() never wrote.
+        assert model._get_thing() == "IntIdModel:5"
+        assert str(model._record_id()) == model._get_thing()
+
+    def test_string_id_that_looks_numeric_is_quoted(self) -> None:
+        assert Issue156Model(id="5", name="a")._get_thing() == "Issue156Model:`5`"
+
+    def test_target_string_is_quoted_like_a_model_id(self) -> None:
+        source = Issue156Model(id="5", name="a")
+        assert Issue156Model._resolve_target_thing("Issue156Model:5") == source._get_thing()
+
+    def test_already_quoted_target_is_kept_verbatim(self) -> None:
+        assert Issue156Model._resolve_target_thing("Issue156Model:`5`") == "Issue156Model:`5`"
+
+    def test_record_id_target_keeps_the_integer_form(self) -> None:
+        assert Issue156Model._resolve_target_thing(RecordID("Issue156Model", 5)) == "Issue156Model:5"
+
+    def test_a_backtick_in_an_id_is_refused(self) -> None:
+        with pytest.raises(ValueError):
+            Issue156Model(id="a`b", name="a")._get_thing()
+
+
+class TestWarningsReachUserCode:
+    """A fixed stacklevel pointed inside the ORM, so Python's default filters hid the warning."""
+
+    def test_deprecation_warning_points_at_the_caller(self) -> None:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            Issue156Model.objects().filter(name="$admin")._build_where()
+        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        assert deprecations, [str(w.message) for w in caught]
+        assert deprecations[0].filename == __file__
+
+    async def test_queryset_query_warns_on_multiple_statements(self) -> None:
+        class FakeClient:
+            async def query(self, query: str, variables: dict) -> list:
+                return []
+
+        async def fake_get_client() -> FakeClient:
+            return FakeClient()
+
+        original = surreal_orm_lite.SurrealDBConnectionManager.get_client
+        surreal_orm_lite.SurrealDBConnectionManager.get_client = fake_get_client  # type: ignore[assignment]
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                await Issue156Model.objects().query("SELECT * FROM Issue156Model; SELECT age FROM Issue156Model;")
+        finally:
+            surreal_orm_lite.SurrealDBConnectionManager.get_client = original  # type: ignore[assignment]
+        assert any("only the first" in str(w.message) for w in caught), [str(w.message) for w in caught]
+
+
+class TestSplitStatementsComments:
+    async def test_double_slash_comment_is_not_a_statement(self) -> None:
+        from src.surreal_orm_lite.utils import split_statements
+
+        assert len(split_statements("SELECT * FROM M; // note; end")) == 1
+        # An apostrophe inside a // comment must not open a string state and swallow the
+        # rest of the query.
+        assert len(split_statements("SELECT * FROM M; // don't\nSELECT 1; SELECT 2;")) == 3
+
+
+class TestCriteriaPayloadInterpretation:
+    """``_criteria_payload`` must read values the same way the WHERE builder does."""
+
+    def test_double_dollar_is_unescaped_in_the_write_payload(self) -> None:
+        payload = surreal_orm_lite.QuerySet(Issue156Model)._criteria_payload({"name": "$$admin"})
+        assert payload == {"name": "$admin"}
+
+    def test_variable_reference_cannot_be_written(self) -> None:
+        qs = surreal_orm_lite.QuerySet(Issue156Model)
+        with pytest.raises(SurrealDbError, match="query-variable reference"):
+            qs._criteria_payload({"name": Var("admin")})
+        with pytest.raises(SurrealDbError, match="query-variable reference"):
+            qs._criteria_payload({"name": "$admin"})
+
+
+class TestDollarEscapeRoundTripE2E:
+    async def test_get_or_create_converges_on_an_escaped_literal(self) -> None:
+        client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
+        with contextlib.suppress(Exception):
+            await client.query("REMOVE TABLE Issue156Model;")
+
+        # `id` stays out of the criteria: it is a RecordID on the row, so an equality
+        # lookup on the plain string would never match — unrelated to the escape itself.
+        first, created_first = await Issue156Model.objects().get_or_create(defaults={"id": "dollar", "age": 1}, name="$$admin")
+        second, created_second = await Issue156Model.objects().get_or_create(
+            defaults={"id": "dollar", "age": 1}, name="$$admin"
+        )
+        assert created_first is True
+        assert created_second is False, "the escaped literal must round-trip, not duplicate"
+        assert first.name == "$admin"
+        assert len(await Issue156Model.objects().all()) == 1

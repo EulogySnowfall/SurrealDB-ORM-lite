@@ -53,12 +53,31 @@ on both lines afterwards. No documented behaviour was removed.
   record id `"1"`, but an unquoted `Model:1` is the _integer_ one in SurrealQL — so `relate()`,
   `get_related()`, `traverse()` and `remove_relation()` addressed a record the ORM had never
   written and silently traversed nothing. Such ids are now backtick-quoted (`` Model:`1` ``).
+  The quoting keys off the id's **Python type**, not its textual shape, so a model with
+  `id: int` keeps the integer record id `Model:5` that `save()` actually wrote. A `"table:id"`
+  string passed as a relation target is quoted by the same rule, so `a.relate(edge, "M:1")`
+  and `M(id="1")` name the same record; pass a `RecordID` (or the model instance) to target an
+  integer record id, and an id written with backticks is kept verbatim. A backtick inside an id
+  is now rejected instead of producing malformed SurrealQL.
 - **`get_related(model_class=)` costs one round-trip instead of two.** It fetched record ids and
   then issued a second `SELECT * FROM $ids`; the records are now projected in the traversal
   itself (`->edge->?.*`). Same results, verified on both lines.
-- **`raw_query()` warns on a multi-statement query.** The SDK returns only the first statement's
-  rows and says nothing about the rest, so half the output vanished silently. Detection is
-  quote- and comment-aware, so a `;` inside a string literal is not mistaken for a separator.
+- **`raw_query()` and `objects().query()` warn on a multi-statement query.** The SDK returns
+  only the first statement's rows and says nothing about the rest, so half the output vanished
+  silently. Detection is quote- and comment-aware (`--`, `//`, `#` and `/* … */`), so a `;`
+  inside a string literal or a comment is not mistaken for a separator, and a trailing comment
+  does not count as a statement of its own.
+- **The `"$$literal"` escape round-trips through `get_or_create()` / `update_or_create()`.** The
+  escape was decoded only when compiling the `WHERE` clause, so `get_or_create(name="$$admin")`
+  looked for `"$admin"` but stored `"$$admin"` — it never converged and created a duplicate row
+  on every call. The create payload now reads values exactly as the lookup does. A query-variable
+  reference (`Var(...)` or `"$x"`) as an equality criterion raises `SurrealDbError` instead of a
+  Pydantic error: its value lives on the server and cannot be written back — pass the literal in
+  `defaults=`.
+- **Warnings point at the caller.** The `DeprecationWarning` on `"$x"` filter values and the
+  multi-statement warning reported a frame inside the ORM, and Python's default filters only
+  surface a `DeprecationWarning` raised from `__main__` — so the deprecation runway reached
+  nobody. The reported frame is now the first one outside the package.
 
 - **Dependabot PRs can be tested again.** The readiness probe piped SurrealDB's `/health` into
   `grep -q "OK"`, but that endpoint answers `200` with an _empty body_ — the match could never

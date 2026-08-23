@@ -26,8 +26,8 @@ from .signals import (
 )
 from .transaction import Transaction
 from .utils import (
-    BARE_RECORD_ID,
     build_set_clause,
+    format_record_id,
     merge_extra_vars,
     remove_quotes_for_variables,
     validate_alias_name,
@@ -1169,22 +1169,32 @@ class BaseSurrealModel(BaseModel):
             # contain SurrealQL escaping (e.g. "Table:⟨1⟩") which validate_thing
             # intentionally rejects. Skip validation for trusted RecordID values.
             return str(id_val)
-        thing = f"{self.get_table_name()}:{id_val}"
-        validate_thing(thing)
-        if not BARE_RECORD_ID.match(str(id_val)):
-            # save() stores a str id as a *string* record id, but an unquoted digit run in
-            # SurrealQL is an integer one — so `M:1` addressed a record the ORM never wrote,
-            # and every relation built from this thing silently pointed at nothing. Backticks
-            # keep the string form the record actually has (found while fixing issue #156).
-            thing = f"{self.get_table_name()}:`{id_val}`"
-        return thing
+        table = self.get_table_name()
+        validate_thing(f"{table}:{id_val}")
+        # save() stores a str id as a *string* record id, but an unquoted digit run in
+        # SurrealQL is an integer one — so `M:1` addressed a record the ORM never wrote, and
+        # every relation built from this thing silently pointed at nothing. format_record_id
+        # keys off the value's Python type, so `id: int` keeps the integer form that
+        # _record_id() (and therefore save()) uses (issue #156).
+        return f"{table}:{format_record_id(id_val)}"
 
     @staticmethod
-    def _resolve_target_thing(target: "BaseSurrealModel | str") -> str:
-        """Resolve a target to ``table:id`` string."""
+    def _resolve_target_thing(target: "BaseSurrealModel | str | RecordID") -> str:
+        """Resolve a target to a ``table:id`` string.
+
+        A ``"table:id"`` string is quoted by the same rule as a model's own id, so
+        ``a.relate(edge, "M:1")`` and ``M(id="1")`` name the same record; pass a ``RecordID``
+        (or the model instance) to target an integer record id. An id already written
+        backtick-quoted is kept verbatim.
+        """
+        if isinstance(target, RecordID):
+            return f"{target.table_name}:{format_record_id(target.id)}"
         if isinstance(target, str):
             validate_thing(target)
-            return target
+            table, _, raw_id = target.partition(":")
+            if raw_id.startswith("`"):
+                return target
+            return f"{table}:{format_record_id(raw_id)}"
         if isinstance(target, BaseSurrealModel):
             return target._get_thing()
         raise TypeError(f"target must be a BaseSurrealModel instance or 'table:id' string, got {type(target).__name__}")

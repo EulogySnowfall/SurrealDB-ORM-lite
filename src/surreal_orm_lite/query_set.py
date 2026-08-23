@@ -9,6 +9,7 @@ from . import BaseSurrealModel, SurrealDBConnectionManager
 from ._sdk import NotFoundError, RecordID
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
+from .functions import Var
 from .q import Q
 from .utils import (
     build_filter_condition,
@@ -17,6 +18,7 @@ from .utils import (
     validate_alias_name,
     validate_field_name,
     validate_patch_operations,
+    warn_on_multiple_statements,
 )
 
 if TYPE_CHECKING:
@@ -798,12 +800,27 @@ class QuerySet:
         lookups (``gt``/``contains``/``in``/…) still drive the lookup but cannot be written,
         so they are excluded here — mirroring Django, which only writes exact lookups on
         create.
+
+        Values go through the same interpretation the WHERE builder applies, so the row that
+        gets created is the row the next lookup finds: ``"$$literal"`` is un-escaped to
+        ``"$literal"`` (otherwise ``get_or_create(name="$$admin")`` filtered on ``"$admin"``
+        but stored ``"$$admin"``, never converging and creating a duplicate on every call),
+        and a query-variable reference is refused outright — its value lives on the server,
+        so it cannot be written back (issue #156 follow-up).
         """
         payload: dict[str, Any] = {}
         for key, value in criteria.items():
             field_name, lookup = parse_lookup(key)
-            if lookup == "exact":
-                payload[field_name] = value
+            if lookup != "exact":
+                continue
+            if isinstance(value, Var) or (isinstance(value, str) and value.startswith("$") and value[1:2] != "$"):
+                raise SurrealDbError(
+                    f"Cannot create a record from the query-variable reference given for '{field_name}': "
+                    "its value is only known to the database. Pass the literal value in defaults=."
+                )
+            if isinstance(value, str) and value.startswith("$$"):
+                value = value[1:]
+            payload[field_name] = value
         return payload
 
     async def _lookup_matches(self, criteria: dict[str, Any]) -> list[Any]:
@@ -877,8 +894,9 @@ class QuerySet:
         window exists, the same non-atomic fallback Django documents. ``criteria`` must be
         non-empty.
 
-        Create builds ``self.model(**payload)``: keys not declared on the model are dropped by
-        Pydantic, and a missing required field raises ``ValidationError`` at construction.
+        Create builds ``self.model(**payload)``: a key the model does not declare raises
+        ``SurrealDbError`` (unless the model sets ``extra="allow"``), and a missing required
+        field raises ``ValidationError`` at construction.
         """
         if not criteria:
             raise SurrealDbError("update_or_create() requires at least one lookup criteria.")
@@ -913,8 +931,9 @@ class QuerySet:
         ``objects(tx=)`` participation); the lookup routes through the transaction too.
         ``criteria`` must be non-empty.
 
-        Create builds ``self.model(**payload)``: keys not declared on the model are dropped by
-        Pydantic, and a missing required field raises ``ValidationError`` at construction.
+        Create builds ``self.model(**payload)``: a key the model does not declare raises
+        ``SurrealDbError`` (unless the model sets ``extra="allow"``), and a missing required
+        field raises ``ValidationError`` at construction.
         """
         if not criteria:
             raise SurrealDbError("get_or_create() requires at least one lookup criteria.")
@@ -944,6 +963,9 @@ class QuerySet:
         """
         if f"FROM {self._model_table}" not in query:
             raise SurrealDbError(f"The query must include 'FROM {self._model_table}' to reference the correct table.")
+        # Same silent truncation raw_query() warns about: only the first statement's results
+        # come back from the SDK (issue #156).
+        warn_on_multiple_statements(query)
         client = await SurrealDBConnectionManager.get_client()
         try:
             # User-authored SurrealQL is sent verbatim: the caller owns that string and

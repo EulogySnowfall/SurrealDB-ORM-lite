@@ -278,8 +278,11 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   `update_or_create`/`get_or_create` refuse undeclared keys on **both** paths (they used to be
   dropped on create and written to the row on update); user-authored SurrealQL is sent verbatim;
   `upsert()` reports `created` from `UPSERT … RETURN $before`; a numeric-looking string id is
-  backtick-quoted so relations reach it; `get_related(model_class=)` is one round-trip;
-  `raw_query()` warns on multi-statement queries
+  backtick-quoted so relations reach it (an `id: int` keeps its integer record id, and a
+  `"table:id"` relation target is quoted by the same rule); `get_related(model_class=)` is one
+  round-trip; `raw_query()` **and `objects().query()`** warn on multi-statement queries; the
+  `"$$literal"` escape round-trips through `get_or_create`/`update_or_create`; warnings report
+  the caller's frame, not one inside the ORM
 - New: `Var("name")` for an explicit query-variable reference in a filter, plus the `"$$literal"`
   escape. The bare `"$x"` string form is deprecated — **flipping the default so strings are
   always literals is planned for a later minor**, and the deprecation warning is the runway

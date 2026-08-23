@@ -1,3 +1,5 @@
+import inspect
+import os
 import re
 import warnings
 from collections.abc import Iterable, Mapping
@@ -19,8 +21,8 @@ VALID_ALIAS_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 VALID_GRAPH_PATH_PATTERN = re.compile(r"^(<-|->)[a-zA-Z_][a-zA-Z0-9_]*((<-|->)[a-zA-Z_][a-zA-Z0-9_]*)*$")
 
 # Pattern for valid record thing strings: table:id where both parts are safe
-# ID part allows alphanumeric, underscores, and hyphens
-VALID_THING_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*:[a-zA-Z0-9_`-]+$")
+# ID part allows alphanumeric, underscores, and hyphens, optionally backtick-quoted
+VALID_THING_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*:(`[a-zA-Z0-9_-]+`|[a-zA-Z0-9_-]+)$")
 
 # A record id that SurrealQL reads as a bare identifier. Anything else (a digit run, a
 # hyphen, punctuation) must be backtick-quoted to keep its string form.
@@ -35,13 +37,36 @@ def remove_quotes_for_variables(query: str) -> str:
     return re.sub(r"'(\$[a-zA-Z_]\w*)'", r"\1", query)
 
 
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def user_stacklevel() -> int:
+    """``stacklevel`` that makes ``warnings.warn`` point at the first frame outside the ORM.
+
+    A fixed ``stacklevel`` lands inside ``query_set.py``/``q.py``, and Python's default
+    filters only surface a ``DeprecationWarning`` reported from ``__main__`` — so the
+    deprecation runway never reached users at all (issue #156 follow-up). Call sites reach
+    here through paths of differing depth, so the level is measured, not guessed.
+    """
+    frame = inspect.currentframe()
+    level = 0
+    while frame is not None and frame.f_back is not None:
+        frame = frame.f_back
+        level += 1
+        if os.path.dirname(os.path.abspath(frame.f_code.co_filename)) != _PACKAGE_DIR:
+            return level
+    return 2
+
+
 def split_statements(query: str) -> list[str]:
     """Split SurrealQL on the statement separator, ignoring ``;`` inside strings and comments.
 
     Deliberately a scanner and not a parser: it only needs to tell "one statement" from
     "several", and the string/comment forms below are the ones that can hide a semicolon.
-    Single quotes, double quotes (with backslash escapes), ``--`` / ``#`` line comments and
-    ``/* … */`` block comments are honoured; anything else is ordinary text.
+    Single quotes, double quotes (with backslash escapes), ``--`` / ``//`` / ``#`` line
+    comments and ``/* … */`` block comments are honoured; anything else is ordinary text.
+    Comments are dropped rather than kept, so a query ending in a trailing comment still
+    counts as one statement.
     """
     statements: list[str] = []
     current: list[str] = []
@@ -71,16 +96,12 @@ def split_statements(query: str) -> list[str]:
 
         if query.startswith("/*", index):
             end = query.find("*/", index + 2)
-            end = length if end == -1 else end + 2
-            current.append(query[index:end])
-            index = end
+            index = length if end == -1 else end + 2
             continue
 
-        if query.startswith("--", index) or char == "#":
+        if query.startswith("--", index) or query.startswith("//", index) or char == "#":
             end = query.find("\n", index)
-            end = length if end == -1 else end
-            current.append(query[index:end])
-            index = end
+            index = length if end == -1 else end
             continue
 
         if char == ";":
@@ -110,7 +131,7 @@ def warn_on_multiple_statements(query: str) -> None:
             "returned by the SurrealDB SDK; run one statement per call, or use "
             "transaction() if they must be atomic.",
             UserWarning,
-            stacklevel=3,
+            stacklevel=user_stacklevel(),
         )
 
 
@@ -279,6 +300,25 @@ def validate_thing(thing: str) -> None:
         )
 
 
+def format_record_id(id_value: Any) -> str:
+    """Render a Python id value as the SurrealQL record-id literal that addresses that record.
+
+    Keys off the value's *type*, not its textual shape: ``5`` is the integer record id ``5``
+    (what the SDK writes for ``id: int``), while ``"5"`` is the string record id and must be
+    backtick-quoted — unquoted, ``M:5`` would address a record the ORM never wrote (#156).
+    """
+    if isinstance(id_value, bool):
+        raise ValueError("a record id cannot be a boolean")
+    if isinstance(id_value, int):
+        return str(id_value)
+    text = str(id_value)
+    if BARE_RECORD_ID.match(text):
+        return text
+    if "`" in text:
+        raise ValueError(f"Invalid record id '{text}': a record id cannot contain a backtick")
+    return f"`{text}`"
+
+
 def parse_lookup(key: str) -> tuple[str, str]:
     """
     Parse a filter key into field name and lookup type.
@@ -351,7 +391,7 @@ def build_filter_condition(field: str, lookup: str, value: Any, counter: int) ->
             f"variable {value} and is deprecated; use Var({value[1:]!r}) to reference a "
             f"variable, or '${value}' to match the literal string.",
             DeprecationWarning,
-            stacklevel=2,
+            stacklevel=user_stacklevel(),
         )
         return f"{field} {op} {value}", {}, counter
     else:
