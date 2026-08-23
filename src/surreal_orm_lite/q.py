@@ -68,12 +68,15 @@ class Q:
             parts.append("negated=True")
         return f"Q({', '.join(parts)})"
 
-    def to_sql(self, counter: int = 0) -> tuple[str, dict[str, Any], int]:
+    def to_sql(self, counter: int = 0, record_table: str | None = None) -> tuple[str, dict[str, Any], int]:
         """
         Generate a parameterized SQL WHERE fragment.
 
         Args:
             counter: The starting variable counter for unique naming.
+            record_table: The table the query runs against, propagated by the QuerySet so a
+                lookup on the ``id`` column can be coerced to a ``RecordID`` (issue #159).
+                ``None`` — a ``Q`` compiled on its own — leaves values untouched.
 
         Returns:
             A tuple of (sql_fragment, variables_dict, next_counter).
@@ -86,7 +89,7 @@ class Q:
             filter_parts: list[str] = []
             for key, value in self.filters.items():
                 field, lookup = parse_lookup(key)
-                sql, vars_, counter = build_filter_condition(field, lookup, value, counter)
+                sql, vars_, counter = build_filter_condition(field, lookup, value, counter, record_table)
                 filter_parts.append(sql)
                 all_variables.update(vars_)
             if len(filter_parts) == 1:
@@ -96,7 +99,7 @@ class Q:
 
         # Child Q objects
         for child in self.children:
-            sql, vars_, counter = child.to_sql(counter)
+            sql, vars_, counter = child.to_sql(counter, record_table)
             if sql:
                 all_parts.append(sql)
                 all_variables.update(vars_)
