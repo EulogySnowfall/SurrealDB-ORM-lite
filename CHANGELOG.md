@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.5] - 2026-08-23
+
+Connection correctness: the client cache is now per event loop.
+
+### Fixed
+
+- **A cached client is no longer handed to a different event loop.**
+  `SurrealDBConnectionManager` kept a single client in a class attribute with no notion of the
+  loop that created it. A SurrealDB WebSocket client is bound to its loop, so the second of two
+  successive `asyncio.run(...)` calls in the same process got a client belonging to a loop that
+  no longer existed and failed with `got Future attached to a different loop` — or hung outright,
+  which is what writing the regression test revealed
+  ([#163](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/163)). The cache is keyed by
+  the running loop, so each loop gets its own connection. Also reached by a sync wrapper that
+  spins a loop per call, a test suite with per-test loops (how it was found), and any framework
+  that runs handlers on more than one loop.
+- **Two live loops no longer evict each other.** Threads or multi-loop servers each keep their
+  own client instead of stealing the single cached one.
+
+### Added
+
+- **`close_all_connections()`** — tear down every cached client whatever loop created it.
+  `unset_connection()` now uses it. A client belonging to another _live_ loop is dropped rather
+  than awaited, since it cannot be closed from here.
+
+### Changed
+
+- **`close_connection()` closes the running loop's client only.** Closing another loop's client
+  from here is both impossible and wrong. Single-loop applications see no difference.
+- **`is_connected()` answers for the loop asking.** Inside a running loop it reports that loop's
+  client; called outside one it reports whether any loop still holds a client.
+
+### Notes
+
+- Entries whose loop is closed are pruned on the next `get_client()`. The stale client is dropped
+  rather than closed — `close()` would have to be awaited on a loop that is already gone — and its
+  socket is released when the loop is finalised.
+- The public API is unchanged apart from the new `close_all_connections()`. A long-lived
+  single-loop application behaves exactly as before: one loop, one connection.
+- Loop binding is an asyncio/SDK property, not a server one, so this is identical on 2.6.x and
+  3.x. Example notebook: `examples/v0.14.5_event_loops.ipynb`.
+
 ## [0.14.4] - 2026-08-23
 
 Follow-up correctness release: record-id lookups. Reproduced against live SurrealDB **3.2.4

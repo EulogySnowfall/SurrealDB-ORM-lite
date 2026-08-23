@@ -272,6 +272,20 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 ---
 
+### Version 0.14.5 — Per-event-loop connections (issue #163)
+
+- The client cache is keyed by the running event loop. A WebSocket client is bound to its
+  loop, so the single cached client made the second of two `asyncio.run()` calls fail with
+  `got Future attached to a different loop` — or hang
+- Two live loops (threads, multi-loop servers) each keep their own connection instead of
+  evicting one another
+- `close_connection()` closes the running loop's client only; new `close_all_connections()`
+  tears everything down; `is_connected()` answers for the loop asking
+- Entries for closed loops are pruned on the next `get_client()`
+- Identical on 2.6.5 and 3.2.4 — loop binding is an asyncio/SDK property, not a server one
+
+---
+
 ### Version 0.14.4 — Record-id lookups (issue #159)
 
 - `filter(id=...)` matched nothing: the row's `id` is a native `RecordID`, but the `WHERE`
