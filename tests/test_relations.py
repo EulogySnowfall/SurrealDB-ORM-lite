@@ -193,20 +193,34 @@ def setup_surrealdb() -> None:
 
 
 class TestRelationsE2E:
-    """E2E tests for relations (require running SurrealDB)."""
+    """E2E tests for relations (require running SurrealDB).
+
+    Every test starts from the same three people and no edges, courtesy of ``reset_graph``.
+    They used to share one accumulating graph — ``test_relate_basic`` created alice and bob,
+    every later test read them back, and the edge each one asserted on was left behind by its
+    predecessor — so the class only passed in declaration order and failed wholesale under
+    ``pytest-randomly`` or ``pytest-xdist`` (issue #160).
+    """
+
+    @pytest.fixture(autouse=True)
+    async def reset_graph(self) -> None:
+        client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
+        await Person.objects().delete_table()
+        await Product.objects().delete_table()
+        for edge in ("follows", "purchased", "never_edge"):
+            with contextlib.suppress(NotFoundError):
+                await client.query(f"DELETE {edge};", {})
+        with contextlib.suppress(NotFoundError):
+            await client.query("DELETE Post;", {})
+
+        await Person(id="alice", name="Alice", age=30).save()
+        await Person(id="bob", name="Bob", age=25).save()
+        await Person(id="charlie", name="Charlie", age=35).save()
 
     async def test_relate_basic(self) -> None:
         """Create a basic relation between two records."""
-        # Clean up
-        await Person.objects().delete_table()
-        client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
-        with contextlib.suppress(NotFoundError):
-            await client.query("DELETE follows;", {})
-
-        alice = Person(id="alice", name="Alice", age=30)
-        await alice.save()
-        bob = Person(id="bob", name="Bob", age=25)
-        await bob.save()
+        alice = await Person.objects().get("alice")
+        bob = await Person.objects().get("bob")
 
         result = await alice.relate("follows", bob)
         assert isinstance(result, list)
@@ -215,10 +229,6 @@ class TestRelationsE2E:
     async def test_relate_with_data(self) -> None:
         """Create a relation with data on the edge."""
         client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
-        with contextlib.suppress(NotFoundError):
-            await client.query("DELETE purchased;", {})
-
-        await Product.objects().delete_table()
         product = Product(id="widget", name="Widget", price=29.99)
         await product.save()
 
@@ -236,9 +246,6 @@ class TestRelationsE2E:
 
     async def test_relate_with_string_target(self) -> None:
         """Create a relation using a string target."""
-        charlie = Person(id="charlie", name="Charlie", age=35)
-        await charlie.save()
-
         alice = await Person.objects().get("alice")
         result = await alice.relate("follows", "Person:charlie")
         assert isinstance(result, list)
@@ -247,6 +254,8 @@ class TestRelationsE2E:
     async def test_get_related_out(self) -> None:
         """Get outgoing related records."""
         alice = await Person.objects().get("alice")
+        await alice.relate("follows", await Person.objects().get("bob"))
+
         following = await alice.get_related("follows", direction="out", model_class=Person)
         assert isinstance(following, list)
         assert len(following) >= 1
@@ -255,7 +264,10 @@ class TestRelationsE2E:
 
     async def test_get_related_in(self) -> None:
         """Get incoming related records."""
+        alice = await Person.objects().get("alice")
         bob = await Person.objects().get("bob")
+        await alice.relate("follows", bob)
+
         followers = await bob.get_related("follows", direction="in", model_class=Person)
         assert isinstance(followers, list)
         assert len(followers) >= 1
@@ -265,6 +277,8 @@ class TestRelationsE2E:
     async def test_get_related_no_model_class(self) -> None:
         """Get related without model_class returns raw data."""
         alice = await Person.objects().get("alice")
+        await alice.relate("follows", await Person.objects().get("bob"))
+
         following = await alice.get_related("follows", direction="out")
         assert isinstance(following, list)
         assert len(following) >= 1
@@ -278,6 +292,7 @@ class TestRelationsE2E:
     async def test_remove_relation(self) -> None:
         """Remove a specific relation."""
         alice = await Person.objects().get("alice")
+        await alice.relate("follows", await Person.objects().get("charlie"))
 
         # Alice follows charlie - remove it
         await alice.remove_relation("follows", "Person:charlie")
@@ -288,10 +303,10 @@ class TestRelationsE2E:
 
     async def test_remove_all_relations_out(self) -> None:
         """Remove all outgoing relations."""
-        # First re-establish some relations
         alice = await Person.objects().get("alice")
         charlie = await Person.objects().get("charlie")
         await alice.relate("follows", charlie)
+        await alice.relate("follows", await Person.objects().get("bob"))
 
         # Now remove all outgoing follows
         await alice.remove_all_relations("follows", direction="out")
@@ -307,10 +322,6 @@ class TestRelationsE2E:
 
     async def test_traverse(self) -> None:
         """Basic graph traversal."""
-        client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
-        with contextlib.suppress(NotFoundError):
-            await client.query("DELETE follows;", {})
-
         alice = await Person.objects().get("alice")
         bob = await Person.objects().get("bob")
         charlie = await Person.objects().get("charlie")
@@ -336,8 +347,6 @@ class TestRelationsE2E:
         client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
 
         # Create a post-like structure using raw queries
-        with contextlib.suppress(NotFoundError):
-            await client.query("DELETE Post;", {})
         await client.query(
             "CREATE Post:1 SET title = 'Hello', author = Person:alice;",
             {},
@@ -368,10 +377,6 @@ class TestRelationsE2E:
 
     async def test_remove_all_relations_both(self) -> None:
         """Remove all relations in both directions."""
-        client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
-        with contextlib.suppress(NotFoundError):
-            await client.query("DELETE follows;", {})
-
         alice = await Person.objects().get("alice")
         bob = await Person.objects().get("bob")
 
@@ -394,11 +399,7 @@ class TestRelationsE2E:
         SurrealQL-escaped (e.g. ``Person:⟨100⟩``). _get_thing()/get_related() must
         not reject that via validate_thing.
         """
-        client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
         await Person.objects().delete_table()
-        with contextlib.suppress(NotFoundError):
-            await client.query("DELETE follows;", {})
-
         await Person(id="100", name="Hundred", age=10).save()
         await Person(id="200", name="TwoHundred", age=20).save()
 

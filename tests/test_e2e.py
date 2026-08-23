@@ -53,6 +53,19 @@ def setup_surrealdb() -> None:
     )
 
 
+@pytest.fixture(autouse=True)
+async def clean_tables() -> None:
+    """Give every test an empty ``ModelTest`` / ``ModelTestEmpty`` to arrange from.
+
+    These tests used to run as one narrative — ``test_save_model`` created ``ModelTest:1``,
+    ``test_merge_model`` merged it, ``test_update_model`` updated it — so they only passed in
+    declaration order and the whole file failed under ``pytest-randomly`` or ``pytest-xdist``
+    (issue #160). Each test now arranges what it asserts on.
+    """
+    for model in (ModelTest, ModelTestEmpty):
+        await model.objects().delete_table()
+
+
 async def test_save_model() -> None:
     model = ModelTest(id="1", name="Test Man", age=42)
     await model.save()
@@ -67,6 +80,8 @@ async def test_save_model() -> None:
 
 
 async def test_merge_model() -> None:
+    await ModelTest(id="1", name="Test Man", age=42).save()
+
     item = await ModelTest.objects().get("1")
     assert item.name == "Test Man"
     assert item.age == 42
@@ -82,6 +97,8 @@ async def test_merge_model() -> None:
 
 
 async def test_update_model() -> None:
+    await ModelTest(id="1", name="Test Man", age=32).save()
+
     item = await ModelTest.objects().get("1")
     assert item.name == "Test Man"
     assert item.age == 32
@@ -114,6 +131,8 @@ async def test_update_model() -> None:
 
 
 async def test_first_model() -> None:
+    await ModelTest(id="1", name="Test Man", age=25).save()
+
     model = await ModelTest.objects().filter(name="Test Man").first()
     assert isinstance(model, ModelTest), "Expected ModelTest instance"
     assert model.name == "Test Man"
@@ -127,6 +146,7 @@ async def test_first_model() -> None:
 
 
 async def test_filter_model() -> None:
+    await ModelTest(id="1", name="Test Man", age=25).save()
     item3 = ModelTest(name="Test2", age=17)
     await item3.save()
 
@@ -137,6 +157,8 @@ async def test_filter_model() -> None:
 
 
 async def test_save_model_already_exist() -> None:
+    await ModelTest(id="1", name="Test Man", age=25).save()
+
     model = ModelTest(id="1", name="Test2", age=34)
     with pytest.raises(SurrealDbError) as exc:
         await model.save()
@@ -145,6 +167,9 @@ async def test_save_model_already_exist() -> None:
 
 
 async def test_delete_model() -> None:
+    await ModelTest(id="1", name="Test Man", age=25).save()
+    await ModelTest(id="2", name="Test2", age=17).save()
+
     model = ModelTest(id="4", name="Test2", age=34)
     await model.save()
     client = await surreal_orm_lite.SurrealDBConnectionManager.get_client()
@@ -164,13 +189,17 @@ async def test_delete_model() -> None:
 
 
 async def test_query_model() -> None:
-    # Utiliser test_model pour exécuter la requête
+    await ModelTest(id="1", name="Test Man", age=25).save()
+
     results = await ModelTest.objects().filter(name="Test Man").exec()
     assert len(results) == 1
     assert results[0].name == "Test Man"
 
 
 async def test_multi_select() -> None:
+    # The five rows every count below is written against.
+    await ModelTest(id="1", name="Test Man", age=25).save()
+    await ModelTest(id="2", name="Test2", age=17).save()
     await ModelTest(name="Ian", age=23).save()
     await ModelTest(name="Yan", age=32).save()
     await ModelTest(name="Isa", age=32).save()
@@ -227,6 +256,9 @@ async def test_multi_select() -> None:
 
 
 async def test_error_on_get_multi() -> None:
+    await ModelTest(id="1", name="Test Man", age=25).save()
+    await ModelTest(id="2", name="Test2", age=17).save()
+
     with pytest.raises(SurrealDbError) as exc1:
         await ModelTest.objects().get()
 
@@ -354,9 +386,11 @@ async def test_duplicate_save_raises_surreal_error() -> None:
 
 
 async def test_delete_table() -> None:
-    # Suppression de la table via test_model
+    await ModelTest(id="1", name="Test Man", age=25).save()
+
     result = await ModelTest.objects().delete_table()
     assert result is True
+    assert await ModelTest.objects().all() == []
 
 
 async def test_loaded_record_keeps_native_recordid() -> None:
