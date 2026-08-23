@@ -69,9 +69,11 @@ no_implicit_reexport = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-ra -q --cov=src.surreal_orm_lite --cov-branch --cov-report=xml --cov-report=html --cov-report=term-missing --cov-fail-under=70 --cov-context=test"
+# pytest-randomly is installed but OFF by default: CI stays deterministic and reproducible.
+# `make test-random` (or `-p randomly`) turns it on to catch order coupling — see issue #160.
+addopts = "-ra -q -p no:randomly --cov=src.surreal_orm_lite --cov-branch --cov-report=xml --cov-report=html --cov-report=term-missing --cov-fail-under=70 --cov-context=test"
 asyncio_mode = "auto"
-asyncio_default_fixture_loop_scope = "module"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.pyright]
 include = ["src"]
@@ -83,6 +85,7 @@ dev = [
     "pytest>=9.0.3",
     "pytest-asyncio>=1.4.0",
     "pytest-cov>=7.0.0",
+    "pytest-randomly>=4.0.0",
     "pydantic>=2.13.4",
     "docker>=7.1.0",
     "python-dotenv>=1.2.1",

@@ -32,6 +32,10 @@ typecheck:
 test:
 	uv run pytest
 
+.PHONY: test-random  # Run the suite in a randomised order (guards against order coupling)
+test-random:
+	uv run pytest -p randomly
+
 .PHONY: test-all-python  # Run tests on Python 3.11 to 3.13
 test-all-python:
 	uv run --python 3.11 coverage run -p -m pytest --junitxml=junit.xml -o junit_family=legacy
