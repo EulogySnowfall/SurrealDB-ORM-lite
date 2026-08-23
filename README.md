@@ -242,6 +242,13 @@ following = await user.get_related("follows", direction="out", model_class=User)
 # Get related records (incoming)
 followers = await user.get_related("follows", direction="in", model_class=User)
 
+# A target can also be a "table:id" string. Its id is read as a *string* record id — the
+# same rule the ORM applies to a model's own id — so these two name the same record:
+await user.relate("follows", "User:1")        # -> User:`1`, i.e. User(id="1")
+# Pass a RecordID to target an *integer* record id (what a model with `id: int` stores):
+from surrealdb import RecordID
+await user.relate("follows", RecordID("User", 1))   # -> User:1
+
 # Remove a specific relation
 await user.remove_relation("follows", other_user)
 
