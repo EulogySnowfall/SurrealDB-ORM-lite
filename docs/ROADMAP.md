@@ -272,6 +272,22 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 ---
 
+### Version 0.14.4 — Record-id lookups (issue #159)
+
+- `filter(id=...)` matched nothing: the row's `id` is a native `RecordID`, but the `WHERE`
+  builder bound the caller's raw Python value. Now coerced through `coerce_record_id()`,
+  which accepts `RecordID`, `int`, a bare identifier, a backticked one and the full
+  `"Table:id"` form (unwrapped only when the prefix names the queried table)
+- The same lookup drives `get_or_create(id=…)` / `update_or_create(id=…)`, which therefore
+  never converged — every call took the create path and the second raised `already exists`
+- `get()` shares the helper, fixing `get(5)` on a model declared `id: int`
+- A text/collection lookup on `id` (`contains`, `startswith`, `regex`, …) now raises instead
+  of silently returning nothing
+- An aliased `primary_key` column stays an ordinary string column — untouched by design
+- Identical on 2.6.5 and 3.2.4
+
+---
+
 ### Version 0.14.3 — Correctness release (issue #156)
 
 - Eight findings closed: `first()` no longer leaves `LIMIT 1` on the queryset;

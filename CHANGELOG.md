@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.4] - 2026-08-23
+
+Follow-up correctness release: record-id lookups. Reproduced against live SurrealDB **3.2.4
+and 2.6.5** before the fix and verified on both afterwards.
+
+### Fixed
+
+- **`filter(id=...)` matches again.** A record's `id` column holds a native `RecordID`, but
+  the `WHERE` builder bound whatever Python value the caller passed — so `filter(id="alice")`
+  compiled to `id = $_f0` with a plain string, and SurrealDB does not consider a `RecordID`
+  equal to the string form of its identifier. The lookup matched nothing, with no error and
+  no warning ([#159](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/159)). It now
+  goes through `coerce_record_id()`, which accepts a `RecordID`, an `int`, a bare identifier
+  (`"alice"`), a backticked one (``"`5`"``) and the full `"User:alice"` form — the last
+  unwrapped only when the prefix names the queried table, since `"Other:d"` may genuinely be
+  the stored string id. The value's **Python type** still decides which record is addressed:
+  `filter(id=5)` is the integer record id, `filter(id="5")` the string one.
+- **`get_or_create(id=…)` / `update_or_create(id=…)` converge.** They inherit the same lookup,
+  so the criterion never matched: every call took the create path and the second one raised
+  `already exists`. The v0.14.3 regression test had to work around this by filtering on `name`.
+- **`get()` accepts a non-string id.** It built `RecordID(table, str(id_item))`, so `get(5)` on
+  a model declared `id: int` looked for the _string_ record id `"5"` and raised
+  `SurrealDbNotFoundError`. It now shares the helper with `filter()`, so the two agree.
+- **A text lookup on `id` fails loudly.** `contains`, `not_contains`, `containsall`,
+  `containsany`, `startswith`, `endswith`, `like`, `ilike`, `match` and `regex` raise
+  `ValueError` naming the column instead of returning an empty set — a record id is not a
+  string. The message points at `string::contains(record::id(id), …)` in a raw query for
+  callers who really want the textual form.
+
+### Changed
+
+- `build_filter_condition()` and `Q.to_sql()` take an optional `record_table` argument. The
+  QuerySet supplies it, so `filter()`, `Q` trees and the `*_or_create` lookups all route
+  through one rule. Omitted — a `Q` compiled outside a QuerySet — nothing is coerced, so no
+  existing call changes meaning.
+
+### Notes
+
+- An aliased primary key (`model_config = {"primary_key": "code"}`) stores that alias as an
+  **ordinary column** next to the RecordID `id`, so `filter(code="abc")` is a plain string
+  comparison and is deliberately left untouched. Only the column literally named `id` is coerced.
+- Identical behaviour on 2.6.x and 3.x; example notebook:
+  `examples/v0.14.4_record_id_lookups.ipynb`.
+
 ## [0.14.3] - 2026-08-23
 
 Correctness release: the eight findings of [issue #156](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/156)
