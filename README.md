@@ -172,6 +172,35 @@ results = await User.objects().query(
 - `match`, `regex`
 - `isnull`
 
+#### Filtering on the record id
+
+The `id` column holds a native `RecordID`, not a string, so the ORM coerces an `id` lookup
+before binding it. All of these address the same record:
+
+```python
+await User.objects().filter(id="alice").exec()                        # bare identifier
+await User.objects().filter(id="User:alice").exec()                   # full table:id form
+await User.objects().filter(id=RecordID("User", "alice")).exec()      # explicit
+await User.objects().get("alice")                                     # same rule
+await User.objects().filter(id__in=["alice", "bob"]).exec()
+```
+
+The value's **Python type** decides which record is addressed, exactly as it does when a
+record is saved: `filter(id=5)` is the _integer_ record id `User:5`, `filter(id="5")` is the
+_string_ one. They are two different records — a model declared `id: int` needs the former.
+
+A text or collection lookup (`contains`, `startswith`, `regex`, `like`, `containsall`, …) on
+`id` raises `ValueError` rather than silently matching nothing, since a record id is not a
+string:
+
+```python
+await User.objects().filter(id__startswith="al").exec()
+# ValueError: 'startswith' cannot be applied to the record id column 'id' …
+```
+
+A model that aliases its identity through `primary_key` keeps that alias as an ordinary
+column, so `filter(code="abc")` is a normal string comparison and is unaffected.
+
 #### Filter values that start with `$`
 
 A filter value beginning with `$` is read as a reference to a **query variable**, not as data.
@@ -708,6 +737,7 @@ listed behave the same on both lines.
 | Invalid computed-field expression — raw SDK exception                                                                                  | `InternalError`                                                              | `ValidationError`                                                        | v0.14.0 |
 | Invalid computed-field expression — through the ORM                                                                                    | `SurrealDbError` (normalised)                                                | `SurrealDbError` (normalised)                                            | v0.14.0 |
 | Issue #156 correctness fixes (`Var`/`$$`, `first()`, `*_or_create` strictness, `created` on upsert, quoted ids, one-hop `get_related`) | same on both lines (each fix reproduced and verified on 2.6.5)               | same on both lines (verified on 3.2.4)                                   | v0.14.3 |
+| Record-id lookups (`filter(id=…)`, `id__in`, `get(…)`, `*_or_create(id=…)`) coerced to `RecordID`                                      | same on both lines (int/str typing verified on 2.6.5)                        | same on both lines (verified on 3.2.4)                                   | v0.14.4 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
 
@@ -737,6 +767,7 @@ Contributions are welcome! Please:
 | v0.12.0           | retry_on_conflict & optimistic concurrency       | ✅ Released |
 | v0.13.0           | SurrealFunc & server-side values                 | ✅ Released |
 | v0.14.0           | Computed fields (`DEFINE FIELD … VALUE`)         | ✅ Released |
+| v0.14.3 – v0.14.4 | Correctness: `$`-values, record-id lookups       | ✅ Released |
 | v0.15.0 – v0.22.0 | Tier 1 — Core (auth, live, relations)            | 📋 Planned  |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)  | 📋 Planned  |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI) | 📋 Planned  |

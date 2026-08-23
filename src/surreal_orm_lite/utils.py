@@ -3,8 +3,9 @@ import os
 import re
 import warnings
 from collections.abc import Iterable, Mapping
-from typing import Any
+from typing import Any, cast
 
+from ._sdk import RecordID
 from .constants import LOOKUP_OPERATORS
 from .functions import SurrealFunc, Var
 
@@ -319,6 +320,66 @@ def format_record_id(id_value: Any) -> str:
     return f"`{text}`"
 
 
+# The column that holds a record's identity. It is a RecordID on the row, never a string,
+# so a lookup on it has to be coerced before binding (issue #159). A model that aliases its
+# identity through ``primary_key`` still stores that alias as an ordinary column alongside
+# ``id``, and that column is a plain value — only ``id`` itself is coerced.
+RECORD_ID_COLUMN = "id"
+
+# Lookups whose operand is a record id, and therefore get coerced.
+_RECORD_ID_SCALAR_LOOKUPS = frozenset({"exact", "gt", "gte", "lt", "lte"})
+_RECORD_ID_SEQUENCE_LOOKUPS = frozenset({"in", "not_in"})
+
+# Lookups that treat their operand as text or as a collection. A record id is neither, and
+# SurrealDB answers an empty set rather than an error — the silent failure #159 is about.
+_RECORD_ID_INVALID_LOOKUPS = frozenset(
+    {
+        "like",
+        "ilike",
+        "contains",
+        "not_contains",
+        "containsall",
+        "containsany",
+        "startswith",
+        "endswith",
+        "match",
+        "regex",
+    }
+)
+
+
+def coerce_record_id(value: Any, table: str) -> RecordID:
+    """Convert a filter value for the ``id`` column into the ``RecordID`` the row stores.
+
+    Accepts the forms a caller naturally reaches for, and keeps the typing rule
+    :func:`format_record_id` applies on the relation paths — a Python ``int`` is an *integer*
+    record id, a ``str`` is a *string* one, and the two address different records:
+
+    ==================  ==========================
+    ``RecordID(...)``   returned unchanged
+    ``5``               ``RecordID(table, 5)``
+    ``"5"``             ``RecordID(table, "5")``
+    ``"`5`"``           ``RecordID(table, "5")`` — backticks stripped, as ``get()`` does
+    ``"table:d"``       ``RecordID(table, "d")`` — only when the prefix is *this* table
+    ``"Other:d"``       ``RecordID(table, "Other:d")`` — may genuinely be the string id
+    ==================  ==========================
+    """
+    if isinstance(value, RecordID):
+        return value
+    if isinstance(value, bool):
+        raise ValueError("a record id cannot be a boolean")
+    if isinstance(value, int):
+        return RecordID(table, value)
+
+    raw = str(value)
+    prefix = f"{table}:"
+    if raw.startswith(prefix):
+        raw = raw[len(prefix) :]
+    if len(raw) > 1 and raw.startswith("`") and raw.endswith("`"):
+        raw = raw[1:-1]
+    return RecordID(table, raw)
+
+
 def parse_lookup(key: str) -> tuple[str, str]:
     """
     Parse a filter key into field name and lookup type.
@@ -336,7 +397,9 @@ def parse_lookup(key: str) -> tuple[str, str]:
     return field_name, lookup_name
 
 
-def build_filter_condition(field: str, lookup: str, value: Any, counter: int) -> tuple[str, dict[str, Any], int]:
+def build_filter_condition(
+    field: str, lookup: str, value: Any, counter: int, record_table: str | None = None
+) -> tuple[str, dict[str, Any], int]:
     """
     Build a single parameterized filter condition.
 
@@ -345,12 +408,16 @@ def build_filter_condition(field: str, lookup: str, value: Any, counter: int) ->
         lookup: The lookup type (e.g. ``"exact"``, ``"gt"``, ``"in"``).
         value: The filter value.
         counter: The current variable counter for unique naming.
+        record_table: The table the query runs against, when known. It is what lets a lookup
+            on the ``id`` column be coerced to a ``RecordID`` (issue #159). ``None`` — a
+            ``Q`` compiled outside a QuerySet — leaves values untouched.
 
     Returns:
         A tuple of (sql_fragment, variables_dict, next_counter).
 
     Raises:
-        ValueError: If the lookup type is not supported or the field name is invalid.
+        ValueError: If the lookup type is not supported, the field name is invalid, or a
+            text/collection lookup is applied to the ``id`` column.
     """
     validate_field_name(field, "filter field")
     op = LOOKUP_OPERATORS.get(lookup)
@@ -358,6 +425,14 @@ def build_filter_condition(field: str, lookup: str, value: Any, counter: int) ->
         raise ValueError(f"Unsupported lookup type: '{lookup}'")
 
     var_name = f"_f{counter}"
+
+    is_record_id_column = record_table is not None and field == RECORD_ID_COLUMN
+    if is_record_id_column and lookup in _RECORD_ID_INVALID_LOOKUPS:
+        raise ValueError(
+            f"'{lookup}' cannot be applied to the record id column '{field}': a record id is "
+            "not a string. Filter on a regular column, or reach for the textual form "
+            "explicitly in a raw query (e.g. string::contains(record::id(id), '...'))."
+        )
 
     if lookup == "isnull":
         if not isinstance(value, bool):
@@ -369,7 +444,10 @@ def build_filter_condition(field: str, lookup: str, value: Any, counter: int) ->
     elif lookup in ("in", "not_in", "containsall", "containsany"):
         if isinstance(value, (str, dict)) or not hasattr(value, "__iter__"):
             raise ValueError(f"'{lookup}' lookup requires an iterable (list, tuple, or set), got {type(value).__name__}")
-        return f"{field} {op} ${var_name}", {var_name: list(value)}, counter + 1
+        items = list(value)
+        if is_record_id_column and lookup in _RECORD_ID_SEQUENCE_LOOKUPS:
+            items = [coerce_record_id(item, cast(str, record_table)) for item in items]
+        return f"{field} {op} ${var_name}", {var_name: items}, counter + 1
     elif isinstance(value, Var):
         # The explicit, unambiguous form (v0.14.3).
         return f"{field} {op} {value.reference}", {}, counter
@@ -395,6 +473,8 @@ def build_filter_condition(field: str, lookup: str, value: Any, counter: int) ->
         )
         return f"{field} {op} {value}", {}, counter
     else:
+        if is_record_id_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
+            value = coerce_record_id(value, cast(str, record_table))
         return f"{field} {op} ${var_name}", {var_name: value}, counter + 1
 
 

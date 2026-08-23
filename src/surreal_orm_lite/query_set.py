@@ -6,13 +6,14 @@ from typing import TYPE_CHECKING, Any, Self, cast
 from pydantic_core import ValidationError
 
 from . import BaseSurrealModel, SurrealDBConnectionManager
-from ._sdk import NotFoundError, RecordID
+from ._sdk import NotFoundError
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import Var
 from .q import Q
 from .utils import (
     build_filter_condition,
+    coerce_record_id,
     parse_lookup,
     remove_quotes_for_variables,
     validate_alias_name,
@@ -231,13 +232,13 @@ class QuerySet:
 
         # Regular keyword filters (AND-joined)
         for field_name, lookup_name, value in self._filters:
-            sql, vars_, counter = build_filter_condition(field_name, lookup_name, value, counter)
+            sql, vars_, counter = build_filter_condition(field_name, lookup_name, value, counter, self._model_table)
             parts.append(sql)
             variables.update(vars_)
 
         # Q object filters
         for q in self._q_filters:
-            sql, vars_, counter = q.to_sql(counter)
+            sql, vars_, counter = q.to_sql(counter, self._model_table)
             if sql:
                 parts.append(sql)
                 variables.update(vars_)
@@ -419,13 +420,10 @@ class QuerySet:
             The retrieved model instance or dictionary.
         """
         if id_item:
-            if isinstance(id_item, RecordID):
-                record_id = id_item
-            else:
-                raw = str(id_item)
-                if raw.startswith("`") and raw.endswith("`"):
-                    raw = raw[1:-1]
-                record_id = RecordID(self._model_table, raw)
+            # Same rule as filter(id=...): an int is an *integer* record id, a str a string
+            # one. Building RecordID(table, str(id_item)) made get(5) unreachable on a model
+            # with `id: int` (issue #159).
+            record_id = coerce_record_id(id_item, self._model_table)
 
             if self._tx is not None:
                 try:
