@@ -1,4 +1,4 @@
-__version__ = "0.14.5"
+__version__ = "0.14.6"
 
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
 from .concurrency import is_conflict_error, retry_on_conflict
