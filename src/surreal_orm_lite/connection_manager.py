@@ -240,6 +240,7 @@ class SurrealDBConnectionManager:
         *,
         params: Mapping[str, Any] | None = None,
         return_type: Any = None,
+        tx: Transaction | None = None,
     ) -> Any:
         """Call a custom server-side function declared with ``DEFINE FUNCTION fn::…``.
 
@@ -291,6 +292,12 @@ class SurrealDBConnectionManager:
                 "Pass either 'args' (positional) or 'params' (named), not both — they are two "
                 "ways to supply the same arguments."
             )
+        if return_type is not None and tx is not None and not tx.is_interactive:
+            raise ValueError(
+                "return_type= cannot be used with a buffered transaction: the call is queued "
+                "and returns no value until commit. Drop return_type=, or use a WebSocket "
+                "connection to SurrealDB 3.x (interactive transactions)."
+            )
 
         name = normalize_function_name(function)
 
@@ -300,6 +307,15 @@ class SurrealDBConnectionManager:
             values = await cls._resolve_named_args(client, name, params)
 
         statement, variables = build_call_statement(name, values)
+
+        if tx is not None:
+            try:
+                # Buffered: queued, returns None. Interactive: runs now, returns the value.
+                return cls._coerce_call_result(await tx.add(statement, variables), return_type, name)
+            except (SurrealDbError, ValueError):
+                raise
+            except Exception as exc:
+                raise cls._wrap_call_error(exc, name) from exc
         try:
             value = await client.query(statement, variables)
         except Exception as exc:

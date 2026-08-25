@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel as PydanticBaseModel
 
-from surreal_orm_lite import SurrealDBConnectionManager
+from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
 from surreal_orm_lite.exceptions import SurrealDbError, SurrealDbNotFoundError, SurrealDbValidationError
 from surreal_orm_lite.functions import (
     build_call_statement,
@@ -89,6 +89,21 @@ class TestSignatureParsing:
     def test_nested_namespace_declaration(self) -> None:
         define = "DEFINE FUNCTION fn::billing::total($cart: array) { RETURN 1 } PERMISSIONS FULL"
         assert parse_function_parameters(define) == ("cart",)
+
+    def test_reads_a_backtick_quoted_parameter_name(self) -> None:
+        """SurrealDB 2.6.x quotes a name that collides with a reserved word — ``fn::f($by)``
+        comes back as ``$`by```, while 3.x leaves it bare. Missing this yields an EMPTY
+        signature, so ``params=`` fails on one line only."""
+        define = "DEFINE FUNCTION fn::cf_bump($`by`: int) { RETURN 1; } PERMISSIONS FULL"
+        assert parse_function_parameters(define) == ("by",)
+
+    def test_reads_a_bracket_quoted_parameter_name(self) -> None:
+        define = "DEFINE FUNCTION fn::f($\u27e8order\u27e9: int) { RETURN 1 } PERMISSIONS FULL"
+        assert parse_function_parameters(define) == ("order",)
+
+    def test_mixes_quoted_and_bare_names_in_declaration_order(self) -> None:
+        define = "DEFINE FUNCTION fn::f($a: int, $`by`: int, $c: int) { RETURN 1 } PERMISSIONS FULL"
+        assert parse_function_parameters(define) == ("a", "by", "c")
 
     def test_rejects_text_that_is_not_a_define_function(self) -> None:
         with pytest.raises(ValueError):
@@ -398,3 +413,112 @@ class TestSignatureCache:
     def test_unset_connection_clears_the_cache(self) -> None:
         SurrealDBConnectionManager.clear_function_signature_cache()
         assert SurrealDBConnectionManager.function_signature_cache_size() == 0
+
+
+class CfCounter(BaseSurrealModel):
+    id: str
+    n: int = 0
+
+
+class TestCallFunctionTransactionE2E:
+    """``tx=`` on both strategies. ``fn::cf_bump`` mutates, so the writes are observable."""
+
+    @staticmethod
+    async def _define_bump(client: Any) -> None:
+        await client.query("DEFINE FUNCTION OVERWRITE fn::cf_bump($by: int) { UPDATE cf_ctr:a SET n += $by; };", {})
+        await client.query("UPSERT cf_ctr:a SET n = 0;", {})
+
+    @staticmethod
+    async def _counter(client: Any) -> int:
+        rows = await client.query("SELECT * FROM cf_ctr:a;", {})
+        return int(rows[0]["n"])
+
+    @pytest.mark.asyncio
+    async def test_the_functions_write_lands_after_commit(self) -> None:
+        async with cf_client("cf_ctr", "CfCounter") as client:
+            await self._define_bump(client)
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await SurrealDBConnectionManager.call_function("fn::cf_bump", [3], tx=tx)
+            assert await self._counter(client) == 3
+            with contextlib.suppress(Exception):
+                await client.query("REMOVE FUNCTION fn::cf_bump;", {})
+
+    @pytest.mark.asyncio
+    async def test_a_statement_queued_after_the_call_still_executes(self) -> None:
+        """Regression guard for the v0.15.0 design finding.
+
+        ``RETURN`` inside a ``BEGIN … COMMIT`` batch terminates the transaction early and
+        SILENTLY: the statement after it is reported ``status: OK`` and never runs, on BOTH DB
+        lines. If anyone reintroduces ``RETURN`` into the generated call, the ``save()`` below
+        vanishes while the test's other assertion still passes — which is exactly the silent
+        data loss this guards.
+        """
+        async with cf_client("cf_ctr", "CfCounter") as client:
+            await self._define_bump(client)
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await SurrealDBConnectionManager.call_function("fn::cf_bump", [5], tx=tx)
+                await CfCounter(id="after", n=99).save(tx=tx)
+
+            assert await self._counter(client) == 5, "the function's own write was lost"
+            survivors = await client.query("SELECT * FROM CfCounter;", {})
+            assert len(survivors) == 1, "the statement queued AFTER the call never executed"
+            with contextlib.suppress(Exception):
+                await client.query("REMOVE FUNCTION fn::cf_bump;", {})
+
+    @pytest.mark.asyncio
+    async def test_a_rollback_undoes_the_functions_write(self) -> None:
+        async with cf_client("cf_ctr", "CfCounter") as client:
+            await self._define_bump(client)
+            with contextlib.suppress(RuntimeError):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await SurrealDBConnectionManager.call_function("fn::cf_bump", [7], tx=tx)
+                    raise RuntimeError("abort")
+            assert await self._counter(client) == 0
+            with contextlib.suppress(Exception):
+                await client.query("REMOVE FUNCTION fn::cf_bump;", {})
+
+    @pytest.mark.asyncio
+    async def test_interactive_transaction_returns_the_value(self) -> None:
+        async with cf_client("cf_ctr") as client:
+            await self._define_bump(client)
+            async with SurrealDBConnectionManager.transaction() as tx:
+                if not tx.is_interactive:
+                    pytest.skip("interactive transactions need WebSocket + SurrealDB 3.x")
+                assert await SurrealDBConnectionManager.call_function("fn::cf_greet", ["ada"], tx=tx) == "hi ada"
+            with contextlib.suppress(Exception):
+                await client.query("REMOVE FUNCTION fn::cf_bump;", {})
+
+    @pytest.mark.asyncio
+    async def test_buffered_transaction_returns_none(self) -> None:
+        async with cf_client("cf_ctr") as client:
+            await self._define_bump(client)
+            async with SurrealDBConnectionManager.transaction() as tx:
+                if tx.is_interactive:
+                    pytest.skip("buffered strategy only (SurrealDB 2.6.x or HTTP)")
+                assert await SurrealDBConnectionManager.call_function("fn::cf_greet", ["ada"], tx=tx) is None
+            with contextlib.suppress(Exception):
+                await client.query("REMOVE FUNCTION fn::cf_bump;", {})
+
+    @pytest.mark.asyncio
+    async def test_return_type_with_a_buffered_transaction_raises(self) -> None:
+        """There is no value to coerce yet — better a loud error than a silent ``None``."""
+        async with cf_client("cf_ctr") as client:
+            await self._define_bump(client)
+            async with SurrealDBConnectionManager.transaction() as tx:
+                if tx.is_interactive:
+                    pytest.skip("buffered strategy only (SurrealDB 2.6.x or HTTP)")
+                with pytest.raises(ValueError, match="return_type"):
+                    await SurrealDBConnectionManager.call_function("fn::cf_greet", ["ada"], tx=tx, return_type=str)
+            with contextlib.suppress(Exception):
+                await client.query("REMOVE FUNCTION fn::cf_bump;", {})
+
+    @pytest.mark.asyncio
+    async def test_named_params_work_inside_a_transaction(self) -> None:
+        """The signature read must bypass ``tx`` — buffered transactions forbid reads."""
+        async with cf_client("cf_ctr") as client:
+            await self._define_bump(client)
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await SurrealDBConnectionManager.call_function("fn::cf_bump", params={"by": 4}, tx=tx)
+            assert await self._counter(client) == 4
+            with contextlib.suppress(Exception):
+                await client.query("REMOVE FUNCTION fn::cf_bump;", {})

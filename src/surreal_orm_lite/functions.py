@@ -419,6 +419,15 @@ CALL_ARG_PREFIX = "_fnarg"
 
 _DEFINE_FUNCTION_HEAD = re.compile(r"\bDEFINE\s+FUNCTION\b", re.IGNORECASE)
 
+#: A parameter reference in a ``DEFINE FUNCTION`` signature, in any of the three forms the
+#: server may echo back. SurrealDB **quotes a name that collides with a reserved word**, and
+#: the two DB lines disagree about when: 2.6.x renders ``fn::f($by: int)`` as ``$`by```, while
+#: 3.x leaves it bare. Missing the quoted form silently yields an EMPTY signature, which is
+#: how this was found — ``params={"by": …}`` failed only on 2.6.5.
+_PARAMETER_REFERENCE = re.compile(
+    r"\$(?:([a-zA-Z_][a-zA-Z0-9_]*)|`([^`]+)`|⟨([^⟩]+)⟩)",
+)
+
 
 def normalize_function_name(function: str) -> str:
     """Return *function* as a validated ``fn::…`` name, adding the prefix when absent.
@@ -494,9 +503,10 @@ def parse_function_parameters(define_statement: str) -> tuple[str, ...]:
             if depth == 0:
                 break
         elif char == "$" and depth == 1:
-            match = re.match(r"\$([a-zA-Z_][a-zA-Z0-9_]*)", define_statement[index:])
+            match = _PARAMETER_REFERENCE.match(define_statement[index:])
             if match:
-                names.append(match.group(1))
+                # Exactly one of the three alternatives matched: bare, `backtick`, or ⟨bracket⟩.
+                names.append(next(group for group in match.groups() if group is not None))
                 index += match.end() - 1
         index += 1
     else:  # pragma: no cover - defensive: a truncated statement from the server
