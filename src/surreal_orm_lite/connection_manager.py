@@ -5,8 +5,15 @@ import weakref
 from collections.abc import Sequence
 from typing import Any
 
+from pydantic import TypeAdapter, ValidationError
+
 from ._sdk import AsyncSurreal, NotFoundError
-from .exceptions import SurrealDbConnectionError, SurrealDbError, SurrealDbNotFoundError
+from .exceptions import (
+    SurrealDbConnectionError,
+    SurrealDbError,
+    SurrealDbNotFoundError,
+    SurrealDbValidationError,
+)
 from .functions import build_call_statement, normalize_function_name
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
 
@@ -223,6 +230,8 @@ class SurrealDBConnectionManager:
         cls,
         function: str,
         args: Sequence[Any] | None = None,
+        *,
+        return_type: Any = None,
     ) -> Any:
         """Call a custom server-side function declared with ``DEFINE FUNCTION fn::…``.
 
@@ -238,11 +247,23 @@ class SurrealDBConnectionManager:
         and is therefore validated first — an invalid name raises ``ValueError`` before any
         query is issued.
 
+        Pass ``return_type`` to convert the result — any annotation Pydantic can adapt works,
+        so a model, a dataclass, a scalar and a generic are all one code path::
+
+            lock = await SurrealDBConnectionManager.call_function(
+                "fn::acquire_lock", [table_id, pod_id], return_type=LockResult,
+            )
+            locks = await SurrealDBConnectionManager.call_function(
+                "fn::all_locks", return_type=list[LockResult],
+            )
+
         :param function: ``"fn::name"``, ``"name"``, or a nested ``"fn::namespace::name"``.
         :param args: positional arguments, in the function's declaration order.
+        :param return_type: a type annotation to coerce the result into; ``None`` returns it raw.
         :return: the function's return value; ``None`` when it returns ``NONE``.
         :raises ValueError: if the function name is not an identifier path.
         :raises SurrealDbNotFoundError: if the server has no such function.
+        :raises SurrealDbValidationError: if the result does not fit ``return_type``.
         :raises SurrealDbError: for any other database failure.
         """
         name = normalize_function_name(function)
@@ -250,9 +271,26 @@ class SurrealDBConnectionManager:
 
         client = await cls.get_client()
         try:
-            return await client.query(statement, variables)
+            value = await client.query(statement, variables)
         except Exception as exc:
             raise cls._wrap_call_error(exc, name) from exc
+
+        return cls._coerce_call_result(value, return_type, name)
+
+    @staticmethod
+    def _coerce_call_result(value: Any, return_type: Any, function: str) -> Any:
+        """Convert a stored function's result to *return_type*, or return it untouched.
+
+        One ``TypeAdapter`` covers every shape a caller might ask for — a Pydantic model, a
+        dataclass, ``list[Model]``, ``int``, ``datetime`` — so there is no per-kind branching
+        to keep in sync.
+        """
+        if return_type is None:
+            return value
+        try:
+            return TypeAdapter(return_type).validate_python(value)
+        except ValidationError as exc:
+            raise SurrealDbValidationError(f"The value returned by {function!r} does not fit {return_type!r}: {exc}") from exc
 
     @staticmethod
     def _wrap_call_error(exc: Exception, function: str) -> Exception:

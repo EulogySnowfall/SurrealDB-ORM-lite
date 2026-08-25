@@ -10,9 +10,10 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
+from pydantic import BaseModel as PydanticBaseModel
 
 from surreal_orm_lite import SurrealDBConnectionManager
-from surreal_orm_lite.exceptions import SurrealDbError, SurrealDbNotFoundError
+from surreal_orm_lite.exceptions import SurrealDbError, SurrealDbNotFoundError, SurrealDbValidationError
 from surreal_orm_lite.functions import (
     build_call_statement,
     normalize_function_name,
@@ -251,3 +252,64 @@ class TestCallFunctionE2E:
             assert not isinstance(caught.value, SurrealDbNotFoundError)
             with contextlib.suppress(Exception):
                 await client.query("REMOVE FUNCTION fn::cf_inner_fail;", {})
+
+
+class CfLock(PydanticBaseModel):
+    acquired: bool
+    holder: str
+
+
+class TestCallFunctionReturnTypeE2E:
+    @pytest.mark.asyncio
+    async def test_coerces_an_object_into_a_pydantic_model(self) -> None:
+        async with cf_client() as client:
+            await client.query(
+                "DEFINE FUNCTION OVERWRITE fn::cf_lock($who: string) { RETURN { acquired: true, holder: $who }; };",
+                {},
+            )
+            lock = await SurrealDBConnectionManager.call_function("fn::cf_lock", ["pod-1"], return_type=CfLock)
+            assert isinstance(lock, CfLock)
+            assert lock.acquired is True
+            assert lock.holder == "pod-1"
+            with contextlib.suppress(Exception):
+                await client.query("REMOVE FUNCTION fn::cf_lock;", {})
+
+    @pytest.mark.asyncio
+    async def test_coerces_a_scalar(self) -> None:
+        async with cf_client():
+            value = await SurrealDBConnectionManager.call_function("fn::cf_sum", [2, 3], return_type=float)
+            assert isinstance(value, float)
+            assert value == 5.0
+
+    @pytest.mark.asyncio
+    async def test_scalar_coercion_follows_pydantic_and_does_not_stringify_numbers(self) -> None:
+        """``return_type`` is plain Pydantic validation, not a cast: an ``int`` asked to be a
+        ``str`` is a mismatch, not a silent ``str(5)``."""
+        async with cf_client():
+            with pytest.raises(SurrealDbValidationError):
+                await SurrealDBConnectionManager.call_function("fn::cf_sum", [2, 3], return_type=str)
+
+    @pytest.mark.asyncio
+    async def test_coerces_a_list_element_wise(self) -> None:
+        async with cf_client() as client:
+            await client.query(
+                "DEFINE FUNCTION OVERWRITE fn::cf_locks() "
+                "{ RETURN [{ acquired: true, holder: 'a' }, { acquired: false, holder: 'b' }]; };",
+                {},
+            )
+            locks = await SurrealDBConnectionManager.call_function("fn::cf_locks", return_type=list[CfLock])
+            assert [type(item) for item in locks] == [CfLock, CfLock]
+            assert locks[1].holder == "b"
+            with contextlib.suppress(Exception):
+                await client.query("REMOVE FUNCTION fn::cf_locks;", {})
+
+    @pytest.mark.asyncio
+    async def test_without_a_return_type_the_raw_value_is_returned(self) -> None:
+        async with cf_client():
+            assert await SurrealDBConnectionManager.call_function("fn::cf_sum", [2, 3]) == 5
+
+    @pytest.mark.asyncio
+    async def test_a_value_that_does_not_fit_raises_a_validation_error(self) -> None:
+        async with cf_client():
+            with pytest.raises(SurrealDbValidationError):
+                await SurrealDBConnectionManager.call_function("fn::cf_greet", ["ada"], return_type=CfLock)
