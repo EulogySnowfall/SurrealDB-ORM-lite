@@ -313,3 +313,88 @@ class TestCallFunctionReturnTypeE2E:
         async with cf_client():
             with pytest.raises(SurrealDbValidationError):
                 await SurrealDBConnectionManager.call_function("fn::cf_greet", ["ada"], return_type=CfLock)
+
+
+class TestCallFunctionNamedParamsE2E:
+    @pytest.mark.asyncio
+    async def test_named_params_match_the_positional_call(self) -> None:
+        async with cf_client() as client:
+            # A non-commutative function: a wrong order would silently give a wrong answer.
+            await client.query("DEFINE FUNCTION OVERWRITE fn::cf_sub($a: int, $b: int) { RETURN $a - $b; };", {})
+            positional = await SurrealDBConnectionManager.call_function("fn::cf_sub", [10, 3])
+            named = await SurrealDBConnectionManager.call_function("fn::cf_sub", params={"b": 3, "a": 10})
+            assert positional == 7
+            assert named == 7
+            with contextlib.suppress(Exception):
+                await client.query("REMOVE FUNCTION fn::cf_sub;", {})
+
+    @pytest.mark.asyncio
+    async def test_passing_both_args_and_params_raises(self) -> None:
+        async with cf_client():
+            with pytest.raises(ValueError, match="both"):
+                await SurrealDBConnectionManager.call_function("fn::cf_sum", [1, 2], params={"a": 1, "b": 2})
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_key_raises_naming_the_expected_parameters(self) -> None:
+        async with cf_client():
+            with pytest.raises(ValueError) as caught:
+                await SurrealDBConnectionManager.call_function("fn::cf_sum", params={"a": 1, "nope": 2})
+            assert "a" in str(caught.value) and "b" in str(caught.value)
+
+    @pytest.mark.asyncio
+    async def test_a_missing_key_raises_naming_the_expected_parameters(self) -> None:
+        async with cf_client():
+            with pytest.raises(ValueError) as caught:
+                await SurrealDBConnectionManager.call_function("fn::cf_sum", params={"a": 1})
+            assert "b" in str(caught.value)
+
+    @pytest.mark.asyncio
+    async def test_empty_params_on_a_zero_argument_function(self) -> None:
+        async with cf_client():
+            assert await SurrealDBConnectionManager.call_function("fn::cf_noargs", params={}) == 42
+
+    @pytest.mark.asyncio
+    async def test_the_signature_is_cached_across_calls(self) -> None:
+        async with cf_client() as client:
+            SurrealDBConnectionManager.clear_function_signature_cache()
+            await SurrealDBConnectionManager.call_function("fn::cf_sum", params={"a": 1, "b": 2})
+
+            info_calls = 0
+            original = client.query
+
+            async def counting(statement: str, variables: Any = None, **kwargs: Any) -> Any:
+                nonlocal info_calls
+                if "INFO FOR DB" in statement:
+                    info_calls += 1
+                return await original(statement, variables, **kwargs)
+
+            client.query = counting  # type: ignore[method-assign]
+            try:
+                await SurrealDBConnectionManager.call_function("fn::cf_sum", params={"a": 1, "b": 2})
+                assert info_calls == 0
+            finally:
+                client.query = original  # type: ignore[method-assign]
+
+    @pytest.mark.asyncio
+    async def test_a_redefined_function_resolves_after_one_automatic_refresh(self) -> None:
+        """A stale cached signature must self-heal rather than reject a valid call."""
+        async with cf_client() as client:
+            await client.query("DEFINE FUNCTION OVERWRITE fn::cf_shift($a: int) { RETURN $a; };", {})
+            assert await SurrealDBConnectionManager.call_function("fn::cf_shift", params={"a": 1}) == 1
+
+            await client.query("DEFINE FUNCTION OVERWRITE fn::cf_shift($x: int, $y: int) { RETURN $x + $y; };", {})
+            assert await SurrealDBConnectionManager.call_function("fn::cf_shift", params={"x": 1, "y": 2}) == 3
+            with contextlib.suppress(Exception):
+                await client.query("REMOVE FUNCTION fn::cf_shift;", {})
+
+    @pytest.mark.asyncio
+    async def test_named_params_for_a_missing_function_raise_not_found(self) -> None:
+        async with cf_client():
+            with pytest.raises(SurrealDbNotFoundError):
+                await SurrealDBConnectionManager.call_function("fn::cf_absent", params={"a": 1})
+
+
+class TestSignatureCache:
+    def test_unset_connection_clears_the_cache(self) -> None:
+        SurrealDBConnectionManager.clear_function_signature_cache()
+        assert SurrealDBConnectionManager.function_signature_cache_size() == 0
