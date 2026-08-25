@@ -4,8 +4,15 @@ The pure helpers (name normalisation, signature parsing, statement building) are
 everything that talks to a server lives in a ``…E2E`` class and runs on both DB lines.
 """
 
+import contextlib
+import os
+from collections.abc import AsyncIterator
+from typing import Any
+
 import pytest
 
+from surreal_orm_lite import SurrealDBConnectionManager
+from surreal_orm_lite.exceptions import SurrealDbError, SurrealDbNotFoundError
 from surreal_orm_lite.functions import (
     build_call_statement,
     normalize_function_name,
@@ -110,3 +117,137 @@ class TestCallStatementBuilding:
 
     def test_accepts_any_sequence(self) -> None:
         assert build_call_statement("fn::sum", (1, 2))[1] == {"_fnarg0": 1, "_fnarg1": 2}
+
+
+# ---------------------------------------------------------------------------
+# E2E — everything below talks to a real server and runs on both DB lines.
+# ---------------------------------------------------------------------------
+
+
+def _url() -> str:
+    host = os.environ.get("SURREALDB_HOST", "localhost")
+    port = os.environ.get("SURREALDB_PORT", "8000")
+    return f"ws://{host}:{port}/rpc"
+
+
+def _connect() -> None:
+    SurrealDBConnectionManager.set_connection(url=_url(), user="root", password="root", namespace="ns", database="db")
+
+
+#: The demo functions every E2E class relies on, defined fresh per test.
+CF_FIXTURES: dict[str, str] = {
+    "cf_greet": "DEFINE FUNCTION OVERWRITE fn::cf_greet($name: string) { RETURN 'hi ' + $name; };",
+    "cf_sum": "DEFINE FUNCTION OVERWRITE fn::cf_sum($a: int, $b: int) { RETURN $a + $b; };",
+    "cf_noargs": "DEFINE FUNCTION OVERWRITE fn::cf_noargs() { RETURN 42; };",
+    "cf_none": "DEFINE FUNCTION OVERWRITE fn::cf_none() { RETURN NONE; };",
+    "cf_ns::cf_nested": "DEFINE FUNCTION OVERWRITE fn::cf_ns::cf_nested($x: int) { RETURN $x * 2; };",
+}
+
+
+@contextlib.asynccontextmanager
+async def cf_client(*tables: str) -> AsyncIterator[Any]:
+    """Connected ORM client with the demo functions defined, dropped again afterwards.
+
+    An async context manager rather than a pytest fixture: the SDK's WebSocket client is bound
+    to the event loop that created it, and fixtures run in the module-scoped loop while tests
+    get their own — so the client must be opened inside the test's loop.
+    """
+    _connect()
+    client = await SurrealDBConnectionManager.get_client()
+    for statement in CF_FIXTURES.values():
+        await client.query(statement, {})
+    for table in tables:
+        with contextlib.suppress(Exception):
+            await client.query(f"REMOVE TABLE {table};", {})
+    try:
+        yield client
+    finally:
+        for name in CF_FIXTURES:
+            with contextlib.suppress(Exception):
+                await client.query(f"REMOVE FUNCTION fn::{name};", {})
+        for table in tables:
+            with contextlib.suppress(Exception):
+                await client.query(f"REMOVE TABLE {table};", {})
+        await SurrealDBConnectionManager.close_connection()
+
+
+class TestCallFunctionE2E:
+    @pytest.mark.asyncio
+    async def test_returns_the_value_of_a_one_argument_function(self) -> None:
+        async with cf_client():
+            assert await SurrealDBConnectionManager.call_function("fn::cf_greet", ["ada"]) == "hi ada"
+
+    @pytest.mark.asyncio
+    async def test_returns_the_value_of_a_two_argument_function(self) -> None:
+        async with cf_client():
+            assert await SurrealDBConnectionManager.call_function("fn::cf_sum", [2, 3]) == 5
+
+    @pytest.mark.asyncio
+    async def test_adds_the_fn_prefix_when_absent(self) -> None:
+        async with cf_client():
+            assert await SurrealDBConnectionManager.call_function("cf_greet", ["ada"]) == "hi ada"
+
+    @pytest.mark.asyncio
+    async def test_resolves_a_nested_namespace_function(self) -> None:
+        async with cf_client():
+            assert await SurrealDBConnectionManager.call_function("fn::cf_ns::cf_nested", [21]) == 42
+
+    @pytest.mark.asyncio
+    async def test_zero_argument_function(self) -> None:
+        async with cf_client():
+            assert await SurrealDBConnectionManager.call_function("fn::cf_noargs") == 42
+
+    @pytest.mark.asyncio
+    async def test_a_function_returning_none_yields_python_none(self) -> None:
+        async with cf_client():
+            assert await SurrealDBConnectionManager.call_function("fn::cf_none") is None
+
+    @pytest.mark.asyncio
+    async def test_arguments_are_bound_never_interpolated(self) -> None:
+        """A hostile argument comes back as data; the record it tries to delete survives."""
+        hostile = ");DELETE cf_probe;--"
+        async with cf_client("cf_probe") as client:
+            await client.query("UPSERT cf_probe:a SET n = 1;", {})
+            assert await SurrealDBConnectionManager.call_function("fn::cf_greet", [hostile]) == f"hi {hostile}"
+            survivors = await client.query("SELECT * FROM cf_probe;", {})
+            assert len(survivors) == 1
+
+    @pytest.mark.asyncio
+    async def test_an_invalid_name_raises_before_any_query_is_issued(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def _explode() -> Any:
+            raise AssertionError("call_function must validate the name before touching the client")
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", _explode)
+        with pytest.raises(ValueError):
+            await SurrealDBConnectionManager.call_function("fn::x; DROP TABLE user")
+
+    @pytest.mark.asyncio
+    async def test_a_missing_function_raises_not_found(self) -> None:
+        """Asserted on the exception TYPE: 3.x and 2.6.x word this error differently."""
+        async with cf_client():
+            with pytest.raises(SurrealDbNotFoundError):
+                await SurrealDBConnectionManager.call_function("fn::cf_does_not_exist")
+
+    @pytest.mark.asyncio
+    async def test_wrong_arity_raises_a_database_error_not_a_not_found(self) -> None:
+        """The function exists — misclassifying arity as 'missing' would mislead the caller.
+
+        ``SurrealDbNotFoundError`` subclasses ``SurrealDbError``, so asserting the base class
+        alone would pass either way; the type is pinned exactly.
+        """
+        async with cf_client():
+            with pytest.raises(SurrealDbError) as caught:
+                await SurrealDBConnectionManager.call_function("fn::cf_sum", [1])
+            assert not isinstance(caught.value, SurrealDbNotFoundError)
+
+    @pytest.mark.asyncio
+    async def test_a_failure_inside_the_function_body_is_not_reported_as_missing(self) -> None:
+        """A 'not found' raised by the function's own body must not be mistaken for the
+        function itself being absent."""
+        async with cf_client() as client:
+            await client.query("DEFINE FUNCTION OVERWRITE fn::cf_inner_fail() { RETURN fn::cf_absent_inner(); };", {})
+            with pytest.raises(SurrealDbError) as caught:
+                await SurrealDBConnectionManager.call_function("fn::cf_inner_fail")
+            assert not isinstance(caught.value, SurrealDbNotFoundError)
+            with contextlib.suppress(Exception):
+                await client.query("REMOVE FUNCTION fn::cf_inner_fail;", {})

@@ -2,10 +2,12 @@ import asyncio
 import contextlib
 import logging
 import weakref
+from collections.abc import Sequence
 from typing import Any
 
 from ._sdk import AsyncSurreal, NotFoundError
-from .exceptions import SurrealDbConnectionError
+from .exceptions import SurrealDbConnectionError, SurrealDbError, SurrealDbNotFoundError
+from .functions import build_call_statement, normalize_function_name
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
 
 logger = logging.getLogger(__name__)
@@ -215,6 +217,57 @@ class SurrealDBConnectionManager:
                 await tx.cancel()
                 raise
             await tx.fire_post_commit()
+
+    @classmethod
+    async def call_function(
+        cls,
+        function: str,
+        args: Sequence[Any] | None = None,
+    ) -> Any:
+        """Call a custom server-side function declared with ``DEFINE FUNCTION fn::…``.
+
+        Arguments are **bound as query parameters**, never formatted into the statement::
+
+            total = await SurrealDBConnectionManager.call_function("fn::cart_total", [cart_id])
+
+        The ``fn::`` prefix is added when absent, so ``"cart_total"`` and ``"fn::cart_total"``
+        are the same call. SurrealQL function arguments are **positional**, so *args* is a
+        sequence in declaration order.
+
+        The name itself is interpolated (SurrealQL takes no bound parameter in call position)
+        and is therefore validated first — an invalid name raises ``ValueError`` before any
+        query is issued.
+
+        :param function: ``"fn::name"``, ``"name"``, or a nested ``"fn::namespace::name"``.
+        :param args: positional arguments, in the function's declaration order.
+        :return: the function's return value; ``None`` when it returns ``NONE``.
+        :raises ValueError: if the function name is not an identifier path.
+        :raises SurrealDbNotFoundError: if the server has no such function.
+        :raises SurrealDbError: for any other database failure.
+        """
+        name = normalize_function_name(function)
+        statement, variables = build_call_statement(name, args or [])
+
+        client = await cls.get_client()
+        try:
+            return await client.query(statement, variables)
+        except Exception as exc:
+            raise cls._wrap_call_error(exc, name) from exc
+
+    @staticmethod
+    def _wrap_call_error(exc: Exception, function: str) -> Exception:
+        """Map an SDK exception raised by a stored-function call to the ORM hierarchy.
+
+        A missing function is reported differently by each DB line — SurrealDB 3.x says
+        ``Function 'fn::x' not found: The function 'fn::x' does not exist`` while 2.6.x says
+        only ``The function 'fn::x' does not exist`` — so the shared substring is what is
+        matched, and callers assert on the exception type rather than the wording.
+        """
+        message = str(exc)
+        missing = ("does not exist" in message or "not found" in message.lower()) and function in message
+        if missing:
+            return SurrealDbNotFoundError(f"Stored function {function!r} does not exist: {message}")
+        return SurrealDbError(f"Call to stored function {function!r} failed: {message}")
 
     @classmethod
     async def reconnect(cls) -> Any:
