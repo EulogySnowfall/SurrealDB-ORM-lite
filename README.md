@@ -682,7 +682,7 @@ from surreal_orm_lite import SurrealDBConnectionManager
 client = await SurrealDBConnectionManager.get_client()
 await client.query("""
     DEFINE FUNCTION OVERWRITE fn::acquire_lock($table_id: string, $pod_id: string, $ttl: int) {
-        UPSERT type::record('lock', $table_id) SET holder = $pod_id, ttl = $ttl;
+        UPSERT type::record("lock:⟨" + $table_id + "⟩") SET holder = $pod_id, ttl = $ttl;
         RETURN { acquired: true, holder: $pod_id };
     };
 """, {})
@@ -752,7 +752,22 @@ lock = await GameTable.call_function("fn::acquire_lock", ["t1", "pod-a", 30])
 ```
 
 Errors are normalised: a function the server does not know raises `SurrealDbNotFoundError`,
-anything else raises `SurrealDbError`.
+anything else raises `SurrealDbError`. A result that does not fit `return_type` raises
+`SurrealDbValidationError` — inside an interactive transaction too. The one exception is a
+**buffered** transaction, where the call is merely queued: a missing function cannot be detected
+at call time and surfaces at commit as `SurrealDbError`.
+
+> **Portability note** — building a record id inside a function is the one fiddly part, and the
+> spelling above is the one verified on **both** DB lines. The two-argument
+> `type::record($table, $id)` is 3.x-only (on 2.6.x the second argument means a _type_, not an
+> id), and `type::thing` is its 2.6-only inverse. The `⟨…⟩` brackets around the id matter too:
+> without them `type::record("lock:" + $id)` truncates an id containing a hyphen (`"table-1"`
+> becomes `table`) on 3.x and is rejected outright on 2.6.x.
+
+Signature caching is transparent, but two helpers are available if you redefine functions
+out-of-band: `SurrealDBConnectionManager.clear_function_signature_cache()` and
+`function_signature_cache_size()`. The cache is also cleared by `set_connection()` and
+`unset_connection()`, and a mismatched signature self-heals on its own.
 
 ---
 
@@ -856,6 +871,7 @@ listed behave the same on both lines.
 | `call_function()` — the call itself (`args`, `params`, `return_type`, nested `fn::a::b`)                                               | same on both lines (bare call form chosen so it is portable)                   | same on both lines (verified on 3.2.4)                                   | v0.15.0 |
 | `call_function(tx=)` — return value                                                                                                    | `None` (buffered: queued until commit)                                         | the function's value (interactive returns it immediately)                | v0.15.0 |
 | `call_function(tx=, return_type=)`                                                                                                     | raises `ValueError` (no value to coerce yet)                                   | coerces the returned value                                               | v0.15.0 |
+| Missing function called inside a transaction                                                                                           | surfaces at COMMIT as `SurrealDbError` (buffered: the call is only queued)     | raises `SurrealDbNotFoundError` at call time                             | v0.15.0 |
 | Declared parameter name that collides with a reserved word, as echoed by `INFO FOR DB`                                                 | quoted: `` $`by` `` — parser accepts it                                        | bare: `$by`                                                              | v0.15.0 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.

@@ -412,7 +412,7 @@ class SurrealRandFunction(SurrealFunction):
 # ---------------------------------------------------------------------------
 
 #: One ``::``-separated segment of a stored-function name.
-_FUNCTION_SEGMENT = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_FUNCTION_SEGMENT = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
 
 #: The parameter prefix used when binding a stored function's arguments.
 CALL_ARG_PREFIX = "_fnarg"
@@ -457,7 +457,8 @@ def normalize_function_name(function: str) -> str:
         name = name[len("fn::") :]
 
     segments = name.split("::")
-    if not segments or not all(_FUNCTION_SEGMENT.match(segment) for segment in segments):
+    # fullmatch, not match: '$' also matches before a trailing newline, so 'ab\n' would pass.
+    if not segments or not all(_FUNCTION_SEGMENT.fullmatch(segment) for segment in segments):
         raise ValueError(
             f"Invalid stored function name: {function!r}. Expected 'fn::name' or "
             "'fn::namespace::name', where each segment is an identifier "
@@ -496,6 +497,13 @@ def parse_function_parameters(define_statement: str) -> tuple[str, ...]:
     index = start
     while index < len(define_statement):
         char = define_statement[index]
+        if char in "'\"":
+            # Skip a string literal wholesale: a literal type such as `$mode: 'a)b' | 'c'` would
+            # otherwise close the parameter list early, and one containing a `$` would invent a
+            # phantom parameter.
+            closing = define_statement.find(char, index + 1)
+            index = len(define_statement) if closing == -1 else closing + 1
+            continue
         if char == "(":
             depth += 1
         elif char == ")":

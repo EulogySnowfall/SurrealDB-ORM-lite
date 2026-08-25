@@ -9,6 +9,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from ._sdk import AsyncSurreal, NotFoundError
 from .exceptions import (
+    SurrealDbConflictError,
     SurrealDbConnectionError,
     SurrealDbError,
     SurrealDbNotFoundError,
@@ -59,6 +60,9 @@ class SurrealDBConnectionManager:
         cls.__password = password
         cls.__namespace = namespace
         cls.__database = database
+        # Signatures belong to the server that declared them; re-pointing the connection must
+        # not hand stale ones to the new one.
+        cls.clear_function_signature_cache()
 
     @classmethod
     async def unset_connection(cls) -> None:
@@ -299,6 +303,12 @@ class SurrealDBConnectionManager:
                 "connection to SurrealDB 3.x (interactive transactions)."
             )
 
+        if isinstance(args, str | bytes):
+            raise TypeError(
+                f"'args' must be a sequence of arguments, not {type(args).__name__!r} — a string "
+                "would be bound one character per argument. Wrap it: args=[value]."
+            )
+
         name = normalize_function_name(function)
 
         client = await cls.get_client()
@@ -311,11 +321,17 @@ class SurrealDBConnectionManager:
         if tx is not None:
             try:
                 # Buffered: queued, returns None. Interactive: runs now, returns the value.
-                return cls._coerce_call_result(await tx.add(statement, variables), return_type, name)
-            except (SurrealDbError, ValueError):
+                raw = await tx.add(statement, variables)
+            except SurrealDbConflictError:
+                # A retryable conflict must keep its type: retry_on_conflict dispatches on it.
                 raise
             except Exception as exc:
+                # Includes the SurrealDbError the transaction layer already raised, so a call
+                # to a missing function is still classified as SurrealDbNotFoundError here.
                 raise cls._wrap_call_error(exc, name) from exc
+            # Coercion happens OUTSIDE the try: SurrealDbValidationError does not subclass
+            # SurrealDbError, so catching it here would silently downgrade it.
+            return cls._coerce_call_result(raw, return_type, name)
         try:
             value = await client.query(statement, variables)
         except Exception as exc:
@@ -346,8 +362,12 @@ class SurrealDBConnectionManager:
         the signature re-read **once**, and only a second mismatch raises. That way a function
         redefined at runtime resolves instead of failing on a cache the caller cannot see.
         """
+        key = (cls.__namespace, cls.__database, function)
+        was_cached = key in cls.__function_signatures
         expected = await cls._function_signature(client, function)
-        if set(params) != set(expected):
+        if set(params) != set(expected) and was_cached:
+            # Only worth a second round trip if the first answer came from the cache; a freshly
+            # read signature that already disagrees will not change on re-reading.
             expected = await cls._function_signature(client, function, refresh=True)
         if set(params) != set(expected):
             raise ValueError(

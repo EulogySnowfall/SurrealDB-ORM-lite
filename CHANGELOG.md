@@ -50,6 +50,10 @@ Call custom server-side functions (`DEFINE FUNCTION fn::…`) from the ORM.
 - **`BaseSurrealModel.call_function()`** — the same call for code organised around models. A
   stored function is not table-bound, so it delegates verbatim.
 
+- **`clear_function_signature_cache()` / `function_signature_cache_size()`** on the connection
+  manager, for redefining functions out-of-band. The cache is cleared by `set_connection()` and
+  `unset_connection()` too, since signatures belong to the server that declared them.
+
 ### Notes
 
 - **The ORM emits the bare call form `fn::name($_fnarg0);`, never `RETURN fn::name(…)`.** A
@@ -69,6 +73,12 @@ Call custom server-side functions (`DEFINE FUNCTION fn::…`) from the ORM.
   SurrealDB 2.6.x reports `fn::f($by: int)` as ``$`by` `` while 3.x leaves it bare; the
   signature parser accepts `$name`, ``$`name` `` and `$⟨name⟩`.
 - The call itself behaves identically on SurrealDB 2.6.x and 3.x.
+- Passing a bare `str` as `args` raises `TypeError` rather than binding one argument per
+  character.
+- **A missing function is reported at a different moment per strategy.** Outside a transaction
+  and inside an interactive one it raises `SurrealDbNotFoundError` at call time. Inside a
+  buffered one the call is only queued, so the failure cannot be known until commit and arrives
+  as `SurrealDbError` from the transaction layer.
 - **Deferred**: a `define_function()` DDL helper. Declaring is DDL and belongs with the other
   `schema.py` helpers planned for **v0.31.0**; v0.15.0 is about calling. Declare a function with
   `client.query("DEFINE FUNCTION fn::… { … };")` meanwhile.

@@ -409,10 +409,23 @@ class TestCallFunctionNamedParamsE2E:
                 await SurrealDBConnectionManager.call_function("fn::cf_absent", params={"a": 1})
 
 
-class TestSignatureCache:
-    def test_unset_connection_clears_the_cache(self) -> None:
-        SurrealDBConnectionManager.clear_function_signature_cache()
-        assert SurrealDBConnectionManager.function_signature_cache_size() == 0
+class TestSignatureCacheE2E:
+    @pytest.mark.asyncio
+    async def test_unset_connection_clears_the_cache(self) -> None:
+        async with cf_client():
+            await SurrealDBConnectionManager.call_function("fn::cf_sum", params={"a": 1, "b": 2})
+            assert SurrealDBConnectionManager.function_signature_cache_size() > 0
+            await SurrealDBConnectionManager.unset_connection()
+            assert SurrealDBConnectionManager.function_signature_cache_size() == 0
+
+    @pytest.mark.asyncio
+    async def test_set_connection_clears_the_cache(self) -> None:
+        """Signatures belong to the server that declared them."""
+        async with cf_client():
+            await SurrealDBConnectionManager.call_function("fn::cf_sum", params={"a": 1, "b": 2})
+            assert SurrealDBConnectionManager.function_signature_cache_size() > 0
+            _connect()
+            assert SurrealDBConnectionManager.function_signature_cache_size() == 0
 
 
 class CfCounter(BaseSurrealModel):
@@ -560,3 +573,54 @@ class TestModelCallFunctionE2E:
         async with cf_client():
             with pytest.raises(ValueError, match="both"):
                 await CfCounter.call_function("fn::cf_sum", [1, 2], params={"a": 1, "b": 2})
+
+
+class TestCallFunctionTransactionErrorsE2E:
+    """The error contract inside a transaction — the combination the first review found untested."""
+
+    @pytest.mark.asyncio
+    async def test_a_missing_function_in_an_interactive_transaction_raises_not_found(self) -> None:
+        """The transaction layer pre-wraps failures as ``SurrealDbError``; the call must still
+        classify a missing function, or the documented contract is a lie inside a ``tx``."""
+        async with cf_client():
+            async with SurrealDBConnectionManager.transaction() as probe:
+                interactive = probe.is_interactive
+            if not interactive:
+                pytest.skip("buffered transactions cannot report a missing function before commit")
+            with pytest.raises(SurrealDbNotFoundError):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await SurrealDBConnectionManager.call_function("fn::cf_absent_in_tx", tx=tx)
+
+    @pytest.mark.asyncio
+    async def test_a_missing_function_in_a_buffered_transaction_surfaces_at_commit(self) -> None:
+        """A buffered call is only queued, so the ORM cannot know the function is missing when
+        it is called — the failure arrives at COMMIT, from the transaction layer, as a plain
+        ``SurrealDbError``. Documented in the 2.6.x-vs-3.x behaviour table."""
+        async with cf_client():
+            async with SurrealDBConnectionManager.transaction() as probe:
+                interactive = probe.is_interactive
+            if interactive:
+                pytest.skip("interactive transactions report it at call time instead")
+            with pytest.raises(SurrealDbError):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    # Queued only: this call itself does not raise.
+                    await SurrealDBConnectionManager.call_function("fn::cf_absent_in_tx", tx=tx)
+
+    @pytest.mark.asyncio
+    async def test_return_type_mismatch_in_a_transaction_raises_a_validation_error(self) -> None:
+        """``SurrealDbValidationError`` does NOT subclass ``SurrealDbError``, so coercion must
+        happen outside the transaction's exception handling or it is silently downgraded."""
+        async with cf_client(), SurrealDBConnectionManager.transaction() as tx:
+            if not tx.is_interactive:
+                pytest.skip("a buffered transaction returns no value to coerce")
+            with pytest.raises(SurrealDbValidationError):
+                await SurrealDBConnectionManager.call_function("fn::cf_greet", ["ada"], tx=tx, return_type=CfLock)
+
+
+class TestArgsTypeGuard:
+    @pytest.mark.asyncio
+    async def test_a_bare_string_as_args_is_rejected(self) -> None:
+        """``args="ada"`` would bind one argument per character — a silent wrong call."""
+        async with cf_client():
+            with pytest.raises(TypeError, match="sequence"):
+                await SurrealDBConnectionManager.call_function("fn::cf_greet", "ada")  # type: ignore[arg-type]
