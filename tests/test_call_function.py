@@ -522,3 +522,41 @@ class TestCallFunctionTransactionE2E:
             assert await self._counter(client) == 4
             with contextlib.suppress(Exception):
                 await client.query("REMOVE FUNCTION fn::cf_bump;", {})
+
+
+class TestModelCallFunctionE2E:
+    """``Model.call_function()`` is a pure delegation: a stored function is not table-bound."""
+
+    @pytest.mark.asyncio
+    async def test_returns_the_same_value_as_the_manager(self) -> None:
+        async with cf_client():
+            assert await CfCounter.call_function("fn::cf_greet", ["ada"]) == "hi ada"
+
+    @pytest.mark.asyncio
+    async def test_forwards_named_params(self) -> None:
+        async with cf_client():
+            assert await CfCounter.call_function("fn::cf_sum", params={"b": 3, "a": 2}) == 5
+
+    @pytest.mark.asyncio
+    async def test_forwards_return_type(self) -> None:
+        async with cf_client():
+            value = await CfCounter.call_function("fn::cf_sum", [2, 3], return_type=float)
+            assert isinstance(value, float)
+
+    @pytest.mark.asyncio
+    async def test_forwards_tx(self) -> None:
+        async with cf_client("cf_ctr") as client:
+            await client.query("DEFINE FUNCTION OVERWRITE fn::cf_bump($by: int) { UPDATE cf_ctr:a SET n += $by; };", {})
+            await client.query("UPSERT cf_ctr:a SET n = 0;", {})
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await CfCounter.call_function("fn::cf_bump", [2], tx=tx)
+            rows = await client.query("SELECT * FROM cf_ctr:a;", {})
+            assert rows[0]["n"] == 2
+            with contextlib.suppress(Exception):
+                await client.query("REMOVE FUNCTION fn::cf_bump;", {})
+
+    @pytest.mark.asyncio
+    async def test_rejects_args_and_params_together_like_the_manager(self) -> None:
+        async with cf_client():
+            with pytest.raises(ValueError, match="both"):
+                await CfCounter.call_function("fn::cf_sum", [1, 2], params={"a": 1, "b": 2})

@@ -2,7 +2,7 @@ import contextlib
 import functools
 import logging
 import typing
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from decimal import Decimal
 from typing import Any, Self
 
@@ -1472,3 +1472,26 @@ class BaseSurrealModel(BaseModel):
                 return results
 
         return []
+
+    # ==================== Stored Function Calls (v0.15.0) ====================
+
+    @classmethod
+    async def call_function(
+        cls,
+        function: str,
+        args: Sequence[Any] | None = None,
+        *,
+        params: Mapping[str, Any] | None = None,
+        return_type: Any = None,
+        tx: Transaction | None = None,
+    ) -> Any:
+        """Call a custom server-side function declared with ``DEFINE FUNCTION fn::…``.
+
+        A convenience shortcut for code organised around models; it delegates verbatim to
+        :meth:`SurrealDBConnectionManager.call_function`, which documents the arguments and
+        the transaction semantics. A stored function is **not** bound to a table, so calling
+        it through one model rather than another changes nothing::
+
+            acquired = await GameTable.call_function("fn::acquire_lock", [table_id, pod_id])
+        """
+        return await SurrealDBConnectionManager.call_function(function, args, params=params, return_type=return_type, tx=tx)
