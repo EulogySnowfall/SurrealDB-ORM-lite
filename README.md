@@ -159,6 +159,7 @@ results = await User.objects().query(
 | Retry on conflict      | ✅     |
 | Server-side functions  | ✅     |
 | Computed fields        | ✅     |
+| Stored `fn::` calls    | ✅     |
 
 ### Supported Filter Lookups
 
@@ -669,6 +670,92 @@ is **identical on SurrealDB 2.6.x and 3.x**.
 
 ---
 
+### 17. Stored functions: `call_function()`
+
+Invoke a function declared server-side with `DEFINE FUNCTION fn::…`. Arguments are **bound as
+query parameters**, never formatted into the statement.
+
+```python
+from surreal_orm_lite import SurrealDBConnectionManager
+
+# Declare it once (DDL goes through query(); a define_function() helper lands in v0.31.0)
+client = await SurrealDBConnectionManager.get_client()
+await client.query("""
+    DEFINE FUNCTION OVERWRITE fn::acquire_lock($table_id: string, $pod_id: string, $ttl: int) {
+        UPSERT type::record('lock', $table_id) SET holder = $pod_id, ttl = $ttl;
+        RETURN { acquired: true, holder: $pod_id };
+    };
+""", {})
+
+# Positional — SurrealQL's own calling convention
+lock = await SurrealDBConnectionManager.call_function(
+    "fn::acquire_lock", ["table-1", "pod-a", 30],
+)
+
+# The fn:: prefix is optional, and nested namespaces work
+total = await SurrealDBConnectionManager.call_function("billing::total", [cart_id])
+```
+
+**Named arguments.** SurrealQL function arguments are positional, so the ORM reads the
+function's declared signature (`INFO FOR DB`, cached) and orders them for you — the mapping's
+own order is irrelevant:
+
+```python
+lock = await SurrealDBConnectionManager.call_function(
+    "fn::acquire_lock", params={"pod_id": "pod-a", "ttl": 30, "table_id": "table-1"},
+)
+```
+
+Passing both `args` and `params` raises `ValueError`, as does a key that does not match the
+declared parameters (the error names the ones expected).
+
+**Typed results.** `return_type=` accepts anything Pydantic can adapt — a model, a dataclass, a
+scalar, or a generic like `list[Model]`:
+
+```python
+from pydantic import BaseModel
+
+class LockResult(BaseModel):
+    acquired: bool
+    holder: str
+
+lock = await SurrealDBConnectionManager.call_function(
+    "fn::acquire_lock", ["table-1", "pod-a", 30], return_type=LockResult,
+)
+lock.acquired  # True
+```
+
+A result that does not fit raises `SurrealDbValidationError`. Note this is Pydantic
+_validation_, not a cast: an `int` asked to be a `str` is a mismatch, not a silent `str(5)`.
+
+**Inside a transaction.** Pass `tx=` so the function runs _inside_ the transaction — without it
+the call would execute outside it and silently break atomicity, which matters because stored
+functions typically mutate state:
+
+```python
+async with SurrealDBConnectionManager.transaction() as tx:
+    await SurrealDBConnectionManager.call_function("fn::acquire_lock", ["t1", "pod-a", 30], tx=tx)
+    await Booking(id="b1", table_id="t1").save(tx=tx)
+# both the function's writes and the booking commit together, or neither does
+```
+
+The **return value** depends on the transaction strategy (the v0.9.0 contract): interactive
+transactions (WebSocket + SurrealDB 3.x) return the value immediately; buffered ones (SurrealDB
+2.6.x or HTTP) queue the call and return `None` until commit. Combining `return_type=` with a
+buffered `tx=` raises `ValueError` rather than silently returning `None`.
+
+**From a model.** A stored function is not bound to a table, but the shortcut is convenient in
+model-oriented code:
+
+```python
+lock = await GameTable.call_function("fn::acquire_lock", ["t1", "pod-a", 30])
+```
+
+Errors are normalised: a function the server does not know raises `SurrealDbNotFoundError`,
+anything else raises `SurrealDbError`.
+
+---
+
 ## Configuration Options
 
 ### Custom Primary Key
@@ -766,6 +853,10 @@ listed behave the same on both lines.
 | Issue #156 correctness fixes (`Var`/`$$`, `first()`, `*_or_create` strictness, `created` on upsert, quoted ids, one-hop `get_related`) | same on both lines (each fix reproduced and verified on 2.6.5)                 | same on both lines (verified on 3.2.4)                                   | v0.14.3 |
 | Record-id lookups (`filter(id=…)`, `id__in`, `get(…)`, `*_or_create(id=…)`) coerced to `RecordID`                                      | same on both lines (int/str typing verified on 2.6.5)                          | same on both lines (verified on 3.2.4)                                   | v0.14.4 |
 | Per-event-loop client cache (`get_client`, `close_connection`, `close_all_connections`)                                                | same on both lines (loop binding is an asyncio/SDK property, not a server one) | same on both lines (verified on 3.2.4)                                   | v0.14.5 |
+| `call_function()` — the call itself (`args`, `params`, `return_type`, nested `fn::a::b`)                                               | same on both lines (bare call form chosen so it is portable)                   | same on both lines (verified on 3.2.4)                                   | v0.15.0 |
+| `call_function(tx=)` — return value                                                                                                    | `None` (buffered: queued until commit)                                         | the function's value (interactive returns it immediately)                | v0.15.0 |
+| `call_function(tx=, return_type=)`                                                                                                     | raises `ValueError` (no value to coerce yet)                                   | coerces the returned value                                               | v0.15.0 |
+| Declared parameter name that collides with a reserved word, as echoed by `INFO FOR DB`                                                 | quoted: `` $`by` `` — parser accepts it                                        | bare: `$by`                                                              | v0.15.0 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
 
@@ -785,22 +876,23 @@ Contributions are welcome! Please:
 
 ## Roadmap
 
-| Version           | Theme                                             | Status      |
-| ----------------- | ------------------------------------------------- | ----------- |
-| v0.2.x – v0.7.0   | Core ORM → SDK 2.0 / SurrealDB 3.x migration      | ✅ Released |
-| v0.8.0            | Transactions ORM (`tx=`)                          | ✅ Released |
-| v0.9.0            | Transactions — QuerySet & interactive (3.x)       | ✅ Released |
-| v0.10.0           | upsert / update_or_create / get_or_create         | ✅ Released |
-| v0.11.0           | patch / atomic field & array ops                  | ✅ Released |
-| v0.12.0           | retry_on_conflict & optimistic concurrency        | ✅ Released |
-| v0.13.0           | SurrealFunc & server-side values                  | ✅ Released |
-| v0.14.0           | Computed fields (`DEFINE FIELD … VALUE`)          | ✅ Released |
-| v0.14.3 – v0.14.5 | Correctness: `$`-values, record-id lookups, loops | ✅ Released |
-| v0.15.0 – v0.22.0 | Tier 1 — Core (auth, live, relations)             | 📋 Planned  |
-| v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)   | 📋 Planned  |
-| v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)  | 📋 Planned  |
-| v0.40.0           | Beta Phase (API freeze, hardening)                | 📋 Planned  |
-| v2.0.0            | Production / GA (aligned with SDK 2.0)            | 📋 Planned  |
+| Version           | Theme                                              | Status      |
+| ----------------- | -------------------------------------------------- | ----------- |
+| v0.2.x – v0.7.0   | Core ORM → SDK 2.0 / SurrealDB 3.x migration       | ✅ Released |
+| v0.8.0            | Transactions ORM (`tx=`)                           | ✅ Released |
+| v0.9.0            | Transactions — QuerySet & interactive (3.x)        | ✅ Released |
+| v0.10.0           | upsert / update_or_create / get_or_create          | ✅ Released |
+| v0.11.0           | patch / atomic field & array ops                   | ✅ Released |
+| v0.12.0           | retry_on_conflict & optimistic concurrency         | ✅ Released |
+| v0.13.0           | SurrealFunc & server-side values                   | ✅ Released |
+| v0.14.0           | Computed fields (`DEFINE FIELD … VALUE`)           | ✅ Released |
+| v0.14.3 – v0.14.5 | Correctness: `$`-values, record-id lookups, loops  | ✅ Released |
+| v0.15.0           | `call_function()` — custom `fn::` stored functions | ✅ Released |
+| v0.16.0 – v0.22.0 | Tier 1 — Core (auth, live, relations)              | 📋 Planned  |
+| v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)    | 📋 Planned  |
+| v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)   | 📋 Planned  |
+| v0.40.0           | Beta Phase (API freeze, hardening)                 | 📋 Planned  |
+| v2.0.0            | Production / GA (aligned with SDK 2.0)             | 📋 Planned  |
 
 > Every roadmap feature is implementable with the **official SDK 2.0** (native methods or
 > `query()` SurrealQL) — no custom SDK. GA is numbered **v2.0.0** to mirror SDK 2.0; the `1.x`
@@ -836,6 +928,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Retry on conflict             | ✅ v0.12.0              | ✅               |
 | SurrealFunc & server values   | ✅ v0.13.0              | ✅               |
 | Computed fields               | ✅ v0.14.0              | ✅               |
+| `call_function()` (`fn::`)    | ✅ v0.15.0              | ✅               |
 | JWT Authentication            | v0.16 – v0.17           | ✅               |
 | Field Aliases & DX            | v0.18.0                 | ✅               |
 | Live Models / CDC             | v0.19 – v0.21           | ✅               |

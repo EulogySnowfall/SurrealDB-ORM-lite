@@ -23,7 +23,8 @@
 | v0.10.0 – v0.12.0 | Tier 1 — Core write-path (upsert, patch, retry)      | Done    |
 | v0.13.0           | Tier 1 — SurrealFunc & server-side values            | Done    |
 | v0.14.0           | Tier 1 — Computed Fields                             | Done    |
-| v0.15.0 – v0.22.0 | Tier 1 — Core (call_function, auth, live, relations) | Planned |
+| v0.15.0           | Tier 1 — `call_function()` (custom `fn::`)           | Done    |
+| v0.16.0 – v0.22.0 | Tier 1 — Core (auth, live, relations)                | Planned |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 7 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
@@ -65,7 +66,7 @@ pieces stay out.
 | Retry on conflict                   | transactions + retry logic                            | v0.12.0        |
 | SurrealFunc & server values         | `query()` + native fns (`CREATE`/`UPDATE … SET`)      | ✅ v0.13.0     |
 | Computed fields                     | `DEFINE FIELD … VALUE` via `query()`                  | ✅ v0.14.0     |
-| `call_function()`                   | RPC `run()` / `RETURN fn::…`                          | v0.15.0        |
+| `call_function()`                   | `query()` + `fn::name($args)` ¹                       | ✅ v0.15.0     |
 | JWT / scope auth                    | `signup`/`signin`/`authenticate`/`invalidate`/`info`  | v0.16 – v0.17  |
 | Field aliases & DX                  | Pydantic `Field(alias=)` + config                     | v0.18.0        |
 | Live Models / Live Queries          | `live()` / `subscribe_live()` / `kill()`              | v0.19 – v0.20  |
@@ -73,13 +74,14 @@ pieces stay out.
 | Native typed relations              | `insert_relation()`                                   | v0.22.0        |
 | Rich field types                    | native `Datetime`/`Duration`/`Decimal`/`Range`/`Uuid` | v0.23.0        |
 | Geospatial fields (`nearby()`)      | native `Geometry` + `geo::*`                          | v0.24.0        |
-| Embedded / in-memory test engine    | `mem://` / `surrealkv://` ¹                           | v0.25.0        |
-| Versioned storage (time-travel)     | `surrealkv+versioned://` ¹                            | v0.26.0        |
+| Embedded / in-memory test engine    | `mem://` / `surrealkv://` ²                           | v0.25.0        |
+| Versioned storage (time-travel)     | `surrealkv+versioned://` ²                            | v0.26.0        |
 | Subqueries                          | nested `SELECT` via `query()`                         | v0.27.0        |
 | Query cache (TTL)                   | client-side cache (SDK-independent)                   | v0.28.0        |
 | Multi-database                      | multiple `AsyncSurreal` instances                     | v0.29.0        |
 | Schema introspection                | `INFO FOR DB` / `INFO FOR TABLE`                      | v0.30.0        |
 | `DEFINE EVENT` (triggers)           | DDL via `query()`                                     | v0.31.0        |
+| `define_function()` DDL helper      | `DEFINE FUNCTION` via `query()` (`schema.py`)         | v0.31.0        |
 | Materialized views                  | `DEFINE TABLE … AS SELECT`                            | v0.32.0        |
 | `TYPE RELATION` enforcement         | `DEFINE TABLE … TYPE RELATION`                        | v0.33.0        |
 | Full-Text Search (BM25)             | `DEFINE ANALYZER` + `SEARCH` index + `search::*`      | v0.34.0        |
@@ -90,7 +92,11 @@ pieces stay out.
 | Test fixtures & factories           | `ModelFactory`, pytest fixtures                       | v0.39.0        |
 | QueryLogger / profiling             | wraps `query()` calls                                 | v0.40.0 (Beta) |
 
-¹ **To confirm** against the targeted SDK build (embedded extra). If unavailable on PyPI,
+¹ SDK 2.0.0 exposes **no** `run()`/`call()` method, so the call goes through `query()` with
+the bare form `fn::name($args);` — never `RETURN fn::name(…)`, which silently truncates a
+`BEGIN … COMMIT` batch on both DB lines.
+
+² **To confirm** against the targeted SDK build (embedded extra). If unavailable on PyPI,
 v0.25.0/v0.26.0 are reclassified to Future.
 
 **Still NOT in lite** (full-ORM only, even with SDK 2.0):
@@ -118,11 +124,12 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | FETCH clause                  | yes        | v0.6.0                      |
 | Transactions (`tx=`)          | yes        | ✅ v0.8 core, v0.9 QuerySet |
 | `upsert` / `update_or_create` | yes        | ✅ v0.10.0                  |
+| `call_function()` (`fn::`)    | yes        | ✅ v0.15.0                  |
 | Atomic field/array ops        | yes        | ✅ v0.11.0                  |
 | Retry on conflict             | yes        | ✅ v0.12.0                  |
 | SurrealFunc & server values   | yes        | ✅ v0.13.0                  |
 | Computed fields               | yes        | ✅ v0.14.0                  |
-| `call_function()`             | yes        | v0.15.0                     |
+| `call_function()`             | yes        | ✅ v0.15.0                  |
 | JWT Authentication            | yes        | v0.16 – v0.17               |
 | Field aliases & DX            | yes        | v0.18.0                     |
 | Live Models / CDC             | yes        | v0.19 – v0.21               |
@@ -250,6 +257,26 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - Security: expressions are developer-controlled and inlined; user input goes through
   `extra_vars` and is always bound (the injection boundary)
 
+### Version 0.15.0 — `call_function()` (custom `fn::` stored functions)
+
+- `SurrealDBConnectionManager.call_function(function, args=None, *, params=, return_type=, tx=)`
+  and the `BaseSurrealModel.call_function()` shortcut
+- Arguments **bound** as query parameters; the function _name_ is validated as an identifier
+  path before interpolation (SurrealQL takes no bound parameter in call position)
+- `params=` names the arguments: the declared signature is read from `INFO FOR DB` and cached
+  per namespace/database, so the mapping's order is irrelevant; a stale entry self-heals
+- `return_type=` coerces the result through one `pydantic.TypeAdapter` pass (model, dataclass,
+  scalar, `list[Model]`)
+- `tx=` runs the function **inside** an open transaction on both DB lines
+- **Same on both lines** for the call itself. `tx=` follows the v0.9.0 contract: interactive
+  (WS + 3.x) returns the value, buffered (2.6.x / HTTP) returns `None` until commit;
+  `return_type=` with a buffered `tx=` raises rather than returning a silent `None`
+- The generated statement uses the **bare call form** `fn::name($_fnarg0);`. A `RETURN` inside
+  a `BEGIN … COMMIT` batch terminates the transaction early and silently — the next statement
+  is reported `status: OK` and never runs — on 2.6.5 **and** 3.2.4. A regression test pins this
+- SDK 2.0.0 exposes no `run()`/`call()`; everything goes through `query()`
+- `define_function()` (DDL) deliberately deferred to v0.31.0, with the other `schema.py` helpers
+
 ### Version 0.14.0 — Computed fields
 
 - `Computed[T] = computed("<expr>")` declares a field SurrealDB derives from other fields on
@@ -341,7 +368,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 | ---------- | ------------------------------------------------------------ | ---------------------- |
 | ✅ v0.13.0 | SurrealFunc + `server_values=` / `extra_vars=` on save/merge | `query()` + native fns |
 | ✅ v0.14.0 | Computed Fields (`Computed[...]` → `DEFINE FIELD … VALUE`)   | `DEFINE FIELD`         |
-| v0.15.0    | `call_function()` (call defined SurrealDB functions)         | RPC `run()`            |
+| ✅ v0.15.0 | `call_function()` (call defined SurrealDB functions)         | `query()` + `fn::…`    |
 
 ### 🟣 Phase C — Auth & DX
 
@@ -376,7 +403,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 | v0.23.0 | Rich field types: `Datetime`, `Duration`, `Decimal`, `Range`, `Uuid` | typed Pydantic ↔ native SDK types |
 | v0.24.0 | Geospatial fields: `Geometry` + `nearby()` / distance                | native `Geometry` + `geo::*`      |
 | v0.25.0 | Embedded test engine: `mem://` / `surrealkv://` + base fixtures ¹    | SDK embedded connection           |
-| v0.26.0 | Versioned storage / time-travel: `surrealkv+versioned://` ¹          | embedded versioned engine         |
+| v0.26.0 | Versioned storage / time-travel: `surrealkv+versioned://` ²          | embedded versioned engine         |
 | v0.27.0 | Subqueries (nested QuerySets in `filter`/`in`)                       | nested `SELECT` via `query()`     |
 | v0.28.0 | Query cache (TTL + invalidation), client-side                        | client cache                      |
 | v0.29.0 | Multi-database: named connection registry                            | N × `AsyncSurreal` instances      |
