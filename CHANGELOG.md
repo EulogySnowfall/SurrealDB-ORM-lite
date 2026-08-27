@@ -5,6 +5,86 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-08-25
+
+Call custom server-side functions (`DEFINE FUNCTION fn::…`) from the ORM.
+
+### Added
+
+- **`SurrealDBConnectionManager.call_function()`** — invoke a stored function, with arguments
+  bound as query parameters:
+
+  ```python
+  acquired = await SurrealDBConnectionManager.call_function(
+      "fn::acquire_lock", [table_id, pod_id, 30],
+  )
+  ```
+
+  The `fn::` prefix is added when absent, and nested namespaces (`fn::billing::total`) work.
+  The function _name_ is interpolated (SurrealQL takes no bound parameter in call position) and
+  is therefore validated as an identifier path first — an invalid name raises `ValueError`
+  before any query is issued. Argument _values_ are never interpolated.
+
+- **Named arguments via `params=`** — SurrealQL function arguments are positional, so the ORM
+  reads the function's declared signature (`INFO FOR DB`, cached per URL/namespace/database)
+  and orders them for you. The mapping's own order is irrelevant:
+
+  ```python
+  await SurrealDBConnectionManager.call_function(
+      "fn::acquire_lock", params={"pod_id": pod_id, "table_id": table_id, "ttl": 30},
+  )
+  ```
+
+  A stale signature self-heals: on a key mismatch the entry is dropped and re-read once, so a
+  function redefined at runtime resolves instead of failing. The one exception is a function
+  redefined with the same parameter names in a **different order**, which a mapping carries no
+  order to detect — call `clear_function_signature_cache()` after such a change. `args` and
+  `params` together raise `ValueError`.
+
+- **`return_type=`** — coerce the result with one `pydantic.TypeAdapter` pass, so a model, a
+  dataclass, a scalar and `list[Model]` are all supported. A mismatch raises
+  `SurrealDbValidationError`.
+
+- **`tx=`** — a stored function called inside `async with transaction()` runs **inside** that
+  transaction on both DB lines. Without it the call would run outside an open transaction and
+  silently break atomicity, which matters because stored functions typically mutate state.
+
+- **`BaseSurrealModel.call_function()`** — the same call for code organised around models. A
+  stored function is not table-bound, so it delegates verbatim.
+
+- **`clear_function_signature_cache()` / `function_signature_cache_size()`** on the connection
+  manager, for redefining functions out-of-band. The cache is cleared by `set_connection()` and
+  `unset_connection()` too, since signatures belong to the server that declared them.
+
+### Notes
+
+- **The ORM emits the bare call form `fn::name($_fnarg0);`, never `RETURN fn::name(…)`.** A
+  `RETURN` inside a `BEGIN … COMMIT` batch terminates the transaction early **and silently**:
+  the statement queued after it is reported `status: OK` and never executes. Verified on both
+  2.6.5 and 3.2.4. The bare form returns the same value in every context without that hazard,
+  and a regression test pins it.
+- **`tx=` return value differs by strategy** (the v0.9.0 contract): interactive transactions
+  (WebSocket + SurrealDB 3.x) return the function's value immediately; buffered ones
+  (SurrealDB 2.6.x or HTTP) queue the call and return `None` until commit. Combining
+  `return_type=` with a buffered `tx=` raises `ValueError` rather than silently returning
+  `None`.
+- **Signature reads bypass the transaction** — `params=` therefore works inside a buffered
+  transaction, where reads are otherwise forbidden. A schema read needs no transactional
+  isolation.
+- **A parameter name that collides with a reserved word is quoted differently by each line.**
+  SurrealDB 2.6.x reports `fn::f($by: int)` as ``$`by` `` while 3.x leaves it bare; the
+  signature parser accepts `$name`, ``$`name` `` and `$⟨name⟩`.
+- The call itself behaves identically on SurrealDB 2.6.x and 3.x.
+- Passing a bare `str` as `args` raises `TypeError` rather than binding one argument per
+  character.
+- **A missing function is reported at a different moment per strategy.** Outside a transaction
+  and inside an interactive one it raises `SurrealDbNotFoundError` at call time. Inside a
+  buffered one the call is only queued, so the failure cannot be known until commit and arrives
+  as `SurrealDbError` from the transaction layer.
+- **Deferred**: a `define_function()` DDL helper. Declaring is DDL and belongs with the other
+  `schema.py` helpers planned for **v0.31.0**; v0.15.0 is about calling. Declare a function with
+  `client.query("DEFINE FUNCTION fn::… { … };")` meanwhile.
+
 ## [0.14.5] - 2026-08-23
 
 Connection correctness: the client cache is now per event loop.

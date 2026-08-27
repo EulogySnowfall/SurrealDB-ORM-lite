@@ -2,13 +2,43 @@ import asyncio
 import contextlib
 import logging
 import weakref
+from collections.abc import Mapping, Sequence
+from functools import lru_cache
 from typing import Any
 
+from pydantic import TypeAdapter, ValidationError
+
 from ._sdk import AsyncSurreal, NotFoundError
-from .exceptions import SurrealDbConnectionError
+from .exceptions import (
+    SurrealDbConflictError,
+    SurrealDbConnectionError,
+    SurrealDbError,
+    SurrealDbNotFoundError,
+    SurrealDbValidationError,
+)
+from .functions import build_call_statement, normalize_function_name, parse_function_parameters
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=256)
+def _cached_type_adapter(return_type: Any) -> TypeAdapter[Any]:
+    """Build (once) the ``TypeAdapter`` for *return_type*."""
+    return TypeAdapter(return_type)
+
+
+def _type_adapter(return_type: Any) -> TypeAdapter[Any]:
+    """Return the ``TypeAdapter`` for *return_type*, cached when the type is hashable.
+
+    Building an adapter compiles a validator, which is far more expensive than the call it
+    guards; every realistic ``return_type`` (a model, a dataclass, ``list[Model]``, ``int``)
+    is hashable and hits the cache. Unhashable annotations still work, uncached.
+    """
+    try:
+        return _cached_type_adapter(return_type)
+    except TypeError:
+        return TypeAdapter(return_type)
 
 
 class SurrealDBConnectionManager:
@@ -25,6 +55,13 @@ class SurrealDBConnectionManager:
     # that is garbage-collected takes its entry with it; loops that are merely closed are
     # pruned on the next get_client().
     __clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any]" = weakref.WeakKeyDictionary()
+
+    # Declared parameter names of stored functions, keyed by (url, namespace, database, fn
+    # name). SurrealQL function arguments are positional, so `params=` needs the declaration
+    # order; reading it costs one INFO FOR DB, which is worth caching. The url is part of the
+    # key because set_url() repoints the manager at another server without clearing the cache:
+    # without it, a signature read from one server would silently order `params=` for another.
+    __function_signatures: dict[tuple[str | None, str | None, str | None, str], tuple[str, ...]] = {}
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         await SurrealDBConnectionManager.close_connection()
@@ -44,6 +81,9 @@ class SurrealDBConnectionManager:
         cls.__password = password
         cls.__namespace = namespace
         cls.__database = database
+        # Signatures belong to the server that declared them; re-pointing the connection must
+        # not hand stale ones to the new one.
+        cls.clear_function_signature_cache()
 
     @classmethod
     async def unset_connection(cls) -> None:
@@ -55,6 +95,7 @@ class SurrealDBConnectionManager:
         cls.__password = None
         cls.__namespace = None
         cls.__database = None
+        cls.clear_function_signature_cache()
         await cls.close_all_connections()
 
     @classmethod
@@ -215,6 +256,212 @@ class SurrealDBConnectionManager:
                 await tx.cancel()
                 raise
             await tx.fire_post_commit()
+
+    @classmethod
+    async def call_function(
+        cls,
+        function: str,
+        args: Sequence[Any] | None = None,
+        *,
+        params: Mapping[str, Any] | None = None,
+        return_type: Any = None,
+        tx: Transaction | None = None,
+    ) -> Any:
+        """Call a custom server-side function declared with ``DEFINE FUNCTION fn::…``.
+
+        Arguments are **bound as query parameters**, never formatted into the statement::
+
+            total = await SurrealDBConnectionManager.call_function("fn::cart_total", [cart_id])
+
+        The ``fn::`` prefix is added when absent, so ``"cart_total"`` and ``"fn::cart_total"``
+        are the same call. SurrealQL function arguments are **positional**, so *args* is a
+        sequence in declaration order.
+
+        The name itself is interpolated (SurrealQL takes no bound parameter in call position)
+        and is therefore validated first — an invalid name raises ``ValueError`` before any
+        query is issued.
+
+        Pass ``return_type`` to convert the result — any annotation Pydantic can adapt works,
+        so a model, a dataclass, a scalar and a generic are all one code path::
+
+            lock = await SurrealDBConnectionManager.call_function(
+                "fn::acquire_lock", [table_id, pod_id], return_type=LockResult,
+            )
+            locks = await SurrealDBConnectionManager.call_function(
+                "fn::all_locks", return_type=list[LockResult],
+            )
+
+        Or pass ``params`` to name the arguments instead of ordering them. SurrealQL has no
+        named arguments, so the ORM reads the function's declared signature (via
+        ``INFO FOR DB``, cached) and orders them for you — the mapping's own order is
+        irrelevant::
+
+            await SurrealDBConnectionManager.call_function(
+                "fn::acquire_lock", params={"pod_id": pod_id, "table_id": table_id},
+            )
+
+        :param function: ``"fn::name"``, ``"name"``, or a nested ``"fn::namespace::name"``.
+        :param args: positional arguments, in the function's declaration order.
+        :param params: named arguments, ordered by the declared signature. Mutually
+            exclusive with *args*.
+        :param return_type: a type annotation to coerce the result into; ``None`` returns it raw.
+        :return: the function's return value; ``None`` when it returns ``NONE``.
+        :raises ValueError: if the function name is not an identifier path, if both *args* and
+            *params* are given, or if *params* does not match the declared parameters.
+        :raises SurrealDbNotFoundError: if the server has no such function.
+        :raises SurrealDbValidationError: if the result does not fit ``return_type``.
+        :raises SurrealDbError: for any other database failure.
+        """
+        if args is not None and params is not None:
+            raise ValueError(
+                "Pass either 'args' (positional) or 'params' (named), not both — they are two "
+                "ways to supply the same arguments."
+            )
+        if return_type is not None and tx is not None and not tx.is_interactive:
+            raise ValueError(
+                "return_type= cannot be used with a buffered transaction: the call is queued "
+                "and returns no value until commit. Drop return_type=, or use a WebSocket "
+                "connection to SurrealDB 3.x (interactive transactions)."
+            )
+
+        if isinstance(args, str | bytes):
+            raise TypeError(
+                f"'args' must be a sequence of arguments, not {type(args).__name__!r} — a string "
+                "would be bound one character per argument. Wrap it: args=[value]."
+            )
+
+        name = normalize_function_name(function)
+
+        client = await cls.get_client()
+        values: Sequence[Any] = args if args is not None else []
+        if params is not None:
+            values = await cls._resolve_named_args(client, name, params)
+
+        statement, variables = build_call_statement(name, values)
+
+        if tx is not None:
+            try:
+                # Buffered: queued, returns None. Interactive: runs now, returns the value.
+                raw = await tx.add(statement, variables)
+            except SurrealDbConflictError:
+                # A retryable conflict must keep its type: retry_on_conflict dispatches on it.
+                raise
+            except Exception as exc:
+                # Includes the SurrealDbError the transaction layer already raised, so a call
+                # to a missing function is still classified as SurrealDbNotFoundError here.
+                raise cls._wrap_call_error(exc, name) from exc
+            # Coercion happens OUTSIDE the try: SurrealDbValidationError does not subclass
+            # SurrealDbError, so catching it here would silently downgrade it.
+            return cls._coerce_call_result(raw, return_type, name)
+        try:
+            value = await client.query(statement, variables)
+        except Exception as exc:
+            raise cls._wrap_call_error(exc, name) from exc
+
+        return cls._coerce_call_result(value, return_type, name)
+
+    @staticmethod
+    def _coerce_call_result(value: Any, return_type: Any, function: str) -> Any:
+        """Convert a stored function's result to *return_type*, or return it untouched.
+
+        One ``TypeAdapter`` covers every shape a caller might ask for — a Pydantic model, a
+        dataclass, ``list[Model]``, ``int``, ``datetime`` — so there is no per-kind branching
+        to keep in sync.
+        """
+        if return_type is None:
+            return value
+        try:
+            return _type_adapter(return_type).validate_python(value)
+        except ValidationError as exc:
+            raise SurrealDbValidationError(f"The value returned by {function!r} does not fit {return_type!r}: {exc}") from exc
+
+    @classmethod
+    async def _resolve_named_args(cls, client: Any, function: str, params: Mapping[str, Any]) -> list[Any]:
+        """Order *params* by the function's declared signature.
+
+        A stale cached signature self-heals: when the keys do not match, the entry is dropped,
+        the signature re-read **once**, and only a second mismatch raises. That way a function
+        redefined at runtime resolves instead of failing on a cache the caller cannot see.
+
+        The one redefinition this cannot catch is a **reorder** of the same parameter names:
+        *params* is a mapping and carries no order of its own, so there is nothing to compare
+        the cached order against, and re-reading on every call would defeat the cache. Callers
+        that reorder a function's parameters must call
+        :meth:`clear_function_signature_cache`.
+        """
+        key = (cls.__url, cls.__namespace, cls.__database, function)
+        was_cached = key in cls.__function_signatures
+        expected = await cls._function_signature(client, function)
+        if set(params) != set(expected) and was_cached:
+            # Only worth a second round trip if the first answer came from the cache; a freshly
+            # read signature that already disagrees will not change on re-reading.
+            expected = await cls._function_signature(client, function, refresh=True)
+        if set(params) != set(expected):
+            raise ValueError(
+                f"Arguments for {function!r} do not match its declared parameters. "
+                f"Expected {list(expected)}, got {sorted(params)}."
+            )
+        return [params[name] for name in expected]
+
+    @classmethod
+    async def _function_signature(cls, client: Any, function: str, refresh: bool = False) -> tuple[str, ...]:
+        """Return the declared parameter names of *function*, in order, caching the result.
+
+        The read goes through ``client.query()`` directly and never through an open
+        transaction: buffered transactions forbid reads, and routing it through one would make
+        ``params=`` unusable inside a transaction for no benefit — a schema read needs no
+        transactional isolation.
+        """
+        key = (cls.__url, cls.__namespace, cls.__database, function)
+        if refresh:
+            cls.__function_signatures.pop(key, None)
+        elif key in cls.__function_signatures:
+            return cls.__function_signatures[key]
+
+        try:
+            info = await client.query("INFO FOR DB;", {})
+        except Exception as exc:
+            raise SurrealDbError(f"Could not read the signature of {function!r}: {exc}") from exc
+
+        functions = info.get("functions", {}) if isinstance(info, dict) else {}
+        # INFO FOR DB keys functions WITHOUT the fn:: prefix.
+        define = functions.get(function[len("fn::") :])
+        if not define:
+            raise SurrealDbNotFoundError(f"Stored function {function!r} does not exist.")
+
+        signature = parse_function_parameters(str(define))
+        cls.__function_signatures[key] = signature
+        return signature
+
+    @classmethod
+    def clear_function_signature_cache(cls) -> None:
+        """Forget every cached stored-function signature.
+
+        Called by :meth:`unset_connection`; also useful in tests, and **required** after
+        redefining a function with the same parameter names in a different order — the only
+        staleness :meth:`_resolve_named_args` cannot self-heal.
+        """
+        cls.__function_signatures.clear()
+
+    @classmethod
+    def function_signature_cache_size(cls) -> int:
+        """Number of cached stored-function signatures (introspection aid)."""
+        return len(cls.__function_signatures)
+
+    @staticmethod
+    def _wrap_call_error(exc: Exception, function: str) -> Exception:
+        """Map an SDK exception raised by a stored-function call to the ORM hierarchy.
+
+        A missing function is reported differently by each DB line — SurrealDB 3.x says
+        ``Function 'fn::x' not found: The function 'fn::x' does not exist`` while 2.6.x says
+        only ``The function 'fn::x' does not exist`` — so the shared substring is what is
+        matched, and callers assert on the exception type rather than the wording.
+        """
+        message = str(exc)
+        missing = ("does not exist" in message or "not found" in message.lower()) and function in message
+        if missing:
+            return SurrealDbNotFoundError(f"Stored function {function!r} does not exist: {message}")
+        return SurrealDbError(f"Call to stored function {function!r} failed: {message}")
 
     @classmethod
     async def reconnect(cls) -> Any:

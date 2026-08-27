@@ -13,6 +13,7 @@ This module deliberately imports nothing from the rest of the package (``utils``
 """
 
 import re
+from collections.abc import Sequence
 from enum import StrEnum
 from typing import Annotated, Any, Optional, TypeAlias, TypeVar
 
@@ -20,6 +21,7 @@ from typing import Annotated, Any, Optional, TypeAlias, TypeVar
 VALID_VARIABLE_NAME = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 __all__ = [
+    "CALL_ARG_PREFIX",
     "Computed",
     "Var",
     "SurrealArrayFunction",
@@ -30,7 +32,10 @@ __all__ = [
     "SurrealRandFunction",
     "SurrealStringFunction",
     "SurrealTimeFunction",
+    "build_call_statement",
     "computed",
+    "normalize_function_name",
+    "parse_function_parameters",
 ]
 
 
@@ -397,3 +402,149 @@ class SurrealRandFunction(SurrealFunction):
     STRING = "rand::string"
     TIME = "rand::time"
     ENUM = "rand::enum"
+
+
+# ---------------------------------------------------------------------------
+# Stored function calls (v0.15.0)
+#
+# Pure helpers behind ``SurrealDBConnectionManager.call_function()``. They do no I/O, so the
+# call path can be reasoned about (and unit-tested) without a server.
+# ---------------------------------------------------------------------------
+
+#: One ``::``-separated segment of a stored-function name.
+_FUNCTION_SEGMENT = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
+
+#: The parameter prefix used when binding a stored function's arguments.
+CALL_ARG_PREFIX = "_fnarg"
+
+_DEFINE_FUNCTION_HEAD = re.compile(r"\bDEFINE\s+FUNCTION\b", re.IGNORECASE)
+
+#: A parameter reference in a ``DEFINE FUNCTION`` signature, in any of the three forms the
+#: server may echo back. SurrealDB **quotes a name that collides with a reserved word**, and
+#: the two DB lines disagree about when: 2.6.x renders ``fn::f($by: int)`` as ``$`by```, while
+#: 3.x leaves it bare. Missing the quoted form silently yields an EMPTY signature, which is
+#: how this was found — ``params={"by": …}`` failed only on 2.6.5.
+_PARAMETER_REFERENCE = re.compile(
+    r"\$(?:([a-zA-Z_][a-zA-Z0-9_]*)|`([^`]+)`|⟨([^⟩]+)⟩)",
+)
+
+
+def normalize_function_name(function: str) -> str:
+    """Return *function* as a validated ``fn::…`` name, adding the prefix when absent.
+
+    The name is **interpolated** into the generated statement, because SurrealQL does not
+    accept a bound parameter in call position. It is therefore validated first: after the
+    ``fn::`` prefix, the name must be one or more identifier segments joined by ``::``
+    (``fn::greet``, ``fn::billing::total``). Everything else is rejected::
+
+        normalize_function_name("greet")             # "fn::greet"
+        normalize_function_name("fn::billing::sum")  # "fn::billing::sum"
+        normalize_function_name("fn::x; DROP TABLE") # ValueError
+
+    Arguments are never interpolated — :func:`build_call_statement` binds them.
+
+    :raises TypeError: if *function* is not a string.
+    :raises ValueError: if the name is empty or is not an identifier path.
+    """
+    if not isinstance(function, str):
+        raise TypeError(f"Function name must be a string, got {type(function).__name__!r}.")
+
+    name = function.strip()
+    if not name:
+        raise ValueError("Function name cannot be empty.")
+
+    if name.startswith("fn::"):
+        name = name[len("fn::") :]
+
+    segments = name.split("::")
+    # fullmatch, not match: '$' also matches before a trailing newline, so 'ab\n' would pass.
+    if not segments or not all(_FUNCTION_SEGMENT.fullmatch(segment) for segment in segments):
+        raise ValueError(
+            f"Invalid stored function name: {function!r}. Expected 'fn::name' or "
+            "'fn::namespace::name', where each segment is an identifier "
+            "([A-Za-z_][A-Za-z0-9_]*)."
+        )
+
+    return f"fn::{'::'.join(segments)}"
+
+
+def parse_function_parameters(define_statement: str) -> tuple[str, ...]:
+    """Read a function's parameter names, in declaration order, from its ``DEFINE`` text.
+
+    ``INFO FOR DB`` returns each stored function as the full statement that defines it::
+
+        DEFINE FUNCTION fn::greet($name: string, $times: int) { … } PERMISSIONS FULL
+
+    from which this recovers ``("name", "times")`` — the order in which
+    :meth:`SurrealDBConnectionManager.call_function` must pass named ``params``, since
+    SurrealQL function arguments are positional.
+
+    Only the parameter list is read: the scan tracks bracket depth and collects ``$ident`` at
+    depth 1, so a ``TYPE`` clause containing commas or angle brackets
+    (``$opts: option<array<string>>``) cannot split it wrongly, and the body is never reached.
+
+    :raises ValueError: if the text is not a ``DEFINE FUNCTION`` statement.
+    """
+    if not isinstance(define_statement, str) or not _DEFINE_FUNCTION_HEAD.search(define_statement):
+        raise ValueError(f"Not a DEFINE FUNCTION statement: {define_statement!r}")
+
+    start = define_statement.find("(")
+    if start == -1:
+        raise ValueError(f"DEFINE FUNCTION statement has no parameter list: {define_statement!r}")
+
+    names: list[str] = []
+    depth = 0
+    index = start
+    while index < len(define_statement):
+        char = define_statement[index]
+        if char in "'\"":
+            # Skip a string literal wholesale: a literal type such as `$mode: 'a)b' | 'c'` would
+            # otherwise close the parameter list early, and one containing a `$` would invent a
+            # phantom parameter. Backslash escapes are honoured, so `'a\\'b'` is one literal and
+            # the scan does not resume inside it and run past the closing paren.
+            index += 1
+            while index < len(define_statement):
+                if define_statement[index] == "\\":
+                    index += 2
+                    continue
+                if define_statement[index] == char:
+                    index += 1
+                    break
+                index += 1
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        elif char == "$" and depth == 1:
+            match = _PARAMETER_REFERENCE.match(define_statement[index:])
+            if match:
+                # Exactly one of the three alternatives matched: bare, `backtick`, or ⟨bracket⟩.
+                names.append(next(group for group in match.groups() if group is not None))
+                index += match.end() - 1
+        index += 1
+    else:  # pragma: no cover - defensive: a truncated statement from the server
+        raise ValueError(f"Unterminated parameter list in: {define_statement!r}")
+
+    return tuple(names)
+
+
+def build_call_statement(function: str, args: Sequence[Any]) -> tuple[str, dict[str, Any]]:
+    """Build the statement and bound variables that call *function* with *args*.
+
+        build_call_statement("fn::greet", ["ada", 3])
+        # ("fn::greet($_fnarg0, $_fnarg1);", {"_fnarg0": "ada", "_fnarg1": 3})
+
+    The **bare call form** is deliberate: a ``RETURN`` statement inside a
+    ``BEGIN … COMMIT`` batch terminates the transaction early — and silently, on both
+    SurrealDB 2.6.x and 3.x — so every statement queued after it is reported as successful
+    and never runs. The bare form returns the same value, in every context, without that
+    hazard. See the v0.15.0 design spec.
+
+    *function* is expected to be already normalised by :func:`normalize_function_name`.
+    """
+    variables = {f"{CALL_ARG_PREFIX}{index}": value for index, value in enumerate(args)}
+    rendered = ", ".join(f"${name}" for name in variables)
+    return f"{function}({rendered});", variables
