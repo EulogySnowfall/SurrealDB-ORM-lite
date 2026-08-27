@@ -3,6 +3,7 @@ import contextlib
 import logging
 import weakref
 from collections.abc import Mapping, Sequence
+from functools import lru_cache
 from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
@@ -21,6 +22,25 @@ from .transaction import BufferedTransaction, InteractiveTransaction, Transactio
 logger = logging.getLogger(__name__)
 
 
+@lru_cache(maxsize=256)
+def _cached_type_adapter(return_type: Any) -> TypeAdapter[Any]:
+    """Build (once) the ``TypeAdapter`` for *return_type*."""
+    return TypeAdapter(return_type)
+
+
+def _type_adapter(return_type: Any) -> TypeAdapter[Any]:
+    """Return the ``TypeAdapter`` for *return_type*, cached when the type is hashable.
+
+    Building an adapter compiles a validator, which is far more expensive than the call it
+    guards; every realistic ``return_type`` (a model, a dataclass, ``list[Model]``, ``int``)
+    is hashable and hits the cache. Unhashable annotations still work, uncached.
+    """
+    try:
+        return _cached_type_adapter(return_type)
+    except TypeError:
+        return TypeAdapter(return_type)
+
+
 class SurrealDBConnectionManager:
     __url: str | None = None
     __user: str | None = None
@@ -36,11 +56,12 @@ class SurrealDBConnectionManager:
     # pruned on the next get_client().
     __clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any]" = weakref.WeakKeyDictionary()
 
-    # Declared parameter names of stored functions, keyed by (namespace, database, fn name).
-    # SurrealQL function arguments are positional, so `params=` needs the declaration order;
-    # reading it costs one INFO FOR DB, which is worth caching. Keyed by namespace/database
-    # because the same function name can be defined differently in each.
-    __function_signatures: dict[tuple[str | None, str | None, str], tuple[str, ...]] = {}
+    # Declared parameter names of stored functions, keyed by (url, namespace, database, fn
+    # name). SurrealQL function arguments are positional, so `params=` needs the declaration
+    # order; reading it costs one INFO FOR DB, which is worth caching. The url is part of the
+    # key because set_url() repoints the manager at another server without clearing the cache:
+    # without it, a signature read from one server would silently order `params=` for another.
+    __function_signatures: dict[tuple[str | None, str | None, str | None, str], tuple[str, ...]] = {}
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         await SurrealDBConnectionManager.close_connection()
@@ -350,7 +371,7 @@ class SurrealDBConnectionManager:
         if return_type is None:
             return value
         try:
-            return TypeAdapter(return_type).validate_python(value)
+            return _type_adapter(return_type).validate_python(value)
         except ValidationError as exc:
             raise SurrealDbValidationError(f"The value returned by {function!r} does not fit {return_type!r}: {exc}") from exc
 
@@ -361,8 +382,14 @@ class SurrealDBConnectionManager:
         A stale cached signature self-heals: when the keys do not match, the entry is dropped,
         the signature re-read **once**, and only a second mismatch raises. That way a function
         redefined at runtime resolves instead of failing on a cache the caller cannot see.
+
+        The one redefinition this cannot catch is a **reorder** of the same parameter names:
+        *params* is a mapping and carries no order of its own, so there is nothing to compare
+        the cached order against, and re-reading on every call would defeat the cache. Callers
+        that reorder a function's parameters must call
+        :meth:`clear_function_signature_cache`.
         """
-        key = (cls.__namespace, cls.__database, function)
+        key = (cls.__url, cls.__namespace, cls.__database, function)
         was_cached = key in cls.__function_signatures
         expected = await cls._function_signature(client, function)
         if set(params) != set(expected) and was_cached:
@@ -385,7 +412,7 @@ class SurrealDBConnectionManager:
         ``params=`` unusable inside a transaction for no benefit — a schema read needs no
         transactional isolation.
         """
-        key = (cls.__namespace, cls.__database, function)
+        key = (cls.__url, cls.__namespace, cls.__database, function)
         if refresh:
             cls.__function_signatures.pop(key, None)
         elif key in cls.__function_signatures:
@@ -410,8 +437,9 @@ class SurrealDBConnectionManager:
     def clear_function_signature_cache(cls) -> None:
         """Forget every cached stored-function signature.
 
-        Called by :meth:`unset_connection`; also useful in tests, or after redefining a
-        function out-of-band (though :meth:`call_function` self-heals on a mismatch anyway).
+        Called by :meth:`unset_connection`; also useful in tests, and **required** after
+        redefining a function with the same parameter names in a different order — the only
+        staleness :meth:`_resolve_named_args` cannot self-heal.
         """
         cls.__function_signatures.clear()
 

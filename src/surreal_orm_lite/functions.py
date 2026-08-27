@@ -500,9 +500,17 @@ def parse_function_parameters(define_statement: str) -> tuple[str, ...]:
         if char in "'\"":
             # Skip a string literal wholesale: a literal type such as `$mode: 'a)b' | 'c'` would
             # otherwise close the parameter list early, and one containing a `$` would invent a
-            # phantom parameter.
-            closing = define_statement.find(char, index + 1)
-            index = len(define_statement) if closing == -1 else closing + 1
+            # phantom parameter. Backslash escapes are honoured, so `'a\\'b'` is one literal and
+            # the scan does not resume inside it and run past the closing paren.
+            index += 1
+            while index < len(define_statement):
+                if define_statement[index] == "\\":
+                    index += 2
+                    continue
+                if define_statement[index] == char:
+                    index += 1
+                    break
+                index += 1
             continue
         if char == "(":
             depth += 1

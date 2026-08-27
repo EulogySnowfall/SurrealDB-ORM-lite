@@ -26,8 +26,8 @@ Call custom server-side functions (`DEFINE FUNCTION fn::…`) from the ORM.
   before any query is issued. Argument _values_ are never interpolated.
 
 - **Named arguments via `params=`** — SurrealQL function arguments are positional, so the ORM
-  reads the function's declared signature (`INFO FOR DB`, cached per namespace/database) and
-  orders them for you. The mapping's own order is irrelevant:
+  reads the function's declared signature (`INFO FOR DB`, cached per URL/namespace/database)
+  and orders them for you. The mapping's own order is irrelevant:
 
   ```python
   await SurrealDBConnectionManager.call_function(
@@ -36,8 +36,10 @@ Call custom server-side functions (`DEFINE FUNCTION fn::…`) from the ORM.
   ```
 
   A stale signature self-heals: on a key mismatch the entry is dropped and re-read once, so a
-  function redefined at runtime resolves instead of failing. `args` and `params` together raise
-  `ValueError`.
+  function redefined at runtime resolves instead of failing. The one exception is a function
+  redefined with the same parameter names in a **different order**, which a mapping carries no
+  order to detect — call `clear_function_signature_cache()` after such a change. `args` and
+  `params` together raise `ValueError`.
 
 - **`return_type=`** — coerce the result with one `pydantic.TypeAdapter` pass, so a model, a
   dataclass, a scalar and `list[Model]` are all supported. A mismatch raises

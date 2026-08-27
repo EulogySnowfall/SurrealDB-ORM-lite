@@ -7,12 +7,13 @@ everything that talks to a server lives in a ``…E2E`` class and runs on both D
 import contextlib
 import os
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Annotated, Any
 
 import pytest
 from pydantic import BaseModel as PydanticBaseModel
 
 from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
+from surreal_orm_lite.connection_manager import _type_adapter
 from surreal_orm_lite.exceptions import SurrealDbError, SurrealDbNotFoundError, SurrealDbValidationError
 from surreal_orm_lite.functions import (
     build_call_statement,
@@ -105,9 +106,31 @@ class TestSignatureParsing:
         define = "DEFINE FUNCTION fn::f($a: int, $`by`: int, $c: int) { RETURN 1 } PERMISSIONS FULL"
         assert parse_function_parameters(define) == ("a", "by", "c")
 
+    def test_an_escaped_quote_inside_a_literal_type_does_not_end_the_literal(self) -> None:
+        """A backslash-escaped quote keeps the literal open; the scan must not resume inside it.
+
+        Without escape handling the literal closes early, the scan runs on through the body and
+        collects its ``$`` references — here ``$a`` a second time.
+        """
+        define = "DEFINE FUNCTION fn::f($a: int, $m: 'x\\'y') { RETURN ($a) } PERMISSIONS FULL"
+        assert parse_function_parameters(define) == ("a", "m")
+
+    def test_an_unterminated_literal_raises_rather_than_returning_junk(self) -> None:
+        with pytest.raises(ValueError, match="Unterminated"):
+            parse_function_parameters("DEFINE FUNCTION fn::f($a: 'oops) { RETURN 1 }")
+
     def test_rejects_text_that_is_not_a_define_function(self) -> None:
         with pytest.raises(ValueError):
             parse_function_parameters("DEFINE TABLE user SCHEMALESS")
+
+
+class TestReturnTypeAdapterCache:
+    def test_the_same_return_type_reuses_one_adapter(self) -> None:
+        assert _type_adapter(list[int]) is _type_adapter(list[int])
+
+    def test_an_unhashable_annotation_still_works(self) -> None:
+        unhashable = Annotated[int, {"not": "hashable"}]
+        assert _type_adapter(unhashable).validate_python(3) == 3
 
 
 class TestCallStatementBuilding:
@@ -417,6 +440,23 @@ class TestSignatureCacheE2E:
             assert SurrealDBConnectionManager.function_signature_cache_size() > 0
             await SurrealDBConnectionManager.unset_connection()
             assert SurrealDBConnectionManager.function_signature_cache_size() == 0
+
+    @pytest.mark.asyncio
+    async def test_a_signature_is_not_reused_across_urls(self) -> None:
+        """set_url() repoints the manager at another server without clearing the cache.
+
+        The url is part of the cache key, so the second call re-reads instead of ordering
+        ``params=`` with a signature that belongs to a different server.
+        """
+        async with cf_client():
+            await SurrealDBConnectionManager.call_function("fn::cf_sum", params={"a": 1, "b": 2})
+            assert SurrealDBConnectionManager.function_signature_cache_size() == 1
+            try:
+                await SurrealDBConnectionManager.set_url("ws://elsewhere.invalid:8000/rpc")
+                await SurrealDBConnectionManager.call_function("fn::cf_sum", params={"a": 1, "b": 2})
+                assert SurrealDBConnectionManager.function_signature_cache_size() == 2
+            finally:
+                await SurrealDBConnectionManager.set_url(_url())
 
     @pytest.mark.asyncio
     async def test_set_connection_clears_the_cache(self) -> None:

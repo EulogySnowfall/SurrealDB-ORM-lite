@@ -766,8 +766,13 @@ at call time and surfaces at commit as `SurrealDbError`.
 
 Signature caching is transparent, but two helpers are available if you redefine functions
 out-of-band: `SurrealDBConnectionManager.clear_function_signature_cache()` and
-`function_signature_cache_size()`. The cache is also cleared by `set_connection()` and
-`unset_connection()`, and a mismatched signature self-heals on its own.
+`function_signature_cache_size()`. The cache is keyed by URL, namespace and database, so
+`set_url()`, `set_namespace()` and `set_database()` cannot serve a signature read elsewhere;
+it is cleared outright by `set_connection()` and `unset_connection()`. A signature whose
+parameter _names_ changed self-heals on its own — but one redefined with the **same names in a
+different order** cannot be detected, since `params=` is a mapping and carries no order to
+compare against. After such a redefinition, call `clear_function_signature_cache()`, or
+`params=` keeps binding in the stale order.
 
 ---
 
