@@ -5,6 +5,95 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.0] - 2026-08-29
+
+Authenticate the connection as a SurrealDB **record user** or a different **system user**, keep
+that identity across reconnects, and read back who is signed in.
+
+### Added
+
+- **Five auth methods on `SurrealDBConnectionManager`** — `signin()`, `signup()`,
+  `authenticate()`, `invalidate()` and `info()`, all native SDK primitives:
+
+  ```python
+  tokens = await SurrealDBConnectionManager.signup(
+      access="account", variables={"email": email, "pass": password},
+  )
+  tokens = await SurrealDBConnectionManager.signin(
+      access="account", variables={"email": email, "pass": password},
+  )
+  me = await SurrealDBConnectionManager.info(return_type=User)   # User | None
+  await SurrealDBConnectionManager.invalidate()                  # back to the app identity
+  ```
+
+  `signin()` takes exactly one of three credential shapes: record access (`access=` +
+  `variables=`), a system user (`username=` + `password=`), or a refresh exchange (`access=` +
+  `refresh=`). `namespace`/`database` default to the configured connection's **for record
+  access only** — a root user is defined at neither level, and sending them would turn a root
+  signin into a database-user signin against a user the server does not have.
+
+- **`AuthTokens`** — a frozen dataclass with `access` (guaranteed non-`None`) and `refresh`.
+  Its `repr` redacts both values while still showing whether a refresh token is present, and
+  there is deliberately **no `__str__` returning the JWT**, so a token cannot leak into a log
+  line, a traceback or a pytest assertion diff by accident. Read `tokens.access` explicitly.
+
+- **Session persistence** — the authenticated identity survives `reconnect()`, a dropped client
+  and a new event loop: `get_client()` replays the stored token. Without it, a reconnect would
+  silently hand back the configured root identity — a privilege change nobody asked for.
+
+- **`SurrealDbAuthenticationError`** — one exception for every authentication failure. The SDK
+  reports them inconsistently (the same wrong password is `NotFoundError` on 3.x and
+  `InternalError` on 2.6.x; a malformed token is a client-side `ValueError` that never reaches
+  a server), so the ORM normalises them all. It subclasses `SurrealDbError`, so existing
+  `except SurrealDbError` handlers keep working.
+
+- **Refresh-token exchange** (SurrealDB 3.x) — renew an access token without the password:
+
+  ```python
+  tokens = await SurrealDBConnectionManager.signin(access="account", refresh=stored_refresh)
+  store(tokens.refresh)   # the previous one is now dead — see Notes
+  ```
+
+- **`is_authenticated()`, `get_session_token()`, `get_refresh_token()`** — introspection, for
+  putting a JWT in a web session — and **`clear_session()`**, the local counterpart to
+  `invalidate()`: it forgets the stored tokens without a server round trip and without
+  touching the live session.
+
+### Changed
+
+- `_coerce_call_result` was generalised to `_coerce_result(value, return_type, subject)` so
+  `info(return_type=)` reuses the one `TypeAdapter` path `call_function()` already used.
+  Internal only; `call_function()`'s messages and behaviour are unchanged.
+
+### Notes
+
+- **Refresh tokens rotate.** A successful exchange kills the token it spent, immediately and
+  permanently. Persist the new `tokens.refresh` before the next request: dropping it logs the
+  user out for good, with nothing raised at the call site to warn you.
+- **Refresh tokens are SurrealDB 3.x only.** `DEFINE ACCESS … WITH REFRESH` does not parse on
+  2.6.x ("expected the experimental bearer access feature to be enabled"), so `tokens.refresh`
+  is always `None` there and their tests self-skip. Everything else behaves identically on both
+  lines.
+- **`invalidate()` returns the connection to its configured identity** rather than leaving it
+  anonymous. The SDK's own `invalidate()` leaves the session anonymous, and since the manager
+  caches one client per event loop, every later ORM call on that connection would fail.
+- **`info()` returns `None` unless the record's table grants that record user `select` on
+  itself.** The signin succeeded and `$auth` is set, but the server returns nothing — quiet and
+  easy to misread. Grant e.g. `PERMISSIONS FOR select WHERE id = $auth.id`. Because the cause is
+  a permission, a `None` is passed through untouched even when `return_type=` is given.
+- **Signing in as a system user does not end a record session.** SurrealDB swaps the
+  permissions but leaves `$auth` pointing at the record, so `info()` keeps reporting it. Only
+  `invalidate()` really logs a record user out. Identical on both lines.
+- **`namespace=` and `database=` go together** for record access. Pairing one explicit value
+  with the configured default would point the signin at a target the caller never named, so
+  half-explicit raises `ValueError`.
+- **`set_connection()` drops any stored session token**, the same way it already drops the
+  cached stored-function signatures: a JWT is bound to a server, namespace, database and
+  access method, so it must not survive a re-point.
+- **Auth changes the identity of the whole connection.** One client is cached per event loop and
+  every model shares it, so an auth call affects every subsequent ORM operation — not just the
+  caller's.
+
 ## [0.15.0] - 2026-08-25
 
 Call custom server-side functions (`DEFINE FUNCTION fn::…`) from the ORM.

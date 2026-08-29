@@ -9,7 +9,9 @@ from typing import Any
 from pydantic import TypeAdapter, ValidationError
 
 from ._sdk import AsyncSurreal, NotFoundError
+from .auth import AuthTokens, build_auth_payload, wrap_auth_error
 from .exceptions import (
+    SurrealDbAuthenticationError,
     SurrealDbConflictError,
     SurrealDbConnectionError,
     SurrealDbError,
@@ -63,6 +65,14 @@ class SurrealDBConnectionManager:
     # without it, a signature read from one server would silently order `params=` for another.
     __function_signatures: dict[tuple[str | None, str | None, str | None, str], tuple[str, ...]] = {}
 
+    # The identity the manager re-establishes on every new connection. Clients are per event
+    # loop and are dropped whenever a loop dies, so without replaying the token a reconnect
+    # would silently hand the caller back the configured root identity — a privilege change
+    # nobody asked for. The refresh token rides along so an application can renew without
+    # keeping the password.
+    __session_token: str | None = None
+    __refresh_token: str | None = None
+
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         await SurrealDBConnectionManager.close_connection()
 
@@ -82,7 +92,10 @@ class SurrealDBConnectionManager:
         cls.__namespace = namespace
         cls.__database = database
         # Signatures belong to the server that declared them; re-pointing the connection must
-        # not hand stale ones to the new one.
+        # not hand stale ones to the new one. A JWT is bound even more tightly — to a server,
+        # namespace, database and access method — so it is dropped for the same reason, and
+        # the alternative is a replay failure surfacing from an unrelated ORM call later.
+        cls.clear_session()
         cls.clear_function_signature_cache()
 
     @classmethod
@@ -95,6 +108,7 @@ class SurrealDBConnectionManager:
         cls.__password = None
         cls.__namespace = None
         cls.__database = None
+        cls.clear_session()
         cls.clear_function_signature_cache()
         await cls.close_all_connections()
 
@@ -159,8 +173,6 @@ class SurrealDBConnectionManager:
             await _client.signin({"username": cls.__user, "password": cls.__password})
             await _client.use(cls.__namespace, cls.__database)
 
-            cls.__clients[loop] = _client
-            return _client
         except Exception as e:
             logger.warning(f"Can't get connection: {e}")
             stale = cls.__clients.pop(loop, None)
@@ -168,6 +180,47 @@ class SurrealDBConnectionManager:
                 with contextlib.suppress(NotImplementedError):
                     await stale.close()
             raise SurrealDbConnectionError("Can't connect to the database.") from None
+
+        # Deliberately after the client is cached and OUTSIDE the except above. A dead token
+        # is not a connection failure — the socket is up, the configured credentials worked,
+        # only the identity is gone — and collapsing the two would send callers debugging
+        # their network. The client stays cached and usable at the configured identity, so
+        # the caller can simply sign in again.
+        # Published only once the replay has settled — in a `finally`, so a rejected token
+        # still leaves a usable client behind. Caching it *before* awaiting the replay would
+        # let a concurrent get_client() on this loop take the fast path and run statements as
+        # the configured root user while the record identity is still being established.
+        try:
+            await cls._replay_session(_client)
+        finally:
+            cls.__clients[loop] = _client
+        return _client
+
+    @classmethod
+    async def _replay_session(cls, client: Any) -> None:
+        """Re-establish the stored identity on a freshly built connection.
+
+        Clients are per event loop and are dropped whenever a loop dies (issue #163), so
+        without this a ``reconnect()`` would silently hand back the configured root identity
+        — a privilege change nobody asked for, and one that fails open rather than closed.
+
+        A rejected token is forgotten before raising, so the next call connects normally
+        instead of failing forever on a credential the caller can no longer see.
+        """
+        token = cls.__session_token
+        if token is None:
+            return
+        # See authenticate(): on HTTP the SDK stamps the token before sending, so a rejected
+        # one must be rolled back or the freshly built client is born poisoned.
+        previous = getattr(client, "token", None)
+        try:
+            await client.authenticate(token)
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                client.token = previous
+            cls.__session_token = None
+            cls.__refresh_token = None
+            raise wrap_auth_error(exc, "restoring the session on a new connection") from exc
 
     @classmethod
     async def close_connection(cls) -> None:
@@ -256,6 +309,318 @@ class SurrealDBConnectionManager:
                 await tx.cancel()
                 raise
             await tx.fire_post_commit()
+
+    # ------------------------------------------------------------------
+    # Authentication (v0.16.0)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    async def signin(
+        cls,
+        *,
+        username: str | None = None,
+        password: str | None = None,
+        access: str | None = None,
+        variables: Mapping[str, Any] | None = None,
+        refresh: str | None = None,
+        namespace: str | None = None,
+        database: str | None = None,
+        store: bool = True,
+    ) -> AuthTokens:
+        """Authenticate the connection, and remember the identity for later reconnects.
+
+        Exactly one of three credential shapes::
+
+            # a record user, against a DEFINE ACCESS … TYPE RECORD method
+            await SurrealDBConnectionManager.signin(
+                access="account", variables={"email": email, "pass": password},
+            )
+
+            # a system user (root, or namespace/database level)
+            await SurrealDBConnectionManager.signin(username="root", password="root")
+
+            # renew an existing record session — SurrealDB 3.x only
+            await SurrealDBConnectionManager.signin(access="account", refresh=stored_refresh)
+
+        ``namespace``/``database`` default to the configured connection's **for record
+        access**, which the server requires. A system user gets neither unless you pass them:
+        a root user is defined at no level, and sending them would turn a root signin into a
+        database-user signin against a user that does not exist.
+
+        .. warning::
+            **This changes the identity of the whole connection.** The manager caches one
+            client per event loop and every model shares it, so every subsequent ORM
+            operation runs as the identity signed in here — not just the caller's. An
+            application serving concurrent users must not route them through a single
+            connection manager identity.
+
+        .. warning::
+            **Refresh tokens rotate.** A successful ``refresh=`` exchange kills the token it
+            spent, immediately and permanently. Persist ``tokens.refresh`` before the next
+            request: dropping it logs the user out for good, with no error raised at the call
+            site to warn you.
+
+        :param store: whether the resulting token becomes the identity replayed on reconnect.
+            Pass ``False`` to mint a token for someone else — issuing a JWT for a web client —
+            without changing what this process re-authenticates as. The connection's *current*
+            session changes either way; that is the SDK's behaviour and the ORM does not hide it.
+        :return: the access token, plus the refresh token on SurrealDB 3.x when the access
+            method declares ``WITH REFRESH`` (always ``None`` on 2.6.x).
+        :raises ValueError: for an invalid credential combination — raised **before** any
+            request is issued.
+        :raises SurrealDbAuthenticationError: if the server refuses the credentials.
+        """
+        payload = build_auth_payload(
+            username=username,
+            password=password,
+            access=access,
+            variables=variables,
+            refresh=refresh,
+            namespace=namespace,
+            database=database,
+            default_namespace=cls.__namespace,
+            default_database=cls.__database,
+        )
+        client = await cls.get_client()
+        try:
+            tokens = await client.signin(payload)
+        except Exception as exc:
+            raise wrap_auth_error(exc, "signin") from exc
+        return cls._adopt_tokens(tokens, store=store, operation="signin")
+
+    @classmethod
+    async def signup(
+        cls,
+        *,
+        access: str | None = None,
+        variables: Mapping[str, Any] | None = None,
+        namespace: str | None = None,
+        database: str | None = None,
+        store: bool = True,
+    ) -> AuthTokens:
+        """Register a new record user through a ``DEFINE ACCESS … TYPE RECORD`` SIGNUP clause.
+
+        ::
+
+            tokens = await SurrealDBConnectionManager.signup(
+                access="account", variables={"email": email, "pass": password},
+            )
+
+        Only record access is accepted — SurrealDB has no signup for system users. On success
+        the connection is left authenticated as the newly created record, exactly as
+        :meth:`signin` leaves it; the warnings there apply here too.
+
+        ``access`` and ``variables`` are declared optional in the signature so that omitting one
+        raises a :class:`ValueError` explaining what is missing, rather than a bare
+        ``TypeError``. Both are required in practice.
+
+        :raises ValueError: if ``access`` or ``variables`` is missing — before any request.
+        :raises SurrealDbAuthenticationError: if the server refuses the signup.
+        """
+        payload = build_auth_payload(
+            access=access,
+            variables=variables,
+            namespace=namespace,
+            database=database,
+            default_namespace=cls.__namespace,
+            default_database=cls.__database,
+        )
+        client = await cls.get_client()
+        try:
+            tokens = await client.signup(payload)
+        except Exception as exc:
+            raise wrap_auth_error(exc, "signup") from exc
+        return cls._adopt_tokens(tokens, store=store, operation="signup")
+
+    @classmethod
+    def _adopt_tokens(cls, tokens: Any, *, store: bool, operation: str) -> AuthTokens:
+        """Convert the SDK's ``Tokens`` to :class:`AuthTokens`, optionally remembering it.
+
+        The SDK types ``access`` as optional; the ORM does not hand back a token-shaped object
+        with no token in it, so an empty one is an authentication failure rather than a
+        surprise ``None`` three call frames later.
+        """
+        access = getattr(tokens, "access", None)
+        if not access:
+            raise SurrealDbAuthenticationError(f"The server returned no access token for {operation}.")
+
+        adopted = AuthTokens(access=access, refresh=getattr(tokens, "refresh", None))
+        if store:
+            cls.__session_token = adopted.access
+            cls.__refresh_token = adopted.refresh
+        return adopted
+
+    @classmethod
+    async def authenticate(cls, token: str, *, store: bool = True) -> None:
+        """Authenticate the connection with a JWT obtained earlier.
+
+        The other half of handing ``tokens.access`` to a web client: give it back here on the
+        next request and the connection resumes that identity.
+
+        .. warning::
+            Like :meth:`signin`, this changes the identity of the whole connection — every
+            model shares it.
+
+        A failure changes nothing: the previously stored token is left in place, because the
+        call that failed never took effect. (Only the reconnect replay drops a stored token,
+        and only after the server has rejected the one it was holding.)
+
+        :param store: whether to adopt this token as the identity replayed on reconnect.
+        :raises SurrealDbAuthenticationError: if the token is malformed, expired or revoked.
+            A malformed one never reaches the server — the SDK rejects its shape with a plain
+            ``ValueError``, which is normalised here like any other authentication failure.
+        """
+        client = await cls.get_client()
+        # The SDK's HTTP connection assigns `self.token` BEFORE sending, unlike the WebSocket
+        # one. So a rejected token stays stamped on the client and every later request comes
+        # back 401 — and since the manager caches that client for the life of the event loop,
+        # one bad JWT would break the application permanently. Restore what was there.
+        previous = getattr(client, "token", None)
+        try:
+            await client.authenticate(token)
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                client.token = previous
+            raise wrap_auth_error(exc, "authenticate") from exc
+
+        if store:
+            cls.__session_token = token
+            # A JWT handed in from outside brings no refresh token with it. Keeping the one
+            # from a previous session would pair a refresh token with an identity it cannot
+            # renew — worse than having none.
+            cls.__refresh_token = None
+
+    @classmethod
+    async def invalidate(cls) -> None:
+        """End the current session and return the connection to its configured identity.
+
+        ::
+
+            await SurrealDBConnectionManager.invalidate()   # log the record user out
+
+        This is the only way to really end a record session: signing in as a system user swaps
+        the permissions but leaves ``$auth`` pointing at the record, so ``info()`` would keep
+        reporting it.
+
+        The SDK's ``invalidate()`` on its own leaves the session **anonymous**, and since the
+        manager caches one client per event loop, every later ORM call on that connection —
+        one the caller never closed — would fail. So the stored token is forgotten and the
+        credentials given to :meth:`set_connection` are signed in again: "log the record user
+        out, back to the application's own identity", not "break the connection".
+
+        :raises SurrealDbAuthenticationError: if the server refuses either step.
+        """
+        client = await cls.get_client()
+        try:
+            await client.invalidate()
+        except Exception as exc:
+            raise wrap_auth_error(exc, "invalidate") from exc
+
+        cls.clear_session()
+
+        try:
+            await client.signin({"username": cls.__user, "password": cls.__password})
+            if cls.__namespace is not None and cls.__database is not None:
+                await client.use(cls.__namespace, cls.__database)
+        except Exception as exc:
+            # The session is anonymous at this point — exactly the state this method exists to
+            # avoid. Drop the client so the next get_client() rebuilds at the configured
+            # identity, rather than handing every later call a dead connection.
+            with contextlib.suppress(Exception):
+                await cls.close_connection()
+            raise wrap_auth_error(exc, "invalidate (restoring the configured identity)") from exc
+
+    @classmethod
+    def clear_session(cls) -> None:
+        """Forget the stored tokens without touching the server or the connection settings.
+
+        The local counterpart to :meth:`invalidate`: that one ends the session on the server
+        and costs two round trips, while this simply stops the manager replaying an identity
+        on the next connection. Useful when an application drops a user locally, and in tests
+        that must not leak a token into the next one.
+
+        The **current** connection keeps whatever identity it already has; only the replay is
+        forgotten. Call :meth:`invalidate` when you mean to log out for real.
+        """
+        cls.__session_token = None
+        cls.__refresh_token = None
+
+    @classmethod
+    def is_authenticated(cls) -> bool:
+        """Whether the manager holds a session token it will replay on reconnect.
+
+        This answers "has someone signed in through the ORM", **not** "is the connection
+        usable": a connection with no session token is still authenticated as the configured
+        user and works normally.
+
+        :return: True if a session token is stored, False otherwise.
+        """
+        return cls.__session_token is not None
+
+    @classmethod
+    def get_session_token(cls) -> str | None:
+        """The stored access token (JWT), or ``None``.
+
+        Useful for putting the token in a web session so a later request can restore the
+        identity with :meth:`authenticate`. It is a credential — do not log it.
+
+        :return: The stored access token, or None if no session is held.
+        """
+        return cls.__session_token
+
+    @classmethod
+    def get_refresh_token(cls) -> str | None:
+        """The stored refresh token, or ``None``.
+
+        Populated only on SurrealDB 3.x, and only when the access method declares
+        ``WITH REFRESH``; 2.6.x cannot parse that clause, so it is always ``None`` there.
+
+        :return: The stored refresh token, or None if there is none.
+        """
+        return cls.__refresh_token
+
+    @classmethod
+    async def info(cls, *, return_type: Any = None) -> Any:
+        """Return the record the connection is authenticated as, or ``None``.
+
+        ::
+
+            me = await SurrealDBConnectionManager.info()                    # dict | None
+            me = await SurrealDBConnectionManager.info(return_type=User)    # User | None
+
+        ``None`` means "no record to report", and it has **two** causes worth telling apart:
+
+        - the session is a system user (root, namespace or database), which is not a record;
+        - the session *is* a record user, but the record's table does not grant it ``select``
+          on itself, so the server returns nothing. This one is quiet and catches people out:
+          the signin succeeded and ``$auth`` is set, yet ``info()`` reports nothing. Grant the
+          table something like ``PERMISSIONS FOR select WHERE id = $auth.id``.
+
+        Because that second case is a permissions problem, a ``None`` is passed straight
+        through even when *return_type* is given, rather than failing validation against a
+        model that was never the culprit.
+
+        .. note::
+            After signing in as a system user, this can still report the record from an
+            earlier record session: SurrealDB swaps the permissions but leaves ``$auth`` in
+            place. Only :meth:`invalidate` really ends a record session.
+
+        :param return_type: a type annotation to coerce the record into — a Pydantic model, a
+            dataclass, or anything else Pydantic can adapt. ``None`` returns the raw mapping.
+        :raises SurrealDbAuthenticationError: if the session is anonymous (after
+            ``invalidate()``), or the server otherwise refuses.
+        :raises SurrealDbValidationError: if a non-``None`` record does not fit *return_type*.
+        """
+        client = await cls.get_client()
+        try:
+            value = await client.info()
+        except Exception as exc:
+            raise wrap_auth_error(exc, "info") from exc
+
+        if value is None:
+            return None
+        # Outside the try: SurrealDbValidationError must not be downgraded to an auth error.
+        return cls._coerce_result(value, return_type, "info()")
 
     @classmethod
     async def call_function(
@@ -352,28 +717,30 @@ class SurrealDBConnectionManager:
                 raise cls._wrap_call_error(exc, name) from exc
             # Coercion happens OUTSIDE the try: SurrealDbValidationError does not subclass
             # SurrealDbError, so catching it here would silently downgrade it.
-            return cls._coerce_call_result(raw, return_type, name)
+            return cls._coerce_result(raw, return_type, repr(name))
         try:
             value = await client.query(statement, variables)
         except Exception as exc:
             raise cls._wrap_call_error(exc, name) from exc
 
-        return cls._coerce_call_result(value, return_type, name)
+        return cls._coerce_result(value, return_type, repr(name))
 
     @staticmethod
-    def _coerce_call_result(value: Any, return_type: Any, function: str) -> Any:
-        """Convert a stored function's result to *return_type*, or return it untouched.
+    def _coerce_result(value: Any, return_type: Any, subject: str) -> Any:
+        """Convert a server value to *return_type*, or return it untouched.
 
         One ``TypeAdapter`` covers every shape a caller might ask for — a Pydantic model, a
         dataclass, ``list[Model]``, ``int``, ``datetime`` — so there is no per-kind branching
-        to keep in sync.
+        to keep in sync. Shared by ``call_function()`` and ``info()``; *subject* is what the
+        error message names as the source, already formatted (``repr(name)`` for a stored
+        function, ``"info()"`` for the session record).
         """
         if return_type is None:
             return value
         try:
             return _type_adapter(return_type).validate_python(value)
         except ValidationError as exc:
-            raise SurrealDbValidationError(f"The value returned by {function!r} does not fit {return_type!r}: {exc}") from exc
+            raise SurrealDbValidationError(f"The value returned by {subject} does not fit {return_type!r}: {exc}") from exc
 
     @classmethod
     async def _resolve_named_args(cls, client: Any, function: str, params: Mapping[str, Any]) -> list[Any]:
