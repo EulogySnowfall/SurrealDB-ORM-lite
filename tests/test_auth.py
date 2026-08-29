@@ -19,10 +19,15 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from pydantic import BaseModel as PydanticBaseModel
 
 from surreal_orm_lite import SurrealDBConnectionManager
 from surreal_orm_lite.auth import AuthTokens, build_auth_payload, wrap_auth_error
-from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbError
+from surreal_orm_lite.exceptions import (
+    SurrealDbAuthenticationError,
+    SurrealDbError,
+    SurrealDbValidationError,
+)
 
 
 class TestAuthTokens:
@@ -246,7 +251,7 @@ PASSWORD = "s3cret-passphrase"
 #: The record table grants the record user SELECT on itself. Without that permission `info()`
 #: silently returns None on both DB lines — the single sharpest gotcha of this feature, and
 #: the reason one test below asserts that None on purpose.
-DEFINE_TABLE = f"DEFINE TABLE OVERWRITE {AUTH_TABLE} SCHEMALESS PERMISSIONS FOR select, update WHERE id = $auth.id;"
+SELF_READABLE = "FOR select, update WHERE id = $auth.id"
 
 DEFINE_ACCESS = f"""
 DEFINE ACCESS OVERWRITE {AUTH_ACCESS} ON DATABASE TYPE RECORD
@@ -257,7 +262,7 @@ DEFINE ACCESS OVERWRITE {AUTH_ACCESS} ON DATABASE TYPE RECORD
 
 
 @contextlib.asynccontextmanager
-async def auth_client() -> AsyncIterator[Any]:
+async def auth_client(*, permissions: str = SELF_READABLE) -> AsyncIterator[Any]:
     """Connected ORM client with a record-access method defined, removed again afterwards.
 
     An async context manager rather than a pytest fixture: the SDK's WebSocket client is bound
@@ -270,7 +275,7 @@ async def auth_client() -> AsyncIterator[Any]:
     """
     _connect()
     client = await SurrealDBConnectionManager.get_client()
-    await client.query(DEFINE_TABLE, {})
+    await client.query(f"DEFINE TABLE OVERWRITE {AUTH_TABLE} SCHEMALESS PERMISSIONS {permissions};", {})
     await client.query(DEFINE_ACCESS, {})
     try:
         yield client
@@ -419,3 +424,87 @@ class TestAuthArgumentsAreValidatedBeforeAnyRequest:
             await SurrealDBConnectionManager.signin(
                 username="root", password="root", access=AUTH_ACCESS, variables={"email": "a@b.c"}
             )
+
+
+class AuthUser(PydanticBaseModel):
+    """What a caller actually wants back from ``info()`` — extras (id, hash) are ignored."""
+
+    email: str
+
+
+class MismatchedUser(PydanticBaseModel):
+    email: str
+    subscription_tier: int  # no such field on the record
+
+
+class TestInfoE2E:
+    @pytest.mark.asyncio
+    async def test_reports_the_authenticated_record(self) -> None:
+        async with auth_client():
+            email = _unique_email()
+            await _signup(email)
+
+            info = await SurrealDBConnectionManager.info()
+
+            assert info is not None
+            assert info["email"] == email
+
+    @pytest.mark.asyncio
+    async def test_hydrates_a_model_when_given_a_return_type(self) -> None:
+        async with auth_client():
+            email = _unique_email()
+            await _signup(email)
+
+            me = await SurrealDBConnectionManager.info(return_type=AuthUser)
+
+            assert isinstance(me, AuthUser)
+            assert me.email == email
+
+    @pytest.mark.asyncio
+    async def test_a_payload_that_does_not_fit_raises_a_validation_error(self) -> None:
+        async with auth_client():
+            await _signup(_unique_email())
+
+            with pytest.raises(SurrealDbValidationError):
+                await SurrealDBConnectionManager.info(return_type=MismatchedUser)
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_the_table_denies_the_record_user(self) -> None:
+        """The quietest trap in this feature: the signin succeeded, the identity is real
+        (``$auth`` is set), but the record cannot read *itself*, so the server hands back
+        nothing. Same on both DB lines."""
+        async with auth_client(permissions="NONE") as client:
+            email = _unique_email()
+            await _signup(email)
+            assert await client.query("RETURN $auth;", {}) is not None, "the identity is real"
+
+            assert await SurrealDBConnectionManager.info() is None
+
+    @pytest.mark.asyncio
+    async def test_a_return_type_does_not_turn_that_none_into_a_validation_error(self) -> None:
+        """Coercing ``None`` would raise and point at the model — the wrong culprit entirely,
+        since the cause is a table permission. ``None`` passes through untouched."""
+        async with auth_client(permissions="NONE"):
+            await _signup(_unique_email())
+
+            assert await SurrealDBConnectionManager.info(return_type=AuthUser) is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_for_a_system_user(self) -> None:
+        """On a *fresh* connection: root has never been a record here.
+
+        Deliberately not written as "sign in as a record, then switch back to root" — that
+        leaves ``$auth`` pointing at the record and ``info()`` still reports it (see
+        ``test_a_system_user_signin_does_not_clear_the_record_identity``).
+        """
+        async with auth_client():
+            assert await SurrealDBConnectionManager.info() is None
+
+    @pytest.mark.asyncio
+    async def test_an_anonymous_session_raises_an_authentication_error(self) -> None:
+        async with auth_client() as client:
+            await _signup(_unique_email())
+            await client.invalidate()
+
+            with pytest.raises(SurrealDbAuthenticationError):
+                await SurrealDBConnectionManager.info()

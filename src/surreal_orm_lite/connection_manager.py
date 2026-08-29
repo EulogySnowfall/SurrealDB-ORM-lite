@@ -409,6 +409,49 @@ class SurrealDBConnectionManager:
         return adopted
 
     @classmethod
+    async def info(cls, *, return_type: Any = None) -> Any:
+        """Return the record the connection is authenticated as, or ``None``.
+
+        ::
+
+            me = await SurrealDBConnectionManager.info()                    # dict | None
+            me = await SurrealDBConnectionManager.info(return_type=User)    # User | None
+
+        ``None`` means "no record to report", and it has **two** causes worth telling apart:
+
+        - the session is a system user (root, namespace or database), which is not a record;
+        - the session *is* a record user, but the record's table does not grant it ``select``
+          on itself, so the server returns nothing. This one is quiet and catches people out:
+          the signin succeeded and ``$auth`` is set, yet ``info()`` reports nothing. Grant the
+          table something like ``PERMISSIONS FOR select WHERE id = $auth.id``.
+
+        Because that second case is a permissions problem, a ``None`` is passed straight
+        through even when *return_type* is given, rather than failing validation against a
+        model that was never the culprit.
+
+        .. note::
+            After signing in as a system user, this can still report the record from an
+            earlier record session: SurrealDB swaps the permissions but leaves ``$auth`` in
+            place. Only :meth:`invalidate` really ends a record session.
+
+        :param return_type: a type annotation to coerce the record into — a Pydantic model, a
+            dataclass, or anything else Pydantic can adapt. ``None`` returns the raw mapping.
+        :raises SurrealDbAuthenticationError: if the session is anonymous (after
+            ``invalidate()``), or the server otherwise refuses.
+        :raises SurrealDbValidationError: if a non-``None`` record does not fit *return_type*.
+        """
+        client = await cls.get_client()
+        try:
+            value = await client.info()
+        except Exception as exc:
+            raise wrap_auth_error(exc, "info") from exc
+
+        if value is None:
+            return None
+        # Outside the try: SurrealDbValidationError must not be downgraded to an auth error.
+        return cls._coerce_result(value, return_type, "info()")
+
+    @classmethod
     async def call_function(
         cls,
         function: str,
@@ -503,28 +546,30 @@ class SurrealDBConnectionManager:
                 raise cls._wrap_call_error(exc, name) from exc
             # Coercion happens OUTSIDE the try: SurrealDbValidationError does not subclass
             # SurrealDbError, so catching it here would silently downgrade it.
-            return cls._coerce_call_result(raw, return_type, name)
+            return cls._coerce_result(raw, return_type, repr(name))
         try:
             value = await client.query(statement, variables)
         except Exception as exc:
             raise cls._wrap_call_error(exc, name) from exc
 
-        return cls._coerce_call_result(value, return_type, name)
+        return cls._coerce_result(value, return_type, repr(name))
 
     @staticmethod
-    def _coerce_call_result(value: Any, return_type: Any, function: str) -> Any:
-        """Convert a stored function's result to *return_type*, or return it untouched.
+    def _coerce_result(value: Any, return_type: Any, subject: str) -> Any:
+        """Convert a server value to *return_type*, or return it untouched.
 
         One ``TypeAdapter`` covers every shape a caller might ask for — a Pydantic model, a
         dataclass, ``list[Model]``, ``int``, ``datetime`` — so there is no per-kind branching
-        to keep in sync.
+        to keep in sync. Shared by ``call_function()`` and ``info()``; *subject* is what the
+        error message names as the source, already formatted (``repr(name)`` for a stored
+        function, ``"info()"`` for the session record).
         """
         if return_type is None:
             return value
         try:
             return _type_adapter(return_type).validate_python(value)
         except ValidationError as exc:
-            raise SurrealDbValidationError(f"The value returned by {function!r} does not fit {return_type!r}: {exc}") from exc
+            raise SurrealDbValidationError(f"The value returned by {subject} does not fit {return_type!r}: {exc}") from exc
 
     @classmethod
     async def _resolve_named_args(cls, client: Any, function: str, params: Mapping[str, Any]) -> list[Any]:
