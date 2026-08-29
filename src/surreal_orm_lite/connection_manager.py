@@ -9,7 +9,9 @@ from typing import Any
 from pydantic import TypeAdapter, ValidationError
 
 from ._sdk import AsyncSurreal, NotFoundError
+from .auth import AuthTokens, build_auth_payload, wrap_auth_error
 from .exceptions import (
+    SurrealDbAuthenticationError,
     SurrealDbConflictError,
     SurrealDbConnectionError,
     SurrealDbError,
@@ -63,6 +65,14 @@ class SurrealDBConnectionManager:
     # without it, a signature read from one server would silently order `params=` for another.
     __function_signatures: dict[tuple[str | None, str | None, str | None, str], tuple[str, ...]] = {}
 
+    # The identity the manager re-establishes on every new connection. Clients are per event
+    # loop and are dropped whenever a loop dies, so without replaying the token a reconnect
+    # would silently hand the caller back the configured root identity — a privilege change
+    # nobody asked for. The refresh token rides along so an application can renew without
+    # keeping the password.
+    __session_token: str | None = None
+    __refresh_token: str | None = None
+
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         await SurrealDBConnectionManager.close_connection()
 
@@ -95,6 +105,8 @@ class SurrealDBConnectionManager:
         cls.__password = None
         cls.__namespace = None
         cls.__database = None
+        cls.__session_token = None
+        cls.__refresh_token = None
         cls.clear_function_signature_cache()
         await cls.close_all_connections()
 
@@ -256,6 +268,145 @@ class SurrealDBConnectionManager:
                 await tx.cancel()
                 raise
             await tx.fire_post_commit()
+
+    # ------------------------------------------------------------------
+    # Authentication (v0.16.0)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    async def signin(
+        cls,
+        *,
+        username: str | None = None,
+        password: str | None = None,
+        access: str | None = None,
+        variables: Mapping[str, Any] | None = None,
+        refresh: str | None = None,
+        namespace: str | None = None,
+        database: str | None = None,
+        store: bool = True,
+    ) -> AuthTokens:
+        """Authenticate the connection, and remember the identity for later reconnects.
+
+        Exactly one of three credential shapes::
+
+            # a record user, against a DEFINE ACCESS … TYPE RECORD method
+            await SurrealDBConnectionManager.signin(
+                access="account", variables={"email": email, "pass": password},
+            )
+
+            # a system user (root, or namespace/database level)
+            await SurrealDBConnectionManager.signin(username="root", password="root")
+
+            # renew an existing record session — SurrealDB 3.x only
+            await SurrealDBConnectionManager.signin(access="account", refresh=stored_refresh)
+
+        ``namespace``/``database`` default to the configured connection's **for record
+        access**, which the server requires. A system user gets neither unless you pass them:
+        a root user is defined at no level, and sending them would turn a root signin into a
+        database-user signin against a user that does not exist.
+
+        .. warning::
+            **This changes the identity of the whole connection.** The manager caches one
+            client per event loop and every model shares it, so every subsequent ORM
+            operation runs as the identity signed in here — not just the caller's. An
+            application serving concurrent users must not route them through a single
+            connection manager identity.
+
+        .. warning::
+            **Refresh tokens rotate.** A successful ``refresh=`` exchange kills the token it
+            spent, immediately and permanently. Persist ``tokens.refresh`` before the next
+            request: dropping it logs the user out for good, with no error raised at the call
+            site to warn you.
+
+        :param store: whether the resulting token becomes the identity replayed on reconnect.
+            Pass ``False`` to mint a token for someone else — issuing a JWT for a web client —
+            without changing what this process re-authenticates as. The connection's *current*
+            session changes either way; that is the SDK's behaviour and the ORM does not hide it.
+        :return: the access token, plus the refresh token on SurrealDB 3.x when the access
+            method declares ``WITH REFRESH`` (always ``None`` on 2.6.x).
+        :raises ValueError: for an invalid credential combination — raised **before** any
+            request is issued.
+        :raises SurrealDbAuthenticationError: if the server refuses the credentials.
+        """
+        payload = build_auth_payload(
+            username=username,
+            password=password,
+            access=access,
+            variables=variables,
+            refresh=refresh,
+            namespace=namespace,
+            database=database,
+            default_namespace=cls.__namespace,
+            default_database=cls.__database,
+        )
+        client = await cls.get_client()
+        try:
+            tokens = await client.signin(payload)
+        except Exception as exc:
+            raise wrap_auth_error(exc, "signin") from exc
+        return cls._adopt_tokens(tokens, store=store, operation="signin")
+
+    @classmethod
+    async def signup(
+        cls,
+        *,
+        access: str | None = None,
+        variables: Mapping[str, Any] | None = None,
+        namespace: str | None = None,
+        database: str | None = None,
+        store: bool = True,
+    ) -> AuthTokens:
+        """Register a new record user through a ``DEFINE ACCESS … TYPE RECORD`` SIGNUP clause.
+
+        ::
+
+            tokens = await SurrealDBConnectionManager.signup(
+                access="account", variables={"email": email, "pass": password},
+            )
+
+        Only record access is accepted — SurrealDB has no signup for system users. On success
+        the connection is left authenticated as the newly created record, exactly as
+        :meth:`signin` leaves it; the warnings there apply here too.
+
+        ``access`` and ``variables`` are keyword arguments with no default so that omitting one
+        raises a :class:`ValueError` explaining what is missing, rather than a bare ``TypeError``.
+
+        :raises ValueError: if ``access`` or ``variables`` is missing — before any request.
+        :raises SurrealDbAuthenticationError: if the server refuses the signup.
+        """
+        payload = build_auth_payload(
+            access=access,
+            variables=variables,
+            namespace=namespace,
+            database=database,
+            default_namespace=cls.__namespace,
+            default_database=cls.__database,
+        )
+        client = await cls.get_client()
+        try:
+            tokens = await client.signup(payload)
+        except Exception as exc:
+            raise wrap_auth_error(exc, "signup") from exc
+        return cls._adopt_tokens(tokens, store=store, operation="signup")
+
+    @classmethod
+    def _adopt_tokens(cls, tokens: Any, *, store: bool, operation: str) -> AuthTokens:
+        """Convert the SDK's ``Tokens`` to :class:`AuthTokens`, optionally remembering it.
+
+        The SDK types ``access`` as optional; the ORM does not hand back a token-shaped object
+        with no token in it, so an empty one is an authentication failure rather than a
+        surprise ``None`` three call frames later.
+        """
+        access = getattr(tokens, "access", None)
+        if not access:
+            raise SurrealDbAuthenticationError(f"The server returned no access token for {operation}.")
+
+        adopted = AuthTokens(access=access, refresh=getattr(tokens, "refresh", None))
+        if store:
+            cls.__session_token = adopted.access
+            cls.__refresh_token = adopted.refresh
+        return adopted
 
     @classmethod
     async def call_function(
