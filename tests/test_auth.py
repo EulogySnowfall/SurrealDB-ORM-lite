@@ -807,3 +807,17 @@ class TestRefreshTokenE2E:
 
             with pytest.raises(SurrealDbAuthenticationError):
                 await SurrealDBConnectionManager.signin(access=REFRESH_ACCESS, refresh="surreal-refresh-not-a-real-grant")
+
+
+class TestPublicExports:
+    def test_auth_tokens_is_exported_from_the_package_root(self) -> None:
+        import surreal_orm_lite
+
+        assert surreal_orm_lite.AuthTokens is AuthTokens
+        assert "AuthTokens" in surreal_orm_lite.__all__
+
+    def test_the_authentication_error_is_exported_from_the_package_root(self) -> None:
+        import surreal_orm_lite
+
+        assert surreal_orm_lite.SurrealDbAuthenticationError is SurrealDbAuthenticationError
+        assert "SurrealDbAuthenticationError" in surreal_orm_lite.__all__
