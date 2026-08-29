@@ -69,3 +69,25 @@ class SurrealDbConflictError(SurrealDbError):
     """
 
     pass
+
+
+class SurrealDbAuthenticationError(SurrealDbError):
+    """
+    Authentication failure.
+
+    Raised by every connection-level auth operation — ``signin``, ``signup``,
+    ``authenticate``, ``invalidate``, ``info`` — when the server (or the SDK) refuses:
+    wrong credentials, an unknown access method, a malformed or expired token, a spent
+    refresh token, or a request made while the session is anonymous.
+
+    The SDK reports these inconsistently: the same wrong password surfaces as
+    ``NotFoundError`` on SurrealDB 3.x and ``InternalError`` on 2.6.x, and a malformed token
+    is rejected client-side as a plain ``ValueError`` before it ever reaches a server. This
+    exception is the single type callers match on, so their handling does not depend on which
+    DB line they happen to run against.
+
+    Inherits from SurrealDbError, so existing ``except SurrealDbError`` handlers
+    continue to catch it.
+    """
+
+    pass
