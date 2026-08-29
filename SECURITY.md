@@ -6,8 +6,8 @@ The following versions of Surreal-ORM-Lite are currently supported with security
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.15.x  | :white_check_mark: |
-| < 0.15  | :x:                |
+| 0.16.x  | :white_check_mark: |
+| < 0.16  | :x:                |
 
 ## Reporting a Vulnerability
 

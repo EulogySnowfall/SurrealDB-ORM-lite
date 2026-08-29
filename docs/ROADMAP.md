@@ -24,7 +24,8 @@
 | v0.13.0           | Tier 1 — SurrealFunc & server-side values            | Done    |
 | v0.14.0           | Tier 1 — Computed Fields                             | Done    |
 | v0.15.0           | Tier 1 — `call_function()` (custom `fn::`)           | Done    |
-| v0.16.0 – v0.22.0 | Tier 1 — Core (auth, live, relations)                | Planned |
+| v0.16.0           | Tier 1 — Connection-level auth (JWT / record users)  | Done    |
+| v0.17.0 – v0.22.0 | Tier 1 — Core (model auth, live, relations)          | Planned |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 7 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
@@ -67,7 +68,8 @@ pieces stay out.
 | SurrealFunc & server values         | `query()` + native fns (`CREATE`/`UPDATE … SET`)      | ✅ v0.13.0     |
 | Computed fields                     | `DEFINE FIELD … VALUE` via `query()`                  | ✅ v0.14.0     |
 | `call_function()`                   | `query()` + `fn::name($args)` ¹                       | ✅ v0.15.0     |
-| JWT / scope auth                    | `signup`/`signin`/`authenticate`/`invalidate`/`info`  | v0.16 – v0.17  |
+| JWT / scope auth (connection)       | `signup`/`signin`/`authenticate`/`invalidate`/`info`  | ✅ v0.16.0     |
+| JWT / scope auth (model mixin)      | idem, on a `BaseSurrealModel` subclass                | v0.17.0        |
 | Field aliases & DX                  | Pydantic `Field(alias=)` + config                     | v0.18.0        |
 | Live Models / Live Queries          | `live()` / `subscribe_live()` / `kill()`              | v0.19 – v0.20  |
 | Change Feeds / Auto-Resubscribe     | live queries + reconnect logic                        | v0.21.0        |
@@ -130,7 +132,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | SurrealFunc & server values   | yes        | ✅ v0.13.0                  |
 | Computed fields               | yes        | ✅ v0.14.0                  |
 | `call_function()`             | yes        | ✅ v0.15.0                  |
-| JWT Authentication            | yes        | v0.16 – v0.17               |
+| JWT Authentication            | yes        | ✅ v0.16.0 (connection)     |
 | Field aliases & DX            | yes        | v0.18.0                     |
 | Live Models / CDC             | yes        | v0.19 – v0.21               |
 | Native typed relations        | yes        | v0.22.0                     |
@@ -277,6 +279,31 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - SDK 2.0.0 exposes no `run()`/`call()`; everything goes through `query()`
 - `define_function()` (DDL) deliberately deferred to v0.31.0, with the other `schema.py` helpers
 
+### Version 0.16.0 — Connection-level authentication
+
+- `SurrealDBConnectionManager.signin()`, `signup()`, `authenticate()`, `invalidate()`, `info()`
+  — all native SDK primitives, no `query()` fallback needed
+- `signin()` takes exactly one of three credential shapes: record access (`access=` +
+  `variables=`), a system user (`username=` + `password=`), or a refresh exchange (`access=` +
+  `refresh=`). `namespace`/`database` default to the configured connection's **for record
+  access only** — injecting them into a system-user signin would turn a root signin into a
+  database-user signin against a user the server does not have
+- `AuthTokens` — frozen, `access` guaranteed non-`None`, `repr` redacts both tokens and there is
+  no `__str__` returning the JWT, so a credential cannot leak into a log or a traceback
+- **Session persistence**: `get_client()` replays the stored token, so the identity survives
+  `reconnect()`, a dropped client and a new event loop instead of silently reverting to root
+- `SurrealDbAuthenticationError` normalises every auth failure — the SDK reports the same wrong
+  password as `NotFoundError` on 3.x and `InternalError` on 2.6.x, and rejects a malformed token
+  client-side as a bare `ValueError`
+- `info(return_type=)` reuses `call_function()`'s `TypeAdapter` path; a `None` result passes
+  through **without** coercion, because its usual cause is a table permission, not a bad model
+- `invalidate()` restores the configured identity rather than leaving the shared client anonymous
+- **Same on both lines** for the five methods. **3.x only**: `DEFINE ACCESS … WITH REFRESH` and
+  therefore `AuthTokens.refresh` and `signin(refresh=)` — 2.6.x cannot parse the clause, and
+  those tests self-skip. Refresh tokens **rotate**: a spent one is rejected immediately
+- Model-level auth (`AuthenticatedUserMixin`, `User.signup()` returning an instance) is v0.17.0;
+  a `define_access()` DDL helper belongs with `schema.py` at v0.31.0
+
 ### Version 0.14.0 — Computed fields
 
 - `Computed[T] = computed("<expr>")` declares a field SurrealDB derives from other fields on
@@ -372,11 +399,11 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 ### 🟣 Phase C — Auth & DX
 
-| Version | Theme                                                                       | SDK 2.0 primitive |
-| ------- | --------------------------------------------------------------------------- | ----------------- |
-| v0.16.0 | Connection-level auth: `signin`/`signup`/`authenticate`/`invalidate`/`info` | SDK auth methods  |
-| v0.17.0 | `AuthenticatedUserMixin` (model-level signup/signin, scoped sessions)       | idem              |
-| v0.18.0 | Field aliases (`Field(alias=)`) + `server_fields` + `merge(refresh=False)`  | Pydantic + config |
+| Version    | Theme                                                                       | SDK 2.0 primitive |
+| ---------- | --------------------------------------------------------------------------- | ----------------- |
+| ✅ v0.16.0 | Connection-level auth: `signin`/`signup`/`authenticate`/`invalidate`/`info` | SDK auth methods  |
+| v0.17.0    | `AuthenticatedUserMixin` (model-level signup/signin, scoped sessions)       | idem              |
+| v0.18.0    | Field aliases (`Field(alias=)`) + `server_fields` + `merge(refresh=False)`  | Pydantic + config |
 
 ### 🟡 Phase D — Real-time
 
