@@ -284,7 +284,11 @@ async def auth_client(*, permissions: str = SELF_READABLE) -> AsyncIterator[Any]
         with contextlib.suppress(Exception):
             await client.signin({"username": "root", "password": "root"})
             await client.use("ns", "db")
-        for statement in (f"REMOVE ACCESS {AUTH_ACCESS} ON DATABASE;", f"REMOVE TABLE {AUTH_TABLE};"):
+        for statement in (
+            f"REMOVE ACCESS {AUTH_ACCESS} ON DATABASE;",
+            f"REMOVE ACCESS {REFRESH_ACCESS} ON DATABASE;",
+            f"REMOVE TABLE {AUTH_TABLE};",
+        ):
             with contextlib.suppress(Exception):
                 await client.query(statement, {})
         await SurrealDBConnectionManager.unset_connection()
@@ -695,3 +699,111 @@ class TestSessionPersistenceE2E:
             assert SurrealDBConnectionManager.get_session_token() is None
             recovered = await SurrealDBConnectionManager.get_client()
             await recovered.query("INFO FOR DB;", {})
+
+
+REFRESH_ACCESS = "auth_acct_refresh"
+
+DEFINE_REFRESH_ACCESS = f"""
+DEFINE ACCESS OVERWRITE {REFRESH_ACCESS} ON DATABASE TYPE RECORD
+  SIGNUP ( CREATE {AUTH_TABLE} SET email = $email, pass = crypto::argon2::generate($pass) )
+  SIGNIN ( SELECT * FROM {AUTH_TABLE} WHERE email = $email AND crypto::argon2::compare(pass, $pass) )
+  WITH REFRESH DURATION FOR TOKEN 15m, FOR SESSION 12h, FOR GRANT 30d;
+"""
+
+
+async def _define_refresh_access(client: Any) -> None:
+    """Declare a WITH REFRESH access method, or skip on a server that cannot parse it.
+
+    SurrealDB 2.6.x rejects the clause outright ("expected the experimental bearer access
+    feature to be enabled"), so this is the capability probe for the whole class — the same
+    adaptive-skip contract v0.9.0 uses for interactive transactions.
+    """
+    try:
+        await client.query(DEFINE_REFRESH_ACCESS, {})
+    except Exception as exc:  # noqa: BLE001 — any parse failure means the feature is absent
+        pytest.skip(f"DEFINE ACCESS … WITH REFRESH requires SurrealDB 3.x: {exc}")
+
+
+async def _signup_refreshable(email: str) -> AuthTokens:
+    return await SurrealDBConnectionManager.signup(access=REFRESH_ACCESS, variables={"email": email, "pass": PASSWORD})
+
+
+class TestRefreshTokenE2E:
+    @pytest.mark.asyncio
+    async def test_a_with_refresh_access_method_issues_a_refresh_token(self) -> None:
+        async with auth_client() as client:
+            await _define_refresh_access(client)
+
+            tokens = await _signup_refreshable(_unique_email())
+
+            assert tokens.refresh, "3.x must issue a refresh token for a WITH REFRESH method"
+
+    @pytest.mark.asyncio
+    async def test_exchanging_a_refresh_token_restores_the_same_record(self) -> None:
+        async with auth_client() as client:
+            await _define_refresh_access(client)
+            email = _unique_email()
+            first = await _signup_refreshable(email)
+            assert first.refresh is not None
+
+            renewed = await SurrealDBConnectionManager.signin(access=REFRESH_ACCESS, refresh=first.refresh)
+
+            assert renewed.access
+            info = await SurrealDBConnectionManager.info()
+            assert info is not None and info["email"] == email
+
+    @pytest.mark.asyncio
+    async def test_the_exchange_rotates_the_refresh_token(self) -> None:
+        async with auth_client() as client:
+            await _define_refresh_access(client)
+            first = await _signup_refreshable(_unique_email())
+            assert first.refresh is not None
+
+            renewed = await SurrealDBConnectionManager.signin(access=REFRESH_ACCESS, refresh=first.refresh)
+
+            assert renewed.refresh is not None
+            assert renewed.refresh != first.refresh
+
+    @pytest.mark.asyncio
+    async def test_the_spent_refresh_token_is_rejected(self) -> None:
+        """The sharpest footgun of the feature: an application that keeps the old value and
+        drops the new one locks its user out permanently, with nothing raised at the moment
+        it made the mistake."""
+        async with auth_client() as client:
+            await _define_refresh_access(client)
+            first = await _signup_refreshable(_unique_email())
+            assert first.refresh is not None
+            await SurrealDBConnectionManager.signin(access=REFRESH_ACCESS, refresh=first.refresh)
+
+            with pytest.raises(SurrealDbAuthenticationError):
+                await SurrealDBConnectionManager.signin(access=REFRESH_ACCESS, refresh=first.refresh)
+
+    @pytest.mark.asyncio
+    async def test_the_exchange_replaces_both_stored_tokens(self) -> None:
+        async with auth_client() as client:
+            await _define_refresh_access(client)
+            first = await _signup_refreshable(_unique_email())
+
+            renewed = await SurrealDBConnectionManager.signin(access=REFRESH_ACCESS, refresh=first.refresh)
+
+            assert SurrealDBConnectionManager.get_session_token() == renewed.access
+            assert SurrealDBConnectionManager.get_refresh_token() == renewed.refresh
+
+    @pytest.mark.asyncio
+    async def test_store_false_leaves_the_stored_pair_alone(self) -> None:
+        async with auth_client() as client:
+            await _define_refresh_access(client)
+            first = await _signup_refreshable(_unique_email())
+
+            await SurrealDBConnectionManager.signin(access=REFRESH_ACCESS, refresh=first.refresh, store=False)
+
+            assert SurrealDBConnectionManager.get_session_token() == first.access
+            assert SurrealDBConnectionManager.get_refresh_token() == first.refresh
+
+    @pytest.mark.asyncio
+    async def test_a_bogus_refresh_token_raises_an_authentication_error(self) -> None:
+        async with auth_client() as client:
+            await _define_refresh_access(client)
+
+            with pytest.raises(SurrealDbAuthenticationError):
+                await SurrealDBConnectionManager.signin(access=REFRESH_ACCESS, refresh="surreal-refresh-not-a-real-grant")
