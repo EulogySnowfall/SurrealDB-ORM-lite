@@ -508,3 +508,129 @@ class TestInfoE2E:
 
             with pytest.raises(SurrealDbAuthenticationError):
                 await SurrealDBConnectionManager.info()
+
+
+class TestAuthenticateE2E:
+    @pytest.mark.asyncio
+    async def test_re_attaches_a_stored_token(self) -> None:
+        """The web-app round trip: hand the JWT to a client, get it back on the next request."""
+        async with auth_client():
+            email = _unique_email()
+            tokens = await _signup(email)
+            await SurrealDBConnectionManager.invalidate()
+            assert await SurrealDBConnectionManager.info() is None
+
+            await SurrealDBConnectionManager.authenticate(tokens.access)
+
+            info = await SurrealDBConnectionManager.info()
+            assert info is not None and info["email"] == email
+
+    @pytest.mark.asyncio
+    async def test_a_malformed_token_raises_an_authentication_error(self) -> None:
+        """The SDK rejects the shape client-side with a bare ``ValueError``; the ORM must not
+        leak that — a caller catching ``SurrealDbAuthenticationError`` has to see this one."""
+        async with auth_client():
+            with pytest.raises(SurrealDbAuthenticationError):
+                await SurrealDBConnectionManager.authenticate("not-a-jwt")
+
+    @pytest.mark.asyncio
+    async def test_a_failed_authenticate_leaves_the_stored_token_untouched(self) -> None:
+        """The call failed, so it changed nothing. Only the ``get_client()`` replay drops a
+        token, and only once the server has rejected the one it was holding."""
+        async with auth_client():
+            await _signup(_unique_email())
+            before = SurrealDBConnectionManager.get_session_token()
+
+            with pytest.raises(SurrealDbAuthenticationError):
+                await SurrealDBConnectionManager.authenticate("not-a-jwt")
+
+            assert SurrealDBConnectionManager.get_session_token() == before
+
+    @pytest.mark.asyncio
+    async def test_store_false_authenticates_without_adopting_the_identity(self) -> None:
+        async with auth_client():
+            tokens = await _signup(_unique_email())
+            await SurrealDBConnectionManager.invalidate()
+
+            await SurrealDBConnectionManager.authenticate(tokens.access, store=False)
+
+            assert await SurrealDBConnectionManager.info() is not None, "the session did change"
+            assert SurrealDBConnectionManager.get_session_token() is None, "but nothing was adopted"
+
+
+class TestInvalidateE2E:
+    @pytest.mark.asyncio
+    async def test_leaves_the_connection_usable_at_the_configured_identity(self) -> None:
+        """The SDK's ``invalidate()`` alone leaves the session anonymous, and every later ORM
+        call on that shared client would fail. The ORM signs back in, so "log out" does not
+        mean "break the connection"."""
+        async with auth_client() as client:
+            await _signup(_unique_email())
+
+            await SurrealDBConnectionManager.invalidate()
+
+            await client.query(f"SELECT * FROM {AUTH_TABLE};", {})  # no reconnect() needed
+
+    @pytest.mark.asyncio
+    async def test_really_ends_the_record_session(self) -> None:
+        """Unlike a system-user signin, which leaves ``$auth`` in place."""
+        async with auth_client() as client:
+            await _signup(_unique_email())
+
+            await SurrealDBConnectionManager.invalidate()
+
+            assert await client.query("RETURN $auth;", {}) is None
+
+    @pytest.mark.asyncio
+    async def test_forgets_the_session_token(self) -> None:
+        async with auth_client():
+            await _signup(_unique_email())
+            assert SurrealDBConnectionManager.get_session_token() is not None
+
+            await SurrealDBConnectionManager.invalidate()
+
+            assert SurrealDBConnectionManager.get_session_token() is None
+            assert SurrealDBConnectionManager.get_refresh_token() is None
+
+
+class TestSessionIntrospectionE2E:
+    @pytest.mark.asyncio
+    async def test_tracks_signin_authenticate_and_invalidate(self) -> None:
+        async with auth_client():
+            assert not SurrealDBConnectionManager.is_authenticated()
+
+            tokens = await _signup(_unique_email())
+            assert SurrealDBConnectionManager.is_authenticated()
+            assert SurrealDBConnectionManager.get_session_token() == tokens.access
+
+            await SurrealDBConnectionManager.invalidate()
+            assert not SurrealDBConnectionManager.is_authenticated()
+
+            await SurrealDBConnectionManager.authenticate(tokens.access)
+            assert SurrealDBConnectionManager.is_authenticated()
+
+    @pytest.mark.asyncio
+    async def test_store_false_mints_a_token_without_adopting_it(self) -> None:
+        """Issuing a JWT for a web client must not change what *this* process runs as."""
+        async with auth_client():
+            tokens = await SurrealDBConnectionManager.signup(
+                access=AUTH_ACCESS,
+                variables={"email": _unique_email(), "pass": PASSWORD},
+                store=False,
+            )
+
+            assert tokens.access
+            assert SurrealDBConnectionManager.get_session_token() is None
+            assert not SurrealDBConnectionManager.is_authenticated()
+
+    @pytest.mark.asyncio
+    async def test_unset_connection_forgets_the_session(self) -> None:
+        async with auth_client():
+            await _signup(_unique_email())
+            assert SurrealDBConnectionManager.is_authenticated()
+
+        # auth_client()'s teardown calls unset_connection(); no token may outlive it, or the
+        # next test's first get_client() would replay a dead identity.
+        assert not SurrealDBConnectionManager.is_authenticated()
+        assert SurrealDBConnectionManager.get_session_token() is None
+        assert SurrealDBConnectionManager.get_refresh_token() is None

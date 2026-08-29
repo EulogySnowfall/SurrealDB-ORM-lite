@@ -409,6 +409,109 @@ class SurrealDBConnectionManager:
         return adopted
 
     @classmethod
+    async def authenticate(cls, token: str, *, store: bool = True) -> None:
+        """Authenticate the connection with a JWT obtained earlier.
+
+        The other half of handing ``tokens.access`` to a web client: give it back here on the
+        next request and the connection resumes that identity.
+
+        .. warning::
+            Like :meth:`signin`, this changes the identity of the whole connection — every
+            model shares it.
+
+        A failure changes nothing: the previously stored token is left in place, because the
+        call that failed never took effect. (Only the reconnect replay drops a stored token,
+        and only after the server has rejected the one it was holding.)
+
+        :param store: whether to adopt this token as the identity replayed on reconnect.
+        :raises SurrealDbAuthenticationError: if the token is malformed, expired or revoked.
+            A malformed one never reaches the server — the SDK rejects its shape with a plain
+            ``ValueError``, which is normalised here like any other authentication failure.
+        """
+        client = await cls.get_client()
+        try:
+            await client.authenticate(token)
+        except Exception as exc:
+            raise wrap_auth_error(exc, "authenticate") from exc
+
+        if store:
+            cls.__session_token = token
+            # A JWT handed in from outside brings no refresh token with it. Keeping the one
+            # from a previous session would pair a refresh token with an identity it cannot
+            # renew — worse than having none.
+            cls.__refresh_token = None
+
+    @classmethod
+    async def invalidate(cls) -> None:
+        """End the current session and return the connection to its configured identity.
+
+        ::
+
+            await SurrealDBConnectionManager.invalidate()   # log the record user out
+
+        This is the only way to really end a record session: signing in as a system user swaps
+        the permissions but leaves ``$auth`` pointing at the record, so ``info()`` would keep
+        reporting it.
+
+        The SDK's ``invalidate()`` on its own leaves the session **anonymous**, and since the
+        manager caches one client per event loop, every later ORM call on that connection —
+        one the caller never closed — would fail. So the stored token is forgotten and the
+        credentials given to :meth:`set_connection` are signed in again: "log the record user
+        out, back to the application's own identity", not "break the connection".
+
+        :raises SurrealDbAuthenticationError: if the server refuses either step.
+        """
+        client = await cls.get_client()
+        try:
+            await client.invalidate()
+        except Exception as exc:
+            raise wrap_auth_error(exc, "invalidate") from exc
+
+        cls.__session_token = None
+        cls.__refresh_token = None
+
+        try:
+            await client.signin({"username": cls.__user, "password": cls.__password})
+            if cls.__namespace is not None and cls.__database is not None:
+                await client.use(cls.__namespace, cls.__database)
+        except Exception as exc:
+            raise wrap_auth_error(exc, "invalidate (restoring the configured identity)") from exc
+
+    @classmethod
+    def is_authenticated(cls) -> bool:
+        """Whether the manager holds a session token it will replay on reconnect.
+
+        This answers "has someone signed in through the ORM", **not** "is the connection
+        usable": a connection with no session token is still authenticated as the configured
+        user and works normally.
+
+        :return: True if a session token is stored, False otherwise.
+        """
+        return cls.__session_token is not None
+
+    @classmethod
+    def get_session_token(cls) -> str | None:
+        """The stored access token (JWT), or ``None``.
+
+        Useful for putting the token in a web session so a later request can restore the
+        identity with :meth:`authenticate`. It is a credential — do not log it.
+
+        :return: The stored access token, or None if no session is held.
+        """
+        return cls.__session_token
+
+    @classmethod
+    def get_refresh_token(cls) -> str | None:
+        """The stored refresh token, or ``None``.
+
+        Populated only on SurrealDB 3.x, and only when the access method declares
+        ``WITH REFRESH``; 2.6.x cannot parse that clause, so it is always ``None`` there.
+
+        :return: The stored refresh token, or None if there is none.
+        """
+        return cls.__refresh_token
+
+    @classmethod
     async def info(cls, *, return_type: Any = None) -> Any:
         """Return the record the connection is authenticated as, or ``None``.
 
