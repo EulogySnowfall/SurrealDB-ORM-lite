@@ -25,7 +25,6 @@ from surreal_orm_lite import SurrealDBConnectionManager
 from surreal_orm_lite.auth import AuthTokens, build_auth_payload, wrap_auth_error
 from surreal_orm_lite.exceptions import (
     SurrealDbAuthenticationError,
-    SurrealDbConnectionError,
     SurrealDbError,
     SurrealDbValidationError,
 )
@@ -188,6 +187,19 @@ class TestBuildAuthPayloadValidation:
         with pytest.raises(ValueError):
             build_auth_payload(username=username, password=password)
 
+    def test_rejects_half_an_explicit_target_for_record_access(self) -> None:
+        """An explicit namespace paired with the configured database points the signin at a
+        target the caller never named. Explicit means explicit."""
+        for half in ({"namespace": "other_ns"}, {"database": "other_db"}):
+            with pytest.raises(ValueError):
+                build_auth_payload(
+                    access="acct",
+                    variables={"email": "a@b.c"},
+                    default_namespace="ns",
+                    default_database="db",
+                    **half,
+                )
+
     def test_rejects_a_database_without_a_namespace(self) -> None:
         """SurrealDB scopes a database inside a namespace; the pair is meaningless alone."""
         with pytest.raises(ValueError):
@@ -225,14 +237,14 @@ class TestWrapAuthError:
 # ---------------------------------------------------------------------------
 
 
-def _url() -> str:
+def _url(scheme: str = "ws") -> str:
     host = os.environ.get("SURREALDB_HOST", "localhost")
     port = os.environ.get("SURREALDB_PORT", "8000")
-    return f"ws://{host}:{port}/rpc"
+    return f"ws://{host}:{port}/rpc" if scheme == "ws" else f"http://{host}:{port}"
 
 
-def _connect() -> None:
-    SurrealDBConnectionManager.set_connection(url=_url(), user="root", password="root", namespace="ns", database="db")
+def _connect(scheme: str = "ws") -> None:
+    SurrealDBConnectionManager.set_connection(url=_url(scheme), user="root", password="root", namespace="ns", database="db")
 
 
 def _unique_email() -> str:
@@ -263,7 +275,7 @@ DEFINE ACCESS OVERWRITE {AUTH_ACCESS} ON DATABASE TYPE RECORD
 
 
 @contextlib.asynccontextmanager
-async def auth_client(*, permissions: str = SELF_READABLE) -> AsyncIterator[Any]:
+async def auth_client(*, permissions: str = SELF_READABLE, scheme: str = "ws") -> AsyncIterator[Any]:
     """Connected ORM client with a record-access method defined, removed again afterwards.
 
     An async context manager rather than a pytest fixture: the SDK's WebSocket client is bound
@@ -274,7 +286,7 @@ async def auth_client(*, permissions: str = SELF_READABLE) -> AsyncIterator[Any]
     session authenticated as a record user (or anonymous), and neither can drop a table. It
     then calls ``unset_connection()`` so no session token survives into the next test.
     """
-    _connect()
+    _connect(scheme)
     client = await SurrealDBConnectionManager.get_client()
     await client.query(f"DEFINE TABLE OVERWRITE {AUTH_TABLE} SCHEMALESS PERMISSIONS {permissions};", {})
     await client.query(DEFINE_ACCESS, {})
@@ -679,10 +691,11 @@ class TestSessionPersistenceE2E:
             await SurrealDBConnectionManager.signin(username="root", password="root", store=False)
             await client.query(f"REMOVE ACCESS {AUTH_ACCESS} ON DATABASE;", {})
 
-            with pytest.raises(SurrealDbAuthenticationError) as caught:
+            # SurrealDbAuthenticationError and SurrealDbConnectionError are siblings, so
+            # pinning the type here IS the guarantee that a dead token is not reported as a
+            # network failure — which would send callers debugging their infrastructure.
+            with pytest.raises(SurrealDbAuthenticationError):
                 await SurrealDBConnectionManager.reconnect()
-
-            assert not isinstance(caught.value, SurrealDbConnectionError)
 
     @pytest.mark.asyncio
     async def test_a_revoked_token_is_dropped_and_the_connection_stays_usable(self) -> None:
@@ -720,7 +733,13 @@ async def _define_refresh_access(client: Any) -> None:
     """
     try:
         await client.query(DEFINE_REFRESH_ACCESS, {})
-    except Exception as exc:  # noqa: BLE001 — any parse failure means the feature is absent
+    except Exception as exc:
+        # ONLY a parse failure means the feature is absent. Skipping on any exception would
+        # turn a real 3.x regression — a permissions problem, a dropped connection, a future
+        # syntax change — into a green run, which is exactly what the skip must never hide.
+        message = str(exc).lower()
+        if "bearer" not in message and "parse error" not in message:
+            raise
         pytest.skip(f"DEFINE ACCESS … WITH REFRESH requires SurrealDB 3.x: {exc}")
 
 
@@ -821,3 +840,87 @@ class TestPublicExports:
 
         assert surreal_orm_lite.SurrealDbAuthenticationError is SurrealDbAuthenticationError
         assert "SurrealDbAuthenticationError" in surreal_orm_lite.__all__
+
+
+#: A well-formed JWT the server will reject — as opposed to "not-a-jwt", which the SDK refuses
+#: client-side on shape alone. Both must leave the connection usable.
+FORGED_JWT = "eyJhbGciOiJIUzI1NiJ9.eyJJRCI6ImZha2UifQ.bogussignature"
+
+
+@pytest.mark.parametrize("scheme", ["ws", "http"])
+class TestAuthSurvivesTheTransportE2E:
+    """HTTP and WebSocket fail differently, so both are exercised here.
+
+    The SDK's HTTP ``authenticate()`` assigns ``self.token`` **before** sending, while the
+    WebSocket one never touches it. So on HTTP a rejected token stays stamped on the client
+    and poisons every later request with a raw ``401`` — the ORM caches that client for the
+    life of the event loop, which would leave an application permanently broken by the most
+    ordinary failure this feature has.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("bad_token", ["not-a-jwt", FORGED_JWT])
+    async def test_a_failed_authenticate_leaves_the_connection_usable(self, scheme: str, bad_token: str) -> None:
+        async with auth_client(scheme=scheme) as client:
+            await _signup(_unique_email())
+
+            with pytest.raises(SurrealDbAuthenticationError):
+                await SurrealDBConnectionManager.authenticate(bad_token)
+
+            # Identity-agnostic on purpose: any authenticated session can evaluate this, so a
+            # failure here means the *connection* is broken, not that permissions are missing.
+            assert await client.query("RETURN 1;", {}) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_revoked_token_leaves_the_connection_usable_after_the_replay(self, scheme: str) -> None:
+        async with auth_client(scheme=scheme) as client:
+            await _signup(_unique_email())
+            await SurrealDBConnectionManager.signin(username="root", password="root", store=False)
+            await client.query(f"REMOVE ACCESS {AUTH_ACCESS} ON DATABASE;", {})
+
+            with contextlib.suppress(SurrealDbAuthenticationError):
+                await SurrealDBConnectionManager.reconnect()
+
+            assert SurrealDBConnectionManager.get_session_token() is None
+            recovered = await SurrealDBConnectionManager.get_client()
+            assert await recovered.query("RETURN 1;", {}) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_identity_survives_a_reconnect(self, scheme: str) -> None:
+        async with auth_client(scheme=scheme):
+            email = _unique_email()
+            await _signup(email)
+
+            await SurrealDBConnectionManager.reconnect()
+
+            info = await SurrealDBConnectionManager.info()
+            assert info is not None and info["email"] == email
+
+
+class TestClearSession:
+    @pytest.mark.asyncio
+    async def test_forgets_the_tokens_without_touching_the_connection(self) -> None:
+        async with auth_client() as client:
+            await _signup(_unique_email())
+            assert SurrealDBConnectionManager.is_authenticated()
+
+            SurrealDBConnectionManager.clear_session()
+
+            assert not SurrealDBConnectionManager.is_authenticated()
+            assert SurrealDBConnectionManager.get_session_token() is None
+            assert SurrealDBConnectionManager.get_refresh_token() is None
+            # The live session is untouched — only the replay is forgotten.
+            assert await client.query("RETURN $auth.email;", {}) is not None
+
+    @pytest.mark.asyncio
+    async def test_set_connection_drops_a_token_from_another_server(self) -> None:
+        """A JWT is bound to a server, namespace, database and access method. Re-pointing the
+        manager must not carry it over, or the next connection replays a foreign identity and
+        the failure surfaces from an unrelated ORM call."""
+        async with auth_client():
+            await _signup(_unique_email())
+            assert SurrealDBConnectionManager.is_authenticated()
+
+            _connect()  # same call an application makes to re-point the manager
+
+            assert SurrealDBConnectionManager.get_session_token() is None

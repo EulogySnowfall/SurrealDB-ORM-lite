@@ -36,6 +36,10 @@ class AuthTokens:
     handing back ``None``), and the repr redacts. A token that lands in a log line, a
     traceback or a pytest assertion diff is a leaked credential, so there is deliberately
     **no** ``__str__`` returning the JWT either — read ``tokens.access`` explicitly.
+
+    Redaction covers every rendering path (``repr``, ``str``, f-strings, nesting in a list or
+    dict). It cannot cover ``dataclasses.asdict()`` / ``astuple()``, which read the fields
+    directly — so do not hand this object to a generic serialiser.
     """
 
     access: str
@@ -120,6 +124,13 @@ def build_auth_payload(
     if variables is None and refresh is None:
         raise ValueError("access= needs variables= (to sign in) or refresh= (to renew a session).")
 
+    if (namespace is None) != (database is None):
+        # Half-explicit is a trap: pairing an explicit namespace with the *configured*
+        # database (or vice versa) points the signin at a target the caller never named.
+        raise ValueError(
+            "Pass namespace= and database= together, or neither — pairing one explicit value "
+            "with the configured default silently targets a database you did not name."
+        )
     resolved_namespace = namespace if namespace is not None else default_namespace
     resolved_database = database if database is not None else default_database
     if resolved_namespace is None or resolved_database is None:

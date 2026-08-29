@@ -55,7 +55,9 @@ that identity across reconnects, and read back who is signed in.
   ```
 
 - **`is_authenticated()`, `get_session_token()`, `get_refresh_token()`** — introspection, for
-  putting a JWT in a web session.
+  putting a JWT in a web session — and **`clear_session()`**, the local counterpart to
+  `invalidate()`: it forgets the stored tokens without a server round trip and without
+  touching the live session.
 
 ### Changed
 
@@ -82,6 +84,12 @@ that identity across reconnects, and read back who is signed in.
 - **Signing in as a system user does not end a record session.** SurrealDB swaps the
   permissions but leaves `$auth` pointing at the record, so `info()` keeps reporting it. Only
   `invalidate()` really logs a record user out. Identical on both lines.
+- **`namespace=` and `database=` go together** for record access. Pairing one explicit value
+  with the configured default would point the signin at a target the caller never named, so
+  half-explicit raises `ValueError`.
+- **`set_connection()` drops any stored session token**, the same way it already drops the
+  cached stored-function signatures: a JWT is bound to a server, namespace, database and
+  access method, so it must not survive a re-point.
 - **Auth changes the identity of the whole connection.** One client is cached per event loop and
   every model shares it, so an auth call affects every subsequent ORM operation — not just the
   caller's.

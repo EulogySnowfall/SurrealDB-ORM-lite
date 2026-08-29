@@ -92,7 +92,10 @@ class SurrealDBConnectionManager:
         cls.__namespace = namespace
         cls.__database = database
         # Signatures belong to the server that declared them; re-pointing the connection must
-        # not hand stale ones to the new one.
+        # not hand stale ones to the new one. A JWT is bound even more tightly — to a server,
+        # namespace, database and access method — so it is dropped for the same reason, and
+        # the alternative is a replay failure surfacing from an unrelated ORM call later.
+        cls.clear_session()
         cls.clear_function_signature_cache()
 
     @classmethod
@@ -105,8 +108,7 @@ class SurrealDBConnectionManager:
         cls.__password = None
         cls.__namespace = None
         cls.__database = None
-        cls.__session_token = None
-        cls.__refresh_token = None
+        cls.clear_session()
         cls.clear_function_signature_cache()
         await cls.close_all_connections()
 
@@ -171,7 +173,6 @@ class SurrealDBConnectionManager:
             await _client.signin({"username": cls.__user, "password": cls.__password})
             await _client.use(cls.__namespace, cls.__database)
 
-            cls.__clients[loop] = _client
         except Exception as e:
             logger.warning(f"Can't get connection: {e}")
             stale = cls.__clients.pop(loop, None)
@@ -185,7 +186,14 @@ class SurrealDBConnectionManager:
         # only the identity is gone — and collapsing the two would send callers debugging
         # their network. The client stays cached and usable at the configured identity, so
         # the caller can simply sign in again.
-        await cls._replay_session(_client)
+        # Published only once the replay has settled — in a `finally`, so a rejected token
+        # still leaves a usable client behind. Caching it *before* awaiting the replay would
+        # let a concurrent get_client() on this loop take the fast path and run statements as
+        # the configured root user while the record identity is still being established.
+        try:
+            await cls._replay_session(_client)
+        finally:
+            cls.__clients[loop] = _client
         return _client
 
     @classmethod
@@ -202,9 +210,14 @@ class SurrealDBConnectionManager:
         token = cls.__session_token
         if token is None:
             return
+        # See authenticate(): on HTTP the SDK stamps the token before sending, so a rejected
+        # one must be rolled back or the freshly built client is born poisoned.
+        previous = getattr(client, "token", None)
         try:
             await client.authenticate(token)
         except Exception as exc:
+            with contextlib.suppress(Exception):
+                client.token = previous
             cls.__session_token = None
             cls.__refresh_token = None
             raise wrap_auth_error(exc, "restoring the session on a new connection") from exc
@@ -397,8 +410,9 @@ class SurrealDBConnectionManager:
         the connection is left authenticated as the newly created record, exactly as
         :meth:`signin` leaves it; the warnings there apply here too.
 
-        ``access`` and ``variables`` are keyword arguments with no default so that omitting one
-        raises a :class:`ValueError` explaining what is missing, rather than a bare ``TypeError``.
+        ``access`` and ``variables`` are declared optional in the signature so that omitting one
+        raises a :class:`ValueError` explaining what is missing, rather than a bare
+        ``TypeError``. Both are required in practice.
 
         :raises ValueError: if ``access`` or ``variables`` is missing — before any request.
         :raises SurrealDbAuthenticationError: if the server refuses the signup.
@@ -457,9 +471,16 @@ class SurrealDBConnectionManager:
             ``ValueError``, which is normalised here like any other authentication failure.
         """
         client = await cls.get_client()
+        # The SDK's HTTP connection assigns `self.token` BEFORE sending, unlike the WebSocket
+        # one. So a rejected token stays stamped on the client and every later request comes
+        # back 401 — and since the manager caches that client for the life of the event loop,
+        # one bad JWT would break the application permanently. Restore what was there.
+        previous = getattr(client, "token", None)
         try:
             await client.authenticate(token)
         except Exception as exc:
+            with contextlib.suppress(Exception):
+                client.token = previous
             raise wrap_auth_error(exc, "authenticate") from exc
 
         if store:
@@ -495,15 +516,34 @@ class SurrealDBConnectionManager:
         except Exception as exc:
             raise wrap_auth_error(exc, "invalidate") from exc
 
-        cls.__session_token = None
-        cls.__refresh_token = None
+        cls.clear_session()
 
         try:
             await client.signin({"username": cls.__user, "password": cls.__password})
             if cls.__namespace is not None and cls.__database is not None:
                 await client.use(cls.__namespace, cls.__database)
         except Exception as exc:
+            # The session is anonymous at this point — exactly the state this method exists to
+            # avoid. Drop the client so the next get_client() rebuilds at the configured
+            # identity, rather than handing every later call a dead connection.
+            with contextlib.suppress(Exception):
+                await cls.close_connection()
             raise wrap_auth_error(exc, "invalidate (restoring the configured identity)") from exc
+
+    @classmethod
+    def clear_session(cls) -> None:
+        """Forget the stored tokens without touching the server or the connection settings.
+
+        The local counterpart to :meth:`invalidate`: that one ends the session on the server
+        and costs two round trips, while this simply stops the manager replaying an identity
+        on the next connection. Useful when an application drops a user locally, and in tests
+        that must not leak a token into the next one.
+
+        The **current** connection keeps whatever identity it already has; only the replay is
+        forgotten. Call :meth:`invalidate` when you mean to log out for real.
+        """
+        cls.__session_token = None
+        cls.__refresh_token = None
 
     @classmethod
     def is_authenticated(cls) -> bool:
