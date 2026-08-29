@@ -25,6 +25,7 @@ from surreal_orm_lite import SurrealDBConnectionManager
 from surreal_orm_lite.auth import AuthTokens, build_auth_payload, wrap_auth_error
 from surreal_orm_lite.exceptions import (
     SurrealDbAuthenticationError,
+    SurrealDbConnectionError,
     SurrealDbError,
     SurrealDbValidationError,
 )
@@ -634,3 +635,63 @@ class TestSessionIntrospectionE2E:
         assert not SurrealDBConnectionManager.is_authenticated()
         assert SurrealDBConnectionManager.get_session_token() is None
         assert SurrealDBConnectionManager.get_refresh_token() is None
+
+
+class TestSessionPersistenceE2E:
+    @pytest.mark.asyncio
+    async def test_the_identity_survives_a_reconnect(self) -> None:
+        """Without the replay this returns None: the new connection would be plain root, a
+        silent privilege change the caller never asked for."""
+        async with auth_client():
+            email = _unique_email()
+            await _signup(email)
+
+            await SurrealDBConnectionManager.reconnect()
+
+            info = await SurrealDBConnectionManager.info()
+            assert info is not None and info["email"] == email
+
+    @pytest.mark.asyncio
+    async def test_the_identity_survives_a_dropped_client(self) -> None:
+        """The case nobody writes on purpose: a loop ends, its client is dropped, and the next
+        call rebuilds one (issue #163). It must come back as the same user."""
+        async with auth_client():
+            email = _unique_email()
+            await _signup(email)
+
+            await SurrealDBConnectionManager.close_connection()
+
+            info = await SurrealDBConnectionManager.info()  # rebuilds the client
+            assert info is not None and info["email"] == email
+
+    @pytest.mark.asyncio
+    async def test_a_revoked_token_fails_as_an_auth_error_not_a_connection_error(self) -> None:
+        """A dead token is not a network problem, and reporting it as one sends people
+        debugging their infrastructure. The connection is fine; only the identity is gone."""
+        async with auth_client() as client:
+            await _signup(_unique_email())
+            # Regain root WITHOUT adopting root's token, so the record token stays the one
+            # the next connection will replay.
+            await SurrealDBConnectionManager.signin(username="root", password="root", store=False)
+            await client.query(f"REMOVE ACCESS {AUTH_ACCESS} ON DATABASE;", {})
+
+            with pytest.raises(SurrealDbAuthenticationError) as caught:
+                await SurrealDBConnectionManager.reconnect()
+
+            assert not isinstance(caught.value, SurrealDbConnectionError)
+
+    @pytest.mark.asyncio
+    async def test_a_revoked_token_is_dropped_and_the_connection_stays_usable(self) -> None:
+        """Self-healing: the dead token is forgotten, so the very next call connects at the
+        configured identity instead of failing forever."""
+        async with auth_client() as client:
+            await _signup(_unique_email())
+            await SurrealDBConnectionManager.signin(username="root", password="root", store=False)
+            await client.query(f"REMOVE ACCESS {AUTH_ACCESS} ON DATABASE;", {})
+
+            with contextlib.suppress(SurrealDbAuthenticationError):
+                await SurrealDBConnectionManager.reconnect()
+
+            assert SurrealDBConnectionManager.get_session_token() is None
+            recovered = await SurrealDBConnectionManager.get_client()
+            await recovered.query("INFO FOR DB;", {})

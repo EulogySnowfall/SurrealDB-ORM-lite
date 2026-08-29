@@ -172,7 +172,6 @@ class SurrealDBConnectionManager:
             await _client.use(cls.__namespace, cls.__database)
 
             cls.__clients[loop] = _client
-            return _client
         except Exception as e:
             logger.warning(f"Can't get connection: {e}")
             stale = cls.__clients.pop(loop, None)
@@ -180,6 +179,35 @@ class SurrealDBConnectionManager:
                 with contextlib.suppress(NotImplementedError):
                     await stale.close()
             raise SurrealDbConnectionError("Can't connect to the database.") from None
+
+        # Deliberately after the client is cached and OUTSIDE the except above. A dead token
+        # is not a connection failure — the socket is up, the configured credentials worked,
+        # only the identity is gone — and collapsing the two would send callers debugging
+        # their network. The client stays cached and usable at the configured identity, so
+        # the caller can simply sign in again.
+        await cls._replay_session(_client)
+        return _client
+
+    @classmethod
+    async def _replay_session(cls, client: Any) -> None:
+        """Re-establish the stored identity on a freshly built connection.
+
+        Clients are per event loop and are dropped whenever a loop dies (issue #163), so
+        without this a ``reconnect()`` would silently hand back the configured root identity
+        — a privilege change nobody asked for, and one that fails open rather than closed.
+
+        A rejected token is forgotten before raising, so the next call connects normally
+        instead of failing forever on a credential the caller can no longer see.
+        """
+        token = cls.__session_token
+        if token is None:
+            return
+        try:
+            await client.authenticate(token)
+        except Exception as exc:
+            cls.__session_token = None
+            cls.__refresh_token = None
+            raise wrap_auth_error(exc, "restoring the session on a new connection") from exc
 
     @classmethod
     async def close_connection(cls) -> None:
