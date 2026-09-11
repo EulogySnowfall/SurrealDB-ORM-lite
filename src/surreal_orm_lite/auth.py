@@ -6,8 +6,9 @@ trip), and the error normalisation. ``connection_manager.py`` holds the async me
 them.
 
 Keeping this module I/O-free mirrors how ``functions.py`` backs ``call_function()``: it
-imports only :mod:`.exceptions`, so it stays cycle-free — and it is where v0.17.0's
-``AuthenticatedUserMixin`` will land.
+imports only :mod:`.exceptions`, so it stays cycle-free. v0.17.0's
+``AuthenticatedUserMixin`` therefore lives in :mod:`.model_auth` instead: it needs
+``connection_manager``, which already imports this module.
 """
 
 from collections.abc import Mapping
