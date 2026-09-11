@@ -25,7 +25,8 @@
 | v0.14.0           | Tier 1 — Computed Fields                             | Done    |
 | v0.15.0           | Tier 1 — `call_function()` (custom `fn::`)           | Done    |
 | v0.16.0           | Tier 1 — Connection-level auth (JWT / record users)  | Done    |
-| v0.17.0 – v0.22.0 | Tier 1 — Core (model auth, live, relations)          | Planned |
+| v0.17.0           | Tier 1 — Model auth (`AuthenticatedUserMixin`)       | Done    |
+| v0.18.0 – v0.22.0 | Tier 1 — Core (aliases & DX, live, relations)        | Planned |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 7 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
@@ -69,7 +70,7 @@ pieces stay out.
 | Computed fields                     | `DEFINE FIELD … VALUE` via `query()`                  | ✅ v0.14.0     |
 | `call_function()`                   | `query()` + `fn::name($args)` ¹                       | ✅ v0.15.0     |
 | JWT / scope auth (connection)       | `signup`/`signin`/`authenticate`/`invalidate`/`info`  | ✅ v0.16.0     |
-| JWT / scope auth (model mixin)      | idem, on a `BaseSurrealModel` subclass                | v0.17.0        |
+| JWT / scope auth (model mixin)      | idem, on a `BaseSurrealModel` subclass                | ✅ v0.17.0     |
 | Field aliases & DX                  | Pydantic `Field(alias=)` + config                     | v0.18.0        |
 | Live Models / Live Queries          | `live()` / `subscribe_live()` / `kill()`              | v0.19 – v0.20  |
 | Change Feeds / Auto-Resubscribe     | live queries + reconnect logic                        | v0.21.0        |
@@ -133,6 +134,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | Computed fields               | yes        | ✅ v0.14.0                  |
 | `call_function()`             | yes        | ✅ v0.15.0                  |
 | JWT Authentication            | yes        | ✅ v0.16.0 (connection)     |
+| Model-level auth mixin        | yes        | ✅ v0.17.0                  |
 | Field aliases & DX            | yes        | v0.18.0                     |
 | Live Models / CDC             | yes        | v0.19 – v0.21               |
 | Native typed relations        | yes        | v0.22.0                     |
@@ -304,6 +306,30 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - Model-level auth (`AuthenticatedUserMixin`, `User.signup()` returning an instance) is v0.17.0;
   a `define_access()` DDL helper belongs with `schema.py` at v0.31.0
 
+### Version 0.17.0 — Model-level authentication
+
+- `AuthenticatedUserMixin` turns a `BaseSurrealModel` subclass into a user model: `signup()`,
+  `signin()`, `authenticate()` and `refresh()` return **hydrated instances**
+  (`AuthResult.user`) instead of bare tokens, paired with the v0.16.0 `AuthTokens`
+- **Session isolation is the headline.** Every call runs on its own short-lived connection via
+  `SurrealDBConnectionManager.ephemeral_client()`, so the process-wide client keeps the identity
+  `set_connection()` gave it. v0.16.0's connection-level `signin()` re-identifies everything
+  sharing that client, which makes it unusable per-request in a concurrent server; `bind=True`
+  opts back into that behaviour deliberately
+- `access_ddl()` / `define_access()` render and apply `DEFINE ACCESS … TYPE RECORD` from the
+  model, mirroring v0.14.0's `computed_field_ddl()` / `define_computed_fields()` pair. The
+  `DEFINE TABLE … PERMISSIONS FOR select WHERE id = $auth.id` ships with it by default, because
+  without it a signin succeeds yet returns no record — v0.16.0's sharpest gotcha
+- A configured `primary_key` makes SIGNUP target `type::thing('<table>', $<pk>)`, so the record
+  stays addressable by the ORM afterwards instead of landing on a random id
+- The hydrated instance's password field holds the **hash**; SurrealDB returns the stored record
+- New `SurrealConfigDict` keys: `access_name`, `identifier_field`, `password_field`,
+  `auth_algorithm`, `auth_duration_token`, `auth_duration_session`, `auth_duration_grant`,
+  `with_refresh`
+- **Same on both lines** except `with_refresh=True` / `refresh()`, which are **3.x only**: 2.6.x
+  cannot parse `WITH REFRESH`, so `define_access()` raises a message naming the requirement and
+  those tests self-skip. Refresh tokens rotate
+
 ### Version 0.14.0 — Computed fields
 
 - `Computed[T] = computed("<expr>")` declares a field SurrealDB derives from other fields on
@@ -402,7 +428,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 | Version    | Theme                                                                       | SDK 2.0 primitive |
 | ---------- | --------------------------------------------------------------------------- | ----------------- |
 | ✅ v0.16.0 | Connection-level auth: `signin`/`signup`/`authenticate`/`invalidate`/`info` | SDK auth methods  |
-| v0.17.0    | `AuthenticatedUserMixin` (model-level signup/signin, scoped sessions)       | idem              |
+| ✅ v0.17.0 | `AuthenticatedUserMixin` (model-level signup/signin, isolated sessions)     | idem              |
 | v0.18.0    | Field aliases (`Field(alias=)`) + `server_fields` + `merge(refresh=False)`  | Pydantic + config |
 
 ### 🟡 Phase D — Real-time

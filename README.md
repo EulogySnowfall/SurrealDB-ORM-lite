@@ -161,6 +161,7 @@ results = await User.objects().query(
 | Computed fields        | ✅     |
 | Stored `fn::` calls    | ✅     |
 | JWT / record auth      | ✅     |
+| Model-level auth mixin | ✅     |
 
 ### Supported Filter Lookups
 
@@ -866,6 +867,94 @@ persist(tokens.refresh)   # REQUIRED — see below
 
 ---
 
+### 19. Model-level authentication (`AuthenticatedUserMixin`)
+
+Where section 18 authenticates the _connection_, this authenticates a **model**: declare a user
+model, let the ORM generate its `DEFINE ACCESS` statement, and get **hydrated model instances**
+back instead of bare tokens.
+
+```python
+from surreal_orm_lite import AuthenticatedUserMixin, BaseSurrealModel, SurrealConfigDict
+
+class User(AuthenticatedUserMixin, BaseSurrealModel):
+    model_config = SurrealConfigDict(access_name="account")
+
+    id: str | None = None
+    email: str
+    password: str
+    name: str = ""
+
+# Once, at start-up — emits DEFINE TABLE … PERMISSIONS + DEFINE ACCESS …
+await User.define_access()
+
+result = await User.signup(email="ada@example.com", password="s3cret", name="Ada")
+result.user     # a User instance, carrying the id the server generated
+result.tokens   # AuthTokens — repr redacts, so no JWT reaches your logs
+
+result = await User.signin(email="ada@example.com", password="s3cret")
+
+# A later request carrying the stored JWT: token → current user
+me = await User.authenticate(result.tokens.access)
+```
+
+**Each call runs on its own short-lived connection.** The process-wide client keeps the identity
+`set_connection()` gave it, so a web application can authenticate concurrent users without them
+trampling each other — the footgun that makes section 18's `signin()` unsuitable per-request.
+Pass `bind=True` to _also_ adopt the token process-wide (handy in a script or notebook, wrong in
+a concurrent server).
+
+The model must declare either an `id` field or a `primary_key`, as every ORM model must. Prefer
+`id` here so the server mints the record id during SIGNUP; configure `primary_key` when identity
+_is_ a column, and the SIGNUP clause targets `type::thing(…)` to match.
+
+#### Configuration
+
+| Key                     | Default          | Purpose                                      |
+| ----------------------- | ---------------- | -------------------------------------------- |
+| `access_name`           | `<table>_access` | Name of the `DEFINE ACCESS` method           |
+| `identifier_field`      | `email`          | Field a user signs in with                   |
+| `password_field`        | `password`       | Field holding the password hash              |
+| `auth_algorithm`        | `argon2`         | `argon2` / `bcrypt` / `pbkdf2` / `scrypt`    |
+| `auth_duration_token`   | `15m`            | JWT lifetime                                 |
+| `auth_duration_session` | `12h`            | Session lifetime                             |
+| `with_refresh`          | `False`          | Emit `WITH REFRESH` — **SurrealDB 3.x only** |
+| `auth_duration_grant`   | `30d`            | Refresh-grant lifetime                       |
+
+#### Inspecting the DDL before applying it
+
+`access_ddl()` is pure — it renders without touching the database, so you can print it, diff it,
+or feed it to a migration:
+
+```python
+for statement in User.access_ddl():
+    print(statement)
+# DEFINE TABLE OVERWRITE User SCHEMALESS PERMISSIONS FOR select, update WHERE id = $auth.id;
+# DEFINE ACCESS OVERWRITE account ON DATABASE TYPE RECORD SIGNUP ( ... ) SIGNIN ( ... ) ...;
+```
+
+The `DEFINE TABLE` ships **by default**, and deliberately: without `FOR select WHERE id = $auth.id`
+a signin succeeds and `$auth` is set, yet the server returns no record — so no instance can be
+built. `define_access(with_table=False)` opts out when you manage the table yourself.
+
+> **The password field holds the hash.** SurrealDB returns the stored record, so
+> `result.user.password` is `$argon2id$v=19$…`, never the plaintext you submitted.
+
+#### Renewing a session (SurrealDB 3.x only)
+
+```python
+class User(AuthenticatedUserMixin, BaseSurrealModel):
+    model_config = SurrealConfigDict(access_name="account", with_refresh=True)
+    ...
+
+result = await User.refresh(stored_refresh_token)
+persist(result.tokens.refresh)   # REQUIRED — refresh tokens rotate
+```
+
+On SurrealDB 2.6.x the `WITH REFRESH` clause does not parse at all, so `define_access()` raises a
+`SurrealDbError` that says exactly that, and no refresh token ever exists.
+
+---
+
 ## Configuration Options
 
 ### Custom Primary Key
@@ -977,6 +1066,11 @@ listed behave the same on both lines.
 | `info()` when the record's table denies it `select` on itself                                                                          | returns `None` (no error)                                                              | returns `None` (no error)                                                | v0.16.0 |
 | Signing in as a system user while a record session is open                                                                             | permissions change, `$auth` still points at the record — only `invalidate()` clears it | same on both lines                                                       | v0.16.0 |
 | Duplicate signin identifier in the record table                                                                                        | signin fails (`No record was returned`)                                                | signin succeeds, picking one record                                      | v0.16.0 |
+| Model auth (`signup`/`signin`/`authenticate`, `access_ddl`/`define_access`)                                                            | same on both lines (verified on 2.6.5)                                                 | same on both lines (verified on 3.2.4)                                   | v0.17.0 |
+| Model auth session isolation (each call on its own ephemeral connection)                                                               | same on both lines (an SDK/connection property, not a server one)                      | same on both lines (verified on 3.2.4)                                   | v0.17.0 |
+| Hydrated instance's password field after `signup`/`signin`                                                                             | holds the stored **hash**, never the plaintext                                         | same on both lines                                                       | v0.17.0 |
+| Model config `with_refresh=True` → `define_access()`                                                                                   | raises `SurrealDbError` (clause does not parse; message names the 3.x requirement)     | applies, and `AuthResult.tokens.refresh` is populated                    | v0.17.0 |
+| `Model.refresh(token)` renewal                                                                                                         | unavailable — no refresh token can exist                                               | returns a fresh, rotated pair; the spent token is rejected               | v0.17.0 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
 
@@ -1009,7 +1103,8 @@ Contributions are welcome! Please:
 | v0.14.3 – v0.14.5 | Correctness: `$`-values, record-id lookups, loops  | ✅ Released |
 | v0.15.0           | `call_function()` — custom `fn::` stored functions | ✅ Released |
 | v0.16.0           | Connection auth (`signin`/`signup`/`info`)         | ✅ Released |
-| v0.17.0 – v0.22.0 | Tier 1 — Core (model auth, live, relations)        | 📋 Planned  |
+| v0.17.0           | Model auth (`AuthenticatedUserMixin`)              | ✅ Released |
+| v0.18.0 – v0.22.0 | Tier 1 — Core (aliases & DX, live, relations)      | 📋 Planned  |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)    | 📋 Planned  |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)   | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)                 | 📋 Planned  |
@@ -1051,6 +1146,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Computed fields               | ✅ v0.14.0              | ✅               |
 | `call_function()` (`fn::`)    | ✅ v0.15.0              | ✅               |
 | JWT Authentication            | ✅ v0.16.0 (connection) | ✅               |
+| Model auth mixin              | ✅ v0.17.0              | ✅               |
 | Field Aliases & DX            | v0.18.0                 | ✅               |
 | Live Models / CDC             | v0.19 – v0.21           | ✅               |
 | Native typed relations        | v0.22.0                 | ✅               |

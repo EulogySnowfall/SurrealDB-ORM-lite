@@ -5,6 +5,76 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.17.0] - 2026-09-11
+
+Authenticate a **model**, not just the connection: declare a user model, let the ORM generate its
+`DEFINE ACCESS` statement, and get **hydrated model instances** back from signup and signin —
+each on its own short-lived connection, so the shared client's identity is never disturbed.
+
+### Added
+
+- **`AuthenticatedUserMixin`** — mix it into a `BaseSurrealModel` subclass for
+  `signup()`, `signin()`, `authenticate()` and `refresh()`:
+
+  ```python
+  class User(AuthenticatedUserMixin, BaseSurrealModel):
+      model_config = SurrealConfigDict(access_name="account")
+
+      id: str | None = None
+      email: str
+      password: str
+      name: str = ""
+
+  await User.define_access()                 # once, at start-up
+
+  result = await User.signup(email="ada@example.com", password="s3cret", name="Ada")
+  result.user     # a User instance, with the id the server generated
+  result.tokens   # AuthTokens
+
+  me = await User.authenticate(result.tokens.access)   # token → current user
+  ```
+
+- **`AuthResult`** — a frozen, generic dataclass pairing `.user` with `.tokens`. Its repr
+  delegates to `AuthTokens`, so no JWT reaches a log line, a traceback or an assertion diff.
+
+- **`access_ddl()` / `define_access()`** — render and apply the model's authentication DDL,
+  mirroring v0.14.0's `computed_field_ddl()` / `define_computed_fields()` pair. `access_ddl()`
+  is pure, so it can be printed, diffed or fed to a migration; `define_access()` is idempotent
+  and safe at start-up.
+
+- **`SurrealDBConnectionManager.ephemeral_client()`** — a short-lived, anonymous client on the
+  configured URL/namespace/database that never enters the per-event-loop cache.
+
+- **Auth keys on `SurrealConfigDict`** — `access_name`, `identifier_field`, `password_field`,
+  `auth_algorithm`, `auth_duration_token`, `auth_duration_session`, `auth_duration_grant` and
+  `with_refresh`.
+
+### Notes
+
+- **Session isolation is the point.** v0.16.0's `signin()` re-identifies the process-wide client,
+  which makes it unusable per-request in a concurrent server. Every method here runs on its own
+  ephemeral connection instead, so the shared client keeps the identity `set_connection()` gave
+  it. Pass `bind=True` to opt into the older, process-wide behaviour.
+
+- **The `DEFINE TABLE` ships with the access method by default.** Without
+  `PERMISSIONS FOR select WHERE id = $auth.id`, a signin succeeds and `$auth` is set yet the
+  server returns no record — v0.16.0 documented that as this feature's sharpest gotcha, and an
+  API that promises an instance cannot walk into it. When the record is unreadable anyway, the
+  raised error names the missing permission instead of returning `None`.
+
+- **The hydrated instance's password field holds the hash**, not the plaintext, because
+  SurrealDB returns the stored record verbatim.
+
+- **A configured `primary_key` drives the record id**: the SIGNUP clause targets
+  `type::thing('<table>', $<pk>)`, so a signed-up record is addressable by
+  `User.objects().get(...)` afterwards. Models must declare either an `id` field or a
+  `primary_key`, as every ORM model must.
+
+- **Same on both DB lines** for `access_ddl`, `define_access`, `signup`, `signin` and
+  `authenticate`. **3.x only**: `with_refresh=True` and `refresh()` — SurrealDB 2.6.x cannot
+  parse `WITH REFRESH`, so `define_access()` raises a message naming the requirement and those
+  tests self-skip. Refresh tokens **rotate**: a spent one is rejected immediately.
+
 ## [0.16.0] - 2026-08-29
 
 Authenticate the connection as a SurrealDB **record user** or a different **system user**, keep

@@ -1,4 +1,4 @@
-__version__ = "0.16.6"
+__version__ = "0.17.0"
 
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
 from .auth import AuthTokens
