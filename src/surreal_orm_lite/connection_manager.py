@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import logging
 import weakref
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from functools import lru_cache
 from typing import Any
 
@@ -254,6 +254,44 @@ class SurrealDBConnectionManager:
             with contextlib.suppress(NotImplementedError):
                 await client.close()
         cls.__clients.clear()
+
+    @classmethod
+    @contextlib.asynccontextmanager
+    async def ephemeral_client(cls) -> AsyncIterator[Any]:
+        """A short-lived, **anonymous** client on the configured URL/namespace/database.
+
+        Unlike :meth:`get_client`, this never enters the per-event-loop cache and never signs
+        in as the configured user — it is handed to the caller anonymous, ready to be
+        authenticated as somebody else. That is what lets model-level auth (v0.17.0) sign a
+        record user in without re-identifying the connection every other model shares.
+
+        Closed on exit, including when the body raises. Closing is best-effort: a connection
+        the server already dropped must not turn into an error the caller never caused.
+
+        :raises ValueError: if no connection has been configured.
+        :raises SurrealDbConnectionError: if the connection cannot be opened.
+        """
+        if not cls.is_connection_set():
+            raise ValueError("Connection not been set.")
+        assert cls.__url is not None
+        assert cls.__namespace is not None
+        assert cls.__database is not None
+
+        url = cls.__url
+        try:
+            client = AsyncSurreal(url)
+            if url.startswith(("ws://", "wss://")):
+                await client.connect(url)
+            await client.use(cls.__namespace, cls.__database)
+        except Exception as e:
+            logger.warning(f"Can't open an ephemeral connection: {e}")
+            raise SurrealDbConnectionError("Can't connect to the database.") from None
+
+        try:
+            yield client
+        finally:
+            with contextlib.suppress(Exception):
+                await client.close()
 
     @classmethod
     @contextlib.asynccontextmanager
