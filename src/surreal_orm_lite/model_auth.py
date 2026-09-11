@@ -61,11 +61,18 @@ class AuthenticatedUserMixin:
         class User(AuthenticatedUserMixin, BaseSurrealModel):
             model_config = SurrealConfigDict(access_name="account")
 
+            id: str | None = None
             email: str
             password: str
 
         await User.define_access()                       # once, at start-up
         result = await User.signup(email=…, password=…)  # → AuthResult[User]
+
+    The model must satisfy the ORM's standing contract of declaring either an ``id`` field or
+    a ``primary_key`` — otherwise the instance these methods return cannot be constructed at
+    all. Prefer the ``id`` field here: SIGNUP lets the server mint the record id, and this is
+    what receives it. Configure ``primary_key`` instead when the identity *is* a column (say
+    the e-mail address), and the SIGNUP clause will target ``type::thing(…)`` accordingly.
     """
 
     # ------------------------------------------------------------------
