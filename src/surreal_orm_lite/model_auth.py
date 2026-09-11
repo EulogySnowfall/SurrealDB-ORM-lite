@@ -14,6 +14,7 @@ This is a leaf module: it imports ``connection_manager`` and ``auth`` at runtime
 imports ``auth``, so the mixin could not live there).
 """
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
@@ -36,6 +37,12 @@ _M = TypeVar("_M")
 #: server-side, buried in a DDL string — caught here instead.
 _HASH_ALGORITHMS = frozenset({"argon2", "bcrypt", "pbkdf2", "scrypt"})
 
+#: A SurrealQL duration literal (``15m``, ``12h``, ``30d``). Durations are interpolated into the
+#: ``DEFINE ACCESS`` statement, which ``define_access()`` runs on the root-authenticated shared
+#: client — so, like every other interpolated value here, they are validated rather than trusted.
+#: A model config assembled from settings or environment is not an exotic pattern.
+_DURATION_RE = re.compile(r"^\d+(ns|us|ms|s|m|h|d|w|y)$")
+
 
 @dataclass(frozen=True, slots=True)
 class AuthResult(Generic[_M]):
@@ -45,8 +52,10 @@ class AuthResult(Generic[_M]):
     the server-generated id — and, because SurrealDB returns the stored record verbatim, the
     **password hash** rather than the plaintext that was submitted.
 
-    The repr redacts: it delegates to :class:`AuthTokens`, which prints no JWT. That keeps a
-    token out of logs, tracebacks and pytest assertion diffs.
+    The repr keeps the **JWT** out of logs, tracebacks and pytest assertion diffs, by
+    delegating to :class:`AuthTokens`. It does not redact ``user``: that renders the model's own
+    repr, so the password field's stored hash is visible there. A hash is not a plaintext, but
+    do not treat this repr as safe to publish wholesale.
     """
 
     user: _M
@@ -124,6 +133,14 @@ class AuthenticatedUserMixin:
     def get_password_field(cls) -> str:
         """Field holding the password hash — defaults to ``password``."""
         return cls._auth_field("password_field", "password")
+
+    @classmethod
+    def _auth_duration(cls, key: str, default: str) -> str:
+        """Resolve a duration config key, and prove it is a bare SurrealQL duration literal."""
+        value = str(cls._auth_setting(key, default))
+        if not _DURATION_RE.match(value):
+            raise ValueError(f"{key}={value!r} is not a SurrealQL duration literal (e.g. '15m', '12h', '30d').")
+        return value
 
     @classmethod
     def _get_algorithm(cls) -> str:
@@ -217,11 +234,11 @@ class AuthenticatedUserMixin:
             parts.append("WITH REFRESH")
 
         duration = (
-            f"DURATION FOR TOKEN {cls._auth_setting('auth_duration_token', '15m')}, "
-            f"FOR SESSION {cls._auth_setting('auth_duration_session', '12h')}"
+            f"DURATION FOR TOKEN {cls._auth_duration('auth_duration_token', '15m')}, "
+            f"FOR SESSION {cls._auth_duration('auth_duration_session', '12h')}"
         )
         if with_refresh:
-            duration += f", FOR GRANT {cls._auth_setting('auth_duration_grant', '30d')}"
+            duration += f", FOR GRANT {cls._auth_duration('auth_duration_grant', '30d')}"
         parts.append(f"{duration};")
 
         statements.append(" ".join(parts))
@@ -239,6 +256,11 @@ class AuthenticatedUserMixin:
 
         Safe at application start-up: with the default ``overwrite=True`` it is idempotent and
         converges the database onto the model.
+
+        Unlike every other method here, this runs on the **shared** connection and is DDL, so it
+        needs an identity allowed to define access methods — typically the root user
+        ``set_connection()`` configured. Calling it after a ``bind=True`` signin has re-identified
+        that connection as a record user will fail on permissions.
 
         Statements run one per call so a failure can name the offending one. The two server
         lines raise different SDK exceptions for the same bad DDL, so both are normalised to
@@ -280,6 +302,17 @@ class AuthenticatedUserMixin:
     # ------------------------------------------------------------------
 
     @classmethod
+    def _require_connection(cls) -> None:
+        """Fail with the connection error every other ORM entry point raises.
+
+        Without this, ``build_auth_payload`` is reached first with no configured namespace and
+        complains that "record access needs a namespace and a database … or pass namespace=" —
+        advice these methods cannot take, since they do not expose that argument.
+        """
+        if not SurrealDBConnectionManager.is_connection_set():
+            raise ValueError("Connection not been set.")
+
+    @classmethod
     def _auth_variables(cls, action: str, values: dict[str, Any], *, require_all: bool) -> dict[str, Any]:
         """Validate caller kwargs against the model, and bind the access method's variables.
 
@@ -314,13 +347,21 @@ class AuthenticatedUserMixin:
         payload: dict[str, Any] | None,
         token: str | None,
         bind: bool,
+        label: str | None = None,
     ) -> tuple[Any, AuthTokens | None]:
         """Run one auth exchange on a throwaway connection and read the record back.
 
         This is the whole isolation story in one place: the client is built, authenticated,
         queried and closed here, so nothing about the shared connection changes unless the
         caller asked for it with ``bind=True``.
+
+        Args:
+            action: the **SDK method** to call (``signup`` / ``signin``), or ``authenticate``.
+            label: the **ORM method** to name in error messages, when it differs from *action*.
+                :meth:`refresh` rides the SDK's ``signin``, and a caller who asked to refresh
+                should not be told that "signin" failed.
         """
+        label = label or action
         async with SurrealDBConnectionManager.ephemeral_client() as client:
             try:
                 tokens: AuthTokens | None = None
@@ -331,17 +372,17 @@ class AuthenticatedUserMixin:
                     raw = await getattr(client, action)(payload)
                     access = getattr(raw, "access", None)
                     if not access:
-                        raise SurrealDbAuthenticationError(f"The server returned no access token for {action}.")
+                        raise SurrealDbAuthenticationError(f"The server returned no access token for {label}.")
                     tokens = AuthTokens(access=access, refresh=getattr(raw, "refresh", None))
                 record = await client.info()
             except SurrealDbAuthenticationError:
                 raise
             except Exception as exc:
-                raise wrap_auth_error(exc, action) from exc
+                raise wrap_auth_error(exc, label) from exc
 
         if record is None:
             raise SurrealDbAuthenticationError(
-                f"{cls.__name__}.{action}() authenticated successfully but the server returned no "
+                f"{cls.__name__}.{label}() authenticated successfully but the server returned no "
                 f"record, so no instance can be built. The usual cause is table PERMISSIONS: the "
                 f"record cannot select itself. Grant it with 'DEFINE TABLE "
                 f"{cls.get_table_name()} PERMISSIONS FOR select WHERE id = $auth.id;' "  # type: ignore[attr-defined]
@@ -352,6 +393,11 @@ class AuthenticatedUserMixin:
             # Adopted on the *shared* connection as a second, deliberate round trip: the
             # ephemeral client is already closed and was never the shared one.
             await SurrealDBConnectionManager.authenticate(tokens.access)
+            # authenticate() deliberately forgets any refresh token, because a JWT arriving
+            # from outside has none to match it. Here we *do* hold the matching one, so put the
+            # pair back — otherwise a refresh(bind=True) would leave the shared session unable
+            # to renew itself, holding a live rotated token it had silently dropped.
+            SurrealDBConnectionManager._adopt_tokens(tokens, store=True, operation=label)
 
         return cls.from_db(dict(record)), tokens  # type: ignore[attr-defined]
 
@@ -384,6 +430,7 @@ class AuthenticatedUserMixin:
             SurrealDbAuthenticationError: if the server refuses the signup, or returns no
                 record for the new session (the message says how to grant the permission).
         """
+        cls._require_connection()
         variables = cls._auth_variables("signup", fields, require_all=True)
         payload = build_auth_payload(
             access=cls.get_access_name(),
@@ -412,6 +459,7 @@ class AuthenticatedUserMixin:
                 normalised here: the same wrong password surfaces as ``NotFoundError`` on 3.x
                 and ``InternalError`` on 2.6.x.
         """
+        cls._require_connection()
         variables = cls._auth_variables("signin", credentials, require_all=False)
         payload = build_auth_payload(
             access=cls.get_access_name(),
@@ -461,15 +509,28 @@ class AuthenticatedUserMixin:
             you.
 
         Raises:
+            ValueError: if no connection is configured, or the model is not declared with
+                ``with_refresh=True`` — both before any request.
             SurrealDbAuthenticationError: if the token is spent or expired, or the server does
                 not support refresh.
         """
+        cls._require_connection()
+        if not cls._auth_setting("with_refresh", False):
+            # Without this the exchange reaches the server and comes back "No record was
+            # returned" — indistinguishable from a wrong password, for what is actually a
+            # model misconfiguration.
+            raise ValueError(
+                f"{cls.__name__} is not configured for refresh tokens. Set "
+                f"with_refresh=True in its model_config (SurrealDB 3.x only) and re-run "
+                f"define_access() before calling refresh()."
+            )
         payload = build_auth_payload(
             access=cls.get_access_name(),
             refresh=refresh_token,
             default_namespace=SurrealDBConnectionManager.get_namespace(),
             default_database=SurrealDBConnectionManager.get_database(),
         )
-        user, tokens = await cls._authenticate_session(action="signin", payload=payload, token=None, bind=bind)
+        # The SDK renews through signin(); only the wording should say "refresh".
+        user, tokens = await cls._authenticate_session(action="signin", payload=payload, token=None, bind=bind, label="refresh")
         assert tokens is not None
         return AuthResult(user=user, tokens=tokens)

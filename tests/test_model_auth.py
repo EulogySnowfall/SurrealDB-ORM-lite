@@ -379,8 +379,10 @@ class TestSessionIsolationE2E:
             await model.signin(email=email, password=AUTH_PASSWORD)
 
             assert SurrealDBConnectionManager.get_session_token() == before
-            # Still root: a record user could never run this.
+            # `before` is None for a root connection, so that assert alone is weak. These two
+            # carry the real weight: a record user could run neither.
             client = await SurrealDBConnectionManager.get_client()
+            assert await client.info() is None, "shared session became a record user"
             await client.query("INFO FOR DB;", {})
 
     @pytest.mark.asyncio
@@ -485,3 +487,133 @@ class TestPublicExports:
         result = AuthResult(user="whatever", tokens=AuthTokens(access="secret-jwt", refresh="r"))
         assert "secret-jwt" not in repr(result)
         assert "<redacted>" in repr(result)
+
+
+class TestAuthValidation:
+    """Guards that fire before any request reaches a server."""
+
+    def test_rejects_a_duration_that_is_not_a_duration(self) -> None:
+        """Durations are interpolated into DDL that define_access() runs as root."""
+
+        class Sneaky(AuthenticatedUserMixin, BaseSurrealModel):
+            model_config = SurrealConfigDict(auth_duration_token="15m; DEFINE USER hacker ON ROOT PASSWORD 'p' ROLES OWNER")
+            id: str | None = None
+            email: str
+            password: str
+
+        with pytest.raises(ValueError, match="auth_duration_token"):
+            Sneaky.access_ddl()
+
+    def test_accepts_ordinary_duration_literals(self) -> None:
+        class Durations(AuthenticatedUserMixin, BaseSurrealModel):
+            model_config = SurrealConfigDict(auth_duration_token="90s", auth_duration_session="7d")
+            id: str | None = None
+            email: str
+            password: str
+
+        assert "DURATION FOR TOKEN 90s, FOR SESSION 7d;" in Durations.access_ddl(with_table=False)[0]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("method", ["signup", "signin", "authenticate", "refresh"])
+    async def test_every_method_reports_a_missing_connection_the_same_way(self, method: str) -> None:
+        await SurrealDBConnectionManager.unset_connection()
+        calls = {
+            "signup": lambda: E2EUser.signup(email="a@b.c", password=AUTH_PASSWORD),
+            "signin": lambda: E2EUser.signin(email="a@b.c", password=AUTH_PASSWORD),
+            "authenticate": lambda: E2EUser.authenticate("token"),
+            "refresh": lambda: E2EUser.refresh("token"),
+        }
+        with pytest.raises(ValueError, match="Connection not been set"):
+            await calls[method]()
+
+    @pytest.mark.asyncio
+    async def test_refresh_on_a_model_without_with_refresh_says_so(self) -> None:
+        """Otherwise the server answers 'No record was returned' — a wrong-password message."""
+        _connect()
+        try:
+            with pytest.raises(ValueError, match="with_refresh=True"):
+                await E2EUser.refresh("any-token")
+        finally:
+            await SurrealDBConnectionManager.unset_connection()
+
+
+class TestDefineAccessInTransactionE2E:
+    @pytest.mark.asyncio
+    async def test_applies_through_a_transaction(self) -> None:
+        _connect()
+        try:
+            async with SurrealDBConnectionManager.transaction() as tx:
+                applied = await E2EUser.define_access(tx=tx)
+                assert applied == E2EUser.access_ddl()
+
+            # Committed: the access method is really there, and usable.
+            result = await E2EUser.signup(email=_unique_email(), password=AUTH_PASSWORD)
+            assert result.user.get_id() is not None
+        finally:
+            with contextlib.suppress(Exception):
+                client = await SurrealDBConnectionManager.get_client()
+                await client.query("REMOVE ACCESS e2e_acct ON DATABASE;", {})
+                await client.query("REMOVE TABLE E2EUser;", {})
+            await SurrealDBConnectionManager.unset_connection()
+
+
+class TestHttpSchemeE2E:
+    """The ephemeral client skips connect() on HTTP — a distinct code path."""
+
+    @pytest.mark.asyncio
+    async def test_the_full_cycle_works_over_http(self) -> None:
+        async with auth_model(scheme="http") as model:
+            email = _unique_email()
+            created = await model.signup(email=email, password=AUTH_PASSWORD, name="Ada")
+            assert created.user.email == email
+
+            signed_in = await model.signin(email=email, password=AUTH_PASSWORD)
+            assert signed_in.user.get_id() == created.user.get_id()
+
+            me = await model.authenticate(created.tokens.access)
+            assert me.get_id() == created.user.get_id()
+
+
+class TestAuthenticateBindE2E:
+    @pytest.mark.asyncio
+    async def test_bind_true_adopts_the_token_on_the_shared_connection(self) -> None:
+        async with auth_model() as model:
+            created = await model.signup(email=_unique_email(), password=AUTH_PASSWORD)
+
+            me = await model.authenticate(created.tokens.access, bind=True)
+            assert me.get_id() == created.user.get_id()
+            assert SurrealDBConnectionManager.get_session_token() == created.tokens.access
+
+
+class TestBindKeepsTheRefreshTokenE2E:
+    """`bind=True` must not drop a refresh token it actually holds — SurrealDB 3.x only."""
+
+    @pytest.mark.asyncio
+    async def test_the_shared_session_can_still_renew_itself(self) -> None:
+        class BindRefreshUser(AuthenticatedUserMixin, BaseSurrealModel):
+            model_config = SurrealConfigDict(access_name="e2e_bind_refresh", with_refresh=True)
+            id: str | None = None
+            email: str
+            password: str
+
+        _connect()
+        try:
+            try:
+                await BindRefreshUser.define_access()
+            except SurrealDbError as exc:
+                pytest.skip(f"WITH REFRESH requires SurrealDB 3.x: {exc}")
+
+            created = await BindRefreshUser.signup(email=_unique_email(), password=AUTH_PASSWORD, bind=True)
+            assert created.tokens.refresh is not None
+
+            # CM.authenticate() clears the refresh token by design; the mixin puts the matching
+            # one back, so the bound session is not left holding a live token it forgot.
+            assert SurrealDBConnectionManager.get_session_token() == created.tokens.access
+            assert SurrealDBConnectionManager.get_refresh_token() == created.tokens.refresh
+        finally:
+            with contextlib.suppress(Exception):
+                await SurrealDBConnectionManager.invalidate()
+                client = await SurrealDBConnectionManager.get_client()
+                await client.query("REMOVE ACCESS e2e_bind_refresh ON DATABASE;", {})
+                await client.query("REMOVE TABLE BindRefreshUser;", {})
+            await SurrealDBConnectionManager.unset_connection()
