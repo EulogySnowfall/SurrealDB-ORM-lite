@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import logging
 import weakref
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from functools import lru_cache
 from typing import Any
 
@@ -135,6 +135,56 @@ class SurrealDBConnectionManager:
             logger.debug("Dropped the cached SurrealDB client of a closed event loop.")
 
     @classmethod
+    def require_connection(cls) -> None:
+        """Raise the canonical error if no connection has been configured.
+
+        One owner for this check, so the wording stays identical everywhere it is raised —
+        :meth:`get_client`, :meth:`ephemeral_client` and the model-level auth entry points all
+        call it, and the tests match the literal string.
+        """
+        if not cls.is_connection_set():
+            raise ValueError("Connection not been set.")
+
+    @classmethod
+    async def _open_client(cls, *, signin_as_configured: bool) -> Any:
+        """Open one SDK client on the configured URL/namespace/database.
+
+        The single owner of the open handshake, so its quirks — ``connect()`` only for
+        WebSocket, ``use()`` after signin — live in one place rather than being re-derived by
+        every caller that needs a connection.
+
+        A failure closes whatever was half-opened before raising: ``connect()`` can succeed and
+        ``use()`` still fail, and leaving that socket behind leaks one live connection per
+        attempt against a flaky server.
+
+        :param signin_as_configured: sign in as the configured user. ``False`` yields an
+            **anonymous** client, ready to be authenticated as somebody else.
+        """
+        assert cls.__url is not None
+        assert cls.__namespace is not None
+        assert cls.__database is not None
+
+        url = cls.__url
+        client: Any = None
+        try:
+            client = AsyncSurreal(url)
+            # WebSocket connections require explicit connect()
+            if url.startswith(("ws://", "wss://")):
+                await client.connect(url)
+            if signin_as_configured:
+                assert cls.__user is not None
+                assert cls.__password is not None
+                await client.signin({"username": cls.__user, "password": cls.__password})
+            await client.use(cls.__namespace, cls.__database)
+        except Exception as e:
+            logger.warning(f"Can't get connection: {e}")
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await client.close()
+            raise SurrealDbConnectionError("Can't connect to the database.") from None
+        return client
+
+    @classmethod
     async def get_client(cls) -> Any:
         """
         Connect to the SurrealDB instance, reusing this event loop's client.
@@ -151,10 +201,9 @@ class SurrealDBConnectionManager:
         if existing is not None:
             return existing
 
-        if not cls.is_connection_set():
-            raise ValueError("Connection not been set.")
+        cls.require_connection()
 
-        # After is_connection_set(), these are guaranteed to be non-None
+        # After require_connection(), these are guaranteed to be non-None
         assert cls.__url is not None
         assert cls.__namespace is not None
         assert cls.__database is not None
@@ -163,23 +212,13 @@ class SurrealDBConnectionManager:
 
         # Establish the connection
         try:
-            url = cls.__url
-            _client = AsyncSurreal(url)
-
-            # WebSocket connections require explicit connect()
-            if url.startswith(("ws://", "wss://")):
-                await _client.connect(url)
-
-            await _client.signin({"username": cls.__user, "password": cls.__password})
-            await _client.use(cls.__namespace, cls.__database)
-
-        except Exception as e:
-            logger.warning(f"Can't get connection: {e}")
+            _client = await cls._open_client(signin_as_configured=True)
+        except SurrealDbConnectionError:
             stale = cls.__clients.pop(loop, None)
             if stale is not None:  # pragma: no cover
                 with contextlib.suppress(NotImplementedError):
                     await stale.close()
-            raise SurrealDbConnectionError("Can't connect to the database.") from None
+            raise
 
         # Deliberately after the client is cached and OUTSIDE the except above. A dead token
         # is not a connection failure — the socket is up, the configured credentials worked,
@@ -254,6 +293,30 @@ class SurrealDBConnectionManager:
             with contextlib.suppress(NotImplementedError):
                 await client.close()
         cls.__clients.clear()
+
+    @classmethod
+    @contextlib.asynccontextmanager
+    async def ephemeral_client(cls) -> AsyncIterator[Any]:
+        """A short-lived, **anonymous** client on the configured URL/namespace/database.
+
+        Unlike :meth:`get_client`, this never enters the per-event-loop cache and never signs
+        in as the configured user — it is handed to the caller anonymous, ready to be
+        authenticated as somebody else. That is what lets model-level auth (v0.17.0) sign a
+        record user in without re-identifying the connection every other model shares.
+
+        Closed on exit, including when the body raises. Closing is best-effort: a connection
+        the server already dropped must not turn into an error the caller never caused.
+
+        :raises ValueError: if no connection has been configured.
+        :raises SurrealDbConnectionError: if the connection cannot be opened.
+        """
+        cls.require_connection()
+        client = await cls._open_client(signin_as_configured=False)
+        try:
+            yield client
+        finally:
+            with contextlib.suppress(Exception):
+                await client.close()
 
     @classmethod
     @contextlib.asynccontextmanager
@@ -451,7 +514,7 @@ class SurrealDBConnectionManager:
         return adopted
 
     @classmethod
-    async def authenticate(cls, token: str, *, store: bool = True) -> None:
+    async def authenticate(cls, token: str, *, store: bool = True, refresh: str | None = None) -> None:
         """Authenticate the connection with a JWT obtained earlier.
 
         The other half of handing ``tokens.access`` to a web client: give it back here on the
@@ -466,6 +529,10 @@ class SurrealDBConnectionManager:
         and only after the server has rejected the one it was holding.)
 
         :param store: whether to adopt this token as the identity replayed on reconnect.
+        :param refresh: the refresh token that belongs with *token*, when the caller holds the
+            matching pair (model-level auth does). Omitted, any previously stored refresh token
+            is dropped — a JWT handed in from outside brings none, and pairing a stale one with
+            a new identity is worse than having none.
         :raises SurrealDbAuthenticationError: if the token is malformed, expired or revoked.
             A malformed one never reaches the server — the SDK rejects its shape with a plain
             ``ValueError``, which is normalised here like any other authentication failure.
@@ -485,10 +552,10 @@ class SurrealDBConnectionManager:
 
         if store:
             cls.__session_token = token
-            # A JWT handed in from outside brings no refresh token with it. Keeping the one
-            # from a previous session would pair a refresh token with an identity it cannot
-            # renew — worse than having none.
-            cls.__refresh_token = None
+            # A JWT handed in from outside brings no refresh token with it, so the previous
+            # session's one is dropped rather than left paired with an identity it cannot
+            # renew. A caller that *does* hold the matching pair passes refresh=.
+            cls.__refresh_token = refresh
 
     @classmethod
     async def invalidate(cls) -> None:

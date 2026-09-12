@@ -1,4 +1,4 @@
-__version__ = "0.16.6"
+__version__ = "0.17.0"
 
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
 from .auth import AuthTokens
@@ -27,6 +27,7 @@ from .functions import (
     Var,
     computed,
 )
+from .model_auth import AuthenticatedUserMixin, AuthResult
 from .model_base import BaseSurrealModel, SurrealConfigDict
 from .q import Q
 from .query_set import QuerySet
@@ -80,6 +81,8 @@ __all__ = [
     "around_delete",
     # Authentication
     "AuthTokens",
+    "AuthResult",
+    "AuthenticatedUserMixin",
     # Concurrency
     "retry_on_conflict",
     "is_conflict_error",

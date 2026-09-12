@@ -26,6 +26,7 @@ from .signals import (
 )
 from .transaction import Transaction
 from .utils import (
+    apply_ddl_statements,
     build_set_clause,
     format_record_id,
     merge_extra_vars,
@@ -65,10 +66,28 @@ class SurrealConfigDict(ConfigDict):
 
     Attributes:
         primary_key (str | None): The primary key field name for the model.
+        access_name (str | None): Name of the DEFINE ACCESS method (v0.17.0).
+        identifier_field (str | None): Field a user signs in with (v0.17.0).
+        password_field (str | None): Field holding the password hash (v0.17.0).
+        auth_algorithm (str | None): crypto:: hash family used by the access method.
+        auth_duration_token (str | None): JWT lifetime, e.g. "15m".
+        auth_duration_session (str | None): Session lifetime, e.g. "12h".
+        auth_duration_grant (str | None): Refresh-grant lifetime; 3.x, WITH REFRESH only.
+        with_refresh (bool | None): Emit WITH REFRESH — SurrealDB 3.x only.
     """
 
     primary_key: str | None
     " The primary key field name for the model. "
+
+    # --- v0.17.0: model-level authentication (see model_auth.AuthenticatedUserMixin) ---
+    access_name: str | None
+    identifier_field: str | None
+    password_field: str | None
+    auth_algorithm: str | None
+    auth_duration_token: str | None
+    auth_duration_session: str | None
+    auth_duration_grant: str | None
+    with_refresh: bool | None
 
 
 class BaseSurrealModel(BaseModel):
@@ -191,15 +210,7 @@ class BaseSurrealModel(BaseModel):
             return []
         # Cheap even inside a transaction: get_client() returns the already-connected client.
         client = await SurrealDBConnectionManager.get_client()
-        for statement in statements:
-            try:
-                if tx is not None:
-                    await tx.add(statement, None)
-                else:
-                    await client.query(statement, {})
-            except ServerError as e:
-                raise SurrealDbError(f"Can't apply computed field definition: {statement} -> {e}") from e
-        return statements
+        return await apply_ddl_statements(statements, client=client, tx=tx, what="computed field")
 
     @classmethod
     def get_table_name(cls) -> str:
