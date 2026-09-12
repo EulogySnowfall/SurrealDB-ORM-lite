@@ -5,8 +5,9 @@ import warnings
 from collections.abc import Iterable, Mapping
 from typing import Any, cast
 
-from ._sdk import RecordID
+from ._sdk import RecordID, ServerError
 from .constants import LOOKUP_OPERATORS
+from .exceptions import SurrealDbError
 from .functions import SurrealFunc, Var
 
 # Pattern for valid field names: alphanumeric, underscores, dots (for nested fields)
@@ -539,3 +540,39 @@ def validate_patch_operations(operations: Any) -> None:
             if "from" not in op:
                 raise ValueError(f"patch operation #{i} ({kind!r}) is missing required 'from'")
             validate_json_pointer(op["from"], f"operation #{i} from")
+
+
+async def apply_ddl_statements(
+    statements: list[str],
+    *,
+    client: Any,
+    tx: Any = None,
+    what: str,
+    hint: str = "",
+) -> list[str]:
+    """Run DDL statements one at a time, normalising every rejection to `SurrealDbError`.
+
+    One statement per call so a failure can name the offending one, and one owner for the
+    error handling because the exception type depends on *how* the statement was run:
+
+    - directly, or in a **buffered** transaction, the SDK surfaces a ``ServerError``
+      (``InternalError`` on 2.6.x, ``ValidationError`` on 3.x);
+    - in a **native interactive** transaction (WebSocket + SurrealDB 3.x), ``Transaction.add``
+      has already inspected the response and raised ``SurrealDbError`` itself.
+
+    Catching only the first leaves the interactive path propagating a bare
+    "Transaction failed and rolled back" with no mention of which definition caused it.
+
+    :param what: names the kind of definition, for the message (e.g. ``"access"``).
+    :param hint: appended to the message — extra guidance when the cause is likely known.
+    :returns: the statements applied, so callers can hand them straight back.
+    """
+    for statement in statements:
+        try:
+            if tx is not None:
+                await tx.add(statement, None)
+            else:
+                await client.query(statement, {})
+        except (ServerError, SurrealDbError) as e:
+            raise SurrealDbError(f"Can't apply {what} definition: {statement} -> {e}{hint}") from e
+    return statements

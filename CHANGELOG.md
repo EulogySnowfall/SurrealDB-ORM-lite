@@ -49,6 +49,13 @@ each on its own short-lived connection, so the shared client's identity is never
   `auth_algorithm`, `auth_duration_token`, `auth_duration_session`, `auth_duration_grant` and
   `with_refresh`.
 
+- **`SurrealDBConnectionManager.authenticate(token, *, refresh=None)`** — accepts the refresh
+  token that belongs with _token_, for callers holding the matching pair. Omitted, behaviour is
+  unchanged (any stored refresh token is dropped).
+
+- **`SurrealDBConnectionManager.require_connection()`** — the "Connection not been set." check,
+  now owned in one place instead of being re-spelled by each caller.
+
 ### Notes
 
 - **Session isolation is the point.** v0.16.0's `signin()` re-identifies the process-wide client,
@@ -69,6 +76,15 @@ each on its own short-lived connection, so the shared client's identity is never
   `type::thing('<table>', $<pk>)`, so a signed-up record is addressable by
   `User.objects().get(...)` afterwards. Models must declare either an `id` field or a
   `primary_key`, as every ORM model must.
+
+- **`signup()` validates the whole payload before the exchange.** A required field with no
+  default used to be sent as `NONE`: SurrealDB created the account and issued tokens, and only
+  then did hydration fail — leaving an orphaned record the caller never saw. Model defaults are
+  now applied, and a genuinely missing field raises before any request.
+
+- **`define_access()` normalises errors from a native interactive transaction too.** Those raise
+  `SurrealDbError` rather than the SDK's `ServerError`, which previously slipped past the
+  wrapper. The apply-DDL path is now shared with `define_computed_fields()`, so both benefit.
 
 - **Same on both DB lines** for `access_ddl`, `define_access`, `signup`, `signin` and
   `authenticate`. **3.x only**: `with_refresh=True` and `refresh()` — SurrealDB 2.6.x cannot

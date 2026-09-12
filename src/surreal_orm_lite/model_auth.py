@@ -18,12 +18,11 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from ._sdk import ServerError
 from .auth import AuthTokens, build_auth_payload, wrap_auth_error
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbAuthenticationError, SurrealDbError
 from .transaction import Transaction
-from .utils import validate_alias_name, validate_field_name
+from .utils import apply_ddl_statements, validate_alias_name, validate_field_name
 
 if TYPE_CHECKING:  # pragma: no cover
     from typing import Self
@@ -97,9 +96,14 @@ class AuthenticatedUserMixin:
 
     @classmethod
     def _model_field_names(cls) -> list[str]:
-        """This model's Pydantic field names, excluding computed ones."""
+        """This model's Pydantic field names, excluding computed ones.
+
+        Computed fields come from ``get_computed_fields()`` — model_base calls it "the single
+        source of truth every write path consults", and reading the backing attribute directly
+        would let a future rename silently start writing computed fields into SIGNUP.
+        """
         fields = getattr(cls, "model_fields", {}) or {}
-        computed = getattr(cls, "__surreal_computed__", {}) or {}
+        computed = cls.get_computed_fields()  # type: ignore[attr-defined]
         return [name for name in fields if name not in computed]
 
     @classmethod
@@ -163,6 +167,34 @@ class AuthenticatedUserMixin:
         return [name for name in cls._model_field_names() if name != "id"]
 
     @classmethod
+    def _signup_primary_key(cls) -> str | None:
+        """The primary key SIGNUP builds the record id from, or ``None`` for a server id.
+
+        The key has to be *bindable*: SIGNUP renders ``type::thing(table, $pk)``, so a key that
+        is not among the fields signup sends would evaluate to ``type::thing(table, NONE)`` and
+        fail server-side with an opaque error. ``primary_key="id"`` is the trap — ``id`` is
+        deliberately excluded from the signup payload (the server mints it), so it can never be
+        bound. Caught here, at render time, rather than on every signup.
+        """
+        primary_key = cls.get_index_primary_key()  # type: ignore[attr-defined]
+        if primary_key is None:
+            return None
+        validate_field_name(primary_key)
+        if primary_key not in cls._signup_fields():
+            if primary_key == "id":
+                raise ValueError(
+                    f"{cls.__name__} sets primary_key='id', which model-level auth cannot use: "
+                    f"SIGNUP lets the server mint the record id, so $id is never bound. Drop "
+                    f"primary_key and declare an `id` field instead, or point primary_key at a "
+                    f"real column such as the identifier field."
+                )
+            raise ValueError(
+                f"{cls.__name__} sets primary_key={primary_key!r}, which is not a field signup "
+                f"can bind. Known signup fields: {', '.join(cls._signup_fields())}."
+            )
+        return str(primary_key)
+
+    @classmethod
     def access_ddl(cls, *, overwrite: bool = True, with_table: bool = True) -> list[str]:
         """Render this model's authentication DDL. Pure — it touches no database.
 
@@ -210,12 +242,8 @@ class AuthenticatedUserMixin:
         # The record id follows the model's primary key, because the rest of the ORM does: a
         # random id here would leave User.objects().get(email=…) addressing a record the
         # signup never wrote.
-        primary_key = cls.get_index_primary_key()  # type: ignore[attr-defined]
-        if primary_key is not None:
-            validate_field_name(primary_key)
-            target = f"type::thing('{table}', ${primary_key})"
-        else:
-            target = table
+        primary_key = cls._signup_primary_key()
+        target = f"type::thing('{table}', ${primary_key})" if primary_key is not None else table
 
         assignments = ", ".join(
             f"{name} = crypto::{algorithm}::generate(${name})" if name == password else f"{name} = ${name}"
@@ -279,38 +307,22 @@ class AuthenticatedUserMixin:
                 ``WITH REFRESH`` at all, and the message says so.
         """
         statements = cls.access_ddl(overwrite=overwrite, with_table=with_table)
+        # Gated on the model's own flag, not on the rendered text: a model with a field named
+        # `refresh_token` puts "refresh" in the SIGNUP clause without asking for the feature,
+        # and would otherwise collect a misleading "3.x required" hint on any rejection.
+        hint = ""
+        if cls._auth_setting("with_refresh", False):
+            hint = (
+                " Note: WITH REFRESH requires SurrealDB 3.x; 2.6.x cannot parse it. "
+                "Set with_refresh=False to support both lines."
+            )
         # Cheap even inside a transaction: get_client() returns the already-connected client.
         client = await SurrealDBConnectionManager.get_client()
-        for statement in statements:
-            try:
-                if tx is not None:
-                    await tx.add(statement, None)
-                else:
-                    await client.query(statement, {})
-            except ServerError as e:
-                hint = ""
-                if "REFRESH" in statement.upper():
-                    hint = (
-                        " Note: WITH REFRESH requires SurrealDB 3.x; 2.6.x cannot parse it. "
-                        "Set with_refresh=False to support both lines."
-                    )
-                raise SurrealDbError(f"Can't apply access definition: {statement} -> {e}{hint}") from e
-        return statements
+        return await apply_ddl_statements(statements, client=client, tx=tx, what="access", hint=hint)
 
     # ------------------------------------------------------------------
     # Authentication
     # ------------------------------------------------------------------
-
-    @classmethod
-    def _require_connection(cls) -> None:
-        """Fail with the connection error every other ORM entry point raises.
-
-        Without this, ``build_auth_payload`` is reached first with no configured namespace and
-        complains that "record access needs a namespace and a database … or pass namespace=" —
-        advice these methods cannot take, since they do not expose that argument.
-        """
-        if not SurrealDBConnectionManager.is_connection_set():
-            raise ValueError("Connection not been set.")
 
     @classmethod
     def _auth_variables(cls, action: str, values: dict[str, Any], *, require_all: bool) -> dict[str, Any]:
@@ -332,12 +344,42 @@ class AuthenticatedUserMixin:
         identifier = cls.get_identifier_field()
         password = cls.get_password_field()
         for required in (identifier, password):
-            if not values.get(required):
+            # `is None`, not falsiness: 0, "" and False are values a caller may legitimately
+            # have passed (an integer identifier field, say), and refusing them as "missing"
+            # would reject a credential that was in fact supplied.
+            if values.get(required) is None:
                 raise ValueError(f"{cls.__name__}.{action}() requires {required}=.")
 
-        if require_all:
-            return {name: values.get(name) for name in cls._signup_fields()}
-        return {identifier: values[identifier], password: values[password]}
+        if not require_all:
+            return {identifier: values[identifier], password: values[password]}
+
+        # Every field the SIGNUP clause names must be bound. Resolving that here — against the
+        # model's own defaults, and refusing an omitted required field *before* the exchange —
+        # is what stops signup from creating the account server-side and only then failing to
+        # build the instance, which would leave the caller with neither tokens nor a record
+        # they knew was created.
+        model_fields = getattr(cls, "model_fields", {}) or {}
+        payload: dict[str, Any] = {}
+        missing: list[str] = []
+        for name in cls._signup_fields():
+            if name in values:
+                payload[name] = values[name]
+                continue
+            field = model_fields.get(name)
+            if field is None:
+                payload[name] = None
+            elif field.is_required():
+                missing.append(name)
+            else:
+                payload[name] = field.get_default(call_default_factory=True)
+        if missing:
+            raise ValueError(
+                f"{cls.__name__}.{action}() is missing required field"
+                f"{'s' if len(missing) > 1 else ''}: {', '.join(missing)}. "
+                f"They have no default, so the instance could not be built from the record "
+                f"the server would create."
+            )
+        return payload
 
     @classmethod
     async def _authenticate_session(
@@ -392,14 +434,51 @@ class AuthenticatedUserMixin:
         if bind and tokens is not None:
             # Adopted on the *shared* connection as a second, deliberate round trip: the
             # ephemeral client is already closed and was never the shared one.
-            await SurrealDBConnectionManager.authenticate(tokens.access)
-            # authenticate() deliberately forgets any refresh token, because a JWT arriving
-            # from outside has none to match it. Here we *do* hold the matching one, so put the
-            # pair back — otherwise a refresh(bind=True) would leave the shared session unable
-            # to renew itself, holding a live rotated token it had silently dropped.
-            SurrealDBConnectionManager._adopt_tokens(tokens, store=True, operation=label)
+            # refresh= because we hold the *matching* pair: without it the shared session
+            # would be left unable to renew itself, holding a live rotated token it had
+            # silently dropped.
+            await SurrealDBConnectionManager.authenticate(tokens.access, refresh=tokens.refresh)
 
-        return cls.from_db(dict(record)), tokens  # type: ignore[attr-defined]
+        try:
+            user = cls.from_db(dict(record))  # type: ignore[attr-defined]
+        except Exception as exc:
+            # The exchange already succeeded, so on signup the account now exists and a token
+            # was issued — both of which a bare pydantic ValidationError would hide. Say so, or
+            # the caller retries a signup that will then fail as a duplicate.
+            raise SurrealDbError(
+                f"{cls.__name__}.{label}() succeeded on the server but the returned record does "
+                f"not fit the model, so no instance could be built: {exc}. The session is "
+                f"authenticated and, for a signup, the record has been created — reconcile the "
+                f"model with the table rather than retrying."
+            ) from exc
+
+        return user, tokens
+
+    @classmethod
+    async def _exchange(
+        cls,
+        *,
+        action: str,
+        payload_kwargs: dict[str, Any],
+        bind: bool,
+        label: str | None = None,
+    ) -> "AuthResult[Self]":
+        """Build the payload, run the exchange, and pair the instance with its tokens.
+
+        The shared body of :meth:`signup`, :meth:`signin` and :meth:`refresh`, which differ only
+        in the credentials they send and the name they answer to. Three copies of these five
+        steps had already started to drift; one owner makes the next change a decision instead
+        of an omission.
+        """
+        payload = build_auth_payload(
+            access=cls.get_access_name(),
+            default_namespace=SurrealDBConnectionManager.get_namespace(),
+            default_database=SurrealDBConnectionManager.get_database(),
+            **payload_kwargs,
+        )
+        user, tokens = await cls._authenticate_session(action=action, payload=payload, token=None, bind=bind, label=label)
+        assert tokens is not None, "a successful exchange always yields tokens"
+        return AuthResult(user=user, tokens=tokens)
 
     @classmethod
     async def signup(cls, *, bind: bool = False, **fields: Any) -> "AuthResult[Self]":
@@ -430,17 +509,9 @@ class AuthenticatedUserMixin:
             SurrealDbAuthenticationError: if the server refuses the signup, or returns no
                 record for the new session (the message says how to grant the permission).
         """
-        cls._require_connection()
+        SurrealDBConnectionManager.require_connection()
         variables = cls._auth_variables("signup", fields, require_all=True)
-        payload = build_auth_payload(
-            access=cls.get_access_name(),
-            variables=variables,
-            default_namespace=SurrealDBConnectionManager.get_namespace(),
-            default_database=SurrealDBConnectionManager.get_database(),
-        )
-        user, tokens = await cls._authenticate_session(action="signup", payload=payload, token=None, bind=bind)
-        assert tokens is not None
-        return AuthResult(user=user, tokens=tokens)
+        return await cls._exchange(action="signup", payload_kwargs={"variables": variables}, bind=bind)
 
     @classmethod
     async def signin(cls, *, bind: bool = False, **credentials: Any) -> "AuthResult[Self]":
@@ -459,17 +530,9 @@ class AuthenticatedUserMixin:
                 normalised here: the same wrong password surfaces as ``NotFoundError`` on 3.x
                 and ``InternalError`` on 2.6.x.
         """
-        cls._require_connection()
+        SurrealDBConnectionManager.require_connection()
         variables = cls._auth_variables("signin", credentials, require_all=False)
-        payload = build_auth_payload(
-            access=cls.get_access_name(),
-            variables=variables,
-            default_namespace=SurrealDBConnectionManager.get_namespace(),
-            default_database=SurrealDBConnectionManager.get_database(),
-        )
-        user, tokens = await cls._authenticate_session(action="signin", payload=payload, token=None, bind=bind)
-        assert tokens is not None
-        return AuthResult(user=user, tokens=tokens)
+        return await cls._exchange(action="signin", payload_kwargs={"variables": variables}, bind=bind)
 
     @classmethod
     async def authenticate(cls, token: str, *, bind: bool = False) -> "Self":
@@ -514,7 +577,7 @@ class AuthenticatedUserMixin:
             SurrealDbAuthenticationError: if the token is spent or expired, or the server does
                 not support refresh.
         """
-        cls._require_connection()
+        SurrealDBConnectionManager.require_connection()
         if not cls._auth_setting("with_refresh", False):
             # Without this the exchange reaches the server and comes back "No record was
             # returned" — indistinguishable from a wrong password, for what is actually a
@@ -524,13 +587,5 @@ class AuthenticatedUserMixin:
                 f"with_refresh=True in its model_config (SurrealDB 3.x only) and re-run "
                 f"define_access() before calling refresh()."
             )
-        payload = build_auth_payload(
-            access=cls.get_access_name(),
-            refresh=refresh_token,
-            default_namespace=SurrealDBConnectionManager.get_namespace(),
-            default_database=SurrealDBConnectionManager.get_database(),
-        )
         # The SDK renews through signin(); only the wording should say "refresh".
-        user, tokens = await cls._authenticate_session(action="signin", payload=payload, token=None, bind=bind, label="refresh")
-        assert tokens is not None
-        return AuthResult(user=user, tokens=tokens)
+        return await cls._exchange(action="signin", payload_kwargs={"refresh": refresh_token}, bind=bind, label="refresh")

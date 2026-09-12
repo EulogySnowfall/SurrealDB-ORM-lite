@@ -15,6 +15,7 @@ from surreal_orm_lite import (
     BaseSurrealModel,
     SurrealConfigDict,
     SurrealDbAuthenticationError,
+    SurrealDbConnectionError,
     SurrealDBConnectionManager,
     SurrealDbError,
 )
@@ -616,4 +617,156 @@ class TestBindKeepsTheRefreshTokenE2E:
                 client = await SurrealDBConnectionManager.get_client()
                 await client.query("REMOVE ACCESS e2e_bind_refresh ON DATABASE;", {})
                 await client.query("REMOVE TABLE BindRefreshUser;", {})
+            await SurrealDBConnectionManager.unset_connection()
+
+
+class TestReviewRegressions:
+    """One test per correctness issue raised in the v0.17.0 PR review."""
+
+    def test_primary_key_id_is_refused_at_render_time(self) -> None:
+        """SIGNUP never binds $id, so type::thing(table, NONE) would fail server-side."""
+
+        class PkId(AuthenticatedUserMixin, BaseSurrealModel):
+            model_config = SurrealConfigDict(primary_key="id")
+            id: str | None = None
+            email: str
+            password: str
+
+        with pytest.raises(ValueError, match="primary_key='id'"):
+            PkId.access_ddl()
+
+    def test_primary_key_must_be_a_field_signup_binds(self) -> None:
+        class PkGhost(AuthenticatedUserMixin, BaseSurrealModel):
+            model_config = SurrealConfigDict(primary_key="slug")
+            id: str | None = None
+            slug: str
+            email: str
+            password: str
+
+        # `slug` IS a signup field, so this one renders.
+        assert "type::thing('PkGhost', $slug)" in PkGhost.access_ddl(with_table=False)[0]
+
+    def test_falsy_credentials_are_not_treated_as_missing(self) -> None:
+        """0, '' and False are values, not omissions."""
+
+        class Numbered(AuthenticatedUserMixin, BaseSurrealModel):
+            model_config = SurrealConfigDict(identifier_field="user_number")
+            id: str | None = None
+            user_number: int
+            password: str
+
+        bound = Numbered._auth_variables("signin", {"user_number": 0, "password": "pw"}, require_all=False)
+        assert bound == {"user_number": 0, "password": "pw"}
+
+        with pytest.raises(ValueError, match="requires user_number="):
+            Numbered._auth_variables("signin", {"password": "pw"}, require_all=False)
+
+    def test_signup_refuses_a_missing_required_field_before_the_exchange(self) -> None:
+        """Otherwise the account is created server-side and hydration then fails."""
+
+        class Required(AuthenticatedUserMixin, BaseSurrealModel):
+            id: str | None = None
+            email: str
+            password: str
+            name: str  # required, no default
+
+        with pytest.raises(ValueError, match="missing required field"):
+            Required._auth_variables("signup", {"email": "a@b.c", "password": "pw"}, require_all=True)
+
+    def test_signup_sends_model_defaults_not_none(self) -> None:
+        class Defaulted(AuthenticatedUserMixin, BaseSurrealModel):
+            id: str | None = None
+            email: str
+            password: str
+            role: str = "member"
+
+        bound = Defaulted._auth_variables("signup", {"email": "a@b.c", "password": "pw"}, require_all=True)
+        assert bound["role"] == "member"
+
+    @pytest.mark.asyncio
+    async def test_a_required_field_never_reaches_the_server(self) -> None:
+        """The load-bearing half: no orphaned account is left behind."""
+
+        class E2ERequired(AuthenticatedUserMixin, BaseSurrealModel):
+            model_config = SurrealConfigDict(access_name="e2e_required")
+            id: str | None = None
+            email: str
+            password: str
+            name: str
+
+        async with auth_model(E2ERequired) as model:
+            email = _unique_email()
+            with pytest.raises(ValueError, match="missing required field"):
+                await model.signup(email=email, password=AUTH_PASSWORD)
+
+            client = await SurrealDBConnectionManager.get_client()
+            rows = await client.query(f"SELECT email FROM {model.get_table_name()};", {})
+            assert not rows, "signup created a record despite refusing the call"
+
+    def test_the_refresh_hint_follows_the_flag_not_the_ddl_text(self) -> None:
+        """A `refresh_token` field puts 'refresh' in the DDL without asking for the feature."""
+
+        class HasRefreshField(AuthenticatedUserMixin, BaseSurrealModel):
+            id: str | None = None
+            email: str
+            password: str
+            refresh_token: str = ""
+
+        assert "REFRESH" in HasRefreshField.access_ddl(with_table=False)[0].upper()
+        assert not HasRefreshField._auth_setting("with_refresh", False)
+
+    @pytest.mark.asyncio
+    async def test_bad_ddl_is_wrapped_inside_an_interactive_transaction(self) -> None:
+        """An interactive tx raises SurrealDbError, which `except ServerError` used to miss."""
+
+        class BadDDL(AuthenticatedUserMixin, BaseSurrealModel):
+            model_config = SurrealConfigDict(access_name="e2e_bad_ddl")
+            id: str | None = None
+            email: str
+            password: str
+
+        BadDDL.access_ddl = classmethod(  # type: ignore[method-assign]
+            lambda cls, **kw: ["DEFINE ACCESS e2e_bad_ddl ON DATABASE TYPE RECORD SIGNUP ( NOT SURREALQL );"]
+        )
+        _connect()
+        try:
+            async with SurrealDBConnectionManager.transaction() as probe:
+                interactive = probe.is_interactive
+            if not interactive:
+                # On a buffered transaction (HTTP, or SurrealDB 2.6.x) the statements are only
+                # queued, so a rejected one surfaces at COMMIT rather than inside
+                # define_access() — documented behaviour, and a different code path.
+                pytest.skip("native interactive transactions require SurrealDB 3.x")
+
+            with pytest.raises(SurrealDbError, match="Can't apply access definition"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await BadDDL.define_access(tx=tx)
+        finally:
+            with contextlib.suppress(Exception):
+                client = await SurrealDBConnectionManager.get_client()
+                await client.query("REMOVE ACCESS e2e_bad_ddl ON DATABASE;", {})
+            await SurrealDBConnectionManager.unset_connection()
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_client_closes_the_socket_when_use_fails(self) -> None:
+        """connect() can succeed and use() still fail; that socket must not leak."""
+        _connect()
+        opened: list[Any] = []
+        real_open = SurrealDBConnectionManager._open_client
+
+        async def failing_use(*, signin_as_configured: bool) -> Any:
+            client = await real_open(signin_as_configured=signin_as_configured)
+            opened.append(client)
+            raise SurrealDbConnectionError("Can't connect to the database.")
+
+        try:
+            SurrealDBConnectionManager._open_client = failing_use  # type: ignore[method-assign]
+            with pytest.raises(SurrealDbConnectionError):
+                async with SurrealDBConnectionManager.ephemeral_client():
+                    pass  # pragma: no cover
+        finally:
+            SurrealDBConnectionManager._open_client = real_open  # type: ignore[method-assign]
+            for client in opened:
+                with contextlib.suppress(Exception):
+                    await client.close()
             await SurrealDBConnectionManager.unset_connection()

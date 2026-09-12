@@ -26,6 +26,7 @@ from .signals import (
 )
 from .transaction import Transaction
 from .utils import (
+    apply_ddl_statements,
     build_set_clause,
     format_record_id,
     merge_extra_vars,
@@ -209,15 +210,7 @@ class BaseSurrealModel(BaseModel):
             return []
         # Cheap even inside a transaction: get_client() returns the already-connected client.
         client = await SurrealDBConnectionManager.get_client()
-        for statement in statements:
-            try:
-                if tx is not None:
-                    await tx.add(statement, None)
-                else:
-                    await client.query(statement, {})
-            except ServerError as e:
-                raise SurrealDbError(f"Can't apply computed field definition: {statement} -> {e}") from e
-        return statements
+        return await apply_ddl_statements(statements, client=client, tx=tx, what="computed field")
 
     @classmethod
     def get_table_name(cls) -> str:
