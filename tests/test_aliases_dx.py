@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 from pydantic import Field
 
-from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
+from surreal_orm_lite import BaseSurrealModel, Q, SurrealDBConnectionManager
 from surreal_orm_lite.functions import Computed, SurrealFunc, computed
 from surreal_orm_lite.model_base import SurrealConfigDict
 
@@ -389,3 +389,101 @@ class TestMergeAliasesE2E:
             await instance.patch([{"op": "replace", "path": "/password_hash", "value": "patched"}])
             assert (await _raw_row(client, "Aliased", "ada"))["password_hash"] == "patched"
             assert instance.password == "patched"
+
+
+# ==================== Task 6 — QuerySet and Q ====================
+
+
+class TestQuerySetAliases:
+    def test_filter_names_the_column(self) -> None:
+        query, _ = Aliased.objects().filter(password="secret")._compile_query()
+        assert "password_hash =" in query
+        assert "password =" not in query
+
+    def test_filter_lookup_names_the_column(self) -> None:
+        query, _ = Aliased.objects().filter(display__contains="Ad")._compile_query()
+        assert "display_name" in query
+        assert "display " not in query.replace("display_name", "")
+
+    def test_q_object_names_the_column(self) -> None:
+        query, _ = Aliased.objects().filter(Q(password="a") | Q(display="b"))._compile_query()
+        assert "password_hash" in query
+        assert "display_name" in query
+
+    def test_nested_q_names_the_column(self) -> None:
+        query, _ = Aliased.objects().filter(~(Q(password="a") & Q(plain=1)))._compile_query()
+        assert "password_hash" in query
+
+    def test_order_by_names_the_column(self) -> None:
+        query, _ = Aliased.objects().order_by("-password")._compile_query()
+        assert "ORDER BY password_hash DESC" in query
+
+    def test_values_group_by_names_the_column(self) -> None:
+        """``values()`` feeds the GROUP BY of the aggregation compiler, not ``_compile_query``."""
+        queryset = Aliased.objects().values("display")
+        assert queryset._group_by_fields == ["display_name"]
+        query, _ = queryset._compile_group_by_query()
+        assert "GROUP BY display_name" in query
+
+    def test_fetch_names_the_column(self) -> None:
+        query, _ = Aliased.objects().fetch("password")._compile_query()
+        assert "FETCH password_hash" in query
+
+    def test_unaliased_model_is_untouched(self) -> None:
+        query, _ = Plain.objects().filter(name="x").order_by("name")._compile_query()
+        assert "name =" in query
+        assert "ORDER BY name ASC" in query
+
+
+class TestQuerySetAliasesE2E:
+    @pytest.mark.asyncio
+    async def test_filter_and_order_round_trip(self) -> None:
+        async with alias_client():
+            await Aliased(id="a", password="alpha", display="A").save()
+            await Aliased(id="b", password="beta", display="B").save()
+
+            found = await Aliased.objects().filter(password="beta").exec()
+            assert len(found) == 1
+            assert found[0].display == "B"
+
+            ordered = await Aliased.objects().order_by("-password").exec()
+            assert [item.password for item in ordered] == ["beta", "alpha"]
+
+    @pytest.mark.asyncio
+    async def test_bulk_update_writes_the_column(self) -> None:
+        async with alias_client() as client:
+            await Aliased(id="a", password="alpha").save()
+            await Aliased(id="b", password="beta").save()
+
+            count = await Aliased.objects().filter(password="beta").bulk_update(password="rotated")
+            assert count == 1
+            assert (await _raw_row(client, "Aliased", "b"))["password_hash"] == "rotated"
+            assert (await _raw_row(client, "Aliased", "a"))["password_hash"] == "alpha"
+
+    @pytest.mark.asyncio
+    async def test_aggregation_helpers_name_the_column(self) -> None:
+        async with alias_client("Scored"):
+
+            class Scored(BaseSurrealModel):
+                id: str
+                score: int = Field(default=0, alias="score_value")
+
+            await Scored(id="a", score=10).save()
+            await Scored(id="b", score=30).save()
+
+            assert await Scored.objects().sum("score") == 40
+            assert await Scored.objects().avg("score") == 20.0
+            assert await Scored.objects().min("score") == 10
+            assert await Scored.objects().max("score") == 30
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_round_trips_on_an_aliased_field(self) -> None:
+        async with alias_client() as client:
+            created_obj, created = await Aliased.objects().get_or_create(id="a", defaults={"password": "alpha"})
+            assert created is True
+            assert created_obj.password == "alpha"
+            assert (await _raw_row(client, "Aliased", "a"))["password_hash"] == "alpha"
+
+            again, created = await Aliased.objects().get_or_create(id="a", defaults={"password": "ignored"})
+            assert created is False
+            assert again.password == "alpha"
