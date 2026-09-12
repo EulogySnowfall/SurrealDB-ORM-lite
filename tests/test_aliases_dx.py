@@ -193,6 +193,23 @@ async def _raw_row(client: Any, table: str, record: str) -> dict[str, Any]:
     return dict(rows) if isinstance(rows, dict) else {}
 
 
+def _spy(client: Any, method: str) -> list[tuple[Any, ...]]:
+    """Record every call to ``client.<method>`` from now on, still calling through.
+
+    Used to assert on *round-trips* rather than on results: "did this issue a SELECT" is the
+    observable difference ``refresh=False`` makes, and it is invisible in the final state.
+    """
+    calls: list[tuple[Any, ...]] = []
+    original = getattr(client, method)
+
+    async def recorder(*args: Any, **kwargs: Any) -> Any:
+        calls.append((args, kwargs))
+        return await original(*args, **kwargs)
+
+    setattr(client, method, recorder)
+    return calls
+
+
 class Stamped2(BaseSurrealModel):
     """E2E twin of ``Stamped``: ``created_at`` is filled by a server-side ``DEFAULT``."""
 
@@ -487,3 +504,97 @@ class TestQuerySetAliasesE2E:
             again, created = await Aliased.objects().get_or_create(id="a", defaults={"password": "ignored"})
             assert created is False
             assert again.password == "alpha"
+
+
+# ==================== Task 7 — merge(refresh=False) ====================
+
+
+class TestMergeRefreshE2E:
+    @pytest.mark.asyncio
+    async def test_default_still_resyncs_from_the_server(self) -> None:
+        async with alias_client() as client:
+            instance = await Aliased(id="ada", password="secret").save()
+            selects = _spy(client, "select")
+            await instance.merge(password="rotated")
+            assert selects, "the default merge must still round-trip to resync the instance"
+            assert instance.password == "rotated"
+
+    @pytest.mark.asyncio
+    async def test_refresh_false_skips_the_round_trip(self) -> None:
+        async with alias_client() as client:
+            instance = await Aliased(id="ada", password="secret").save()
+            selects = _spy(client, "select")
+            await instance.merge(password="rotated", refresh=False)
+            assert selects == [], "refresh=False must not issue the resync SELECT"
+            assert instance.password == "rotated"
+
+    @pytest.mark.asyncio
+    async def test_refresh_false_still_persists(self) -> None:
+        async with alias_client() as client:
+            instance = await Aliased(id="ada", password="secret").save()
+            await instance.merge(password="rotated", refresh=False)
+            assert (await _raw_row(client, "Aliased", "ada"))["password_hash"] == "rotated"
+
+    @pytest.mark.asyncio
+    async def test_server_values_ask_for_no_row_back(self) -> None:
+        async with alias_client() as client:
+            instance = await Aliased(id="ada", password="secret").save()
+            queries = _spy(client, "query")
+            await instance.merge(
+                display="local",
+                server_values={"password": SurrealFunc("string::uppercase('x')")},
+                refresh=False,
+            )
+            statements = [call[0][0] for call in queries if call[0]]
+            assert any("RETURN NONE" in statement for statement in statements)
+            # The literal kwarg is applied locally; the server-computed one stays as it was.
+            assert instance.display == "local"
+            assert (await _raw_row(client, "Aliased", "ada"))["password_hash"] == "X"
+
+    @pytest.mark.asyncio
+    async def test_server_values_default_still_syncs(self) -> None:
+        async with alias_client():
+            instance = await Aliased(id="ada", password="secret").save()
+            await instance.merge(server_values={"password": SurrealFunc("string::uppercase('x')")})
+            assert instance.password == "X"
+
+
+# ==================== Task 8 — computed vs server_fields write guards ====================
+
+
+class TestWriteGuards:
+    """The two halves of ``get_server_fields()`` are equal for payload building and opposite
+    for explicit writes: a computed field can never be written, a ``server_fields`` entry can."""
+
+    @pytest.mark.asyncio
+    async def test_merge_still_refuses_a_computed_field(self) -> None:
+        with pytest.raises(ValueError, match="computed field"):
+            await StampedComputed(id="a").merge(shouted="nope")
+
+    @pytest.mark.asyncio
+    async def test_merge_accepts_an_explicit_server_field(self) -> None:
+        async with alias_client("Stamped2") as client:
+            instance = await Stamped2(id="a", title="first").save()
+            await instance.merge(created_at="backfilled")
+            assert (await _raw_row(client, "Stamped2", "a"))["created_at"] == "backfilled"
+            assert instance.created_at == "backfilled"
+
+    @pytest.mark.asyncio
+    async def test_bulk_update_accepts_an_explicit_server_field(self) -> None:
+        async with alias_client("Stamped2") as client:
+            await Stamped2(id="a", title="first").save()
+            count = await Stamped2.objects().filter(id="a").bulk_update(created_at="backfilled")
+            assert count == 1
+            assert (await _raw_row(client, "Stamped2", "a"))["created_at"] == "backfilled"
+
+    @pytest.mark.asyncio
+    async def test_server_values_accept_an_explicit_server_field(self) -> None:
+        async with alias_client("Stamped2") as client:
+            instance = await Stamped2(id="a", title="first").save()
+            await instance.merge(server_values={"created_at": SurrealFunc("'computed'")})
+            assert (await _raw_row(client, "Stamped2", "a"))["created_at"] == "computed"
+
+    @pytest.mark.asyncio
+    async def test_bulk_update_still_refuses_a_computed_field(self) -> None:
+        with pytest.raises(ValueError, match="computed field"):
+            await StampedComputed.objects().bulk_update(shouted="nope")

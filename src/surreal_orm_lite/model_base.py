@@ -788,6 +788,48 @@ class BaseSurrealModel(BaseModel):
             if hasattr(self, key):
                 object.__setattr__(self, key, value)
 
+    async def _run_update(self, statement: str, variables: dict[str, Any], refresh: bool) -> None:
+        """Run a compiled ``UPDATE``, syncing this instance from the returned row when asked.
+
+        ``refresh=True`` delegates to :meth:`_run_update_returning_row`, which applies the row
+        and treats an empty result as "no record found". ``refresh=False`` means the statement
+        was compiled with ``RETURN NONE``, so there is no row to apply and emptiness carries no
+        information — only a missing *table* is still surfaced, because the server raises for
+        that rather than returning nothing.
+        """
+        if refresh:
+            await self._run_update_returning_row(statement, variables)
+            return
+        client = await SurrealDBConnectionManager.get_client()
+        try:
+            await client.query(statement, variables)
+        except NotFoundError as e:
+            raise SurrealDbError("Can't merge data, no record found.") from e
+
+    async def _resync_after_merge(self, data: Mapping[str, Any], refresh: bool) -> None:
+        """Bring this instance back in step after a native ``MERGE``.
+
+        ``refresh=True`` re-reads the row, which also surfaces a record that is gone. ``False``
+        skips that round-trip and settles for the values just written — see ``merge(refresh=)``
+        for what is given up.
+        """
+        if refresh:
+            await self.refresh()
+        else:
+            self._apply_merge_data_locally(data, {})
+
+    def _apply_merge_data_locally(self, data: Mapping[str, Any], server_values: Mapping[str, Any]) -> None:
+        """Apply a merge's literal kwargs to this instance without consulting the server.
+
+        The fallback whenever no row comes back: a buffered transaction (nothing has run yet)
+        or ``refresh=False`` (the row was deliberately not requested). A kwarg that
+        ``server_values`` overrode is skipped — writing it would leave the instance holding a
+        value that never reached the database. Keys here are Python field names.
+        """
+        for key, value in data.items():
+            if key not in server_values and hasattr(self, key):
+                object.__setattr__(self, key, value)
+
     async def _run_update_returning_row(self, statement: str, variables: dict[str, Any]) -> None:
         """Run an ``UPDATE`` and apply its row, raising a uniform error when it matched nothing.
 
@@ -957,6 +999,7 @@ class BaseSurrealModel(BaseModel):
         server_values: Mapping[str, SurrealFunc],
         extra_vars: Mapping[str, Any] | None,
         data: dict[str, Any],
+        refresh: bool = True,
     ) -> Any:
         """Partial update routed through ``UPDATE … SET`` so server functions are evaluated.
 
@@ -966,6 +1009,11 @@ class BaseSurrealModel(BaseModel):
         native MERGE path needs — and its emptiness is how a missing record is detected,
         both here (interactive tx) and in :meth:`_run_update_returning_row` (no tx). Only a
         buffered tx cannot tell: nothing runs before commit.
+
+        With ``refresh=False`` the statement asks for ``RETURN NONE`` instead, so the row is
+        not sent back at all — the same saving the native path makes by skipping its SELECT.
+        The literal kwargs are applied locally, exactly as in a buffered transaction. The
+        missing-record detection goes with it: that check *was* the returned row.
         """
         sender = self.__class__
         record_id = self._record_id()
@@ -977,7 +1025,7 @@ class BaseSurrealModel(BaseModel):
         clause, variables = build_set_clause(merged)
         variables["rid"] = record_id
         variables = merge_extra_vars(variables, extra_vars)
-        statement = f"UPDATE $rid SET {clause};"
+        statement = f"UPDATE $rid SET {clause} RETURN NONE;" if not refresh else f"UPDATE $rid SET {clause};"
         update_fields = [*data, *(key for key in server_values if key not in data)]
 
         has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
@@ -986,7 +1034,7 @@ class BaseSurrealModel(BaseModel):
             if has_signals:
                 await pre_update.send(sender, instance=self, update_fields=update_fields)
             rows = await tx.add(statement, variables)
-            if tx.is_interactive:
+            if tx.is_interactive and refresh:
                 # An UPDATE matching nothing is not a server error — it returns no rows. The
                 # native merge(tx=) path surfaces that through refresh(), which raises, so
                 # raise here too (aborting the tx) instead of silently no-opping.
@@ -994,24 +1042,24 @@ class BaseSurrealModel(BaseModel):
                     raise SurrealDbError("Can't merge data, no record found.")
                 self._apply_record(rows)
             else:
-                # Buffered: the server-computed values are unknown until commit, so only
-                # the literal kwargs can be applied — func fields stay stale. A kwarg that
-                # `server_values` overrode is skipped: writing it would leave the instance
-                # holding a value that never reaches the database.
-                for key, value in data.items():
-                    if key not in server_values and hasattr(self, key):
-                        object.__setattr__(self, key, value)
+                # Buffered, or refresh=False: no row to apply, so the literal kwargs are all
+                # that can be synced — server-computed fields stay stale until a refresh().
+                self._apply_merge_data_locally(data, server_values)
             if has_signals:
                 tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
             return None
 
         if not has_signals:
-            await self._run_update_returning_row(statement, variables)
+            await self._run_update(statement, variables, refresh)
+            if not refresh:
+                self._apply_merge_data_locally(data, server_values)
             return None
 
         await pre_update.send(sender, instance=self, update_fields=update_fields)
         async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-            await self._run_update_returning_row(statement, variables)
+            await self._run_update(statement, variables, refresh)
+            if not refresh:
+                self._apply_merge_data_locally(data, server_values)
         await post_update.send(sender, instance=self, update_fields=update_fields)
         return None
 
@@ -1020,6 +1068,7 @@ class BaseSurrealModel(BaseModel):
         tx: Transaction | None = None,
         server_values: Mapping[str, SurrealFunc] | None = None,
         extra_vars: Mapping[str, Any] | None = None,
+        refresh: bool = True,
         **data: Any,
     ) -> Any:
         """
@@ -1028,9 +1077,9 @@ class BaseSurrealModel(BaseModel):
         When ``tx`` is provided, the UPDATE…MERGE statement is buffered onto the
         transaction instead of being executed immediately.
 
-        Note: ``tx``, ``server_values`` and ``extra_vars`` are reserved keyword arguments
-        for this method. A model field literally named like one of them cannot be merged
-        by keyword; use a dict-unpacking workaround if needed (no realistic SurrealDB
+        Note: ``tx``, ``server_values``, ``extra_vars`` and ``refresh`` are reserved keyword
+        arguments for this method. A model field literally named like one of them cannot be
+        merged by keyword; use a dict-unpacking workaround if needed (no realistic SurrealDB
         column carries those names).
 
         Emits pre_update, post_update, and around_update signals. In tx mode,
@@ -1051,15 +1100,27 @@ class BaseSurrealModel(BaseModel):
                 row syncs the instance, so no extra ``refresh()`` round-trip is needed.
             extra_vars: Extra query variables the expressions reference, bound (never
                 interpolated). Requires ``server_values``.
+            refresh: ``True`` (default) resyncs the instance from the server after the write —
+                a second round-trip on the native path (a ``SELECT``), or the row the
+                ``server_values`` path asks back. ``False`` skips it: the write still happens,
+                the literal ``data`` is applied locally, and nothing is read back. Use it for
+                fire-and-forget updates such as a presence ping or a counter bump.
+
+                **The missing-record check goes with it.** That check *is* the returned row, so
+                under ``refresh=False`` a merge against a record that no longer exists is a
+                silent no-op instead of a ``SurrealDbError``, and a field computed by
+                ``server_values`` keeps its stale value until the next ``refresh()``. Keep the
+                default whenever you need to know the write landed.
 
         Example:
             >>> await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
+            >>> await user.merge(last_seen=now, refresh=False)  # fire-and-forget
         """
         self._reject_computed_writes(data, "merge()")
         self._validate_server_values(server_values, extra_vars)
         if server_values:
             self._reject_computed_writes(server_values, "merge(server_values=)")
-            return await self._merge_server(tx, server_values, extra_vars, data)
+            return await self._merge_server(tx, server_values, extra_vars, data, refresh)
 
         sender = self.__class__
         data_set = dict(data.items())
@@ -1078,12 +1139,10 @@ class BaseSurrealModel(BaseModel):
             if has_signals:
                 await pre_update.send(sender, instance=self, update_fields=update_fields)
             await tx.add(f"UPDATE {record_id} MERGE $data;", {"data": wire_data})
-            if tx.is_interactive:
+            if tx.is_interactive and refresh:
                 await self.refresh(tx=tx)
             else:
-                for key, value in data_set.items():
-                    if hasattr(self, key):
-                        object.__setattr__(self, key, value)
+                self._apply_merge_data_locally(data_set, {})
             if has_signals:
                 tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
             return None
@@ -1092,7 +1151,7 @@ class BaseSurrealModel(BaseModel):
 
         if not has_signals:
             await client.merge(record_id, wire_data)
-            await self.refresh()
+            await self._resync_after_merge(data_set, refresh)
             return
 
         update_fields = list(data_set.keys())
@@ -1100,7 +1159,7 @@ class BaseSurrealModel(BaseModel):
 
         async with around_update.wrap(sender, instance=self, update_fields=update_fields):
             await client.merge(record_id, wire_data)
-            await self.refresh()
+            await self._resync_after_merge(data_set, refresh)
 
         await post_update.send(sender, instance=self, update_fields=update_fields)
 
