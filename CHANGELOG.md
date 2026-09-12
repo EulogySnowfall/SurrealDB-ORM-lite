@@ -5,6 +5,97 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.0] - 2026-09-12
+
+Let a model's **Python surface** differ from its **SurrealDB column surface**, mark the columns
+the server owns, and skip the resync round-trip when you do not need it. All three features are
+client-side, so they behave **identically on SurrealDB 2.6.x and 3.x**.
+
+### Added
+
+- **Field aliases** — `Field(alias="password_hash")` renames the _column_, not the attribute:
+
+  ```python
+  class User(BaseSurrealModel):
+      id: str
+      password: str = Field(alias="password_hash")
+
+  user = User(id="ada", password="secret")            # either name validates
+  await user.save()                                   # stores password_hash
+  await User.objects().filter(password="secret").exec()   # queries password_hash
+  ```
+
+  The alias is honoured at every boundary the ORM owns: writes (`save`/`update`/`upsert`/
+  `merge`/`bulk_create`, `server_values=`, and the whole `atomic_*` family), read hydration
+  (`exec()`, `refresh()`, the row a write returns), **every QuerySet clause** (`select`,
+  `filter` including nested and negated `Q` objects, `order_by`, `values`, `fetch`,
+  `bulk_update`, the `sum`/`avg`/`min`/`max` helpers and the aggregation objects given to
+  `annotate()`), the DDL the ORM generates (`computed_field_ddl()`, and
+  `AuthenticatedUserMixin`'s `access_ddl()`), and signal payloads (`update_fields` always names
+  Python attributes). QuerySet filter rewriting is the piece the full ORM still documents as an
+  open gap. A grouped `values()`/`annotate()` result is re-keyed to Python names on the way
+  out.
+
+  `patch()` is the deliberate exception: it takes raw RFC 6902 pointers, which address the
+  stored document, so `/password_hash` is correct there.
+
+- **`get_field_aliases()` / `to_db_field()` / `to_py_field()`** — the mapping, exposed as
+  classmethods and cached per class.
+
+- **`SurrealConfigDict(server_fields=[...])`** — columns the server owns (a
+  `DEFINE FIELD … DEFAULT`, an event, a trigger). They are dropped from **create** payloads so
+  the server's default applies, hydrated back from the row the write returns, and still
+  writable when a caller names one explicitly. `get_server_fields()` returns them merged with
+  the model's computed fields, which are server-owned by construction.
+
+- **`merge(refresh=False)`** — skip the post-merge resync for fire-and-forget updates. The
+  native path drops its `SELECT`; the `server_values` path compiles `RETURN NONE`; the literal
+  keyword arguments are applied locally instead.
+
+### Changed
+
+- `BaseSurrealModel` now sets `populate_by_name=True`. Strictly widening: an aliased field
+  previously validated only under its alias, which made `User(password=…)` an error in the very
+  code the alias exists to keep readable.
+
+- `update()` and `upsert()` keep `server_fields` in their payload, while `save()` omits them.
+  Not an inconsistency — omission means different things in the two statements. Probed on 2.6.5
+  and 3.2.4 with identical results: a `DEFAULT` is a **create-time** default, so on
+  `UPDATE`/`UPSERT … CONTENT` an omitted optional column is _deleted_ and an omitted required
+  one fails outright (`Found NONE for field 'created_at' … but expected a datetime`). A uniform
+  exclusion would have made `update()` destroy the very columns the feature protects.
+
+- Hydration is consolidated: `_do_save()` and `refresh()` now route through `_apply_record()`,
+  so the column → attribute rule lives in one place instead of four ad-hoc loops.
+
+### Notes
+
+- **`refresh=False` forfeits the missing-record check.** That check _is_ the returned row, so a
+  merge against a record that no longer exists becomes a silent no-op instead of a
+  `SurrealDbError`, and a field computed by `server_values` keeps its stale value until the next
+  `refresh()`. Keep the default whenever you need to know the write landed.
+
+- Only a plain, symmetric `Field(alias=…)` is treated as a column rename. A separate
+  `validation_alias` / `serialization_alias`, and in particular `AliasPath` / `AliasChoices`,
+  describe something other than a renamed column and are left entirely to Pydantic. Write
+  payloads are re-keyed through the ORM's own map rather than `model_dump(by_alias=True)`,
+  which would honour a `serialization_alias` and write the row under a name `filter()`,
+  `select()` and hydration never look for — landing the value in the database and making it
+  unreachable through the ORM.
+
+- **The alias map must be a bijection**, checked the first time it is used: an alias that
+  collides with another field's name, or two fields sharing one column, raises `ValueError`.
+  Either shape collapses two payload keys into one and silently drops a field.
+
+- `AuthenticatedUserMixin`'s SIGNUP clause now also skips `server_fields`, for the same reason
+  `save()` does — SIGNUP is a `CREATE`, so listing the column would overwrite the server's
+  `DEFAULT` with `NONE` and force every caller to supply a value the server is meant to mint.
+
+- `merge()` now reserves `refresh` alongside `tx`, `server_values` and `extra_vars`.
+
+- No new SDK surface: nothing was added to `_sdk.py`. Verified on SurrealDB **2.6.5** and
+  **3.2.4**; no test in this version is skipped on either line.
+
 ## [0.17.0] - 2026-09-11
 
 Authenticate a **model**, not just the connection: declare a user model, let the ORM generate its

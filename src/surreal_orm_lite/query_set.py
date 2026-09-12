@@ -57,6 +57,28 @@ class QuerySet:
         self._annotations: dict[str, Aggregation] = {}
         self._tx: Any = None
 
+    def _py_keyed(self, row: Any) -> Any:
+        """Re-key a grouped result row from columns back to Python field names (v0.18.0).
+
+        A GROUP BY result is a plain dict, not a model, so nothing else would translate it: the
+        caller wrote ``values("display")`` in Python names and would otherwise get
+        ``{"display_name": …}`` back. Annotation aliases are the caller's own words and pass
+        through untouched — ``to_py_field`` leaves an unmapped name alone.
+        """
+        if not isinstance(row, dict):
+            return row
+        return {self.model.to_py_field(key): value for key, value in row.items()}
+
+    def _column(self, field: str) -> str:
+        """Translate a Python field name to the SurrealDB column it is stored under (v0.18.0).
+
+        Every clause this class builds names columns; every argument a caller passes names
+        Python fields. This is the one boundary between the two, so an aliased model is
+        addressable by its Python names throughout the query API. A model with no aliases gets
+        the name back unchanged.
+        """
+        return self.model.to_db_field(field)
+
     def select(self, *fields: str) -> Self:
         """
         Specify the fields to retrieve in the query.
@@ -70,7 +92,7 @@ class QuerySet:
         Returns:
             Self: The current instance for method chaining.
         """
-        self.select_item = list(fields)
+        self.select_item = [self._column(field) for field in fields]
         return self
 
     def variables(self, **kwargs: Any) -> Self:
@@ -118,7 +140,7 @@ class QuerySet:
             self._q_filters.append(arg)
         for key, value in kwargs.items():
             field_name, lookup = parse_lookup(key)
-            self._filters.append((field_name, lookup, value))
+            self._filters.append((self._column(field_name), lookup, value))
         return self
 
     def limit(self, value: int) -> Self:
@@ -179,16 +201,16 @@ class QuerySet:
             # Backward compat: check if next arg is an OrderBy direction
             if i + 1 < len(fields) and str(fields[i + 1]) in ("ASC", "DESC"):
                 validate_field_name(field, "order_by field")
-                order_parts.append(f"{field} {fields[i + 1]}")
+                order_parts.append(f"{self._column(field)} {fields[i + 1]}")
                 i += 2
             elif field.startswith("-"):
                 actual_field = field[1:]
                 validate_field_name(actual_field, "order_by field")
-                order_parts.append(f"{actual_field} DESC")
+                order_parts.append(f"{self._column(actual_field)} DESC")
                 i += 1
             else:
                 validate_field_name(field, "order_by field")
-                order_parts.append(f"{field} ASC")
+                order_parts.append(f"{self._column(field)} ASC")
                 i += 1
 
         self._order_by = ", ".join(order_parts)
@@ -213,7 +235,7 @@ class QuerySet:
         """
         for field in fields:
             validate_field_name(field, "FETCH field")
-        self._fetch_fields.extend(fields)
+        self._fetch_fields.extend(self._column(field) for field in fields)
         return self
 
     # ==================== Internal query building ====================
@@ -238,7 +260,7 @@ class QuerySet:
 
         # Q object filters
         for q in self._q_filters:
-            sql, vars_, counter = q.to_sql(counter, self._model_table)
+            sql, vars_, counter = q.to_sql(counter, self._model_table, self.model.get_field_aliases())
             if sql:
                 parts.append(sql)
                 variables.update(vars_)
@@ -316,7 +338,7 @@ class QuerySet:
 
         select_parts = list(self._group_by_fields)
         for alias, agg in self._annotations.items():
-            select_parts.append(f"{agg.to_sql()} AS {alias}")
+            select_parts.append(f"{agg.to_sql(self.model.get_field_aliases())} AS {alias}")
 
         query = f"SELECT {', '.join(select_parts)} FROM {self._model_table}"
         query += where_clause
@@ -373,7 +395,9 @@ class QuerySet:
         if self._annotations:
             query, variables = self._compile_group_by_query()
             results = await self._execute_query(query, variables)
-            return results if isinstance(results, list) else []
+            if not isinstance(results, list):
+                return []
+            return [self._py_keyed(row) for row in results]
 
         query, variables = self._compile_query()
         results = await self._execute_query(query, variables)
@@ -501,7 +525,7 @@ class QuerySet:
         """
         for field in fields:
             validate_field_name(field, "GROUP BY field")
-        self._group_by_fields = list(fields)
+        self._group_by_fields = [self._column(field) for field in fields]
         return self
 
     def annotate(self, **annotations: "Aggregation") -> Self:
@@ -552,7 +576,7 @@ class QuerySet:
             The sum of the field values, or 0 if no records match.
         """
         validate_field_name(field, "sum() field")
-        query, variables = self._compile_aggregation_query(f"math::sum({field})", alias="sum")
+        query, variables = self._compile_aggregation_query(f"math::sum({self._column(field)})", alias="sum")
         results = await self._execute_query(query, variables)
 
         if isinstance(results, list) and len(results) > 0:
@@ -574,7 +598,7 @@ class QuerySet:
             The average of the field values, or 0.0 if no records match.
         """
         validate_field_name(field, "avg() field")
-        query, variables = self._compile_aggregation_query(f"math::mean({field})", alias="avg")
+        query, variables = self._compile_aggregation_query(f"math::mean({self._column(field)})", alias="avg")
         results = await self._execute_query(query, variables)
 
         if isinstance(results, list) and len(results) > 0:
@@ -598,7 +622,7 @@ class QuerySet:
             The minimum value, or None if no records match.
         """
         validate_field_name(field, "min() field")
-        query, variables = self._compile_aggregation_query(f"math::min({field})", alias="min")
+        query, variables = self._compile_aggregation_query(f"math::min({self._column(field)})", alias="min")
         results = await self._execute_query(query, variables)
 
         if isinstance(results, list) and len(results) > 0:
@@ -622,7 +646,7 @@ class QuerySet:
             The maximum value, or None if no records match.
         """
         validate_field_name(field, "max() field")
-        query, variables = self._compile_aggregation_query(f"math::max({field})", alias="max")
+        query, variables = self._compile_aggregation_query(f"math::max({self._column(field)})", alias="max")
         results = await self._execute_query(query, variables)
 
         if isinstance(results, list) and len(results) > 0:
@@ -722,7 +746,7 @@ class QuerySet:
         for i, (field, value) in enumerate(kwargs.items()):
             validate_field_name(field, "bulk_update field")
             var_name = f"_v{i}"
-            set_parts.append(f"{field} = ${var_name}")
+            set_parts.append(f"{self._column(field)} = ${var_name}")
             set_vars[var_name] = value
 
         set_clause = ", ".join(set_parts)
@@ -854,8 +878,12 @@ class QuerySet:
         wants to hear about it rather than lose the value. Models that opt into extra fields
         (``model_config = ConfigDict(extra="allow")``) keep them, on both paths.
         """
-        computed = self.model.get_computed_fields()
-        vetted = {key: value for key, value in payload.items() if key not in computed}
+        # get_server_fields() covers computed fields *and* `server_fields` entries. Both are
+        # dropped by save()'s payload on the create branch, so dropping them here too keeps the
+        # two branches writing the same columns — otherwise `get_or_create(created_at=…)` would
+        # filter on a column the create never writes and mint a duplicate on every call.
+        server_owned = self.model.get_server_fields()
+        vetted = {key: value for key, value in payload.items() if key not in server_owned}
 
         if self.model.model_config.get("extra") == "allow":
             return vetted

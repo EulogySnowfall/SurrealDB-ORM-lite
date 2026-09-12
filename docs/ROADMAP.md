@@ -26,7 +26,8 @@
 | v0.15.0           | Tier 1 — `call_function()` (custom `fn::`)           | Done    |
 | v0.16.0           | Tier 1 — Connection-level auth (JWT / record users)  | Done    |
 | v0.17.0           | Tier 1 — Model auth (`AuthenticatedUserMixin`)       | Done    |
-| v0.18.0 – v0.22.0 | Tier 1 — Core (aliases & DX, live, relations)        | Planned |
+| v0.18.0           | Tier 1 — Field aliases & DX                          | Done    |
+| v0.19.0 – v0.22.0 | Tier 1 — Core (live queries, typed relations)        | Planned |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 7 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
@@ -71,7 +72,7 @@ pieces stay out.
 | `call_function()`                   | `query()` + `fn::name($args)` ¹                       | ✅ v0.15.0     |
 | JWT / scope auth (connection)       | `signup`/`signin`/`authenticate`/`invalidate`/`info`  | ✅ v0.16.0     |
 | JWT / scope auth (model mixin)      | idem, on a `BaseSurrealModel` subclass                | ✅ v0.17.0     |
-| Field aliases & DX                  | Pydantic `Field(alias=)` + config                     | v0.18.0        |
+| Field aliases & DX                  | Pydantic `Field(alias=)` + config                     | ✅ v0.18.0     |
 | Live Models / Live Queries          | `live()` / `subscribe_live()` / `kill()`              | v0.19 – v0.20  |
 | Change Feeds / Auto-Resubscribe     | live queries + reconnect logic                        | v0.21.0        |
 | Native typed relations              | `insert_relation()`                                   | v0.22.0        |
@@ -135,7 +136,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | `call_function()`             | yes        | ✅ v0.15.0                  |
 | JWT Authentication            | yes        | ✅ v0.16.0 (connection)     |
 | Model-level auth mixin        | yes        | ✅ v0.17.0                  |
-| Field aliases & DX            | yes        | v0.18.0                     |
+| Field aliases & DX            | yes        | ✅ v0.18.0                  |
 | Live Models / CDC             | yes        | v0.19 – v0.21               |
 | Native typed relations        | yes        | v0.22.0                     |
 | Rich field types              | yes        | v0.23.0                     |
@@ -306,6 +307,33 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - Model-level auth (`AuthenticatedUserMixin`, `User.signup()` returning an instance) is v0.17.0;
   a `define_access()` DDL helper belongs with `schema.py` at v0.31.0
 
+### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
+
+- `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
+  honoured on writes, on read hydration, and in **every QuerySet clause** — `select`, `filter`
+  (nested and negated `Q` objects included), `order_by`, `values`, `fetch`, `bulk_update` and
+  the `sum`/`avg`/`min`/`max` helpers. Filter rewriting is the piece the full ORM still lists as
+  an open gap, so lite is ahead of it here
+- `get_field_aliases()` / `to_db_field()` / `to_py_field()` expose the mapping; a single
+  boundary (`_columns_for()` on the model, `_column()` on the QuerySet) keeps Python names on
+  one side of the wire and columns on the other
+- `BaseSurrealModel` gains `populate_by_name=True`, so an aliased field validates under either
+  name — strictly widening
+- `SurrealConfigDict(server_fields=[…])` marks columns the server owns. `get_server_fields()`
+  merges them with the model's computed fields, since both are server-owned for payload building
+- **Create and replace exclude differently, and the server is why.** Probed on 2.6.5 and 3.2.4
+  with identical results: a `DEFINE FIELD … DEFAULT` is a _create-time_ default, so on
+  `UPDATE`/`UPSERT … CONTENT` an omitted optional column is deleted and an omitted required one
+  raises. `server_fields` are therefore dropped from creates (letting the default apply) and
+  kept on replaces (so the column survives). Computed fields stay excluded on both — a `VALUE`
+  clause re-evaluates every write
+- An **explicit** write to a `server_fields` entry is allowed (`merge`, `bulk_update`,
+  `server_values`); a computed field still raises. Naming the column is taken as consent
+- `merge(refresh=False)` skips the resync: no `SELECT` on the native path, `RETURN NONE` on the
+  `server_values` path. It forfeits the missing-record check, which _is_ the returned row
+- **Same on both lines**, in and out of a transaction — no capability probe, and no test in this
+  version skips on either server
+
 ### Version 0.17.0 — Model-level authentication
 
 - `AuthenticatedUserMixin` turns a `BaseSurrealModel` subclass into a user model: `signup()`,
@@ -429,7 +457,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 | ---------- | --------------------------------------------------------------------------- | ----------------- |
 | ✅ v0.16.0 | Connection-level auth: `signin`/`signup`/`authenticate`/`invalidate`/`info` | SDK auth methods  |
 | ✅ v0.17.0 | `AuthenticatedUserMixin` (model-level signup/signin, isolated sessions)     | idem              |
-| v0.18.0    | Field aliases (`Field(alias=)`) + `server_fields` + `merge(refresh=False)`  | Pydantic + config |
+| ✅ v0.18.0 | Field aliases (`Field(alias=)`) + `server_fields` + `merge(refresh=False)`  | Pydantic + config |
 
 ### 🟡 Phase D — Real-time
 

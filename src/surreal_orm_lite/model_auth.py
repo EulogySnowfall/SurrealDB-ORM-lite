@@ -163,8 +163,17 @@ class AuthenticatedUserMixin:
 
     @classmethod
     def _signup_fields(cls) -> list[str]:
-        """Fields the SIGNUP clause writes: every non-computed field except ``id``."""
-        return [name for name in cls._model_field_names() if name != "id"]
+        """Fields the SIGNUP clause writes: every client-owned field except ``id``.
+
+        Server-owned columns are excluded for the same reason ``save()`` omits them: SIGNUP is
+        a ``CREATE``, so listing ``created_at = $created_at`` would overwrite the column's
+        server-side ``DEFAULT`` with whatever the caller passed — usually ``NONE`` — and
+        ``_auth_variables(require_all=True)`` would additionally force every caller to supply a
+        value the server is supposed to mint. ``get_server_fields()`` covers computed fields
+        too, so this subsumes the exclusion it replaces.
+        """
+        server_owned = cls.get_server_fields()  # type: ignore[attr-defined]
+        return [name for name in cls._model_field_names() if name != "id" and name not in server_owned]
 
     @classmethod
     def _signup_primary_key(cls) -> str | None:
@@ -245,16 +254,25 @@ class AuthenticatedUserMixin:
         primary_key = cls._signup_primary_key()
         target = f"type::thing('{table}', ${primary_key})" if primary_key is not None else table
 
+        # Column on the left of each assignment, bound variable on the right: the variable
+        # keeps the Python name the caller passes as a keyword argument, while the column is
+        # what the rest of the ORM reads and writes (v0.18.0). Rendering the Python name on
+        # both sides would make SIGNUP write `password` while save()/merge() write
+        # `password_hash` — signin would then keep validating against a hash no ORM write ever
+        # updates.
+        to_column = cls.to_db_field  # type: ignore[attr-defined]
         assignments = ", ".join(
-            f"{name} = crypto::{algorithm}::generate(${name})" if name == password else f"{name} = ${name}"
+            f"{to_column(name)} = crypto::{algorithm}::generate(${name})"
+            if name == password
+            else f"{to_column(name)} = ${name}"
             for name in cls._signup_fields()
         )
 
         parts = [
             f"DEFINE ACCESS {clause} {access} ON DATABASE TYPE RECORD",
             f"SIGNUP ( CREATE {target} SET {assignments} )",
-            f"SIGNIN ( SELECT * FROM {table} WHERE {identifier} = ${identifier} "
-            f"AND crypto::{algorithm}::compare({password}, ${password}) )",
+            f"SIGNIN ( SELECT * FROM {table} WHERE {to_column(identifier)} = ${identifier} "
+            f"AND crypto::{algorithm}::compare({to_column(password)}, ${password}) )",
         ]
 
         with_refresh = bool(cls._auth_setting("with_refresh", False))

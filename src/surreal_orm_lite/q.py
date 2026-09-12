@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from .utils import build_filter_condition, parse_lookup
@@ -68,7 +69,12 @@ class Q:
             parts.append("negated=True")
         return f"Q({', '.join(parts)})"
 
-    def to_sql(self, counter: int = 0, record_table: str | None = None) -> tuple[str, dict[str, Any], int]:
+    def to_sql(
+        self,
+        counter: int = 0,
+        record_table: str | None = None,
+        field_map: Mapping[str, str] | None = None,
+    ) -> tuple[str, dict[str, Any], int]:
         """
         Generate a parameterized SQL WHERE fragment.
 
@@ -77,6 +83,12 @@ class Q:
             record_table: The table the query runs against, propagated by the QuerySet so a
                 lookup on the ``id`` column can be coerced to a ``RecordID`` (issue #159).
                 ``None`` — a ``Q`` compiled on its own — leaves values untouched.
+            field_map: ``{python_field_name: column}`` for the model being queried, propagated
+                by the QuerySet (v0.18.0). A ``Q`` is written in Python names like any other
+                filter, so without this an aliased field would compile against a column that
+                does not exist. ``None`` — a ``Q`` compiled on its own, with no model in sight —
+                leaves names untouched. Passed down to child nodes so a nested expression
+                translates too.
 
         Returns:
             A tuple of (sql_fragment, variables_dict, next_counter).
@@ -89,6 +101,8 @@ class Q:
             filter_parts: list[str] = []
             for key, value in self.filters.items():
                 field, lookup = parse_lookup(key)
+                if field_map:
+                    field = field_map.get(field, field)
                 sql, vars_, counter = build_filter_condition(field, lookup, value, counter, record_table)
                 filter_parts.append(sql)
                 all_variables.update(vars_)
@@ -99,7 +113,7 @@ class Q:
 
         # Child Q objects
         for child in self.children:
-            sql, vars_, counter = child.to_sql(counter, record_table)
+            sql, vars_, counter = child.to_sql(counter, record_table, field_map)
             if sql:
                 all_parts.append(sql)
                 all_variables.update(vars_)
