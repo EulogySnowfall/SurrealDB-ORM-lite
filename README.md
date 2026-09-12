@@ -162,6 +162,7 @@ results = await User.objects().query(
 | Stored `fn::` calls    | ✅     |
 | JWT / record auth      | ✅     |
 | Model-level auth mixin | ✅     |
+| Field aliases & DX     | ✅     |
 
 ### Supported Filter Lookups
 
@@ -953,6 +954,113 @@ persist(result.tokens.refresh)   # REQUIRED — refresh tokens rotate
 On SurrealDB 2.6.x the `WITH REFRESH` clause does not parse at all, so `define_access()` raises a
 `SurrealDbError` that says exactly that, and no refresh token ever exists.
 
+### 20. Field aliases, `server_fields` and `merge(refresh=False)`
+
+Three developer-experience features (v0.18.0) that let a model's Python surface differ from its
+SurrealDB column surface, and let a caller skip work they do not need. All three behave
+**identically on SurrealDB 2.6.x and 3.x**.
+
+#### Field aliases
+
+Declare the column name with plain Pydantic; the ORM honours it everywhere.
+
+```python
+from pydantic import Field
+from surreal_orm_lite import BaseSurrealModel
+
+class User(BaseSurrealModel):
+    id: str
+    password: str = Field(alias="password_hash")   # column is password_hash
+    display: str = Field(alias="display_name")
+
+# Build with either name — the Python one in your code, the alias when hydrating a row.
+user = User(id="ada", password="secret", display="Ada")
+await user.save()                                   # stores password_hash / display_name
+
+# Query in Python names; the ORM emits the columns.
+found = await User.objects().filter(password="secret").order_by("-display").exec()
+await user.merge(password="rotated")
+await User.objects().filter(display="Ada").bulk_update(password="rotated")
+```
+
+The translation covers `save`/`update`/`upsert`/`merge`/`bulk_create`, `server_values=`, read
+hydration (`exec()`, `refresh()`, the row a write returns), and every QuerySet clause —
+`select`, `filter` (including `Q` objects, nested and negated), `order_by`, `values`, `fetch`,
+`bulk_update` and the `sum`/`avg`/`min`/`max` helpers.
+
+Three classmethods expose the mapping if you need it directly:
+
+| Method                | Returns                                                   |
+| --------------------- | --------------------------------------------------------- |
+| `get_field_aliases()` | `{python_name: column}` for aliased fields (`{}` if none) |
+| `to_db_field(name)`   | the column for `name` (unchanged when unaliased)          |
+| `to_py_field(column)` | the Python attribute for `column`                         |
+
+Only a plain, symmetric `Field(alias=…)` is treated as a column rename. A separate
+`validation_alias` / `serialization_alias`, and in particular `AliasPath` / `AliasChoices`,
+describe something other than a renamed column and are left entirely to Pydantic.
+
+`patch()` is the one exception, by design: it takes raw RFC 6902 JSON pointers, which address
+the stored document, so you write `/password_hash` there.
+
+#### `server_fields`
+
+Mark the columns the **server** owns — filled by a `DEFINE FIELD … DEFAULT`, an event or a
+trigger — so the client never volunteers them:
+
+```python
+from surreal_orm_lite import SurrealConfigDict
+
+class Post(BaseSurrealModel):
+    model_config = SurrealConfigDict(server_fields=["created_at"])
+    id: str
+    title: str
+    created_at: datetime | None = None
+
+post = await Post(id="a", title="First").save()
+post.created_at        # populated from the row the server sent back
+```
+
+What it does, precisely:
+
+- **Creates** (`save()`, `bulk_create()`) omit the column, which is exactly what lets the
+  server's `DEFAULT` apply.
+- **Replaces** (`update()`, `upsert()`) keep it. `DEFAULT` is a _create-time_ default on both DB
+  lines, so on `UPDATE … CONTENT` an omitted optional column would be **deleted** and an omitted
+  required one is a hard server error. The instance's value is carried instead, which for any
+  record loaded or saved through the ORM is the server's own.
+- After a write, the column is hydrated back onto the instance.
+- An **explicit** write still works: `merge(created_at=…)`, `bulk_update(created_at=…)` and
+  `server_values={"created_at": …}` all go through, because naming the column is taken as
+  consent (a backfill, an admin correction).
+
+That last point is where `server_fields` differs from a computed field. A `Computed[...]` field
+is defined by `DEFINE FIELD … VALUE`, so the server discards any client write — the ORM raises
+rather than let an invisible no-op through. `get_server_fields()` returns the union of both
+sets, since for payload building they are the same thing. A name in `server_fields` that the
+model does not declare raises `ValueError` naming it.
+
+#### `merge(refresh=False)`
+
+By default `merge()` resyncs the instance from the server afterwards — a second round-trip.
+Skip it for fire-and-forget updates:
+
+```python
+await user.merge(last_seen=now, refresh=False)                       # no SELECT afterwards
+await user.merge(server_values={"seen": SurrealFunc("time::now()")}, refresh=False)
+```
+
+The write still happens and the literal keyword arguments are applied locally. On the
+`server_values` path the statement is compiled with `RETURN NONE`, so no row is sent back at
+all.
+
+**What you give up**: the "no rows came back ⇒ record not found" check _is_ the returned row.
+Under `refresh=False` a merge against a record that no longer exists is a silent no-op instead
+of a `SurrealDbError`, and a field computed by `server_values` keeps its stale value until the
+next `refresh()`. Keep the default whenever you need to know the write landed.
+
+`tx`, `server_values`, `extra_vars` and `refresh` are reserved keyword names on `merge()`.
+
 ---
 
 ## Configuration Options
@@ -1071,6 +1179,10 @@ listed behave the same on both lines.
 | Hydrated instance's password field after `signup`/`signin`                                                                             | holds the stored **hash**, never the plaintext                                         | same on both lines                                                       | v0.17.0 |
 | Model config `with_refresh=True` → `define_access()`                                                                                   | raises `SurrealDbError` (clause does not parse; message names the 3.x requirement)     | applies, and `AuthResult.tokens.refresh` is populated                    | v0.17.0 |
 | `Model.refresh(token)` renewal                                                                                                         | unavailable — no refresh token can exist                                               | returns a fresh, rotated pair; the spent token is rejected               | v0.17.0 |
+| Field aliases (`Field(alias=…)`) across writes, hydration and every QuerySet clause                                                    | same on both lines (pure Pydantic + client-side name translation)                      | same on both lines (verified on 3.2.4)                                   | v0.18.0 |
+| `server_fields` — excluded from creates, kept on replaces, hydrated back                                                               | same on both lines; a `DEFAULT` is a create-time default on 2.6.5                      | same on both lines; a `DEFAULT` is a create-time default on 3.2.4        | v0.18.0 |
+| A server column omitted from a REPLACE (`UPDATE`/`UPSERT … CONTENT`)                                                                   | an optional column is deleted; a required one raises `Found NONE for field …`          | same on both lines — which is why the ORM keeps it in replace payloads   | v0.18.0 |
+| `merge(refresh=False)` — skipped resync, `RETURN NONE`, forfeited missing-record check                                                 | same on both lines                                                                     | same on both lines (verified on 3.2.4)                                   | v0.18.0 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
 
@@ -1104,7 +1216,8 @@ Contributions are welcome! Please:
 | v0.15.0           | `call_function()` — custom `fn::` stored functions | ✅ Released |
 | v0.16.0           | Connection auth (`signin`/`signup`/`info`)         | ✅ Released |
 | v0.17.0           | Model auth (`AuthenticatedUserMixin`)              | ✅ Released |
-| v0.18.0 – v0.22.0 | Tier 1 — Core (aliases & DX, live, relations)      | 📋 Planned  |
+| v0.18.0           | Field aliases, `server_fields`, `merge(refresh=)`  | ✅ Released |
+| v0.19.0 – v0.22.0 | Tier 1 — Core (live queries, typed relations)      | 📋 Planned  |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)    | 📋 Planned  |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)   | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)                 | 📋 Planned  |
@@ -1147,7 +1260,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | `call_function()` (`fn::`)    | ✅ v0.15.0              | ✅               |
 | JWT Authentication            | ✅ v0.16.0 (connection) | ✅               |
 | Model auth mixin              | ✅ v0.17.0              | ✅               |
-| Field Aliases & DX            | v0.18.0                 | ✅               |
+| Field Aliases & DX            | ✅ v0.18.0              | ✅               |
 | Live Models / CDC             | v0.19 – v0.21           | ✅               |
 | Native typed relations        | v0.22.0                 | ✅               |
 | Rich field types              | v0.23.0                 | ✅               |
