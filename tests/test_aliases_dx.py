@@ -13,7 +13,7 @@ import pytest
 from pydantic import Field
 
 from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
-from surreal_orm_lite.functions import Computed, computed
+from surreal_orm_lite.functions import Computed, SurrealFunc, computed
 from surreal_orm_lite.model_base import SurrealConfigDict
 
 # ==================== Models ====================
@@ -340,3 +340,52 @@ class TestHydrationE2E:
             await client.query("DEFINE FIELD created_at ON Stamped2 TYPE option<datetime> DEFAULT time::now();", {})
             instance = await Stamped2(id="a", title="first").save()
             assert instance.created_at is not None
+
+
+# ==================== Task 5 — merge() and server_values ====================
+
+
+class TestMergeAliasesE2E:
+    @pytest.mark.asyncio
+    async def test_merge_writes_the_aliased_column(self) -> None:
+        async with alias_client() as client:
+            instance = await Aliased(id="ada", password="secret").save()
+            await instance.merge(password="rotated")
+            row = await _raw_row(client, "Aliased", "ada")
+            assert row["password_hash"] == "rotated"
+            assert "password" not in row
+            assert instance.password == "rotated"
+
+    @pytest.mark.asyncio
+    async def test_server_values_compile_against_the_column(self) -> None:
+        async with alias_client() as client:
+            instance = await Aliased(id="ada", password="secret").save()
+            await instance.merge(server_values={"display": SurrealFunc("string::uppercase($who)")}, extra_vars={"who": "ada"})
+            row = await _raw_row(client, "Aliased", "ada")
+            assert row["display_name"] == "ADA"
+            assert "display" not in row
+            assert instance.display == "ADA"
+
+    @pytest.mark.asyncio
+    async def test_save_with_server_values_uses_the_column(self) -> None:
+        async with alias_client() as client:
+            instance = await Aliased(id="ada").save(
+                server_values={"password": SurrealFunc("string::concat('h:', $raw)")},
+                extra_vars={"raw": "secret"},
+            )
+            row = await _raw_row(client, "Aliased", "ada")
+            assert row["password_hash"] == "h:secret"
+            assert "password" not in row
+            assert instance.password == "h:secret"
+
+    @pytest.mark.asyncio
+    async def test_upsert_and_patch_address_the_column(self) -> None:
+        async with alias_client() as client:
+            instance = await Aliased(id="ada", password="secret").save()
+            instance.password = "upserted"
+            await instance.upsert()
+            assert (await _raw_row(client, "Aliased", "ada"))["password_hash"] == "upserted"
+
+            await instance.patch([{"op": "replace", "path": "/password_hash", "value": "patched"}])
+            assert (await _raw_row(client, "Aliased", "ada"))["password_hash"] == "patched"
+            assert instance.password == "patched"

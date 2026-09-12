@@ -287,6 +287,18 @@ class BaseSurrealModel(BaseModel):
         return cls._translate_field(column, cls._alias_maps()[1])
 
     @classmethod
+    def _columns_for(cls, data: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Re-key a Python-named mapping to the columns it writes to.
+
+        The boundary helper for every wire payload assembled from keyword arguments
+        (``merge(**data)``, ``server_values=``). Values are untouched; a model with no aliases
+        gets an ordinary copy back.
+        """
+        if not data:
+            return {}
+        return {cls.to_db_field(key): value for key, value in data.items()}
+
+    @classmethod
     def get_server_fields(cls) -> frozenset[str]:
         """Return the columns the **server** owns — never volunteered in a write payload.
 
@@ -653,7 +665,10 @@ class BaseSurrealModel(BaseModel):
         and 3.1.3), hence the full clause rather than a hybrid.
         """
         record_id = self._record_id()
-        merged: dict[str, Any] = {**self._write_payload(), **(server_values or {})}
+        # _write_payload() is already column-keyed; server_values arrive under Python names, so
+        # they are translated here — otherwise an aliased field would compile a SET against a
+        # column that does not exist.
+        merged: dict[str, Any] = {**self._write_payload(), **self._columns_for(server_values)}
         clause, variables = build_set_clause(merged)
 
         if record_id is not None:
@@ -957,12 +972,13 @@ class BaseSurrealModel(BaseModel):
         if record_id is None:
             raise SurrealDbError(f"No Id for the data to merge: {data}")
 
-        merged: dict[str, Any] = {**data, **server_values}
+        # Columns on the wire, Python names in the signal payload and the local apply below.
+        merged: dict[str, Any] = {**self._columns_for(data), **self._columns_for(server_values)}
         clause, variables = build_set_clause(merged)
         variables["rid"] = record_id
         variables = merge_extra_vars(variables, extra_vars)
         statement = f"UPDATE $rid SET {clause};"
-        update_fields = list(merged.keys())
+        update_fields = [*data, *(key for key in server_values if key not in data)]
 
         has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
 
@@ -1047,6 +1063,9 @@ class BaseSurrealModel(BaseModel):
 
         sender = self.__class__
         data_set = dict(data.items())
+        # Keyword arguments name Python fields; the MERGE payload names columns. Everything
+        # that stays on this side of the wire — signals, the local apply — keeps `data_set`.
+        wire_data = self._columns_for(data_set)
         record_id = self._record_id()
 
         if record_id is None:
@@ -1058,7 +1077,7 @@ class BaseSurrealModel(BaseModel):
             update_fields = list(data_set.keys())
             if has_signals:
                 await pre_update.send(sender, instance=self, update_fields=update_fields)
-            await tx.add(f"UPDATE {record_id} MERGE $data;", {"data": data_set})
+            await tx.add(f"UPDATE {record_id} MERGE $data;", {"data": wire_data})
             if tx.is_interactive:
                 await self.refresh(tx=tx)
             else:
@@ -1072,7 +1091,7 @@ class BaseSurrealModel(BaseModel):
         client = await SurrealDBConnectionManager.get_client()
 
         if not has_signals:
-            await client.merge(record_id, data_set)
+            await client.merge(record_id, wire_data)
             await self.refresh()
             return
 
@@ -1080,7 +1099,7 @@ class BaseSurrealModel(BaseModel):
         await pre_update.send(sender, instance=self, update_fields=update_fields)
 
         async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-            await client.merge(record_id, data_set)
+            await client.merge(record_id, wire_data)
             await self.refresh()
 
         await post_update.send(sender, instance=self, update_fields=update_fields)
