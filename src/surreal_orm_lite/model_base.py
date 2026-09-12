@@ -431,9 +431,7 @@ class BaseSurrealModel(BaseModel):
             record = rows[0] if isinstance(rows, list) and rows else rows
             if not isinstance(record, dict):
                 raise SurrealDbError("Can't refresh data, no record found.")
-            for key, value in record.items():
-                if hasattr(self, key):
-                    object.__setattr__(self, key, value)
+            self._apply_record(record)
             return
         if not self.get_id():
             raise SurrealDbError("Can't refresh data, not recorded yet.")  # pragma: no cover
@@ -451,21 +449,37 @@ class BaseSurrealModel(BaseModel):
             record = record[0]
 
         # Update current instance with refreshed data (keep native RecordID for id)
-        if isinstance(record, dict):
-            for key, value in record.items():
-                if hasattr(self, key):
-                    object.__setattr__(self, key, value)
+        self._apply_record(record)
 
-    def _write_payload(self) -> dict[str, Any]:
-        """Return this instance's data for a write: no ``id``, no computed fields.
+    def _write_payload(self, replace: bool = False) -> dict[str, Any]:
+        """Return this instance's data for a write: no ``id``, no client-owned server column.
 
-        Computed fields are owned by the server (``DEFINE FIELD … VALUE``), so sending one is
-        at best wasted bytes: SurrealDB discards it in favour of the expression. It is worse
-        than wasted if the definition has not been applied yet — the value, typically ``None``,
-        would land and null the column. Every write path funnels through here so the exclusion
-        cannot drift between them.
+        Keys come out as **column** names (``by_alias=True``): this is the wire payload, and
+        past this point nothing else knows about Python field names. ``exclude`` is matched on
+        field names, which is what Pydantic expects regardless of ``by_alias``.
+
+        What gets excluded depends on what omitting a field *means* in the statement being
+        built, which is not the same for a create and a replace:
+
+        - **Computed fields** are excluded always. ``DEFINE FIELD … VALUE`` re-evaluates on
+          every write, create and replace alike, so sending one is at best wasted bytes and at
+          worst — if the definition has not been applied yet — a ``None`` that nulls the column.
+        - **``server_fields``** are excluded from a **create** only. There, omitting the column
+          is precisely how the server's ``DEFAULT`` gets to apply. In a **replace**
+          (``UPDATE``/``UPSERT … CONTENT``) omission does not mean "server, fill this in": a
+          ``DEFAULT`` is a create-time default on both 2.6.x and 3.x, so an omitted optional
+          column is *deleted* and an omitted required one is a hard server error. The instance's
+          value is therefore kept, which round-trips the server's own value for any record that
+          was loaded or saved through the ORM.
+
+        Args:
+            replace: ``True`` for the full-replace paths (``update()``, ``upsert()``), which
+                keeps ``server_fields`` in the payload for the reason above.
         """
-        return self.model_dump(exclude={"id", *self.get_computed_fields()})
+        excluded = {"id", *self.get_computed_fields()}
+        if not replace:
+            excluded |= self.get_server_fields()
+        return self.model_dump(by_alias=True, exclude=excluded)
 
     @classmethod
     def _reject_computed_writes(cls, fields: Iterable[str], context: str) -> None:
@@ -553,10 +567,8 @@ class BaseSurrealModel(BaseModel):
                 # An interactive transaction (3.x/WebSocket) answers with the created row, so
                 # hydrate the server-owned fields exactly as the non-tx path does. A buffered
                 # transaction defers the statement and has nothing to return yet — its
-                # computed fields stay None until the instance is refreshed after commit.
-                record = rows[0] if isinstance(rows, list) and rows else rows
-                if isinstance(record, dict):
-                    self._apply_record(record, only=self.get_computed_fields())
+                # server-owned fields stay None until the instance is refreshed after commit.
+                self._apply_record(rows, only=self.get_server_fields())
                 return self, True
             if not tx.is_interactive:
                 raise SurrealDbError(
@@ -564,11 +576,7 @@ class BaseSurrealModel(BaseModel):
                     "(auto-id requires a WebSocket connection to SurrealDB 3.x)."
                 )
             rows = await tx.add(f"CREATE {table} CONTENT $data;", {"data": data})
-            record = rows[0] if isinstance(rows, list) and rows else rows
-            if isinstance(record, dict):
-                for key, value in record.items():
-                    if hasattr(self, key):
-                        object.__setattr__(self, key, value)
+            self._apply_record(rows)
             return self, True
 
         client = await SurrealDBConnectionManager.get_client()
@@ -585,12 +593,12 @@ class BaseSurrealModel(BaseModel):
                 if "already exists" in str(e).lower():
                     raise SurrealDbError(f"There was a problem with the database: {e}") from e
                 raise
-            # Pull back the fields the SERVER owns — computed fields (DEFINE FIELD … VALUE) —
-            # so they are readable straight after save(). Deliberately narrow: applying the
-            # whole row here would bypass Pydantic validation for every field (see
-            # _apply_record), turning nested models into plain dicts. A model with no computed
-            # fields is untouched, exactly as before v0.14.0.
-            self._apply_record(record, only=self.get_computed_fields())
+            # Pull back the fields the SERVER owns — computed fields (DEFINE FIELD … VALUE) and
+            # `server_fields` entries — so they are readable straight after save().
+            # Deliberately narrow: applying the whole row here would bypass Pydantic validation
+            # for every field (see _apply_record), turning nested models into plain dicts. A
+            # model that declares neither is untouched, exactly as before v0.14.0.
+            self._apply_record(record, only=self.get_server_fields())
             return self, True
 
         # Auto-generate the ID
@@ -604,9 +612,7 @@ class BaseSurrealModel(BaseModel):
 
         # Update current instance with the auto-generated ID (kept as native RecordID)
         if isinstance(record, dict):
-            for key, value in record.items():
-                if hasattr(self, key):
-                    object.__setattr__(self, key, value)
+            self._apply_record(record)
             return self, True
 
         raise SurrealDbError("Can't save data, no record returned.")  # pragma: no cover
@@ -747,6 +753,10 @@ class BaseSurrealModel(BaseModel):
         a caller that needs just a few known-scalar fields should say so rather than re-applying
         the whole row.
 
+        A row arrives keyed by **column**, so each key is translated back to its Python field
+        name first (v0.18.0). ``only`` is therefore matched on Python names — the same
+        vocabulary the callers use, since they pass things like ``get_server_fields()``.
+
         Args:
             only: restrict the copy to these field names. ``None`` (default) applies every field
                 in the row.
@@ -756,7 +766,8 @@ class BaseSurrealModel(BaseModel):
         if not isinstance(record, dict):
             return
         allowed = None if only is None else set(only)
-        for key, value in record.items():
+        for column, value in record.items():
+            key = self.to_py_field(column)
             if allowed is not None and key not in allowed:
                 continue
             if hasattr(self, key):
@@ -833,7 +844,7 @@ class BaseSurrealModel(BaseModel):
                 "upsert() requires an explicit id (there is nothing to match without one); "
                 "use save() to create a record with an auto-generated id."
             )
-        data = self._write_payload()
+        data = self._write_payload(replace=True)
 
         # RETURN $before, $after reports both states of the row in a single statement, so
         # `created` is the truth rather than an assumption (issue #156). Verified on
@@ -893,7 +904,7 @@ class BaseSurrealModel(BaseModel):
         ``post_update`` only fires after a successful commit.
         """
         sender = self.__class__
-        data = self._write_payload()
+        data = self._write_payload(replace=True)
         record_id = self._record_id()
         if record_id is None:
             raise SurrealDbError("Can't update data, no id found.")

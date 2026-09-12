@@ -191,3 +191,152 @@ async def _raw_row(client: Any, table: str, record: str) -> dict[str, Any]:
     if isinstance(rows, list):
         return dict(rows[0]) if rows else {}
     return dict(rows) if isinstance(rows, dict) else {}
+
+
+class Stamped2(BaseSurrealModel):
+    """E2E twin of ``Stamped``: ``created_at`` is filled by a server-side ``DEFAULT``."""
+
+    model_config = SurrealConfigDict(server_fields=["created_at"])
+    id: str
+    title: str = ""
+    created_at: Any = None
+
+
+# ==================== Task 3 — write payloads ====================
+
+
+class TestWritePayload:
+    def test_uses_the_column_names(self) -> None:
+        payload = Aliased(id="a", password="secret", display="Ada")._write_payload()
+        assert payload == {"password_hash": "secret", "display_name": "Ada", "plain": 0}
+
+    def test_omits_the_id(self) -> None:
+        assert "id" not in Aliased(id="a")._write_payload()
+
+    def test_omits_server_fields_on_a_create(self) -> None:
+        payload = Stamped(id="a", title="t", created_at="anything")._write_payload()
+        assert payload == {"title": "t"}
+
+    def test_keeps_server_fields_on_a_replace(self) -> None:
+        """On ``UPDATE/UPSERT … CONTENT`` omission *deletes* the column — a ``DEFAULT`` is a
+        create-time default on both DB lines — so the instance's value is sent instead."""
+        payload = Stamped(id="a", title="t", created_at="kept")._write_payload(replace=True)
+        assert payload == {"title": "t", "created_at": "kept"}
+
+    def test_omits_computed_fields_on_both(self) -> None:
+        """A ``VALUE`` clause re-evaluates on every write, so a computed field is never sent."""
+        assert StampedComputed(id="a", first="ada")._write_payload() == {"first": "ada"}
+        # The replace payload keeps the server_fields half, but never the computed one.
+        assert StampedComputed(id="a", first="ada")._write_payload(replace=True) == {
+            "first": "ada",
+            "created_at": None,
+        }
+
+    def test_plain_model_is_unchanged(self) -> None:
+        assert Plain(id="a", name="x")._write_payload() == {"name": "x"}
+
+
+class TestWritePayloadE2E:
+    @pytest.mark.asyncio
+    async def test_save_stores_the_aliased_column(self) -> None:
+        async with alias_client() as client:
+            await Aliased(id="ada", password="secret", display="Ada").save()
+            row = await _raw_row(client, "Aliased", "ada")
+            assert row["password_hash"] == "secret"
+            assert row["display_name"] == "Ada"
+            assert "password" not in row and "display" not in row
+
+    @pytest.mark.asyncio
+    async def test_server_default_survives_a_save(self) -> None:
+        """The point of ``server_fields``: the client never volunteers the column, so the
+        server's ``DEFAULT`` applies instead of being overwritten with the model's ``None``."""
+        async with alias_client("Stamped2") as client:
+            await client.query("DEFINE FIELD created_at ON Stamped2 TYPE option<datetime> DEFAULT time::now();", {})
+            await Stamped2(id="a", title="first").save()
+            row = await _raw_row(client, "Stamped2", "a")
+            assert row["created_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_server_stamp_survives_a_replace(self) -> None:
+        """``update()``/``upsert()`` are REPLACE: the stamp is carried in the payload rather
+        than omitted, because omitting it would delete the column outright."""
+        async with alias_client("Stamped2") as client:
+            await client.query("DEFINE FIELD created_at ON Stamped2 TYPE option<datetime> DEFAULT time::now();", {})
+            instance = await Stamped2(id="a", title="first").save()
+            stamped = (await _raw_row(client, "Stamped2", "a"))["created_at"]
+            assert stamped is not None
+
+            instance.title = "second"
+            await instance.update()
+            row = await _raw_row(client, "Stamped2", "a")
+            assert row["title"] == "second"
+            assert row["created_at"] == stamped
+
+            instance.title = "third"
+            await instance.upsert()
+            row = await _raw_row(client, "Stamped2", "a")
+            assert row["title"] == "third"
+            assert row["created_at"] == stamped
+
+    @pytest.mark.asyncio
+    async def test_required_server_field_does_not_break_a_replace(self) -> None:
+        """A non-optional server column omitted from a REPLACE is a hard server error
+        ("Found NONE for field …"), on 2.6.x and 3.x alike. Keeping it in the payload is what
+        makes ``update()`` usable on such a model at all."""
+        async with alias_client("Stamped2") as client:
+            await client.query("DEFINE FIELD created_at ON Stamped2 TYPE datetime DEFAULT time::now();", {})
+            instance = await Stamped2(id="a", title="first").save()
+            instance.title = "second"
+            await instance.update()
+            assert (await _raw_row(client, "Stamped2", "a"))["title"] == "second"
+
+
+# ==================== Task 4 — hydration ====================
+
+
+class TestApplyRecord:
+    def test_maps_a_column_onto_the_python_attribute(self) -> None:
+        instance = Aliased(id="a")
+        instance._apply_record({"password_hash": "secret"})
+        assert instance.password == "secret"
+
+    def test_only_is_matched_on_python_names(self) -> None:
+        instance = Aliased(id="a")
+        instance._apply_record({"password_hash": "secret", "display_name": "Ada"}, only={"password"})
+        assert instance.password == "secret"
+        assert instance.display == ""
+
+    def test_ignores_an_unknown_column(self) -> None:
+        instance = Aliased(id="a")
+        instance._apply_record({"nope": 1})
+        assert not hasattr(instance, "nope")
+
+    def test_plain_columns_still_apply(self) -> None:
+        instance = Aliased(id="a")
+        instance._apply_record({"plain": 7})
+        assert instance.plain == 7
+
+
+class TestHydrationE2E:
+    @pytest.mark.asyncio
+    async def test_from_db_hydrates_the_python_attribute(self) -> None:
+        async with alias_client():
+            await Aliased(id="ada", password="secret", display="Ada").save()
+            found = await Aliased.objects().filter(id="ada").exec()
+            assert found[0].password == "secret"
+            assert found[0].display == "Ada"
+
+    @pytest.mark.asyncio
+    async def test_refresh_hydrates_the_python_attribute(self) -> None:
+        async with alias_client() as client:
+            instance = await Aliased(id="ada", password="secret").save()
+            await client.query("UPDATE Aliased:ada SET password_hash = 'rotated';", {})
+            await instance.refresh()
+            assert instance.password == "rotated"
+
+    @pytest.mark.asyncio
+    async def test_server_field_is_hydrated_after_save(self) -> None:
+        async with alias_client("Stamped2") as client:
+            await client.query("DEFINE FIELD created_at ON Stamped2 TYPE option<datetime> DEFAULT time::now();", {})
+            instance = await Stamped2(id="a", title="first").save()
+            assert instance.created_at is not None
