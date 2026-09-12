@@ -42,6 +42,13 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+# Per-class derivations of v0.18.0, computed once on first use. They cannot be built in
+# ``__init_subclass__``: that runs inside ``type.__new__``, before Pydantic has finished
+# assembling ``model_fields``, so the aliases would not be visible yet. Keyed on the class
+# object, which is what makes them inheritance-correct — a subclass gets its own entry.
+_ALIAS_MAPS: dict[type, tuple[dict[str, str], dict[str, str]]] = {}
+_SERVER_FIELDS: dict[type, frozenset[str]] = {}
+
 
 def _own_annotation_names(cls: type) -> set[str]:
     """Return the names annotated in **this** class's body, ignoring inherited ones.
@@ -74,10 +81,16 @@ class SurrealConfigDict(ConfigDict):
         auth_duration_session (str | None): Session lifetime, e.g. "12h".
         auth_duration_grant (str | None): Refresh-grant lifetime; 3.x, WITH REFRESH only.
         with_refresh (bool | None): Emit WITH REFRESH — SurrealDB 3.x only.
+        server_fields (list[str] | None): Columns the server owns (v0.18.0). They are dropped
+            from implicit write payloads and hydrated back from the row the write returns,
+            but stay writable when a caller names one explicitly.
     """
 
     primary_key: str | None
     " The primary key field name for the model. "
+
+    # --- v0.18.0: columns the server owns (see BaseSurrealModel.get_server_fields) ---
+    server_fields: list[str] | None
 
     # --- v0.17.0: model-level authentication (see model_auth.AuthenticatedUserMixin) ---
     access_name: str | None
@@ -93,6 +106,15 @@ class SurrealConfigDict(ConfigDict):
 class BaseSurrealModel(BaseModel):
     """
     Base class for models interacting with SurrealDB.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+    """Accept either name for an aliased field (v0.18.0).
+
+    ``Field(alias="password_hash")`` renames the **column**, not the Python attribute, so both
+    spellings have to validate: the Python name in application code, the alias when hydrating a
+    row the server sent. Pydantic's default is alias-only, which would make ``User(password=…)``
+    a validation error in the very code the alias exists to keep readable.
     """
 
     __surreal_computed__: typing.ClassVar[dict[str, str]] = {}
@@ -211,6 +233,95 @@ class BaseSurrealModel(BaseModel):
         # Cheap even inside a transaction: get_client() returns the already-connected client.
         client = await SurrealDBConnectionManager.get_client()
         return await apply_ddl_statements(statements, client=client, tx=tx, what="computed field")
+
+    # ==================== Field aliases & server-owned fields (v0.18.0) ====================
+
+    @classmethod
+    def _alias_maps(cls) -> tuple[dict[str, str], dict[str, str]]:
+        """Return this model's ``(python → column, column → python)`` alias maps, cached.
+
+        Built from ``FieldInfo.alias`` only. A separate ``validation_alias`` /
+        ``serialization_alias`` — and in particular an ``AliasPath``/``AliasChoices`` — does not
+        describe a column *rename*, which is the whole contract here, so those are deliberately
+        left to Pydantic and never enter this map.
+        """
+        cached = _ALIAS_MAPS.get(cls)
+        if cached is None:
+            forward = {name: info.alias for name, info in cls.model_fields.items() if info.alias}
+            cached = (forward, {column: name for name, column in forward.items()})
+            _ALIAS_MAPS[cls] = cached
+        return cached
+
+    @staticmethod
+    def _translate_field(name: str, mapping: Mapping[str, str]) -> str:
+        """Map ``name`` through ``mapping``, translating only its first dotted segment.
+
+        A nested path belongs to its root field: if ``password`` is stored as ``password_hash``
+        then ``password.inner`` is stored as ``password_hash.inner``. This is the same rule the
+        computed-field and atomic-op guards apply to nested paths. An unmapped name passes
+        through unchanged, so every call site can translate unconditionally.
+        """
+        if not mapping or not name:
+            return name
+        head, separator, rest = name.partition(".")
+        mapped = mapping.get(head)
+        return name if mapped is None else mapped + separator + rest
+
+    @classmethod
+    def get_field_aliases(cls) -> dict[str, str]:
+        """Return ``{python_field_name: surrealdb_column}`` for this model's aliased fields.
+
+        ``{}`` when no field declares ``Field(alias=…)``. Returns a copy: the underlying map is
+        cached per class and every write path reads it.
+        """
+        return dict(cls._alias_maps()[0])
+
+    @classmethod
+    def to_db_field(cls, name: str) -> str:
+        """Translate a Python field name to the SurrealDB column it is stored under."""
+        return cls._translate_field(name, cls._alias_maps()[0])
+
+    @classmethod
+    def to_py_field(cls, column: str) -> str:
+        """Translate a SurrealDB column back to the Python attribute that holds it."""
+        return cls._translate_field(column, cls._alias_maps()[1])
+
+    @classmethod
+    def get_server_fields(cls) -> frozenset[str]:
+        """Return the columns the **server** owns — never volunteered in a write payload.
+
+        The union of two sources, because they are the same thing from the ORM's side:
+
+        - ``model_config = SurrealConfigDict(server_fields=[…])`` — columns a ``DEFINE FIELD …
+          DEFAULT``/``VALUE``, an event or a trigger fills in, which the ORM does not define
+          itself;
+        - this model's computed fields, which are server-owned by construction.
+
+        They differ on one point only, and it is about *explicit* writes rather than payload
+        building: naming a computed field in ``merge()``/``bulk_update()`` raises (the server
+        would discard it — an invisible no-op), while naming a ``server_fields`` entry is
+        allowed, because a caller who spells the column out is deliberately overriding it.
+
+        Raises:
+            ValueError: if ``server_fields`` names a field the model does not declare — a typo
+                there would otherwise silently protect nothing.
+        """
+        cached = _SERVER_FIELDS.get(cls)
+        if cached is None:
+            configured = cls.model_config.get("server_fields") or ()
+            if isinstance(configured, str) or not isinstance(configured, Iterable):
+                raise TypeError(f"{cls.__name__}: server_fields must be a list of field names, got {configured!r}.")
+            names = tuple(configured)
+            undeclared = sorted(name for name in names if name not in cls.model_fields)
+            if undeclared:
+                raise ValueError(
+                    f"{cls.__name__}: server_fields names {', '.join(undeclared)}, "
+                    f"which {'is' if len(undeclared) == 1 else 'are'} not declared on the model. "
+                    "Add the field, or drop the name from server_fields."
+                )
+            cached = frozenset(names) | frozenset(cls.get_computed_fields())
+            _SERVER_FIELDS[cls] = cached
+        return cached
 
     @classmethod
     def get_table_name(cls) -> str:
