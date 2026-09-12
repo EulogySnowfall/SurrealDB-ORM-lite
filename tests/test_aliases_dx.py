@@ -14,7 +14,7 @@ from pydantic import Field
 
 from surreal_orm_lite import BaseSurrealModel, Q, SurrealDBConnectionManager
 from surreal_orm_lite.functions import Computed, SurrealFunc, computed
-from surreal_orm_lite.model_base import SurrealConfigDict
+from surreal_orm_lite.model_base import _ALIAS_MAPS, SurrealConfigDict
 
 # ==================== Models ====================
 
@@ -598,3 +598,203 @@ class TestWriteGuards:
     async def test_bulk_update_still_refuses_a_computed_field(self) -> None:
         with pytest.raises(ValueError, match="computed field"):
             await StampedComputed.objects().bulk_update(shouted="nope")
+
+
+# ==================== Review follow-up: every other alias boundary ====================
+
+
+class Scored(BaseSurrealModel):
+    id: str
+    amount: int = Field(default=0, alias="amt")
+    tags: list[str] = Field(default_factory=list, alias="tag_list")
+    group: str = Field(default="", alias="grp")
+
+
+class TestAtomicOpsAliases:
+    """Atomic ops interpolate the field straight into a SET clause. Before the fix they wrote
+    the Python name, which SurrealDB happily honours — by creating a *second*, phantom column
+    and leaving the real one untouched."""
+
+    @pytest.mark.asyncio
+    async def test_increment_targets_the_column(self) -> None:
+        async with alias_client("Scored") as client:
+            item = await Scored(id="a", amount=1).save()
+            await item.atomic_increment("amount", 5)
+            row = await _raw_row(client, "Scored", "a")
+            assert row["amt"] == 6
+            assert "amount" not in row
+            assert item.amount == 6
+
+    @pytest.mark.asyncio
+    async def test_array_ops_target_the_column(self) -> None:
+        async with alias_client("Scored") as client:
+            item = await Scored(id="a", tags=["x"]).save()
+            await item.atomic_append("tags", "y")
+            await item.atomic_set_add("tags", "y")
+            await item.atomic_append_many("tags", ["z", "w"])
+            await item.atomic_remove("tags", "x")
+            row = await _raw_row(client, "Scored", "a")
+            assert row["tag_list"] == ["y", "z", "w"]
+            assert "tags" not in row
+            assert item.tags == ["y", "z", "w"]
+
+    @pytest.mark.asyncio
+    async def test_remove_many_targets_the_column(self) -> None:
+        async with alias_client("Scored") as client:
+            item = await Scored(id="a", tags=["x", "y", "z"]).save()
+            await item.atomic_remove_many("tags", ["x", "z"])
+            assert (await _raw_row(client, "Scored", "a"))["tag_list"] == ["y"]
+
+
+class TestAnnotateAliases:
+    """``values()`` was translated but the ``Aggregation`` objects were not, so the statement
+    looked right and silently aggregated a column that does not exist — a permanent zero."""
+
+    def test_aggregation_expressions_name_the_column(self) -> None:
+        from surreal_orm_lite import Count, Sum
+
+        query, _ = Scored.objects().values("group").annotate(total=Sum("amount"), n=Count("amount"))._compile_group_by_query()
+        assert "math::sum(amt)" in query
+        assert "count(amt)" in query
+        assert "GROUP BY grp" in query
+
+    @pytest.mark.asyncio
+    async def test_annotate_returns_real_numbers_and_python_keys(self) -> None:
+        from surreal_orm_lite import Sum
+
+        async with alias_client("Scored"):
+            await Scored(id="a", amount=10, group="g").save()
+            await Scored(id="b", amount=30, group="g").save()
+
+            rows = await Scored.objects().values("group").annotate(total=Sum("amount")).exec()
+            assert len(rows) == 1
+            assert rows[0]["total"] == 40
+            # The caller asked in Python names, so the result is keyed that way too.
+            assert rows[0]["group"] == "g"
+            assert "grp" not in rows[0]
+
+
+class TestSignalPayloadNames:
+    @pytest.mark.asyncio
+    async def test_update_reports_python_field_names(self) -> None:
+        from surreal_orm_lite import post_update
+
+        seen: list[list[str]] = []
+
+        async def handler(sender: Any, instance: Any, update_fields: list[str]) -> None:
+            seen.append(sorted(update_fields))
+
+        post_update.connect(Scored)(handler)
+        try:
+            async with alias_client("Scored"):
+                item = await Scored(id="a", amount=1).save()
+                await item.update()
+                await item.merge(amount=2)
+        finally:
+            post_update.disconnect(handler, Scored)
+
+        # Both paths must speak the vocabulary a handler knows: the model's attributes.
+        assert seen[0] == ["amount", "group", "tags"]
+        assert seen[1] == ["amount"]
+
+
+class TestAliasMapValidation:
+    def test_alias_colliding_with_another_field_raises(self) -> None:
+        class Collide(BaseSurrealModel):
+            id: str
+            pw: str = Field(default="", alias="hash")
+            hash: str = ""
+
+        with pytest.raises(ValueError, match="collides"):
+            Collide.get_field_aliases()
+
+    def test_two_fields_sharing_one_column_raises(self) -> None:
+        class Shared(BaseSurrealModel):
+            id: str
+            a: str = Field(default="", alias="same")
+            b: str = Field(default="", alias="same")
+
+        with pytest.raises(ValueError, match="both alias"):
+            Shared.get_field_aliases()
+
+    def test_alias_equal_to_its_own_name_is_fine(self) -> None:
+        class SelfNamed(BaseSurrealModel):
+            id: str
+            a: str = Field(default="", alias="a")
+
+        assert SelfNamed.get_field_aliases() == {"a": "a"}
+
+
+class TestSerializationAliasIsNotAColumnRename:
+    """``model_dump(by_alias=True)`` also honours ``serialization_alias``, which the ORM's map
+    deliberately ignores. Letting the two disagree wrote rows under a name no read path ever
+    looks for — the value landed in the database and became unreachable."""
+
+    def test_payload_follows_the_orm_map_not_pydantic(self) -> None:
+        class Mixed(BaseSurrealModel):
+            id: str
+            a: str = Field(default="A", serialization_alias="a_col")
+            b: str = Field(default="B", alias="b_in", serialization_alias="b_out")
+
+        assert Mixed.get_field_aliases() == {"b": "b_in"}
+        assert Mixed(id="x")._write_payload() == {"a": "A", "b_in": "B"}
+
+    @pytest.mark.asyncio
+    async def test_the_written_row_is_findable(self) -> None:
+        class Mixed2(BaseSurrealModel):
+            id: str
+            b: str = Field(default="", alias="b_in", serialization_alias="b_out")
+
+        async with alias_client("Mixed2") as client:
+            await Mixed2(id="x", b="value").save()
+            assert (await _raw_row(client, "Mixed2", "x"))["b_in"] == "value"
+            found = await Mixed2.objects().filter(b="value").exec()
+            assert len(found) == 1
+
+
+class TestModelAuthAliases:
+    def test_signup_and_signin_ddl_name_the_columns(self) -> None:
+        from surreal_orm_lite import AuthenticatedUserMixin
+
+        class AliasUser(AuthenticatedUserMixin, BaseSurrealModel):
+            model_config = SurrealConfigDict(access_name="alias_acct")
+            id: str | None = None
+            email: str = Field(default="", alias="email_addr")
+            password: str = Field(default="", alias="password_hash")
+
+        ddl = "\n".join(AliasUser.access_ddl())
+        # Column on the left, the caller's keyword on the right.
+        assert "email_addr = $email" in ddl
+        assert "password_hash = crypto::argon2::generate($password)" in ddl
+        assert "WHERE email_addr = $email" in ddl
+        assert "crypto::argon2::compare(password_hash, $password)" in ddl
+
+    def test_signup_skips_server_owned_columns(self) -> None:
+        from surreal_orm_lite import AuthenticatedUserMixin
+
+        class StampedUser(AuthenticatedUserMixin, BaseSurrealModel):
+            model_config = SurrealConfigDict(access_name="stamped_acct", server_fields=["created_at"])
+            id: str | None = None
+            email: str = ""
+            password: str = ""
+            created_at: Any = None
+
+        ddl = "\n".join(StampedUser.access_ddl())
+        # SIGNUP is a CREATE: listing the column would overwrite the server's DEFAULT with NONE.
+        assert "created_at" not in ddl
+
+
+class TestComputedDdlAliases:
+    def test_define_field_names_the_column(self) -> None:
+        class ComputedAliased(BaseSurrealModel):
+            id: str
+            first: str = ""
+            shouted: Computed[str] = computed("string::uppercase(first)")
+
+        ComputedAliased.model_fields["shouted"].alias = "shouted_col"
+        _ALIAS_MAPS.pop(ComputedAliased, None)
+        try:
+            assert "DEFINE FIELD OVERWRITE shouted_col ON ComputedAliased" in ComputedAliased.computed_field_ddl()[0]
+        finally:
+            ComputedAliased.model_fields["shouted"].alias = None
+            _ALIAS_MAPS.pop(ComputedAliased, None)

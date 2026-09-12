@@ -195,8 +195,9 @@ class BaseSurrealModel(BaseModel):
         clause = "OVERWRITE" if overwrite else "IF NOT EXISTS"
         statements: list[str] = []
         for name, expression in computed.items():
-            validate_alias_name(name)
-            statements.append(f"DEFINE FIELD {clause} {name} ON {table} VALUE {expression};")
+            column = cls.to_db_field(name)
+            validate_alias_name(column)
+            statements.append(f"DEFINE FIELD {clause} {column} ON {table} VALUE {expression};")
         return statements
 
     @classmethod
@@ -248,9 +249,41 @@ class BaseSurrealModel(BaseModel):
         cached = _ALIAS_MAPS.get(cls)
         if cached is None:
             forward = {name: info.alias for name, info in cls.model_fields.items() if info.alias}
+            cls._reject_ambiguous_aliases(forward)
             cached = (forward, {column: name for name, column in forward.items()})
             _ALIAS_MAPS[cls] = cached
         return cached
+
+    @classmethod
+    def _reject_ambiguous_aliases(cls, forward: Mapping[str, str]) -> None:
+        """Raise if the alias map is not a bijection between field names and columns.
+
+        Two shapes make the translation lossy, and both are silent without this check:
+
+        - a column that is also **another field's** name (``pw = Field(alias="hash")`` next to
+          a field called ``hash``) — the payload's two keys collapse into one, so one field is
+          dropped, and the reverse map sends the column to the wrong attribute;
+        - two fields sharing **one column** — same collapse, no survivor worth picking.
+
+        A field aliased to its own name is harmless and allowed.
+        """
+        stolen = sorted(
+            f"{name} -> {column}" for name, column in forward.items() if column != name and column in cls.model_fields
+        )
+        if stolen:
+            raise ValueError(
+                f"{cls.__name__}: alias {', '.join(stolen)} collides with another field of that name. "
+                "A column name that is also a field name makes writes and hydration ambiguous; "
+                "rename the field or choose a different alias."
+            )
+        seen: dict[str, str] = {}
+        for name, column in forward.items():
+            if column in seen:
+                raise ValueError(
+                    f"{cls.__name__}: {seen[column]} and {name} both alias the column {column!r}. "
+                    "Each field needs its own column."
+                )
+            seen[column] = name
 
     @staticmethod
     def _translate_field(name: str, mapping: Mapping[str, str]) -> str:
@@ -297,6 +330,16 @@ class BaseSurrealModel(BaseModel):
         if not data:
             return {}
         return {cls.to_db_field(key): value for key, value in data.items()}
+
+    @classmethod
+    def _py_fields(cls, payload: Mapping[str, Any]) -> list[str]:
+        """Name a column-keyed payload's fields the way a signal handler expects them.
+
+        ``update_fields`` reaches user code, which knows the model's Python attributes and not
+        the columns behind them — ``if "display" in update_fields`` has to keep working on an
+        aliased model, and it is what ``merge()`` has always sent.
+        """
+        return [cls.to_py_field(key) for key in payload]
 
     @classmethod
     def get_server_fields(cls) -> frozenset[str]:
@@ -466,9 +509,12 @@ class BaseSurrealModel(BaseModel):
     def _write_payload(self, replace: bool = False) -> dict[str, Any]:
         """Return this instance's data for a write: no ``id``, no client-owned server column.
 
-        Keys come out as **column** names (``by_alias=True``): this is the wire payload, and
-        past this point nothing else knows about Python field names. ``exclude`` is matched on
-        field names, which is what Pydantic expects regardless of ``by_alias``.
+        Keys come out as **column** names. The re-keying goes through :meth:`_columns_for`
+        rather than ``model_dump(by_alias=True)`` on purpose: ``by_alias`` would also honour a
+        ``serialization_alias``, which :meth:`_alias_maps` deliberately ignores because it does
+        not describe a symmetric column rename. Letting the two disagree would write the row
+        under a name that ``filter()``, ``select()`` and ``_apply_record()`` never look for —
+        the value would land in the database and become unreachable through the ORM.
 
         What gets excluded depends on what omitting a field *means* in the statement being
         built, which is not the same for a create and a replace:
@@ -491,7 +537,7 @@ class BaseSurrealModel(BaseModel):
         excluded = {"id", *self.get_computed_fields()}
         if not replace:
             excluded |= self.get_server_fields()
-        return self.model_dump(by_alias=True, exclude=excluded)
+        return self._columns_for(self.model_dump(exclude=excluded))
 
     @classmethod
     def _reject_computed_writes(cls, fields: Iterable[str], context: str) -> None:
@@ -512,16 +558,23 @@ class BaseSurrealModel(BaseModel):
             )
 
     @classmethod
-    def _validate_atomic_field(cls, field: str) -> None:
-        """Validate an atomic-op target: a valid name, and not a computed field.
+    def _validate_atomic_field(cls, field: str) -> str:
+        """Validate an atomic-op target and return the **column** it addresses.
 
         Dotted paths are legal here (``validate_field_name`` allows them for nested fields),
         so the guard compares the **first** segment: a computed field is server-owned in full,
         making ``tag_count.items`` no more writable than ``tag_count`` — the same rule the
         patch guard applies to ``/tag_count/0``.
+
+        The translated name is returned rather than merely validated because the caller
+        interpolates it straight into a ``SET`` clause (v0.18.0). Handing back the Python name
+        would compile ``amount = array::append(amount, …)`` for a field stored as ``amt``,
+        which SurrealDB happily honours — by creating a second, phantom column and leaving the
+        real one untouched.
         """
         validate_field_name(field, "atomic field")
         cls._reject_computed_writes([field.split(".", 1)[0]], "atomic operation")
+        return cls.to_db_field(field)
 
     @classmethod
     def _reject_computed_patch(cls, operations: list[dict[str, Any]], context: str) -> None:
@@ -972,7 +1025,7 @@ class BaseSurrealModel(BaseModel):
             if not has_signals:
                 await tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
                 return None
-            update_fields = list(data.keys())
+            update_fields = self._py_fields(data)
             await pre_update.send(sender, instance=self, update_fields=update_fields)
             await tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
             tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
@@ -983,7 +1036,7 @@ class BaseSurrealModel(BaseModel):
         if not has_signals:
             return await client.update(record_id, data)
 
-        update_fields = list(data.keys())
+        update_fields = self._py_fields(data)
         await pre_update.send(sender, instance=self, update_fields=update_fields)
 
         async with around_update.wrap(sender, instance=self, update_fields=update_fields):
@@ -1222,8 +1275,8 @@ class BaseSurrealModel(BaseModel):
         Compiled to ``array::append`` — identical on SurrealDB 2.6.x and 3.x. For set
         semantics (skip if already present) use :meth:`atomic_set_add`. Emits no signals.
         """
-        self._validate_atomic_field(field)
-        return await self._atomic_update(f"{field} = array::append({field}, $value)", {"value": value}, tx)
+        column = self._validate_atomic_field(field)
+        return await self._atomic_update(f"{column} = array::append({column}, $value)", {"value": value}, tx)
 
     async def atomic_remove(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
         """Atomically remove ALL occurrences of ``value`` from an array ``field``.
@@ -1232,8 +1285,8 @@ class BaseSurrealModel(BaseModel):
         3.x. (The ``-=`` operator is deliberately NOT used: it removes all occurrences on 3.x
         but only the first on 2.6.x.) Emits no signals.
         """
-        self._validate_atomic_field(field)
-        return await self._atomic_update(f"{field} = array::complement({field}, [$value])", {"value": value}, tx)
+        column = self._validate_atomic_field(field)
+        return await self._atomic_update(f"{column} = array::complement({column}, [$value])", {"value": value}, tx)
 
     async def atomic_set_add(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
         """Atomically add ``value`` to an array ``field`` only if not already present.
@@ -1241,8 +1294,8 @@ class BaseSurrealModel(BaseModel):
         Compiled to ``array::add`` (set semantics) — identical on 2.6.x and 3.x. (NOT the
         ``+=`` operator, which appends duplicates on both server lines.) Emits no signals.
         """
-        self._validate_atomic_field(field)
-        return await self._atomic_update(f"{field} = array::add({field}, $value)", {"value": value}, tx)
+        column = self._validate_atomic_field(field)
+        return await self._atomic_update(f"{column} = array::add({column}, $value)", {"value": value}, tx)
 
     async def atomic_increment(self, field: str, amount: Decimal | int | float = 1, tx: Transaction | None = None) -> Self:
         """Atomically add ``amount`` (default 1) to a numeric ``field``.
@@ -1252,8 +1305,8 @@ class BaseSurrealModel(BaseModel):
         (the value is bound, not interpolated); adding a ``Decimal`` to an int/float field
         coerces the stored field to SurrealDB ``decimal``. Emits no signals.
         """
-        self._validate_atomic_field(field)
-        return await self._atomic_update(f"{field} += $amount", {"amount": amount}, tx)
+        column = self._validate_atomic_field(field)
+        return await self._atomic_update(f"{column} += $amount", {"amount": amount}, tx)
 
     @staticmethod
     def _as_value_list(values: Any) -> list[Any]:
@@ -1272,9 +1325,9 @@ class BaseSurrealModel(BaseModel):
         single element) — identical on 2.6.x and 3.x. An empty ``values`` is a safe no-op.
         Emits no signals.
         """
-        self._validate_atomic_field(field)
+        column = self._validate_atomic_field(field)
         return await self._atomic_update(
-            f"{field} = array::concat({field}, $values)", {"values": self._as_value_list(values)}, tx
+            f"{column} = array::concat({column}, $values)", {"values": self._as_value_list(values)}, tx
         )
 
     async def atomic_set_add_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
@@ -1284,8 +1337,10 @@ class BaseSurrealModel(BaseModel):
         ``values`` are also collapsed). Compiled to ``array::add`` — identical on 2.6.x and 3.x.
         An empty ``values`` is a safe no-op. Emits no signals.
         """
-        self._validate_atomic_field(field)
-        return await self._atomic_update(f"{field} = array::add({field}, $values)", {"values": self._as_value_list(values)}, tx)
+        column = self._validate_atomic_field(field)
+        return await self._atomic_update(
+            f"{column} = array::add({column}, $values)", {"values": self._as_value_list(values)}, tx
+        )
 
     async def atomic_remove_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
         """Atomically remove ALL occurrences of every element of ``values`` from an array ``field``.
@@ -1293,9 +1348,9 @@ class BaseSurrealModel(BaseModel):
         The list-valued counterpart of :meth:`atomic_remove`. Compiled to ``array::complement``
         — identical on 2.6.x and 3.x. An empty ``values`` is a safe no-op. Emits no signals.
         """
-        self._validate_atomic_field(field)
+        column = self._validate_atomic_field(field)
         return await self._atomic_update(
-            f"{field} = array::complement({field}, $values)", {"values": self._as_value_list(values)}, tx
+            f"{column} = array::complement({column}, $values)", {"values": self._as_value_list(values)}, tx
         )
 
     async def delete(self, tx: Transaction | None = None) -> None:

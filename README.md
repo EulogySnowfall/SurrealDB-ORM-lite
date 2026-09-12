@@ -983,10 +983,20 @@ await user.merge(password="rotated")
 await User.objects().filter(display="Ada").bulk_update(password="rotated")
 ```
 
-The translation covers `save`/`update`/`upsert`/`merge`/`bulk_create`, `server_values=`, read
-hydration (`exec()`, `refresh()`, the row a write returns), and every QuerySet clause —
-`select`, `filter` (including `Q` objects, nested and negated), `order_by`, `values`, `fetch`,
-`bulk_update` and the `sum`/`avg`/`min`/`max` helpers.
+The translation covers every boundary the ORM owns:
+
+- **writes** — `save`, `update`, `upsert`, `merge`, `bulk_create`, `server_values=`, and the
+  `atomic_*` family (`atomic_increment`, `atomic_append`, `atomic_set_add`, `atomic_remove`
+  and their `*_many` counterparts);
+- **reads** — `exec()`, `refresh()`, and the row a write returns;
+- **every QuerySet clause** — `select`, `filter` (including `Q` objects, nested and negated),
+  `order_by`, `values`, `fetch`, `bulk_update`, the `sum`/`avg`/`min`/`max` helpers and the
+  `Count`/`Sum`/`Avg`/`Min`/`Max` objects passed to `annotate()`. A grouped result comes back
+  keyed by your Python names, not by columns;
+- **DDL the ORM generates** — `computed_field_ddl()`, and `AuthenticatedUserMixin`'s
+  `access_ddl()` (its `SIGNUP`/`SIGNIN` clauses name the column on the left and keep your
+  keyword argument as the bound variable on the right);
+- **signal payloads** — `update_fields` always names the model's Python attributes.
 
 Three classmethods expose the mapping if you need it directly:
 
@@ -998,7 +1008,13 @@ Three classmethods expose the mapping if you need it directly:
 
 Only a plain, symmetric `Field(alias=…)` is treated as a column rename. A separate
 `validation_alias` / `serialization_alias`, and in particular `AliasPath` / `AliasChoices`,
-describe something other than a renamed column and are left entirely to Pydantic.
+describe something other than a renamed column and are left entirely to Pydantic — write
+payloads follow the ORM's map, not `model_dump(by_alias=True)`, so a row can never land under
+a name the read paths do not look for.
+
+The map has to be unambiguous, and the ORM checks it the first time it is used: an alias that
+collides with another field's name, or two fields sharing one column, raises `ValueError`.
+Either shape would make the payload's two keys collapse into one and silently drop a field.
 
 `patch()` is the one exception, by design: it takes raw RFC 6902 JSON pointers, which address
 the stored document, so you write `/password_hash` there.

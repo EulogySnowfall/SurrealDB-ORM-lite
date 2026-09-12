@@ -57,6 +57,18 @@ class QuerySet:
         self._annotations: dict[str, Aggregation] = {}
         self._tx: Any = None
 
+    def _py_keyed(self, row: Any) -> Any:
+        """Re-key a grouped result row from columns back to Python field names (v0.18.0).
+
+        A GROUP BY result is a plain dict, not a model, so nothing else would translate it: the
+        caller wrote ``values("display")`` in Python names and would otherwise get
+        ``{"display_name": …}`` back. Annotation aliases are the caller's own words and pass
+        through untouched — ``to_py_field`` leaves an unmapped name alone.
+        """
+        if not isinstance(row, dict):
+            return row
+        return {self.model.to_py_field(key): value for key, value in row.items()}
+
     def _column(self, field: str) -> str:
         """Translate a Python field name to the SurrealDB column it is stored under (v0.18.0).
 
@@ -326,7 +338,7 @@ class QuerySet:
 
         select_parts = list(self._group_by_fields)
         for alias, agg in self._annotations.items():
-            select_parts.append(f"{agg.to_sql()} AS {alias}")
+            select_parts.append(f"{agg.to_sql(self.model.get_field_aliases())} AS {alias}")
 
         query = f"SELECT {', '.join(select_parts)} FROM {self._model_table}"
         query += where_clause
@@ -383,7 +395,9 @@ class QuerySet:
         if self._annotations:
             query, variables = self._compile_group_by_query()
             results = await self._execute_query(query, variables)
-            return results if isinstance(results, list) else []
+            if not isinstance(results, list):
+                return []
+            return [self._py_keyed(row) for row in results]
 
         query, variables = self._compile_query()
         results = await self._execute_query(query, variables)
@@ -864,8 +878,12 @@ class QuerySet:
         wants to hear about it rather than lose the value. Models that opt into extra fields
         (``model_config = ConfigDict(extra="allow")``) keep them, on both paths.
         """
-        computed = self.model.get_computed_fields()
-        vetted = {key: value for key, value in payload.items() if key not in computed}
+        # get_server_fields() covers computed fields *and* `server_fields` entries. Both are
+        # dropped by save()'s payload on the create branch, so dropping them here too keeps the
+        # two branches writing the same columns — otherwise `get_or_create(created_at=…)` would
+        # filter on a column the create never writes and mint a duplicate on every call.
+        server_owned = self.model.get_server_fields()
+        vetted = {key: value for key, value in payload.items() if key not in server_owned}
 
         if self.model.model_config.get("extra") == "allow":
             return vetted

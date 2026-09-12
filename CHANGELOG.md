@@ -25,11 +25,16 @@ client-side, so they behave **identically on SurrealDB 2.6.x and 3.x**.
   await User.objects().filter(password="secret").exec()   # queries password_hash
   ```
 
-  The alias is honoured on writes (`save`/`update`/`upsert`/`merge`/`bulk_create`,
-  `server_values=`), on read hydration (`exec()`, `refresh()`, the row a write returns), and in
-  **every QuerySet clause** — `select`, `filter` (including nested and negated `Q` objects),
-  `order_by`, `values`, `fetch`, `bulk_update` and the `sum`/`avg`/`min`/`max` helpers. This
-  last part is the piece the full ORM still documents as an open gap.
+  The alias is honoured at every boundary the ORM owns: writes (`save`/`update`/`upsert`/
+  `merge`/`bulk_create`, `server_values=`, and the whole `atomic_*` family), read hydration
+  (`exec()`, `refresh()`, the row a write returns), **every QuerySet clause** (`select`,
+  `filter` including nested and negated `Q` objects, `order_by`, `values`, `fetch`,
+  `bulk_update`, the `sum`/`avg`/`min`/`max` helpers and the aggregation objects given to
+  `annotate()`), the DDL the ORM generates (`computed_field_ddl()`, and
+  `AuthenticatedUserMixin`'s `access_ddl()`), and signal payloads (`update_fields` always names
+  Python attributes). QuerySet filter rewriting is the piece the full ORM still documents as an
+  open gap. A grouped `values()`/`annotate()` result is re-keyed to Python names on the way
+  out.
 
   `patch()` is the deliberate exception: it takes raw RFC 6902 pointers, which address the
   stored document, so `/password_hash` is correct there.
@@ -72,7 +77,19 @@ client-side, so they behave **identically on SurrealDB 2.6.x and 3.x**.
 
 - Only a plain, symmetric `Field(alias=…)` is treated as a column rename. A separate
   `validation_alias` / `serialization_alias`, and in particular `AliasPath` / `AliasChoices`,
-  describe something other than a renamed column and are left entirely to Pydantic.
+  describe something other than a renamed column and are left entirely to Pydantic. Write
+  payloads are re-keyed through the ORM's own map rather than `model_dump(by_alias=True)`,
+  which would honour a `serialization_alias` and write the row under a name `filter()`,
+  `select()` and hydration never look for — landing the value in the database and making it
+  unreachable through the ORM.
+
+- **The alias map must be a bijection**, checked the first time it is used: an alias that
+  collides with another field's name, or two fields sharing one column, raises `ValueError`.
+  Either shape collapses two payload keys into one and silently drops a field.
+
+- `AuthenticatedUserMixin`'s SIGNUP clause now also skips `server_fields`, for the same reason
+  `save()` does — SIGNUP is a `CREATE`, so listing the column would overwrite the server's
+  `DEFAULT` with `NONE` and force every caller to supply a value the server is meant to mint.
 
 - `merge()` now reserves `refresh` alongside `tx`, `server_values` and `extra_vars`.
 
