@@ -10,9 +10,9 @@ import pytest
 from pydantic import Field
 from surrealdb import NotFoundError, RecordID
 
-from src import surreal_orm_lite
-from src.surreal_orm_lite.exceptions import SurrealDbError
-from src.surreal_orm_lite.utils import validate_edge_name, validate_graph_path
+import surreal_orm_lite
+from surreal_orm_lite.exceptions import SurrealDbError
+from surreal_orm_lite.utils import validate_edge_name, validate_graph_path
 
 # =============================================================================
 # Test Models

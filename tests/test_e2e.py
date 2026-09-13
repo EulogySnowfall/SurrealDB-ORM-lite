@@ -4,8 +4,8 @@ import pytest
 from pydantic import Field
 from surrealdb import RecordID
 
-from src import surreal_orm_lite
-from src.surreal_orm_lite.exceptions import SurrealDbError, SurrealDbNotFoundError
+import surreal_orm_lite
+from surreal_orm_lite.exceptions import SurrealDbError, SurrealDbNotFoundError
 
 SURREALDB_HOST = os.environ.get("SURREALDB_HOST", "localhost")
 SURREALDB_PORT = os.environ.get("SURREALDB_PORT", "8000")
@@ -369,7 +369,7 @@ async def test_filter_contains() -> None:
 async def test_duplicate_save_raises_surreal_error() -> None:
     import contextlib
 
-    from src.surreal_orm_lite.exceptions import SurrealDbError
+    from surreal_orm_lite.exceptions import SurrealDbError
 
     class DupModel(surreal_orm_lite.BaseSurrealModel):
         id: str | RecordID | None = None

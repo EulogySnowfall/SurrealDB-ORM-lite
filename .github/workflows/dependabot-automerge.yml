@@ -108,7 +108,7 @@ jobs:
           SURREALDB_PORT: 8000
         run: |
           uv run pytest tests/ -v \
-            --cov=src.surreal_orm_lite \
+            --cov=src/surreal_orm_lite \
             --cov-branch \
             --cov-report=xml
 

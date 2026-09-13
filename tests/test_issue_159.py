@@ -14,10 +14,10 @@ import os
 import pytest
 from surrealdb import RecordID
 
-from src import surreal_orm_lite
-from src.surreal_orm_lite import BaseSurrealModel, Q, Var
-from src.surreal_orm_lite.exceptions import SurrealDbNotFoundError
-from src.surreal_orm_lite.utils import build_filter_condition, coerce_record_id
+import surreal_orm_lite
+from surreal_orm_lite import BaseSurrealModel, Q, Var
+from surreal_orm_lite.exceptions import SurrealDbNotFoundError
+from surreal_orm_lite.utils import build_filter_condition, coerce_record_id
 
 SURREALDB_HOST = os.environ.get("SURREALDB_HOST", "localhost")
 SURREALDB_PORT = os.environ.get("SURREALDB_PORT", "8000")

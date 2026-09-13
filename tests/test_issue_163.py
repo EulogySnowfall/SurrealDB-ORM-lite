@@ -16,8 +16,8 @@ import threading
 
 import pytest
 
-from src import surreal_orm_lite
-from src.surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
+import surreal_orm_lite
+from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
 
 SURREALDB_HOST = os.environ.get("SURREALDB_HOST", "localhost")
 SURREALDB_PORT = os.environ.get("SURREALDB_PORT", "8000")

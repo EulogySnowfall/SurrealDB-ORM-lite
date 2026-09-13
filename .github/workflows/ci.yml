@@ -98,7 +98,7 @@ jobs:
         env:
           SURREALDB_HOST: localhost
           SURREALDB_PORT: 8000
-        run: uv run pytest tests/ -v --cov=src.surreal_orm_lite --cov-report=xml
+        run: uv run pytest tests/ -v --cov=src/surreal_orm_lite --cov-report=xml
 
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.14'
