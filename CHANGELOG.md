@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.18.0] - 2026-09-12
 
 Let a model's **Python surface** differ from its **SurrealDB column surface**, mark the columns
-the server owns, and skip the resync round-trip when you do not need it. All three features are
+the server owns, and ask for no row back when you do not need it. All three features are
 client-side, so they behave **identically on SurrealDB 2.6.x and 3.x**.
 
 ### Added
@@ -36,8 +36,10 @@ client-side, so they behave **identically on SurrealDB 2.6.x and 3.x**.
   open gap. A grouped `values()`/`annotate()` result is re-keyed to Python names on the way
   out.
 
-  `patch()` is the deliberate exception: it takes raw RFC 6902 pointers, which address the
-  stored document, so `/password_hash` is correct there.
+  `patch()` and `QuerySet.patch()` rewrite each pointer's top-level segment (and a `move`/`copy`
+  `from`) to the column, so `/password` and `/password_hash` both work; a whole-document
+  operation has its object value re-keyed. Dotted paths translate their root in `Q` objects and
+  aggregations exactly as in `filter(**kw)` — `Q(**{"address.city": …})` addresses `addr.city`.
 
 - **`get_field_aliases()` / `to_db_field()` / `to_py_field()`** — the mapping, exposed as
   classmethods and cached per class.
@@ -48,9 +50,8 @@ client-side, so they behave **identically on SurrealDB 2.6.x and 3.x**.
   writable when a caller names one explicitly. `get_server_fields()` returns them merged with
   the model's computed fields, which are server-owned by construction.
 
-- **`merge(refresh=False)`** — skip the post-merge resync for fire-and-forget updates. The
-  native path drops its `SELECT`; the `server_values` path compiles `RETURN NONE`; the literal
-  keyword arguments are applied locally instead.
+- **`merge(refresh=False)`** — for fire-and-forget updates, compile the write with `RETURN NONE`
+  so the server sends no row back; the literal keyword arguments are applied locally instead.
 
 ### Changed
 
@@ -67,6 +68,27 @@ client-side, so they behave **identically on SurrealDB 2.6.x and 3.x**.
 
 - Hydration is consolidated: `_do_save()` and `refresh()` now route through `_apply_record()`,
   so the column → attribute rule lives in one place instead of four ad-hoc loops.
+
+- **`merge()` costs one round-trip instead of two.** The SDK's `merge()` already answers with
+  the merged row; the ORM used to discard it and `SELECT` the record again. The instance is now
+  synced from that row, which also means server-side changes (a `VALUE` clause, an event) are
+  hydrated just as before, and a missing record still raises. Inside an interactive transaction
+  the row `tx.add()` returns is used the same way.
+
+- `get_or_create()` / `update_or_create()` store a `server_fields` entry named as a criterion or
+  in `defaults` on both branches. Before, the create branch let the server's `DEFAULT` win, so
+  the next identical lookup missed the row and created a duplicate.
+
+- A grouped `values()`/`annotate()` row never renames an annotation alias, and an alias that
+  spells a grouped field (by name or by column) raises `ValueError` — the row could only hold
+  one of the two values. A projection that fails model validation falls back to dicts keyed by
+  Python names, matching the grouped branch.
+
+### Fixed
+
+- `merge()` on a table that was never created raised the SDK's raw `NotFoundError` on SurrealDB
+  3.x, while 2.6.x raised the ORM's `SurrealDbError`. Both lines now raise `SurrealDbError`
+  ("no record found").
 
 ### Notes
 

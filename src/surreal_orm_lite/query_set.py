@@ -58,16 +58,33 @@ class QuerySet:
         self._tx: Any = None
 
     def _py_keyed(self, row: Any) -> Any:
-        """Re-key a grouped result row from columns back to Python field names (v0.18.0).
+        """Re-key a raw result row from columns back to Python field names (v0.18.0).
 
-        A GROUP BY result is a plain dict, not a model, so nothing else would translate it: the
-        caller wrote ``values("display")`` in Python names and would otherwise get
-        ``{"display_name": …}`` back. Annotation aliases are the caller's own words and pass
-        through untouched — ``to_py_field`` leaves an unmapped name alone.
+        A GROUP BY row, or a projection that failed model validation, is a plain dict rather
+        than a model, so nothing else would translate it: the caller wrote ``values("display")``
+        or ``select("display")`` in Python names and would otherwise get ``{"display_name": …}``
+        back. Annotation aliases are the caller's own words and are never renamed, even when
+        one happens to spell an aliased column.
         """
         if not isinstance(row, dict):
             return row
-        return {self.model.to_py_field(key): value for key, value in row.items()}
+        return {key if key in self._annotations else self.model.to_py_field(key): value for key, value in row.items()}
+
+    def _reject_annotation_collisions(self) -> None:
+        """Raise if an annotation alias shares a name with a grouped field.
+
+        ``SELECT display_name, count() AS display_name`` returns a single key, so one of the
+        two values is silently lost — and the same happens after re-keying when the alias
+        spells the grouped field's Python name instead. Either spelling is refused.
+        """
+        for column in self._group_by_fields:
+            name = self.model.to_py_field(column)
+            clashing = sorted({column, name} & set(self._annotations))
+            if clashing:
+                raise ValueError(
+                    f"annotation alias {', '.join(clashing)} collides with the grouped field "
+                    f"{name!r} (column {column!r}); choose a different alias."
+                )
 
     def _column(self, field: str) -> str:
         """Translate a Python field name to the SurrealDB column it is stored under (v0.18.0).
@@ -260,7 +277,7 @@ class QuerySet:
 
         # Q object filters
         for q in self._q_filters:
-            sql, vars_, counter = q.to_sql(counter, self._model_table, self.model.get_field_aliases())
+            sql, vars_, counter = q.to_sql(counter, self._model_table, self.model.to_db_field)
             if sql:
                 parts.append(sql)
                 variables.update(vars_)
@@ -334,11 +351,12 @@ class QuerySet:
         Returns:
             A tuple of (query_string, variables_dict).
         """
+        self._reject_annotation_collisions()
         where_clause, where_vars = self._build_where()
 
         select_parts = list(self._group_by_fields)
         for alias, agg in self._annotations.items():
-            select_parts.append(f"{agg.to_sql(self.model.get_field_aliases())} AS {alias}")
+            select_parts.append(f"{agg.to_sql(self.model.to_db_field)} AS {alias}")
 
         query = f"SELECT {', '.join(select_parts)} FROM {self._model_table}"
         query += where_clause
@@ -408,7 +426,7 @@ class QuerySet:
             return self.model.from_db(data.get("result", []))
         except ValidationError as e:
             logger.info(f"Pydantic invalid format for the class, returning dict value: {e}")
-            return results if isinstance(results, list) else []
+            return [self._py_keyed(row) for row in results] if isinstance(results, list) else []
 
     async def first(self) -> Any:
         """
@@ -801,7 +819,7 @@ class QuerySet:
         self.model._reject_computed_patch(operations, "patch()")
         where_clause, where_vars = self._build_where()
         query = f"UPDATE {self._model_table} PATCH $_ops{where_clause};"
-        all_vars = {**self._variables, **where_vars, "_ops": operations}
+        all_vars = {**self._variables, **where_vars, "_ops": self.model._columns_for_patch(operations)}
         if self._tx is not None:
             rows = await self._tx.add(query, all_vars)
             return len(rows) if isinstance(rows, list) else 0
@@ -864,6 +882,11 @@ class QuerySet:
     def _writable_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Vet a ``*_or_create`` write payload: drop computed fields, reject undeclared ones.
 
+        ``server_fields`` entries are kept. Naming one — as a criterion or in ``defaults`` — is
+        an explicit write, which ``SurrealConfigDict`` promises stays possible: the update
+        branch passes it to ``merge()`` and the create branch to :meth:`_save_naming`, so both
+        store it and the next identical lookup finds the row.
+
         Filtering by a computed field is legitimate (it is an ordinary column to read), so a
         computed name can legitimately appear in ``criteria``. But it is server-owned and must
         not be *written*. Without this, the same call would succeed on the create path (where
@@ -878,12 +901,8 @@ class QuerySet:
         wants to hear about it rather than lose the value. Models that opt into extra fields
         (``model_config = ConfigDict(extra="allow")``) keep them, on both paths.
         """
-        # get_server_fields() covers computed fields *and* `server_fields` entries. Both are
-        # dropped by save()'s payload on the create branch, so dropping them here too keeps the
-        # two branches writing the same columns — otherwise `get_or_create(created_at=…)` would
-        # filter on a column the create never writes and mint a duplicate on every call.
-        server_owned = self.model.get_server_fields()
-        vetted = {key: value for key, value in payload.items() if key not in server_owned}
+        computed = self.model.get_computed_fields()
+        vetted = {key: value for key, value in payload.items() if key not in computed}
 
         if self.model.model_config.get("extra") == "allow":
             return vetted
@@ -933,7 +952,7 @@ class QuerySet:
         payload = self._writable_payload({**self._criteria_payload(criteria), **defaults})
         if not matches:
             obj: Any = self.model(**payload)
-            await obj.save(tx=self._tx)
+            await obj._save_naming(payload, tx=self._tx)
             return obj, True
         obj = self.model.from_db(matches[0])
         await obj.merge(tx=self._tx, **payload)
@@ -971,7 +990,7 @@ class QuerySet:
             return self.model.from_db(matches[0]), False
         payload = self._writable_payload({**self._criteria_payload(criteria), **defaults})
         obj = self.model(**payload)
-        await obj.save(tx=self._tx)
+        await obj._save_naming(payload, tx=self._tx)
         return obj, True
 
     # ==================== Custom Query ====================

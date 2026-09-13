@@ -1016,8 +1016,15 @@ The map has to be unambiguous, and the ORM checks it the first time it is used: 
 collides with another field's name, or two fields sharing one column, raises `ValueError`.
 Either shape would make the payload's two keys collapse into one and silently drop a field.
 
-`patch()` is the one exception, by design: it takes raw RFC 6902 JSON pointers, which address
-the stored document, so you write `/password_hash` there.
+`patch()` pointers follow the same rule. A pointer's top-level segment may name the field or
+its column — `/password` and `/password_hash` both reach `password_hash`, and so does the `from`
+of a `move`/`copy`. A whole-document operation (`"path": ""`) has its object value re-keyed.
+Nested paths translate their root: `Q(**{"address.city": …})` and `Sum("address.n")` address
+`addr.city` / `addr.n`, exactly like `filter(**{"address.city": …})`.
+
+Result keys stay in your vocabulary too, with one rule for grouped rows: an `annotate()` alias is
+your own word and is never renamed. An alias that spells a grouped field — by name or by column —
+would lose one of the two values in the same row, so it raises `ValueError`.
 
 #### `server_fields`
 
@@ -1048,7 +1055,10 @@ What it does, precisely:
 - After a write, the column is hydrated back onto the instance.
 - An **explicit** write still works: `merge(created_at=…)`, `bulk_update(created_at=…)` and
   `server_values={"created_at": …}` all go through, because naming the column is taken as
-  consent (a backfill, an admin correction).
+  consent (a backfill, an admin correction). `get_or_create()` / `update_or_create()` count
+  too: a server field named as a criterion or in `defaults` is stored on **both** branches, so
+  `get_or_create(owner="bob", region="us")` finds the row it created on the next call instead
+  of creating another under the server's default.
 
 That last point is where `server_fields` differs from a computed field. A `Computed[...]` field
 is defined by `DEFINE FIELD … VALUE`, so the server discards any client write — the ORM raises
@@ -1058,17 +1068,16 @@ model does not declare raises `ValueError` naming it.
 
 #### `merge(refresh=False)`
 
-By default `merge()` resyncs the instance from the server afterwards — a second round-trip.
-Skip it for fire-and-forget updates:
+By default `merge()` resyncs the instance from the row the `UPDATE` itself returns — one
+round-trip, no follow-up read, and a merge that matched no record raises `SurrealDbError`. For
+fire-and-forget updates, ask the server not to send that row at all:
 
 ```python
-await user.merge(last_seen=now, refresh=False)                       # no SELECT afterwards
+await user.merge(last_seen=now, refresh=False)                       # compiled with RETURN NONE
 await user.merge(server_values={"seen": SurrealFunc("time::now()")}, refresh=False)
 ```
 
-The write still happens and the literal keyword arguments are applied locally. On the
-`server_values` path the statement is compiled with `RETURN NONE`, so no row is sent back at
-all.
+The write still happens and the literal keyword arguments are applied locally.
 
 **What you give up**: the "no rows came back ⇒ record not found" check _is_ the returned row.
 Under `refresh=False` a merge against a record that no longer exists is a silent no-op instead
@@ -1199,6 +1208,7 @@ listed behave the same on both lines.
 | `server_fields` — excluded from creates, kept on replaces, hydrated back                                                               | same on both lines; a `DEFAULT` is a create-time default on 2.6.5                      | same on both lines; a `DEFAULT` is a create-time default on 3.2.4        | v0.18.0 |
 | A server column omitted from a REPLACE (`UPDATE`/`UPSERT … CONTENT`)                                                                   | an optional column is deleted; a required one raises `Found NONE for field …`          | same on both lines — which is why the ORM keeps it in replace payloads   | v0.18.0 |
 | `merge(refresh=False)` — skipped resync, `RETURN NONE`, forfeited missing-record check                                                 | same on both lines                                                                     | same on both lines (verified on 3.2.4)                                   | v0.18.0 |
+| `merge()` on a table that was never created                                                                                            | server returns no rows → ORM raises `SurrealDbError` ("no record found")               | server raises `NotFoundError` → normalised to the same `SurrealDbError`  | v0.18.0 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
 

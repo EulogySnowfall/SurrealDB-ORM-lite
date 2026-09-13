@@ -18,7 +18,7 @@ Example:
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable
 
 from .utils import validate_field_name
 
@@ -46,27 +46,28 @@ class Aggregation(ABC):
         self.alias = alias
 
     @abstractmethod
-    def to_sql(self, field_map: Mapping[str, str] | None = None) -> str:
+    def to_sql(self, to_column: Callable[[str], str] | None = None) -> str:
         """
         Convert the aggregation to a SurrealDB SQL expression.
 
         Args:
-            field_map: ``{python_field_name: column}`` for the model being queried, propagated
-                by the QuerySet (v0.18.0). An aggregation is written in Python field names like
-                any other clause, so without this an aliased field would compile to
-                ``math::sum(amount)`` against a column actually stored as ``amt`` — which is
-                not an error, just a permanent ``NONE``. ``None`` leaves the name untouched.
+            to_column: The queried model's ``to_db_field``, propagated by the QuerySet
+                (v0.18.0). An aggregation is written in Python field names like any other
+                clause, so without this an aliased field would compile to ``math::sum(amount)``
+                against a column actually stored as ``amt`` — not an error, just a permanent
+                ``NONE``. A callable, so a dotted path translates its root. ``None`` leaves the
+                name untouched.
 
         Returns:
             str: The SQL expression for this aggregation.
         """
         pass  # pragma: no cover
 
-    def _column(self, field_map: Mapping[str, str] | None) -> str | None:
+    def _column(self, to_column: Callable[[str], str] | None) -> str | None:
         """Return this aggregation's target as the column it is stored under."""
-        if self.field is None or not field_map:
+        if self.field is None or to_column is None:
             return self.field
-        return field_map.get(self.field, self.field)
+        return to_column(self.field)
 
     def get_alias(self) -> str:
         """
@@ -113,14 +114,14 @@ class Count(Aggregation):
             validate_field_name(field, "Count field")
         super().__init__(field, alias)
 
-    def to_sql(self, field_map: Mapping[str, str] | None = None) -> str:
+    def to_sql(self, to_column: Callable[[str], str] | None = None) -> str:
         """
         Convert to SurrealDB SQL.
 
         Returns:
             str: "count()" or "count(field)" expression.
         """
-        column = self._column(field_map)
+        column = self._column(to_column)
         if column:
             return f"count({column})"
         return "count()"
@@ -158,14 +159,14 @@ class Sum(Aggregation):
         validate_field_name(field, "Sum field")
         super().__init__(field, alias)
 
-    def to_sql(self, field_map: Mapping[str, str] | None = None) -> str:
+    def to_sql(self, to_column: Callable[[str], str] | None = None) -> str:
         """
         Convert to SurrealDB SQL.
 
         Returns:
             str: "math::sum(field)" expression.
         """
-        return f"math::sum({self._column(field_map)})"
+        return f"math::sum({self._column(to_column)})"
 
 
 class Avg(Aggregation):
@@ -200,14 +201,14 @@ class Avg(Aggregation):
         validate_field_name(field, "Avg field")
         super().__init__(field, alias)
 
-    def to_sql(self, field_map: Mapping[str, str] | None = None) -> str:
+    def to_sql(self, to_column: Callable[[str], str] | None = None) -> str:
         """
         Convert to SurrealDB SQL.
 
         Returns:
             str: "math::mean(field)" expression.
         """
-        return f"math::mean({self._column(field_map)})"
+        return f"math::mean({self._column(to_column)})"
 
 
 class Min(Aggregation):
@@ -242,14 +243,14 @@ class Min(Aggregation):
         validate_field_name(field, "Min field")
         super().__init__(field, alias)
 
-    def to_sql(self, field_map: Mapping[str, str] | None = None) -> str:
+    def to_sql(self, to_column: Callable[[str], str] | None = None) -> str:
         """
         Convert to SurrealDB SQL.
 
         Returns:
             str: "math::min(field)" expression.
         """
-        return f"math::min({self._column(field_map)})"
+        return f"math::min({self._column(to_column)})"
 
 
 class Max(Aggregation):
@@ -284,11 +285,11 @@ class Max(Aggregation):
         validate_field_name(field, "Max field")
         super().__init__(field, alias)
 
-    def to_sql(self, field_map: Mapping[str, str] | None = None) -> str:
+    def to_sql(self, to_column: Callable[[str], str] | None = None) -> str:
         """
         Convert to SurrealDB SQL.
 
         Returns:
             str: "math::max(field)" expression.
         """
-        return f"math::max({self._column(field_map)})"
+        return f"math::max({self._column(to_column)})"

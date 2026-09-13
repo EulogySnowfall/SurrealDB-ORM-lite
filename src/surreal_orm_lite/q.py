@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable
 from typing import Any
 
 from .utils import build_filter_condition, parse_lookup
@@ -73,7 +73,7 @@ class Q:
         self,
         counter: int = 0,
         record_table: str | None = None,
-        field_map: Mapping[str, str] | None = None,
+        to_column: Callable[[str], str] | None = None,
     ) -> tuple[str, dict[str, Any], int]:
         """
         Generate a parameterized SQL WHERE fragment.
@@ -83,12 +83,13 @@ class Q:
             record_table: The table the query runs against, propagated by the QuerySet so a
                 lookup on the ``id`` column can be coerced to a ``RecordID`` (issue #159).
                 ``None`` — a ``Q`` compiled on its own — leaves values untouched.
-            field_map: ``{python_field_name: column}`` for the model being queried, propagated
-                by the QuerySet (v0.18.0). A ``Q`` is written in Python names like any other
-                filter, so without this an aliased field would compile against a column that
-                does not exist. ``None`` — a ``Q`` compiled on its own, with no model in sight —
-                leaves names untouched. Passed down to child nodes so a nested expression
-                translates too.
+            to_column: The queried model's ``to_db_field``, propagated by the QuerySet
+                (v0.18.0). A ``Q`` is written in Python names like any other filter, so without
+                this an aliased field would compile against a column that does not exist. It is
+                a callable rather than the alias dict so a dotted path translates its **root**
+                (``address.city`` → ``addr.city``) exactly as ``filter(**kw)`` does. ``None`` —
+                a ``Q`` compiled on its own, with no model in sight — leaves names untouched.
+                Passed down to child nodes so a nested expression translates too.
 
         Returns:
             A tuple of (sql_fragment, variables_dict, next_counter).
@@ -101,8 +102,8 @@ class Q:
             filter_parts: list[str] = []
             for key, value in self.filters.items():
                 field, lookup = parse_lookup(key)
-                if field_map:
-                    field = field_map.get(field, field)
+                if to_column is not None:
+                    field = to_column(field)
                 sql, vars_, counter = build_filter_condition(field, lookup, value, counter, record_table)
                 filter_parts.append(sql)
                 all_variables.update(vars_)
@@ -113,7 +114,7 @@ class Q:
 
         # Child Q objects
         for child in self.children:
-            sql, vars_, counter = child.to_sql(counter, record_table, field_map)
+            sql, vars_, counter = child.to_sql(counter, record_table, to_column)
             if sql:
                 all_parts.append(sql)
                 all_variables.update(vars_)

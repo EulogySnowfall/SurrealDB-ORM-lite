@@ -2,7 +2,7 @@ import contextlib
 import functools
 import logging
 import typing
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from decimal import Decimal
 from typing import Any, Self
 
@@ -506,7 +506,7 @@ class BaseSurrealModel(BaseModel):
         # Update current instance with refreshed data (keep native RecordID for id)
         self._apply_record(record)
 
-    def _write_payload(self, replace: bool = False) -> dict[str, Any]:
+    def _write_payload(self, replace: bool = False, keep: Collection[str] = ()) -> dict[str, Any]:
         """Return this instance's data for a write: no ``id``, no client-owned server column.
 
         Keys come out as **column** names. The re-keying goes through :meth:`_columns_for`
@@ -533,10 +533,14 @@ class BaseSurrealModel(BaseModel):
         Args:
             replace: ``True`` for the full-replace paths (``update()``, ``upsert()``), which
                 keeps ``server_fields`` in the payload for the reason above.
+            keep: ``server_fields`` a caller named explicitly, written on a create after all.
+                Only ``*_or_create`` passes it: there the name came from the lookup or from
+                ``defaults``, and omitting it would create a row the same lookup cannot find.
+                A computed field listed here is still excluded.
         """
         excluded = {"id", *self.get_computed_fields()}
         if not replace:
-            excluded |= self.get_server_fields()
+            excluded |= self.get_server_fields() - set(keep)
         return self._columns_for(self.model_dump(exclude=excluded))
 
     @classmethod
@@ -608,22 +612,77 @@ class BaseSurrealModel(BaseModel):
                     value = op.get("value")
                     # No inspectable value (e.g. ``remove`` on the whole document) — treat it
                     # as touching everything the server owns.
-                    targets.extend([str(key) for key in value] if isinstance(value, dict) else cls.get_computed_fields())
+                    if isinstance(value, dict):
+                        targets.extend(cls._pointer_segment_field(str(key)) for key in value)
+                    else:
+                        targets.extend(cls.get_computed_fields())
                     continue
-                segment = pointer.split("/")[1] if "/" in pointer else ""
-                # RFC 6901 escapes; field names never contain them, but decode before comparing.
-                targets.append(segment.replace("~1", "/").replace("~0", "~"))
+                targets.append(cls._pointer_segment_field(cls._pointer_head(pointer)))
         cls._reject_computed_writes(targets, context)
 
-    async def _do_save(self, tx: Transaction | None = None) -> tuple[Self, bool]:
+    @staticmethod
+    def _pointer_head(pointer: str) -> str:
+        """Return a JSON Pointer's first reference token, RFC 6901 escapes decoded."""
+        segment = pointer.split("/")[1] if "/" in pointer else ""
+        return segment.replace("~1", "/").replace("~0", "~")
+
+    @classmethod
+    def _pointer_segment_field(cls, segment: str) -> str:
+        """Name the Python field a pointer's top-level segment addresses, in either vocabulary.
+
+        ``patch()`` accepts ``/display`` and ``/display_name`` alike, so the guard has to fold
+        both onto the field name ``_reject_computed_writes`` compares against. The alias map is
+        a bijection (see :meth:`_reject_ambiguous_aliases`), so no segment can mean two fields.
+        The maps are used directly rather than through ``to_db_field`` because a reference
+        token is a literal key: a ``.`` in it is not a nested path.
+        """
+        forward, reverse = cls._alias_maps()
+        column = forward.get(segment, segment)
+        return reverse.get(column, column)
+
+    @classmethod
+    def _pointer_to_column(cls, pointer: str) -> str:
+        """Rewrite a JSON Pointer's top-level segment to the column it addresses."""
+        if not pointer:
+            return pointer
+        _, separator, rest = pointer[1:].partition("/")
+        head = cls._pointer_head(pointer)
+        column = cls._alias_maps()[0].get(head, head).replace("~", "~0").replace("/", "~1")
+        return f"/{column}{separator}{rest}"
+
+    @classmethod
+    def _columns_for_patch(cls, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return a copy of a JSON Patch document whose pointers address columns (v0.18.0).
+
+        A pointer is written against the model like every other argument, so ``/display``
+        has to reach the server as ``/display_name`` — sent verbatim, SurrealDB creates a
+        phantom ``display`` column, leaves the real one alone, and the row it returns never
+        maps back onto the attribute. A pointer already naming the column passes through
+        unchanged, so callers who wrote ``/display_name`` keep working.
+
+        ``path`` and ``from`` are rewritten; a whole-document operation (``path == ""``) has
+        its object ``value`` re-keyed instead. The caller's list and dicts are not mutated.
+        """
+        rewritten: list[dict[str, Any]] = []
+        for op in operations:
+            copy = dict(op)
+            copy["path"] = cls._pointer_to_column(op["path"])
+            if "from" in op:
+                copy["from"] = cls._pointer_to_column(op["from"])
+            if op["path"] == "" and isinstance(op.get("value"), dict):
+                copy["value"] = cls._columns_for(op["value"])
+            rewritten.append(copy)
+        return rewritten
+
+    async def _do_save(self, tx: Transaction | None = None, keep: Collection[str] = ()) -> tuple[Self, bool]:
         """Internal save logic. Returns (self, created).
 
         When ``tx`` is provided the CREATE statement is buffered (deferred to commit)
         and the in-memory instance is returned as-is. Buffered creates require an
-        explicit record id.
+        explicit record id. ``keep`` is forwarded to :meth:`_write_payload`.
         """
         record_id = self._record_id()
-        data = self._write_payload()
+        data = self._write_payload(keep=keep)
         table = self.get_table_name()
 
         if tx is not None:
@@ -759,6 +818,18 @@ class BaseSurrealModel(BaseModel):
         self._apply_record(rows)
         return self, True
 
+    async def _save_naming(self, fields: Iterable[str], tx: Transaction | None = None) -> Self:
+        """``save()`` that also writes the ``server_fields`` among ``fields``.
+
+        Backs the create branch of ``get_or_create``/``update_or_create``, where a server field
+        can legitimately be named — as a lookup criterion or in ``defaults`` — and must then be
+        stored, or the next identical lookup would miss the row and create another one.
+        """
+        keep = frozenset(fields) & self.get_server_fields()
+        if not keep:
+            return await self.save(tx=tx)
+        return await self._save_with_signals(functools.partial(self._do_save, keep=keep), tx)
+
     async def save(
         self,
         tx: Transaction | None = None,
@@ -841,35 +912,27 @@ class BaseSurrealModel(BaseModel):
             if hasattr(self, key):
                 object.__setattr__(self, key, value)
 
-    async def _run_update(self, statement: str, variables: dict[str, Any], refresh: bool) -> None:
-        """Run a compiled ``UPDATE``, syncing this instance from the returned row when asked.
+    def _sync_after_merge(
+        self,
+        rows: Any,
+        refresh: bool,
+        data: Mapping[str, Any],
+        server_values: Mapping[str, Any],
+    ) -> None:
+        """Bring this instance in step after a merge, from the row the server sent back.
 
-        ``refresh=True`` delegates to :meth:`_run_update_returning_row`, which applies the row
-        and treats an empty result as "no record found". ``refresh=False`` means the statement
-        was compiled with ``RETURN NONE``, so there is no row to apply and emptiness carries no
-        information — only a missing *table* is still surfaced, because the server raises for
-        that rather than returning nothing.
+        ``refresh=True`` applies that row and treats its absence as "no record found" — an
+        ``UPDATE`` matching nothing is not a server error, it just returns nothing. Under
+        ``refresh=False`` the statement asked for no row (or, in a buffered transaction, has not
+        run yet), so emptiness carries no information and only the literal ``data`` can be
+        applied: see :meth:`_apply_merge_data_locally`.
         """
-        if refresh:
-            await self._run_update_returning_row(statement, variables)
+        if not refresh:
+            self._apply_merge_data_locally(data, server_values)
             return
-        client = await SurrealDBConnectionManager.get_client()
-        try:
-            await client.query(statement, variables)
-        except NotFoundError as e:
-            raise SurrealDbError("Can't merge data, no record found.") from e
-
-    async def _resync_after_merge(self, data: Mapping[str, Any], refresh: bool) -> None:
-        """Bring this instance back in step after a native ``MERGE``.
-
-        ``refresh=True`` re-reads the row, which also surfaces a record that is gone. ``False``
-        skips that round-trip and settles for the values just written — see ``merge(refresh=)``
-        for what is given up.
-        """
-        if refresh:
-            await self.refresh()
-        else:
-            self._apply_merge_data_locally(data, {})
+        if not rows:
+            raise SurrealDbError("Can't merge data, no record found.")
+        self._apply_record(rows)
 
     def _apply_merge_data_locally(self, data: Mapping[str, Any], server_values: Mapping[str, Any]) -> None:
         """Apply a merge's literal kwargs to this instance without consulting the server.
@@ -883,25 +946,47 @@ class BaseSurrealModel(BaseModel):
             if key not in server_values and hasattr(self, key):
                 object.__setattr__(self, key, value)
 
-    async def _run_update_returning_row(self, statement: str, variables: dict[str, Any]) -> None:
-        """Run an ``UPDATE`` and apply its row, raising a uniform error when it matched nothing.
+    async def _run_update(
+        self,
+        statement: str,
+        variables: dict[str, Any],
+        refresh: bool,
+        data: Mapping[str, Any],
+        server_values: Mapping[str, Any],
+    ) -> None:
+        """Run a compiled merge ``UPDATE`` outside a transaction and sync this instance.
 
-        Two server behaviours are normalised here, so ``merge(server_values=)`` fails the same
-        way as the native ``merge()`` path (whose follow-up ``refresh()`` raises) on both DB
-        lines:
-
-        - a missing **record** returns no rows on 2.6.x and 3.x alike;
-        - a missing **table** returns no rows on 2.6.x but raises ``NotFoundError`` on 3.x
-          (same divergence the read paths normalise since v0.7.0).
+        A missing **table** returns no rows on 2.6.x but raises ``NotFoundError`` on 3.x (the
+        divergence the read paths normalise since v0.7.0); both become the same
+        ``SurrealDbError`` as a missing record, so every merge path fails identically on both
+        DB lines. That holds under ``refresh=False`` too: the server raises for a missing table
+        whatever the statement asks back.
         """
         client = await SurrealDBConnectionManager.get_client()
         try:
             rows = await client.query(statement, variables)
         except NotFoundError as e:
             raise SurrealDbError("Can't merge data, no record found.") from e
-        if not rows:
-            raise SurrealDbError("Can't merge data, no record found.")
-        self._apply_record(rows)
+        self._sync_after_merge(rows, refresh, data, server_values)
+
+    async def _merge_native(self, record_id: Any, wire_data: dict[str, Any], data: Mapping[str, Any], refresh: bool) -> None:
+        """Run a non-transactional ``merge()`` without ``server_values``.
+
+        The SDK's ``merge()`` already answers with the merged row, which is everything a
+        re-read would return — so the instance is synced from it in one round-trip, and its
+        emptiness still reports a record that does not exist. ``refresh=False`` needs
+        ``RETURN NONE``, which the SDK method cannot express, so that case is compiled.
+        """
+        if not refresh:
+            statement = "UPDATE $rid MERGE $data RETURN NONE;"
+            await self._run_update(statement, {"rid": record_id, "data": wire_data}, False, data, {})
+            return
+        client = await SurrealDBConnectionManager.get_client()
+        try:
+            row = await client.merge(record_id, wire_data)
+        except NotFoundError as e:
+            raise SurrealDbError("Can't merge data, no record found.") from e
+        self._sync_after_merge(row, True, data, {})
 
     async def _save_with_signals(
         self,
@@ -1058,15 +1143,14 @@ class BaseSurrealModel(BaseModel):
 
         ``UPDATE … SET`` only touches the listed fields, so this keeps ``merge``'s partial
         semantics while letting SurrealDB compute values. The statement returns the updated
-        row (``RETURN AFTER`` by default), which replaces the ``refresh()`` round-trip the
-        native MERGE path needs — and its emptiness is how a missing record is detected,
-        both here (interactive tx) and in :meth:`_run_update_returning_row` (no tx). Only a
-        buffered tx cannot tell: nothing runs before commit.
+        row (``RETURN AFTER`` by default), which syncs the instance — and its emptiness is how
+        a missing record is detected, see :meth:`_sync_after_merge`. Only a buffered tx cannot
+        tell: nothing runs before commit.
 
         With ``refresh=False`` the statement asks for ``RETURN NONE`` instead, so the row is
-        not sent back at all — the same saving the native path makes by skipping its SELECT.
-        The literal kwargs are applied locally, exactly as in a buffered transaction. The
-        missing-record detection goes with it: that check *was* the returned row.
+        not sent back at all. The literal kwargs are applied locally, exactly as in a buffered
+        transaction. The missing-record detection goes with it: that check *is* the returned
+        row.
         """
         sender = self.__class__
         record_id = self._record_id()
@@ -1087,32 +1171,20 @@ class BaseSurrealModel(BaseModel):
             if has_signals:
                 await pre_update.send(sender, instance=self, update_fields=update_fields)
             rows = await tx.add(statement, variables)
-            if tx.is_interactive and refresh:
-                # An UPDATE matching nothing is not a server error — it returns no rows. The
-                # native merge(tx=) path surfaces that through refresh(), which raises, so
-                # raise here too (aborting the tx) instead of silently no-opping.
-                if not rows:
-                    raise SurrealDbError("Can't merge data, no record found.")
-                self._apply_record(rows)
-            else:
-                # Buffered, or refresh=False: no row to apply, so the literal kwargs are all
-                # that can be synced — server-computed fields stay stale until a refresh().
-                self._apply_merge_data_locally(data, server_values)
+            # A buffered tx has no row yet, so it syncs like refresh=False: literal kwargs only,
+            # server-computed fields stale until a refresh() after commit.
+            self._sync_after_merge(rows, tx.is_interactive and refresh, data, server_values)
             if has_signals:
                 tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
             return None
 
         if not has_signals:
-            await self._run_update(statement, variables, refresh)
-            if not refresh:
-                self._apply_merge_data_locally(data, server_values)
+            await self._run_update(statement, variables, refresh, data, server_values)
             return None
 
         await pre_update.send(sender, instance=self, update_fields=update_fields)
         async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-            await self._run_update(statement, variables, refresh)
-            if not refresh:
-                self._apply_merge_data_locally(data, server_values)
+            await self._run_update(statement, variables, refresh, data, server_values)
         await post_update.send(sender, instance=self, update_fields=update_fields)
         return None
 
@@ -1137,12 +1209,12 @@ class BaseSurrealModel(BaseModel):
 
         Emits pre_update, post_update, and around_update signals. In tx mode,
         ``around_update`` is skipped (the write is deferred to commit) and
-        ``post_update`` only fires after a successful commit. The non-tx path calls
-        ``refresh()`` to resync the instance with the server; the tx path cannot
-        (reads inside a tx are not supported and the write is buffered), so
-        ``data`` is applied to ``self`` directly at buffer time. A rollback will
-        therefore leave the instance ahead of the database — caller must treat the
-        instance as stale after a failed tx.
+        ``post_update`` only fires after a successful commit. The instance is resynced from
+        the row the ``UPDATE`` itself returns — one round-trip, no follow-up read — and a
+        merge that matches no record raises ``SurrealDbError``. A buffered transaction has no
+        row yet, so ``data`` is applied to ``self`` directly at buffer time; a rollback will
+        therefore leave the instance ahead of the database — caller must treat the instance
+        as stale after a failed tx.
 
         Args:
             tx: Optional transaction the statement is buffered onto.
@@ -1153,11 +1225,11 @@ class BaseSurrealModel(BaseModel):
                 row syncs the instance, so no extra ``refresh()`` round-trip is needed.
             extra_vars: Extra query variables the expressions reference, bound (never
                 interpolated). Requires ``server_values``.
-            refresh: ``True`` (default) resyncs the instance from the server after the write —
-                a second round-trip on the native path (a ``SELECT``), or the row the
-                ``server_values`` path asks back. ``False`` skips it: the write still happens,
-                the literal ``data`` is applied locally, and nothing is read back. Use it for
-                fire-and-forget updates such as a presence ping or a counter bump.
+            refresh: ``True`` (default) resyncs the instance from the row the write returns.
+                ``False`` compiles the write with ``RETURN NONE``: it still happens, but the
+                server sends no row back and only the literal ``data`` is applied locally. Use
+                it for fire-and-forget updates such as a presence ping or a counter bump, where
+                the row is not worth its bytes.
 
                 **The missing-record check goes with it.** That check *is* the returned row, so
                 under ``refresh=False`` a merge against a record that no longer exists is a
@@ -1191,28 +1263,22 @@ class BaseSurrealModel(BaseModel):
             update_fields = list(data_set.keys())
             if has_signals:
                 await pre_update.send(sender, instance=self, update_fields=update_fields)
-            await tx.add(f"UPDATE {record_id} MERGE $data;", {"data": wire_data})
-            if tx.is_interactive and refresh:
-                await self.refresh(tx=tx)
-            else:
-                self._apply_merge_data_locally(data_set, {})
+            statement = "UPDATE $rid MERGE $data;" if refresh else "UPDATE $rid MERGE $data RETURN NONE;"
+            rows = await tx.add(statement, {"rid": record_id, "data": wire_data})
+            self._sync_after_merge(rows, tx.is_interactive and refresh, data_set, {})
             if has_signals:
                 tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
             return None
 
-        client = await SurrealDBConnectionManager.get_client()
-
         if not has_signals:
-            await client.merge(record_id, wire_data)
-            await self._resync_after_merge(data_set, refresh)
+            await self._merge_native(record_id, wire_data, data_set, refresh)
             return
 
         update_fields = list(data_set.keys())
         await pre_update.send(sender, instance=self, update_fields=update_fields)
 
         async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-            await client.merge(record_id, wire_data)
-            await self._resync_after_merge(data_set, refresh)
+            await self._merge_native(record_id, wire_data, data_set, refresh)
 
         await post_update.send(sender, instance=self, update_fields=update_fields)
 
@@ -1231,10 +1297,13 @@ class BaseSurrealModel(BaseModel):
         (same caveat as ``merge(tx=)``).
 
         Unlike ``merge``/``save`` this emits NO signals: it is a low-level atomic primitive.
-        ``operations`` is validated then bound as data, never string-interpolated.
+        ``operations`` is validated then bound as data, never string-interpolated. Pointers may
+        name a field either way — ``/password`` or its column ``/password_hash`` — and are
+        rewritten to the column before they are sent.
         """
         validate_patch_operations(operations)
         self._reject_computed_patch(operations, "patch()")
+        operations = self._columns_for_patch(operations)
         record_id = self._record_id()
         if record_id is None:
             raise SurrealDbError("patch() requires an explicit id (there is nothing to patch without one).")

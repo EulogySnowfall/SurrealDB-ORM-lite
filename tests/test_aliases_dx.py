@@ -5,16 +5,16 @@ skipped round-trip), so nothing here is version-gated: every test must pass iden
 SurrealDB 2.6.x and 3.x. A ``pytest.skip`` appearing in this file would be a design smell.
 """
 
-import contextlib
-import os
 from typing import Any
 
 import pytest
 from pydantic import Field
 
 from surreal_orm_lite import BaseSurrealModel, Q, SurrealDBConnectionManager
+from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.functions import Computed, SurrealFunc, computed
 from surreal_orm_lite.model_base import _ALIAS_MAPS, SurrealConfigDict
+from tests.conftest import orm_client
 
 # ==================== Models ====================
 
@@ -152,39 +152,6 @@ class TestServerFields:
 # ==================== E2E helpers ====================
 
 
-def _url() -> str:
-    host = os.environ.get("SURREALDB_HOST", "localhost")
-    port = os.environ.get("SURREALDB_PORT", "8000")
-    return f"ws://{host}:{port}/rpc"
-
-
-def _connect() -> None:
-    SurrealDBConnectionManager.set_connection(url=_url(), user="root", password="root", namespace="ns", database="db")
-
-
-@contextlib.asynccontextmanager
-async def alias_client(*tables: str):
-    """Connected ORM client with the given tables dropped before and after.
-
-    Same shape as the computed-field suite's helper: the SDK's WebSocket client is bound to
-    the loop that created it, so it must be opened inside the test's own loop rather than in
-    a module-scoped fixture.
-    """
-    tables = tables or ("Aliased",)
-    _connect()
-    client = await SurrealDBConnectionManager.get_client()
-    for table in tables:
-        with contextlib.suppress(Exception):
-            await client.query(f"REMOVE TABLE {table};", {})
-    try:
-        yield client
-    finally:
-        for table in tables:
-            with contextlib.suppress(Exception):
-                await client.query(f"REMOVE TABLE {table};", {})
-        await SurrealDBConnectionManager.close_connection()
-
-
 async def _raw_row(client: Any, table: str, record: str) -> dict[str, Any]:
     """Read a row as the *server* stores it, bypassing the ORM's hydration."""
     rows = await client.query(f"SELECT * FROM {table}:{record};", {})
@@ -256,7 +223,7 @@ class TestWritePayload:
 class TestWritePayloadE2E:
     @pytest.mark.asyncio
     async def test_save_stores_the_aliased_column(self) -> None:
-        async with alias_client() as client:
+        async with orm_client() as client:
             await Aliased(id="ada", password="secret", display="Ada").save()
             row = await _raw_row(client, "Aliased", "ada")
             assert row["password_hash"] == "secret"
@@ -267,7 +234,7 @@ class TestWritePayloadE2E:
     async def test_server_default_survives_a_save(self) -> None:
         """The point of ``server_fields``: the client never volunteers the column, so the
         server's ``DEFAULT`` applies instead of being overwritten with the model's ``None``."""
-        async with alias_client("Stamped2") as client:
+        async with orm_client("Stamped2") as client:
             await client.query("DEFINE FIELD created_at ON Stamped2 TYPE option<datetime> DEFAULT time::now();", {})
             await Stamped2(id="a", title="first").save()
             row = await _raw_row(client, "Stamped2", "a")
@@ -277,7 +244,7 @@ class TestWritePayloadE2E:
     async def test_server_stamp_survives_a_replace(self) -> None:
         """``update()``/``upsert()`` are REPLACE: the stamp is carried in the payload rather
         than omitted, because omitting it would delete the column outright."""
-        async with alias_client("Stamped2") as client:
+        async with orm_client("Stamped2") as client:
             await client.query("DEFINE FIELD created_at ON Stamped2 TYPE option<datetime> DEFAULT time::now();", {})
             instance = await Stamped2(id="a", title="first").save()
             stamped = (await _raw_row(client, "Stamped2", "a"))["created_at"]
@@ -300,7 +267,7 @@ class TestWritePayloadE2E:
         """A non-optional server column omitted from a REPLACE is a hard server error
         ("Found NONE for field …"), on 2.6.x and 3.x alike. Keeping it in the payload is what
         makes ``update()`` usable on such a model at all."""
-        async with alias_client("Stamped2") as client:
+        async with orm_client("Stamped2") as client:
             await client.query("DEFINE FIELD created_at ON Stamped2 TYPE datetime DEFAULT time::now();", {})
             instance = await Stamped2(id="a", title="first").save()
             instance.title = "second"
@@ -337,7 +304,7 @@ class TestApplyRecord:
 class TestHydrationE2E:
     @pytest.mark.asyncio
     async def test_from_db_hydrates_the_python_attribute(self) -> None:
-        async with alias_client():
+        async with orm_client():
             await Aliased(id="ada", password="secret", display="Ada").save()
             found = await Aliased.objects().filter(id="ada").exec()
             assert found[0].password == "secret"
@@ -345,7 +312,7 @@ class TestHydrationE2E:
 
     @pytest.mark.asyncio
     async def test_refresh_hydrates_the_python_attribute(self) -> None:
-        async with alias_client() as client:
+        async with orm_client() as client:
             instance = await Aliased(id="ada", password="secret").save()
             await client.query("UPDATE Aliased:ada SET password_hash = 'rotated';", {})
             await instance.refresh()
@@ -353,7 +320,7 @@ class TestHydrationE2E:
 
     @pytest.mark.asyncio
     async def test_server_field_is_hydrated_after_save(self) -> None:
-        async with alias_client("Stamped2") as client:
+        async with orm_client("Stamped2") as client:
             await client.query("DEFINE FIELD created_at ON Stamped2 TYPE option<datetime> DEFAULT time::now();", {})
             instance = await Stamped2(id="a", title="first").save()
             assert instance.created_at is not None
@@ -365,7 +332,7 @@ class TestHydrationE2E:
 class TestMergeAliasesE2E:
     @pytest.mark.asyncio
     async def test_merge_writes_the_aliased_column(self) -> None:
-        async with alias_client() as client:
+        async with orm_client() as client:
             instance = await Aliased(id="ada", password="secret").save()
             await instance.merge(password="rotated")
             row = await _raw_row(client, "Aliased", "ada")
@@ -375,7 +342,7 @@ class TestMergeAliasesE2E:
 
     @pytest.mark.asyncio
     async def test_server_values_compile_against_the_column(self) -> None:
-        async with alias_client() as client:
+        async with orm_client() as client:
             instance = await Aliased(id="ada", password="secret").save()
             await instance.merge(server_values={"display": SurrealFunc("string::uppercase($who)")}, extra_vars={"who": "ada"})
             row = await _raw_row(client, "Aliased", "ada")
@@ -385,7 +352,7 @@ class TestMergeAliasesE2E:
 
     @pytest.mark.asyncio
     async def test_save_with_server_values_uses_the_column(self) -> None:
-        async with alias_client() as client:
+        async with orm_client() as client:
             instance = await Aliased(id="ada").save(
                 server_values={"password": SurrealFunc("string::concat('h:', $raw)")},
                 extra_vars={"raw": "secret"},
@@ -397,7 +364,7 @@ class TestMergeAliasesE2E:
 
     @pytest.mark.asyncio
     async def test_upsert_and_patch_address_the_column(self) -> None:
-        async with alias_client() as client:
+        async with orm_client() as client:
             instance = await Aliased(id="ada", password="secret").save()
             instance.password = "upserted"
             await instance.upsert()
@@ -455,7 +422,7 @@ class TestQuerySetAliases:
 class TestQuerySetAliasesE2E:
     @pytest.mark.asyncio
     async def test_filter_and_order_round_trip(self) -> None:
-        async with alias_client():
+        async with orm_client():
             await Aliased(id="a", password="alpha", display="A").save()
             await Aliased(id="b", password="beta", display="B").save()
 
@@ -468,7 +435,7 @@ class TestQuerySetAliasesE2E:
 
     @pytest.mark.asyncio
     async def test_bulk_update_writes_the_column(self) -> None:
-        async with alias_client() as client:
+        async with orm_client() as client:
             await Aliased(id="a", password="alpha").save()
             await Aliased(id="b", password="beta").save()
 
@@ -479,7 +446,7 @@ class TestQuerySetAliasesE2E:
 
     @pytest.mark.asyncio
     async def test_aggregation_helpers_name_the_column(self) -> None:
-        async with alias_client("Scored"):
+        async with orm_client("Scored"):
 
             class Scored(BaseSurrealModel):
                 id: str
@@ -495,7 +462,7 @@ class TestQuerySetAliasesE2E:
 
     @pytest.mark.asyncio
     async def test_get_or_create_round_trips_on_an_aliased_field(self) -> None:
-        async with alias_client() as client:
+        async with orm_client() as client:
             created_obj, created = await Aliased.objects().get_or_create(id="a", defaults={"password": "alpha"})
             assert created is True
             assert created_obj.password == "alpha"
@@ -511,33 +478,33 @@ class TestQuerySetAliasesE2E:
 
 class TestMergeRefreshE2E:
     @pytest.mark.asyncio
-    async def test_default_still_resyncs_from_the_server(self) -> None:
-        async with alias_client() as client:
+    async def test_default_resyncs_from_the_returned_row(self) -> None:
+        async with orm_client() as client:
             instance = await Aliased(id="ada", password="secret").save()
-            selects = _spy(client, "select")
+            merges = _spy(client, "merge")
             await instance.merge(password="rotated")
-            assert selects, "the default merge must still round-trip to resync the instance"
+            assert len(merges) == 1
             assert instance.password == "rotated"
 
     @pytest.mark.asyncio
     async def test_refresh_false_skips_the_round_trip(self) -> None:
-        async with alias_client() as client:
+        async with orm_client() as client:
             instance = await Aliased(id="ada", password="secret").save()
             selects = _spy(client, "select")
             await instance.merge(password="rotated", refresh=False)
-            assert selects == [], "refresh=False must not issue the resync SELECT"
+            assert selects == [], "refresh=False must not read anything back"
             assert instance.password == "rotated"
 
     @pytest.mark.asyncio
     async def test_refresh_false_still_persists(self) -> None:
-        async with alias_client() as client:
+        async with orm_client() as client:
             instance = await Aliased(id="ada", password="secret").save()
             await instance.merge(password="rotated", refresh=False)
             assert (await _raw_row(client, "Aliased", "ada"))["password_hash"] == "rotated"
 
     @pytest.mark.asyncio
     async def test_server_values_ask_for_no_row_back(self) -> None:
-        async with alias_client() as client:
+        async with orm_client() as client:
             instance = await Aliased(id="ada", password="secret").save()
             queries = _spy(client, "query")
             await instance.merge(
@@ -553,7 +520,7 @@ class TestMergeRefreshE2E:
 
     @pytest.mark.asyncio
     async def test_server_values_default_still_syncs(self) -> None:
-        async with alias_client():
+        async with orm_client():
             instance = await Aliased(id="ada", password="secret").save()
             await instance.merge(server_values={"password": SurrealFunc("string::uppercase('x')")})
             assert instance.password == "X"
@@ -573,7 +540,7 @@ class TestWriteGuards:
 
     @pytest.mark.asyncio
     async def test_merge_accepts_an_explicit_server_field(self) -> None:
-        async with alias_client("Stamped2") as client:
+        async with orm_client("Stamped2") as client:
             instance = await Stamped2(id="a", title="first").save()
             await instance.merge(created_at="backfilled")
             assert (await _raw_row(client, "Stamped2", "a"))["created_at"] == "backfilled"
@@ -581,7 +548,7 @@ class TestWriteGuards:
 
     @pytest.mark.asyncio
     async def test_bulk_update_accepts_an_explicit_server_field(self) -> None:
-        async with alias_client("Stamped2") as client:
+        async with orm_client("Stamped2") as client:
             await Stamped2(id="a", title="first").save()
             count = await Stamped2.objects().filter(id="a").bulk_update(created_at="backfilled")
             assert count == 1
@@ -589,7 +556,7 @@ class TestWriteGuards:
 
     @pytest.mark.asyncio
     async def test_server_values_accept_an_explicit_server_field(self) -> None:
-        async with alias_client("Stamped2") as client:
+        async with orm_client("Stamped2") as client:
             instance = await Stamped2(id="a", title="first").save()
             await instance.merge(server_values={"created_at": SurrealFunc("'computed'")})
             assert (await _raw_row(client, "Stamped2", "a"))["created_at"] == "computed"
@@ -617,7 +584,7 @@ class TestAtomicOpsAliases:
 
     @pytest.mark.asyncio
     async def test_increment_targets_the_column(self) -> None:
-        async with alias_client("Scored") as client:
+        async with orm_client("Scored") as client:
             item = await Scored(id="a", amount=1).save()
             await item.atomic_increment("amount", 5)
             row = await _raw_row(client, "Scored", "a")
@@ -627,7 +594,7 @@ class TestAtomicOpsAliases:
 
     @pytest.mark.asyncio
     async def test_array_ops_target_the_column(self) -> None:
-        async with alias_client("Scored") as client:
+        async with orm_client("Scored") as client:
             item = await Scored(id="a", tags=["x"]).save()
             await item.atomic_append("tags", "y")
             await item.atomic_set_add("tags", "y")
@@ -640,7 +607,7 @@ class TestAtomicOpsAliases:
 
     @pytest.mark.asyncio
     async def test_remove_many_targets_the_column(self) -> None:
-        async with alias_client("Scored") as client:
+        async with orm_client("Scored") as client:
             item = await Scored(id="a", tags=["x", "y", "z"]).save()
             await item.atomic_remove_many("tags", ["x", "z"])
             assert (await _raw_row(client, "Scored", "a"))["tag_list"] == ["y"]
@@ -662,7 +629,7 @@ class TestAnnotateAliases:
     async def test_annotate_returns_real_numbers_and_python_keys(self) -> None:
         from surreal_orm_lite import Sum
 
-        async with alias_client("Scored"):
+        async with orm_client("Scored"):
             await Scored(id="a", amount=10, group="g").save()
             await Scored(id="b", amount=30, group="g").save()
 
@@ -686,7 +653,7 @@ class TestSignalPayloadNames:
 
         post_update.connect(Scored)(handler)
         try:
-            async with alias_client("Scored"):
+            async with orm_client("Scored"):
                 item = await Scored(id="a", amount=1).save()
                 await item.update()
                 await item.merge(amount=2)
@@ -745,7 +712,7 @@ class TestSerializationAliasIsNotAColumnRename:
             id: str
             b: str = Field(default="", alias="b_in", serialization_alias="b_out")
 
-        async with alias_client("Mixed2") as client:
+        async with orm_client("Mixed2") as client:
             await Mixed2(id="x", b="value").save()
             assert (await _raw_row(client, "Mixed2", "x"))["b_in"] == "value"
             found = await Mixed2.objects().filter(b="value").exec()
@@ -798,3 +765,261 @@ class TestComputedDdlAliases:
         finally:
             ComputedAliased.model_fields["shouted"].alias = None
             _ALIAS_MAPS.pop(ComputedAliased, None)
+
+
+# ==================== PR #183 review ====================
+
+
+class Located(BaseSurrealModel):
+    id: str
+    address: dict[str, Any] = Field(default_factory=dict, alias="addr")
+    category: str = ""
+    display: str = Field(default="", alias="display_name")
+
+
+class Regioned(BaseSurrealModel):
+    """``region`` is filled by a server ``DEFAULT`` unless a caller names it."""
+
+    model_config = SurrealConfigDict(server_fields=["region"])
+    id: str | None = None
+    owner: str = ""
+    region: str | None = None
+
+
+class TestDottedPathsTranslateTheRoot:
+    """``filter(**kw)`` translated the root of a dotted path; ``Q`` and ``Aggregation`` compared
+    the whole key against the map, so ``address.city`` never matched and filtered nothing."""
+
+    def test_q_translates_the_first_segment(self) -> None:
+        query, _ = Located.objects().filter(Q(**{"address.city": "x"}))._compile_query()
+        assert "addr.city" in query
+        assert "address.city" not in query
+
+    def test_q_and_kwarg_compile_the_same_column(self) -> None:
+        kwarg, _ = Located.objects().filter(**{"address.city": "x"})._compile_query()
+        q_obj, _ = Located.objects().filter(Q(**{"address.city": "x"}))._compile_query()
+        assert kwarg == q_obj
+
+    def test_aggregation_translates_the_first_segment(self) -> None:
+        from surreal_orm_lite import Sum
+
+        query, _ = Located.objects().values("category").annotate(n=Sum("address.n"))._compile_group_by_query()
+        assert "math::sum(addr.n)" in query
+
+    @pytest.mark.asyncio
+    async def test_q_on_a_nested_path_finds_the_row(self) -> None:
+        async with orm_client("Located"):
+            await Located(id="a", address={"city": "Paris"}).save()
+            found = await Located.objects().filter(Q(**{"address.city": "Paris"})).exec()
+            assert [row.id for row in found] == ["a"]
+
+
+class TestPatchTranslatesPointers:
+    """Pointers used to go out verbatim, so ``/display`` created a phantom ``display`` column,
+    left ``display_name`` alone, and the instance kept its old value — with no error."""
+
+    def test_python_name_pointer_is_rewritten(self) -> None:
+        ops = Located._columns_for_patch([{"op": "replace", "path": "/display/0", "value": "A"}])
+        assert ops == [{"op": "replace", "path": "/display_name/0", "value": "A"}]
+
+    def test_column_pointer_is_left_alone(self) -> None:
+        ops = Located._columns_for_patch([{"op": "replace", "path": "/display_name", "value": "A"}])
+        assert ops[0]["path"] == "/display_name"
+
+    def test_from_is_rewritten_for_move_and_copy(self) -> None:
+        ops = Located._columns_for_patch(
+            [
+                {"op": "move", "from": "/display", "path": "/category"},
+                {"op": "copy", "from": "/address/city", "path": "/display"},
+            ]
+        )
+        assert ops[0] == {"op": "move", "from": "/display_name", "path": "/category"}
+        assert ops[1] == {"op": "copy", "from": "/addr/city", "path": "/display_name"}
+
+    def test_whole_document_value_is_rekeyed(self) -> None:
+        ops = Located._columns_for_patch([{"op": "replace", "path": "", "value": {"display": "A", "category": "c"}}])
+        assert ops[0]["value"] == {"display_name": "A", "category": "c"}
+
+    def test_the_callers_list_is_not_mutated(self) -> None:
+        original = [{"op": "replace", "path": "/display", "value": "A"}]
+        Located._columns_for_patch(original)
+        assert original == [{"op": "replace", "path": "/display", "value": "A"}]
+
+    def test_computed_guard_sees_through_a_column_pointer(self) -> None:
+        class ComputedCol(BaseSurrealModel):
+            id: str
+            first: str = ""
+            shouted: Computed[str] = computed("string::uppercase(first)")
+
+        ComputedCol.model_fields["shouted"].alias = "shouted_col"
+        _ALIAS_MAPS.pop(ComputedCol, None)
+        try:
+            with pytest.raises(ValueError, match="computed field"):
+                ComputedCol._reject_computed_patch([{"op": "replace", "path": "/shouted_col", "value": "x"}], "patch()")
+        finally:
+            ComputedCol.model_fields["shouted"].alias = None
+            _ALIAS_MAPS.pop(ComputedCol, None)
+
+    @pytest.mark.asyncio
+    async def test_instance_patch_by_python_name(self) -> None:
+        async with orm_client("Located") as client:
+            instance = await Located(id="a", display="old").save()
+            await instance.patch([{"op": "replace", "path": "/display", "value": "new"}])
+            row = await _raw_row(client, "Located", "a")
+            assert row["display_name"] == "new"
+            assert "display" not in row
+            assert instance.display == "new"
+
+    @pytest.mark.asyncio
+    async def test_queryset_patch_by_python_name(self) -> None:
+        async with orm_client("Located") as client:
+            await Located(id="a", display="old").save()
+            assert await Located.objects().filter(id="a").patch([{"op": "replace", "path": "/display", "value": "new"}]) == 1
+            row = await _raw_row(client, "Located", "a")
+            assert row["display_name"] == "new"
+            assert "display" not in row
+
+
+class TestOrCreateHonoursExplicitServerFields:
+    """``_writable_payload`` dropped a named ``server_fields`` entry, so ``update_or_create``
+    lost it on the merge branch and ``get_or_create`` created a row the next identical call
+    could not find."""
+
+    def test_writable_payload_keeps_a_server_field(self) -> None:
+        assert Regioned.objects()._writable_payload({"owner": "bob", "region": "us"}) == {"owner": "bob", "region": "us"}
+
+    def test_writable_payload_still_drops_a_computed_field(self) -> None:
+        payload = StampedComputed.objects()._writable_payload({"first": "a", "shouted": "X", "created_at": "t"})
+        assert payload == {"first": "a", "created_at": "t"}
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_converges_on_a_server_field(self) -> None:
+        async with orm_client("Regioned") as client:
+            await client.query("DEFINE FIELD region ON Regioned TYPE option<string> DEFAULT 'eu';", {})
+            _, created = await Regioned.objects().get_or_create(owner="bob", region="us")
+            assert created is True
+            _, created = await Regioned.objects().get_or_create(owner="bob", region="us")
+            assert created is False
+            assert await Regioned.objects().count() == 1
+
+    @pytest.mark.asyncio
+    async def test_the_default_still_applies_when_unnamed(self) -> None:
+        async with orm_client("Regioned") as client:
+            await client.query("DEFINE FIELD region ON Regioned TYPE option<string> DEFAULT 'eu';", {})
+            obj, _ = await Regioned.objects().get_or_create(id="x", owner="bob")
+            assert obj.region == "eu"
+
+    @pytest.mark.asyncio
+    async def test_update_or_create_writes_a_server_field_on_update(self) -> None:
+        async with orm_client("Regioned") as client:
+            await Regioned(id="a", owner="bob", region="eu").save()
+            _, created = await Regioned.objects().update_or_create(id="a", defaults={"region": "us"})
+            assert created is False
+            assert (await _raw_row(client, "Regioned", "a"))["region"] == "us"
+
+
+class TestGroupedResultKeys:
+    def _queryset(self, **annotations: Any) -> Any:
+        from surreal_orm_lite import Count
+
+        return Located.objects().values("category").annotate(**(annotations or {"n": Count()}))
+
+    def test_an_annotation_alias_is_never_renamed(self) -> None:
+        from surreal_orm_lite import Count
+
+        queryset = self._queryset(display_name=Count())
+        assert queryset._py_keyed({"category": "a", "display_name": 3}) == {"category": "a", "display_name": 3}
+
+    def test_a_grouped_column_is_renamed(self) -> None:
+        from surreal_orm_lite import Count
+
+        queryset = Located.objects().values("display").annotate(n=Count())
+        assert queryset._py_keyed({"display_name": "A", "n": 1}) == {"display": "A", "n": 1}
+
+    def test_an_alias_colliding_with_a_grouped_field_is_refused(self) -> None:
+        from surreal_orm_lite import Count
+
+        with pytest.raises(ValueError, match="display"):
+            Located.objects().values("display").annotate(display=Count())._compile_group_by_query()
+        with pytest.raises(ValueError, match="display_name"):
+            Located.objects().values("display").annotate(display_name=Count())._compile_group_by_query()
+
+    @pytest.mark.asyncio
+    async def test_validation_fallback_is_keyed_by_python_names(self) -> None:
+        """A projection missing a required field fails model validation and falls back to raw
+        dicts — which must speak the same vocabulary as the GROUP BY branch."""
+
+        class Strict(BaseSurrealModel):
+            id: str
+            label: str = Field(alias="label_col")
+            required: int
+
+        async with orm_client("Strict") as client:
+            await client.query("CREATE Strict:a SET label_col = 'x', required = 1;", {})
+            rows = await Strict.objects().select("label").exec()
+            assert rows == [{"label": "x"}]
+
+
+class TestMergeUsesTheReturnedRow:
+    """``client.merge()`` already returns the merged row; re-reading it was a self-inflicted
+    second round-trip."""
+
+    @pytest.mark.asyncio
+    async def test_default_merge_issues_no_select(self) -> None:
+        async with orm_client() as client:
+            instance = await Aliased(id="ada", password="secret").save()
+            selects = _spy(client, "select")
+            await instance.merge(password="rotated")
+            assert selects == []
+            assert instance.password == "rotated"
+
+    @pytest.mark.asyncio
+    async def test_default_merge_hydrates_server_side_changes(self) -> None:
+        async with orm_client("Stamped2") as client:
+            await client.query(
+                "DEFINE FIELD title ON Stamped2 TYPE string VALUE string::uppercase($value);",
+                {},
+            )
+            instance = await Stamped2(id="a", title="first").save()
+            await instance.merge(title="second")
+            assert instance.title == "SECOND"
+
+    @pytest.mark.asyncio
+    async def test_default_merge_on_a_missing_record_raises(self) -> None:
+        async with orm_client() as client:
+            ghost = Aliased(id="ghost")
+            with pytest.raises(SurrealDbError, match="no record found"):
+                await ghost.merge(password="x")  # table never created
+            await Aliased(id="real").save()
+            with pytest.raises(SurrealDbError, match="no record found"):
+                await ghost.merge(password="x")  # table exists, record does not
+            assert await client.query("SELECT * FROM Aliased:ghost;", {}) == []
+
+    @pytest.mark.asyncio
+    async def test_refresh_false_asks_for_no_row(self) -> None:
+        async with orm_client() as client:
+            instance = await Aliased(id="ada", password="secret").save()
+            queries = _spy(client, "query")
+            merges = _spy(client, "merge")
+            await instance.merge(password="rotated", refresh=False)
+            assert merges == []
+            assert any("RETURN NONE" in call[0][0] for call in queries if call[0])
+            assert (await _raw_row(client, "Aliased", "ada"))["password_hash"] == "rotated"
+
+    @pytest.mark.asyncio
+    async def test_interactive_tx_merge_on_a_missing_record_raises(self) -> None:
+        async with orm_client() as client:
+            await Aliased(id="real").save()
+            error: Exception | None = None
+            interactive = False
+            try:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    interactive = tx.is_interactive
+                    await Aliased(id="ghost").merge(tx=tx, password="x")
+            except SurrealDbError as exc:
+                error = exc
+            if interactive:
+                assert error is not None and "no record found" in str(error)
+            else:
+                assert error is None
+            assert await client.query("SELECT * FROM Aliased:ghost;", {}) == []

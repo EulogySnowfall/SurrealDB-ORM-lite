@@ -310,10 +310,11 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
-  honoured on writes, on read hydration, and in **every QuerySet clause** — `select`, `filter`
-  (nested and negated `Q` objects included), `order_by`, `values`, `fetch`, `bulk_update` and
-  the `sum`/`avg`/`min`/`max` helpers. Filter rewriting is the piece the full ORM still lists as
-  an open gap, so lite is ahead of it here
+  honoured on writes (`patch()` pointers and the `atomic_*` family included), on read
+  hydration, in the DDL the ORM generates, and in **every QuerySet clause** — `select`, `filter`
+  (nested and negated `Q` objects, dotted paths included), `order_by`, `values`, `fetch`,
+  `bulk_update`, the aggregation helpers and `annotate()`. Filter rewriting is the piece the full
+  ORM still lists as an open gap, so lite is ahead of it here
 - `get_field_aliases()` / `to_db_field()` / `to_py_field()` expose the mapping; a single
   boundary (`_columns_for()` on the model, `_column()` on the QuerySet) keeps Python names on
   one side of the wire and columns on the other
@@ -329,8 +330,9 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   clause re-evaluates every write
 - An **explicit** write to a `server_fields` entry is allowed (`merge`, `bulk_update`,
   `server_values`); a computed field still raises. Naming the column is taken as consent
-- `merge(refresh=False)` skips the resync: no `SELECT` on the native path, `RETURN NONE` on the
-  `server_values` path. It forfeits the missing-record check, which _is_ the returned row
+- `merge()` resyncs from the row the `UPDATE` returns — one round-trip instead of the former
+  write-then-`SELECT` — and `merge(refresh=False)` compiles `RETURN NONE` so no row comes back.
+  It forfeits the missing-record check, which _is_ the returned row
 - **Same on both lines**, in and out of a transaction — no capability probe, and no test in this
   version skips on either server
 
