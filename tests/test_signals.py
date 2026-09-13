@@ -14,8 +14,8 @@ import pytest
 from pydantic import Field
 from surrealdb import RecordID
 
-from src import surreal_orm_lite
-from src.surreal_orm_lite.signals import (
+import surreal_orm_lite
+from surreal_orm_lite.signals import (
     AroundSignal,
     Signal,
     around_delete,
@@ -457,7 +457,7 @@ class TestImports:
 
     def test_import_signals_from_package(self) -> None:
         """All signal instances should be importable from surreal_orm_lite."""
-        from src.surreal_orm_lite import (
+        from surreal_orm_lite import (
             AroundSignal,
             Signal,
             around_delete,

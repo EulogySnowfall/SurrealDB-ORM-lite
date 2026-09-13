@@ -15,10 +15,10 @@ import pytest
 from pydantic import ConfigDict, Field
 from surrealdb import RecordID
 
-from src import surreal_orm_lite
-from src.surreal_orm_lite import Var
-from src.surreal_orm_lite.exceptions import SurrealDbError
-from src.surreal_orm_lite.utils import build_filter_condition, remove_quotes_for_variables
+import surreal_orm_lite
+from surreal_orm_lite import Var
+from surreal_orm_lite.exceptions import SurrealDbError
+from surreal_orm_lite.utils import build_filter_condition, remove_quotes_for_variables
 
 SURREALDB_HOST = os.environ.get("SURREALDB_HOST", "localhost")
 SURREALDB_PORT = os.environ.get("SURREALDB_PORT", "8000")
@@ -373,7 +373,7 @@ class TestWarningsReachUserCode:
 
 class TestSplitStatementsComments:
     async def test_double_slash_comment_is_not_a_statement(self) -> None:
-        from src.surreal_orm_lite.utils import split_statements
+        from surreal_orm_lite.utils import split_statements
 
         assert len(split_statements("SELECT * FROM M; // note; end")) == 1
         # An apostrophe inside a // comment must not open a string state and swallow the

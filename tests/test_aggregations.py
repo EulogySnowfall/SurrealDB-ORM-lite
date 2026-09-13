@@ -16,8 +16,8 @@ import pytest
 from pydantic import Field
 from surrealdb import RecordID
 
-from src import surreal_orm_lite
-from src.surreal_orm_lite import Avg, Count, Max, Min, Sum
+import surreal_orm_lite
+from surreal_orm_lite import Avg, Count, Max, Min, Sum
 
 # =============================================================================
 # Test Models

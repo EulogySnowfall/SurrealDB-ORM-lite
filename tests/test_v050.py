@@ -10,9 +10,9 @@ import pytest
 from pydantic import Field
 from surrealdb import RecordID
 
-from src import surreal_orm_lite
-from src.surreal_orm_lite.q import Q
-from src.surreal_orm_lite.utils import build_filter_condition, parse_lookup
+import surreal_orm_lite
+from surreal_orm_lite.q import Q
+from surreal_orm_lite.utils import build_filter_condition, parse_lookup
 
 # =============================================================================
 # Test Models

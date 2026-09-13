@@ -4,8 +4,8 @@ from typing import Any
 
 import pytest
 
-from src.surreal_orm_lite import SurrealDBConnectionManager
-from src.surreal_orm_lite.exceptions import SurrealDbConnectionError
+from surreal_orm_lite import SurrealDBConnectionManager
+from surreal_orm_lite.exceptions import SurrealDbConnectionError
 
 SURREALDB_HOST = os.environ.get("SURREALDB_HOST", "localhost")
 SURREALDB_PORT = os.environ.get("SURREALDB_PORT", "8000")

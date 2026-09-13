@@ -71,9 +71,17 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 # pytest-randomly is installed but OFF by default: CI stays deterministic and reproducible.
 # `make test-random` (or `-p randomly`) turns it on to catch order coupling — see issue #160.
-addopts = "-ra -q -p no:randomly --cov=src.surreal_orm_lite --cov-branch --cov-report=xml --cov-report=html --cov-report=term-missing --cov-fail-under=70 --cov-context=test"
+addopts = "-ra -q -p no:randomly --cov=src/surreal_orm_lite --cov-branch --cov-report=xml --cov-report=html --cov-report=term-missing --cov-fail-under=70 --cov-context=test"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+
+[tool.coverage.run]
+# Report paths relative to the repository root (`src/surreal_orm_lite/model_base.py`), not to
+# the measured package directory. Coverage used to infer that root from the `src.surreal_orm_lite`
+# module spec; that spelling is gone (it loaded the package a second time — see
+# tests/test_import_identity.py), and without this the XML would carry bare file names and
+# Codecov would lose the mapping to the repo's files.
+relative_files = true
 
 [tool.pyright]
 include = ["src"]

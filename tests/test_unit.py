@@ -1,10 +1,10 @@
 import pytest
 from pydantic import Field
 
-from src.surreal_orm_lite._sdk import RecordID
-from src.surreal_orm_lite.exceptions import SurrealDbError
-from src.surreal_orm_lite.model_base import BaseSurrealModel, SurrealConfigDict
-from src.surreal_orm_lite.query_set import QuerySet
+from surreal_orm_lite._sdk import RecordID
+from surreal_orm_lite.exceptions import SurrealDbError
+from surreal_orm_lite.model_base import BaseSurrealModel, SurrealConfigDict
+from surreal_orm_lite.query_set import QuerySet
 
 
 class ModelTest(BaseSurrealModel):
