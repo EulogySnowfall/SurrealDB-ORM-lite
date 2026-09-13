@@ -30,7 +30,8 @@ LEGACY_PIN = ROOT / ".surrealdb-version2x"
 
 # Deliberately NOT covered: CHANGELOG.md. Its entries state what a given release was cut and
 # verified against, which stays true after a later bump — rewriting them would falsify the
-# history. Same for docs/superpowers/, which is dated design material.
+# history. The dated design specs and plans are out of reach for the same reason: they live
+# with the maintainer's working notes, outside the repository.
 TARGETS = ["README.md", "docs/ROADMAP.md", ".github/workflows/ci.yml"]
 
 

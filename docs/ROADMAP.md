@@ -431,8 +431,8 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 ## Planned — Tier 1: Core (SDK 2.0 strict)
 
-> Per-version detail and acceptance criteria live in the design spec:
-> [`docs/superpowers/specs/2026-06-06-roadmap-sdk-2.0-design.md`](superpowers/specs/2026-06-06-roadmap-sdk-2.0-design.md).
+> Per-version detail and acceptance criteria are worked out in a design spec before the code,
+> kept with the maintainer's working notes rather than in the repository.
 > Every version keeps coverage ≥ 70 %, green `ruff`/`mypy`, and E2E green on 2.6.x + 3.2.x.
 
 ### 🔵 Phase A — Write-path & atomicity
@@ -587,4 +587,3 @@ remains for after GA:
 - [SurrealDB Python SDK](https://surrealdb.com/docs/sdk/python/methods)
 - [SurrealDB-ORM (full)](https://github.com/EulogySnowfall/SurrealDB-ORM)
 - [Pydantic v2](https://docs.pydantic.dev/latest/)
-- Design spec: [`docs/superpowers/specs/2026-06-06-roadmap-sdk-2.0-design.md`](superpowers/specs/2026-06-06-roadmap-sdk-2.0-design.md)
