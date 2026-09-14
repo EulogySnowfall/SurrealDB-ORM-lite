@@ -282,6 +282,7 @@ class TestLiveClauseGuards:
             ("offset()", lambda qs: qs.offset(1)),
             ("order_by()", lambda qs: qs.order_by("name")),
             ("fetch()", lambda qs: qs.fetch("name")),
+            ("values()", lambda qs: qs.values("name")),
         ],
     )
     @pytest.mark.asyncio
@@ -290,6 +291,23 @@ class TestLiveClauseGuards:
             await build(Watched.objects()).live()
         assert label in str(excinfo.value)
         assert "v0.20.0" in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_rejects_annotate(self) -> None:
+        from surreal_orm_lite import Count
+
+        with pytest.raises(SurrealDbError, match=r"annotate\(\)"):
+            await Watched.objects().annotate(total=Count("id")).live()
+
+    @pytest.mark.asyncio
+    async def test_names_every_offending_clause_at_once(self) -> None:
+        """A caller who chained three unusable clauses should not have to fix them one by one."""
+        with pytest.raises(SurrealDbError) as excinfo:
+            await Watched.objects().filter(name="a").limit(2).order_by("name").live()
+        message = str(excinfo.value)
+        assert "filter()" in message
+        assert "limit()" in message
+        assert "order_by()" in message
 
     @pytest.mark.asyncio
     async def test_rejects_a_q_filter(self) -> None:

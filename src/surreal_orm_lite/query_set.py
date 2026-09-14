@@ -1017,7 +1017,9 @@ class QuerySet:
             "order_by()": self._order_by is not None,
             "fetch()": bool(self._fetch_fields),
             "annotate()": bool(self._annotations),
-            "group_by": bool(self._group_by_fields),
+            # values() is the only public setter of _group_by_fields, so name it, not the
+            # internal grouping concept the caller never typed.
+            "values()": bool(self._group_by_fields),
         }
         offenders = sorted(name for name, present in unsupported.items() if present)
         if offenders:
