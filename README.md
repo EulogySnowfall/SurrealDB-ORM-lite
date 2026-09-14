@@ -163,6 +163,7 @@ results = await User.objects().query(
 | JWT / record auth      | ✅     |
 | Model-level auth mixin | ✅     |
 | Field aliases & DX     | ✅     |
+| Live queries (raw)     | ✅     |
 
 ### Supported Filter Lookups
 
@@ -1088,6 +1089,86 @@ next `refresh()`. Keep the default whenever you need to know the write landed.
 
 ---
 
+### 21. Live queries (real-time notifications)
+
+A live query is a server-side subscription: SurrealDB pushes a notification every time a
+record in the watched table is created, updated or deleted. It needs a **WebSocket**
+connection, and it works on both SurrealDB 2.6.x and 3.2.x.
+
+The simplest form is `watch()`, an async context manager that kills the subscription when the
+block exits:
+
+```python
+from surreal_orm_lite import LiveAction
+
+async with User.objects().watch() as stream:
+    async for notif in stream:
+        print(notif["action"], notif["result"])
+        if notif["action"] == LiveAction.DELETE:
+            break
+# the live query is killed here, even if the body raised
+```
+
+Each notification is the server's **raw envelope**, a plain dict:
+
+| Key       | Type       | Meaning                                                       |
+| --------- | ---------- | ------------------------------------------------------------- |
+| `action`  | `str`      | `CREATE`, `UPDATE` or `DELETE` — compare against `LiveAction` |
+| `id`      | `UUID`     | the live query's own uuid                                     |
+| `record`  | `RecordID` | the affected record                                           |
+| `result`  | `dict`     | the record after the change; for `DELETE`, its last content   |
+| `session` | `UUID`     | SurrealDB 3.x only — absent on 2.6.x                          |
+
+Values keep their SDK types (`RecordID`, `Datetime`) rather than being coerced. Deserializing
+notifications into model instances is v0.20.0.
+
+`LiveAction` is a `StrEnum`, so it compares directly against the raw string and you never need
+to quote a magic value.
+
+#### The explicit form
+
+When you need the uuid itself — to hand it to another task, or to kill the subscription from
+somewhere else — use the three primitives directly:
+
+```python
+from surreal_orm_lite import SurrealDBConnectionManager
+
+live_id = await User.objects().live()
+
+async for notif in SurrealDBConnectionManager.subscribe_live(live_id):
+    handle(notif)
+    if enough:
+        break
+
+await SurrealDBConnectionManager.kill(live_id)
+```
+
+`subscribe_live()` is **not** a coroutine: call it without `await`. Buffering starts the moment
+you call it rather than at the first iteration, so a write you make in between is still
+reported. Several readers can subscribe to the same uuid and each receives every notification.
+
+`kill()` is idempotent — an unknown or already-killed uuid is a no-op — and it ends every open
+stream on that uuid, so the `async for` above terminates rather than waiting forever.
+
+#### What a live query will refuse
+
+- **A non-WebSocket connection.** Live queries cannot run over HTTP; `live()` says so instead
+  of letting the SDK raise a bare `NotImplementedError`.
+- **A queryset with clauses it cannot honour.** v0.19.0 watches a whole table, so
+  `filter()`, `select()`, `limit()`, `offset()`, `order_by()`, `fetch()` and `annotate()` are
+  rejected by name rather than silently ignored. The filtered form (`LIVE SELECT … WHERE`)
+  lands in v0.20.0.
+- **A table that does not exist, on SurrealDB 3.x.** You get a `SurrealDbNotFoundError` naming
+  the table. On 2.6.x the same call succeeds and simply never notifies. Define the table first
+  if you need the two lines to behave alike.
+
+> **Not yet available**: `diff` / JSON-Patch mode. The installed SDK accepts a `diff=True`
+> argument on `live()` but never puts it on the wire, so it would change nothing. v0.20.0
+> implements it through `LIVE SELECT DIFF` instead. Automatic resubscribe after a dropped
+> WebSocket is v0.21.0; today a dropped connection ends the stream.
+
+---
+
 ## Configuration Options
 
 ### Custom Primary Key
@@ -1209,6 +1290,12 @@ listed behave the same on both lines.
 | A server column omitted from a REPLACE (`UPDATE`/`UPSERT … CONTENT`)                                                                   | an optional column is deleted; a required one raises `Found NONE for field …`          | same on both lines — which is why the ORM keeps it in replace payloads   | v0.18.0 |
 | `merge(refresh=False)` — skipped resync, `RETURN NONE`, forfeited missing-record check                                                 | same on both lines                                                                     | same on both lines (verified on 3.2.4)                                   | v0.18.0 |
 | `merge()` on a table that was never created                                                                                            | server returns no rows → ORM raises `SurrealDbError` ("no record found")               | server raises `NotFoundError` → normalised to the same `SurrealDbError`  | v0.18.0 |
+| Live queries (`live()`, `subscribe_live()`, `kill()`) — the subscription itself                                                        | supported over WebSocket (verified on 2.6.5)                                           | supported over WebSocket (verified on 3.2.4)                             | v0.19.0 |
+| `live()` on a table that does not exist                                                                                                | succeeds; the stream simply never fires                                                | server raises `NotFound` → ORM raises `SurrealDbNotFoundError`           | v0.19.0 |
+| Server notification after `kill()`                                                                                                     | none is sent                                                                           | a final envelope whose action is `KILLED`                                | v0.19.0 |
+| End of a `subscribe_live()` stream after `kill()`                                                                                      | ORM pushes its own sentinel so the `async for` ends                                    | ends on the sentinel or the `KILLED` envelope, whichever lands first     | v0.19.0 |
+| `session` key in a live notification envelope                                                                                          | absent                                                                                 | present (the SDK session uuid)                                           | v0.19.0 |
+| Live queries over HTTP                                                                                                                 | refused by the ORM with a message naming the WebSocket requirement                     | same on both lines                                                       | v0.19.0 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
 
@@ -1228,26 +1315,27 @@ Contributions are welcome! Please:
 
 ## Roadmap
 
-| Version           | Theme                                              | Status      |
-| ----------------- | -------------------------------------------------- | ----------- |
-| v0.2.x – v0.7.0   | Core ORM → SDK 2.0 / SurrealDB 3.x migration       | ✅ Released |
-| v0.8.0            | Transactions ORM (`tx=`)                           | ✅ Released |
-| v0.9.0            | Transactions — QuerySet & interactive (3.x)        | ✅ Released |
-| v0.10.0           | upsert / update_or_create / get_or_create          | ✅ Released |
-| v0.11.0           | patch / atomic field & array ops                   | ✅ Released |
-| v0.12.0           | retry_on_conflict & optimistic concurrency         | ✅ Released |
-| v0.13.0           | SurrealFunc & server-side values                   | ✅ Released |
-| v0.14.0           | Computed fields (`DEFINE FIELD … VALUE`)           | ✅ Released |
-| v0.14.3 – v0.14.5 | Correctness: `$`-values, record-id lookups, loops  | ✅ Released |
-| v0.15.0           | `call_function()` — custom `fn::` stored functions | ✅ Released |
-| v0.16.0           | Connection auth (`signin`/`signup`/`info`)         | ✅ Released |
-| v0.17.0           | Model auth (`AuthenticatedUserMixin`)              | ✅ Released |
-| v0.18.0           | Field aliases, `server_fields`, `merge(refresh=)`  | ✅ Released |
-| v0.19.0 – v0.22.0 | Tier 1 — Core (live queries, typed relations)      | 📋 Planned  |
-| v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)    | 📋 Planned  |
-| v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)   | 📋 Planned  |
-| v0.40.0           | Beta Phase (API freeze, hardening)                 | 📋 Planned  |
-| v2.0.0            | Production / GA (aligned with SDK 2.0)             | 📋 Planned  |
+| Version           | Theme                                                | Status      |
+| ----------------- | ---------------------------------------------------- | ----------- |
+| v0.2.x – v0.7.0   | Core ORM → SDK 2.0 / SurrealDB 3.x migration         | ✅ Released |
+| v0.8.0            | Transactions ORM (`tx=`)                             | ✅ Released |
+| v0.9.0            | Transactions — QuerySet & interactive (3.x)          | ✅ Released |
+| v0.10.0           | upsert / update_or_create / get_or_create            | ✅ Released |
+| v0.11.0           | patch / atomic field & array ops                     | ✅ Released |
+| v0.12.0           | retry_on_conflict & optimistic concurrency           | ✅ Released |
+| v0.13.0           | SurrealFunc & server-side values                     | ✅ Released |
+| v0.14.0           | Computed fields (`DEFINE FIELD … VALUE`)             | ✅ Released |
+| v0.14.3 – v0.14.5 | Correctness: `$`-values, record-id lookups, loops    | ✅ Released |
+| v0.15.0           | `call_function()` — custom `fn::` stored functions   | ✅ Released |
+| v0.16.0           | Connection auth (`signin`/`signup`/`info`)           | ✅ Released |
+| v0.17.0           | Model auth (`AuthenticatedUserMixin`)                | ✅ Released |
+| v0.18.0           | Field aliases, `server_fields`, `merge(refresh=)`    | ✅ Released |
+| v0.19.0           | Live queries (base): `live()` / `kill()`, raw notifs | ✅ Released |
+| v0.20.0 – v0.22.0 | Tier 1 — Core (typed live sets, typed relations)     | 📋 Planned  |
+| v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)      | 📋 Planned  |
+| v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)     | 📋 Planned  |
+| v0.40.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
+| v2.0.0            | Production / GA (aligned with SDK 2.0)               | 📋 Planned  |
 
 > Every roadmap feature is implementable with the **official SDK 2.0** (native methods or
 > `query()` SurrealQL) — no custom SDK. GA is numbered **v2.0.0** to mirror SDK 2.0; the `1.x`
@@ -1287,7 +1375,8 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | JWT Authentication            | ✅ v0.16.0 (connection) | ✅               |
 | Model auth mixin              | ✅ v0.17.0              | ✅               |
 | Field Aliases & DX            | ✅ v0.18.0              | ✅               |
-| Live Models / CDC             | v0.19 – v0.21           | ✅               |
+| Live queries (raw notifs)     | ✅ v0.19.0              | ✅               |
+| Typed live sets / CDC         | v0.20 – v0.21           | ✅               |
 | Native typed relations        | v0.22.0                 | ✅               |
 | Rich field types              | v0.23.0                 | ✅               |
 | Geospatial Fields             | v0.24.0                 | ✅               |

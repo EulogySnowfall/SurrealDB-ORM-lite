@@ -5,6 +5,81 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.0] - 2026-09-13
+
+Real-time, phase one: subscribe to a table and receive a notification whenever a record is
+created, updated or deleted. This is the **raw** layer — notifications arrive as the server's
+own envelope — that the typed `LiveQuerySet` planned for v0.20.0 will build on. Live queries
+need a WebSocket connection and work on **both SurrealDB 2.6.x and 3.2.x**.
+
+### Added
+
+- **`QuerySet.watch()`** — an async context manager that subscribes to the model's table and
+  kills the subscription on the way out, including when the body raises:
+
+  ```python
+  from surreal_orm_lite import LiveAction
+
+  async with User.objects().watch() as stream:
+      async for notif in stream:
+          print(notif["action"], notif["result"])
+          if notif["action"] == LiveAction.DELETE:
+              break
+  ```
+
+  The handle exposes `live_id`, `table`, `is_active` and `stop()`, named to match the full
+  ORM's `LiveModelStream` so the typed layer can present the same object.
+
+- **`QuerySet.live()`** — the explicit form, returning the live query's `UUID` for callers that
+  need to pass it around or kill it from elsewhere.
+
+- **`SurrealDBConnectionManager.subscribe_live(uuid)`** — an async iterator over the raw
+  notification envelopes (`action`, `id`, `record`, `result`, and `session` on 3.x). It is
+  **not** a coroutine: call it without `await`. Buffering starts at the call rather than at the
+  first iteration, so a write made in between is still reported, and several readers can
+  subscribe to the same uuid.
+
+- **`SurrealDBConnectionManager.kill(uuid)`** — stops a live query and ends every stream
+  reading it. Idempotent: an unknown or already-killed uuid is a no-op, like the ORM's other
+  cleanup-on-a-missing-target operations.
+
+- **`LiveAction`** — a `StrEnum` (`CREATE`, `UPDATE`, `DELETE`, `KILLED`) that compares directly
+  against the raw string in an envelope, so no magic values are needed.
+
+- **`LiveStream`** and `LiveAction` are exported from the package root.
+
+### Notes
+
+- **Guards, not silent surprises.** `live()` refuses a non-WebSocket connection with a message
+  naming the requirement, rather than letting the SDK's HTTP path raise a bare
+  `NotImplementedError`. It also refuses a queryset carrying `filter()`, `select()`, `limit()`,
+  `offset()`, `order_by()`, `fetch()` or `annotate()` — a table-level live query cannot honour
+  them, and quietly watching the whole table instead would be worse than an error. The filtered
+  form arrives in v0.20.0.
+
+- **Two measured 2.6.x / 3.x divergences, both normalised.** SurrealDB 3.x refuses to watch a
+  table that does not exist while 2.6.x accepts and stays silent; the ORM turns the 3.x
+  `NotFound` into a `SurrealDbNotFoundError` naming the table. After `kill()`, 3.x sends a final
+  `KILLED` notification and 2.6.x sends nothing at all, which would leave a reader's `async for`
+  hanging on 2.6.x; the ORM pushes its own end-of-stream marker so the loop terminates
+  identically on both lines. Both rows are in the README behaviour table.
+
+- **Why the ORM does not call the SDK's `subscribe_live()`.** Its generator body is
+  `yield ret["result"]`, which discards the envelope and makes `CREATE`, `UPDATE` and `DELETE`
+  indistinguishable. The ORM registers its own queue in the connection's public `live_queues`
+  registry — the mechanism the SDK's own `subscribe_live()` uses — and keeps the whole envelope.
+  Two tests guard this: one fails if the SDK drops the attribute, the other if the SDK ever
+  starts yielding the envelope itself (at which point the ORM can drop its registry).
+
+- **`diff` / JSON-Patch mode is deliberately not exposed.** The installed SDK accepts
+  `live(diff=True)` but never puts the flag on the wire — `prep_live()` encodes only the table —
+  so the argument would change nothing. v0.20.0 implements diff through `LIVE SELECT DIFF`,
+  which was verified to work on both lines.
+
+- **Not yet**: notifications deserialized into model instances and filtered live queries
+  (v0.20.0), and automatic resubscribe after a dropped WebSocket (v0.21.0). Today a dropped
+  connection ends the stream.
+
 ## [0.18.0] - 2026-09-13
 
 Let a model's **Python surface** differ from its **SurrealDB column surface**, mark the columns
