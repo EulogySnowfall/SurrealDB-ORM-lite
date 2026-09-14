@@ -1155,17 +1155,49 @@ stream on that uuid, so the `async for` above terminates rather than waiting for
 - **A non-WebSocket connection.** Live queries cannot run over HTTP; `live()` says so instead
   of letting the SDK raise a bare `NotImplementedError`.
 - **A queryset with clauses it cannot honour.** v0.19.0 watches a whole table, so
-  `filter()`, `select()`, `limit()`, `offset()`, `order_by()`, `fetch()` and `annotate()` are
-  rejected by name rather than silently ignored. The filtered form (`LIVE SELECT … WHERE`)
-  lands in v0.20.0.
+  `filter()`, `select()`, `limit()`, `offset()`, `order_by()`, `fetch()`, `values()` and
+  `annotate()` are rejected by name rather than silently ignored. The filtered form
+  (`LIVE SELECT … WHERE`) lands in v0.20.0.
 - **A table that does not exist, on SurrealDB 3.x.** You get a `SurrealDbNotFoundError` naming
   the table. On 2.6.x the same call succeeds and simply never notifies. Define the table first
   if you need the two lines to behave alike.
 
 > **Not yet available**: `diff` / JSON-Patch mode. The installed SDK accepts a `diff=True`
 > argument on `live()` but never puts it on the wire, so it would change nothing. v0.20.0
-> implements it through `LIVE SELECT DIFF` instead. Automatic resubscribe after a dropped
-> WebSocket is v0.21.0; today a dropped connection ends the stream.
+> implements it through `LIVE SELECT DIFF` instead.
+
+#### The `LiveStream` handle
+
+`watch()` returns a `LiveStream`, also exported from the package root:
+
+| Member      | Type             | Meaning                                                       |
+| ----------- | ---------------- | ------------------------------------------------------------- |
+| `live_id`   | `UUID \| None`   | the live query's uuid; `None` before start and after `stop()` |
+| `table`     | `str`            | the table being watched                                       |
+| `is_active` | `bool`           | whether the subscription is running                           |
+| `stop()`    | `async` → `None` | kill the subscription; safe before start and to repeat        |
+
+`__aexit__` calls `stop()`, so the `async with` form needs none of these. They are there for the
+cases where you hold the stream yourself.
+
+#### Lifecycle and limitations
+
+A reader parked on `async for` only wakes when something wakes it, so it is worth knowing
+exactly what ends a stream.
+
+- **`kill()` ends it**, and so does leaving a `watch()` block. This works identically on both
+  server lines.
+- **Closing the connection ends it.** `close_connection()` and `close_all_connections()` release
+  every reader on that event loop first, so an ordinary shutdown does not leave a wedged task
+  behind.
+- **A WebSocket that drops on its own does _not_ end it.** The SDK's receive task absorbs the
+  close without telling live-query subscribers, so the iterator stays suspended and receives
+  nothing further. Call `kill()` or close the connection to release it. Automatic reconnect and
+  resubscribe is v0.21.0.
+- **Subscriptions are per event loop.** A uuid belongs to the connection that created it, on the
+  loop that created it. Killing it from another loop is not supported.
+- **The buffer is unbounded.** A stream you stop reading but never kill keeps accumulating
+  notifications. Use `watch()`, or pair every `live()` with a `kill()`.
 
 ---
 

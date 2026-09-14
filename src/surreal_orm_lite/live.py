@@ -10,21 +10,32 @@ pieces of plumbing the official SDK does not provide.
 it, so ``CREATE``, ``UPDATE`` and ``DELETE`` all arrive looking identical. The action is the
 whole point of a live query, so the ORM registers its own queue in the connection's public
 ``live_queues`` registry — the same mechanism the SDK's own ``subscribe_live()`` uses — and
-yields the complete envelope. If a future SDK drops that attribute the ORM degrades to the
-SDK generator instead of breaking; ``tests/test_live_queries.py`` guards the attribute so the
-degradation is never silent.
+yields the complete envelope. An SDK build without that attribute is refused outright rather
+than degraded to the SDK generator: action-less envelopes would silently break every
+``notif["action"] == …`` comparison, and a wrong answer is worse than a clear failure.
+``tests/test_live_queries.py`` guards the attribute, so an SDK bump that removes it fails in
+CI rather than in production.
 
-**Why the ORM owns end-of-stream.** After ``kill()``, SurrealDB 3.x sends a final envelope
-with ``action="KILLED"`` and 2.6.x sends nothing at all, so a reader's ``async for`` would
-end on one line and hang forever on the other. ``close_subscribers()`` pushes a private
-sentinel onto every queue this module handed out, which makes termination identical on both
-lines. It has to be a separate registry because the SDK's ``kill()`` pops its own
-``live_queues`` entry, orphaning the queue that was in it.
+**Why the ORM owns end-of-stream.** A reader parked on ``queue.get()`` only ever wakes if
+something wakes it, and the server cannot be relied on to do so. After ``kill()``, SurrealDB
+3.x sends a final envelope with ``action="KILLED"`` and 2.6.x sends nothing at all; when the
+WebSocket drops, the SDK's receive task swallows the close and never touches ``live_queues``,
+so nothing arrives on either line. ``close_subscribers()`` (one live query) and
+``close_all_subscribers()`` (connection teardown) push a private sentinel onto every queue
+this module handed out, which makes termination identical everywhere. It has to be a separate
+registry because the SDK's ``kill()`` pops its own ``live_queues`` entry, orphaning the queue
+that was in it.
+
+**What still hangs.** A WebSocket that drops on its own — no ``kill()``, no
+``close_connection()`` — leaves readers suspended, because nothing in the SDK reports the
+close to a live-query subscriber. Calling ``kill()`` or closing the connection through the
+ORM always releases them. Automatic resubscribe is v0.21.0.
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from typing import TYPE_CHECKING, Any, Final
 from uuid import UUID
 
@@ -39,13 +50,44 @@ __all__ = ["LiveStream"]
 # Private end-of-stream marker. Identity-compared, so it can never collide with a payload.
 _STREAM_END: Final = object()
 
-# Queues this module handed out, keyed by the live query's uuid as a string. Mirrors the SDK's
-# ``live_queues`` so ``kill()`` can still reach them once the SDK has dropped its own entry.
-_SUBSCRIBERS: dict[str, list[asyncio.Queue[Any]]] = {}
+# Queues this module handed out, keyed by the event loop that owns them and then by the live
+# query's uuid. Mirrors the SDK's ``live_queues`` so ``kill()`` can still reach a queue once the
+# SDK has dropped its own entry.
+#
+# The loop is part of the key for the same reason the connection manager caches clients per loop
+# (issue #163): an ``asyncio.Queue`` belongs to the loop that awaits it, and ``put_nowait()`` on a
+# queue with a waiting getter schedules a callback on *that* loop. Waking another loop's queue
+# from here would either raise or wake nothing; keying by loop makes it impossible to try.
+_SUBSCRIBERS: dict[asyncio.AbstractEventLoop, dict[str, list[asyncio.Queue[Any]]]] = {}
+
+# Uuids killed recently, per loop. A subscription opened on a dead uuid can never receive
+# anything — no notification, and no sentinel, because ``kill()`` already fired — so it would
+# wait forever. Remembering the last few lets ``open_stream`` hand back an empty iterator
+# instead. Bounded, because this is a courtesy for a mis-sequenced call, not bookkeeping.
+_RECENTLY_KILLED: dict[asyncio.AbstractEventLoop, deque[str]] = {}
+_RECENTLY_KILLED_MAX = 64
 
 
 def _key(query_uuid: str | UUID) -> str:
     return str(query_uuid)
+
+
+def _prune_dead_loops() -> None:
+    """Forget the registries of loops that have been closed, so they cannot accumulate."""
+    for registry in (_SUBSCRIBERS, _RECENTLY_KILLED):
+        for loop in [loop for loop in registry if loop.is_closed()]:
+            registry.pop(loop, None)  # type: ignore[arg-type]
+
+
+def _bucket() -> dict[str, list[asyncio.Queue[Any]]]:
+    """This event loop's subscriber registry, created on first use."""
+    _prune_dead_loops()
+    return _SUBSCRIBERS.setdefault(asyncio.get_running_loop(), {})
+
+
+def _killed() -> deque[str]:
+    """This event loop's recently-killed uuids."""
+    return _RECENTLY_KILLED.setdefault(asyncio.get_running_loop(), deque(maxlen=_RECENTLY_KILLED_MAX))
 
 
 def _sdk_queues(client: Any) -> dict[str, list[asyncio.Queue[Any]]] | None:
@@ -68,16 +110,16 @@ def register_subscriber(client: Any, query_uuid: str | UUID) -> asyncio.Queue[An
     queues = _sdk_queues(client)
     if queues is not None:
         queues.setdefault(key, []).append(queue)
-    _SUBSCRIBERS.setdefault(key, []).append(queue)
+    _bucket().setdefault(key, []).append(queue)
     return queue
 
 
 def unregister_subscriber(client: Any, query_uuid: str | UUID, queue: asyncio.Queue[Any]) -> None:
     """Drop one subscriber, leaving any other reader of the same live query untouched."""
     key = _key(query_uuid)
-    for registry in (_sdk_queues(client), _SUBSCRIBERS):
-        if registry is None:
-            continue
+    sdk = _sdk_queues(client)
+    registries = [_bucket()] if sdk is None else [sdk, _bucket()]
+    for registry in registries:
         holders = registry.get(key)
         if holders is None:
             continue
@@ -89,8 +131,25 @@ def unregister_subscriber(client: Any, query_uuid: str | UUID, queue: asyncio.Qu
 
 def close_subscribers(query_uuid: str | UUID) -> None:
     """End every stream open on ``query_uuid``. Idempotent."""
-    for queue in _SUBSCRIBERS.pop(_key(query_uuid), []):
+    key = _key(query_uuid)
+    for queue in _bucket().pop(key, []):
         queue.put_nowait(_STREAM_END)
+    killed = _killed()
+    if key not in killed:
+        killed.append(key)
+
+
+def close_all_subscribers() -> None:
+    """End every stream open on this event loop.
+
+    Called by the connection-teardown paths. A live query rides the WebSocket, so once the
+    connection is gone no notification can ever arrive — and neither can the ``KILLED``
+    envelope SurrealDB 3.x would otherwise send. Without this, closing the connection leaves
+    every reader parked on ``queue.get()`` forever, and the ``async with`` around a
+    :class:`LiveStream` never reaches its ``__aexit__``.
+    """
+    for key in list(_bucket()):
+        close_subscribers(key)
 
 
 def open_stream(client: Any, query_uuid: str | UUID) -> AsyncIterator[dict[str, Any]]:
@@ -102,10 +161,24 @@ def open_stream(client: Any, query_uuid: str | UUID) -> AsyncIterator[dict[str, 
     everything the server pushes from this moment on is buffered until the caller gets round
     to reading it.
     """
-    if _sdk_queues(client) is None:  # pragma: no cover - guarded by the SDK-shape test
-        return _sdk_fallback(client, query_uuid)
+    queues = _sdk_queues(client)
+    if queues is None:
+        raise SurrealDbError(
+            "This SurrealDB SDK connection does not expose a `live_queues` registry, which the "
+            "ORM needs to read the `action` of each notification — the SDK's own "
+            "`subscribe_live()` discards it. Live queries cannot be served correctly against "
+            "this SDK build; pin a `surrealdb` release that provides it."
+        )
+    if _key(query_uuid) in _killed():
+        return _exhausted()
     queue = register_subscriber(client, query_uuid)
     return _drain(client, query_uuid, queue)
+
+
+async def _exhausted() -> AsyncIterator[dict[str, Any]]:
+    """An already-finished stream, for a uuid this loop has already killed."""
+    return
+    yield {}  # pragma: no cover - unreachable, but makes this an async generator
 
 
 async def _drain(client: Any, query_uuid: str | UUID, queue: asyncio.Queue[Any]) -> AsyncIterator[dict[str, Any]]:
@@ -120,12 +193,6 @@ async def _drain(client: Any, query_uuid: str | UUID, queue: asyncio.Queue[Any])
             yield envelope
     finally:
         unregister_subscriber(client, query_uuid, queue)
-
-
-async def _sdk_fallback(client: Any, query_uuid: str | UUID) -> AsyncIterator[dict[str, Any]]:  # pragma: no cover
-    """Degraded path for an SDK connection with no ``live_queues``: payloads without an action."""
-    async for payload in await client.subscribe_live(query_uuid):
-        yield {"id": query_uuid, "action": None, "record": None, "result": payload}
 
 
 def require_websocket(url: str | None) -> None:
@@ -203,13 +270,17 @@ class LiveStream:
 
     async def stop(self) -> None:
         """Kill the subscription and end the iteration. Safe before start and to repeat."""
-        live_id, self._live_id = self._live_id, None
-        self._iterator = None
-        if live_id is None:
+        if self._live_id is None:
+            self._iterator = None
             return
         from .connection_manager import SurrealDBConnectionManager
 
-        await SurrealDBConnectionManager.kill(live_id)
+        # `live_id` is cleared only once the kill has actually gone through. A transient
+        # failure would otherwise leave the caller reporting `is_active is False` with a
+        # subscription still running on the server and no uuid left to retry with.
+        await SurrealDBConnectionManager.kill(self._live_id)
+        self._live_id = None
+        self._iterator = None
 
     def __aiter__(self) -> LiveStream:
         return self

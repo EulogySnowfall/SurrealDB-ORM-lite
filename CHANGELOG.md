@@ -53,7 +53,7 @@ need a WebSocket connection and work on **both SurrealDB 2.6.x and 3.2.x**.
 - **Guards, not silent surprises.** `live()` refuses a non-WebSocket connection with a message
   naming the requirement, rather than letting the SDK's HTTP path raise a bare
   `NotImplementedError`. It also refuses a queryset carrying `filter()`, `select()`, `limit()`,
-  `offset()`, `order_by()`, `fetch()` or `annotate()` — a table-level live query cannot honour
+  `offset()`, `order_by()`, `fetch()`, `values()` or `annotate()` — a table-level live query cannot honour
   them, and quietly watching the whole table instead would be worse than an error. The filtered
   form arrives in v0.20.0.
 
@@ -76,9 +76,19 @@ need a WebSocket connection and work on **both SurrealDB 2.6.x and 3.2.x**.
   so the argument would change nothing. v0.20.0 implements diff through `LIVE SELECT DIFF`,
   which was verified to work on both lines.
 
+- **What ends a stream.** `kill()` does, leaving a `watch()` block does, and so does
+  `close_connection()` / `close_all_connections()` — those release every reader on the loop
+  before the socket goes, so an ordinary shutdown cannot leave a wedged task behind. A
+  WebSocket that drops on its **own** does not: the SDK's receive task absorbs the close
+  without telling live-query subscribers, so the iterator stays suspended until you call
+  `kill()` or close the connection. Automatic reconnect and resubscribe is v0.21.0.
+
+- **An SDK without `live_queues` is refused, not degraded.** Yielding action-less envelopes
+  would silently break every `notif["action"] == …` comparison, and a wrong answer is worse
+  than a clear failure. The guard test catches such an SDK in CI instead.
+
 - **Not yet**: notifications deserialized into model instances and filtered live queries
-  (v0.20.0), and automatic resubscribe after a dropped WebSocket (v0.21.0). Today a dropped
-  connection ends the stream.
+  (v0.20.0), and automatic resubscribe after a dropped WebSocket (v0.21.0).
 
 ## [0.18.0] - 2026-09-13
 

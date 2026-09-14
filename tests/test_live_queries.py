@@ -55,16 +55,20 @@ class TestLiveAction:
 
 
 class TestSubscriberRegistry:
-    def test_register_returns_a_queue_visible_to_both_registries(self) -> None:
+    """The registry is keyed by event loop, so every test here runs inside one."""
+
+    @pytest.mark.asyncio
+    async def test_register_returns_a_queue_visible_to_both_registries(self) -> None:
         from surreal_orm_lite import live
 
         client = _FakeClient()
         queue = live.register_subscriber(client, "abc")
         assert queue in client.live_queues["abc"]
-        assert queue in live._SUBSCRIBERS["abc"]
+        assert queue in live._bucket()["abc"]
         live.close_subscribers("abc")
 
-    def test_close_pushes_the_sentinel_to_every_queue(self) -> None:
+    @pytest.mark.asyncio
+    async def test_close_pushes_the_sentinel_to_every_queue(self) -> None:
         from surreal_orm_lite import live
 
         client = _FakeClient()
@@ -74,43 +78,39 @@ class TestSubscriberRegistry:
         assert first.get_nowait() is live._STREAM_END
         assert second.get_nowait() is live._STREAM_END
 
-    def test_close_drops_the_entry_and_is_idempotent(self) -> None:
+    @pytest.mark.asyncio
+    async def test_close_drops_the_entry_and_is_idempotent(self) -> None:
         from surreal_orm_lite import live
 
         client = _FakeClient()
         live.register_subscriber(client, "abc")
         live.close_subscribers("abc")
-        assert "abc" not in live._SUBSCRIBERS
+        assert "abc" not in live._bucket()
         live.close_subscribers("abc")  # must not raise
 
-    def test_unregister_leaves_the_other_subscribers_intact(self) -> None:
+    @pytest.mark.asyncio
+    async def test_unregister_leaves_the_other_subscribers_intact(self) -> None:
         from surreal_orm_lite import live
 
         client = _FakeClient()
         first = live.register_subscriber(client, "abc")
         second = live.register_subscriber(client, "abc")
         live.unregister_subscriber(client, "abc", first)
-        assert live._SUBSCRIBERS["abc"] == [second]
+        assert live._bucket()["abc"] == [second]
         assert client.live_queues["abc"] == [second]
         live.close_subscribers("abc")
 
-    def test_unregister_of_the_last_queue_drops_the_entry(self) -> None:
+    @pytest.mark.asyncio
+    async def test_unregister_of_the_last_queue_drops_the_entry(self) -> None:
         from surreal_orm_lite import live
 
         client = _FakeClient()
         only = live.register_subscriber(client, "abc")
         live.unregister_subscriber(client, "abc", only)
-        assert "abc" not in live._SUBSCRIBERS
+        assert "abc" not in live._bucket()
 
-    def test_registry_tolerates_a_client_without_live_queues(self) -> None:
-        """A future SDK layout must degrade, not explode."""
-        from surreal_orm_lite import live
-
-        queue = live.register_subscriber(object(), "abc")
-        assert queue in live._SUBSCRIBERS["abc"]
-        live.close_subscribers("abc")
-
-    def test_accepts_a_uuid_as_well_as_a_string(self) -> None:
+    @pytest.mark.asyncio
+    async def test_accepts_a_uuid_as_well_as_a_string(self) -> None:
         from uuid import uuid4
 
         from surreal_orm_lite import live
@@ -120,7 +120,103 @@ class TestSubscriberRegistry:
         queue = live.register_subscriber(client, key)
         assert queue in client.live_queues[str(key)]
         live.close_subscribers(key)
-        assert str(key) not in live._SUBSCRIBERS
+        assert str(key) not in live._bucket()
+
+    @pytest.mark.asyncio
+    async def test_close_all_ends_every_stream_on_this_loop(self) -> None:
+        from surreal_orm_lite import live
+
+        client = _FakeClient()
+        first = live.register_subscriber(client, "one")
+        second = live.register_subscriber(client, "two")
+        live.close_all_subscribers()
+        assert first.get_nowait() is live._STREAM_END
+        assert second.get_nowait() is live._STREAM_END
+        assert live._bucket() == {}
+
+    @pytest.mark.asyncio
+    async def test_close_all_on_an_empty_registry_is_a_no_op(self) -> None:
+        from surreal_orm_lite import live
+
+        live.close_all_subscribers()
+        assert live._bucket() == {}
+
+    @pytest.mark.asyncio
+    async def test_registry_is_partitioned_by_event_loop(self) -> None:
+        """A queue belongs to the loop that awaits it, so one loop must not see another's."""
+        from surreal_orm_lite import live
+
+        client = _FakeClient()
+        live.register_subscriber(client, "mine")
+        assert "mine" in live._bucket()
+
+        # A separate thread, because a loop cannot be run from inside a running one.
+        assert "mine" not in _in_another_loop(_bucket_keys)
+        live.close_subscribers("mine")
+
+    @pytest.mark.asyncio
+    async def test_closed_loops_are_pruned(self) -> None:
+        from surreal_orm_lite import live
+
+        _in_another_loop(_register_and_leave)
+        assert any(loop.is_closed() for loop in live._SUBSCRIBERS)
+        live._prune_dead_loops()
+        assert all(not loop.is_closed() for loop in live._SUBSCRIBERS)
+
+
+def _in_another_loop(coro_factory: Any) -> Any:
+    """Run *coro_factory* to completion on a brand-new loop in a separate thread."""
+    import asyncio as _asyncio
+    import threading
+
+    box: dict[str, Any] = {}
+
+    def _run() -> None:
+        loop = _asyncio.new_event_loop()
+        try:
+            box["value"] = loop.run_until_complete(coro_factory())
+        finally:
+            loop.close()
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    thread.join(timeout=10)
+    return box.get("value")
+
+
+async def _bucket_keys() -> list[str]:
+    from surreal_orm_lite import live
+
+    return list(live._bucket())
+
+
+async def _register_and_leave() -> None:
+    from surreal_orm_lite import live
+
+    live.register_subscriber(_FakeClient(), "left-behind")
+
+
+class TestOpenStreamGuards:
+    @pytest.mark.asyncio
+    async def test_refuses_an_sdk_connection_without_live_queues(self) -> None:
+        """Degrading would silently drop `action`; a wrong answer is worse than an error."""
+        from surreal_orm_lite import live
+
+        with pytest.raises(SurrealDbError, match="live_queues"):
+            live.open_stream(object(), "abc")
+
+    @pytest.mark.asyncio
+    async def test_subscribing_to_an_already_killed_uuid_ends_at_once(self) -> None:
+        """Nothing can ever wake such a stream, so it must not park on the queue."""
+        from surreal_orm_lite import live
+
+        client = _FakeClient()
+        live.register_subscriber(client, "gone")
+        live.close_subscribers("gone")
+
+        stream = live.open_stream(client, "gone")
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(stream.__anext__(), timeout=5)
 
 
 @pytest.fixture(autouse=True)
@@ -129,6 +225,7 @@ def _clear_registry() -> Any:
 
     yield
     live._SUBSCRIBERS.clear()
+    live._RECENTLY_KILLED.clear()
 
 
 # ==================== E2E helpers ====================
@@ -233,7 +330,7 @@ class TestSubscribeLiveE2E:
             await SurrealDBConnectionManager.kill(live_id)
             await client.query(f"CREATE {TABLE}:after SET name = 'after';", {})
             with pytest.raises(StopAsyncIteration):
-                await stream.__anext__()
+                await asyncio.wait_for(stream.__anext__(), timeout=10)
 
     @pytest.mark.asyncio
     async def test_kill_of_an_unknown_uuid_is_a_no_op(self) -> None:
@@ -481,3 +578,126 @@ class TestExports:
         assert surreal_orm_lite.LiveAction is LiveAction
         assert "LiveAction" in surreal_orm_lite.__all__
         assert "LiveStream" in surreal_orm_lite.__all__
+
+
+# ==================== Connection teardown must release readers ====================
+
+
+class TestTeardownEndsStreamsE2E:
+    """A reader parked on the queue only wakes if something wakes it.
+
+    Nothing in the SDK reports a closed WebSocket to a live-query subscriber: its receive task
+    catches the close and never touches ``live_queues``. So every ORM path that takes the
+    connection away has to end the streams itself, or an application's ordinary shutdown leaves
+    a permanently wedged task behind and the server-side subscription is never killed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_close_connection_ends_an_open_stream(self) -> None:
+        async with orm_client(TABLE) as client:
+            await _define_table(client)
+            live_id = await Watched.objects().live()
+            stream = SurrealDBConnectionManager.subscribe_live(live_id)
+
+            async def consume() -> str:
+                async for _ in stream:
+                    pass
+                return "ended"
+
+            consumer = asyncio.create_task(consume())
+            await asyncio.sleep(0.2)
+            await SurrealDBConnectionManager.close_connection()
+            assert await asyncio.wait_for(consumer, timeout=10) == "ended"
+
+    @pytest.mark.asyncio
+    async def test_close_connection_releases_a_watch_block(self) -> None:
+        async with orm_client(TABLE) as client:
+            await _define_table(client)
+
+            async def watch_forever() -> str:
+                async with Watched.objects().watch() as stream:
+                    async for _ in stream:
+                        pass
+                return "exited"
+
+            watcher = asyncio.create_task(watch_forever())
+            await asyncio.sleep(0.3)
+            await SurrealDBConnectionManager.close_connection()
+            assert await asyncio.wait_for(watcher, timeout=10) == "exited"
+
+    @pytest.mark.asyncio
+    async def test_close_all_connections_ends_an_open_stream(self) -> None:
+        async with orm_client(TABLE) as client:
+            await _define_table(client)
+            live_id = await Watched.objects().live()
+            stream = SurrealDBConnectionManager.subscribe_live(live_id)
+
+            async def consume() -> str:
+                async for _ in stream:
+                    pass
+                return "ended"
+
+            consumer = asyncio.create_task(consume())
+            await asyncio.sleep(0.2)
+            await SurrealDBConnectionManager.close_all_connections()
+            assert await asyncio.wait_for(consumer, timeout=10) == "ended"
+
+
+# ==================== Error paths a mis-sequenced caller hits ====================
+
+
+class TestLiveErrorPaths:
+    @pytest.mark.asyncio
+    async def test_subscribe_live_without_a_connection_explains_itself(self) -> None:
+        await SurrealDBConnectionManager.close_connection()
+        with pytest.raises(SurrealDbError) as excinfo:
+            SurrealDBConnectionManager.subscribe_live("00000000-0000-0000-0000-000000000000")
+        message = str(excinfo.value)
+        assert "event loop" in message
+        assert "live()" in message
+
+    @pytest.mark.asyncio
+    async def test_a_kill_failure_that_is_not_an_unknown_uuid_is_reported(self) -> None:
+        """Only "no such live query" is swallowed; anything else must reach the caller."""
+
+        class _AngryClient:
+            live_queues: dict[str, Any] = {}
+
+            async def kill(self, query_uuid: Any) -> None:
+                raise RuntimeError("connection reset by peer")
+
+        async with orm_client(TABLE):
+            original = SurrealDBConnectionManager.get_client
+            SurrealDBConnectionManager.get_client = classmethod(  # type: ignore[method-assign,assignment]
+                lambda cls: asyncio.sleep(0, result=_AngryClient())
+            )
+            try:
+                with pytest.raises(SurrealDbError, match="Failed to kill live query"):
+                    await SurrealDBConnectionManager.kill("11111111-1111-1111-1111-111111111111")
+            finally:
+                SurrealDBConnectionManager.get_client = original  # type: ignore[method-assign]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_kill_still_releases_the_readers(self) -> None:
+        """The sentinel is pushed in a `finally`, so a broken connection cannot wedge a reader."""
+
+        class _AngryClient:
+            live_queues: dict[str, Any] = {}
+
+            async def kill(self, query_uuid: Any) -> None:
+                raise RuntimeError("connection reset by peer")
+
+        from surreal_orm_lite import live
+
+        async with orm_client(TABLE):
+            queue = live.register_subscriber(_AngryClient(), "22222222-2222-2222-2222-222222222222")
+            original = SurrealDBConnectionManager.get_client
+            SurrealDBConnectionManager.get_client = classmethod(  # type: ignore[method-assign,assignment]
+                lambda cls: asyncio.sleep(0, result=_AngryClient())
+            )
+            try:
+                with pytest.raises(SurrealDbError):
+                    await SurrealDBConnectionManager.kill("22222222-2222-2222-2222-222222222222")
+            finally:
+                SurrealDBConnectionManager.get_client = original  # type: ignore[method-assign]
+            assert queue.get_nowait() is live._STREAM_END

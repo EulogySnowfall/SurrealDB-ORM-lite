@@ -20,7 +20,7 @@ from .exceptions import (
     SurrealDbValidationError,
 )
 from .functions import build_call_statement, normalize_function_name, parse_function_parameters
-from .live import close_subscribers, open_stream, require_websocket
+from .live import close_all_subscribers, close_subscribers, open_stream, require_websocket
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
 
 logger = logging.getLogger(__name__)
@@ -273,6 +273,9 @@ class SurrealDBConnectionManager:
         :meth:`close_all_connections` to tear everything down.
         """
         cls.__prune_dead_loops()
+        # Before the socket goes: a live-query reader is parked on a queue nothing will ever
+        # feed once the connection is gone, so releasing them has to happen here.
+        close_all_subscribers()
         client = cls.__clients.pop(asyncio.get_running_loop(), None)
         if client is None:
             return
@@ -290,6 +293,7 @@ class SurrealDBConnectionManager:
         Only the running loop's client is closed properly.
         """
         loop = asyncio.get_running_loop()
+        close_all_subscribers()
         client = cls.__clients.pop(loop, None)
         if client is not None:
             with contextlib.suppress(NotImplementedError):
