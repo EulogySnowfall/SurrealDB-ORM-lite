@@ -497,7 +497,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 | Version    | Theme                                                                           | SDK 2.0 primitive             |
 | ---------- | ------------------------------------------------------------------------------- | ----------------------------- |
 | ✅ v0.19.0 | Live Queries (base): `live()`/`watch()`/`subscribe_live()`/`kill()`, raw notifs | `live`/`kill` + `live_queues` |
-| v0.20.0    | `LiveQuerySet` typed: filters + notifications deserialized, diff mode           | idem + diff mode              |
+| v0.20.0    | `LiveQuerySet` typed: filters + notifications deserialized, diff mode           | `LIVE SELECT [DIFF] … WHERE`  |
 | v0.21.0    | Change Feeds / Auto-Resubscribe: WS reconnect + resubscribe + cursor            | live + reconnect              |
 
 ### 🟠 Phase E — Graph
