@@ -2,6 +2,7 @@ import contextlib
 import logging
 import math
 from typing import TYPE_CHECKING, Any, Self, cast
+from uuid import UUID
 
 from pydantic_core import ValidationError
 
@@ -10,6 +11,7 @@ from ._sdk import NotFoundError
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import Var
+from .live import LiveStream, missing_table_error, require_websocket
 from .q import Q
 from .utils import (
     build_filter_condition,
@@ -994,6 +996,85 @@ class QuerySet:
         return obj, True
 
     # ==================== Custom Query ====================
+
+    # ------------------------------------------------------------------
+    # Live queries (v0.19.0)
+    # ------------------------------------------------------------------
+
+    def _reject_live_clauses(self) -> None:
+        """Refuse a live query that would silently drop part of the queryset.
+
+        The SDK's ``live()`` subscribes to a whole table and takes no other argument, so a
+        clause set on the queryset could not be honoured. Ignoring it quietly would be the
+        worst outcome — the caller would believe they were watching a filtered subset — so
+        each unusable clause is named and the caller is pointed at the version that adds it.
+        """
+        unsupported = {
+            "filter()": bool(self._filters or self._q_filters),
+            "select()": bool(self.select_item),
+            "limit()": self._limit is not None,
+            "offset()": self._offset is not None,
+            "order_by()": self._order_by is not None,
+            "fetch()": bool(self._fetch_fields),
+            "annotate()": bool(self._annotations),
+            # values() is the only public setter of _group_by_fields, so name it, not the
+            # internal grouping concept the caller never typed.
+            "values()": bool(self._group_by_fields),
+        }
+        offenders = sorted(name for name, present in unsupported.items() if present)
+        if offenders:
+            raise SurrealDbError(
+                f"Live queries in v0.19.0 watch a whole table and cannot honour "
+                f"{', '.join(offenders)}. Drop the clause, or wait for the filtered form "
+                f"(`LIVE SELECT ... WHERE`) landing in v0.20.0."
+            )
+
+    async def live(self) -> UUID:
+        """Start a live query on this model's table and return its uuid.
+
+        Pair it with :meth:`SurrealDBConnectionManager.subscribe_live` to read the raw
+        notifications, and :meth:`SurrealDBConnectionManager.kill` to stop them::
+
+            live_id = await User.objects().live()
+            async for notif in SurrealDBConnectionManager.subscribe_live(live_id):
+                print(notif["action"], notif["result"])
+            await SurrealDBConnectionManager.kill(live_id)
+
+        Prefer :meth:`watch` unless you need the uuid itself: it kills the subscription for
+        you, which a manual pairing forgets under an exception.
+
+        :returns: the live query's uuid.
+        :raises SurrealDbError: on a non-WebSocket connection, or a queryset carrying clauses
+            a table-level live query cannot apply.
+        :raises SurrealDbNotFoundError: on SurrealDB 3.x, if the table does not exist.
+        """
+        self._reject_live_clauses()
+        require_websocket(SurrealDBConnectionManager.get_connection_string())
+        client = await SurrealDBConnectionManager.get_client()
+        table = self.model.get_table_name()
+        try:
+            live_id: UUID = await client.live(table)
+        except NotFoundError as exc:
+            raise missing_table_error(exc, table) from exc
+        return live_id
+
+    def watch(self) -> LiveStream:
+        """Watch this model's table, killing the subscription when the block exits.
+
+        The safe pairing of :meth:`live`, ``subscribe_live()`` and ``kill()``::
+
+            async with User.objects().watch() as stream:
+                async for notif in stream:
+                    print(notif["action"], notif["result"])
+                    if enough:
+                        break
+
+        The live query is killed on the way out of the ``async with``, including when the body
+        raises — a subscription left running holds server-side resources until the connection
+        drops.
+        """
+        self._reject_live_clauses()
+        return LiveStream(self.model.get_table_name(), self.live)
 
     async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
         """

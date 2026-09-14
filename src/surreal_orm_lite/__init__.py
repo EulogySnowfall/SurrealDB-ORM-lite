@@ -1,10 +1,10 @@
-__version__ = "0.18.0"
+__version__ = "0.19.0"
 
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
 from .auth import AuthTokens
 from .concurrency import is_conflict_error, retry_on_conflict
 from .connection_manager import SurrealDBConnectionManager
-from .enum import OrderBy
+from .enum import LiveAction, OrderBy
 from .exceptions import (
     SurrealDbAuthenticationError,
     SurrealDbConflictError,
@@ -27,6 +27,7 @@ from .functions import (
     Var,
     computed,
 )
+from .live import LiveStream
 from .model_auth import AuthenticatedUserMixin, AuthResult
 from .model_base import BaseSurrealModel, SurrealConfigDict
 from .q import Q
@@ -60,6 +61,9 @@ __all__ = [
     "QuerySet",
     "Q",
     "OrderBy",
+    # Live queries
+    "LiveAction",
+    "LiveStream",
     # Aggregations
     "Aggregation",
     "Count",

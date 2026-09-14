@@ -27,7 +27,8 @@
 | v0.16.0           | Tier 1 — Connection-level auth (JWT / record users)  | Done    |
 | v0.17.0           | Tier 1 — Model auth (`AuthenticatedUserMixin`)       | Done    |
 | v0.18.0           | Tier 1 — Field aliases & DX                          | Done    |
-| v0.19.0 – v0.22.0 | Tier 1 — Core (live queries, typed relations)        | Planned |
+| v0.19.0           | Tier 1 — Live queries (base), raw notifications      | Done    |
+| v0.20.0 – v0.22.0 | Tier 1 — Core (typed live sets, typed relations)     | Planned |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 7 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
@@ -73,7 +74,8 @@ pieces stay out.
 | JWT / scope auth (connection)       | `signup`/`signin`/`authenticate`/`invalidate`/`info`  | ✅ v0.16.0     |
 | JWT / scope auth (model mixin)      | idem, on a `BaseSurrealModel` subclass                | ✅ v0.17.0     |
 | Field aliases & DX                  | Pydantic `Field(alias=)` + config                     | ✅ v0.18.0     |
-| Live Models / Live Queries          | `live()` / `subscribe_live()` / `kill()`              | v0.19 – v0.20  |
+| Live queries (raw notifications)    | `live()` / `subscribe_live()` / `kill()`              | ✅ v0.19.0     |
+| Typed live sets (`LiveQuerySet`)    | idem + deserialization + `LIVE SELECT … WHERE`        | v0.20.0        |
 | Change Feeds / Auto-Resubscribe     | live queries + reconnect logic                        | v0.21.0        |
 | Native typed relations              | `insert_relation()`                                   | v0.22.0        |
 | Rich field types                    | native `Datetime`/`Duration`/`Decimal`/`Range`/`Uuid` | v0.23.0        |
@@ -137,7 +139,8 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | JWT Authentication            | yes        | ✅ v0.16.0 (connection)     |
 | Model-level auth mixin        | yes        | ✅ v0.17.0                  |
 | Field aliases & DX            | yes        | ✅ v0.18.0                  |
-| Live Models / CDC             | yes        | v0.19 – v0.21               |
+| Live queries (raw notifs)     | yes        | ✅ v0.19.0                  |
+| Typed live sets / CDC         | yes        | v0.20 – v0.21               |
 | Native typed relations        | yes        | v0.22.0                     |
 | Rich field types              | yes        | v0.23.0                     |
 | Geospatial fields             | yes        | v0.24.0                     |
@@ -307,6 +310,34 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - Model-level auth (`AuthenticatedUserMixin`, `User.signup()` returning an instance) is v0.17.0;
   a `define_access()` DDL helper belongs with `schema.py` at v0.31.0
 
+### Version 0.19.0 — Live queries (base)
+
+- `QuerySet.watch()` is the everyday form: an async context manager that subscribes to the
+  model's table and **kills the subscription on exit**, including when the body raises. The
+  handle exposes `live_id`, `table`, `is_active` and `stop()`, named after the full ORM's
+  `LiveModelStream` so the typed v0.20.0 layer can present the same object
+- `QuerySet.live()` returns the live query's `UUID`;
+  `SurrealDBConnectionManager.subscribe_live()` iterates the raw envelopes and `kill()` stops
+  them. `subscribe_live()` is intentionally **not** a coroutine, so buffering starts at the call
+  rather than at the first iteration and a write made in between is still reported
+- `LiveAction` (`StrEnum`) lets `notif["action"] == LiveAction.CREATE` work against the raw
+  string, keeping the envelope a plain dict
+- **The SDK's own `subscribe_live()` is unusable here**: its body is `yield ret["result"]`, which
+  discards the envelope and makes CREATE, UPDATE and DELETE indistinguishable. The ORM registers
+  its own queue in the connection's public `live_queues` registry — the same mechanism — and
+  keeps the action. Two tests guard the coupling: one fails if the attribute disappears, the
+  other if the SDK ever starts yielding the envelope itself
+- **`live(diff=True)` is a no-op in the installed SDK** (`prep_live()` encodes only the table),
+  so no `diff=` argument is exposed. v0.20.0 does it through `LIVE SELECT DIFF`, verified on both
+  lines
+- **Two measured divergences, both normalised.** 3.x refuses to watch an undefined table (→
+  `SurrealDbNotFoundError`) while 2.6.x accepts and stays silent; after `kill()` 3.x sends a
+  `KILLED` notification and 2.6.x sends nothing, so the ORM pushes its own end-of-stream marker
+  and the `async for` terminates the same way on both lines
+- Guards rather than surprises: HTTP connections are refused by name, and a queryset carrying
+  `filter`/`select`/`limit`/`offset`/`order_by`/`fetch`/`annotate` is rejected instead of being
+  silently watched whole
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -463,11 +494,11 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 ### 🟡 Phase D — Real-time
 
-| Version | Theme                                                                 | SDK 2.0 primitive              |
-| ------- | --------------------------------------------------------------------- | ------------------------------ |
-| v0.19.0 | Live Queries (base): `live()`/`subscribe_live()`/`kill()`, raw notifs | `live`/`subscribe_live`/`kill` |
-| v0.20.0 | `LiveQuerySet` typed: filters + notifications deserialized, diff mode | idem + diff mode               |
-| v0.21.0 | Change Feeds / Auto-Resubscribe: WS reconnect + resubscribe + cursor  | live + reconnect               |
+| Version    | Theme                                                                           | SDK 2.0 primitive             |
+| ---------- | ------------------------------------------------------------------------------- | ----------------------------- |
+| ✅ v0.19.0 | Live Queries (base): `live()`/`watch()`/`subscribe_live()`/`kill()`, raw notifs | `live`/`kill` + `live_queues` |
+| v0.20.0    | `LiveQuerySet` typed: filters + notifications deserialized, diff mode           | `LIVE SELECT [DIFF] … WHERE`  |
+| v0.21.0    | Change Feeds / Auto-Resubscribe: WS reconnect + resubscribe + cursor            | live + reconnect              |
 
 ### 🟠 Phase E — Graph
 
