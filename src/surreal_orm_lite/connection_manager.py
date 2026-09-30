@@ -20,7 +20,7 @@ from .exceptions import (
     SurrealDbValidationError,
 )
 from .functions import build_call_statement, normalize_function_name, parse_function_parameters
-from .live import close_all_subscribers, close_subscribers, open_stream, require_websocket
+from .live import LiveIterator, close_all_subscribers, mark_killed, open_stream, release_subscribers, require_websocket
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
 
 logger = logging.getLogger(__name__)
@@ -293,7 +293,9 @@ class SurrealDBConnectionManager:
         Only the running loop's client is closed properly.
         """
         loop = asyncio.get_running_loop()
-        close_all_subscribers()
+        # Every loop's client is dropped below, so every loop's readers are released too —
+        # another loop's through its own thread, since only that loop may wake its queues.
+        close_all_subscribers(every_loop=True)
         client = cls.__clients.pop(loop, None)
         if client is not None:
             with contextlib.suppress(NotImplementedError):
@@ -908,7 +910,7 @@ class SurrealDBConnectionManager:
     # ------------------------------------------------------------------
 
     @classmethod
-    def subscribe_live(cls, query_uuid: str | UUID) -> AsyncIterator[dict[str, Any]]:
+    def subscribe_live(cls, query_uuid: str | UUID) -> LiveIterator:
         """Iterate the raw notification envelopes of a running live query.
 
         Not a coroutine: call it without ``await`` and iterate the result directly::
@@ -923,12 +925,26 @@ class SurrealDBConnectionManager:
         its values left in SDK types (``RecordID``, ``Datetime``). Deserializing them into
         model instances is v0.20.0.
 
-        The iteration ends when the live query is killed, on either server line.
+        The iteration ends when the live query is killed or the connection is closed, on
+        either server line. A read cancelled by a timeout loses nothing, so
+        ``asyncio.wait_for(anext(stream), timeout)`` is a safe way to poll; ``aclose()`` stops
+        this reader without killing the live query.
 
         :param query_uuid: the uuid returned by :meth:`QuerySet.live`.
-        :raises SurrealDbError: if no client is connected on this event loop.
+        :raises SurrealDbError: on a non-WebSocket connection, or if no client is connected on
+            this event loop.
         """
+        require_websocket(cls.__url)
         return open_stream(cls._live_client(), query_uuid)
+
+    @classmethod
+    def _cached_client(cls) -> Any:
+        """This event loop's cached client, or ``None`` — never opens a connection."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        return cls.__clients.get(loop)
 
     @classmethod
     def _live_client(cls) -> Any:
@@ -939,11 +955,7 @@ class SurrealDBConnectionManager:
         cannot exist without a connection, so requiring the cached one costs nothing and keeps
         the no-await guarantee.
         """
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-        client = cls.__clients.get(loop) if loop is not None else None
+        client = cls._cached_client()
         if client is None:
             raise SurrealDbError(
                 "No SurrealDB client is connected on this event loop. Start the live query "
@@ -958,17 +970,34 @@ class SurrealDBConnectionManager:
         Idempotent: an unknown or already-killed uuid is a no-op, matching the ORM's existing
         treatment of cleanup against a missing target (``delete_table``, ``remove_relation``).
 
+        Never opens a connection. A live query dies with the WebSocket that carried it, so with
+        no client cached on this loop there is nothing left to kill: the readers are released
+        and the call returns. Reaching for ``get_client()`` here would silently reconnect —
+        sign in, replay the session, cache a socket nobody asked for — only to send a KILL the
+        new connection could not own, and it would turn the ``__aexit__`` of a ``watch()`` block
+        that outlived its connection into a network call.
+
         :param query_uuid: the uuid returned by :meth:`QuerySet.live`.
+        :raises SurrealDbError: if the server refuses the kill for a reason other than an
+            unknown uuid. The readers are released anyway, but the uuid is **not** recorded as
+            dead — the subscription is still running, so a retry can re-attach to it.
         """
-        require_websocket(cls.__url)
-        client = await cls.get_client()
+        client = cls._cached_client()
         try:
-            await client.kill(query_uuid)
-        except Exception as exc:
-            if not cls._is_unknown_live_query(exc):
-                raise SurrealDbError(f"Failed to kill live query {query_uuid}: {exc}") from exc
+            if client is None:
+                mark_killed(query_uuid)
+                return
+            require_websocket(cls.__url)
+            try:
+                await client.kill(query_uuid)
+            except Exception as exc:
+                if not cls._is_unknown_live_query(exc):
+                    raise SurrealDbError(f"Failed to kill live query {query_uuid}: {exc}") from exc
+            mark_killed(query_uuid)
         finally:
-            close_subscribers(query_uuid)
+            # In a `finally` so that every exit — success, failure, cancellation — wakes the
+            # readers; nothing else ever would.
+            release_subscribers(query_uuid)
 
     @staticmethod
     def _is_unknown_live_query(exc: Exception) -> bool:

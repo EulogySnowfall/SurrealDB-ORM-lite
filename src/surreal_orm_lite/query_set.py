@@ -1020,6 +1020,11 @@ class QuerySet:
             # values() is the only public setter of _group_by_fields, so name it, not the
             # internal grouping concept the caller never typed.
             "values()": bool(self._group_by_fields),
+            # A live query is a connection-level subscription with no transaction to join; under
+            # `objects(tx=)` it would quietly run outside the transaction the caller opened.
+            "objects(tx=)": self._tx is not None,
+            # Only a WHERE clause could reference them, and there is none to reference them in.
+            "variables()": bool(self._variables),
         }
         offenders = sorted(name for name, present in unsupported.items() if present)
         if offenders:
@@ -1051,7 +1056,7 @@ class QuerySet:
         self._reject_live_clauses()
         require_websocket(SurrealDBConnectionManager.get_connection_string())
         client = await SurrealDBConnectionManager.get_client()
-        table = self.model.get_table_name()
+        table = self._model_table
         try:
             live_id: UUID = await client.live(table)
         except NotFoundError as exc:
@@ -1074,7 +1079,7 @@ class QuerySet:
         drops.
         """
         self._reject_live_clauses()
-        return LiveStream(self.model.get_table_name(), self.live)
+        return LiveStream(self._model_table, self.live)
 
     async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
         """

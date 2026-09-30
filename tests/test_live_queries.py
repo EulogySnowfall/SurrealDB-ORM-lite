@@ -504,6 +504,8 @@ class TestWatchE2E:
 
     @pytest.mark.asyncio
     async def test_kills_the_subscription_on_exit(self) -> None:
+        from surreal_orm_lite import live
+
         async with orm_client(TABLE) as client:
             await _define_table(client)
             async with Watched.objects().watch() as stream:
@@ -511,7 +513,7 @@ class TestWatchE2E:
             assert live_id is not None
             # Already dead: a second kill is the documented no-op, and nothing is left reading.
             await SurrealDBConnectionManager.kill(live_id)
-            assert str(live_id) not in _subscribers()
+            assert str(live_id) not in live._bucket()
 
     @pytest.mark.asyncio
     async def test_kills_the_subscription_when_the_body_raises(self) -> None:
@@ -534,16 +536,10 @@ class TestWatchE2E:
                 assert stream.live_id == first
 
 
-def _subscribers() -> dict[str, Any]:
-    from surreal_orm_lite import live
-
-    return live._SUBSCRIBERS
-
-
 # ==================== Task 5 — SDK coupling guard and exports ====================
 
 
-class TestSdkCoupling:
+class TestSdkCouplingE2E:
     @pytest.mark.asyncio
     async def test_connection_still_exposes_live_queues(self) -> None:
         """The ORM reads the envelope out of this registry because the SDK's own
@@ -646,7 +642,7 @@ class TestTeardownEndsStreamsE2E:
 # ==================== Error paths a mis-sequenced caller hits ====================
 
 
-class TestLiveErrorPaths:
+class TestLiveErrorPathsE2E:
     @pytest.mark.asyncio
     async def test_subscribe_live_without_a_connection_explains_itself(self) -> None:
         await SurrealDBConnectionManager.close_connection()
@@ -667,15 +663,15 @@ class TestLiveErrorPaths:
                 raise RuntimeError("connection reset by peer")
 
         async with orm_client(TABLE):
-            original = SurrealDBConnectionManager.get_client
-            SurrealDBConnectionManager.get_client = classmethod(  # type: ignore[method-assign,assignment]
-                lambda cls: asyncio.sleep(0, result=_AngryClient())
+            original = SurrealDBConnectionManager._cached_client
+            SurrealDBConnectionManager._cached_client = classmethod(  # type: ignore[method-assign,assignment]
+                lambda cls: _AngryClient()
             )
             try:
                 with pytest.raises(SurrealDbError, match="Failed to kill live query"):
                     await SurrealDBConnectionManager.kill("11111111-1111-1111-1111-111111111111")
             finally:
-                SurrealDBConnectionManager.get_client = original  # type: ignore[method-assign]
+                SurrealDBConnectionManager._cached_client = original  # type: ignore[method-assign]
 
     @pytest.mark.asyncio
     async def test_a_failed_kill_still_releases_the_readers(self) -> None:
@@ -691,13 +687,206 @@ class TestLiveErrorPaths:
 
         async with orm_client(TABLE):
             queue = live.register_subscriber(_AngryClient(), "22222222-2222-2222-2222-222222222222")
-            original = SurrealDBConnectionManager.get_client
-            SurrealDBConnectionManager.get_client = classmethod(  # type: ignore[method-assign,assignment]
-                lambda cls: asyncio.sleep(0, result=_AngryClient())
+            original = SurrealDBConnectionManager._cached_client
+            SurrealDBConnectionManager._cached_client = classmethod(  # type: ignore[method-assign,assignment]
+                lambda cls: _AngryClient()
             )
             try:
                 with pytest.raises(SurrealDbError):
                     await SurrealDBConnectionManager.kill("22222222-2222-2222-2222-222222222222")
             finally:
-                SurrealDBConnectionManager.get_client = original  # type: ignore[method-assign]
+                SurrealDBConnectionManager._cached_client = original  # type: ignore[method-assign]
             assert queue.get_nowait() is live._STREAM_END
+
+
+# ==================== PR #184 review — lifecycle and guard defects ====================
+
+
+class TestKillWithoutAConnectionE2E:
+    """A uuid cannot be live on a connection that no longer exists, so ``kill()`` must never
+    open one to deliver a KILL that the new socket could not own anyway."""
+
+    @pytest.mark.asyncio
+    async def test_watch_exit_after_close_connection_does_not_reconnect(self) -> None:
+        async with orm_client(TABLE) as client:
+            await _define_table(client)
+
+            async def watch_forever() -> None:
+                async with Watched.objects().watch() as stream:
+                    async for _ in stream:
+                        pass
+
+            watcher = asyncio.create_task(watch_forever())
+            await asyncio.sleep(0.3)
+            await SurrealDBConnectionManager.close_connection()
+            await asyncio.wait_for(watcher, timeout=10)
+            assert SurrealDBConnectionManager.is_connected() is False
+
+    @pytest.mark.asyncio
+    async def test_unset_connection_does_not_mask_the_body_exception(self) -> None:
+        async with orm_client(TABLE) as client:
+            await _define_table(client)
+            with pytest.raises(ValueError, match="body error"):
+                async with Watched.objects().watch():
+                    await SurrealDBConnectionManager.unset_connection()
+                    raise ValueError("body error")
+
+    @pytest.mark.asyncio
+    async def test_kill_with_no_cached_client_still_releases_readers(self) -> None:
+        from surreal_orm_lite import live
+
+        async with orm_client(TABLE):
+            queue = live.register_subscriber(_FakeClient(), "33333333-3333-3333-3333-333333333333")
+            await SurrealDBConnectionManager.close_connection()
+            live.register_subscriber(_FakeClient(), "33333333-3333-3333-3333-333333333333")
+            await SurrealDBConnectionManager.kill("33333333-3333-3333-3333-333333333333")
+            assert queue.get_nowait() is live._STREAM_END
+            assert SurrealDBConnectionManager.is_connected() is False
+
+
+class TestFailedKillE2E:
+    @pytest.mark.asyncio
+    async def test_a_failed_kill_does_not_mark_the_uuid_dead(self) -> None:
+        """The subscription is still running on the server, so a retry must be able to
+        re-attach to it — and the notifications it sends must still be delivered."""
+        from surreal_orm_lite import live
+
+        class _AngryClient:
+            live_queues: dict[str, Any] = {}
+
+            async def kill(self, query_uuid: Any) -> None:
+                raise RuntimeError("connection reset by peer")
+
+        async with orm_client(TABLE) as client:
+            await _define_table(client)
+            live_id = await Watched.objects().live()
+            original = SurrealDBConnectionManager._cached_client
+            SurrealDBConnectionManager._cached_client = classmethod(  # type: ignore[method-assign,assignment]
+                lambda cls: _AngryClient()
+            )
+            try:
+                with pytest.raises(SurrealDbError):
+                    await SurrealDBConnectionManager.kill(live_id)
+            finally:
+                SurrealDBConnectionManager._cached_client = original  # type: ignore[method-assign]
+
+            assert str(live_id) not in live._killed()
+            stream = SurrealDBConnectionManager.subscribe_live(live_id)
+            try:
+                await client.query(f"CREATE {TABLE}:retry SET name = 'retry';", {})
+                envelopes = await _collect(stream, 1)
+            finally:
+                await SurrealDBConnectionManager.kill(live_id)
+        assert envelopes[0]["result"]["name"] == "retry"
+
+
+class TestCancelledReadE2E:
+    @pytest.mark.asyncio
+    async def test_a_timed_out_read_leaves_the_stream_alive(self) -> None:
+        """``asyncio.wait_for(anext(stream), timeout)`` is the ordinary polling idiom; one quiet
+        tick must not end the stream while ``is_active`` keeps reporting ``True``."""
+        async with orm_client(TABLE) as client:
+            await _define_table(client)
+            async with Watched.objects().watch() as stream:
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(stream.__anext__(), timeout=0.3)
+                assert stream.is_active is True
+                await client.query(f"CREATE {TABLE}:later SET name = 'later';", {})
+                envelope = await asyncio.wait_for(stream.__anext__(), timeout=10)
+        assert envelope["action"] == LiveAction.CREATE
+        assert envelope["result"]["name"] == "later"
+
+    @pytest.mark.asyncio
+    async def test_a_timed_out_read_on_subscribe_live_leaves_it_alive(self) -> None:
+        async with orm_client(TABLE) as client:
+            await _define_table(client)
+            live_id = await Watched.objects().live()
+            stream = SurrealDBConnectionManager.subscribe_live(live_id)
+            try:
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(stream.__anext__(), timeout=0.3)
+                await client.query(f"CREATE {TABLE}:poll SET name = 'poll';", {})
+                envelope = await asyncio.wait_for(stream.__anext__(), timeout=10)
+            finally:
+                await SurrealDBConnectionManager.kill(live_id)
+        assert envelope["result"]["name"] == "poll"
+
+    @pytest.mark.asyncio
+    async def test_aclose_detaches_the_reader(self) -> None:
+        async with orm_client(TABLE) as client:
+            await _define_table(client)
+            live_id = await Watched.objects().live()
+            stream = SurrealDBConnectionManager.subscribe_live(live_id)
+            await stream.aclose()
+            with pytest.raises(StopAsyncIteration):
+                await asyncio.wait_for(stream.__anext__(), timeout=5)
+            assert not client.live_queues.get(str(live_id))
+            await SurrealDBConnectionManager.kill(live_id)
+
+
+class TestReviewGuards:
+    @pytest.mark.asyncio
+    async def test_rejects_a_transaction(self) -> None:
+        """A live query cannot run inside a transaction; accepting ``objects(tx=)`` would run
+        it outside the transaction without saying so."""
+        qs = Watched.objects()
+        qs._tx = object()
+        with pytest.raises(SurrealDbError, match=r"objects\(tx=\)"):
+            await qs.live()
+
+    @pytest.mark.asyncio
+    async def test_rejects_query_variables(self) -> None:
+        with pytest.raises(SurrealDbError, match=r"variables\(\)"):
+            await Watched.objects().variables(x=1).live()
+
+    @pytest.mark.asyncio
+    async def test_subscribe_live_on_http_names_the_transport(self) -> None:
+        """The fix is a ws:// URL, not a different SDK build — the message must say so."""
+        SurrealDBConnectionManager.set_connection(
+            url="http://localhost:8000", user="root", password="root", namespace="ns", database="db"
+        )
+        try:
+            with pytest.raises(SurrealDbError, match="WebSocket"):
+                SurrealDBConnectionManager.subscribe_live("00000000-0000-0000-0000-000000000000")
+        finally:
+            await SurrealDBConnectionManager.close_connection()
+
+    def test_missing_table_error_keeps_the_server_wording(self) -> None:
+        from surreal_orm_lite.live import missing_table_error
+
+        err = missing_table_error(RuntimeError("The table 'x' does not exist"), "x")
+        assert "The table 'x' does not exist" in str(err)
+
+
+class TestCrossLoopTeardown:
+    @pytest.mark.asyncio
+    async def test_close_all_connections_releases_another_loops_reader(self) -> None:
+        """#163 supports a loop per thread; tearing everything down must wake readers there too."""
+        import threading
+
+        from surreal_orm_lite import live
+
+        parked = threading.Event()
+        result: dict[str, Any] = {}
+
+        async def read_on_other_loop() -> None:
+            queue = live.register_subscriber(_FakeClient(), "44444444-4444-4444-4444-444444444444")
+            parked.set()
+            result["item"] = await asyncio.wait_for(queue.get(), timeout=10)
+
+        def run() -> None:
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(read_on_other_loop())
+            except BaseException as exc:  # noqa: BLE001 - reported through `result`
+                result["error"] = exc
+            finally:
+                loop.close()
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        assert await asyncio.to_thread(parked.wait, 10)
+        await SurrealDBConnectionManager.close_all_connections()
+        await asyncio.to_thread(thread.join, 15)
+        assert "error" not in result, result.get("error")
+        assert result["item"] is live._STREAM_END

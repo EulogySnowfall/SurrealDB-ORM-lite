@@ -29,23 +29,21 @@ that was in it.
 **What still hangs.** A WebSocket that drops on its own — no ``kill()``, no
 ``close_connection()`` — leaves readers suspended, because nothing in the SDK reports the
 close to a live-query subscriber. Calling ``kill()`` or closing the connection through the
-ORM always releases them. Automatic resubscribe is v0.21.0.
+ORM always releases them: ``close_connection()`` on its own loop, ``close_all_connections()`` on
+every loop. Automatic resubscribe is v0.21.0.
 """
 
 from __future__ import annotations
 
 import asyncio
 from collections import deque
-from typing import TYPE_CHECKING, Any, Final
+from typing import Any, Final
 from uuid import UUID
 
 from .enum import LiveAction
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 
-if TYPE_CHECKING:  # pragma: no cover
-    from collections.abc import AsyncIterator
-
-__all__ = ["LiveStream"]
+__all__ = ["LiveIterator", "LiveStream"]
 
 # Private end-of-stream marker. Identity-compared, so it can never collide with a payload.
 _STREAM_END: Final = object()
@@ -73,10 +71,16 @@ def _key(query_uuid: str | UUID) -> str:
 
 
 def _prune_dead_loops() -> None:
-    """Forget the registries of loops that have been closed, so they cannot accumulate."""
+    """Forget the registries of loops that have been closed, so they cannot accumulate.
+
+    Iterates a snapshot: with a loop per thread (issue #163), another thread's ``_bucket()`` can
+    add its loop to the same dict while ``is_closed()`` runs, and iterating the live dict would
+    then raise ``dictionary changed size during iteration``.
+    """
     for registry in (_SUBSCRIBERS, _RECENTLY_KILLED):
-        for loop in [loop for loop in registry if loop.is_closed()]:
-            registry.pop(loop, None)  # type: ignore[arg-type]
+        for loop in list(registry):
+            if loop.is_closed():
+                registry.pop(loop, None)  # type: ignore[arg-type]
 
 
 def _bucket() -> dict[str, list[asyncio.Queue[Any]]]:
@@ -85,9 +89,13 @@ def _bucket() -> dict[str, list[asyncio.Queue[Any]]]:
     return _SUBSCRIBERS.setdefault(asyncio.get_running_loop(), {})
 
 
+def _killed_on(loop: asyncio.AbstractEventLoop) -> deque[str]:
+    return _RECENTLY_KILLED.setdefault(loop, deque(maxlen=_RECENTLY_KILLED_MAX))
+
+
 def _killed() -> deque[str]:
     """This event loop's recently-killed uuids."""
-    return _RECENTLY_KILLED.setdefault(asyncio.get_running_loop(), deque(maxlen=_RECENTLY_KILLED_MAX))
+    return _killed_on(asyncio.get_running_loop())
 
 
 def _sdk_queues(client: Any) -> dict[str, list[asyncio.Queue[Any]]] | None:
@@ -129,37 +137,119 @@ def unregister_subscriber(client: Any, query_uuid: str | UUID, queue: asyncio.Qu
             registry.pop(key, None)
 
 
-def close_subscribers(query_uuid: str | UUID) -> None:
-    """End every stream open on ``query_uuid``. Idempotent."""
-    key = _key(query_uuid)
-    for queue in _bucket().pop(key, []):
+def release_subscribers(query_uuid: str | UUID) -> None:
+    """Wake every reader of ``query_uuid`` on this loop with end-of-stream. Idempotent.
+
+    Deliberately separate from :func:`mark_killed`: a ``kill()`` that *fails* must still release
+    its readers — nothing else would wake them — but must not record the uuid as dead, because
+    the subscription is still running on the server and a retry has to be able to re-attach.
+    """
+    for queue in _bucket().pop(_key(query_uuid), []):
         queue.put_nowait(_STREAM_END)
+
+
+def mark_killed(query_uuid: str | UUID) -> None:
+    """Record ``query_uuid`` as dead on this loop, so a later subscription ends at once."""
+    key = _key(query_uuid)
     killed = _killed()
     if key not in killed:
         killed.append(key)
 
 
-def close_all_subscribers() -> None:
-    """End every stream open on this event loop.
+def close_subscribers(query_uuid: str | UUID) -> None:
+    """End every stream open on ``query_uuid`` and record the uuid as dead. Idempotent."""
+    release_subscribers(query_uuid)
+    mark_killed(query_uuid)
+
+
+def _release_loop(loop: asyncio.AbstractEventLoop) -> None:
+    """End every stream registered on *loop*. Must run **on** that loop."""
+    killed = _killed_on(loop)
+    for key, queues in _SUBSCRIBERS.pop(loop, {}).items():
+        for queue in queues:
+            queue.put_nowait(_STREAM_END)
+        if key not in killed:
+            killed.append(key)
+
+
+def close_all_subscribers(*, every_loop: bool = False) -> None:
+    """End every stream open on this event loop — and, with ``every_loop``, on all of them.
 
     Called by the connection-teardown paths. A live query rides the WebSocket, so once the
     connection is gone no notification can ever arrive — and neither can the ``KILLED``
     envelope SurrealDB 3.x would otherwise send. Without this, closing the connection leaves
     every reader parked on ``queue.get()`` forever, and the ``async with`` around a
     :class:`LiveStream` never reaches its ``__aexit__``.
+
+    ``every_loop`` serves ``close_all_connections()``, which drops every loop's client. Another
+    loop's queues can only be woken from that loop's own thread, so the release is handed to it
+    with ``call_soon_threadsafe`` rather than performed here.
     """
-    for key in list(_bucket()):
-        close_subscribers(key)
+    current = asyncio.get_running_loop()
+    _prune_dead_loops()
+    _release_loop(current)
+    if not every_loop:
+        return
+    for loop in list(_SUBSCRIBERS):
+        if loop is current or loop.is_closed():
+            continue
+        try:
+            loop.call_soon_threadsafe(_release_loop, loop)
+        except RuntimeError:  # pragma: no cover - closed between the check and the call
+            _SUBSCRIBERS.pop(loop, None)
 
 
-def open_stream(client: Any, query_uuid: str | UUID) -> AsyncIterator[dict[str, Any]]:
+class LiveIterator:
+    """Async iterator over one reader's raw notification envelopes.
+
+    A class rather than an ``async def`` generator, for two reasons a generator cannot meet:
+
+    * **Registration happens at construction.** A generator body does not run until its first
+      ``__anext__``, so a caller that subscribes, writes a record and only then iterates would
+      miss its own write.
+    * **A cancelled read loses nothing.** Cancelling a generator's pending ``__anext__`` throws
+      into its body, runs its ``finally`` and finishes it for good — so the ordinary polling
+      idiom ``asyncio.wait_for(anext(stream), timeout)`` would end the stream on its first quiet
+      tick. Here the pending ``queue.get()`` is simply abandoned; ``asyncio.Queue`` removes no
+      item for a cancelled getter, and the next read picks up where the last one left off.
+
+    The iteration ends when the live query is killed or its connection is closed. Call
+    :meth:`aclose` to stop reading early without killing the live query.
+    """
+
+    def __init__(self, client: Any, query_uuid: str | UUID, queue: asyncio.Queue[Any] | None) -> None:
+        self._client = client
+        self._query_uuid = query_uuid
+        self._queue = queue
+
+    def __aiter__(self) -> LiveIterator:
+        return self
+
+    async def __anext__(self) -> dict[str, Any]:
+        if self._queue is None:
+            raise StopAsyncIteration
+        envelope = await self._queue.get()
+        if envelope is _STREAM_END or (isinstance(envelope, dict) and envelope.get("action") == LiveAction.KILLED):
+            self._detach()
+            raise StopAsyncIteration
+        return envelope  # type: ignore[no-any-return]
+
+    async def aclose(self) -> None:
+        """Stop reading and drop this reader's buffer. The live query itself keeps running."""
+        self._detach()
+
+    def _detach(self) -> None:
+        if self._queue is None:
+            return
+        queue, self._queue = self._queue, None
+        unregister_subscriber(self._client, self._query_uuid, queue)
+
+
+def open_stream(client: Any, query_uuid: str | UUID) -> LiveIterator:
     """Start buffering ``query_uuid``'s notifications now, and return an iterator over them.
 
-    Deliberately **not** an ``async def`` generator. A generator body does not run until its
-    first ``__anext__``, so a caller that starts a live query, writes a record and only then
-    iterates would miss its own write. Registering the queue at call time closes that window:
-    everything the server pushes from this moment on is buffered until the caller gets round
-    to reading it.
+    Everything the server pushes from this moment on is buffered until the caller gets round to
+    reading it — see :class:`LiveIterator` for why registration cannot wait for the first read.
     """
     queues = _sdk_queues(client)
     if queues is None:
@@ -170,29 +260,8 @@ def open_stream(client: Any, query_uuid: str | UUID) -> AsyncIterator[dict[str, 
             "this SDK build; pin a `surrealdb` release that provides it."
         )
     if _key(query_uuid) in _killed():
-        return _exhausted()
-    queue = register_subscriber(client, query_uuid)
-    return _drain(client, query_uuid, queue)
-
-
-async def _exhausted() -> AsyncIterator[dict[str, Any]]:
-    """An already-finished stream, for a uuid this loop has already killed."""
-    return
-    yield {}  # pragma: no cover - unreachable, but makes this an async generator
-
-
-async def _drain(client: Any, query_uuid: str | UUID, queue: asyncio.Queue[Any]) -> AsyncIterator[dict[str, Any]]:
-    """Yield raw envelopes until the live query is killed, from either end-of-stream marker."""
-    try:
-        while True:
-            envelope = await queue.get()
-            if envelope is _STREAM_END:
-                return
-            if isinstance(envelope, dict) and envelope.get("action") == LiveAction.KILLED:
-                return
-            yield envelope
-    finally:
-        unregister_subscriber(client, query_uuid, queue)
+        return LiveIterator(client, query_uuid, None)
+    return LiveIterator(client, query_uuid, register_subscriber(client, query_uuid))
 
 
 def require_websocket(url: str | None) -> None:
@@ -219,7 +288,7 @@ def missing_table_error(exc: Exception, table: str) -> SurrealDbNotFoundError:
     return SurrealDbNotFoundError(
         f"Cannot start a live query on {table!r}: the table does not exist. SurrealDB 3.x "
         f"refuses to watch an undefined table (2.6.x accepts it and stays silent). Create it "
-        f"first, e.g. DEFINE TABLE {table} SCHEMALESS."
+        f"first, e.g. DEFINE TABLE {table} SCHEMALESS. Server said: {exc}"
     )
 
 
@@ -239,7 +308,7 @@ class LiveStream:
         self._starter = starter
         self._live_id: UUID | None = None
         self._client: Any = None
-        self._iterator: AsyncIterator[dict[str, Any]] | None = None
+        self._iterator: LiveIterator | None = None
 
     @property
     def table(self) -> str:
@@ -271,7 +340,7 @@ class LiveStream:
     async def stop(self) -> None:
         """Kill the subscription and end the iteration. Safe before start and to repeat."""
         if self._live_id is None:
-            self._iterator = None
+            await self._drop_iterator()
             return
         from .connection_manager import SurrealDBConnectionManager
 
@@ -280,7 +349,12 @@ class LiveStream:
         # subscription still running on the server and no uuid left to retry with.
         await SurrealDBConnectionManager.kill(self._live_id)
         self._live_id = None
-        self._iterator = None
+        await self._drop_iterator()
+
+    async def _drop_iterator(self) -> None:
+        iterator, self._iterator = self._iterator, None
+        if iterator is not None:
+            await iterator.aclose()
 
     def __aiter__(self) -> LiveStream:
         return self
