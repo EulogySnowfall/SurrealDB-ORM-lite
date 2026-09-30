@@ -1147,17 +1147,33 @@ await SurrealDBConnectionManager.kill(live_id)
 you call it rather than at the first iteration, so a write you make in between is still
 reported. Several readers can subscribe to the same uuid and each receives every notification.
 
+A read that times out loses nothing, so polling with a deadline is safe:
+
+```python
+stream = SurrealDBConnectionManager.subscribe_live(live_id)
+while True:
+    try:
+        notif = await asyncio.wait_for(anext(stream), timeout=1.0)
+    except TimeoutError:
+        continue  # a quiet second; the stream is still alive
+    handle(notif)
+```
+
+`await stream.aclose()` stops one reader and drops its buffer without killing the live query.
+
 `kill()` is idempotent — an unknown or already-killed uuid is a no-op — and it ends every open
 stream on that uuid, so the `async for` above terminates rather than waiting forever.
 
 #### What a live query will refuse
 
-- **A non-WebSocket connection.** Live queries cannot run over HTTP; `live()` says so instead
-  of letting the SDK raise a bare `NotImplementedError`.
+- **A non-WebSocket connection.** Live queries cannot run over HTTP; `live()` and
+  `subscribe_live()` say so instead of letting the SDK raise a bare `NotImplementedError`.
 - **A queryset with clauses it cannot honour.** v0.19.0 watches a whole table, so
-  `filter()`, `select()`, `limit()`, `offset()`, `order_by()`, `fetch()`, `values()` and
-  `annotate()` are rejected by name rather than silently ignored. The filtered form
-  (`LIVE SELECT … WHERE`) lands in v0.20.0.
+  `filter()`, `select()`, `limit()`, `offset()`, `order_by()`, `fetch()`, `values()`,
+  `annotate()` and `variables()` are rejected by name rather than silently ignored. The filtered
+  form (`LIVE SELECT … WHERE`) lands in v0.20.0.
+- **A transaction.** A live query is a connection-level subscription with no transaction to
+  join, so `objects(tx=tx).live()` is refused rather than quietly run outside it.
 - **A table that does not exist, on SurrealDB 3.x.** You get a `SurrealDbNotFoundError` naming
   the table. On 2.6.x the same call succeeds and simply never notifies. Define the table first
   if you need the two lines to behave alike.
@@ -1187,15 +1203,21 @@ exactly what ends a stream.
 
 - **`kill()` ends it**, and so does leaving a `watch()` block. This works identically on both
   server lines.
-- **Closing the connection ends it.** `close_connection()` and `close_all_connections()` release
-  every reader on that event loop first, so an ordinary shutdown does not leave a wedged task
-  behind.
+- **Closing the connection ends it.** `close_connection()` releases every reader on its event
+  loop before the socket goes, and `close_all_connections()` releases every reader on every
+  loop, so an ordinary shutdown does not leave a wedged task behind. Leaving a `watch()` block
+  afterwards does not reconnect: with the connection gone there is nothing left to kill.
+- **A timed-out read does _not_ end it.** Cancelling a pending read loses nothing; the next read
+  picks up where it left off.
 - **A WebSocket that drops on its own does _not_ end it.** The SDK's receive task absorbs the
   close without telling live-query subscribers, so the iterator stays suspended and receives
   nothing further. Call `kill()` or close the connection to release it. Automatic reconnect and
   resubscribe is v0.21.0.
 - **Subscriptions are per event loop.** A uuid belongs to the connection that created it, on the
   loop that created it. Killing it from another loop is not supported.
+- **A failed `kill()` releases the readers but keeps the uuid alive.** When the server refuses
+  the kill for any reason other than an unknown uuid, the error is raised, the readers are woken,
+  and the subscription is still running — so you can subscribe to it again or retry `stop()`.
 - **The buffer is unbounded.** A stream you stop reading but never kill keeps accumulating
   notifications. Use `watch()`, or pair every `live()` with a `kill()`.
 

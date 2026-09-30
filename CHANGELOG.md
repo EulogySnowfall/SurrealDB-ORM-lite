@@ -53,9 +53,11 @@ need a WebSocket connection and work on **both SurrealDB 2.6.x and 3.2.x**.
 - **Guards, not silent surprises.** `live()` refuses a non-WebSocket connection with a message
   naming the requirement, rather than letting the SDK's HTTP path raise a bare
   `NotImplementedError`. It also refuses a queryset carrying `filter()`, `select()`, `limit()`,
-  `offset()`, `order_by()`, `fetch()`, `values()` or `annotate()` — a table-level live query cannot honour
-  them, and quietly watching the whole table instead would be worse than an error. The filtered
-  form arrives in v0.20.0.
+  `offset()`, `order_by()`, `fetch()`, `values()`, `annotate()` or `variables()` — a table-level
+  live query cannot honour them, and quietly watching the whole table instead would be worse
+  than an error. The filtered form arrives in v0.20.0. `objects(tx=)` is refused for the same
+  reason: a live query has no transaction to join. `subscribe_live()` names the WebSocket
+  requirement too, instead of blaming the SDK build.
 
 - **Two measured 2.6.x / 3.x divergences, both normalised.** SurrealDB 3.x refuses to watch a
   table that does not exist while 2.6.x accepts and stays silent; the ORM turns the 3.x
@@ -76,9 +78,16 @@ need a WebSocket connection and work on **both SurrealDB 2.6.x and 3.2.x**.
   so the argument would change nothing. v0.20.0 implements diff through `LIVE SELECT DIFF`,
   which was verified to work on both lines.
 
+- **Polling is safe.** A read cancelled by `asyncio.wait_for(anext(stream), timeout)` loses
+  nothing and leaves the stream alive, and `aclose()` stops one reader without killing the live
+  query. The reader is a small iterator class rather than an async generator precisely because a
+  cancelled generator finishes for good.
+
 - **What ends a stream.** `kill()` does, leaving a `watch()` block does, and so does
-  `close_connection()` / `close_all_connections()` — those release every reader on the loop
-  before the socket goes, so an ordinary shutdown cannot leave a wedged task behind. A
+  `close_connection()` / `close_all_connections()` — the first releases every reader on its
+  loop before the socket goes, the second every reader on every loop, so an ordinary shutdown
+  cannot leave a wedged task behind. `kill()` never opens a connection: leaving a `watch()`
+  block after the connection closed does not silently reconnect. A
   WebSocket that drops on its **own** does not: the SDK's receive task absorbs the close
   without telling live-query subscribers, so the iterator stays suspended until you call
   `kill()` or close the connection. Automatic reconnect and resubscribe is v0.21.0.
