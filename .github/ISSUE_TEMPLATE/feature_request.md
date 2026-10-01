@@ -25,7 +25,7 @@ you've considered (including doing it manually with the official SDK).
 **SurrealDB compatibility**
 Does this depend on a specific SurrealDB server version or feature?
 
-- Target SurrealDB version(s): [e.g. 2.6.x, 3.1.x, both]
+- Target SurrealDB version(s): [e.g. 2.x, 3.x, both]
 - Relevant SurrealQL / SDK capability: [if applicable]
 
 **Additional context**

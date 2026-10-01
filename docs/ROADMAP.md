@@ -47,10 +47,10 @@
 A key advantage of ORM-lite: it runs on **both** major SurrealDB lines, while the full ORM
 (custom SDK) targets 3.x only.
 
-| Project                               | Supported SurrealDB versions |
-| ------------------------------------- | ---------------------------- |
-| **SurrealDB-ORM-lite** (official SDK) | **2.6.x and 3.2.x**          |
-| **SurrealDB-ORM** (custom SDK)        | **3.x only**                 |
+| Project                               | Supported SurrealDB versions            |
+| ------------------------------------- | --------------------------------------- |
+| **SurrealDB-ORM-lite** (official SDK) | **2.x (2.6 / 2.7) and 3.x (3.2 / 3.3)** |
+| **SurrealDB-ORM** (custom SDK)        | **3.x only**                            |
 
 ---
 
@@ -119,7 +119,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 
 | Feature                       | ORM (full) | ORM-lite                    |
 | ----------------------------- | ---------- | --------------------------- |
-| Supported SurrealDB           | 3.x only   | **2.6.x + 3.2.x**           |
+| Supported SurrealDB           | 3.x only   | **2.6/2.7 + 3.2/3.3**       |
 | CRUD & QuerySet               | yes        | v0.2.0                      |
 | Aggregations & GROUP BY       | yes        | v0.3.0                      |
 | Model Signals                 | yes        | v0.4.0                      |
@@ -196,7 +196,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 
 - Dependency `surrealdb[pydantic]>=2.0.0,<3.0.0`
 - Native `RecordID`, structured SDK exceptions, signin-before-use ordering
-- CI matrix tested on SurrealDB **v2.6.5 and v3.2.4**
+- CI matrix tested on SurrealDB **v2.7.0 and v3.3.0**
 
 ### Version 0.8.0 — Transactions ORM (core)
 
@@ -258,7 +258,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   the returned row syncs the instance — `merge()` stays a partial update
 - Six curated function-name enums (`SurrealTimeFunction`, `SurrealMathFunction`,
   `SurrealStringFunction`, `SurrealArrayFunction`, `SurrealCryptoFunction`,
-  `SurrealRandFunction`) — **every member is executed against 2.6.5 AND 3.2.4 by the suite**;
+  `SurrealRandFunction`) — **every member is executed against 2.7.0 AND 3.3.0 by the suite**;
   names diverging between the lines (`rand::guid`, `type::is::*`) are excluded on purpose
 - **Identical on SurrealDB 2.6.x and 3.x** — no 3.x-only primitive. Only the inherited v0.9.0
   transaction rule differs: on a buffered tx the computed value reaches the instance at commit
@@ -464,7 +464,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 > Per-version detail and acceptance criteria are worked out in a design spec before the code,
 > kept with the maintainer's working notes rather than in the repository.
-> Every version keeps coverage ≥ 70 %, green `ruff`/`mypy`, and E2E green on 2.6.x + 3.2.x.
+> Every version keeps coverage ≥ 70 %, green `ruff`/`mypy`, and E2E green on the pinned 2.x and 3.x lines.
 
 ### 🔵 Phase A — Write-path & atomicity
 
@@ -570,7 +570,7 @@ unavailable on PyPI.
 - Complete documentation (docstrings, migration guide, examples)
 - **Public API freeze** — no breaking changes until GA
 
-**Completion criteria**: E2E green on 2.6.x + 3.2.x, coverage ≥ 75 %, full API docs, API-freeze
+**Completion criteria**: E2E green on the pinned 2.x and 3.x lines, coverage ≥ 75 %, full API docs, API-freeze
 changelog published, no regression since v0.39.0.
 
 ### Version 2.0.0 — Production / GA
