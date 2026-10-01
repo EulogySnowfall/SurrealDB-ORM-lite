@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.2] - 2026-10-01
+
+Security release for the locked dependencies. No library code changes; the published package
+behaves exactly as 0.19.1.
+
+### Security
+
+- **urllib3 2.7.0 → 2.8.0** (GHSA-8988-9cw3-xx77, GHSA-vxq7-64xx-v4gw, GHSA-gh4c-6fx4-qh6g).
+  urllib3 is reached at runtime through the SDK (`surrealdb` → `requests` → `urllib3`) and by
+  the dev-only `docker` package.
+- **tornado 6.5.8 → 6.5.9** (GHSA-c2m8-h5v5-343r, GHSA-chx6-46f5-w4vp, GHSA-3hv7-mjh2-fv65).
+  Dev only: pulled in by `ipykernel` and `jupyter-client` for the example notebooks.
+
+### Notes
+
+- **This updates `uv.lock`, which protects CI and contributors, not your installation.** The ORM
+  declares no bound on urllib3 (it never imports it; the SDK's `requests` does), so your
+  environment keeps whatever urllib3 it resolved. If it is older than 2.8.0, upgrade it
+  (`pip install -U "urllib3>=2.8.0"` or `uv lock --upgrade-package urllib3`).
+
 ## [0.19.1] - 2026-10-01
 
 Tested against the new SurrealDB releases on both supported lines: **2.7.0** and **3.3.0**. No
