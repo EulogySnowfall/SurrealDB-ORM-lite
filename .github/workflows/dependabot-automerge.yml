@@ -73,7 +73,7 @@ jobs:
         run: uv run mypy src/
 
       # Both supported lines. .surrealdb-version pins the primary (latest) line, currently
-      # 3.2.x; .surrealdb-version2x pins the legacy 2.6.x line.
+      # 3.3.x; .surrealdb-version2x pins the legacy 2.x line (2.7.x). Both moved in v0.19.1.
       - name: Start SurrealDB (both supported lines)
         run: |
           start_one() {
@@ -112,7 +112,7 @@ jobs:
             --cov-branch \
             --cov-report=xml
 
-      - name: Run all tests (legacy line, 2.6.x)
+      - name: Run all tests (legacy line, 2.x)
         env:
           SURREALDB_HOST: localhost
           SURREALDB_PORT: 8001

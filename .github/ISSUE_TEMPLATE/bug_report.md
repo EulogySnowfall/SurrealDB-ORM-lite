@@ -38,7 +38,7 @@ The full traceback or error message (use a code block):
 
 - Surreal ORM Lite version: [e.g. 0.10.0]
 - Python version: [e.g. 3.12]
-- SurrealDB server version: [e.g. 2.6.5 or 3.1.3]
+- SurrealDB server version: [e.g. 2.7.0 or 3.2.4]
 - Official SurrealDB SDK version (`surrealdb`): [e.g. 2.x]
 - Connection protocol: [WebSocket (`ws://`/`wss://`) or HTTP (`http://`/`https://`)]
 - OS: [e.g. Ubuntu 24.04, macOS 15, Windows 11]

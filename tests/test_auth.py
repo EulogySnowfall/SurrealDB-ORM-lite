@@ -306,6 +306,12 @@ async def auth_client(*, permissions: str = SELF_READABLE, scheme: str = "ws") -
         await SurrealDBConnectionManager.unset_connection()
 
 
+def _server_version(reported: str) -> tuple[int, int]:
+    """``"surrealdb-3.3.0"`` → ``(3, 3)``: the major and minor the server reports."""
+    major, minor = reported.rsplit("-", 1)[-1].split(".")[:2]
+    return int(major), int(minor)
+
+
 async def _signup(email: str) -> AuthTokens:
     return await SurrealDBConnectionManager.signup(access=AUTH_ACCESS, variables={"email": email, "pass": PASSWORD})
 
@@ -361,21 +367,36 @@ class TestSigninE2E:
             await client.query("REMOVE TABLE root_only;", {})
 
     @pytest.mark.asyncio
-    async def test_a_system_user_signin_does_not_clear_the_record_identity(self) -> None:
-        """Pins a surprising server behaviour, identical on 2.6.5 and 3.2.4.
+    async def test_a_system_user_signin_and_the_record_identity(self) -> None:
+        """Pins a server behaviour that changed in SurrealDB 3.3.0.
 
-        Signing in as root swaps the *permissions* but leaves ``$auth``, ``$access`` and
-        ``$session.rd`` pointing at the record user. Only ``invalidate()`` really ends a record
-        session — which is exactly why "log out" is :meth:`invalidate`, never a root re-signin,
-        and why ``info()`` can still report a record after switching to a system user.
+        Up to 3.2.x — and on the whole 2.x line, measured on 2.6.5 and 2.7.0 — signing in as
+        root swaps the *permissions* but leaves ``$auth``, ``$access`` and ``$session.rd``
+        pointing at the record user, so ``info()`` keeps reporting it. From 3.3.0 the system
+        signin replaces the identity outright: all three are cleared and ``info()`` returns
+        ``None``. Either way only ``invalidate()`` is a portable "log out", which is why the ORM
+        documents it as such.
+
+        Keyed on the server's own version rather than on a capability probe because this test
+        exists to pin a server fact: if a future release moves it again, it must go red.
         """
         async with auth_client() as client:
             email = _unique_email()
             await _signup(email)
+            server = await client.version()
 
             await SurrealDBConnectionManager.signin(username="root", password="root")
 
-            assert await client.query("RETURN $auth.email;", {}) == email
+            identity = await client.query("RETURN [$auth.email, $access, $session.rd];", {})
+            reported = await SurrealDBConnectionManager.info()
+            if _server_version(server) >= (3, 3):
+                assert identity == [None, None, None]
+                assert reported is None
+            else:
+                assert identity[0] == email
+                assert identity[1] == AUTH_ACCESS
+                assert identity[2] is not None
+                assert reported is not None and reported["email"] == email
 
     @pytest.mark.asyncio
     async def test_a_wrong_password_raises_an_authentication_error(self) -> None:
@@ -510,9 +531,9 @@ class TestInfoE2E:
     async def test_returns_none_for_a_system_user(self) -> None:
         """On a *fresh* connection: root has never been a record here.
 
-        Deliberately not written as "sign in as a record, then switch back to root" — that
-        leaves ``$auth`` pointing at the record and ``info()`` still reports it (see
-        ``test_a_system_user_signin_does_not_clear_the_record_identity``).
+        Deliberately not written as "sign in as a record, then switch back to root": up to
+        SurrealDB 3.2.x that leaves ``$auth`` pointing at the record and ``info()`` still
+        reports it (see ``test_a_system_user_signin_and_the_record_identity``).
         """
         async with auth_client():
             assert await SurrealDBConnectionManager.info() is None

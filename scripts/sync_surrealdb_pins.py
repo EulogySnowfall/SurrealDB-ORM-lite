@@ -3,8 +3,8 @@
 
 The pin files are the single source of truth:
 
-    .surrealdb-version      the primary supported line (3.2.x)
-    .surrealdb-version2x    the legacy supported line  (2.6.x)
+    .surrealdb-version      the primary supported line (3.x)
+    .surrealdb-version2x    the legacy supported line  (2.x)
 
 The version monitors bump those files unattended and open an auto-merging PR, but by design
 they touch only the pin and the CI matrix — never the prose. So every automatic bump used to
