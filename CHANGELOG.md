@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.1] - 2026-10-01
+
+Tested against the new SurrealDB releases on both supported lines: **2.7.0** and **3.3.0**. No
+library code changes; the published package behaves exactly as 0.19.0.
+
+### Changed
+
+- **SurrealDB test pins moved**: the 2.x line from 2.6.5 to **2.7.0**, the 3.x line from 3.2.4
+  to **3.3.0**. The CI matrix, the README badge, compatibility table and behaviour table, and the
+  ROADMAP follow the pins through `scripts/sync_surrealdb_pins.py`. 2.6.5 and 3.2.4 stay listed
+  as compatible, tested up to v0.19.0.
+
+### Notes
+
+- **2.7.0 is indistinguishable from 2.6.5 for the ORM.** The full suite passes with the same
+  3.x-only skips, and every divergence in the behaviour table was re-measured on it: no native
+  transaction RPC, `WITH REFRESH` rejected, a live query on a missing table accepted, nothing
+  sent after `kill()`, no `session` key in a live notification.
+- **3.3.0 changes one server behaviour.** Signing in as a system user while a record session is
+  open used to swap only the permissions, leaving `$auth`, `$access` and `$session.rd` on the
+  record so `info()` kept reporting it. 3.3.0 clears all three and `info()` returns `None`.
+  Nothing in the ORM depends on the old behaviour, and `invalidate()` remains the portable way
+  to log a record user out. The test that pinned the old behaviour now pins each line's, keyed
+  on the server's reported version so a further change goes red; it was checked on 3.3.0,
+  3.2.4, 3.1.5 and 2.7.0. Every other 3.x divergence holds unchanged on 3.3.0.
+
+### Fixed
+
+- **The SurrealDB version monitor files its failure report again** (#188). `gh issue create`
+  refuses the whole call when one label does not exist, and `needs-investigation` never did, so
+  the 3.3.0 failure above was never reported. Labels are now created first, with an unlabelled
+  issue as fallback.
+
+### Dependencies
+
+- ruff 0.16.7 → 0.16.9 (dev only, #190).
+
 ## [0.19.0] - 2026-09-30
 
 Real-time, phase one: subscribe to a table and receive a notification whenever a record is
