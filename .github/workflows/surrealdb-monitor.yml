@@ -615,6 +615,7 @@ jobs:
           LINE: ${{ inputs.line }}
         run: |
           ISSUE_TITLE="SurrealDB v${{ needs.check-release.outputs.latest-version }} — tests failed"
+          LABELS="bug,surrealdb,needs-investigation"
 
           EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
             --search "$ISSUE_TITLE" --json number -q '.[0].number')
@@ -623,10 +624,7 @@ jobs:
             exit 0
           fi
 
-          gh issue create --repo "$GITHUB_REPOSITORY" \
-            --title "$ISSUE_TITLE" \
-            --label "bug,surrealdb,needs-investigation" \
-            --body "$(cat <<EOF
+          ISSUE_BODY="$(cat <<EOF
           ## SurrealDB Compatibility Issue
 
           Tests failed with SurrealDB v${{ needs.check-release.outputs.latest-version }} on the
@@ -645,3 +643,27 @@ jobs:
           *Automatically created by the SurrealDB ${LINE}.x version monitor.*
           EOF
           )"
+
+          # `gh issue create` refuses the WHOLE call when one label does not exist
+          # ("could not add label: 'needs-investigation' not found"), so a label nobody ever
+          # created costs the entire report. That is not hypothetical: `needs-investigation`
+          # was never created in this repo, so every 3.x failure since v3.3.0 died here — the
+          # run went red with the compatibility failure it exists to surface left unfiled.
+          # Create them first; no `--force`, which would overwrite an existing label's colour
+          # and description, and `|| true` because a create that loses a race is still a
+          # label that exists.
+          IFS=',' read -ra LABEL_LIST <<< "$LABELS"
+          for LABEL in "${LABEL_LIST[@]}"; do
+            gh label create "$LABEL" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || true
+          done
+
+          # Belt and braces: whatever else goes wrong with labelling, the report is the point.
+          # File it unlabelled rather than lose it — a findable issue with no labels beats a
+          # red run and silence.
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "$ISSUE_TITLE" \
+            --label "$LABELS" \
+            --body "$ISSUE_BODY" \
+          || gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "$ISSUE_TITLE" \
+            --body "$ISSUE_BODY"
