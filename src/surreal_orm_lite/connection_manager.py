@@ -573,9 +573,11 @@ class SurrealDBConnectionManager:
 
             await SurrealDBConnectionManager.invalidate()   # log the record user out
 
-        This is the only way to really end a record session: signing in as a system user swaps
-        the permissions but leaves ``$auth`` pointing at the record, so ``info()`` would keep
-        reporting it.
+        This is the only portable way to end a record session. Up to SurrealDB 3.2.x (and on
+        the whole 2.x line) signing in as a system user swaps the permissions but leaves
+        ``$auth`` pointing at the record, so ``info()`` would keep reporting it; 3.3.0 clears
+        the identity on such a signin, but code that must run on every supported line should
+        not rely on that.
 
         The SDK's ``invalidate()`` on its own leaves the session **anonymous**, and since the
         manager caches one client per event loop, every later ORM call on that connection —
@@ -676,9 +678,10 @@ class SurrealDBConnectionManager:
         model that was never the culprit.
 
         .. note::
-            After signing in as a system user, this can still report the record from an
-            earlier record session: SurrealDB swaps the permissions but leaves ``$auth`` in
-            place. Only :meth:`invalidate` really ends a record session.
+            Up to SurrealDB 3.2.x, and on the 2.x line, signing in as a system user swaps the
+            permissions but leaves ``$auth`` in place, so this can still report the record from
+            an earlier record session. SurrealDB 3.3.0 clears the identity on that signin and
+            this returns ``None``. :meth:`invalidate` ends a record session on every line.
 
         :param return_type: a type annotation to coerce the record into — a Pydantic model, a
             dataclass, or anything else Pydantic can adapt. ``None`` returns the raw mapping.
