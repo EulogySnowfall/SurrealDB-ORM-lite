@@ -118,7 +118,7 @@ def to_surql_literal(value: Any) -> str:
             parts.append(f"{_string(key)}: {to_surql_literal(item)}")
         return "{" + ", ".join(parts) + "}"
     raise TypeError(
-        f"Cannot inline a {type(value).__name__} value into a live query filter. SurrealDB 2.x "
+        f"Cannot inline a value of type {type(value).__name__} into a live query filter. SurrealDB 2.x "
         f"ignores bound parameters there, so the ORM writes each value as a SurrealQL literal, "
         f"and {type(value).__name__} has no verified literal form. Supported: {_SUPPORTED}."
     )
