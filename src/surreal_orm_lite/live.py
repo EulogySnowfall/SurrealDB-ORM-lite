@@ -418,7 +418,9 @@ def _pointer_root(path: str) -> str:
 
 def _minimal_instance(model: type[T], record: Any) -> T:
     """An instance holding only the id — the full ORM's rule for a change with no record."""
-    data = model.set_data({"id": record})
+    # ``set_data`` is the model's own RecordID → id conversion; mypy sees pydantic's decorator
+    # proxy rather than the classmethod it resolves to at runtime.
+    data = cast(Any, model).set_data({"id": record})
     try:
         return model.model_validate(data)
     except ValidationError:
