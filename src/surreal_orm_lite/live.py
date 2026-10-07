@@ -37,13 +37,21 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from typing import Any, Final
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Final, Generic, TypeVar, cast
 from uuid import UUID
+
+from pydantic import ValidationError
 
 from .enum import LiveAction
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 
-__all__ = ["LiveIterator", "LiveStream"]
+if TYPE_CHECKING:
+    from .model_base import BaseSurrealModel
+
+__all__ = ["LiveIterator", "LiveStream", "ModelChangeEvent"]
+
+T = TypeVar("T", bound="BaseSurrealModel")
 
 # Private end-of-stream marker. Identity-compared, so it can never collide with a payload.
 _STREAM_END: Final = object()
@@ -369,3 +377,88 @@ class LiveStream:
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         await self.stop()
+
+
+# ------------------------------------------------------------------
+# Typed events (v0.20.0)
+# ------------------------------------------------------------------
+
+# The root JSON Pointer of a diff patch: SurrealDB 3.x spells it "" and 2.x spells it "/".
+_ROOT_POINTERS: Final = ("", "/")
+
+
+@dataclass
+class ModelChangeEvent(Generic[T]):
+    """One typed live-query notification — the full SurrealDB-ORM's event, field for field.
+
+    :ivar action: ``CREATE``, ``UPDATE`` or ``DELETE``.
+    :ivar instance: the model instance. For a non-diff stream it is the record after the change
+        (for ``DELETE``, its last state). In diff mode ``CREATE`` carries the whole record and
+        ``UPDATE`` a minimal instance holding just the ``id``; ``DELETE`` is minimal on 3.x and
+        the last state on 2.x, which sends the whole record there.
+    :ivar record_id: the affected record, e.g. ``"user:abc"``.
+    :ivar changed_fields: diff mode only — the top-level fields the patches touch, as Python
+        field names (aliases resolved).
+    :ivar raw: the notification's ``result`` as received: a dict, or in diff mode the list of
+        patches. SurrealDB's diff is JSON Patch **extended**: a changed string arrives as
+        ``{"op": "change", "value": "<diff-match-patch text>"}`` rather than a ``replace``.
+    """
+
+    action: LiveAction
+    instance: T
+    record_id: str
+    changed_fields: list[str] = field(default_factory=list)
+    raw: Any = field(default_factory=dict)
+
+
+def _pointer_root(path: str) -> str:
+    """The first segment of a non-root JSON Pointer, unescaped (``~1`` → ``/``, ``~0`` → ``~``)."""
+    return path[1:].split("/", 1)[0].replace("~1", "/").replace("~0", "~")
+
+
+def _minimal_instance(model: type[T], record: Any) -> T:
+    """An instance holding only the id — the full ORM's rule for a change with no record."""
+    data = model.set_data({"id": record})
+    try:
+        return model.model_validate(data)
+    except ValidationError:
+        return model.model_construct(**data)
+
+
+def to_change_event(model: type[T], envelope: dict[str, Any], *, diff: bool) -> ModelChangeEvent[T]:
+    """Convert one raw notification envelope into a :class:`ModelChangeEvent`.
+
+    In diff mode the two server lines answer differently and both are normalised here: the root
+    patch path is ``""`` on 3.x and ``"/"`` on 2.x, and a ``DELETE`` is a ``replace`` of the root
+    with ``None`` on 3.x but the whole last record on 2.x.
+
+    :raises pydantic.ValidationError: if a whole record does not validate against *model* —
+        the same contract as the full ORM, rather than a silently half-built instance.
+    """
+    record = envelope.get("record")
+    result = envelope.get("result")
+    payload: Any = result
+    changed: list[str] = []
+    if diff and isinstance(result, list):
+        payload = None
+        for patch in result:
+            if not isinstance(patch, dict):
+                continue
+            path = patch.get("path", "")
+            if path in _ROOT_POINTERS:
+                # CREATE replaces the root with the record; DELETE (3.x) replaces it with None.
+                payload = patch.get("value")
+                continue
+            if path.startswith("/"):
+                name = model.to_py_field(_pointer_root(path))
+                if name not in changed:
+                    changed.append(name)
+    # A copy for hydration: it rewrites the id in place, and ``raw`` must stay as received.
+    instance = cast(T, model.from_db(dict(payload))) if isinstance(payload, dict) else _minimal_instance(model, record)
+    return ModelChangeEvent(
+        action=LiveAction(envelope["action"]),
+        instance=instance,
+        record_id=str(record) if record is not None else "",
+        changed_fields=changed,
+        raw=result if result is not None else {},
+    )

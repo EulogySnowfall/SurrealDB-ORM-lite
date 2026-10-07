@@ -261,3 +261,103 @@ class TestFilteredWatchE2E:
         assert delete["result"] in ([{"op": "replace", "path": "", "value": None}],) or (
             delete["result"]["age"] == 2  # SurrealDB 2.x: the last state, not a patch
         )
+
+
+# ==================== Task 3 — envelope → ModelChangeEvent (unit) ====================
+
+from surreal_orm_lite._sdk import RecordID  # noqa: E402
+from surreal_orm_lite.live import ModelChangeEvent, to_change_event  # noqa: E402
+
+
+class Strict(BaseSurrealModel):
+    id: str
+    name: str  # required: a minimal instance cannot validate
+
+
+def _envelope(action: str, record: RecordID, result: Any) -> dict[str, Any]:
+    return {"action": action, "record": record, "result": result, "id": "lq"}
+
+
+class TestToChangeEvent:
+    def test_full_record(self) -> None:
+        rid = RecordID(TABLE, "a")
+        event = to_change_event(Ticket, _envelope("CREATE", rid, {"id": rid, "status": "s", "label_col": "L"}), diff=False)
+        assert isinstance(event, ModelChangeEvent)
+        assert event.action is LiveAction.CREATE
+        assert isinstance(event.instance, Ticket)
+        assert event.instance.id == "a"
+        assert event.instance.label == "L"
+        assert event.record_id == str(rid)
+        assert event.changed_fields == []
+
+    def test_raw_is_not_mutated_by_hydration(self) -> None:
+        rid = RecordID(TABLE, "a")
+        result = {"id": rid, "status": "s"}
+        event = to_change_event(Ticket, _envelope("UPDATE", rid, result), diff=False)
+        assert event.raw is result
+        assert result["id"] is rid
+
+    def test_delete_carries_the_last_state(self) -> None:
+        rid = RecordID(TABLE, "a")
+        event = to_change_event(Ticket, _envelope("DELETE", rid, {"id": rid, "status": "gone"}), diff=False)
+        assert event.action is LiveAction.DELETE
+        assert event.instance.status == "gone"
+
+    def test_diff_create_hydrates_from_the_root_replace(self) -> None:
+        rid = RecordID(TABLE, "a")
+        patches = [{"op": "replace", "path": "", "value": {"id": rid, "age": 1}}]
+        event = to_change_event(Ticket, _envelope("CREATE", rid, patches), diff=True)
+        assert event.instance.age == 1
+        assert event.changed_fields == []
+        assert event.raw is patches
+
+    def test_diff_update_reports_python_field_names(self) -> None:
+        rid = RecordID(TABLE, "a")
+        patches = [
+            {"op": "replace", "path": "/age", "value": 2},
+            {"op": "change", "path": "/label_col", "value": "@@ -1 +1 @@"},
+            {"op": "add", "path": "/age/extra", "value": 1},
+            {"op": "add", "path": "/a~1b~0c", "value": 1},
+        ]
+        event = to_change_event(Ticket, _envelope("UPDATE", rid, patches), diff=True)
+        assert event.changed_fields == ["age", "label", "a/b~c"]
+        assert event.instance.id == "a"
+        assert event.record_id == str(rid)
+
+    def test_diff_delete_is_a_minimal_instance(self) -> None:
+        rid = RecordID(TABLE, "a")
+        patches = [{"op": "replace", "path": "", "value": None}]
+        event = to_change_event(Ticket, _envelope("DELETE", rid, patches), diff=True)
+        assert event.instance.id == "a"
+        assert event.changed_fields == []
+
+    def test_minimal_instance_falls_back_to_construct(self) -> None:
+        """Review focus #3: required fields make validation fail; the id must survive."""
+        rid = RecordID("Strict", "z")
+        event = to_change_event(Strict, _envelope("UPDATE", rid, [{"op": "replace", "path": "/name", "value": "n"}]), diff=True)
+        assert isinstance(event.instance, Strict)
+        assert event.instance.id == "z"
+        assert event.changed_fields == ["name"]
+
+    def test_invalid_full_record_raises(self) -> None:
+        from pydantic import ValidationError
+
+        rid = RecordID("Strict", "z")
+        with pytest.raises(ValidationError):
+            to_change_event(Strict, _envelope("CREATE", rid, {"id": rid}), diff=False)
+
+    def test_diff_create_on_2x_uses_a_slash_root(self) -> None:
+        """SurrealDB 2.x spells the root pointer "/" where 3.x spells it ""."""
+        rid = RecordID(TABLE, "a")
+        patches = [{"op": "replace", "path": "/", "value": {"id": rid, "age": 1}}]
+        event = to_change_event(Ticket, _envelope("CREATE", rid, patches), diff=True)
+        assert event.instance.age == 1
+        assert event.changed_fields == []
+
+    def test_diff_delete_on_2x_carries_the_last_state(self) -> None:
+        """SurrealDB 2.x answers a diff-mode DELETE with the whole record, not a patch list."""
+        rid = RecordID(TABLE, "a")
+        event = to_change_event(Ticket, _envelope("DELETE", rid, {"id": rid, "age": 9}), diff=True)
+        assert event.instance.id == "a"
+        assert event.instance.age == 9
+        assert event.changed_fields == []
