@@ -28,7 +28,8 @@
 | v0.17.0           | Tier 1 — Model auth (`AuthenticatedUserMixin`)       | Done    |
 | v0.18.0           | Tier 1 — Field aliases & DX                          | Done    |
 | v0.19.0           | Tier 1 — Live queries (base), raw notifications      | Done    |
-| v0.20.0 – v0.22.0 | Tier 1 — Core (typed live sets, typed relations)     | Planned |
+| v0.20.0           | Tier 1 — Typed live queries (`LiveModelStream`)      | Done    |
+| v0.21.0 – v0.22.0 | Tier 1 — Core (auto-resubscribe, typed relations)    | Planned |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 7 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
@@ -62,41 +63,41 @@ types unavailable in SDK 1.0.8. Crucially, `query()` runs **any SurrealQL**, inc
 As a result, **everything below is implementable in lite** — only the founding custom-SDK
 pieces stay out.
 
-| Feature                             | SDK 2.0 realization                                   | Version        |
-| ----------------------------------- | ----------------------------------------------------- | -------------- |
-| Native transactions (`tx=`)         | `BEGIN`/`COMMIT`/`CANCEL` via `query()`               | v0.8 – v0.9    |
-| `upsert()` / `update_or_create()`   | `upsert()`                                            | v0.10.0        |
-| Atomic field/array ops              | `patch()` (JSON Patch RFC 6902)                       | v0.11.0        |
-| Retry on conflict                   | transactions + retry logic                            | v0.12.0        |
-| SurrealFunc & server values         | `query()` + native fns (`CREATE`/`UPDATE … SET`)      | ✅ v0.13.0     |
-| Computed fields                     | `DEFINE FIELD … VALUE` via `query()`                  | ✅ v0.14.0     |
-| `call_function()`                   | `query()` + `fn::name($args)` ¹                       | ✅ v0.15.0     |
-| JWT / scope auth (connection)       | `signup`/`signin`/`authenticate`/`invalidate`/`info`  | ✅ v0.16.0     |
-| JWT / scope auth (model mixin)      | idem, on a `BaseSurrealModel` subclass                | ✅ v0.17.0     |
-| Field aliases & DX                  | Pydantic `Field(alias=)` + config                     | ✅ v0.18.0     |
-| Live queries (raw notifications)    | `live()` / `subscribe_live()` / `kill()`              | ✅ v0.19.0     |
-| Typed live sets (`LiveQuerySet`)    | idem + deserialization + `LIVE SELECT … WHERE`        | v0.20.0        |
-| Change Feeds / Auto-Resubscribe     | live queries + reconnect logic                        | v0.21.0        |
-| Native typed relations              | `insert_relation()`                                   | v0.22.0        |
-| Rich field types                    | native `Datetime`/`Duration`/`Decimal`/`Range`/`Uuid` | v0.23.0        |
-| Geospatial fields (`nearby()`)      | native `Geometry` + `geo::*`                          | v0.24.0        |
-| Embedded / in-memory test engine    | `mem://` / `surrealkv://` ²                           | v0.25.0        |
-| Versioned storage (time-travel)     | `surrealkv+versioned://` ²                            | v0.26.0        |
-| Subqueries                          | nested `SELECT` via `query()`                         | v0.27.0        |
-| Query cache (TTL)                   | client-side cache (SDK-independent)                   | v0.28.0        |
-| Multi-database                      | multiple `AsyncSurreal` instances                     | v0.29.0        |
-| Schema introspection                | `INFO FOR DB` / `INFO FOR TABLE`                      | v0.30.0        |
-| `DEFINE EVENT` (triggers)           | DDL via `query()`                                     | v0.31.0        |
-| `define_function()` DDL helper      | `DEFINE FUNCTION` via `query()` (`schema.py`)         | v0.31.0        |
-| Materialized views                  | `DEFINE TABLE … AS SELECT`                            | v0.32.0        |
-| `TYPE RELATION` enforcement         | `DEFINE TABLE … TYPE RELATION`                        | v0.33.0        |
-| Full-Text Search (BM25)             | `DEFINE ANALYZER` + `SEARCH` index + `search::*`      | v0.34.0        |
-| Vector Search (KNN, HNSW/MTREE)     | `DEFINE INDEX … HNSW/MTREE` + KNN operator            | v0.35.0        |
-| Hybrid Search (RRF)                 | vector + FTS fusion                                   | v0.36.0        |
-| Migrations (makemigrations/migrate) | DDL orchestration + tracking table via `query()`      | v0.37.0        |
-| CLI `surreal-orm-lite`              | shell / migrate / inspectdb                           | v0.38.0        |
-| Test fixtures & factories           | `ModelFactory`, pytest fixtures                       | v0.39.0        |
-| QueryLogger / profiling             | wraps `query()` calls                                 | v0.40.0 (Beta) |
+| Feature                                | SDK 2.0 realization                                   | Version        |
+| -------------------------------------- | ----------------------------------------------------- | -------------- |
+| Native transactions (`tx=`)            | `BEGIN`/`COMMIT`/`CANCEL` via `query()`               | v0.8 – v0.9    |
+| `upsert()` / `update_or_create()`      | `upsert()`                                            | v0.10.0        |
+| Atomic field/array ops                 | `patch()` (JSON Patch RFC 6902)                       | v0.11.0        |
+| Retry on conflict                      | transactions + retry logic                            | v0.12.0        |
+| SurrealFunc & server values            | `query()` + native fns (`CREATE`/`UPDATE … SET`)      | ✅ v0.13.0     |
+| Computed fields                        | `DEFINE FIELD … VALUE` via `query()`                  | ✅ v0.14.0     |
+| `call_function()`                      | `query()` + `fn::name($args)` ¹                       | ✅ v0.15.0     |
+| JWT / scope auth (connection)          | `signup`/`signin`/`authenticate`/`invalidate`/`info`  | ✅ v0.16.0     |
+| JWT / scope auth (model mixin)         | idem, on a `BaseSurrealModel` subclass                | ✅ v0.17.0     |
+| Field aliases & DX                     | Pydantic `Field(alias=)` + config                     | ✅ v0.18.0     |
+| Live queries (raw notifications)       | `live()` / `subscribe_live()` / `kill()`              | ✅ v0.19.0     |
+| Typed live queries (`LiveModelStream`) | idem + deserialization + `LIVE SELECT [DIFF] … WHERE` | ✅ v0.20.0     |
+| Change Feeds / Auto-Resubscribe        | live queries + reconnect logic                        | v0.21.0        |
+| Native typed relations                 | `insert_relation()`                                   | v0.22.0        |
+| Rich field types                       | native `Datetime`/`Duration`/`Decimal`/`Range`/`Uuid` | v0.23.0        |
+| Geospatial fields (`nearby()`)         | native `Geometry` + `geo::*`                          | v0.24.0        |
+| Embedded / in-memory test engine       | `mem://` / `surrealkv://` ²                           | v0.25.0        |
+| Versioned storage (time-travel)        | `surrealkv+versioned://` ²                            | v0.26.0        |
+| Subqueries                             | nested `SELECT` via `query()`                         | v0.27.0        |
+| Query cache (TTL)                      | client-side cache (SDK-independent)                   | v0.28.0        |
+| Multi-database                         | multiple `AsyncSurreal` instances                     | v0.29.0        |
+| Schema introspection                   | `INFO FOR DB` / `INFO FOR TABLE`                      | v0.30.0        |
+| `DEFINE EVENT` (triggers)              | DDL via `query()`                                     | v0.31.0        |
+| `define_function()` DDL helper         | `DEFINE FUNCTION` via `query()` (`schema.py`)         | v0.31.0        |
+| Materialized views                     | `DEFINE TABLE … AS SELECT`                            | v0.32.0        |
+| `TYPE RELATION` enforcement            | `DEFINE TABLE … TYPE RELATION`                        | v0.33.0        |
+| Full-Text Search (BM25)                | `DEFINE ANALYZER` + `SEARCH` index + `search::*`      | v0.34.0        |
+| Vector Search (KNN, HNSW/MTREE)        | `DEFINE INDEX … HNSW/MTREE` + KNN operator            | v0.35.0        |
+| Hybrid Search (RRF)                    | vector + FTS fusion                                   | v0.36.0        |
+| Migrations (makemigrations/migrate)    | DDL orchestration + tracking table via `query()`      | v0.37.0        |
+| CLI `surreal-orm-lite`                 | shell / migrate / inspectdb                           | v0.38.0        |
+| Test fixtures & factories              | `ModelFactory`, pytest fixtures                       | v0.39.0        |
+| QueryLogger / profiling                | wraps `query()` calls                                 | v0.40.0 (Beta) |
 
 ¹ SDK 2.0.0 exposes **no** `run()`/`call()` method, so the call goes through `query()` with
 the bare form `fn::name($args);` — never `RETURN fn::name(…)`, which silently truncates a
@@ -140,7 +141,8 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | Model-level auth mixin        | yes        | ✅ v0.17.0                  |
 | Field aliases & DX            | yes        | ✅ v0.18.0                  |
 | Live queries (raw notifs)     | yes        | ✅ v0.19.0                  |
-| Typed live sets / CDC         | yes        | v0.20 – v0.21               |
+| Typed live queries            | yes        | ✅ v0.20.0                  |
+| Live auto-resubscribe / CDC   | yes        | v0.21                       |
 | Native typed relations        | yes        | v0.22.0                     |
 | Rich field types              | yes        | v0.23.0                     |
 | Geospatial fields             | yes        | v0.24.0                     |
@@ -315,7 +317,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - `QuerySet.watch()` is the everyday form: an async context manager that subscribes to the
   model's table and **kills the subscription on exit**, including when the body raises. The
   handle exposes `live_id`, `table`, `is_active` and `stop()`, named after the full ORM's
-  `LiveModelStream` so the typed v0.20.0 layer can present the same object
+  `LiveModelStream` so the typed v0.20.0 layer presents the same object
 - `QuerySet.live()` returns the live query's `UUID`;
   `SurrealDBConnectionManager.subscribe_live()` iterates the raw envelopes and `kill()` stops
   them. `subscribe_live()` is intentionally **not** a coroutine, so buffering starts at the call
@@ -337,6 +339,23 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - Guards rather than surprises: HTTP connections are refused by name, and a queryset carrying
   `filter`/`select`/`limit`/`offset`/`order_by`/`fetch`/`annotate` is rejected instead of being
   silently watched whole
+
+### Version 0.20.0 — Typed live queries
+
+- `QuerySet.live(diff=)` returns a `LiveModelStream` yielding `ModelChangeEvent`s with a model
+  `instance` — the full SurrealDB-ORM's API, names and fields, so migrating is an import change.
+  `post_live_change` is the full ORM's signal. `auto_resubscribe`/`on_reconnect` are v0.21.0
+- `filter()`/`Q`/`Var`+`variables()` and `fetch()` are applied server-side through
+  `LIVE SELECT [DIFF] … WHERE … FETCH`, sent with `query()`; `watch()` gains the same filters
+- **SurrealDB 2.x drops bound parameters in a live query** — the filter silently matches
+  nothing. Values are therefore inlined as literals by a closed encoder (`surql_literal.py`),
+  as the full ORM does, but stricter: unknown types raise instead of being stringified, `Decimal`
+  stays a decimal, and record ids use the backtick form both lines parse identically. Each
+  literal is round-tripped against both servers in the test suite
+- Diff mode: `changed_fields` from the patch paths (aliases resolved); the root path (`""` on 3.x,
+  `"/"` on 2.x) and the 2.x diff `DELETE` (a whole record) are normalised by `live()`
+- `await qs.live()` (uuid) is deprecated but kept, so v0.19.0 code keeps running
+- Measured the same on both lines: filter enter/leave semantics, `fetch()` in notifications
 
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
@@ -497,7 +516,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 | Version    | Theme                                                                           | SDK 2.0 primitive             |
 | ---------- | ------------------------------------------------------------------------------- | ----------------------------- |
 | ✅ v0.19.0 | Live Queries (base): `live()`/`watch()`/`subscribe_live()`/`kill()`, raw notifs | `live`/`kill` + `live_queues` |
-| v0.20.0    | `LiveQuerySet` typed: filters + notifications deserialized, diff mode           | `LIVE SELECT [DIFF] … WHERE`  |
+| ✅ v0.20.0 | Typed live queries: `live()` → `LiveModelStream`, filters, diff, signal         | `LIVE SELECT [DIFF] … WHERE`  |
 | v0.21.0    | Change Feeds / Auto-Resubscribe: WS reconnect + resubscribe + cursor            | live + reconnect              |
 
 ### 🟠 Phase E — Graph
