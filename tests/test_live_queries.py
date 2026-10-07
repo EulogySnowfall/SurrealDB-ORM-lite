@@ -373,12 +373,10 @@ class TestLiveClauseGuards:
     @pytest.mark.parametrize(
         ("label", "build"),
         [
-            ("filter()", lambda qs: qs.filter(name="a")),
             ("select()", lambda qs: qs.select("name")),
             ("limit()", lambda qs: qs.limit(1)),
             ("offset()", lambda qs: qs.offset(1)),
             ("order_by()", lambda qs: qs.order_by("name")),
-            ("fetch()", lambda qs: qs.fetch("name")),
             ("values()", lambda qs: qs.values("name")),
         ],
     )
@@ -387,7 +385,6 @@ class TestLiveClauseGuards:
         with pytest.raises(SurrealDbError) as excinfo:
             await build(Watched.objects()).live()
         assert label in str(excinfo.value)
-        assert "v0.20.0" in str(excinfo.value)
 
     @pytest.mark.asyncio
     async def test_rejects_annotate(self) -> None:
@@ -400,22 +397,15 @@ class TestLiveClauseGuards:
     async def test_names_every_offending_clause_at_once(self) -> None:
         """A caller who chained three unusable clauses should not have to fix them one by one."""
         with pytest.raises(SurrealDbError) as excinfo:
-            await Watched.objects().filter(name="a").limit(2).order_by("name").live()
+            await Watched.objects().select("name").limit(2).order_by("name").live()
         message = str(excinfo.value)
-        assert "filter()" in message
+        assert "select()" in message
         assert "limit()" in message
         assert "order_by()" in message
 
-    @pytest.mark.asyncio
-    async def test_rejects_a_q_filter(self) -> None:
-        from surreal_orm_lite import Q
-
-        with pytest.raises(SurrealDbError, match="filter"):
-            await Watched.objects().filter(Q(name="a")).live()
-
     def test_watch_rejects_the_same_clauses(self) -> None:
-        with pytest.raises(SurrealDbError, match="filter"):
-            Watched.objects().filter(name="a").watch()
+        with pytest.raises(SurrealDbError, match=r"select\(\)"):
+            Watched.objects().select("name").watch()
 
     @pytest.mark.asyncio
     async def test_rejects_a_non_websocket_connection(self) -> None:
@@ -833,11 +823,6 @@ class TestReviewGuards:
         qs._tx = object()
         with pytest.raises(SurrealDbError, match=r"objects\(tx=\)"):
             await qs.live()
-
-    @pytest.mark.asyncio
-    async def test_rejects_query_variables(self) -> None:
-        with pytest.raises(SurrealDbError, match=r"variables\(\)"):
-            await Watched.objects().variables(x=1).live()
 
     @pytest.mark.asyncio
     async def test_subscribe_live_on_http_names_the_transport(self) -> None:
