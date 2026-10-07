@@ -361,3 +361,178 @@ class TestToChangeEvent:
         assert event.instance.id == "a"
         assert event.instance.age == 9
         assert event.changed_fields == []
+
+
+# ==================== Task 4 — typed live() (E2E, both lines) ====================
+
+from uuid import UUID  # noqa: E402
+
+from surreal_orm_lite import SurrealDBConnectionManager  # noqa: E402
+from surreal_orm_lite.signals import post_live_change  # noqa: E402
+
+
+class TestTypedLiveE2E:
+    @pytest.mark.asyncio
+    async def test_yields_typed_events_for_the_filter_only(self) -> None:
+        async with orm_client(TABLE) as client:
+            await _define(client)
+            async with Ticket.objects().filter(status="active").live() as stream:
+                assert stream.is_active and isinstance(stream.live_id, UUID)
+                assert stream.table == TABLE
+                await client.query(f"CREATE {TABLE}:off SET status = 'inactive';", {})
+                await client.query(f"CREATE {TABLE}:on SET status = 'active', label_col = 'L';", {})
+                await client.query(f"DELETE {TABLE}:on;", {})
+                created, deleted = await _take(stream, 2)
+                await _assert_silent(stream)
+            assert not stream.is_active
+        assert created.action is LiveAction.CREATE
+        assert isinstance(created.instance, Ticket)
+        assert (created.instance.id, created.instance.label) == ("on", "L")
+        assert created.record_id == f"{TABLE}:on"
+        assert deleted.action is LiveAction.DELETE
+        assert deleted.instance.id == "on"
+
+    @pytest.mark.asyncio
+    async def test_diff_mode(self) -> None:
+        async with orm_client(TABLE) as client:
+            await _define(client)
+            async with Ticket.objects().live(diff=True) as stream:
+                await client.query(f"CREATE {TABLE}:d SET age = 1, label_col = 'a';", {})
+                await client.query(f"UPDATE {TABLE}:d SET age = 2, label_col = 'b';", {})
+                await client.query(f"DELETE {TABLE}:d;", {})
+                create, update, delete = await _take(stream, 3)
+        assert create.instance.age == 1
+        assert sorted(update.changed_fields) == ["age", "label"]
+        assert update.instance.id == "d"
+        assert update.record_id == f"{TABLE}:d"
+        assert delete.instance.id == "d"
+
+    @pytest.mark.asyncio
+    async def test_two_filtered_streams_are_independent(self) -> None:
+        """Review focus #5."""
+        async with orm_client(TABLE) as client:
+            await _define(client)
+            async with (
+                Ticket.objects().filter(status="a").live() as first,
+                Ticket.objects().filter(status="b").live() as second,
+            ):
+                await client.query(f"CREATE {TABLE}:x SET status = 'a';", {})
+                await client.query(f"CREATE {TABLE}:y SET status = 'b';", {})
+                [a] = await _take(first, 1)
+                [b] = await _take(second, 1)
+                await _assert_silent(first, 0.5)
+                await _assert_silent(second, 0.5)
+        assert (a.instance.id, b.instance.id) == ("x", "y")
+
+    @pytest.mark.asyncio
+    async def test_validation_error_propagates_and_still_kills(self) -> None:
+        """Review focus #4."""
+        from pydantic import ValidationError
+
+        async with orm_client("Strict") as client:
+            await _define(client, "Strict")
+            stream = Strict.objects().live()
+            with pytest.raises(ValidationError):
+                async with stream:
+                    await client.query("CREATE Strict:bad SET other = 1;", {})
+                    await _take(stream, 1)
+            assert not stream.is_active
+
+    @pytest.mark.asyncio
+    async def test_await_form_still_returns_a_uuid_and_warns(self) -> None:
+        async with orm_client(TABLE) as client:
+            await _define(client)
+            with pytest.warns(DeprecationWarning, match=r"async with"):
+                live_id = await Ticket.objects().filter(status="w").live()
+            assert isinstance(live_id, UUID)
+            raw = SurrealDBConnectionManager.subscribe_live(live_id)
+            try:
+                await client.query(f"CREATE {TABLE}:n SET status = 'x';", {})
+                await client.query(f"CREATE {TABLE}:w SET status = 'w';", {})
+                [envelope] = await _take(raw, 1)
+                assert str(envelope["record"].id) == "w"
+            finally:
+                await SurrealDBConnectionManager.kill(live_id)
+
+    def test_reconnect_kwargs_are_not_accepted_yet(self) -> None:
+        with pytest.raises(TypeError):
+            Ticket.objects().live(auto_resubscribe=True)  # type: ignore[call-arg]
+
+    def test_refused_clause_raises_at_call_time(self) -> None:
+        with pytest.raises(SurrealDbError, match=r"limit\(\)"):
+            Ticket.objects().limit(1).live()
+
+
+class TestPostLiveChangeE2E:
+    @pytest.mark.asyncio
+    async def test_handlers_receive_the_full_orm_kwargs(self) -> None:
+        received: list[dict[str, Any]] = []
+        done = asyncio.Event()
+
+        @post_live_change.connect(Ticket)
+        async def handler(sender: type, **kwargs: Any) -> None:
+            received.append({"sender": sender, **kwargs})
+            done.set()
+
+        try:
+            async with orm_client(TABLE) as client:
+                await _define(client)
+                async with Ticket.objects().live() as stream:
+                    await client.query(f"CREATE {TABLE}:s SET age = 1;", {})
+                    [event] = await _take(stream, 1)
+                    await asyncio.wait_for(done.wait(), timeout=5)
+        finally:
+            post_live_change.disconnect(handler, Ticket)
+        [call] = received
+        assert call["sender"] is Ticket
+        assert call["instance"] is event.instance
+        assert call["action"] is LiveAction.CREATE
+        assert call["record_id"] == f"{TABLE}:s"
+        assert call["changed_fields"] == []
+
+    @pytest.mark.asyncio
+    async def test_a_failing_handler_is_logged_and_never_stops_the_stream(self, caplog: Any) -> None:
+        @post_live_change.connect(Ticket)
+        async def boom(sender: type, **kwargs: Any) -> None:
+            raise RuntimeError("handler exploded")
+
+        try:
+            async with orm_client(TABLE) as client:
+                await _define(client)
+                async with Ticket.objects().live() as stream:
+                    await client.query(f"CREATE {TABLE}:1 SET age = 1;", {})
+                    await client.query(f"CREATE {TABLE}:2 SET age = 2;", {})
+                    events = await _take(stream, 2)
+                    await asyncio.sleep(0.1)
+        finally:
+            post_live_change.disconnect(boom, Ticket)
+        assert len(events) == 2
+        assert "handler exploded" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_in_flight_handlers(self) -> None:
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        @post_live_change.connect(Ticket)
+        async def slow(sender: type, **kwargs: Any) -> None:
+            started.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        try:
+            async with orm_client(TABLE) as client:
+                await _define(client)
+                async with Ticket.objects().live() as stream:
+                    await client.query(f"CREATE {TABLE}:c SET age = 1;", {})
+                    await _take(stream, 1)
+                    await asyncio.wait_for(started.wait(), timeout=5)
+                await asyncio.wait_for(cancelled.wait(), timeout=5)
+        finally:
+            post_live_change.disconnect(slow, Ticket)
+
+    def test_no_task_without_handlers(self) -> None:
+        assert not post_live_change.has_handlers(Ticket)

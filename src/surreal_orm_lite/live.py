@@ -1,9 +1,11 @@
-"""Live queries — the raw notification layer (v0.19.0).
+"""Live queries — the raw notification layer (v0.19.0) and the typed layer on top (v0.20.0).
 
 A live query is a server-side subscription: SurrealDB pushes a notification over the
 WebSocket every time a record in the watched table is created, updated or deleted. This
 module turns that push stream into an async iterator of **raw envelopes**, and owns the two
-pieces of plumbing the official SDK does not provide.
+pieces of plumbing the official SDK does not provide. :class:`LiveModelStream` then converts
+each envelope into a :class:`ModelChangeEvent` carrying a model instance — the full
+SurrealDB-ORM's API, so code written against it migrates with an import change.
 
 **Why the ORM does not call the SDK's ``subscribe_live()``.** The SDK's generator body is
 ``yield ret["result"]``: it hands back the record payload and discards the envelope around
@@ -36,7 +38,10 @@ every loop. Automatic resubscribe is v0.21.0.
 from __future__ import annotations
 
 import asyncio
+import logging
+import warnings
 from collections import deque
+from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final, Generic, TypeVar, cast
 from uuid import UUID
@@ -45,11 +50,14 @@ from pydantic import ValidationError
 
 from .enum import LiveAction
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
+from .utils import user_stacklevel
 
 if TYPE_CHECKING:
     from .model_base import BaseSurrealModel
 
-__all__ = ["LiveIterator", "LiveStream", "ModelChangeEvent"]
+__all__ = ["LiveIterator", "LiveModelStream", "LiveStream", "ModelChangeEvent"]
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound="BaseSurrealModel")
 
@@ -303,8 +311,8 @@ def missing_table_error(exc: Exception, table: str) -> SurrealDbNotFoundError:
 class LiveStream:
     """Async context manager and iterator over one live query's raw notifications.
 
-    Member names mirror the full ORM's ``LiveModelStream`` so the typed layer planned for
-    v0.20.0 can present the same handle::
+    Member names mirror the full ORM's ``LiveModelStream``, which :class:`LiveModelStream`
+    wraps this class to provide::
 
         async with User.objects().watch() as stream:
             async for notif in stream:
@@ -464,3 +472,115 @@ def to_change_event(model: type[T], envelope: dict[str, Any], *, diff: bool) -> 
         changed_fields=changed,
         raw=result if result is not None else {},
     )
+
+
+class LiveModelStream(Generic[T]):
+    """Typed live query: async context manager and iterator of :class:`ModelChangeEvent`.
+
+    The full SurrealDB-ORM's class, on the official SDK::
+
+        async with User.objects().filter(role="admin").live() as stream:
+            async for event in stream:
+                print(event.action, event.instance, event.record_id)
+
+    It wraps a :class:`LiveStream`, which owns the subscription — start, kill on exit, and an
+    end of iteration that is identical on both server lines — and only converts each envelope.
+
+    **Deprecated v0.19.0 form:** ``await qs.live()`` still starts a live query and returns its
+    uuid, for :meth:`SurrealDBConnectionManager.subscribe_live`. That subscription belongs to the
+    caller, not to this object.
+    """
+
+    def __init__(
+        self,
+        model: type[T],
+        table: str,
+        starter: Callable[[], Awaitable[UUID]],
+        *,
+        diff: bool = False,
+    ) -> None:
+        self._model = model
+        self._diff = diff
+        self._starter = starter
+        self._stream = LiveStream(table, starter)
+        self._signal_tasks: set[asyncio.Task[None]] = set()
+
+    @property
+    def table(self) -> str:
+        """The table this stream is subscribed to."""
+        return self._stream.table
+
+    @property
+    def live_id(self) -> UUID | None:
+        """The live query's uuid, or ``None`` before start and after :meth:`stop`."""
+        return self._stream.live_id
+
+    @property
+    def is_active(self) -> bool:
+        """Whether the subscription is currently running."""
+        return self._stream.is_active
+
+    async def start(self) -> LiveModelStream[T]:
+        """Open the subscription. Calling it on a running stream is a no-op."""
+        await self._stream.start()
+        return self
+
+    async def stop(self) -> None:
+        """Kill the subscription, end the iteration and cancel in-flight signal handlers."""
+        try:
+            await self._stream.stop()
+        finally:
+            for task in list(self._signal_tasks):
+                task.cancel()
+            self._signal_tasks.clear()
+
+    def __aiter__(self) -> LiveModelStream[T]:
+        return self
+
+    async def __anext__(self) -> ModelChangeEvent[T]:
+        envelope = await self._stream.__anext__()
+        event = to_change_event(self._model, envelope, diff=self._diff)
+        self._emit(event)
+        return event
+
+    async def __aenter__(self) -> LiveModelStream[T]:
+        return await self.start()
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.stop()
+
+    def __await__(self) -> Generator[Any, None, UUID]:
+        warnings.warn(
+            "`await QuerySet.live()` returning the live query's uuid is deprecated since v0.20.0; "
+            "use `async with Model.objects().live() as stream:` for typed events, or `watch()` "
+            "for raw envelopes.",
+            DeprecationWarning,
+            stacklevel=user_stacklevel(),
+        )
+        return self._starter().__await__()
+
+    def _emit(self, event: ModelChangeEvent[T]) -> None:
+        """Send ``post_live_change`` in the background; never block or break the stream."""
+        from .signals import post_live_change
+
+        if not post_live_change.has_handlers(self._model):
+            return
+        task = asyncio.get_running_loop().create_task(
+            post_live_change.send(
+                self._model,
+                instance=event.instance,
+                action=event.action,
+                record_id=event.record_id,
+                changed_fields=event.changed_fields,
+            )
+        )
+        self._signal_tasks.add(task)
+        task.add_done_callback(self._signal_done)
+
+    def _signal_done(self, task: asyncio.Task[None]) -> None:
+        self._signal_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("post_live_change handler failed for %s", self._model.__name__, exc_info=exc)

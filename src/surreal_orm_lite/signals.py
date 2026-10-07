@@ -284,3 +284,22 @@ post_delete = Signal("post_delete")
 around_save = AroundSignal("around_save")
 around_update = AroundSignal("around_update")
 around_delete = AroundSignal("around_delete")
+
+# Live change signal (v0.20.0) — same name and arguments as the full SurrealDB-ORM.
+post_live_change = Signal("post_live_change")
+"""Sent for every event a typed live query (``QuerySet.live()``) yields.
+
+Unlike ``post_save``/``post_update``/``post_delete``, which fire for this process's own writes,
+it fires for changes the database reports — made by any client.
+
+Arguments: ``sender`` (the model class), ``instance``, ``action`` (``LiveAction``),
+``record_id`` (e.g. ``"user:abc"``), ``changed_fields`` (diff mode only).
+
+Handlers run as background tasks so a slow one never stalls the stream; a handler that raises
+is logged, and in-flight handlers are cancelled when the stream stops::
+
+    @post_live_change.connect(Player)
+    async def on_player_change(sender, instance, action, **kwargs):
+        if action == LiveAction.CREATE:
+            await broadcast({"type": "player_joined", "name": instance.name})
+"""

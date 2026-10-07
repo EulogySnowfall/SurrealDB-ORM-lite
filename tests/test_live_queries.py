@@ -22,6 +22,10 @@ from surreal_orm_lite.enum import LiveAction
 from surreal_orm_lite.exceptions import SurrealDbError, SurrealDbNotFoundError
 from tests.conftest import orm_client
 
+# v0.20.0 deprecated `await qs.live()` in favour of `async with qs.live()`; these v0.19.0 tests
+# keep exercising the awaitable form on purpose, as the compatibility contract.
+pytestmark = pytest.mark.filterwarnings(r"ignore:`await QuerySet\.live\(\)`:DeprecationWarning")
+
 
 class _FakeClient:
     """Stand-in for the SDK connection: only ``live_queues`` matters to the registry."""

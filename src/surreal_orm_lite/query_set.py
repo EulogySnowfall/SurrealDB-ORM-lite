@@ -12,7 +12,7 @@ from ._sdk import NotFoundError
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import Var
-from .live import LiveStream, missing_table_error, require_websocket
+from .live import LiveModelStream, LiveStream, missing_table_error, require_websocket
 from .q import Q
 from .surql_literal import inline_variables
 from .utils import (
@@ -1069,9 +1069,32 @@ class QuerySet:
 
         return start
 
-    async def live(self) -> UUID:
-        """Start a live query on this queryset and return its uuid (v0.19.0 shape; typed in Task 4)."""
-        return await self._live_starter(False)()
+    def live(self, *, diff: bool = False) -> LiveModelStream[Any]:
+        """Subscribe to the records this queryset matches, as typed model events.
+
+        Same API as the full SurrealDB-ORM::
+
+            async with User.objects().filter(role="admin").live() as stream:
+                async for event in stream:
+                    match event.action:
+                        case LiveAction.CREATE: print("new", event.instance.name)
+                        case LiveAction.UPDATE: print("updated", event.instance)
+                        case LiveAction.DELETE: print("removed", event.record_id)
+
+        ``filter()``, ``variables()`` and ``fetch()`` are applied by the server, identically on
+        SurrealDB 2.x and 3.x (values are inlined — see ``surql_literal``). With ``diff=True``
+        the server sends patches: ``changed_fields`` lists what changed, and only ``CREATE``
+        carries a whole record. The live query is killed when the ``async with`` exits.
+
+        ``await qs.live()`` — the v0.19.0 form returning the uuid — still works and is
+        deprecated. Automatic reconnection (``auto_resubscribe=``) arrives in v0.21.0.
+
+        :raises SurrealDbError: for ``select``/``values``/``annotate``/``order_by``/``limit``/
+            ``offset``/``objects(tx=)``, here; for a non-WebSocket connection, on start.
+        :raises TypeError: for a filter value with no SurrealQL literal form, here.
+        :raises SurrealDbNotFoundError: on SurrealDB 3.x, on start, if the table does not exist.
+        """
+        return LiveModelStream(self.model, self._model_table, self._live_starter(diff), diff=diff)
 
     def watch(self, *, diff: bool = False) -> LiveStream:
         """Watch the records this queryset matches, killing the subscription when the block exits.
