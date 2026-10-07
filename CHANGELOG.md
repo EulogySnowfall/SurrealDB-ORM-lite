@@ -30,8 +30,13 @@ Typed live queries, with the same API as the full SurrealDB-ORM: code written ag
 - **Diff mode** — `live(diff=True)` / `watch(diff=True)` use `LIVE SELECT DIFF`; `changed_fields`
   lists the top-level fields each update touched.
 - **`post_live_change` signal** — same name and arguments as the full ORM (`instance`, `action`,
-  `record_id`, `changed_fields`), run in the background for every event a `live()` stream yields;
-  a failing handler is logged and never interrupts the stream.
+  `record_id`, `changed_fields`), run for every event a `live()` stream yields on one background
+  task per stream, in event order. A failing handler is logged and never interrupts the stream;
+  a normal exit waits for pending handlers (`signal_drain_timeout`, 5 s), an exception cancels
+  them.
+- **`ModelChangeEvent.validation_error`** — a record that does not fit the model no longer ends
+  the stream: the event carries the error and an unvalidated instance, and a warning is logged
+  once per stream.
 - **`watch(diff=)`**, and `watch()` now honours the same filters as `live()`.
 - `LiveModelStream`, `ModelChangeEvent` and `post_live_change` are exported from the package root.
 
@@ -39,9 +44,10 @@ Typed live queries, with the same API as the full SurrealDB-ORM: code written ag
 
 - **`await QuerySet.live()` is deprecated.** It still starts a live query and returns its uuid
   (the v0.19.0 contract), with a `DeprecationWarning` pointing at `async with ….live()` or
-  `watch()`. `live()` is therefore no longer a coroutine function: `await qs.live()`,
-  `gather` and `wait_for` keep working, but `asyncio.create_task(qs.live())` raises `TypeError`
-  — use `asyncio.ensure_future(qs.live())`. To hold a subscription across tasks, start the stream
+  `watch()`. The stream `live()` now returns also implements the coroutine protocol, so
+  `asyncio.create_task(qs.live())` and `asyncio.run(qs.live())` keep working; it can be awaited
+  once, and an awaited stream refuses to `start()` (and the reverse). `inspect.iscoroutine()` is
+  `False` for it. To hold a subscription across tasks, start the stream
   (`await qs.watch().start()`), read **it**, and stop it with `kill(stream.live_id)`.
 - Every live query now starts through `LIVE SELECT` sent with `query()` rather than the SDK's
   table-only `live()`. `filter()`, `fetch()` and `variables()` are no longer refused; `select()`,
@@ -54,9 +60,13 @@ Typed live queries, with the same API as the full SurrealDB-ORM: code written ag
   is accepted, then `$s` evaluates to `NONE` at notification time and the filter matches nothing,
   without an error. For live queries only, the ORM therefore writes each filter value as a
   SurrealQL literal — the full ORM's approach — through a closed encoder (`None`, `bool`, `int`,
-  `float`, `str`, `Decimal`, `datetime`, `UUID`, `RecordID`, lists and dicts). Any other type, a
-  string containing NUL, or an integer beyond 64 bits raises `TypeError` at the call, before
-  anything is sent. Every literal is checked against the server on both lines by the test suite.
+  `float`, `str`, `Decimal`, `datetime` in UTC, `UUID`, `RecordID` incl. UUID keys, lists and
+  dicts). Any other type, a string containing NUL, an integer beyond 64 bits or a `Decimal`
+  beyond 28 significant fractional digits / a 96-bit mantissa raises `TypeError` at the call,
+  before anything is sent. A reference that is neither bound through `variables()` nor a server
+  parameter (`$auth`, `$session`, …) raises `SurrealDbError`: unbound, it would read as `NONE`
+  on every notification. Every literal is checked against the server on both lines by the test
+  suite.
 - Filter semantics, measured identically on 2.7.0 and 3.3.0: a record entering the filter through
   an update arrives as `UPDATE`; one leaving it reports nothing, nor its later `DELETE`.
 - **Diff mode differs by line in its raw form**: the root patch path is `"/"` on 2.x and `""` on

@@ -41,7 +41,7 @@ import asyncio
 import logging
 import warnings
 from collections import deque
-from collections.abc import Awaitable, Callable, Generator
+from collections.abc import Awaitable, Callable, Coroutine, Generator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final, Generic, TypeVar, cast
 from uuid import UUID
@@ -347,7 +347,9 @@ class LiveStream:
             return self
         from .connection_manager import SurrealDBConnectionManager
 
-        # Client first, so no await sits between opening the subscription and buffering it.
+        # Transport first: on an http:// URL no client should be opened just to be refused.
+        require_websocket(SurrealDBConnectionManager.get_connection_string())
+        # Client next, so no await sits between opening the subscription and buffering it.
         self._client = await SurrealDBConnectionManager.get_client()
         self._live_id = await self._starter()
         self._iterator = open_stream(self._client, self._live_id)
@@ -407,6 +409,10 @@ class ModelChangeEvent(Generic[T]):
     :ivar record_id: the affected record, e.g. ``"user:abc"``.
     :ivar changed_fields: diff mode only — the top-level fields the patches touch, as Python
         field names (aliases resolved).
+    :ivar validation_error: set when the record does not validate against the model — e.g. a
+        ``fetch()``-resolved link on a field typed ``str``, or a row another client wrote with a
+        missing field. ``instance`` is then built **without validation** from the record as
+        received, and the stream carries on. ``None`` for every valid event.
     :ivar raw: the notification's ``result`` as received: a dict, or in diff mode the list of
         patches — except a diff-mode ``DELETE`` on SurrealDB 2.x, which is the whole last record
         (a dict). SurrealDB's diff is JSON Patch **extended**: a changed string arrives as
@@ -418,6 +424,7 @@ class ModelChangeEvent(Generic[T]):
     record_id: str
     changed_fields: list[str] = field(default_factory=list)
     raw: Any = field(default_factory=dict)
+    validation_error: ValidationError | None = None
 
 
 def _pointer_root(path: str) -> str:
@@ -443,8 +450,10 @@ def to_change_event(model: type[T], envelope: dict[str, Any], *, diff: bool) -> 
     patch path is ``""`` on 3.x and ``"/"`` on 2.x, and a ``DELETE`` is a ``replace`` of the root
     with ``None`` on 3.x but the whole last record on 2.x.
 
-    :raises pydantic.ValidationError: if a whole record does not validate against *model* —
-        the same contract as the full ORM, rather than a silently half-built instance.
+    A record that does not validate against *model* does not raise: one bad row would otherwise
+    end the consumer's ``async for`` and kill the subscription. The event carries the error in
+    ``validation_error`` and an unvalidated instance, the way ``QuerySet.exec()`` falls back to
+    plain rows instead of failing.
     """
     record = envelope.get("record")
     result = envelope.get("result")
@@ -464,14 +473,23 @@ def to_change_event(model: type[T], envelope: dict[str, Any], *, diff: bool) -> 
                 name = model.to_py_field(_pointer_root(path))
                 if name not in changed:
                     changed.append(name)
-    # A copy for hydration: it rewrites the id in place, and ``raw`` must stay as received.
-    instance = cast(T, model.from_db(dict(payload))) if isinstance(payload, dict) else _minimal_instance(model, record)
+    error: ValidationError | None = None
+    if isinstance(payload, dict):
+        # Copies throughout: hydration rewrites the id in place, and ``raw`` must stay as received.
+        try:
+            instance = cast(T, model.from_db(dict(payload)))
+        except ValidationError as exc:
+            error = exc
+            instance = model.model_construct(**cast(Any, model).set_data(dict(payload)))
+    else:
+        instance = _minimal_instance(model, record)
     return ModelChangeEvent(
         action=LiveAction(envelope["action"]),
         instance=instance,
         record_id=str(record) if record is not None else "",
         changed_fields=changed,
         raw=result if result is not None else {},
+        validation_error=error,
     )
 
 
@@ -487,10 +505,21 @@ class LiveModelStream(Generic[T]):
     It wraps a :class:`LiveStream`, which owns the subscription — start, kill on exit, and an
     end of iteration that is identical on both server lines — and only converts each envelope.
 
+    **``post_live_change`` handlers** run on one background task per stream, in event order, so
+    a slow handler never stalls the iteration and never lets a later event's handler overtake
+    it. Leaving the block normally waits up to :attr:`signal_drain_timeout` seconds for the
+    pending handlers to finish; leaving it on an exception cancels them.
+
     **Deprecated v0.19.0 form:** ``await qs.live()`` still starts a live query and returns its
     uuid, for :meth:`SurrealDBConnectionManager.subscribe_live`. That subscription belongs to the
-    caller, not to this object.
+    caller, not to this object. The object also behaves as a coroutine for that path, so
+    ``asyncio.create_task(qs.live())`` and ``asyncio.run(qs.live())`` keep working. Like a
+    coroutine it can be awaited once, and an awaited stream cannot also be started (nor the
+    reverse): the two would be separate subscriptions, and only one would be killed.
     """
+
+    #: Seconds a normal exit waits for pending ``post_live_change`` handlers before cancelling.
+    signal_drain_timeout: float = 5.0
 
     def __init__(
         self,
@@ -504,7 +533,11 @@ class LiveModelStream(Generic[T]):
         self._diff = diff
         self._starter = starter
         self._stream = LiveStream(table, starter)
-        self._signal_tasks: set[asyncio.Task[None]] = set()
+        self._started = False
+        self._uuid_start: Coroutine[Any, Any, UUID] | None = None
+        self._warned_invalid = False
+        self._signal_queue: asyncio.Queue[ModelChangeEvent[T] | None] | None = None
+        self._signal_worker: asyncio.Task[None] | None = None
 
     @property
     def table(self) -> str:
@@ -522,25 +555,52 @@ class LiveModelStream(Generic[T]):
         return self._stream.is_active
 
     async def start(self) -> LiveModelStream[T]:
-        """Open the subscription. Calling it on a running stream is a no-op."""
+        """Open the subscription. Calling it on a running stream is a no-op.
+
+        :raises SurrealDbError: if this object was already awaited for a uuid.
+        """
+        if self._uuid_start is not None:
+            raise SurrealDbError(
+                "This live() stream was awaited for its uuid (the deprecated v0.19.0 form), which "
+                "started a separate subscription it does not own. Call live() again for a stream."
+            )
+        self._started = True
         await self._stream.start()
         return self
 
     async def stop(self) -> None:
-        """Kill the subscription, end the iteration and cancel in-flight signal handlers."""
+        """Kill the subscription and end the iteration.
+
+        Pending ``post_live_change`` handlers get up to :attr:`signal_drain_timeout` seconds to
+        finish, then are cancelled.
+        """
+        await self._stop(cancel_handlers=False)
+
+    async def _stop(self, *, cancel_handlers: bool) -> None:
         try:
             await self._stream.stop()
         finally:
-            for task in list(self._signal_tasks):
-                task.cancel()
-            self._signal_tasks.clear()
+            await self._finish_signals(cancel=cancel_handlers)
 
     def __aiter__(self) -> LiveModelStream[T]:
         return self
 
     async def __anext__(self) -> ModelChangeEvent[T]:
-        envelope = await self._stream.__anext__()
+        try:
+            envelope = await self._stream.__anext__()
+        except StopAsyncIteration:
+            # Killed elsewhere or the connection closed: let the handler task drain and exit.
+            self._close_signal_queue()
+            raise
         event = to_change_event(self._model, envelope, diff=self._diff)
+        if event.validation_error is not None and not self._warned_invalid:
+            self._warned_invalid = True
+            logger.warning(
+                "A live %s record does not validate against the model; events carry the error in "
+                "`validation_error` and an unvalidated instance (logged once per stream): %s",
+                self._model.__name__,
+                event.validation_error,
+            )
         self._emit(event)
         return event
 
@@ -548,40 +608,93 @@ class LiveModelStream(Generic[T]):
         return await self.start()
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        await self.stop()
+        await self._stop(cancel_handlers=exc_type is not None)
+
+    # -- deprecated v0.19.0 form: ``await qs.live()`` → uuid ---------------------------------
+
+    def _uuid_coroutine(self) -> Coroutine[Any, Any, UUID]:
+        if self._uuid_start is None:
+            if self._started:
+                raise SurrealDbError(
+                    "This live() stream is already started; await it only for the deprecated "
+                    "uuid form, on a fresh `qs.live()`. Use `stream.live_id` instead."
+                )
+            warnings.warn(
+                "`await QuerySet.live()` returning the live query's uuid is deprecated since "
+                "v0.20.0; use `async with Model.objects().live() as stream:` for typed events, "
+                "or `watch()` for raw envelopes.",
+                DeprecationWarning,
+                stacklevel=user_stacklevel(),
+            )
+            self._uuid_start = cast(Coroutine[Any, Any, UUID], self._starter())
+        return self._uuid_start
 
     def __await__(self) -> Generator[Any, None, UUID]:
-        warnings.warn(
-            "`await QuerySet.live()` returning the live query's uuid is deprecated since v0.20.0; "
-            "use `async with Model.objects().live() as stream:` for typed events, or `watch()` "
-            "for raw envelopes.",
-            DeprecationWarning,
-            stacklevel=user_stacklevel(),
-        )
-        return self._starter().__await__()
+        return self._uuid_coroutine().__await__()
+
+    def send(self, value: Any) -> Any:
+        """Coroutine protocol, so ``asyncio.create_task(qs.live())`` keeps working (deprecated)."""
+        return self._uuid_coroutine().send(value)
+
+    def throw(self, *args: Any) -> Any:
+        """Coroutine protocol (see :meth:`send`)."""
+        return self._uuid_coroutine().throw(*args)
+
+    def close(self) -> None:
+        """Coroutine protocol (see :meth:`send`). Never touches a started stream."""
+        if self._uuid_start is not None:
+            self._uuid_start.close()
+
+    # -- post_live_change ------------------------------------------------------------------
 
     def _emit(self, event: ModelChangeEvent[T]) -> None:
-        """Send ``post_live_change`` in the background; never block or break the stream."""
+        """Queue ``post_live_change`` for the handler task; never block or break the stream."""
         from .signals import post_live_change
 
         if not post_live_change.has_handlers(self._model):
             return
-        task = asyncio.get_running_loop().create_task(
-            post_live_change.send(
-                self._model,
-                instance=event.instance,
-                action=event.action,
-                record_id=event.record_id,
-                changed_fields=event.changed_fields,
-            )
-        )
-        self._signal_tasks.add(task)
-        task.add_done_callback(self._signal_done)
+        if self._signal_queue is None:
+            self._signal_queue = asyncio.Queue()
+            self._signal_worker = asyncio.get_running_loop().create_task(self._run_signals(self._signal_queue))
+        self._signal_queue.put_nowait(event)
 
-    def _signal_done(self, task: asyncio.Task[None]) -> None:
-        self._signal_tasks.discard(task)
-        if task.cancelled():
+    async def _run_signals(self, queue: asyncio.Queue[ModelChangeEvent[T] | None]) -> None:
+        """Send queued events one at a time, in order, until the end marker."""
+        from .signals import post_live_change
+
+        while (event := await queue.get()) is not None:
+            try:
+                await post_live_change.send(
+                    self._model,
+                    instance=event.instance,
+                    action=event.action,
+                    record_id=event.record_id,
+                    changed_fields=event.changed_fields,
+                )
+            except Exception:
+                logger.exception("post_live_change handler failed for %s", self._model.__name__)
+
+    def _close_signal_queue(self) -> None:
+        if self._signal_queue is not None:
+            self._signal_queue.put_nowait(None)
+
+    async def _finish_signals(self, *, cancel: bool) -> None:
+        worker, self._signal_worker = self._signal_worker, None
+        self._close_signal_queue()
+        self._signal_queue = None
+        if worker is None or worker.done():
             return
-        exc = task.exception()
-        if exc is not None:
-            logger.error("post_live_change handler failed for %s", self._model.__name__, exc_info=exc)
+        if not cancel:
+            try:
+                await asyncio.wait_for(asyncio.shield(worker), self.signal_drain_timeout)
+                return
+            except TimeoutError:
+                logger.warning(
+                    "post_live_change handlers for %s did not finish within %.1fs; cancelling them",
+                    self._model.__name__,
+                    self.signal_drain_timeout,
+                )
+        worker.cancel()
+        # ``wait`` rather than ``await worker``: it does not re-raise the worker's own
+        # CancelledError, yet still lets a cancellation of *this* task propagate.
+        await asyncio.wait({worker})

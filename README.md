@@ -1118,17 +1118,21 @@ async with User.objects().filter(role="admin").live() as stream:
 
 Each item is a `ModelChangeEvent`:
 
-| Attribute        | Type          | Meaning                                                                                         |
-| ---------------- | ------------- | ----------------------------------------------------------------------------------------------- |
-| `action`         | `LiveAction`  | `CREATE`, `UPDATE` or `DELETE`                                                                  |
-| `instance`       | your model    | the record after the change; for `DELETE`, its last state                                       |
-| `record_id`      | `str`         | the affected record, e.g. `"user:abc"`                                                          |
-| `changed_fields` | `list[str]`   | diff mode only: the top-level fields that changed, as Python field names                        |
-| `raw`            | `dict / list` | the payload as received: a dict, or the patch list in diff mode (a 2.x diff `DELETE` is a dict) |
+| Attribute          | Type                      | Meaning                                                                                         |
+| ------------------ | ------------------------- | ----------------------------------------------------------------------------------------------- |
+| `action`           | `LiveAction`              | `CREATE`, `UPDATE` or `DELETE`                                                                  |
+| `instance`         | your model                | the record after the change; for `DELETE`, its last state                                       |
+| `record_id`        | `str`                     | the affected record, e.g. `"user:abc"`                                                          |
+| `changed_fields`   | `list[str]`               | diff mode only: the top-level fields that changed, as Python field names                        |
+| `raw`              | `dict / list`             | the payload as received: a dict, or the patch list in diff mode (a 2.x diff `DELETE` is a dict) |
+| `validation_error` | `ValidationError \| None` | set when the record does not fit the model; `None` otherwise                                    |
 
-A record that does not validate against the model raises `pydantic.ValidationError` from the
-iteration — the stream does not hand you a half-built instance — and the `async with` still
-kills the live query.
+A record that does not validate against the model does **not** end the stream — one bad row
+written by another client, or a `fetch()`-resolved link on a field typed `str`, would otherwise
+stop your `async for` and kill the subscription. The event carries the error in
+`validation_error` and an instance built **without validation** from the record as received,
+the way `exec()` falls back to plain rows. A warning is logged once per stream; check
+`event.validation_error` before trusting `event.instance`.
 
 **What the server filters.** `filter()` (keyword lookups, `Q` objects, `Var` references with
 `variables()`) and `fetch()` are honoured, with field aliases translated as everywhere else.
@@ -1143,9 +1147,13 @@ into a live query: `LIVE SELECT … WHERE status = $s` is accepted, then `$s` ev
 at notification time and the filter matches nothing, silently. So for live queries only, the ORM
 writes each value as a SurrealQL literal — the same approach as the full SurrealDB-ORM — and the
 filter behaves identically on both lines. The encoder is closed: `None`, `bool`, `int`, `float`,
-`str`, `Decimal`, `datetime`, `UUID`, `RecordID`, and lists or dicts of these. Anything else, a
-string containing a NUL character, or an integer beyond 64 bits raises `TypeError` when you call
-`live()`, before anything is sent. Every other query keeps binding parameters.
+`str`, `Decimal`, `datetime` (written in UTC), `UUID`, `RecordID`, and lists or dicts of these.
+Anything else, a string containing a NUL character, an integer beyond 64 bits or a `Decimal`
+SurrealDB would round raises `TypeError` when you call `live()`, before anything is sent. A
+`Var` must be supplied through `variables()` — an unbound reference would read as `NONE` on every
+notification, so `age > $min_age` would match every record; it raises `SurrealDbError` instead
+(server parameters such as `$auth` and `$session` are allowed). Every other query keeps binding
+parameters.
 
 #### Diff mode
 
@@ -1179,9 +1187,12 @@ async def on_player_change(sender, instance, action, record_id, changed_fields, 
         await broadcast({"type": "player_joined", "name": instance.name})
 ```
 
-Handlers run as background tasks, so a slow one never stalls the stream. One that raises is
-logged and does not interrupt the iteration, and handlers still running when the stream stops
-are cancelled. The signal fires only while you iterate a `live()` stream.
+Handlers run on one background task per stream, **in event order** — a slow handler for a
+`CREATE` never lets the `DELETE` that follows overtake it — and never stall the iteration. One
+that raises is logged and does not interrupt anything. Leaving the block normally waits for the
+pending handlers (up to `stream.signal_drain_timeout`, 5 s by default) so the last event's side
+effects are not lost; leaving it on an exception cancels them. The signal fires only while you
+iterate a `live()` stream.
 
 #### Migrating from SurrealDB-ORM
 
@@ -1249,8 +1260,10 @@ opening a second reader on its uuid and leaving the stream's own buffer to grow.
 — useful to fan one subscription out to several consumers, each of which must keep reading.
 
 `await User.objects().live()`, the v0.19.0 way to get the uuid, still works but is deprecated
-(`DeprecationWarning`). `live()` is no longer a coroutine function: `await` it directly, or use
-`asyncio.ensure_future(qs.live())`, since `asyncio.create_task()` only accepts coroutines.
+(`DeprecationWarning`). The returned stream also behaves as a coroutine for that path, so
+`asyncio.create_task(qs.live())` and `asyncio.run(qs.live())` keep working too. Like a coroutine
+it can be awaited once, and an awaited stream refuses to `start()` (and the reverse): the two
+would be separate subscriptions, and leaving the block would kill only one of them.
 
 `subscribe_live()` is **not** a coroutine: call it without `await`. Buffering starts the moment
 you call it rather than at the first iteration, so a write you make in between is still

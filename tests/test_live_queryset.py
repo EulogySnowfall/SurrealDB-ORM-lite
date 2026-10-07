@@ -345,13 +345,6 @@ class TestToChangeEvent:
         assert event.instance.id == "z"
         assert event.changed_fields == ["name"]
 
-    def test_invalid_full_record_raises(self) -> None:
-        from pydantic import ValidationError
-
-        rid = RecordID("Strict", "z")
-        with pytest.raises(ValidationError):
-            to_change_event(Strict, _envelope("CREATE", rid, {"id": rid}), diff=False)
-
     def test_diff_create_on_2x_uses_a_slash_root(self) -> None:
         """SurrealDB 2.x spells the root pointer "/" where 3.x spells it ""."""
         rid = RecordID(TABLE, "a")
@@ -431,20 +424,6 @@ class TestTypedLiveE2E:
         assert (a.instance.id, b.instance.id) == ("x", "y")
 
     @pytest.mark.asyncio
-    async def test_validation_error_propagates_and_still_kills(self) -> None:
-        """Review focus #4."""
-        from pydantic import ValidationError
-
-        async with orm_client("Strict") as client:
-            await _define(client, "Strict")
-            stream = Strict.objects().live()
-            with pytest.raises(ValidationError):
-                async with stream:
-                    await client.query("CREATE Strict:bad SET other = 1;", {})
-                    await _take(stream, 1)
-            assert not stream.is_active
-
-    @pytest.mark.asyncio
     async def test_await_form_still_returns_a_uuid_and_warns(self) -> None:
         async with orm_client(TABLE) as client:
             await _define(client)
@@ -515,31 +494,6 @@ class TestPostLiveChangeE2E:
         assert len(events) == 2
         assert "handler exploded" in caplog.text
 
-    @pytest.mark.asyncio
-    async def test_stop_cancels_in_flight_handlers(self) -> None:
-        started = asyncio.Event()
-        cancelled = asyncio.Event()
-
-        @post_live_change.connect(Ticket)
-        async def slow(sender: type, **kwargs: Any) -> None:
-            started.set()
-            try:
-                await asyncio.sleep(30)
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
-
-        try:
-            async with orm_client(TABLE) as client:
-                await _define(client)
-                async with Ticket.objects().live() as stream:
-                    await client.query(f"CREATE {TABLE}:c SET age = 1;", {})
-                    await _take(stream, 1)
-                    await asyncio.wait_for(started.wait(), timeout=5)
-                await asyncio.wait_for(cancelled.wait(), timeout=5)
-        finally:
-            post_live_change.disconnect(slow, Ticket)
-
     def test_no_task_without_handlers(self) -> None:
         assert not post_live_change.has_handlers(Ticket)
 
@@ -597,14 +551,204 @@ class TestExplicitFormE2E:
         assert "watch()" in message
         assert "await Model.objects().live()" not in message
 
+
+# ==================== PR #199 review fixes — the typed stream ====================
+
+import collections.abc  # noqa: E402
+import logging  # noqa: E402
+
+
+class Linked(BaseSurrealModel):
+    id: str
+    owner: str = ""  # a record link; fetch() turns it into a nested dict
+
+
+class TestInvalidRecords:
+    def test_invalid_record_is_kept_with_its_error(self) -> None:
+        """Review #1: a record that does not fit the model must not end the stream."""
+        from pydantic import ValidationError
+
+        rid = RecordID("Strict", "z")
+        result = {"id": rid, "other": 1}
+        event = to_change_event(Strict, _envelope("CREATE", rid, result), diff=False)
+        assert isinstance(event.validation_error, ValidationError)
+        assert isinstance(event.instance, Strict)
+        assert event.instance.id == "z"
+        assert event.raw is result
+
+    def test_valid_record_has_no_error(self) -> None:
+        rid = RecordID(TABLE, "a")
+        event = to_change_event(Ticket, _envelope("CREATE", rid, {"id": rid, "age": 1}), diff=False)
+        assert event.validation_error is None
+
+    def test_constructed_instance_uses_python_field_names(self) -> None:
+        rid = RecordID("Linked", "l")
+        event = to_change_event(Linked, _envelope("CREATE", rid, {"id": rid, "owner": {"name": "U"}}), diff=False)
+        assert event.validation_error is not None
+        assert event.instance.owner == {"name": "U"}
+
+
+class TestReviewFixesStreamE2E:
     @pytest.mark.asyncio
-    async def test_ensure_future_accepts_the_deprecated_await_form(self) -> None:
-        """CHANGELOG 0.20.0: create_task() needs a coroutine; ensure_future() takes the stream."""
+    async def test_invalid_records_do_not_end_the_stream(self, caplog: Any) -> None:
+        """Review #1, end to end: fetch() resolves a link the model types as str."""
+        async with orm_client("Linked", "Owner") as client:
+            await _define(client, "Linked", "Owner")
+            await client.query("CREATE Owner:1 SET name = 'U';", {})
+            with caplog.at_level(logging.WARNING, logger="surreal_orm_lite.live"):
+                async with Linked.objects().fetch("owner").live() as stream:
+                    await client.query("CREATE Linked:a SET owner = Owner:1;", {})
+                    await client.query("CREATE Linked:b SET owner = Owner:1;", {})
+                    first, second = await _take(stream, 2)
+                    assert stream.is_active
+        assert first.validation_error is not None and second.validation_error is not None
+        assert first.instance.owner["name"] == "U"
+        assert caplog.text.count("does not validate") == 1  # logged once per stream
+
+    @pytest.mark.asyncio
+    async def test_handlers_run_in_event_order(self) -> None:
+        """Review #2: a slow CREATE handler must not let the DELETE handler finish first."""
+        order: list[str] = []
+        done = asyncio.Event()
+
+        @post_live_change.connect(Ticket)
+        async def handler(sender: type, action: LiveAction, **kwargs: Any) -> None:
+            if action == LiveAction.CREATE:
+                await asyncio.sleep(0.3)
+            order.append(action)
+            if len(order) == 2:
+                done.set()
+
+        try:
+            async with orm_client(TABLE) as client:
+                await _define(client)
+                async with Ticket.objects().live() as stream:
+                    await client.query(f"CREATE {TABLE}:o SET age = 1;", {})
+                    await client.query(f"DELETE {TABLE}:o;", {})
+                    await _take(stream, 2)
+                    await asyncio.wait_for(done.wait(), timeout=5)
+        finally:
+            post_live_change.disconnect(handler, Ticket)
+        assert order == [LiveAction.CREATE, LiveAction.DELETE]
+
+    @pytest.mark.asyncio
+    async def test_normal_exit_lets_pending_handlers_finish(self) -> None:
+        """Review #3: breaking out after the last event must not cancel its handler."""
+        finished: list[str] = []
+
+        @post_live_change.connect(Ticket)
+        async def handler(sender: type, record_id: str, **kwargs: Any) -> None:
+            await asyncio.sleep(0.3)
+            finished.append(record_id)
+
+        try:
+            async with orm_client(TABLE) as client:
+                await _define(client)
+                async with Ticket.objects().live() as stream:
+                    await client.query(f"CREATE {TABLE}:n SET age = 1;", {})
+                    await _take(stream, 1)
+        finally:
+            post_live_change.disconnect(handler, Ticket)
+        assert finished == [f"{TABLE}:n"]
+
+    @pytest.mark.asyncio
+    async def test_error_exit_cancels_pending_handlers(self) -> None:
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        @post_live_change.connect(Ticket)
+        async def slow(sender: type, **kwargs: Any) -> None:
+            started.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        try:
+            async with orm_client(TABLE) as client:
+                await _define(client)
+                with pytest.raises(RuntimeError, match="boom"):
+                    async with Ticket.objects().live() as stream:
+                        await client.query(f"CREATE {TABLE}:c SET age = 1;", {})
+                        await _take(stream, 1)
+                        await asyncio.wait_for(started.wait(), timeout=5)
+                        raise RuntimeError("boom")
+                await asyncio.wait_for(cancelled.wait(), timeout=5)
+        finally:
+            post_live_change.disconnect(slow, Ticket)
+
+    @pytest.mark.asyncio
+    async def test_drain_gives_up_after_the_timeout(self, caplog: Any) -> None:
+        cancelled = asyncio.Event()
+
+        @post_live_change.connect(Ticket)
+        async def stuck(sender: type, **kwargs: Any) -> None:
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        try:
+            async with orm_client(TABLE) as client:
+                await _define(client)
+                stream = Ticket.objects().live()
+                stream.signal_drain_timeout = 0.2
+                async with stream:
+                    await client.query(f"CREATE {TABLE}:t SET age = 1;", {})
+                    await _take(stream, 1)
+                await asyncio.wait_for(cancelled.wait(), timeout=5)
+        finally:
+            post_live_change.disconnect(stuck, Ticket)
+        assert "post_live_change" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_live_is_a_coroutine_again_for_create_task(self) -> None:
+        """Review #6: v0.19.0 code passing ``qs.live()`` to create_task/run keeps working."""
         async with orm_client(TABLE) as client:
             await _define(client)
-            with pytest.raises(TypeError):
-                asyncio.create_task(Ticket.objects().live())  # type: ignore[arg-type]
-            with pytest.warns(DeprecationWarning):
-                live_id = await asyncio.ensure_future(Ticket.objects().live())
+            assert isinstance(Ticket.objects().live(), collections.abc.Coroutine)
+            with pytest.warns(DeprecationWarning, match="async with"):
+                live_id = await asyncio.create_task(Ticket.objects().live())
             assert isinstance(live_id, UUID)
             await SurrealDBConnectionManager.kill(live_id)
+
+    @pytest.mark.asyncio
+    async def test_an_awaited_stream_refuses_to_start(self) -> None:
+        """Review #7: ``uid = await s`` then ``async with s`` used to open two live queries and
+        kill only one."""
+        async with orm_client(TABLE) as client:
+            await _define(client)
+            stream = Ticket.objects().live()
+            with pytest.warns(DeprecationWarning):
+                live_id = await stream
+            try:
+                with pytest.raises(SurrealDbError, match="awaited"):
+                    await stream.start()
+                with pytest.raises(RuntimeError):
+                    await stream
+            finally:
+                await SurrealDBConnectionManager.kill(live_id)
+
+    @pytest.mark.asyncio
+    async def test_a_started_stream_refuses_to_be_awaited(self) -> None:
+        async with orm_client(TABLE) as client:
+            await _define(client)
+            async with Ticket.objects().live() as stream:
+                with pytest.raises(SurrealDbError, match="already started"):
+                    await stream
+
+    @pytest.mark.asyncio
+    async def test_http_is_refused_before_any_client_is_opened(self) -> None:
+        """Review #10."""
+        SurrealDBConnectionManager.set_connection(
+            url="http://localhost:8000", user="root", password="root", namespace="ns", database="db"
+        )
+        try:
+            for build in (lambda: Ticket.objects().watch(), lambda: Ticket.objects().live()):
+                with pytest.raises(SurrealDbError, match="WebSocket"):
+                    await build().start()
+                assert SurrealDBConnectionManager._cached_client() is None
+        finally:
+            await SurrealDBConnectionManager.close_connection()
