@@ -32,6 +32,7 @@ from typing import Any
 from uuid import UUID
 
 from ._sdk import RecordID
+from .exceptions import SurrealDbError
 
 __all__ = ["inline_variables", "to_surql_literal"]
 
@@ -46,6 +47,10 @@ _DECIMAL_SCALE_MAX = 28
 
 # A ``$name`` reference. Greedy, so ``$_f10`` is never read as ``$_f1`` followed by ``0``.
 _REFERENCE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+
+# Parameters the server itself defines while it evaluates a live query. They are the only
+# references allowed to stay unbound: any other one would read as NONE on every notification.
+_SERVER_PARAMETERS = frozenset({"auth", "session", "token", "access", "scope", "this", "parent"})
 
 _SUPPORTED = "None, bool, int, float, str, Decimal, datetime, UUID, RecordID, and lists or dicts of these"
 
@@ -73,16 +78,25 @@ def _record_id(value: RecordID) -> str:
     key = value.id
     if isinstance(key, str):
         id_part = _identifier(key)
+    elif isinstance(key, UUID):
+        # ``CREATE user:uuid()`` keys come back from the SDK as ``uuid.UUID``.
+        id_part = to_surql_literal(key)
     elif (isinstance(key, int) and not isinstance(key, bool)) or isinstance(key, list | tuple | Mapping):
         id_part = to_surql_literal(key)
     else:
-        raise TypeError(f"Cannot inline a record id whose key is a {type(key).__name__}; supported keys: str, int, list, dict.")
+        raise TypeError(
+            f"Cannot inline a record id whose key is a {type(key).__name__}; supported keys: str, int, UUID, list, dict."
+        )
     return f"{_identifier(value.table_name)}:{id_part}"
 
 
 def _decimal(value: Decimal) -> str:
     text = format(value, "f")
     whole, _, fraction = text.lstrip("-").partition(".")
+    if len(fraction) > _DECIMAL_SCALE_MAX:
+        # Trailing zeros carry no value: 1.000…0 is exactly 1, so drop them before judging.
+        fraction = fraction.rstrip("0")
+        text = text.rstrip("0").rstrip(".")
     if len(fraction) > _DECIMAL_SCALE_MAX:
         raise TypeError(
             f"Cannot inline Decimal({str(value)!r}): SurrealDB decimals keep at most "
@@ -151,17 +165,29 @@ def inline_variables(sql: str, variables: Mapping[str, Any]) -> str:
 
     The replacement is a callable, so the rendered text is inserted verbatim (``re.sub`` would
     otherwise read backslashes in a replacement *string* as escapes) and is never scanned again
-    (a value that spells ``$other`` stays a string). A reference with no entry in *variables* —
-    ``$auth``, ``$session``, a ``Var`` the caller did not supply — is left as written. Only the
-    referenced values are rendered, so an unused variable of an unsupported type is harmless.
+    (a value that spells ``$other`` stays a string). Only the referenced values are rendered, so
+    an unused variable of an unsupported type is harmless.
+
+    A reference with no entry in *variables* is refused, except the parameters the server
+    defines itself (``$auth``, ``$session``, ``$token``, ``$access``, ``$scope``, ``$this``,
+    ``$parent``): an unbound ``$min_age`` reads as ``NONE`` on every notification, so
+    ``age > $min_age`` would silently match every record and ``age = $min_age`` none.
 
     :raises TypeError: naming the variable, if a referenced value cannot be inlined.
+    :raises SurrealDbError: naming the variable, if a reference is neither bound nor a server
+        parameter.
     """
 
     def render(match: re.Match[str]) -> str:
         name = match.group(1)
         if name not in variables:
-            return match.group(0)
+            if name in _SERVER_PARAMETERS:
+                return match.group(0)
+            raise SurrealDbError(
+                f"${name} is not bound: pass it with .variables({name}=...). In a live query an "
+                f"unbound reference reads as NONE on every notification, so the filter would "
+                f"silently match everything or nothing."
+            )
         try:
             return to_surql_literal(variables[name])
         except TypeError as exc:

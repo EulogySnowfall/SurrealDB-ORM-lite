@@ -208,6 +208,8 @@ ROUND_TRIP: list[Any] = [
     RecordID("we-ird", "a b"),
     RecordID("user", [1, "a"]),
     RecordID("user", {"a": 1}),
+    RecordID("user", UUID("0190c4b6-0000-7000-8000-000000000000")),
+    Decimal("1." + "0" * 29),
     [1, "a", None, [True]],
     {"a b": 1, "it's": "x", "nested": {"k": [1]}},
 ]
@@ -229,3 +231,56 @@ class TestRoundTripE2E:
         async with orm_client() as client:
             result = await client.query(f"RETURN {to_surql_literal(value)} == $p;", {"p": value})
         assert result is True
+
+
+# ==================== PR #199 review fixes ====================
+
+
+class TestReviewFixesEncoder:
+    def test_record_id_with_a_uuid_key(self) -> None:
+        """Review #5: ``CREATE user:uuid()`` keys decode to ``uuid.UUID``."""
+        key = UUID("0190c4b6-0000-7000-8000-000000000000")
+        assert to_surql_literal(RecordID("user", key)) == "`user`:u'0190c4b6-0000-7000-8000-000000000000'"
+
+    def test_trailing_zeros_do_not_count_against_the_scale(self) -> None:
+        """Review #8: 1.000…0 (29 zeros) is exactly 1 — nothing would be rounded."""
+        assert to_surql_literal(Decimal("1." + "0" * 29)) == "1dec"
+        assert to_surql_literal(Decimal("2.50")) == "2.50dec"
+        assert to_surql_literal(Decimal("-0.000")) == "-0.000dec"
+
+    def test_unbound_reference_is_refused(self) -> None:
+        """Review #4: an unbound $name evaluates to NONE on every notification, so
+        ``age > $min_age`` silently matches every record (and ``=`` none)."""
+        from surreal_orm_lite.exceptions import SurrealDbError
+
+        with pytest.raises(SurrealDbError, match=r"\$min_age.*variables\(min_age="):
+            inline_variables("age > $min_age", {})
+
+    @pytest.mark.parametrize("name", ["auth", "session", "token", "access", "scope", "this", "parent"])
+    def test_server_parameters_are_left_alone(self, name: str) -> None:
+        assert inline_variables(f"owner = ${name}", {}) == f"owner = ${name}"
+
+    def test_where_builders_emit_dollar_only_as_references(self) -> None:
+        """Review #9: inlining rewrites every ``$name`` in the WHERE, so the builders must never
+        write a ``$`` of their own. Pins that invariant for every lookup and for Q objects."""
+        import re
+
+        from surreal_orm_lite import Q
+        from surreal_orm_lite.constants import LOOKUP_OPERATORS
+        from surreal_orm_lite.utils import build_filter_condition
+
+        reference = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
+        bound = re.compile(r"\$_f\d+")
+        for lookup in LOOKUP_OPERATORS:
+            if lookup == "isnull":
+                value: Any = True
+            elif lookup in ("in", "not_in", "containsall", "containsany"):
+                value = ["$a", "b$c"]
+            else:
+                value = "x$y $z"
+            sql, variables, _ = build_filter_condition("field", lookup, value, 0, "T")
+            assert "$" not in reference.sub("", sql), (lookup, sql)
+            assert not bound.search(inline_variables(sql, variables)), (lookup, sql)
+        with pytest.warns(DeprecationWarning):  # "$x" is the deprecated variable-reference form
+            sql, variables, _ = (Q(a="$x") | ~Q(b__in=["$y"])).to_sql(0, "T")
+        assert "$" not in reference.sub("", sql)

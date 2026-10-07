@@ -1042,11 +1042,14 @@ class QuerySet:
         """
         self._reject_live_clauses()
         where_clause, where_vars = self._build_where()
+        # Only the WHERE fragment is rewritten: it is the one place references live, and the
+        # table name and FETCH list never pass through the inliner.
+        where_clause = inline_variables(where_clause, {**self._variables, **where_vars})
         projection = "DIFF" if diff else "*"
         query = f"LIVE SELECT {projection} FROM {self._model_table}{where_clause}"
         if self._fetch_fields:
             query += f" FETCH {', '.join(self._fetch_fields)}"
-        return inline_variables(query, {**self._variables, **where_vars}) + ";"
+        return query + ";"
 
     def _live_starter(self, diff: bool) -> Callable[[], Awaitable[UUID]]:
         """Compile now, and return the coroutine function that starts the live query.

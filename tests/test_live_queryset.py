@@ -83,9 +83,15 @@ class TestCompileLive:
         sql = Ticket.objects().filter(age__gte=Var("min")).variables(min=5)._compile_live(False)
         assert sql.endswith("WHERE age >= 5;")
 
-    def test_unbound_var_is_left_as_a_reference(self) -> None:
-        sql = Ticket.objects().filter(age__gte=Var("missing"))._compile_live(False)
-        assert sql.endswith("WHERE age >= $missing;")
+    def test_unbound_var_is_refused(self) -> None:
+        """PR #199 review #4: unbound, ``$missing`` would read as NONE and ``age >= NONE``
+        matches every record."""
+        with pytest.raises(SurrealDbError, match=r"\$missing is not bound"):
+            Ticket.objects().filter(age__gte=Var("missing"))._compile_live(False)
+
+    def test_server_parameter_var_is_left_as_a_reference(self) -> None:
+        sql = Ticket.objects().filter(owner=Var("auth"))._compile_live(False)
+        assert sql.endswith("WHERE owner = $auth;")
 
     def test_record_id_filter_is_coerced(self) -> None:
         sql = Ticket.objects().filter(id="t1")._compile_live(False)
