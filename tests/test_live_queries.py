@@ -644,7 +644,7 @@ class TestLiveErrorPathsE2E:
             SurrealDBConnectionManager.subscribe_live("00000000-0000-0000-0000-000000000000")
         message = str(excinfo.value)
         assert "event loop" in message
-        assert "live()" in message
+        assert "watch()" in message
 
     @pytest.mark.asyncio
     async def test_a_kill_failure_that_is_not_an_unknown_uuid_is_reported(self) -> None:

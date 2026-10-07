@@ -1118,13 +1118,13 @@ async with User.objects().filter(role="admin").live() as stream:
 
 Each item is a `ModelChangeEvent`:
 
-| Attribute        | Type          | Meaning                                                                  |
-| ---------------- | ------------- | ------------------------------------------------------------------------ |
-| `action`         | `LiveAction`  | `CREATE`, `UPDATE` or `DELETE`                                           |
-| `instance`       | your model    | the record after the change; for `DELETE`, its last state                |
-| `record_id`      | `str`         | the affected record, e.g. `"user:abc"`                                   |
-| `changed_fields` | `list[str]`   | diff mode only: the top-level fields that changed, as Python field names |
-| `raw`            | `dict / list` | the notification's payload as received                                   |
+| Attribute        | Type          | Meaning                                                                                         |
+| ---------------- | ------------- | ----------------------------------------------------------------------------------------------- |
+| `action`         | `LiveAction`  | `CREATE`, `UPDATE` or `DELETE`                                                                  |
+| `instance`       | your model    | the record after the change; for `DELETE`, its last state                                       |
+| `record_id`      | `str`         | the affected record, e.g. `"user:abc"`                                                          |
+| `changed_fields` | `list[str]`   | diff mode only: the top-level fields that changed, as Python field names                        |
+| `raw`            | `dict / list` | the payload as received: a dict, or the patch list in diff mode (a 2.x diff `DELETE` is a dict) |
 
 A record that does not validate against the model raises `pydantic.ValidationError` from the
 iteration — the stream does not hand you a half-built instance — and the `async with` still
@@ -1226,29 +1226,35 @@ to quote a magic value.
 
 #### The explicit form
 
-When you need the uuid itself — to hand it to another task, or to kill the subscription from
-somewhere else — start a stream yourself and use the primitives:
+When the subscription must outlive one block — read in one task, stopped from another — start
+the stream yourself, hand **the stream** to the reader, and kill it by uuid from anywhere:
 
 ```python
 from surreal_orm_lite import SurrealDBConnectionManager
 
-stream = await User.objects().filter(role="admin").watch().start()
-live_id = stream.live_id
+stream = await User.objects().filter(role="admin").watch().start()  # or .live().start()
 
-async for notif in SurrealDBConnectionManager.subscribe_live(live_id):
-    handle(notif)
-    if enough:
-        break
+async def reader() -> None:
+    async for notif in stream:  # ends when the live query is killed
+        handle(notif)
 
-await SurrealDBConnectionManager.kill(live_id)
+task = asyncio.create_task(reader())
+...
+await SurrealDBConnectionManager.kill(stream.live_id)
 ```
 
+A started stream buffers every notification until it is read, so always read **it** rather than
+opening a second reader on its uuid and leaving the stream's own buffer to grow.
+`SurrealDBConnectionManager.subscribe_live(live_id)` adds another reader to the same live query
+— useful to fan one subscription out to several consumers, each of which must keep reading.
+
 `await User.objects().live()`, the v0.19.0 way to get the uuid, still works but is deprecated
-(`DeprecationWarning`) in favour of the two forms above.
+(`DeprecationWarning`). `live()` is no longer a coroutine function: `await` it directly, or use
+`asyncio.ensure_future(qs.live())`, since `asyncio.create_task()` only accepts coroutines.
 
 `subscribe_live()` is **not** a coroutine: call it without `await`. Buffering starts the moment
 you call it rather than at the first iteration, so a write you make in between is still
-reported. Several readers can subscribe to the same uuid and each receives every notification.
+reported. Each reader on a uuid receives every notification.
 
 A read that times out loses nothing, so polling with a deadline is safe:
 

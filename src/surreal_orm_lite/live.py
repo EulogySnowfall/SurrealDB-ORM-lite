@@ -408,7 +408,8 @@ class ModelChangeEvent(Generic[T]):
     :ivar changed_fields: diff mode only — the top-level fields the patches touch, as Python
         field names (aliases resolved).
     :ivar raw: the notification's ``result`` as received: a dict, or in diff mode the list of
-        patches. SurrealDB's diff is JSON Patch **extended**: a changed string arrives as
+        patches — except a diff-mode ``DELETE`` on SurrealDB 2.x, which is the whole last record
+        (a dict). SurrealDB's diff is JSON Patch **extended**: a changed string arrives as
         ``{"op": "change", "value": "<diff-match-patch text>"}`` rather than a ``replace``.
     """
 

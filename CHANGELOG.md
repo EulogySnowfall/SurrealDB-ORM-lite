@@ -39,7 +39,10 @@ Typed live queries, with the same API as the full SurrealDB-ORM: code written ag
 
 - **`await QuerySet.live()` is deprecated.** It still starts a live query and returns its uuid
   (the v0.19.0 contract), with a `DeprecationWarning` pointing at `async with ….live()` or
-  `watch()`. For the uuid, use `(await qs.watch().start()).live_id`.
+  `watch()`. `live()` is therefore no longer a coroutine function: `await qs.live()`,
+  `gather` and `wait_for` keep working, but `asyncio.create_task(qs.live())` raises `TypeError`
+  — use `asyncio.ensure_future(qs.live())`. To hold a subscription across tasks, start the stream
+  (`await qs.watch().start()`), read **it**, and stop it with `kill(stream.live_id)`.
 - Every live query now starts through `LIVE SELECT` sent with `query()` rather than the SDK's
   table-only `live()`. `filter()`, `fetch()` and `variables()` are no longer refused; `select()`,
   `values()`, `annotate()`, `order_by()`, `limit()`, `offset()` and `objects(tx=)` still are, by

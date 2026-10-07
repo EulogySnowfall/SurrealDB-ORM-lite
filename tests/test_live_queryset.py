@@ -545,3 +545,60 @@ class TestExportsV020:
         for name in ("LiveModelStream", "ModelChangeEvent", "post_live_change", "LiveAction", "LiveStream"):
             assert name in orm.__all__
             assert getattr(orm, name) is not None
+
+
+# ==================== Final review fixes ====================
+
+
+class TestExplicitFormE2E:
+    @pytest.mark.asyncio
+    async def test_documented_explicit_form_keeps_no_unread_buffer(self) -> None:
+        """README "The explicit form": hand the started stream to a reader task and kill it by
+        uuid from elsewhere. One reader registered, nothing buffered unread, and the kill ends
+        the reader's loop."""
+        async with orm_client(TABLE) as client:
+            await _define(client)
+            stream = await Ticket.objects().watch().start()
+            live_id = stream.live_id
+            seen: list[Any] = []
+
+            async def reader() -> None:
+                async for notif in stream:
+                    seen.append(notif)
+
+            task = asyncio.create_task(reader())
+            try:
+                for i in range(5):
+                    await client.query(f"CREATE {TABLE}:x{i} SET age = {i};", {})
+                assert len(client.live_queues[str(live_id)]) == 1
+                for _ in range(50):
+                    if len(seen) == 5:
+                        break
+                    await asyncio.sleep(0.05)
+            finally:
+                await SurrealDBConnectionManager.kill(live_id)
+            await asyncio.wait_for(task, timeout=5)
+        assert len(seen) == 5
+
+    @pytest.mark.asyncio
+    async def test_subscribe_live_without_a_connection_points_at_the_current_api(self) -> None:
+        from surreal_orm_lite import SurrealDBConnectionManager as Manager
+
+        await Manager.close_connection()
+        with pytest.raises(SurrealDbError) as excinfo:
+            Manager.subscribe_live("00000000-0000-0000-0000-000000000000")
+        message = str(excinfo.value)
+        assert "watch()" in message
+        assert "await Model.objects().live()" not in message
+
+    @pytest.mark.asyncio
+    async def test_ensure_future_accepts_the_deprecated_await_form(self) -> None:
+        """CHANGELOG 0.20.0: create_task() needs a coroutine; ensure_future() takes the stream."""
+        async with orm_client(TABLE) as client:
+            await _define(client)
+            with pytest.raises(TypeError):
+                asyncio.create_task(Ticket.objects().live())  # type: ignore[arg-type]
+            with pytest.warns(DeprecationWarning):
+                live_id = await asyncio.ensure_future(Ticket.objects().live())
+            assert isinstance(live_id, UUID)
+            await SurrealDBConnectionManager.kill(live_id)

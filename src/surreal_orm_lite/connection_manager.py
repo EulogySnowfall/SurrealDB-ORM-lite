@@ -918,22 +918,26 @@ class SurrealDBConnectionManager:
 
         Not a coroutine: call it without ``await`` and iterate the result directly::
 
-            live_id = await User.objects().live()
-            async for notif in SurrealDBConnectionManager.subscribe_live(live_id):
+            stream = await User.objects().watch().start()
+            async for notif in SurrealDBConnectionManager.subscribe_live(stream.live_id):
                 print(notif["action"], notif["result"])
+
+        Prefer reading ``stream`` itself: it already buffers every notification, so a second
+        reader here is only for fanning one live query out to several consumers, each of which
+        must keep reading.
 
         Buffering starts the moment this is called, not at the first iteration, so a write
         made between the two is still reported. Each envelope is the server's own dict —
         ``action``, ``id``, ``record``, ``result``, plus ``session`` on SurrealDB 3.x — with
-        its values left in SDK types (``RecordID``, ``Datetime``). Deserializing them into
-        model instances is v0.20.0.
+        its values left in SDK types (``RecordID``, ``Datetime``). For model instances, use
+        :meth:`QuerySet.live`.
 
         The iteration ends when the live query is killed or the connection is closed, on
         either server line. A read cancelled by a timeout loses nothing, so
         ``asyncio.wait_for(anext(stream), timeout)`` is a safe way to poll; ``aclose()`` stops
         this reader without killing the live query.
 
-        :param query_uuid: the uuid returned by :meth:`QuerySet.live`.
+        :param query_uuid: the uuid of a running live query, e.g. ``stream.live_id``.
         :raises SurrealDbError: on a non-WebSocket connection, or if no client is connected on
             this event loop.
         """
@@ -962,7 +966,8 @@ class SurrealDBConnectionManager:
         if client is None:
             raise SurrealDbError(
                 "No SurrealDB client is connected on this event loop. Start the live query "
-                "with `await Model.objects().live()` before subscribing to it."
+                "first, e.g. `stream = await Model.objects().watch().start()`, then subscribe "
+                "to `stream.live_id`."
             )
         return client
 
@@ -980,7 +985,7 @@ class SurrealDBConnectionManager:
         new connection could not own, and it would turn the ``__aexit__`` of a ``watch()`` block
         that outlived its connection into a network call.
 
-        :param query_uuid: the uuid returned by :meth:`QuerySet.live`.
+        :param query_uuid: the uuid of a running live query, e.g. ``stream.live_id``.
         :raises SurrealDbError: if the server refuses the kill for a reason other than an
             unknown uuid. The readers are released anyway, but the uuid is **not** recorded as
             dead — the subscription is still running, so a retry can re-attach to it.
