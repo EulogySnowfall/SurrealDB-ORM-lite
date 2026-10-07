@@ -412,7 +412,8 @@ class ModelChangeEvent(Generic[T]):
     :ivar validation_error: set when the record does not validate against the model — e.g. a
         ``fetch()``-resolved link on a field typed ``str``, or a row another client wrote with a
         missing field. ``instance`` is then built **without validation** from the record as
-        received, and the stream carries on. ``None`` for every valid event.
+        received, and the stream carries on; ``post_live_change`` is not sent for such an event.
+        ``None`` for every valid event.
     :ivar raw: the notification's ``result`` as received: a dict, or in diff mode the list of
         patches — except a diff-mode ``DELETE`` on SurrealDB 2.x, which is the whole last record
         (a dict). SurrealDB's diff is JSON Patch **extended**: a changed string arrives as
@@ -507,7 +508,8 @@ class LiveModelStream(Generic[T]):
 
     **``post_live_change`` handlers** run on one background task per stream, in event order, so
     a slow handler never stalls the iteration and never lets a later event's handler overtake
-    it. Leaving the block normally waits up to :attr:`signal_drain_timeout` seconds for the
+    it. They only receive validated instances: an event with a ``validation_error`` is yielded
+    to the iterating code but not signalled. Leaving the block normally waits up to :attr:`signal_drain_timeout` seconds for the
     pending handlers to finish; leaving it on an exception cancels them.
 
     **Deprecated v0.19.0 form:** ``await qs.live()`` still starts a live query and returns its
@@ -593,15 +595,21 @@ class LiveModelStream(Generic[T]):
             self._close_signal_queue()
             raise
         event = to_change_event(self._model, envelope, diff=self._diff)
-        if event.validation_error is not None and not self._warned_invalid:
+        if event.validation_error is None:
+            self._emit(event)
+        elif not self._warned_invalid:
             self._warned_invalid = True
+            # Locations and error types only: the error's own text embeds the record's values,
+            # which may be anything the table holds (hashes, emails, tokens).
+            problems = [(e["loc"], e["type"]) for e in event.validation_error.errors(include_input=False)]
             logger.warning(
-                "A live %s record does not validate against the model; events carry the error in "
-                "`validation_error` and an unvalidated instance (logged once per stream): %s",
+                "A live %s record (%s) does not validate against the model: %s. Events carry the "
+                "error in `validation_error` and an unvalidated instance; post_live_change is not "
+                "sent for them. Logged once per stream.",
                 self._model.__name__,
-                event.validation_error,
+                event.record_id,
+                problems,
             )
-        self._emit(event)
         return event
 
     async def __aenter__(self) -> LiveModelStream[T]:

@@ -752,3 +752,44 @@ class TestReviewFixesStreamE2E:
                 assert SurrealDBConnectionManager._cached_client() is None
         finally:
             await SurrealDBConnectionManager.close_connection()
+
+
+class TestInvalidRecordSafetyE2E:
+    @pytest.mark.asyncio
+    async def test_the_warning_never_logs_record_values(self, caplog: Any) -> None:
+        """Security review: the ValidationError text embeds the input values."""
+        async with orm_client("Linked", "Owner") as client:
+            await _define(client, "Linked", "Owner")
+            await client.query("CREATE Owner:1 SET secret = 'S3CRET-VALUE';", {})
+            with caplog.at_level(logging.WARNING, logger="surreal_orm_lite.live"):
+                async with Linked.objects().fetch("owner").live() as stream:
+                    await client.query("CREATE Linked:a SET owner = Owner:1;", {})
+                    await _take(stream, 1)
+        assert "does not validate" in caplog.text
+        assert "owner" in caplog.text
+        assert "S3CRET-VALUE" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_handlers_only_receive_validated_instances(self) -> None:
+        """Security review: handlers written for the full ORM assume a validated instance."""
+        received: list[str] = []
+        done = asyncio.Event()
+
+        @post_live_change.connect(Linked)
+        async def handler(sender: type, record_id: str, **kwargs: Any) -> None:
+            received.append(record_id)
+            done.set()
+
+        try:
+            async with orm_client("Linked", "Owner") as client:
+                await _define(client, "Linked", "Owner")
+                await client.query("CREATE Owner:1 SET name = 'U';", {})
+                async with Linked.objects().live() as stream:
+                    await client.query("CREATE Linked:bad SET owner = 42;", {})
+                    await client.query("CREATE Linked:ok SET owner = 'plain';", {})
+                    bad, ok = await _take(stream, 2)
+                    await asyncio.wait_for(done.wait(), timeout=5)
+        finally:
+            post_live_change.disconnect(handler, Linked)
+        assert bad.validation_error is not None and ok.validation_error is None
+        assert received == ["Linked:ok"]

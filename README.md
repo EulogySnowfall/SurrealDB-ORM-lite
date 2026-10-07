@@ -1131,8 +1131,10 @@ A record that does not validate against the model does **not** end the stream â€
 written by another client, or a `fetch()`-resolved link on a field typed `str`, would otherwise
 stop your `async for` and kill the subscription. The event carries the error in
 `validation_error` and an instance built **without validation** from the record as received,
-the way `exec()` falls back to plain rows. A warning is logged once per stream; check
-`event.validation_error` before trusting `event.instance`.
+the way `exec()` falls back to plain rows. Check `event.validation_error` before trusting
+`event.instance`; `post_live_change` handlers are not called for such events, so they only ever
+see validated instances. A warning naming the failing fields (never their values) is logged once
+per stream.
 
 **What the server filters.** `filter()` (keyword lookups, `Q` objects, `Var` references with
 `variables()`) and `fetch()` are honoured, with field aliases translated as everywhere else.

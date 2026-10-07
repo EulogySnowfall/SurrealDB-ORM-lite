@@ -35,8 +35,9 @@ Typed live queries, with the same API as the full SurrealDB-ORM: code written ag
   a normal exit waits for pending handlers (`signal_drain_timeout`, 5 s), an exception cancels
   them.
 - **`ModelChangeEvent.validation_error`** — a record that does not fit the model no longer ends
-  the stream: the event carries the error and an unvalidated instance, and a warning is logged
-  once per stream.
+  the stream: the event carries the error and an unvalidated instance, `post_live_change` is not
+  sent for it, and a warning naming the failing fields — never their values — is logged once per
+  stream.
 - **`watch(diff=)`**, and `watch()` now honours the same filters as `live()`.
 - `LiveModelStream`, `ModelChangeEvent` and `post_live_change` are exported from the package root.
 
