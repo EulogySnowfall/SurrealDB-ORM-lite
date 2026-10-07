@@ -26,7 +26,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
@@ -37,6 +37,12 @@ __all__ = ["inline_variables", "to_surql_literal"]
 
 _INT64_MIN = -(2**63)
 _INT64_MAX = 2**63 - 1
+
+# SurrealDB decimals (2.x and 3.x alike) hold a 96-bit mantissa and at most 28 fractional
+# digits. A 29th digit is rounded away without an error, which would silently move a filter
+# boundary, so both limits are refused up front.
+_DECIMAL_MANTISSA_MAX = 2**96 - 1
+_DECIMAL_SCALE_MAX = 28
 
 # A ``$name`` reference. Greedy, so ``$_f10`` is never read as ``$_f1`` followed by ``0``.
 _REFERENCE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
@@ -74,11 +80,25 @@ def _record_id(value: RecordID) -> str:
     return f"{_identifier(value.table_name)}:{id_part}"
 
 
+def _decimal(value: Decimal) -> str:
+    text = format(value, "f")
+    whole, _, fraction = text.lstrip("-").partition(".")
+    if len(fraction) > _DECIMAL_SCALE_MAX:
+        raise TypeError(
+            f"Cannot inline Decimal({str(value)!r}): SurrealDB decimals keep at most "
+            f"{_DECIMAL_SCALE_MAX} fractional digits and would round the rest away silently."
+        )
+    if int(whole + fraction) > _DECIMAL_MANTISSA_MAX:
+        raise TypeError(f"Cannot inline Decimal({str(value)!r}): SurrealDB decimals hold a 96-bit mantissa.")
+    return f"{text}dec"
+
+
 def to_surql_literal(value: Any) -> str:
     """Return the SurrealQL literal that means exactly *value*.
 
     :raises TypeError: for a type with no verified literal form, a string containing ``\\x00``,
-        an ``int`` outside signed 64-bit, a non-finite ``Decimal`` or a non-``str`` dict key.
+        an ``int`` outside signed 64-bit, a ``Decimal`` that is non-finite or beyond SurrealDB's
+        28 fractional digits / 96-bit mantissa, or a non-``str`` dict key.
     """
     if value is None:
         return "NONE"
@@ -99,11 +119,13 @@ def to_surql_literal(value: Any) -> str:
     if isinstance(value, Decimal):
         if not value.is_finite():
             raise TypeError(f"Cannot inline Decimal({str(value)!r}): only finite decimals have a literal form.")
-        return f"{format(value, 'f')}dec"
+        return _decimal(value)
     if isinstance(value, datetime):
-        text = value.isoformat()
-        # A naive datetime is what the SDK itself sends as UTC; say so explicitly.
-        return f"d'{text}'" if value.tzinfo is not None else f"d'{text}Z'"
+        # Always UTC: an offset with seconds (historic local mean time, e.g. +00:09:21) is a parse
+        # error on 2.x and compared wrongly on 3.x. A naive datetime is what the SDK itself sends
+        # as UTC, so it is taken as UTC too.
+        utc = value.astimezone(UTC) if value.tzinfo is not None else value
+        return f"d'{utc.replace(tzinfo=None).isoformat()}Z'"
     if isinstance(value, UUID):
         return f"u'{value}'"
     if isinstance(value, RecordID):

@@ -91,8 +91,25 @@ class TestScalars:
 
     def test_datetimes(self) -> None:
         aware = datetime(2026, 1, 1, 0, 0, 0, 123456, tzinfo=UTC)
-        assert to_surql_literal(aware) == "d'2026-01-01T00:00:00.123456+00:00'"
+        assert to_surql_literal(aware) == "d'2026-01-01T00:00:00.123456Z'"
         assert to_surql_literal(datetime(2026, 1, 1)) == "d'2026-01-01T00:00:00Z'"
+
+    def test_aware_datetimes_are_rendered_in_utc(self) -> None:
+        """An offset with seconds (historic local mean time) parses on neither line correctly:
+        2.x rejects it and 3.x compares it wrongly. UTC is unambiguous on both."""
+        odd = datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=5, minutes=30, seconds=15)))
+        assert to_surql_literal(odd) == "d'2025-12-31T18:29:45Z'"
+
+    def test_decimal_beyond_28_fractional_digits_is_refused(self) -> None:
+        """SurrealDB decimals keep 28 fractional digits; a 29th is rounded away silently."""
+        assert to_surql_literal(Decimal("1E-28")) == "0.0000000000000000000000000001dec"
+        with pytest.raises(TypeError, match="28"):
+            to_surql_literal(Decimal("1E-29"))
+
+    def test_decimal_beyond_96_bits_is_refused(self) -> None:
+        assert to_surql_literal(Decimal(2**96 - 1)) == f"{2**96 - 1}dec"
+        with pytest.raises(TypeError, match="96-bit"):
+            to_surql_literal(Decimal(2**96))
 
     def test_uuid(self) -> None:
         value = UUID("0190c4b6-0000-7000-8000-000000000000")
@@ -180,6 +197,8 @@ ROUND_TRIP: list[Any] = [
     Decimal("0.000001"),
     datetime(2026, 1, 1, 0, 0, 0, 123456, tzinfo=UTC),
     datetime(2026, 1, 1, 2, 0, tzinfo=timezone(timedelta(hours=2))),
+    -(2**63),
+    1e-05,
     datetime(2026, 1, 1),
     UUID("0190c4b6-0000-7000-8000-000000000000"),
     RecordID("user", 1),
@@ -195,6 +214,15 @@ ROUND_TRIP: list[Any] = [
 
 
 class TestRoundTripE2E:
+    @pytest.mark.asyncio
+    async def test_offset_with_seconds_is_the_right_instant(self) -> None:
+        """Checked against ``time::unix`` rather than a bound parameter: the SDK itself encodes
+        this datetime wrongly (3.x drops the offset's seconds; 2.x loses the connection)."""
+        value = datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=5, minutes=30, seconds=15)))
+        async with orm_client() as client:
+            result = await client.query(f"RETURN time::unix({to_surql_literal(value)});", {})
+        assert result == int(value.timestamp())
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("value", ROUND_TRIP, ids=repr)
     async def test_literal_equals_the_bound_parameter(self, value: Any) -> None:
