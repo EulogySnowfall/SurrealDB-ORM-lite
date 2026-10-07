@@ -536,3 +536,12 @@ class TestPostLiveChangeE2E:
 
     def test_no_task_without_handlers(self) -> None:
         assert not post_live_change.has_handlers(Ticket)
+
+
+class TestExportsV020:
+    def test_full_orm_names_are_importable_from_the_package(self) -> None:
+        import surreal_orm_lite as orm
+
+        for name in ("LiveModelStream", "ModelChangeEvent", "post_live_change", "LiveAction", "LiveStream"):
+            assert name in orm.__all__
+            assert getattr(orm, name) is not None
