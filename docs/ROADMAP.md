@@ -198,7 +198,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 
 - Dependency `surrealdb[pydantic]>=2.0.0,<3.0.0`
 - Native `RecordID`, structured SDK exceptions, signin-before-use ordering
-- CI matrix tested on SurrealDB **v2.7.0 and v3.3.0**
+- CI matrix tested on SurrealDB **v2.7.0 and v3.3.2**
 
 ### Version 0.8.0 — Transactions ORM (core)
 
@@ -260,7 +260,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   the returned row syncs the instance — `merge()` stays a partial update
 - Six curated function-name enums (`SurrealTimeFunction`, `SurrealMathFunction`,
   `SurrealStringFunction`, `SurrealArrayFunction`, `SurrealCryptoFunction`,
-  `SurrealRandFunction`) — **every member is executed against 2.7.0 AND 3.3.0 by the suite**;
+  `SurrealRandFunction`) — **every member is executed against 2.7.0 AND 3.3.2 by the suite**;
   names diverging between the lines (`rand::guid`, `type::is::*`) are excluded on purpose
 - **Identical on SurrealDB 2.6.x and 3.x** — no 3.x-only primitive. Only the inherited v0.9.0
   transaction rule differs: on a buffered tx the computed value reaches the instance at commit

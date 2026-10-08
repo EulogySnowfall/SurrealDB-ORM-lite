@@ -54,7 +54,7 @@ jobs:
         # 3.2 is its own line, not a drop-in for 3.1 (SurrealDB 3.2.0 regressed uncorrelated
         # sub-SELECTs combining ORDER BY and LIMIT, EulogySnowfall/SurrealDB-ORM#147), so it
         # is tested directly rather than assumed equivalent.
-        surrealdb-version: ['v2.7.0', 'v3.3.0']
+        surrealdb-version: ['v2.7.0', 'v3.3.2']
 
     steps:
       - name: Start SurrealDB ${{ matrix.surrealdb-version }}
