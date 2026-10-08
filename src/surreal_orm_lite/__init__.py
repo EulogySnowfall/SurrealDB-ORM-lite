@@ -1,4 +1,4 @@
-__version__ = "0.19.5"
+__version__ = "0.20.0"
 
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
 from .auth import AuthTokens
@@ -27,7 +27,7 @@ from .functions import (
     Var,
     computed,
 )
-from .live import LiveStream
+from .live import LiveModelStream, LiveStream, ModelChangeEvent
 from .model_auth import AuthenticatedUserMixin, AuthResult
 from .model_base import BaseSurrealModel, SurrealConfigDict
 from .q import Q
@@ -39,6 +39,7 @@ from .signals import (
     around_save,
     around_update,
     post_delete,
+    post_live_change,
     post_save,
     post_update,
     pre_delete,
@@ -64,6 +65,8 @@ __all__ = [
     # Live queries
     "LiveAction",
     "LiveStream",
+    "LiveModelStream",
+    "ModelChangeEvent",
     # Aggregations
     "Aggregation",
     "Count",
@@ -83,6 +86,7 @@ __all__ = [
     "around_save",
     "around_update",
     "around_delete",
+    "post_live_change",
     # Authentication
     "AuthTokens",
     "AuthResult",

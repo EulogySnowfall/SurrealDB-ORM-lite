@@ -1,6 +1,7 @@
 import contextlib
 import logging
 import math
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any, Self, cast
 from uuid import UUID
 
@@ -11,8 +12,9 @@ from ._sdk import NotFoundError
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import Var
-from .live import LiveStream, missing_table_error, require_websocket
+from .live import LiveModelStream, LiveStream, missing_table_error, require_websocket
 from .q import Q
+from .surql_literal import inline_variables
 from .utils import (
     build_filter_condition,
     coerce_record_id,
@@ -998,88 +1000,119 @@ class QuerySet:
     # ==================== Custom Query ====================
 
     # ------------------------------------------------------------------
-    # Live queries (v0.19.0)
+    # Live queries (v0.19.0 raw, v0.20.0 filtered + typed)
     # ------------------------------------------------------------------
 
     def _reject_live_clauses(self) -> None:
-        """Refuse a live query that would silently drop part of the queryset.
+        """Refuse a clause a live query cannot honour, rather than silently dropping it.
 
-        The SDK's ``live()`` subscribes to a whole table and takes no other argument, so a
-        clause set on the queryset could not be honoured. Ignoring it quietly would be the
-        worst outcome — the caller would believe they were watching a filtered subset — so
-        each unusable clause is named and the caller is pointed at the version that adds it.
+        ``LIVE SELECT`` has no ``ORDER BY``, ``LIMIT`` or ``START`` (both server lines reject
+        them at parse time), a typed stream needs whole records, and a live query is a
+        connection-level subscription with no transaction to join. Each offender is named so
+        the caller fixes them all at once.
         """
         unsupported = {
-            "filter()": bool(self._filters or self._q_filters),
             "select()": bool(self.select_item),
             "limit()": self._limit is not None,
             "offset()": self._offset is not None,
             "order_by()": self._order_by is not None,
-            "fetch()": bool(self._fetch_fields),
             "annotate()": bool(self._annotations),
-            # values() is the only public setter of _group_by_fields, so name it, not the
-            # internal grouping concept the caller never typed.
+            # values() is the only public setter of _group_by_fields.
             "values()": bool(self._group_by_fields),
-            # A live query is a connection-level subscription with no transaction to join; under
-            # `objects(tx=)` it would quietly run outside the transaction the caller opened.
             "objects(tx=)": self._tx is not None,
-            # Only a WHERE clause could reference them, and there is none to reference them in.
-            "variables()": bool(self._variables),
         }
         offenders = sorted(name for name, present in unsupported.items() if present)
         if offenders:
             raise SurrealDbError(
-                f"Live queries in v0.19.0 watch a whole table and cannot honour "
-                f"{', '.join(offenders)}. Drop the clause, or wait for the filtered form "
-                f"(`LIVE SELECT ... WHERE`) landing in v0.20.0."
+                f"A live query cannot honour {', '.join(offenders)}: SurrealDB's LIVE SELECT has "
+                f"no ORDER BY, LIMIT or START, streams whole records, and runs outside any "
+                f"transaction. Drop the clause — filter(), variables() and fetch() are supported."
             )
 
-    async def live(self) -> UUID:
-        """Start a live query on this model's table and return its uuid.
+    def _compile_live(self, diff: bool) -> str:
+        """Compile this queryset into a ``LIVE SELECT`` with every bound value inlined.
 
-        Pair it with :meth:`SurrealDBConnectionManager.subscribe_live` to read the raw
-        notifications, and :meth:`SurrealDBConnectionManager.kill` to stop them::
+        The WHERE is the ordinary parameterised one from :meth:`_build_where` — identifiers,
+        operators and ``$name`` references only — and the values are then written in as
+        literals, because SurrealDB 2.x evaluates a live query's parameters as ``NONE`` at
+        notification time and the filter would silently match nothing (see ``surql_literal``).
 
-            live_id = await User.objects().live()
-            async for notif in SurrealDBConnectionManager.subscribe_live(live_id):
-                print(notif["action"], notif["result"])
-            await SurrealDBConnectionManager.kill(live_id)
-
-        Prefer :meth:`watch` unless you need the uuid itself: it kills the subscription for
-        you, which a manual pairing forgets under an exception.
-
-        :returns: the live query's uuid.
-        :raises SurrealDbError: on a non-WebSocket connection, or a queryset carrying clauses
-            a table-level live query cannot apply.
-        :raises SurrealDbNotFoundError: on SurrealDB 3.x, if the table does not exist.
+        :raises SurrealDbError: for a clause a live query cannot honour.
+        :raises TypeError: for a filter value with no SurrealQL literal form.
         """
         self._reject_live_clauses()
-        require_websocket(SurrealDBConnectionManager.get_connection_string())
-        client = await SurrealDBConnectionManager.get_client()
+        where_clause, where_vars = self._build_where()
+        # Only the WHERE fragment is rewritten: it is the one place references live, and the
+        # table name and FETCH list never pass through the inliner.
+        where_clause = inline_variables(where_clause, {**self._variables, **where_vars})
+        projection = "DIFF" if diff else "*"
+        query = f"LIVE SELECT {projection} FROM {self._model_table}{where_clause}"
+        if self._fetch_fields:
+            query += f" FETCH {', '.join(self._fetch_fields)}"
+        return query + ";"
+
+    def _live_starter(self, diff: bool) -> Callable[[], Awaitable[UUID]]:
+        """Compile now, and return the coroutine function that starts the live query.
+
+        Compiling eagerly makes a bad clause or value fail at the ``live()``/``watch()`` call,
+        before any network traffic, and snapshots the query: changing the queryset afterwards
+        does not change a stream already built from it.
+        """
+        query = self._compile_live(diff)
         table = self._model_table
-        try:
-            live_id: UUID = await client.live(table)
-        except NotFoundError as exc:
-            raise missing_table_error(exc, table) from exc
-        return live_id
 
-    def watch(self) -> LiveStream:
-        """Watch this model's table, killing the subscription when the block exits.
+        async def start() -> UUID:
+            require_websocket(SurrealDBConnectionManager.get_connection_string())
+            client = await SurrealDBConnectionManager.get_client()
+            try:
+                live_id = await client.query(query)
+            except NotFoundError as exc:
+                raise missing_table_error(exc, table) from exc
+            return live_id if isinstance(live_id, UUID) else UUID(str(live_id))
 
-        The safe pairing of :meth:`live`, ``subscribe_live()`` and ``kill()``::
+        return start
 
-            async with User.objects().watch() as stream:
+    def live(self, *, diff: bool = False) -> LiveModelStream[Any]:
+        """Subscribe to the records this queryset matches, as typed model events.
+
+        Same API as the full SurrealDB-ORM::
+
+            async with User.objects().filter(role="admin").live() as stream:
+                async for event in stream:
+                    match event.action:
+                        case LiveAction.CREATE: print("new", event.instance.name)
+                        case LiveAction.UPDATE: print("updated", event.instance)
+                        case LiveAction.DELETE: print("removed", event.record_id)
+
+        ``filter()``, ``variables()`` and ``fetch()`` are applied by the server, identically on
+        SurrealDB 2.x and 3.x (values are inlined — see ``surql_literal``). With ``diff=True``
+        the server sends patches: ``changed_fields`` lists what changed, and only ``CREATE``
+        carries a whole record. The live query is killed when the ``async with`` exits.
+
+        ``await qs.live()`` — the v0.19.0 form returning the uuid — still works and is
+        deprecated. Automatic reconnection (``auto_resubscribe=``) arrives in v0.21.0.
+
+        :raises SurrealDbError: for ``select``/``values``/``annotate``/``order_by``/``limit``/
+            ``offset``/``objects(tx=)``, here; for a non-WebSocket connection, on start.
+        :raises TypeError: for a filter value with no SurrealQL literal form, here.
+        :raises SurrealDbNotFoundError: on SurrealDB 3.x, on start, if the table does not exist.
+        """
+        return LiveModelStream(self.model, self._model_table, self._live_starter(diff), diff=diff)
+
+    def watch(self, *, diff: bool = False) -> LiveStream:
+        """Watch the records this queryset matches, killing the subscription when the block exits.
+
+        Yields the **raw** notification envelopes (``action``, ``record``, ``result``)::
+
+            async with User.objects().filter(status="active").watch() as stream:
                 async for notif in stream:
                     print(notif["action"], notif["result"])
-                    if enough:
-                        break
 
-        The live query is killed on the way out of the ``async with``, including when the body
-        raises — a subscription left running holds server-side resources until the connection
-        drops.
+        ``filter()``, ``variables()`` and ``fetch()`` are applied by the server. With
+        ``diff=True`` each ``result`` is a list of patches instead of a record. For model
+        instances, use :meth:`live`.
         """
-        self._reject_live_clauses()
-        return LiveStream(self._model_table, self.live)
+        return LiveStream(self._model_table, self._live_starter(diff))
 
     async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
         """

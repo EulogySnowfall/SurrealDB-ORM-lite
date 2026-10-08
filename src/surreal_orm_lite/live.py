@@ -1,9 +1,11 @@
-"""Live queries — the raw notification layer (v0.19.0).
+"""Live queries — the raw notification layer (v0.19.0) and the typed layer on top (v0.20.0).
 
 A live query is a server-side subscription: SurrealDB pushes a notification over the
 WebSocket every time a record in the watched table is created, updated or deleted. This
 module turns that push stream into an async iterator of **raw envelopes**, and owns the two
-pieces of plumbing the official SDK does not provide.
+pieces of plumbing the official SDK does not provide. :class:`LiveModelStream` then converts
+each envelope into a :class:`ModelChangeEvent` carrying a model instance — the full
+SurrealDB-ORM's API, so code written against it migrates with an import change.
 
 **Why the ORM does not call the SDK's ``subscribe_live()``.** The SDK's generator body is
 ``yield ret["result"]``: it hands back the record payload and discards the envelope around
@@ -36,14 +38,28 @@ every loop. Automatic resubscribe is v0.21.0.
 from __future__ import annotations
 
 import asyncio
+import logging
+import warnings
 from collections import deque
-from typing import Any, Final
+from collections.abc import Awaitable, Callable, Coroutine, Generator
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Final, Generic, TypeVar, cast
 from uuid import UUID
+
+from pydantic import ValidationError
 
 from .enum import LiveAction
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
+from .utils import user_stacklevel
 
-__all__ = ["LiveIterator", "LiveStream"]
+if TYPE_CHECKING:
+    from .model_base import BaseSurrealModel
+
+__all__ = ["LiveIterator", "LiveModelStream", "LiveStream", "ModelChangeEvent"]
+
+logger = logging.getLogger(__name__)
+
+T = TypeVar("T", bound="BaseSurrealModel")
 
 # Private end-of-stream marker. Identity-compared, so it can never collide with a payload.
 _STREAM_END: Final = object()
@@ -295,8 +311,8 @@ def missing_table_error(exc: Exception, table: str) -> SurrealDbNotFoundError:
 class LiveStream:
     """Async context manager and iterator over one live query's raw notifications.
 
-    Member names mirror the full ORM's ``LiveModelStream`` so the typed layer planned for
-    v0.20.0 can present the same handle::
+    Member names mirror the full ORM's ``LiveModelStream``, which :class:`LiveModelStream`
+    wraps this class to provide::
 
         async with User.objects().watch() as stream:
             async for notif in stream:
@@ -331,7 +347,9 @@ class LiveStream:
             return self
         from .connection_manager import SurrealDBConnectionManager
 
-        # Client first, so no await sits between opening the subscription and buffering it.
+        # Transport first: on an http:// URL no client should be opened just to be refused.
+        require_websocket(SurrealDBConnectionManager.get_connection_string())
+        # Client next, so no await sits between opening the subscription and buffering it.
         self._client = await SurrealDBConnectionManager.get_client()
         self._live_id = await self._starter()
         self._iterator = open_stream(self._client, self._live_id)
@@ -369,3 +387,322 @@ class LiveStream:
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         await self.stop()
+
+
+# ------------------------------------------------------------------
+# Typed events (v0.20.0)
+# ------------------------------------------------------------------
+
+# The root JSON Pointer of a diff patch: SurrealDB 3.x spells it "" and 2.x spells it "/".
+_ROOT_POINTERS: Final = ("", "/")
+
+
+@dataclass
+class ModelChangeEvent(Generic[T]):
+    """One typed live-query notification — the full SurrealDB-ORM's event, field for field.
+
+    :ivar action: ``CREATE``, ``UPDATE`` or ``DELETE``.
+    :ivar instance: the model instance. For a non-diff stream it is the record after the change
+        (for ``DELETE``, its last state). In diff mode ``CREATE`` carries the whole record and
+        ``UPDATE`` a minimal instance holding just the ``id``; ``DELETE`` is minimal on 3.x and
+        the last state on 2.x, which sends the whole record there.
+    :ivar record_id: the affected record, e.g. ``"user:abc"``.
+    :ivar changed_fields: diff mode only — the top-level fields the patches touch, as Python
+        field names (aliases resolved).
+    :ivar validation_error: set when the record does not validate against the model — e.g. a
+        ``fetch()``-resolved link on a field typed ``str``, or a row another client wrote with a
+        missing field. ``instance`` is then built **without validation** from the record as
+        received, and the stream carries on; ``post_live_change`` is not sent for such an event.
+        ``None`` for every valid event.
+    :ivar raw: the notification's ``result`` as received: a dict, or in diff mode the list of
+        patches — except a diff-mode ``DELETE`` on SurrealDB 2.x, which is the whole last record
+        (a dict). SurrealDB's diff is JSON Patch **extended**: a changed string arrives as
+        ``{"op": "change", "value": "<diff-match-patch text>"}`` rather than a ``replace``.
+    """
+
+    action: LiveAction
+    instance: T
+    record_id: str
+    changed_fields: list[str] = field(default_factory=list)
+    raw: Any = field(default_factory=dict)
+    validation_error: ValidationError | None = None
+
+
+def _pointer_root(path: str) -> str:
+    """The first segment of a non-root JSON Pointer, unescaped (``~1`` → ``/``, ``~0`` → ``~``)."""
+    return path[1:].split("/", 1)[0].replace("~1", "/").replace("~0", "~")
+
+
+def _minimal_instance(model: type[T], record: Any) -> T:
+    """An instance holding only the id — the full ORM's rule for a change with no record."""
+    # ``set_data`` is the model's own RecordID → id conversion; mypy sees pydantic's decorator
+    # proxy rather than the classmethod it resolves to at runtime.
+    data = cast(Any, model).set_data({"id": record})
+    try:
+        return model.model_validate(data)
+    except ValidationError:
+        return model.model_construct(**data)
+
+
+def to_change_event(model: type[T], envelope: dict[str, Any], *, diff: bool) -> ModelChangeEvent[T]:
+    """Convert one raw notification envelope into a :class:`ModelChangeEvent`.
+
+    In diff mode the two server lines answer differently and both are normalised here: the root
+    patch path is ``""`` on 3.x and ``"/"`` on 2.x, and a ``DELETE`` is a ``replace`` of the root
+    with ``None`` on 3.x but the whole last record on 2.x.
+
+    A record that does not validate against *model* does not raise: one bad row would otherwise
+    end the consumer's ``async for`` and kill the subscription. The event carries the error in
+    ``validation_error`` and an unvalidated instance, the way ``QuerySet.exec()`` falls back to
+    plain rows instead of failing.
+    """
+    record = envelope.get("record")
+    result = envelope.get("result")
+    payload: Any = result
+    changed: list[str] = []
+    if diff and isinstance(result, list):
+        payload = None
+        for patch in result:
+            if not isinstance(patch, dict):
+                continue
+            path = patch.get("path", "")
+            if path in _ROOT_POINTERS:
+                # CREATE replaces the root with the record; DELETE (3.x) replaces it with None.
+                payload = patch.get("value")
+                continue
+            if path.startswith("/"):
+                name = model.to_py_field(_pointer_root(path))
+                if name not in changed:
+                    changed.append(name)
+    error: ValidationError | None = None
+    if isinstance(payload, dict):
+        # Copies throughout: hydration rewrites the id in place, and ``raw`` must stay as received.
+        try:
+            instance = cast(T, model.from_db(dict(payload)))
+        except ValidationError as exc:
+            error = exc
+            instance = model.model_construct(**cast(Any, model).set_data(dict(payload)))
+    else:
+        instance = _minimal_instance(model, record)
+    return ModelChangeEvent(
+        action=LiveAction(envelope["action"]),
+        instance=instance,
+        record_id=str(record) if record is not None else "",
+        changed_fields=changed,
+        raw=result if result is not None else {},
+        validation_error=error,
+    )
+
+
+class LiveModelStream(Generic[T]):
+    """Typed live query: async context manager and iterator of :class:`ModelChangeEvent`.
+
+    The full SurrealDB-ORM's class, on the official SDK::
+
+        async with User.objects().filter(role="admin").live() as stream:
+            async for event in stream:
+                print(event.action, event.instance, event.record_id)
+
+    It wraps a :class:`LiveStream`, which owns the subscription — start, kill on exit, and an
+    end of iteration that is identical on both server lines — and only converts each envelope.
+
+    **``post_live_change`` handlers** run on one background task per stream, in event order, so
+    a slow handler never stalls the iteration and never lets a later event's handler overtake
+    it. They only receive validated instances: an event with a ``validation_error`` is yielded
+    to the iterating code but not signalled. Leaving the block normally waits up to :attr:`signal_drain_timeout` seconds for the
+    pending handlers to finish; leaving it on an exception cancels them.
+
+    **Deprecated v0.19.0 form:** ``await qs.live()`` still starts a live query and returns its
+    uuid, for :meth:`SurrealDBConnectionManager.subscribe_live`. That subscription belongs to the
+    caller, not to this object. The object also behaves as a coroutine for that path, so
+    ``asyncio.create_task(qs.live())`` and ``asyncio.run(qs.live())`` keep working. Like a
+    coroutine it can be awaited once, and an awaited stream cannot also be started (nor the
+    reverse): the two would be separate subscriptions, and only one would be killed.
+    """
+
+    #: Seconds a normal exit waits for pending ``post_live_change`` handlers before cancelling.
+    signal_drain_timeout: float = 5.0
+
+    def __init__(
+        self,
+        model: type[T],
+        table: str,
+        starter: Callable[[], Awaitable[UUID]],
+        *,
+        diff: bool = False,
+    ) -> None:
+        self._model = model
+        self._diff = diff
+        self._starter = starter
+        self._stream = LiveStream(table, starter)
+        self._started = False
+        self._uuid_start: Coroutine[Any, Any, UUID] | None = None
+        self._warned_invalid = False
+        self._signal_queue: asyncio.Queue[ModelChangeEvent[T] | None] | None = None
+        self._signal_worker: asyncio.Task[None] | None = None
+
+    @property
+    def table(self) -> str:
+        """The table this stream is subscribed to."""
+        return self._stream.table
+
+    @property
+    def live_id(self) -> UUID | None:
+        """The live query's uuid, or ``None`` before start and after :meth:`stop`."""
+        return self._stream.live_id
+
+    @property
+    def is_active(self) -> bool:
+        """Whether the subscription is currently running."""
+        return self._stream.is_active
+
+    async def start(self) -> LiveModelStream[T]:
+        """Open the subscription. Calling it on a running stream is a no-op.
+
+        :raises SurrealDbError: if this object was already awaited for a uuid.
+        """
+        if self._uuid_start is not None:
+            raise SurrealDbError(
+                "This live() stream was awaited for its uuid (the deprecated v0.19.0 form), which "
+                "started a separate subscription it does not own. Call live() again for a stream."
+            )
+        self._started = True
+        await self._stream.start()
+        return self
+
+    async def stop(self) -> None:
+        """Kill the subscription and end the iteration.
+
+        Pending ``post_live_change`` handlers get up to :attr:`signal_drain_timeout` seconds to
+        finish, then are cancelled.
+        """
+        await self._stop(cancel_handlers=False)
+
+    async def _stop(self, *, cancel_handlers: bool) -> None:
+        try:
+            await self._stream.stop()
+        finally:
+            await self._finish_signals(cancel=cancel_handlers)
+
+    def __aiter__(self) -> LiveModelStream[T]:
+        return self
+
+    async def __anext__(self) -> ModelChangeEvent[T]:
+        try:
+            envelope = await self._stream.__anext__()
+        except StopAsyncIteration:
+            # Killed elsewhere or the connection closed: let the handler task drain and exit.
+            self._close_signal_queue()
+            raise
+        event = to_change_event(self._model, envelope, diff=self._diff)
+        if event.validation_error is None:
+            self._emit(event)
+        elif not self._warned_invalid:
+            self._warned_invalid = True
+            # Locations and error types only: the error's own text embeds the record's values,
+            # which may be anything the table holds (hashes, emails, tokens).
+            problems = [(e["loc"], e["type"]) for e in event.validation_error.errors(include_input=False)]
+            logger.warning(
+                "A live %s record (%s) does not validate against the model: %s. Events carry the "
+                "error in `validation_error` and an unvalidated instance; post_live_change is not "
+                "sent for them. Logged once per stream.",
+                self._model.__name__,
+                event.record_id,
+                problems,
+            )
+        return event
+
+    async def __aenter__(self) -> LiveModelStream[T]:
+        return await self.start()
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self._stop(cancel_handlers=exc_type is not None)
+
+    # -- deprecated v0.19.0 form: ``await qs.live()`` → uuid ---------------------------------
+
+    def _uuid_coroutine(self) -> Coroutine[Any, Any, UUID]:
+        if self._uuid_start is None:
+            if self._started:
+                raise SurrealDbError(
+                    "This live() stream is already started; await it only for the deprecated "
+                    "uuid form, on a fresh `qs.live()`. Use `stream.live_id` instead."
+                )
+            warnings.warn(
+                "`await QuerySet.live()` returning the live query's uuid is deprecated since "
+                "v0.20.0; use `async with Model.objects().live() as stream:` for typed events, "
+                "or `watch()` for raw envelopes.",
+                DeprecationWarning,
+                stacklevel=user_stacklevel(),
+            )
+            self._uuid_start = cast(Coroutine[Any, Any, UUID], self._starter())
+        return self._uuid_start
+
+    def __await__(self) -> Generator[Any, None, UUID]:
+        return self._uuid_coroutine().__await__()
+
+    def send(self, value: Any) -> Any:
+        """Coroutine protocol, so ``asyncio.create_task(qs.live())`` keeps working (deprecated)."""
+        return self._uuid_coroutine().send(value)
+
+    def throw(self, *args: Any) -> Any:
+        """Coroutine protocol (see :meth:`send`)."""
+        return self._uuid_coroutine().throw(*args)
+
+    def close(self) -> None:
+        """Coroutine protocol (see :meth:`send`). Never touches a started stream."""
+        if self._uuid_start is not None:
+            self._uuid_start.close()
+
+    # -- post_live_change ------------------------------------------------------------------
+
+    def _emit(self, event: ModelChangeEvent[T]) -> None:
+        """Queue ``post_live_change`` for the handler task; never block or break the stream."""
+        from .signals import post_live_change
+
+        if not post_live_change.has_handlers(self._model):
+            return
+        if self._signal_queue is None:
+            self._signal_queue = asyncio.Queue()
+            self._signal_worker = asyncio.get_running_loop().create_task(self._run_signals(self._signal_queue))
+        self._signal_queue.put_nowait(event)
+
+    async def _run_signals(self, queue: asyncio.Queue[ModelChangeEvent[T] | None]) -> None:
+        """Send queued events one at a time, in order, until the end marker."""
+        from .signals import post_live_change
+
+        while (event := await queue.get()) is not None:
+            try:
+                await post_live_change.send(
+                    self._model,
+                    instance=event.instance,
+                    action=event.action,
+                    record_id=event.record_id,
+                    changed_fields=event.changed_fields,
+                )
+            except Exception:
+                logger.exception("post_live_change handler failed for %s", self._model.__name__)
+
+    def _close_signal_queue(self) -> None:
+        if self._signal_queue is not None:
+            self._signal_queue.put_nowait(None)
+
+    async def _finish_signals(self, *, cancel: bool) -> None:
+        worker, self._signal_worker = self._signal_worker, None
+        self._close_signal_queue()
+        self._signal_queue = None
+        if worker is None or worker.done():
+            return
+        if not cancel:
+            try:
+                await asyncio.wait_for(asyncio.shield(worker), self.signal_drain_timeout)
+                return
+            except TimeoutError:
+                logger.warning(
+                    "post_live_change handlers for %s did not finish within %.1fs; cancelling them",
+                    self._model.__name__,
+                    self.signal_drain_timeout,
+                )
+        worker.cancel()
+        # ``wait`` rather than ``await worker``: it does not re-raise the worker's own
+        # CancelledError, yet still lets a cancellation of *this* task propagate.
+        await asyncio.wait({worker})
