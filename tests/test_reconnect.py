@@ -973,3 +973,56 @@ class TestOpenClientFailuresE2E:
         response = type("ClientResponseError", (Exception,), {"__module__": "aiohttp.client_exceptions"})
         assert is_connection_failure(disconnected("gone"), None)
         assert not is_connection_failure(response("400"), None)
+
+
+class TestIdentityStampOnOpenUnit:
+    """Security review of the review fixes: the stamp a freshly opened client gets."""
+
+    @staticmethod
+    def _fake_open(monkeypatch: pytest.MonkeyPatch, closed: list[bool]) -> None:
+        class _Client:
+            async def close(self) -> None:
+                closed.append(True)
+
+        async def _open(cls: Any, *, signin_as_configured: bool) -> Any:
+            return _Client()
+
+        SurrealDBConnectionManager.set_connection(
+            url="ws://unused.invalid/rpc", user="root", password="root", namespace="ns", database="db"
+        )
+        monkeypatch.setattr(SurrealDBConnectionManager, "_open_client", classmethod(_open))
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_replay_neither_caches_nor_stamps_the_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        closed: list[bool] = []
+        self._fake_open(monkeypatch, closed)
+
+        async def _slow_replay(cls: Any, client: Any) -> None:
+            await asyncio.sleep(10)
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "_replay_session", classmethod(_slow_replay))
+        task = asyncio.ensure_future(SurrealDBConnectionManager.get_client())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert SurrealDBConnectionManager._cached_client() is None
+        assert closed == [True]
+
+    @pytest.mark.asyncio
+    async def test_an_identity_change_during_the_open_leaves_the_stamp_stale(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        closed: list[bool] = []
+        self._fake_open(monkeypatch, closed)
+
+        async def _replay_while_someone_signs_in(cls: Any, client: Any) -> None:
+            SurrealDBConnectionManager._replay_identity_changed()  # e.g. signin() on another loop
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "_replay_session", classmethod(_replay_while_someone_signs_in))
+        try:
+            client = await SurrealDBConnectionManager.get_client()
+            stamp = SurrealDBConnectionManager._identity_of(client)
+            assert stamp is not None
+            assert stamp[0] != SurrealDBConnectionManager._current_replay_epoch()
+        finally:
+            await SurrealDBConnectionManager.close_connection()

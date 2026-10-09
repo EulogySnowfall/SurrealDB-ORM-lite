@@ -297,6 +297,11 @@ class SurrealDBConnectionManager:
         assert cls.__user is not None
         assert cls.__password is not None
 
+        # Read before anything is opened: if what a reconnect restores changes while this client
+        # is being built (a signin on another loop, set_connection()…), the client was built from
+        # the old state, and its stamp must say so.
+        epoch = cls.__replay_epoch
+
         # Establish the connection
         try:
             _client = await cls._open_client(signin_as_configured=True)
@@ -318,11 +323,21 @@ class SurrealDBConnectionManager:
         # the configured root user while the record identity is still being established.
         try:
             await cls._replay_session(_client)
-        finally:
-            # Either the stored identity was replayed or, refused, it was forgotten and the client
-            # stayed at the configured one: in both cases what a reconnect would restore.
-            cls._stamp_identity(_client, replayable=True)
+        except Exception:
+            # Refused: the token was forgotten (moving the epoch by exactly one) and the client
+            # stayed at the configured identity — what a reconnect now restores, unless something
+            # else changed meanwhile.
+            cls._stamp_identity(_client, replayable=cls.__replay_epoch == epoch + 1)
             cls.__clients[loop] = _client
+            raise
+        except BaseException:
+            # Cancelled mid-replay: nobody knows which identity the client ended up with, so it is
+            # neither published nor trusted — closed, and the next caller opens a fresh one.
+            with contextlib.suppress(Exception):
+                await _client.close()
+            raise
+        cls._stamp_identity(_client, replayable=True, epoch=epoch)
+        cls.__clients[loop] = _client
         return _client
 
     @classmethod
@@ -619,10 +634,14 @@ class SurrealDBConnectionManager:
         cls.__replay_epoch += 1
 
     @classmethod
-    def _stamp_identity(cls, client: Any, *, replayable: bool) -> None:
-        """Record that the manager just set *client*'s identity, and whether a reconnect restores it."""
+    def _stamp_identity(cls, client: Any, *, replayable: bool, epoch: int | None = None) -> None:
+        """Record that the manager just set *client*'s identity, and whether a reconnect restores it.
+
+        *epoch* is the replay epoch the identity was derived from, when it was read before an
+        await; by default, the current one.
+        """
         with contextlib.suppress(TypeError):  # an object that cannot be weakly referenced
-            cls.__client_identities[client] = (cls.__replay_epoch, replayable)
+            cls.__client_identities[client] = (cls.__replay_epoch if epoch is None else epoch, replayable)
 
     @classmethod
     def _identity_of(cls, client: Any) -> tuple[int, bool] | None:
