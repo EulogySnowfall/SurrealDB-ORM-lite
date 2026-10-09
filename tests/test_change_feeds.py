@@ -67,6 +67,22 @@ async def feed_client(definition: str = "CHANGEFEED 1h", *, scheme: str = "ws", 
         await SurrealDBConnectionManager.close_connection()
 
 
+async def _write(operation: Any) -> Any:
+    """Run a test write, retrying SurrealDB's retryable conflicts.
+
+    Seen once in CI on a fresh 2.7.0 container: a plain write to a change-feed table failed with
+    "read or write conflict … can be retried", with no concurrent writer in the test (never
+    reproduced locally). The ORM's answer to a retryable conflict is ``retry_on_conflict``.
+    """
+    from surreal_orm_lite import retry_on_conflict
+
+    @retry_on_conflict(max_retries=5)
+    async def _run() -> Any:
+        return await operation()
+
+    return await _run()
+
+
 async def _take(stream: Any, count: int, timeout: float = 5.0) -> list[Any]:
     events: list[Any] = []
     async with asyncio.timeout(timeout):
@@ -257,9 +273,9 @@ class TestChangesE2E:
         async with feed_client():
             stream = await Fed.objects().changes(poll_interval=0.05).start()
             record = Fed(id="a", name="first")
-            await record.save()
-            await record.merge(name="second")
-            await record.delete()
+            await _write(lambda: record.save())
+            await _write(lambda: record.merge(name="second"))
+            await _write(lambda: record.delete())
 
             events = await _take(stream, 3)
 
@@ -271,10 +287,10 @@ class TestChangesE2E:
     @pytest.mark.asyncio
     async def test_since_none_replays_no_history(self) -> None:
         async with feed_client():
-            await Fed(id="old1").save()
-            await Fed(id="old2").save()
+            await _write(lambda: Fed(id="old1").save())
+            await _write(lambda: Fed(id="old2").save())
             stream = await Fed.objects().changes(poll_interval=0.05).start()
-            await Fed(id="new").save()
+            await _write(lambda: Fed(id="new").save())
 
             [event] = await _take(stream, 1)
             assert _ids([event]) == ["new"]
@@ -286,7 +302,7 @@ class TestChangesE2E:
         async with feed_client():
             first = await Fed.objects().changes(poll_interval=0.05).start()
             for n in range(5):
-                await Fed(id=f"r{n}").save()
+                await _write(lambda n=n: Fed(id=f"r{n}").save())
             consumed = await _take(first, 3)
             cursor = first.cursor
             first.stop()
@@ -304,7 +320,7 @@ class TestChangesE2E:
         async with feed_client() as client:
             stream = await Fed.objects().changes(poll_interval=0.05).start()
             before = stream.cursor
-            await client.query(f"BEGIN; CREATE {TABLE}:t1; CREATE {TABLE}:t2; COMMIT;", {})
+            await _write(lambda: client.query(f"BEGIN; CREATE {TABLE}:t1; CREATE {TABLE}:t2; COMMIT;", {}))
 
             await _take(stream, 1)
             assert stream.cursor == before, "resuming here must re-deliver the whole transaction"
@@ -323,7 +339,7 @@ class TestChangesE2E:
         async with feed_client():
             stream = await Fed.objects().changes(poll_interval=0.05, batch_size=2).start()
             for n in range(7):
-                await Fed(id=f"p{n}").save()
+                await _write(lambda n=n: Fed(id=f"p{n}").save())
             events = await _take(stream, 7)
             assert _ids(events) == [f"p{n}" for n in range(7)]
 
@@ -331,11 +347,11 @@ class TestChangesE2E:
     async def test_since_a_datetime(self) -> None:
         """Exact on 3.x (the ORM converts it to a versionstamp); a superset on 2.x."""
         async with feed_client() as client:
-            await Fed(id="early").save()
+            await _write(lambda: Fed(id="early").save())
             await asyncio.sleep(0.2)
             moment = await client.query("RETURN time::now();", {})
             await asyncio.sleep(0.2)
-            await Fed(id="late").save()
+            await _write(lambda: Fed(id="late").save())
 
             stream = Fed.objects().changes(since=moment, poll_interval=0.05)
             seen: list[str] = []
@@ -353,9 +369,9 @@ class TestChangesE2E:
         async with feed_client("CHANGEFEED 1h INCLUDE ORIGINAL"):
             stream = await Fed.objects().changes(poll_interval=0.05).start()
             record = Fed(id="o", name="a")
-            await record.save()
-            await record.merge(name="b")
-            await record.delete()
+            await _write(lambda: record.save())
+            await _write(lambda: record.merge(name="b"))
+            await _write(lambda: record.delete())
 
             created, updated, deleted = await _take(stream, 3)
 
@@ -381,7 +397,7 @@ class TestChangesE2E:
     async def test_works_over_http(self) -> None:
         async with feed_client(scheme="http"):
             stream = await Fed.objects().changes(poll_interval=0.05).start()
-            await Fed(id="h").save()
+            await _write(lambda: Fed(id="h").save())
             [event] = await _take(stream, 1)
             assert _ids([event]) == ["h"]
 
@@ -406,7 +422,7 @@ class TestChangesE2E:
             assert stream.cursor == cursor
 
             lazy = Fed.objects().changes(poll_interval=0.05)
-            await Fed(id="x").save()
+            await _write(lambda: Fed(id="x").save())
             await _nothing_within(lazy)  # its "now" is the first read, after the write
 
 
@@ -417,8 +433,8 @@ class TestChangesReconnectE2E:
 
         async with CuttableProxy() as proxy, feed_client(url=proxy.url()):
             stream = _fast(await Fed.objects().changes(poll_interval=0.05).start())
-            await Fed(id="d0").save()
-            await Fed(id="d1").save()
+            await _write(lambda: Fed(id="d0").save())
+            await _write(lambda: Fed(id="d1").save())
             before = await _take(stream, 2)
 
             client = await SurrealDBConnectionManager.get_client()
@@ -429,7 +445,7 @@ class TestChangesReconnectE2E:
                 while not is_dead(client):
                     await asyncio.sleep(0.005)
             for n in range(2, 5):
-                await Fed(id=f"d{n}").save()
+                await _write(lambda n=n: Fed(id=f"d{n}").save())
             after = await _take(stream, 3)
 
             assert _ids(before + after) == [f"d{n}" for n in range(5)]
@@ -486,7 +502,7 @@ class TestReviewChangeFeedE2E:
             await client.query(f"DEFINE DATABASE OVERWRITE {database} CHANGEFEED 1h;", {})
             await client.query(f"DEFINE TABLE OVERWRITE {TABLE} SCHEMALESS;", {})
             stream = await Fed.objects().changes(poll_interval=0.05).start()
-            await Fed(id="dbf").save()
+            await _write(lambda: Fed(id="dbf").save())
             [event] = await _take(stream, 1)
             assert _ids([event]) == ["dbf"]
         finally:

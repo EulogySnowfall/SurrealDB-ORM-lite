@@ -87,6 +87,9 @@ server lines.
 - A change feed does not record the kind of write: a creation arrives as `UPDATE`. A table
   without a change feed answers `SHOW CHANGES` with `[]` on both lines, so `changes()` checks
   `INFO FOR DB` and refuses it (skipped when `INFO` is not permitted).
+- Observed once in CI on a fresh SurrealDB 2.7.0 server, never reproduced locally: a plain write
+  to a table with a change feed failed with the retryable "read or write conflict" error, with no
+  concurrent writer. `retry_on_conflict` (v0.12.0) handles it; the test suite now uses it there.
 - **What a live query misses during an outage is not replayed** — catch up in `on_reconnect`,
   or from a change feed. A request already in flight when the socket drops fails with the SDK's
   own `KeyError`; retrying arbitrary queries is v0.40.0.
