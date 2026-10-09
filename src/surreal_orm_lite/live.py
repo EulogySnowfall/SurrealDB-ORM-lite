@@ -127,6 +127,26 @@ def _sdk_queues(client: Any) -> dict[str, list[asyncio.Queue[Any]]] | None:
     return None
 
 
+def recv_task_of(client: Any) -> asyncio.Task[Any] | None:
+    """The SDK WebSocket connection's receive task, or ``None`` (HTTP, or not connected yet).
+
+    The task reads the socket for as long as it is open, and **ends when the connection drops**
+    — measured on 2.7.0 and 3.3.2, within milliseconds of an abort. It is the only drop signal
+    the SDK exposes: the receive loop swallows the close and tells no one else.
+    """
+    for candidate in (client, getattr(client, "_connection", None)):
+        task = getattr(candidate, "recv_task", None)
+        if isinstance(task, asyncio.Task):
+            return task
+    return None
+
+
+def is_dead(client: Any) -> bool:
+    """Whether *client*'s WebSocket has dropped. An HTTP client never is: it holds no socket."""
+    task = recv_task_of(client)
+    return task is not None and task.done()
+
+
 def register_subscriber(client: Any, query_uuid: str | UUID) -> asyncio.Queue[Any]:
     """Create a queue fed by ``query_uuid``'s notifications and register it everywhere."""
     key = _key(query_uuid)

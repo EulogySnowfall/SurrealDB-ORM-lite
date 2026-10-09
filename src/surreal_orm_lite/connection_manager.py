@@ -20,7 +20,15 @@ from .exceptions import (
     SurrealDbValidationError,
 )
 from .functions import build_call_statement, normalize_function_name, parse_function_parameters
-from .live import LiveIterator, close_all_subscribers, mark_killed, open_stream, release_subscribers, require_websocket
+from .live import (
+    LiveIterator,
+    close_all_subscribers,
+    is_dead,
+    mark_killed,
+    open_stream,
+    release_subscribers,
+    require_websocket,
+)
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
 
 logger = logging.getLogger(__name__)
@@ -59,6 +67,12 @@ class SurrealDBConnectionManager:
     # that is garbage-collected takes its entry with it; loops that are merely closed are
     # pruned on the next get_client().
     __clients: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Any]" = weakref.WeakKeyDictionary()
+
+    # One lock per event loop around opening a client. Without it, N callers that find the cache
+    # empty at once — at start-up, or every live stream resubscribing after the same drop — each
+    # open a connection and the last one wins the cache; the others leak their socket, and a live
+    # query started on one of them can never be killed. A lock belongs to its loop, hence per loop.
+    __open_locks: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = weakref.WeakKeyDictionary()
 
     # Declared parameter names of stored functions, keyed by (url, namespace, database, fn
     # name). SurrealQL function arguments are positional, so `params=` needs the declaration
@@ -200,9 +214,38 @@ class SurrealDBConnectionManager:
         cls.__prune_dead_loops()
 
         existing = cls.__clients.get(loop)
-        if existing is not None:
+        if existing is not None and not is_dead(existing):
             return existing
 
+        lock = cls.__open_locks.get(loop)
+        if lock is None:
+            lock = cls.__open_locks[loop] = asyncio.Lock()
+        async with lock:
+            # Whoever held the lock before us may have opened the client already.
+            existing = cls.__clients.get(loop)
+            if existing is not None and not is_dead(existing):
+                return existing
+            if existing is not None:
+                await cls._discard_dead_client(loop, existing)
+            return await cls._connect_for_loop(loop)
+
+    @classmethod
+    async def _discard_dead_client(cls, loop: asyncio.AbstractEventLoop, client: Any) -> None:
+        """Forget a client whose WebSocket dropped, so the next caller gets a working one.
+
+        Live-query readers are deliberately **not** released here: each one already learnt of
+        the drop from the SDK's receive task, and decides on its own whether to resubscribe.
+        Closing is best-effort — the socket is already gone, only the SDK's bookkeeping remains.
+        """
+        if cls.__clients.get(loop) is client:
+            cls.__clients.pop(loop, None)
+        logger.info("The SurrealDB WebSocket connection dropped; opening a new one.")
+        with contextlib.suppress(Exception):
+            await client.close()
+
+    @classmethod
+    async def _connect_for_loop(cls, loop: asyncio.AbstractEventLoop) -> Any:
+        """Open, sign in, replay the session and cache a client for *loop*. Caller holds the lock."""
         cls.require_connection()
 
         # After require_connection(), these are guaranteed to be non-None
@@ -992,7 +1035,9 @@ class SurrealDBConnectionManager:
         """
         client = cls._cached_client()
         try:
-            if client is None:
+            # A dropped socket took its live queries with it (the server removes them with the
+            # session), so a dead client is as good as none — and sending on it would raise.
+            if client is None or is_dead(client):
                 mark_killed(query_uuid)
                 return
             require_websocket(cls.__url)
