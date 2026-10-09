@@ -410,7 +410,7 @@ def open_stream(client: Any, query_uuid: str | UUID, *, on_lost: Callable[[], No
     return LiveIterator(client, query_uuid, register_subscriber(client, query_uuid), on_lost=on_lost)
 
 
-def _is_connection_failure(exc: BaseException, client: Any) -> bool:
+def is_connection_failure(exc: BaseException, client: Any) -> bool:
     """Whether a failed resubscribe attempt is worth retrying: was the *connection* the problem?
 
     Retried: the ORM's own connection error (server unreachable), an ``OSError``, anything the
@@ -429,7 +429,7 @@ def _is_connection_failure(exc: BaseException, client: Any) -> bool:
     return client is not None and is_dead(client)
 
 
-def _cancelled_from_outside() -> bool:
+def cancelled_from_outside() -> bool:
     """Whether the running task is being cancelled, as opposed to seeing an SDK future cancelled."""
     task = asyncio.current_task()
     return task is not None and task.cancelling() > 0
@@ -614,11 +614,11 @@ class LiveStream:
                 new_id = await self._start_on(client)
                 break
             except asyncio.CancelledError:
-                if _cancelled_from_outside():
+                if cancelled_from_outside():
                     raise
                 error: Exception = SurrealDbConnectionError("the connection dropped during the request")
             except Exception as exc:
-                if not _is_connection_failure(exc, client):
+                if not is_connection_failure(exc, client):
                     self._give_up(exc)
                     return
                 error = exc
@@ -687,7 +687,7 @@ class LiveStream:
         try:
             return await asyncio.shield(start)
         except asyncio.CancelledError:
-            if _cancelled_from_outside():
+            if cancelled_from_outside():
                 # The LIVE SELECT may already be running on the server: kill it once it answers.
                 start.add_done_callback(_kill_when_started)
             raise
@@ -791,7 +791,7 @@ def _pointer_root(path: str) -> str:
     return path[1:].split("/", 1)[0].replace("~1", "/").replace("~0", "~")
 
 
-def _minimal_instance(model: type[T], record: Any) -> T:
+def minimal_instance(model: type[T], record: Any) -> T:
     """An instance holding only the id — the full ORM's rule for a change with no record."""
     # ``set_data`` is the model's own RecordID → id conversion; mypy sees pydantic's decorator
     # proxy rather than the classmethod it resolves to at runtime.
@@ -800,6 +800,31 @@ def _minimal_instance(model: type[T], record: Any) -> T:
         return model.model_validate(data)
     except ValidationError:
         return model.model_construct(**data)
+
+
+def hydrate(model: type[T], record: dict[str, Any]) -> tuple[T, ValidationError | None]:
+    """A model instance from a record, never raising for a record that does not validate.
+
+    An invalid record yields an instance built **without** validation, plus the error — one bad
+    row must not end a stream. Shared by live events and change-feed events.
+    """
+    # Copies throughout: hydration rewrites the id in place, and ``raw`` must stay as received.
+    try:
+        return cast(T, model.from_db(dict(record))), None
+    except ValidationError as exc:
+        return model.model_construct(**cast(Any, model).set_data(dict(record))), exc
+
+
+def patched_fields(model: type[BaseSurrealModel], patches: Any) -> list[str]:
+    """The top-level fields a JSON Patch list touches, as Python names, in order, once each."""
+    changed: list[str] = []
+    for patch in patches if isinstance(patches, list) else ():
+        path = patch.get("path", "") if isinstance(patch, dict) else ""
+        if path not in _ROOT_POINTERS and path.startswith("/"):
+            name = model.to_py_field(_pointer_root(path))
+            if name not in changed:
+                changed.append(name)
+    return changed
 
 
 def to_change_event(model: type[T], envelope: dict[str, Any], *, diff: bool) -> ModelChangeEvent[T]:
@@ -834,14 +859,9 @@ def to_change_event(model: type[T], envelope: dict[str, Any], *, diff: bool) -> 
                     changed.append(name)
     error: ValidationError | None = None
     if isinstance(payload, dict):
-        # Copies throughout: hydration rewrites the id in place, and ``raw`` must stay as received.
-        try:
-            instance = cast(T, model.from_db(dict(payload)))
-        except ValidationError as exc:
-            error = exc
-            instance = model.model_construct(**cast(Any, model).set_data(dict(payload)))
+        instance, error = hydrate(model, payload)
     else:
-        instance = _minimal_instance(model, record)
+        instance = minimal_instance(model, record)
     return ModelChangeEvent(
         action=LiveAction(envelope["action"]),
         instance=instance,

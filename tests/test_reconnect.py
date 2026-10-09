@@ -632,7 +632,7 @@ class TestResubscribeFailuresUnit:
         await stream.stop()
 
     def test_the_failure_classifier(self) -> None:
-        from surreal_orm_lite.live import _is_connection_failure
+        from surreal_orm_lite.live import is_connection_failure
 
         class _Dead:
             """A client whose receive task has finished — what a dropped socket leaves behind."""
@@ -645,13 +645,13 @@ class TestResubscribeFailuresUnit:
 
         ConnectionClosedError = type("ConnectionClosedError", (Exception,), {"__module__": "websockets.exceptions"})
 
-        assert _is_connection_failure(SurrealDbConnectionError("x"), None)
-        assert _is_connection_failure(ConnectionRefusedError("x"), None)
-        assert _is_connection_failure(ConnectionClosedError("x"), None)
+        assert is_connection_failure(SurrealDbConnectionError("x"), None)
+        assert is_connection_failure(ConnectionRefusedError("x"), None)
+        assert is_connection_failure(ConnectionClosedError("x"), None)
         # The SDK's in-flight-request KeyError: only a connection failure because the client died.
-        assert _is_connection_failure(KeyError("req"), _Dead())
-        assert not _is_connection_failure(KeyError("req"), None)
-        assert not _is_connection_failure(ValueError("bad"), None)
+        assert is_connection_failure(KeyError("req"), _Dead())
+        assert not is_connection_failure(KeyError("req"), None)
+        assert not is_connection_failure(ValueError("bad"), None)
 
 
 # ==================== Task 3 — security review: identity drift on resubscribe ====================

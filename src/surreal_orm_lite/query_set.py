@@ -9,6 +9,7 @@ from pydantic_core import ValidationError
 
 from . import BaseSurrealModel, SurrealDBConnectionManager
 from ._sdk import NotFoundError
+from .changefeed import ChangeModelStream, Since
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import Var
@@ -1148,6 +1149,69 @@ class QuerySet:
             self._live_starter(diff),
             auto_resubscribe=auto_resubscribe,
             on_reconnect=on_reconnect,
+        )
+
+    def _reject_changes_clauses(self) -> None:
+        """Refuse every clause, naming each: ``SHOW CHANGES`` reads a whole table's feed.
+
+        It has no ``WHERE``, projection, ordering or paging, so a filtered queryset would
+        silently stream every record of the table — the wrong answer the ORM never gives.
+        """
+        unsupported = {
+            "filter()": bool(self._filters or self._q_filters),
+            "variables()": bool(self._variables),
+            "select()": bool(self.select_item),
+            "limit()": self._limit is not None,
+            "offset()": self._offset is not None,
+            "order_by()": self._order_by is not None,
+            "annotate()": bool(self._annotations),
+            "values()": bool(self._group_by_fields),
+            "fetch()": bool(self._fetch_fields),
+            "objects(tx=)": self._tx is not None,
+        }
+        offenders = sorted(name for name, present in unsupported.items() if present)
+        if offenders:
+            raise SurrealDbError(
+                f"A change feed cannot honour {', '.join(offenders)}: SurrealDB's SHOW CHANGES "
+                f"reads the whole table's log, with no WHERE, projection, ordering or paging, "
+                f"outside any transaction. Call changes() on Model.objects() and filter the events."
+            )
+
+    def changes(
+        self,
+        *,
+        since: Since = None,
+        poll_interval: float = 0.1,
+        batch_size: int = 100,
+    ) -> ChangeModelStream[Any]:
+        """Stream the table's change feed — the full SurrealDB-ORM's API, with a usable cursor::
+
+            stream = Order.objects().changes(since=saved_cursor)   # None = from now
+            async for event in stream:
+                await publish(event.action, event.instance)
+                save(stream.cursor)
+
+        The table must be defined with a change feed (``DEFINE TABLE … CHANGEFEED 7d``). Unlike a
+        live query, nothing is missed while nobody reads: resuming from ``stream.cursor`` delivers
+        every later change, on SurrealDB 2.x and 3.x alike (their cursor units differ; the ORM
+        normalises them). Works over HTTP as well as WebSocket.
+
+        :param since: a cursor from :attr:`ChangeModelStream.cursor`; a ``datetime`` or ISO-8601
+            string (naive means UTC; exact on 3.x, at-least-once on 2.x, whose server also returns
+            some earlier changes); or ``None`` for changes made after the stream starts.
+        :param poll_interval: seconds between two polls when the feed has nothing new.
+        :param batch_size: entries read per poll.
+        :raises SurrealDbError: for any queryset clause, here; on start, for a table that does not
+            exist or has no change feed.
+        :raises TypeError, ValueError: for an unusable ``since``/``poll_interval``/``batch_size``.
+        """
+        self._reject_changes_clauses()
+        return ChangeModelStream(
+            self.model,
+            self._model_table,
+            since=since,
+            poll_interval=poll_interval,
+            batch_size=batch_size,
         )
 
     async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
