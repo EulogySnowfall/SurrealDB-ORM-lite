@@ -449,3 +449,13 @@ class TestChangesReconnectE2E:
                 async with asyncio.timeout(5):
                     await anext(stream)
             proxy.accept()
+
+
+class TestExports:
+    def test_v0_21_symbols_are_public(self) -> None:
+        import surreal_orm_lite as orm
+
+        for name in ("ChangeModelStream", "ReconnectCallback"):
+            assert name in orm.__all__
+            assert hasattr(orm, name)
+        assert orm.ChangeModelStream is ChangeModelStream
