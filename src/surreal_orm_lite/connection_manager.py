@@ -89,6 +89,18 @@ class SurrealDBConnectionManager:
     __session_token: str | None = None
     __refresh_token: str | None = None
 
+    # Which identity a *new* connection would come back as, relative to the current one — read
+    # by live streams before they resubscribe (v0.21.0). A live query is opened once and then
+    # evaluated with the permissions of the identity that opened it, so reopening it after a
+    # drop under any other identity would silently widen (or narrow) what it reports. The epoch
+    # moves on every identity change the manager makes; ``unreplayable`` is set while the
+    # connection runs as an identity a reconnect cannot restore (``store=False``, or
+    # ``clear_session()`` under a stored one). Global, like the stored token: per-loop clients
+    # all replay that same token. Conservative by design — when in doubt a stream refuses to
+    # resubscribe and raises, it never guesses.
+    __identity_epoch: int = 0
+    __identity_unreplayable: bool = False
+
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         await SurrealDBConnectionManager.close_connection()
 
@@ -304,6 +316,8 @@ class SurrealDBConnectionManager:
                 client.token = previous
             cls.__session_token = None
             cls.__refresh_token = None
+            # The new connection is left at the configured identity, not the one it replaced.
+            cls._identity_changed(replayable=True)
             raise wrap_auth_error(exc, "restoring the session on a new connection") from exc
 
     @classmethod
@@ -562,7 +576,19 @@ class SurrealDBConnectionManager:
         if store:
             cls.__session_token = adopted.access
             cls.__refresh_token = adopted.refresh
+        cls._identity_changed(replayable=store)
         return adopted
+
+    @classmethod
+    def _identity_changed(cls, *, replayable: bool) -> None:
+        """Record an identity change on the connection; see ``__identity_epoch``."""
+        cls.__identity_epoch += 1
+        cls.__identity_unreplayable = not replayable
+
+    @classmethod
+    def _identity_snapshot(cls) -> tuple[int, bool]:
+        """``(epoch, unreplayable)`` — what a live stream records when it starts."""
+        return cls.__identity_epoch, cls.__identity_unreplayable
 
     @classmethod
     async def authenticate(cls, token: str, *, store: bool = True, refresh: str | None = None) -> None:
@@ -607,6 +633,7 @@ class SurrealDBConnectionManager:
             # session's one is dropped rather than left paired with an identity it cannot
             # renew. A caller that *does* hold the matching pair passes refresh=.
             cls.__refresh_token = refresh
+        cls._identity_changed(replayable=store)
 
     @classmethod
     async def invalidate(cls) -> None:
@@ -637,6 +664,9 @@ class SurrealDBConnectionManager:
             raise wrap_auth_error(exc, "invalidate") from exc
 
         cls.clear_session()
+        # Back to the configured identity — on this client below, or on the next one if that
+        # fails — which is exactly what a reconnect restores.
+        cls._identity_changed(replayable=True)
 
         try:
             await client.signin({"username": cls.__user, "password": cls.__password})
@@ -662,6 +692,10 @@ class SurrealDBConnectionManager:
         The **current** connection keeps whatever identity it already has; only the replay is
         forgotten. Call :meth:`invalidate` when you mean to log out for real.
         """
+        if cls.__session_token is not None:
+            # The connection still runs as the stored identity, but a reconnect would now come
+            # back as the configured one.
+            cls._identity_changed(replayable=False)
         cls.__session_token = None
         cls.__refresh_token = None
 

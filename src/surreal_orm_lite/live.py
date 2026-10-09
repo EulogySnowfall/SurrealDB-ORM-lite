@@ -53,7 +53,12 @@ from uuid import UUID
 from pydantic import ValidationError
 
 from .enum import LiveAction
-from .exceptions import SurrealDbConnectionError, SurrealDbError, SurrealDbNotFoundError
+from .exceptions import (
+    SurrealDbAuthenticationError,
+    SurrealDbConnectionError,
+    SurrealDbError,
+    SurrealDbNotFoundError,
+)
 from .utils import user_stacklevel
 
 if TYPE_CHECKING:
@@ -508,6 +513,8 @@ class LiveStream:
         self._stopping = False
         self._resubscribe_pending = False
         self._tasks: set[asyncio.Task[None]] = set()
+        # The connection manager's identity when the live query was opened (see _identity_refusal).
+        self._identity: tuple[int, bool] | None = None
 
     @property
     def table(self) -> str:
@@ -535,6 +542,7 @@ class LiveStream:
         # Client next, so no await sits between opening the subscription and buffering it.
         self._stopping = False
         self._client = await SurrealDBConnectionManager.get_client()
+        self._identity = SurrealDBConnectionManager._identity_snapshot()
         self._live_id = await self._starter(self._client)
         on_lost = self._schedule_resubscribe if self._auto_resubscribe else None
         self._iterator = open_stream(self._client, self._live_id, on_lost=on_lost)
@@ -599,7 +607,10 @@ class LiveStream:
             attempt += 1
             client: Any = None
             try:
+                self._check_identity()
                 client = await SurrealDBConnectionManager.get_client()
+                # Again once connected: the replay itself, or a concurrent signin, may have moved it.
+                self._check_identity()
                 new_id = await self._start_on(client)
                 break
             except asyncio.CancelledError:
@@ -637,6 +648,38 @@ class LiveStream:
         self._resubscribe_pending = False
         logger.info("Live query on %s resubscribed after a dropped connection (%s → %s)", self._table, old_id, new_id)
         await self._notify_reconnect(old_id, new_id)
+
+    def _check_identity(self) -> None:
+        """Refuse to reopen the live query under an identity other than the one that opened it.
+
+        A live query is evaluated with the permissions of whoever opened it. A new connection
+        comes back as the identity the manager *replays* — the stored session token, else the
+        configured user — so resubscribing is only sound when that is still the identity the
+        stream started under. Otherwise the stream ends with an authentication error instead
+        of carrying on with different permissions, possibly the configured root user's.
+
+        :raises SurrealDbAuthenticationError: the stream started under an identity that cannot be
+            replayed (``store=False``), or the identity changed since (signin, signup,
+            authenticate, invalidate, clear_session, or a session the server refused to restore).
+        """
+        from .connection_manager import SurrealDBConnectionManager
+
+        started = self._identity
+        if started is None:
+            return
+        if started[1]:
+            raise SurrealDbAuthenticationError(
+                f"The live query on {self._table!r} was opened under an identity the connection "
+                "manager cannot restore on a new connection (signin/signup/authenticate with "
+                "store=False, or clear_session() since). It is not resubscribed: a new connection "
+                "would run it with different permissions."
+            )
+        if SurrealDBConnectionManager._identity_snapshot() != started:
+            raise SurrealDbAuthenticationError(
+                f"The connection's identity changed since the live query on {self._table!r} was "
+                "opened (signin, signup, authenticate, invalidate, or a rejected session replay). "
+                "It is not resubscribed: the new subscription would run with different permissions."
+            )
 
     async def _start_on(self, client: Any) -> UUID:
         """Run the starter, shielded: a stop() landing mid-request must not orphan its result."""

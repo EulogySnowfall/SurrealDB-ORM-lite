@@ -34,6 +34,16 @@ class Reconnected(BaseSurrealModel):
     role: str = ""
 
 
+@pytest.fixture(autouse=True)
+def _replayable_identity() -> None:
+    """Start every test from a replayable identity, whatever another test file left behind.
+
+    The manager's identity bookkeeping is global, like its stored token: a ``store=False``
+    signin elsewhere would otherwise make every stream here refuse to resubscribe.
+    """
+    SurrealDBConnectionManager._identity_changed(replayable=True)
+
+
 def _direct_url() -> str:
     host = os.environ.get("SURREALDB_HOST", "localhost")
     port = os.environ.get("SURREALDB_PORT", "8000")
@@ -642,3 +652,117 @@ class TestResubscribeFailuresUnit:
         assert _is_connection_failure(KeyError("req"), _Dead())
         assert not _is_connection_failure(KeyError("req"), None)
         assert not _is_connection_failure(ValueError("bad"), None)
+
+
+# ==================== Task 3 — security review: identity drift on resubscribe ====================
+
+
+@pytest.mark.usefixtures("fast_backoff")
+class TestResubscribeIdentityUnit:
+    """A live query runs with the permissions of whoever opened it; a resubscribe must not change that."""
+
+    @pytest.mark.asyncio
+    async def test_an_identity_change_since_start_refuses_to_resubscribe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from surreal_orm_lite.exceptions import SurrealDbAuthenticationError
+
+        first, second = _FakeWs(), _FakeWs()
+        clients: list[Any] = [first, second]
+        stream, starts = TestResubscribeFailuresUnit._stream(monkeypatch, clients, [])
+        await stream.start()
+        SurrealDBConnectionManager._identity_changed(replayable=True)  # e.g. signin() as someone else
+        first.drop()
+
+        with pytest.raises(SurrealDbAuthenticationError, match="identity changed"):
+            await _next_within(stream)
+        assert starts[0] == 1
+        assert clients == [second], "no connection is even opened"
+
+    @pytest.mark.asyncio
+    async def test_an_unreplayable_identity_refuses_to_resubscribe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from surreal_orm_lite.exceptions import SurrealDbAuthenticationError
+
+        first, second = _FakeWs(), _FakeWs()
+        stream, starts = TestResubscribeFailuresUnit._stream(monkeypatch, [first, second], [])
+        SurrealDBConnectionManager._identity_changed(replayable=False)  # signin(store=False)
+        await stream.start()
+        first.drop()
+
+        with pytest.raises(SurrealDbAuthenticationError, match="cannot restore"):
+            await _next_within(stream)
+        assert starts[0] == 1
+
+
+OWNED_ACCESS = "reconnect_owned_acct"
+OWNED_USERS = "reconnect_owner"
+
+
+@contextlib.asynccontextmanager
+async def record_user(*, store: bool) -> AsyncIterator[str]:
+    """Inside :func:`proxied`: make ``Reconnected`` owner-readable, sign a record user up, yield its id."""
+    root = await SurrealDBConnectionManager.get_client()
+    await root.query(
+        f"DEFINE TABLE OVERWRITE {TABLE} SCHEMALESS PERMISSIONS FOR select WHERE owner = $auth.id;"
+        f"DEFINE TABLE OVERWRITE {OWNED_USERS} SCHEMALESS PERMISSIONS FOR select WHERE id = $auth.id;"
+        f"DEFINE ACCESS OVERWRITE {OWNED_ACCESS} ON DATABASE TYPE RECORD"
+        f" SIGNUP (CREATE {OWNED_USERS} SET email = $email)"
+        f" SIGNIN (SELECT * FROM {OWNED_USERS} WHERE email = $email);",
+        {},
+    )
+    try:
+        await SurrealDBConnectionManager.signup(
+            access=OWNED_ACCESS, variables={"email": f"{uuid4().hex}@example.test"}, store=store
+        )
+        user_id = await root.query("RETURN <string> $auth.id;", {})
+        yield str(user_id)
+    finally:
+        SurrealDBConnectionManager.clear_session()
+        await SurrealDBConnectionManager.close_connection()
+        SurrealDBConnectionManager._identity_changed(replayable=True)
+        cleanup = await SurrealDBConnectionManager.get_client()
+        for statement in (f"REMOVE ACCESS {OWNED_ACCESS} ON DATABASE;", f"REMOVE TABLE {OWNED_USERS};"):
+            with contextlib.suppress(Exception):
+                await cleanup.query(statement, {})
+
+
+async def _direct_query(sql: str) -> Any:
+    from surrealdb import AsyncSurreal
+
+    client = AsyncSurreal(_direct_url())
+    await client.connect(_direct_url())
+    try:
+        await client.signin({"username": "root", "password": "root"})
+        await client.use("ns", "db")
+        return await client.query(sql, {})
+    finally:
+        await client.close()
+
+
+@pytest.mark.usefixtures("fast_backoff")
+class TestResubscribeIdentityE2E:
+    @pytest.mark.asyncio
+    async def test_a_stored_record_identity_resubscribes_with_its_own_permissions(self) -> None:
+        async with proxied() as proxy, record_user(store=True) as user_id, Reconnected.objects().watch() as stream:
+            old = stream.live_id
+            proxy.cut()
+            await _resubscribed(stream, old)
+
+            # Written as root on a separate connection: the live query must still filter by
+            # the record user's permission, so only the owned record is reported.
+            await _direct_query(f"CREATE {TABLE}:foreign SET owner = {OWNED_USERS}:nobody;")
+            await _direct_query(f"CREATE {TABLE}:mine SET owner = <record> '{user_id}';")
+
+            envelope = await _next_within(stream)
+            assert str(envelope["record"].id) == "mine"
+
+    @pytest.mark.asyncio
+    async def test_an_unstored_record_identity_is_not_resubscribed_as_root(self) -> None:
+        from surreal_orm_lite.exceptions import SurrealDbAuthenticationError
+
+        async with proxied() as proxy, record_user(store=False):
+            async with Reconnected.objects().watch() as stream:
+                proxy.cut()
+                with pytest.raises(SurrealDbAuthenticationError):
+                    await _next_within(stream)
+                assert stream.is_active is False
+            await asyncio.sleep(0.2)
+            assert await _direct_lives() == {}
