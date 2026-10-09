@@ -29,7 +29,8 @@
 | v0.18.0           | Tier 1 — Field aliases & DX                          | Done    |
 | v0.19.0           | Tier 1 — Live queries (base), raw notifications      | Done    |
 | v0.20.0           | Tier 1 — Typed live queries (`LiveModelStream`)      | Done    |
-| v0.21.0 – v0.22.0 | Tier 1 — Core (auto-resubscribe, typed relations)    | Planned |
+| v0.21.0           | Tier 1 — Auto-resubscribe & change feeds (cursor)    | Done    |
+| v0.22.0           | Tier 1 — Core (native typed relations)               | Planned |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 7 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
@@ -77,7 +78,7 @@ pieces stay out.
 | Field aliases & DX                     | Pydantic `Field(alias=)` + config                     | ✅ v0.18.0     |
 | Live queries (raw notifications)       | `live()` / `subscribe_live()` / `kill()`              | ✅ v0.19.0     |
 | Typed live queries (`LiveModelStream`) | idem + deserialization + `LIVE SELECT [DIFF] … WHERE` | ✅ v0.20.0     |
-| Change Feeds / Auto-Resubscribe        | live queries + reconnect logic                        | v0.21.0        |
+| Change Feeds / Auto-Resubscribe        | `recv_task` drop signal + `SHOW CHANGES … SINCE`      | ✅ v0.21.0     |
 | Native typed relations                 | `insert_relation()`                                   | v0.22.0        |
 | Rich field types                       | native `Datetime`/`Duration`/`Decimal`/`Range`/`Uuid` | v0.23.0        |
 | Geospatial fields (`nearby()`)         | native `Geometry` + `geo::*`                          | v0.24.0        |
@@ -142,7 +143,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | Field aliases & DX            | yes        | ✅ v0.18.0                  |
 | Live queries (raw notifs)     | yes        | ✅ v0.19.0                  |
 | Typed live queries            | yes        | ✅ v0.20.0                  |
-| Live auto-resubscribe / CDC   | yes        | v0.21                       |
+| Live auto-resubscribe / CDC   | yes        | ✅ v0.21.0                  |
 | Native typed relations        | yes        | v0.22.0                     |
 | Rich field types              | yes        | v0.23.0                     |
 | Geospatial fields             | yes        | v0.24.0                     |
@@ -344,7 +345,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 - `QuerySet.live(diff=)` returns a `LiveModelStream` yielding `ModelChangeEvent`s with a model
   `instance` — the full SurrealDB-ORM's API, names and fields, so migrating is an import change.
-  `post_live_change` is the full ORM's signal. `auto_resubscribe`/`on_reconnect` are v0.21.0
+  `post_live_change` is the full ORM's signal. `auto_resubscribe`/`on_reconnect` arrived in v0.21.0
 - `filter()`/`Q`/`Var`+`variables()` and `fetch()` are applied server-side through
   `LIVE SELECT [DIFF] … WHERE … FETCH`, sent with `query()`; `watch()` gains the same filters
 - **SurrealDB 2.x drops bound parameters in a live query** — the filter silently matches
@@ -356,6 +357,26 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   `"/"` on 2.x) and the 2.x diff `DELETE` (a whole record) are normalised by `live()`
 - `await qs.live()` (uuid) is deprecated but kept, so v0.19.0 code keeps running
 - Measured the same on both lines: filter enter/leave semantics, `fetch()` in notifications
+
+### Version 0.21.0 — Auto-resubscribe & change feeds
+
+- `live()`/`watch()` take the full ORM's `auto_resubscribe=True` and `on_reconnect=`: a dropped
+  WebSocket is detected through the SDK's receive task (it ends within milliseconds on both
+  lines), and the stream resubscribes on a new connection with backoff, keeping its buffer, so
+  an `async for` carries on. `on_reconnect(old_id, new_id)` is the catch-up hook — a live query
+  never replays an outage
+- A resubscribe never changes identity: a stream opened under an identity a new connection
+  cannot restore (`store=False`), or whose identity changed since, ends with
+  `SurrealDbAuthenticationError` rather than reopening as someone else
+- No reader hangs on a drop any more: `auto_resubscribe=False` and `subscribe_live()` readers
+  raise `SurrealDbConnectionError`; deliberate teardowns still end streams cleanly
+- `get_client()` replaces a dead WebSocket client, and opening is serialised per event loop
+- `QuerySet.changes(since=, poll_interval=, batch_size=)` → `ChangeModelStream` (full ORM API)
+  with an `int` cursor that resumes exactly on both lines — 2.x's `SINCE` takes
+  `versionstamp >> 16`, 3.x's the stamp itself. `since=datetime` is exact on 3.x (converted to
+  `unix_ms << 16`, since the server's own datetime `SINCE` is always empty there) and
+  at-least-once on 2.x. At-least-once per transaction; works over HTTP; clauses refused; a table
+  without `CHANGEFEED` refused
 
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
@@ -517,7 +538,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 | ---------- | ------------------------------------------------------------------------------- | ----------------------------- |
 | ✅ v0.19.0 | Live Queries (base): `live()`/`watch()`/`subscribe_live()`/`kill()`, raw notifs | `live`/`kill` + `live_queues` |
 | ✅ v0.20.0 | Typed live queries: `live()` → `LiveModelStream`, filters, diff, signal         | `LIVE SELECT [DIFF] … WHERE`  |
-| v0.21.0    | Change Feeds / Auto-Resubscribe: WS reconnect + resubscribe + cursor            | live + reconnect              |
+| ✅ v0.21.0 | Change Feeds / Auto-Resubscribe: WS reconnect + resubscribe + cursor            | `recv_task` + `SHOW CHANGES`  |
 
 ### 🟠 Phase E — Graph
 
