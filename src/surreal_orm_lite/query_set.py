@@ -12,7 +12,7 @@ from ._sdk import NotFoundError
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import Var
-from .live import LiveModelStream, LiveStream, missing_table_error, require_websocket
+from .live import LiveModelStream, LiveStream, ReconnectCallback, missing_table_error, require_websocket
 from .q import Q
 from .surql_literal import inline_variables
 from .utils import (
@@ -1072,7 +1072,13 @@ class QuerySet:
 
         return start
 
-    def live(self, *, diff: bool = False) -> LiveModelStream[Any]:
+    def live(
+        self,
+        *,
+        auto_resubscribe: bool = True,
+        diff: bool = False,
+        on_reconnect: ReconnectCallback | None = None,
+    ) -> LiveModelStream[Any]:
         """Subscribe to the records this queryset matches, as typed model events.
 
         Same API as the full SurrealDB-ORM::
@@ -1090,16 +1096,37 @@ class QuerySet:
         carries a whole record. The live query is killed when the ``async with`` exits.
 
         ``await qs.live()`` — the v0.19.0 form returning the uuid — still works and is
-        deprecated. Automatic reconnection (``auto_resubscribe=``) arrives in v0.21.0.
+        deprecated, and never resubscribes: the caller owns that uuid.
+
+        **Dropped connections (v0.21.0).** With ``auto_resubscribe=True`` (the default, as in the
+        full ORM) a stream whose WebSocket drops resubscribes on a new connection, with backoff,
+        and the ``async for`` carries on; ``on_reconnect(old_id, new_id)`` — sync or async — is
+        then called, the place to catch up on what changed during the outage, which a live query
+        cannot replay. With ``auto_resubscribe=False`` the iteration raises
+        ``SurrealDbConnectionError`` instead. A teardown you ask for (``kill()``,
+        ``close_connection()``…) ends the stream either way.
 
         :raises SurrealDbError: for ``select``/``values``/``annotate``/``order_by``/``limit``/
             ``offset``/``objects(tx=)``, here; for a non-WebSocket connection, on start.
         :raises TypeError: for a filter value with no SurrealQL literal form, here.
         :raises SurrealDbNotFoundError: on SurrealDB 3.x, on start, if the table does not exist.
         """
-        return LiveModelStream(self.model, self._model_table, self._live_starter(diff), diff=diff)
+        return LiveModelStream(
+            self.model,
+            self._model_table,
+            self._live_starter(diff),
+            diff=diff,
+            auto_resubscribe=auto_resubscribe,
+            on_reconnect=on_reconnect,
+        )
 
-    def watch(self, *, diff: bool = False) -> LiveStream:
+    def watch(
+        self,
+        *,
+        diff: bool = False,
+        auto_resubscribe: bool = True,
+        on_reconnect: ReconnectCallback | None = None,
+    ) -> LiveStream:
         """Watch the records this queryset matches, killing the subscription when the block exits.
 
         Yields the **raw** notification envelopes (``action``, ``record``, ``result``)::
@@ -1110,9 +1137,15 @@ class QuerySet:
 
         ``filter()``, ``variables()`` and ``fetch()`` are applied by the server. With
         ``diff=True`` each ``result`` is a list of patches instead of a record. For model
-        instances, use :meth:`live`.
+        instances, use :meth:`live`. ``auto_resubscribe`` and ``on_reconnect`` behave as for
+        :meth:`live`.
         """
-        return LiveStream(self._model_table, self._live_starter(diff))
+        return LiveStream(
+            self._model_table,
+            self._live_starter(diff),
+            auto_resubscribe=auto_resubscribe,
+            on_reconnect=on_reconnect,
+        )
 
     async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
         """

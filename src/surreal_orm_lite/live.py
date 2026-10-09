@@ -49,20 +49,39 @@ from uuid import UUID
 from pydantic import ValidationError
 
 from .enum import LiveAction
-from .exceptions import SurrealDbError, SurrealDbNotFoundError
+from .exceptions import SurrealDbConnectionError, SurrealDbError, SurrealDbNotFoundError
 from .utils import user_stacklevel
 
 if TYPE_CHECKING:
     from .model_base import BaseSurrealModel
 
-__all__ = ["LiveIterator", "LiveModelStream", "LiveStream", "ModelChangeEvent"]
+__all__ = ["LiveIterator", "LiveModelStream", "LiveStream", "ModelChangeEvent", "ReconnectCallback"]
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound="BaseSurrealModel")
 
+#: ``on_reconnect(old_id, new_id)`` — called once a dropped live query is running again under
+#: ``new_id``. Sync or async. The full ORM passes ``str`` ids; lite passes the ``UUID`` its
+#: ``live_id`` already is, so ``str(old_id)`` code works with both.
+ReconnectCallback = Callable[[UUID, UUID], Awaitable[None] | None]
+
 # Private end-of-stream marker. Identity-compared, so it can never collide with a payload.
 _STREAM_END: Final = object()
+
+
+class _Lost:
+    """Enqueued when the subscription is gone for good: the reader raises :attr:`error`.
+
+    A class rather than a second sentinel, because the reader has to say *why* — a dropped
+    connection, or the reconnect that gave up and the error that made it give up.
+    """
+
+    __slots__ = ("error",)
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
 
 # Queues this module handed out, keyed by the event loop that owns them and then by the live
 # query's uuid. Mirrors the SDK's ``live_queues`` so ``kill()`` can still reach a queue once the
@@ -158,6 +177,11 @@ def register_subscriber(client: Any, query_uuid: str | UUID) -> asyncio.Queue[An
     return queue
 
 
+def _is_registered(loop: asyncio.AbstractEventLoop, query_uuid: str | UUID, queue: asyncio.Queue[Any]) -> bool:
+    """Whether *queue* still reads *query_uuid* on *loop* — i.e. nobody released it on purpose."""
+    return queue in _SUBSCRIBERS.get(loop, {}).get(_key(query_uuid), ())
+
+
 def unregister_subscriber(client: Any, query_uuid: str | UUID, queue: asyncio.Queue[Any]) -> None:
     """Drop one subscriber, leaving any other reader of the same live query untouched."""
     key = _key(query_uuid)
@@ -249,14 +273,66 @@ class LiveIterator:
       tick. Here the pending ``queue.get()`` is simply abandoned; ``asyncio.Queue`` removes no
       item for a cancelled getter, and the next read picks up where the last one left off.
 
-    The iteration ends when the live query is killed or its connection is closed. Call
-    :meth:`aclose` to stop reading early without killing the live query.
+    The iteration ends when the live query is killed or its connection is closed. If the
+    WebSocket **drops** instead, it raises :class:`SurrealDbConnectionError` — the subscription
+    died with the socket, and waiting on would mean waiting forever. Call :meth:`aclose` to stop
+    reading early without killing the live query.
+
+    **Telling a drop from a teardown.** Both end the SDK's receive task, which is the only drop
+    signal there is. Every deliberate path — ``kill()``, ``close_connection()``, the connection
+    manager's other teardowns — releases the reader's queue *before* the socket goes, so a queue
+    still registered when the task ends means nobody asked for it: that is a drop.
+    ``on_lost`` lets :class:`LiveStream` take over at that point and resubscribe.
     """
 
-    def __init__(self, client: Any, query_uuid: str | UUID, queue: asyncio.Queue[Any] | None) -> None:
+    def __init__(
+        self,
+        client: Any,
+        query_uuid: str | UUID,
+        queue: asyncio.Queue[Any] | None,
+        *,
+        on_lost: Callable[[], None] | None = None,
+    ) -> None:
         self._client = client
         self._query_uuid = query_uuid
         self._queue = queue
+        self._on_lost = on_lost
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._watched: asyncio.Task[Any] | None = None
+        if queue is not None:
+            self._loop = asyncio.get_running_loop()
+            self._watch(client)
+
+    def _watch(self, client: Any) -> None:
+        task = recv_task_of(client)
+        if task is not None:
+            self._watched = task
+            # On a task that is already done, the callback is scheduled at once: a drop that
+            # happened before the reader existed is still reported.
+            task.add_done_callback(self._connection_lost)
+
+    def _unwatch(self) -> None:
+        task, self._watched = self._watched, None
+        if task is not None:
+            task.remove_done_callback(self._connection_lost)
+
+    def _connection_lost(self, _task: asyncio.Task[Any]) -> None:
+        """The SDK's receive task ended: the socket is gone, whether or not anyone asked."""
+        queue = self._queue
+        if queue is None or self._loop is None or not _is_registered(self._loop, self._query_uuid, queue):
+            return  # released on purpose — kill() or a connection teardown got there first
+        if self._on_lost is not None:
+            self._on_lost()
+            return
+        queue.put_nowait(
+            _Lost(
+                SurrealDbConnectionError(
+                    f"The WebSocket connection carrying live query {self._query_uuid} dropped; "
+                    "the server removed the subscription with it. Start a new one, or use "
+                    "watch()/live() with auto_resubscribe=True to have the ORM do it."
+                )
+            )
+        )
 
     def __aiter__(self) -> LiveIterator:
         return self
@@ -265,6 +341,9 @@ class LiveIterator:
         if self._queue is None:
             raise StopAsyncIteration
         envelope = await self._queue.get()
+        if isinstance(envelope, _Lost):
+            self._detach()
+            raise envelope.error
         if envelope is _STREAM_END or (isinstance(envelope, dict) and envelope.get("action") == LiveAction.KILLED):
             self._detach()
             raise StopAsyncIteration
@@ -275,13 +354,14 @@ class LiveIterator:
         self._detach()
 
     def _detach(self) -> None:
+        self._unwatch()
         if self._queue is None:
             return
         queue, self._queue = self._queue, None
         unregister_subscriber(self._client, self._query_uuid, queue)
 
 
-def open_stream(client: Any, query_uuid: str | UUID) -> LiveIterator:
+def open_stream(client: Any, query_uuid: str | UUID, *, on_lost: Callable[[], None] | None = None) -> LiveIterator:
     """Start buffering ``query_uuid``'s notifications now, and return an iterator over them.
 
     Everything the server pushes from this moment on is buffered until the caller gets round to
@@ -297,7 +377,7 @@ def open_stream(client: Any, query_uuid: str | UUID) -> LiveIterator:
         )
     if _key(query_uuid) in _killed():
         return LiveIterator(client, query_uuid, None)
-    return LiveIterator(client, query_uuid, register_subscriber(client, query_uuid))
+    return LiveIterator(client, query_uuid, register_subscriber(client, query_uuid), on_lost=on_lost)
 
 
 def require_websocket(url: str | None) -> None:
@@ -339,9 +419,18 @@ class LiveStream:
                 print(notif["action"], notif["result"])
     """
 
-    def __init__(self, table: str, starter: Any) -> None:
+    def __init__(
+        self,
+        table: str,
+        starter: Any,
+        *,
+        auto_resubscribe: bool = True,
+        on_reconnect: ReconnectCallback | None = None,
+    ) -> None:
         self._table = table
         self._starter = starter
+        self._auto_resubscribe = auto_resubscribe
+        self._on_reconnect = on_reconnect
         self._live_id: UUID | None = None
         self._client: Any = None
         self._iterator: LiveIterator | None = None
@@ -400,7 +489,14 @@ class LiveStream:
     async def __anext__(self) -> dict[str, Any]:
         if self._iterator is None:
             raise StopAsyncIteration
-        return await self._iterator.__anext__()
+        try:
+            return await self._iterator.__anext__()
+        except Exception:
+            # The iterator only raises to report a lost subscription (a drop, or a reconnect
+            # that gave up). Nothing is left on the server, so nothing remains to kill.
+            self._live_id = None
+            self._iterator = None
+            raise
 
     async def __aenter__(self) -> LiveStream:
         return await self.start()
@@ -550,11 +646,13 @@ class LiveModelStream(Generic[T]):
         starter: Callable[[], Awaitable[UUID]],
         *,
         diff: bool = False,
+        auto_resubscribe: bool = True,
+        on_reconnect: ReconnectCallback | None = None,
     ) -> None:
         self._model = model
         self._diff = diff
         self._starter = starter
-        self._stream = LiveStream(table, starter)
+        self._stream = LiveStream(table, starter, auto_resubscribe=auto_resubscribe, on_reconnect=on_reconnect)
         self._started = False
         self._uuid_start: Coroutine[Any, Any, UUID] | None = None
         self._warned_invalid = False
@@ -610,8 +708,10 @@ class LiveModelStream(Generic[T]):
     async def __anext__(self) -> ModelChangeEvent[T]:
         try:
             envelope = await self._stream.__anext__()
-        except StopAsyncIteration:
-            # Killed elsewhere or the connection closed: let the handler task drain and exit.
+        except (StopAsyncIteration, Exception):
+            # Killed elsewhere, the connection closed, or the subscription was lost: let the
+            # handler task drain and exit. (A cancelled read is a BaseException and lands
+            # nowhere near here — the stream stays alive for the next read.)
             self._close_signal_queue()
             raise
         event = to_change_event(self._model, envelope, diff=self._diff)
