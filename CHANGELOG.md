@@ -5,6 +5,95 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.0] - 2026-10-09
+
+Live queries that survive a dropped connection, and change feeds with a cursor that resumes
+exactly — the rest of the full SurrealDB-ORM's real-time API, on the official SDK and on both
+server lines.
+
+### Added
+
+- **Auto-resubscribe** — `QuerySet.live(*, auto_resubscribe=True, diff=False, on_reconnect=None)`,
+  the full ORM's signature, and the same two arguments on `watch()`. When the WebSocket drops,
+  the stream opens a new connection, sends the same live query again (filters, `DIFF`, `FETCH`
+  intact) and moves its buffer onto the new uuid, so an `async for` simply carries on:
+
+  ```python
+  async def catch_up(old_id, new_id):
+      ...  # re-read what changed while the connection was down
+
+  async with Order.objects().filter(status="open").live(on_reconnect=catch_up) as stream:
+      async for event in stream:
+          ...
+  ```
+
+  `on_reconnect(old_id, new_id)` is sync or async, receives `UUID`s, and runs once the new
+  subscription is already buffering; an exception in it is logged. Connection failures are
+  retried with exponential backoff (`reconnect_delay` 0.5 s, `reconnect_max_delay` 30 s,
+  `reconnect_max_attempts` 10 — class attributes on `LiveStream`/`LiveModelStream`); when they
+  run out, or on any other failure, the error is raised from the iteration.
+
+- **Change feeds** — `QuerySet.changes(*, since=None, poll_interval=0.1, batch_size=100)` →
+  `ChangeModelStream`, the full ORM's API: an async iterator of `ModelChangeEvent` read from
+  `SHOW CHANGES`, over HTTP or WebSocket. `stream.cursor` (an `int`) resumes exactly with
+  `changes(since=cursor)`, on 2.x and 3.x alike; it advances past a transaction only after its
+  last event, so saving it after each event is at-least-once. `since=` also takes a `datetime`
+  or ISO-8601 string. With `INCLUDE ORIGINAL`, updates carry `changed_fields`. `start()` fixes
+  the starting position early; `stop()` ends the iteration at once, even during a retry
+  backoff. A change feed defined on the database (`DEFINE DATABASE … CHANGEFEED`) is accepted.
+- `ChangeModelStream` and `ReconnectCallback` are exported from the package root.
+
+### Changed
+
+- **A dropped WebSocket no longer hangs anything.** A stream with `auto_resubscribe=False`, and a
+  secondary `subscribe_live()` reader, now raise `SurrealDbConnectionError` on a drop; before,
+  they waited forever. Deliberate teardowns (`kill()`, `close_connection()`, …) still end streams
+  cleanly and never trigger a resubscribe.
+- **`get_client()` replaces a dropped WebSocket client** (signed in, session replayed) instead of
+  handing back a dead one that failed every call until `reconnect()`.
+- **Opening a client is serialised per event loop.** Concurrent `get_client()` calls with no
+  usable client share one new connection; before, each opened its own and the extras leaked —
+  a live query started on one could never be killed.
+- `kill()` on a dropped client returns without a network call instead of raising
+  `SurrealDbError`, and the live queries of a replaced client are recorded as dead, so a late
+  `subscribe_live()` on one of them ends at once.
+- A `get_client()` cancelled while opening the connection now closes the half-open socket.
+- `live()` and `watch()` no longer refuse `auto_resubscribe=` / `on_reconnect=` with `TypeError`.
+
+### Security
+
+- **A resubscribe never changes the identity a live query runs under.** A live query is
+  evaluated with the permissions of whoever opened it, and a new connection comes back as the
+  identity the manager replays. The manager stamps each connection whenever it sets its
+  identity, and tracks every change to what a reconnect would restore (stored token,
+  `invalidate()`, `clear_session()`, `set_connection()` and the `set_*` setters). A stream opened
+  under an identity that cannot be replayed (`store=False`), or whose replayed identity changed
+  since, ends with `SurrealDbAuthenticationError` instead of resubscribing — possibly as the
+  configured root user.
+- **Reconnect loops do not retry a server that answered "no".** `get_client()` still raises
+  `SurrealDbConnectionError` when the configured credentials are rejected, but live streams and
+  change feeds raise it at once instead of retrying it for minutes.
+
+### Notes
+
+- **The change-feed cursor differs by line.** Every entry carries a `versionstamp`, but 2.x's
+  `SINCE` takes `versionstamp >> 16` — resuming with the stamp the server returned silently
+  yields nothing, forever — while 3.x's takes the stamp itself, inclusively. The ORM reads the
+  server version once per stream and stores the next `SINCE` value.
+- **`SINCE <datetime>` is unusable as is**: always empty on 3.x, and on 2.x it also returns
+  changes from before the moment. A datetime is converted to 3.x's versionstamp layout
+  (`unix_ms << 16`, pinned by a test) and passed through on 2.x (at-least-once); "from now" on
+  2.x is found by searching the counter.
+- A change feed does not record the kind of write: a creation arrives as `UPDATE`. A table
+  without a change feed answers `SHOW CHANGES` with `[]` on both lines, so `changes()` checks
+  `INFO FOR DB` and refuses it (skipped when `INFO` is not permitted).
+- Observed once in CI on a fresh SurrealDB 2.7.0 server, never reproduced locally: a plain write
+  to a table with a change feed failed with the retryable "read or write conflict" error, with no
+  concurrent writer. `retry_on_conflict` (v0.12.0) handles it; the test suite now uses it there.
+- **What a live query misses during an outage is not replayed** — catch up in `on_reconnect`,
+  or from a change feed. A request already in flight when the socket drops fails with the SDK's
+  own `KeyError`; retrying arbitrary queries is v0.40.0.
+
 ## [0.20.0] - 2026-10-07
 
 Typed live queries, with the same API as the full SurrealDB-ORM: code written against

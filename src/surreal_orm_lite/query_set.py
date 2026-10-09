@@ -9,10 +9,11 @@ from pydantic_core import ValidationError
 
 from . import BaseSurrealModel, SurrealDBConnectionManager
 from ._sdk import NotFoundError
+from .changefeed import ChangeModelStream, Since
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import Var
-from .live import LiveModelStream, LiveStream, missing_table_error, require_websocket
+from .live import LiveModelStream, LiveStream, ReconnectCallback, missing_table_error, require_websocket
 from .q import Q
 from .surql_literal import inline_variables
 from .utils import (
@@ -1051,7 +1052,7 @@ class QuerySet:
             query += f" FETCH {', '.join(self._fetch_fields)}"
         return query + ";"
 
-    def _live_starter(self, diff: bool) -> Callable[[], Awaitable[UUID]]:
+    def _live_starter(self, diff: bool) -> Callable[..., Awaitable[UUID]]:
         """Compile now, and return the coroutine function that starts the live query.
 
         Compiling eagerly makes a bad clause or value fail at the ``live()``/``watch()`` call,
@@ -1061,9 +1062,12 @@ class QuerySet:
         query = self._compile_live(diff)
         table = self._model_table
 
-        async def start() -> UUID:
+        async def start(client: Any = None) -> UUID:
+            # A resubscribe passes the client it is about to move the stream onto, so the live
+            # query is guaranteed to run on that very connection.
             require_websocket(SurrealDBConnectionManager.get_connection_string())
-            client = await SurrealDBConnectionManager.get_client()
+            if client is None:
+                client = await SurrealDBConnectionManager.get_client()
             try:
                 live_id = await client.query(query)
             except NotFoundError as exc:
@@ -1072,7 +1076,13 @@ class QuerySet:
 
         return start
 
-    def live(self, *, diff: bool = False) -> LiveModelStream[Any]:
+    def live(
+        self,
+        *,
+        auto_resubscribe: bool = True,
+        diff: bool = False,
+        on_reconnect: ReconnectCallback | None = None,
+    ) -> LiveModelStream[Any]:
         """Subscribe to the records this queryset matches, as typed model events.
 
         Same API as the full SurrealDB-ORM::
@@ -1090,16 +1100,37 @@ class QuerySet:
         carries a whole record. The live query is killed when the ``async with`` exits.
 
         ``await qs.live()`` — the v0.19.0 form returning the uuid — still works and is
-        deprecated. Automatic reconnection (``auto_resubscribe=``) arrives in v0.21.0.
+        deprecated, and never resubscribes: the caller owns that uuid.
+
+        **Dropped connections (v0.21.0).** With ``auto_resubscribe=True`` (the default, as in the
+        full ORM) a stream whose WebSocket drops resubscribes on a new connection, with backoff,
+        and the ``async for`` carries on; ``on_reconnect(old_id, new_id)`` — sync or async — is
+        then called, the place to catch up on what changed during the outage, which a live query
+        cannot replay. With ``auto_resubscribe=False`` the iteration raises
+        ``SurrealDbConnectionError`` instead. A teardown you ask for (``kill()``,
+        ``close_connection()``…) ends the stream either way.
 
         :raises SurrealDbError: for ``select``/``values``/``annotate``/``order_by``/``limit``/
             ``offset``/``objects(tx=)``, here; for a non-WebSocket connection, on start.
         :raises TypeError: for a filter value with no SurrealQL literal form, here.
         :raises SurrealDbNotFoundError: on SurrealDB 3.x, on start, if the table does not exist.
         """
-        return LiveModelStream(self.model, self._model_table, self._live_starter(diff), diff=diff)
+        return LiveModelStream(
+            self.model,
+            self._model_table,
+            self._live_starter(diff),
+            diff=diff,
+            auto_resubscribe=auto_resubscribe,
+            on_reconnect=on_reconnect,
+        )
 
-    def watch(self, *, diff: bool = False) -> LiveStream:
+    def watch(
+        self,
+        *,
+        diff: bool = False,
+        auto_resubscribe: bool = True,
+        on_reconnect: ReconnectCallback | None = None,
+    ) -> LiveStream:
         """Watch the records this queryset matches, killing the subscription when the block exits.
 
         Yields the **raw** notification envelopes (``action``, ``record``, ``result``)::
@@ -1110,9 +1141,78 @@ class QuerySet:
 
         ``filter()``, ``variables()`` and ``fetch()`` are applied by the server. With
         ``diff=True`` each ``result`` is a list of patches instead of a record. For model
-        instances, use :meth:`live`.
+        instances, use :meth:`live`. ``auto_resubscribe`` and ``on_reconnect`` behave as for
+        :meth:`live`.
         """
-        return LiveStream(self._model_table, self._live_starter(diff))
+        return LiveStream(
+            self._model_table,
+            self._live_starter(diff),
+            auto_resubscribe=auto_resubscribe,
+            on_reconnect=on_reconnect,
+        )
+
+    def _reject_changes_clauses(self) -> None:
+        """Refuse every clause, naming each: ``SHOW CHANGES`` reads a whole table's feed.
+
+        It has no ``WHERE``, projection, ordering or paging, so a filtered queryset would
+        silently stream every record of the table — the wrong answer the ORM never gives.
+        """
+        unsupported = {
+            "filter()": bool(self._filters or self._q_filters),
+            "variables()": bool(self._variables),
+            "select()": bool(self.select_item),
+            "limit()": self._limit is not None,
+            "offset()": self._offset is not None,
+            "order_by()": self._order_by is not None,
+            "annotate()": bool(self._annotations),
+            "values()": bool(self._group_by_fields),
+            "fetch()": bool(self._fetch_fields),
+            "objects(tx=)": self._tx is not None,
+        }
+        offenders = sorted(name for name, present in unsupported.items() if present)
+        if offenders:
+            raise SurrealDbError(
+                f"A change feed cannot honour {', '.join(offenders)}: SurrealDB's SHOW CHANGES "
+                f"reads the whole table's log, with no WHERE, projection, ordering or paging, "
+                f"outside any transaction. Call changes() on Model.objects() and filter the events."
+            )
+
+    def changes(
+        self,
+        *,
+        since: Since = None,
+        poll_interval: float = 0.1,
+        batch_size: int = 100,
+    ) -> ChangeModelStream[Any]:
+        """Stream the table's change feed — the full SurrealDB-ORM's API, with a usable cursor::
+
+            stream = Order.objects().changes(since=saved_cursor)   # None = from now
+            async for event in stream:
+                await publish(event.action, event.instance)
+                save(stream.cursor)
+
+        The table must be defined with a change feed (``DEFINE TABLE … CHANGEFEED 7d``). Unlike a
+        live query, nothing is missed while nobody reads: resuming from ``stream.cursor`` delivers
+        every later change, on SurrealDB 2.x and 3.x alike (their cursor units differ; the ORM
+        normalises them). Works over HTTP as well as WebSocket.
+
+        :param since: a cursor from :attr:`ChangeModelStream.cursor`; a ``datetime`` or ISO-8601
+            string (naive means UTC; exact on 3.x, at-least-once on 2.x, whose server also returns
+            some earlier changes); or ``None`` for changes made after the stream starts.
+        :param poll_interval: seconds between two polls when the feed has nothing new.
+        :param batch_size: entries read per poll.
+        :raises SurrealDbError: for any queryset clause, here; on start, for a table that does not
+            exist or has no change feed (on the table or on its database).
+        :raises TypeError, ValueError: for an unusable ``since``/``poll_interval``/``batch_size``.
+        """
+        self._reject_changes_clauses()
+        return ChangeModelStream(
+            self.model,
+            self._model_table,
+            since=since,
+            poll_interval=poll_interval,
+            batch_size=batch_size,
+        )
 
     async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
         """

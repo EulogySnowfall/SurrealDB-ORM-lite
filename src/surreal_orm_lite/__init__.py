@@ -1,7 +1,8 @@
-__version__ = "0.20.0"
+__version__ = "0.21.0"
 
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
 from .auth import AuthTokens
+from .changefeed import ChangeModelStream
 from .concurrency import is_conflict_error, retry_on_conflict
 from .connection_manager import SurrealDBConnectionManager
 from .enum import LiveAction, OrderBy
@@ -27,7 +28,7 @@ from .functions import (
     Var,
     computed,
 )
-from .live import LiveModelStream, LiveStream, ModelChangeEvent
+from .live import LiveModelStream, LiveStream, ModelChangeEvent, ReconnectCallback
 from .model_auth import AuthenticatedUserMixin, AuthResult
 from .model_base import BaseSurrealModel, SurrealConfigDict
 from .q import Q
@@ -67,6 +68,8 @@ __all__ = [
     "LiveStream",
     "LiveModelStream",
     "ModelChangeEvent",
+    "ReconnectCallback",
+    "ChangeModelStream",
     # Aggregations
     "Aggregation",
     "Count",

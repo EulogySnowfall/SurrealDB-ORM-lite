@@ -165,6 +165,8 @@ results = await User.objects().query(
 | Field aliases & DX     | ✅     |
 | Live queries (raw)     | ✅     |
 | Typed live queries     | ✅     |
+| Live auto-resubscribe  | ✅     |
+| Change feeds (CDC)     | ✅     |
 
 ### Supported Filter Lookups
 
@@ -1196,14 +1198,67 @@ pending handlers (up to `stream.signal_drain_timeout`, 5 s by default) so the la
 effects are not lost; leaving it on an exception cancels them. The signal fires only while you
 iterate a `live()` stream.
 
+#### Surviving a dropped connection
+
+Since v0.21.0 a `live()` or `watch()` stream survives a WebSocket that drops — a network
+failure, a server restart, a proxy timing out. The ORM notices within milliseconds, opens a new
+connection (signed in, session restored), sends the same live query again and carries on: an
+`async for` parked on the stream simply receives the next event later. `stream.live_id` changes.
+
+```python
+async def catch_up(old_id, new_id):
+    # A live query only reports what happens while it runs: re-read what the outage hid.
+    await refresh_dashboard(await Order.objects().filter(status="open").all())
+
+async with Order.objects().filter(status="open").live(on_reconnect=catch_up) as stream:
+    async for event in stream:
+        ...
+```
+
+- **`on_reconnect(old_id, new_id)`** — sync or async, called with both `UUID`s once the new
+  subscription is already buffering, so nothing written after it is missed while it runs. An
+  exception in it is logged, never raised.
+- **The outage itself is not replayed.** Changes made while the connection was down are lost to
+  a live query. Catch up in `on_reconnect`, or pair the stream with a change feed (below), which
+  can be resumed exactly from a cursor.
+- **Backoff:** `reconnect_delay` (0.5 s) doubling up to `reconnect_max_delay` (30 s), at most
+  `reconnect_max_attempts` (10; `None` retries forever) — class attributes on `LiveModelStream`
+  and `LiveStream`, overridable per stream. Only connection failures are retried. When the
+  attempts run out, or anything else goes wrong (the table was removed, the session token was
+  refused), the error is raised from the iteration and `is_active` turns `False`.
+- **Never under another identity.** A live query runs with the permissions of whoever opened it,
+  and a new connection comes back as the identity the manager replays (the stored session
+  token, else the configured user). If the stream was opened under an identity a new connection
+  cannot restore (`signin(..., store=False)`), or what a new connection would restore has
+  changed since (`signin`/`signup`/`authenticate` with the default `store=True`, `invalidate()`,
+  `clear_session()`, `set_connection()` or a `set_*` setter, a refused session replay), the
+  stream ends with `SurrealDbAuthenticationError` instead of resubscribing as somebody else.
+  Minting a token for someone else with `store=False` after the stream started does not block it.
+  The check is per connection, so another event loop's identity changes do not leak in. Identity
+  changes made directly on the SDK client are not seen by the ORM.
+- **`auto_resubscribe=False`** ends the stream on a drop with `SurrealDbConnectionError`, as does
+  any secondary reader from `subscribe_live(uuid)`, which is tied to one uuid. Before v0.21.0
+  they all waited forever.
+- **Teardowns you ask for still end the stream.** `kill()`, leaving the block,
+  `close_connection()`, `reconnect()`, `set_url(reconnect=True)` — none of them triggers a
+  resubscribe. `stop()` during a reconnect cancels it.
+- A silent network loss with no TCP reset is noticed by the WebSocket keepalive, within about
+  40 s.
+
+The connection manager benefits too: `get_client()` now replaces a dropped WebSocket client
+instead of handing back a dead one, and concurrent callers share one new connection. A request
+that was already in flight when the socket dropped still fails — with the SDK's own `KeyError` —
+because retrying arbitrary queries is planned for v0.40.0.
+
 #### Migrating from SurrealDB-ORM
 
 `live()`, `ModelChangeEvent`, `LiveModelStream`, `LiveAction` and `post_live_change` have the
 same names, fields and arguments as in the full ORM — change the import from `surreal_orm` to
 `surreal_orm_lite`. The differences:
 
-- `auto_resubscribe=` and `on_reconnect=` are **not accepted yet** (v0.21.0); passing them
-  raises `TypeError` rather than pretending the stream survives a reconnect.
+- `auto_resubscribe=` and `on_reconnect=` are accepted with the same defaults (v0.21.0).
+  `on_reconnect` receives `UUID`s rather than `str`, like lite's `live_id`; `str(old_id)` works
+  with both.
 - Lite **refuses** a clause a live query cannot honour (`order_by()`, `limit()`, …) where the
   full ORM ignores it, and honours `fetch()`.
 - `record_id` is filled in diff mode too.
@@ -1331,10 +1386,10 @@ exactly what ends a stream.
   afterwards does not reconnect: with the connection gone there is nothing left to kill.
 - **A timed-out read does _not_ end it.** Cancelling a pending read loses nothing; the next read
   picks up where it left off.
-- **A WebSocket that drops on its own does _not_ end it.** The SDK's receive task absorbs the
-  close without telling live-query subscribers, so the iterator stays suspended and receives
-  nothing further. Call `kill()` or close the connection to release it. Automatic reconnect and
-  resubscribe is v0.21.0.
+- **A WebSocket that drops on its own does _not_ end it** (v0.21.0): the stream resubscribes —
+  see [Surviving a dropped connection](#surviving-a-dropped-connection). With
+  `auto_resubscribe=False`, and for `subscribe_live()` readers, it raises
+  `SurrealDbConnectionError` instead.
 - **Subscriptions are per event loop.** A uuid belongs to the connection that created it, on the
   loop that created it. Killing it from another loop is not supported.
 - **A failed `kill()` releases the readers but keeps the uuid alive.** When the server refuses
@@ -1342,6 +1397,49 @@ exactly what ends a stream.
   and the subscription is still running — so you can subscribe to it again or retry `stop()`.
 - **The buffer is unbounded.** A stream you stop reading but never kill keeps accumulating
   notifications. Use the `async with` forms, or pair every uuid you start with a `kill()`.
+
+### 22. Change feeds (`changes()`)
+
+A change feed is SurrealDB's durable log of a table's writes, kept for a retention period you
+choose. Unlike a live query, nothing is missed while nobody reads: a consumer that stops and
+restarts resumes exactly where it left off. It suits event streaming, replication and audit.
+
+```sql
+DEFINE TABLE order SCHEMALESS CHANGEFEED 7d;   -- only writes made after this are recorded
+```
+
+```python
+stream = Order.objects().changes(since=load_cursor())   # None = from now
+async for event in stream:
+    await publish(event.action, event.instance)          # ModelChangeEvent, as for live()
+    save_cursor(stream.cursor)                           # after processing
+```
+
+- **`stream.cursor`** is an `int`: pass it back as `since=` to resume. It moves past a
+  transaction only once that transaction's last event has been yielded, so saving it after each
+  event gives **at-least-once** delivery: nothing is ever skipped, and a transaction cut short by
+  a crash is delivered again in full.
+- **`since=`** takes a cursor, a `datetime` or ISO-8601 string (naive means UTC), or `None` for
+  changes made after the stream starts. A datetime is exact on SurrealDB 3.x and at-least-once on
+  2.x, whose server also returns some earlier changes.
+- **What an event says.** A change feed records writes, not their kind: a creation arrives as
+  `UPDATE`, a deletion as `DELETE`. With `CHANGEFEED … INCLUDE ORIGINAL` on the table, updates
+  also carry `changed_fields`, and on SurrealDB 3.3 a deletion carries the last state of the
+  record (elsewhere the instance holds only its `id`).
+- **`poll_interval`** (0.1 s) is the pause when the feed has nothing new; **`batch_size`** (100)
+  the entries read per poll. `stop()` ends the iteration at once when it is waiting between
+  polls or in a retry backoff, or as soon as a request already sent returns; `start()` fixes the
+  starting position before the first read.
+- Works over **HTTP** as well as WebSocket. A dropped connection is retried with the same
+  backoff as live streams, and nothing is lost, because the next read starts from the cursor.
+- **Refused:** any queryset clause — `SHOW CHANGES` has no `WHERE`, so `filter()` would silently
+  stream the whole table — and a table that is missing or has no change feed (on the table or
+  on its database), with the `DEFINE TABLE` to run.
+
+**Why the cursor is not the server's `versionstamp`.** SurrealDB 2.x and 3.x number their feeds
+differently: resuming a 2.x feed with the stamp it returned yields nothing at all, and asking
+3.x for changes since a datetime always answers empty. `ChangeModelStream` normalises both (see
+the behaviour table), so the same code resumes correctly on either line.
 
 ---
 
@@ -1420,7 +1518,8 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on
+2.7.0 and 3.3.2, with 3.1.5 where it differs.
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                              | SurrealDB 3.2.x / 3.3.x                                                                                                       | Since   |
 | -------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------- |
@@ -1484,6 +1583,15 @@ Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0.
 | Raw diff payload (`watch(diff=True)`): `DELETE`                                                                                        | the whole last record (a dict, not a patch list)                                                                                                     | `[{op: replace, path: "", value: None}]`                                                                                      | v0.20.0 |
 | Typed diff `DELETE` (`live(diff=True)`): `event.instance`                                                                              | the last state of the record                                                                                                                         | an instance holding only the `id`                                                                                             | v0.20.0 |
 | Diff patch format                                                                                                                      | extended JSON Patch: a changed string is an `op: change` with diff-match-patch text                                                                  | same on both lines                                                                                                            | v0.20.0 |
+| A WebSocket that drops (detection, server-side cleanup)                                                                                | the SDK's receive task ends within milliseconds; the server removes the session's live queries                                                       | same on both lines                                                                                                            | v0.21.0 |
+| Live stream after a drop (`auto_resubscribe=True`)                                                                                     | resubscribed on a new connection; `live_id` changes, `on_reconnect` runs                                                                             | same on both lines                                                                                                            | v0.21.0 |
+| A request in flight when the socket drops                                                                                              | fails with the SDK's `KeyError` (not normalised; the next call reconnects)                                                                           | same on both lines                                                                                                            | v0.21.0 |
+| Change-feed entry shape                                                                                                                | `{versionstamp, changes}`; a create is reported as `update`                                                                                          | same on both lines                                                                                                            | v0.21.0 |
+| Change-feed `SINCE <n>` — what `n` is                                                                                                  | the counter, `versionstamp >> 16` (the raw stamp silently returns nothing); `ChangeModelStream.cursor` normalises it                                 | the versionstamp, inclusive; `cursor` normalises it                                                                           | v0.21.0 |
+| `changes(since=<datetime>)`                                                                                                            | the server also returns some earlier changes → at-least-once                                                                                         | the server returns nothing → the ORM converts to a versionstamp → exact                                                       | v0.21.0 |
+| `changes(since=None)` — finding "now"                                                                                                  | the ORM searches the counter (no history replayed)                                                                                                   | the ORM uses the server clock (no history replayed)                                                                           | v0.21.0 |
+| `INCLUDE ORIGINAL` delete in a change feed                                                                                             | the id only → an instance holding only the `id`                                                                                                      | 3.3.x: carries `original` → the last state of the record; 3.1.5: as 2.x                                                       | v0.21.0 |
+| `SHOW CHANGES` on a table without a change feed                                                                                        | returns `[]`; `changes()` raises `SurrealDbError` instead                                                                                            | same on both lines                                                                                                            | v0.21.0 |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                          | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                   | v0.19.1 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
@@ -1521,7 +1629,8 @@ Contributions are welcome! Please:
 | v0.18.0           | Field aliases, `server_fields`, `merge(refresh=)`    | ✅ Released |
 | v0.19.0           | Live queries (base): `live()` / `kill()`, raw notifs | ✅ Released |
 | v0.20.0           | Typed live queries: `LiveModelStream`, diff, filters | ✅ Released |
-| v0.21.0 – v0.22.0 | Tier 1 — Core (auto-resubscribe, typed relations)    | 📋 Planned  |
+| v0.21.0           | Auto-resubscribe & change feeds (`changes()`)        | ✅ Released |
+| v0.22.0           | Tier 1 — Native typed relations                      | 📋 Planned  |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)      | 📋 Planned  |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)     | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
@@ -1567,7 +1676,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Field Aliases & DX            | ✅ v0.18.0              | ✅               |
 | Live queries (raw notifs)     | ✅ v0.19.0              | ✅               |
 | Typed live queries            | ✅ v0.20.0              | ✅               |
-| Live auto-resubscribe / CDC   | v0.21                   | ✅               |
+| Live auto-resubscribe / CDC   | ✅ v0.21.0              | ✅               |
 | Native typed relations        | v0.22.0                 | ✅               |
 | Rich field types              | v0.23.0                 | ✅               |
 | Geospatial Fields             | v0.24.0                 | ✅               |
