@@ -16,7 +16,7 @@ import contextlib
 import os
 from collections.abc import AsyncIterator
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -321,3 +321,324 @@ class TestDropCallbackUnit:
         await iterator.aclose()
         assert client.recv_task.remove_done_callback(iterator._connection_lost) == 0
         client.recv_task.cancel()
+
+
+# ==================== Task 3 — auto-resubscribe ====================
+
+
+@pytest.fixture
+def fast_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shrink the reconnect backoff so the tests measure behaviour, not patience."""
+    from surreal_orm_lite.live import LiveModelStream, LiveStream
+
+    for cls in (LiveStream, LiveModelStream):
+        monkeypatch.setattr(cls, "reconnect_delay", 0.05)
+        monkeypatch.setattr(cls, "reconnect_max_delay", 0.2)
+
+
+async def _resubscribed(stream: Any, old: Any, timeout: float = 5.0) -> None:
+    """Until the stream runs under a new live query id."""
+    async with asyncio.timeout(timeout):
+        while stream.live_id is None or stream.live_id == old:
+            await asyncio.sleep(0.01)
+
+
+async def _direct_lives(table: str = TABLE) -> dict[str, Any]:
+    """The live queries the server holds on *table*, read over a separate direct connection."""
+    from surrealdb import AsyncSurreal
+
+    client = AsyncSurreal(_direct_url())
+    await client.connect(_direct_url())
+    try:
+        await client.signin({"username": "root", "password": "root"})
+        await client.use("ns", "db")
+        info = await client.query(f"INFO FOR TABLE {table};", {})
+        return dict(info.get("lives") or {})
+    finally:
+        await client.close()
+
+
+@pytest.mark.usefixtures("fast_backoff")
+class TestAutoResubscribeE2E:
+    @pytest.mark.asyncio
+    async def test_watch_resubscribes_after_a_drop(self) -> None:
+        async with proxied() as proxy, Reconnected.objects().watch() as stream:
+            old = stream.live_id
+            proxy.cut()
+            await _resubscribed(stream, old)
+
+            await Reconnected(id="after", name="x").save()
+
+            envelope = await _next_within(stream)
+            assert envelope["action"] == "CREATE"
+            assert str(envelope["record"].id) == "after"
+            assert stream.is_active is True
+            assert proxy.connections == 2
+
+    @pytest.mark.asyncio
+    async def test_a_reader_parked_in_async_for_never_notices(self) -> None:
+        """The queue moves to the new uuid unchanged, so a pending read simply completes."""
+        async with proxied() as proxy, Reconnected.objects().watch() as stream:
+            old = stream.live_id
+            pending = asyncio.ensure_future(_next_within(stream, timeout=5.0))
+            await asyncio.sleep(0.05)
+            proxy.cut()
+            await _resubscribed(stream, old)
+            await Reconnected(id="late", name="x").save()
+            envelope = await pending
+            assert str(envelope["record"].id) == "late"
+
+    @pytest.mark.asyncio
+    async def test_typed_stream_keeps_its_filter_and_diff_mode(self) -> None:
+        async with proxied() as proxy, Reconnected.objects().filter(role="admin").live(diff=True) as stream:
+            old = stream.live_id
+            proxy.cut()
+            await _resubscribed(stream, old)
+
+            await Reconnected(id="guest", name="g", role="guest").save()
+            boss = Reconnected(id="boss", name="a", role="admin")
+            await boss.save()
+            await boss.merge(name="b")
+
+            created = await _next_within(stream)
+            updated = await _next_within(stream)
+            assert created.action == "CREATE"
+            assert isinstance(created.instance, Reconnected)
+            assert created.instance.id == "boss"
+            assert updated.action == "UPDATE"
+            assert updated.changed_fields == ["name"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["async", "sync"])
+    async def test_on_reconnect_receives_the_old_and_new_uuids(self, kind: str) -> None:
+        calls: list[tuple[Any, Any]] = []
+        done = asyncio.Event()
+
+        def _sync(old: UUID, new: UUID) -> None:
+            calls.append((old, new))
+            done.set()
+
+        async def _async(old: UUID, new: UUID) -> None:
+            _sync(old, new)
+
+        callback = _async if kind == "async" else _sync
+        async with proxied() as proxy, Reconnected.objects().watch(on_reconnect=callback) as stream:
+            old = stream.live_id
+            proxy.cut()
+            async with asyncio.timeout(5):
+                await done.wait()
+
+            assert calls == [(old, stream.live_id)]
+            assert isinstance(calls[0][0], UUID) and isinstance(calls[0][1], UUID)
+            assert calls[0][0] != calls[0][1]
+
+    @pytest.mark.asyncio
+    async def test_a_failing_on_reconnect_is_logged_and_the_stream_carries_on(self, caplog: pytest.LogCaptureFixture) -> None:
+        async def _broken(old: UUID, new: UUID) -> None:
+            raise RuntimeError("catch-up failed")
+
+        async with proxied() as proxy, Reconnected.objects().watch(on_reconnect=_broken) as stream:
+            old = stream.live_id
+            with caplog.at_level("ERROR", logger="surreal_orm_lite.live"):
+                proxy.cut()
+                await _resubscribed(stream, old)
+                await Reconnected(id="still", name="x").save()
+                envelope = await _next_within(stream)
+            assert str(envelope["record"].id) == "still"
+            assert "on_reconnect" in caplog.text
+            assert "catch-up failed" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_resumes_once_the_server_is_reachable_again(self) -> None:
+        async with proxied() as proxy, Reconnected.objects().watch() as stream:
+            old = stream.live_id
+            proxy.refuse()
+            proxy.cut()
+            await asyncio.sleep(0.4)  # several refused attempts
+            assert stream.live_id == old, "nothing to resubscribe to while the server is unreachable"
+            proxy.accept()
+            await _resubscribed(stream, old)
+
+            await Reconnected(id="back", name="x").save()
+            envelope = await _next_within(stream)
+            assert str(envelope["record"].id) == "back"
+
+    @pytest.mark.asyncio
+    async def test_gives_up_after_the_last_attempt(self) -> None:
+        async with proxied() as proxy, Reconnected.objects().watch() as stream:
+            stream.reconnect_max_attempts = 2
+            proxy.refuse()
+            proxy.cut()
+            with pytest.raises(SurrealDbConnectionError, match="2 attempts"):
+                await _next_within(stream, timeout=5.0)
+            assert stream.is_active is False
+
+    @pytest.mark.asyncio
+    async def test_the_typed_stream_forwards_its_own_policy(self) -> None:
+        async with proxied() as proxy, Reconnected.objects().live() as stream:
+            stream.reconnect_max_attempts = 1
+            proxy.refuse()
+            proxy.cut()
+            with pytest.raises(SurrealDbConnectionError, match="1 attempt"):
+                await _next_within(stream, timeout=5.0)
+            assert stream.is_active is False
+
+    @pytest.mark.asyncio
+    async def test_stop_during_a_pending_resubscribe_leaves_nothing_behind(self) -> None:
+        async with proxied() as proxy:
+            stream = await Reconnected.objects().watch().start()
+            proxy.refuse()
+            proxy.cut()
+            await asyncio.sleep(0.1)
+
+            await stream.stop()
+            proxy.accept()
+            await asyncio.sleep(0.4)
+
+            assert stream.is_active is False
+            assert proxy.connections == 1, "a cancelled resubscribe must not reconnect afterwards"
+            assert await _direct_lives() == {}
+
+    @pytest.mark.asyncio
+    async def test_a_drop_during_on_reconnect_resubscribes_again(self) -> None:
+        calls: list[UUID] = []
+        second = asyncio.Event()
+        proxy_ref: list[CuttableProxy] = []
+
+        async def _flaky(old: UUID, new: UUID) -> None:
+            calls.append(new)
+            if len(calls) == 1:
+                proxy_ref[0].cut()
+            else:
+                second.set()
+
+        async with proxied() as proxy, Reconnected.objects().watch(on_reconnect=_flaky) as stream:
+            proxy_ref.append(proxy)
+            proxy.cut()
+            async with asyncio.timeout(5):
+                await second.wait()
+            await Reconnected(id="twice", name="x").save()
+            envelope = await _next_within(stream)
+            assert str(envelope["record"].id) == "twice"
+            assert stream.live_id == calls[-1]
+
+    @pytest.mark.asyncio
+    async def test_exactly_one_live_query_remains_after_a_resubscribe(self) -> None:
+        async with proxied() as proxy, Reconnected.objects().watch() as stream:
+            old = stream.live_id
+            proxy.cut()
+            await _resubscribed(stream, old)
+            lives = await _direct_lives()
+            assert list(lives) == [str(stream.live_id)]
+        assert await _direct_lives() == {}
+
+
+class _FakeWs:
+    """An SDK-shaped WebSocket client: a live-query registry and a receive task to end."""
+
+    def __init__(self) -> None:
+        self.live_queues: dict[str, Any] = {}
+        self.recv_task: asyncio.Task[None] = asyncio.create_task(asyncio.sleep(3600))
+
+    def drop(self) -> None:
+        self.recv_task.cancel()
+
+    async def close(self) -> None:
+        self.recv_task.cancel()
+
+
+@pytest.mark.usefixtures("fast_backoff")
+class TestResubscribeFailuresUnit:
+    """Which failures are retried, driven with fakes so each one can be produced on demand."""
+
+    @staticmethod
+    def _stream(
+        monkeypatch: pytest.MonkeyPatch, clients: list[Any], starter_errors: list[Exception | None]
+    ) -> tuple[Any, list[int]]:
+        from surreal_orm_lite.live import LiveStream
+
+        SurrealDBConnectionManager.set_connection(
+            url="ws://unused.invalid/rpc", user="root", password="root", namespace="ns", database="db"
+        )
+
+        async def _get_client(cls: Any) -> Any:
+            item = clients.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", classmethod(_get_client))
+        starts = [0]
+
+        async def _starter(client: Any = None) -> UUID:
+            starts[0] += 1
+            error = starter_errors.pop(0) if starter_errors else None
+            if error is not None:
+                raise error
+            return uuid4()
+
+        return LiveStream("t", _starter), starts
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_session_token_is_never_retried_as_root(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from surreal_orm_lite.exceptions import SurrealDbAuthenticationError
+
+        first = _FakeWs()
+        rejected = SurrealDbAuthenticationError("restoring the session on a new connection failed")
+        stream, starts = self._stream(monkeypatch, [first, rejected], [])
+        await stream.start()
+        first.drop()
+
+        with pytest.raises(SurrealDbAuthenticationError):
+            await _next_within(stream)
+        assert starts[0] == 1, "no subscription may be opened once the identity is lost"
+        assert stream.is_active is False
+
+    @pytest.mark.asyncio
+    async def test_a_missing_table_is_not_retried(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from surreal_orm_lite.exceptions import SurrealDbNotFoundError
+
+        first, second = _FakeWs(), _FakeWs()
+        stream, starts = self._stream(monkeypatch, [first, second], [None, SurrealDbNotFoundError("gone")])
+        await stream.start()
+        first.drop()
+
+        with pytest.raises(SurrealDbNotFoundError):
+            await _next_within(stream)
+        assert starts[0] == 2
+
+    @pytest.mark.asyncio
+    async def test_connection_failures_are_retried_until_one_succeeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        first, fourth = _FakeWs(), _FakeWs()
+        clients: list[Any] = [first, SurrealDbConnectionError("down"), ConnectionRefusedError("down"), fourth]
+        stream, starts = self._stream(monkeypatch, clients, [])
+        await stream.start()
+        old = stream.live_id
+        first.drop()
+
+        await _resubscribed(stream, old)
+        assert starts[0] == 2
+        assert stream._client is fourth
+        await stream.stop()
+
+    def test_the_failure_classifier(self) -> None:
+        from surreal_orm_lite.live import _is_connection_failure
+
+        class _Dead:
+            """A client whose receive task has finished — what a dropped socket leaves behind."""
+
+            def __init__(self) -> None:
+                loop = asyncio.new_event_loop()
+                self.recv_task = loop.create_task(asyncio.sleep(0))
+                loop.run_until_complete(self.recv_task)
+                loop.close()
+
+        ConnectionClosedError = type("ConnectionClosedError", (Exception,), {"__module__": "websockets.exceptions"})
+
+        assert _is_connection_failure(SurrealDbConnectionError("x"), None)
+        assert _is_connection_failure(ConnectionRefusedError("x"), None)
+        assert _is_connection_failure(ConnectionClosedError("x"), None)
+        # The SDK's in-flight-request KeyError: only a connection failure because the client died.
+        assert _is_connection_failure(KeyError("req"), _Dead())
+        assert not _is_connection_failure(KeyError("req"), None)
+        assert not _is_connection_failure(ValueError("bad"), None)

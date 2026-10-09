@@ -1051,7 +1051,7 @@ class QuerySet:
             query += f" FETCH {', '.join(self._fetch_fields)}"
         return query + ";"
 
-    def _live_starter(self, diff: bool) -> Callable[[], Awaitable[UUID]]:
+    def _live_starter(self, diff: bool) -> Callable[..., Awaitable[UUID]]:
         """Compile now, and return the coroutine function that starts the live query.
 
         Compiling eagerly makes a bad clause or value fail at the ``live()``/``watch()`` call,
@@ -1061,9 +1061,12 @@ class QuerySet:
         query = self._compile_live(diff)
         table = self._model_table
 
-        async def start() -> UUID:
+        async def start(client: Any = None) -> UUID:
+            # A resubscribe passes the client it is about to move the stream onto, so the live
+            # query is guaranteed to run on that very connection.
             require_websocket(SurrealDBConnectionManager.get_connection_string())
-            client = await SurrealDBConnectionManager.get_client()
+            if client is None:
+                client = await SurrealDBConnectionManager.get_client()
             try:
                 live_id = await client.query(query)
             except NotFoundError as exc:

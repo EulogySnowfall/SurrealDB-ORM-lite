@@ -28,16 +28,20 @@ this module handed out, which makes termination identical everywhere. It has to 
 registry because the SDK's ``kill()`` pops its own ``live_queues`` entry, orphaning the queue
 that was in it.
 
-**What still hangs.** A WebSocket that drops on its own — no ``kill()``, no
-``close_connection()`` — leaves readers suspended, because nothing in the SDK reports the
-close to a live-query subscriber. Calling ``kill()`` or closing the connection through the
-ORM always releases them: ``close_connection()`` on its own loop, ``close_all_connections()`` on
-every loop. Automatic resubscribe is v0.21.0.
+**Dropped connections (v0.21.0).** A WebSocket that drops on its own — no ``kill()``, no
+``close_connection()`` — used to leave readers suspended, because nothing in the SDK reports the
+close to a live-query subscriber. Its receive task does end, though, within milliseconds on both
+server lines, and every reader now watches it. A stream with ``auto_resubscribe`` (the default)
+reconnects and moves its buffer onto a new live query; any other reader raises
+``SurrealDbConnectionError``. Deliberate teardowns release their readers *before* the socket
+closes, which is how the two cases are told apart. What changed while the connection was down is
+not replayed: a live query only sees what happens while it runs.
 """
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import warnings
 from collections import deque
@@ -166,10 +170,15 @@ def is_dead(client: Any) -> bool:
     return task is not None and task.done()
 
 
-def register_subscriber(client: Any, query_uuid: str | UUID) -> asyncio.Queue[Any]:
-    """Create a queue fed by ``query_uuid``'s notifications and register it everywhere."""
+def register_subscriber(client: Any, query_uuid: str | UUID, queue: asyncio.Queue[Any] | None = None) -> asyncio.Queue[Any]:
+    """Register a queue fed by ``query_uuid``'s notifications everywhere — a new one by default.
+
+    Passing an existing *queue* is how a resubscribe keeps a reader's buffer: what it has not
+    read yet stays queued, and a read parked on it simply completes with the new uuid's events.
+    """
     key = _key(query_uuid)
-    queue: asyncio.Queue[Any] = asyncio.Queue()
+    if queue is None:
+        queue = asyncio.Queue()
     queues = _sdk_queues(client)
     if queues is not None:
         queues.setdefault(key, []).append(queue)
@@ -353,6 +362,22 @@ class LiveIterator:
         """Stop reading and drop this reader's buffer. The live query itself keeps running."""
         self._detach()
 
+    def rebind(self, client: Any, query_uuid: str | UUID) -> None:
+        """Move this reader, buffer and all, onto a resubscribed live query on *client*."""
+        queue = self._queue
+        if queue is None:
+            return
+        self._unwatch()
+        unregister_subscriber(self._client, self._query_uuid, queue)
+        self._client, self._query_uuid = client, query_uuid
+        register_subscriber(client, query_uuid, queue)
+        self._watch(client)
+
+    def fail(self, error: Exception) -> None:
+        """End the iteration with *error*, after whatever is still buffered."""
+        if self._queue is not None:
+            self._queue.put_nowait(_Lost(error))
+
     def _detach(self) -> None:
         self._unwatch()
         if self._queue is None:
@@ -378,6 +403,31 @@ def open_stream(client: Any, query_uuid: str | UUID, *, on_lost: Callable[[], No
     if _key(query_uuid) in _killed():
         return LiveIterator(client, query_uuid, None)
     return LiveIterator(client, query_uuid, register_subscriber(client, query_uuid), on_lost=on_lost)
+
+
+def _is_connection_failure(exc: BaseException, client: Any) -> bool:
+    """Whether a failed resubscribe attempt is worth retrying: was the *connection* the problem?
+
+    Retried: the ORM's own connection error (server unreachable), an ``OSError``, anything the
+    ``websockets`` transport raises (matched by module, so the ORM imports nothing from it), and
+    anything at all raised on a client that is dead by now — the SDK reports a request caught by
+    a drop as a bare ``KeyError`` (its receive loop clears the pending-request map before the
+    request's own cleanup runs). Everything else — an authentication failure, a removed table —
+    would fail identically on the next attempt, so it ends the stream instead. That is also what
+    keeps a rejected session token from being "retried" into a subscription opened as the
+    configured user.
+    """
+    if isinstance(exc, (SurrealDbConnectionError, OSError)):
+        return True
+    if type(exc).__module__.split(".", 1)[0] == "websockets":
+        return True
+    return client is not None and is_dead(client)
+
+
+def _cancelled_from_outside() -> bool:
+    """Whether the running task is being cancelled, as opposed to seeing an SDK future cancelled."""
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
 
 
 def require_websocket(url: str | None) -> None:
@@ -417,12 +467,30 @@ class LiveStream:
         async with User.objects().watch() as stream:
             async for notif in stream:
                 print(notif["action"], notif["result"])
+
+    **Surviving a dropped connection (v0.21.0).** With ``auto_resubscribe`` (the default) a
+    WebSocket that drops — not one closed through the ORM — is answered by a background task:
+    it opens a new connection (``get_client()``, which signs in and replays the session), sends
+    the same ``LIVE SELECT`` again, and moves this stream's buffer onto the new uuid, so a read
+    parked in ``async for`` simply completes later. ``live_id`` changes; ``on_reconnect(old_id,
+    new_id)`` is then called. Only connection failures are retried, with exponential backoff
+    (:attr:`reconnect_delay` doubling up to :attr:`reconnect_max_delay`, at most
+    :attr:`reconnect_max_attempts` tries); any other failure, or the last attempt failing, is
+    raised from the iteration. **What changed during the outage is not replayed** — a live query
+    only reports what happens while it runs — so ``on_reconnect`` is where to catch up.
     """
+
+    #: Seconds before the first reconnect attempt after a drop. Doubles after each failure.
+    reconnect_delay: float = 0.5
+    #: Upper bound of the delay between two reconnect attempts, in seconds.
+    reconnect_max_delay: float = 30.0
+    #: Attempts before giving up and raising from the iteration; ``None`` retries forever.
+    reconnect_max_attempts: int | None = 10
 
     def __init__(
         self,
         table: str,
-        starter: Any,
+        starter: Callable[..., Awaitable[UUID]],
         *,
         auto_resubscribe: bool = True,
         on_reconnect: ReconnectCallback | None = None,
@@ -434,6 +502,12 @@ class LiveStream:
         self._live_id: UUID | None = None
         self._client: Any = None
         self._iterator: LiveIterator | None = None
+        # Where the reconnect policy is read from: this stream, or the typed stream wrapping it,
+        # so that ``LiveModelStream.reconnect_max_attempts = …`` is honoured too.
+        self._policy: Any = self
+        self._stopping = False
+        self._resubscribe_pending = False
+        self._tasks: set[asyncio.Task[None]] = set()
 
     @property
     def table(self) -> str:
@@ -459,13 +533,21 @@ class LiveStream:
         # Transport first: on an http:// URL no client should be opened just to be refused.
         require_websocket(SurrealDBConnectionManager.get_connection_string())
         # Client next, so no await sits between opening the subscription and buffering it.
+        self._stopping = False
         self._client = await SurrealDBConnectionManager.get_client()
-        self._live_id = await self._starter()
-        self._iterator = open_stream(self._client, self._live_id)
+        self._live_id = await self._starter(self._client)
+        on_lost = self._schedule_resubscribe if self._auto_resubscribe else None
+        self._iterator = open_stream(self._client, self._live_id, on_lost=on_lost)
         return self
 
     async def stop(self) -> None:
-        """Kill the subscription and end the iteration. Safe before start and to repeat."""
+        """Kill the subscription and end the iteration. Safe before start and to repeat.
+
+        A resubscribe still in progress is cancelled first, and a subscription it managed to
+        open meanwhile is killed too.
+        """
+        self._stopping = True
+        await self._cancel_tasks()
         if self._live_id is None:
             await self._drop_iterator()
             return
@@ -482,6 +564,108 @@ class LiveStream:
         iterator, self._iterator = self._iterator, None
         if iterator is not None:
             await iterator.aclose()
+
+    # -- resubscribe (v0.21.0) ---------------------------------------------------------------
+
+    def _schedule_resubscribe(self) -> None:
+        """The reader's socket dropped: start resubscribing, unless already on it or stopping."""
+        if self._stopping or self._resubscribe_pending or self._live_id is None:
+            return
+        self._resubscribe_pending = True
+        task = asyncio.get_running_loop().create_task(self._resubscribe(self._live_id))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _cancel_tasks(self) -> None:
+        # Never the running task: stop() called from inside an on_reconnect callback would
+        # otherwise wait on itself.
+        tasks = {t for t in self._tasks if t is not asyncio.current_task()}
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            # ``wait`` rather than ``gather``: it never re-raises the tasks' CancelledError, yet
+            # still lets a cancellation of *this* task propagate.
+            await asyncio.wait(tasks)
+
+    async def _resubscribe(self, old_id: UUID) -> None:
+        from .connection_manager import SurrealDBConnectionManager
+
+        # The old uuid is gone with the socket; a late subscribe_live() on it must end at once.
+        mark_killed(old_id)
+        policy = self._policy
+        delay = float(policy.reconnect_delay)
+        attempt = 0
+        while True:
+            attempt += 1
+            client: Any = None
+            try:
+                client = await SurrealDBConnectionManager.get_client()
+                new_id = await self._start_on(client)
+                break
+            except asyncio.CancelledError:
+                if _cancelled_from_outside():
+                    raise
+                error: Exception = SurrealDbConnectionError("the connection dropped during the request")
+            except Exception as exc:
+                if not _is_connection_failure(exc, client):
+                    self._give_up(exc)
+                    return
+                error = exc
+            limit = policy.reconnect_max_attempts
+            if limit is not None and attempt >= limit:
+                self._give_up(
+                    SurrealDbConnectionError(
+                        f"Lost the live query on {self._table!r} and could not resubscribe: gave up "
+                        f"after {attempt} attempt{'s' if attempt > 1 else ''}. Last error: {error}"
+                    )
+                )
+                return
+            logger.warning(
+                "Resubscribing the live query on %s failed (attempt %d): %s; retrying in %.2fs",
+                self._table,
+                attempt,
+                error,
+                delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, float(policy.reconnect_max_delay))
+
+        self._client, self._live_id = client, new_id
+        if self._iterator is not None:
+            self._iterator.rebind(client, new_id)
+        # Cleared *before* the callback: a second drop while it runs must resubscribe again.
+        self._resubscribe_pending = False
+        logger.info("Live query on %s resubscribed after a dropped connection (%s → %s)", self._table, old_id, new_id)
+        await self._notify_reconnect(old_id, new_id)
+
+    async def _start_on(self, client: Any) -> UUID:
+        """Run the starter, shielded: a stop() landing mid-request must not orphan its result."""
+        start = asyncio.ensure_future(self._starter(client))
+        try:
+            return await asyncio.shield(start)
+        except asyncio.CancelledError:
+            if _cancelled_from_outside():
+                # The LIVE SELECT may already be running on the server: kill it once it answers.
+                start.add_done_callback(_kill_when_started)
+            raise
+
+    def _give_up(self, error: Exception) -> None:
+        """End the stream with *error*: no subscription is left, so nothing remains to kill."""
+        self._resubscribe_pending = False
+        self._live_id = None
+        if self._iterator is not None:
+            self._iterator.fail(error)
+
+    async def _notify_reconnect(self, old_id: UUID, new_id: UUID) -> None:
+        callback = self._on_reconnect
+        if callback is None:
+            return
+        try:
+            result = callback(old_id, new_id)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.exception("on_reconnect callback failed for the live query on %s", self._table)
 
     def __aiter__(self) -> LiveStream:
         return self
@@ -503,6 +687,21 @@ class LiveStream:
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         await self.stop()
+
+
+def _kill_when_started(start: asyncio.Future[UUID]) -> None:
+    """Kill a live query whose start outlived the stream that requested it."""
+    if start.cancelled() or start.exception() is not None:
+        return
+    from .connection_manager import SurrealDBConnectionManager
+
+    task = asyncio.get_running_loop().create_task(SurrealDBConnectionManager.kill(start.result()))
+    _ORPHAN_KILLS.add(task)
+    task.add_done_callback(_ORPHAN_KILLS.discard)
+
+
+# Strong references to fire-and-forget kills, which the event loop alone would let be collected.
+_ORPHAN_KILLS: set[asyncio.Task[None]] = set()
 
 
 # ------------------------------------------------------------------
@@ -638,12 +837,16 @@ class LiveModelStream(Generic[T]):
 
     #: Seconds a normal exit waits for pending ``post_live_change`` handlers before cancelling.
     signal_drain_timeout: float = 5.0
+    #: Reconnect policy after a dropped connection — see :class:`LiveStream`.
+    reconnect_delay: float = LiveStream.reconnect_delay
+    reconnect_max_delay: float = LiveStream.reconnect_max_delay
+    reconnect_max_attempts: int | None = LiveStream.reconnect_max_attempts
 
     def __init__(
         self,
         model: type[T],
         table: str,
-        starter: Callable[[], Awaitable[UUID]],
+        starter: Callable[..., Awaitable[UUID]],
         *,
         diff: bool = False,
         auto_resubscribe: bool = True,
@@ -653,6 +856,7 @@ class LiveModelStream(Generic[T]):
         self._diff = diff
         self._starter = starter
         self._stream = LiveStream(table, starter, auto_resubscribe=auto_resubscribe, on_reconnect=on_reconnect)
+        self._stream._policy = self
         self._started = False
         self._uuid_start: Coroutine[Any, Any, UUID] | None = None
         self._warned_invalid = False
