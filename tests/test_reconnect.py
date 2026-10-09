@@ -34,16 +34,6 @@ class Reconnected(BaseSurrealModel):
     role: str = ""
 
 
-@pytest.fixture(autouse=True)
-def _replayable_identity() -> None:
-    """Start every test from a replayable identity, whatever another test file left behind.
-
-    The manager's identity bookkeeping is global, like its stored token: a ``store=False``
-    signin elsewhere would otherwise make every stream here refuse to resubscribe.
-    """
-    SurrealDBConnectionManager._identity_changed(replayable=True)
-
-
 def _direct_url() -> str:
     host = os.environ.get("SURREALDB_HOST", "localhost")
     port = os.environ.get("SURREALDB_PORT", "8000")
@@ -575,6 +565,9 @@ class TestResubscribeFailuresUnit:
             item = clients.pop(0)
             if isinstance(item, Exception):
                 raise item
+            # What the real get_client() does for every client it opens.
+            if SurrealDBConnectionManager._identity_of(item) is None:
+                SurrealDBConnectionManager._stamp_identity(item, replayable=True)
             return item
 
         monkeypatch.setattr(SurrealDBConnectionManager, "get_client", classmethod(_get_client))
@@ -669,10 +662,10 @@ class TestResubscribeIdentityUnit:
         clients: list[Any] = [first, second]
         stream, starts = TestResubscribeFailuresUnit._stream(monkeypatch, clients, [])
         await stream.start()
-        SurrealDBConnectionManager._identity_changed(replayable=True)  # e.g. signin() as someone else
+        SurrealDBConnectionManager._replay_identity_changed()  # e.g. signin() as someone else
         first.drop()
 
-        with pytest.raises(SurrealDbAuthenticationError, match="identity changed"):
+        with pytest.raises(SurrealDbAuthenticationError, match="comes back as changed"):
             await _next_within(stream)
         assert starts[0] == 1
         assert clients == [second], "no connection is even opened"
@@ -683,11 +676,41 @@ class TestResubscribeIdentityUnit:
 
         first, second = _FakeWs(), _FakeWs()
         stream, starts = TestResubscribeFailuresUnit._stream(monkeypatch, [first, second], [])
-        SurrealDBConnectionManager._identity_changed(replayable=False)  # signin(store=False)
+        SurrealDBConnectionManager._stamp_identity(first, replayable=False)  # signin(store=False)
         await stream.start()
         first.drop()
 
         with pytest.raises(SurrealDbAuthenticationError, match="cannot restore"):
+            await _next_within(stream)
+        assert starts[0] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_store_false_signin_after_start_does_not_block_a_resubscribe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Minting a token for someone else (store=False) does not change what a reconnect
+        restores, so a stream opened before it may resubscribe (review finding #4b)."""
+        first, second = _FakeWs(), _FakeWs()
+        stream, starts = TestResubscribeFailuresUnit._stream(monkeypatch, [first, second], [])
+        await stream.start()
+        old = stream.live_id
+        SurrealDBConnectionManager._stamp_identity(first, replayable=False)
+        first.drop()
+
+        await _resubscribed(stream, old)
+        assert starts[0] == 2
+        await stream.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_changed_configuration_refuses_to_resubscribe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """set_connection() and the set_* setters change who a new connection signs in as (#3a)."""
+        from surreal_orm_lite.exceptions import SurrealDbAuthenticationError
+
+        first, second = _FakeWs(), _FakeWs()
+        stream, starts = TestResubscribeFailuresUnit._stream(monkeypatch, [first, second], [])
+        await stream.start()
+        await SurrealDBConnectionManager.set_database("elsewhere")
+        first.drop()
+
+        with pytest.raises(SurrealDbAuthenticationError):
             await _next_within(stream)
         assert starts[0] == 1
 
@@ -717,7 +740,6 @@ async def record_user(*, store: bool) -> AsyncIterator[str]:
     finally:
         SurrealDBConnectionManager.clear_session()
         await SurrealDBConnectionManager.close_connection()
-        SurrealDBConnectionManager._identity_changed(replayable=True)
         cleanup = await SurrealDBConnectionManager.get_client()
         for statement in (f"REMOVE ACCESS {OWNED_ACCESS} ON DATABASE;", f"REMOVE TABLE {OWNED_USERS};"):
             with contextlib.suppress(Exception):
@@ -766,3 +788,188 @@ class TestResubscribeIdentityE2E:
                 assert stream.is_active is False
             await asyncio.sleep(0.2)
             assert await _direct_lives() == {}
+
+
+# ==================== review of the branch — lifecycle and connection fixes ====================
+
+
+@pytest.mark.usefixtures("fast_backoff")
+class TestReviewLifecycleE2E:
+    @pytest.mark.asyncio
+    async def test_a_stream_restarted_after_stop_during_a_resubscribe_still_resubscribes(self) -> None:
+        """Finding #1: the pending flag survived the cancelled task, so the next drop hung."""
+        async with proxied() as proxy:
+            stream = await Reconnected.objects().watch().start()
+            proxy.refuse()
+            proxy.cut()
+            await asyncio.sleep(0.1)
+            await stream.stop()
+            proxy.accept()
+
+            await stream.start()
+            old = stream.live_id
+            proxy.cut()
+            await _resubscribed(stream, old)
+            await Reconnected(id="again", name="x").save()
+            envelope = await _next_within(stream)
+            assert str(envelope["record"].id) == "again"
+            await stream.stop()
+
+    @pytest.mark.asyncio
+    async def test_close_connection_during_the_backoff_cancels_the_resubscribe(self) -> None:
+        """Finding #2: the resubscribe used to reopen a connection and leak a live query."""
+        calls: list[Any] = []
+        async with proxied() as proxy:
+            stream = await Reconnected.objects().watch(on_reconnect=lambda o, n: calls.append(n)).start()
+            proxy.refuse()
+            proxy.cut()
+            await asyncio.sleep(0.1)
+
+            await SurrealDBConnectionManager.close_connection()
+            proxy.accept()
+            await asyncio.sleep(0.5)
+
+            with pytest.raises(StopAsyncIteration):
+                await _next_within(stream)
+            assert calls == []
+            assert proxy.connections == 1
+            assert await _direct_lives() == {}
+            await stream.stop()
+
+    @pytest.mark.asyncio
+    async def test_kill_of_the_old_uuid_during_the_backoff_cancels_the_resubscribe(self) -> None:
+        async with proxied() as proxy:
+            stream = await Reconnected.objects().watch().start()
+            old = stream.live_id
+            assert old is not None
+            proxy.refuse()
+            proxy.cut()
+            await asyncio.sleep(0.1)
+
+            await SurrealDBConnectionManager.kill(old)
+            proxy.accept()
+            await asyncio.sleep(0.5)
+
+            with pytest.raises(StopAsyncIteration):
+                await _next_within(stream)
+            assert proxy.connections == 1
+            assert await _direct_lives() == {}
+
+    @pytest.mark.asyncio
+    async def test_subscribing_to_a_dropped_uuid_after_the_client_was_replaced_ends_at_once(self) -> None:
+        """Finding #7: the old uuid used to be registered on the new client and wait forever."""
+        async with proxied() as proxy:
+            stream = await Reconnected.objects().watch(auto_resubscribe=False).start()
+            old = stream.live_id
+            assert old is not None
+            client = await SurrealDBConnectionManager.get_client()
+            proxy.cut()
+            await _wait_dead(client)
+            await SurrealDBConnectionManager.get_client()  # replaces the dead client
+
+            reader = SurrealDBConnectionManager.subscribe_live(old)
+            with pytest.raises(StopAsyncIteration):
+                await _next_within(reader, timeout=1.0)
+            await stream.stop()
+
+
+@pytest.mark.usefixtures("fast_backoff")
+class TestReviewIdentityE2E:
+    @pytest.mark.asyncio
+    async def test_after_clear_session_and_a_reconnect_new_streams_resubscribe(self) -> None:
+        """Finding #4a: clear_session() used to make every later stream refuse to resubscribe."""
+        async with proxied() as proxy, record_user(store=True):
+            SurrealDBConnectionManager.clear_session()
+            await SurrealDBConnectionManager.reconnect()  # now really the configured identity
+            async with Reconnected.objects().watch() as stream:
+                old = stream.live_id
+                proxy.cut()
+                await _resubscribed(stream, old)
+
+    @pytest.mark.asyncio
+    async def test_set_connection_to_another_database_refuses_to_resubscribe(self) -> None:
+        """Finding #3a: a new connection would now open the live query somewhere else."""
+        from surreal_orm_lite.exceptions import SurrealDbAuthenticationError
+
+        async with proxied() as proxy, Reconnected.objects().watch() as stream:
+            SurrealDBConnectionManager.set_connection(
+                url=proxy.url(), user="root", password="root", namespace="ns", database="elsewhere"
+            )
+            proxy.cut()
+            with pytest.raises(SurrealDbAuthenticationError):
+                await _next_within(stream)
+            assert stream.is_active is False
+
+
+class TestOpenClientFailuresE2E:
+    @pytest.mark.asyncio
+    async def test_rejected_configured_credentials_are_not_retryable(self) -> None:
+        """Finding #6a: a server that answered "no" answers the same on the next attempt."""
+        from surreal_orm_lite.live import is_connection_failure
+
+        SurrealDBConnectionManager.set_connection(
+            url=_direct_url(), user="root", password="wrong-password", namespace="ns", database="db"
+        )
+        try:
+            with pytest.raises(SurrealDbConnectionError) as excinfo:
+                await SurrealDBConnectionManager.get_client()
+        finally:
+            SurrealDBConnectionManager.set_connection(
+                url=_direct_url(), user="root", password="root", namespace="ns", database="db"
+            )
+        assert str(excinfo.value) == "Can't connect to the database."
+        assert is_connection_failure(excinfo.value, None) is False
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_server_is_retryable(self) -> None:
+        from surreal_orm_lite.live import is_connection_failure
+
+        async with CuttableProxy() as proxy:
+            proxy.refuse()
+            SurrealDBConnectionManager.set_connection(
+                url=proxy.url(), user="root", password="root", namespace="ns", database="db"
+            )
+            with pytest.raises(SurrealDbConnectionError) as excinfo:
+                await SurrealDBConnectionManager.get_client()
+        assert is_connection_failure(excinfo.value, None) is True
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_open_closes_its_socket(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Finding #8: a stop() landing inside the open used to leak the connected socket."""
+        from surreal_orm_lite import connection_manager
+
+        closed: list[bool] = []
+
+        class _SlowSurreal:
+            def __init__(self, url: str) -> None:
+                pass
+
+            async def connect(self, url: str) -> None:
+                pass
+
+            async def signin(self, payload: Any) -> None:
+                await asyncio.sleep(10)
+
+            async def close(self) -> None:
+                closed.append(True)
+
+        monkeypatch.setattr(connection_manager, "AsyncSurreal", _SlowSurreal)
+        SurrealDBConnectionManager.set_connection(
+            url="ws://unused.invalid/rpc", user="root", password="root", namespace="ns", database="db"
+        )
+        task = asyncio.ensure_future(SurrealDBConnectionManager.get_client())
+        await asyncio.sleep(0.05)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert closed == [True]
+
+    def test_transport_errors_are_matched_by_module(self) -> None:
+        """Finding #6b: aiohttp's ServerDisconnectedError is not an OSError."""
+        from surreal_orm_lite.live import is_connection_failure
+
+        base = type("ClientConnectionError", (Exception,), {"__module__": "aiohttp.client_exceptions"})
+        disconnected = type("ServerDisconnectedError", (base,), {"__module__": "aiohttp.client_exceptions"})
+        response = type("ClientResponseError", (Exception,), {"__module__": "aiohttp.client_exceptions"})
+        assert is_connection_failure(disconnected("gone"), None)
+        assert not is_connection_failure(response("400"), None)

@@ -28,6 +28,7 @@ cursor.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 from collections import deque
@@ -60,6 +61,8 @@ Since = int | datetime | str | None
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _VERSION = re.compile(r"(\d+)\.\d+")
+# The clause itself, not the word: a COMMENT or a name may contain "changefeed".
+_CHANGEFEED_CLAUSE = re.compile(r"\bCHANGEFEED\s+\d", re.IGNORECASE)
 # SurrealQL integers are signed 64-bit: the 2.x counter search must stay within them.
 _MAX_COUNTER = (1 << 63) - 1
 
@@ -218,6 +221,9 @@ class ChangeModelStream(Generic[T]):
         # Events not yet yielded, each with the cursor to adopt once it is (set on an entry's last).
         self._pending: deque[list[Any]] = deque()
         self._stopped = False
+        # Set by stop() so a pending poll pause or retry backoff wakes at once; created lazily,
+        # because an asyncio.Event belongs to the loop that awaits it.
+        self._stop_event: asyncio.Event | None = None
 
     @property
     def table(self) -> str:
@@ -234,9 +240,24 @@ class ChangeModelStream(Generic[T]):
         return self._cursor
 
     def stop(self) -> None:
-        """End the iteration within one ``poll_interval``. Events not yet yielded are dropped,
-        and :attr:`cursor` still points at the first of them."""
+        """End the iteration. Events not yet yielded are dropped, and :attr:`cursor` still points
+        at the first of them.
+
+        A read waiting between polls or in a retry backoff returns at once; one waiting on a
+        request already sent ends as soon as the server answers.
+        """
         self._stopped = True
+        if self._stop_event is not None:
+            self._stop_event.set()
+
+    async def _pause(self, seconds: float) -> None:
+        """Sleep, unless stop() is (or gets) called."""
+        if self._stopped:
+            return
+        if self._stop_event is None:
+            self._stop_event = asyncio.Event()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._stop_event.wait(), seconds)
 
     async def start(self) -> ChangeModelStream[T]:
         """Fix the starting position now rather than at the first read. Idempotent.
@@ -281,8 +302,8 @@ class ChangeModelStream(Generic[T]):
                 return event  # type: ignore[no-any-return]
             await self.start()
             full = await self._poll()
-            if not self._pending and not full and not self._stopped:
-                await asyncio.sleep(self._poll_interval)
+            if not self._pending and not full:
+                await self._pause(self._poll_interval)
 
     # -- internals ---------------------------------------------------------------------------
 
@@ -352,17 +373,17 @@ class ChangeModelStream(Generic[T]):
         return high
 
     async def _check_changefeed(self) -> None:
-        """Refuse a table with no change feed: ``SHOW CHANGES`` would just answer ``[]`` forever."""
-        try:
-            info = await self._with_retry(lambda client: client.query("INFO FOR DB;", {}))
-        except SurrealDbConnectionError:
-            raise
-        except Exception as exc:
-            # A record user may not be allowed INFO FOR DB; the check is a courtesy, not a gate.
-            logger.debug("Could not read INFO FOR DB to check %s for a change feed: %s", self._table, exc)
-            return
-        tables = info.get("tables") if isinstance(info, dict) else None
-        if not isinstance(tables, dict):
+        """Refuse a table with no change feed: ``SHOW CHANGES`` would just answer ``[]`` forever.
+
+        A feed can be defined on the table or on the whole database (``DEFINE DATABASE …
+        CHANGEFEED``, which covers every table — measured on both lines), so both definitions are
+        read. The check is a courtesy, not a gate: when ``INFO`` is not permitted (a record user),
+        it is skipped.
+        """
+        from .connection_manager import SurrealDBConnectionManager
+
+        tables = await self._info("INFO FOR DB;", "tables")
+        if tables is None:
             return
         definition = tables.get(self._table)
         fix = f"DEFINE TABLE {self._table} SCHEMALESS CHANGEFEED 7d"
@@ -371,12 +392,31 @@ class ChangeModelStream(Generic[T]):
                 f"Cannot read the change feed of {self._table!r}: the table does not exist. "
                 f"Define it with a change feed first, e.g. {fix}."
             )
-        if "CHANGEFEED" not in str(definition).upper():
-            raise SurrealDbError(
-                f"Table {self._table!r} has no change feed, so SHOW CHANGES would stay empty "
-                f"forever. Add one, e.g. DEFINE TABLE OVERWRITE … CHANGEFEED 7d (as in: {fix}); "
-                f"only writes made after that are recorded."
-            )
+        if _CHANGEFEED_CLAUSE.search(str(definition)):
+            return
+        databases = await self._info("INFO FOR NS;", "databases")
+        if databases is None:
+            return
+        database = databases.get(SurrealDBConnectionManager.get_database() or "")
+        if _CHANGEFEED_CLAUSE.search(str(database or "")):
+            return
+        raise SurrealDbError(
+            f"Table {self._table!r} has no change feed (nor does its database), so SHOW CHANGES "
+            f"would stay empty forever. Add one, e.g. DEFINE TABLE OVERWRITE … CHANGEFEED 7d (as "
+            f"in: {fix}); only writes made after that are recorded."
+        )
+
+    async def _info(self, statement: str, key: str) -> dict[str, Any] | None:
+        """One section of an ``INFO`` statement, or ``None`` when it cannot be read."""
+        try:
+            info = await self._with_retry(lambda client: client.query(statement, {}))
+        except SurrealDbConnectionError:
+            raise
+        except Exception as exc:
+            logger.debug("Could not run %s to check %s for a change feed: %s", statement, self._table, exc)
+            return None
+        section = info.get(key) if isinstance(info, dict) else None
+        return section if isinstance(section, dict) else None
 
     async def _with_retry(self, operation: Callable[[Any], Awaitable[Any]]) -> Any:
         """Run *operation* on the manager's client, retrying connection failures with backoff."""
@@ -412,5 +452,7 @@ class ChangeModelStream(Generic[T]):
                 error,
                 delay,
             )
-            await asyncio.sleep(delay)
+            await self._pause(delay)
+            if self._stopped:
+                raise StopAsyncIteration
             delay = min(delay * 2, float(self.reconnect_max_delay))

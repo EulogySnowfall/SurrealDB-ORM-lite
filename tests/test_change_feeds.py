@@ -459,3 +459,78 @@ class TestExports:
             assert name in orm.__all__
             assert hasattr(orm, name)
         assert orm.ChangeModelStream is ChangeModelStream
+
+
+async def _direct_write(sql: str) -> None:
+    """A write on a separate, direct connection — not through the stream's proxy."""
+    from surrealdb import AsyncSurreal
+
+    client = AsyncSurreal(_url())
+    await client.connect(_url())
+    try:
+        await client.signin({"username": "root", "password": "root"})
+        await client.use("ns", "db")
+        await client.query(sql, {})
+    finally:
+        await client.close()
+
+
+class TestReviewChangeFeedE2E:
+    @pytest.mark.asyncio
+    async def test_a_database_level_change_feed_is_accepted(self) -> None:
+        """Finding #5: DEFINE DATABASE … CHANGEFEED covers every table, without a table clause."""
+        database = "cf_dbfeed"
+        SurrealDBConnectionManager.set_connection(url=_url(), user="root", password="root", namespace="ns", database=database)
+        client = await SurrealDBConnectionManager.get_client()
+        try:
+            await client.query(f"DEFINE DATABASE OVERWRITE {database} CHANGEFEED 1h;", {})
+            await client.query(f"DEFINE TABLE OVERWRITE {TABLE} SCHEMALESS;", {})
+            stream = await Fed.objects().changes(poll_interval=0.05).start()
+            await Fed(id="dbf").save()
+            [event] = await _take(stream, 1)
+            assert _ids([event]) == ["dbf"]
+        finally:
+            with contextlib.suppress(Exception):
+                await client.query(f"REMOVE DATABASE {database};", {})
+            await SurrealDBConnectionManager.close_connection()
+
+    @pytest.mark.asyncio
+    async def test_the_word_changefeed_in_a_comment_is_not_a_change_feed(self) -> None:
+        async with feed_client("COMMENT 'no changefeed here'"):
+            with pytest.raises(SurrealDbError, match="no change feed"):
+                await Fed.objects().changes().start()
+
+    @pytest.mark.asyncio
+    async def test_stop_ends_a_read_waiting_in_the_retry_backoff(self) -> None:
+        """Finding #10: stop() used to wait out the backoff, up to 30 s."""
+        from tests._proxy import CuttableProxy
+
+        async with CuttableProxy() as proxy, feed_client(url=proxy.url()):
+            stream = await Fed.objects().changes(poll_interval=0.05).start()
+            stream.reconnect_delay = 10.0
+            proxy.refuse()
+            proxy.cut()
+            pending = asyncio.ensure_future(anext(stream))
+            await asyncio.sleep(0.3)
+            stream.stop()
+            with pytest.raises(StopAsyncIteration):
+                async with asyncio.timeout(1):
+                    await pending
+            proxy.accept()
+
+    @pytest.mark.asyncio
+    async def test_a_drop_over_http_is_retried(self) -> None:
+        """Finding #6b: aiohttp's ServerDisconnectedError is not an OSError, yet a lost connection."""
+        from tests._proxy import CuttableProxy
+
+        async with CuttableProxy() as proxy, feed_client(url=proxy.url("http")):
+            stream = _fast(await Fed.objects().changes(poll_interval=0.05).start())
+            await _direct_write(f"CREATE {TABLE}:h0;")
+            first = await _take(stream, 1)
+
+            proxy.cut()  # the pooled keep-alive connection dies under the next poll
+            await _direct_write(f"CREATE {TABLE}:h1;")
+            await _direct_write(f"CREATE {TABLE}:h2;")
+            rest = await _take(stream, 2)
+
+            assert _ids(first + rest) == ["h0", "h1", "h2"]

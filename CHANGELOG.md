@@ -39,7 +39,8 @@ server lines.
   `changes(since=cursor)`, on 2.x and 3.x alike; it advances past a transaction only after its
   last event, so saving it after each event is at-least-once. `since=` also takes a `datetime`
   or ISO-8601 string. With `INCLUDE ORIGINAL`, updates carry `changed_fields`. `start()` fixes
-  the starting position early; `stop()` ends the iteration within one poll.
+  the starting position early; `stop()` ends the iteration at once, even during a retry
+  backoff. A change feed defined on the database (`DEFINE DATABASE … CHANGEFEED`) is accepted.
 - `ChangeModelStream` and `ReconnectCallback` are exported from the package root.
 
 ### Changed
@@ -54,17 +55,24 @@ server lines.
   usable client share one new connection; before, each opened its own and the extras leaked —
   a live query started on one could never be killed.
 - `kill()` on a dropped client returns without a network call instead of raising
-  `SurrealDbError`.
+  `SurrealDbError`, and the live queries of a replaced client are recorded as dead, so a late
+  `subscribe_live()` on one of them ends at once.
+- A `get_client()` cancelled while opening the connection now closes the half-open socket.
 - `live()` and `watch()` no longer refuse `auto_resubscribe=` / `on_reconnect=` with `TypeError`.
 
 ### Security
 
 - **A resubscribe never changes the identity a live query runs under.** A live query is
   evaluated with the permissions of whoever opened it, and a new connection comes back as the
-  identity the manager replays. A stream opened under an identity that cannot be replayed
-  (`signin`/`signup`/`authenticate` with `store=False`), or whose connection identity changed
+  identity the manager replays. The manager stamps each connection whenever it sets its
+  identity, and tracks every change to what a reconnect would restore (stored token,
+  `invalidate()`, `clear_session()`, `set_connection()` and the `set_*` setters). A stream opened
+  under an identity that cannot be replayed (`store=False`), or whose replayed identity changed
   since, ends with `SurrealDbAuthenticationError` instead of resubscribing — possibly as the
   configured root user.
+- **Reconnect loops do not retry a server that answered "no".** `get_client()` still raises
+  `SurrealDbConnectionError` when the configured credentials are rejected, but live streams and
+  change feeds raise it at once instead of retrying it for minutes.
 
 ### Notes
 

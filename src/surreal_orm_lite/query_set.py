@@ -1202,7 +1202,7 @@ class QuerySet:
         :param poll_interval: seconds between two polls when the feed has nothing new.
         :param batch_size: entries read per poll.
         :raises SurrealDbError: for any queryset clause, here; on start, for a table that does not
-            exist or has no change feed.
+            exist or has no change feed (on the table or on its database).
         :raises TypeError, ValueError: for an unusable ``since``/``poll_interval``/``batch_size``.
         """
         self._reject_changes_clauses()

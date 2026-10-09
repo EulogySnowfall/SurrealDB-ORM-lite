@@ -1226,12 +1226,16 @@ async with Order.objects().filter(status="open").live(on_reconnect=catch_up) as 
   and `LiveStream`, overridable per stream. Only connection failures are retried. When the
   attempts run out, or anything else goes wrong (the table was removed, the session token was
   refused), the error is raised from the iteration and `is_active` turns `False`.
-- **Never under another identity.** A live query runs with the permissions of whoever opened it.
-  If the stream was opened under an identity a new connection cannot restore
-  (`signin(..., store=False)`), or the connection's identity changed since (`signin`,
-  `authenticate`, `invalidate`, …), the stream ends with `SurrealDbAuthenticationError` instead
-  of resubscribing as somebody else. Identity changes made directly on the SDK client are not
-  seen by the ORM.
+- **Never under another identity.** A live query runs with the permissions of whoever opened it,
+  and a new connection comes back as the identity the manager replays (the stored session
+  token, else the configured user). If the stream was opened under an identity a new connection
+  cannot restore (`signin(..., store=False)`), or what a new connection would restore has
+  changed since (`signin`/`signup`/`authenticate` with the default `store=True`, `invalidate()`,
+  `clear_session()`, `set_connection()` or a `set_*` setter, a refused session replay), the
+  stream ends with `SurrealDbAuthenticationError` instead of resubscribing as somebody else.
+  Minting a token for someone else with `store=False` after the stream started does not block it.
+  The check is per connection, so another event loop's identity changes do not leak in. Identity
+  changes made directly on the SDK client are not seen by the ORM.
 - **`auto_resubscribe=False`** ends the stream on a drop with `SurrealDbConnectionError`, as does
   any secondary reader from `subscribe_live(uuid)`, which is tied to one uuid. Before v0.21.0
   they all waited forever.
@@ -1423,13 +1427,14 @@ async for event in stream:
   also carry `changed_fields`, and on SurrealDB 3.3 a deletion carries the last state of the
   record (elsewhere the instance holds only its `id`).
 - **`poll_interval`** (0.1 s) is the pause when the feed has nothing new; **`batch_size`** (100)
-  the entries read per poll. `stop()` ends the iteration within one `poll_interval`; `start()`
-  fixes the starting position before the first read.
+  the entries read per poll. `stop()` ends the iteration at once when it is waiting between
+  polls or in a retry backoff, or as soon as a request already sent returns; `start()` fixes the
+  starting position before the first read.
 - Works over **HTTP** as well as WebSocket. A dropped connection is retried with the same
   backoff as live streams, and nothing is lost, because the next read starts from the cursor.
 - **Refused:** any queryset clause — `SHOW CHANGES` has no `WHERE`, so `filter()` would silently
-  stream the whole table — and a table that is missing or has no change feed, with the
-  `DEFINE TABLE` to run.
+  stream the whole table — and a table that is missing or has no change feed (on the table or
+  on its database), with the `DEFINE TABLE` to run.
 
 **Why the cursor is not the server's `versionstamp`.** SurrealDB 2.x and 3.x number their feeds
 differently: resuming a 2.x feed with the stamp it returned yields nothing at all, and asking

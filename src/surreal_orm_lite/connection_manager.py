@@ -23,6 +23,7 @@ from .functions import build_call_statement, normalize_function_name, parse_func
 from .live import (
     LiveIterator,
     close_all_subscribers,
+    is_connection_failure,
     is_dead,
     mark_killed,
     open_stream,
@@ -89,17 +90,24 @@ class SurrealDBConnectionManager:
     __session_token: str | None = None
     __refresh_token: str | None = None
 
-    # Which identity a *new* connection would come back as, relative to the current one — read
-    # by live streams before they resubscribe (v0.21.0). A live query is opened once and then
-    # evaluated with the permissions of the identity that opened it, so reopening it after a
-    # drop under any other identity would silently widen (or narrow) what it reports. The epoch
-    # moves on every identity change the manager makes; ``unreplayable`` is set while the
-    # connection runs as an identity a reconnect cannot restore (``store=False``, or
-    # ``clear_session()`` under a stored one). Global, like the stored token: per-loop clients
-    # all replay that same token. Conservative by design — when in doubt a stream refuses to
-    # resubscribe and raises, it never guesses.
-    __identity_epoch: int = 0
-    __identity_unreplayable: bool = False
+    # Identity bookkeeping for live-query resubscribe (v0.21.0). A live query is evaluated with
+    # the permissions of whoever opened it, so reopening it after a drop is only sound when a new
+    # connection comes back as that same identity. Two pieces answer that:
+    #
+    # * ``__replay_epoch`` moves whenever what a *new* connection would be identified as changes:
+    #   the stored session token (signin/signup/authenticate with store=True, invalidate,
+    #   clear_session, a replay the server refused) or the configured credentials and target
+    #   (set_connection and the set_* setters).
+    # * each client carries a stamp ``(replay_epoch, replayable)`` set whenever the manager sets
+    #   its identity: opened (and replayed), signed in, authenticated, invalidated. ``replayable``
+    #   is False after ``store=False``, which identifies the client as someone a reconnect will
+    #   not restore.
+    #
+    # A stream may resubscribe only if its client's stamp was replayable at start and the replay
+    # epoch has not moved since. Per client rather than global: clients are per event loop, and
+    # a store=False signin on one loop says nothing about another loop's connection.
+    __replay_epoch: int = 0
+    __client_identities: "weakref.WeakKeyDictionary[Any, tuple[int, bool]]" = weakref.WeakKeyDictionary()
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         await SurrealDBConnectionManager.close_connection()
@@ -119,6 +127,8 @@ class SurrealDBConnectionManager:
         cls.__password = password
         cls.__namespace = namespace
         cls.__database = database
+        # A new connection would now sign in as somebody else, or somewhere else.
+        cls._replay_identity_changed()
         # Signatures belong to the server that declared them; re-pointing the connection must
         # not hand stale ones to the new one. A JWT is bound even more tightly — to a server,
         # namespace, database and access method — so it is dropped for the same reason, and
@@ -209,7 +219,18 @@ class SurrealDBConnectionManager:
             if client is not None:
                 with contextlib.suppress(Exception):
                     await client.close()
-            raise SurrealDbConnectionError("Can't connect to the database.") from None
+            error = SurrealDbConnectionError("Can't connect to the database.")
+            # Kept as SurrealDbConnectionError for every caller, but a server that *answered*
+            # — the configured credentials rejected, the namespace refused — will answer the same
+            # on the next attempt, so the reconnect loops (v0.21.0) must not retry it.
+            error.retryable = is_connection_failure(e, client)  # type: ignore[attr-defined]
+            raise error from None
+        except BaseException:
+            # A cancellation (a stream stopped mid-reconnect) must not leave a socket behind.
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    await client.close()
+            raise
         return client
 
     @classmethod
@@ -246,14 +267,23 @@ class SurrealDBConnectionManager:
         """Forget a client whose WebSocket dropped, so the next caller gets a working one.
 
         Live-query readers are deliberately **not** released here: each one already learnt of
-        the drop from the SDK's receive task, and decides on its own whether to resubscribe.
-        Closing is best-effort — the socket is already gone, only the SDK's bookkeeping remains.
+        the drop from the SDK's receive task, and decides on its own whether to resubscribe. Their
+        uuids are recorded as dead, so a late ``subscribe_live()`` on one ends at once instead of
+        waiting on the new connection for a subscription that no longer exists.
+
+        The client is deliberately **not** closed: its socket is already gone, and the SDK's
+        ``close()`` would reset it to "never connected" — after which any stale reference to it
+        (an open transaction, say) would silently open a fresh, anonymous, uncached socket on its
+        next call. Left as is, such a call fails loudly on the dead socket.
         """
         if cls.__clients.get(loop) is client:
             cls.__clients.pop(loop, None)
         logger.info("The SurrealDB WebSocket connection dropped; opening a new one.")
-        with contextlib.suppress(Exception):
-            await client.close()
+        for candidate in (client, getattr(client, "_connection", None)):
+            queues = getattr(candidate, "live_queues", None)
+            if isinstance(queues, dict):
+                for key in list(queues):
+                    mark_killed(key)
 
     @classmethod
     async def _connect_for_loop(cls, loop: asyncio.AbstractEventLoop) -> Any:
@@ -289,6 +319,9 @@ class SurrealDBConnectionManager:
         try:
             await cls._replay_session(_client)
         finally:
+            # Either the stored identity was replayed or, refused, it was forgotten and the client
+            # stayed at the configured one: in both cases what a reconnect would restore.
+            cls._stamp_identity(_client, replayable=True)
             cls.__clients[loop] = _client
         return _client
 
@@ -316,8 +349,8 @@ class SurrealDBConnectionManager:
                 client.token = previous
             cls.__session_token = None
             cls.__refresh_token = None
-            # The new connection is left at the configured identity, not the one it replaced.
-            cls._identity_changed(replayable=True)
+            # A reconnect now restores the configured identity, not the one that was stored.
+            cls._replay_identity_changed()
             raise wrap_auth_error(exc, "restoring the session on a new connection") from exc
 
     @classmethod
@@ -514,7 +547,7 @@ class SurrealDBConnectionManager:
             tokens = await client.signin(payload)
         except Exception as exc:
             raise wrap_auth_error(exc, "signin") from exc
-        return cls._adopt_tokens(tokens, store=store, operation="signin")
+        return cls._adopt_tokens(tokens, store=store, operation="signin", client=client)
 
     @classmethod
     async def signup(
@@ -558,10 +591,10 @@ class SurrealDBConnectionManager:
             tokens = await client.signup(payload)
         except Exception as exc:
             raise wrap_auth_error(exc, "signup") from exc
-        return cls._adopt_tokens(tokens, store=store, operation="signup")
+        return cls._adopt_tokens(tokens, store=store, operation="signup", client=client)
 
     @classmethod
-    def _adopt_tokens(cls, tokens: Any, *, store: bool, operation: str) -> AuthTokens:
+    def _adopt_tokens(cls, tokens: Any, *, store: bool, operation: str, client: Any) -> AuthTokens:
         """Convert the SDK's ``Tokens`` to :class:`AuthTokens`, optionally remembering it.
 
         The SDK types ``access`` as optional; the ORM does not hand back a token-shaped object
@@ -576,19 +609,32 @@ class SurrealDBConnectionManager:
         if store:
             cls.__session_token = adopted.access
             cls.__refresh_token = adopted.refresh
-        cls._identity_changed(replayable=store)
+            cls._replay_identity_changed()
+        cls._stamp_identity(client, replayable=store)
         return adopted
 
     @classmethod
-    def _identity_changed(cls, *, replayable: bool) -> None:
-        """Record an identity change on the connection; see ``__identity_epoch``."""
-        cls.__identity_epoch += 1
-        cls.__identity_unreplayable = not replayable
+    def _replay_identity_changed(cls) -> None:
+        """What a new connection would be identified as has changed; see ``__replay_epoch``."""
+        cls.__replay_epoch += 1
 
     @classmethod
-    def _identity_snapshot(cls) -> tuple[int, bool]:
-        """``(epoch, unreplayable)`` — what a live stream records when it starts."""
-        return cls.__identity_epoch, cls.__identity_unreplayable
+    def _stamp_identity(cls, client: Any, *, replayable: bool) -> None:
+        """Record that the manager just set *client*'s identity, and whether a reconnect restores it."""
+        with contextlib.suppress(TypeError):  # an object that cannot be weakly referenced
+            cls.__client_identities[client] = (cls.__replay_epoch, replayable)
+
+    @classmethod
+    def _identity_of(cls, client: Any) -> tuple[int, bool] | None:
+        """*client*'s identity stamp, or ``None`` for a client the manager did not identify."""
+        try:
+            return cls.__client_identities.get(client)
+        except TypeError:
+            return None
+
+    @classmethod
+    def _current_replay_epoch(cls) -> int:
+        return cls.__replay_epoch
 
     @classmethod
     async def authenticate(cls, token: str, *, store: bool = True, refresh: str | None = None) -> None:
@@ -633,7 +679,8 @@ class SurrealDBConnectionManager:
             # session's one is dropped rather than left paired with an identity it cannot
             # renew. A caller that *does* hold the matching pair passes refresh=.
             cls.__refresh_token = refresh
-        cls._identity_changed(replayable=store)
+            cls._replay_identity_changed()
+        cls._stamp_identity(client, replayable=store)
 
     @classmethod
     async def invalidate(cls) -> None:
@@ -664,14 +711,13 @@ class SurrealDBConnectionManager:
             raise wrap_auth_error(exc, "invalidate") from exc
 
         cls.clear_session()
-        # Back to the configured identity — on this client below, or on the next one if that
-        # fails — which is exactly what a reconnect restores.
-        cls._identity_changed(replayable=True)
 
         try:
             await client.signin({"username": cls.__user, "password": cls.__password})
             if cls.__namespace is not None and cls.__database is not None:
                 await client.use(cls.__namespace, cls.__database)
+            # Back at the configured identity — exactly what a reconnect restores.
+            cls._stamp_identity(client, replayable=True)
         except Exception as exc:
             # The session is anonymous at this point — exactly the state this method exists to
             # avoid. Drop the client so the next get_client() rebuilds at the configured
@@ -693,9 +739,9 @@ class SurrealDBConnectionManager:
         forgotten. Call :meth:`invalidate` when you mean to log out for real.
         """
         if cls.__session_token is not None:
-            # The connection still runs as the stored identity, but a reconnect would now come
-            # back as the configured one.
-            cls._identity_changed(replayable=False)
+            # A reconnect would now come back as the configured identity, not the stored one;
+            # the connections already open keep the stored one, so their stamps go stale.
+            cls._replay_identity_changed()
         cls.__session_token = None
         cls.__refresh_token = None
 
@@ -1152,6 +1198,7 @@ class SurrealDBConnectionManager:
             raise ValueError("You can't change the URL when the others setting are not already set.")
 
         cls.__url = url
+        cls._replay_identity_changed()
 
         if reconnect and not await cls.validate_connection():  # pragma: no cover
             cls.__url = None
@@ -1171,6 +1218,7 @@ class SurrealDBConnectionManager:
             raise ValueError("You can't change the User when the others setting are not already set.")
 
         cls.__user = user
+        cls._replay_identity_changed()
 
         if reconnect and not await cls.validate_connection():  # pragma: no cover
             cls.__user = None
@@ -1190,6 +1238,7 @@ class SurrealDBConnectionManager:
             raise ValueError("You can't change the password when the others setting are not already set.")
 
         cls.__password = password
+        cls._replay_identity_changed()
 
         if reconnect and not await cls.validate_connection():  # pragma: no cover
             cls.__password = None
@@ -1209,6 +1258,7 @@ class SurrealDBConnectionManager:
             raise ValueError("You can't change the namespace when the others setting are not already set.")
 
         cls.__namespace = namespace
+        cls._replay_identity_changed()
 
         if reconnect and not await cls.validate_connection():  # pragma: no cover
             cls.__namespace = None
@@ -1227,6 +1277,7 @@ class SurrealDBConnectionManager:
             raise ValueError("You can't change the database when the others setting are not already set.")
 
         cls.__database = database
+        cls._replay_identity_changed()
 
         if reconnect and not await cls.validate_connection():  # pragma: no cover
             cls.__database = None

@@ -41,6 +41,7 @@ not replayed: a live query only sees what happens while it runs.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 import warnings
@@ -410,21 +411,35 @@ def open_stream(client: Any, query_uuid: str | UUID, *, on_lost: Callable[[], No
     return LiveIterator(client, query_uuid, register_subscriber(client, query_uuid), on_lost=on_lost)
 
 
-def is_connection_failure(exc: BaseException, client: Any) -> bool:
-    """Whether a failed resubscribe attempt is worth retrying: was the *connection* the problem?
+def _is_transport_error(exc: BaseException) -> bool:
+    """An error raised by the transport itself, matched by module so nothing is imported from it.
 
-    Retried: the ORM's own connection error (server unreachable), an ``OSError``, anything the
-    ``websockets`` transport raises (matched by module, so the ORM imports nothing from it), and
-    anything at all raised on a client that is dead by now — the SDK reports a request caught by
-    a drop as a bare ``KeyError`` (its receive loop clears the pending-request map before the
-    request's own cleanup runs). Everything else — an authentication failure, a removed table —
-    would fail identically on the next attempt, so it ends the stream instead. That is also what
-    keeps a rejected session token from being "retried" into a subscription opened as the
-    configured user.
+    ``websockets`` (the WebSocket client) raises its own hierarchy on a closed socket; ``aiohttp``
+    (the HTTP client) raises ``ClientConnectionError`` subclasses — ``ServerDisconnectedError``
+    among them is *not* an ``OSError``.
     """
-    if isinstance(exc, (SurrealDbConnectionError, OSError)):
-        return True
-    if type(exc).__module__.split(".", 1)[0] == "websockets":
+    for klass in type(exc).__mro__:
+        root = klass.__module__.split(".", 1)[0]
+        if root == "websockets" or (root == "aiohttp" and klass.__name__ == "ClientConnectionError"):
+            return True
+    return False
+
+
+def is_connection_failure(exc: BaseException, client: Any) -> bool:
+    """Whether a failed attempt is worth retrying: was the *connection* the problem?
+
+    Retried: the ORM's own connection error when the server could not be reached, an
+    ``OSError``, anything the ``websockets``/``aiohttp`` transports raise for a lost connection,
+    and anything at all raised on a client that is dead by now — the SDK reports a request caught
+    by a drop as a bare ``KeyError`` (its receive loop clears the pending-request map before the
+    request's own cleanup runs). Everything else — an authentication failure, the configured
+    credentials rejected, a removed table — would fail identically on the next attempt, so it ends
+    the stream instead. That is also what keeps a rejected session token from being "retried"
+    into a subscription opened as the configured user.
+    """
+    if isinstance(exc, SurrealDbConnectionError):
+        return bool(getattr(exc, "retryable", True))
+    if isinstance(exc, OSError) or _is_transport_error(exc):
         return True
     return client is not None and is_dead(client)
 
@@ -511,9 +526,10 @@ class LiveStream:
         # so that ``LiveModelStream.reconnect_max_attempts = …`` is honoured too.
         self._policy: Any = self
         self._stopping = False
-        self._resubscribe_pending = False
+        # The resubscribe in progress, if any — at most one at a time.
+        self._resubscribing: asyncio.Task[None] | None = None
         self._tasks: set[asyncio.Task[None]] = set()
-        # The connection manager's identity when the live query was opened (see _identity_refusal).
+        # The identity stamp of the client the live query was opened on (see _check_identity).
         self._identity: tuple[int, bool] | None = None
 
     @property
@@ -539,10 +555,13 @@ class LiveStream:
 
         # Transport first: on an http:// URL no client should be opened just to be refused.
         require_websocket(SurrealDBConnectionManager.get_connection_string())
+        # A resubscribe left over from a previous run must not land on this one.
+        await self._cancel_tasks()
+        self._resubscribing = None
         # Client next, so no await sits between opening the subscription and buffering it.
         self._stopping = False
         self._client = await SurrealDBConnectionManager.get_client()
-        self._identity = SurrealDBConnectionManager._identity_snapshot()
+        self._identity = SurrealDBConnectionManager._identity_of(self._client)
         self._live_id = await self._starter(self._client)
         on_lost = self._schedule_resubscribe if self._auto_resubscribe else None
         self._iterator = open_stream(self._client, self._live_id, on_lost=on_lost)
@@ -577,10 +596,10 @@ class LiveStream:
 
     def _schedule_resubscribe(self) -> None:
         """The reader's socket dropped: start resubscribing, unless already on it or stopping."""
-        if self._stopping or self._resubscribe_pending or self._live_id is None:
+        if self._stopping or self._resubscribing is not None or self._live_id is None:
             return
-        self._resubscribe_pending = True
         task = asyncio.get_running_loop().create_task(self._resubscribe(self._live_id))
+        self._resubscribing = task
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
@@ -596,21 +615,47 @@ class LiveStream:
             await asyncio.wait(tasks)
 
     async def _resubscribe(self, old_id: UUID) -> None:
+        try:
+            await self._resubscribe_once(old_id)
+        finally:
+            # Whatever happened — success, giving up, cancellation by stop() — this task is no
+            # longer resubscribing; a later drop must be able to start a new one.
+            if self._resubscribing is asyncio.current_task():
+                self._resubscribing = None
+
+    def _still_wanted(self, iterator: LiveIterator | None, queue: asyncio.Queue[Any] | None, old_id: UUID) -> bool:
+        """Whether the reader this resubscribe serves is still waiting for it.
+
+        A teardown the caller asked for after the drop — ``stop()``, ``kill()``,
+        ``close_connection()``, ``reconnect()`` — releases the reader's queue; reopening the live
+        query after that would open a connection and a subscription nobody will ever read or kill.
+        """
+        if self._stopping or iterator is None or queue is None or iterator._loop is None:
+            return False
+        if self._iterator is not iterator or iterator._queue is not queue:
+            return False
+        return _is_registered(iterator._loop, old_id, queue)
+
+    async def _resubscribe_once(self, old_id: UUID) -> None:
         from .connection_manager import SurrealDBConnectionManager
 
         # The old uuid is gone with the socket; a late subscribe_live() on it must end at once.
         mark_killed(old_id)
+        iterator = self._iterator
+        queue = iterator._queue if iterator is not None else None
         policy = self._policy
         delay = float(policy.reconnect_delay)
         attempt = 0
         while True:
+            if not self._still_wanted(iterator, queue, old_id):
+                return
             attempt += 1
             client: Any = None
             try:
                 self._check_identity()
                 client = await SurrealDBConnectionManager.get_client()
                 # Again once connected: the replay itself, or a concurrent signin, may have moved it.
-                self._check_identity()
+                self._check_identity(client)
                 new_id = await self._start_on(client)
                 break
             except asyncio.CancelledError:
@@ -641,15 +686,20 @@ class LiveStream:
             await asyncio.sleep(delay)
             delay = min(delay * 2, float(policy.reconnect_max_delay))
 
+        if not self._still_wanted(iterator, queue, old_id):
+            # Torn down while the LIVE SELECT was in flight: the new subscription is nobody's.
+            with contextlib.suppress(Exception):
+                await SurrealDBConnectionManager.kill(new_id)
+            return
+        assert iterator is not None
         self._client, self._live_id = client, new_id
-        if self._iterator is not None:
-            self._iterator.rebind(client, new_id)
+        iterator.rebind(client, new_id)
         # Cleared *before* the callback: a second drop while it runs must resubscribe again.
-        self._resubscribe_pending = False
+        self._resubscribing = None
         logger.info("Live query on %s resubscribed after a dropped connection (%s → %s)", self._table, old_id, new_id)
         await self._notify_reconnect(old_id, new_id)
 
-    def _check_identity(self) -> None:
+    def _check_identity(self, client: Any = None) -> None:
         """Refuse to reopen the live query under an identity other than the one that opened it.
 
         A live query is evaluated with the permissions of whoever opened it. A new connection
@@ -658,27 +708,33 @@ class LiveStream:
         stream started under. Otherwise the stream ends with an authentication error instead
         of carrying on with different permissions, possibly the configured root user's.
 
-        :raises SurrealDbAuthenticationError: the stream started under an identity that cannot be
-            replayed (``store=False``), or the identity changed since (signin, signup,
-            authenticate, invalidate, clear_session, or a session the server refused to restore).
+        The connection manager stamps each client with ``(replay_epoch, replayable)`` whenever it
+        sets the client's identity; the epoch moves whenever what a new connection would be
+        identified as changes. So: the client the stream started on must have been replayable,
+        the epoch must not have moved since, and the new *client* must carry that same stamp.
+
+        :raises SurrealDbAuthenticationError: the stream started under an identity a reconnect
+            cannot restore (``store=False``), or that identity is no longer the one a reconnect
+            restores (signin, signup, authenticate, invalidate, clear_session, set_connection or a
+            setter, or a session the server refused to replay).
         """
         from .connection_manager import SurrealDBConnectionManager
 
         started = self._identity
-        if started is None:
-            return
-        if started[1]:
+        if started is None or not started[1]:
             raise SurrealDbAuthenticationError(
                 f"The live query on {self._table!r} was opened under an identity the connection "
                 "manager cannot restore on a new connection (signin/signup/authenticate with "
-                "store=False, or clear_session() since). It is not resubscribed: a new connection "
-                "would run it with different permissions."
+                "store=False). It is not resubscribed: a new connection would run it with "
+                "different permissions."
             )
-        if SurrealDBConnectionManager._identity_snapshot() != started:
+        moved = started[0] != SurrealDBConnectionManager._current_replay_epoch()
+        if moved or (client is not None and SurrealDBConnectionManager._identity_of(client) != started):
             raise SurrealDbAuthenticationError(
-                f"The connection's identity changed since the live query on {self._table!r} was "
-                "opened (signin, signup, authenticate, invalidate, or a rejected session replay). "
-                "It is not resubscribed: the new subscription would run with different permissions."
+                f"The identity a new connection comes back as changed since the live query on "
+                f"{self._table!r} was opened (signin, signup, authenticate, invalidate, "
+                "clear_session, set_connection or a setter, or a refused session replay). It is not "
+                "resubscribed: the new subscription would run with different permissions."
             )
 
     async def _start_on(self, client: Any) -> UUID:
@@ -694,7 +750,6 @@ class LiveStream:
 
     def _give_up(self, error: Exception) -> None:
         """End the stream with *error*: no subscription is left, so nothing remains to kill."""
-        self._resubscribe_pending = False
         self._live_id = None
         if self._iterator is not None:
             self._iterator.fail(error)
