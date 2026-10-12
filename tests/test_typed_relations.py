@@ -12,6 +12,13 @@ Filter values (spec §4.6):
   matching nothing. Node columns are untouched: a string column may legitimately hold ``"a:b"``;
 - a lookup on a field whose name ends in ``_`` works: ``in___in`` is the ``in`` lookup on ``in_``.
 
+The edge model (spec §4.2): ``BaseSurrealEdge`` declares the endpoints ``in_`` (column ``in``) and
+``out`` as frozen ``RecordID`` fields. A node instance, a ``RecordID`` or a ``"table:id"`` string is
+read through ``utils.coerce_endpoint`` — anything else is a ``ValidationError``. The ``in_ → in``
+mapping comes from the ``_implicit_aliases()`` hook of the v0.18.0 alias map, so every path that
+already honours an alias (writes, filters, ``order_by``, hydration) honours it, whatever the call
+order and on subclasses too. A subclass may not redeclare an endpoint.
+
 E2E tables are dedicated (``tr_*``), dropped on entry and exit by ``orm_client``; nodes are created
 inside the ``async with orm_client(...)`` block. Same behaviour on SurrealDB 2.x and 3.x.
 """
@@ -19,9 +26,10 @@ inside the ``async with orm_client(...)`` block. Same behaviour on SurrealDB 2.x
 import asyncio
 
 import pytest
+from pydantic import Field, ValidationError
 from surrealdb import RecordID
 
-from surreal_orm_lite import BaseSurrealModel, Q, SurrealConfigDict, Var
+from surreal_orm_lite import BaseSurrealEdge, BaseSurrealModel, Q, SurrealConfigDict, Var
 from surreal_orm_lite.enum import LiveAction
 from surreal_orm_lite.query_set import QuerySet
 from surreal_orm_lite.utils import build_filter_condition, coerce_endpoint, parse_lookup
@@ -57,6 +65,19 @@ class TrOrder(BaseSurrealModel):
     id: str | None = None
     customer: RecordID
     note: str = ""
+
+
+class TrPurchased(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="tr_purchased")
+
+    quantity: int = Field(default=1, ge=1)
+    price: float = 0.0
+
+
+class TrFollows(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="tr_follows")
+
+    weight: int = 1
 
 
 ENDPOINTS = frozenset({"in", "out"})
@@ -362,3 +383,250 @@ class TestFilterByInstanceE2E:
             assert event.record_id == "tr_order:oa"
             assert isinstance(event.instance, TrOrder)
             assert event.instance.customer == ALICE
+
+
+# ==================== Task 3 — the edge model (unit) ====================
+
+
+class TrIntNode(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="tr_int_node")
+
+    id: int | None = None
+
+
+PERSON_A = RecordID("tr_person", "a")
+WIDGET = RecordID("tr_product", "widget")
+
+
+class TestEdgeModel:
+    def test_exported(self) -> None:
+        import surreal_orm_lite
+        from surreal_orm_lite.edge import BaseSurrealEdge as from_module
+
+        assert "BaseSurrealEdge" in surreal_orm_lite.__all__
+        assert surreal_orm_lite.BaseSurrealEdge is BaseSurrealEdge is from_module
+        assert issubclass(BaseSurrealEdge, BaseSurrealModel)
+
+    def test_declared_fields(self) -> None:
+        assert set(TrPurchased.model_fields) == {"id", "in_", "out", "quantity", "price"}
+        assert TrPurchased.get_table_name() == "tr_purchased"
+        edge = TrPurchased(id="p1", in_=PERSON_A, out=WIDGET)
+        assert edge._record_id() == RecordID("tr_purchased", "p1")
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (RecordID("tr_person", "a"), RecordID("tr_person", "a")),
+            (TrPerson(id="a"), RecordID("tr_person", "a")),
+            ("tr_person:a", RecordID("tr_person", "a")),
+            ("tr_person:5", RecordID("tr_person", "5")),
+            ("tr_person:`a-b`", RecordID("tr_person", "a-b")),
+            (TrPerson(id="joe@x.com"), RecordID("tr_person", "joe@x.com")),
+            (TrIntNode(id=5), RecordID("tr_int_node", 5)),
+        ],
+        ids=["record-id", "node", "string", "digit-string", "backticked", "non-identifier-id", "int-id-node"],
+    )
+    def test_endpoint_from_record_id_node_and_string(self, value: object, expected: RecordID) -> None:
+        as_in = TrPurchased(in_=value, out=WIDGET)
+        as_out = TrPurchased(in_=PERSON_A, out=value)
+        for endpoint in (as_in.in_, as_out.out):
+            assert isinstance(endpoint, RecordID)
+            assert endpoint == expected
+            # The id keeps its type: a string id stays a string, an integer id an integer.
+            assert type(endpoint.id) is type(expected.id)
+
+    def test_endpoint_accepts_column_name_in(self) -> None:
+        edge = TrPurchased.model_validate({"in": TrPerson(id="a"), "out": "tr_product:widget", "quantity": 2})
+        assert edge.in_ == PERSON_A
+        assert edge.out == WIDGET
+        assert edge.quantity == 2
+        by_name = TrPurchased.model_validate({"in_": "tr_person:a", "out": WIDGET})
+        assert by_name.in_ == PERSON_A
+
+    @pytest.mark.parametrize(
+        "value",
+        [TrPerson(name="unsaved"), "nocolon", "a;b:c", "tr_person:joe@x.com", "", 42, None, {"id": "tr_person:a"}],
+        ids=["unsaved-node", "no-colon", "injection", "non-identifier-id", "empty", "int", "none", "dict"],
+    )
+    def test_invalid_endpoints_raise_validation_error(self, value: object) -> None:
+        # pytest.raises(ValidationError) also proves the SDK's InvalidRecordIdError never escapes.
+        with pytest.raises(ValidationError) as as_in:
+            TrPurchased(in_=value, out=WIDGET)
+        assert [error["type"] for error in as_in.value.errors()] == ["value_error"]
+        with pytest.raises(ValidationError):
+            TrPurchased(in_=PERSON_A, out=value)
+        with pytest.raises(ValidationError):
+            TrPurchased.model_validate({"in": value, "out": WIDGET})
+
+    def test_unsaved_node_message(self) -> None:
+        with pytest.raises(ValidationError, match="An unsaved TrPerson has no record id"):
+            TrPurchased(in_=TrPerson(name="x"), out=WIDGET)
+
+    def test_missing_endpoint_raises_validation_error(self) -> None:
+        with pytest.raises(ValidationError) as missing_out:
+            TrPurchased.model_validate({"in": PERSON_A})
+        assert [error["type"] for error in missing_out.value.errors()] == ["missing"]
+        with pytest.raises(ValidationError):
+            TrPurchased.model_validate({"out": WIDGET})
+
+    def test_column_mapping(self) -> None:
+        assert TrPurchased.get_field_aliases() == {"in_": "in"}
+        assert TrPurchased.to_db_field("in_") == "in"
+        assert TrPurchased.to_db_field("out") == "out"
+        assert TrPurchased.to_py_field("in") == "in_"
+        assert TrPurchased.to_db_field("in_.name") == "in.name"
+
+        payload = TrPurchased(in_=PERSON_A, out=WIDGET, quantity=2, price=9.5)._write_payload()
+        assert payload == {"in": PERSON_A, "out": WIDGET, "quantity": 2, "price": 9.5}
+        assert isinstance(payload["in"], RecordID)
+        assert isinstance(payload["out"], RecordID)
+
+        query, variables = TrPurchased.objects().filter(in_=PERSON_A)._compile_query()
+        assert query == "SELECT * FROM tr_purchased WHERE in = $_f0;"
+        assert variables == {"_f0": PERSON_A}
+
+        query, _ = TrPurchased.objects().order_by("in_")._compile_query()
+        assert query == "SELECT * FROM tr_purchased ORDER BY in ASC;"
+
+    def test_alias_map_is_complete_whatever_the_call_order(self) -> None:
+        class TrFreshEdge(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="tr_fresh_edge")
+
+            note: str = ""
+
+        # The base implementation first: there is no override that could be bypassed.
+        forward, reverse = BaseSurrealModel._alias_maps.__func__(TrFreshEdge)
+        assert (forward, reverse) == ({"in_": "in"}, {"in": "in_"})
+        assert TrFreshEdge.get_field_aliases() == {"in_": "in"}
+
+        class TrFreshParent(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="tr_fresh_parent")
+
+        class TrFreshChild(TrFreshParent):
+            extra: int = 0
+
+        # The child's map is built before its parent's.
+        assert TrFreshChild.get_field_aliases() == {"in_": "in"}
+        assert TrFreshChild.to_py_field("in") == "in_"
+        assert TrFreshParent.get_field_aliases() == {"in_": "in"}
+        assert TrFreshChild.get_table_name() == "tr_fresh_parent"
+
+    def test_subclass_of_a_concrete_edge_maps_in(self) -> None:
+        class TrPurchasedSub(TrPurchased):
+            gift: bool = False
+
+        assert TrPurchasedSub.get_field_aliases() == {"in_": "in"}
+        edge = TrPurchasedSub(in_=PERSON_A, out=WIDGET, gift=True)
+        assert edge._write_payload() == {"in": PERSON_A, "out": WIDGET, "quantity": 1, "price": 0.0, "gift": True}
+        assert TrPurchasedSub._endpoint_columns() == frozenset({"in", "out"})
+
+    def test_user_alias_on_data_field_still_works(self) -> None:
+        class TrMemoEdge(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="tr_memo_edge")
+
+            note: str = Field(default="", alias="memo")
+
+        assert TrMemoEdge.get_field_aliases() == {"in_": "in", "note": "memo"}
+        assert TrMemoEdge.to_py_field("memo") == "note"
+        edge = TrMemoEdge(in_=PERSON_A, out=WIDGET, note="hi")
+        assert edge._write_payload() == {"in": PERSON_A, "out": WIDGET, "memo": "hi"}
+        row = TrMemoEdge.from_db({"id": RecordID("tr_memo_edge", "m"), "in": PERSON_A, "out": WIDGET, "memo": "x"})
+        assert isinstance(row, TrMemoEdge)
+        assert (row.in_, row.note) == (PERSON_A, "x")
+
+    def test_user_alias_onto_endpoint_column_rejected(self) -> None:
+        class TrAliasOut(BaseSurrealEdge):
+            x: str = Field(default="", alias="out")
+
+        with pytest.raises(ValueError, match="collides with another field"):
+            TrAliasOut.get_field_aliases()
+
+        class TrAliasIn(BaseSurrealEdge):
+            x: str = Field(default="", alias="in")
+
+        with pytest.raises(ValueError, match="in_ and x both alias the column 'in'"):
+            TrAliasIn.get_field_aliases()
+
+    def test_endpoint_filters_coerce_strings(self) -> None:
+        query, variables = TrPurchased.objects().filter(in_="tr_person:alice")._compile_query()
+        assert query == "SELECT * FROM tr_purchased WHERE in = $_f0;"
+        assert variables == {"_f0": RecordID("tr_person", "alice")}
+        assert isinstance(variables["_f0"], RecordID)
+
+        bob = TrPerson(id="bob")
+        query, variables = TrPurchased.objects().filter(in___in=["tr_person:a", bob])._compile_query()
+        assert query == "SELECT * FROM tr_purchased WHERE in IN $_f0;"
+        assert variables == {"_f0": [RecordID("tr_person", "a"), RecordID("tr_person", "bob")]}
+
+        _, variables = TrPurchased.objects().filter(Q(out="tr_product:widget"))._compile_query()
+        assert variables == {"_f0": WIDGET}
+
+        with pytest.raises(ValueError, match="edge endpoint column 'in'"):
+            TrPurchased.objects().filter(in___contains="x")._compile_query()
+
+    def test_endpoints_are_frozen(self) -> None:
+        edge = TrPurchased(in_=PERSON_A, out=WIDGET)
+        with pytest.raises(ValidationError, match="frozen"):
+            edge.out = RecordID("tr_product", "other")
+        with pytest.raises(ValidationError, match="frozen"):
+            edge.in_ = RecordID("tr_person", "b")
+        assert (edge.in_, edge.out) == (PERSON_A, WIDGET)
+
+        edge.quantity = 3  # data fields stay writable
+        assert edge.quantity == 3
+
+    def test_model_copy_is_not_checked(self) -> None:
+        """Documented, not refused: a copy meant as a new edge (``id=None``) is legitimate."""
+        edge = TrPurchased(id="p1", in_=PERSON_A, out=WIDGET)
+        other = RecordID("tr_product", "other")
+        copy = edge.model_copy(update={"id": None, "out": other})
+        assert (copy.id, copy.in_, copy.out) == (None, PERSON_A, other)
+        assert edge.out == WIDGET
+
+    def test_redeclaring_an_endpoint_is_refused(self) -> None:
+        with pytest.raises(TypeError, match="TrBadOut: 'in_'/'out' are the endpoints declared by BaseSurrealEdge"):
+
+            class TrBadOut(BaseSurrealEdge):
+                out: RecordID
+
+        with pytest.raises(TypeError, match="cannot be redeclared"):
+
+            class TrBadIn(BaseSurrealEdge):
+                in_: RecordID | None = None
+
+        with pytest.raises(TypeError, match="cannot be redeclared"):
+
+            class TrBadSub(TrPurchased):
+                out: RecordID = Field(frozen=True)
+
+    def test_hydrates_from_row(self) -> None:
+        edge = TrPurchased.from_db(
+            {"id": RecordID("tr_purchased", "x"), "in": PERSON_A, "out": WIDGET, "quantity": 2, "price": 1.5}
+        )
+        assert isinstance(edge, TrPurchased)
+        assert isinstance(edge.id, RecordID)
+        assert edge.id == RecordID("tr_purchased", "x")
+        assert (edge.in_, edge.out, edge.quantity, edge.price) == (PERSON_A, WIDGET, 2, 1.5)
+        assert edge._record_id() == RecordID("tr_purchased", "x")
+
+    def test_apply_record_still_updates_endpoints(self) -> None:
+        """Hydrating a returned row bypasses validation (``object.__setattr__``), frozen or not."""
+        edge = TrPurchased(in_=PERSON_A, out=WIDGET)
+        edge._apply_record({"id": RecordID("tr_purchased", "x"), "in": RecordID("tr_person", "b")})
+        assert edge.in_ == RecordID("tr_person", "b")
+        assert edge.id == RecordID("tr_purchased", "x")
+
+    def test_marker_and_hooks(self) -> None:
+        assert BaseSurrealEdge.__surreal_edge__ is True
+        assert TrPurchased.__surreal_edge__ is True
+        assert BaseSurrealModel.__surreal_edge__ is False
+        assert TrPerson.__surreal_edge__ is False
+        assert "__surreal_edge__" not in TrPurchased.model_fields
+
+        assert TrPurchased._endpoint_columns() == frozenset({"in", "out"})
+        assert TrPerson._endpoint_columns() == frozenset()
+        assert TrPurchased._write_protected_fields() == frozenset({"in_", "out"})
+        assert TrPerson._write_protected_fields() == frozenset()
+        assert TrPurchased._implicit_aliases() == {"in_": "in"}
+        assert TrPerson._implicit_aliases() == {}
+        assert TrFollows.get_field_aliases() == {"in_": "in"}

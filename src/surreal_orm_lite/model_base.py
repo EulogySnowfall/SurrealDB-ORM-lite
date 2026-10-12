@@ -167,6 +167,13 @@ class BaseSurrealModel(BaseModel):
     __surreal_computed__: typing.ClassVar[dict[str, str]] = {}
     """Computed field name → SurrealQL expression, collected by ``__init_subclass__``."""
 
+    __surreal_edge__: typing.ClassVar[bool] = False
+    """``True`` on :class:`~surreal_orm_lite.edge.BaseSurrealEdge` and its subclasses (v0.22.0).
+
+    The internal marker the write paths, ``relate()`` and live hydration test to tell an edge
+    model from a node, so they need not import ``edge.py`` (which imports this module).
+    """
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Collect ``Computed(...)`` defaults before Pydantic builds the model.
 
@@ -311,17 +318,36 @@ class BaseSurrealModel(BaseModel):
     # ==================== Field aliases & server-owned fields (v0.18.0) ====================
 
     @classmethod
+    def _implicit_aliases(cls) -> dict[str, str]:
+        """Return the column renames the model class itself implies, ``{python_name: column}``.
+
+        Empty on a node. An edge model maps its ``in_`` field to the ``in`` column (v0.22.0):
+        ``in`` is a Python keyword, so the field cannot carry that name, and a
+        ``Field(alias="in")`` would make every ``Edge(in_=…)`` call a type-checker error. The
+        entries go through :meth:`_alias_maps` exactly like a ``Field(alias=…)``.
+        """
+        return {}
+
+    @classmethod
     def _alias_maps(cls) -> tuple[dict[str, str], dict[str, str]]:
         """Return this model's ``(python → column, column → python)`` alias maps, cached.
 
-        Built from ``FieldInfo.alias`` only. A separate ``validation_alias`` /
-        ``serialization_alias`` — and in particular an ``AliasPath``/``AliasChoices`` — does not
-        describe a column *rename*, which is the whole contract here, so those are deliberately
-        left to Pydantic and never enter this map.
+        Built from :meth:`_implicit_aliases` (``in_ → in`` on an edge model, v0.22.0) and then
+        ``FieldInfo.alias``. A separate ``validation_alias`` / ``serialization_alias`` — and in
+        particular an ``AliasPath``/``AliasChoices`` — does not describe a column *rename*,
+        which is the whole contract here, so those are deliberately left to Pydantic and never
+        enter this map. Both sources pass the same ambiguity check, so a user field aliased to
+        an implied column (``in``) is refused like any other collision.
+
+        Never overridden: the implied entries are read through the hook, so the per-class cache
+        holds the complete map whichever class method builds it first.
         """
         cached = _ALIAS_MAPS.get(cls)
         if cached is None:
-            forward = {name: info.alias for name, info in cls.model_fields.items() if info.alias}
+            forward = {
+                **cls._implicit_aliases(),
+                **{name: info.alias for name, info in cls.model_fields.items() if info.alias},
+            }
             cls._reject_ambiguous_aliases(forward)
             cached = (forward, {column: name for name, column in forward.items()})
             _ALIAS_MAPS[cls] = cached
@@ -377,8 +403,9 @@ class BaseSurrealModel(BaseModel):
     def get_field_aliases(cls) -> dict[str, str]:
         """Return ``{python_field_name: surrealdb_column}`` for this model's aliased fields.
 
-        ``{}`` when no field declares ``Field(alias=…)``. Returns a copy: the underlying map is
-        cached per class and every write path reads it.
+        ``{}`` on a node when no field declares ``Field(alias=…)``; an edge model always holds
+        ``{"in_": "in"}`` (v0.22.0). Returns a copy: the underlying map is cached per class and
+        every write path reads it.
         """
         return dict(cls._alias_maps()[0])
 
@@ -471,6 +498,15 @@ class BaseSurrealModel(BaseModel):
         ``in``/``out`` on an edge model, none on a node. The QuerySet hands them to the filter
         builder, which reads a ``"table:id"`` string given for one of them as the record id it
         names (:func:`~surreal_orm_lite.utils.coerce_endpoint`) and refuses text lookups there.
+        """
+        return frozenset()
+
+    @classmethod
+    def _write_protected_fields(cls) -> frozenset[str]:
+        """Return the fields of this model no write may change once the record exists (v0.22.0).
+
+        Python names. ``in_``/``out`` on an edge model — SurrealDB ignores a change to an edge's
+        endpoints on both lines — none on a node.
         """
         return frozenset()
 

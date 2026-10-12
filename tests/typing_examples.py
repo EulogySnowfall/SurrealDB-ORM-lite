@@ -8,7 +8,9 @@ Deliberately named ``typing_examples`` rather than ``test_*`` so pytest does not
 the assertions here are made by mypy, not at runtime.
 """
 
-from surreal_orm_lite import BaseSurrealModel, Computed, SurrealConfigDict, SurrealFunc, computed
+from surrealdb import RecordID
+
+from surreal_orm_lite import BaseSurrealEdge, BaseSurrealModel, Computed, SurrealConfigDict, SurrealFunc, computed
 
 
 class Player(BaseSurrealModel):
@@ -49,3 +51,26 @@ class Stamped(BaseSurrealModel):
 
 def tagged_table() -> str:
     return Tagged.get_table_name()
+
+
+class Purchased(BaseSurrealEdge):
+    """v0.22.0: an edge model. ``in_`` (column ``in``) and ``out`` are declared by the base."""
+
+    model_config = SurrealConfigDict(table_name="purchased")
+
+    quantity: int = 1
+    price: float = 0.0
+
+
+def new_purchase() -> Purchased:
+    """The endpoints are ``RecordID`` parameters named ``in_`` and ``out`` — not the keyword ``in``."""
+    return Purchased(in_=RecordID("Person", "a"), out=RecordID("Product", "w"), quantity=2)
+
+
+def purchase_buyer(edge: Purchased) -> RecordID:
+    """An endpoint reads back as a ``RecordID``, whatever form it was given in."""
+    return edge.in_
+
+
+def purchase_item(edge: Purchased) -> RecordID:
+    return edge.out
