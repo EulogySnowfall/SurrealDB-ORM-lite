@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.21.1] - 2026-10-12
+
+Python 3.15 support. No library code changes; the published package behaves exactly as 0.21.0.
+
+### Added
+
+- **Python 3.15** (#206). The CI matrix runs the full suite on Python 3.11 to 3.15 against both
+  SurrealDB lines, the package declares the `Programming Language :: Python :: 3.15`
+  classifier, and the README's requirements table states the tested range. Lint and the
+  coverage upload stay on 3.14.
+
+### Changed
+
+- **`uv.lock` refreshed so the development environment installs from wheels on Python 3.15.**
+  Only the locked packages with no CPython 3.15 wheel, or only a pure-Python fallback, were
+  upgraded, plus those that follow from their new floors: aiohttp 3.14.5, cffi 2.1.1,
+  charset-normalizer 3.5.2, coverage 7.16.2, debugpy 1.8.22, markupsafe 3.0.4, propcache
+  0.5.4, pydantic 2.14.1 (pydantic-core 2.50.1), tomli 2.5.0, typing-extensions 4.16.0,
+  typing-inspection 0.4.4, websockets 17.2 and yarl 1.25.1.
+
+### Notes
+
+- **The dependency ranges in `pyproject.toml` are unchanged** (`pydantic>=2.13.4`,
+  `surrealdb[pydantic]>=2.0.0,<3.0.0`), so this release changes nothing in what your
+  environment resolves; the lock only pins what CI and contributors install. The full suite
+  passes on the refreshed lock, pydantic 2.14 and websockets 17 (the SDK's WebSocket transport)
+  included, on SurrealDB 2.7.0 and 3.3.3.
+
 ## [0.21.0] - 2026-10-12
 
 Live queries that survive a dropped connection, and change feeds with a cursor that resumes
