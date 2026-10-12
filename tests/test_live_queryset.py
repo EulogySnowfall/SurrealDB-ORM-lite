@@ -439,9 +439,14 @@ class TestTypedLiveE2E:
             finally:
                 await SurrealDBConnectionManager.kill(live_id)
 
-    def test_reconnect_kwargs_are_not_accepted_yet(self) -> None:
-        with pytest.raises(TypeError):
-            Ticket.objects().live(auto_resubscribe=True)  # type: ignore[call-arg]
+    def test_reconnect_kwargs_are_accepted_since_v0_21(self) -> None:
+        """v0.20.0 refused them with TypeError; v0.21.0 implements them (tests/test_reconnect.py)."""
+
+        async def _on_reconnect(old: UUID, new: UUID) -> None:
+            pass
+
+        stream = Ticket.objects().live(auto_resubscribe=False, on_reconnect=_on_reconnect)
+        assert stream.is_active is False
 
     def test_refused_clause_raises_at_call_time(self) -> None:
         with pytest.raises(SurrealDbError, match=r"limit\(\)"):
