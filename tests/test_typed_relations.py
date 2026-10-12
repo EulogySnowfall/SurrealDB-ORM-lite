@@ -19,17 +19,43 @@ mapping comes from the ``_implicit_aliases()`` hook of the v0.18.0 alias map, so
 already honours an alias (writes, filters, ``order_by``, hydration) honours it, whatever the call
 order and on subclasses too. A subclass may not redeclare an endpoint.
 
+Creating an edge (spec §2.4, §2.7, §4.3): ``save()`` writes through ``INSERT RELATION`` — the SDK's
+own ``insert_relation()`` for an auto id, a guarded statement (``… RETURN VALUE IF $before != NONE
+{ THROW … }``) for an explicit one, because a raw duplicate id is silently kept on 2.7.0 and 3.1.5
+but raises on 3.3.3. Through the ORM a duplicate raises ``SurrealDbError`` "already exists" on every
+line, server refusals become ORM errors (``SurrealDbNotFoundError`` for an ``ENFORCED`` endpoint),
+and a write the table's ``PERMISSIONS`` refuse — which the server answers with no row and no error —
+raises instead of returning an edge without an id.
+
 E2E tables are dedicated (``tr_*``), dropped on entry and exit by ``orm_client``; nodes are created
 inside the ``async with orm_client(...)`` block. Same behaviour on SurrealDB 2.x and 3.x.
 """
 
 import asyncio
+import contextlib
+import os
+import re
+from collections.abc import AsyncIterator
+from typing import Any
+from uuid import uuid4
 
 import pytest
 from pydantic import Field, ValidationError
-from surrealdb import RecordID
+from surrealdb import AlreadyExistsError, NotFoundError, RecordID
 
-from surreal_orm_lite import BaseSurrealEdge, BaseSurrealModel, Q, SurrealConfigDict, Var
+from surreal_orm_lite import (
+    AuthenticatedUserMixin,
+    BaseSurrealEdge,
+    BaseSurrealModel,
+    Q,
+    SurrealConfigDict,
+    SurrealDBConnectionManager,
+    SurrealDbError,
+    SurrealDbNotFoundError,
+    Var,
+    post_save,
+    pre_save,
+)
 from surreal_orm_lite.enum import LiveAction
 from surreal_orm_lite.query_set import QuerySet
 from surreal_orm_lite.utils import build_filter_condition, coerce_endpoint, parse_lookup
@@ -630,3 +656,415 @@ class TestEdgeModel:
         assert TrPurchased._implicit_aliases() == {"in_": "in"}
         assert TrPerson._implicit_aliases() == {}
         assert TrFollows.get_field_aliases() == {"in_": "in"}
+
+
+# ==================== Task 4 — creating an edge with save() (E2E, both lines) ====================
+
+EDGE_TABLES = ("tr_person", "tr_product", "tr_purchased", "tr_follows")
+SAVE_TABLES = (*EDGE_TABLES, "tr_rel_strict", "tr_rel_enf", "tr_normal", "tr_srv")
+ALICE_P = RecordID("tr_person", "alice")
+BOB_P = RecordID("tr_person", "bob")
+
+
+class TrStrictEdge(BaseSurrealEdge):
+    """Edge on ``tr_rel_strict`` (``TYPE RELATION IN tr_person OUT tr_product``)."""
+
+    model_config = SurrealConfigDict(table_name="tr_rel_strict")
+
+
+class TrEnforcedEdge(BaseSurrealEdge):
+    """Edge on ``tr_rel_enf`` (``… ENFORCED``)."""
+
+    model_config = SurrealConfigDict(table_name="tr_rel_enf")
+
+
+class TrNormalEdge(BaseSurrealEdge):
+    """Edge model pointed at ``tr_normal``, a ``TYPE NORMAL`` table."""
+
+    model_config = SurrealConfigDict(table_name="tr_normal")
+
+
+class TrSrvEdge(BaseSurrealEdge):
+    """Edge whose ``source`` column the server fills in (``DEFINE FIELD … DEFAULT``)."""
+
+    model_config = SurrealConfigDict(table_name="tr_srv", server_fields=["source"])
+
+    source: str | None = None
+
+
+async def _nodes() -> tuple[TrPerson, TrPerson, TrProduct]:
+    """Save alice, bob and widget. Call it inside the ``orm_client`` block (it drops the tables)."""
+    alice = await TrPerson(id="alice", name="Alice").save()
+    bob = await TrPerson(id="bob", name="Bob").save()
+    widget = await TrProduct(id="widget", name="Widget").save()
+    return alice, bob, widget
+
+
+async def _server_version() -> tuple[int, int, int]:
+    """The connected server's version: ``"surrealdb-3.1.5"`` → ``(3, 1, 5)``."""
+    raw = str(await (await SurrealDBConnectionManager.get_client()).version())
+    major, minor, patch = (int(n) for n in re.findall(r"\d+", raw)[:3])
+    return major, minor, patch
+
+
+def _http_url() -> str:
+    return f"http://{os.environ.get('SURREALDB_HOST', 'localhost')}:{os.environ.get('SURREALDB_PORT', '8000')}"
+
+
+@contextlib.asynccontextmanager
+async def http_orm_client(*tables: str) -> AsyncIterator[Any]:
+    """``orm_client`` over HTTP: connected as root, ``tables`` dropped before and after."""
+    SurrealDBConnectionManager.set_connection(url=_http_url(), user="root", password="root", namespace="ns", database="db")
+    client = await SurrealDBConnectionManager.get_client()
+    for table in tables:
+        with contextlib.suppress(Exception):
+            await client.query(f"REMOVE TABLE {table};", {})
+    try:
+        yield client
+    finally:
+        for table in tables:
+            with contextlib.suppress(Exception):
+                await client.query(f"REMOVE TABLE {table};", {})
+        await SurrealDBConnectionManager.close_connection()
+
+
+class _InsertRelationSpy:
+    """Stands in for the connected SDK client's ``insert_relation()``: records each call, then forwards it."""
+
+    def __init__(self, client: Any) -> None:
+        self.calls: list[tuple[Any, Any]] = []
+        self._forward = client.insert_relation
+
+    async def __call__(self, table: Any, data: Any, *args: Any, **kwargs: Any) -> Any:
+        self.calls.append((table, data))
+        return await self._forward(table, data, *args, **kwargs)
+
+
+def _spy_insert_relation(monkeypatch: pytest.MonkeyPatch, client: Any) -> _InsertRelationSpy:
+    spy = _InsertRelationSpy(client)
+    monkeypatch.setattr(client, "insert_relation", spy)
+    return spy
+
+
+async def _stored(client: Any, table: str) -> list[Any]:
+    """Every row of ``table``, sorted by id; ``[]`` for a table never created (3.x raises, 2.x does not)."""
+    try:
+        rows = await client.query(f"SELECT * FROM {table} ORDER BY id;", {})
+    except NotFoundError:
+        return []
+    return rows if isinstance(rows, list) else []
+
+
+class TestEdgeSaveE2E:
+    @pytest.mark.asyncio
+    async def test_save_creates_traversable_edge_via_insert_relation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with orm_client(*SAVE_TABLES) as client:
+            alice, _bob, widget = await _nodes()
+            spy = _spy_insert_relation(monkeypatch, client)
+
+            edge = await TrPurchased(in_=alice, out=widget, quantity=2).save()
+
+            assert spy.calls == [("tr_purchased", {"in": ALICE_P, "out": WIDGET, "quantity": 2, "price": 0.0})]
+            assert isinstance(edge.id, RecordID)
+            assert edge.id.table_name == "tr_purchased"
+            assert (edge.in_, edge.out, edge.quantity) == (ALICE_P, WIDGET, 2)
+
+            traversed = await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {})
+            assert traversed == [WIDGET]
+            related = await alice.get_related("tr_purchased", model_class=TrProduct)
+            assert [(type(p), p.get_raw_id()) for p in related] == [(TrProduct, "widget")]
+
+            loaded = await TrPurchased.objects().get(edge.get_raw_id())
+            assert (loaded.id, loaded.in_, loaded.out, loaded.quantity) == (edge.id, ALICE_P, WIDGET, 2)
+
+    @pytest.mark.asyncio
+    async def test_save_over_http(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with http_orm_client(*SAVE_TABLES) as client:
+            alice, _bob, widget = await _nodes()
+            spy = _spy_insert_relation(monkeypatch, client)
+
+            edge = await TrPurchased(in_=alice, out=widget, quantity=3).save()
+            assert spy.calls == [("tr_purchased", {"in": ALICE_P, "out": WIDGET, "quantity": 3, "price": 0.0})]
+            assert isinstance(edge.id, RecordID)
+            assert edge.id.table_name == "tr_purchased"
+
+            explicit = await TrPurchased(id="h1", in_=alice, out=widget).save()
+            assert len(spy.calls) == 1
+            assert explicit.id == RecordID("tr_purchased", "h1")
+
+            with pytest.raises(SurrealDbError, match="already exists"):
+                await TrPurchased(id="h1", in_=alice, out=widget, quantity=9).save()
+
+            traversed = await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {})
+            assert traversed == [WIDGET, WIDGET]
+            assert sorted(row["quantity"] for row in await _stored(client, "tr_purchased")) == [1, 3]
+
+    @pytest.mark.asyncio
+    async def test_explicit_id_uses_guarded_statement(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with orm_client(*SAVE_TABLES) as client:
+            alice, _bob, widget = await _nodes()
+            spy = _spy_insert_relation(monkeypatch, client)
+
+            edge = await TrPurchased(id="p1", in_=alice, out=widget, quantity=2).save()
+            assert spy.calls == []
+            assert edge.id == RecordID("tr_purchased", "p1")
+
+            # An id that is already a RecordID of the edge table is accepted as is.
+            same_table = await TrPurchased(id=RecordID("tr_purchased", "p2"), in_=alice, out=widget).save()
+            assert spy.calls == []
+            assert same_table.id == RecordID("tr_purchased", "p2")
+
+            traversed = await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {})
+            assert traversed == [WIDGET, WIDGET]
+            assert [row["id"] for row in await _stored(client, "tr_purchased")] == [
+                RecordID("tr_purchased", "p1"),
+                RecordID("tr_purchased", "p2"),
+            ]
+
+    @pytest.mark.asyncio
+    async def test_duplicate_explicit_id_raises_on_both_lines(self) -> None:
+        async with orm_client(*SAVE_TABLES) as client:
+            alice, bob, widget = await _nodes()
+            await TrPurchased(id="p1", in_=alice, out=widget, quantity=2).save()
+
+            with pytest.raises(SurrealDbError, match="already exists"):
+                await TrPurchased(id="p1", in_=alice, out=widget, quantity=5).save()
+
+            # Other endpoints under the same id: 2.x and 3.1.5 report a field mismatch rather
+            # than "already exists" (spike 2026-10-12) — still an ORM error, still nothing changed.
+            with pytest.raises(SurrealDbError):
+                await TrPurchased(id="p1", in_=bob, out=widget, quantity=7).save()
+
+            stored = await _stored(client, "tr_purchased")
+            assert [(row["id"], row["in"], row["out"], row["quantity"]) for row in stored] == [
+                (RecordID("tr_purchased", "p1"), ALICE_P, WIDGET, 2)
+            ]
+            # …and it is a relation, not a plain record carrying `in`/`out` fields.
+            traversed = await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {})
+            assert traversed == [WIDGET]
+
+    @pytest.mark.asyncio
+    async def test_raw_insert_relation_duplicate_follows_version_rule(self) -> None:
+        """Pin of the raw SDK call with a duplicate explicit edge id (spec §2.2, rule R6).
+
+        Measured on 2026-10-12: SurrealDB 2.7.0 and 3.1.5 silently keep the old edge and return
+        it; 3.3.3 raises AlreadyExistsError. The SurrealDB docs announce a record-exists error
+        'from SurrealDB 3.1.5'; 3.1.5 measured otherwise. This is why save()/bulk_create() use
+        the guarded statement. A failure means the server changed: the guard stays correct, but
+        README row 2 (ORM behaviour table) must be re-measured and updated.
+        """
+        async with orm_client(*SAVE_TABLES) as client:
+            version = await _server_version()
+            keeps_old = (2, 7, 0) <= version < (3, 0, 0) or version == (3, 1, 5)
+            raises = version >= (3, 3, 3)
+            if not keeps_old and not raises:
+                pytest.skip(f"raw duplicate behaviour not measured on {version}")
+
+            row = {"id": "raw1", "in": ALICE_P, "out": WIDGET, "quantity": 2}
+            first = await client.insert_relation("tr_purchased", row)
+            assert [(r["id"], r["quantity"]) for r in first] == [(RecordID("tr_purchased", "raw1"), 2)]
+
+            if keeps_old:
+                again = await client.insert_relation("tr_purchased", {**row, "quantity": 5})
+                assert [(r["id"], r["quantity"]) for r in again] == [(RecordID("tr_purchased", "raw1"), 2)]
+            else:
+                with pytest.raises(AlreadyExistsError):
+                    await client.insert_relation("tr_purchased", {**row, "quantity": 5})
+
+            stored = await _stored(client, "tr_purchased")
+            assert [(r["id"], r["quantity"]) for r in stored] == [(RecordID("tr_purchased", "raw1"), 2)]
+
+    @pytest.mark.asyncio
+    async def test_foreign_table_record_id_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with orm_client(*SAVE_TABLES, "other") as client:
+            alice, _bob, widget = await _nodes()
+            spy = _spy_insert_relation(monkeypatch, client)
+            query_calls: list[str] = []
+            forward_query = client.query
+
+            async def recording_query(query: str, *args: Any, **kwargs: Any) -> Any:
+                query_calls.append(query)
+                return await forward_query(query, *args, **kwargs)
+
+            monkeypatch.setattr(client, "query", recording_query)
+
+            with pytest.raises(
+                ValueError, match=r"TrPurchased: id .* belongs to table 'other', not to the edge table 'tr_purchased'"
+            ):
+                await TrPurchased(id=RecordID("other", "x"), in_=alice, out=widget).save()
+
+            boolean = TrPurchased(in_=alice, out=widget)
+            object.__setattr__(boolean, "id", True)  # `id: str | RecordID | None` refuses True at validation
+            with pytest.raises(ValueError, match="a record id cannot be a boolean"):
+                await boolean.save()
+
+            assert spy.calls == []
+            assert query_calls == []
+            monkeypatch.undo()
+            assert await _stored(client, "tr_purchased") == []
+            assert await _stored(client, "other") == []
+
+    @pytest.mark.asyncio
+    async def test_type_relation_wrong_endpoint_table(self) -> None:
+        async with orm_client(*SAVE_TABLES) as client:
+            _alice, bob, widget = await _nodes()
+            await client.query("DEFINE TABLE tr_rel_strict TYPE RELATION IN tr_person OUT tr_product;", {})
+
+            with pytest.raises(SurrealDbError, match="There was a problem with the database") as auto:
+                await TrStrictEdge(in_=bob, out=bob).save()
+            assert not isinstance(auto.value, SurrealDbNotFoundError)
+            with pytest.raises(SurrealDbError, match="There was a problem with the database"):
+                await TrStrictEdge(id="s1", in_=bob, out=bob).save()
+            assert await _stored(client, "tr_rel_strict") == []
+
+            # The declared tables are accepted.
+            ok = await TrStrictEdge(in_=bob, out=widget).save()
+            assert isinstance(ok.id, RecordID)
+
+    @pytest.mark.asyncio
+    async def test_enforced_missing_endpoint_is_not_found(self) -> None:
+        async with orm_client(*SAVE_TABLES) as client:
+            _alice, _bob, widget = await _nodes()
+            await client.query("DEFINE TABLE tr_rel_enf TYPE RELATION IN tr_person OUT tr_product ENFORCED;", {})
+            ghost = RecordID("tr_person", "ghost")
+
+            with pytest.raises(SurrealDbNotFoundError, match="does not exist"):
+                await TrEnforcedEdge(in_=ghost, out=widget).save()
+            with pytest.raises(SurrealDbNotFoundError, match="does not exist"):
+                await TrEnforcedEdge(id="e1", in_=ghost, out=widget).save()
+            assert await _stored(client, "tr_rel_enf") == []
+
+    @pytest.mark.asyncio
+    async def test_normal_table_rejected(self) -> None:
+        async with orm_client(*SAVE_TABLES) as client:
+            alice, _bob, widget = await _nodes()
+            await client.query("DEFINE TABLE tr_normal TYPE NORMAL;", {})
+
+            with pytest.raises(SurrealDbError, match="There was a problem with the database"):
+                await TrNormalEdge(in_=alice, out=widget).save()
+            with pytest.raises(SurrealDbError, match="There was a problem with the database"):
+                await TrNormalEdge(id="n1", in_=alice, out=widget).save()
+            assert await _stored(client, "tr_normal") == []
+
+    @pytest.mark.asyncio
+    async def test_server_fields_hydrated_after_save(self) -> None:
+        async with orm_client(*SAVE_TABLES) as client:
+            alice, _bob, widget = await _nodes()
+            await client.query('DEFINE TABLE tr_srv TYPE RELATION; DEFINE FIELD source ON tr_srv DEFAULT "server";', {})
+
+            auto = await TrSrvEdge(in_=alice, out=widget, source="client").save()
+            assert auto.source == "server"  # not sent on a create: the DEFAULT applies, and comes back
+            explicit = await TrSrvEdge(id="s1", in_=alice, out=widget).save()
+            assert explicit.source == "server"
+            assert explicit.id == RecordID("tr_srv", "s1")
+
+            assert sorted(row["source"] for row in await _stored(client, "tr_srv")) == ["server", "server"]
+
+    @pytest.mark.asyncio
+    async def test_save_signals(self) -> None:
+        events: list[tuple[str, Any, bool | None]] = []
+
+        @pre_save.connect(TrPurchased)
+        async def on_pre(sender: Any, instance: Any, **kwargs: Any) -> None:
+            events.append(("pre_save", instance.id, None))
+
+        @post_save.connect(TrPurchased)
+        async def on_post(sender: Any, instance: Any, created: bool, **kwargs: Any) -> None:
+            events.append(("post_save", instance.id, created))
+
+        try:
+            async with orm_client(*SAVE_TABLES):
+                alice, _bob, widget = await _nodes()
+                edge = await TrPurchased(in_=alice, out=widget).save()
+                assert events == [("pre_save", None, None), ("post_save", edge.id, True)]
+                assert isinstance(edge.id, RecordID)
+
+                events.clear()
+                with pytest.raises(SurrealDbError, match="already exists"):
+                    await TrPurchased(id=edge.id, in_=alice, out=widget).save()
+                assert [event[0] for event in events] == ["pre_save"]  # no post_save for a refused write
+        finally:
+            pre_save.disconnect(on_pre, TrPurchased)
+            post_save.disconnect(on_post, TrPurchased)
+
+    @pytest.mark.asyncio
+    async def test_filter_by_string_endpoint_finds_saved_edge(self) -> None:
+        async with orm_client(*SAVE_TABLES):
+            alice, bob, widget = await _nodes()
+            saved = await TrPurchased(in_=alice, out=widget, quantity=4).save()
+
+            found = await TrPurchased.objects().filter(in_="tr_person:alice").exec()
+            assert [(edge.id, edge.in_, edge.out, edge.quantity) for edge in found] == [(saved.id, ALICE_P, WIDGET, 4)]
+            assert await TrPurchased.objects().filter(in___in=["tr_person:alice", bob]).count() == 1
+            assert await TrPurchased.objects().filter(Q(out="tr_product:widget")).count() == 1
+            assert await TrPurchased.objects().filter(in_="tr_person:bob").count() == 0
+
+
+# ==================== Task 4 — a write refused by PERMISSIONS (E2E, both lines) ====================
+
+
+class TrEdgeUser(AuthenticatedUserMixin, BaseSurrealModel):
+    model_config = SurrealConfigDict(access_name="tr_edge_acct", table_name="tr_edge_user")
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+class TrPermEdge(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="tr_perm")
+
+    quantity: int = 1
+
+
+def _connect_root_ws() -> None:
+    host, port = os.environ.get("SURREALDB_HOST", "localhost"), os.environ.get("SURREALDB_PORT", "8000")
+    SurrealDBConnectionManager.set_connection(f"ws://{host}:{port}/rpc", "root", "root", "ns", "db")
+
+
+class TestEdgePermissionsE2E:
+    @pytest.mark.asyncio
+    async def test_save_refused_by_permissions_raises(self) -> None:
+        """The server answers a refused ``INSERT RELATION`` with no row and no error (spec §2.7)."""
+        saved: list[Any] = []
+
+        @post_save.connect(TrPermEdge)
+        async def on_post(sender: Any, instance: Any, created: bool, **kwargs: Any) -> None:
+            saved.append(instance.id)
+
+        _connect_root_ws()
+        try:
+            root = await SurrealDBConnectionManager.get_client()
+            with contextlib.suppress(Exception):
+                await root.query("REMOVE TABLE tr_perm;", {})
+            await root.query(
+                "DEFINE TABLE tr_perm TYPE RELATION PERMISSIONS FOR select FULL, FOR create WHERE quantity > 1;", {}
+            )
+            await TrEdgeUser.define_access()
+            await TrEdgeUser.signup(email=f"{uuid4().hex}@example.test", password="s3cret-passphrase", bind=True)
+
+            a, w = RecordID("tr_person", "a"), RecordID("tr_product", "w")
+            with pytest.raises(SurrealDbError, match="no record returned"):
+                await TrPermEdge(in_=a, out=w, quantity=1).save()  # auto id: insert_relation()
+            with pytest.raises(SurrealDbError, match="no record returned"):
+                await TrPermEdge(id="refused", in_=a, out=w, quantity=1).save()  # explicit id: the guard
+            assert saved == []
+
+            allowed = await TrPermEdge(in_=a, out=w, quantity=2).save()  # the same user may create this one
+            assert isinstance(allowed.id, RecordID)
+            assert saved == [allowed.id]
+
+            await SurrealDBConnectionManager.unset_connection()
+            _connect_root_ws()
+            root = await SurrealDBConnectionManager.get_client()
+            assert await root.query("SELECT VALUE quantity FROM tr_perm;", {}) == [2]
+        finally:
+            post_save.disconnect(on_post, TrPermEdge)
+            await SurrealDBConnectionManager.unset_connection()
+            _connect_root_ws()
+            with contextlib.suppress(Exception):
+                root = await SurrealDBConnectionManager.get_client()
+                await root.query("REMOVE ACCESS tr_edge_acct ON DATABASE;", {})
+                await root.query("REMOVE TABLE tr_perm;", {})
+                await root.query("REMOVE TABLE tr_edge_user;", {})
+            await SurrealDBConnectionManager.unset_connection()
