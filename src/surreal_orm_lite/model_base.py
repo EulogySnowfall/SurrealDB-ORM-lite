@@ -6,7 +6,7 @@ import typing
 import warnings
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from decimal import Decimal
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self, TypeVar, overload
 
 import pydantic
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -32,6 +32,7 @@ from .utils import (
     VALID_ALIAS_PATTERN,
     apply_ddl_statements,
     build_set_clause,
+    coerce_endpoint,
     format_record_id,
     merge_extra_vars,
     remove_quotes_for_variables,
@@ -45,7 +46,12 @@ from .utils import (
     warn_on_multiple_statements,
 )
 
+if TYPE_CHECKING:
+    from .edge import BaseSurrealEdge
+
 logger = logging.getLogger(__name__)
+
+_E = TypeVar("_E", bound="BaseSurrealEdge")
 
 # Per-class derivations of v0.18.0, computed once on first use. They cannot be built in
 # ``__init_subclass__``: that runs inside ``type.__new__``, before Pydantic has finished
@@ -684,6 +690,24 @@ class BaseSurrealModel(BaseModel):
                 f"{'is a computed field' if len(offenders) == 1 else 'are computed fields'} "
                 f"on {cls.__name__}, set server-side by DEFINE FIELD … VALUE and not writable. "
                 "Update the fields the expression reads instead."
+            )
+
+    @classmethod
+    def _reject_undeclared_writes(cls, fields: Iterable[str]) -> None:
+        """Raise if ``fields`` (Python names) names a field the model does not declare.
+
+        A model that opts into extra fields (``model_config = ConfigDict(extra="allow")``) keeps
+        them. Shared by ``*_or_create`` and the typed ``relate()``: a caller who mistypes a
+        field name wants to hear about it rather than lose the value.
+        """
+        if cls.model_config.get("extra") == "allow":
+            return
+        undeclared = sorted(field for field in fields if field not in cls.model_fields)
+        if undeclared:
+            raise SurrealDbError(
+                f"{cls.__name__} does not declare {', '.join(undeclared)}; "
+                "remove the key, add the field to the model, or set "
+                'model_config = ConfigDict(extra="allow") to store undeclared fields.'
             )
 
     @classmethod
@@ -1659,30 +1683,158 @@ class BaseSurrealModel(BaseModel):
             return target._get_thing()
         raise TypeError(f"target must be a BaseSurrealModel instance or 'table:id' string, got {type(target).__name__}")
 
+    @staticmethod
+    def _edge_name(edge: object) -> str:
+        """Return the edge table an ``edge`` argument names (v0.22.0).
+
+        An edge model class names its ``get_table_name()`` (an identifier, checked when the class
+        was defined); a string passes :func:`~surreal_orm_lite.utils.validate_edge_name` and is
+        returned as is. Shared by ``relate()`` and the graph helpers, so they all refuse the same
+        arguments the same way, before any call.
+
+        Raises:
+            TypeError: a model class that is not an edge model, or anything that is neither a
+                class nor a string.
+            ValueError: a string that is not a valid edge name.
+        """
+        if isinstance(edge, str):
+            validate_edge_name(edge)
+            return edge
+        if isinstance(edge, type) and issubclass(edge, BaseSurrealModel):
+            if not edge.__surreal_edge__:
+                raise TypeError(
+                    f"{edge.__name__} is not an edge model: subclass BaseSurrealEdge, or pass the edge table name as a string."
+                )
+            return edge.get_table_name()
+        raise TypeError(f"edge must be an edge model class or an edge table name, got {type(edge).__name__}")
+
+    def _graph_source(self) -> RecordID:
+        """Return this record's id, bound as the source of a graph statement (v0.22.0).
+
+        Bound, never interpolated, so the id needs no identifier check: a node saved as
+        ``joe@x.com`` relates like it saves.
+
+        Raises:
+            SurrealDbError: the instance has no id yet.
+        """
+        record_id = self._record_id()
+        if record_id is None:
+            raise SurrealDbError("Cannot use relations on an unsaved model (no id).")
+        return record_id
+
+    @staticmethod
+    def _graph_target(target: object) -> RecordID:
+        """Return the record id a graph ``target`` names, to bind (v0.22.0).
+
+        A model instance gives its record id (an unsaved one raises), a ``RecordID`` is returned
+        as is, and a ``"table:id"`` string is read by
+        :func:`~surreal_orm_lite.utils.coerce_endpoint` — the rule of the edge endpoints, so
+        ``"M:1"`` names the string id ``"1"``, as ``M(id="1")`` does, and ``"M:`a-b`"`` the id
+        ``a-b``. A string without ``:`` is refused.
+
+        Raises:
+            SurrealDbError: an unsaved instance.
+            ValueError: a malformed ``"table:id"`` string.
+            TypeError: any other type.
+        """
+        if isinstance(target, BaseSurrealModel):
+            return target._graph_source()
+        if isinstance(target, RecordID):
+            return target
+        if isinstance(target, str):
+            return coerce_endpoint(target)
+        raise TypeError(
+            f"target must be a BaseSurrealModel instance, a RecordID or a 'table:id' string, got {type(target).__name__}"
+        )
+
+    @overload
+    async def relate(
+        self,
+        edge: type[_E],
+        target: "BaseSurrealModel | RecordID | str",
+        reverse: bool = False,
+        tx: Transaction | None = None,
+        *,
+        data: Mapping[str, Any] | None = None,
+    ) -> _E: ...
+
+    @overload
     async def relate(
         self,
         edge: str,
-        target: "BaseSurrealModel | str",
+        target: "BaseSurrealModel | RecordID | str",
+        reverse: bool = False,
+        tx: Transaction | None = None,
         *,
-        data: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
+        data: Mapping[str, Any] | None = None,
+    ) -> list[dict[str, Any]]: ...
+
+    async def relate(
+        self,
+        edge: "str | type[BaseSurrealEdge]",
+        target: "BaseSurrealModel | RecordID | str",
+        reverse: bool = False,
+        tx: Transaction | None = None,
+        *,
+        data: Mapping[str, Any] | None = None,
+    ) -> "BaseSurrealEdge | list[dict[str, Any]]":
         """
-        Create a graph relation from this record to the target.
+        Create a graph relation (an edge) from this record to the target.
+
+        ``edge`` is an edge model class or an edge table name:
+
+        - **An edge model class** (a :class:`~surreal_orm_lite.edge.BaseSurrealEdge` subclass,
+          v0.22.0) — the edge is validated, created through the edge's ``save()``
+          (``INSERT RELATION``, the ``save`` signals) and returned, typed: ``id`` is the
+          server's ``RecordID``, ``in_`` this record, ``out`` the target. Both are bound as
+          record ids, so a node saved with an id such as ``joe@x.com`` relates like it saves.
+          ``data`` holds the edge's fields; before any call it may not name an endpoint
+          (``in``/``in_``/``out``), a computed field or a field the model does not declare
+          (unless it sets ``extra="allow"``). A ``server_fields`` field named in ``data`` is
+          written instead of being left to the server.
+        - **An edge table name** — the v0.6.0 ``RELATE`` (any target table), ``data`` written
+          with ``SET``; returns the rows the database sent back.
+
+        Parameters follow the full SurrealDB-ORM's order, ``(edge, target, reverse, tx)``, each
+        by position or by keyword; ``data`` is keyword-only.
 
         Args:
-            edge: The relation/edge table name (e.g. ``"follows"``).
-            target: The target model instance or ``"table:id"`` string.
-            data: Optional data to store on the relation edge.
+            edge: An edge model class, or the relation/edge table name (e.g. ``"follows"``).
+            target: A saved model instance, a ``RecordID`` or a ``"table:id"`` string.
+            reverse: Reserved for ``target -> edge -> self``; ``True`` raises
+                ``NotImplementedError`` for now.
+            tx: Optional transaction. On an interactive one (WebSocket + SurrealDB 3.x) the
+                edge is written at once and comes back as usual; on a buffered one it is
+                written at commit: the typed form returns the edge with ``id`` ``None``, the
+                string form ``[]``.
+            data: Optional data stored on the edge.
 
         Returns:
-            The created relation record(s) as returned by the database.
+            The created edge (edge model class), or the created relation rows (table name).
+
+        Raises:
+            TypeError: ``edge`` is a model class that is not an edge model, or neither a class
+                nor a string; ``target`` is of another type.
+            ValueError: a malformed name or ``"table:id"`` string; ``data`` names an endpoint or
+                a computed field (typed form).
+            SurrealDbError: an unsaved source or target; ``data`` names an undeclared field
+                (typed form); the write is refused.
+            pydantic.ValidationError: ``data`` is invalid for the edge model (nothing written).
 
         Example::
 
+            edge = await user.relate(Purchased, product, data={"quantity": 2})  # -> Purchased
             await user.relate("follows", other_user)
             await user.relate("purchased", product, data={"quantity": 2})
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await user.relate(Follows, other_user, tx=tx)
         """
-        validate_edge_name(edge)
+        if reverse:
+            raise NotImplementedError("relate(reverse=True) is not implemented yet")
+        if isinstance(edge, type) and issubclass(edge, BaseSurrealModel) and edge.__surreal_edge__:
+            return await self._relate_typed(edge, target, data or {}, tx)
+
+        edge_name = self._edge_name(edge)
         source = self._get_thing()
         target_thing = self._resolve_target_thing(target)
 
@@ -1695,44 +1847,76 @@ class BaseSurrealModel(BaseModel):
                 set_parts.append(f"{key} = ${var_name}")
                 variables[var_name] = value
             set_clause = " SET " + ", ".join(set_parts)
-            query = f"RELATE {source}->{edge}->{target_thing}{set_clause};"
+            query = f"RELATE {source}->{edge_name}->{target_thing}{set_clause};"
         else:
             variables = {}
-            query = f"RELATE {source}->{edge}->{target_thing};"
+            query = f"RELATE {source}->{edge_name}->{target_thing};"
+
+        if tx is not None:
+            rows = await tx.add(remove_quotes_for_variables(query), variables)
+            return rows if isinstance(rows, list) else []
 
         client = await SurrealDBConnectionManager.get_client()
         result = await client.query(remove_quotes_for_variables(query), variables)
         return result if isinstance(result, list) else []
 
+    async def _relate_typed(
+        self,
+        edge: type[_E],
+        target: object,
+        fields: Mapping[str, Any],
+        tx: Transaction | None,
+    ) -> _E:
+        """``relate(EdgeModel, …)``: validate, create through the edge's ``save()``, return it.
+
+        Every check runs before any call: the source and the target (bound as record ids), then
+        ``fields`` — keys in either vocabulary (Python name or column), translated to Python
+        names — and the model's own validation.
+        """
+        source = self._graph_source()
+        destination = self._graph_target(target)
+        names = [edge.to_py_field(key) for key in fields]
+        endpoints = [key for key, name in zip(fields, names, strict=True) if name in edge._write_protected_fields()]
+        if endpoints:
+            raise ValueError(
+                f"relate(): `in`/`out` are the endpoints of edge `{edge.__name__}`: relate() takes them from "
+                f"this record and the target, so data= cannot name them (got {', '.join(endpoints)})."
+            )
+        edge._reject_computed_writes(names, "relate()")
+        edge._reject_undeclared_writes(names)
+        instance = edge.model_validate({**fields, "in": source, "out": destination})
+        return await instance._save_naming(names, tx=tx)
+
     async def remove_relation(
         self,
-        edge: str,
-        target: "BaseSurrealModel | str",
+        edge: "str | type[BaseSurrealEdge]",
+        target: "BaseSurrealModel | RecordID | str",
     ) -> None:
         """
         Remove a specific relation between this record and the target.
 
         Args:
-            edge: The relation/edge table name.
-            target: The target model instance or ``"table:id"`` string.
+            edge: An edge model class (v0.22.0), or the relation/edge table name.
+            target: The target model instance, ``RecordID`` or ``"table:id"`` string.
 
         Example::
 
             await user.remove_relation("follows", other_user)
             await user.remove_relation("follows", "User:bob")
+            await user.remove_relation(Follows, other_user)
         """
-        validate_edge_name(edge)
+        edge_name = self._edge_name(edge)
         source = self._get_thing()
         target_thing = self._resolve_target_thing(target)
 
-        query = f"DELETE {edge} WHERE in = {source} AND out = {target_thing};"
+        query = f"DELETE {edge_name} WHERE in = {source} AND out = {target_thing};"
         client = await SurrealDBConnectionManager.get_client()
         with contextlib.suppress(NotFoundError):
             await client.query(query, {})
 
     async def remove_all_relations(
         self,
-        edge: str,
+        edge: "str | type[BaseSurrealEdge]",
         *,
         direction: str = "out",
     ) -> None:
@@ -1740,7 +1924,7 @@ class BaseSurrealModel(BaseModel):
         Remove all relations of a given type from or to this record.
 
         Args:
-            edge: The relation/edge table name.
+            edge: An edge model class (v0.22.0), or the relation/edge table name.
             direction: ``"out"`` removes outgoing relations (default),
                        ``"in"`` removes incoming relations,
                        ``"both"`` removes all relations involving this record.
@@ -1748,17 +1932,17 @@ class BaseSurrealModel(BaseModel):
         Example::
 
             await user.remove_all_relations("follows", direction="out")
-            await user.remove_all_relations("follows", direction="both")
+            await user.remove_all_relations(Follows, direction="both")
         """
-        validate_edge_name(edge)
+        edge_name = self._edge_name(edge)
         thing = self._get_thing()
 
         if direction == "out":
-            query = f"DELETE {edge} WHERE in = {thing};"
+            query = f"DELETE {edge_name} WHERE in = {thing};"
         elif direction == "in":
-            query = f"DELETE {edge} WHERE out = {thing};"
+            query = f"DELETE {edge_name} WHERE out = {thing};"
         elif direction == "both":
-            query = f"DELETE {edge} WHERE in = {thing} OR out = {thing};"
+            query = f"DELETE {edge_name} WHERE in = {thing} OR out = {thing};"
         else:
             raise ValueError(f"direction must be 'out', 'in', or 'both', got '{direction}'")
 
@@ -1768,7 +1952,7 @@ class BaseSurrealModel(BaseModel):
 
     async def get_related(
         self,
-        edge: str,
+        edge: "str | type[BaseSurrealEdge]",
         *,
         direction: str = "out",
         model_class: type["BaseSurrealModel"] | None = None,
@@ -1777,7 +1961,7 @@ class BaseSurrealModel(BaseModel):
         Get related records through a relation edge.
 
         Args:
-            edge: The relation/edge table name.
+            edge: An edge model class (v0.22.0), or the relation/edge table name.
             direction: ``"out"`` for outgoing relations (default),
                        ``"in"`` for incoming relations.
             model_class: Optional model class to deserialize results into.
@@ -1791,7 +1975,7 @@ class BaseSurrealModel(BaseModel):
             following = await user.get_related("follows", direction="out", model_class=User)
             followers = await user.get_related("follows", direction="in", model_class=User)
         """
-        validate_edge_name(edge)
+        edge_name = self._edge_name(edge)
         thing = self._get_thing()
 
         # With a model class the caller wants whole records, so project them in the traversal
@@ -1800,9 +1984,9 @@ class BaseSurrealModel(BaseModel):
         projection = "?.*" if model_class is not None else "?"
 
         if direction == "out":
-            query = f"SELECT VALUE ->{edge}->{projection} FROM ONLY {thing};"
+            query = f"SELECT VALUE ->{edge_name}->{projection} FROM ONLY {thing};"
         elif direction == "in":
-            query = f"SELECT VALUE <-{edge}<-{projection} FROM ONLY {thing};"
+            query = f"SELECT VALUE <-{edge_name}<-{projection} FROM ONLY {thing};"
         else:
             raise ValueError(f"direction must be 'out' or 'in', got '{direction}'")
 

@@ -914,18 +914,7 @@ class QuerySet:
         """
         computed = self.model.get_computed_fields()
         vetted = {key: value for key, value in payload.items() if key not in computed}
-
-        if self.model.model_config.get("extra") == "allow":
-            return vetted
-
-        declared = set(self.model.model_fields)
-        undeclared = sorted(key for key in vetted if key not in declared)
-        if undeclared:
-            raise SurrealDbError(
-                f"{self.model.__name__} does not declare {', '.join(undeclared)}; "
-                "remove the key, add the field to the model, or set "
-                'model_config = ConfigDict(extra="allow") to store undeclared fields.'
-            )
+        self.model._reject_undeclared_writes(vetted)
         return vetted
 
     async def update_or_create(

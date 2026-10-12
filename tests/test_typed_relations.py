@@ -35,6 +35,16 @@ queued, ``edge.id`` stays ``None`` (an auto id is allowed, unlike a node's buffe
 is written at commit and rolled back with the batch, and a duplicate explicit id fails the commit.
 ``pre_save`` fires at call time, ``post_save`` only after a successful commit.
 
+``relate()`` (spec §4.3.2) takes an edge model class or an edge table name, in the full ORM's
+parameter order ``(edge, target, reverse=False, tx=None, *, data=None)``. With an edge class it
+creates the edge through the same ``save()`` and returns the validated, hydrated edge — source and
+target bound as record ids (a node id such as ``joe@x.com`` relates like it saves), ``data`` checked
+before any call (no endpoint, no computed field, no undeclared key), a ``server_fields`` key in
+``data`` written. With a name it keeps the v0.6.0 ``RELATE`` and its rows. Both take ``tx=``: rows
+at once on an interactive transaction, nothing (``[]``, or an edge whose ``id`` is ``None``) on a
+buffered one. ``get_related``, ``remove_relation`` and ``remove_all_relations`` accept an edge class
+too; any other class or value is a ``TypeError``.
+
 E2E tables are dedicated (``tr_*``), dropped on entry and exit by ``orm_client``; nodes are created
 inside the ``async with orm_client(...)`` block. Same behaviour on SurrealDB 2.x and 3.x, except the
 transaction strategy the server supports (interactive tests skip on 2.x; buffered ones run over HTTP
@@ -57,12 +67,14 @@ from surreal_orm_lite import (
     AuthenticatedUserMixin,
     BaseSurrealEdge,
     BaseSurrealModel,
+    Computed,
     Q,
     SurrealConfigDict,
     SurrealDBConnectionManager,
     SurrealDbError,
     SurrealDbNotFoundError,
     Var,
+    computed,
     post_save,
     pre_save,
 )
@@ -1352,3 +1364,444 @@ class TestEdgeTransactionsE2E:
         finally:
             pre_save.disconnect(on_pre, TrPurchased)
             post_save.disconnect(on_post, TrPurchased)
+
+
+# ==================== Task 6 — typed relate(EdgeModel, …), tx= on relate() ====================
+
+RELATE_TABLES = (*EDGE_TABLES, "tr_srv")
+
+
+class TrMemoEdge(BaseSurrealEdge):
+    """Edge whose ``note`` field is stored in the column ``memo``."""
+
+    model_config = SurrealConfigDict(table_name="tr_memo")
+
+    note: str = Field(default="", alias="memo")
+
+
+class TrLooseEdge(BaseSurrealEdge):
+    """Edge that stores undeclared fields (``extra="allow"``)."""
+
+    model_config = SurrealConfigDict(table_name="tr_loose", extra="allow")
+
+
+class TrScoredEdge(BaseSurrealEdge):
+    """Edge with a computed field."""
+
+    model_config = SurrealConfigDict(table_name="tr_scored")
+
+    quantity: int = 1
+    double: Computed[int] = computed("quantity * 2")
+
+
+def _queued_guarded_insert(table: str, n: int) -> str:
+    """The guarded ``INSERT RELATION`` as the ``n``-th statement of a buffered transaction."""
+    return (
+        f"INSERT RELATION INTO {table} $t{n}_data RETURN VALUE IF $before != NONE "
+        f"{{ THROW 'Database record `' + <string> $before.id + '` already exists' }} ELSE {{ $after }};"
+    )
+
+
+@pytest.fixture
+def no_client(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Replace the connection by one that fails the test as soon as anything asks for it."""
+    calls: list[str] = []
+
+    async def _get_client(cls: Any) -> Any:
+        calls.append("get_client")
+        raise AssertionError("the database was reached before the argument checks failed")
+
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", classmethod(_get_client))
+    return calls
+
+
+class TestRelateTypedValidation:
+    """``relate()`` and the graph helpers check their arguments before any call (no server)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", ["in", "in_", "out"])
+    async def test_endpoint_in_data_is_refused(self, no_client: list[str], key: str) -> None:
+        alice, widget = TrPerson(id="alice"), TrProduct(id="widget")
+        with pytest.raises(ValueError, match="endpoint"):
+            await alice.relate(TrPurchased, widget, data={key: RecordID("tr_person", "bob")})
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    async def test_computed_field_in_data_is_refused(self, no_client: list[str]) -> None:
+        alice, widget = TrPerson(id="alice"), TrProduct(id="widget")
+        with pytest.raises(ValueError, match=r"relate\(\): double is a computed field on TrScoredEdge"):
+            await alice.relate(TrScoredEdge, widget, data={"double": 4})
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    async def test_undeclared_key_is_refused(self, no_client: list[str]) -> None:
+        alice, widget = TrPerson(id="alice"), TrProduct(id="widget")
+        with pytest.raises(SurrealDbError, match="TrPurchased does not declare bogus"):
+            await alice.relate(TrPurchased, widget, data={"quantity": 2, "bogus": 1})
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    async def test_invalid_data_raises_validation_error(self, no_client: list[str]) -> None:
+        alice, widget = TrPerson(id="alice"), TrProduct(id="widget")
+        with pytest.raises(ValidationError):
+            await alice.relate(TrPurchased, widget, data={"quantity": 0})
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    async def test_non_edge_model_class_is_refused(self, no_client: list[str]) -> None:
+        alice, widget = TrPerson(id="alice"), TrProduct(id="widget")
+        with pytest.raises(TypeError, match="TrPerson is not an edge model: subclass BaseSurrealEdge"):
+            await alice.relate(TrPerson, widget)  # type: ignore[call-overload]
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "edge",
+        [42, None, int, TrFollows(in_=RecordID("tr_person", "a"), out=RecordID("tr_person", "b"))],
+        ids=["int", "None", "plain-class", "edge-instance"],
+    )
+    async def test_edge_of_another_kind_is_refused(self, no_client: list[str], edge: object) -> None:
+        alice, widget = TrPerson(id="alice"), TrProduct(id="widget")
+        with pytest.raises(TypeError, match="edge must be an edge model class or an edge table name"):
+            await alice.relate(edge, widget)  # type: ignore[call-overload]
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("edge", [TrPurchased, "tr_purchased"], ids=["typed", "string"])
+    async def test_target_of_another_type_is_refused(self, no_client: list[str], edge: Any) -> None:
+        alice = TrPerson(id="alice")
+        with pytest.raises(TypeError, match="target must be a BaseSurrealModel instance"):
+            await alice.relate(edge, 42)
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("target", ["nocolon", "a;b:c", "tr_product:joe@x.com"])
+    async def test_malformed_target_string_is_refused(self, no_client: list[str], target: str) -> None:
+        alice = TrPerson(id="alice")
+        with pytest.raises(ValueError):
+            await alice.relate(TrPurchased, target)
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    async def test_unsaved_source_or_target_is_refused(self, no_client: list[str]) -> None:
+        saved, unsaved = TrPerson(id="alice"), TrPerson()
+        widget = TrProduct(id="widget")
+        with pytest.raises(SurrealDbError, match="unsaved"):
+            await unsaved.relate(TrPurchased, widget)
+        with pytest.raises(SurrealDbError, match="unsaved"):
+            await saved.relate(TrPurchased, TrProduct())
+        with pytest.raises(SurrealDbError, match="unsaved"):
+            await unsaved.relate("tr_purchased", widget)
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    async def test_graph_helpers_check_the_edge(self, no_client: list[str]) -> None:
+        alice, widget = TrPerson(id="alice"), TrProduct(id="widget")
+        with pytest.raises(TypeError, match="edge must be an edge model class or an edge table name, got int"):
+            await alice.get_related(42)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="edge must be"):
+            await alice.remove_relation(42, widget)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="edge must be"):
+            await alice.remove_all_relations(None)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="TrPerson is not an edge model"):
+            await alice.get_related(TrPerson)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="TrProduct is not an edge model"):
+            await alice.remove_relation(TrProduct, widget)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="Invalid edge name"):
+            await alice.remove_all_relations("bad-name")
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    async def test_reverse_raises_until_implemented(self, no_client: list[str]) -> None:
+        """``reverse=True`` raises instead of silently relating the wrong way round."""
+        alice, bob = TrPerson(id="alice"), TrPerson(id="bob")
+        with pytest.raises(NotImplementedError, match="reverse=True"):
+            await alice.relate(TrFollows, bob, reverse=True)
+        with pytest.raises(NotImplementedError, match="reverse=True"):
+            await alice.relate("tr_follows", bob, True)
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    async def test_data_is_keyword_only(self, no_client: list[str]) -> None:
+        alice, bob = TrPerson(id="alice"), TrPerson(id="bob")
+        with pytest.raises(TypeError):
+            await alice.relate("tr_follows", bob, False, None, {"w": 1})  # type: ignore[call-overload]
+        assert no_client == []
+
+
+class TestRelateTypedStatements:
+    """What ``relate()`` queues on a buffered transaction (no server: nothing runs before commit)."""
+
+    @pytest.mark.asyncio
+    async def test_typed_relate_queues_the_edge_insert(self, no_client: list[str]) -> None:
+        alice, bob, widget = TrPerson(id="alice"), TrPerson(id="bob"), TrProduct(id="widget")
+        tx = BufferedTransaction()
+
+        edge = await alice.relate(TrPurchased, widget, tx=tx, data={"quantity": 2, "price": 9.5})
+        follow = await alice.relate(TrFollows, bob, False, tx)  # tx by position: the full ORM's order
+
+        assert type(edge) is TrPurchased
+        assert (edge.id, edge.in_, edge.out, edge.quantity, edge.price) == (None, ALICE_P, WIDGET, 2, 9.5)
+        assert type(follow) is TrFollows
+        assert (follow.in_, follow.out) == (ALICE_P, BOB_P)
+        assert tx.statements == [_queued_guarded_insert("tr_purchased", 0), _queued_guarded_insert("tr_follows", 1)]
+        assert tx.variables == {
+            "t0_data": {"in": ALICE_P, "out": WIDGET, "quantity": 2, "price": 9.5},
+            "t1_data": {"in": ALICE_P, "out": BOB_P, "weight": 1},
+        }
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    async def test_typed_relate_binds_ids_as_record_ids(self, no_client: list[str]) -> None:
+        """Model ids are bound, never interpolated: no identifier check on them (``joe@x.com``, int ids)."""
+        joe = TrPerson(id="joe@x.com")
+        tx = BufferedTransaction()
+
+        await joe.relate(TrPurchased, RecordID("tr_product", 7), tx=tx)
+        await joe.relate(TrPurchased, "tr_product:`a-b`", tx=tx)
+        await joe.relate(TrPurchased, TrIntNode(id=5), tx=tx)
+
+        int_node = RecordID(TrIntNode.get_table_name(), 5)
+        assert [(v["in"], v["out"]) for v in tx.variables.values()] == [
+            (RecordID("tr_person", "joe@x.com"), RecordID("tr_product", 7)),
+            (RecordID("tr_person", "joe@x.com"), RecordID("tr_product", "a-b")),
+            (RecordID("tr_person", "joe@x.com"), int_node),
+        ]
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    async def test_typed_relate_maps_aliases_and_keeps_allowed_extras(self, no_client: list[str]) -> None:
+        alice, widget = TrPerson(id="alice"), TrProduct(id="widget")
+        tx = BufferedTransaction()
+
+        by_column = await alice.relate(TrMemoEdge, widget, tx=tx, data={"memo": "a"})
+        by_name = await alice.relate(TrMemoEdge, widget, tx=tx, data={"note": "b"})
+        loose = await alice.relate(TrLooseEdge, widget, tx=tx, data={"bogus": 1})
+
+        assert (by_column.note, by_name.note) == ("a", "b")
+        assert loose.model_extra == {"bogus": 1}
+        assert tx.variables == {
+            "t0_data": {"in": ALICE_P, "out": WIDGET, "memo": "a"},
+            "t1_data": {"in": ALICE_P, "out": WIDGET, "memo": "b"},
+            "t2_data": {"in": ALICE_P, "out": WIDGET, "bogus": 1},
+        }
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    async def test_typed_relate_writes_a_named_server_field(self, no_client: list[str]) -> None:
+        alice, widget = TrPerson(id="alice"), TrProduct(id="widget")
+        tx = BufferedTransaction()
+
+        await alice.relate(TrSrvEdge, widget, tx=tx, data={"source": "client"})
+        await alice.relate(TrSrvEdge, widget, tx=tx)
+
+        assert tx.variables == {
+            "t0_data": {"in": ALICE_P, "out": WIDGET, "source": "client"},
+            "t1_data": {"in": ALICE_P, "out": WIDGET},  # not named: left to the server's DEFAULT
+        }
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    async def test_string_relate_queues_the_relate_statement(self, no_client: list[str]) -> None:
+        alice, bob = TrPerson(id="alice"), TrPerson(id="bob")
+        tx = BufferedTransaction()
+
+        assert await alice.relate("tr_follows", bob, tx=tx, data={"weight": 2}) == []
+        assert await alice.relate("tr_follows", RecordID("tr_person", "carol"), False, tx) == []
+
+        assert tx.statements == [
+            "RELATE tr_person:alice->tr_follows->tr_person:bob SET weight = $t0__rd0;",
+            "RELATE tr_person:alice->tr_follows->tr_person:carol;",
+        ]
+        assert tx.variables == {"t0__rd0": 2}
+        assert no_client == []
+
+
+class TestRelateTypedE2E:
+    @pytest.mark.asyncio
+    async def test_relate_returns_typed_edge(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with orm_client(*RELATE_TABLES) as client:
+            alice, _bob, widget = await _nodes()
+            spy = _spy_insert_relation(monkeypatch, client)
+
+            edge = await alice.relate(TrPurchased, widget, data={"quantity": 2, "price": 9.5})
+
+            assert type(edge) is TrPurchased
+            assert isinstance(edge.id, RecordID)
+            assert edge.id.table_name == "tr_purchased"
+            assert (edge.in_, edge.out, edge.quantity, edge.price) == (ALICE_P, WIDGET, 2, 9.5)
+            assert spy.calls == [("tr_purchased", {"in": ALICE_P, "out": WIDGET, "quantity": 2, "price": 9.5})]
+            # A relation graph traversal sees, not a plain record carrying `in`/`out`.
+            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
+            loaded = await TrPurchased.objects().get(edge.get_raw_id())
+            assert (loaded.id, loaded.in_, loaded.out, loaded.quantity, loaded.price) == (
+                edge.id,
+                ALICE_P,
+                WIDGET,
+                2,
+                9.5,
+            )
+
+    @pytest.mark.asyncio
+    async def test_relate_fires_the_save_signals(self) -> None:
+        events: list[tuple[str, Any, bool | None]] = []
+
+        @pre_save.connect(TrPurchased)
+        async def on_pre(sender: Any, instance: Any, **kwargs: Any) -> None:
+            events.append(("pre_save", instance.id, None))
+
+        @post_save.connect(TrPurchased)
+        async def on_post(sender: Any, instance: Any, created: bool, **kwargs: Any) -> None:
+            events.append(("post_save", instance.id, created))
+
+        try:
+            async with orm_client(*RELATE_TABLES):
+                alice, _bob, widget = await _nodes()
+                edge = await alice.relate(TrPurchased, widget)
+                assert events == [("pre_save", None, None), ("post_save", edge.id, True)]
+
+                events.clear()
+                await alice.relate("tr_purchased", widget)
+                assert events == []  # the string form fires none (unchanged)
+        finally:
+            pre_save.disconnect(on_pre, TrPurchased)
+            post_save.disconnect(on_post, TrPurchased)
+
+    @pytest.mark.asyncio
+    async def test_relate_targets_string_and_record_id(self) -> None:
+        async with orm_client(*RELATE_TABLES):
+            alice, _bob, widget = await _nodes()
+
+            by_string = await alice.relate(TrPurchased, "tr_product:widget")
+            by_record_id = await alice.relate(TrPurchased, RecordID("tr_product", "widget"), data={"quantity": 3})
+
+            assert by_string.out == by_record_id.out == WIDGET
+            assert await TrPurchased.objects().filter(out=widget).count() == 2
+            related = await alice.get_related("tr_purchased", model_class=TrProduct)
+            assert [p.get_raw_id() for p in related] == ["widget", "widget"]
+
+    @pytest.mark.asyncio
+    async def test_relate_node_with_non_identifier_id(self) -> None:
+        async with orm_client(*RELATE_TABLES):
+            _alice, _bob, widget = await _nodes()
+            joe = await TrPerson(id="joe@x.com", name="Joe").save()
+
+            edge = await joe.relate(TrPurchased, widget)
+
+            assert edge.in_ == RecordID("tr_person", "joe@x.com")
+            assert await TrPurchased.objects().filter(in_=joe).count() == 1
+
+    @pytest.mark.asyncio
+    async def test_relate_writes_named_server_field(self) -> None:
+        async with orm_client(*RELATE_TABLES) as client:
+            alice, _bob, widget = await _nodes()
+            await client.query('DEFINE TABLE tr_srv TYPE RELATION; DEFINE FIELD source ON tr_srv DEFAULT "server";', {})
+
+            named = await alice.relate(TrSrvEdge, widget, data={"source": "client"})
+            unnamed = await alice.relate(TrSrvEdge, widget)
+
+            assert named.source == "client"  # named in data: written, not left to the DEFAULT
+            assert unnamed.source == "server"  # hydrated from the row the server returned
+            assert sorted(row["source"] for row in await _stored(client, "tr_srv")) == ["client", "server"]
+
+    @pytest.mark.asyncio
+    async def test_invalid_data_writes_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with orm_client(*RELATE_TABLES) as client:
+            alice, _bob, widget = await _nodes()
+            spy = _spy_insert_relation(monkeypatch, client)
+
+            with pytest.raises(ValidationError):
+                await alice.relate(TrPurchased, widget, data={"quantity": 0})
+            with pytest.raises(SurrealDbError, match="does not declare"):
+                await alice.relate(TrPurchased, widget, data={"bogus": 1})
+
+            assert spy.calls == []
+            assert await _stored(client, "tr_purchased") == []
+
+    @pytest.mark.asyncio
+    async def test_relate_with_tx_interactive(self) -> None:
+        async with orm_client(*RELATE_TABLES) as client:
+            if not await _native_txn_supported():
+                pytest.skip("requires SurrealDB 3.x native transactions")
+            alice, bob, widget = await _nodes()
+
+            reached = False
+            with pytest.raises(RuntimeError, match="roll back"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    assert tx.is_interactive
+                    edge = await alice.relate(TrPurchased, widget, tx=tx, data={"quantity": 2})
+                    assert isinstance(edge.id, RecordID)
+                    assert edge.id.table_name == "tr_purchased"
+                    seen = await TrPurchased.objects(tx=tx).filter(in_=alice).exec()
+                    assert [(e.id, e.quantity) for e in seen] == [(edge.id, 2)]
+                    reached = True
+                    raise RuntimeError("roll back")
+            assert reached
+            assert await _stored(client, "tr_purchased") == []
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                kept = await alice.relate(TrFollows, bob, False, tx, data={"weight": 3})
+                assert isinstance(kept.id, RecordID)
+            stored = await _stored(client, "tr_follows")
+            assert [(row["id"], row["in"], row["out"], row["weight"]) for row in stored] == [(kept.id, ALICE_P, BOB_P, 3)]
+
+    @pytest.mark.asyncio
+    async def test_relate_with_tx_buffered(self) -> None:
+        async with http_orm_client(*RELATE_TABLES) as client:
+            alice, _bob, widget = await _nodes()
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert not tx.is_interactive
+                edge = await alice.relate(TrPurchased, widget, tx=tx, data={"quantity": 2})
+                assert edge.id is None  # queued: no row before commit
+                assert (edge.in_, edge.out, edge.quantity) == (ALICE_P, WIDGET, 2)
+                assert await _stored(client, "tr_purchased") == []
+
+            stored = await _stored(client, "tr_purchased")
+            assert [(row["in"], row["out"], row["quantity"]) for row in stored] == [(ALICE_P, WIDGET, 2)]
+            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("transport", ["ws", "http"])
+    async def test_string_relate_accepts_tx(self, transport: str) -> None:
+        """Over WebSocket the transaction is interactive on 3.x and buffered on 2.x; over HTTP buffered on both."""
+        connect = orm_client if transport == "ws" else http_orm_client
+        async with connect(*RELATE_TABLES) as client:
+            alice, bob, _widget = await _nodes()
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                rows = await alice.relate("tr_follows", bob, tx=tx, data={"weight": 2})
+                if tx.is_interactive:
+                    assert [(row["in"], row["out"], row["weight"]) for row in rows] == [(ALICE_P, BOB_P, 2)]
+                else:
+                    assert rows == []
+                    assert await _stored(client, "tr_follows") == []
+
+            stored = await _stored(client, "tr_follows")
+            assert [(row["in"], row["out"], row["weight"]) for row in stored] == [(ALICE_P, BOB_P, 2)]
+
+            with pytest.raises(RuntimeError, match="roll back"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await alice.relate("tr_follows", bob, False, tx)
+                    raise RuntimeError("roll back")
+            assert len(await _stored(client, "tr_follows")) == 1
+
+    @pytest.mark.asyncio
+    async def test_graph_helpers_accept_edge_class(self) -> None:
+        async with orm_client(*RELATE_TABLES):
+            alice, bob, widget = await _nodes()
+            await alice.relate(TrPurchased, widget)
+            await alice.relate(TrFollows, bob)
+
+            related = await alice.get_related(TrPurchased, model_class=TrProduct)
+            assert [(type(p), p.get_raw_id()) for p in related] == [(TrProduct, "widget")]
+            assert await bob.get_related(TrFollows, direction="in") == [ALICE_P]
+
+            await alice.remove_relation(TrPurchased, widget)
+            assert await alice.get_related(TrPurchased) == []
+
+            await alice.remove_all_relations(TrFollows, direction="out")
+            assert await TrFollows.objects().count() == 0
+
+            with pytest.raises(TypeError, match="TrPerson is not an edge model"):
+                await alice.get_related(TrPerson)  # type: ignore[arg-type]

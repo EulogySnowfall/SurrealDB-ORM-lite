@@ -8,9 +8,19 @@ Deliberately named ``typing_examples`` rather than ``test_*`` so pytest does not
 the assertions here are made by mypy, not at runtime.
 """
 
+from typing import Any
+
 from surrealdb import RecordID
 
-from surreal_orm_lite import BaseSurrealEdge, BaseSurrealModel, Computed, SurrealConfigDict, SurrealFunc, computed
+from surreal_orm_lite import (
+    BaseSurrealEdge,
+    BaseSurrealModel,
+    Computed,
+    SurrealConfigDict,
+    SurrealFunc,
+    Transaction,
+    computed,
+)
 
 
 class Player(BaseSurrealModel):
@@ -74,3 +84,30 @@ def purchase_buyer(edge: Purchased) -> RecordID:
 
 def purchase_item(edge: Purchased) -> RecordID:
     return edge.out
+
+
+class Person(BaseSurrealModel):
+    id: str | None = None
+
+
+class Product(BaseSurrealModel):
+    id: str | None = None
+
+
+async def typed_relate(a: Person, p: Product) -> Purchased:
+    """An edge class gives back that edge, typed (the first ``relate()`` overload)."""
+    return await a.relate(Purchased, p, data={"quantity": 1})
+
+
+async def typed_relate_in_tx(a: Person, p: Product, tx: Transaction) -> Purchased:
+    """``tx`` by position, the full ORM's order: ``(edge, target, reverse, tx)``."""
+    return await a.relate(Purchased, p, False, tx)
+
+
+async def raw_relate(a: Person, b: Person) -> list[dict[str, Any]]:
+    """An edge table name keeps the v0.6.0 return: the ``RELATE`` rows."""
+    return await a.relate("follows", b)
+
+
+async def related_through_edge_class(a: Person) -> list[Any]:
+    return await a.get_related(Purchased, model_class=Product)
