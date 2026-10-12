@@ -2,13 +2,18 @@ import inspect
 import os
 import re
 import warnings
-from collections.abc import Iterable, Mapping
-from typing import Any, cast
+from collections.abc import Collection, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, cast
+
+import pydantic
 
 from ._sdk import RecordID, ServerError
 from .constants import LOOKUP_OPERATORS
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, Var
+
+if TYPE_CHECKING:
+    from .model_base import BaseSurrealModel
 
 # Pattern for valid field names: alphanumeric, underscores, dots (for nested fields)
 # Must start with a letter or underscore
@@ -390,9 +395,82 @@ def coerce_record_id(value: Any, table: str) -> RecordID:
     return RecordID(table, raw)
 
 
+def _instance_record_id(instance: "BaseSurrealModel") -> RecordID:
+    """Return the record id of a model instance, refusing an unsaved one."""
+    record_id = instance._record_id()
+    if record_id is None:
+        raise ValueError(f"An unsaved {type(instance).__name__} has no record id; save it first or pass a RecordID.")
+    return record_id
+
+
+def as_record_value(value: Any) -> Any:
+    """Replace a model instance by the record id that addresses it; return anything else unchanged.
+
+    What a model instance means as a filter value (v0.22.0): ``filter(customer=alice)`` asks
+    for the rows whose ``customer`` column links to alice, i.e. ``customer = <alice's
+    RecordID>``. Binding the instance itself would hand the SDK a Pydantic model to encode.
+    Applied to every scalar filter value, to each item of a sequence lookup, and to the
+    create payload of ``get_or_create``/``update_or_create`` — so the row those create is the
+    row their next lookup finds.
+
+    Raises:
+        ValueError: for an unsaved instance — it has no record id to compare against.
+    """
+    from .model_base import BaseSurrealModel  # model_base imports this module
+
+    if isinstance(value, BaseSurrealModel):
+        return _instance_record_id(value)
+    return value
+
+
+def coerce_endpoint(value: Any) -> RecordID:
+    """Read an edge endpoint (``in``/``out``) as the ``RecordID`` the edge stores (v0.22.0).
+
+    The one rule shared by the endpoint fields of an edge model and by the filters on its
+    endpoint columns, so the edge ``get_or_create(in_="person:alice", …)`` creates is the
+    edge its next lookup finds:
+
+    ======================  ==================================================
+    ``RecordID(...)``       returned unchanged
+    a model instance        its record id — an unsaved one raises
+    ``"table:id"``          ``RecordID("table", "id")`` — the id is a string
+    ``"table:`a-b`"``       ``RecordID("table", "a-b")`` — backticks stripped
+    anything else           ``ValueError``
+    ======================  ==================================================
+
+    A string must pass :func:`validate_thing` (id made of letters, digits, ``_`` and ``-``,
+    optionally backtick-quoted), the rule ``relate()`` already applies to its targets. An id
+    with other characters (``joe@x.com``) or an integer id: pass the instance or a
+    ``RecordID``.
+
+    Raises:
+        ValueError: for an unsaved instance, a malformed string, or any other type.
+    """
+    from .model_base import BaseSurrealModel  # model_base imports this module
+
+    if isinstance(value, RecordID):
+        return value
+    if isinstance(value, BaseSurrealModel):
+        return _instance_record_id(value)
+    if isinstance(value, str):
+        validate_thing(value)
+        table, _, raw = value.partition(":")
+        if len(raw) > 1 and raw.startswith("`") and raw.endswith("`"):
+            raw = raw[1:-1]
+        return RecordID(table, raw)
+    raise ValueError(
+        f"an edge endpoint must be a model instance, a RecordID or a 'table:id' string, got {type(value).__name__}"
+    )
+
+
 def parse_lookup(key: str) -> tuple[str, str]:
     """
     Parse a filter key into field name and lookup type.
+
+    The key is split on its first ``__``. Leading underscores of the lookup part belong to the
+    field (v0.22.0): no lookup name starts with ``_``, so ``in___in`` is the ``in`` lookup on the
+    field ``in_`` and ``type___gt`` the ``gt`` lookup on ``type_``. A key without ``__`` is a
+    field name (``in_`` → ``("in_", "exact")``).
 
     Args:
         key: The filter key in the format ``field__lookup`` or just ``field``.
@@ -402,16 +480,28 @@ def parse_lookup(key: str) -> tuple[str, str]:
     """
     if "__" in key:
         field_name, lookup_name = key.split("__", 1)
+        while lookup_name.startswith("_"):
+            field_name += "_"
+            lookup_name = lookup_name[1:]
     else:
         field_name, lookup_name = key, "exact"
     return field_name, lookup_name
 
 
 def build_filter_condition(
-    field: str, lookup: str, value: Any, counter: int, record_table: str | None = None
+    field: str,
+    lookup: str,
+    value: Any,
+    counter: int,
+    record_table: str | None = None,
+    *,
+    endpoint_columns: Collection[str] = (),
 ) -> tuple[str, dict[str, Any], int]:
     """
     Build a single parameterized filter condition.
+
+    A model instance given as the value — or as an item of a sequence lookup — is bound as its
+    record id (:func:`as_record_value`, v0.22.0).
 
     Args:
         field: The field name.
@@ -421,13 +511,20 @@ def build_filter_condition(
         record_table: The table the query runs against, when known. It is what lets a lookup
             on the ``id`` column be coerced to a ``RecordID`` (issue #159). ``None`` — a
             ``Q`` compiled outside a QuerySet — leaves values untouched.
+        endpoint_columns: The queried model's edge endpoint columns (``in``/``out`` on an edge
+            model, none on a node; v0.22.0). On those columns a scalar or ``in``/``not_in``
+            value goes through :func:`coerce_endpoint`, so ``"person:alice"`` is the record id
+            it names, and a text/collection lookup is refused. Node columns are untouched: a
+            string column may legitimately hold ``"a:b"``.
 
     Returns:
         A tuple of (sql_fragment, variables_dict, next_counter).
 
     Raises:
-        ValueError: If the lookup type is not supported, the field name is invalid, or a
-            text/collection lookup is applied to the ``id`` column.
+        ValueError: If the lookup type is not supported, the field name is invalid, a
+            text/collection lookup is applied to the ``id`` column or to an endpoint column,
+            a sequence lookup gets a single model instance, a model instance is unsaved, or
+            an endpoint value is not a record id.
     """
     validate_field_name(field, "filter field")
     op = LOOKUP_OPERATORS.get(lookup)
@@ -443,6 +540,9 @@ def build_filter_condition(
             "not a string. Filter on a regular column, or reach for the textual form "
             "explicitly in a raw query (e.g. string::contains(record::id(id), '...'))."
         )
+    is_endpoint_column = field in endpoint_columns
+    if is_endpoint_column and lookup in _RECORD_ID_INVALID_LOOKUPS:
+        raise ValueError(f"'{lookup}' cannot be applied to the edge endpoint column '{field}': it holds a record id, not text.")
 
     if lookup == "isnull":
         if not isinstance(value, bool):
@@ -454,11 +554,21 @@ def build_filter_condition(
     elif lookup in ("in", "not_in", "containsall", "containsany"):
         if isinstance(value, (str, dict)) or not hasattr(value, "__iter__"):
             raise ValueError(f"'{lookup}' lookup requires an iterable (list, tuple, or set), got {type(value).__name__}")
-        items = list(value)
+        if isinstance(value, pydantic.BaseModel):
+            # A Pydantic model is iterable — it would become a list of (name, value) pairs.
+            raise ValueError(
+                f"'{lookup}' lookup requires an iterable (list, tuple, or set), got a single "
+                f"{type(value).__name__} instance; wrap it in a list."
+            )
+        items = [as_record_value(item) for item in value]
         if is_record_id_column and lookup in _RECORD_ID_SEQUENCE_LOOKUPS:
             items = [coerce_record_id(item, cast(str, record_table)) for item in items]
+        elif is_endpoint_column and lookup in _RECORD_ID_SEQUENCE_LOOKUPS:
+            items = [coerce_endpoint(item) for item in items]
         return f"{field} {op} ${var_name}", {var_name: items}, counter + 1
-    elif isinstance(value, Var):
+
+    value = as_record_value(value)
+    if isinstance(value, Var):
         # The explicit, unambiguous form (v0.14.3).
         return f"{field} {op} {value.reference}", {}, counter
     elif isinstance(value, str) and value.startswith("$$"):
@@ -485,6 +595,8 @@ def build_filter_condition(
     else:
         if is_record_id_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
             value = coerce_record_id(value, cast(str, record_table))
+        elif is_endpoint_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
+            value = coerce_endpoint(value)
         return f"{field} {op} ${var_name}", {var_name: value}, counter + 1
 
 

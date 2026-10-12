@@ -465,6 +465,16 @@ class BaseSurrealModel(BaseModel):
         return legacy if legacy is not None else cls.__name__
 
     @classmethod
+    def _endpoint_columns(cls) -> frozenset[str]:
+        """Return the columns of this model that hold an edge endpoint (v0.22.0).
+
+        ``in``/``out`` on an edge model, none on a node. The QuerySet hands them to the filter
+        builder, which reads a ``"table:id"`` string given for one of them as the record id it
+        names (:func:`~surreal_orm_lite.utils.coerce_endpoint`) and refuses text lookups there.
+        """
+        return frozenset()
+
+    @classmethod
     def get_index_primary_key(cls) -> str | None:
         """
         Get the primary key field name for the model.

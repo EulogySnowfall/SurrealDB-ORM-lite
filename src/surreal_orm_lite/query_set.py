@@ -17,6 +17,7 @@ from .live import LiveModelStream, LiveStream, ReconnectCallback, missing_table_
 from .q import Q
 from .surql_literal import inline_variables
 from .utils import (
+    as_record_value,
     build_filter_condition,
     coerce_record_id,
     parse_lookup,
@@ -273,16 +274,19 @@ class QuerySet:
         parts: list[str] = []
         variables: dict[str, Any] = {}
         counter = 0
+        endpoint_columns = self.model._endpoint_columns()
 
         # Regular keyword filters (AND-joined)
         for field_name, lookup_name, value in self._filters:
-            sql, vars_, counter = build_filter_condition(field_name, lookup_name, value, counter, self._model_table)
+            sql, vars_, counter = build_filter_condition(
+                field_name, lookup_name, value, counter, self._model_table, endpoint_columns=endpoint_columns
+            )
             parts.append(sql)
             variables.update(vars_)
 
         # Q object filters
         for q in self._q_filters:
-            sql, vars_, counter = q.to_sql(counter, self._model_table, self.model.to_db_field)
+            sql, vars_, counter = q.to_sql(counter, self._model_table, self.model.to_db_field, endpoint_columns)
             if sql:
                 parts.append(sql)
                 variables.update(vars_)
@@ -851,7 +855,9 @@ class QuerySet:
         ``"$literal"`` (otherwise ``get_or_create(name="$$admin")`` filtered on ``"$admin"``
         but stored ``"$$admin"``, never converging and creating a duplicate on every call),
         and a query-variable reference is refused outright — its value lives on the server,
-        so it cannot be written back (issue #156 follow-up).
+        so it cannot be written back (issue #156 follow-up). A model instance is written as its
+        record id, the value its lookup binds (v0.22.0): ``get_or_create(customer=alice)``
+        stores ``customer = RecordID(...)``.
         """
         payload: dict[str, Any] = {}
         for key, value in criteria.items():
@@ -865,7 +871,7 @@ class QuerySet:
                 )
             if isinstance(value, str) and value.startswith("$$"):
                 value = value[1:]
-            payload[field_name] = value
+            payload[field_name] = as_record_value(value)
         return payload
 
     async def _lookup_matches(self, criteria: dict[str, Any]) -> list[Any]:
