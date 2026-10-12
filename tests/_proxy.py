@@ -5,7 +5,7 @@ the data the test wrote, and would break every other test sharing that server. T
 between the ORM and the server on a random local port instead:
 
 * :meth:`cut` aborts every connection it carries — the client sees close code 1006, exactly as
-  for a network failure (measured on 2.7.0 and 3.3.2: the SDK's receive task ends within 2 ms);
+  for a network failure (measured on 2.7.0, 3.3.2 and 3.3.3: the SDK's receive task ends within 2 ms);
 * :meth:`refuse` makes new connections fail at once, as an unreachable server does, until
   :meth:`accept` lets them through again.
 

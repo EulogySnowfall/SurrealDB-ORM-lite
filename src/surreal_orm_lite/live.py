@@ -160,7 +160,7 @@ def recv_task_of(client: Any) -> asyncio.Task[Any] | None:
     """The SDK WebSocket connection's receive task, or ``None`` (HTTP, or not connected yet).
 
     The task reads the socket for as long as it is open, and **ends when the connection drops**
-    — measured on 2.7.0 and 3.3.2, within milliseconds of an abort. It is the only drop signal
+    — measured on 2.7.0, 3.3.2 and 3.3.3, within milliseconds of an abort. It is the only drop signal
     the SDK exposes: the receive loop swallows the close and tells no one else.
     """
     for candidate in (client, getattr(client, "_connection", None)):

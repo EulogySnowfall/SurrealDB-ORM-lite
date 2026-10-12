@@ -1,7 +1,7 @@
 """Tests for v0.21.0 — change feeds: ``QuerySet.changes()`` → ``ChangeModelStream``.
 
 A change feed is SurrealDB's durable log of a table's writes (``DEFINE TABLE … CHANGEFEED``),
-read with ``SHOW CHANGES FOR TABLE … SINCE …``. Measured on 2.7.0, 3.3.2 and 3.1.5: the entries
+read with ``SHOW CHANGES FOR TABLE … SINCE …``. Measured on 2.7.0, 3.3.2, 3.3.3 and 3.1.5: the entries
 look the same on both lines, but **the cursor does not**. 3.x's ``SINCE`` takes the versionstamp
 an entry carries; 2.x's takes that versionstamp ``>> 16``, so resuming a 2.x feed with the stamp
 it returned silently yields nothing, forever. ``SINCE <datetime>`` is always empty on 3.x and
@@ -196,7 +196,7 @@ class TestRefusedClausesUnit:
 
 
 class TestFeedEventsUnit:
-    """Entry shapes copied from the measured output of 2.7.0, 3.3.2 and 3.1.5."""
+    """Entry shapes copied from the measured output of 2.7.0, 3.3.2, 3.3.3 and 3.1.5."""
 
     @staticmethod
     def _rid(key: str) -> Any:

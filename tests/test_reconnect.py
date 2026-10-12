@@ -1,7 +1,7 @@
 """Tests for v0.21.0 — surviving a dropped WebSocket.
 
 Every E2E test here talks to SurrealDB through :class:`tests._proxy.CuttableProxy`, which can
-abort the connection the way a network failure does. Measured on 2.7.0 and 3.3.2 alike: the
+abort the connection the way a network failure does. Measured on 2.7.0, 3.3.2 and 3.3.3 alike: the
 SDK's receive task ends within milliseconds, the server forgets the session's live queries, and
 the dead client fails every later call. Nothing in this file is version-gated.
 

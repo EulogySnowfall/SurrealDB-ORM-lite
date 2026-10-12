@@ -7,7 +7,7 @@ nothing is lost while the reader is away: :class:`ChangeModelStream` polls the l
 :attr:`~ChangeModelStream.cursor` resumes exactly where it stopped, even in another process.
 
 **The cursor is not what the server returns, and the two lines disagree on why.** Measured on
-2.7.0, 3.3.2 and 3.1.5, every entry carries a ``versionstamp``, but:
+2.7.0, 3.3.2, 3.3.3 and 3.1.5, every entry carries a ``versionstamp``, but:
 
 * on 3.x ``SINCE`` takes that stamp and is inclusive, so the next position is ``stamp + 1``;
 * on 2.x the stamp is a counter shifted left 16 bits and ``SINCE`` takes the *counter*, so the
@@ -84,7 +84,7 @@ def next_cursor(versionstamp: int, *, major: int) -> int:
 def versionstamp_at(moment: datetime) -> int:
     """SurrealDB 3.x's versionstamp for *moment*: unix milliseconds shifted left 16 bits.
 
-    The server's own hybrid-clock layout (measured on 3.1.5 and 3.3.2), not a documented
+    The server's own hybrid-clock layout (measured on 3.1.5, 3.3.2 and 3.3.3), not a documented
     contract; ``tests/test_change_feeds.py`` pins it, so a server that changes it fails CI.
     """
     return ((moment - _EPOCH) // timedelta(milliseconds=1)) << 16

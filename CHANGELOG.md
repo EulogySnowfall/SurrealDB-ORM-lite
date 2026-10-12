@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.21.0] - 2026-10-09
+## [0.21.0] - 2026-10-12
 
 Live queries that survive a dropped connection, and change feeds with a cursor that resumes
 exactly — the rest of the full SurrealDB-ORM's real-time API, on the official SDK and on both
@@ -99,6 +99,9 @@ server lines.
 - Observed once in CI on a fresh SurrealDB 2.7.0 server, never reproduced locally: a plain write
   to a table with a change feed failed with the retryable "read or write conflict" error, with no
   concurrent writer. `retry_on_conflict` (v0.12.0) handles it; the test suite now uses it there.
+- Tested against SurrealDB 2.7.0 and 3.3.3 (the pin since 0.20.1), with 3.1.5 as the
+  backward-compatibility check. Every server behaviour described in this entry was measured on
+  3.3.2 and re-measured on 3.3.3, with identical results.
 - **What a live query misses during an outage is not replayed** — catch up in `on_reconnect`,
   or from a change feed. A request already in flight when the socket drops fails with the SDK's
   own `KeyError`; retrying arbitrary queries is v0.40.0.
