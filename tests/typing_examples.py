@@ -8,7 +8,7 @@ Deliberately named ``typing_examples`` rather than ``test_*`` so pytest does not
 the assertions here are made by mypy, not at runtime.
 """
 
-from surreal_orm_lite import BaseSurrealModel, Computed, SurrealFunc, computed
+from surreal_orm_lite import BaseSurrealModel, Computed, SurrealConfigDict, SurrealFunc, computed
 
 
 class Player(BaseSurrealModel):
@@ -28,3 +28,24 @@ def read_computed(player: Player) -> str | None:
 
 def read_computed_int(player: Player) -> int | None:
     return player.name_len
+
+
+class Tagged(BaseSurrealModel):
+    """v0.22.0: ``table_name`` alone — every ``SurrealConfigDict`` key is optional (``total=False``)."""
+
+    model_config = SurrealConfigDict(table_name="tagged")
+
+    id: str | None = None
+
+
+class Stamped(BaseSurrealModel):
+    """The README §v0.18.0 declaration: ``server_fields`` alone used to fail mypy ("Missing keys")."""
+
+    model_config = SurrealConfigDict(server_fields=["created"])
+
+    id: str | None = None
+    created: str | None = None
+
+
+def tagged_table() -> str:
+    return Tagged.get_table_name()

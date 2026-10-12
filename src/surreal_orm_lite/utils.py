@@ -42,21 +42,30 @@ def remove_quotes_for_variables(query: str) -> str:
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def user_stacklevel() -> int:
+def user_stacklevel(*, also_skip: tuple[str, ...] = ()) -> int:
     """``stacklevel`` that makes ``warnings.warn`` point at the first frame outside the ORM.
 
     A fixed ``stacklevel`` lands inside ``query_set.py``/``q.py``, and Python's default
     filters only surface a ``DeprecationWarning`` reported from ``__main__`` — so the
     deprecation runway never reached users at all (issue #156 follow-up). Call sites reach
     here through paths of differing depth, so the level is measured, not guessed.
+
+    Args:
+        also_skip: directories whose frames count as "inside" too, subdirectories included —
+            e.g. Pydantic's, for a warning raised while its metaclass builds a model, so the
+            warning lands on the user's ``class`` statement (v0.22.0).
     """
     frame = inspect.currentframe()
     level = 0
     while frame is not None and frame.f_back is not None:
         frame = frame.f_back
         level += 1
-        if os.path.dirname(os.path.abspath(frame.f_code.co_filename)) != _PACKAGE_DIR:
-            return level
+        directory = os.path.dirname(os.path.abspath(frame.f_code.co_filename))
+        if directory == _PACKAGE_DIR:
+            continue
+        if any(directory == root or directory.startswith(root + os.sep) for root in also_skip):
+            continue
+        return level
     return 2
 
 

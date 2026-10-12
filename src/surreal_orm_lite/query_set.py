@@ -55,7 +55,7 @@ class QuerySet:
         self._limit: int | None = None
         self._offset: int | None = None
         self._order_by: str | None = None
-        self._model_table: str = getattr(model, "_table_name", model.__name__)
+        self._model_table: str = model.get_table_name()
         self._variables: dict = {}
         self._fetch_fields: list[str] = []
         self._group_by_fields: list[str] = []

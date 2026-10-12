@@ -1,11 +1,14 @@
 import contextlib
 import functools
 import logging
+import os
 import typing
+import warnings
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from decimal import Decimal
 from typing import Any, Self
 
+import pydantic
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic_core import ValidationError
 
@@ -26,11 +29,13 @@ from .signals import (
 )
 from .transaction import Transaction
 from .utils import (
+    VALID_ALIAS_PATTERN,
     apply_ddl_statements,
     build_set_clause,
     format_record_id,
     merge_extra_vars,
     remove_quotes_for_variables,
+    user_stacklevel,
     validate_alias_name,
     validate_edge_name,
     validate_field_name,
@@ -48,6 +53,39 @@ logger = logging.getLogger(__name__)
 # object, which is what makes them inheritance-correct — a subclass gets its own entry.
 _ALIAS_MAPS: dict[type, tuple[dict[str, str], dict[str, str]]] = {}
 _SERVER_FIELDS: dict[type, frozenset[str]] = {}
+
+# Pydantic's metaclass sits between ``__pydantic_init_subclass__`` and the user's ``class``
+# statement; a warning raised there must skip its frames to land on the user's line (v0.22.0).
+_PYDANTIC_DIR = os.path.dirname(os.path.abspath(pydantic.__file__))
+
+
+def _legacy_table_name(cls: type) -> str | None:
+    """Return the deprecated ``_table_name: ClassVar[str]`` of ``cls`` (or a base), else ``None``.
+
+    Only the ``ClassVar`` form is a plain ``str`` on the class, and it is the only form that ever
+    named a table. ``_table_name = "t"`` and ``_table_name: str = "t"`` are Pydantic **private
+    attributes** — the class answers a ``ModelPrivateAttr`` — and are ignored, as they always
+    should have been (the ``QuerySet`` used to interpolate that object's ``repr`` into SurrealQL).
+    """
+    legacy = getattr(cls, "_table_name", None)
+    return legacy if isinstance(legacy, str) else None
+
+
+def _check_table_name(cls: type, key: str, name: Any) -> None:
+    """Refuse a table name that is not a SurrealQL identifier: it is interpolated into queries.
+
+    Raises:
+        TypeError: ``name`` is not a ``str``.
+        ValueError: ``name`` is not an identifier (letters, digits, underscores; not starting
+            with a digit). ``fullmatch`` so a trailing newline does not slip through ``$``.
+    """
+    if not isinstance(name, str):
+        raise TypeError(f"{cls.__name__}: {key} must be a str, got {type(name).__name__}.")
+    if not VALID_ALIAS_PATTERN.fullmatch(name):
+        raise ValueError(
+            f"{cls.__name__}: {key} {name!r} must be an identifier (letters, digits, underscores; "
+            "not starting with a digit): it is interpolated into SurrealQL."
+        )
 
 
 def _own_annotation_names(cls: type) -> set[str]:
@@ -67,11 +105,17 @@ def _own_annotation_names(cls: type) -> set[str]:
     return set(annotationlib.get_annotations(cls, format=annotationlib.Format.STRING))
 
 
-class SurrealConfigDict(ConfigDict):
+class SurrealConfigDict(ConfigDict, total=False):
     """
     SurrealConfigDict is a configuration dictionary for SurrealDB models.
 
+    Every key is optional, for type checkers too (``total=False``, v0.22.0): set only the ones
+    the model needs, e.g. ``SurrealConfigDict(table_name="purchased")``.
+
     Attributes:
+        table_name (str | None): Override the table name; default: the class name. Full
+            SurrealDB-ORM key (v0.22.0). Must be an identifier — checked when the class is
+            defined — and inherited by subclasses unless they set their own.
         primary_key (str | None): The primary key field name for the model.
         access_name (str | None): Name of the DEFINE ACCESS method (v0.17.0).
         identifier_field (str | None): Field a user signs in with (v0.17.0).
@@ -85,6 +129,9 @@ class SurrealConfigDict(ConfigDict):
             from implicit write payloads and hydrated back from the row the write returns,
             but stay writable when a caller names one explicitly.
     """
+
+    table_name: str | None
+    " Override the table name; default: the class name. Full SurrealDB-ORM key. "
 
     primary_key: str | None
     " The primary key field name for the model. "
@@ -154,6 +201,32 @@ class BaseSurrealModel(BaseModel):
                 setattr(cls, name, None)
         cls.__surreal_computed__ = collected
         super().__init_subclass__(**kwargs)
+
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
+        """Check the table name once Pydantic has finished building the model (v0.22.0).
+
+        ``__init_subclass__`` runs too early: the merged ``model_config`` does not exist yet.
+        A bad name fails at the ``class`` statement rather than on the first query, because
+        ``get_table_name()`` is interpolated into SurrealQL.
+
+        The deprecated ``_table_name: ClassVar[str]`` is checked the same way and warns once,
+        where it is defined — a subclass inheriting it does not warn again.
+        """
+        super().__pydantic_init_subclass__(**kwargs)
+        configured = cls.model_config.get("table_name")
+        if configured is not None:
+            _check_table_name(cls, "table_name", configured)
+        legacy = cls.__dict__.get("_table_name")
+        if isinstance(legacy, str):
+            _check_table_name(cls, "_table_name", legacy)
+            message = (
+                f"{cls.__name__}._table_name is deprecated and will be removed in a future minor; "
+                "use model_config = SurrealConfigDict(table_name=…)."
+            )
+            if isinstance(configured, str):
+                message += " table_name wins."
+            warnings.warn(message, DeprecationWarning, stacklevel=user_stacklevel(also_skip=(_PYDANTIC_DIR,)))
 
     @classmethod
     def get_computed_fields(cls) -> dict[str, str]:
@@ -380,10 +453,16 @@ class BaseSurrealModel(BaseModel):
 
     @classmethod
     def get_table_name(cls) -> str:
+        """Return the table this model reads and writes — the one name every query path uses.
+
+        ``model_config = SurrealConfigDict(table_name=…)`` when set (v0.22.0); else the
+        deprecated ``_table_name: ClassVar[str]``; else the class name.
         """
-        Get the table name for the model.
-        """
-        return cls.__name__
+        configured = cls.model_config.get("table_name")
+        if isinstance(configured, str):
+            return configured
+        legacy = _legacy_table_name(cls)
+        return legacy if legacy is not None else cls.__name__
 
     @classmethod
     def get_index_primary_key(cls) -> str | None:
