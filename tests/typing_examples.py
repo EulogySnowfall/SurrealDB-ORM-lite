@@ -111,3 +111,35 @@ async def raw_relate(a: Person, b: Person) -> list[dict[str, Any]]:
 
 async def related_through_edge_class(a: Person) -> list[Any]:
     return await a.get_related(Purchased, model_class=Product)
+
+
+async def typed_reverse(a: Person, p: Product) -> Purchased:
+    """``reverse=True`` and keyword edge fields keep the edge-class overload."""
+    return await a.relate(Purchased, p, reverse=True, quantity=1)
+
+
+async def typed_reverse_positional(a: Person, p: Product) -> Purchased:
+    """A positional ``reverse`` (the full ORM's order) is still typed ``Purchased``."""
+    return await a.relate(Purchased, p, True, None, quantity=1)
+
+
+async def raw_kwargs(a: Person, b: Person) -> list[dict[str, Any]]:
+    """The string form with keyword edge fields keeps the ``RELATE`` rows."""
+    return await a.relate("follows", b, reverse=True, since="2025-01-01")
+
+
+async def unlink(a: Person, p: Product) -> None:
+    """``reverse=``/``tx=`` on ``remove_relation``, a bare id, and a mixed list of edges."""
+    await a.remove_relation(Purchased, p, reverse=True, tx=None)
+    await a.remove_relation("follows", "abc123")
+    await a.remove_all_relations([Purchased, "follows"], direction="both", tx=None)
+    await a.remove_all_relations([Purchased, "follows"], "both", None)
+
+
+async def both(a: Person) -> list[Any]:
+    return await a.get_related("follows", direction="both")
+
+
+async def related_positional(a: Person) -> list[Any]:
+    """``get_related(edge, direction, model_class)`` by position, the full ORM's order."""
+    return await a.get_related("follows", "in", Person)

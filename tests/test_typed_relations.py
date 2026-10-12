@@ -36,7 +36,7 @@ is written at commit and rolled back with the batch, and a duplicate explicit id
 ``pre_save`` fires at call time, ``post_save`` only after a successful commit.
 
 ``relate()`` (spec §4.3.2) takes an edge model class or an edge table name, in the full ORM's
-parameter order ``(edge, target, reverse=False, tx=None, *, data=None)``. With an edge class it
+parameter order ``(edge, target, reverse=False, tx=None, *, data=None, **edge_data)``. With an edge class it
 creates the edge through the same ``save()`` and returns the validated, hydrated edge — source and
 target bound as record ids (a node id such as ``joe@x.com`` relates like it saves), ``data`` checked
 before any call (no endpoint, no computed field, no undeclared key), a ``server_fields`` key in
@@ -44,6 +44,17 @@ before any call (no endpoint, no computed field, no undeclared key), a ``server_
 at once on an interactive transaction, nothing (``[]``, or an edge whose ``id`` is ``None``) on a
 buffered one. ``get_related``, ``remove_relation`` and ``remove_all_relations`` accept an edge class
 too; any other class or value is a ``TypeError``.
+
+Graph API parity with the full ORM (spec §2.8, §4.3.2, §4.3.6, §4.5): the four graph helpers take
+their parameters in the full ORM's order, by position or by keyword (only ``data=`` is
+keyword-only); ``reverse=True`` relates or unlinks ``target -> edge -> self``; edge fields may be
+given as keywords (``**edge_data``), merged with ``data=``; ``remove_relation`` and
+``remove_all_relations`` take ``tx=``, the latter a list of edges, and ``get_related`` a ``"both"``
+direction (out-neighbours, then in-neighbours). The removals are graph-path ``DELETE`` statements
+with bound record ids (``DELETE $src->e WHERE out = $dst``): exactly the edges traversal sees, a
+native no-op on an edge table that was never created, the same in and out of a transaction. A
+``remove_relation()`` target without ``:`` is a bare record id, bound verbatim and compared as a
+string with ``record::id(out)``: it matches that id in any table, never an integer id.
 
 E2E tables are dedicated (``tr_*``), dropped on entry and exit by ``orm_client``; nodes are created
 inside the ``async with orm_client(...)`` block. Same behaviour on SurrealDB 2.x and 3.x, except the
@@ -55,7 +66,8 @@ import asyncio
 import contextlib
 import os
 import re
-from collections.abc import AsyncIterator
+from collections import Counter
+from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 from uuid import uuid4
 
@@ -1512,16 +1524,6 @@ class TestRelateTypedValidation:
         assert no_client == []
 
     @pytest.mark.asyncio
-    async def test_reverse_raises_until_implemented(self, no_client: list[str]) -> None:
-        """``reverse=True`` raises instead of silently relating the wrong way round."""
-        alice, bob = TrPerson(id="alice"), TrPerson(id="bob")
-        with pytest.raises(NotImplementedError, match="reverse=True"):
-            await alice.relate(TrFollows, bob, reverse=True)
-        with pytest.raises(NotImplementedError, match="reverse=True"):
-            await alice.relate("tr_follows", bob, True)
-        assert no_client == []
-
-    @pytest.mark.asyncio
     async def test_data_is_keyword_only(self, no_client: list[str]) -> None:
         alice, bob = TrPerson(id="alice"), TrPerson(id="bob")
         with pytest.raises(TypeError):
@@ -1805,3 +1807,655 @@ class TestRelateTypedE2E:
 
             with pytest.raises(TypeError, match="TrPerson is not an edge model"):
                 await alice.get_related(TrPerson)  # type: ignore[arg-type]
+
+
+# ==================== Task 6b — graph API parity with the full ORM ====================
+
+
+class TrLikes(BaseSurrealEdge):
+    """A second edge table, for edge lists (``remove_all_relations([...])``)."""
+
+    model_config = SurrealConfigDict(table_name="tr_likes")
+
+
+GRAPH_TABLES = (*EDGE_TABLES, "tr_likes")
+BLANK_TARGET = (
+    "remove_relation() target must not be empty or blank: pass a model instance, a RecordID, "
+    "a 'table:id' string or a bare record id."
+)
+
+
+class _RecordingClient:
+    """Stands in for the connected SDK client: records every call and runs nothing.
+
+    ``query()`` returns ``[]``; ``insert_relation()`` returns one row per row sent, so the
+    count check of ``insert_edges()`` (refused writes) passes.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Any, ...]] = []
+
+    async def query(self, q: str, v: dict[str, Any] | None = None) -> Any:
+        self.calls.append((q, v))
+        return []
+
+    async def insert_relation(self, table: str, data: Any) -> Any:
+        self.calls.append(("insert_relation", table, data))
+        rows = data if isinstance(data, list) else [data]
+        return [{**r, "id": RecordID(table, f"stub{i}")} for i, r in enumerate(rows)]
+
+
+@pytest.fixture
+def recording(monkeypatch: pytest.MonkeyPatch) -> _RecordingClient:
+    """Install a :class:`_RecordingClient` as the connected client."""
+    stub = _RecordingClient()
+
+    async def _get_client(cls: Any) -> Any:
+        return stub
+
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", classmethod(_get_client))
+    return stub
+
+
+async def _recorded(stub: _RecordingClient, call: Awaitable[Any]) -> tuple[list[tuple[Any, ...]], Any]:
+    """Run ``call`` on a cleared recording; return what it recorded and what it returned."""
+    stub.calls.clear()
+    result = await call
+    return list(stub.calls), result
+
+
+class TestGraphParityUnit:
+    """The exact statements of the graph helpers, recorded by a client stub (no server)."""
+
+    @pytest.mark.asyncio
+    async def test_remove_relation_statement(self, recording: _RecordingClient) -> None:
+        alice, bob = TrPerson(id="alice"), TrPerson(id="bob")
+
+        calls, result = await _recorded(recording, alice.remove_relation("tr_follows", bob))
+        assert result is None
+        assert calls == [("DELETE $src->tr_follows WHERE out = $dst;", {"src": ALICE_P, "dst": BOB_P})]
+
+        calls, _ = await _recorded(recording, alice.remove_relation("tr_follows", bob, reverse=True))
+        assert calls == [("DELETE $src<-tr_follows WHERE in = $dst;", {"src": ALICE_P, "dst": BOB_P})]
+
+        calls, _ = await _recorded(recording, alice.remove_relation(TrFollows, "tr_person:bob"))
+        assert calls == [("DELETE $src->tr_follows WHERE out = $dst;", {"src": ALICE_P, "dst": BOB_P})]
+
+        target = RecordID("tr_product", 7)
+        calls, _ = await _recorded(recording, alice.remove_relation("tr_follows", target))
+        assert calls == [("DELETE $src->tr_follows WHERE out = $dst;", {"src": ALICE_P, "dst": target})]
+        assert calls[0][1]["dst"] is target  # bound as is: an integer id stays reachable
+
+    @pytest.mark.asyncio
+    async def test_remove_relation_bare_id_statement(self, recording: _RecordingClient) -> None:
+        alice = TrPerson(id="alice")
+
+        forward, _ = await _recorded(recording, alice.remove_relation("tr_follows", "bob"))
+        assert forward == [("DELETE $src->tr_follows WHERE record::id(out) = $id;", {"src": ALICE_P, "id": "bob"})]
+
+        backward, _ = await _recorded(recording, alice.remove_relation("tr_follows", "bob", reverse=True))
+        assert backward == [("DELETE $src<-tr_follows WHERE record::id(in) = $id;", {"src": ALICE_P, "id": "bob"})]
+
+        by_class, _ = await _recorded(recording, alice.remove_relation(TrFollows, "bob"))
+        assert by_class == forward
+        by_class_reversed, _ = await _recorded(recording, alice.remove_relation(TrFollows, "bob", reverse=True))
+        assert by_class_reversed == backward
+
+        # Bound verbatim: no identifier rule, no strip, no unquoting.
+        for raw in ["joe@x.com", " bob", "`bob`", "7"]:
+            calls, _ = await _recorded(recording, alice.remove_relation("tr_follows", raw))
+            assert calls == [("DELETE $src->tr_follows WHERE record::id(out) = $id;", {"src": ALICE_P, "id": raw})]
+
+    @pytest.mark.asyncio
+    async def test_remove_all_relations_statements(self, recording: _RecordingClient) -> None:
+        alice = TrPerson(id="alice")
+        edges = ["tr_follows", TrLikes, "tr_follows"]  # de-duplicated, in order
+
+        expected = {
+            "out": "DELETE $src->(tr_follows, tr_likes);",
+            "in": "DELETE $src<-(tr_follows, tr_likes);",
+            "both": "DELETE $src->(tr_follows, tr_likes), $src<-(tr_follows, tr_likes);",
+        }
+        for direction, statement in expected.items():
+            calls, result = await _recorded(recording, alice.remove_all_relations(edges, direction=direction))
+            assert result is None
+            assert calls == [(statement, {"src": ALICE_P})]
+
+        calls, _ = await _recorded(recording, alice.remove_all_relations(("tr_follows", TrLikes)))
+        assert calls == [("DELETE $src->(tr_follows, tr_likes);", {"src": ALICE_P})]
+        calls, _ = await _recorded(recording, alice.remove_all_relations("tr_follows"))
+        assert calls == [("DELETE $src->(tr_follows);", {"src": ALICE_P})]
+        calls, _ = await _recorded(recording, alice.remove_all_relations(TrLikes, "in"))
+        assert calls == [("DELETE $src<-(tr_likes);", {"src": ALICE_P})]
+
+    @pytest.mark.asyncio
+    async def test_get_related_statements(self, recording: _RecordingClient) -> None:
+        alice = TrPerson(id="alice")
+        expected = {
+            "out": ("SELECT VALUE ->tr_follows->? FROM ONLY $src;", "SELECT VALUE ->tr_follows->?.* FROM ONLY $src;"),
+            "in": ("SELECT VALUE <-tr_follows<-? FROM ONLY $src;", "SELECT VALUE <-tr_follows<-?.* FROM ONLY $src;"),
+            "both": (
+                "SELECT VALUE array::concat(->tr_follows->?, <-tr_follows<-?) FROM ONLY $src;",
+                "SELECT VALUE array::concat(->tr_follows->?.*, <-tr_follows<-?.*) FROM ONLY $src;",
+            ),
+        }
+        for direction, (ids_statement, records_statement) in expected.items():
+            calls, result = await _recorded(recording, alice.get_related("tr_follows", direction=direction))
+            assert (calls, result) == ([(ids_statement, {"src": ALICE_P})], [])
+            calls, _ = await _recorded(recording, alice.get_related(TrFollows, direction=direction, model_class=TrPerson))
+            assert calls == [(records_statement, {"src": ALICE_P})]
+
+    @pytest.mark.asyncio
+    async def test_positional_calls_match_keyword_forms(self, recording: _RecordingClient) -> None:
+        """R2: each positional call records exactly what its keyword form records."""
+        alice, bob = TrPerson(id="alice"), TrPerson(id="bob")
+        pairs: list[tuple[Callable[[], Awaitable[Any]], Callable[[], Awaitable[Any]], list[tuple[Any, ...]]]] = [
+            (
+                lambda: alice.relate("tr_follows", bob, True),
+                lambda: alice.relate("tr_follows", bob, reverse=True),
+                [("RELATE tr_person:bob->tr_follows->tr_person:alice;", {})],
+            ),
+            (
+                lambda: alice.relate(TrFollows, bob, True, None, weight=3),
+                lambda: alice.relate(TrFollows, bob, reverse=True, tx=None, weight=3),
+                [("insert_relation", "tr_follows", {"in": BOB_P, "out": ALICE_P, "weight": 3})],
+            ),
+            (
+                lambda: alice.remove_relation("tr_follows", bob, True),
+                lambda: alice.remove_relation("tr_follows", bob, reverse=True),
+                [("DELETE $src<-tr_follows WHERE in = $dst;", {"src": ALICE_P, "dst": BOB_P})],
+            ),
+            (
+                lambda: alice.remove_relation("tr_follows", "bob", True, None),
+                lambda: alice.remove_relation("tr_follows", "bob", reverse=True, tx=None),
+                [("DELETE $src<-tr_follows WHERE record::id(in) = $id;", {"src": ALICE_P, "id": "bob"})],
+            ),
+            (
+                lambda: alice.remove_all_relations(["tr_follows"], "both"),
+                lambda: alice.remove_all_relations(["tr_follows"], direction="both"),
+                [("DELETE $src->(tr_follows), $src<-(tr_follows);", {"src": ALICE_P})],
+            ),
+            (
+                lambda: alice.remove_all_relations(["tr_follows"], "in", None),
+                lambda: alice.remove_all_relations(["tr_follows"], direction="in", tx=None),
+                [("DELETE $src<-(tr_follows);", {"src": ALICE_P})],
+            ),
+            (
+                lambda: alice.get_related("tr_follows", "in", TrPerson),
+                lambda: alice.get_related("tr_follows", direction="in", model_class=TrPerson),
+                [("SELECT VALUE <-tr_follows<-?.* FROM ONLY $src;", {"src": ALICE_P})],
+            ),
+        ]
+        for positional, keyword, expected in pairs:
+            by_position, positional_result = await _recorded(recording, positional())
+            by_keyword, keyword_result = await _recorded(recording, keyword())
+            assert by_position == by_keyword == expected
+            assert type(positional_result) is type(keyword_result)
+
+        edge = await alice.relate(TrFollows, bob, True, None, weight=3)
+        assert type(edge) is TrFollows
+        assert (edge.in_, edge.out, edge.weight) == (BOB_P, ALICE_P, 3)
+        assert edge.id == RecordID("tr_follows", "stub0")
+
+        recording.calls.clear()
+        with pytest.raises(TypeError):
+            await alice.relate("tr_follows", bob, False, None, {"w": 1})  # type: ignore[call-overload]
+        assert recording.calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("call", "error", "match"),
+        [
+            (lambda a: a.remove_all_relations([]), ValueError, "needs at least one edge"),
+            (lambda a: a.remove_all_relations(()), ValueError, "needs at least one edge"),
+            (lambda a: a.remove_all_relations(["tr_follows", "bad-name"]), ValueError, "Invalid edge name"),
+            (lambda a: a.remove_all_relations(["tr_follows", TrPerson]), TypeError, "TrPerson is not an edge model"),
+            (lambda a: a.remove_all_relations([42]), TypeError, "edge must be an edge model class"),
+            (
+                lambda a: a.remove_all_relations("tr_follows", direction="sideways"),
+                ValueError,
+                "direction must be 'out', 'in', or 'both', got 'sideways'",
+            ),
+            (lambda a: a.get_related("tr_follows", direction="sideways"), ValueError, "direction must be"),
+            (lambda a: a.get_related("tr_follows", "both ways"), ValueError, "direction must be"),
+            (lambda a: a.remove_relation("tr_follows", 42), TypeError, "target must be"),
+            (lambda a: a.remove_relation("tr_follows", ""), ValueError, re.escape(BLANK_TARGET)),
+            (lambda a: a.remove_relation("tr_follows", "   "), ValueError, re.escape(BLANK_TARGET)),
+            (lambda a: a.remove_relation(TrFollows, "\t", reverse=True), ValueError, "empty or blank"),
+            (lambda a: a.remove_relation("tr_follows", "a;b:c"), ValueError, "record identifier"),
+            (lambda a: a.remove_relation("bad-name", "bob"), ValueError, "Invalid edge name"),
+            (lambda a: a.remove_relation("tr_follows", TrPerson()), SurrealDbError, "unsaved"),
+            (lambda a: a.relate("tr_follows", "nocolon"), ValueError, "record identifier"),
+            (lambda a: a.relate(TrFollows, "nocolon"), ValueError, "record identifier"),
+            (lambda a: TrPerson().get_related("tr_follows"), SurrealDbError, "unsaved"),
+            (lambda a: TrPerson().remove_relation("tr_follows", "bob"), SurrealDbError, "unsaved"),
+            (lambda a: TrPerson().remove_relation("tr_follows", a), SurrealDbError, "unsaved"),
+            (lambda a: TrPerson().remove_all_relations(["tr_follows"]), SurrealDbError, "unsaved"),
+            (lambda a: TrPerson().relate("tr_follows", a, True), SurrealDbError, "unsaved"),
+        ],
+    )
+    async def test_graph_helpers_validate_before_any_call(
+        self,
+        recording: _RecordingClient,
+        call: Callable[[TrPerson], Awaitable[Any]],
+        error: type[Exception],
+        match: str,
+    ) -> None:
+        with pytest.raises(error, match=match):
+            await call(TrPerson(id="alice"))
+        assert recording.calls == []
+
+    @pytest.mark.asyncio
+    async def test_remove_helpers_queue_in_buffered_tx(self, recording: _RecordingClient) -> None:
+        alice, bob = TrPerson(id="alice"), TrPerson(id="bob")
+        tx = BufferedTransaction(client=None)
+
+        assert await alice.remove_relation("tr_follows", bob, tx=tx) is None
+        assert await alice.remove_all_relations(["tr_follows", "tr_never"], direction="both", tx=tx) is None
+        assert await alice.remove_relation(TrFollows, "bob", reverse=True, tx=tx) is None
+        await alice.remove_relation("tr_follows", "carol", False, tx)  # bare id, positional tx
+
+        assert tx.statements == [
+            "DELETE $t0_src->tr_follows WHERE out = $t0_dst;",
+            "DELETE $t1_src->(tr_follows, tr_never), $t1_src<-(tr_follows, tr_never);",
+            "DELETE $t2_src<-tr_follows WHERE record::id(in) = $t2_id;",
+            "DELETE $t3_src->tr_follows WHERE record::id(out) = $t3_id;",
+        ]
+        assert tx.variables == {
+            "t0_src": ALICE_P,
+            "t0_dst": BOB_P,
+            "t1_src": ALICE_P,
+            "t2_src": ALICE_P,
+            "t2_id": "bob",
+            "t3_src": ALICE_P,
+            "t3_id": "carol",
+        }
+        assert recording.calls == []
+
+    @pytest.mark.asyncio
+    async def test_relate_reverse_queues_in_buffered_tx(self, recording: _RecordingClient) -> None:
+        alice, bob = TrPerson(id="alice"), TrPerson(id="bob")
+        tx = BufferedTransaction(client=None)
+
+        edge = await alice.relate(TrFollows, bob, True, tx, weight=2)
+        rows = await alice.relate("tr_follows", bob, True, tx, since="2025-01-01")
+
+        assert (edge.id, edge.in_, edge.out, edge.weight) == (None, BOB_P, ALICE_P, 2)
+        assert rows == []
+        assert tx.statements == [
+            _queued_guarded_insert("tr_follows", 0),
+            "RELATE tr_person:bob->tr_follows->tr_person:alice SET since = $t1__rd0;",
+        ]
+        assert tx.variables == {"t0_data": {"in": BOB_P, "out": ALICE_P, "weight": 2}, "t1__rd0": "2025-01-01"}
+        assert recording.calls == []
+
+    @pytest.mark.asyncio
+    async def test_relate_edge_fields_merge_and_conflict(self, recording: _RecordingClient) -> None:
+        alice, bob, widget = TrPerson(id="alice"), TrPerson(id="bob"), TrProduct(id="widget")
+
+        refused: list[tuple[Callable[[], Awaitable[Any]], type[Exception], str]] = [
+            (lambda: alice.relate("tr_follows", bob, data={"w": 1}, w=2), TypeError, "both in data= and as keyword"),
+            (
+                lambda: alice.relate(TrPurchased, widget, data={"quantity": 1}, quantity=2),
+                TypeError,
+                "both in data= and as keyword",
+            ),
+            (lambda: alice.relate(TrMemoEdge, widget, data={"memo": "a"}, note="b"), TypeError, "both in data="),
+            (lambda: alice.relate(TrMemoEdge, widget, data={"note": "a"}, memo="b"), TypeError, "both in data="),
+            (lambda: alice.relate(TrPurchased, widget, in_=bob), ValueError, "endpoints"),
+            (lambda: alice.relate(TrPurchased, widget, out=bob), ValueError, "endpoints"),
+            (lambda: alice.relate(TrPurchased, widget, bogus=1), SurrealDbError, "does not declare bogus"),
+            (lambda: alice.relate(TrScoredEdge, widget, double=4), ValueError, "computed field"),
+            (lambda: alice.relate(TrPurchased, widget, quantity=0), ValidationError, "greater than or equal to 1"),
+            (lambda: alice.relate("tr_follows", bob, **{"bad-name": 1}), ValueError, "relation data field name"),
+        ]
+        for call, error, match in refused:
+            recording.calls.clear()
+            with pytest.raises(error, match=match):
+                await call()
+            assert recording.calls == []
+
+        calls, rows = await _recorded(recording, alice.relate("tr_follows", bob, since="2025-01-01"))
+        assert rows == []
+        assert calls == [("RELATE tr_person:alice->tr_follows->tr_person:bob SET since = $_rd0;", {"_rd0": "2025-01-01"})]
+
+        calls, _ = await _recorded(recording, alice.relate("tr_follows", bob, reverse=True, since="2025-01-01"))
+        assert calls == [("RELATE tr_person:bob->tr_follows->tr_person:alice SET since = $_rd0;", {"_rd0": "2025-01-01"})]
+
+        calls, _ = await _recorded(recording, alice.relate("tr_follows", bob, since="2025-01-01", data={"weight": 2}))
+        assert calls == [
+            (
+                "RELATE tr_person:alice->tr_follows->tr_person:bob SET weight = $_rd0, since = $_rd1;",
+                {"_rd0": 2, "_rd1": "2025-01-01"},
+            )
+        ]
+
+        calls, _ = await _recorded(recording, alice.relate("tr_follows", bob, data={"reverse": True}))
+        assert calls == [("RELATE tr_person:alice->tr_follows->tr_person:bob SET reverse = $_rd0;", {"_rd0": True})]
+
+        calls, edge = await _recorded(recording, alice.relate(TrPurchased, widget, quantity=2, price=9.5))
+        assert calls == [("insert_relation", "tr_purchased", {"in": ALICE_P, "out": WIDGET, "quantity": 2, "price": 9.5})]
+        assert (type(edge), edge.quantity, edge.price) == (TrPurchased, 2, 9.5)
+
+        calls, memo = await _recorded(recording, alice.relate(TrMemoEdge, widget, memo="m"))
+        assert calls == [("insert_relation", "tr_memo", {"in": ALICE_P, "out": WIDGET, "memo": "m"})]
+        assert memo.note == "m"
+
+
+def _people_pairs(rows: list[Any]) -> list[tuple[str, str]]:
+    return sorted((str(row["in"]), str(row["out"])) for row in rows)
+
+
+async def _edge_ids(client: Any) -> list[str]:
+    rows = [*await _stored(client, "tr_follows"), *await _stored(client, "tr_likes")]
+    return sorted(str(row["id"]) for row in rows)
+
+
+class TestGraphParityE2E:
+    @pytest.mark.asyncio
+    async def test_relate_reverse_string_and_typed(self) -> None:
+        async with orm_client(*GRAPH_TABLES) as client:
+            alice, bob, _widget = await _nodes()
+
+            rows = await alice.relate("tr_follows", bob, reverse=True)
+            assert [(row["in"], row["out"]) for row in rows] == [(BOB_P, ALICE_P)]
+            assert await alice.get_related("tr_follows", direction="in") == [BOB_P]
+            assert await alice.get_related("tr_follows", direction="out") == []
+            assert await bob.get_related("tr_follows") == [ALICE_P]
+
+            edge = await alice.relate(TrFollows, bob, reverse=True, weight=3)
+            assert type(edge) is TrFollows
+            assert isinstance(edge.id, RecordID)
+            assert (edge.in_, edge.out, edge.weight) == (BOB_P, ALICE_P, 3)
+
+            positional = await alice.relate(TrFollows, bob, True)
+            assert (positional.in_, positional.out) == (BOB_P, ALICE_P)
+            assert await alice.get_related("tr_follows", "out") == []
+            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:bob;", {}) == [ALICE_P] * 3
+
+    @pytest.mark.asyncio
+    async def test_remove_relation_reverse(self) -> None:
+        async with orm_client(*GRAPH_TABLES) as client:
+            alice, bob, _widget = await _nodes()
+
+            for edge in ["tr_follows", TrFollows]:
+                await bob.relate("tr_follows", alice)
+                await alice.remove_relation(edge, bob)  # alice -> bob: none, so nothing to remove
+                assert _people_pairs(await _stored(client, "tr_follows")) == [("tr_person:bob", "tr_person:alice")]
+                await alice.remove_relation(edge, bob, reverse=True)
+                assert await _stored(client, "tr_follows") == []
+
+            await bob.relate("tr_follows", alice)
+            await alice.remove_relation("tr_follows", bob, True)  # positional reverse
+            assert await _stored(client, "tr_follows") == []
+
+    @pytest.mark.asyncio
+    async def test_relate_keyword_edge_fields(self) -> None:
+        async with orm_client(*GRAPH_TABLES) as client:
+            alice, bob, widget = await _nodes()
+
+            rows = await alice.relate("tr_follows", bob, since="2025-01-01", data={"weight": 2})
+            assert [(row["since"], row["weight"]) for row in rows] == [("2025-01-01", 2)]
+
+            edge = await alice.relate(TrPurchased, widget, quantity=2, price=9.5)
+            assert (type(edge), edge.quantity, edge.price) == (TrPurchased, 2, 9.5)
+            assert [(row["quantity"], row["price"]) for row in await _stored(client, "tr_purchased")] == [(2, 9.5)]
+
+            await alice.relate("tr_likes", widget, data={"reverse": True})
+            assert [(row["in"], row["out"], row["reverse"]) for row in await _stored(client, "tr_likes")] == [
+                (ALICE_P, WIDGET, True)
+            ]
+
+            with pytest.raises(TypeError, match="both in data= and as keyword"):
+                await alice.relate("tr_follows", bob, data={"weight": 1}, weight=2)
+            with pytest.raises(TypeError, match="both in data= and as keyword"):
+                await alice.relate(TrPurchased, widget, data={"quantity": 1}, quantity=2)
+            assert len(await _stored(client, "tr_follows")) == 1
+            assert len(await _stored(client, "tr_purchased")) == 1
+
+    @pytest.mark.asyncio
+    async def test_remove_all_relations_list_and_directions(self) -> None:
+        async with orm_client(*GRAPH_TABLES) as client:
+            alice, bob, widget = await _nodes()
+            carol = await TrPerson(id="carol", name="Carol").save()
+
+            async def fixture() -> None:
+                for table in ("tr_follows", "tr_likes"):
+                    with contextlib.suppress(NotFoundError):  # 3.x: not created yet on the first call
+                        await client.query(f"DELETE {table};", {})
+                await TrFollows(id="ab", in_=alice, out=bob).save()
+                await TrFollows(id="ca", in_=carol, out=alice).save()
+                await TrFollows(id="aa", in_=alice, out=alice).save()
+                await TrLikes(id="aw", in_=alice, out=widget).save()
+                await TrFollows(id="bc", in_=bob, out=carol).save()
+
+            edges = ["tr_follows", TrLikes, "tr_never"]
+            expected = {
+                "out": ["tr_follows:bc", "tr_follows:ca"],
+                "in": ["tr_follows:ab", "tr_follows:bc", "tr_likes:aw"],
+                "both": ["tr_follows:bc"],
+            }
+            for direction, remaining in expected.items():
+                await fixture()
+                assert len(await _edge_ids(client)) == 5
+                await alice.remove_all_relations(edges, direction=direction)
+                assert await _edge_ids(client) == remaining, direction
+
+            await fixture()
+            await alice.remove_all_relations(edges, "both")  # positional direction
+            assert await _edge_ids(client) == ["tr_follows:bc"]
+
+            await fixture()
+            with pytest.raises(TypeError, match="not an edge model"):
+                await alice.remove_all_relations(["tr_follows", TrPerson], direction="both")  # type: ignore[list-item]
+            with pytest.raises(ValueError, match="at least one edge"):
+                await alice.remove_all_relations([], direction="both")
+            assert len(await _edge_ids(client)) == 5  # nothing deleted
+
+    @pytest.mark.asyncio
+    async def test_get_related_both_is_out_then_in_neighbours(self) -> None:
+        async with orm_client(*GRAPH_TABLES):
+            alice, bob, _widget = await _nodes()
+            carol = await TrPerson(id="carol", name="Carol").save()
+            await alice.relate("tr_follows", bob)
+            await carol.relate("tr_follows", alice)
+
+            people = await alice.get_related("tr_follows", direction="both", model_class=TrPerson)
+            assert all(type(p) is TrPerson for p in people)
+            assert sorted(p.get_raw_id() for p in people) == ["bob", "carol"]
+            ids = await alice.get_related("tr_follows", "both")
+            assert Counter(map(str, ids)) == Counter(["tr_person:bob", "tr_person:carol"])
+
+            await alice.relate(TrFollows, alice)  # a self-loop: alice once per direction, never more
+            ids = await alice.get_related(TrFollows, direction="both")
+            assert Counter(map(str, ids)) == Counter(["tr_person:bob", "tr_person:carol", "tr_person:alice", "tr_person:alice"])
+            people = await alice.get_related("tr_follows", "both", TrPerson)
+            assert sorted(p.get_raw_id() for p in people) == ["alice", "alice", "bob", "carol"]
+
+            # Out-neighbours first, then in-neighbours (the order inside each group is unspecified).
+            out = await alice.get_related("tr_follows", "out")
+            incoming = await alice.get_related("tr_follows", "in")
+            assert Counter(map(str, ids[: len(out)])) == Counter(map(str, out))
+            assert Counter(map(str, ids[len(out) :])) == Counter(map(str, incoming))
+
+    @pytest.mark.asyncio
+    async def test_graph_helpers_for_non_identifier_id(self) -> None:
+        async with orm_client(*GRAPH_TABLES):
+            _alice, _bob, widget = await _nodes()
+            joe = await TrPerson(id="joe@x.com", name="Joe").save()
+            joe_id = RecordID("tr_person", "joe@x.com")
+
+            edge = await joe.relate(TrPurchased, widget)
+            assert edge.in_ == joe_id
+            assert await joe.get_related(TrPurchased) == [WIDGET]
+            assert [p.get_raw_id() for p in await joe.get_related(TrPurchased, "out", TrProduct)] == ["widget"]
+            assert [p.get_raw_id() for p in await widget.get_related(TrPurchased, "in", TrPerson)] == ["joe@x.com"]
+
+            await joe.remove_relation(TrPurchased, widget)
+            assert await joe.get_related(TrPurchased) == []
+
+            await joe.relate(TrFollows, widget)
+            await widget.remove_relation("tr_follows", joe, reverse=True)
+            assert await joe.get_related("tr_follows", "both") == []
+
+            await joe.relate(TrPurchased, widget)
+            await joe.remove_all_relations([TrPurchased], "both")
+            assert await TrPurchased.objects().count() == 0
+
+    @pytest.mark.asyncio
+    async def test_missing_edge_table_is_a_silent_noop(self) -> None:
+        async with orm_client(*GRAPH_TABLES):
+            alice, bob, _widget = await _nodes()
+
+            assert await alice.remove_relation("tr_never", bob) is None
+            assert await alice.remove_relation("tr_never", bob, reverse=True) is None
+            assert await alice.remove_relation("tr_never", "bob") is None
+            assert await alice.remove_relation("tr_never", "bob", reverse=True) is None
+            assert await alice.remove_all_relations(["tr_never"], direction="both") is None
+            assert await alice.remove_all_relations("tr_never") is None
+            assert await alice.get_related("tr_never", direction="both") == []
+
+    @pytest.mark.asyncio
+    async def test_remove_relation_bare_id_any_table(self) -> None:
+        async with orm_client(*GRAPH_TABLES) as client:
+            alice, bob, _widget = await _nodes()
+            carol = await TrPerson(id="carol", name="Carol").save()
+            pbob = await TrProduct(id="bob", name="Bob the product").save()
+            await alice.relate("tr_follows", bob)
+            await alice.relate("tr_follows", pbob)
+            await alice.relate("tr_follows", carol)
+            await client.query("CREATE tr_product:7; RELATE tr_person:alice->tr_follows->tr_product:7;", {})
+
+            async def outs() -> list[str]:
+                rows = await client.query("SELECT VALUE out FROM tr_follows WHERE in = $a;", {"a": ALICE_P})
+                return sorted(map(str, rows))
+
+            assert len(await outs()) == 4
+            await alice.remove_relation("tr_follows", "bob")  # tr_person:bob and tr_product:bob
+            assert await outs() == sorted([str(RecordID("tr_person", "carol")), "tr_product:7"])
+
+            await alice.remove_relation("tr_follows", "7")  # a string never matches an integer id
+            assert await outs() == sorted([str(RecordID("tr_person", "carol")), "tr_product:7"])
+
+            await alice.remove_relation(TrFollows, RecordID("tr_product", 7))  # a RecordID reaches it
+            assert await outs() == [str(RecordID("tr_person", "carol"))]
+
+    @pytest.mark.asyncio
+    async def test_remove_relation_bare_id_reverse(self) -> None:
+        async with orm_client(*GRAPH_TABLES) as client:
+            alice, bob, _widget = await _nodes()
+            carol = await TrPerson(id="carol", name="Carol").save()
+            await bob.relate("tr_follows", alice)
+            await carol.relate("tr_follows", alice)
+            await alice.relate("tr_follows", bob)
+
+            await alice.remove_relation("tr_follows", "bob", reverse=True)
+
+            assert _people_pairs(await _stored(client, "tr_follows")) == [
+                ("tr_person:alice", "tr_person:bob"),
+                ("tr_person:carol", "tr_person:alice"),
+            ]
+
+
+class TestGraphParityTransactionsE2E:
+    @pytest.mark.asyncio
+    async def test_remove_in_interactive_tx_rolls_back_and_commits(self) -> None:
+        async with orm_client(*GRAPH_TABLES) as client:
+            if not await _native_txn_supported():
+                pytest.skip("requires SurrealDB 3.x native transactions")
+            alice, bob, _widget = await _nodes()
+            carol = await TrPerson(id="carol", name="Carol").save()
+            await alice.relate("tr_follows", bob)
+            await carol.relate("tr_follows", alice)
+
+            reached = False
+            with pytest.raises(RuntimeError, match="roll back"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    assert tx.is_interactive
+                    await alice.remove_relation("tr_follows", bob, tx=tx)
+                    assert await TrFollows.objects(tx=tx).filter(in_=alice).count() == 0
+                    assert await TrFollows.objects().filter(in_=alice).count() == 1  # outside: not yet
+                    reached = True
+                    raise RuntimeError("roll back")
+            assert reached
+            assert _people_pairs(await _stored(client, "tr_follows")) == [
+                ("tr_person:alice", "tr_person:bob"),
+                ("tr_person:carol", "tr_person:alice"),
+            ]
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await alice.remove_all_relations(["tr_follows", "tr_never"], direction="both", tx=tx)
+                assert await TrFollows.objects(tx=tx).count() == 0
+            assert await _stored(client, "tr_follows") == []
+
+            await alice.relate("tr_follows", bob)
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await alice.remove_relation(TrFollows, "bob", False, tx)  # bare id, positional tx
+            assert await _stored(client, "tr_follows") == []
+
+    @pytest.mark.asyncio
+    async def test_remove_in_buffered_tx_applies_at_commit(self) -> None:
+        async with http_orm_client(*GRAPH_TABLES) as client:
+            alice, bob, _widget = await _nodes()
+            carol = await TrPerson(id="carol", name="Carol").save()
+            await alice.relate("tr_follows", bob)
+            await carol.relate("tr_follows", alice)
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert not tx.is_interactive
+                assert await alice.remove_relation("tr_follows", bob, tx=tx) is None
+                assert await TrFollows.objects().count() == 2  # queued, not run
+            assert _people_pairs(await _stored(client, "tr_follows")) == [("tr_person:carol", "tr_person:alice")]
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await alice.remove_all_relations(["tr_follows", "tr_never"], direction="both", tx=tx)
+                assert await TrFollows.objects().count() == 1
+            assert await _stored(client, "tr_follows") == []
+
+    @pytest.mark.asyncio
+    async def test_remove_in_buffered_tx_rolled_back_with_failing_statement(self) -> None:
+        async with http_orm_client(*GRAPH_TABLES) as client:
+            alice, bob, _widget = await _nodes()
+            await alice.relate("tr_follows", bob)
+
+            with pytest.raises(SurrealDbError, match="rolled back"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await alice.remove_relation("tr_follows", bob, tx=tx)
+                    await alice.remove_all_relations(["tr_follows"], "both", tx)
+                    await TrPerson(id="alice", name="Again").save(tx=tx)  # alice exists: CREATE fails at commit
+
+            assert _people_pairs(await _stored(client, "tr_follows")) == [("tr_person:alice", "tr_person:bob")]
+            assert await alice.get_related("tr_follows") == [BOB_P]
+
+    @pytest.mark.asyncio
+    async def test_relate_reverse_in_buffered_tx(self) -> None:
+        async with http_orm_client(*GRAPH_TABLES) as client:
+            alice, bob, _widget = await _nodes()
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                edge = await alice.relate(TrFollows, bob, reverse=True, tx=tx, weight=4)
+                assert (edge.id, edge.in_, edge.out, edge.weight) == (None, BOB_P, ALICE_P, 4)
+                assert await alice.relate("tr_follows", bob, True, tx) == []
+                assert await _stored(client, "tr_follows") == []
+
+            stored = await _stored(client, "tr_follows")
+            assert _people_pairs(stored) == [("tr_person:bob", "tr_person:alice")] * 2
+            assert sorted(row.get("weight", 0) for row in stored) == [0, 4]
+            assert await bob.get_related("tr_follows") == [ALICE_P, ALICE_P]
+
+    @pytest.mark.asyncio
+    async def test_remove_bare_id_in_buffered_tx(self) -> None:
+        async with http_orm_client(*GRAPH_TABLES) as client:
+            alice, bob, _widget = await _nodes()
+            pbob = await TrProduct(id="bob", name="Bob the product").save()
+            await alice.relate("tr_follows", bob)
+            await alice.relate("tr_follows", pbob)
+
+            async def count() -> int:
+                rows = await client.query("SELECT VALUE id FROM tr_follows WHERE in = $a;", {"a": ALICE_P})
+                return len(rows)
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await alice.remove_relation("tr_follows", "bob", tx=tx)
+                assert await count() == 2  # queued, not run
+            assert await count() == 0

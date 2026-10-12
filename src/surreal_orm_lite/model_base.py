@@ -1747,6 +1747,29 @@ class BaseSurrealModel(BaseModel):
             f"target must be a BaseSurrealModel instance, a RecordID or a 'table:id' string, got {type(target).__name__}"
         )
 
+    @staticmethod
+    def _merge_edge_fields(
+        data: Mapping[str, Any] | None,
+        edge_data: Mapping[str, Any],
+        to_name: Callable[[str], str],
+    ) -> dict[str, Any]:
+        """Merge ``relate()``'s ``data=`` with its keyword edge fields (v0.22.0).
+
+        ``to_name`` reads a key as the field it names: ``to_py_field`` on the typed path, so a
+        column alias (``memo``) and its Python name (``note``) are the same field, and the
+        identity on the string path. Every later check runs on the merged mapping.
+
+        Raises:
+            TypeError: a field given both in ``data=`` and as a keyword argument.
+        """
+        given = dict(data or {})
+        both = {to_name(key) for key in given} & {to_name(key) for key in edge_data}
+        if both:
+            raise TypeError(
+                f"relate() got edge field(s) {sorted(both)} both in data= and as keyword arguments; pass each one once."
+            )
+        return {**given, **edge_data}
+
     @overload
     async def relate(
         self,
@@ -1756,6 +1779,7 @@ class BaseSurrealModel(BaseModel):
         tx: Transaction | None = None,
         *,
         data: Mapping[str, Any] | None = None,
+        **edge_data: Any,
     ) -> _E: ...
 
     @overload
@@ -1767,6 +1791,7 @@ class BaseSurrealModel(BaseModel):
         tx: Transaction | None = None,
         *,
         data: Mapping[str, Any] | None = None,
+        **edge_data: Any,
     ) -> list[dict[str, Any]]: ...
 
     async def relate(
@@ -1777,80 +1802,92 @@ class BaseSurrealModel(BaseModel):
         tx: Transaction | None = None,
         *,
         data: Mapping[str, Any] | None = None,
+        **edge_data: Any,
     ) -> "BaseSurrealEdge | list[dict[str, Any]]":
         """
-        Create a graph relation (an edge) from this record to the target.
+        Create a graph relation (an edge) between this record and the target.
 
         ``edge`` is an edge model class or an edge table name:
 
         - **An edge model class** (a :class:`~surreal_orm_lite.edge.BaseSurrealEdge` subclass,
           v0.22.0) — the edge is validated, created through the edge's ``save()``
           (``INSERT RELATION``, the ``save`` signals) and returned, typed: ``id`` is the
-          server's ``RecordID``, ``in_`` this record, ``out`` the target. Both are bound as
-          record ids, so a node saved with an id such as ``joe@x.com`` relates like it saves.
-          ``data`` holds the edge's fields; before any call it may not name an endpoint
-          (``in``/``in_``/``out``), a computed field or a field the model does not declare
-          (unless it sets ``extra="allow"``). A ``server_fields`` field named in ``data`` is
-          written instead of being left to the server.
-        - **An edge table name** — the v0.6.0 ``RELATE`` (any target table), ``data`` written
-          with ``SET``; returns the rows the database sent back.
+          server's ``RecordID``, ``in_``/``out`` the two records. Both are bound as record ids,
+          so a node saved with an id such as ``joe@x.com`` relates like it saves. The edge
+          fields may not name an endpoint (``in``/``in_``/``out``), a computed field or a field
+          the model does not declare (unless it sets ``extra="allow"``); this is checked before
+          any call. A ``server_fields`` field named there is written instead of being left to
+          the server.
+        - **An edge table name** — the v0.6.0 ``RELATE`` (any target table), the edge fields
+          written with ``SET``; returns the rows the database sent back.
 
-        Parameters follow the full SurrealDB-ORM's order, ``(edge, target, reverse, tx)``, each
-        by position or by keyword; ``data`` is keyword-only.
+        Parameters follow the full SurrealDB-ORM's order, each by position or by keyword:
+        ``relate(edge, target, reverse, tx)`` is ``relate(edge, target, reverse=…, tx=…)``.
+        ``data`` is keyword-only. Edge fields go in ``data=`` (lite spelling) or as keyword
+        arguments (full ORM spelling), or both: a field given both ways is a ``TypeError``. A
+        field named like a parameter of this method — ``self``, ``edge``, ``target``,
+        ``data``, ``reverse`` or ``tx`` — cannot be a keyword argument (Python binds it to
+        the parameter): pass it in ``data=`` (``data={"reverse": True}``).
 
         Args:
             edge: An edge model class, or the relation/edge table name (e.g. ``"follows"``).
             target: A saved model instance, a ``RecordID`` or a ``"table:id"`` string.
-            reverse: Reserved for ``target -> edge -> self``; ``True`` raises
-                ``NotImplementedError`` for now.
+            reverse: ``False`` (default) relates ``self -> edge -> target``; ``True`` relates
+                ``target -> edge -> self`` (the typed edge's ``in_`` is then the target).
             tx: Optional transaction. On an interactive one (WebSocket + SurrealDB 3.x) the
                 edge is written at once and comes back as usual; on a buffered one it is
                 written at commit: the typed form returns the edge with ``id`` ``None``, the
                 string form ``[]``.
-            data: Optional data stored on the edge.
+            data: Optional fields stored on the edge.
+            **edge_data: More fields stored on the edge, merged with ``data``.
 
         Returns:
             The created edge (edge model class), or the created relation rows (table name).
 
         Raises:
             TypeError: ``edge`` is a model class that is not an edge model, or neither a class
-                nor a string; ``target`` is of another type.
-            ValueError: a malformed name or ``"table:id"`` string; ``data`` names an endpoint or
-                a computed field (typed form).
-            SurrealDbError: an unsaved source or target; ``data`` names an undeclared field
+                nor a string; ``target`` is of another type; a field is given both in ``data``
+                and as a keyword argument.
+            ValueError: a malformed name or ``"table:id"`` string; the fields name an endpoint
+                or a computed field (typed form).
+            SurrealDbError: an unsaved source or target; the fields name an undeclared field
                 (typed form); the write is refused.
-            pydantic.ValidationError: ``data`` is invalid for the edge model (nothing written).
+            pydantic.ValidationError: the fields are invalid for the edge model (nothing
+                written).
 
         Example::
 
-            edge = await user.relate(Purchased, product, data={"quantity": 2})  # -> Purchased
-            await user.relate("follows", other_user)
-            await user.relate("purchased", product, data={"quantity": 2})
+            edge = await user.relate(Purchased, product, quantity=2)  # -> Purchased
+            edge = await user.relate(Purchased, product, data={"quantity": 2})  # lite spelling
+            await user.relate("follows", other_user, since="2025-01-01")
+            await table.relate("created", creator, reverse=True)  # creator -> created -> table
+            await table.relate("created", creator, True)  # same call, the full ORM's order
             async with SurrealDBConnectionManager.transaction() as tx:
                 await user.relate(Follows, other_user, tx=tx)
         """
-        if reverse:
-            raise NotImplementedError("relate(reverse=True) is not implemented yet")
         if isinstance(edge, type) and issubclass(edge, BaseSurrealModel) and edge.__surreal_edge__:
-            return await self._relate_typed(edge, target, data or {}, tx)
+            fields = self._merge_edge_fields(data, edge_data, edge.to_py_field)
+            return await self._relate_typed(edge, target, fields, reverse, tx)
 
         edge_name = self._edge_name(edge)
+        fields = self._merge_edge_fields(data, edge_data, str)  # a column name is the field name
         source = self._get_thing()
         target_thing = self._resolve_target_thing(target)
+        start, end = (target_thing, source) if reverse else (source, target_thing)
 
-        if data:
+        if fields:
             set_parts: list[str] = []
             variables: dict[str, Any] = {}
-            for i, (key, value) in enumerate(data.items()):
+            for i, (key, value) in enumerate(fields.items()):
                 validate_field_name(key, "relation data field")
                 var_name = f"_rd{i}"
                 set_parts.append(f"{key} = ${var_name}")
                 variables[var_name] = value
             set_clause = " SET " + ", ".join(set_parts)
-            query = f"RELATE {source}->{edge_name}->{target_thing}{set_clause};"
+            query = f"RELATE {start}->{edge_name}->{end}{set_clause};"
         else:
             variables = {}
-            query = f"RELATE {source}->{edge_name}->{target_thing};"
+            query = f"RELATE {start}->{edge_name}->{end};"
 
         if tx is not None:
             rows = await tx.add(remove_quotes_for_variables(query), variables)
@@ -1865,13 +1902,14 @@ class BaseSurrealModel(BaseModel):
         edge: type[_E],
         target: object,
         fields: Mapping[str, Any],
+        reverse: bool,
         tx: Transaction | None,
     ) -> _E:
         """``relate(EdgeModel, …)``: validate, create through the edge's ``save()``, return it.
 
         Every check runs before any call: the source and the target (bound as record ids), then
         ``fields`` — keys in either vocabulary (Python name or column), translated to Python
-        names — and the model's own validation.
+        names — and the model's own validation. ``reverse`` swaps the endpoints.
         """
         source = self._graph_source()
         destination = self._graph_target(target)
@@ -1880,118 +1918,228 @@ class BaseSurrealModel(BaseModel):
         if endpoints:
             raise ValueError(
                 f"relate(): `in`/`out` are the endpoints of edge `{edge.__name__}`: relate() takes them from "
-                f"this record and the target, so data= cannot name them (got {', '.join(endpoints)})."
+                f"this record and the target, so its edge fields cannot name them (got {', '.join(endpoints)})."
             )
         edge._reject_computed_writes(names, "relate()")
         edge._reject_undeclared_writes(names)
-        instance = edge.model_validate({**fields, "in": source, "out": destination})
+        start, end = (destination, source) if reverse else (source, destination)
+        instance = edge.model_validate({**fields, "in": start, "out": end})
         return await instance._save_naming(names, tx=tx)
+
+    @staticmethod
+    def _edge_names(edge: object) -> list[str]:
+        """The edge tables a ``remove_all_relations()`` argument names (v0.22.0).
+
+        A ``list`` or ``tuple`` names each of its items (de-duplicated, in order), anything else
+        one edge; every item goes through :meth:`_edge_name`.
+
+        Raises:
+            ValueError: an empty list or tuple, or an invalid edge name.
+            TypeError: an item that is neither an edge model class nor a string.
+        """
+        if isinstance(edge, (list, tuple)):
+            names = list(dict.fromkeys(BaseSurrealModel._edge_name(item) for item in edge))
+            if not names:
+                raise ValueError("remove_all_relations() needs at least one edge")
+            return names
+        return [BaseSurrealModel._edge_name(edge)]
+
+    @staticmethod
+    def _check_direction(direction: str) -> None:
+        """Refuse a graph direction other than ``"out"``, ``"in"`` or ``"both"``."""
+        if direction not in ("out", "in", "both"):
+            raise ValueError(f"direction must be 'out', 'in', or 'both', got '{direction}'")
+
+    @staticmethod
+    async def _run_graph_delete(statement: str, variables: dict[str, Any], tx: Transaction | None) -> None:
+        """Run a graph-path ``DELETE`` now, or queue it on ``tx``.
+
+        Outside a transaction a ``NotFoundError`` is a silent no-op (the v0.7.0 contract: on 3.x
+        it is only raised for a source record whose own table does not exist). Inside one the
+        transaction layer's errors apply, so such a statement fails the transaction.
+        """
+        if tx is not None:
+            await tx.add(statement, variables)
+            return
+        client = await SurrealDBConnectionManager.get_client()
+        with contextlib.suppress(NotFoundError):
+            await client.query(statement, variables)
 
     async def remove_relation(
         self,
         edge: "str | type[BaseSurrealEdge]",
         target: "BaseSurrealModel | RecordID | str",
+        reverse: bool = False,
+        tx: Transaction | None = None,
     ) -> None:
         """
-        Remove a specific relation between this record and the target.
+        Remove the relations of one edge table between this record and the target.
+
+        Parameters follow the full SurrealDB-ORM's order, each by position or by keyword:
+        ``remove_relation(edge, target, reverse, tx)`` is
+        ``remove_relation(edge, target, reverse=…, tx=…)``.
+
+        The statement is a graph-path ``DELETE`` with bound record ids
+        (``DELETE $src->edge WHERE out = $dst``): it removes exactly the edges graph traversal
+        sees — a plain record that merely carries ``in``/``out`` fields is not an edge and is
+        not matched. An edge table that was never created is a no-op, also in a transaction.
+
+        ``target`` is one of:
+
+        - a saved model instance, a ``RecordID`` or a ``"table:id"`` string — that record;
+        - a **bare record id** (a string without ``:``, e.g. ``"abc123"``) — bound verbatim and
+          compared **as a string** with the id of the edge's ``out`` (``in`` with
+          ``reverse=True``), so it matches that id in **any** table linked through the edge
+          table (``Player:abc123`` and ``Bot:abc123`` alike) and never an integer record id
+          (``"7"`` does not match ``Player:7``). Pass the instance or a ``RecordID`` to pin the
+          table or to reach an integer id. An empty or blank string raises ``ValueError``.
 
         Args:
-            edge: An edge model class (v0.22.0), or the relation/edge table name.
-            target: The target model instance, ``RecordID`` or ``"table:id"`` string.
+            edge: An edge model class, or the relation/edge table name.
+            target: The other record, as above.
+            reverse: ``False`` (default) removes ``self -> edge -> target``; ``True`` removes
+                ``target -> edge -> self``.
+            tx: Optional transaction. On an interactive one (WebSocket + SurrealDB 3.x) the
+                statement runs now: the removal is visible to ``objects(tx=)`` reads and a
+                rollback restores the edges. On a buffered one (2.x, or HTTP) it is queued,
+                applied at commit and rolled back with the batch. Inside a transaction, a source
+                record whose own table does not exist fails the statement on 3.x (and so the
+                transaction); outside one it is a silent no-op.
+
+        Raises:
+            TypeError: ``edge`` is not an edge model class or a string; ``target`` is of
+                another type.
+            ValueError: an invalid edge name, a malformed ``"table:id"`` string, or an empty or
+                blank target.
+            SurrealDbError: an unsaved source or target.
 
         Example::
 
             await user.remove_relation("follows", other_user)
-            await user.remove_relation("follows", "User:bob")
-            await user.remove_relation(Follows, other_user)
+            await user.remove_relation(Follows, "User:bob")
+            await table.remove_relation("created", creator, reverse=True)  # creator -> table
+            await table.remove_relation("created", creator, True)  # same call, positional
+            await table.remove_relation("has_player", "abc123")  # bare id, any table
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await user.remove_relation(Follows, other_user, tx=tx)
         """
         edge_name = self._edge_name(edge)
-        source = self._get_thing()
-        target_thing = self._resolve_target_thing(target)
-
-        query = f"DELETE {edge_name} WHERE in = {source} AND out = {target_thing};"
-        client = await SurrealDBConnectionManager.get_client()
-        with contextlib.suppress(NotFoundError):
-            await client.query(query, {})
+        source = self._graph_source()
+        arrow, column = ("<-", "in") if reverse else ("->", "out")
+        if isinstance(target, str) and ":" not in target:
+            if not target.strip():
+                raise ValueError(
+                    "remove_relation() target must not be empty or blank: pass a model instance, a RecordID, "
+                    "a 'table:id' string or a bare record id."
+                )
+            statement = f"DELETE $src{arrow}{edge_name} WHERE record::id({column}) = $id;"
+            variables: dict[str, Any] = {"src": source, "id": target}
+        else:
+            statement = f"DELETE $src{arrow}{edge_name} WHERE {column} = $dst;"
+            variables = {"src": source, "dst": self._graph_target(target)}
+        await self._run_graph_delete(statement, variables, tx)
 
     async def remove_all_relations(
         self,
-        edge: "str | type[BaseSurrealEdge]",
-        *,
+        edge: "str | type[BaseSurrealEdge] | Sequence[str | type[BaseSurrealEdge]]",
         direction: str = "out",
+        tx: Transaction | None = None,
     ) -> None:
         """
-        Remove all relations of a given type from or to this record.
+        Remove every relation of the given edge table(s) from and/or to this record.
+
+        Parameters follow the full SurrealDB-ORM's order, each by position or by keyword:
+        ``remove_all_relations(edge, direction, tx)`` is
+        ``remove_all_relations(edge, direction=…, tx=…)``.
+
+        One graph-path ``DELETE`` with a bound record id (``DELETE $src->(e1, e2)``): it removes
+        exactly the edges graph traversal sees — a plain record that merely carries
+        ``in``/``out`` fields is not an edge and is not matched — a self-loop once, and an edge
+        table that was never created is a no-op, also in a transaction.
 
         Args:
-            edge: An edge model class (v0.22.0), or the relation/edge table name.
-            direction: ``"out"`` removes outgoing relations (default),
-                       ``"in"`` removes incoming relations,
-                       ``"both"`` removes all relations involving this record.
+            edge: An edge model class or an edge table name, or a list (or tuple) of them.
+            direction: ``"out"`` removes outgoing relations (default), ``"in"`` incoming ones,
+                ``"both"`` every relation involving this record.
+            tx: Optional transaction. On an interactive one (WebSocket + SurrealDB 3.x) the
+                statement runs now: the removal is visible to ``objects(tx=)`` reads and a
+                rollback restores the edges. On a buffered one (2.x, or HTTP) it is queued,
+                applied at commit and rolled back with the batch. Inside a transaction, a source
+                record whose own table does not exist fails the statement on 3.x (and so the
+                transaction); outside one it is a silent no-op.
+
+        Raises:
+            ValueError: an invalid direction or edge name, or an empty list.
+            TypeError: an edge that is neither an edge model class nor a string.
+            SurrealDbError: an unsaved record.
 
         Example::
 
             await user.remove_all_relations("follows", direction="out")
-            await user.remove_all_relations(Follows, direction="both")
+            await user.remove_all_relations(Follows, "both")  # positional direction
+            await table.remove_all_relations(["has_player", HasAction, "has_state"])
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await user.remove_all_relations(["likes", "blocks"], direction="both", tx=tx)
         """
-        edge_name = self._edge_name(edge)
-        thing = self._get_thing()
-
-        if direction == "out":
-            query = f"DELETE {edge_name} WHERE in = {thing};"
-        elif direction == "in":
-            query = f"DELETE {edge_name} WHERE out = {thing};"
-        elif direction == "both":
-            query = f"DELETE {edge_name} WHERE in = {thing} OR out = {thing};"
-        else:
-            raise ValueError(f"direction must be 'out', 'in', or 'both', got '{direction}'")
-
-        client = await SurrealDBConnectionManager.get_client()
-        with contextlib.suppress(NotFoundError):
-            await client.query(query, {})
+        self._check_direction(direction)
+        names = ", ".join(self._edge_names(edge))
+        source = self._graph_source()
+        paths = {"out": f"$src->({names})", "in": f"$src<-({names})", "both": f"$src->({names}), $src<-({names})"}
+        await self._run_graph_delete(f"DELETE {paths[direction]};", {"src": source}, tx)
 
     async def get_related(
         self,
         edge: "str | type[BaseSurrealEdge]",
-        *,
         direction: str = "out",
         model_class: type["BaseSurrealModel"] | None = None,
     ) -> list[Any]:
         """
         Get related records through a relation edge.
 
+        Parameters follow the full SurrealDB-ORM's order, each by position or by keyword:
+        ``get_related(edge, direction, model_class)`` is
+        ``get_related(edge, direction=…, model_class=…)``.
+
         Args:
-            edge: An edge model class (v0.22.0), or the relation/edge table name.
-            direction: ``"out"`` for outgoing relations (default),
-                       ``"in"`` for incoming relations.
+            edge: An edge model class, or the relation/edge table name.
+            direction: ``"out"`` for outgoing relations (default), ``"in"`` for incoming ones,
+                ``"both"`` for the out-neighbours followed by the in-neighbours (one query; a
+                neighbour linked by k edges appears k times, this record only through a
+                self-loop, once per direction; the order inside each group is unspecified).
             model_class: Optional model class to deserialize results into.
 
         Returns:
-            A list of related records (model instances if model_class is provided,
-            otherwise raw dicts/values).
+            A list of related records: model instances if ``model_class`` is given, otherwise
+            the neighbours' record ids (``RecordID``).
+
+        Raises:
+            ValueError: an invalid direction or edge name.
+            TypeError: ``edge`` is not an edge model class or a string.
+            SurrealDbError: an unsaved record.
 
         Example::
 
             following = await user.get_related("follows", direction="out", model_class=User)
-            followers = await user.get_related("follows", direction="in", model_class=User)
+            followers = await user.get_related("follows", "in", User)  # positional
+            everyone = await user.get_related(Follows, direction="both", model_class=User)
         """
+        self._check_direction(direction)
         edge_name = self._edge_name(edge)
-        thing = self._get_thing()
+        source = self._graph_source()
 
         # With a model class the caller wants whole records, so project them in the traversal
         # itself (``->edge->?.*``) instead of fetching ids and then selecting them: same
         # result, one round-trip instead of two (issue #156). Verified on 2.6.x and 3.x.
         projection = "?.*" if model_class is not None else "?"
-
-        if direction == "out":
-            query = f"SELECT VALUE ->{edge_name}->{projection} FROM ONLY {thing};"
-        elif direction == "in":
-            query = f"SELECT VALUE <-{edge_name}<-{projection} FROM ONLY {thing};"
-        else:
-            raise ValueError(f"direction must be 'out' or 'in', got '{direction}'")
+        outgoing = f"->{edge_name}->{projection}"
+        incoming = f"<-{edge_name}<-{projection}"
+        # "both": the full ORM's two queries in one; `<->edge<->?` would return both ends of
+        # every edge, so this record once per edge (measured on 2.7.0, 3.1.5 and 3.3.3).
+        selected = {"out": outgoing, "in": incoming, "both": f"array::concat({outgoing}, {incoming})"}[direction]
+        query = f"SELECT VALUE {selected} FROM ONLY $src;"
 
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.query(query, {})
+        results = await client.query(query, {"src": source})
 
         if not isinstance(results, list) or len(results) == 0:
             return []
