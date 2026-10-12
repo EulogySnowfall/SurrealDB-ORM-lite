@@ -56,6 +56,15 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound="BaseSurrealModel")
 
+
+class _StreamStopped(Exception):  # noqa: N818 - a signal, not an error
+    """Raised inside the stream once stop() was called, so no further request is sent.
+
+    Private, and never a ``StopAsyncIteration``: that one is an ordinary ``Exception`` to every
+    ``except Exception`` on the way out, and would be mistaken for a failed request.
+    """
+
+
 #: What ``changes(since=…)`` accepts: a cursor, a moment, an ISO-8601 string, or ``None`` (now).
 Since = int | datetime | str | None
 
@@ -124,6 +133,9 @@ def feed_events(model: type[T], entry: dict[str, Any]) -> list[ModelChangeEvent[
     ``INCLUDE ORIGINAL`` ``{"current": <record>, "update": [<reverse patches>]}`` for an update
     and, on 3.3.x only, ``{"delete": {"id": …, "original": <record>}}``. Anything else — the
     ``define_table`` entry a definition leaves — is not a record change and is skipped.
+
+    ``raw`` is always a record-shaped dict carrying the ``id``: the record after an update, the
+    delete payload for a delete.
     """
     events: list[ModelChangeEvent[T]] = []
     for item in entry.get("changes") or ():
@@ -138,7 +150,9 @@ def feed_events(model: type[T], entry: dict[str, Any]) -> list[ModelChangeEvent[
                     instance=instance,
                     record_id=_record_id(current),
                     changed_fields=patched_fields(model, update),
-                    raw=item,
+                    # The record, as in every other branch, so ``event.raw["id"]`` works whether or
+                    # not the table has INCLUDE ORIGINAL; the patches are what changed_fields reads.
+                    raw=current,
                     validation_error=error,
                 )
             )
@@ -265,10 +279,17 @@ class ChangeModelStream(Generic[T]):
         With ``since=None`` "now" is the moment of this call, so a write made between ``start()``
         and the first read is delivered.
 
+        A stream stopped while starting returns without sending anything more; iterating it ends.
+
         :raises SurrealDbError: if the table does not exist or has no change feed.
         """
         if self._major is not None:
             return self
+        with contextlib.suppress(_StreamStopped):
+            await self._start()
+        return self
+
+    async def _start(self) -> None:
         version = await self._with_retry(lambda client: client.version())
         match = _VERSION.search(str(version))
         major = int(match.group(1)) if match else 3
@@ -286,7 +307,6 @@ class ChangeModelStream(Generic[T]):
         else:
             self._cursor = await self._end_of_feed_2x()
         self._major = major
-        return self
 
     def __aiter__(self) -> ChangeModelStream[T]:
         return self
@@ -301,7 +321,12 @@ class ChangeModelStream(Generic[T]):
                     self._cursor = after
                 return event  # type: ignore[no-any-return]
             await self.start()
-            full = await self._poll()
+            if self._stopped:
+                raise StopAsyncIteration
+            try:
+                full = await self._poll()
+            except _StreamStopped:
+                raise StopAsyncIteration from None
             if not self._pending and not full:
                 await self._pause(self._poll_interval)
 
@@ -410,7 +435,7 @@ class ChangeModelStream(Generic[T]):
         """One section of an ``INFO`` statement, or ``None`` when it cannot be read."""
         try:
             info = await self._with_retry(lambda client: client.query(statement, {}))
-        except SurrealDbConnectionError:
+        except (SurrealDbConnectionError, _StreamStopped):
             raise
         except Exception as exc:
             logger.debug("Could not run %s to check %s for a change feed: %s", statement, self._table, exc)
@@ -425,6 +450,8 @@ class ChangeModelStream(Generic[T]):
         delay = float(self.reconnect_delay)
         attempt = 0
         while True:
+            if self._stopped:
+                raise _StreamStopped
             attempt += 1
             client: Any = None
             try:
@@ -453,6 +480,4 @@ class ChangeModelStream(Generic[T]):
                 delay,
             )
             await self._pause(delay)
-            if self._stopped:
-                raise StopAsyncIteration
             delay = min(delay * 2, float(self.reconnect_max_delay))

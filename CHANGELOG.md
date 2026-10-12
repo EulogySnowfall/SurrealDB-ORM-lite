@@ -50,7 +50,9 @@ server lines.
   they waited forever. Deliberate teardowns (`kill()`, `close_connection()`, …) still end streams
   cleanly and never trigger a resubscribe.
 - **`get_client()` replaces a dropped WebSocket client** (signed in, session replayed) instead of
-  handing back a dead one that failed every call until `reconnect()`.
+  handing back a dead one that failed every call until `reconnect()`. The dead client's socket is
+  closed, which matters when the SDK's receive loop died on an undecodable frame with the socket
+  still open: the server would otherwise keep that session's live queries running.
 - **Opening a client is serialised per event loop.** Concurrent `get_client()` calls with no
   usable client share one new connection; before, each opened its own and the extras leaked —
   a live query started on one could never be killed.
@@ -64,12 +66,19 @@ server lines.
 
 - **A resubscribe never changes the identity a live query runs under.** A live query is
   evaluated with the permissions of whoever opened it, and a new connection comes back as the
-  identity the manager replays. The manager stamps each connection whenever it sets its
-  identity, and tracks every change to what a reconnect would restore (stored token,
-  `invalidate()`, `clear_session()`, `set_connection()` and the `set_*` setters). A stream opened
-  under an identity that cannot be replayed (`store=False`), or whose replayed identity changed
-  since, ends with `SurrealDbAuthenticationError` instead of resubscribing — possibly as the
-  configured root user.
+  identity the manager replays. The manager stamps each connection with a fingerprint of what it
+  was built from (url, namespace, database, user, stored token) whenever it sets its identity. A
+  stream opened under an identity that cannot be replayed (`store=False`), or whose fingerprint
+  is no longer the replay identity, ends with `SurrealDbAuthenticationError` instead of
+  resubscribing — possibly as the configured root user. Settings changed and then restored count
+  as no change.
+- **A dropped connection never silently comes back as the configured user.** If it ran as an
+  identity the manager does not store (`signin`/`signup`/`authenticate` with `store=False`),
+  every call on that event loop raises `SurrealDbAuthenticationError` until the application signs
+  in or authenticates again, calls `invalidate()`, or `reconnect()`/`close_connection()`.
+- **A network failure while the stored session is replayed no longer erases it.** It is reported
+  as a retryable `SurrealDbConnectionError`; only a token the server actually refuses is
+  forgotten (the behaviour since v0.16.0).
 - **Reconnect loops do not retry a server that answered "no".** `get_client()` still raises
   `SurrealDbConnectionError` when the configured credentials are rejected, but live streams and
   change feeds raise it at once instead of retrying it for minutes.

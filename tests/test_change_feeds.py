@@ -235,7 +235,9 @@ class TestFeedEventsUnit:
         assert event.action == LiveAction.UPDATE
         assert event.instance.name == "new"
         assert event.changed_fields == ["name"]
-        assert event.raw == item
+        # The record, as in the other branches (PR #201 review): `raw["id"]` must not depend on
+        # whether the table has INCLUDE ORIGINAL.
+        assert event.raw == item["current"]
 
     def test_include_original_delete_with_the_original_record(self) -> None:
         """3.3.x carries `original` on a delete; 2.x and 3.1.x do not."""
@@ -550,3 +552,42 @@ class TestReviewChangeFeedE2E:
             rest = await _take(stream, 2)
 
             assert _ids(first + rest) == ["h0", "h1", "h2"]
+
+
+class TestReviewStoppedStartE2E:
+    @pytest.mark.asyncio
+    async def test_stop_during_a_starting_backoff_sends_nothing_more_and_raises_nothing(self) -> None:
+        """PR #201 review: the stopped signal used to be a StopAsyncIteration, swallowed as "INFO not
+        permitted" — start() then carried on querying after stop()."""
+        from tests._proxy import CuttableProxy
+
+        async with CuttableProxy() as proxy, feed_client(url=proxy.url()):
+            client = await SurrealDBConnectionManager.get_client()
+            stream = Fed.objects().changes(poll_interval=0.05)
+            stream.reconnect_delay = 10.0
+            proxy.refuse()
+            proxy.cut()
+            async with asyncio.timeout(2):
+                while not is_dead(client):
+                    await asyncio.sleep(0.005)
+
+            starting = asyncio.ensure_future(stream.start())
+            await asyncio.sleep(0.3)
+            stream.stop()
+            async with asyncio.timeout(1):
+                assert await starting is stream  # returns, no stray StopAsyncIteration
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+            proxy.accept()
+
+    @pytest.mark.asyncio
+    async def test_the_info_check_lets_the_stopped_signal_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from surreal_orm_lite import changefeed
+
+        async def _stopped(self: Any, operation: Any) -> Any:
+            raise changefeed._StreamStopped
+
+        stream = Fed.objects().changes()
+        monkeypatch.setattr(changefeed.ChangeModelStream, "_with_retry", _stopped)
+        with pytest.raises(changefeed._StreamStopped):
+            await stream._check_changefeed()

@@ -1229,13 +1229,13 @@ async with Order.objects().filter(status="open").live(on_reconnect=catch_up) as 
 - **Never under another identity.** A live query runs with the permissions of whoever opened it,
   and a new connection comes back as the identity the manager replays (the stored session
   token, else the configured user). If the stream was opened under an identity a new connection
-  cannot restore (`signin(..., store=False)`), or what a new connection would restore has
-  changed since (`signin`/`signup`/`authenticate` with the default `store=True`, `invalidate()`,
-  `clear_session()`, `set_connection()` or a `set_*` setter, a refused session replay), the
-  stream ends with `SurrealDbAuthenticationError` instead of resubscribing as somebody else.
-  Minting a token for someone else with `store=False` after the stream started does not block it.
-  The check is per connection, so another event loop's identity changes do not leak in. Identity
-  changes made directly on the SDK client are not seen by the ORM.
+  cannot restore (`signin(..., store=False)`), or what a new connection would restore is no
+  longer that identity (another stored token, other connection settings, a refused session
+  replay), the stream ends with `SurrealDbAuthenticationError` instead of resubscribing as
+  somebody else. The comparison is on the settings themselves, so changing them and changing them
+  back — or `signin()` then `invalidate()` — counts as no change. It is per connection, so another
+  event loop's identity changes do not leak in. Identity changes made directly on the SDK client
+  are not seen by the ORM.
 - **`auto_resubscribe=False`** ends the stream on a drop with `SurrealDbConnectionError`, as does
   any secondary reader from `subscribe_live(uuid)`, which is tied to one uuid. Before v0.21.0
   they all waited forever.
@@ -1249,6 +1249,16 @@ The connection manager benefits too: `get_client()` now replaces a dropped WebSo
 instead of handing back a dead one, and concurrent callers share one new connection. A request
 that was already in flight when the socket dropped still fails — with the SDK's own `KeyError` —
 because retrying arbitrary queries is planned for v0.40.0.
+
+**One exception: an identity the manager does not store.** `signin()`, `signup()` and
+`authenticate()` with `store=False` change the connection's own identity (that is the SDK's
+behaviour) without telling the manager to restore it. If that connection drops, a new one could
+only come back as the configured user — a silent change of privileges. So every call on that
+event loop raises `SurrealDbAuthenticationError` until the application chooses: sign in or
+authenticate again, `invalidate()`, or `reconnect()`/`close_connection()` to continue as the
+configured user. Live streams on that connection end the same way. To mint tokens for other
+users without touching the shared connection, use the model-level auth (section 19), which runs
+on its own short-lived connections.
 
 #### Migrating from SurrealDB-ORM
 

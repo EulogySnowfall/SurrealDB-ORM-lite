@@ -530,7 +530,7 @@ class LiveStream:
         self._resubscribing: asyncio.Task[None] | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         # The identity stamp of the client the live query was opened on (see _check_identity).
-        self._identity: tuple[int, bool] | None = None
+        self._identity: tuple[str, bool] | None = None
 
     @property
     def table(self) -> str:
@@ -653,7 +653,11 @@ class LiveStream:
             client: Any = None
             try:
                 self._check_identity()
-                client = await SurrealDBConnectionManager.get_client()
+                client = await SurrealDBConnectionManager._acquire_client(
+                    still_wanted=lambda: self._still_wanted(iterator, queue, old_id)
+                )
+                if not self._still_wanted(iterator, queue, old_id):
+                    return
                 # Again once connected: the replay itself, or a concurrent signin, may have moved it.
                 self._check_identity(client)
                 new_id = await self._start_on(client)
@@ -663,6 +667,8 @@ class LiveStream:
                     raise
                 error: Exception = SurrealDbConnectionError("the connection dropped during the request")
             except Exception as exc:
+                if not self._still_wanted(iterator, queue, old_id):
+                    return  # torn down meanwhile: whatever failed, nobody is waiting for it
                 if not is_connection_failure(exc, client):
                     self._give_up(exc)
                     return
@@ -708,10 +714,11 @@ class LiveStream:
         stream started under. Otherwise the stream ends with an authentication error instead
         of carrying on with different permissions, possibly the configured root user's.
 
-        The connection manager stamps each client with ``(replay_epoch, replayable)`` whenever it
-        sets the client's identity; the epoch moves whenever what a new connection would be
-        identified as changes. So: the client the stream started on must have been replayable,
-        the epoch must not have moved since, and the new *client* must carry that same stamp.
+        The connection manager stamps each client with ``(fingerprint, replayable)`` whenever it
+        sets the client's identity, the fingerprint covering what a connection is built from (url,
+        namespace, database, user, stored token). So: the client the stream started on must have
+        been replayable, its fingerprint must still be the replay identity, and the new *client*
+        must carry that same stamp. Settings changed and then restored count as no change.
 
         :raises SurrealDbAuthenticationError: the stream started under an identity a reconnect
             cannot restore (``store=False``), or that identity is no longer the one a reconnect
@@ -728,7 +735,7 @@ class LiveStream:
                 "store=False). It is not resubscribed: a new connection would run it with "
                 "different permissions."
             )
-        moved = started[0] != SurrealDBConnectionManager._current_replay_epoch()
+        moved = started[0] != SurrealDBConnectionManager._replay_identity()
         if moved or (client is not None and SurrealDBConnectionManager._identity_of(client) != started):
             raise SurrealDbAuthenticationError(
                 f"The identity a new connection comes back as changed since the live query on "
