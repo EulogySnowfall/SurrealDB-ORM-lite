@@ -23,7 +23,7 @@ This ORM is designed to:
 
 | Dependency   | Version                           |
 | ------------ | --------------------------------- |
-| Python       | 3.11+                             |
+| Python       | 3.11+ (tested on 3.11 to 3.15)    |
 | SurrealDB    | 2.6.x / 2.7.x or 3.2.x / 3.3.x    |
 | Official SDK | surrealdb[pydantic]>=2.0.0,<3.0.0 |
 | Pydantic     | >=2.13.4                          |

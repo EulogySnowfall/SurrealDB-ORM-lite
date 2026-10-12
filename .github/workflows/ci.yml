@@ -49,7 +49,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ['3.11', '3.12', '3.13', '3.14']
+        python-version: ['3.11', '3.12', '3.13', '3.14', '3.15']
         # The two supported server lines. 3.1.x was dropped in v0.14.0 in favour of 3.2.x —
         # 3.2 is its own line, not a drop-in for 3.1 (SurrealDB 3.2.0 regressed uncorrelated
         # sub-SELECTs combining ORDER BY and LIMIT, EulogySnowfall/SurrealDB-ORM#147), so it
