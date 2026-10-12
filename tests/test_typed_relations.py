@@ -27,8 +27,18 @@ line, server refusals become ORM errors (``SurrealDbNotFoundError`` for an ``ENF
 and a write the table's ``PERMISSIONS`` refuse — which the server answers with no row and no error —
 raises instead of returning an edge without an id.
 
+Edges inside a transaction (spec §4.5) follow the v0.9.0 strategy of every write, through the
+guarded statement and ``tx.add()``: on an **interactive** transaction (WebSocket + 3.x) the row comes
+back at once — ``edge.id`` set, visible to ``objects(tx=)``, gone after a rollback, a duplicate or a
+refused write raising inside the block; on a **buffered** one (2.x, or HTTP on any line) the edge is
+queued, ``edge.id`` stays ``None`` (an auto id is allowed, unlike a node's buffered ``save()``), it
+is written at commit and rolled back with the batch, and a duplicate explicit id fails the commit.
+``pre_save`` fires at call time, ``post_save`` only after a successful commit.
+
 E2E tables are dedicated (``tr_*``), dropped on entry and exit by ``orm_client``; nodes are created
-inside the ``async with orm_client(...)`` block. Same behaviour on SurrealDB 2.x and 3.x.
+inside the ``async with orm_client(...)`` block. Same behaviour on SurrealDB 2.x and 3.x, except the
+transaction strategy the server supports (interactive tests skip on 2.x; buffered ones run over HTTP
+on both lines).
 """
 
 import asyncio
@@ -58,6 +68,7 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite.enum import LiveAction
 from surreal_orm_lite.query_set import QuerySet
+from surreal_orm_lite.transaction import BufferedTransaction
 from surreal_orm_lite.utils import build_filter_condition, coerce_endpoint, parse_lookup
 from tests.conftest import orm_client
 
@@ -728,6 +739,34 @@ async def http_orm_client(*tables: str) -> AsyncIterator[Any]:
         await SurrealDBConnectionManager.close_connection()
 
 
+async def _define_tables(client: Any, *tables: str) -> None:
+    """Define ``tables`` before a transaction meant to fail, so that it never creates one implicitly.
+
+    Measured on 2026-10-12: on SurrealDB 2.7.0, a table first created implicitly inside a
+    transaction that then rolls back is left half-known to the server — later writes store their
+    rows but never define the table, so ``INFO FOR DB`` misses it and ``REMOVE TABLE`` fails ("does
+    not exist"), leaving rows behind for the next test. 3.3.3 and 3.1.5 do not. Any write does it
+    (``CREATE``, ``RELATE``, ``INSERT RELATION``); a ``DEFINE TABLE`` heals it.
+    """
+    for table in tables:
+        await client.query(f"DEFINE TABLE IF NOT EXISTS {table};", {})
+
+
+async def _native_txn_supported() -> bool:
+    """True if the server runs native interactive transactions (SurrealDB 3.x).
+
+    The probe of ``tests/test_transactions.py``: ``client.begin()`` then ``cancel()``.
+    """
+    client = await SurrealDBConnectionManager.get_client()
+    try:
+        txn = await client.begin()
+    except Exception:
+        return False
+    with contextlib.suppress(Exception):
+        await client.cancel(txn)
+    return True
+
+
 class _InsertRelationSpy:
     """Stands in for the connected SDK client's ``insert_relation()``: records each call, then forwards it."""
 
@@ -1022,6 +1061,43 @@ def _connect_root_ws() -> None:
     SurrealDBConnectionManager.set_connection(f"ws://{host}:{port}/rpc", "root", "root", "ns", "db")
 
 
+@contextlib.asynccontextmanager
+async def _perm_edge_record_user() -> AsyncIterator[None]:
+    """Connected over WebSocket as a fresh record user of ``tr_edge_acct``.
+
+    As root first: ``tr_perm`` is (re)defined as a relation table whose ``PERMISSIONS`` let a
+    record user create an edge only when ``quantity > 1`` (and select every edge), and the access
+    is defined. On exit, as root again: the access and both tables are removed.
+    """
+    _connect_root_ws()
+    try:
+        root = await SurrealDBConnectionManager.get_client()
+        with contextlib.suppress(Exception):
+            await root.query("REMOVE TABLE tr_perm;", {})
+        await root.query("DEFINE TABLE tr_perm TYPE RELATION PERMISSIONS FOR select FULL, FOR create WHERE quantity > 1;", {})
+        await TrEdgeUser.define_access()
+        await TrEdgeUser.signup(email=f"{uuid4().hex}@example.test", password="s3cret-passphrase", bind=True)
+        yield
+    finally:
+        await SurrealDBConnectionManager.unset_connection()
+        _connect_root_ws()
+        with contextlib.suppress(Exception):
+            root = await SurrealDBConnectionManager.get_client()
+            await root.query("REMOVE ACCESS tr_edge_acct ON DATABASE;", {})
+            await root.query("REMOVE TABLE tr_perm;", {})
+            await root.query("REMOVE TABLE tr_edge_user;", {})
+        await SurrealDBConnectionManager.unset_connection()
+
+
+async def _stored_perm_quantities_as_root() -> list[Any]:
+    """Reconnect as root (the record user may not see what it did not write) and read ``tr_perm``."""
+    await SurrealDBConnectionManager.unset_connection()
+    _connect_root_ws()
+    root = await SurrealDBConnectionManager.get_client()
+    rows = await root.query("SELECT VALUE quantity FROM tr_perm;", {})
+    return rows if isinstance(rows, list) else []
+
+
 class TestEdgePermissionsE2E:
     @pytest.mark.asyncio
     async def test_save_refused_by_permissions_raises(self) -> None:
@@ -1032,39 +1108,247 @@ class TestEdgePermissionsE2E:
         async def on_post(sender: Any, instance: Any, created: bool, **kwargs: Any) -> None:
             saved.append(instance.id)
 
-        _connect_root_ws()
         try:
-            root = await SurrealDBConnectionManager.get_client()
-            with contextlib.suppress(Exception):
-                await root.query("REMOVE TABLE tr_perm;", {})
-            await root.query(
-                "DEFINE TABLE tr_perm TYPE RELATION PERMISSIONS FOR select FULL, FOR create WHERE quantity > 1;", {}
-            )
-            await TrEdgeUser.define_access()
-            await TrEdgeUser.signup(email=f"{uuid4().hex}@example.test", password="s3cret-passphrase", bind=True)
+            async with _perm_edge_record_user():
+                a, w = RecordID("tr_person", "a"), RecordID("tr_product", "w")
+                with pytest.raises(SurrealDbError, match="no record returned"):
+                    await TrPermEdge(in_=a, out=w, quantity=1).save()  # auto id: insert_relation()
+                with pytest.raises(SurrealDbError, match="no record returned"):
+                    await TrPermEdge(id="refused", in_=a, out=w, quantity=1).save()  # explicit id: the guard
+                assert saved == []
 
-            a, w = RecordID("tr_person", "a"), RecordID("tr_product", "w")
-            with pytest.raises(SurrealDbError, match="no record returned"):
-                await TrPermEdge(in_=a, out=w, quantity=1).save()  # auto id: insert_relation()
-            with pytest.raises(SurrealDbError, match="no record returned"):
-                await TrPermEdge(id="refused", in_=a, out=w, quantity=1).save()  # explicit id: the guard
-            assert saved == []
+                allowed = await TrPermEdge(in_=a, out=w, quantity=2).save()  # the same user may create this one
+                assert isinstance(allowed.id, RecordID)
+                assert saved == [allowed.id]
 
-            allowed = await TrPermEdge(in_=a, out=w, quantity=2).save()  # the same user may create this one
-            assert isinstance(allowed.id, RecordID)
-            assert saved == [allowed.id]
-
-            await SurrealDBConnectionManager.unset_connection()
-            _connect_root_ws()
-            root = await SurrealDBConnectionManager.get_client()
-            assert await root.query("SELECT VALUE quantity FROM tr_perm;", {}) == [2]
+                assert await _stored_perm_quantities_as_root() == [2]
         finally:
             post_save.disconnect(on_post, TrPermEdge)
-            await SurrealDBConnectionManager.unset_connection()
-            _connect_root_ws()
-            with contextlib.suppress(Exception):
-                root = await SurrealDBConnectionManager.get_client()
-                await root.query("REMOVE ACCESS tr_edge_acct ON DATABASE;", {})
-                await root.query("REMOVE TABLE tr_perm;", {})
-                await root.query("REMOVE TABLE tr_edge_user;", {})
-            await SurrealDBConnectionManager.unset_connection()
+
+    @pytest.mark.asyncio
+    async def test_interactive_tx_refused_write_raises_and_rolls_back(self) -> None:
+        """Inside an interactive transaction a refused create raises in the block, rolling the batch back (§4.3.4)."""
+        saved: list[Any] = []
+
+        @post_save.connect(TrPermEdge)
+        async def on_post(sender: Any, instance: Any, created: bool, **kwargs: Any) -> None:
+            saved.append(instance.id)
+
+        try:
+            async with _perm_edge_record_user():
+                if not await _native_txn_supported():
+                    pytest.skip("requires SurrealDB 3.x native transactions")
+                a, w = RecordID("tr_person", "a"), RecordID("tr_product", "w")
+                reached = False
+                with pytest.raises(SurrealDbError, match="no record returned"):
+                    async with SurrealDBConnectionManager.transaction() as tx:
+                        assert tx.is_interactive
+                        allowed = await TrPermEdge(in_=a, out=w, quantity=2).save(tx=tx)
+                        assert isinstance(allowed.id, RecordID)  # accepted: its row came back in the block
+                        await TrPermEdge(in_=a, out=w, quantity=1).save(tx=tx)
+                        reached = True
+                assert not reached  # raised by save(), not at commit
+                assert saved == []  # post_save waits for a commit that never happens
+
+                assert await _stored_perm_quantities_as_root() == []  # the accepted edge is rolled back too
+        finally:
+            post_save.disconnect(on_post, TrPermEdge)
+
+
+# ==================== Task 5 — edges inside transactions (spec §4.5) ====================
+
+
+class TestEdgeTransactionStatements:
+    """What a buffered transaction queues for an edge (no server: nothing runs before commit)."""
+
+    @pytest.mark.asyncio
+    async def test_buffered_save_queues_guarded_statement(self) -> None:
+        tx = BufferedTransaction()
+        auto = await TrPurchased(in_=ALICE_P, out=WIDGET, quantity=2).save(tx=tx)
+        explicit = await TrFollows(id="f1", in_=ALICE_P, out=BOB_P).save(tx=tx)
+
+        assert auto.id is None  # an auto id is allowed on a buffered transaction; no row yet
+        assert explicit.id == "f1"
+        # The guarded statement, its `$data` renamed per statement; `$before`/`$after` are the
+        # statement's own parameters and are left alone.
+        assert tx.statements == [
+            f"INSERT RELATION INTO {table} $t{n}_data RETURN VALUE IF $before != NONE "
+            f"{{ THROW 'Database record `' + <string> $before.id + '` already exists' }} ELSE {{ $after }};"
+            for n, table in enumerate(("tr_purchased", "tr_follows"))
+        ]
+        assert tx.variables == {
+            "t0_data": {"in": ALICE_P, "out": WIDGET, "quantity": 2, "price": 0.0},
+            "t1_data": {"in": ALICE_P, "out": BOB_P, "weight": 1, "id": RecordID("tr_follows", "f1")},
+        }
+
+    @pytest.mark.asyncio
+    async def test_buffered_save_checks_the_id_before_queueing(self) -> None:
+        tx = BufferedTransaction()
+        with pytest.raises(ValueError, match="belongs to table 'other'"):
+            await TrPurchased(id=RecordID("other", "x"), in_=ALICE_P, out=WIDGET).save(tx=tx)
+        assert tx.statements == []
+
+
+class TestEdgeTransactionsE2E:
+    @pytest.mark.asyncio
+    async def test_interactive_tx_returns_row_and_rolls_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with orm_client(*EDGE_TABLES) as client:
+            if not await _native_txn_supported():
+                pytest.skip("requires SurrealDB 3.x native transactions")
+            alice, bob, widget = await _nodes()
+            spy = _spy_insert_relation(monkeypatch, client)
+
+            reached = False
+            with pytest.raises(RuntimeError, match="roll back"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    assert tx.is_interactive
+                    edge = await TrPurchased(in_=alice, out=widget, quantity=2).save(tx=tx)
+                    assert isinstance(edge.id, RecordID)
+                    assert edge.id.table_name == "tr_purchased"
+                    seen = await TrPurchased.objects(tx=tx).filter(in_=alice).exec()
+                    assert [(e.id, e.in_, e.out, e.quantity) for e in seen] == [(edge.id, ALICE_P, WIDGET, 2)]
+                    reached = True
+                    raise RuntimeError("roll back")
+            assert reached
+            assert await _stored(client, "tr_purchased") == []
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                kept = await TrFollows(id="f1", in_=alice, out=bob, weight=3).save(tx=tx)
+                assert kept.id == RecordID("tr_follows", "f1")
+                assert await TrFollows.objects(tx=tx).filter(out="tr_person:bob").count() == 1
+            assert spy.calls == []  # under tx=, the guarded statement runs through tx.add()
+            stored = await _stored(client, "tr_follows")
+            assert [(row["id"], row["in"], row["out"], row["weight"]) for row in stored] == [
+                (RecordID("tr_follows", "f1"), ALICE_P, BOB_P, 3)
+            ]
+            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
+
+    @pytest.mark.asyncio
+    async def test_interactive_duplicate_explicit_id_raises_in_block(self) -> None:
+        async with orm_client(*EDGE_TABLES) as client:
+            if not await _native_txn_supported():
+                pytest.skip("requires SurrealDB 3.x native transactions")
+            alice, bob, widget = await _nodes()
+            await TrPurchased(id="p1", in_=alice, out=widget, quantity=2).save()
+
+            reached = False
+            with pytest.raises(SurrealDbError, match="already exists"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TrFollows(in_=alice, out=bob).save(tx=tx)
+                    await TrPurchased(id="p1", in_=alice, out=widget, quantity=5).save(tx=tx)
+                    reached = True
+            assert not reached  # raised by tx.add(), inside the block
+
+            assert await _stored(client, "tr_follows") == []  # rolled back with the batch
+            stored = await _stored(client, "tr_purchased")
+            assert [(row["id"], row["quantity"]) for row in stored] == [(RecordID("tr_purchased", "p1"), 2)]
+
+    @pytest.mark.asyncio
+    async def test_buffered_tx_writes_at_commit(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with http_orm_client(*EDGE_TABLES) as client:
+            alice, bob, widget = await _nodes()
+            spy = _spy_insert_relation(monkeypatch, client)
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert not tx.is_interactive
+                auto = await TrPurchased(in_=alice, out=widget, quantity=2).save(tx=tx)
+                explicit = await TrFollows(id="f1", in_=alice, out=bob, weight=3).save(tx=tx)
+                assert auto.id is None  # unlike a node's buffered save(), no explicit id is needed
+                assert explicit.id == "f1"
+                assert await _stored(client, "tr_purchased") == []  # queued, not run
+                assert await _stored(client, "tr_follows") == []
+
+            assert spy.calls == []
+            assert auto.id is None  # nothing is read back at commit
+            purchased = await _stored(client, "tr_purchased")
+            assert [(row["in"], row["out"], row["quantity"]) for row in purchased] == [(ALICE_P, WIDGET, 2)]
+            follows = await _stored(client, "tr_follows")
+            assert [(row["id"], row["in"], row["out"], row["weight"]) for row in follows] == [
+                (RecordID("tr_follows", "f1"), ALICE_P, BOB_P, 3)
+            ]
+            # Relations, not plain records carrying `in`/`out` fields.
+            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
+            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
+
+    @pytest.mark.asyncio
+    async def test_buffered_tx_rolls_back_with_failing_statement(self) -> None:
+        async with http_orm_client(*EDGE_TABLES) as client:
+            alice, _bob, widget = await _nodes()
+            await _define_tables(client, "tr_purchased")
+
+            with pytest.raises(SurrealDbError, match="rolled back"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TrPurchased(in_=alice, out=widget).save(tx=tx)
+                    await TrPurchased(id="p1", in_=alice, out=widget).save(tx=tx)
+                    await TrPerson(id="alice", name="Again").save(tx=tx)  # alice exists: CREATE fails at commit
+
+            assert await _stored(client, "tr_purchased") == []
+            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == []
+            assert (await TrPerson.objects().get("alice")).name == "Alice"
+
+    @pytest.mark.asyncio
+    async def test_buffered_duplicate_explicit_id_fails_commit(self) -> None:
+        async with http_orm_client(*EDGE_TABLES) as client:
+            alice, bob, widget = await _nodes()
+            await TrPurchased(id="p1", in_=alice, out=widget, quantity=2).save()
+            await _define_tables(client, "tr_follows")
+
+            reached = False
+            with pytest.raises(SurrealDbError, match="already exists"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TrFollows(in_=alice, out=bob).save(tx=tx)
+                    await TrPurchased(id="p1", in_=alice, out=widget, quantity=5).save(tx=tx)
+                    reached = True
+            assert reached  # queued without error: the duplicate is found at commit
+
+            assert await _stored(client, "tr_follows") == []  # the whole batch is rolled back
+            stored = await _stored(client, "tr_purchased")
+            assert [(row["id"], row["quantity"]) for row in stored] == [(RecordID("tr_purchased", "p1"), 2)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("transport", ["ws", "http"])
+    async def test_post_save_deferred_to_commit(self, transport: str) -> None:
+        """``pre_save`` at call time, ``post_save`` after a successful commit only — on either strategy.
+
+        Over WebSocket the transaction is interactive on 3.x and buffered on 2.x; over HTTP it is
+        buffered on both lines.
+        """
+        events: list[tuple[str, Any]] = []
+
+        @pre_save.connect(TrPurchased)
+        async def on_pre(sender: Any, instance: Any, **kwargs: Any) -> None:
+            events.append(("pre_save", instance.id))
+
+        @post_save.connect(TrPurchased)
+        async def on_post(sender: Any, instance: Any, created: bool, **kwargs: Any) -> None:
+            events.append(("post_save", created))
+
+        connect = orm_client if transport == "ws" else http_orm_client
+        try:
+            async with connect(*EDGE_TABLES) as client:
+                alice, _bob, widget = await _nodes()
+
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    edge = await TrPurchased(in_=alice, out=widget).save(tx=tx)
+                    assert events == [("pre_save", None)]
+                assert events == [("pre_save", None), ("post_save", True)]
+                assert isinstance(edge.id, RecordID) is tx.is_interactive  # buffered: no row came back
+
+                events.clear()
+                with pytest.raises(RuntimeError, match="roll back"):
+                    async with SurrealDBConnectionManager.transaction() as tx:
+                        await TrPurchased(in_=alice, out=widget).save(tx=tx)
+                        raise RuntimeError("roll back")
+                assert events == [("pre_save", None)]
+
+                await TrPurchased(id="dup", in_=alice, out=widget).save()
+                events.clear()
+                with pytest.raises(SurrealDbError, match="already exists"):
+                    async with SurrealDBConnectionManager.transaction() as tx:
+                        await TrPurchased(id="dup", in_=alice, out=widget, quantity=2).save(tx=tx)
+                assert events == [("pre_save", "dup")]  # a failed write or commit never sends post_save
+
+                assert len(await _stored(client, "tr_purchased")) == 2  # the first commit and `dup`
+        finally:
+            pre_save.disconnect(on_pre, TrPurchased)
+            post_save.disconnect(on_post, TrPurchased)
