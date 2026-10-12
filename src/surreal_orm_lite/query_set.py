@@ -10,6 +10,7 @@ from pydantic_core import ValidationError
 from . import BaseSurrealModel, SurrealDBConnectionManager
 from ._sdk import NotFoundError
 from .changefeed import ChangeModelStream, Since
+from .edge import _check_edge_id, insert_edges
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import Var
@@ -713,19 +714,50 @@ class QuerySet:
 
         Uses the SDK's ``insert()`` method for efficient bulk insertion.
 
+        On an **edge model** (:class:`~surreal_orm_lite.edge.BaseSurrealEdge`) the batch is
+        created with ``INSERT RELATION``, so every edge is a relation that graph traversal sees,
+        on SurrealDB 2.x and 3.x alike: N edges without an id go through **one** call of the SDK's
+        ``insert_relation()``; as soon as one edge has an explicit id, the whole batch goes
+        through the guarded statement of :meth:`BaseSurrealEdge.save`, so an id that already
+        exists raises :class:`SurrealDbError` ("already exists") and **nothing** of the batch is
+        written. Every id is checked before any call (a ``RecordID`` of another table, or a
+        ``bool``, is a ``ValueError``). The batch is one statement, but outside a transaction it
+        is not atomic against the table's ``PERMISSIONS``: when they refuse some edges, the
+        server writes the others and returns them only, and this raises :class:`SurrealDbError`
+        ("Only k of n edges came back …") — the accepted edges stay written. No signals fire, as
+        for nodes.
+
         Args:
             models: A list of model instances to create.
 
         Returns:
-            A list of created model instances with their assigned IDs.
+            A list of created model instances with their assigned IDs. Under
+            ``objects(tx=…)``: the hydrated instances on an interactive transaction (WebSocket +
+            SurrealDB 3.x), the input models unchanged on a buffered one (written at commit; an
+            edge without an explicit id keeps ``id=None``). ``[]`` for an empty list, without any
+            call.
+
+        Raises:
+            SurrealDbError: an edge id that already exists, edges the ``PERMISSIONS`` refused, or
+                any other refusal of an edge batch by the server.
+            SurrealDbNotFoundError: an endpoint of an ``ENFORCED`` relation that does not exist.
+            ValueError: an edge id that is a ``RecordID`` of another table, or a ``bool``.
 
         Example::
 
             users = [User(name="Alice"), User(name="Bob"), User(name="Charlie")]
             created = await User.objects().bulk_create(users)
+
+            edges = await Purchased.objects().bulk_create([
+                Purchased(in_=alice, out=widget, quantity=3),
+                Purchased(in_=bob, out=widget, quantity=1),
+            ])  # one insert_relation() round-trip
         """
         if not models:
             return []
+
+        if self.model.__surreal_edge__:
+            return await self._bulk_create_edges(models)
 
         data_list = []
         for model in models:
@@ -747,6 +779,28 @@ class QuerySet:
         if isinstance(results, list):
             return self.model.from_db(results)  # type: ignore
         return []
+
+    async def _bulk_create_edges(self, models: list[BaseSurrealModel]) -> list[BaseSurrealModel]:
+        """The edge route of :meth:`bulk_create`: one :func:`~surreal_orm_lite.edge.insert_edges` call.
+
+        Each row is what :meth:`BaseSurrealEdge.save` sends — the column-keyed write payload
+        (``in``, ``out``, the data) plus ``id`` as a ``RecordID`` when the edge has one — and
+        every id is checked before the call. ``insert_edges`` picks the statement, normalises
+        the server's errors and raises when fewer rows come back than were sent.
+        """
+        rows: list[dict[str, Any]] = []
+        for model in models:
+            _check_edge_id(model)
+            row = model._write_payload()
+            record_id = model._record_id()
+            if record_id is not None:
+                row["id"] = record_id
+            rows.append(row)
+
+        created = await insert_edges(self._model_table, rows, tx=self._tx)
+        if self._tx is not None and not self._tx.is_interactive:
+            return models  # buffered: not executed until commit; return inputs
+        return cast(list[BaseSurrealModel], self.model.from_db(created))
 
     async def bulk_update(self, **kwargs: Any) -> int:
         """

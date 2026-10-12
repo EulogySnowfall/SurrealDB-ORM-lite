@@ -27,6 +27,13 @@ line, server refusals become ORM errors (``SurrealDbNotFoundError`` for an ``ENF
 and a write the table's ``PERMISSIONS`` refuse — which the server answers with no row and no error —
 raises instead of returning an edge without an id.
 
+``bulk_create()`` on an edge model (spec §4.3.5) takes the same path for a whole batch: N edges
+without an id in **one** ``insert_relation()`` call; the guarded statement for the whole batch as
+soon as one edge has an explicit id, so one duplicate — stored already or repeated in the batch —
+writes nothing; every id checked before any call. It returns the hydrated edges (no transaction, or
+an interactive one) or the inputs (buffered). A batch the ``PERMISSIONS`` partly refuse raises
+"Only k of n edges came back" and keeps the accepted edges (outside a transaction it is not atomic).
+
 Edges inside a transaction (spec §4.5) follow the v0.9.0 strategy of every write, through the
 guarded statement and ``tx.add()``: on an **interactive** transaction (WebSocket + 3.x) the row comes
 back at once — ``edge.id`` set, visible to ``objects(tx=)``, gone after a rollback, a duplicate or a
@@ -1177,6 +1184,31 @@ class TestEdgePermissionsE2E:
                 assert await _stored_perm_quantities_as_root() == []  # the accepted edge is rolled back too
         finally:
             post_save.disconnect(on_post, TrPermEdge)
+
+    @pytest.mark.asyncio
+    async def test_bulk_create_partly_refused_reports_count(self) -> None:
+        """A batch the ``PERMISSIONS`` partly refuse raises with the count; the accepted edge stays (§4.3.4).
+
+        Outside a transaction a batch is not atomic: the server writes the rows it accepts and
+        answers with those only, so the ORM cannot return the hydrated batch — it says how many
+        came back. Same on the ``insert_relation()`` path (auto ids) and the guarded one.
+        """
+        async with _perm_edge_record_user():
+            a, w = RecordID("tr_person", "a"), RecordID("tr_product", "w")
+            with pytest.raises(SurrealDbError, match="Only 1 of 2 edges came back") as auto:
+                await TrPermEdge.objects().bulk_create(
+                    [TrPermEdge(in_=a, out=w, quantity=1), TrPermEdge(in_=a, out=w, quantity=2)]
+                )
+            assert "not atomic" in str(auto.value)
+            assert await _stored_perm_quantities_as_root() == [2]
+
+        async with _perm_edge_record_user():
+            a, w = RecordID("tr_person", "a"), RecordID("tr_product", "w")
+            with pytest.raises(SurrealDbError, match="Only 1 of 2 edges came back"):
+                await TrPermEdge.objects().bulk_create(
+                    [TrPermEdge(id="r1", in_=a, out=w, quantity=1), TrPermEdge(id="r2", in_=a, out=w, quantity=2)]
+                )
+            assert await _stored_perm_quantities_as_root() == [2]
 
 
 # ==================== Task 5 — edges inside transactions (spec §4.5) ====================
@@ -2459,3 +2491,255 @@ class TestGraphParityTransactionsE2E:
                 await alice.remove_relation("tr_follows", "bob", tx=tx)
                 assert await count() == 2  # queued, not run
             assert await count() == 0
+
+
+# ==================== Task 7 — bulk_create() on an edge model (spec §4.3.5) ====================
+
+
+def _purchase_rows(edges: list[Any]) -> list[tuple[str, str, int]]:
+    """``(in, out, quantity)`` of each edge or row, endpoints as strings, in the given order."""
+    return [
+        (str(e["in"]), str(e["out"]), e["quantity"]) if isinstance(e, dict) else (str(e.in_), str(e.out), e.quantity)
+        for e in edges
+    ]
+
+
+class TestEdgeBulkCreateStatements:
+    """What ``bulk_create()`` sends for an edge model before any server runs it (no server)."""
+
+    @pytest.mark.asyncio
+    async def test_empty_list_makes_no_call(self, no_client: list[str]) -> None:
+        assert await TrPurchased.objects().bulk_create([]) == []
+        tx = BufferedTransaction()
+        assert await TrPurchased.objects(tx=tx).bulk_create([]) == []
+        assert tx.statements == []
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    async def test_buffered_bulk_create_queues_one_guarded_statement(self) -> None:
+        tx = BufferedTransaction()
+        inputs: list[BaseSurrealModel] = [
+            TrPurchased(in_=ALICE_P, out=WIDGET, quantity=2),
+            TrPurchased(id="b1", in_=BOB_P, out=WIDGET),
+        ]
+
+        out = await TrPurchased.objects(tx=tx).bulk_create(inputs)
+
+        assert out == inputs and all(a is b for a, b in zip(out, inputs, strict=True))  # the inputs, unchanged
+        assert tx.statements == [_queued_guarded_insert("tr_purchased", 0)]  # one statement for the batch
+        assert tx.variables == {
+            "t0_data": [
+                {"in": ALICE_P, "out": WIDGET, "quantity": 2, "price": 0.0},
+                {"in": BOB_P, "out": WIDGET, "quantity": 1, "price": 0.0, "id": RecordID("tr_purchased", "b1")},
+            ]
+        }
+
+    @pytest.mark.asyncio
+    async def test_every_id_is_checked_before_any_call(self, no_client: list[str]) -> None:
+        valid = TrPurchased(in_=ALICE_P, out=WIDGET)
+        foreign = TrPurchased(id=RecordID("other", "x"), in_=ALICE_P, out=WIDGET)
+        with pytest.raises(ValueError, match="belongs to table 'other'"):
+            await TrPurchased.objects().bulk_create([valid, foreign])
+
+        boolean = TrPurchased(in_=ALICE_P, out=WIDGET)
+        object.__setattr__(boolean, "id", True)  # `id: str | RecordID | None` refuses True at validation
+        with pytest.raises(ValueError, match="a record id cannot be a boolean"):
+            await TrPurchased.objects().bulk_create([valid, boolean])
+
+        tx = BufferedTransaction()
+        with pytest.raises(ValueError, match="belongs to table 'other'"):
+            await TrPurchased.objects(tx=tx).bulk_create([valid, foreign])
+        assert tx.statements == []
+        assert no_client == []
+
+
+class TestEdgeBulkCreateE2E:
+    @pytest.mark.asyncio
+    async def test_bulk_create_one_insert_relation_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with orm_client(*EDGE_TABLES) as client:
+            alice, bob, widget = await _nodes()
+            spy = _spy_insert_relation(monkeypatch, client)
+
+            created = await TrPurchased.objects().bulk_create(
+                [
+                    TrPurchased(in_=alice, out=widget, quantity=1),
+                    TrPurchased(in_=bob, out=widget, quantity=2, price=4.5),
+                    TrPurchased.model_validate({"in": alice, "out": widget, "quantity": 3}),
+                ]
+            )
+
+            assert spy.calls == [
+                (
+                    "tr_purchased",
+                    [
+                        {"in": ALICE_P, "out": WIDGET, "quantity": 1, "price": 0.0},
+                        {"in": BOB_P, "out": WIDGET, "quantity": 2, "price": 4.5},
+                        {"in": ALICE_P, "out": WIDGET, "quantity": 3, "price": 0.0},
+                    ],
+                )
+            ]
+            assert [type(edge) for edge in created] == [TrPurchased] * 3
+            ids = [edge.id for edge in created]
+            assert all(isinstance(i, RecordID) and i.table_name == "tr_purchased" for i in ids)
+            assert len({str(i) for i in ids}) == 3
+            assert _purchase_rows(created) == [
+                ("tr_person:alice", "tr_product:widget", 1),
+                ("tr_person:bob", "tr_product:widget", 2),
+                ("tr_person:alice", "tr_product:widget", 3),
+            ]
+            assert [edge.price for edge in created] == [0.0, 4.5, 0.0]  # type: ignore[attr-defined]
+
+            stored = await _stored(client, "tr_purchased")
+            assert sorted(str(row["id"]) for row in stored) == sorted(str(i) for i in ids)
+            # Relations, not plain records carrying `in`/`out` fields.
+            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET] * 2
+            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:bob;", {}) == [WIDGET]
+            related = await bob.get_related(TrPurchased, model_class=TrProduct)
+            assert [(type(p), p.get_raw_id()) for p in related] == [(TrProduct, "widget")]
+
+    @pytest.mark.asyncio
+    async def test_bulk_create_explicit_ids_guarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with orm_client(*EDGE_TABLES) as client:
+            alice, bob, widget = await _nodes()
+            spy = _spy_insert_relation(monkeypatch, client)
+
+            created = await TrPurchased.objects().bulk_create(
+                [
+                    TrPurchased(id="b1", in_=alice, out=widget, quantity=1),
+                    TrPurchased(id=RecordID("tr_purchased", "b2"), in_=bob, out=widget, quantity=2),
+                    TrPurchased(in_=alice, out=widget, quantity=3),  # an auto id in the same batch
+                ]
+            )
+
+            assert spy.calls == []  # one explicit id sends the whole batch through the guarded statement
+            assert [edge.id for edge in created][:2] == [RecordID("tr_purchased", "b1"), RecordID("tr_purchased", "b2")]
+            auto_id = created[2].id
+            assert isinstance(auto_id, RecordID) and auto_id.table_name == "tr_purchased"
+            assert _purchase_rows(created) == [
+                ("tr_person:alice", "tr_product:widget", 1),
+                ("tr_person:bob", "tr_product:widget", 2),
+                ("tr_person:alice", "tr_product:widget", 3),
+            ]
+
+            stored = await _stored(client, "tr_purchased")
+            assert sorted(str(row["id"]) for row in stored) == sorted(str(edge.id) for edge in created)
+            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET] * 2
+            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:bob;", {}) == [WIDGET]
+
+    @pytest.mark.asyncio
+    async def test_bulk_create_duplicate_writes_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with orm_client(*EDGE_TABLES) as client:
+            alice, bob, widget = await _nodes()
+            await TrPurchased(id="b1", in_=alice, out=widget, quantity=2).save()
+            spy = _spy_insert_relation(monkeypatch, client)
+
+            with pytest.raises(SurrealDbError, match="already exists"):
+                await TrPurchased.objects().bulk_create(
+                    [
+                        TrPurchased(id="b3", in_=bob, out=widget, quantity=3),
+                        TrPurchased(in_=bob, out=widget, quantity=4),
+                        TrPurchased(id="b1", in_=alice, out=widget, quantity=9),
+                    ]
+                )
+
+            # The same id twice in one batch: the second row meets the first one (measured on
+            # 2.7.0, 3.1.5 and 3.3.3 on 2026-10-12).
+            with pytest.raises(SurrealDbError, match="already exists"):
+                await TrPurchased.objects().bulk_create(
+                    [
+                        TrPurchased(id="b4", in_=bob, out=widget, quantity=4),
+                        TrPurchased(id="b4", in_=bob, out=widget, quantity=5),
+                    ]
+                )
+
+            assert spy.calls == []
+            stored = await _stored(client, "tr_purchased")
+            assert [(row["id"], row["quantity"]) for row in stored] == [(RecordID("tr_purchased", "b1"), 2)]
+            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:bob;", {}) == []
+
+    @pytest.mark.asyncio
+    async def test_bulk_create_foreign_table_id_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with orm_client(*EDGE_TABLES, "other") as client:
+            alice, _bob, widget = await _nodes()
+            spy = _spy_insert_relation(monkeypatch, client)
+
+            with pytest.raises(ValueError, match="belongs to table 'other', not to the edge table 'tr_purchased'"):
+                await TrPurchased.objects().bulk_create(
+                    [TrPurchased(in_=alice, out=widget), TrPurchased(id=RecordID("other", "x"), in_=alice, out=widget)]
+                )
+
+            assert spy.calls == []
+            assert await _stored(client, "tr_purchased") == []
+            assert await _stored(client, "other") == []
+
+    @pytest.mark.asyncio
+    async def test_bulk_create_in_interactive_tx(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with orm_client(*EDGE_TABLES) as client:
+            if not await _native_txn_supported():
+                pytest.skip("requires SurrealDB 3.x native transactions")
+            alice, bob, widget = await _nodes()
+            spy = _spy_insert_relation(monkeypatch, client)
+
+            reached = False
+            with pytest.raises(RuntimeError, match="roll back"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    assert tx.is_interactive
+                    created = await TrPurchased.objects(tx=tx).bulk_create(
+                        [TrPurchased(in_=alice, out=widget, quantity=1), TrPurchased(id="t1", in_=bob, out=widget, quantity=2)]
+                    )
+                    assert [type(edge) for edge in created] == [TrPurchased] * 2
+                    assert isinstance(created[0].id, RecordID)
+                    assert created[1].id == RecordID("tr_purchased", "t1")
+                    assert _purchase_rows(created) == [
+                        ("tr_person:alice", "tr_product:widget", 1),
+                        ("tr_person:bob", "tr_product:widget", 2),
+                    ]
+                    assert await TrPurchased.objects(tx=tx).count() == 2
+                    reached = True
+                    raise RuntimeError("roll back")
+            assert reached
+            assert await _stored(client, "tr_purchased") == []
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                created = await TrPurchased.objects(tx=tx).bulk_create(
+                    [TrPurchased(in_=alice, out=widget, quantity=5), TrPurchased(in_=bob, out=widget, quantity=6)]
+                )
+                assert all(isinstance(edge.id, RecordID) for edge in created)
+            assert spy.calls == []  # under tx=, the guarded statement runs through tx.add()
+            stored = await _stored(client, "tr_purchased")
+            assert sorted(str(row["id"]) for row in stored) == sorted(str(edge.id) for edge in created)
+            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:bob;", {}) == [WIDGET]
+
+    @pytest.mark.asyncio
+    async def test_bulk_create_in_buffered_tx(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with http_orm_client(*EDGE_TABLES) as client:
+            alice, bob, widget = await _nodes()
+            spy = _spy_insert_relation(monkeypatch, client)
+            inputs: list[BaseSurrealModel] = [
+                TrPurchased(in_=alice, out=widget, quantity=1),
+                TrPurchased(id="t1", in_=bob, out=widget, quantity=2),
+            ]
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert not tx.is_interactive
+                out = await TrPurchased.objects(tx=tx).bulk_create(inputs)
+                assert all(a is b for a, b in zip(out, inputs, strict=True))  # the inputs, unchanged
+                assert [edge.id for edge in out] == [None, "t1"]
+                assert await _stored(client, "tr_purchased") == []  # queued, not run
+
+            assert spy.calls == []
+            stored = await _stored(client, "tr_purchased")
+            assert sorted(_purchase_rows(stored)) == [
+                ("tr_person:alice", "tr_product:widget", 1),
+                ("tr_person:bob", "tr_product:widget", 2),
+            ]
+            assert RecordID("tr_purchased", "t1") in [row["id"] for row in stored]
+            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
+
+            # A duplicate in a buffered batch fails the commit; nothing of the batch is written.
+            with pytest.raises(SurrealDbError, match="already exists"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TrPurchased.objects(tx=tx).bulk_create(
+                        [TrPurchased(in_=alice, out=widget, quantity=7), TrPurchased(id="t1", in_=bob, out=widget)]
+                    )
+            assert len(await _stored(client, "tr_purchased")) == 2
