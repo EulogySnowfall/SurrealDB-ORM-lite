@@ -60,7 +60,10 @@ given as keywords (``**edge_data``), merged with ``data=``; ``remove_relation`` 
 direction (out-neighbours, then in-neighbours). The removals are graph-path ``DELETE`` statements
 with bound record ids (``DELETE $src->e WHERE out = $dst``): exactly the edges traversal sees, a
 native no-op on an edge table that was never created, the same in and out of a transaction. A
-``remove_relation()`` target without ``:`` is a bare record id, bound verbatim and compared as a
+source whose own table was never created is where the lines diverge: 3.x raises "The table …
+does not exist", 2.x returns ``[]``. Outside a transaction the ORM keeps it a silent no-op on both;
+under ``tx=`` the 3.x failure fails the transaction (at once if interactive, at commit if buffered).
+A ``remove_relation()`` target without ``:`` is a bare record id, bound verbatim and compared as a
 string with ``record::id(out)``: it matches that id in any table, never an integer id.
 
 Writes on a stored edge (spec §4.4, §2.9): SurrealDB ignores a change to an edge's endpoints on both
@@ -1911,7 +1914,15 @@ class TrLikes(BaseSurrealEdge):
     model_config = SurrealConfigDict(table_name="tr_likes")
 
 
-GRAPH_TABLES = (*EDGE_TABLES, "tr_likes")
+class TrGhost(BaseSurrealModel):
+    """A node whose table is never created: the source of a removal from a record never saved."""
+
+    model_config = SurrealConfigDict(table_name="tr_ghost")
+
+    id: str | None = None
+
+
+GRAPH_TABLES = (*EDGE_TABLES, "tr_likes", "tr_ghost")
 BLANK_TARGET = (
     "remove_relation() target must not be empty or blank: pass a model instance, a RecordID, "
     "a 'table:id' string or a bare record id."
@@ -2409,6 +2420,35 @@ class TestGraphParityE2E:
             assert await alice.get_related("tr_never", direction="both") == []
 
     @pytest.mark.asyncio
+    async def test_missing_source_table_is_a_silent_noop(self) -> None:
+        """A source whose own table was never created: the server diverges, the ORM does not.
+
+        The graph-path ``DELETE`` raises ``NotFoundError`` ("The table … does not exist") on 3.x
+        and returns ``[]`` on 2.x. Outside a transaction the ORM keeps the v0.7.0 contract on both
+        lines: a silent no-op that removes nothing.
+        """
+        async with orm_client(*GRAPH_TABLES) as client:
+            alice, bob, _widget = await _nodes()
+            await alice.relate("tr_follows", bob)  # the edge table exists, only tr_ghost does not
+            ghost = TrGhost(id="g")  # never saved: its table is never created
+
+            statement = "DELETE $src->tr_follows WHERE out = $dst;"
+            variables = {"src": RecordID("tr_ghost", "g"), "dst": BOB_P}
+            if (await _server_version())[0] >= 3:
+                with pytest.raises(NotFoundError, match="does not exist"):
+                    await client.query(statement, variables)
+            else:
+                assert await client.query(statement, variables) == []
+
+            assert await ghost.remove_relation("tr_follows", bob) is None
+            assert await ghost.remove_relation("tr_follows", "bob") is None
+            assert await ghost.remove_relation("tr_follows", bob, reverse=True) is None
+            assert await ghost.remove_relation(TrFollows, "bob", reverse=True) is None
+            assert await ghost.remove_all_relations(["tr_follows"], direction="both") is None
+            assert await ghost.remove_all_relations(TrFollows, "in") is None
+            assert _people_pairs(await _stored(client, "tr_follows")) == [("tr_person:alice", "tr_person:bob")]
+
+    @pytest.mark.asyncio
     async def test_remove_relation_bare_id_any_table(self) -> None:
         async with orm_client(*GRAPH_TABLES) as client:
             alice, bob, _widget = await _nodes()
@@ -2552,6 +2592,54 @@ class TestGraphParityTransactionsE2E:
                 await alice.remove_relation("tr_follows", "bob", tx=tx)
                 assert await count() == 2  # queued, not run
             assert await count() == 0
+
+    @pytest.mark.asyncio
+    async def test_missing_source_table_in_buffered_tx(self) -> None:
+        """Under ``tx=`` the server's divergence stands: 3.x fails the commit, 2.x commits."""
+        async with http_orm_client(*GRAPH_TABLES) as client:
+            alice, bob, _widget = await _nodes()
+            carol = await TrPerson(id="carol", name="Carol").save()
+            await alice.relate("tr_follows", bob)
+            await alice.relate("tr_follows", carol)
+            ghost = TrGhost(id="g")  # never saved: its table is never created
+
+            async def remove() -> None:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    assert not tx.is_interactive
+                    await alice.remove_relation("tr_follows", bob, tx=tx)
+                    await ghost.remove_relation("tr_follows", carol, tx=tx)
+                    await ghost.remove_all_relations(["tr_follows"], direction="both", tx=tx)
+
+            if (await _server_version())[0] >= 3:
+                with pytest.raises(SurrealDbError, match="does not exist"):
+                    await remove()
+                assert _people_pairs(await _stored(client, "tr_follows")) == [
+                    ("tr_person:alice", "tr_person:bob"),
+                    ("tr_person:alice", "tr_person:carol"),
+                ]  # alice's removal is rolled back with the batch
+            else:
+                await remove()
+                assert _people_pairs(await _stored(client, "tr_follows")) == [("tr_person:alice", "tr_person:carol")]
+
+    @pytest.mark.asyncio
+    async def test_missing_source_table_in_interactive_tx(self) -> None:
+        """3.x over WebSocket: the statement fails at once, and the transaction with it."""
+        async with orm_client(*GRAPH_TABLES) as client:
+            if not await _native_txn_supported():
+                pytest.skip("requires SurrealDB 3.x native transactions")
+            alice, bob, _widget = await _nodes()
+            await alice.relate("tr_follows", bob)
+            ghost = TrGhost(id="g")
+
+            reached = False
+            with pytest.raises(SurrealDbError, match="does not exist"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    assert tx.is_interactive
+                    await alice.remove_relation("tr_follows", bob, tx=tx)
+                    reached = True
+                    await ghost.remove_relation("tr_follows", bob, tx=tx)
+            assert reached
+            assert _people_pairs(await _stored(client, "tr_follows")) == [("tr_person:alice", "tr_person:bob")]
 
 
 # ==================== Task 7 — bulk_create() on an edge model (spec §4.3.5) ====================
