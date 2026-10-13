@@ -1550,6 +1550,10 @@ async for event in stream:
   the entries read per poll. `stop()` ends the iteration at once when it is waiting between
   polls or in a retry backoff, or as soon as a request already sent returns; `start()` fixes the
   starting position before the first read.
+- **A read under `asyncio.timeout()` or `asyncio.wait_for()`** times out as asked and loses
+  nothing: the stream keeps going, and the next read starts from the cursor. Before v0.22.2 a
+  read cancelled just as the server answered could be retried as a dropped connection instead,
+  and never time out.
 - Works over **HTTP** as well as WebSocket. A dropped connection is retried with the same
   backoff as live streams, and nothing is lost, because the next read starts from the cursor.
 - **Refused:** any queryset clause — `SHOW CHANGES` has no `WHERE`, so `filter()` would silently
