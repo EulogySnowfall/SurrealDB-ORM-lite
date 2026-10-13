@@ -26,7 +26,20 @@ from uuid import UUID
 import aiohttp
 import pytest
 import surrealdb
-from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field, ValidationError
+from pydantic import (
+    AliasChoices,
+    AliasPath,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    FutureDate,
+    FutureDatetime,
+    NaiveDatetime,
+    PastDate,
+    PastDatetime,
+    ValidationError,
+)
 from surrealdb import TAG_DECIMAL_STRING, TAG_DURATION_COMPACT, AsyncSurreal, RecordID
 from surrealdb.cbor import CBORTag, undefined
 from surrealdb.data.cbor import encode as sdk_cbor_encode
@@ -2377,6 +2390,134 @@ class TestAtomicIncrementStatement:
             await RfEvent(id="x").atomic_increment(field, amount)
         assert type(info.value) is ValueError
         assert field in str(info.value)
+
+
+# --- Pydantic's datetime and date types (AwareDatetime, PastDate…) --------------------------------
+
+_DATE_TYPES = pytest.mark.parametrize(
+    ("declared", "base"),
+    [
+        (AwareDatetime, datetime),
+        (NaiveDatetime, datetime),
+        (PastDatetime, datetime),
+        (FutureDatetime, datetime),
+        (PastDate, date),
+        (FutureDate, date),
+    ],
+    ids=["AwareDatetime", "NaiveDatetime", "PastDatetime", "FutureDatetime", "PastDate", "FutureDate"],
+)
+
+
+class _Dated(surreal_orm_lite.BaseSurrealModel):
+    model_config = surreal_orm_lite.SurrealConfigDict(table_name="rf_dated_unit")
+
+    id: str | None = None
+    at: AwareDatetime | None = None
+    naive: NaiveDatetime | None = None
+    expires: FutureDatetime | None = None
+    day: PastDate | None = None
+    due: FutureDate | None = None
+    days: list[PastDate] = []
+
+
+class TestPydanticDateTypes:
+    """Pydantic's ``AwareDatetime``, ``NaiveDatetime``, ``PastDatetime``, ``FutureDatetime``, ``PastDate``
+    and ``FutureDate`` are rich types, as the ``datetime`` or ``date`` their values are. At run time
+    each is a class of its own (its MRO is ``(cls, object)``), never a subclass of ``datetime`` or
+    ``date``: without the wire's table of these classes, a field so typed had no rich kind, and its
+    keyword writes, typed lookups and ``atomic_increment`` statement fell back to v0.22's."""
+
+    def test_they_are_not_subclasses_at_run_time(self) -> None:
+        for declared in (AwareDatetime, NaiveDatetime, PastDatetime, FutureDatetime, PastDate, FutureDate):
+            assert not issubclass(declared, date), declared  # the reason the wire needs its own table
+
+    @_DATE_TYPES
+    def test_rich_kinds(self, declared: Any, base: type) -> None:
+        kind = base.__name__
+        assert rich_kinds(declared) == {kind}
+        assert rich_kinds(declared | None) == {kind}
+        assert rich_kinds(Annotated[declared, "x"] | None) == {kind}
+        assert rich_kinds(list[declared]) == {kind}
+        assert rich_kinds(Range[declared]) == {"range", kind}
+
+    @_DATE_TYPES
+    def test_declared_kind(self, declared: Any, base: type) -> None:
+        assert wire.declared_kind(declared) == base.__name__
+        assert wire.declared_kind(declared | None) == base.__name__
+        assert wire.declared_kind(Annotated[declared, "x"] | None) == base.__name__
+
+    @_DATE_TYPES
+    def test_lookup_type_is_the_plain_class(self, declared: Any, base: type) -> None:
+        """A filter bound is not a value of the field: ``expires__lt=now`` on a ``FutureDatetime``
+        compares with an instant that is not in the future. It is validated as the plain class."""
+        assert wire.lookup_type(declared | None, "gt", "x") == (False, base)
+        assert wire.lookup_type(declared, "exact", "x") == (False, base)
+        assert wire.lookup_type(declared, "in", ["x"]) == (True, base)
+        range_of: Any = Range
+        assert wire.lookup_type(declared, "in", Range(BoundIncluded("x"), None)) == (False, range_of[base])
+        assert wire.lookup_type(list[declared], "contains", "x") == (False, base)
+        assert wire.lookup_type(list[declared], "containsany", ["x"]) == (True, base)
+        assert wire.lookup_type(Range[declared], "contains", "x") == (False, base)
+
+    @_DATE_TYPES
+    def test_field_input_gives_the_sdk_datetime_text(self, declared: Any, base: type) -> None:
+        sdk = surrealdb.Datetime("2020-01-02T00:00:00Z")
+        assert field_input(declared, sdk) == "2020-01-02T00:00:00Z"
+        assert field_input(declared | None, sdk) == "2020-01-02T00:00:00Z"
+        assert field_input(declared | int, sdk) == "2020-01-02T00:00:00Z"  # a union member (rule 6)
+        assert field_input(list[declared], [sdk]) == ["2020-01-02T00:00:00Z"]
+        assert field_input(declared | timedelta, "1h") == timedelta(hours=1)  # still a timedelta member
+
+    def test_keyword_writes_validate_against_the_declared_type(self) -> None:
+        coerce = _Dated._coerce_field_value
+        at = coerce("at", "2027-01-01T00:00:00Z")
+        assert type(at) is datetime
+        assert at == datetime(2027, 1, 1, tzinfo=UTC)
+        for context in ("merge", "bulk_update", "signup"):
+            with pytest.raises(ValueError, match=rf"^{context}\(at=…\): .* is not a valid AwareDatetime \(.*timezone info"):
+                coerce("at", datetime(2027, 1, 1), context=context)  # naive: refused as by the constructor
+        day = coerce("day", "2020-01-02")
+        assert type(day) is date
+        assert day == date(2020, 1, 2)
+        with pytest.raises(ValueError, match=r"^merge\(day=…\): .* is not a valid PastDate \(.*in the past"):
+            coerce("day", "2999-01-01")
+        assert coerce("days", ["2020-01-02"]) == [date(2020, 1, 2)]
+
+    def test_filters_validate_as_the_plain_class(self) -> None:
+        now = datetime.now(UTC)
+        assert _Dated._coerce_lookup_value("expires", "lt", now) is now  # not a FutureDatetime: a bound
+        coerced = _Dated._coerce_lookup_value("at", "gt", "2030-01-01T00:00:00Z")
+        assert coerced == datetime(2030, 1, 1, tzinfo=UTC)
+        assert _Dated._coerce_lookup_value("at", "gt", datetime(2030, 1, 1)) == datetime(2030, 1, 1)  # naive bound
+        assert _Dated._coerce_lookup_value("due", "lte", "2020-01-02") == date(2020, 1, 2)  # a past bound
+        assert _Dated._coerce_lookup_value("days", "contains", "2020-01-02") == date(2020, 1, 2)
+        with pytest.raises(ValueError, match=r"^filter\(at__gt=…\): 'soon' is not a valid datetime"):
+            _Dated._coerce_lookup_value("at", "gt", "soon")
+
+    def test_apply_record_reads_a_date_back(self) -> None:
+        dated = _Dated(id="x")
+        dated._apply_record({"day": datetime(2020, 1, 2, tzinfo=UTC), "days": [datetime(2020, 1, 3, tzinfo=UTC)]})
+        assert type(dated.day) is date
+        assert dated.day == date(2020, 1, 2)
+        assert dated.days == [date(2020, 1, 3)]
+        past = datetime(2020, 1, 2, tzinfo=UTC)
+        dated._apply_record({"due": past})
+        assert dated.due is past  # a FutureDate now in the past fails its constraint: kept as it came
+
+    async def test_atomic_increment_shifts_the_instant(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: list[str] = []
+
+        async def capture(self: Any, set_expr: str, variables: dict[str, Any], tx: Any) -> Any:
+            seen.append(set_expr)
+            return self
+
+        monkeypatch.setattr(_Dated, "_atomic_update", capture)
+        await _Dated(id="x").atomic_increment("at", timedelta(hours=1))
+        await _Dated(id="x").atomic_increment("expires", timedelta(hours=1))
+        await _Dated(id="x").atomic_increment("day", timedelta(days=1))
+        assert seen == ["at = at + $amount", "expires = expires + $amount", "day = day + $amount"]
+        with pytest.raises(ValueError, match="whole number of days"):
+            await _Dated(id="x").atomic_increment("due", timedelta(hours=1))
 
 
 # --- raw SDK E2E: what both server lines do with each encoded form (AC-6, AC-29, AC-32 b) ---------

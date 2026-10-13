@@ -42,7 +42,7 @@ from uuid import UUID
 import pytest
 import pytest_asyncio
 import surrealdb
-from pydantic import AliasChoices, BaseModel, Field, ValidationError
+from pydantic import AliasChoices, AwareDatetime, BaseModel, Field, PastDate, ValidationError
 from surrealdb import RecordID
 
 from surreal_orm_lite import (
@@ -1478,6 +1478,64 @@ class TestKeywordWritesE2E:
 
             assert await _raw("z") == before
             await _assert_client_usable(client_before)
+
+
+class RfStamped(BaseSurrealModel):
+    """Pydantic's own datetime and date types, rich types like the plain ``datetime`` and ``date``."""
+
+    model_config = SurrealConfigDict(table_name="rf_stamped")
+
+    id: str | None = None
+    at: AwareDatetime | None = None
+    day: PastDate | None = None
+    n: int = 0
+
+
+class TestPydanticDateTypesE2E:
+    """An ``AwareDatetime`` or a ``PastDate`` field is a ``datetime`` or a ``date`` one on both lines: its
+    filters compare instants, its keyword writes store datetimes, ``atomic_increment`` shifts it and
+    a row read back gives a ``date``. At run time these classes are not subclasses of ``datetime``
+    and ``date``, so such a field used to keep v0.22's behaviour: a string filter compared texts, a
+    merge stored a string, and an increment wrote a duration into the datetime field."""
+
+    async def test_filters_writes_and_reads(self) -> None:
+        async with orm_client("rf_stamped") as client:
+            stamped = RfStamped(at=datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC), day=date(2020, 1, 2))
+            await stamped.save()  # no id: the row the server sends back is applied
+            assert type(stamped.day) is date
+            assert stamped.day == date(2020, 1, 2)
+            rid = stamped.id
+            assert isinstance(rid, RecordID)
+
+            assert await RfStamped.objects().filter(at__gt="2030-01-01T00:00:00Z").exec() == []
+            assert [row.id for row in await RfStamped.objects().filter(at__lt="2030-01-01T00:00:00Z").exec()] == [rid.id]
+            assert [row.id for row in await RfStamped.objects().filter(day__lte="2020-01-02").exec()] == [rid.id]
+
+            await stamped.merge(at="2027-01-01T00:00:00Z")
+            stored = (await _raw(rid))["at"]
+            assert type(stored) is datetime, f"not stored as a datetime: {stored!r}"
+            assert stored == datetime(2027, 1, 1, tzinfo=UTC)
+            assert type(stamped.at) is datetime
+            with pytest.raises(ValueError, match=r"^merge\(at=…\): .*timezone info"):
+                await stamped.merge(at=datetime(2027, 1, 1))  # naive: refused before anything is sent
+            assert (await _raw(rid))["at"] == datetime(2027, 1, 1, tzinfo=UTC)
+            await _assert_client_usable(client)
+
+    async def test_atomic_increment_never_writes_a_duration(self) -> None:
+        async with orm_client("rf_stamped") as client:
+            await client.query("CREATE rf_stamped:d SET at = d'2026-01-02T03:04:05Z', n = 1;", {})
+            await client.query("CREATE rf_stamped:m SET n = 1;", {})  # no at
+            stamped = await RfStamped.objects().get("d")
+            missing = await RfStamped.objects().get("m")
+
+            await stamped.atomic_increment("at", timedelta(hours=1))
+            assert (await _raw("d", "rf_stamped"))["at"] == datetime(2026, 1, 2, 4, 4, 5, tzinfo=UTC)
+            assert type(stamped.at) is datetime
+
+            with pytest.raises(surrealdb.ServerError, match="addition"):
+                await missing.atomic_increment("at", timedelta(hours=1))
+            assert "at" not in await _raw("m", "rf_stamped")  # nothing written, never a duration
+            await _assert_client_usable(client)
 
 
 # ==================== Keyword writes of a sub-model holding a rich type (spec §4.1) ====================

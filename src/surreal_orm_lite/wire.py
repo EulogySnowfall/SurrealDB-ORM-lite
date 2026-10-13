@@ -48,7 +48,16 @@ from types import NoneType, UnionType
 from typing import Annotated, Any, ForwardRef, TypeVar, Union, get_args, get_origin
 from uuid import UUID
 
-from pydantic import AliasChoices, BaseModel
+from pydantic import (
+    AliasChoices,
+    AwareDatetime,
+    BaseModel,
+    FutureDate,
+    FutureDatetime,
+    NaiveDatetime,
+    PastDate,
+    PastDatetime,
+)
 from pydantic.fields import FieldInfo
 
 from . import _sdk
@@ -104,6 +113,18 @@ _MAPPING_ORIGINS: frozenset[Any] = frozenset({dict, Mapping, MutableMapping})
 # The container values ``field_input`` walks into (a ``str`` is never one).
 _SEQUENCE_VALUES = (list, tuple, set, frozenset)
 
+# Pydantic's datetime and date classes → the class of their values. At run time each is a class
+# of its own (MRO ``(cls, object)``), never a subclass of ``datetime`` or ``date``, so ``issubclass``
+# alone misses them; every annotation check goes through :func:`_plain_class` instead.
+_PLAIN_CLASSES: dict[Any, type] = {
+    AwareDatetime: datetime,
+    NaiveDatetime: datetime,
+    PastDatetime: datetime,
+    FutureDatetime: datetime,
+    PastDate: date,
+    FutureDate: date,
+}
+
 
 def duration_ns(value: object) -> int:
     """The exact number of nanoseconds of a ``timedelta`` or an ORM or SDK ``Duration``.
@@ -141,13 +162,29 @@ def _is_model(annotation: Any) -> bool:
     return isinstance(annotation, type) and issubclass(annotation, BaseModel)
 
 
+def _plain_class(annotation: Any) -> Any:
+    """``datetime`` for Pydantic's ``AwareDatetime``/``NaiveDatetime``/``PastDatetime``/``FutureDatetime``,
+    ``date`` for its ``PastDate``/``FutureDate``; any other annotation unchanged."""
+    return _PLAIN_CLASSES.get(annotation, annotation) if isinstance(annotation, type) else annotation
+
+
 def _is_subclass(annotation: Any, cls: type) -> bool:
-    """``issubclass`` that answers ``False`` for what is not a plain class (generics, strings…)."""
+    """``issubclass`` that answers ``False`` for what is not a plain class (generics, strings…).
+
+    Pydantic's datetime and date classes count as the class of their values (:func:`_plain_class`):
+    ``_is_subclass(AwareDatetime, date)`` is ``True``.
+    """
+    annotation = _plain_class(annotation)
     return isinstance(annotation, type) and get_origin(annotation) is None and issubclass(annotation, cls)
 
 
 def _scalar_kind(annotation: Any) -> str | None:
-    """The kind of a plain class annotation, or ``None`` when it is not a rich type."""
+    """The kind of a plain class annotation, or ``None`` when it is not a rich type.
+
+    Pydantic's ``AwareDatetime``/``NaiveDatetime``/``PastDatetime``/``FutureDatetime`` are
+    ``"datetime"``, its ``PastDate``/``FutureDate`` ``"date"`` (:func:`_plain_class`).
+    """
+    annotation = _plain_class(annotation)
     if not isinstance(annotation, type) or get_origin(annotation) is not None:
         return None
     if annotation is Duration:
@@ -175,7 +212,9 @@ def rich_kinds(annotation: Any, *, into_models: bool = True) -> frozenset[str]:
 
     Kinds: ``"timedelta"``, ``"date"``, ``"datetime"``, ``"decimal"``, ``"uuid"``, ``"duration"``
     (the ORM's ``Duration``), ``"range"`` (the ORM's ``Range``) and the containers that need
-    re-validating after a raw read — ``"set"``, ``"frozenset"``, ``"tuple"``. The walk enters
+    re-validating after a raw read — ``"set"``, ``"frozenset"``, ``"tuple"``. Pydantic's
+    ``AwareDatetime``, ``NaiveDatetime``, ``PastDatetime`` and ``FutureDatetime`` are ``"datetime"``,
+    its ``PastDate`` and ``FutureDate`` ``"date"``. The walk enters
     ``Annotated``, unions (``Optional`` included), ``list``/``set``/``frozenset``/``tuple``/``Sequence``/
     ``AbstractSet`` items, ``dict``/``Mapping`` values (keys are never converted), the ``T`` of
     ``Range[T]`` and, with ``into_models`` (the default), the fields of a nested
@@ -393,7 +432,8 @@ def field_input(annotation: Any, value: Any) -> Any:
     4. ``timedelta`` → an ORM or SDK ``Duration``, or a string ``Duration.parse`` accepts (``"1h30m"``,
        ``" 7d "``), becomes a ``timedelta`` floored to the microsecond (``ValueError`` naming
        ``Duration`` beyond ``timedelta.max``); anything else is left for Pydantic.
-    5. ``datetime`` / ``date`` → an SDK ``Datetime`` becomes its ISO string.
+    5. ``datetime`` / ``date`` (Pydantic's ``AwareDatetime``, ``PastDate``… included) → an SDK
+       ``Datetime`` becomes its ISO string.
     6. A union, ``None`` dropped: one member left → as that member. Several: a scalar gets rule 4
        when ``timedelta`` is a member and no member claims the value as it is (``Any``/``object``
        claim everything, ``Duration`` an ORM/SDK ``Duration``, ``str`` a string), and rule 5 when
@@ -471,7 +511,8 @@ def declared_kind(annotation: Any) -> str | None:
     """The rich kind of a field's annotation once ``Annotated`` and ``Optional`` are stripped.
 
     ``datetime | None`` → ``"datetime"``, ``Annotated[date, …]`` → ``"date"``, ``timedelta`` →
-    ``"timedelta"``…; ``None`` for a container, a union of several types, ``Any`` or a plain type.
+    ``"timedelta"``, ``AwareDatetime | None`` → ``"datetime"``, ``PastDate`` → ``"date"``…; ``None``
+    for a container, a union of several types, ``Any`` or a plain type.
     ``atomic_increment`` picks its duration statement from it (spec §4.6).
     """
     return _scalar_kind(_strip_optional(annotation))
@@ -521,7 +562,9 @@ def lookup_type(annotation: Any, lookup: str, value: Any) -> tuple[bool, Any] | 
     ``(False, X)``: the value as ``X``; ``(True, X)``: each item of the value (an iterable) as ``X``;
     ``None``: the value is bound as given. ``Annotated`` and ``Optional`` are stripped first, so
     ``Computed[S]`` qualifies. ``S`` is a rich scalar: ``datetime``, ``date``, ``timedelta``,
-    ``Decimal``, ``UUID`` or ``Duration``.
+    ``Decimal``, ``UUID`` or ``Duration``. Pydantic's ``AwareDatetime``, ``PastDate``… give the plain
+    ``datetime`` or ``date``: a filter bound is not a value of the field (``expires__lt=now`` on a
+    ``FutureDatetime``), as the field's constraints (``Field(gt=…)``) do not apply to it either.
 
     - ``S`` with ``exact``/``gt``/``gte``/``lt``/``lte`` → ``S``; with ``in``/``not_in`` → each item as
       ``S``, or ``Range[S]`` when ``value`` is an ORM or SDK ``Range`` (range membership);
@@ -532,7 +575,7 @@ def lookup_type(annotation: Any, lookup: str, value: Any) -> tuple[bool, Any] | 
     - anything else → ``None``: another annotation, another lookup, a ``Range`` given to ``in`` on a
       field that is not ``S``, a union of several types, ``Range[Any]`` with ``contains``.
     """
-    core = _strip_optional(annotation)
+    core = _plain_class(_strip_optional(annotation))
     if _is_lookup_scalar(core):
         if lookup in _COMPARISON_LOOKUPS:
             return False, core
@@ -547,9 +590,9 @@ def lookup_type(annotation: Any, lookup: str, value: Any) -> tuple[bool, Any] | 
             return False, core
         args = get_args(core)
         if lookup in _CONTAINS_LOOKUPS and args and args[0] is not Any and not isinstance(args[0], TypeVar):
-            return False, args[0]
+            return False, _plain_class(args[0])
         return None
-    item = _collection_item(core)
+    item = _plain_class(_collection_item(core))
     if item is not None and _is_lookup_scalar(item):
         if lookup in _CONTAINS_LOOKUPS:
             return False, item
