@@ -869,12 +869,21 @@ def hydrate(model: type[T], record: dict[str, Any]) -> tuple[T, ValidationError 
 
     An invalid record yields an instance built **without** validation, plus the error — one bad
     row must not end a stream. Shared by live events and change-feed events.
+
+    For an edge model (v0.22.0), SurrealDB 2.x's edge marker is dropped first: 2.x adds
+    ``"__": true`` to the record of a ``CREATE``/``UPDATE`` notification and of a change-feed
+    ``update`` entry (3.x never does, and ``DELETE`` payloads never carry it), so the instance is
+    the same on both lines and an ``extra="allow"`` edge never grows a ``__`` attribute. Node
+    models are untouched: there ``__`` may be a column of the user's.
     """
     # Copies throughout: hydration rewrites the id in place, and ``raw`` must stay as received.
+    data = dict(record)
+    if model.__surreal_edge__ and data.get("__") is True:
+        del data["__"]
     try:
-        return cast(T, model.from_db(dict(record))), None
+        return cast(T, model.from_db(dict(data))), None
     except ValidationError as exc:
-        return model.model_construct(**cast(Any, model).set_data(dict(record))), exc
+        return model.model_construct(**cast(Any, model).set_data(dict(data))), exc
 
 
 def patched_fields(model: type[BaseSurrealModel], patches: Any) -> list[str]:

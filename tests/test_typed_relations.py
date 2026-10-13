@@ -75,6 +75,14 @@ relate — instances, record ids and ``"table:id"`` strings converge on one row 
 the ORM: a deterministic array id raises "already exists" on a second save, a ``UNIQUE`` index on
 ``in, out`` "already contains" on a second relate (the reverse pair is another edge).
 
+Live queries and change feeds on edge tables (spec §2.5, §4.7): ``live()`` (full and diff) and
+``changes()`` yield typed edges, and a live filter on an endpoint — a node instance, a ``RecordID``
+or a ``"table:id"`` string — is applied by the server (proven by order: bob's edge is created first,
+alice's event still comes first). SurrealDB 2.x adds ``"__": true`` to the edge record of a
+``CREATE``/``UPDATE`` notification and of a change-feed update entry: the typed instance drops it
+(an ``extra="allow"`` edge never grows a ``__`` attribute), ``raw`` keeps it as sent; ``DELETE``
+payloads carry no marker on either line.
+
 E2E tables are dedicated (``tr_*``), dropped on entry and exit by ``orm_client``; nodes are created
 inside the ``async with orm_client(...)`` block. Same behaviour on SurrealDB 2.x and 3.x, except the
 transaction strategy the server supports (interactive tests skip on 2.x; buffered ones run over HTTP
@@ -110,7 +118,9 @@ from surreal_orm_lite import (
     post_save,
     pre_save,
 )
+from surreal_orm_lite.changefeed import feed_events
 from surreal_orm_lite.enum import LiveAction
+from surreal_orm_lite.live import to_change_event
 from surreal_orm_lite.query_set import QuerySet
 from surreal_orm_lite.transaction import BufferedTransaction
 from surreal_orm_lite.utils import build_filter_condition, coerce_endpoint, parse_lookup
@@ -3189,3 +3199,305 @@ class TestNativeIdempotencyE2E:
             stored = await _stored(client, "tr_follows_uq")
             assert sorted(str(row["id"]) for row in stored) == sorted([str(first.id), str(reverse.id)])
             assert await client.query("SELECT VALUE ->tr_follows_uq->? FROM ONLY tr_person:bob;", {}) == [ALICE_P]
+
+
+# ==================== Task 9 — live queries and change feeds on edge tables (E2E, both lines) ====================
+
+
+class TrLiveEdge(BaseSurrealEdge):
+    """Edge on ``tr_live`` that keeps undeclared fields (``extra="allow"``): a stray ``__`` would show."""
+
+    model_config = SurrealConfigDict(table_name="tr_live", extra="allow")
+
+    quantity: int = 1
+
+
+class TrCfEdge(BaseSurrealEdge):
+    """Edge on ``tr_cf`` (``TYPE RELATION CHANGEFEED 1h``) that keeps undeclared fields (``extra="allow"``)."""
+
+    model_config = SurrealConfigDict(table_name="tr_cf", extra="allow")
+
+    quantity: int = 1
+
+
+LIVE_TABLES = (*EDGE_TABLES, "tr_live")
+CF_DATABASE = "tr_edge_cf"
+WIDGET_P = RecordID("tr_product", "widget")
+
+
+@contextlib.asynccontextmanager
+async def _change_feed_database() -> AsyncIterator[Any]:
+    """A root WebSocket client on ``ns``/``tr_edge_cf``, a database removed and redefined on entry, removed on exit.
+
+    Measured on 2026-10-12: SurrealDB 2.7.0 applies the ``LIMIT`` of ``SHOW CHANGES FOR TABLE t …`` to
+    the whole database's feed before keeping ``t``'s entries, and ``REMOVE TABLE`` keeps a table's
+    feed history (on 3.3.3 too). A second change-feed table in ``ns``/``db`` would therefore leak
+    into the feed of ``tests/test_change_feeds.py``. ``REMOVE DATABASE`` clears the feed on both
+    lines, so here ``since=0`` replays this test's changes only.
+    """
+    host, port = os.environ.get("SURREALDB_HOST", "localhost"), os.environ.get("SURREALDB_PORT", "8000")
+    SurrealDBConnectionManager.set_connection(f"ws://{host}:{port}/rpc", "root", "root", "ns", CF_DATABASE)
+    client = await SurrealDBConnectionManager.get_client()
+    await client.query(f"REMOVE DATABASE IF EXISTS {CF_DATABASE}; DEFINE DATABASE {CF_DATABASE};", {})
+    try:
+        yield client
+    finally:
+        with contextlib.suppress(Exception):
+            cleanup = await SurrealDBConnectionManager.get_client()
+            await cleanup.query(f"REMOVE DATABASE IF EXISTS {CF_DATABASE};", {})
+        await SurrealDBConnectionManager.close_connection()
+
+
+async def _next_events(stream: Any, count: int) -> list[Any]:
+    """The next ``count`` events of a live or change-feed stream, within 5 seconds."""
+    events: list[Any] = []
+    async with asyncio.timeout(5):
+        while len(events) < count:
+            events.append(await anext(stream))
+    return events
+
+
+def _assert_no_marker_in_instance(event: Any) -> None:
+    """The typed instance never carries SurrealDB 2.x's ``"__"`` edge marker, even with ``extra="allow"``."""
+    # ``warnings=False``: an unvalidated fallback instance may hold values of the wrong type.
+    assert "__" not in event.instance.model_dump(warnings=False)
+    assert "__" not in (event.instance.model_extra or {})
+
+
+async def _first_event_of_filtered_live(lookup: Callable[[TrPerson], dict[str, Any]]) -> tuple[Any, TrPurchased]:
+    """Watch ``TrPurchased.objects().filter(**lookup(alice)).live()``; create bob's edge, then alice's.
+
+    Returns the first event received and alice's edge. Bob's edge is created first, so the first
+    event would be his had the filter let it through, and none would come had the filter matched
+    nothing: filtering is proven by order, never by waiting for nothing to arrive. Call it inside an
+    ``orm_client(*EDGE_TABLES)`` block.
+    """
+    client = await SurrealDBConnectionManager.get_client()
+    alice, bob, widget = await _nodes()
+    # SurrealDB 3.x refuses a live query on an undefined table.
+    await client.query("DEFINE TABLE tr_purchased TYPE RELATION;", {})
+    async with asyncio.timeout(5):
+        async with TrPurchased.objects().filter(**lookup(alice)).live() as stream:
+            await bob.relate(TrPurchased, widget)
+            mine = await alice.relate(TrPurchased, widget, data={"quantity": 2})
+            event = await anext(stream)
+    return event, mine
+
+
+def _assert_alices_edge_created(event: Any, mine: TrPurchased) -> None:
+    assert event.action is LiveAction.CREATE
+    assert isinstance(event.instance, TrPurchased)
+    assert event.validation_error is None
+    assert (event.instance.in_, event.instance.out, event.instance.quantity) == (ALICE_P, WIDGET_P, 2)
+    assert event.instance.id == mine.id
+    assert event.record_id == str(mine.id)
+    _assert_no_marker_in_instance(event)
+
+
+class TrLooseNode(BaseSurrealModel):
+    """Node that keeps undeclared fields: a ``__`` column there is the user's, never stripped."""
+
+    model_config = SurrealConfigDict(table_name="tr_loose_node", extra="allow")
+
+    id: str | None = None
+
+
+EDGE_LIVE_ID = RecordID("tr_live", "e1")
+
+
+def _marked_edge_record(**fields: Any) -> dict[str, Any]:
+    """An edge record as SurrealDB 2.x sends it in a live notification or a change-feed update."""
+    return {"__": True, "id": EDGE_LIVE_ID, "in": ALICE_P, "out": WIDGET_P, **fields}
+
+
+class TestEdgeLiveHydration:
+    """``live.hydrate()`` drops 2.x's ``"__": true`` for edge models only, and never touches ``raw`` (no server)."""
+
+    @pytest.mark.parametrize("action", ["CREATE", "UPDATE"])
+    def test_live_event_instance_drops_the_marker_raw_keeps_it(self, action: str) -> None:
+        result = _marked_edge_record(quantity=2)
+        event = to_change_event(
+            TrLiveEdge, {"action": action, "record": EDGE_LIVE_ID, "result": result, "id": "lq"}, diff=False
+        )
+
+        assert isinstance(event.instance, TrLiveEdge)
+        assert event.validation_error is None
+        assert (event.instance.id, event.instance.in_, event.instance.quantity) == (EDGE_LIVE_ID, ALICE_P, 2)
+        _assert_no_marker_in_instance(event)
+        assert event.raw is result
+        assert result == _marked_edge_record(quantity=2)
+
+    def test_diff_create_root_value_is_stripped_for_the_instance_only(self) -> None:
+        patches = [{"op": "replace", "path": "/", "value": _marked_edge_record(quantity=2)}]
+        event = to_change_event(
+            TrLiveEdge, {"action": "CREATE", "record": EDGE_LIVE_ID, "result": patches, "id": "lq"}, diff=True
+        )
+
+        assert event.instance.quantity == 2
+        _assert_no_marker_in_instance(event)
+        assert patches[0]["value"]["__"] is True
+
+    def test_invalid_record_falls_back_without_the_marker(self) -> None:
+        """The ``model_construct`` branch (a record that does not validate) drops it too."""
+        result = _marked_edge_record(quantity="many")
+        event = to_change_event(
+            TrLiveEdge, {"action": "UPDATE", "record": EDGE_LIVE_ID, "result": result, "id": "lq"}, diff=False
+        )
+
+        assert isinstance(event.validation_error, ValidationError)
+        assert isinstance(event.instance, TrLiveEdge)
+        assert event.instance.quantity == "many"
+        _assert_no_marker_in_instance(event)
+        assert result["__"] is True
+
+    def test_change_feed_update_entry(self) -> None:
+        update = _marked_edge_record(quantity=3)
+        [event] = feed_events(TrLiveEdge, {"changes": [{"update": update}], "versionstamp": 1})
+
+        assert event.action is LiveAction.UPDATE
+        assert (event.instance.id, event.instance.quantity) == (EDGE_LIVE_ID, 3)
+        _assert_no_marker_in_instance(event)
+        assert event.raw is update
+        assert update["__"] is True
+
+    def test_node_models_keep_a_double_underscore_column(self) -> None:
+        rid = RecordID("tr_loose_node", "n1")
+        event = to_change_event(
+            TrLooseNode, {"action": "CREATE", "record": rid, "result": {"__": True, "id": rid}, "id": "lq"}, diff=False
+        )
+
+        assert event.instance.model_extra == {"__": True}
+
+    def test_only_the_boolean_marker_is_dropped(self) -> None:
+        """An edge column ``__`` holding anything but ``true`` is data, not the 2.x marker."""
+        result = {**_marked_edge_record(), "__": "kept"}
+        event = to_change_event(
+            TrLiveEdge, {"action": "CREATE", "record": EDGE_LIVE_ID, "result": result, "id": "lq"}, diff=False
+        )
+
+        assert event.instance.model_extra == {"__": "kept"}
+
+
+class TestEdgeLiveE2E:
+    """Typed live queries and change feeds on edge tables (spec §2.5, §4.7; both lines).
+
+    Measured on 2026-10-12: SurrealDB 2.7.0 adds ``"__": true`` to the edge record of a ``CREATE`` or
+    ``UPDATE`` live notification (full and diff) and of a change-feed ``update`` entry; ``DELETE``
+    notifications and change-feed ``delete`` entries never carry it; 3.3.3 never sends it. The typed
+    instance drops it, ``raw`` keeps it as the server sent it.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "lookup",
+        [lambda alice: {"in_": alice}, lambda _alice: {"in_": ALICE_P}],
+        ids=["instance", "record_id"],
+    )
+    async def test_typed_live_on_edge_filtered_by_node(self, lookup: Callable[[TrPerson], dict[str, Any]]) -> None:
+        async with orm_client(*EDGE_TABLES):
+            event, mine = await _first_event_of_filtered_live(lookup)
+
+        _assert_alices_edge_created(event, mine)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "lookup",
+        [lambda _alice: {"in_": "tr_person:alice"}, lambda _alice: {"in___in": ["tr_person:alice"]}],
+        ids=["exact", "in-list"],
+    )
+    async def test_typed_live_filter_with_string_endpoint(self, lookup: Callable[[TrPerson], dict[str, Any]]) -> None:
+        """A ``"table:id"`` string on an endpoint column is read as the record id it names."""
+        async with orm_client(*EDGE_TABLES):
+            event, mine = await _first_event_of_filtered_live(lookup)
+
+        _assert_alices_edge_created(event, mine)
+
+    @pytest.mark.asyncio
+    async def test_changes_on_edge_table(self) -> None:
+        """``changes()`` on a ``TYPE RELATION CHANGEFEED`` table yields typed edges (in a database of its own)."""
+        async with _change_feed_database() as client:
+            alice, bob, widget = await _nodes()
+            await client.query("DEFINE TABLE tr_cf TYPE RELATION CHANGEFEED 1h;", {})
+            major = (await _server_version())[0]
+            first = await alice.relate(TrCfEdge, widget, data={"quantity": 2})
+            second = await bob.relate(TrCfEdge, widget)
+            await first.delete()
+            stream = TrCfEdge.objects().changes(since=0, poll_interval=0.05)
+            try:
+                events = await _next_events(stream, 3)
+            finally:
+                stream.stop()
+
+        # The table definition is not a record change: skipped.
+        assert [e.action for e in events] == [LiveAction.UPDATE, LiveAction.UPDATE, LiveAction.DELETE]
+        assert [e.record_id for e in events] == [str(first.id), str(second.id), str(first.id)]
+        created_alice, created_bob, deleted = events
+        for event in (created_alice, created_bob):
+            assert isinstance(event.instance, TrCfEdge)
+            assert event.validation_error is None
+            assert event.instance.id == event.raw["id"]
+            # SurrealDB 2.x marks the edge record of a change-feed update entry; 3.x does not.
+            assert ("__" in event.raw) is (major == 2)
+            if major == 2:
+                assert event.raw["__"] is True
+        alice_edge = created_alice.instance
+        assert (alice_edge.in_, alice_edge.out, alice_edge.quantity) == (ALICE_P, WIDGET_P, 2)
+        assert (created_bob.instance.in_, created_bob.instance.quantity) == (BOB_P, 1)
+        # A delete entry is ``{id}`` only, on both lines: an instance holding the id.
+        assert deleted.raw == {"id": first.id}
+        assert deleted.instance.id == first.id
+        for event in events:
+            _assert_no_marker_in_instance(event)
+
+    @pytest.mark.asyncio
+    async def test_edge_marker_scope(self) -> None:
+        """``"__"`` never reaches the instance; ``raw`` keeps it on 2.x ``CREATE``/``UPDATE`` only."""
+        async with orm_client(*LIVE_TABLES) as client:
+            alice, _bob, widget = await _nodes()
+            await client.query("DEFINE TABLE tr_live TYPE RELATION;", {})
+            major = (await _server_version())[0]
+            async with asyncio.timeout(5):
+                async with TrLiveEdge.objects().live() as stream:
+                    edge = await alice.relate(TrLiveEdge, widget, data={"quantity": 2})
+                    await edge.merge(quantity=3)
+                    await edge.delete()
+                    created, updated, deleted = await _next_events(stream, 3)
+
+        assert [e.action for e in (created, updated, deleted)] == [LiveAction.CREATE, LiveAction.UPDATE, LiveAction.DELETE]
+        for event in (created, updated, deleted):
+            assert isinstance(event.instance, TrLiveEdge)
+            assert event.validation_error is None
+            assert event.instance.id == edge.id
+            assert (event.instance.in_, event.instance.out) == (ALICE_P, WIDGET_P)
+            _assert_no_marker_in_instance(event)
+        assert [e.instance.quantity for e in (created, updated, deleted)] == [2, 3, 3]
+        for event in (created, updated):
+            assert ("__" in event.raw) is (major == 2)
+            if major == 2:
+                assert event.raw["__"] is True
+        assert "__" not in (deleted.raw or {})
+
+    @pytest.mark.asyncio
+    async def test_diff_mode_on_edge(self) -> None:
+        """Diff mode: the ``CREATE`` root value carries the 2.x marker, the instance does not."""
+        async with orm_client(*LIVE_TABLES) as client:
+            alice, _bob, widget = await _nodes()
+            await client.query("DEFINE TABLE tr_live TYPE RELATION;", {})
+            major = (await _server_version())[0]
+            async with asyncio.timeout(5):
+                async with TrLiveEdge.objects().live(diff=True) as stream:
+                    edge = await alice.relate(TrLiveEdge, widget, data={"quantity": 2})
+                    await edge.merge(quantity=3)
+                    await edge.delete()
+                    created, updated, deleted = await _next_events(stream, 3)
+
+        assert [e.action for e in (created, updated, deleted)] == [LiveAction.CREATE, LiveAction.UPDATE, LiveAction.DELETE]
+        assert isinstance(created.instance, TrLiveEdge)
+        assert (created.instance.in_, created.instance.out, created.instance.quantity) == (ALICE_P, WIDGET_P, 2)
+        [root] = created.raw
+        assert ("__" in root["value"]) is (major == 2)
+        assert updated.changed_fields == ["quantity"]
+        assert updated.instance.id == edge.id
+        assert deleted.instance.id == edge.id
+        for event in (created, updated, deleted):
+            _assert_no_marker_in_instance(event)
