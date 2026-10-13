@@ -8,7 +8,7 @@ from functools import lru_cache
 from typing import Any
 from uuid import UUID
 
-from pydantic import TypeAdapter, ValidationError
+from pydantic import TypeAdapter
 
 from ._sdk import AsyncSurreal, NotFoundError
 from .auth import AuthTokens, build_auth_payload, wrap_auth_error
@@ -32,7 +32,7 @@ from .live import (
     require_websocket,
 )
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
-from .wire import encode_wire
+from .wire import encode_wire, field_input
 
 logger = logging.getLogger(__name__)
 
@@ -990,7 +990,9 @@ class SurrealDBConnectionManager:
         Argument values are bound in forms both SurrealDB lines accept (v0.23.0): a
         ``timedelta`` or ``Duration`` as a duration, a ``date`` as midnight UTC, a ``Range`` as a
         range, a ``set`` as an array. A zero duration is sent: the ORM cannot tell what the
-        function does with it.
+        function does with it. A rich ``return_type`` takes the SDK value the server returns:
+        ``return_type=timedelta`` converts an SDK ``Duration`` (floored to the microsecond),
+        ``return_type=Duration`` keeps its nanoseconds.
 
         :param function: ``"fn::name"``, ``"name"``, or a nested ``"fn::namespace::name"``.
         :param args: positional arguments, in the function's declaration order.
@@ -1067,12 +1069,17 @@ class SurrealDBConnectionManager:
         to keep in sync. Shared by ``call_function()`` and ``info()``; *subject* is what the
         error message names as the source, already formatted (``repr(name)`` for a stored
         function, ``"info()"`` for the session record).
+
+        The value first goes through :func:`~surreal_orm_lite.wire.field_input` (v0.23.0), so the
+        SDK forms Pydantic cannot validate fit the rich types that ask for them: an SDK
+        ``Duration`` for ``return_type=timedelta`` (floored to the microsecond), an SDK
+        ``Datetime`` for a ``datetime``, at any depth of a ``list``, ``dict`` or model.
         """
         if return_type is None:
             return value
         try:
-            return _type_adapter(return_type).validate_python(value)
-        except ValidationError as exc:
+            return _type_adapter(return_type).validate_python(field_input(return_type, value))
+        except ValueError as exc:  # Pydantic's ValidationError, or a duration beyond timedelta.max
             raise SurrealDbValidationError(f"The value returned by {subject} does not fit {return_type!r}: {exc}") from exc
 
     @classmethod

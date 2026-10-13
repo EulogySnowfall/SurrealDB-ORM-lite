@@ -1648,6 +1648,122 @@ class TestConstructorInputs:
         assert ev.ttl == timedelta(minutes=1)  # type: ignore[union-attr]
 
 
+class TestApplyRecord:
+    """``_apply_record`` re-validates the rich fields of a returned row, and never raises (spec §5.4)."""
+
+    def test_rich_fields_get_declared_types(self) -> None:
+        from tests.test_rich_fields import RfEvent
+
+        ev = RfEvent(id="x")
+        ev._apply_record(
+            {
+                "id": RecordID("rf_event", "x"),
+                "ttl": surrealdb.Duration(5400 * 10**9 + 1),
+                "grace": surrealdb.Duration(5400 * 10**9 + 1),
+                "day": datetime(2026, 1, 2, tzinfo=UTC),
+                "hours": SdkRange(BoundIncluded(9), BoundExcluded(17)),
+                "period": SdkRange(BoundIncluded(datetime(2026, 1, 1, tzinfo=UTC)), None),
+                "tags": ["b", "a"],
+                "ttls": [surrealdb.Duration(3600 * 10**9)],
+                "n": 1,
+            }
+        )
+        assert ev.id == RecordID("rf_event", "x")  # the id is kept native, as before
+        assert type(ev.ttl) is timedelta
+        assert ev.ttl == timedelta(hours=1, minutes=30)  # floored to the µs
+        assert type(ev.grace) is Duration
+        assert ev.grace.elapsed == 5400 * 10**9 + 1
+        assert type(ev.day) is date
+        assert ev.day == date(2026, 1, 2)
+        assert type(ev.hours) is Range
+        assert ev.hours == Range(BoundIncluded(9), BoundExcluded(17))
+        assert type(ev.period) is Range
+        assert ev.period.end is None
+        assert type(ev.tags) is set
+        assert ev.tags == {"a", "b"}
+        assert ev.ttls == [timedelta(hours=1)]
+        assert ev.n == 1
+
+    def test_other_fields_are_untouched(self) -> None:
+        from tests.test_rich_fields import RfEvent, RfNest
+
+        ev = RfEvent(id="x")
+        ev._apply_record({"n": "not an int", "price": Decimal("12.50"), "token": "not a uuid"})
+        assert ev.n == "not an int"  # type: ignore[comparison-overlap]  # no validation outside the rich kinds
+        assert str(ev.price) == "12.50"
+        assert ev.token == "not a uuid"  # type: ignore[comparison-overlap]
+
+        nest = RfNest(id="x")
+        sched = {"ttl": surrealdb.Duration(60 * 10**9), "grace": surrealdb.Duration(1)}
+        nest._apply_record({"sched": sched})
+        assert nest.sched is sched  # nested models are not entered: the dict, as since v0.18.0
+
+    def test_only_and_aliases_are_respected(self) -> None:
+        from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict
+        from tests.test_rich_fields import RfEvent
+
+        ev = RfEvent(id="x", ttl=timedelta(minutes=1))
+        ev._apply_record({"ttl": surrealdb.Duration(3600 * 10**9), "grace": surrealdb.Duration(1)}, only=["grace"])
+        assert ev.ttl == timedelta(minutes=1)
+        assert type(ev.grace) is Duration
+
+        class _AliasedRow(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_alias_row_unit")
+
+            id: str | None = None
+            ttl: timedelta | None = Field(None, alias="ttl_col")
+
+        aliased = _AliasedRow(id="x")
+        aliased._apply_record({"ttl_col": surrealdb.Duration(60 * 10**9)})
+        assert type(aliased.ttl) is timedelta
+        assert aliased.ttl == timedelta(minutes=1)
+
+    def test_apply_record_never_raises(self) -> None:
+        from tests.test_rich_fields import RfEvent
+
+        ev = RfEvent(id="x")
+        too_long = surrealdb.Duration(MAX_NS)  # beyond timedelta.max
+        not_midnight = datetime(2026, 1, 2, 5, tzinfo=UTC)  # not a date
+        ev._apply_record({"ttl": too_long, "tags": 5, "day": not_midnight, "n": 1})
+        assert ev.ttl is too_long  # the raw values are kept
+        assert ev.tags == 5
+        assert ev.day is not_midnight
+        assert ev.n == 1
+
+
+class TestReturnType:
+    """``call_function(return_type=)`` / ``info(return_type=)`` convert the SDK forms first (spec §5.4)."""
+
+    def test_sdk_values_fit_rich_return_types(self) -> None:
+        coerce = SurrealDBConnectionManager._coerce_result
+        assert coerce(surrealdb.Duration(5400 * 10**9 + 1), timedelta, "x") == timedelta(hours=1, minutes=30)
+        assert coerce([surrealdb.Duration(1000)], list[timedelta], "x") == [timedelta(microseconds=1)]
+        assert coerce(surrealdb.Datetime("2026-01-02T03:04:05.123456789Z"), datetime, "x") == datetime(
+            2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC
+        )
+        as_duration = coerce(surrealdb.Duration(7), Duration, "x")
+        assert type(as_duration) is Duration
+        assert as_duration.elapsed == 7
+        sdk_value = surrealdb.Duration(7)
+        assert coerce(sdk_value, None, "x") is sdk_value  # no return_type: untouched
+
+        class _Lock(BaseModel):
+            ttl: timedelta
+            meta: dict[str, Any] = {}
+
+        lock = coerce({"ttl": surrealdb.Duration(60 * 10**9), "meta": {"d": sdk_value}}, _Lock, "info()")
+        assert lock.ttl == timedelta(minutes=1)
+        assert lock.meta["d"] is sdk_value  # an Any position keeps the SDK value
+
+    def test_unfit_value_is_a_validation_error(self) -> None:
+        from surreal_orm_lite import SurrealDbValidationError
+
+        with pytest.raises(SurrealDbValidationError, match="does not fit"):
+            SurrealDBConnectionManager._coerce_result(surrealdb.Duration(MAX_NS), timedelta, "'fn::x'")
+        with pytest.raises(SurrealDbValidationError, match="does not fit"):
+            SurrealDBConnectionManager._coerce_result("1.5h", timedelta, "'fn::x'")
+
+
 # --- raw SDK E2E: what both server lines do with each encoded form (AC-6, AC-29, AC-32 b) ---------
 
 

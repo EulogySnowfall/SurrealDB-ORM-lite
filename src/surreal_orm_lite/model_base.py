@@ -68,6 +68,15 @@ _RICH_FIELDS: dict[type, dict[str, tuple[Any, frozenset[str], frozenset[str]]]] 
 # ``Duration``, ``Range[T]`` and the other kinds validate the SDK forms themselves.
 _INPUT_KINDS = frozenset({"timedelta", "datetime", "date"})
 
+# The rich kinds ``_apply_record`` re-validates in a row a write sends back: the values a raw row
+# carries in another form than the field declares — an SDK ``Duration`` for a ``timedelta`` or a
+# ``Duration``, a midnight ``datetime`` for a ``date``, an SDK ``Range``, a list for a ``set`` or a
+# ``tuple``. Matched on the *shallow* kinds: nested models are not entered (they arrive as dicts,
+# v0.18.0). A ``datetime``, ``Decimal`` or ``UUID`` already arrives as the declared type.
+_APPLY_KINDS = frozenset({"timedelta", "date", "duration", "range", "set", "frozenset", "tuple"})
+# (model class, field name) → the ``TypeAdapter`` of the field's annotation, built on first use.
+_APPLY_ADAPTERS: dict[tuple[type, str], pydantic.TypeAdapter[Any]] = {}
+
 # Pydantic's metaclass sits between ``__pydantic_init_subclass__`` and the user's ``class``
 # statement; a warning raised there must skip its frames to land on the user's line (v0.22.0).
 _PYDANTIC_DIR = os.path.dirname(os.path.abspath(pydantic.__file__))
@@ -1201,6 +1210,14 @@ class BaseSurrealModel(BaseModel):
         a caller that needs just a few known-scalar fields should say so rather than re-applying
         the whole row.
 
+        The exception (v0.23.0) is a field whose own annotation holds a rich type the row carries
+        in another form — ``timedelta``, ``date``, ``Duration``, ``Range[T]``, ``set``,
+        ``frozenset``, ``tuple``, also inside a ``list``/``dict``/union, but not inside a nested
+        model: its value goes through :func:`~surreal_orm_lite.wire.field_input` and the field's
+        ``TypeAdapter``, so the instance keeps its declared types (an SDK ``Duration`` becomes a
+        ``timedelta``, the list stored for a ``set`` a ``set`` again). A value that does not fit
+        is kept as it came: this never raises on the row's content.
+
         A row arrives keyed by **column**, so each key is translated back to its Python field
         name first (v0.18.0). ``only`` is therefore matched on Python names — the same
         vocabulary the callers use, since they pass things like ``get_server_fields()``.
@@ -1214,12 +1231,35 @@ class BaseSurrealModel(BaseModel):
         if not isinstance(record, dict):
             return
         allowed = None if only is None else set(only)
+        rich = self._rich_fields()
+        fields = type(self).model_fields
         for column, value in record.items():
             key = self.to_py_field(column)
             if allowed is not None and key not in allowed:
                 continue
             if hasattr(self, key):
+                entry = rich.get(key) if key in fields else None
+                if entry is not None and entry[2] & _APPLY_KINDS:
+                    value = self._declared_value(key, entry[0], value)
                 object.__setattr__(self, key, value)
+
+    @classmethod
+    def _declared_value(cls, name: str, annotation: Any, value: Any) -> Any:
+        """``value`` validated as field ``name``'s annotation, or ``value`` itself if it does not fit (v0.23.0).
+
+        :meth:`_apply_record`'s re-validation of a rich field: :func:`~surreal_orm_lite.wire.field_input`
+        (an SDK ``Duration`` at a ``timedelta`` position…), then the field's ``TypeAdapter``,
+        cached per (class, field). A ``ValueError`` (Pydantic's ``ValidationError`` included — a
+        duration beyond ``timedelta.max``, a ``datetime`` that is not a midnight for a ``date``),
+        ``TypeError`` or ``OverflowError`` keeps the raw value, as before v0.23.0.
+        """
+        try:
+            adapter = _APPLY_ADAPTERS.get((cls, name))
+            if adapter is None:
+                adapter = _APPLY_ADAPTERS[(cls, name)] = pydantic.TypeAdapter(annotation)
+            return adapter.validate_python(field_input(annotation, value))
+        except (ValueError, TypeError, OverflowError):
+            return value
 
     def _sync_after_merge(
         self,

@@ -18,11 +18,16 @@ hydrates the declared Python types, on SurrealDB 2.x and 3.x alike.
 - **Reads** (spec §5.4): ``set_data`` converts the SDK forms Pydantic cannot validate, only where the
   annotation asks for them — an SDK ``Duration`` into a ``timedelta`` field (floored to the µs), never
   into an ``Any`` or ``Duration`` position.
+- **Rows returned by writes** (spec §5.4): ``_apply_record`` — the step that copies the row a write
+  sends back onto the instance (``save`` auto id, ``upsert``, ``merge``, ``patch``, ``atomic_*``,
+  ``refresh``, server fields) — re-validates the rich fields, so the instance keeps its declared
+  types (a ``set`` stays a ``set``); ``call_function(return_type=)`` converts the SDK values too.
 
 E2E tables are dedicated (``rf_*``), dropped on entry and exit by ``orm_client``; records are created
 inside the ``async with orm_client(...)`` block.
 """
 
+import asyncio
 import contextlib
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -41,14 +46,18 @@ from surreal_orm_lite import (
     BaseSurrealModel,
     BoundExcluded,
     BoundIncluded,
+    Computed,
     Duration,
     Range,
     SurrealConfigDict,
     SurrealDBConnectionManager,
     SurrealFunc,
+    computed,
+    retry_on_conflict,
 )
 from surreal_orm_lite.wire import sdk_decodes_zero_duration
 from tests.conftest import orm_client
+from tests.test_rich_types import _server_version
 
 # ==================== Shared models and values ====================
 
@@ -603,7 +612,7 @@ async def _http_orm_client(*tables: str) -> AsyncIterator[Any]:
         await SurrealDBConnectionManager.close_connection()
 
 
-def _assert_full_declared(ev: RfEvent) -> None:
+def _assert_full_declared(ev: RfEvent, n: int = 5) -> None:
     """A hydrated ``FULL`` row: the declared Python types and the values written."""
     assert type(ev.at) is datetime
     assert ev.at == FULL["at"]
@@ -625,7 +634,7 @@ def _assert_full_declared(ev: RfEvent) -> None:
     assert ev.tags == {"a", "b"}
     assert ev.ttls == FULL["ttls"]
     assert all(type(d) is timedelta for d in ev.ttls)
-    assert ev.n == 5
+    assert ev.n == n
 
 
 class TestRichStatementWritesE2E:
@@ -723,3 +732,354 @@ class TestRichTransactionsE2E:
             _assert_native(await _raw("t"))
             _assert_sdk_duration((await _raw("m"))["ttl"], 2 * _HOUR_NS)
             _assert_full_declared(await RfEvent.objects().get("t"))
+
+
+# ==================== Task 7 — rows returned by writes, return types, the full read matrix ====================
+
+
+class RfServer(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_server", server_fields=["grace"])
+
+    id: str | None = None
+    grace: Duration | None = None
+    note: str = ""
+
+
+class RfCf(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_cf")
+
+    id: str | None = None
+    ttl: timedelta | None = None
+
+
+class RfTagged(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_tagged")
+
+    id: str | None = None
+    tags: set[str] = set()
+
+
+class RfComp(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_comp")
+
+    id: str | None = None
+    starts: datetime
+    ends: datetime
+    length: Computed[timedelta] = computed("ends - starts")
+
+
+_READ_TABLES = ("rf_event", "rf_link", "rf_server", "rf_cf", "rf_tagged", "rf_comp")
+
+
+async def _retrying(operation: Callable[[], Awaitable[Any]]) -> Any:
+    """A write to a change-feed table, retried on SurrealDB's retryable conflicts (seen once on 2.7.0 in CI)."""
+
+    @retry_on_conflict(max_retries=5)
+    async def _run() -> Any:
+        return await operation()
+
+    return await _run()
+
+
+# --- read paths: a server-written row (SEED) hydrates as the declared types (AC-12) ---
+
+
+async def _read_get() -> RfEvent:
+    ev: RfEvent = await RfEvent.objects().get("s")
+    return ev
+
+
+async def _read_filter() -> RfEvent:
+    rows = await RfEvent.objects().filter(n=1).exec()
+    assert len(rows) == 1
+    return rows[0]
+
+
+async def _read_all() -> RfEvent:
+    rows = await RfEvent.objects().all()
+    assert len(rows) == 1
+    ev: RfEvent = rows[0]
+    return ev
+
+
+async def _read_first() -> RfEvent:
+    ev = await RfEvent.objects().first()
+    assert isinstance(ev, RfEvent)
+    return ev
+
+
+async def _read_get_or_create() -> RfEvent:
+    ev, created = await RfEvent.objects().get_or_create(id="s")
+    assert not created
+    assert isinstance(ev, RfEvent)
+    return ev
+
+
+async def _read_refresh() -> RfEvent:
+    ev = RfEvent(id="s")
+    await ev.refresh()  # the row is applied by _apply_record
+    return ev
+
+
+async def _read_raw_query() -> RfEvent:
+    rows = await RfEvent.raw_query("SELECT * FROM rf_event:s;")
+    assert len(rows) == 1
+    ev = rows[0]
+    assert isinstance(ev, RfEvent)
+    return ev
+
+
+async def _read_in_transaction() -> RfEvent:
+    if not await _native_txn_supported():
+        pytest.skip("requires SurrealDB 3.x native transactions")
+    async with SurrealDBConnectionManager.transaction() as tx:
+        ev: RfEvent = await RfEvent.objects(tx=tx).get("s")
+    return ev
+
+
+async def _read_refresh_in_transaction() -> RfEvent:
+    if not await _native_txn_supported():
+        pytest.skip("requires SurrealDB 3.x native transactions")
+    ev = RfEvent(id="s")
+    async with SurrealDBConnectionManager.transaction() as tx:
+        await ev.refresh(tx=tx)  # _apply_record, inside the transaction
+    return ev
+
+
+_READ_PATHS: list[tuple[str, Callable[[], Awaitable[RfEvent]]]] = [
+    ("get", _read_get),
+    ("filter-exec", _read_filter),
+    ("all", _read_all),
+    ("first", _read_first),
+    ("get_or_create-existing", _read_get_or_create),
+    ("refresh", _read_refresh),
+    ("raw_query", _read_raw_query),
+    ("objects-tx-get", _read_in_transaction),
+    ("refresh-tx", _read_refresh_in_transaction),
+]
+
+
+# --- write paths: the row a write sends back keeps the declared types on the instance (AC-13) ---
+
+
+async def _sync_save_auto_id() -> tuple[RfEvent, int]:
+    ev = RfEvent(**FULL)
+    await ev.save()  # auto id: the whole returned row is applied
+    return ev, 5
+
+
+async def _sync_save_server_values() -> tuple[RfEvent, int]:
+    ev = RfEvent(id="v", **FULL)
+    await ev.save(server_values={"n": SurrealFunc("1 + 1")})
+    return ev, 2
+
+
+async def _sync_upsert() -> tuple[RfEvent, int]:
+    ev = RfEvent(id="u", **FULL)
+    await ev.upsert()
+    return ev, 5
+
+
+async def _sync_merge() -> tuple[RfEvent, int]:
+    ev = await _saved("m")
+    await ev.merge(n=2)
+    return ev, 2
+
+
+async def _sync_patch() -> tuple[RfEvent, int]:
+    ev = await _saved("p")
+    await ev.patch([{"op": "replace", "path": "/n", "value": 3}])
+    return ev, 3
+
+
+async def _sync_atomic_increment() -> tuple[RfEvent, int]:
+    ev = await _saved("i")
+    await ev.atomic_increment("n", 1)
+    return ev, 6
+
+
+async def _sync_refresh() -> tuple[RfEvent, int]:
+    ev = await _saved("r")
+    await ev.refresh()
+    return ev, 5
+
+
+async def _sync_bulk_create() -> tuple[RfEvent, int]:
+    created = await RfEvent.objects().bulk_create([RfEvent(id="b", **FULL)])
+    assert len(created) == 1
+    ev = created[0]
+    assert isinstance(ev, RfEvent)
+    return ev, 5
+
+
+_SYNC_PATHS: list[tuple[str, Callable[[], Awaitable[tuple[RfEvent, int]]]]] = [
+    ("save-auto-id", _sync_save_auto_id),
+    ("save-server-values", _sync_save_server_values),
+    ("upsert", _sync_upsert),
+    ("merge", _sync_merge),
+    ("patch", _sync_patch),
+    ("atomic_increment", _sync_atomic_increment),
+    ("refresh", _sync_refresh),
+    ("bulk_create", _sync_bulk_create),
+]
+
+
+class TestRichReadsE2E:
+    @pytest.mark.parametrize("read", [case for _, case in _READ_PATHS], ids=[name for name, _ in _READ_PATHS])
+    async def test_read_path_returns_declared_types(self, read: Callable[[], Awaitable[RfEvent]]) -> None:
+        async with orm_client(*_READ_TABLES) as client:
+            await client.query(SEED, {})
+            _assert_declared(await read())
+
+    @pytest.mark.parametrize("write", [case for _, case in _SYNC_PATHS], ids=[name for name, _ in _SYNC_PATHS])
+    async def test_returned_rows_sync_declared_types(self, write: Callable[[], Awaitable[tuple[RfEvent, int]]]) -> None:
+        async with orm_client(*_READ_TABLES):
+            ev, n = await write()
+            assert isinstance(ev.get_id(), (str, RecordID))
+            _assert_full_declared(ev, n=n)  # tags back to a set, ttl a timedelta, grace a Duration…
+
+    async def test_server_default_hydrates(self) -> None:
+        async with orm_client(*_READ_TABLES) as client:
+            await client.query("DEFINE FIELD grace ON rf_server DEFAULT 3h;", {})
+            ev = RfServer(id="d", note="x")
+            await ev.save()  # explicit id: only the server fields are applied
+            assert type(ev.grace) is Duration
+            assert ev.grace == Duration.parse("3h")
+            assert ev.note == "x"
+
+    async def test_live_and_change_feed_instances_typed(self) -> None:
+        async with orm_client(*_READ_TABLES) as client:
+            await client.query("DEFINE TABLE rf_event SCHEMALESS;", {})
+            async with asyncio.timeout(10), RfEvent.objects().live() as stream:
+                await RfEvent(id="l", **FULL).save()
+                event = await anext(stream)
+            assert event.record_id == "rf_event:l"
+            _assert_full_declared(event.instance)
+            _assert_sdk_duration(event.raw["ttl"], 5400 * 10**9)  # raw keeps the SDK values
+            assert isinstance(event.raw["hours"], surrealdb.Range)
+
+            await client.query("DEFINE TABLE rf_cf SCHEMALESS CHANGEFEED 1h;", {})
+            # Started before the write rather than ``since=0``: on 3.x a cursor is clock-based, and
+            # ``SHOW CHANGES … SINCE 0`` returns nothing (measured on 3.3.4).
+            changes = await RfCf.objects().changes(poll_interval=0.05).start()
+            try:
+                await _retrying(lambda: RfCf(id="c", ttl=timedelta(hours=1, minutes=30)).save())
+                async with asyncio.timeout(10):
+                    change = await anext(changes)
+            finally:
+                changes.stop()
+            assert change.record_id == "rf_cf:c"
+            assert isinstance(change.instance, RfCf)
+            assert type(change.instance.ttl) is timedelta
+            assert change.instance.ttl == timedelta(hours=1, minutes=30)
+
+    async def test_edge_hydrates_declared_types(self) -> None:
+        async with orm_client(*_READ_TABLES) as client:
+            a, b = RfEvent(id="a"), RfEvent(id="b")
+            await a.save()
+            await b.save()
+
+            link = RfLink(in_=a, out=b, ttl=timedelta(minutes=5), window=Range(BoundIncluded(1), BoundExcluded(5)))
+            await link.save()  # auto id: the returned row is applied
+            assert type(link.ttl) is timedelta
+            assert link.ttl == timedelta(minutes=5)
+            assert type(link.window) is Range
+            assert link.window == Range(BoundIncluded(1), BoundExcluded(5))
+
+            await client.query("RELATE rf_event:a->rf_link:r->rf_event:b SET ttl = 1h30m1ns, window = 1..=5;", {})
+            got = await RfLink.objects().get("r")
+            assert type(got.ttl) is timedelta
+            assert got.ttl == timedelta(hours=1, minutes=30)
+            assert type(got.window) is Range
+            assert got.window == Range(BoundIncluded(1), BoundIncluded(5))
+
+            got.ttl = timedelta(hours=2)
+            await got.refresh()  # the stored row comes back through _apply_record
+            assert type(got.ttl) is timedelta
+            assert got.ttl == timedelta(hours=1, minutes=30)
+            assert type(got.window) is Range
+
+    async def test_set_field_on_array_column(self) -> None:
+        async with orm_client(*_READ_TABLES) as client:
+            await client.query("DEFINE FIELD tags ON rf_tagged TYPE array<string> VALUE $value.distinct();", {})
+            tagged = RfTagged(tags={"b", "a"})
+            await tagged.save()  # auto id: the row's list comes back as the declared set
+            assert type(tagged.tags) is set
+            assert tagged.tags == {"a", "b"}
+
+            rid = tagged.get_id()
+            assert isinstance(rid, RecordID)
+            assert await client.query("SELECT VALUE tags FROM ONLY $rid;", {"rid": rid}) == ["a", "b"]  # a list
+            got = await RfTagged.objects().get(tagged.get_raw_id())
+            assert type(got.tags) is set
+            assert got.tags == {"a", "b"}
+
+            await client.query("UPDATE $rid SET tags = ['c', 'c', 'a'];", {"rid": rid})
+            await tagged.refresh()
+            assert type(tagged.tags) is set
+            assert tagged.tags == {"a", "c"}
+
+    async def test_precision_contract(self) -> None:
+        async with orm_client(*_READ_TABLES) as client:
+            exact = Duration(5400 * 10**9 + 1)
+            await RfEvent(id="p", grace=exact, ttl=exact.to_timedelta()).save()
+            got = await RfEvent.objects().get("p")
+            assert got.grace is not None
+            assert got.grace.elapsed == 5400 * 10**9 + 1  # Duration keeps the nanosecond
+            assert got.grace.elapsed % 1000 == 1
+            assert got.ttl == timedelta(hours=1, minutes=30)  # timedelta floors it
+
+            await client.query("CREATE rf_event:ns SET at = d'2026-01-02T03:04:05.123456789Z';", {})  # never time::now()
+            read_back = (await RfEvent.objects().get("ns")).at
+            assert read_back is not None
+            assert read_back.microsecond == 123456
+            assert await RfEvent.objects().filter(at=read_back).exec() == []  # µs ≠ the stored ns
+            assert [ev.id for ev in await RfEvent.objects().filter(at__gte=read_back).exec()] == ["ns"]
+
+            await RfEvent(id="naive", at=datetime(2026, 1, 1)).save()
+            naive = (await RfEvent.objects().get("naive")).at
+            assert type(naive) is datetime
+            assert naive.utcoffset() == timedelta(0)
+            assert naive == datetime(2026, 1, 1, tzinfo=UTC)
+
+    async def test_computed_and_call_function_return_types(self) -> None:
+        async with orm_client(*_READ_TABLES):
+            await RfComp.define_computed_fields()
+            starts = datetime(2026, 1, 2, 9, tzinfo=UTC)
+            comp = RfComp(id="c", starts=starts, ends=starts + timedelta(hours=1, minutes=30))
+            await comp.save()  # explicit id: the computed field comes back with the server fields
+            assert type(comp.length) is timedelta
+            assert comp.length == timedelta(hours=1, minutes=30)
+            loaded = await RfComp.objects().get("c")
+            assert type(loaded.length) is timedelta
+            assert loaded.length == timedelta(hours=1, minutes=30)
+
+            async with _rf_add_function():
+                as_timedelta = await SurrealDBConnectionManager.call_function(
+                    "fn::rf_add", [timedelta(hours=1)], return_type=timedelta
+                )
+                assert type(as_timedelta) is timedelta
+                assert as_timedelta == timedelta(hours=2)
+                as_duration = await SurrealDBConnectionManager.call_function(
+                    "fn::rf_add", [timedelta(hours=1)], return_type=Duration
+                )
+                assert type(as_duration) is Duration
+                assert as_duration == Duration.parse("2h")
+                as_list = await SurrealDBConnectionManager.call_function(
+                    "fn::rf_add", [Duration.parse("1h30m1ns")], return_type=list[timedelta] | timedelta
+                )
+                assert as_list == timedelta(hours=2, minutes=30)  # floored
+                via_model = await RfEvent.call_function("rf_add", (timedelta(hours=1),), return_type=timedelta)
+                assert via_model == timedelta(hours=2)
+
+    async def test_decimal_trailing_zeros_by_line(self) -> None:
+        async with orm_client(*_READ_TABLES) as client:
+            await client.query("CREATE rf_event:d SET price = 12.50dec;", {})
+            got = (await RfEvent.objects().get("d")).price
+            raw = (await _raw("d"))["price"]
+            assert got == Decimal("12.5")
+            assert raw == Decimal("12.5")
+            expected = "12.50" if await _server_version() < (3, 0, 0) else "12.5"
+            message = "2.x changed decimal trailing zeros — update README behaviour row 2 (spec §12 item 2)"
+            assert str(got) == expected, message
+            assert str(raw) == expected, message
