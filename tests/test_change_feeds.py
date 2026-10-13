@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -591,3 +592,181 @@ class TestReviewStoppedStartE2E:
         monkeypatch.setattr(changefeed.ChangeModelStream, "_with_retry", _stopped)
         with pytest.raises(changefeed._StreamStopped):
             await stream._check_changefeed()
+
+
+# ==================== issue #212: "now" on 3.x is a millisecond, not a stamp ====================
+
+
+def _epoch_ms(moment: datetime) -> int:
+    return (moment - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1)
+
+
+def _at_ms(ms: int) -> datetime:
+    return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(milliseconds=ms)
+
+
+async def _feed_stamps(client: Any) -> list[int]:
+    """Every versionstamp in ``Fed``'s feed (the table is recreated per test, so it is short)."""
+    feed = await client.query(f"SHOW CHANGES FOR TABLE {TABLE} SINCE 0 LIMIT 1000;", {})
+    return [entry["versionstamp"] for entry in feed]
+
+
+async def _require_clock_stamps(client: Any, stamp: int) -> None:
+    """Capability probe: skip unless versionstamps are ``unix_ms << 16 | counter`` (SurrealDB 3.x).
+
+    2.x stamps a counter ``<< 16``, so ``stamp >> 16`` is nowhere near the server's clock there,
+    and ``since=None`` does not read the clock at all (it searches the counter).
+    """
+    now = await client.query("RETURN time::now();", {})
+    if not isinstance(now, datetime):
+        now = datetime.fromisoformat(str(now))
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    if abs((stamp >> 16) - _epoch_ms(now)) > 3_600_000:
+        pytest.skip("versionstamps do not follow the server clock here (SurrealDB 2.x counter)")
+
+
+def _clock_reading(ms: int) -> Any:
+    async def _server_now(self: Any) -> datetime:
+        return _at_ms(ms)
+
+    return _server_now
+
+
+class TestSinceNoneSameMillisecondE2E:
+    """Issue #212: on 3.x a stamp is ``unix_ms << 16 | counter`` and ``SINCE`` is inclusive, so
+    starting "now" at ``versionstamp_at(server_now())`` replayed every entry committed earlier in
+    that same millisecond. The server clock is pinned to the millisecond of an existing entry, which
+    is what CI hit by chance (the fixture's ``DEFINE TABLE``, a ``Fed:x`` written just before)."""
+
+    @pytest.mark.asyncio
+    async def test_an_entry_from_the_clocks_millisecond_is_not_replayed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with feed_client() as client:
+            await _write(lambda: Fed(id="same_ms").save())
+            stamp = (await _feed_stamps(client))[-1]
+            await _require_clock_stamps(client, stamp)
+            monkeypatch.setattr(ChangeModelStream, "_server_now", _clock_reading(stamp >> 16))
+
+            stream = await Fed.objects().changes(poll_interval=0.05).start()
+
+            assert isinstance(stream.cursor, int)
+            assert stream.cursor > stamp
+            await _nothing_within(stream)
+
+    @pytest.mark.asyncio
+    async def test_skips_every_page_of_history_then_delivers_the_next_write(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with feed_client() as client:
+            for n in range(3):
+                await _write(lambda n=n: Fed(id=f"h{n}").save())
+            stamps = await _feed_stamps(client)
+            await _require_clock_stamps(client, stamps[-1])
+            # The clock reads the millisecond of the first write: three entries are at or after it,
+            # one page each with batch_size=1.
+            first_write = stamps[-3]
+            monkeypatch.setattr(ChangeModelStream, "_server_now", _clock_reading(first_write >> 16))
+
+            stream = await Fed.objects().changes(poll_interval=0.05, batch_size=1).start()
+            assert isinstance(stream.cursor, int)
+            assert stream.cursor > stamps[-1]
+            await _write(lambda: Fed(id="after").save())
+
+            [event] = await _take(stream, 1)
+            assert _ids([event]) == ["after"]
+            await _nothing_within(stream)
+
+
+class _FakeServer3x:
+    """A SurrealDB 3.x server in miniature: what ``ChangeModelStream`` asks while it starts and polls.
+
+    Its feed is a list of versionstamps, all in the millisecond its clock reads, so the tests can
+    put a write *after* ``start()`` in the very millisecond ``start()`` read — which a real server
+    only does by chance.
+    """
+
+    def __init__(self, ms: int, counters: list[int]) -> None:
+        from surreal_orm_lite._sdk import RecordID
+
+        self._record = RecordID
+        self.ms = ms
+        self.stamps = [(ms << 16) | counter for counter in counters]
+        self.shows: list[tuple[int, int]] = []
+        self.on_show: Any = None
+
+    def write(self, counter: int) -> None:
+        self.stamps.append((self.ms << 16) | counter)
+
+    async def version(self) -> str:
+        return "surrealdb-3.3.3"
+
+    async def query(self, sql: str, variables: dict[str, Any]) -> Any:
+        if sql.startswith("INFO FOR DB"):
+            return {"tables": {TABLE: f"DEFINE TABLE {TABLE} TYPE ANY SCHEMALESS CHANGEFEED 1h"}}
+        if sql.startswith("RETURN time::now()"):
+            return _at_ms(self.ms)
+        show = re.fullmatch(rf"SHOW CHANGES FOR TABLE {TABLE} SINCE (\d+) LIMIT (\d+);", sql)
+        assert show is not None, f"unexpected query {sql!r}"
+        since, limit = int(show.group(1)), int(show.group(2))
+        self.shows.append((since, limit))
+        if self.on_show is not None:
+            self.on_show()
+        return [
+            {"versionstamp": stamp, "changes": [{"update": {"id": self._record(TABLE, f"c{stamp & 0xFFFF}")}}]}
+            for stamp in self.stamps
+            if stamp >= since
+        ][:limit]
+
+
+class TestEndOfFeed3xUnit:
+    @staticmethod
+    def _serve(monkeypatch: pytest.MonkeyPatch, server: _FakeServer3x) -> None:
+        async def _get_client(cls: Any) -> Any:
+            return server
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", classmethod(_get_client))
+
+    @pytest.mark.asyncio
+    async def test_pages_past_every_entry_of_the_clocks_millisecond(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        server = _FakeServer3x(ms=1_791_868_481_598, counters=[0, 1, 2, 3, 4])
+        self._serve(monkeypatch, server)
+
+        stream = await Fed.objects().changes(batch_size=2).start()
+
+        assert stream.cursor == server.stamps[-1] + 1
+        assert server.shows == [(server.ms << 16, 2), ((server.ms << 16) + 2, 2), ((server.ms << 16) + 4, 2)]
+
+    @pytest.mark.asyncio
+    async def test_a_write_after_start_in_the_same_millisecond_is_delivered(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Starting at ``(ms + 1) << 16`` would also hide the history, and lose this write."""
+        server = _FakeServer3x(ms=1_791_868_481_598, counters=[0])
+        self._serve(monkeypatch, server)
+        stream = await Fed.objects().changes(poll_interval=0).start()
+
+        server.write(1)
+        event = await anext(stream)
+
+        assert event.record_id == f"{TABLE}:c1"
+        assert stream.cursor == server.stamps[-1] + 1
+
+    @pytest.mark.asyncio
+    async def test_an_empty_millisecond_starts_at_the_clock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        server = _FakeServer3x(ms=1_791_868_481_598, counters=[])
+        self._serve(monkeypatch, server)
+
+        stream = await Fed.objects().changes().start()
+
+        assert stream.cursor == server.ms << 16
+        assert len(server.shows) == 1
+
+    @pytest.mark.asyncio
+    async def test_stop_during_the_scan_sends_nothing_more(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        server = _FakeServer3x(ms=1_791_868_481_598, counters=[0, 1, 2])
+        self._serve(monkeypatch, server)
+        stream = Fed.objects().changes(batch_size=1)
+        server.on_show = stream.stop
+
+        assert await stream.start() is stream
+
+        assert len(server.shows) == 1
+        with pytest.raises(StopAsyncIteration):
+            await anext(stream)
+        assert len(server.shows) == 1

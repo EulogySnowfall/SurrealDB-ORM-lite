@@ -18,7 +18,9 @@ The ORM reads the server line once per stream (``version()``) and always stores 
 ``SINCE`` value, so ``changes(since=stream.cursor)`` is correct on both. ``SINCE <datetime>`` is
 worse still: always empty on 3.x, and on 2.x it also returns changes from before the moment. So a
 datetime is converted to the 3.x stamp layout (``unix_ms << 16``, exact), passed through on 2.x
-(documented as at-least-once), and "from now" on 2.x is found by searching the counter instead.
+(documented as at-least-once), and "from now" is the end of the feed: on 2.x found by searching
+the counter; on 3.x the server clock's ``unix_ms << 16``, then past the entries already stamped in
+that millisecond — a 3.x stamp is ``unix_ms << 16 | counter``, so the clock alone would replay them.
 
 Polling is plain ``query()``, so it works over HTTP as well as WebSocket. A dropped connection is
 retried with backoff like a live stream; nothing is lost, because the next poll starts from the
@@ -277,7 +279,9 @@ class ChangeModelStream(Generic[T]):
         """Fix the starting position now rather than at the first read. Idempotent.
 
         With ``since=None`` "now" is the moment of this call, so a write made between ``start()``
-        and the first read is delivered.
+        and the first read is delivered, and nothing already in the feed is. "Now" is the end of the
+        feed: on SurrealDB 3.x the server clock's millisecond, then past the entries already stamped
+        in it (usually one short read); on 2.x a search of the counter.
 
         A stream stopped while starting returns without sending anything more; iterating it ends.
 
@@ -303,7 +307,7 @@ class ChangeModelStream(Generic[T]):
             else:
                 self._since_clause = since_sql(since, major=major)
         elif major >= 3:
-            self._cursor = versionstamp_at(await self._server_now())
+            self._cursor = await self._end_of_feed_3x()
         else:
             self._cursor = await self._end_of_feed_2x()
         self._major = major
@@ -368,6 +372,26 @@ class ChangeModelStream(Generic[T]):
         if not isinstance(now, datetime):
             now = datetime.fromisoformat(str(now))
         return now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+
+    async def _end_of_feed_3x(self) -> int:
+        """The 3.x cursor right after the newest entry: the server clock, then the entries at or after it.
+
+        The clock gives only a millisecond, ``unix_ms << 16``, while a stamp is ``unix_ms << 16 |
+        counter`` and ``SINCE`` is inclusive: every entry committed earlier in that millisecond is
+        at or after it, and would be replayed as history (issue #212). Those entries are read, a
+        page of ``batch_size`` at a time, and the cursor moves past the last one — usually a single
+        short read. Not ``(unix_ms + 1) << 16``: that would also skip a write made right after
+        :meth:`start` in the same millisecond.
+        """
+        cursor = versionstamp_at(await self._server_now())
+        while True:
+            entries = await self._show(str(cursor), self._batch_size)
+            last = entries[-1].get("versionstamp") if entries else None
+            if not isinstance(last, int) or last < cursor:  # nothing to skip, or no progress
+                return cursor
+            cursor = next_cursor(last, major=3)
+            if len(entries) < self._batch_size:
+                return cursor
 
     async def _end_of_feed_2x(self) -> int:
         """The 2.x cursor right after the newest entry, found without reading the feed.
