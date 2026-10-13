@@ -52,6 +52,7 @@ from .utils import (
     warn_on_multiple_statements,
 )
 from .wire import (
+    child_annotation,
     declared_kind,
     duration_ns,
     encode_wire,
@@ -59,6 +60,7 @@ from .wire import (
     field_keys,
     lookup_type,
     model_object,
+    read_keys,
     restore_native,
     rich_kinds,
     sub_model,
@@ -199,40 +201,118 @@ def _keyword_value(context: str, path: str, owner: type[BaseModel], name: str, i
     try:
         validated = _write_adapter(owner, name, info).validate_python(field_input(info.annotation, linked))
     except (ValueError, TypeError) as exc:
-        detail = "; ".join(str(error["msg"]) for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
-        label = _type_label(info.annotation)
-        if isinstance(value, BaseSurrealModel):
-            message = (
-                f"the {type(value).__name__} instance is written as its record id, which {label} does not "
-                f"accept ({detail}); pass a dict, or a sub-model instance, to write an object"
-            )
-        else:
-            message = f"{value!r} is not a valid {label} ({detail})"
-            if linked is not value:
-                message += "; a table-model instance in it is written as its record id"
-        raise ValueError(f"{context}({path}=…): {message}") from exc
+        raise ValueError(f"{context}({path}=…): {_refusal(info.annotation, value, linked, exc)}") from exc
     return _object_forms(validated)
+
+
+def _refusal(annotation: Any, value: Any, linked: Any, exc: Exception) -> str:
+    """Why ``value`` (``linked``: with its table-model instances as record ids) does not fit ``annotation``."""
+    detail = "; ".join(str(error["msg"]) for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
+    label = _type_label(annotation)
+    if isinstance(value, BaseSurrealModel):
+        return (
+            f"the {type(value).__name__} instance is written as its record id, which {label} does not "
+            f"accept ({detail}); pass a dict, or a sub-model instance, to write an object"
+        )
+    message = f"{value!r} is not a valid {label} ({detail})"
+    if linked is not value:
+        message += "; a table-model instance in it is written as its record id"
+    return message
+
+
+def _check_links(context: str, path: str, annotation: Any, value: Any) -> None:
+    """Refuse a table-model instance in ``value`` where ``annotation`` cannot hold its record id (v0.23.0).
+
+    For the writes that send ``value`` without validating it as a field — the ``atomic_*`` helpers
+    and ``patch()`` — since ``encode_wire`` writes such an instance as its record id at any position:
+    without this, ``atomic_append("plains", plain)`` on ``plains: list[Plain]`` stored a record id the
+    row could no longer be read back with. Only a value holding an instance (at the positions
+    :func:`_link_instances` walks) is checked, the instances replaced by their record ids first.
+
+    ``Any`` and an annotation Pydantic has not resolved (a string, a ``ForwardRef``, a
+    ``TypeVar``) declare nothing to check against.
+
+    Raises:
+        ValueError: ``"atomic_append(plains=…): the Plain instance is written as its record id, which
+            Plain does not accept (…)"``, or an unsaved instance (no record id).
+    """
+    linked = _link_instances(context, path, value)
+    if linked is value or annotation is Any or isinstance(annotation, (str, typing.ForwardRef, TypeVar)):
+        return
+    try:
+        _lookup_adapter(annotation).validate_python(field_input(annotation, linked))
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"{context}({path}=…): {_refusal(annotation, value, linked, exc)}") from exc
 
 
 def _partial_object(context: str, path: str, model: type[BaseModel], value: Mapping[Any, Any]) -> dict[Any, Any]:
     """A ``merge()`` dict addressed to sub-model ``model``, converted key by key (v0.23.0).
 
     MERGE merges the object into the stored one (and replaces arrays), so this sends only the
-    caller's keys, under the spelling the caller gave them. Each key is resolved to a sub-field by
-    name or alias (:func:`~surreal_orm_lite.wire.field_keys`, the rule ``field_input`` follows) and
-    its value converted as that sub-field (:func:`_keyword_value`, recursively for a dict under a
-    sub-model sub-field); no default is added and no required sub-field is asked for; an unknown key
-    is sent as given, as in v0.22.x. A new dict: the caller's is never mutated.
+    caller's keys. Each key is resolved to a sub-field by name or alias
+    (:func:`~surreal_orm_lite.wire.field_keys`, the rule ``field_input`` follows), its value converted
+    as that sub-field (:func:`_keyword_value`, recursively for a dict under a sub-model sub-field),
+    and it is sent under the key the sub-field's validation reads
+    (:func:`~surreal_orm_lite.wire.read_keys`, the key ``save()`` writes): ``{"seen": …}`` for
+    ``seen = Field(alias="lastSeen")`` is sent as ``{"lastSeen": …}``, the second string of an
+    ``AliasChoices`` as the first — under its own spelling, nothing would read it back. No default
+    is added and no required sub-field asked for; an unknown key is sent as given, as in v0.22.x.
+    A new dict: the caller's is never mutated.
+
+    Raises:
+        ValueError: two keys name the same sub-field (``{"seen": …, "lastSeen": …}``), or a value
+            does not fit its sub-field (``profile.bday``).
     """
     keys = field_keys(model)
+    stored_as = read_keys(model)
+    named: dict[str, Any] = {}  # sub-field → the caller's key for it
     converted: dict[Any, Any] = {}
     for key, item in value.items():
         name = keys.get(key) if isinstance(key, str) else None
         if name is None:
             converted[key] = item
-        else:
-            converted[key] = _keyword_value(context, f"{path}.{key}", model, name, model.model_fields[name], item)
+            continue
+        if name in named:
+            raise ValueError(
+                f"{context}({path}=…): {named[name]!r} and {key!r} both name the sub-field {name}; pass one of them"
+            )
+        named[name] = key
+        converted[stored_as[name]] = _keyword_value(context, f"{path}.{key}", model, name, model.model_fields[name], item)
     return converted
+
+
+def _set_paths(
+    path: str, segments: tuple[str, ...], model: type[BaseModel], value: Mapping[Any, Any]
+) -> list[tuple[tuple[str, ...], Any]]:
+    """The ``SET`` assignments of a dict addressed to sub-model ``model`` in ``merge(server_values=)`` (v0.23.0).
+
+    ``UPDATE … SET`` replaces each field it assigns, where ``MERGE`` merges objects; so each key of
+    the dict is its own assignment, ``segments`` + the key (``profile.city = $…``), recursively for
+    a dict under a sub-model sub-field (``outer.inner.when``), and the other stored keys stay — as
+    with ``MERGE``. A value of any other kind (an array, an instance, a plain ``dict`` field) is
+    assigned whole. ``value`` is the dict as converted (:func:`_partial_object`): its keys are the
+    read keys of the sub-fields; an empty dict assigns nothing. ``path`` names the value in the
+    error (``profile``, ``outer.inner``).
+
+    Raises:
+        ValueError: a key that is not an identifier (``"zip-code"``): the path of an assignment is
+            SurrealQL text. ``merge()`` without ``server_values`` takes it.
+    """
+    keys = field_keys(model)
+    assignments: list[tuple[tuple[str, ...], Any]] = []
+    for key, item in value.items():
+        if not isinstance(key, str) or not VALID_ALIAS_PATTERN.fullmatch(key):
+            raise ValueError(
+                f"merge({path}=…): the key {key!r} is not an identifier, which the path of an UPDATE … SET "
+                "assignment needs (server_values=); merge it without server_values"
+            )
+        name = keys.get(key)
+        child = None if name is None else sub_model(model.model_fields[name].annotation)
+        if child is not None and isinstance(item, Mapping):
+            assignments.extend(_set_paths(f"{path}.{key}", (*segments, key), child, item))
+        else:
+            assignments.append(((*segments, key), item))
+    return assignments
 
 
 def _link_instances(context: str, path: str, value: Any) -> Any:
@@ -767,27 +847,35 @@ class BaseSurrealModel(BaseModel):
         model's constructor applies to that field. So ``merge(ttl="1h30m")`` stores a duration and
         leaves ``timedelta(hours=1, minutes=30)`` on the instance, where v0.22.1 stored the string.
 
-        A field typed with a sub-model (``profile: Profile | None``):
+        A field typed with a sub-model that holds a rich type (``profile: Profile | None``):
 
-        - in ``merge`` a **dict** is converted key by key: only the caller's keys are sent, under
-          their own spelling, each resolved to a sub-field by name or alias and validated as it
-          (recursively for a dict under a sub-model sub-field; an array whole); no default is added
-          and no required sub-field asked for — SurrealDB's MERGE keeps the other stored keys; an
-          unknown key is sent as given;
+        - in ``merge`` a **dict** is converted key by key: only the caller's keys are sent, each
+          resolved to a sub-field by name or alias, validated as it (recursively for a dict under a
+          sub-model sub-field; an array whole) and sent under the key the sub-field's validation
+          reads (``{"seen": …}`` → ``{"lastSeen": …}`` for ``Field(alias="lastSeen")``; two keys for
+          one sub-field raise); no default is added and no required sub-field asked for —
+          SurrealDB's MERGE keeps the other stored keys, and ``merge(server_values=)`` assigns each
+          key on its own (``profile.city = $…``) for the same result; an unknown key is sent as
+          given;
         - in ``bulk_update``/``signup``/``signin``, which replace the field, a dict is validated as
           the whole sub-model: a missing required sub-field raises;
         - an **instance** is the whole sub-object, sent as ``save()`` writes it.
 
-        A **table-model instance** (``BaseSurrealModel``) given for a declared field — rich or not:
-        this runs before the early return below — is its record id when the field accepts a
-        ``RecordID`` (``author: RecordID | None``), and a ``ValueError`` naming the field otherwise;
-        it is never embedded as an object. A sub-model the validation built from the caller's dict
-        stays an object, even when its class is a table model.
+        A **table-model instance** (``BaseSurrealModel``) is written as its record id
+        (``encode_wire``), so on a declared field — rich or not: this runs before the early return
+        below — a value holding one, at the top or at any position :func:`_link_instances` walks (a
+        ``list``/``tuple`` item, a mapping value), is validated as the field with the instances
+        replaced by their record ids: accepted where the field holds a ``RecordID`` there
+        (``author: RecordID | None``, ``links: list[RecordID]``), a ``ValueError`` naming the field
+        otherwise (``plains: list[Plain]``, ``dict[str, Plain]``, a sub-model); it is never embedded
+        as an object. A sub-model the validation built from the caller's dict stays an object, even
+        when its class is a table model.
 
         ``name`` is a Python field name or its column. Returned unchanged: ``None``, a
         :class:`~surreal_orm_lite.functions.SurrealFunc` (evaluated by the server), a dotted path,
-        and — any other value than a table-model instance — a field without a rich type or not
-        declared (written as before v0.23.0).
+        and — unless it holds a table-model instance — a value for a field without a rich type
+        (written as before v0.23.0); also any value for an undeclared field (an instance there is
+        its record id: no annotation says otherwise).
 
         Args:
             context: the call named in the error: ``"merge"`` (the key-by-key dict rule),
@@ -804,9 +892,55 @@ class BaseSurrealModel(BaseModel):
         info = cls.model_fields.get(field)
         if info is None:
             return value
-        if field not in cls._rich_fields() and not isinstance(value, BaseSurrealModel):
+        if field not in cls._rich_fields() and _link_instances(context, name, value) is value:
             return value
         return _keyword_value(context, name, cls, field, info, value)
+
+    @classmethod
+    def _sub_model_of(cls, name: str) -> type[BaseModel] | None:
+        """The sub-model class field ``name`` (a Python name or its column) is typed with, else ``None``.
+
+        ``profile: Profile | None`` → ``Profile`` (:func:`~surreal_orm_lite.wire.sub_model`); a dotted
+        path, an undeclared field or any other annotation → ``None``.
+        """
+        if "." in name:
+            return None
+        info = cls.model_fields.get(name if name in cls.model_fields else cls.to_py_field(name))
+        return None if info is None else sub_model(info.annotation)
+
+    @classmethod
+    def _annotation_at(cls, segments: Sequence[str]) -> Any:
+        """The annotation declared at a path into this model, else ``None`` (v0.23.0).
+
+        ``segments[0]`` names a field (its Python name or its column, as a JSON Pointer's first
+        token does), each further key goes one level down (:func:`~surreal_orm_lite.wire.child_annotation`:
+        an index or ``-`` into an array, a key into a mapping or a sub-model). ``None`` for an
+        undeclared field or a position nothing is declared for (``Any``…).
+        """
+        if not segments:
+            return None
+        info = cls.model_fields.get(cls._pointer_segment_field(segments[0]))
+        annotation: Any = None if info is None else info.annotation
+        for key in segments[1:]:
+            if annotation is None:
+                break
+            annotation = child_annotation(annotation, key)
+        return annotation
+
+    @classmethod
+    def _check_item_links(cls, context: str, field: str, values: Iterable[Any]) -> None:
+        """Refuse a table-model instance among ``values``, the items an ``atomic_*`` helper adds to or
+        removes from the array ``field``, where the field's item type cannot hold its record id (v0.23.0).
+
+        ``field`` is a Python name, a column or a dotted path; the item type is that of ``field[-]``
+        (:meth:`_annotation_at`). Nothing is checked where nothing is declared — an undeclared field,
+        ``list[Any]`` — and the instance is then its record id.
+        """
+        item = cls._annotation_at([*field.split("."), "-"])
+        if item is None:
+            return
+        for value in values:
+            _check_links(context, field, item, value)
 
     @classmethod
     def _py_fields(cls, payload: Mapping[str, Any]) -> list[str]:
@@ -1261,6 +1395,25 @@ class BaseSurrealModel(BaseModel):
         return f"/{column}{separator}{rest}"
 
     @classmethod
+    def _check_patch_links(cls, pointer: str, value: Any) -> None:
+        """:func:`_check_links` for the value an ``add``/``replace`` writes at JSON Pointer ``pointer``.
+
+        The whole document (``""``) checks each key of an object value as its field. RFC 6901
+        escapes are decoded; a position nothing is declared for is not checked.
+        """
+        if pointer == "":
+            if isinstance(value, Mapping):
+                for key, item in value.items():
+                    annotation = cls._annotation_at([str(key)])
+                    if annotation is not None:
+                        _check_links("patch", f"/{key}", annotation, item)
+            return
+        segments = [segment.replace("~1", "/").replace("~0", "~") for segment in pointer[1:].split("/")]
+        annotation = cls._annotation_at(segments)
+        if annotation is not None:
+            _check_links("patch", pointer, annotation, value)
+
+    @classmethod
     def _columns_for_patch(cls, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Return a copy of a JSON Patch document whose pointers address columns (v0.18.0).
 
@@ -1275,13 +1428,20 @@ class BaseSurrealModel(BaseModel):
 
         Each ``value`` is then encoded for a write (:func:`~surreal_orm_lite.wire.encode_wire`,
         ``stored=True``, v0.23.0): a ``timedelta`` is sent as a duration, a ``date`` as midnight
-        UTC, as in every other write.
+        UTC, as in every other write. A table-model instance in the value of an ``add`` or a
+        ``replace`` is its record id, so where the pointer reaches a declared position
+        (:meth:`_annotation_at`: ``/plains/-`` is an item of ``plains: list[Plain]``; ``""`` each
+        field of the document) the value is checked first (:func:`_check_links`).
 
         Raises:
             ValueError: a value no SurrealDB type can hold (an ``int`` beyond 64 bits, a negative
-                duration…), before anything is sent.
+                duration…), or a table-model instance where the position cannot hold its record
+                id (``patch(/plains/-=…)``), before anything is sent.
             TypeError: a value of a type SurrealDB has no form for (a ``time``).
         """
+        for op in operations:
+            if op.get("op") in ("add", "replace") and "value" in op:
+                cls._check_patch_links(op["path"], op["value"])
         rewritten: list[dict[str, Any]] = []
         for op in operations:
             copy = dict(op)
@@ -1811,6 +1971,11 @@ class BaseSurrealModel(BaseModel):
         not sent back at all. The literal kwargs are applied locally, exactly as in a buffered
         transaction. The missing-record detection goes with it: that check *is* the returned
         row.
+
+        ``SET`` replaces each field it assigns, where ``MERGE`` merges objects, so a dict
+        addressed to a sub-model field is compiled into one assignment per key
+        (:func:`_set_paths`: ``profile.city = $…``) and the other stored keys stay (v0.23.0).
+        A server value for the same field wins over the dict, as over any other keyword.
         """
         sender = self.__class__
         record_id = self._record_id()
@@ -1818,8 +1983,20 @@ class BaseSurrealModel(BaseModel):
             raise SurrealDbError(f"No Id for the data to merge: {data}")
 
         # Columns on the wire, Python names in the signal payload and the local apply below.
-        merged: dict[str, Any] = {**self._wire_columns(data), **self._wire_columns(server_values)}
-        clause, variables = build_set_clause(merged)
+        server_columns = self._wire_columns(server_values)
+        fields: dict[str, Any] = {}
+        paths: list[tuple[tuple[str, ...], Any]] = []
+        for key, value in data.items():
+            column = self.to_db_field(key)
+            if column in server_columns:
+                continue
+            model = self._sub_model_of(key)
+            if model is not None and isinstance(value, Mapping):
+                paths.extend(_set_paths(key, (column,), model, value))
+            else:
+                fields[key] = value
+        merged: dict[str, Any] = {**self._wire_columns(fields), **server_columns}
+        clause, variables = build_set_clause(merged, paths=paths)
         variables["rid"] = record_id
         variables = merge_extra_vars(variables, extra_vars)
         statement = f"UPDATE $rid SET {clause} RETURN NONE;" if not refresh else f"UPDATE $rid SET {clause};"
@@ -1882,17 +2059,26 @@ class BaseSurrealModel(BaseModel):
         stores a duration and sets ``ttl`` to ``timedelta(hours=1, minutes=30)``. ``None`` and a
         ``SurrealFunc`` are written as given.
 
-        A field typed with a sub-model (``profile: Profile | None``) takes a dict or an instance.
-        A **dict** changes only the keys it names: each key is resolved to a sub-field by name or
-        alias and validated as it (``merge(profile={"bday": "1995-05-05"})`` sends a date), a dict
-        under a sub-model sub-field the same way, and nothing else is sent — SurrealDB's MERGE keeps
-        the other stored keys, so a required sub-field need not be repeated; an array is replaced
-        whole; an unknown key is sent as given. (With ``server_values`` the statement is an
-        ``UPDATE … SET``, which replaces the field with that dict.) An **instance** is the whole
+        A field typed with a sub-model that holds a rich type (``profile: Profile | None``) takes a
+        dict or an instance. A **dict** changes only the keys it names: each key is resolved to a
+        sub-field by name or alias, validated as it (``merge(profile={"bday": "1995-05-05"})`` sends
+        a date) and sent under the key the sub-field's validation reads (``{"seen": …}`` is sent as
+        ``{"lastSeen": …}`` for ``Field(alias="lastSeen")``, the second string of an ``AliasChoices``
+        as the first; two keys for one sub-field raise), a dict under a sub-model sub-field the
+        same way, and nothing else is sent — SurrealDB's MERGE keeps the other stored keys, so a
+        required sub-field need not be repeated; an array is replaced whole; an unknown key is sent
+        as given. With ``server_values`` the statement is an ``UPDATE … SET``, which replaces each
+        field it assigns: a sub-model dict is compiled into one assignment per key
+        (``profile.city = $…``, nested for a dict under a sub-model sub-field), so the other stored
+        keys stay there too, and each key must be an identifier. An **instance** is the whole
         sub-object, written as ``save()`` writes it: ``merge(profile=Profile(city="y"))`` drops a
-        stored ``bday``. Sub-fields are written under the key their validation reads (their
-        alias). A **table-model instance** is written as its record id; a field that cannot hold a
-        ``RecordID`` raises ``ValueError``.
+        stored ``bday``. A dict for a sub-model without a rich type is sent as given (keys
+        assigned one by one under ``server_values``).
+
+        A **table-model instance** is written as its record id. On a declared field, rich or not,
+        a value holding one — at the top, in a list or tuple, among a mapping's values — is
+        validated as the field: a field that cannot hold a ``RecordID`` there
+        (``plains: list[Plain]``) raises ``ValueError``.
 
         Args:
             tx: Optional transaction the statement is buffered onto.
@@ -1919,8 +2105,9 @@ class BaseSurrealModel(BaseModel):
         Raises:
             ValueError: a keyword value that does not validate as its rich field
                 (``merge(at="yesterday")``; ``merge(profile={"bday": "someday"})`` names
-                ``profile.bday``), or a table-model instance for a field that cannot hold its
-                record id — before anything is sent.
+                ``profile.bday``), a sub-model dict naming one sub-field twice, a table-model
+                instance where the field cannot hold its record id, or, with ``server_values``, a
+                sub-model dict key that is not an identifier — before anything is sent.
 
         Example:
             >>> await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
@@ -1991,7 +2178,9 @@ class BaseSurrealModel(BaseModel):
         name a field either way — ``/password`` or its column ``/password_hash`` — and are
         rewritten to the column before they are sent. Each ``value`` is bound like every write's
         (v0.23.0): a ``timedelta`` as a duration, a ``date`` as midnight UTC, a ``set`` as an
-        array.
+        array, a table-model instance as its record id — refused (``ValueError``, before anything
+        is sent) where the pointer reaches a declared position that cannot hold one: ``/plains/-``
+        of ``plains: list[Plain]``.
         """
         validate_patch_operations(operations)
         self._reject_computed_patch(operations, "patch()")
@@ -2015,7 +2204,9 @@ class BaseSurrealModel(BaseModel):
         (robust for any id type; anti-injection); only the validated ``set_expr`` is inlined.
         The values are encoded for a write (:func:`~surreal_orm_lite.wire.encode_wire`,
         ``stored=True``, v0.23.0), so a ``ValueError``/``TypeError`` for a value SurrealDB cannot
-        hold is raised before anything is sent.
+        hold is raised before anything is sent. The array helpers check their items first
+        (:meth:`_check_item_links`): a table-model instance is written as its record id, refused
+        where the field's item type cannot hold one.
         Non-tx and interactive-tx apply the returned row to ``self``; a buffered tx leaves
         ``self`` stale (the new value is computed server-side, unknown until commit).
         """
@@ -2038,8 +2229,13 @@ class BaseSurrealModel(BaseModel):
 
         Compiled to ``array::append`` — identical on SurrealDB 2.6.x and 3.x. For set
         semantics (skip if already present) use :meth:`atomic_set_add`. Emits no signals.
+
+        A table-model instance is written as its record id (v0.23.0); where the field's item type
+        cannot hold one (``plains: list[Plain]``) this raises ``ValueError`` before anything is
+        sent. The same holds for every array helper below.
         """
         column = self._validate_atomic_field(field)
+        self._check_item_links("atomic_append", field, [value])
         return await self._atomic_update(f"{column} = array::append({column}, $value)", {"value": value}, tx)
 
     async def atomic_remove(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
@@ -2050,6 +2246,7 @@ class BaseSurrealModel(BaseModel):
         but only the first on 2.6.x.) Emits no signals.
         """
         column = self._validate_atomic_field(field)
+        self._check_item_links("atomic_remove", field, [value])
         return await self._atomic_update(f"{column} = array::complement({column}, [$value])", {"value": value}, tx)
 
     async def atomic_set_add(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
@@ -2059,6 +2256,7 @@ class BaseSurrealModel(BaseModel):
         ``+=`` operator, which appends duplicates on both server lines.) Emits no signals.
         """
         column = self._validate_atomic_field(field)
+        self._check_item_links("atomic_set_add", field, [value])
         return await self._atomic_update(f"{column} = array::add({column}, $value)", {"value": value}, tx)
 
     async def atomic_increment(
@@ -2141,9 +2339,9 @@ class BaseSurrealModel(BaseModel):
         Emits no signals.
         """
         column = self._validate_atomic_field(field)
-        return await self._atomic_update(
-            f"{column} = array::concat({column}, $values)", {"values": self._as_value_list(values)}, tx
-        )
+        items = self._as_value_list(values)
+        self._check_item_links("atomic_append_many", field, items)
+        return await self._atomic_update(f"{column} = array::concat({column}, $values)", {"values": items}, tx)
 
     async def atomic_set_add_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
         """Atomically add every element of ``values`` to an array ``field``, skipping any already present.
@@ -2153,9 +2351,9 @@ class BaseSurrealModel(BaseModel):
         An empty ``values`` is a safe no-op. Emits no signals.
         """
         column = self._validate_atomic_field(field)
-        return await self._atomic_update(
-            f"{column} = array::add({column}, $values)", {"values": self._as_value_list(values)}, tx
-        )
+        items = self._as_value_list(values)
+        self._check_item_links("atomic_set_add_many", field, items)
+        return await self._atomic_update(f"{column} = array::add({column}, $values)", {"values": items}, tx)
 
     async def atomic_remove_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
         """Atomically remove ALL occurrences of every element of ``values`` from an array ``field``.
@@ -2164,9 +2362,9 @@ class BaseSurrealModel(BaseModel):
         — identical on 2.6.x and 3.x. An empty ``values`` is a safe no-op. Emits no signals.
         """
         column = self._validate_atomic_field(field)
-        return await self._atomic_update(
-            f"{column} = array::complement({column}, $values)", {"values": self._as_value_list(values)}, tx
-        )
+        items = self._as_value_list(values)
+        self._check_item_links("atomic_remove_many", field, items)
+        return await self._atomic_update(f"{column} = array::complement({column}, $values)", {"values": items}, tx)
 
     async def delete(self, tx: Transaction | None = None) -> None:
         """

@@ -71,6 +71,7 @@ from .types import Duration, Range
 
 __all__ = [
     "MAX_DURATION_NS",
+    "child_annotation",
     "decimal_text",
     "declared_kind",
     "duration_ns",
@@ -79,6 +80,7 @@ __all__ = [
     "field_keys",
     "lookup_type",
     "model_object",
+    "read_keys",
     "restore_native",
     "rich_kinds",
     "sdk_decodes_zero_duration",
@@ -490,6 +492,29 @@ def _collection_item(annotation: Any) -> Any:
     return None
 
 
+def child_annotation(annotation: Any, key: str) -> Any:
+    """The annotation of the value at ``key`` inside a value declared ``annotation``, else ``None`` (v0.23.0).
+
+    ``Annotated`` and ``Optional`` stripped first. A ``list``/``set``/``Sequence``/``tuple[X, ...]``
+    item (``key`` an index, or ``-``: a JSON Patch append and the item of an ``atomic_*`` helper) →
+    ``X``; a ``dict[K, V]``/``Mapping[K, V]`` value → ``V``; a sub-model's field, ``key`` resolved by
+    name or alias (:func:`field_keys`) → its annotation. ``None`` where nothing is declared for
+    ``key``: ``Any``, a union of several types, a fixed-length tuple, an unknown key. The path of a
+    ``patch()`` pointer or a dotted ``atomic_*`` field is resolved one key at a time.
+    """
+    core = _strip_optional(annotation)
+    item = _collection_item(core)
+    if item is not None:
+        return item if key == "-" or key.isdigit() else None
+    args = get_args(core)
+    if get_origin(core) in _MAPPING_ORIGINS and len(args) == 2:
+        return args[1]
+    if _is_model(core):
+        name = field_keys(core).get(key)
+        return None if name is None else core.model_fields[name].annotation
+    return None
+
+
 def lookup_type(annotation: Any, lookup: str, value: Any) -> tuple[bool, Any] | None:
     """What a filter value on a field declared ``annotation`` is validated as (spec §4.5).
 
@@ -705,7 +730,9 @@ def encode_wire(value: Any, *, stored: bool) -> Any:
       encoded values.
     - a table-model instance (a ``BaseSurrealModel``, at any position — a raw variable, a list item, a
       nested object): its record id, the value it stands for as a filter (v0.22.0) and in the full
-      ORM; an unsaved one has none: ``ValueError``.
+      ORM; an unsaved one has none: ``ValueError``. This function reads no annotation: the write
+      paths check beforehand that a declared field accepts a ``RecordID`` where the instance sits
+      (keyword writes, the ``atomic_*`` helpers, ``patch()``) and refuse it otherwise.
     - any other Pydantic model (a sub-model ``bulk_update(profile={…})`` validated into, a
       ``list[Profile]`` item…): the object a model write sends for it (:func:`model_object`) — each
       sub-field under the key its validation reads, the SDK values of its untyped positions put back
@@ -784,11 +811,12 @@ def _read_key(name: str, info: FieldInfo) -> str:
 
 
 @functools.cache
-def _read_keys(model: type[BaseModel]) -> Mapping[str, str]:
-    """Field name → the key its validation reads (:func:`_read_key`), cached per class.
+def read_keys(model: type[BaseModel]) -> Mapping[str, str]:
+    """Field name → the key its validation reads (:func:`_read_key`), cached per class; never mutate it.
 
-    Every field keeps its name when the model turns validation by alias off
-    (``ConfigDict(validate_by_alias=False)``).
+    The key a write stores each sub-field under — :func:`model_object` for an instance, and each
+    key a ``merge()`` dict resolves (v0.23.0) — so a read gives it back. Every field keeps its
+    name when the model turns validation by alias off (``ConfigDict(validate_by_alias=False)``).
     """
     if model.model_config.get("validate_by_alias", True) is False:
         return {name: name for name in model.model_fields}
@@ -862,25 +890,25 @@ def model_object(model: BaseModel) -> dict[str, Any]:
     return result
 
 
-def _restore(dumped: Any, raw: Any, rekey: bool, read_keys: bool) -> Any:
-    """:func:`restore_native`'s walk; ``rekey``: re-key this level when ``raw`` is a model."""
+def _restore(dumped: Any, raw: Any, rekey: bool, rekey_nested: bool) -> Any:
+    """:func:`restore_native`'s walk; ``rekey``: re-key this level when ``raw`` is a model, ``rekey_nested`` the levels below."""
     if _is_sdk_dataclass(raw):
         return raw
     if isinstance(dumped, dict):
         if not isinstance(raw, (BaseModel, Mapping)):
             return dumped
-        keys = _read_keys(type(raw)) if rekey and isinstance(raw, BaseModel) else None
+        keys = read_keys(type(raw)) if rekey and isinstance(raw, BaseModel) else None
         changed = False
         items: list[tuple[Any, Any]] = []
         for key, item in dumped.items():
             raw_item = _raw_item(raw, key)
-            new = item if raw_item is _MISSING else _restore(item, raw_item, read_keys, read_keys)
+            new = item if raw_item is _MISSING else _restore(item, raw_item, rekey_nested, rekey_nested)
             new_key = keys.get(key, key) if keys is not None and isinstance(key, str) else key
             changed = changed or new is not item or new_key != key
             items.append((new_key, new))
         return dict(items) if changed else dumped
     if isinstance(dumped, (list, tuple)) and isinstance(raw, (list, tuple)) and len(dumped) == len(raw):
-        restored = [_restore(item, raw_item, rekey, read_keys) for item, raw_item in zip(dumped, raw, strict=True)]
+        restored = [_restore(item, raw_item, rekey, rekey_nested) for item, raw_item in zip(dumped, raw, strict=True)]
         if all(new is old for new, old in zip(restored, dumped, strict=True)):
             return dumped
         return restored if isinstance(dumped, list) else tuple(restored)

@@ -2,7 +2,7 @@ import inspect
 import os
 import re
 import warnings
-from collections.abc import Callable, Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 import pydantic
@@ -173,7 +173,12 @@ def validate_field_name(field: str, context: str = "field") -> None:
         )
 
 
-def build_set_clause(merged: Mapping[str, Any], param_prefix: str = "_sv_") -> tuple[str, dict[str, Any]]:
+def build_set_clause(
+    merged: Mapping[str, Any],
+    param_prefix: str = "_sv_",
+    *,
+    paths: Iterable[tuple[Sequence[str], Any]] = (),
+) -> tuple[str, dict[str, Any]]:
     """Compile a ``SET field = value, …`` clause from a field mapping (v0.13.0).
 
     A :class:`~surreal_orm_lite.functions.SurrealFunc` value is **inlined** as a raw
@@ -186,28 +191,41 @@ def build_set_clause(merged: Mapping[str, Any], param_prefix: str = "_sv_") -> t
         # ("name = $_sv_name, joined = time::now()", {"_sv_name": "Alice"})
 
     Field names are validated as plain identifiers before being interpolated (a dotted
-    nested path is rejected here: it would need a different binding strategy).
+    string is rejected here). A nested assignment goes in ``paths`` instead (v0.23.0, the keys
+    of a sub-model dict in ``merge(server_values=)``): each ``(segments, value)`` compiles to
+    ``a.b.c = $<param_prefix><n>_a_b_c``, appended after ``merged``'s assignments. Every segment
+    must be an identifier; ``n`` is the path's position, so the variable never collides with a
+    field's (an identifier does not start with a digit). The value is inlined or bound as above.
 
     Returns:
         The clause text and the variables to bind alongside it.
 
     Raises:
-        ValueError: If ``merged`` is empty (``SET`` with no assignment is a parse error on
-            both server lines), if a field name is not a plain identifier, or if a value has no
-            SurrealDB form (an ``int`` beyond 64 bits, a negative duration…).
+        ValueError: If there is no assignment at all (``SET`` with none is a parse error on both
+            server lines), if a field name or a path segment is not a plain identifier (or a
+            path is empty), or if a value has no SurrealDB form (an ``int`` beyond 64 bits, a
+            negative duration…).
         TypeError: If a value is of a type SurrealDB cannot store (a ``time``).
     """
-    if not merged:
+    assignments: list[tuple[str, str, Any]] = []
+    for field, value in merged.items():
+        validate_alias_name(field)
+        assignments.append((field, f"{param_prefix}{field}", value))
+    for index, (segments, value) in enumerate(paths):
+        if not segments or not all(isinstance(segment, str) and VALID_ALIAS_PATTERN.fullmatch(segment) for segment in segments):
+            raise ValueError(
+                f"Invalid SET path {tuple(segments)!r}: each segment must be an identifier (letters, digits, underscores)."
+            )
+        assignments.append((".".join(segments), f"{param_prefix}{index}_{'_'.join(segments)}", value))
+    if not assignments:
         raise ValueError("build_set_clause() needs at least one field: an empty SET clause is invalid SurrealQL.")
     parts: list[str] = []
     variables: dict[str, Any] = {}
-    for field, value in merged.items():
-        validate_alias_name(field)
+    for target, var_name, value in assignments:
         if isinstance(value, SurrealFunc):
-            parts.append(f"{field} = {value.expression}")
+            parts.append(f"{target} = {value.expression}")
         else:
-            var_name = f"{param_prefix}{field}"
-            parts.append(f"{field} = ${var_name}")
+            parts.append(f"{target} = ${var_name}")
             variables[var_name] = encode_wire(value, stored=True)
     return ", ".join(parts), variables
 

@@ -843,7 +843,9 @@ class QuerySet:
                 ``bulk_update(ttl="2h")`` stores a duration. The ``SET`` replaces each field, so a
                 dict for a sub-model field is validated as the **whole** sub-model (a missing
                 required sub-field raises, unlike ``merge()``'s key-by-key dict). A table-model
-                instance is written as its record id where the field accepts a ``RecordID``.
+                instance is written as its record id: a value holding one (at the top, in a list
+                or tuple, among a mapping's values) is validated as the field, rich or not, and
+                refused where the field cannot hold a ``RecordID`` there (``plains: list[Plain]``).
                 Bound like every write's values: a ``timedelta`` as a duration, a ``date`` as
                 midnight UTC, a ``set`` as an array.
 
@@ -918,7 +920,9 @@ class QuerySet:
         Whole table if unfiltered. Returns the number of affected rows. Participates in
         ``objects(tx=)`` like the other bulk operations. ``operations`` is validated then bound
         as ``$_ops`` (never string-interpolated), each ``value`` encoded like every write's
-        (v0.23.0: a ``timedelta`` as a duration, a ``date`` as midnight UTC). Emits no signals.
+        (v0.23.0: a ``timedelta`` as a duration, a ``date`` as midnight UTC, a table-model instance
+        as its record id — refused where the pointer reaches a declared position that cannot hold
+        one, ``/plains/-`` of ``plains: list[Plain]``). Emits no signals.
 
         Example::
 

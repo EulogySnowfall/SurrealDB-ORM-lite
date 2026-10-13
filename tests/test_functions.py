@@ -262,6 +262,31 @@ class TestBuildSetClause:
         assert clause == "n = $_x_n"
         assert variables == {"_x_n": 1}
 
+    def test_paths_compile_nested_assignments(self) -> None:
+        """``paths`` (v0.23.0, a sub-model dict in ``merge(server_values=)``): one assignment per path,
+        its variable named by position — an identifier never starts with a digit, so it cannot collide
+        with a field's ``$_sv_<field>``."""
+        clause, variables = build_set_clause(
+            {"n": SurrealFunc("n + 1")},
+            paths=[
+                (("profile", "city"), "y"),
+                (("outer", "inner", "when"), None),
+                (("profile", "at"), SurrealFunc("time::now()")),
+            ],
+        )
+        assert (
+            clause
+            == "n = n + 1, profile.city = $_sv_0_profile_city, outer.inner.when = $_sv_1_outer_inner_when, profile.at = time::now()"
+        )
+        assert variables == {"_sv_0_profile_city": "y", "_sv_1_outer_inner_when": None}
+        clause, variables = build_set_clause({}, paths=[(("a", "b"), 1)])
+        assert (clause, variables) == ("a.b = $_sv_0_a_b", {"_sv_0_a_b": 1})
+
+    def test_invalid_path_segment_raises(self) -> None:
+        for bad in (("a", "b c"), ("a", "b;c"), ("a", "b.c"), ("1a", "b"), ("a", ""), ("a", "b\n"), ()):
+            with pytest.raises(ValueError):
+                build_set_clause({}, paths=[(bad, 1)])
+
 
 class TestMergeExtraVars:
     def test_merges_extra_vars(self) -> None:
