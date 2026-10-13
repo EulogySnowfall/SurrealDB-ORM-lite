@@ -12,6 +12,9 @@ import json
 import math
 import os
 import re
+import subprocess
+import sys
+import textwrap
 from collections.abc import Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, date, datetime, time, timedelta, timezone
@@ -1253,11 +1256,45 @@ class TestEncodeWire:
         import decimal
 
         third = Decimal("0.05") / 3
-        # A low precision and trapped rounding signals in the caller's context change nothing.
-        with decimal.localcontext(prec=5, traps=[decimal.Inexact, decimal.Rounded]):
+        # A low precision and trapped rounding signals in the caller's context change nothing. The
+        # traps are set one by one: the pure-Python decimal's localcontext() refuses a list of them.
+        with decimal.localcontext(prec=5) as ctx:
+            ctx.traps[decimal.Inexact] = True
+            ctx.traps[decimal.Rounded] = True
             assert decimal_text(Decimal("8." + "0" * 27 + "49")) == "8." + "0" * 27
             assert decimal_text(third) == "0.0166666666666666666666666667"
             assert decimal_text(Decimal("0." + "1" * 29)) == "0." + "1" * 28
+
+    def test_decimal_text_with_the_pure_python_decimal(self) -> None:
+        """A Python built without the C ``_decimal`` (e.g. ``setup-python``'s 3.15.0) uses ``_pydecimal``.
+
+        The checks above, in a fresh interpreter (``-I``) that cannot import ``_decimal``: ``wire``
+        builds its own context with that module, and its ``localcontext()`` refuses a list of traps.
+        """
+        script = """
+            import sys
+            sys.modules["_decimal"] = None
+            import decimal
+            from decimal import Decimal
+            assert "_pydecimal" in sys.modules, "the C decimal was imported"
+            from surreal_orm_lite.wire import decimal_text
+            third = Decimal("0.05") / 3
+            with decimal.localcontext(prec=5) as ctx:
+                ctx.traps[decimal.Inexact] = True
+                ctx.traps[decimal.Rounded] = True
+                assert decimal_text(Decimal("8." + "0" * 27 + "49")) == "8." + "0" * 27
+                assert decimal_text(third) == "0.0166666666666666666666666667"
+                assert decimal_text(Decimal("0." + "1" * 29)) == "0." + "1" * 28
+            print("ok")
+            """
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", textwrap.dedent(script)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "ok"
 
     @_BOTH_MODES
     @pytest.mark.parametrize(
