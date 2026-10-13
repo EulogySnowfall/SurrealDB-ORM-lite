@@ -8,7 +8,19 @@ Deliberately named ``typing_examples`` rather than ``test_*`` so pytest does not
 the assertions here are made by mypy, not at runtime.
 """
 
-from surreal_orm_lite import BaseSurrealModel, Computed, SurrealFunc, computed
+from typing import Any
+
+from surrealdb import RecordID
+
+from surreal_orm_lite import (
+    BaseSurrealEdge,
+    BaseSurrealModel,
+    Computed,
+    SurrealConfigDict,
+    SurrealFunc,
+    Transaction,
+    computed,
+)
 
 
 class Player(BaseSurrealModel):
@@ -28,3 +40,106 @@ def read_computed(player: Player) -> str | None:
 
 def read_computed_int(player: Player) -> int | None:
     return player.name_len
+
+
+class Tagged(BaseSurrealModel):
+    """v0.22.0: ``table_name`` alone — every ``SurrealConfigDict`` key is optional (``total=False``)."""
+
+    model_config = SurrealConfigDict(table_name="tagged")
+
+    id: str | None = None
+
+
+class Stamped(BaseSurrealModel):
+    """The README §v0.18.0 declaration: ``server_fields`` alone used to fail mypy ("Missing keys")."""
+
+    model_config = SurrealConfigDict(server_fields=["created"])
+
+    id: str | None = None
+    created: str | None = None
+
+
+def tagged_table() -> str:
+    return Tagged.get_table_name()
+
+
+class Purchased(BaseSurrealEdge):
+    """v0.22.0: an edge model. ``in_`` (column ``in``) and ``out`` are declared by the base."""
+
+    model_config = SurrealConfigDict(table_name="purchased")
+
+    quantity: int = 1
+    price: float = 0.0
+
+
+def new_purchase() -> Purchased:
+    """The endpoints are ``RecordID`` parameters named ``in_`` and ``out`` — not the keyword ``in``."""
+    return Purchased(in_=RecordID("Person", "a"), out=RecordID("Product", "w"), quantity=2)
+
+
+def purchase_buyer(edge: Purchased) -> RecordID:
+    """An endpoint reads back as a ``RecordID``, whatever form it was given in."""
+    return edge.in_
+
+
+def purchase_item(edge: Purchased) -> RecordID:
+    return edge.out
+
+
+class Person(BaseSurrealModel):
+    id: str | None = None
+
+
+class Product(BaseSurrealModel):
+    id: str | None = None
+
+
+async def typed_relate(a: Person, p: Product) -> Purchased:
+    """An edge class gives back that edge, typed (the first ``relate()`` overload)."""
+    return await a.relate(Purchased, p, data={"quantity": 1})
+
+
+async def typed_relate_in_tx(a: Person, p: Product, tx: Transaction) -> Purchased:
+    """``tx`` by position, the full ORM's order: ``(edge, target, reverse, tx)``."""
+    return await a.relate(Purchased, p, False, tx)
+
+
+async def raw_relate(a: Person, b: Person) -> list[dict[str, Any]]:
+    """An edge table name keeps the v0.6.0 return: the ``RELATE`` rows."""
+    return await a.relate("follows", b)
+
+
+async def related_through_edge_class(a: Person) -> list[Any]:
+    return await a.get_related(Purchased, model_class=Product)
+
+
+async def typed_reverse(a: Person, p: Product) -> Purchased:
+    """``reverse=True`` and keyword edge fields keep the edge-class overload."""
+    return await a.relate(Purchased, p, reverse=True, quantity=1)
+
+
+async def typed_reverse_positional(a: Person, p: Product) -> Purchased:
+    """A positional ``reverse`` (the full ORM's order) is still typed ``Purchased``."""
+    return await a.relate(Purchased, p, True, None, quantity=1)
+
+
+async def raw_kwargs(a: Person, b: Person) -> list[dict[str, Any]]:
+    """The string form with keyword edge fields keeps the ``RELATE`` rows."""
+    return await a.relate("follows", b, reverse=True, since="2025-01-01")
+
+
+async def unlink(a: Person, p: Product) -> None:
+    """``reverse=``/``tx=`` on ``remove_relation``, a bare id, and a mixed list of edges."""
+    await a.remove_relation(Purchased, p, reverse=True, tx=None)
+    await a.remove_relation("follows", "abc123")
+    await a.remove_all_relations([Purchased, "follows"], direction="both", tx=None)
+    await a.remove_all_relations([Purchased, "follows"], "both", None)
+
+
+async def both(a: Person) -> list[Any]:
+    return await a.get_related("follows", direction="both")
+
+
+async def related_positional(a: Person) -> list[Any]:
+    """``get_related(edge, direction, model_class)`` by position, the full ORM's order."""
+    return await a.get_related("follows", "in", Person)

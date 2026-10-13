@@ -133,6 +133,18 @@ class TestRelateValidation:
         with pytest.raises(TypeError, match="BaseSurrealModel instance"):
             Person._resolve_target_thing(42)  # type: ignore
 
+    def test_record_id_with_a_non_identifier_table_is_refused(self) -> None:
+        """A ``RecordID``'s table name is checked like a model's, in both helpers."""
+        odd = RecordID("User:x; DELETE User; --", 1)
+        with pytest.raises(ValueError, match="record identifier"):
+            Person._resolve_target_thing(odd)
+        with pytest.raises(ValueError, match="record identifier"):
+            Person(id=odd, name="Odd")._get_thing()
+        with pytest.raises(ValueError, match="record identifier"):
+            Person._resolve_target_thing(Person(id=odd, name="Odd"))
+        assert Person._resolve_target_thing(RecordID("User", 1)) == "User:1"
+        assert Person(id=RecordID("Person", "100"), name="P")._get_thing() == "Person:⟨100⟩"
+
 
 # =============================================================================
 # Unit Tests - QuerySet.fetch()

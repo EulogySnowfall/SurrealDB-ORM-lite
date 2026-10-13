@@ -1,11 +1,14 @@
 import contextlib
 import functools
 import logging
+import os
 import typing
+import warnings
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from decimal import Decimal
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self, TypeVar, overload
 
+import pydantic
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic_core import ValidationError
 
@@ -26,11 +29,13 @@ from .signals import (
 )
 from .transaction import Transaction
 from .utils import (
+    VALID_ALIAS_PATTERN,
     apply_ddl_statements,
     build_set_clause,
+    coerce_endpoint,
     format_record_id,
     merge_extra_vars,
-    remove_quotes_for_variables,
+    user_stacklevel,
     validate_alias_name,
     validate_edge_name,
     validate_field_name,
@@ -40,7 +45,12 @@ from .utils import (
     warn_on_multiple_statements,
 )
 
+if TYPE_CHECKING:
+    from .edge import BaseSurrealEdge
+
 logger = logging.getLogger(__name__)
+
+_E = TypeVar("_E", bound="BaseSurrealEdge")
 
 # Per-class derivations of v0.18.0, computed once on first use. They cannot be built in
 # ``__init_subclass__``: that runs inside ``type.__new__``, before Pydantic has finished
@@ -48,6 +58,39 @@ logger = logging.getLogger(__name__)
 # object, which is what makes them inheritance-correct — a subclass gets its own entry.
 _ALIAS_MAPS: dict[type, tuple[dict[str, str], dict[str, str]]] = {}
 _SERVER_FIELDS: dict[type, frozenset[str]] = {}
+
+# Pydantic's metaclass sits between ``__pydantic_init_subclass__`` and the user's ``class``
+# statement; a warning raised there must skip its frames to land on the user's line (v0.22.0).
+_PYDANTIC_DIR = os.path.dirname(os.path.abspath(pydantic.__file__))
+
+
+def _legacy_table_name(cls: type) -> str | None:
+    """Return the deprecated ``_table_name: ClassVar[str]`` of ``cls`` (or a base), else ``None``.
+
+    Only the ``ClassVar`` form is a plain ``str`` on the class, and it is the only form that ever
+    named a table. ``_table_name = "t"`` and ``_table_name: str = "t"`` are Pydantic **private
+    attributes** — the class answers a ``ModelPrivateAttr`` — and are ignored, as they always
+    should have been (the ``QuerySet`` used to interpolate that object's ``repr`` into SurrealQL).
+    """
+    legacy = getattr(cls, "_table_name", None)
+    return legacy if isinstance(legacy, str) else None
+
+
+def _check_table_name(cls: type, key: str, name: Any) -> None:
+    """Refuse a table name that is not a SurrealQL identifier: it is interpolated into queries.
+
+    Raises:
+        TypeError: ``name`` is not a ``str``.
+        ValueError: ``name`` is not an identifier (letters, digits, underscores; not starting
+            with a digit). ``fullmatch`` so a trailing newline does not slip through ``$``.
+    """
+    if not isinstance(name, str):
+        raise TypeError(f"{cls.__name__}: {key} must be a str, got {type(name).__name__}.")
+    if not VALID_ALIAS_PATTERN.fullmatch(name):
+        raise ValueError(
+            f"{cls.__name__}: {key} {name!r} must be an identifier (letters, digits, underscores; "
+            "not starting with a digit): it is interpolated into SurrealQL."
+        )
 
 
 def _own_annotation_names(cls: type) -> set[str]:
@@ -67,11 +110,17 @@ def _own_annotation_names(cls: type) -> set[str]:
     return set(annotationlib.get_annotations(cls, format=annotationlib.Format.STRING))
 
 
-class SurrealConfigDict(ConfigDict):
+class SurrealConfigDict(ConfigDict, total=False):
     """
     SurrealConfigDict is a configuration dictionary for SurrealDB models.
 
+    Every key is optional, for type checkers too (``total=False``, v0.22.0): set only the ones
+    the model needs, e.g. ``SurrealConfigDict(table_name="purchased")``.
+
     Attributes:
+        table_name (str | None): Override the table name; default: the class name. Full
+            SurrealDB-ORM key (v0.22.0). Must be an identifier — checked when the class is
+            defined — and inherited by subclasses unless they set their own.
         primary_key (str | None): The primary key field name for the model.
         access_name (str | None): Name of the DEFINE ACCESS method (v0.17.0).
         identifier_field (str | None): Field a user signs in with (v0.17.0).
@@ -85,6 +134,9 @@ class SurrealConfigDict(ConfigDict):
             from implicit write payloads and hydrated back from the row the write returns,
             but stay writable when a caller names one explicitly.
     """
+
+    table_name: str | None
+    " Override the table name; default: the class name. Full SurrealDB-ORM key. "
 
     primary_key: str | None
     " The primary key field name for the model. "
@@ -120,6 +172,13 @@ class BaseSurrealModel(BaseModel):
     __surreal_computed__: typing.ClassVar[dict[str, str]] = {}
     """Computed field name → SurrealQL expression, collected by ``__init_subclass__``."""
 
+    __surreal_edge__: typing.ClassVar[bool] = False
+    """``True`` on :class:`~surreal_orm_lite.edge.BaseSurrealEdge` and its subclasses (v0.22.0).
+
+    The internal marker the write paths, ``relate()`` and live hydration test to tell an edge
+    model from a node, so they need not import ``edge.py`` (which imports this module).
+    """
+
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Collect ``Computed(...)`` defaults before Pydantic builds the model.
 
@@ -154,6 +213,32 @@ class BaseSurrealModel(BaseModel):
                 setattr(cls, name, None)
         cls.__surreal_computed__ = collected
         super().__init_subclass__(**kwargs)
+
+    @classmethod
+    def __pydantic_init_subclass__(cls, **kwargs: Any) -> None:
+        """Check the table name once Pydantic has finished building the model (v0.22.0).
+
+        ``__init_subclass__`` runs too early: the merged ``model_config`` does not exist yet.
+        A bad name fails at the ``class`` statement rather than on the first query, because
+        ``get_table_name()`` is interpolated into SurrealQL.
+
+        The deprecated ``_table_name: ClassVar[str]`` is checked the same way and warns once,
+        where it is defined — a subclass inheriting it does not warn again.
+        """
+        super().__pydantic_init_subclass__(**kwargs)
+        configured = cls.model_config.get("table_name")
+        if configured is not None:
+            _check_table_name(cls, "table_name", configured)
+        legacy = cls.__dict__.get("_table_name")
+        if isinstance(legacy, str):
+            _check_table_name(cls, "_table_name", legacy)
+            message = (
+                f"{cls.__name__}._table_name is deprecated and will be removed in a future minor; "
+                "use model_config = SurrealConfigDict(table_name=…)."
+            )
+            if isinstance(configured, str):
+                message += " table_name wins."
+            warnings.warn(message, DeprecationWarning, stacklevel=user_stacklevel(also_skip=(_PYDANTIC_DIR,)))
 
     @classmethod
     def get_computed_fields(cls) -> dict[str, str]:
@@ -238,17 +323,36 @@ class BaseSurrealModel(BaseModel):
     # ==================== Field aliases & server-owned fields (v0.18.0) ====================
 
     @classmethod
+    def _implicit_aliases(cls) -> dict[str, str]:
+        """Return the column renames the model class itself implies, ``{python_name: column}``.
+
+        Empty on a node. An edge model maps its ``in_`` field to the ``in`` column (v0.22.0):
+        ``in`` is a Python keyword, so the field cannot carry that name, and a
+        ``Field(alias="in")`` would make every ``Edge(in_=…)`` call a type-checker error. The
+        entries go through :meth:`_alias_maps` exactly like a ``Field(alias=…)``.
+        """
+        return {}
+
+    @classmethod
     def _alias_maps(cls) -> tuple[dict[str, str], dict[str, str]]:
         """Return this model's ``(python → column, column → python)`` alias maps, cached.
 
-        Built from ``FieldInfo.alias`` only. A separate ``validation_alias`` /
-        ``serialization_alias`` — and in particular an ``AliasPath``/``AliasChoices`` — does not
-        describe a column *rename*, which is the whole contract here, so those are deliberately
-        left to Pydantic and never enter this map.
+        Built from :meth:`_implicit_aliases` (``in_ → in`` on an edge model, v0.22.0) and then
+        ``FieldInfo.alias``. A separate ``validation_alias`` / ``serialization_alias`` — and in
+        particular an ``AliasPath``/``AliasChoices`` — does not describe a column *rename*,
+        which is the whole contract here, so those are deliberately left to Pydantic and never
+        enter this map. Both sources pass the same ambiguity check, so a user field aliased to
+        an implied column (``in``) is refused like any other collision.
+
+        Never overridden: the implied entries are read through the hook, so the per-class cache
+        holds the complete map whichever class method builds it first.
         """
         cached = _ALIAS_MAPS.get(cls)
         if cached is None:
-            forward = {name: info.alias for name, info in cls.model_fields.items() if info.alias}
+            forward = {
+                **cls._implicit_aliases(),
+                **{name: info.alias for name, info in cls.model_fields.items() if info.alias},
+            }
             cls._reject_ambiguous_aliases(forward)
             cached = (forward, {column: name for name, column in forward.items()})
             _ALIAS_MAPS[cls] = cached
@@ -304,8 +408,9 @@ class BaseSurrealModel(BaseModel):
     def get_field_aliases(cls) -> dict[str, str]:
         """Return ``{python_field_name: surrealdb_column}`` for this model's aliased fields.
 
-        ``{}`` when no field declares ``Field(alias=…)``. Returns a copy: the underlying map is
-        cached per class and every write path reads it.
+        ``{}`` on a node when no field declares ``Field(alias=…)``; an edge model always holds
+        ``{"in_": "in"}`` (v0.22.0). Returns a copy: the underlying map is cached per class and
+        every write path reads it.
         """
         return dict(cls._alias_maps()[0])
 
@@ -380,10 +485,35 @@ class BaseSurrealModel(BaseModel):
 
     @classmethod
     def get_table_name(cls) -> str:
+        """Return the table this model reads and writes — the one name every query path uses.
+
+        ``model_config = SurrealConfigDict(table_name=…)`` when set (v0.22.0); else the
+        deprecated ``_table_name: ClassVar[str]``; else the class name.
         """
-        Get the table name for the model.
+        configured = cls.model_config.get("table_name")
+        if isinstance(configured, str):
+            return configured
+        legacy = _legacy_table_name(cls)
+        return legacy if legacy is not None else cls.__name__
+
+    @classmethod
+    def _endpoint_columns(cls) -> frozenset[str]:
+        """Return the columns of this model that hold an edge endpoint (v0.22.0).
+
+        ``in``/``out`` on an edge model, none on a node. The QuerySet hands them to the filter
+        builder, which reads a ``"table:id"`` string given for one of them as the record id it
+        names (:func:`~surreal_orm_lite.utils.coerce_endpoint`) and refuses text lookups there.
         """
-        return cls.__name__
+        return frozenset()
+
+    @classmethod
+    def _write_protected_fields(cls) -> frozenset[str]:
+        """Return the fields of this model no write may change once the record exists (v0.22.0).
+
+        Python names. ``in_``/``out`` on an edge model — SurrealDB ignores a change to an edge's
+        endpoints on both lines — none on a node.
+        """
+        return frozenset()
 
     @classmethod
     def get_index_primary_key(cls) -> str | None:
@@ -544,21 +674,74 @@ class BaseSurrealModel(BaseModel):
         return self._columns_for(self.model_dump(exclude=excluded))
 
     @classmethod
+    def _is_write_protected(cls, name: str) -> bool:
+        """Whether ``name`` addresses one of :meth:`_write_protected_fields` (v0.22.0).
+
+        ``name`` is a Python field or its column (``in`` as well as ``in_``), possibly a dotted
+        path, judged on its first segment: ``out.x`` writes inside ``out``.
+        """
+        protected = cls._write_protected_fields()
+        if not protected:
+            return False
+        head = name.split(".", 1)[0]
+        return head in protected or cls.to_py_field(head) in protected
+
+    @classmethod
+    def _reject_endpoint_writes(cls, fields: Iterable[str], context: str) -> None:
+        """Raise if ``fields`` names an edge endpoint (``in_``/``in``/``out``) (v0.22.0).
+
+        SurrealDB ignores a change to an existing edge's endpoints on both lines — ``UPDATE …
+        MERGE``/``SET``/``PATCH`` write the other fields and silently keep ``in``/``out`` — so such
+        a write is an invisible no-op, refused at the call site like a computed-field write. A
+        node protects nothing.
+        """
+        if any(cls._is_write_protected(field) for field in fields):
+            raise ValueError(
+                f"{context}: `in`/`out` are the endpoints of edge `{cls.__name__}`; SurrealDB ignores a change "
+                "to them (both lines), so the ORM refuses it — delete the edge and relate again."
+            )
+
+    @classmethod
     def _reject_computed_writes(cls, fields: Iterable[str], context: str) -> None:
-        """Raise if ``fields`` names a computed field.
+        """Raise if ``fields`` names a computed field — or, on an edge model, an endpoint.
 
         A computed field is set by ``DEFINE FIELD … VALUE``, and the server discards whatever a
         client sends for it — so such a write is an invisible no-op. Raising turns it into an
         error at the call site instead. Update the fields the expression reads.
+
+        An edge's endpoints are the same kind of no-op (v0.22.0, :meth:`_reject_endpoint_writes`),
+        checked first. Every write guard routes through here — ``merge()`` and its
+        ``server_values=``, ``bulk_update()``, both ``patch()`` entry points
+        (:meth:`_reject_computed_patch`) and the atomic helpers (:meth:`_validate_atomic_field`).
         """
+        names = list(fields)
+        cls._reject_endpoint_writes(names, context)
         computed = cls.get_computed_fields()
-        offenders = sorted(field for field in fields if field in computed)
+        offenders = sorted(field for field in names if field in computed)
         if offenders:
             raise ValueError(
                 f"{context}: {', '.join(offenders)} "
                 f"{'is a computed field' if len(offenders) == 1 else 'are computed fields'} "
                 f"on {cls.__name__}, set server-side by DEFINE FIELD … VALUE and not writable. "
                 "Update the fields the expression reads instead."
+            )
+
+    @classmethod
+    def _reject_undeclared_writes(cls, fields: Iterable[str]) -> None:
+        """Raise if ``fields`` (Python names) names a field the model does not declare.
+
+        A model that opts into extra fields (``model_config = ConfigDict(extra="allow")``) keeps
+        them. Shared by ``*_or_create`` and the typed ``relate()``: a caller who mistypes a
+        field name wants to hear about it rather than lose the value.
+        """
+        if cls.model_config.get("extra") == "allow":
+            return
+        undeclared = sorted(field for field in fields if field not in cls.model_fields)
+        if undeclared:
+            raise SurrealDbError(
+                f"{cls.__name__} does not declare {', '.join(undeclared)}; "
+                "remove the key, add the field to the model, or set "
+                'model_config = ConfigDict(extra="allow") to store undeclared fields.'
             )
 
     @classmethod
@@ -582,7 +765,7 @@ class BaseSurrealModel(BaseModel):
 
     @classmethod
     def _reject_computed_patch(cls, operations: list[dict[str, Any]], context: str) -> None:
-        """Raise if a JSON Patch document writes a computed field.
+        """Raise if a JSON Patch document writes a computed field or an edge endpoint.
 
         ``patch()`` is a write like any other, so it gets the same guard as ``merge()`` —
         without it, ``{"op": "replace", "path": "/full_name", …}`` would be accepted here and
@@ -599,6 +782,10 @@ class BaseSurrealModel(BaseModel):
         instead — replacing the document with an object that omits the computed fields is a
         legitimate write, naming one is not.
 
+        On an edge model the same rules refuse ``/in`` (or ``/in_``) and ``/out``, a pointer below
+        them and a whole-document value naming them (v0.22.0); a ``remove`` of the whole document
+        removes them too, so it is refused.
+
         Call **after** :func:`validate_patch_operations`, which guarantees the shape relied on
         here.
         """
@@ -611,11 +798,12 @@ class BaseSurrealModel(BaseModel):
                 if pointer == "":
                     value = op.get("value")
                     # No inspectable value (e.g. ``remove`` on the whole document) — treat it
-                    # as touching everything the server owns.
+                    # as touching everything the server owns, and an edge's endpoints.
                     if isinstance(value, dict):
                         targets.extend(cls._pointer_segment_field(str(key)) for key in value)
                     else:
                         targets.extend(cls.get_computed_fields())
+                        targets.extend(cls._write_protected_fields())
                     continue
                 targets.append(cls._pointer_segment_field(cls._pointer_head(pointer)))
         cls._reject_computed_writes(targets, context)
@@ -679,7 +867,9 @@ class BaseSurrealModel(BaseModel):
 
         When ``tx`` is provided the CREATE statement is buffered (deferred to commit)
         and the in-memory instance is returned as-is. Buffered creates require an
-        explicit record id. ``keep`` is forwarded to :meth:`_write_payload`.
+        explicit record id, which is bound (``$rid``), never written into the statement,
+        so every id shape works: a compound id such as ``pair:[User:alice, User:bob]``
+        included. ``keep`` is forwarded to :meth:`_write_payload`.
         """
         record_id = self._record_id()
         data = self._write_payload(keep=keep)
@@ -687,7 +877,7 @@ class BaseSurrealModel(BaseModel):
 
         if tx is not None:
             if record_id is not None:
-                rows = await tx.add(f"CREATE {record_id} CONTENT $data;", {"data": data})
+                rows = await tx.add("CREATE $rid CONTENT $data;", {"rid": record_id, "data": data})
                 # An interactive transaction (3.x/WebSocket) answers with the created row, so
                 # hydrate the server-owned fields exactly as the non-tx path does. A buffered
                 # transaction defers the statement and has nothing to return yet — its
@@ -1023,12 +1213,14 @@ class BaseSurrealModel(BaseModel):
     async def _do_upsert(self, tx: Transaction | None = None) -> tuple[Self, bool]:
         """Internal upsert logic. Returns (self, created).
 
-        Uses the SDK's native ``upsert()`` which runs ``UPSERT $record CONTENT $data`` —
+        Runs ``UPSERT $rid CONTENT $data`` through ``client.query()`` (or the transaction) —
         a full REPLACE: the record is created if absent, or entirely replaced if present
         (fields omitted from the model are dropped). An explicit id is required (there is
-        nothing to match without one). ``created`` is read from the statement's ``$before``
-        (``None`` → the row did not exist), so the ``post_save`` signal reports it truthfully
-        — at no extra round-trip.
+        nothing to match without one); it is bound (``$rid``), never written into the
+        statement, so every id shape works: a compound id such as
+        ``pair:[User:alice, User:bob]`` included. ``created`` is read from the statement's
+        ``$before`` (``None`` → the row did not exist), so the ``post_save`` signal reports it
+        truthfully — at no extra round-trip.
 
         When ``tx`` is provided the ``UPSERT`` statement is buffered (deferred to commit);
         on an interactive transaction the returned row is applied to ``self``.
@@ -1044,16 +1236,17 @@ class BaseSurrealModel(BaseModel):
         # RETURN $before, $after reports both states of the row in a single statement, so
         # `created` is the truth rather than an assumption (issue #156). Verified on
         # SurrealDB 2.6.x and 3.x alike.
-        statement = f"UPSERT {record_id} CONTENT $data RETURN $before AS before, $after AS after;"
+        statement = "UPSERT $rid CONTENT $data RETURN $before AS before, $after AS after;"
+        variables = {"rid": record_id, "data": data}
 
         if tx is not None:
-            rows = await tx.add(statement, {"data": data})
+            rows = await tx.add(statement, variables)
             before, after = self._split_upsert_result(rows)
             self._apply_record(after if after is not None else rows)
             return self, before is None
 
         client = await SurrealDBConnectionManager.get_client()
-        rows = await client.query(statement, {"data": data})
+        rows = await client.query(statement, variables)
         before, after = self._split_upsert_result(rows)
         self._apply_record(after if after is not None else rows)
         return self, before is None
@@ -1075,7 +1268,7 @@ class BaseSurrealModel(BaseModel):
         """
         Insert the model instance, or fully replace it if a record with the same id exists.
 
-        Backed by the SDK's native ``upsert()`` (``UPSERT $record CONTENT $data``): this is
+        Runs ``UPSERT $rid CONTENT $data``, the record id bound as a query parameter: this is
         REPLACE semantics, so any field omitted from the model is removed from the stored
         record. For a partial update use ``merge()`` instead. An explicit id is required.
 
@@ -1092,7 +1285,9 @@ class BaseSurrealModel(BaseModel):
         Update the model instance to the database.
 
         When ``tx`` is provided, the UPDATE statement is buffered onto the
-        transaction instead of being executed immediately.
+        transaction instead of being executed immediately. The record id is bound
+        (``$rid``), never written into the statement, so every id shape works —
+        an array id such as ``follows:[User:alice, User:bob]`` included.
 
         Emits pre_update, post_update, and around_update signals. In tx mode,
         ``around_update`` is skipped (the write is deferred to commit) and
@@ -1107,12 +1302,13 @@ class BaseSurrealModel(BaseModel):
         has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
 
         if tx is not None:
+            variables = {"rid": record_id, "data": data}
             if not has_signals:
-                await tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
+                await tx.add("UPDATE $rid CONTENT $data;", variables)
                 return None
             update_fields = self._py_fields(data)
             await pre_update.send(sender, instance=self, update_fields=update_fields)
-            await tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
+            await tx.add("UPDATE $rid CONTENT $data;", variables)
             tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
             return None
 
@@ -1427,7 +1623,9 @@ class BaseSurrealModel(BaseModel):
         Delete the model instance from the database.
 
         When ``tx`` is provided, the DELETE statement is buffered onto the
-        transaction instead of being executed immediately.
+        transaction instead of being executed immediately. The record id is bound
+        (``$rid``), never written into the statement, so every id shape works —
+        an array id such as ``follows:[User:alice, User:bob]`` included.
 
         Emits pre_delete, post_delete, and around_delete signals. In tx mode,
         ``around_delete`` is skipped (the write is deferred to commit) and
@@ -1442,10 +1640,10 @@ class BaseSurrealModel(BaseModel):
 
         if tx is not None:
             if not has_signals:
-                await tx.add(f"DELETE {record_id};", None)
+                await tx.add("DELETE $rid;", {"rid": record_id})
                 return None
             await pre_delete.send(sender, instance=self)
-            await tx.add(f"DELETE {record_id};", None)
+            await tx.add("DELETE $rid;", {"rid": record_id})
             tx.enqueue_post_commit(lambda: post_delete.send(sender, instance=self))
             return None
 
@@ -1494,15 +1692,34 @@ class BaseSurrealModel(BaseModel):
 
     # ==================== Relations & Graph ====================
 
+    @staticmethod
+    def _check_thing_table(record_id: RecordID) -> None:
+        """Refuse a ``RecordID`` whose table name is not an identifier, before it becomes text.
+
+        Raises:
+            ValueError: the table name is not an identifier (letters, digits, underscores; not
+                starting with a digit).
+        """
+        if not isinstance(record_id.table_name, str) or not VALID_ALIAS_PATTERN.fullmatch(record_id.table_name):
+            raise ValueError(
+                f"Invalid record identifier: table name {record_id.table_name!r} must be an identifier "
+                "(letters, digits, underscores; not starting with a digit)."
+            )
+
     def _get_thing(self) -> str:
-        """Return ``table:id`` string for this instance."""
+        """Return the ``table:id`` text of this instance.
+
+        The ORM's own graph statements bind the record id instead (:meth:`_graph_source`); this
+        text form is kept for code that reads it. A ``RecordID`` id must name an identifier table.
+        """
         id_val = self.get_id()
         if id_val is None:
             raise SurrealDbError("Cannot use relations on an unsaved model (no id).")
         if isinstance(id_val, RecordID):
-            # A RecordID from the DB is already typed/trusted; its string form may
-            # contain SurrealQL escaping (e.g. "Table:⟨1⟩") which validate_thing
-            # intentionally rejects. Skip validation for trusted RecordID values.
+            # A RecordID from the DB is already typed; its string form may contain SurrealQL
+            # escaping (e.g. "Table:⟨1⟩") which validate_thing intentionally rejects. The SDK's
+            # string form does not escape the table name, though, so that one is checked.
+            self._check_thing_table(id_val)
             return str(id_val)
         table = self.get_table_name()
         validate_thing(f"{table}:{id_val}")
@@ -1518,11 +1735,13 @@ class BaseSurrealModel(BaseModel):
         """Resolve a target to a ``table:id`` string.
 
         A ``"table:id"`` string is quoted by the same rule as a model's own id, so
-        ``a.relate(edge, "M:1")`` and ``M(id="1")`` name the same record; pass a ``RecordID``
-        (or the model instance) to target an integer record id. An id already written
-        backtick-quoted is kept verbatim.
+        ``M:1`` and ``M(id="1")`` name the same record; pass a ``RecordID`` (or the model
+        instance) to target an integer record id. An id already written backtick-quoted is kept
+        verbatim. A ``RecordID`` must name an identifier table. ``relate()`` binds its target
+        instead (:meth:`_graph_target`); this text form is kept for code that reads it.
         """
         if isinstance(target, RecordID):
+            BaseSurrealModel._check_thing_table(target)
             return f"{target.table_name}:{format_record_id(target.id)}"
         if isinstance(target, str):
             validate_thing(target)
@@ -1534,155 +1753,461 @@ class BaseSurrealModel(BaseModel):
             return target._get_thing()
         raise TypeError(f"target must be a BaseSurrealModel instance or 'table:id' string, got {type(target).__name__}")
 
+    @staticmethod
+    def _edge_name(edge: object) -> str:
+        """Return the edge table an ``edge`` argument names (v0.22.0).
+
+        An edge model class names its ``get_table_name()`` (an identifier, checked when the class
+        was defined); a string passes :func:`~surreal_orm_lite.utils.validate_edge_name` and is
+        returned as is. Shared by ``relate()`` and the graph helpers, so they all refuse the same
+        arguments the same way, before any call.
+
+        Raises:
+            TypeError: a model class that is not an edge model, or anything that is neither a
+                class nor a string.
+            ValueError: a string that is not a valid edge name.
+        """
+        if isinstance(edge, str):
+            validate_edge_name(edge)
+            return edge
+        if isinstance(edge, type) and issubclass(edge, BaseSurrealModel):
+            if not edge.__surreal_edge__:
+                raise TypeError(
+                    f"{edge.__name__} is not an edge model: subclass BaseSurrealEdge, or pass the edge table name as a string."
+                )
+            return edge.get_table_name()
+        raise TypeError(f"edge must be an edge model class or an edge table name, got {type(edge).__name__}")
+
+    def _graph_source(self) -> RecordID:
+        """Return this record's id, bound as the source of a graph statement (v0.22.0).
+
+        Bound, never interpolated, so the id needs no identifier check: a node saved as
+        ``joe@x.com`` relates like it saves.
+
+        Raises:
+            SurrealDbError: the instance has no id yet.
+        """
+        record_id = self._record_id()
+        if record_id is None:
+            raise SurrealDbError("Cannot use relations on an unsaved model (no id).")
+        return record_id
+
+    @staticmethod
+    def _graph_target(target: object) -> RecordID:
+        """Return the record id a graph ``target`` names, to bind (v0.22.0).
+
+        A model instance gives its record id (an unsaved one raises), a ``RecordID`` is returned
+        as is, and a ``"table:id"`` string is read by
+        :func:`~surreal_orm_lite.utils.coerce_endpoint` — the rule of the edge endpoints, so
+        ``"M:1"`` names the string id ``"1"``, as ``M(id="1")`` does, and ``"M:`a-b`"`` the id
+        ``a-b``. A string without ``:`` is refused.
+
+        Raises:
+            SurrealDbError: an unsaved instance.
+            ValueError: a malformed ``"table:id"`` string.
+            TypeError: any other type.
+        """
+        if isinstance(target, BaseSurrealModel):
+            return target._graph_source()
+        if isinstance(target, RecordID):
+            return target
+        if isinstance(target, str):
+            return coerce_endpoint(target)
+        raise TypeError(
+            f"target must be a BaseSurrealModel instance, a RecordID or a 'table:id' string, got {type(target).__name__}"
+        )
+
+    @staticmethod
+    def _merge_edge_fields(
+        data: Mapping[str, Any] | None,
+        edge_data: Mapping[str, Any],
+        to_name: Callable[[str], str],
+    ) -> dict[str, Any]:
+        """Merge ``relate()``'s ``data=`` with its keyword edge fields (v0.22.0).
+
+        ``to_name`` reads a key as the field it names: ``to_py_field`` on the typed path, so a
+        column alias (``memo``) and its Python name (``note``) are the same field, and the
+        identity on the string path. Every later check runs on the merged mapping.
+
+        Raises:
+            TypeError: a field given both in ``data=`` and as a keyword argument.
+        """
+        given = dict(data or {})
+        both = {to_name(key) for key in given} & {to_name(key) for key in edge_data}
+        if both:
+            raise TypeError(
+                f"relate() got edge field(s) {sorted(both)} both in data= and as keyword arguments; pass each one once."
+            )
+        return {**given, **edge_data}
+
+    @overload
+    async def relate(
+        self,
+        edge: type[_E],
+        target: "BaseSurrealModel | RecordID | str",
+        reverse: bool = False,
+        tx: Transaction | None = None,
+        *,
+        data: Mapping[str, Any] | None = None,
+        **edge_data: Any,
+    ) -> _E: ...
+
+    @overload
     async def relate(
         self,
         edge: str,
-        target: "BaseSurrealModel | str",
+        target: "BaseSurrealModel | RecordID | str",
+        reverse: bool = False,
+        tx: Transaction | None = None,
         *,
-        data: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
+        data: Mapping[str, Any] | None = None,
+        **edge_data: Any,
+    ) -> list[dict[str, Any]]: ...
+
+    async def relate(
+        self,
+        edge: "str | type[BaseSurrealEdge]",
+        target: "BaseSurrealModel | RecordID | str",
+        reverse: bool = False,
+        tx: Transaction | None = None,
+        *,
+        data: Mapping[str, Any] | None = None,
+        **edge_data: Any,
+    ) -> "BaseSurrealEdge | list[dict[str, Any]]":
         """
-        Create a graph relation from this record to the target.
+        Create a graph relation (an edge) between this record and the target.
+
+        ``edge`` is an edge model class or an edge table name:
+
+        - **An edge model class** (a :class:`~surreal_orm_lite.edge.BaseSurrealEdge` subclass,
+          v0.22.0) — the edge is validated, created through the edge's ``save()``
+          (``INSERT RELATION``, the ``save`` signals) and returned, typed: ``id`` is the
+          server's ``RecordID``, ``in_``/``out`` the two records. The edge fields may not name
+          an endpoint (``in``/``in_``/``out``), a computed field or a field the model does not
+          declare (unless it sets ``extra="allow"``); this is checked before any call. A
+          ``server_fields`` field named there is written instead of being left to the server.
+        - **An edge table name** — the v0.6.0 ``RELATE`` (any target table), the edge fields
+          written with ``SET``; returns the rows the database sent back.
+
+        In both forms the source and the target are bound as record ids (only the edge name and
+        the field names are written into the statement), so a node saved with an id such as
+        ``joe@x.com`` relates like it saves.
+
+        Parameters follow the full SurrealDB-ORM's order, each by position or by keyword:
+        ``relate(edge, target, reverse, tx)`` is ``relate(edge, target, reverse=…, tx=…)``.
+        ``data`` is keyword-only. Edge fields go in ``data=`` (lite spelling) or as keyword
+        arguments (full ORM spelling), or both: a field given both ways is a ``TypeError``. A
+        field named like a parameter of this method — ``self``, ``edge``, ``target``,
+        ``data``, ``reverse`` or ``tx`` — cannot be a keyword argument (Python binds it to
+        the parameter): pass it in ``data=`` (``data={"reverse": True}``).
 
         Args:
-            edge: The relation/edge table name (e.g. ``"follows"``).
-            target: The target model instance or ``"table:id"`` string.
-            data: Optional data to store on the relation edge.
+            edge: An edge model class, or the relation/edge table name (e.g. ``"follows"``).
+            target: A saved model instance, a ``RecordID`` or a ``"table:id"`` string.
+            reverse: ``False`` (default) relates ``self -> edge -> target``; ``True`` relates
+                ``target -> edge -> self`` (the typed edge's ``in_`` is then the target).
+            tx: Optional transaction. On an interactive one (WebSocket + SurrealDB 3.x) the
+                edge is written at once and comes back as usual; on a buffered one it is
+                written at commit: the typed form returns the edge with ``id`` ``None``, the
+                string form ``[]``.
+            data: Optional fields stored on the edge.
+            **edge_data: More fields stored on the edge, merged with ``data``.
 
         Returns:
-            The created relation record(s) as returned by the database.
+            The created edge (edge model class), or the created relation rows (table name).
+
+        Raises:
+            TypeError: ``edge`` is a model class that is not an edge model, or neither a class
+                nor a string; ``target`` is of another type; a field is given both in ``data``
+                and as a keyword argument.
+            ValueError: a malformed name or ``"table:id"`` string; the fields name an endpoint
+                or a computed field (typed form).
+            SurrealDbError: an unsaved source or target; the fields name an undeclared field
+                (typed form); the write is refused.
+            pydantic.ValidationError: the fields are invalid for the edge model (nothing
+                written).
 
         Example::
 
-            await user.relate("follows", other_user)
-            await user.relate("purchased", product, data={"quantity": 2})
+            edge = await user.relate(Purchased, product, quantity=2)  # -> Purchased
+            edge = await user.relate(Purchased, product, data={"quantity": 2})  # lite spelling
+            await user.relate("follows", other_user, since="2025-01-01")
+            await table.relate("created", creator, reverse=True)  # creator -> created -> table
+            await table.relate("created", creator, True)  # same call, the full ORM's order
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await user.relate(Follows, other_user, tx=tx)
         """
-        validate_edge_name(edge)
-        source = self._get_thing()
-        target_thing = self._resolve_target_thing(target)
+        if isinstance(edge, type) and issubclass(edge, BaseSurrealModel) and edge.__surreal_edge__:
+            fields = self._merge_edge_fields(data, edge_data, edge.to_py_field)
+            return await self._relate_typed(edge, target, fields, reverse, tx)
 
-        if data:
-            set_parts: list[str] = []
-            variables: dict[str, Any] = {}
-            for i, (key, value) in enumerate(data.items()):
-                validate_field_name(key, "relation data field")
-                var_name = f"_rd{i}"
-                set_parts.append(f"{key} = ${var_name}")
-                variables[var_name] = value
-            set_clause = " SET " + ", ".join(set_parts)
-            query = f"RELATE {source}->{edge}->{target_thing}{set_clause};"
-        else:
-            variables = {}
-            query = f"RELATE {source}->{edge}->{target_thing};"
+        edge_name = self._edge_name(edge)
+        fields = self._merge_edge_fields(data, edge_data, str)  # a column name is the field name
+        # Both record ids are bound, as in the typed form and the other graph helpers: only the
+        # validated edge name and field names are written into the statement.
+        variables: dict[str, Any] = {"src": self._graph_source(), "dst": self._graph_target(target)}
+        start, end = ("$dst", "$src") if reverse else ("$src", "$dst")
+
+        set_parts: list[str] = []
+        for i, (key, value) in enumerate(fields.items()):
+            validate_field_name(key, "relation data field")
+            var_name = f"_rd{i}"
+            set_parts.append(f"{key} = ${var_name}")
+            variables[var_name] = value
+        set_clause = (" SET " + ", ".join(set_parts)) if set_parts else ""
+        query = f"RELATE {start}->{edge_name}->{end}{set_clause};"
+
+        if tx is not None:
+            rows = await tx.add(query, variables)
+            return rows if isinstance(rows, list) else []
 
         client = await SurrealDBConnectionManager.get_client()
-        result = await client.query(remove_quotes_for_variables(query), variables)
+        result = await client.query(query, variables)
         return result if isinstance(result, list) else []
+
+    async def _relate_typed(
+        self,
+        edge: type[_E],
+        target: object,
+        fields: Mapping[str, Any],
+        reverse: bool,
+        tx: Transaction | None,
+    ) -> _E:
+        """``relate(EdgeModel, …)``: validate, create through the edge's ``save()``, return it.
+
+        Every check runs before any call: the source and the target (bound as record ids), then
+        ``fields`` — keys in either vocabulary (Python name or column), translated to Python
+        names — and the model's own validation. ``reverse`` swaps the endpoints.
+        """
+        source = self._graph_source()
+        destination = self._graph_target(target)
+        names = [edge.to_py_field(key) for key in fields]
+        endpoints = [key for key, name in zip(fields, names, strict=True) if name in edge._write_protected_fields()]
+        if endpoints:
+            raise ValueError(
+                f"relate(): `in`/`out` are the endpoints of edge `{edge.__name__}`: relate() takes them from "
+                f"this record and the target, so its edge fields cannot name them (got {', '.join(endpoints)})."
+            )
+        edge._reject_computed_writes(names, "relate()")
+        edge._reject_undeclared_writes(names)
+        start, end = (destination, source) if reverse else (source, destination)
+        instance = edge.model_validate({**fields, "in": start, "out": end})
+        return await instance._save_naming(names, tx=tx)
+
+    @staticmethod
+    def _edge_names(edge: object) -> list[str]:
+        """The edge tables a ``remove_all_relations()`` argument names (v0.22.0).
+
+        A ``list`` or ``tuple`` names each of its items (de-duplicated, in order), anything else
+        one edge; every item goes through :meth:`_edge_name`.
+
+        Raises:
+            ValueError: an empty list or tuple, or an invalid edge name.
+            TypeError: an item that is neither an edge model class nor a string.
+        """
+        if isinstance(edge, (list, tuple)):
+            names = list(dict.fromkeys(BaseSurrealModel._edge_name(item) for item in edge))
+            if not names:
+                raise ValueError("remove_all_relations() needs at least one edge")
+            return names
+        return [BaseSurrealModel._edge_name(edge)]
+
+    @staticmethod
+    def _check_direction(direction: str) -> None:
+        """Refuse a graph direction other than ``"out"``, ``"in"`` or ``"both"``."""
+        if direction not in ("out", "in", "both"):
+            raise ValueError(f"direction must be 'out', 'in', or 'both', got '{direction}'")
+
+    @staticmethod
+    async def _run_graph_delete(statement: str, variables: dict[str, Any], tx: Transaction | None) -> None:
+        """Run a graph-path ``DELETE`` now, or queue it on ``tx``.
+
+        Outside a transaction a ``NotFoundError`` is a silent no-op (the v0.7.0 contract: on 3.x
+        it is only raised for a source record whose own table does not exist). Inside one the
+        transaction layer's errors apply, so such a statement fails the transaction.
+        """
+        if tx is not None:
+            await tx.add(statement, variables)
+            return
+        client = await SurrealDBConnectionManager.get_client()
+        with contextlib.suppress(NotFoundError):
+            await client.query(statement, variables)
 
     async def remove_relation(
         self,
-        edge: str,
-        target: "BaseSurrealModel | str",
+        edge: "str | type[BaseSurrealEdge]",
+        target: "BaseSurrealModel | RecordID | str",
+        reverse: bool = False,
+        tx: Transaction | None = None,
     ) -> None:
         """
-        Remove a specific relation between this record and the target.
+        Remove the relations of one edge table between this record and the target.
+
+        Parameters follow the full SurrealDB-ORM's order, each by position or by keyword:
+        ``remove_relation(edge, target, reverse, tx)`` is
+        ``remove_relation(edge, target, reverse=…, tx=…)``.
+
+        The statement is a graph-path ``DELETE`` with bound record ids
+        (``DELETE $src->edge WHERE out = $dst``): it removes exactly the edges graph traversal
+        sees — a plain record that merely carries ``in``/``out`` fields is not an edge and is
+        not matched. An edge table that was never created is a no-op, also in a transaction.
+
+        ``target`` is one of:
+
+        - a saved model instance, a ``RecordID`` or a ``"table:id"`` string — that record;
+        - a **bare record id** (a string without ``:``, e.g. ``"abc123"``) — bound verbatim and
+          compared **as a string** with the id of the edge's ``out`` (``in`` with
+          ``reverse=True``), so it matches that id in **any** table linked through the edge
+          table (``Player:abc123`` and ``Bot:abc123`` alike) and never an integer record id
+          (``"7"`` does not match ``Player:7``). Pass the instance or a ``RecordID`` to pin the
+          table or to reach an integer id. An empty or blank string raises ``ValueError``.
 
         Args:
-            edge: The relation/edge table name.
-            target: The target model instance or ``"table:id"`` string.
+            edge: An edge model class, or the relation/edge table name.
+            target: The other record, as above.
+            reverse: ``False`` (default) removes ``self -> edge -> target``; ``True`` removes
+                ``target -> edge -> self``.
+            tx: Optional transaction. On an interactive one (WebSocket + SurrealDB 3.x) the
+                statement runs now: the removal is visible to ``objects(tx=)`` reads and a
+                rollback restores the edges. On a buffered one (2.x, or HTTP) it is queued,
+                applied at commit and rolled back with the batch. Inside a transaction, a source
+                record whose own table does not exist fails the statement on 3.x (and so the
+                transaction); outside one it is a silent no-op.
+
+        Raises:
+            TypeError: ``edge`` is not an edge model class or a string; ``target`` is of
+                another type.
+            ValueError: an invalid edge name, a malformed ``"table:id"`` string, or an empty or
+                blank target.
+            SurrealDbError: an unsaved source or target.
 
         Example::
 
             await user.remove_relation("follows", other_user)
-            await user.remove_relation("follows", "User:bob")
+            await user.remove_relation(Follows, "User:bob")
+            await table.remove_relation("created", creator, reverse=True)  # creator -> table
+            await table.remove_relation("created", creator, True)  # same call, positional
+            await table.remove_relation("has_player", "abc123")  # bare id, any table
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await user.remove_relation(Follows, other_user, tx=tx)
         """
-        validate_edge_name(edge)
-        source = self._get_thing()
-        target_thing = self._resolve_target_thing(target)
-
-        query = f"DELETE {edge} WHERE in = {source} AND out = {target_thing};"
-        client = await SurrealDBConnectionManager.get_client()
-        with contextlib.suppress(NotFoundError):
-            await client.query(query, {})
+        edge_name = self._edge_name(edge)
+        source = self._graph_source()
+        arrow, column = ("<-", "in") if reverse else ("->", "out")
+        if isinstance(target, str) and ":" not in target:
+            if not target.strip():
+                raise ValueError(
+                    "remove_relation() target must not be empty or blank: pass a model instance, a RecordID, "
+                    "a 'table:id' string or a bare record id."
+                )
+            statement = f"DELETE $src{arrow}{edge_name} WHERE record::id({column}) = $id;"
+            variables: dict[str, Any] = {"src": source, "id": target}
+        else:
+            statement = f"DELETE $src{arrow}{edge_name} WHERE {column} = $dst;"
+            variables = {"src": source, "dst": self._graph_target(target)}
+        await self._run_graph_delete(statement, variables, tx)
 
     async def remove_all_relations(
         self,
-        edge: str,
-        *,
+        edge: "str | type[BaseSurrealEdge] | Sequence[str | type[BaseSurrealEdge]]",
         direction: str = "out",
+        tx: Transaction | None = None,
     ) -> None:
         """
-        Remove all relations of a given type from or to this record.
+        Remove every relation of the given edge table(s) from and/or to this record.
+
+        Parameters follow the full SurrealDB-ORM's order, each by position or by keyword:
+        ``remove_all_relations(edge, direction, tx)`` is
+        ``remove_all_relations(edge, direction=…, tx=…)``.
+
+        One graph-path ``DELETE`` with a bound record id (``DELETE $src->(e1, e2)``): it removes
+        exactly the edges graph traversal sees — a plain record that merely carries
+        ``in``/``out`` fields is not an edge and is not matched — a self-loop once, and an edge
+        table that was never created is a no-op, also in a transaction.
 
         Args:
-            edge: The relation/edge table name.
-            direction: ``"out"`` removes outgoing relations (default),
-                       ``"in"`` removes incoming relations,
-                       ``"both"`` removes all relations involving this record.
+            edge: An edge model class or an edge table name, or a list (or tuple) of them.
+            direction: ``"out"`` removes outgoing relations (default), ``"in"`` incoming ones,
+                ``"both"`` every relation involving this record.
+            tx: Optional transaction. On an interactive one (WebSocket + SurrealDB 3.x) the
+                statement runs now: the removal is visible to ``objects(tx=)`` reads and a
+                rollback restores the edges. On a buffered one (2.x, or HTTP) it is queued,
+                applied at commit and rolled back with the batch. Inside a transaction, a source
+                record whose own table does not exist fails the statement on 3.x (and so the
+                transaction); outside one it is a silent no-op.
+
+        Raises:
+            ValueError: an invalid direction or edge name, or an empty list.
+            TypeError: an edge that is neither an edge model class nor a string.
+            SurrealDbError: an unsaved record.
 
         Example::
 
             await user.remove_all_relations("follows", direction="out")
-            await user.remove_all_relations("follows", direction="both")
+            await user.remove_all_relations(Follows, "both")  # positional direction
+            await table.remove_all_relations(["has_player", HasAction, "has_state"])
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await user.remove_all_relations(["likes", "blocks"], direction="both", tx=tx)
         """
-        validate_edge_name(edge)
-        thing = self._get_thing()
-
-        if direction == "out":
-            query = f"DELETE {edge} WHERE in = {thing};"
-        elif direction == "in":
-            query = f"DELETE {edge} WHERE out = {thing};"
-        elif direction == "both":
-            query = f"DELETE {edge} WHERE in = {thing} OR out = {thing};"
-        else:
-            raise ValueError(f"direction must be 'out', 'in', or 'both', got '{direction}'")
-
-        client = await SurrealDBConnectionManager.get_client()
-        with contextlib.suppress(NotFoundError):
-            await client.query(query, {})
+        self._check_direction(direction)
+        names = ", ".join(self._edge_names(edge))
+        source = self._graph_source()
+        paths = {"out": f"$src->({names})", "in": f"$src<-({names})", "both": f"$src->({names}), $src<-({names})"}
+        await self._run_graph_delete(f"DELETE {paths[direction]};", {"src": source}, tx)
 
     async def get_related(
         self,
-        edge: str,
-        *,
+        edge: "str | type[BaseSurrealEdge]",
         direction: str = "out",
         model_class: type["BaseSurrealModel"] | None = None,
     ) -> list[Any]:
         """
         Get related records through a relation edge.
 
+        Parameters follow the full SurrealDB-ORM's order, each by position or by keyword:
+        ``get_related(edge, direction, model_class)`` is
+        ``get_related(edge, direction=…, model_class=…)``.
+
         Args:
-            edge: The relation/edge table name.
-            direction: ``"out"`` for outgoing relations (default),
-                       ``"in"`` for incoming relations.
+            edge: An edge model class, or the relation/edge table name.
+            direction: ``"out"`` for outgoing relations (default), ``"in"`` for incoming ones,
+                ``"both"`` for the out-neighbours followed by the in-neighbours (one query; a
+                neighbour linked by k edges appears k times, this record only through a
+                self-loop, once per direction; the order inside each group is unspecified).
             model_class: Optional model class to deserialize results into.
 
         Returns:
-            A list of related records (model instances if model_class is provided,
-            otherwise raw dicts/values).
+            A list of related records: model instances if ``model_class`` is given, otherwise
+            the neighbours' record ids (``RecordID``).
+
+        Raises:
+            ValueError: an invalid direction or edge name.
+            TypeError: ``edge`` is not an edge model class or a string.
+            SurrealDbError: an unsaved record.
 
         Example::
 
             following = await user.get_related("follows", direction="out", model_class=User)
-            followers = await user.get_related("follows", direction="in", model_class=User)
+            followers = await user.get_related("follows", "in", User)  # positional
+            everyone = await user.get_related(Follows, direction="both", model_class=User)
         """
-        validate_edge_name(edge)
-        thing = self._get_thing()
+        self._check_direction(direction)
+        edge_name = self._edge_name(edge)
+        source = self._graph_source()
 
         # With a model class the caller wants whole records, so project them in the traversal
         # itself (``->edge->?.*``) instead of fetching ids and then selecting them: same
         # result, one round-trip instead of two (issue #156). Verified on 2.6.x and 3.x.
         projection = "?.*" if model_class is not None else "?"
-
-        if direction == "out":
-            query = f"SELECT VALUE ->{edge}->{projection} FROM ONLY {thing};"
-        elif direction == "in":
-            query = f"SELECT VALUE <-{edge}<-{projection} FROM ONLY {thing};"
-        else:
-            raise ValueError(f"direction must be 'out' or 'in', got '{direction}'")
+        outgoing = f"->{edge_name}->{projection}"
+        incoming = f"<-{edge_name}<-{projection}"
+        # "both": the full ORM's two queries in one; `<->edge<->?` would return both ends of
+        # every edge, so this record once per edge (measured on 2.7.0, 3.1.5 and 3.3.3).
+        selected = {"out": outgoing, "in": incoming, "both": f"array::concat({outgoing}, {incoming})"}[direction]
+        query = f"SELECT VALUE {selected} FROM ONLY $src;"
 
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.query(query, {})
+        results = await client.query(query, {"src": source})
 
         if not isinstance(results, list) or len(results) == 0:
             return []
@@ -1713,11 +2238,18 @@ class BaseSurrealModel(BaseModel):
         """
         Execute a graph traversal from this record.
 
+        The path is validated and written into the statement; this record's id is bound, so a
+        node whose id is not an identifier (``joe@x.com``) traverses like it saves.
+
         Args:
             path: A SurrealQL graph traversal path starting with ``->`` or ``<-``.
 
         Returns:
             A list of records found by the traversal.
+
+        Raises:
+            ValueError: an invalid path.
+            SurrealDbError: an unsaved record.
 
         Example::
 
@@ -1725,11 +2257,11 @@ class BaseSurrealModel(BaseModel):
             fof = await user.traverse("->follows->User->follows->User")
         """
         validate_graph_path(path)
-        thing = self._get_thing()
+        source = self._graph_source()
 
-        query = f"SELECT VALUE {path} FROM ONLY {thing};"
+        query = f"SELECT VALUE {path} FROM ONLY $src;"
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.query(query, {})
+        results = await client.query(query, {"src": source})
 
         if isinstance(results, list):
             return results

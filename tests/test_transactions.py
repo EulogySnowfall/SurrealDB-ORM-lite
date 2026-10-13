@@ -3,6 +3,7 @@ import os
 from typing import Any
 
 import pytest
+from surrealdb import RecordID
 
 from surreal_orm_lite import (
     BaseSurrealModel,
@@ -31,22 +32,23 @@ def test_tx_subclasses_exported() -> None:
 @pytest.mark.asyncio
 async def test_add_namespaces_variables() -> None:
     tx = BufferedTransaction()
-    await tx.add("CREATE User:a CONTENT $data;", {"data": {"n": 1}})
-    await tx.add("UPDATE User:b MERGE $data;", {"data": {"n": 2}})
+    a, b = RecordID("User", "a"), RecordID("User", "b")
+    await tx.add("CREATE $rid CONTENT $data;", {"rid": a, "data": {"n": 1}})
+    await tx.add("UPDATE $rid MERGE $data;", {"rid": b, "data": {"n": 2}})
     # Each call's vars are renamed with a per-statement prefix to avoid collisions.
-    assert tx.variables == {"t0_data": {"n": 1}, "t1_data": {"n": 2}}
+    assert tx.variables == {"t0_rid": a, "t0_data": {"n": 1}, "t1_rid": b, "t1_data": {"n": 2}}
     assert tx.statements == [
-        "CREATE User:a CONTENT $t0_data;",
-        "UPDATE User:b MERGE $t1_data;",
+        "CREATE $t0_rid CONTENT $t0_data;",
+        "UPDATE $t1_rid MERGE $t1_data;",
     ]
 
 
 @pytest.mark.asyncio
 async def test_build_query_wraps_in_transaction() -> None:
     tx = BufferedTransaction()
-    await tx.add("CREATE User:a CONTENT $data;", {"data": {"n": 1}})
+    await tx.add("CREATE $rid CONTENT $data;", {"rid": RecordID("User", "a"), "data": {"n": 1}})
     query = tx.build_query()
-    assert query == "BEGIN TRANSACTION;\nCREATE User:a CONTENT $t0_data;\nCOMMIT TRANSACTION;"
+    assert query == "BEGIN TRANSACTION;\nCREATE $t0_rid CONTENT $t0_data;\nCOMMIT TRANSACTION;"
 
 
 def test_build_query_empty_raises() -> None:

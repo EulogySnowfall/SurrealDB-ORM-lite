@@ -1,7 +1,10 @@
 import contextlib
 import os
+from collections.abc import AsyncIterator, Iterator
+from typing import Any
 
 import pytest
+from surrealdb import RecordID
 
 from surreal_orm_lite import (
     BaseSurrealModel,
@@ -11,6 +14,8 @@ from surreal_orm_lite import (
     post_update,
 )
 from surreal_orm_lite.exceptions import SurrealDbError
+from surreal_orm_lite.transaction import BufferedTransaction
+from tests.conftest import orm_client
 
 TABLES = ("UpUser", "UpAccount", "UpEmailUser")
 
@@ -75,6 +80,110 @@ class UpEmailUser(BaseSurrealModel):
     model_config = SurrealConfigDict(primary_key="email")
     email: str
     name: str = ""
+
+
+class UpPair(BaseSurrealModel):
+    """A node keyed by a compound id that holds record ids: ``UpPair:[UpUser:a, UpUser:b]``."""
+
+    model_config = SurrealConfigDict(primary_key="id")
+    id: str | RecordID | None = None
+    weight: int = 0
+
+
+PAIR = RecordID("UpPair", [RecordID("UpUser", "a"), RecordID("UpUser", "b")])
+REVERSED_PAIR = RecordID("UpPair", [RecordID("UpUser", "b"), RecordID("UpUser", "a")])
+UPSERT_STATEMENT = "UPSERT $rid CONTENT $data RETURN $before AS before, $after AS after;"
+
+
+class _RecordingClient:
+    """Stands in for the connected SDK client: records every query and answers with no row."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any] | None]] = []
+
+    async def query(self, q: str, v: dict[str, Any] | None = None) -> Any:
+        self.calls.append((q, v))
+        return []
+
+
+def _http_url() -> str:
+    return f"http://{os.environ.get('SURREALDB_HOST', 'localhost')}:{os.environ.get('SURREALDB_PORT', '8000')}"
+
+
+@contextlib.asynccontextmanager
+async def _http_orm_client(*tables: str) -> AsyncIterator[Any]:
+    """``orm_client`` over HTTP, where a transaction is buffered on both server lines."""
+    SurrealDBConnectionManager.set_connection(url=_http_url(), user="root", password="root", namespace="ns", database="db")
+    client = await SurrealDBConnectionManager.get_client()
+    for table in tables:
+        with contextlib.suppress(Exception):
+            await client.query(f"REMOVE TABLE {table};", {})
+    try:
+        yield client
+    finally:
+        for table in tables:
+            with contextlib.suppress(Exception):
+                await client.query(f"REMOVE TABLE {table};", {})
+        await SurrealDBConnectionManager.close_connection()
+
+
+@contextlib.contextmanager
+def _created_flags() -> Iterator[list[bool]]:
+    """Collect the ``created`` flag of every ``post_save`` sent for ``UpPair``."""
+    seen: list[bool] = []
+
+    async def on_post_save(sender: Any, instance: Any, created: bool, **kwargs: Any) -> None:
+        seen.append(created)
+
+    post_save.connect(UpPair)(on_post_save)
+    try:
+        yield seen
+    finally:
+        post_save.disconnect(on_post_save, UpPair)
+
+
+async def _stored_pairs() -> list[tuple[Any, int]]:
+    """Every ``UpPair`` read back through the ORM, as ``(id, weight)`` sorted on the id text."""
+    rows = await UpPair.objects().exec()
+    return sorted(((row.id, row.weight) for row in rows), key=lambda item: str(item[0]))
+
+
+class TestRecordIdBindingUnit:
+    """``save(tx=)`` and ``upsert()`` bind the record id as ``$rid`` (no server)."""
+
+    @pytest.mark.asyncio
+    async def test_save_and_upsert_in_tx_bind_the_record_id(self) -> None:
+        """Written into the statement, a compound id reads ``UpPair:[RecordID(…), …]``: a parse error."""
+        tx = BufferedTransaction()
+        await UpPair(id=PAIR, weight=1).save(tx=tx)
+        await UpPair(id=PAIR, weight=2).upsert(tx=tx)
+        await UpUser(id="alice", name="Alice").save(tx=tx)
+
+        assert tx.statements == [
+            "CREATE $t0_rid CONTENT $t0_data;",
+            "UPSERT $t1_rid CONTENT $t1_data RETURN $before AS before, $after AS after;",
+            "CREATE $t2_rid CONTENT $t2_data;",
+        ]
+        assert tx.variables == {
+            "t0_rid": PAIR,
+            "t0_data": {"weight": 1},
+            "t1_rid": PAIR,
+            "t1_data": {"weight": 2},
+            "t2_rid": RecordID("UpUser", "alice"),
+            "t2_data": {"name": "Alice", "age": 0},
+        }
+
+    @pytest.mark.asyncio
+    async def test_upsert_binds_the_record_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Outside a transaction too, the id travels as ``$rid``, next to ``$data``."""
+        stub = _RecordingClient()
+
+        async def _get_client(cls: Any) -> Any:
+            return stub
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", classmethod(_get_client))
+        await UpPair(id=PAIR, weight=3).upsert()
+        assert stub.calls == [(UPSERT_STATEMENT, {"rid": PAIR, "data": {"weight": 3}})]
 
 
 class TestUpsertE2E:
@@ -318,3 +427,45 @@ class TestUpsertTxParticipationE2E:
             async with SurrealDBConnectionManager.transaction() as tx:
                 await UpUser.objects(tx=tx).update_or_create(name="NoBuf", defaults={"age": 1})
         await SurrealDBConnectionManager.close_connection()
+
+
+class TestCompoundIdE2E:
+    """A node whose id is a compound id holding record ids, created by ``save(tx=)`` then upserted."""
+
+    @pytest.mark.asyncio
+    async def test_compound_id_save_and_upsert_in_buffered_tx(self) -> None:
+        """HTTP: the transaction is buffered on both server lines."""
+        async with _http_orm_client("UpPair"):
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert not tx.is_interactive
+                await UpPair(id=PAIR, weight=1).save(tx=tx)
+            assert await _stored_pairs() == [(PAIR, 1)]
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await UpPair(id=PAIR, weight=2).upsert(tx=tx)
+            assert await _stored_pairs() == [(PAIR, 2)]
+
+            with _created_flags() as created:
+                await UpPair(id=REVERSED_PAIR, weight=3).upsert()
+                await UpPair(id=REVERSED_PAIR, weight=4).upsert()
+                await UpPair(id=PAIR, weight=5).upsert()
+            assert created == [True, False, False]
+            assert await _stored_pairs() == [(PAIR, 5), (REVERSED_PAIR, 4)]
+
+    @pytest.mark.asyncio
+    async def test_compound_id_save_and_upsert_in_interactive_tx(self) -> None:
+        """WebSocket + SurrealDB 3.x: the transaction is interactive, so ``created`` is known inside it."""
+        async with orm_client("UpPair"):
+            if not await _native_txn_supported():
+                pytest.skip("requires SurrealDB 3.x (interactive transactions)")
+            with _created_flags() as created:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    assert tx.is_interactive
+                    await UpPair(id=PAIR, weight=1).save(tx=tx)
+                    await UpPair(id=PAIR, weight=2).upsert(tx=tx)
+                    await UpPair(id=REVERSED_PAIR, weight=3).upsert(tx=tx)
+                    seen = await UpPair.objects(tx=tx).exec()
+                    assert [row.weight for row in seen if row.id == PAIR] == [2]  # the upsert inside the tx
+                await UpPair(id=PAIR, weight=4).upsert()
+            assert created == [True, False, True, False]
+            assert await _stored_pairs() == [(PAIR, 4), (REVERSED_PAIR, 3)]

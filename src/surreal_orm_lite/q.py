@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from typing import Any
 
 from .utils import build_filter_condition, parse_lookup
@@ -74,6 +74,7 @@ class Q:
         counter: int = 0,
         record_table: str | None = None,
         to_column: Callable[[str], str] | None = None,
+        endpoint_columns: Collection[str] = (),
     ) -> tuple[str, dict[str, Any], int]:
         """
         Generate a parameterized SQL WHERE fragment.
@@ -90,6 +91,10 @@ class Q:
                 (``address.city`` → ``addr.city``) exactly as ``filter(**kw)`` does. ``None`` —
                 a ``Q`` compiled on its own, with no model in sight — leaves names untouched.
                 Passed down to child nodes so a nested expression translates too.
+            endpoint_columns: The queried model's edge endpoint columns (``in``/``out`` on an
+                edge model; v0.22.0), propagated by the QuerySet and passed down to child nodes,
+                so ``Q(out="product:w")`` binds the record id it names. Empty — a node model, or
+                a ``Q`` compiled on its own — leaves strings untouched.
 
         Returns:
             A tuple of (sql_fragment, variables_dict, next_counter).
@@ -104,7 +109,9 @@ class Q:
                 field, lookup = parse_lookup(key)
                 if to_column is not None:
                     field = to_column(field)
-                sql, vars_, counter = build_filter_condition(field, lookup, value, counter, record_table)
+                sql, vars_, counter = build_filter_condition(
+                    field, lookup, value, counter, record_table, endpoint_columns=endpoint_columns
+                )
                 filter_parts.append(sql)
                 all_variables.update(vars_)
             if len(filter_parts) == 1:
@@ -114,7 +121,7 @@ class Q:
 
         # Child Q objects
         for child in self.children:
-            sql, vars_, counter = child.to_sql(counter, record_table, to_column)
+            sql, vars_, counter = child.to_sql(counter, record_table, to_column, endpoint_columns)
             if sql:
                 all_parts.append(sql)
                 all_variables.update(vars_)

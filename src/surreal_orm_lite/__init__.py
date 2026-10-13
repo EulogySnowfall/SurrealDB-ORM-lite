@@ -1,10 +1,11 @@
-__version__ = "0.21.1"
+__version__ = "0.22.0"
 
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
 from .auth import AuthTokens
 from .changefeed import ChangeModelStream
 from .concurrency import is_conflict_error, retry_on_conflict
 from .connection_manager import SurrealDBConnectionManager
+from .edge import BaseSurrealEdge
 from .enum import LiveAction, OrderBy
 from .exceptions import (
     SurrealDbAuthenticationError,
@@ -58,6 +59,7 @@ __all__ = [
     "InteractiveTransaction",
     # Model
     "BaseSurrealModel",
+    "BaseSurrealEdge",
     "SurrealConfigDict",
     # QuerySet
     "QuerySet",

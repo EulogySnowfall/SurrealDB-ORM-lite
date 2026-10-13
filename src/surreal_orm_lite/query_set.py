@@ -10,6 +10,7 @@ from pydantic_core import ValidationError
 from . import BaseSurrealModel, SurrealDBConnectionManager
 from ._sdk import NotFoundError
 from .changefeed import ChangeModelStream, Since
+from .edge import _check_edge_id, insert_edges
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import Var
@@ -17,6 +18,7 @@ from .live import LiveModelStream, LiveStream, ReconnectCallback, missing_table_
 from .q import Q
 from .surql_literal import inline_variables
 from .utils import (
+    as_record_value,
     build_filter_condition,
     coerce_record_id,
     parse_lookup,
@@ -55,7 +57,7 @@ class QuerySet:
         self._limit: int | None = None
         self._offset: int | None = None
         self._order_by: str | None = None
-        self._model_table: str = getattr(model, "_table_name", model.__name__)
+        self._model_table: str = model.get_table_name()
         self._variables: dict = {}
         self._fetch_fields: list[str] = []
         self._group_by_fields: list[str] = []
@@ -273,16 +275,19 @@ class QuerySet:
         parts: list[str] = []
         variables: dict[str, Any] = {}
         counter = 0
+        endpoint_columns = self.model._endpoint_columns()
 
         # Regular keyword filters (AND-joined)
         for field_name, lookup_name, value in self._filters:
-            sql, vars_, counter = build_filter_condition(field_name, lookup_name, value, counter, self._model_table)
+            sql, vars_, counter = build_filter_condition(
+                field_name, lookup_name, value, counter, self._model_table, endpoint_columns=endpoint_columns
+            )
             parts.append(sql)
             variables.update(vars_)
 
         # Q object filters
         for q in self._q_filters:
-            sql, vars_, counter = q.to_sql(counter, self._model_table, self.model.to_db_field)
+            sql, vars_, counter = q.to_sql(counter, self._model_table, self.model.to_db_field, endpoint_columns)
             if sql:
                 parts.append(sql)
                 variables.update(vars_)
@@ -709,19 +714,50 @@ class QuerySet:
 
         Uses the SDK's ``insert()`` method for efficient bulk insertion.
 
+        On an **edge model** (:class:`~surreal_orm_lite.edge.BaseSurrealEdge`) the batch is
+        created with ``INSERT RELATION``, so every edge is a relation that graph traversal sees,
+        on SurrealDB 2.x and 3.x alike: N edges without an id go through **one** call of the SDK's
+        ``insert_relation()``; as soon as one edge has an explicit id, the whole batch goes
+        through the guarded statement of :meth:`BaseSurrealEdge.save`, so an id that already
+        exists raises :class:`SurrealDbError` ("already exists") and **nothing** of the batch is
+        written. Every id is checked before any call (a ``RecordID`` of another table, or a
+        ``bool``, is a ``ValueError``). The batch is one statement, but outside a transaction it
+        is not atomic against the table's ``PERMISSIONS``: when they refuse some edges, the
+        server writes the others and returns them only, and this raises :class:`SurrealDbError`
+        ("Only k of n edges came back …") — the accepted edges stay written. No signals fire, as
+        for nodes.
+
         Args:
             models: A list of model instances to create.
 
         Returns:
-            A list of created model instances with their assigned IDs.
+            A list of created model instances with their assigned IDs. Under
+            ``objects(tx=…)``: the hydrated instances on an interactive transaction (WebSocket +
+            SurrealDB 3.x), the input models unchanged on a buffered one (written at commit; an
+            edge without an explicit id keeps ``id=None``). ``[]`` for an empty list, without any
+            call.
+
+        Raises:
+            SurrealDbError: an edge id that already exists, edges the ``PERMISSIONS`` refused, or
+                any other refusal of an edge batch by the server.
+            SurrealDbNotFoundError: an endpoint of an ``ENFORCED`` relation that does not exist.
+            ValueError: an edge id that is a ``RecordID`` of another table, or a ``bool``.
 
         Example::
 
             users = [User(name="Alice"), User(name="Bob"), User(name="Charlie")]
             created = await User.objects().bulk_create(users)
+
+            edges = await Purchased.objects().bulk_create([
+                Purchased(in_=alice, out=widget, quantity=3),
+                Purchased(in_=bob, out=widget, quantity=1),
+            ])  # one insert_relation() round-trip
         """
         if not models:
             return []
+
+        if self.model.__surreal_edge__:
+            return await self._bulk_create_edges(models)
 
         data_list = []
         for model in models:
@@ -743,6 +779,28 @@ class QuerySet:
         if isinstance(results, list):
             return self.model.from_db(results)  # type: ignore
         return []
+
+    async def _bulk_create_edges(self, models: list[BaseSurrealModel]) -> list[BaseSurrealModel]:
+        """The edge route of :meth:`bulk_create`: one :func:`~surreal_orm_lite.edge.insert_edges` call.
+
+        Each row is what :meth:`BaseSurrealEdge.save` sends — the column-keyed write payload
+        (``in``, ``out``, the data) plus ``id`` as a ``RecordID`` when the edge has one — and
+        every id is checked before the call. ``insert_edges`` picks the statement, normalises
+        the server's errors and raises when fewer rows come back than were sent.
+        """
+        rows: list[dict[str, Any]] = []
+        for model in models:
+            _check_edge_id(model)
+            row = model._write_payload()
+            record_id = model._record_id()
+            if record_id is not None:
+                row["id"] = record_id
+            rows.append(row)
+
+        created = await insert_edges(self._model_table, rows, tx=self._tx)
+        if self._tx is not None and not self._tx.is_interactive:
+            return models  # buffered: not executed until commit; return inputs
+        return cast(list[BaseSurrealModel], self.model.from_db(created))
 
     async def bulk_update(self, **kwargs: Any) -> int:
         """
@@ -851,7 +909,9 @@ class QuerySet:
         ``"$literal"`` (otherwise ``get_or_create(name="$$admin")`` filtered on ``"$admin"``
         but stored ``"$$admin"``, never converging and creating a duplicate on every call),
         and a query-variable reference is refused outright — its value lives on the server,
-        so it cannot be written back (issue #156 follow-up).
+        so it cannot be written back (issue #156 follow-up). A model instance is written as its
+        record id, the value its lookup binds (v0.22.0): ``get_or_create(customer=alice)``
+        stores ``customer = RecordID(...)``.
         """
         payload: dict[str, Any] = {}
         for key, value in criteria.items():
@@ -865,7 +925,7 @@ class QuerySet:
                 )
             if isinstance(value, str) and value.startswith("$$"):
                 value = value[1:]
-            payload[field_name] = value
+            payload[field_name] = as_record_value(value)
         return payload
 
     async def _lookup_matches(self, criteria: dict[str, Any]) -> list[Any]:
@@ -908,18 +968,7 @@ class QuerySet:
         """
         computed = self.model.get_computed_fields()
         vetted = {key: value for key, value in payload.items() if key not in computed}
-
-        if self.model.model_config.get("extra") == "allow":
-            return vetted
-
-        declared = set(self.model.model_fields)
-        undeclared = sorted(key for key in vetted if key not in declared)
-        if undeclared:
-            raise SurrealDbError(
-                f"{self.model.__name__} does not declare {', '.join(undeclared)}; "
-                "remove the key, add the field to the model, or set "
-                'model_config = ConfigDict(extra="allow") to store undeclared fields.'
-            )
+        self.model._reject_undeclared_writes(vetted)
         return vetted
 
     async def update_or_create(
@@ -947,10 +996,18 @@ class QuerySet:
         Create builds ``self.model(**payload)``: a key the model does not declare raises
         ``SurrealDbError`` (unless the model sets ``extra="allow"``), and a missing required
         field raises ``ValidationError`` at construction.
+
+        On an edge model (v0.22.0) the endpoints are lookup criteria, never data:
+        ``update_or_create(in_=a, out=b, defaults={"weight": 3})`` finds or relates ``a -> b``
+        and writes ``weight``. ``defaults`` naming an endpoint (``in_``/``in``/``out``) raises
+        ``ValueError`` before the lookup — it would be written on create and silently ignored by
+        the server on update. On update, the endpoints the criteria named (they matched) are left
+        out of the ``merge()``.
         """
         if not criteria:
             raise SurrealDbError("update_or_create() requires at least one lookup criteria.")
         defaults = defaults or {}
+        self.model._reject_endpoint_writes(defaults, "update_or_create(defaults=)")
         matches = await self._lookup_matches(criteria)
         if len(matches) > 1:
             raise SurrealDbError("update_or_create() matched multiple records; the lookup criteria are not unique.")
@@ -960,7 +1017,9 @@ class QuerySet:
             await obj._save_naming(payload, tx=self._tx)
             return obj, True
         obj = self.model.from_db(matches[0])
-        await obj.merge(tx=self._tx, **payload)
+        # Only the criteria can name an endpoint here (defaults were checked above).
+        changes = {key: value for key, value in payload.items() if not self.model._is_write_protected(key)}
+        await obj.merge(tx=self._tx, **changes)
         return obj, False
 
     async def get_or_create(
