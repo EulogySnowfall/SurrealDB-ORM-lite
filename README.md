@@ -1142,7 +1142,10 @@ Only a plain, symmetric `Field(alias=…)` is treated as a column rename. A sepa
 `validation_alias` / `serialization_alias`, and in particular `AliasPath` / `AliasChoices`,
 describe something other than a renamed column and are left entirely to Pydantic — write
 payloads follow the ORM's map, not `model_dump(by_alias=True)`, so a row can never land under
-a name the read paths do not look for.
+a name the read paths do not look for. Inside a sub-model, by the same logic, each field is
+written under the key its validation reads (its `validation_alias` or `alias`), so the stored
+object reads back into the sub-model (v0.23.0, see
+[Keyword writes](#keyword-writes-and-atomic_increment)).
 
 The map has to be unambiguous, and the ORM checks it the first time it is used: an alias that
 collides with another field's name, or two fields sharing one column, raises `ValueError`.
@@ -2109,12 +2112,30 @@ await event.atomic_increment("day", timedelta(days=1))      # a date: whole days
 `signup()`/`signin()` of an `AuthenticatedUserMixin` model validate each value addressed to a rich
 field against the field's full annotation, constraints included, so `merge(ttl="2h")` stores a
 duration and sets `event.ttl` to `timedelta(hours=2)`, and `signin(badge="0190…")` matches the
-uuid a `UUID` identifier field holds. A field typed with a sub-model that holds a rich type
-(`profile: Profile | None`, `list[Profile]`) takes a dict or an instance: it is validated into the
-sub-model, then stored as the object `save()` writes, a `date` inside it as a datetime. A value that
-does not fit raises `ValueError` naming the field, before anything is sent; `None` and
-`SurrealFunc` values are written as given. Before v0.23.0 such keyword values were stored as
-strings (see [Upgrading from v0.22](#upgrading-from-v022)).
+uuid a `UUID` identifier field holds. A value that does not fit raises `ValueError` naming the
+field, before anything is sent; `None` and `SurrealFunc` values are written as given. Before
+v0.23.0 such keyword values were stored as strings (see [Upgrading from v0.22](#upgrading-from-v022)).
+
+Sub-models and table models in keyword writes:
+
+- A field typed with a sub-model that holds a rich type (`profile: Profile | None`,
+  `list[Profile]`) takes a dict or an instance.
+- In `merge()` and in the update branch of `update_or_create()`, a dict changes only the keys it
+  names. Each key is validated as its sub-field: `merge(profile={"bday": "1995-05-05"})` stores a
+  datetime, and a bad value raises `ValueError` naming `profile.bday`. SurrealDB's `MERGE` keeps the
+  other stored keys, so a required sub-field does not need to be repeated. An array is replaced
+  whole. With `server_values=`, `merge()` runs an `UPDATE … SET`, which replaces the field with the
+  dict.
+- An instance is the whole sub-object, written as `save()` writes it:
+  `merge(profile=Profile(city="y"))` removes a stored `bday`.
+- `bulk_update()` and `signup()` replace the field, so a dict is validated there as the whole
+  sub-model: a missing required sub-field raises `ValueError`.
+- Sub-fields are written under the key their validation reads (their alias):
+  `seen: datetime | None = Field(default=None, alias="lastSeen")` is stored as `lastSeen` by
+  `save()` and by keyword writes alike, so a read gives it back.
+- A table-model instance is written as its record id: `merge(author=alice)` stores alice's
+  `RecordID`, in a raw query's variables too. A field that cannot hold a `RecordID` raises
+  `ValueError`.
 
 `atomic_increment(field, amount)` also takes a duration (a `timedelta`, a `Duration` or the SDK's
 `Duration`), which must be positive: a decrement could reach a zero or negative duration, so it
