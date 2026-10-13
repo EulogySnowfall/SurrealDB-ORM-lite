@@ -4,20 +4,26 @@ Unit tests first (no database); the raw-SDK E2E classes that pin what the server
 wire form are suffixed ``E2E``.
 """
 
+import copy
 import inspect
 import json
-from collections.abc import Callable
-from datetime import timedelta
-from typing import Any
+from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Set as AbstractSet
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+from typing import Annotated, Any, ForwardRef, Literal, Optional, TypeVar, Union
+from uuid import UUID
 
 import pytest
 import surrealdb
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 import surreal_orm_lite
-from surreal_orm_lite import Duration, InvalidDurationError
+from surreal_orm_lite import Computed, Duration, InvalidDurationError
+from surreal_orm_lite.wire import MAX_DURATION_NS, duration_ns, field_input, rich_kinds
 
 MAX_NS = Duration.MAX_NANOSECONDS
+_T = TypeVar("_T")
 
 
 def _assert_invalid_duration(call: Callable[[], Any]) -> None:
@@ -260,3 +266,360 @@ class TestDuration:
         assert M.model_validate_json(m.model_dump_json()) == m
         schema = M.model_json_schema()["properties"]["d"]
         assert "string" in json.dumps(schema)
+
+
+# --- wire.py, first part: duration_ns, rich_kinds, field_input (spec §5.1, §5.4) ------------------
+
+
+class _Node(BaseModel):
+    """A self-referencing model: ``rich_kinds`` must terminate on it (cycle guard)."""
+
+    ttl: timedelta | None = None
+    child: "_Node | None" = None
+
+
+_Node.model_rebuild()
+
+
+class _Holder(BaseModel):
+    ttl: timedelta
+
+
+class _Sched(BaseModel):
+    """Mixed positions in one model (AC-30): only ``ttl`` and ``when`` convert."""
+
+    ttl: timedelta
+    grace: Duration
+    extra: dict[str, Any] = {}
+    when: datetime | None = Field(None, alias="at")
+
+
+class _ComputedHolder(BaseModel):
+    span: Computed[timedelta] = None
+
+
+class TestDurationNs:
+    def test_exact_nanoseconds(self) -> None:
+        assert duration_ns(timedelta(days=1, microseconds=5)) == 86400 * 10**9 + 5000
+        assert duration_ns(Duration(7)) == 7
+        assert duration_ns(surrealdb.Duration(7)) == 7
+        assert duration_ns(Duration(MAX_NS)) == MAX_NS
+        assert duration_ns(timedelta.max) == (timedelta.max.days * 86400 + timedelta.max.seconds) * 10**9 + 999_999_000
+
+    def test_refusals(self) -> None:
+        with pytest.raises(TypeError):
+            duration_ns(surrealdb.Duration(1.5))  # type: ignore[arg-type]
+        with pytest.raises(TypeError):
+            duration_ns(surrealdb.Duration(True))
+        with pytest.raises(TypeError):
+            duration_ns("1h")
+
+    def test_max_duration_constant(self) -> None:
+        assert MAX_DURATION_NS == Duration.MAX_NANOSECONDS
+
+
+class TestRichKinds:
+    @pytest.mark.parametrize(
+        ("annotation", "kinds"),
+        [
+            (timedelta | None, {"timedelta"}),
+            (Optional[timedelta], {"timedelta"}),  # noqa: UP045
+            (Annotated[Decimal, "x"], {"decimal"}),
+            (Computed[timedelta], {"timedelta"}),
+            (list[UUID], {"uuid"}),
+            (set[str], {"set"}),
+            (frozenset[str], {"frozenset"}),
+            (tuple[int, ...], {"tuple"}),
+            (tuple[date, str], {"tuple", "date"}),
+            (dict[str, date], {"date"}),
+            (Mapping[str, timedelta], {"timedelta"}),
+            (Sequence[datetime], {"datetime"}),
+            (AbstractSet[int], {"set"}),
+            (Duration, {"duration"}),
+            (datetime, {"datetime"}),
+            (date, {"date"}),
+            (set, {"set"}),
+            (list[set[timedelta]] | None, {"set", "timedelta"}),
+            (int, set()),
+            (str, set()),
+            (Any, set()),
+            (list[int], set()),
+            (Literal["a"], set()),
+            (_T, set()),
+            ("timedelta", set()),
+            (ForwardRef("timedelta"), set()),
+        ],
+    )
+    def test_kinds(self, annotation: Any, kinds: set[str]) -> None:
+        assert rich_kinds(annotation) == frozenset(kinds)
+
+    def test_computed_as_model_fields_resolves_it(self) -> None:
+        assert rich_kinds(_ComputedHolder.model_fields["span"].annotation) == {"timedelta"}
+
+    def test_into_models(self) -> None:
+        assert rich_kinds(_Holder) == {"timedelta"}
+        assert rich_kinds(_Holder | None) == {"timedelta"}
+        assert rich_kinds(list[_Holder]) == {"timedelta"}
+        assert rich_kinds(_Holder, into_models=False) == frozenset()
+        assert rich_kinds(list[_Holder], into_models=False) == frozenset()
+        assert rich_kinds(_Sched) == {"timedelta", "duration", "datetime"}
+
+    def test_self_referencing_model_terminates(self) -> None:
+        assert rich_kinds(_Node) == {"timedelta"}
+        assert rich_kinds(_Node | None) == {"timedelta"}
+        assert rich_kinds(_Node, into_models=False) == frozenset()
+
+    def test_returns_a_frozenset(self) -> None:
+        assert type(rich_kinds(int)) is frozenset
+        assert type(rich_kinds(timedelta)) is frozenset
+
+
+class TestFieldInput:
+    # Rule 1
+    def test_none(self) -> None:
+        assert field_input(timedelta, None) is None
+        assert field_input(list[timedelta], None) is None
+
+    # Rule 2
+    def test_annotated_is_unwrapped(self) -> None:
+        assert field_input(Annotated[timedelta, "x"], "1h") == timedelta(hours=1)
+        assert field_input(Computed[timedelta], "1h") == timedelta(hours=1)
+
+    # Rule 4
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (surrealdb.Duration(5400 * 10**9 + 1), timedelta(hours=1, minutes=30)),
+            (Duration.parse("1h30m1ns"), timedelta(hours=1, minutes=30)),
+            (surrealdb.Duration(1999), timedelta(microseconds=1)),
+            ("1h30m", timedelta(hours=1, minutes=30)),
+            (" 1h30m ", timedelta(hours=1, minutes=30)),
+            ("7d", timedelta(days=7)),
+            ("0ns", timedelta(0)),
+        ],
+    )
+    def test_timedelta_converts(self, value: Any, expected: timedelta) -> None:
+        result = field_input(timedelta, value)
+        assert result == expected
+        assert type(result) is timedelta
+
+    @pytest.mark.parametrize("value", ["PT1H30M", 90, 1.5, "1.5h", "1h 30m", "", timedelta(hours=1), b"1h"])
+    def test_timedelta_leaves_the_rest(self, value: Any) -> None:
+        assert field_input(timedelta, value) is value
+
+    def test_timedelta_beyond_max_names_duration(self) -> None:
+        with pytest.raises(ValueError, match="Duration"):
+            field_input(timedelta, surrealdb.Duration(MAX_NS))
+        with pytest.raises(ValueError, match="Duration"):
+            field_input(timedelta, Duration(MAX_NS))
+        with pytest.raises(ValueError, match="Duration"):
+            field_input(timedelta, "584942417355y")
+        # The largest timedelta itself still converts.
+        biggest = Duration.from_timedelta(timedelta.max)
+        assert field_input(timedelta, biggest) == timedelta.max
+
+    def test_timedelta_bad_sdk_duration_is_left_to_pydantic(self) -> None:
+        bad = surrealdb.Duration(1.5)  # type: ignore[arg-type]
+        assert field_input(timedelta, bad) is bad
+
+        class M(BaseModel):
+            ttl: timedelta
+
+        with pytest.raises(ValidationError):
+            M.model_validate({"ttl": field_input(timedelta, bad)})
+
+    # Rule 5
+    @pytest.mark.parametrize("annotation", [datetime, date])
+    def test_sdk_datetime_becomes_its_string(self, annotation: Any) -> None:
+        sdk = surrealdb.Datetime("2026-01-02T03:04:05.123456789Z")
+        assert field_input(annotation, sdk) == "2026-01-02T03:04:05.123456789Z"
+        now = datetime(2026, 1, 2, tzinfo=UTC)
+        assert field_input(annotation, now) is now
+        assert field_input(annotation, "2026-01-02") == "2026-01-02"
+
+    def test_sdk_datetime_validates_to_microseconds(self) -> None:
+        class M(BaseModel):
+            at: datetime
+
+        sdk = surrealdb.Datetime("2026-01-02T03:04:05.123456789Z")
+        assert M.model_validate({"at": field_input(datetime, sdk)}).at.microsecond == 123456
+
+    # Rules 3 and 11
+    @pytest.mark.parametrize(
+        "annotation",
+        [Any, object, Duration, Decimal, UUID, dict[str, Any], list[Any], int, str, _T, "timedelta", ForwardRef("timedelta")],
+    )
+    def test_never_converts_elsewhere(self, annotation: Any) -> None:
+        sdk = surrealdb.Duration(5)
+        assert field_input(annotation, sdk) is sdk
+        text = "1h"
+        assert field_input(annotation, text) is text
+
+    def test_any_containers_keep_sdk_values(self) -> None:
+        value = {"x": surrealdb.Duration(500), "y": [surrealdb.Duration(1)]}
+        assert field_input(dict[str, Any], value) is value
+        assert field_input(Any, value) is value
+        listed = [surrealdb.Duration(500)]
+        assert field_input(list[Any], listed) is listed
+        assert field_input(list, listed) is listed
+
+    # Rule 6
+    def test_union_optional(self) -> None:
+        assert field_input(timedelta | None, "1h") == timedelta(hours=1)
+        assert field_input(Optional[timedelta], surrealdb.Duration(10**9)) == timedelta(seconds=1)  # noqa: UP045
+        assert field_input(Union[None, timedelta], "1h") == timedelta(hours=1)  # noqa: UP007
+
+    def test_union_str_claims_strings(self) -> None:
+        text = "1h"
+        assert field_input(timedelta | str, text) is text
+        assert field_input(timedelta | str, surrealdb.Duration(10**9)) == timedelta(seconds=1)
+
+    def test_union_duration_claims_durations(self) -> None:
+        sdk = surrealdb.Duration(5)
+        assert field_input(timedelta | Duration, sdk) is sdk
+        orm = Duration(5)
+        assert field_input(timedelta | Duration | None, orm) is orm
+
+    def test_union_any_claims_everything(self) -> None:
+        sdk = surrealdb.Duration(5)
+        assert field_input(timedelta | Any, sdk) is sdk  # type: ignore[operator]
+        assert field_input(Union[timedelta, object], sdk) is sdk  # noqa: UP007
+
+    def test_union_other_members_do_not_claim(self) -> None:
+        assert field_input(timedelta | int, surrealdb.Duration(10**9)) == timedelta(seconds=1)
+        assert field_input(timedelta | int, "1h") == timedelta(hours=1)
+        number = 90
+        assert field_input(timedelta | int, number) is number
+
+    def test_union_with_datetime(self) -> None:
+        sdk = surrealdb.Datetime("2026-01-02T00:00:00Z")
+        assert field_input(datetime | None, sdk) == "2026-01-02T00:00:00Z"
+        assert field_input(date | str, sdk) == "2026-01-02T00:00:00Z"
+        assert field_input(datetime | timedelta, sdk) == "2026-01-02T00:00:00Z"
+        assert field_input(datetime | timedelta, "1h") == timedelta(hours=1)
+
+    def test_union_without_rich_member_is_untouched(self) -> None:
+        sdk = surrealdb.Duration(5)
+        assert field_input(int | str, sdk) is sdk
+
+    def test_union_containers_take_the_first_matching_shape(self) -> None:
+        annotation = list[timedelta] | dict[str, timedelta]
+        assert field_input(annotation, ["1h"]) == [timedelta(hours=1)]
+        assert field_input(annotation, {"a": "1h"}) == {"a": timedelta(hours=1)}
+        # The first sequence member wins, even when a later one would convert.
+        assert field_input(list[str] | list[timedelta], ["1h"]) == ["1h"]
+        assert field_input(Sequence[timedelta] | None, ("1h",)) == (timedelta(hours=1),)
+        assert field_input(_Holder | None, {"ttl": "1h"}) == {"ttl": timedelta(hours=1)}
+        listed = ["1h"]
+        assert field_input(int | str, listed) is listed
+        mapping = {"a": "1h"}
+        assert field_input(list[timedelta] | None, mapping) is mapping
+
+    # Rules 7 to 9
+    def test_sequences(self) -> None:
+        result = field_input(list[timedelta], ["1h", surrealdb.Duration(1000)])
+        assert result == [timedelta(hours=1), timedelta(microseconds=1)]
+        assert type(result) is list
+        as_tuple = field_input(list[timedelta], ("1h",))
+        assert as_tuple == (timedelta(hours=1),)
+        assert type(as_tuple) is tuple
+        as_set = field_input(set[timedelta], {"1h", "60m"})
+        assert as_set == {timedelta(hours=1)}
+        assert type(as_set) is set
+        as_frozen = field_input(frozenset[timedelta], frozenset({"1h"}))
+        assert as_frozen == frozenset({timedelta(hours=1)})
+        assert type(as_frozen) is frozenset
+        assert field_input(Sequence[timedelta], ["2h"]) == [timedelta(hours=2)]
+        assert field_input(AbstractSet[timedelta], {"2h"}) == {timedelta(hours=2)}
+        text = "1h"
+        assert field_input(list[timedelta], text) is text
+
+    def test_tuples(self) -> None:
+        assert field_input(tuple[timedelta, ...], ("1h", "2h")) == (timedelta(hours=1), timedelta(hours=2))
+        assert field_input(tuple[timedelta, ...], ["1h"]) == [timedelta(hours=1)]
+        assert field_input(tuple[timedelta, str], ("1h", "1h")) == (timedelta(hours=1), "1h")
+        assert field_input(tuple[timedelta, str], ["1h", "1h"]) == [timedelta(hours=1), "1h"]
+        mismatch = ("1h", "1h", "1h")
+        assert field_input(tuple[timedelta, str], mismatch) is mismatch
+        empty: tuple[()] = ()
+        assert field_input(tuple[()], empty) is empty
+        bare = ("1h",)
+        assert field_input(tuple, bare) is bare
+
+    def test_mappings(self) -> None:
+        result = field_input(dict[str, timedelta], {"a": "1h", "b": surrealdb.Duration(10**9)})
+        assert result == {"a": timedelta(hours=1), "b": timedelta(seconds=1)}
+        assert list(result) == ["a", "b"]
+        assert field_input(Mapping[str, list[timedelta]], {"a": ["1h"]}) == {"a": [timedelta(hours=1)]}
+        # Keys are never converted.
+        assert field_input(dict[timedelta, int], {"1h": 1}) == {"1h": 1}
+        listed = ["1h"]
+        assert field_input(dict[str, timedelta], listed) is listed
+
+    # Rule 10
+    def test_model_mixed_positions(self) -> None:
+        sdk_grace = surrealdb.Duration(5400 * 10**9 + 1)
+        extra = {"x": surrealdb.Duration(500), "y": surrealdb.Duration(3600 * 10**9)}
+        zz = surrealdb.Duration(1)
+        raw = {
+            "ttl": surrealdb.Duration(5400 * 10**9 + 1),
+            "grace": sdk_grace,
+            "extra": extra,
+            "at": surrealdb.Datetime("2026-01-02T00:00:00Z"),
+            "zz": zz,
+        }
+        result = field_input(_Sched, raw)
+        assert result["ttl"] == timedelta(hours=1, minutes=30)
+        assert type(result["ttl"]) is timedelta
+        assert result["grace"] is sdk_grace
+        assert result["extra"] is extra
+        assert result["at"] == "2026-01-02T00:00:00Z"
+        assert result["zz"] is zz
+        # AC-30: no nanosecond loss at the Duration position, no timedelta(0) in the Any one.
+        validated = _Sched.model_validate(result)
+        assert validated.grace.elapsed == 5400 * 10**9 + 1
+        assert validated.extra["x"] == surrealdb.Duration(500)
+        assert validated.when == datetime(2026, 1, 2, tzinfo=UTC)
+
+    def test_model_field_names_and_validation_alias(self) -> None:
+        class M(BaseModel):
+            model_config = ConfigDict(populate_by_name=True)
+            when: datetime | None = Field(None, alias="at")
+            ttl: timedelta | None = Field(None, validation_alias="span")
+
+        assert field_input(M, {"when": surrealdb.Datetime("2026-01-02T00:00:00Z")}) == {"when": "2026-01-02T00:00:00Z"}
+        assert field_input(M, {"span": "1h"}) == {"span": timedelta(hours=1)}
+
+    def test_model_instance_is_unchanged(self) -> None:
+        instance = _Sched(ttl=timedelta(1), grace=Duration(1))
+        assert field_input(_Sched, instance) is instance
+        assert field_input(_Sched | None, instance) is instance
+
+    def test_copy_on_write(self) -> None:
+        untouched = {"a": [timedelta(hours=1)], "b": [timedelta(hours=2)]}
+        assert field_input(dict[str, list[timedelta]], untouched) is untouched
+        model_input = {"ttl": timedelta(1), "extra": {"x": surrealdb.Duration(1)}}
+        assert field_input(_Sched, model_input) is model_input
+
+        value = {"a": [timedelta(hours=1)], "b": ["1h", surrealdb.Duration(1000)]}
+        before = copy.deepcopy(value)
+        result = field_input(dict[str, list[timedelta]], value)
+        assert result is not value
+        assert value == before
+        assert value["b"] == ["1h", surrealdb.Duration(1000)]
+        assert result["a"] is value["a"]
+        assert result["b"] == [timedelta(hours=1), timedelta(microseconds=1)]
+
+        nested = {"ttl": "1h", "extra": {}}
+        nested_before = copy.deepcopy(nested)
+        assert field_input(_Sched, nested) is not nested
+        assert nested == nested_before
+
+    def test_self_referencing_model_values(self) -> None:
+        value = {"ttl": "1h", "child": {"ttl": "2h", "child": {"ttl": "3h", "child": None}}}
+        result = field_input(_Node, value)
+        assert result["ttl"] == timedelta(hours=1)
+        assert result["child"]["ttl"] == timedelta(hours=2)
+        assert result["child"]["child"]["ttl"] == timedelta(hours=3)
+        assert result["child"]["child"]["child"] is None
+        assert _Node.model_validate(result).child.child.ttl == timedelta(hours=3)  # type: ignore[union-attr]
