@@ -23,7 +23,7 @@ from uuid import UUID
 import aiohttp
 import pytest
 import surrealdb
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import AliasChoices, AliasPath, BaseModel, ConfigDict, Field, ValidationError
 from surrealdb import TAG_DECIMAL_STRING, TAG_DURATION_COMPACT, AsyncSurreal, RecordID
 from surrealdb.cbor import CBORTag, undefined
 from surrealdb.data.cbor import encode as sdk_cbor_encode
@@ -1023,6 +1023,15 @@ class _Level(enum.IntEnum):
     HIGH = 3
 
 
+class _Linked(surreal_orm_lite.BaseSurrealModel):
+    """A table model given as a value: written as its record id."""
+
+    model_config = surreal_orm_lite.SurrealConfigDict(table_name="rf_linked")
+
+    id: str | None = None
+    name: str = ""
+
+
 class TestEncodeWire:
     @_BOTH_MODES
     @pytest.mark.parametrize(
@@ -1363,9 +1372,10 @@ class TestEncodeWire:
 
     @_BOTH_MODES
     def test_pydantic_models_are_dumped_then_encoded(self, stored: bool) -> None:
-        """A sub-model (the value ``merge(profile={…})`` validates into) leaves as the object
-        ``_write_payload`` writes: dumped by Python field name, the SDK values of its untyped
-        positions put back, every value encoded — the SDK has no encoder for a Pydantic model."""
+        """A sub-model (the value ``bulk_update(profile={…})`` validates into) leaves as the object
+        ``_write_payload`` writes: each sub-field under the key its validation reads (``other``, the
+        alias), the SDK values of its untyped positions put back, every value encoded — the SDK has
+        no encoder for a Pydantic model."""
 
         class Sub(BaseModel):
             model_config = ConfigDict(extra="allow")
@@ -1385,7 +1395,7 @@ class TestEncodeWire:
         expected = {
             "when": datetime(2026, 1, 2, tzinfo=UTC),
             "ttl": _tag14(3600, 0),
-            "renamed": 2,
+            "other": 2,
             "loose": {"d": _tag14(0, 5)},
             "more": _tag10("1.5"),
         }
@@ -1396,6 +1406,97 @@ class TestEncodeWire:
         sdk_cbor_encode(encoded)  # the SDK can send it
         assert sub.when == date(2026, 1, 2)  # never mutated
         assert type(sub.loose["d"]) is surrealdb.Duration
+
+    def test_sub_fields_are_written_under_the_key_their_validation_reads(self) -> None:
+        """The validation alias when it is a string, else the alias, else the name; the first string
+        of an ``AliasChoices``; the name for an ``AliasPath`` and when the sub-model turns validation
+        by alias off; never the ``serialization_alias``. Extras keep their key. So the object
+        written validates back into the same sub-model: a key nothing reads would be lost."""
+
+        class Sub(BaseModel):
+            model_config = ConfigDict(extra="allow")
+
+            plain: int = 0
+            aliased: int = Field(default=0, alias="Aliased")
+            by_validation: int = Field(default=0, validation_alias="ByValidation")
+            both: int = Field(default=0, alias="BothAlias", validation_alias="BothValidation")
+            choices: int = Field(default=0, validation_alias=AliasChoices(AliasPath("other", 0), "First", "Second"))
+            path_only: int = Field(default=0, validation_alias=AliasPath("deep", 0))
+            paths_only: int = Field(default=0, validation_alias=AliasChoices(AliasPath("deep", 1)))
+            for_output: int = Field(default=0, serialization_alias="ForOutput")
+
+        class ByName(BaseModel):
+            model_config = ConfigDict(validate_by_name=True, validate_by_alias=False)
+
+            renamed: int = Field(default=0, alias="Renamed")
+
+        class Outer(BaseModel):
+            sub: Sub
+            subs: list[Sub] = []
+            named: dict[str, ByName] = {}
+
+        sub = Sub.model_validate(
+            {
+                "plain": 1,
+                "Aliased": 2,
+                "ByValidation": 3,
+                "BothValidation": 4,
+                "Second": 5,
+                "deep": [6, 7],
+                "for_output": 8,
+                "extra": 9,
+            }
+        )
+        written = {
+            "plain": 1,
+            "Aliased": 2,
+            "ByValidation": 3,
+            "BothValidation": 4,
+            "First": 5,
+            "path_only": 6,
+            "paths_only": 7,
+            "for_output": 8,
+            "extra": 9,
+        }
+        assert encode_wire(sub, stored=True) == written
+        assert encode_wire(ByName(renamed=1), stored=True) == {"renamed": 1}
+        outer = Outer(sub=sub, subs=[sub], named={"k": ByName(renamed=1)})
+        assert encode_wire(outer, stored=True) == {"sub": written, "subs": [written], "named": {"k": {"renamed": 1}}}
+        # The written object validates back into the same values (an AliasPath sub-field is read
+        # from its path only: the rule gives it its name, as the spec settles).
+        reread = Sub.model_validate(written)
+        assert (reread.plain, reread.aliased, reread.by_validation, reread.both, reread.choices) == (1, 2, 3, 4, 5)
+        assert reread.for_output == 8
+        assert ByName.model_validate({"renamed": 1}).renamed == 1
+
+    def test_aliased_untyped_sub_field_keeps_its_sdk_values(self) -> None:
+        """The SDK values held at an untyped position of an aliased sub-field are put back too."""
+
+        class Sub(BaseModel):
+            meta: dict[str, Any] = Field(default={}, alias="Meta")
+
+        raw = surrealdb.Duration(5)
+        sub = Sub.model_validate({"Meta": {"d": raw}})
+        assert encode_wire(sub, stored=True) == {"Meta": {"d": _tag14(0, 5)}}
+        assert encode_wire({"p": [sub]}, stored=False) == {"p": [{"Meta": {"d": _tag14(0, 5)}}]}
+
+    @_BOTH_MODES
+    def test_table_model_instance_is_its_record_id(self, stored: bool) -> None:
+        """A table-model instance given as a value stands for its record (v0.22.0's filter rule, the
+        full ORM's link rule) — at any position: a raw variable, a list item, a nested object."""
+        alice = _Linked(id="alice", name="Alice")
+        rid = RecordID("rf_linked", "alice")
+        assert encode_wire(alice, stored=stored) == rid
+        assert encode_wire({"x": [alice], "y": {"z": alice}, "t": (alice,)}, stored=stored) == {
+            "x": [rid],
+            "y": {"z": rid},
+            "t": [rid],
+        }
+        assert encode_wire(encode_wire(alice, stored=stored), stored=stored) == rid  # idempotent
+        with pytest.raises(ValueError, match="unsaved _Linked has no record id"):
+            encode_wire(_Linked(name="ghost"), stored=stored)
+        with pytest.raises(ValueError, match="unsaved _Linked has no record id"):
+            encode_wire({"x": [_Linked(name="ghost")]}, stored=stored)
 
 
 class TestZeroDuration:
@@ -1594,6 +1695,47 @@ class TestRestoreNative:
     )
     def test_mismatched_shapes_keep_the_dump(self, dumped: Any, raw: Any) -> None:
         assert restore_native(dumped, raw) is dumped
+
+    def test_read_keys_rekey_the_nested_models_only(self) -> None:
+        """``read_keys=True`` (``_write_payload``): each nested model level is keyed as its validation
+        reads it; the top level keeps its names (``_columns_for`` re-keys it to the columns)."""
+
+        class Sub(BaseModel):
+            model_config = ConfigDict(extra="allow")
+
+            seen: int = Field(default=0, alias="lastSeen")
+            meta: dict[str, Any] = Field(default={}, alias="Meta")
+
+        class Top(BaseModel):
+            top: int = Field(default=0, alias="Top")
+            sub: Sub | None = None
+            subs: list[Sub] = []
+            loose: dict[str, Any] = {}
+
+        raw = surrealdb.Duration(5)
+        top = Top(Top=1, sub=Sub(lastSeen=2, Meta={"d": raw}, more=3), subs=[Sub(lastSeen=4)], loose={"x": {"seen": 5}})
+        dumped = top.model_dump()
+        kept = restore_native(dumped, top)
+        assert kept["sub"] == {"seen": 2, "meta": {"d": raw}, "more": 3}  # names kept by default
+        result = restore_native(dumped, top, read_keys=True)
+        assert result == {
+            "top": 1,
+            "sub": {"lastSeen": 2, "Meta": {"d": raw}, "more": 3},
+            "subs": [{"lastSeen": 4, "Meta": {}}],
+            "loose": {"x": {"seen": 5}},  # a dict is not a model: its keys are data
+        }
+        assert result["sub"]["Meta"]["d"] is raw
+        assert Top.model_validate({"Top": 1, **{k: v for k, v in result.items() if k != "top"}}) == top  # reads back
+
+    def test_raw_item_follows_aliased_keys(self) -> None:
+        """A dump keyed by the read keys still finds the raw values behind them."""
+
+        class Sub(BaseModel):
+            meta: dict[str, Any] = Field(default={}, alias="Meta")
+
+        raw = surrealdb.Duration(5)
+        sub = Sub.model_validate({"Meta": {"d": raw}})
+        assert restore_native({"Meta": {"d": {"elapsed": 5}}}, sub)["Meta"]["d"] is raw
 
     def test_copy_on_write(self) -> None:
         loose = _Loose(meta={"a": 1}, items=[1, 2], note="n")

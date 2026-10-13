@@ -19,15 +19,21 @@ This module converts them, **only where the annotation asks for it**:
 - ``encode_wire(value, stored=…)`` — the other direction: every value the ORM sends, turned into a
   form the SDK encodes and **both** server lines accept (a compact duration tag, a fixed-point
   decimal text, ``undefined`` for an open range side, UTC datetimes, arrays for sets, objects for
-  Pydantic sub-models), or refused before anything is sent when no such form exists (an ``int``
-  beyond 64 bits, a ``time``…).
+  Pydantic sub-models, the record id for a table-model instance), or refused before anything is
+  sent when no such form exists (an ``int`` beyond 64 bits, a ``time``, an unsaved table-model
+  instance…).
 - ``decimal_text(value)`` — the fixed-point text of a ``Decimal``, rounded once the way the server
   rounds it, so the stored value never moves.
 - ``sdk_decodes_zero_duration()`` — whether the installed SDK can read a zero duration back (a local
   probe, no server).
-- ``restore_native(dumped, raw)`` — puts back, into a ``model_dump()``, the SDK values (``Duration``,
-  ``Range``…) an untyped position held and the dump flattened into plain dicts, so a write sends
-  them natively.
+- ``restore_native(dumped, raw, read_keys=…)`` — puts back, into a ``model_dump()``, the SDK values
+  (``Duration``, ``Range``…) an untyped position held and the dump flattened into plain dicts, so a
+  write sends them natively; with ``read_keys``, also keys each nested sub-model's fields as their
+  validation reads them (their alias), so the stored object reads back.
+- ``model_object(model)`` — the object a write sends for a sub-model instance (the same walk, its
+  own level re-keyed too).
+- ``field_keys(model)`` / ``sub_model(annotation)`` — the keys a mapping may use for a model's fields
+  (name and string aliases), and the model class an annotation declares (``Profile | None``).
 """
 
 from __future__ import annotations
@@ -42,7 +48,8 @@ from types import NoneType, UnionType
 from typing import Annotated, Any, ForwardRef, TypeVar, Union, get_args, get_origin
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel
+from pydantic.fields import FieldInfo
 
 from . import _sdk
 from ._sdk import (
@@ -69,10 +76,13 @@ __all__ = [
     "duration_ns",
     "encode_wire",
     "field_input",
+    "field_keys",
     "lookup_type",
+    "model_object",
     "restore_native",
     "rich_kinds",
     "sdk_decodes_zero_duration",
+    "sub_model",
 ]
 
 #: The largest duration SurrealDB stores: 2**64 - 1 seconds plus 999 999 999 nanoseconds.
@@ -333,16 +343,41 @@ def _mapping_input(value: Mapping[Any, Any], annotation_of: Callable[[Any], Any]
     return value if result is None else result
 
 
-def _model_annotations(model: type[BaseModel]) -> dict[str, Any]:
-    """Input key → field annotation: each field's name, then its string ``alias`` / ``validation_alias``."""
-    annotations: dict[str, Any] = {}
+@functools.cache
+def field_keys(model: type[BaseModel]) -> Mapping[str, str]:
+    """Input key → field name for a Pydantic model: each field's name, then its string aliases.
+
+    The keys a mapping may use for a field — its name, its string ``alias``/``validation_alias`` and
+    the strings of an ``AliasChoices`` — as rule 10 of :func:`field_input` resolves them, and as a
+    keyword write resolves the keys of a dict addressed to a sub-model. An alias spelled like another
+    field's name wins over that name (the order Pydantic reads them in). Cached per class; never
+    mutate the result.
+    """
+    keys: dict[str, str] = {name: name for name in model.model_fields}
     for name, info in model.model_fields.items():
-        annotations[name] = info.annotation
-    for info in model.model_fields.values():
-        for alias in (info.alias, info.validation_alias):
+        aliases: list[Any] = [info.alias, info.validation_alias]
+        if isinstance(info.validation_alias, AliasChoices):
+            aliases.extend(info.validation_alias.choices)
+        for alias in aliases:
             if isinstance(alias, str):
-                annotations[alias] = info.annotation
-    return annotations
+                keys[alias] = name
+    return keys
+
+
+def _model_annotations(model: type[BaseModel]) -> dict[str, Any]:
+    """Input key → field annotation, by :func:`field_keys`."""
+    fields = model.model_fields
+    return {key: fields[name].annotation for key, name in field_keys(model).items()}
+
+
+def sub_model(annotation: Any) -> type[BaseModel] | None:
+    """The Pydantic model class an annotation declares, ``Annotated`` and ``Optional`` stripped, else ``None``.
+
+    ``Profile | None`` → ``Profile``; ``Annotated[Profile, …]`` → ``Profile``; a union of several
+    types, a container (``list[Profile]``) or anything else → ``None``.
+    """
+    core = _strip_optional(annotation)
+    return core if _is_model(core) else None
 
 
 def field_input(annotation: Any, value: Any) -> Any:
@@ -367,8 +402,8 @@ def field_input(annotation: Any, value: Any) -> Any:
     8. ``tuple[X, ...]`` → each item as ``X``; ``tuple[A, B, …]`` → by position when the lengths match.
     9. ``dict[K, V]``/``Mapping[K, V]`` with a mapping → each value as ``V``, keys unchanged.
     10. A Pydantic model with a mapping → each key matched to a field by name or string
-        ``alias``/``validation_alias``, its value as that field's annotation; other keys unchanged.
-        A model instance is unchanged.
+        ``alias``/``validation_alias`` (an ``AliasChoices``' strings included, :func:`field_keys`), its
+        value as that field's annotation; other keys unchanged. A model instance is unchanged.
     11. Anything else → unchanged: ``Duration``, ``Range``/``Range[T]`` (its own validator converts
         each bound), ``Decimal``, ``UUID``, ``Literal``, a dataclass…
 
@@ -668,10 +703,13 @@ def encode_wire(value: Any, *, stored: bool) -> Any:
     - ``list``/``tuple``: a ``list`` of encoded items. ``set``/``frozenset``: a ``list`` (an array, never
       a native set), sorted first when the items are orderable. A mapping: a ``dict``, same keys,
       encoded values.
-    - a Pydantic model (a sub-model ``merge(profile={…})`` validated into, a ``list[Profile]`` item…):
-      the object a model write sends for it — ``model_dump()`` by Python field name, the SDK values
-      of its untyped positions put back (:func:`restore_native`), then encoded like a mapping. The
-      SDK has no encoder for a Pydantic model.
+    - a table-model instance (a ``BaseSurrealModel``, at any position — a raw variable, a list item, a
+      nested object): its record id, the value it stands for as a filter (v0.22.0) and in the full
+      ORM; an unsaved one has none: ``ValueError``.
+    - any other Pydantic model (a sub-model ``bulk_update(profile={…})`` validated into, a
+      ``list[Profile]`` item…): the object a model write sends for it (:func:`model_object`) — each
+      sub-field under the key its validation reads, the SDK values of its untyped positions put back
+      — then encoded like a mapping. The SDK has no encoder for a Pydantic model.
     """
     if value is None or value is undefined or isinstance(value, (bool, float, str, bytes, UUID, CBORTag, SurrealFunc)):
         return value
@@ -704,7 +742,12 @@ def encode_wire(value: Any, *, stored: bool) -> Any:
     if isinstance(value, Mapping):
         return {key: encode_wire(item, stored=stored) for key, item in value.items()}
     if isinstance(value, BaseModel):
-        return encode_wire(restore_native(value.model_dump(), value), stored=stored)
+        from .utils import as_record_value  # utils imports this module
+
+        record = as_record_value(value)
+        if record is not value:
+            return encode_wire(record, stored=stored)
+        return encode_wire(model_object(value), stored=stored)
     return value
 
 
@@ -723,11 +766,46 @@ def _is_sdk_dataclass(value: object) -> bool:
     return dataclasses.is_dataclass(value) and not isinstance(value, type) and type(value).__module__.startswith("surrealdb.")
 
 
+def _read_key(name: str, info: FieldInfo) -> str:
+    """The key a sub-field's validation reads: what a write must store it under to read it back.
+
+    Its ``validation_alias`` when that is a string; the first string of an ``AliasChoices``; its
+    ``alias`` when no validation alias is set; else its name — also for an ``AliasPath``, which
+    names a position, not a key. Never its ``serialization_alias``: nothing reads that key back.
+    """
+    alias = info.validation_alias
+    if isinstance(alias, str):
+        return alias
+    if isinstance(alias, AliasChoices):
+        return next((choice for choice in alias.choices if isinstance(choice, str)), name)
+    if alias is None and isinstance(info.alias, str):
+        return info.alias
+    return name
+
+
+@functools.cache
+def _read_keys(model: type[BaseModel]) -> Mapping[str, str]:
+    """Field name → the key its validation reads (:func:`_read_key`), cached per class.
+
+    Every field keeps its name when the model turns validation by alias off
+    (``ConfigDict(validate_by_alias=False)``).
+    """
+    if model.model_config.get("validate_by_alias", True) is False:
+        return {name: name for name in model.model_fields}
+    return {name: _read_key(name, info) for name, info in model.model_fields.items()}
+
+
 def _raw_item(raw: Any, key: Any) -> Any:
-    """The value under ``key`` in ``raw`` (a model: a field by name, else an extra), or ``_MISSING``."""
+    """The value under ``key`` in ``raw``, or ``_MISSING``.
+
+    A model: the field of that name, else the field that key aliases (:func:`field_keys` — a dump
+    keyed by the read keys still finds the raw values behind them), else an extra.
+    """
     if isinstance(raw, BaseModel):
-        if isinstance(key, str) and key in type(raw).model_fields:
-            return getattr(raw, key)
+        if isinstance(key, str):
+            name = key if key in type(raw).model_fields else field_keys(type(raw)).get(key)
+            if name is not None:
+                return getattr(raw, name)
         extra = raw.__pydantic_extra__
         if extra is not None and key in extra:
             return extra[key]
@@ -737,7 +815,7 @@ def _raw_item(raw: Any, key: Any) -> Any:
     return _MISSING
 
 
-def restore_native(dumped: Any, raw: Any) -> Any:
+def restore_native(dumped: Any, raw: Any, *, read_keys: bool = False) -> Any:
     """``dumped`` with the SDK values of ``raw`` put back where ``model_dump()`` flattened them.
 
     ``model_dump()`` turns a dataclass found at an untyped position (a ``dict[str, Any]`` or
@@ -749,36 +827,61 @@ def restore_native(dumped: Any, raw: Any) -> Any:
 
     - where the raw value is an instance of a dataclass from the ``surrealdb`` package, the raw value
       replaces its dump;
-    - a dict dump recurses by key into a raw mapping, or into a raw Pydantic model by field name, then
-      its extras (``__pydantic_extra__``);
+    - a dict dump recurses by key into a raw mapping, or into a raw Pydantic model by field name (or
+      a key that aliases it), then its extras (``__pydantic_extra__``);
     - a list or tuple dump recurses by position into a raw list or tuple of the same length, and keeps
       its own container type;
     - anything else keeps the dump: a dataclass that is not the SDK's, the ORM's ``Duration``/``Range``
       (not dataclasses: the dump keeps them as they are), mismatched shapes, a key missing from
       ``raw``, a raw ``set`` (no positions).
 
+    ``read_keys=True`` (a model write, v0.23.0) also re-keys every **nested** model level — a raw
+    Pydantic model below the top: each declared field goes under the key its validation reads (its
+    ``validation_alias``/``alias``, see :func:`model_object`), so the stored object reads back into
+    the sub-model; extras and the keys of a plain dict are data and keep theirs. The top level keeps
+    its names: a table model's columns come from ``_columns_for``.
+
     Copy-on-write: when nothing changes, ``dumped`` itself is returned; otherwise new containers along
     the changed paths only (untouched branches are shared). Neither argument is mutated.
     """
+    return _restore(dumped, raw, False, read_keys)
+
+
+def model_object(model: BaseModel) -> dict[str, Any]:
+    """The object a write sends for a sub-model instance, before encoding (v0.23.0).
+
+    ``model_dump()``, then :func:`restore_native` with ``read_keys`` — the top level re-keyed too:
+    each sub-field, at every depth, under the key its validation reads — its ``validation_alias``
+    when that is a string, the first string of an ``AliasChoices``, else its ``alias``, else its name
+    (also for an ``AliasPath``, and for every field when the sub-model sets
+    ``validate_by_alias=False``), never its ``serialization_alias``. A key nothing reads back would
+    be a value lost; for ``Field(alias=…)`` this is the full ORM's ``model_dump(by_alias=True)``.
+    Extras keep their key; the SDK values of the untyped positions are put back.
+    """
+    result: dict[str, Any] = _restore(model.model_dump(), model, True, True)
+    return result
+
+
+def _restore(dumped: Any, raw: Any, rekey: bool, read_keys: bool) -> Any:
+    """:func:`restore_native`'s walk; ``rekey``: re-key this level when ``raw`` is a model."""
     if _is_sdk_dataclass(raw):
         return raw
     if isinstance(dumped, dict):
         if not isinstance(raw, (BaseModel, Mapping)):
             return dumped
-        result: dict[Any, Any] | None = None
+        keys = _read_keys(type(raw)) if rekey and isinstance(raw, BaseModel) else None
+        changed = False
+        items: list[tuple[Any, Any]] = []
         for key, item in dumped.items():
             raw_item = _raw_item(raw, key)
-            if raw_item is _MISSING:
-                continue
-            new = restore_native(item, raw_item)
-            if new is not item:
-                if result is None:
-                    result = dict(dumped)
-                result[key] = new
-        return dumped if result is None else result
+            new = item if raw_item is _MISSING else _restore(item, raw_item, read_keys, read_keys)
+            new_key = keys.get(key, key) if keys is not None and isinstance(key, str) else key
+            changed = changed or new is not item or new_key != key
+            items.append((new_key, new))
+        return dict(items) if changed else dumped
     if isinstance(dumped, (list, tuple)) and isinstance(raw, (list, tuple)) and len(dumped) == len(raw):
-        items = [restore_native(item, raw_item) for item, raw_item in zip(dumped, raw, strict=True)]
-        if all(new is old for new, old in zip(items, dumped, strict=True)):
+        restored = [_restore(item, raw_item, rekey, read_keys) for item, raw_item in zip(dumped, raw, strict=True)]
+        if all(new is old for new, old in zip(restored, dumped, strict=True)):
             return dumped
-        return items if isinstance(dumped, list) else tuple(items)
+        return restored if isinstance(dumped, list) else tuple(restored)
     return dumped
