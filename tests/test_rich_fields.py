@@ -56,7 +56,7 @@ from surreal_orm_lite import (
     computed,
     retry_on_conflict,
 )
-from surreal_orm_lite.wire import sdk_decodes_zero_duration
+from surreal_orm_lite.wire import encode_wire, sdk_decodes_zero_duration
 from tests.conftest import orm_client
 from tests.test_rich_types import _server_version
 
@@ -1196,3 +1196,276 @@ class TestTypedLookupsE2E:
             assert not created_update
             assert updated.n == 2
             assert len(await RfEvent.objects().all()) == 1
+
+
+# ==================== Task 9 — keyword writes and duration increments (spec §4.6) ====================
+
+_MINUTE_NS = 60 * 10**9
+_DAY = timedelta(days=1)
+
+
+def _spy_atomic(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the ``SET`` expression of every ``_atomic_update`` call, which still runs."""
+    compiled: list[str] = []
+    original = BaseSurrealModel._atomic_update
+
+    async def spy(self: BaseSurrealModel, set_expr: str, variables: dict[str, Any], tx: Any) -> Any:
+        compiled.append(set_expr)
+        return await original(self, set_expr, variables, tx)
+
+    monkeypatch.setattr(BaseSurrealModel, "_atomic_update", spy)
+    return compiled
+
+
+async def _assert_client_usable(client_before: Any) -> None:
+    assert (await SurrealDBConnectionManager.get_client()) is client_before
+    assert await client_before.query("RETURN 1;", {}) == 1
+
+
+class TestKeywordWritesE2E:
+    """``merge``/``bulk_update``/``update_or_create`` validate keyword values on rich fields, and
+    ``atomic_increment`` adds durations the same way on both lines (AC-21, AC-22)."""
+
+    async def test_merge_validates_rich_fields(self) -> None:
+        async with orm_client("rf_event"):
+            ev = RfEvent(id="k")
+            await ev.save()
+            await ev.merge(
+                ttl="1h30m",
+                at="2026-01-01T00:00:00Z",
+                price="1.50",
+                token=str(_TOKEN),
+                hours=range(1, 3),
+                day="2026-01-02",
+                grace="1h30m1ns",
+                ttls=["1h", timedelta(hours=2)],
+                tags=["b", "a"],
+            )
+
+            row = await _raw("k")
+            _assert_sdk_duration(row["ttl"], 5400 * 10**9)
+            assert isinstance(row["at"], datetime)
+            assert row["at"] == _JAN
+            assert isinstance(row["price"], Decimal)
+            assert row["price"] == Decimal("1.5")
+            assert type(row["token"]) is UUID
+            assert row["token"] == _TOKEN
+            assert isinstance(row["hours"], surrealdb.Range)
+            assert Range(BoundIncluded(1), BoundExcluded(3)) == row["hours"]
+            assert row["day"] == datetime(2026, 1, 2, tzinfo=UTC)
+            _assert_sdk_duration(row["grace"], 5400 * 10**9 + 1)
+            assert [d.elapsed for d in row["ttls"]] == [_HOUR_NS, 2 * _HOUR_NS]
+            assert sorted(row["tags"]) == ["a", "b"]
+
+            assert type(ev.ttl) is timedelta
+            assert ev.ttl == timedelta(hours=1, minutes=30)
+            assert type(ev.at) is datetime
+            assert ev.at == _JAN
+            assert type(ev.price) is Decimal
+            assert ev.price == Decimal("1.5")
+            assert type(ev.token) is UUID
+            assert ev.token == _TOKEN
+            assert type(ev.hours) is Range
+            assert ev.hours == Range(BoundIncluded(1), BoundExcluded(3))
+            assert type(ev.day) is date
+            assert ev.day == date(2026, 1, 2)
+            assert type(ev.grace) is Duration
+            assert ev.grace == Duration.parse("1h30m1ns")
+            assert ev.ttls == [timedelta(hours=1), timedelta(hours=2)]
+            assert type(ev.tags) is set
+            assert ev.tags == {"a", "b"}
+
+    async def test_merge_refresh_false_and_buffered_apply_coerced_values(self) -> None:
+        async with orm_client("rf_event"):
+            ev = RfEvent(id="f")
+            await ev.save()
+            await ev.merge(refresh=False, ttl="2h", token=str(_TOKEN))
+            assert type(ev.ttl) is timedelta
+            assert ev.ttl == timedelta(hours=2)
+            assert type(ev.token) is UUID
+            _assert_sdk_duration((await _raw("f"))["ttl"], 2 * _HOUR_NS)
+
+            # The server_values path (``UPDATE … SET``) validates the literal keywords too.
+            await ev.merge(refresh=False, ttl="3h", server_values={"n": SurrealFunc("7")})
+            assert type(ev.ttl) is timedelta
+            assert ev.ttl == timedelta(hours=3)
+            row = await _raw("f")
+            _assert_sdk_duration(row["ttl"], 3 * _HOUR_NS)
+            assert row["n"] == 7
+
+        async with _http_orm_client("rf_event"):
+            ev = RfEvent(id="b")
+            await ev.save()
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert tx.is_interactive is False
+                await ev.merge(tx=tx, ttl="2h", at="2026-01-01T00:00:00Z")
+                # Buffered: nothing has run yet, the instance holds the validated keyword values.
+                assert type(ev.ttl) is timedelta
+                assert ev.ttl == timedelta(hours=2)
+                assert type(ev.at) is datetime
+                assert ev.at == _JAN
+
+            row = await _raw("b")
+            _assert_sdk_duration(row["ttl"], 2 * _HOUR_NS)
+            assert isinstance(row["at"], datetime)
+            assert row["at"] == _JAN
+
+    async def test_invalid_keyword_value_raises_before_sending(self) -> None:
+        async with orm_client("rf_event"):
+            ev = await _saved("x")
+            before = await _raw("x")
+            client_before = await SurrealDBConnectionManager.get_client()
+
+            with pytest.raises(ValueError, match=r"merge\(at=…\).*'yesterday'.*datetime"):
+                await ev.merge(at="yesterday")
+            with pytest.raises(ValueError, match=r"merge\(ttls=…\)"):
+                await ev.merge(ttls=["1h", "soon"])
+            with pytest.raises(ValueError, match=r"merge\(ttl=…\)"):
+                await ev.merge(refresh=False, ttl="1.5h")
+            with pytest.raises(ValueError, match=r"bulk_update\(token=…\).*'nope'.*UUID"):
+                await RfEvent.objects().filter(id="x").bulk_update(token="nope")
+
+            assert await _raw("x") == before
+            assert ev.at == FULL["at"]  # the instance is untouched too
+            assert ev.ttls == FULL["ttls"]
+            await _assert_client_usable(client_before)
+
+    async def test_bulk_update_validates(self) -> None:
+        async with orm_client("rf_event"):
+            await RfEvent(id="a", n=1).save()
+            await RfEvent(id="b", n=2).save()
+
+            updated = (
+                await RfEvent.objects().filter(n=1).bulk_update(ttl="2h", token=str(_TOKEN), ttls=["1h"], day="2026-01-02")
+            )
+            assert updated == 1
+
+            row = await _raw("a")
+            _assert_sdk_duration(row["ttl"], 2 * _HOUR_NS)
+            assert type(row["token"]) is UUID
+            assert [d.elapsed for d in row["ttls"]] == [_HOUR_NS]
+            assert row["day"] == datetime(2026, 1, 2, tzinfo=UTC)
+            assert (await _raw("b")).get("ttl") is None
+            assert (await RfEvent.objects().get("a")).ttl == timedelta(hours=2)
+
+    async def test_update_or_create_validates_both_branches(self) -> None:
+        async with orm_client("rf_event"):
+            created_obj, created = await RfEvent.objects().update_or_create(id="u", defaults={"ttl": "3h"})
+            assert created  # the constructor validates (set_data)
+            assert created_obj.ttl == timedelta(hours=3)
+            _assert_sdk_duration((await _raw("u"))["ttl"], 3 * _HOUR_NS)
+
+            updated_obj, created_again = await RfEvent.objects().update_or_create(id="u", defaults={"ttl": "4h"})
+            assert not created_again  # the merge branch validates
+            assert type(updated_obj.ttl) is timedelta
+            assert updated_obj.ttl == timedelta(hours=4)
+            _assert_sdk_duration((await _raw("u"))["ttl"], 4 * _HOUR_NS)
+
+    async def test_allow_inf_nan_constraint_is_honoured(self) -> None:
+        async with orm_client("rf_nan"):
+            obj = RfNan(id="n")
+            await obj.save()
+            await obj.merge(d=Decimal("NaN"))  # the field allows it: sent unchanged, as in v0.22.1
+            got = (await RfNan.objects().get("n")).d
+            assert type(got) is Decimal
+            assert got.is_nan()
+
+    async def test_raw_plus_equals_duration_is_a_noop_on_2x(self) -> None:
+        async with orm_client("rf_event") as client:
+            await client.query("CREATE rf_event:p SET ttl = 1h;", {})
+            amount = encode_wire(timedelta(minutes=30), stored=True)
+            await client.query("UPDATE rf_event:p SET ttl += $a;", {"a": amount})
+
+            got = (await _raw("p"))["ttl"]
+            if await _server_version() < (3, 0, 0):
+                message = "2.x now applies += with a duration — update README behaviour row 4 (spec §12 item 2)"
+                assert got.elapsed == _HOUR_NS, message
+            else:
+                assert got.elapsed == _HOUR_NS + 30 * _MINUTE_NS
+
+    async def test_atomic_increment_duration_both_lines(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        compiled = _spy_atomic(monkeypatch)
+        async with orm_client("rf_event") as client:
+            await client.query("CREATE rf_event:t SET ttl = 1h, grace = 1h30m1ns, n = 1;", {})
+            await client.query("CREATE rf_event:e SET n = 1;", {})  # no ttl, no grace
+            ev = await RfEvent.objects().get("t")
+            empty = await RfEvent.objects().get("e")
+
+            await ev.atomic_increment("ttl", timedelta(minutes=30))
+            assert compiled[-1] == "ttl = (ttl ?? 0ns) + $amount"
+            _assert_sdk_duration((await _raw("t"))["ttl"], _HOUR_NS + 30 * _MINUTE_NS)
+            assert type(ev.ttl) is timedelta
+            assert ev.ttl == timedelta(hours=1, minutes=30)
+
+            await empty.atomic_increment("ttl", timedelta(minutes=30))
+            _assert_sdk_duration((await _raw("e"))["ttl"], 30 * _MINUTE_NS)  # missing column → the amount
+            assert empty.ttl == timedelta(minutes=30)
+
+            await ev.atomic_increment("grace", Duration.parse("1ns"))
+            _assert_sdk_duration((await _raw("t"))["grace"], 5400 * 10**9 + 2)
+            assert ev.grace == Duration.parse("1h30m2ns")
+
+            await ev.atomic_increment("ttl", surrealdb.Duration(_HOUR_NS))  # an SDK Duration too
+            _assert_sdk_duration((await _raw("t"))["ttl"], 2 * _HOUR_NS + 30 * _MINUTE_NS)
+
+            await empty.atomic_increment("grace", Duration.parse("1h"))
+            _assert_sdk_duration((await _raw("e"))["grace"], _HOUR_NS)
+
+            await ev.atomic_increment("n", 2)
+            assert compiled[-1] == "n += $amount"  # numeric amounts: the v0.11.0 statement
+            assert (await _raw("t"))["n"] == 3
+
+    async def test_atomic_increment_shifts_datetime_and_date(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        compiled = _spy_atomic(monkeypatch)
+        async with orm_client("rf_event") as client:
+            await client.query("CREATE rf_event:d SET at = d'2026-01-02T03:04:05Z', day = d'2026-01-02T00:00:00Z';", {})
+            await client.query("CREATE rf_event:m SET n = 1;", {})  # no at, no day
+            ev = await RfEvent.objects().get("d")
+            missing = await RfEvent.objects().get("m")
+            client_before = await SurrealDBConnectionManager.get_client()
+
+            await ev.atomic_increment("at", _DAY)
+            assert compiled[-1] == "at = at + $amount"  # no `?? 0ns`: never a duration in a datetime
+            assert (await _raw("d"))["at"] == datetime(2026, 1, 3, 3, 4, 5, tzinfo=UTC)
+            assert type(ev.at) is datetime
+            assert ev.at == datetime(2026, 1, 3, 3, 4, 5, tzinfo=UTC)
+
+            with pytest.raises(surrealdb.ServerError, match="addition"):
+                await missing.atomic_increment("at", _DAY)
+            assert "at" not in await _raw("m")  # nothing written, never a duration
+            await _assert_client_usable(client_before)
+
+            await ev.atomic_increment("day", _DAY)
+            assert compiled[-1] == "day = day + $amount"
+            assert (await _raw("d"))["day"] == datetime(2026, 1, 3, tzinfo=UTC)
+            assert type(ev.day) is date
+            assert ev.day == date(2026, 1, 3)
+            assert (await RfEvent.objects().get("d")).day == date(2026, 1, 3)
+
+            with pytest.raises(surrealdb.ServerError, match="addition"):
+                await missing.atomic_increment("day", Duration.parse("2d"))
+            assert "day" not in await _raw("m")
+
+            before = await _raw("d")
+            with pytest.raises(ValueError, match="whole number of days"):
+                await ev.atomic_increment("day", timedelta(hours=1))
+            assert await _raw("d") == before
+            await _assert_client_usable(client_before)
+
+    @pytest.mark.parametrize(
+        "amount",
+        [timedelta(0), timedelta(seconds=-1), Duration(0), surrealdb.Duration(0)],
+        ids=["timedelta-0", "timedelta-negative", "Duration-0", "sdk-Duration-0"],
+    )
+    async def test_atomic_increment_refuses_non_positive_durations(self, amount: Any) -> None:
+        async with orm_client("rf_event") as client:
+            await client.query("CREATE rf_event:z SET ttl = 1h;", {})
+            ev = await RfEvent.objects().get("z")
+            before = await _raw("z")
+            client_before = await SurrealDBConnectionManager.get_client()
+
+            with pytest.raises(ValueError, match="positive"):
+                await ev.atomic_increment("ttl", amount)
+
+            assert await _raw("z") == before
+            await _assert_client_usable(client_before)

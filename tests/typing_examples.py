@@ -191,3 +191,9 @@ def open_end(start: int) -> Range[int]:
     begin: BoundIncluded | BoundExcluded | None = shift.begin
     assert begin is not None
     return shift
+
+
+async def extend(timed: Timed) -> Timed:
+    """v0.23.0: ``atomic_increment`` takes a duration amount, a ``timedelta`` or a ``Duration``."""
+    await timed.atomic_increment("ttl", timedelta(minutes=30))
+    return await timed.atomic_increment("ttl", Duration.parse("1ns"))

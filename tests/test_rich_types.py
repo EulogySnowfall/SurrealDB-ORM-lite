@@ -2004,6 +2004,166 @@ class TestTypedLookups:
             build_filter_condition("n", "containsany", one_to_five, 0)
 
 
+# --- keyword writes and duration increments (spec §4.6; AC-21, AC-22) -------------------------------
+
+
+class _Constrained(surreal_orm_lite.BaseSurrealModel):
+    model_config = surreal_orm_lite.SurrealConfigDict(table_name="rf_kw_unit")
+
+    id: str | None = None
+    price: Annotated[Decimal, Field(ge=0)] = Decimal(0)
+    loose: Annotated[Decimal, Field(allow_inf_nan=True)] | None = None
+    when: Annotated[datetime, Field(description="an instant")] | None = None
+    meta: dict[str, Any] = {}
+
+
+class TestKeywordWriteValues:
+    """``_coerce_field_value``: a keyword value on a rich field is validated as the field (spec §4.6)."""
+
+    def test_rich_values_take_the_declared_types(self) -> None:
+        from tests.test_rich_fields import RfEvent
+
+        coerce = RfEvent._coerce_field_value
+        assert coerce("ttl", "1h30m") == timedelta(hours=1, minutes=30)
+        assert coerce("ttl", surrealdb.Duration(5400 * 10**9)) == timedelta(hours=1, minutes=30)
+        at = coerce("at", "2026-01-01T00:00:00Z")
+        assert type(at) is datetime
+        assert at == datetime(2026, 1, 1, tzinfo=UTC)
+        day = coerce("day", "2026-01-02")
+        assert type(day) is date
+        assert day == date(2026, 1, 2)
+        price = coerce("price", "1.50")
+        assert type(price) is Decimal
+        assert str(price) == "1.50"
+        assert coerce("token", _TOKEN_TEXT) == UUID(_TOKEN_TEXT)
+        assert coerce("grace", "1h30m1ns") == Duration.parse("1h30m1ns")
+        assert coerce("hours", range(1, 3)) == Range(BoundIncluded(1), BoundExcluded(3))
+        assert coerce("hours", "9..17") == Range(BoundIncluded(9), BoundExcluded(17))
+        assert coerce("ttls", ["1h", timedelta(hours=2)]) == [timedelta(hours=1), timedelta(hours=2)]
+        tags = coerce("tags", ["b", "a"])
+        assert type(tags) is set
+        assert tags == {"a", "b"}
+
+    def test_values_written_as_given(self) -> None:
+        from tests.test_rich_fields import RfEvent
+
+        coerce = RfEvent._coerce_field_value
+        now = SurrealFunc("time::now()")
+        assert coerce("at", now) is now  # evaluated by the server
+        assert coerce("ttl", None) is None
+        assert coerce("n", "not a number") == "not a number"  # not a rich field: unchanged, as in v0.22.1
+        assert coerce("blob", "text") == "text"
+        assert coerce("meta.ttl", "1h") == "1h"  # a dotted path
+        assert coerce("undeclared", "1h") == "1h"
+        same = timedelta(hours=1)
+        assert coerce("ttl", same) == same
+
+    def test_aliased_field_by_name_and_column(self) -> None:
+        assert _AliasedLookup._coerce_field_value("ttl", "1h") == timedelta(hours=1)
+        assert _AliasedLookup._coerce_field_value("ttl_col", "1h") == timedelta(hours=1)
+
+    def test_field_constraints_apply(self) -> None:
+        coerce = _Constrained._coerce_field_value
+        assert coerce("price", "1.5") == Decimal("1.5")
+        with pytest.raises(ValueError, match=r"merge\(price=…\): '-1' is not a valid Decimal"):
+            coerce("price", "-1")
+        assert coerce("loose", Decimal("NaN")).is_nan()  # Field(allow_inf_nan=True) is honoured
+        assert coerce("when", "2026-01-01T00:00:00Z") == datetime(2026, 1, 1, tzinfo=UTC)
+        with pytest.raises(ValueError, match=r"merge\(when=…\): 'soon' is not a valid datetime \("):
+            coerce("when", "soon")
+        assert coerce("meta", {"ttl": "1h"}) == {"ttl": "1h"}  # dict[str, Any]: not rich
+
+    def test_invalid_value_names_the_field_and_the_call(self) -> None:
+        from tests.test_rich_fields import RfEvent
+
+        with pytest.raises(ValueError, match=r"merge\(at=…\): 'yesterday' is not a valid datetime \(") as info:
+            RfEvent._coerce_field_value("at", "yesterday")
+        assert isinstance(info.value.__cause__, ValidationError)
+        assert type(info.value) is ValueError
+        with pytest.raises(ValueError, match=r"bulk_update\(token=…\): 'nope' is not a valid UUID"):
+            RfEvent._coerce_field_value("token", "nope", context="bulk_update")
+        with pytest.raises(ValueError, match=r"merge\(ttls=…\): \['soon'\] is not a valid list\[timedelta\]"):
+            RfEvent._coerce_field_value("ttls", ["soon"])
+        with pytest.raises(ValueError, match=r"is not a valid Range\[int\]"):
+            RfEvent._coerce_field_value("hours", "x..y")
+
+
+class TestAtomicIncrementStatement:
+    """``atomic_increment``'s statement follows the field's annotation for a duration amount (spec §4.6)."""
+
+    @staticmethod
+    async def _compiled(model: Any, field: str, amount: Any, monkeypatch: pytest.MonkeyPatch) -> tuple[str, Any]:
+        seen: list[tuple[str, Any]] = []
+
+        async def capture(self: Any, set_expr: str, variables: dict[str, Any], tx: Any) -> Any:
+            seen.append((set_expr, variables["amount"]))
+            return self
+
+        monkeypatch.setattr(model, "_atomic_update", capture)
+        await model(id="x").atomic_increment(field, amount)
+        assert len(seen) == 1
+        return seen[0]
+
+    @pytest.mark.parametrize(
+        ("field", "amount", "statement"),
+        [
+            ("ttl", timedelta(minutes=30), "ttl = (ttl ?? 0ns) + $amount"),
+            ("grace", Duration(1), "grace = (grace ?? 0ns) + $amount"),
+            ("ttl", surrealdb.Duration(5), "ttl = (ttl ?? 0ns) + $amount"),
+            ("ttls", timedelta(hours=1), "ttls = (ttls ?? 0ns) + $amount"),
+            ("meta.ttl", timedelta(hours=1), "meta.ttl = (meta.ttl ?? 0ns) + $amount"),
+            ("undeclared", timedelta(hours=1), "undeclared = (undeclared ?? 0ns) + $amount"),
+            ("at", timedelta(days=1), "at = at + $amount"),
+            ("at", Duration(1), "at = at + $amount"),
+            ("day", timedelta(days=2), "day = day + $amount"),
+            ("day", Duration.parse("1w"), "day = day + $amount"),
+            ("n", 2, "n += $amount"),
+            ("n", -3, "n += $amount"),
+            ("price", Decimal("0.25"), "price += $amount"),
+            ("price", 1.5, "price += $amount"),
+        ],
+    )
+    async def test_statement(self, field: str, amount: Any, statement: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tests.test_rich_fields import RfEvent
+
+        compiled, bound = await self._compiled(RfEvent, field, amount, monkeypatch)
+        assert compiled == statement
+        assert bound is amount  # encoded by _atomic_update, like every atomic helper's value
+
+    async def test_annotated_and_aliased_fields(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        compiled, _ = await self._compiled(_Constrained, "when", timedelta(days=1), monkeypatch)
+        assert compiled == "when = when + $amount"  # Annotated inside Optional: still a datetime
+        compiled, _ = await self._compiled(_AliasedLookup, "ttl", timedelta(hours=1), monkeypatch)
+        assert compiled == "ttl_col = (ttl_col ?? 0ns) + $amount"  # the column, as every atomic helper
+
+    @pytest.mark.parametrize(
+        ("field", "amount", "match"),
+        [
+            ("ttl", timedelta(0), "positive"),
+            ("ttl", timedelta(seconds=-1), "positive"),
+            ("ttl", timedelta(microseconds=-1), "positive"),
+            ("grace", Duration(0), "positive"),
+            ("ttl", surrealdb.Duration(0), "positive"),
+            ("at", timedelta(0), "positive"),
+            ("day", timedelta(hours=1), "whole number of days"),
+            ("day", timedelta(days=1, microseconds=1), "whole number of days"),
+            ("day", Duration(1), "whole number of days"),
+            ("day", -timedelta(days=1), "positive"),
+        ],
+    )
+    async def test_refused_before_sending(self, field: str, amount: Any, match: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        from tests.test_rich_fields import RfEvent
+
+        async def never(*_args: Any) -> Any:
+            raise AssertionError("nothing may be sent")
+
+        monkeypatch.setattr(RfEvent, "_atomic_update", never)
+        with pytest.raises(ValueError, match=match) as info:
+            await RfEvent(id="x").atomic_increment(field, amount)
+        assert type(info.value) is ValueError
+        assert field in str(info.value)
+
+
 # --- raw SDK E2E: what both server lines do with each encoded form (AC-6, AC-29, AC-32 b) ---------
 
 

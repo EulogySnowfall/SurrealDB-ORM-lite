@@ -838,15 +838,19 @@ class QuerySet:
         Update all records matching the current filters.
 
         Args:
-            **kwargs: Fields and values to update. Bound like every write's values (v0.23.0): a
+            **kwargs: Fields and values to update. A value addressed to a field with a rich type
+                is validated as that field first, like ``merge()``'s (v0.23.0):
+                ``bulk_update(ttl="2h")`` stores a duration. Bound like every write's values: a
                 ``timedelta`` as a duration, a ``date`` as midnight UTC, a ``set`` as an array.
 
         Returns:
             The number of updated records.
 
         Raises:
-            ValueError: a value no SurrealDB type can hold (an ``int`` beyond 64 bits, a negative
-                duration, a zero one the installed SDK cannot read back…), before anything is sent.
+            ValueError: a value that does not validate as its rich field (``token="nope"`` on a
+                ``UUID`` field), or one no SurrealDB type can hold (an ``int`` beyond 64 bits, a
+                negative duration, a zero one the installed SDK cannot read back…), before
+                anything is sent.
             TypeError: a value of a type SurrealDB has no form for (a ``time``).
 
         Example::
@@ -865,6 +869,7 @@ class QuerySet:
             validate_field_name(field, "bulk_update field")
             var_name = f"_v{i}"
             set_parts.append(f"{self._column(field)} = ${var_name}")
+            value = self.model._coerce_field_value(field, value, context="bulk_update")
             set_vars[var_name] = encode_wire(value, stored=True)  # a write (v0.23.0)
 
         set_clause = ", ".join(set_parts)
@@ -1033,7 +1038,9 @@ class QuerySet:
 
         Create builds ``self.model(**payload)``: a key the model does not declare raises
         ``SurrealDbError`` (unless the model sets ``extra="allow"``), and a missing required
-        field raises ``ValidationError`` at construction.
+        field raises ``ValidationError`` at construction. Both branches validate a value written
+        to a field with a rich type (v0.23.0) — the constructor on create, ``merge()`` on update —
+        so ``defaults={"ttl": "3h"}`` stores a duration either way.
 
         On an edge model (v0.22.0) the endpoints are lookup criteria, never data:
         ``update_or_create(in_=a, out=b, defaults={"weight": 3})`` finds or relates ``a -> b``

@@ -6,14 +6,16 @@ import os
 import typing
 import warnings
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
+from datetime import timedelta
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Self, TypeVar, overload
+from types import NoneType, UnionType
+from typing import TYPE_CHECKING, Annotated, Any, Self, TypeVar, overload
 
 import pydantic
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic_core import ValidationError
 
-from ._sdk import NotFoundError, RecordID, ServerError
+from ._sdk import NotFoundError, RecordID, SdkDuration, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, Var, _ComputedDefault
@@ -29,6 +31,7 @@ from .signals import (
     pre_update,
 )
 from .transaction import Transaction
+from .types import Duration
 from .utils import (
     RECORD_ID_COLUMN,
     VALID_ALIAS_PATTERN,
@@ -46,7 +49,7 @@ from .utils import (
     validate_thing,
     warn_on_multiple_statements,
 )
-from .wire import encode_wire, field_input, lookup_type, restore_native, rich_kinds
+from .wire import declared_kind, duration_ns, encode_wire, field_input, lookup_type, restore_native, rich_kinds
 
 if TYPE_CHECKING:
     from .edge import BaseSurrealEdge
@@ -82,6 +85,10 @@ _APPLY_ADAPTERS: dict[tuple[type, str], pydantic.TypeAdapter[Any]] = {}
 # field's type without ``Optional``/``Annotated``, ``Range[S]``, an item type…) → its ``TypeAdapter``,
 # shared by every model, built on first use.
 _LOOKUP_ADAPTERS: dict[Any, pydantic.TypeAdapter[Any]] = {}
+# Keyword writes (v0.23.0): (model class, field name) → the ``TypeAdapter`` of the field's annotation
+# with its constraints (``Field(ge=…)``, ``allow_inf_nan``…), built on first use.
+_WRITE_ADAPTERS: dict[tuple[type, str], pydantic.TypeAdapter[Any]] = {}
+_NS_PER_DAY = 86_400 * 10**9
 
 
 def _lookup_adapter(annotation: Any) -> pydantic.TypeAdapter[Any]:
@@ -96,8 +103,17 @@ def _lookup_adapter(annotation: Any) -> pydantic.TypeAdapter[Any]:
 
 
 def _type_label(annotation: Any) -> str:
-    """An annotation as an error message names it: ``datetime``, ``UUID``, ``Range[int]``…"""
+    """An annotation as an error message names it: ``datetime``, ``UUID``, ``Range[int]``…
+
+    ``Annotated`` metadata and the ``None`` of an ``Optional`` are left out: ``datetime | None`` is
+    ``datetime``, ``list[timedelta] | None`` ``list[timedelta]``, ``int | str`` ``int | str``.
+    """
     origin = typing.get_origin(annotation)
+    if origin is typing.Annotated:
+        return _type_label(typing.get_args(annotation)[0])
+    if origin is typing.Union or origin is UnionType:
+        members = [arg for arg in typing.get_args(annotation) if arg is not NoneType]
+        return " | ".join(_type_label(member) for member in members)
     if origin is not None:
         return f"{_type_label(origin)}[{', '.join(_type_label(arg) for arg in typing.get_args(annotation))}]"
     return str(getattr(annotation, "__name__", annotation))
@@ -602,6 +618,51 @@ class BaseSurrealModel(BaseModel):
         if each:
             return [_lookup_value(key, annotation, item) for item in value]
         return _lookup_value(key, annotation, value)
+
+    @classmethod
+    def _coerce_field_value(cls, name: str, value: Any, *, context: str = "merge") -> Any:
+        """Validate a keyword write's value against the rich field it is written to (v0.23.0).
+
+        The hook of ``merge(**data)`` — hence of ``update_or_create``'s update branch — and
+        ``bulk_update(**kwargs)`` (spec §4.6). On a field whose annotation holds a rich type at any
+        depth (``timedelta``, ``datetime``, ``date``, ``Decimal``, ``UUID``, ``Duration``,
+        ``Range[T]``, ``set``…, ``list[timedelta]`` included), the value goes through
+        :func:`~surreal_orm_lite.wire.field_input` then a ``TypeAdapter`` of the field's annotation
+        **with its constraints** (``Field(ge=…)``, ``allow_inf_nan``…) — the validation the model's
+        constructor applies to that field. So ``merge(ttl="1h30m")`` stores a duration and leaves
+        ``timedelta(hours=1, minutes=30)`` on the instance, where v0.22.1 stored the string.
+
+        ``name`` is a Python field name or its column. Returned unchanged: ``None``, a
+        :class:`~surreal_orm_lite.functions.SurrealFunc` (evaluated by the server), a dotted path,
+        and a field without a rich type or not declared (written as before v0.23.0).
+
+        Args:
+            context: the call named in the error, ``"merge"`` or ``"bulk_update"``.
+
+        Raises:
+            ValueError: the value does not fit — ``"merge(at=…): 'yesterday' is not a valid
+                datetime (…)"`` with Pydantic's message — before anything is sent.
+        """
+        if value is None or isinstance(value, SurrealFunc) or "." in name:
+            return value
+        field = name if name in cls.model_fields else cls.to_py_field(name)
+        info = cls.model_fields.get(field)
+        if info is None or field not in cls._rich_fields():
+            return value
+        adapter = _WRITE_ADAPTERS.get((cls, field))
+        if adapter is None:
+            target: Any = info.annotation
+            if info.metadata:
+                annotated: Any = Annotated
+                target = annotated[(target, *info.metadata)]
+            adapter = _WRITE_ADAPTERS[(cls, field)] = pydantic.TypeAdapter(target)
+        try:
+            return adapter.validate_python(field_input(info.annotation, value))
+        except (ValueError, TypeError) as exc:
+            detail = "; ".join(str(error["msg"]) for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
+            raise ValueError(
+                f"{context}({name}=…): {value!r} is not a valid {_type_label(info.annotation)} ({detail})"
+            ) from exc
 
     @classmethod
     def _py_fields(cls, payload: Mapping[str, Any]) -> list[str]:
@@ -1669,6 +1730,12 @@ class BaseSurrealModel(BaseModel):
         therefore leave the instance ahead of the database — caller must treat the instance
         as stale after a failed tx.
 
+        A keyword addressed to a field with a rich type (``datetime``, ``date``, ``timedelta``,
+        ``Decimal``, ``UUID``, ``Duration``, ``Range[T]``, ``set``…, at any depth) is validated
+        as that field first (v0.23.0), exactly as the constructor would: ``merge(ttl="1h30m")``
+        stores a duration and sets ``ttl`` to ``timedelta(hours=1, minutes=30)``. ``None`` and a
+        ``SurrealFunc`` are written as given.
+
         Args:
             tx: Optional transaction the statement is buffered onto.
             server_values: Field name → :class:`~surreal_orm_lite.functions.SurrealFunc`,
@@ -1690,12 +1757,19 @@ class BaseSurrealModel(BaseModel):
                 ``server_values`` keeps its stale value until the next ``refresh()``. Keep the
                 default whenever you need to know the write landed.
 
+        Raises:
+            ValueError: a keyword value that does not validate as its rich field
+                (``merge(at="yesterday")``), before anything is sent.
+
         Example:
             >>> await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
             >>> await user.merge(last_seen=now, refresh=False)  # fire-and-forget
         """
         self._reject_computed_writes(data, "merge()")
         self._validate_server_values(server_values, extra_vars)
+        # Rich fields take their declared types before anything is built or sent (v0.23.0): the
+        # payload, the local apply and the signals all see the validated values.
+        data = {key: self._coerce_field_value(key, value) for key, value in data.items()}
         if server_values:
             self._reject_computed_writes(server_values, "merge(server_values=)")
             return await self._merge_server(tx, server_values, extra_vars, data, refresh)
@@ -1825,16 +1899,67 @@ class BaseSurrealModel(BaseModel):
         column = self._validate_atomic_field(field)
         return await self._atomic_update(f"{column} = array::add({column}, $value)", {"value": value}, tx)
 
-    async def atomic_increment(self, field: str, amount: Decimal | int | float = 1, tx: Transaction | None = None) -> Self:
-        """Atomically add ``amount`` (default 1) to a numeric ``field``.
+    async def atomic_increment(
+        self,
+        field: str,
+        amount: Decimal | int | float | timedelta | Duration = 1,
+        tx: Transaction | None = None,
+    ) -> Self:
+        """Atomically add ``amount`` (default 1) to a numeric ``field``, or a duration to a duration or a date.
 
-        Compiled to ``{field} += $amount`` — identical on 2.6.x and 3.x. Pass a negative
-        ``amount`` to decrement. ``amount`` may be a ``decimal.Decimal`` for exact arithmetic
-        (the value is bound, not interpolated); adding a ``Decimal`` to an int/float field
-        coerces the stored field to SurrealDB ``decimal``. Emits no signals.
+        A number is compiled to ``{field} += $amount`` — identical on 2.6.x and 3.x. Pass a
+        negative ``amount`` to decrement. ``amount`` may be a ``decimal.Decimal`` for exact
+        arithmetic (the value is bound, not interpolated); adding a ``Decimal`` to an int/float
+        field coerces the stored field to SurrealDB ``decimal``. Emits no signals.
+
+        A duration (v0.23.0: a ``timedelta``, a :class:`~surreal_orm_lite.types.Duration` or the
+        SDK's ``Duration``) must be positive — a decrement could reach a zero or negative duration,
+        which SurrealDB cannot store; use ``merge()``. Its statement follows the field's
+        annotation, because 2.x silently ignores ``+=`` with a duration:
+
+        - ``datetime`` (``Optional``/``Annotated`` aside): ``{field} = {field} + $amount`` shifts
+          the instant; on a record without the field the server reports an error and writes
+          nothing — never a duration into a datetime field;
+        - ``date``: the same, and the amount must be a whole number of days;
+        - anything else (``timedelta``, ``Duration``, ``Any``, a dotted path, an undeclared
+          field): ``{field} = ({field} ?? 0ns) + $amount`` — a record without the field gets the
+          amount.
+
+        Raises:
+            ValueError: a zero or negative duration, or a duration that is not a whole number of
+                days on a ``date`` field, before anything is sent.
         """
         column = self._validate_atomic_field(field)
+        if isinstance(amount, (timedelta, Duration, SdkDuration)):
+            return await self._atomic_update(self._duration_increment(field, column, amount), {"amount": amount}, tx)
         return await self._atomic_update(f"{column} += $amount", {"amount": amount}, tx)
+
+    @classmethod
+    def _duration_increment(cls, field: str, column: str, amount: timedelta | Duration | SdkDuration) -> str:
+        """The ``SET`` expression of ``atomic_increment(field, <duration>)`` (v0.23.0, spec §4.6).
+
+        ``column`` is ``field``'s validated column, the only text interpolated besides the
+        constant ``0ns``. The field's annotation is resolved from ``field`` (a Python name or its
+        column); a dotted path takes the ``?? 0ns`` form.
+        """
+        nanoseconds = duration_ns(amount)
+        if nanoseconds <= 0:
+            raise ValueError(
+                f"atomic_increment({field}): a duration amount must be positive, got {amount!r} — SurrealDB "
+                "cannot store a zero or negative duration; set the new value with merge() instead."
+            )
+        kind = None
+        if "." not in field:
+            info = cls.model_fields.get(field if field in cls.model_fields else cls.to_py_field(field))
+            kind = None if info is None else declared_kind(info.annotation)
+        if kind == "date" and nanoseconds % _NS_PER_DAY:
+            raise ValueError(
+                f"atomic_increment({field}): {field} is a date, so the amount must be a whole number of days, "
+                f"got {amount!r} — a date cannot hold a time of day."
+            )
+        if kind in ("datetime", "date"):
+            return f"{column} = {column} + $amount"
+        return f"{column} = ({column} ?? 0ns) + $amount"
 
     @staticmethod
     def _as_value_list(values: Any) -> list[Any]:

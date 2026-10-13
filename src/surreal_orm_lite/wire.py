@@ -14,7 +14,8 @@ This module converts them, **only where the annotation asks for it**:
   and nothing changes anywhere else (an ``Any``, ``object`` or ``Duration`` position keeps the SDK
   value and its nanoseconds).
 - ``lookup_type(annotation, lookup, value)`` — what a filter value on a rich field is validated as
-  (``ttl__gt="1h"`` → ``timedelta``, ``at__in=Range(…)`` → ``Range[datetime]``…) before it is bound.
+  (``ttl__gt="1h"`` → ``timedelta``, ``at__in=Range(…)`` → ``Range[datetime]``…) before it is bound;
+  ``declared_kind(annotation)`` — a field's rich kind without ``Optional``/``Annotated``.
 - ``encode_wire(value, stored=…)`` — the other direction: every value the ORM sends, turned into a
   form the SDK encodes and **both** server lines accept (a compact duration tag, a fixed-point
   decimal text, ``undefined`` for an open range side, UTC datetimes, arrays for sets), or refused
@@ -63,6 +64,7 @@ from .types import Duration, Range
 __all__ = [
     "MAX_DURATION_NS",
     "decimal_text",
+    "declared_kind",
     "duration_ns",
     "encode_wire",
     "field_input",
@@ -425,6 +427,16 @@ def _strip_optional(annotation: Any) -> Any:
         if len(members) == 1:
             return _strip_optional(members[0])
     return annotation
+
+
+def declared_kind(annotation: Any) -> str | None:
+    """The rich kind of a field's annotation once ``Annotated`` and ``Optional`` are stripped.
+
+    ``datetime | None`` → ``"datetime"``, ``Annotated[date, …]`` → ``"date"``, ``timedelta`` →
+    ``"timedelta"``…; ``None`` for a container, a union of several types, ``Any`` or a plain type.
+    ``atomic_increment`` picks its duration statement from it (spec §4.6).
+    """
+    return _scalar_kind(_strip_optional(annotation))
 
 
 def _is_lookup_scalar(annotation: Any) -> bool:
