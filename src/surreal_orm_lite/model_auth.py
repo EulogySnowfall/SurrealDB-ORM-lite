@@ -550,7 +550,9 @@ class AuthenticatedUserMixin:
         A value addressed to a rich field (``datetime``, ``date``, ``timedelta``, ``Decimal``,
         ``UUID``, ``Range[T]``…) is validated against the field, as in ``merge()``, and stored as
         the server's own type (v0.23.0): ``signup(…, joined="2026-01-01T00:00:00Z")`` stores a
-        datetime.
+        datetime. The record is created whole, so a dict for a sub-model field is validated as the
+        whole sub-model (a missing required sub-field raises), and a table-model instance is
+        written as its record id where the field accepts a ``RecordID``.
 
         Raises:
             ValueError: for an unknown field, a missing required one, or a value that does not fit

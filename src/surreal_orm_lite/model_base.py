@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Self, TypeVar, overload
 
 import pydantic
 from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic.fields import FieldInfo
 from pydantic_core import ValidationError
 
 from ._sdk import NotFoundError, RecordID, SdkDuration, ServerError
@@ -36,6 +37,7 @@ from .utils import (
     RECORD_ID_COLUMN,
     VALID_ALIAS_PATTERN,
     apply_ddl_statements,
+    as_record_value,
     build_set_clause,
     coerce_endpoint,
     format_record_id,
@@ -49,7 +51,18 @@ from .utils import (
     validate_thing,
     warn_on_multiple_statements,
 )
-from .wire import declared_kind, duration_ns, encode_wire, field_input, lookup_type, restore_native, rich_kinds
+from .wire import (
+    declared_kind,
+    duration_ns,
+    encode_wire,
+    field_input,
+    field_keys,
+    lookup_type,
+    model_object,
+    restore_native,
+    rich_kinds,
+    sub_model,
+)
 
 if TYPE_CHECKING:
     from .edge import BaseSurrealEdge
@@ -146,6 +159,128 @@ def _lookup_value(key: str, annotation: Any, value: Any) -> Any:
     except (ValueError, TypeError) as exc:
         detail = "; ".join(str(error["msg"]) for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
         raise ValueError(f"filter({key}=…): {value!r} is not a valid {_type_label(annotation)} ({detail})") from exc
+
+
+def _write_adapter(owner: type[BaseModel], name: str, info: FieldInfo) -> pydantic.TypeAdapter[Any]:
+    """The ``TypeAdapter`` of field ``name`` of ``owner`` **with its constraints**, cached (v0.23.0).
+
+    ``Field(ge=…)``, ``allow_inf_nan``… live in ``info.metadata``, which ``info.annotation`` lacks:
+    the adapter validates what the model's constructor would. ``owner`` is a table model or a
+    sub-model (the sub-fields of a ``merge()`` dict).
+    """
+    adapter = _WRITE_ADAPTERS.get((owner, name))
+    if adapter is None:
+        target: Any = info.annotation
+        if info.metadata:
+            annotated: Any = Annotated
+            target = annotated[(target, *info.metadata)]
+        adapter = _WRITE_ADAPTERS[(owner, name)] = pydantic.TypeAdapter(target)
+    return adapter
+
+
+def _keyword_value(context: str, path: str, owner: type[BaseModel], name: str, info: FieldInfo, value: Any) -> Any:
+    """``value`` written to field ``name`` of ``owner`` by a keyword write, in the form it is sent (v0.23.0).
+
+    ``None`` and a ``SurrealFunc`` as given. In ``merge`` (``context``), a mapping addressed to a
+    sub-model is converted key by key (:func:`_partial_object`): SurrealDB's MERGE merges objects,
+    so only the caller's keys are sent. Anything else is validated as the field — the caller's
+    table-model instances replaced by their record ids first (:func:`_link_instances`), so the field
+    itself says whether it holds a ``RecordID`` there — and the sub-models the validation built
+    take their object form (:func:`_object_forms`). ``path`` names the value in the error:
+    ``profile``, ``profile.bday``.
+    """
+    if value is None or isinstance(value, SurrealFunc):
+        return value
+    if context == "merge" and isinstance(value, Mapping):
+        model = sub_model(info.annotation)
+        if model is not None:
+            return _partial_object(context, path, model, value)
+    linked = _link_instances(context, path, value)
+    try:
+        validated = _write_adapter(owner, name, info).validate_python(field_input(info.annotation, linked))
+    except (ValueError, TypeError) as exc:
+        detail = "; ".join(str(error["msg"]) for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
+        label = _type_label(info.annotation)
+        if isinstance(value, BaseSurrealModel):
+            message = (
+                f"the {type(value).__name__} instance is written as its record id, which {label} does not "
+                f"accept ({detail}); pass a dict, or a sub-model instance, to write an object"
+            )
+        else:
+            message = f"{value!r} is not a valid {label} ({detail})"
+            if linked is not value:
+                message += "; a table-model instance in it is written as its record id"
+        raise ValueError(f"{context}({path}=…): {message}") from exc
+    return _object_forms(validated)
+
+
+def _partial_object(context: str, path: str, model: type[BaseModel], value: Mapping[Any, Any]) -> dict[Any, Any]:
+    """A ``merge()`` dict addressed to sub-model ``model``, converted key by key (v0.23.0).
+
+    MERGE merges the object into the stored one (and replaces arrays), so this sends only the
+    caller's keys, under the spelling the caller gave them. Each key is resolved to a sub-field by
+    name or alias (:func:`~surreal_orm_lite.wire.field_keys`, the rule ``field_input`` follows) and
+    its value converted as that sub-field (:func:`_keyword_value`, recursively for a dict under a
+    sub-model sub-field); no default is added and no required sub-field is asked for; an unknown key
+    is sent as given, as in v0.22.x. A new dict: the caller's is never mutated.
+    """
+    keys = field_keys(model)
+    converted: dict[Any, Any] = {}
+    for key, item in value.items():
+        name = keys.get(key) if isinstance(key, str) else None
+        if name is None:
+            converted[key] = item
+        else:
+            converted[key] = _keyword_value(context, f"{path}.{key}", model, name, model.model_fields[name], item)
+    return converted
+
+
+def _link_instances(context: str, path: str, value: Any) -> Any:
+    """``value`` with the caller's table-model instances replaced by their record ids (v0.23.0).
+
+    At the top, in a ``list``/``tuple`` and among a mapping's values, at any depth — never inside a
+    Pydantic model, which stands for its whole object. Copy-on-write. ``ValueError`` for an unsaved
+    instance (it has no record id), naming ``context`` and ``path``.
+    """
+    if isinstance(value, BaseSurrealModel):
+        try:
+            return as_record_value(value)
+        except ValueError as exc:
+            raise ValueError(f"{context}({path}=…): {exc}") from exc
+    if isinstance(value, (list, tuple)):
+        items = [_link_instances(context, path, item) for item in value]
+        if all(new is old for new, old in zip(items, value, strict=True)):
+            return value
+        return items if isinstance(value, list) else tuple(items)
+    if isinstance(value, Mapping) and not isinstance(value, BaseModel):
+        linked = {key: _link_instances(context, path, item) for key, item in value.items()}
+        if all(linked[key] is item for key, item in value.items()):
+            return value
+        return linked
+    return value
+
+
+def _object_forms(value: Any) -> Any:
+    """``value`` with each table-model instance the validation built from a dict as its object (v0.23.0).
+
+    The caller's own instances are record ids by now (:func:`_link_instances`), so a
+    ``BaseSurrealModel`` left at the top, in a ``list``/``tuple`` or among a mapping's values is a
+    sub-model the ORM validated: it is written as an object (:func:`~surreal_orm_lite.wire.model_object`),
+    never as the record id ``encode_wire`` gives a table-model instance. Copy-on-write.
+    """
+    if isinstance(value, BaseSurrealModel):
+        return model_object(value)
+    if isinstance(value, (list, tuple)):
+        items = [_object_forms(item) for item in value]
+        if all(new is old for new, old in zip(items, value, strict=True)):
+            return value
+        return items if isinstance(value, list) else tuple(items)
+    if isinstance(value, dict):
+        forms = {key: _object_forms(item) for key, item in value.items()}
+        if all(forms[key] is item for key, item in value.items()):
+            return value
+        return forms
+    return value
 
 
 # Pydantic's metaclass sits between ``__pydantic_init_subclass__`` and the user's ``class``
@@ -621,48 +756,57 @@ class BaseSurrealModel(BaseModel):
 
     @classmethod
     def _coerce_field_value(cls, name: str, value: Any, *, context: str = "merge") -> Any:
-        """Validate a keyword write's value against the rich field it is written to (v0.23.0).
+        """Validate a keyword write's value against the field it is written to (v0.23.0).
 
-        The hook of ``merge(**data)`` — hence of ``update_or_create``'s update branch — and
-        ``bulk_update(**kwargs)`` (spec §4.6). On a field whose annotation holds a rich type at any
-        depth (``timedelta``, ``datetime``, ``date``, ``Decimal``, ``UUID``, ``Duration``,
-        ``Range[T]``, ``set``…, ``list[timedelta]`` included), the value goes through
-        :func:`~surreal_orm_lite.wire.field_input` then a ``TypeAdapter`` of the field's annotation
-        **with its constraints** (``Field(ge=…)``, ``allow_inf_nan``…) — the validation the model's
-        constructor applies to that field. So ``merge(ttl="1h30m")`` stores a duration and leaves
-        ``timedelta(hours=1, minutes=30)`` on the instance, where v0.22.1 stored the string.
+        The hook of ``merge(**data)`` — hence of ``update_or_create``'s update branch —,
+        ``bulk_update(**kwargs)`` and ``signup()``/``signin()`` (spec §4.6). On a field whose
+        annotation holds a rich type at any depth (``timedelta``, ``datetime``, ``date``, ``Decimal``,
+        ``UUID``, ``Duration``, ``Range[T]``, ``set``…, ``list[timedelta]`` included), the value goes
+        through :func:`~surreal_orm_lite.wire.field_input` then a ``TypeAdapter`` of the field's
+        annotation **with its constraints** (``Field(ge=…)``, ``allow_inf_nan``…) — the validation the
+        model's constructor applies to that field. So ``merge(ttl="1h30m")`` stores a duration and
+        leaves ``timedelta(hours=1, minutes=30)`` on the instance, where v0.22.1 stored the string.
+
+        A field typed with a sub-model (``profile: Profile | None``):
+
+        - in ``merge`` a **dict** is converted key by key: only the caller's keys are sent, under
+          their own spelling, each resolved to a sub-field by name or alias and validated as it
+          (recursively for a dict under a sub-model sub-field; an array whole); no default is added
+          and no required sub-field asked for — SurrealDB's MERGE keeps the other stored keys; an
+          unknown key is sent as given;
+        - in ``bulk_update``/``signup``/``signin``, which replace the field, a dict is validated as
+          the whole sub-model: a missing required sub-field raises;
+        - an **instance** is the whole sub-object, sent as ``save()`` writes it.
+
+        A **table-model instance** (``BaseSurrealModel``) given for a declared field — rich or not:
+        this runs before the early return below — is its record id when the field accepts a
+        ``RecordID`` (``author: RecordID | None``), and a ``ValueError`` naming the field otherwise;
+        it is never embedded as an object. A sub-model the validation built from the caller's dict
+        stays an object, even when its class is a table model.
 
         ``name`` is a Python field name or its column. Returned unchanged: ``None``, a
         :class:`~surreal_orm_lite.functions.SurrealFunc` (evaluated by the server), a dotted path,
-        and a field without a rich type or not declared (written as before v0.23.0).
+        and — any other value than a table-model instance — a field without a rich type or not
+        declared (written as before v0.23.0).
 
         Args:
-            context: the call named in the error, ``"merge"`` or ``"bulk_update"``.
+            context: the call named in the error: ``"merge"`` (the key-by-key dict rule),
+                ``"bulk_update"``, ``"signup"`` or ``"signin"``.
 
         Raises:
             ValueError: the value does not fit — ``"merge(at=…): 'yesterday' is not a valid
-                datetime (…)"`` with Pydantic's message — before anything is sent.
+                datetime (…)"`` with Pydantic's message, ``"merge(profile.bday=…): …"`` for a
+                sub-field — before anything is sent.
         """
         if value is None or isinstance(value, SurrealFunc) or "." in name:
             return value
         field = name if name in cls.model_fields else cls.to_py_field(name)
         info = cls.model_fields.get(field)
-        if info is None or field not in cls._rich_fields():
+        if info is None:
             return value
-        adapter = _WRITE_ADAPTERS.get((cls, field))
-        if adapter is None:
-            target: Any = info.annotation
-            if info.metadata:
-                annotated: Any = Annotated
-                target = annotated[(target, *info.metadata)]
-            adapter = _WRITE_ADAPTERS[(cls, field)] = pydantic.TypeAdapter(target)
-        try:
-            return adapter.validate_python(field_input(info.annotation, value))
-        except (ValueError, TypeError) as exc:
-            detail = "; ".join(str(error["msg"]) for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
-            raise ValueError(
-                f"{context}({name}=…): {value!r} is not a valid {_type_label(info.annotation)} ({detail})"
-            ) from exc
+        if field not in cls._rich_fields() and not isinstance(value, BaseSurrealModel):
+            return value
+        return _keyword_value(context, name, cls, field, info, value)
 
     @classmethod
     def _py_fields(cls, payload: Mapping[str, Any]) -> list[str]:
@@ -932,7 +1076,9 @@ class BaseSurrealModel(BaseModel):
         Values (v0.23.0) leave in forms both server lines accept: the SDK values an untyped
         position holds (an SDK ``Duration`` or ``Range`` in a ``dict[str, Any]`` field, an
         ``extra="allow"`` column…), which ``model_dump()`` flattens into dicts, are put back
-        (:func:`~surreal_orm_lite.wire.restore_native`), then every value is encoded
+        (:func:`~surreal_orm_lite.wire.restore_native`), each nested sub-model's fields go under the
+        key their validation reads (``Field(alias="lastSeen")`` → ``lastSeen``, as a keyword write
+        sends them; the top-level columns stay :meth:`_columns_for`'s), then every value is encoded
         (:func:`~surreal_orm_lite.wire.encode_wire`, ``stored=True``): a ``timedelta``/``Duration``
         becomes a duration, a ``date`` midnight UTC, a ``Range`` a range, a ``set`` a sorted array,
         a ``Decimal`` a fixed-point decimal.
@@ -945,7 +1091,7 @@ class BaseSurrealModel(BaseModel):
         excluded = {"id", *self.get_computed_fields()}
         if not replace:
             excluded |= self.get_server_fields() - set(keep)
-        dumped = restore_native(self.model_dump(exclude=excluded), self)
+        dumped = restore_native(self.model_dump(exclude=excluded), self, read_keys=True)
         payload: dict[str, Any] = encode_wire(self._columns_for(dumped), stored=True)
         return payload
 
@@ -1736,6 +1882,18 @@ class BaseSurrealModel(BaseModel):
         stores a duration and sets ``ttl`` to ``timedelta(hours=1, minutes=30)``. ``None`` and a
         ``SurrealFunc`` are written as given.
 
+        A field typed with a sub-model (``profile: Profile | None``) takes a dict or an instance.
+        A **dict** changes only the keys it names: each key is resolved to a sub-field by name or
+        alias and validated as it (``merge(profile={"bday": "1995-05-05"})`` sends a date), a dict
+        under a sub-model sub-field the same way, and nothing else is sent — SurrealDB's MERGE keeps
+        the other stored keys, so a required sub-field need not be repeated; an array is replaced
+        whole; an unknown key is sent as given. (With ``server_values`` the statement is an
+        ``UPDATE … SET``, which replaces the field with that dict.) An **instance** is the whole
+        sub-object, written as ``save()`` writes it: ``merge(profile=Profile(city="y"))`` drops a
+        stored ``bday``. Sub-fields are written under the key their validation reads (their
+        alias). A **table-model instance** is written as its record id; a field that cannot hold a
+        ``RecordID`` raises ``ValueError``.
+
         Args:
             tx: Optional transaction the statement is buffered onto.
             server_values: Field name → :class:`~surreal_orm_lite.functions.SurrealFunc`,
@@ -1747,7 +1905,8 @@ class BaseSurrealModel(BaseModel):
                 interpolated). Requires ``server_values``.
             refresh: ``True`` (default) resyncs the instance from the row the write returns.
                 ``False`` compiles the write with ``RETURN NONE``: it still happens, but the
-                server sends no row back and only the literal ``data`` is applied locally. Use
+                server sends no row back and only the literal ``data`` is applied locally, as
+                sent once converted (a sub-model dict stays that partial dict). Use
                 it for fire-and-forget updates such as a presence ping or a counter bump, where
                 the row is not worth its bytes.
 
@@ -1759,7 +1918,9 @@ class BaseSurrealModel(BaseModel):
 
         Raises:
             ValueError: a keyword value that does not validate as its rich field
-                (``merge(at="yesterday")``), before anything is sent.
+                (``merge(at="yesterday")``; ``merge(profile={"bday": "someday"})`` names
+                ``profile.bday``), or a table-model instance for a field that cannot hold its
+                record id — before anything is sent.
 
         Example:
             >>> await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
@@ -1768,7 +1929,8 @@ class BaseSurrealModel(BaseModel):
         self._reject_computed_writes(data, "merge()")
         self._validate_server_values(server_values, extra_vars)
         # Rich fields take their declared types before anything is built or sent (v0.23.0): the
-        # payload, the local apply and the signals all see the validated values.
+        # payload, the local apply and the signals all see the validated values (a sub-model dict
+        # converted key by key, a table-model instance as its record id).
         data = {key: self._coerce_field_value(key, value) for key, value in data.items()}
         if server_values:
             self._reject_computed_writes(server_values, "merge(server_values=)")

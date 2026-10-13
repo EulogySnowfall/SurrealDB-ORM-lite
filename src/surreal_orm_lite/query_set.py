@@ -840,17 +840,22 @@ class QuerySet:
         Args:
             **kwargs: Fields and values to update. A value addressed to a field with a rich type
                 is validated as that field first, like ``merge()``'s (v0.23.0):
-                ``bulk_update(ttl="2h")`` stores a duration. Bound like every write's values: a
-                ``timedelta`` as a duration, a ``date`` as midnight UTC, a ``set`` as an array.
+                ``bulk_update(ttl="2h")`` stores a duration. The ``SET`` replaces each field, so a
+                dict for a sub-model field is validated as the **whole** sub-model (a missing
+                required sub-field raises, unlike ``merge()``'s key-by-key dict). A table-model
+                instance is written as its record id where the field accepts a ``RecordID``.
+                Bound like every write's values: a ``timedelta`` as a duration, a ``date`` as
+                midnight UTC, a ``set`` as an array.
 
         Returns:
             The number of updated records.
 
         Raises:
             ValueError: a value that does not validate as its rich field (``token="nope"`` on a
-                ``UUID`` field), or one no SurrealDB type can hold (an ``int`` beyond 64 bits, a
-                negative duration, a zero one the installed SDK cannot read back…), before
-                anything is sent.
+                ``UUID`` field), a table-model instance for a field that cannot hold its record
+                id, or a value no SurrealDB type can hold (an ``int`` beyond 64 bits, a negative
+                duration, a zero one the installed SDK cannot read back…), before anything is
+                sent.
             TypeError: a value of a type SurrealDB has no form for (a ``time``).
 
         Example::

@@ -5,7 +5,8 @@ hydrates the declared Python types, on SurrealDB 2.x and 3.x alike.
   ``*_or_create``, ``server_values``) and the keyword payload of ``merge()`` go through
   ``wire.encode_wire(…, stored=True)``: a ``timedelta``/``Duration`` becomes a duration, a ``date``
   midnight UTC, a ``Range`` a range, a ``set`` an array, a ``Decimal`` a fixed-point decimal, a
-  Pydantic sub-model the object ``model_dump()`` gives (``merge``, ``bulk_update``, ``signup``). A raw
+  Pydantic sub-model an object keyed as its validation reads it (``merge`` takes a dict key by key,
+  ``bulk_update``/``signup`` the whole sub-model), a table-model instance its record id. A raw
   ``SELECT`` reads them back as SDK values (``_assert_native``).
 - **Statement variables** (spec §5.2, D17): ``patch``, the ``atomic_*`` helpers, ``bulk_update`` and
   ``relate`` encode their bound values for a write (``stored=True``); ``raw_query``,
@@ -1489,6 +1490,33 @@ class RfProfile(BaseModel):
     city: str = ""
 
 
+class RfSeen(BaseModel):
+    """A sub-model whose rich sub-field is aliased: stored under ``lastSeen``, the key its validation reads."""
+
+    seen: datetime | None = Field(default=None, alias="lastSeen")
+    note: str = ""
+
+
+class RfStrict(BaseModel):
+    """Every sub-field required: a partial dict is a MERGE, never a whole sub-model."""
+
+    bday: date
+    city: str
+
+
+class RfInner(BaseModel):
+    when: date | None = None
+    tag: str = ""
+
+
+class RfOuter(BaseModel):
+    """Sub-models two levels deep, and an array of them (replaced whole by a MERGE)."""
+
+    inner: RfInner | None = None
+    items: list[RfInner] = []
+    label: str = ""
+
+
 class RfPerson(BaseSurrealModel):
     model_config = SurrealConfigDict(table_name="rf_person")
 
@@ -1496,6 +1524,28 @@ class RfPerson(BaseSurrealModel):
     profile: RfProfile | None = None
     history: list[RfProfile] = []
     n: int = 0
+    activity: RfSeen | None = None
+    strict: RfStrict | None = None
+    outer: RfOuter | None = None
+    author: RecordID | None = None
+
+
+class RfOwner(BaseSurrealModel):
+    """A table model also used as a sub-model type (``RfHolder.owner``)."""
+
+    model_config = SurrealConfigDict(table_name="rf_owner")
+
+    id: str | None = None
+    since: date | None = None
+    name: str = ""
+
+
+class RfHolder(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_holder")
+
+    id: str | None = None
+    owner: RfOwner | None = None
+    owners: list[RfOwner] = []
 
 
 _BDAY = date(1990, 1, 2)
@@ -1520,13 +1570,16 @@ def _assert_profile(profile: Any, city: str = "x") -> None:
 
 
 class TestNestedModelKeywordWritesE2E:
-    """A keyword write on a field typed with a sub-model that holds a rich type: the value is validated
-    into the sub-model (``_coerce_field_value``), then sent as the object ``save()`` would write —
-    ``encode_wire`` dumps a Pydantic model, which the SDK cannot encode — on both lines.
+    """A keyword write on a field typed with a sub-model that holds a rich type, on both lines. In
+    ``merge()`` a dict is converted key by key (each value validated as its sub-field) and an instance
+    is the whole sub-object; ``bulk_update()`` validates a dict as the whole sub-model. Either way the
+    object is sent with its values encoded — ``encode_wire`` dumps a Pydantic model, which the SDK
+    cannot encode.
 
-    The instance then holds what the write applied: the validated sub-model when it is applied
-    locally (``refresh=False``), the returned row's object when the row is synced
-    (``_apply_record`` does not enter nested models, v0.18.0); a read hydrates the sub-model."""
+    The instance then holds what the write applied: the value sent, converted, when it is applied
+    locally (``refresh=False``: the dict, or the sub-model instance), the returned row's object when
+    the row is synced (``_apply_record`` does not enter nested models, v0.18.0); a read hydrates the
+    sub-model."""
 
     @_PROFILE_FORMS
     @pytest.mark.parametrize("refresh", [True, False], ids=["refresh", "no-refresh"])
@@ -1539,8 +1592,11 @@ class TestNestedModelKeywordWritesE2E:
             _assert_stored_profile((await _raw("m", "rf_person"))["profile"])
             if refresh:
                 _assert_stored_profile(person.profile)  # the row's object
+            elif isinstance(profile, dict):
+                assert person.profile == {"bday": _BDAY, "city": "x"}  # the dict sent, converted
+                assert type(person.profile["bday"]) is date
             else:
-                _assert_profile(person.profile)  # the validated keyword value
+                assert person.profile is profile  # the sub-model instance sent
             _assert_profile((await RfPerson.objects().get("m")).profile)
             await _assert_client_usable(client)
 
@@ -1590,6 +1646,363 @@ class TestNestedModelKeywordWritesE2E:
             _assert_stored_profile(updated_obj.profile, city="z")
             _assert_stored_profile((await _raw("u", "rf_person"))["profile"], city="z")
             _assert_profile((await RfPerson.objects().get("u")).profile, city="z")
+            await _assert_client_usable(client)
+
+
+class TestSubModelKeywordValues:
+    """``_coerce_field_value`` on a field typed with a sub-model, no database.
+
+    ``merge`` (MERGE: SurrealDB merges objects and replaces arrays) converts a dict key by key — only
+    the caller's keys, under their own names, each resolved to a sub-field by name or alias and
+    validated as that sub-field; a dict under a sub-model sub-field recursively; an array whole; no
+    default added, no required sub-field asked for; an unknown key as given. ``bulk_update`` and
+    ``signup`` replace the field, so a dict is validated as the whole sub-model there. A table-model
+    instance is its record id where the field accepts a ``RecordID``, a ``ValueError`` elsewhere."""
+
+    def test_merge_dict_sends_only_the_given_keys(self) -> None:
+        coerce = RfPerson._coerce_field_value
+        assert coerce("profile", {"city": "y"}) == {"city": "y"}
+        # The defect this fixes: the default ``bday=None`` was sent too, and NONE removed the stored date.
+        assert RfPerson._wire_columns({"profile": coerce("profile", {"city": "y"})}) == {"profile": {"city": "y"}}
+        converted = coerce("profile", {"bday": "1995-05-05"})
+        assert converted == {"bday": date(1995, 5, 5)}
+        assert type(converted["bday"]) is date
+        assert RfPerson._wire_columns({"profile": converted}) == {"profile": {"bday": datetime(1995, 5, 5, tzinfo=UTC)}}
+        assert coerce("strict", {"bday": "1991-01-01"}) == {"bday": date(1991, 1, 1)}  # city is not asked for
+        assert coerce("profile", {"bday": None}) == {"bday": None}  # None as given: NONE removes the key
+        assert coerce("profile", {"zip": "H0H", "city": "y"}) == {"zip": "H0H", "city": "y"}  # unknown: as given
+        given = {"bday": "1995-05-05"}
+        coerce("profile", given)
+        assert given == {"bday": "1995-05-05"}  # the caller's dict is never mutated
+
+    def test_merge_dict_keys_resolve_by_name_or_alias_and_keep_their_spelling(self) -> None:
+        coerce = RfPerson._coerce_field_value
+        assert coerce("activity", {"lastSeen": "2026-01-01T00:00:00Z"}) == {"lastSeen": _JAN}
+        assert coerce("activity", {"seen": "2026-01-01T00:00:00Z"}) == {"seen": _JAN}
+
+    def test_merge_dict_recurses_into_sub_models_and_takes_arrays_whole(self) -> None:
+        coerce = RfPerson._coerce_field_value
+        assert coerce("outer", {"inner": {"when": "2026-01-02"}}) == {"inner": {"when": date(2026, 1, 2)}}
+        items = coerce("outer", {"items": [{"when": "2026-01-02"}]})
+        assert items == {"items": [RfInner(when=date(2026, 1, 2))]}  # an array is replaced: validated whole
+        sent = RfPerson._wire_columns({"outer": items})
+        assert sent == {"outer": {"items": [{"when": datetime(2026, 1, 2, tzinfo=UTC), "tag": ""}]}}
+
+    def test_merge_instance_is_the_whole_sub_object(self) -> None:
+        profile = RfProfile(city="y")
+        assert RfPerson._coerce_field_value("profile", profile) is profile
+        assert RfPerson._wire_columns({"profile": profile}) == {"profile": {"bday": None, "city": "y"}}
+
+    @pytest.mark.parametrize(
+        ("field", "value", "named"),
+        [
+            ("profile", {"bday": "someday"}, r"profile\.bday=…\): 'someday' is not a valid date"),
+            ("activity", {"lastSeen": "soon"}, r"activity\.lastSeen=…\): 'soon' is not a valid datetime"),
+            ("outer", {"inner": {"when": "x"}}, r"outer\.inner\.when=…\): 'x' is not a valid date"),
+            ("outer", {"items": [{"when": "x"}]}, r"outer\.items=…\): \[\{'when': 'x'\}\] is not a valid list\[RfInner\]"),
+            ("profile", {"city": 5}, r"profile\.city=…\): 5 is not a valid str"),
+        ],
+        ids=["bday", "alias", "nested", "array", "plain-sub-field"],
+    )
+    def test_merge_dict_invalid_value_names_the_sub_field(self, field: str, value: Any, named: str) -> None:
+        with pytest.raises(ValueError, match=rf"^merge\({named}"):
+            RfPerson._coerce_field_value(field, value)
+
+    @pytest.mark.parametrize("context", ["bulk_update", "signup"])
+    def test_replacing_writes_validate_the_whole_sub_model(self, context: str) -> None:
+        coerce = RfPerson._coerce_field_value
+        with pytest.raises(ValueError, match=rf"^{context}\(strict=…\): .*Field required"):
+            coerce("strict", {"bday": "1991-01-01"}, context=context)
+        assert coerce("profile", {"city": "y"}, context=context) == RfProfile(city="y")
+        assert RfPerson._wire_columns({"activity": coerce("activity", {"lastSeen": _JAN}, context=context)}) == {
+            "activity": {"lastSeen": _JAN, "note": ""}
+        }
+
+    @pytest.mark.parametrize("context", ["merge", "bulk_update", "signup"])
+    def test_table_instance_is_its_record_id_where_the_field_takes_one(self, context: str) -> None:
+        coerce = RfPerson._coerce_field_value
+        alice = RfPerson(id="alice")
+        rid = RecordID("rf_person", "alice")
+        assert coerce("author", alice, context=context) == rid
+        assert coerce("undeclared", alice, context=context) is alice  # encode_wire writes its record id
+        assert encode_wire(coerce("undeclared", alice, context=context), stored=True) == rid
+        # A field that cannot hold a RecordID — a sub-model, a field without a rich type — refuses it.
+        for field in ("profile", "n"):
+            with pytest.raises(
+                ValueError, match=rf"^{context}\({field}=…\): the RfPerson instance is written as its record id"
+            ):
+                coerce(field, alice, context=context)
+        with pytest.raises(ValueError, match=rf"^{context}\(author=…\): .*unsaved RfPerson has no record id"):
+            coerce("author", RfPerson(), context=context)
+
+    def test_table_instance_in_a_merge_dict_follows_the_same_rule(self) -> None:
+        alice = RfPerson(id="alice")
+        with pytest.raises(ValueError, match=r"^merge\(profile\.city=…\): the RfPerson instance is written as its record id"):
+            RfPerson._coerce_field_value("profile", {"city": alice})
+
+    def test_table_model_built_from_a_dict_stays_an_object(self) -> None:
+        """The sub-model the ORM validated from the caller's dict is the object to write, even when
+        its class is a table model; only the caller's own instance is a record id."""
+        for context in ("bulk_update", "signup"):
+            built = RfHolder._coerce_field_value("owner", {"since": "2026-01-02", "name": "o"}, context=context)
+            sent = encode_wire(built, stored=True)
+            assert isinstance(sent, dict), sent
+            assert sent["since"] == datetime(2026, 1, 2, tzinfo=UTC)
+            assert sent["name"] == "o"
+        assert RfHolder._coerce_field_value("owner", {"since": "2026-01-02"}) == {"since": date(2026, 1, 2)}
+        owners = RfHolder._coerce_field_value("owners", [{"since": "2026-01-02"}])
+        sent_items = encode_wire(owners, stored=True)
+        assert isinstance(sent_items[0], dict)
+        assert sent_items[0]["since"] == datetime(2026, 1, 2, tzinfo=UTC)
+        # The caller's own instance inside the array: its record id, which list[RfOwner] cannot hold.
+        with pytest.raises(ValueError, match=r"^merge\(owners=…\): .*record id"):
+            RfHolder._coerce_field_value("owners", [{"since": "2026-01-02"}, RfOwner(id="o1")])
+
+    def test_write_payload_nests_aliased_sub_fields_under_their_alias(self) -> None:
+        """``save()``, ``update()``, ``upsert()``, ``bulk_create()`` and the create branch of
+        ``*_or_create`` write the same sub-object as the keyword writes (top-level columns unchanged)."""
+        person = RfPerson(id="s", activity=RfSeen(lastSeen=_JAN, note="n"), outer=RfOuter(inner=RfInner(when=date(2026, 1, 2))))
+        payload = person._write_payload()
+        assert payload["activity"] == {"lastSeen": _JAN, "note": "n"}
+        assert payload["outer"]["inner"] == {"when": datetime(2026, 1, 2, tzinfo=UTC), "tag": ""}
+
+
+_SEED_PERSON = (
+    "CREATE rf_person:p SET profile = {bday: d'1990-01-02T00:00:00Z', city: 'x'}, "
+    "strict = {bday: d'1990-01-02T00:00:00Z', city: 'x'}, n = 1;"
+)
+_PARTIAL_PROFILES = pytest.mark.parametrize(
+    ("change", "stored", "local", "loaded"),
+    [
+        (
+            {"city": "y"},
+            {"bday": datetime(1990, 1, 2, tzinfo=UTC), "city": "y"},
+            {"city": "y"},
+            RfProfile(bday=_BDAY, city="y"),
+        ),
+        (
+            {"bday": "1995-05-05"},
+            {"bday": datetime(1995, 5, 5, tzinfo=UTC), "city": "x"},
+            {"bday": date(1995, 5, 5)},
+            RfProfile(bday=date(1995, 5, 5), city="x"),
+        ),
+    ],
+    ids=["city", "bday"],
+)
+_REFRESH = pytest.mark.parametrize("refresh", [True, False], ids=["refresh", "no-refresh"])
+
+
+async def _seeded_person(client: Any) -> RfPerson:
+    """``rf_person:p`` with ``profile`` and ``strict`` set to ``{bday: 1990-01-02, city: 'x'}``, loaded."""
+    await client.query(_SEED_PERSON, {})
+    person: RfPerson = await RfPerson.objects().get("p")
+    return person
+
+
+def _assert_loaded(profile: Any, expected: BaseModel) -> None:
+    """A sub-model read back: the declared class, its ``date`` a ``date`` (never the stored datetime)."""
+    assert type(profile) is type(expected), f"not a {type(expected).__name__}: {profile!r}"
+    assert profile == expected
+    assert type(profile.bday) is date
+
+
+class TestSubModelMergeE2E:
+    """``merge()`` and the update branch of ``update_or_create()`` send a sub-model dict key by key, so
+    SurrealDB's MERGE keeps the other stored keys (before, the defaults the validation added were
+    sent too, and ``None`` removed the stored date); ``bulk_update()`` replaces the field, so a dict
+    missing a required sub-field is refused before anything is sent. Both lines."""
+
+    @_PARTIAL_PROFILES
+    @_REFRESH
+    async def test_merge_a_partial_dict_keeps_the_other_keys(
+        self, change: dict[str, Any], stored: dict[str, Any], local: dict[str, Any], loaded: RfProfile, refresh: bool
+    ) -> None:
+        async with orm_client("rf_person") as client:
+            person = await _seeded_person(client)
+            await person.merge(refresh=refresh, profile=change)
+
+            assert (await _raw("p", "rf_person"))["profile"] == stored
+            assert person.profile == (stored if refresh else local)  # the row's object, or the dict sent
+            _assert_loaded((await RfPerson.objects().get("p")).profile, loaded)
+            await _assert_client_usable(client)
+
+    @_PARTIAL_PROFILES
+    async def test_merge_in_a_transaction(
+        self, change: dict[str, Any], stored: dict[str, Any], local: dict[str, Any], loaded: RfProfile
+    ) -> None:
+        async with orm_client("rf_person") as client:
+            person = await _seeded_person(client)
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await person.merge(tx=tx, profile=change)
+
+            assert (await _raw("p", "rf_person"))["profile"] == stored
+            _assert_loaded((await RfPerson.objects().get("p")).profile, loaded)
+            await _assert_client_usable(client)
+
+    @_PARTIAL_PROFILES
+    async def test_update_or_create_update_branch(
+        self, change: dict[str, Any], stored: dict[str, Any], local: dict[str, Any], loaded: RfProfile
+    ) -> None:
+        async with orm_client("rf_person") as client:
+            await _seeded_person(client)
+            obj, created = await RfPerson.objects().update_or_create(id="p", defaults={"profile": change})
+
+            assert not created
+            assert (await _raw("p", "rf_person"))["profile"] == stored
+            assert obj.profile == stored  # the returned row's object
+            _assert_loaded((await RfPerson.objects().get("p")).profile, loaded)
+            await _assert_client_usable(client)
+
+    @_REFRESH
+    async def test_merge_a_dict_missing_a_required_sub_field(self, refresh: bool) -> None:
+        """A partial MERGE, as in v0.22.x: the stored city stays, and the row reads back."""
+        async with orm_client("rf_person") as client:
+            person = await _seeded_person(client)
+            await person.merge(refresh=refresh, strict={"bday": "1991-01-01"})
+
+            assert (await _raw("p", "rf_person"))["strict"] == {"bday": datetime(1991, 1, 1, tzinfo=UTC), "city": "x"}
+            if not refresh:
+                assert person.strict == {"bday": date(1991, 1, 1)}
+            assert (await RfPerson.objects().get("p")).strict == RfStrict(bday=date(1991, 1, 1), city="x")
+            await _assert_client_usable(client)
+
+    async def test_bulk_update_refuses_a_dict_missing_a_required_sub_field(self) -> None:
+        """``bulk_update()`` compiles a SET, which replaces the object: it would not read back."""
+        async with orm_client("rf_person") as client:
+            await _seeded_person(client)
+            with pytest.raises(ValueError, match=r"^bulk_update\(strict=…\): .*Field required"):
+                await RfPerson.objects().filter(n=1).bulk_update(strict={"bday": "1991-01-01"})
+
+            assert (await _raw("p", "rf_person"))["strict"] == {"bday": datetime(1990, 1, 2, tzinfo=UTC), "city": "x"}
+            await _assert_client_usable(client)
+
+
+_SEEN = {"lastSeen": "2026-01-01T00:00:00Z", "note": "n"}
+_SEEN_FORMS = pytest.mark.parametrize("activity", [_SEEN, RfSeen(lastSeen=_JAN, note="n")], ids=["dict", "instance"])
+
+
+def _assert_stored_seen(stored: Any) -> None:
+    """An ``RfSeen`` as stored: under ``lastSeen`` (the key its validation reads), a datetime."""
+    assert isinstance(stored, dict), f"not an object: {stored!r}"
+    assert "seen" not in stored, f"stored under the Python name: {stored!r}"
+    assert isinstance(stored["lastSeen"], datetime), f"lastSeen not a datetime: {stored!r}"
+    assert stored["lastSeen"] == _JAN
+    assert stored["note"] == "n"
+
+
+def _assert_seen(activity: Any) -> None:
+    assert type(activity) is RfSeen, f"not an RfSeen: {activity!r}"
+    assert activity.seen == _JAN
+    assert activity.note == "n"
+
+
+class TestAliasedSubFieldsE2E:
+    """A sub-field declared ``Field(alias="lastSeen")`` is written under ``lastSeen`` by every write —
+    the key its validation reads — so a read gives it back (it used to be written under ``seen``,
+    which nothing reads: ``get()`` returned ``None``). Both lines."""
+
+    @_SEEN_FORMS
+    async def test_merge(self, activity: Any) -> None:
+        async with orm_client("rf_person") as client:
+            person = RfPerson(id="a")
+            await person.save()
+            await person.merge(activity=activity)
+
+            _assert_stored_seen((await _raw("a", "rf_person"))["activity"])
+            _assert_seen((await RfPerson.objects().get("a")).activity)
+            await _assert_client_usable(client)
+
+    @_SEEN_FORMS
+    async def test_bulk_update(self, activity: Any) -> None:
+        async with orm_client("rf_person") as client:
+            await RfPerson(id="b", n=1).save()
+            assert await RfPerson.objects().filter(n=1).bulk_update(activity=activity) == 1
+
+            _assert_stored_seen((await _raw("b", "rf_person"))["activity"])
+            _assert_seen((await RfPerson.objects().get("b")).activity)
+            await _assert_client_usable(client)
+
+    async def test_save_update_and_upsert(self) -> None:
+        async with orm_client("rf_person") as client:
+            person = RfPerson(id="s", activity=RfSeen(lastSeen=_JAN, note="n"))
+            await person.save()
+            _assert_stored_seen((await _raw("s", "rf_person"))["activity"])
+            loaded = await RfPerson.objects().get("s")
+            _assert_seen(loaded.activity)
+
+            loaded.n = 2
+            await loaded.update()  # a full replace from the loaded instance
+            _assert_stored_seen((await _raw("s", "rf_person"))["activity"])
+            await RfPerson(id="u", activity=RfSeen(lastSeen=_JAN, note="n")).upsert()
+            _assert_stored_seen((await _raw("u", "rf_person"))["activity"])
+            _assert_seen((await RfPerson.objects().get("u")).activity)
+            await _assert_client_usable(client)
+
+    @_SEEN_FORMS
+    async def test_signup_then_signin(self, activity: Any) -> None:
+        async with _auth_access(RfProfiled) as client:
+            email = f"{UUID(int=4).hex}@example.test"
+            result = await RfProfiled.signup(email=email, password=_AUTH_PASSWORD, activity=activity)
+            _assert_seen(result.user.activity)
+
+            row = await client.query("SELECT * FROM ONLY rf_profiled WHERE email = $email LIMIT 1;", {"email": email})
+            _assert_stored_seen(row["activity"])
+            again = await RfProfiled.signin(email=email, password=_AUTH_PASSWORD)
+            _assert_seen(again.user.activity)
+            await _assert_client_usable(client)
+
+
+class TestTableInstanceValuesE2E:
+    """A table-model instance given as a value is its record id (v0.22.0's filter rule, the full
+    ORM's link rule): stored as a record link where the field accepts a ``RecordID``, refused before
+    anything is sent elsewhere — never embedded as an object no read accepts. Both lines."""
+
+    async def test_merge_and_bulk_update_store_the_record_id(self) -> None:
+        async with orm_client("rf_person") as client:
+            alice = RfPerson(id="alice")
+            await alice.save()
+            rid = RecordID("rf_person", "alice")
+            bob = RfPerson(id="bob")
+            await bob.save()
+            await bob.merge(author=alice)
+            assert bob.author == rid
+            await RfPerson(id="carol", n=7).save()
+            assert await RfPerson.objects().filter(n=7).bulk_update(author=alice) == 1
+
+            for name in ("bob", "carol"):
+                assert (await _raw(name, "rf_person"))["author"] == rid
+                loaded = await RfPerson.objects().get(name)
+                assert type(loaded.author) is RecordID
+                assert loaded.author == rid
+            everyone = await RfPerson.objects().all()
+            assert sorted(str(person.get_id()) for person in everyone) == ["alice", "bob", "carol"]
+            linked = await RfPerson.objects().filter(author=alice).exec()
+            assert sorted(str(person.get_id()) for person in linked) == ["bob", "carol"]
+            await _assert_client_usable(client)
+
+    async def test_raw_query_variable(self) -> None:
+        async with orm_client("rf_person") as client:
+            alice = RfPerson(id="alice")
+            await alice.save()
+            await RfPerson(id="bob", author=RecordID("rf_person", "alice")).save()
+            rows = await RfPerson.raw_query("SELECT * FROM rf_person WHERE author = $who;", variables={"who": alice})
+            assert len(rows) == 1
+            assert isinstance(rows[0], RfPerson)
+            assert rows[0].get_id() == "bob"
+            await _assert_client_usable(client)
+
+    @pytest.mark.parametrize("write", ["merge", "bulk_update"])
+    async def test_a_field_that_cannot_hold_a_record_id_refuses(self, write: str) -> None:
+        async with orm_client("rf_person") as client:
+            alice = RfPerson(id="alice", n=1)
+            await alice.save()
+            with pytest.raises(ValueError, match=r"\(profile=…\): the RfPerson instance is written as its record id"):
+                if write == "merge":
+                    await alice.merge(profile=alice)
+                else:
+                    await RfPerson.objects().filter(n=1).bulk_update(profile=alice)
+
+            assert (await _raw("alice", "rf_person")).get("profile") is None
             await _assert_client_usable(client)
 
 
@@ -1887,6 +2300,7 @@ class RfProfiled(AuthenticatedUserMixin, BaseSurrealModel):
     password: str
     profile: RfProfile | None = None
     history: list[RfProfile] = []
+    activity: RfSeen | None = None
 
 
 _AUTH_PASSWORD = "s3cret-passphrase"
@@ -1982,7 +2396,7 @@ class TestRichAuthVariables:
             require_all=True,
         )
         stored = {"bday": datetime(1990, 1, 2, tzinfo=UTC), "city": "x"}
-        assert sent == {"email": "a@b.c", "password": "pw", "profile": stored, "history": [stored]}
+        assert sent == {"email": "a@b.c", "password": "pw", "profile": stored, "history": [stored], "activity": None}
 
     def test_signin_variables_are_validated(self) -> None:
         sent = RfBadge._auth_variables("signin", {"badge": str(_TOKEN), "password": "pw"}, require_all=False)
