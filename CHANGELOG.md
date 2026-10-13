@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.2] - 2026-10-13
+
+A change-feed fix for SurrealDB 3.x. No new public API.
+
+### Fixed
+
+- **`changes(since=None)` no longer replays history on SurrealDB 3.x** (#212). On 3.x the stream
+  started at the server clock's millisecond (`unix_ms << 16`), but a 3.x versionstamp is
+  `unix_ms << 16 | counter` and `SINCE` is inclusive, so every entry committed earlier in that
+  same millisecond was delivered as if it were new, and `stream.cursor` did not point at the end
+  of the feed. `start()` now reads the entries stamped in that millisecond, a page of
+  `batch_size` at a time, and moves the cursor past the last one: usually one short read, at most
+  `ceil(n / batch_size) + 1` reads for the `n` entries of that millisecond, however busy the
+  table is. It goes through the same retry and `stop()` path as every other request.
+  - A write committed in that millisecond while `start()` runs is history and is skipped; a write
+    in a later millisecond, or one made after `start()` returns (even in the same millisecond),
+    is delivered.
+  - This was the cause of two intermittent change-feed test failures on SurrealDB 3.x.
+
+### Notes
+
+- **SurrealDB 2.x is unchanged**: there "now" is the end of the feed, found by searching the
+  counter, which never had this problem. The README's "SurrealDB 2.6.x vs 3.x" table now says how
+  the 3.x side finds "now".
+- Tested against SurrealDB 3.3.4 and 2.7.0 (the CI pins), plus 3.1.5 for backward compatibility.
+
 ## [0.22.0] - 2026-10-12
 
 Native typed relations: graph edges as Pydantic models, created through the official SDK's
