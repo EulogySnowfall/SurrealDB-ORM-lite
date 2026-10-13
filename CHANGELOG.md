@@ -5,6 +5,168 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.23.0] - 2026-10-13
+
+Rich field types: SurrealDB's own value types round-trip natively between typed Pydantic fields
+and the official SDK, on every write and read path, with the same behaviour on SurrealDB 2.x and
+3.x. The first minor of Tier 2.
+
+### Added
+
+- **Rich field types.** `datetime`, `date`, `timedelta`, `Decimal`, `UUID`, `bytes` and
+  `set`/`frozenset`/`tuple` annotations, plus the ORM's `Duration` and `Range[T]`, are stored as
+  the server's own types by every write and read back as the declared type by every read:
+  `get()`, `filter()`/`all()`/`first()`, `refresh()`, the rows that `save()`, `upsert()`,
+  `merge()`, `patch()` and the `atomic_*` helpers return, `raw_query()` rows, reads inside an
+  interactive transaction, live and change-feed instances, and edges. Optionals and containers
+  (`X | None`, `list[X]`, `dict[str, X]`, nested `BaseModel` fields) follow the same rules,
+  position by position, and `Computed[timedelta]` works too:
+
+  ```python
+  from datetime import date, datetime, timedelta
+  from decimal import Decimal
+  from surreal_orm_lite import (
+      BaseSurrealModel, BoundExcluded, BoundIncluded, Duration, Range, SurrealConfigDict,
+  )
+
+  class Event(BaseSurrealModel):
+      model_config = SurrealConfigDict(table_name="event")
+      id: str | None = None
+      at: datetime | None = None
+      day: date | None = None
+      ttl: timedelta | None = None
+      grace: Duration | None = None
+      price: Decimal | None = None
+      hours: Range[int] | None = None
+      tags: set[str] = set()
+
+  await Event(
+      id="launch",
+      ttl=timedelta(hours=1, minutes=30),
+      grace=Duration.parse("1h30m1ns"),                   # nanoseconds kept
+      price=Decimal("12.50"),
+      hours=Range(BoundIncluded(9), BoundExcluded(17)),   # 9..17
+  ).save()
+  event = await Event.objects().get("launch")
+  event.ttl   # timedelta(seconds=5400): a duration on the server, a timedelta here
+  ```
+
+- **`Duration`** — a SurrealDB duration with nanosecond precision, where `timedelta` stops at
+  microseconds. It has the API of the SDK's `surrealdb.Duration`, the same members under the same
+  names with the same parameters (`elapsed`, `parse(value, nanoseconds=0)`,
+  `get_seconds_and_nano()`, `to_compact()`, `to_string()`, the unit properties), with exact
+  integer results, and adds `MAX_NANOSECONDS`, `from_timedelta()`, `to_timedelta()`, hashing and
+  ordering. `parse()` reads the server's syntax strictly. As a field it accepts a `Duration`, the
+  SDK's `Duration`, a non-negative `timedelta` or a SurrealQL duration string (`"1h30m"`); its
+  JSON form is that text.
+- **`InvalidDurationError`** — raised for a duration value `Duration` refuses. It is both a
+  `ValueError` and a `surrealdb.InvalidDurationError`, so an `except` written against the SDK
+  catches it.
+- **`Range[T]`** — a SurrealDB range whose bounds are the SDK's `BoundIncluded`/`BoundExcluded`
+  (now exported by the ORM) or `None` for an open side; `str()` is the SurrealQL literal
+  (`9..17`). As a field it validates each bound value as `T` and accepts the SDK's `Range`, a
+  builtin `range` with step 1 and the literal text.
+- **Typed lookups on rich fields.** A filter value compared with a `datetime`, `date`,
+  `timedelta`, `Duration`, `Decimal` or `UUID` field is validated as that type, then bound:
+  `filter(ttl__gt="1h")` compares with a duration and `filter(token="…")` with a UUID. A value
+  that does not fit raises `ValueError` before anything is sent. It applies to `filter()`, `Q`,
+  the lookups of `get_or_create()`/`update_or_create()` and the filters of `bulk_update()`,
+  `bulk_delete()`, `patch()`, `live()` and `watch()`.
+- **Range membership**: `in`/`not_in` with a `Range` (the ORM's or the SDK's) binds one range
+  (`capacity IN $r`), its bounds validated as the field's type; `contains`/`not_contains` on a
+  `Range[T]` field validate the value as `T`, and on a `list[S]`/`set[S]` field as `S`.
+- **Durations in `atomic_increment()`**: a positive `timedelta` or `Duration` compiles to a
+  statement that gives the same result on both lines, `ttl = (ttl ?? 0ns) + $amount`, or
+  `at = at + $amount` on a datetime or date field (whole days only on a date).
+- **Live queries filter on rich fields**: durations, dates and ranges are written as SurrealQL
+  literals (`ttl >= 1h`, `capacity IN 100..500`), which both lines apply the same way.
+- `call_function(return_type=)` and `info(return_type=)` accept the SDK values the server returns
+  for rich types (`return_type=timedelta`).
+- `Duration`, `Range`, `BoundIncluded`, `BoundExcluded` and `InvalidDurationError` are exported
+  from the package root.
+- README section 24, "Rich field types" (annotation table, precision, sets, zero durations, values
+  refused before sending, untyped fields, upgrading from v0.22, a note for users of the full
+  SurrealDB-ORM); example notebook `examples/v0.23.0_rich_field_types.ipynb`.
+
+### Changed
+
+- **Keyword writes validate the values addressed to rich fields.** `merge()`, `bulk_update()`,
+  the update branch of `update_or_create(defaults=)` and `AuthenticatedUserMixin.signup()`/
+  `signin()` validate each such value against the field's full annotation, constraints included,
+  and store the server's type: `merge(at="2026-01-01T00:00:00Z")` now stores a datetime instead of
+  a string and leaves a `datetime` on the instance. A value that does not fit raises `ValueError`
+  naming the field before anything is sent; `None` and `SurrealFunc` values are written as given.
+  Rows v0.22 stored as strings still load, but the typed lookups no longer match them: README
+  section 24, "Upgrading from v0.22", gives a one-off conversion that runs on both lines.
+- **Sub-models in keyword writes.** In `merge()` and the update branch of `update_or_create()`,
+  a dict for a sub-model field changes only the keys it names, each validated as its sub-field
+  (with `server_values=`, one `SET` per key, so the other stored keys stay, as with `MERGE`); an
+  instance replaces the whole sub-object; `bulk_update()` and `signup()` validate a dict as the
+  whole sub-model. Sub-fields are written under the key their validation reads (their alias), so
+  an aliased sub-field reads back.
+- **A table-model instance given as a value is written as its record id** in keyword writes, in
+  raw-query variables, in the `atomic_*` array helpers and in `patch()`. Where the declared field
+  cannot hold a `RecordID` at that position (`list[Plain]`, a sub-model), the write raises
+  `ValueError` before anything is sent.
+- A finite `Decimal` is sent as a fixed-point decimal, rounded client-side exactly as the server
+  rounds it (once, half away from zero, at most 28 fractional digits), so what is stored is what
+  earlier versions stored and a filter with the same value matches it. Sets are sent as arrays,
+  sorted when their items are orderable.
+
+### Fixed
+
+- **Values that dropped the WebSocket are converted before sending.** A `date`, a `set`, the
+  SDK's `Duration`, an open `Range` side and, on 2.x, a `Decimal` whose text uses an exponent
+  (`1E+3`, `0.0000005`) were rejected by the server at decode, and the connection and its live
+  streams were lost. They are now sent in a form both lines accept, on every path, the variables
+  of `raw_query()`, `call_function()` and `signin()`/`signup()` included (a variable of one of
+  these types used to surface as a failed authentication).
+- **Untyped fields keep SurrealDB values.** `update()` and `save()` of a loaded record flattened
+  an SDK `Duration` or `Range` held by a `dict[str, Any]` or `list[Any]` field, an extra column or
+  the `Any` part of a nested model into a dict (`{"elapsed": …}`), silently corrupting the row;
+  they are written back as the duration and the range they were.
+- **Strings compared with datetime, duration or uuid columns** silently matched the wrong rows, or
+  none (see typed lookups).
+- **Values no SurrealDB type can hold are refused before sending**: an `int` outside signed 64-bit
+  (SurrealDB silently wraps `2**63` to `-2**63` and rejects larger values, losing the connection),
+  a record id key included, a `Decimal` beyond the server's range, and a negative duration or one
+  beyond `Duration.MAX_NANOSECONDS` raise `ValueError`; a `datetime.time` raises `TypeError`.
+
+### Security
+
+- Filter values on rich fields are validated, then bound as query variables, never written into
+  the statement. Live queries, whose filters are written as literals, accept only a closed set of
+  value types for range bounds; any other raises `TypeError` at the call.
+- Text input is bounded and parsed strictly: `Duration.parse()` refuses more than 256 characters
+  and the range text more than 1024, with no whitespace inside a range.
+
+### Notes
+
+- **Zero durations.** The surrealdb SDK 2.0.0 cannot read a zero duration (`0ns`) back, on both
+  lines (HTTP `IndexError`; WebSocket `KeyError` and the connection lost), so the ORM's write paths
+  refuse to store one (`ValueError`): declare the field optional and store `None`. A zero in a
+  filter is fine. A local probe of the installed SDK lifts the restriction by itself once an SDK
+  release decodes zero durations.
+- **Native sets on 3.x.** A `TYPE set<…>` column or a `<set>` value is a native set (CBOR tag 56)
+  that SDK 2.0.0 cannot decode: declare such columns `array<…>` (optionally
+  `VALUE $value.distinct()`). `set[X]` fields round-trip on schemaless tables and `array<…>`
+  columns on both lines; SurrealDB 3.1.5 refuses the array the ORM sends to a `set<…>` column.
+- **Precision.** Datetimes are read back in UTC at microsecond precision (the server keeps
+  nanoseconds), so a datetime written with sub-microsecond digits does not match an `exact` filter
+  with itself; `timedelta` truncates sub-microsecond digits, `Duration` keeps them.
+  `Decimal("12.50")` reads back as `12.50` on 2.x and as `12.5` on 3.x: equal values. A NaN or
+  infinite `Decimal` is stored as a float, as before; `Field(allow_inf_nan=True)` reads it back.
+- **Equality with the SDK's values is one-way**: `Duration(5) == surrealdb.Duration(5)` is `True`,
+  the reverse is `False` (the SDK's `__eq__` answers `False` for any other type). The same holds
+  for `Range`. Put the ORM value on the left.
+- SurrealDB 2.x silently ignores `+=`/`-=` with a duration operand; the statements of
+  `atomic_increment()` give the same result on both lines.
+- No new runtime dependency, SDK range or SurrealDB pin. Geometry fields and `nearby()` are
+  planned for v0.24.0; generating `DEFINE FIELD … TYPE` from these annotations belongs to the
+  schema and DDL phase (v0.30.0+).
+- Every behaviour above was measured on SurrealDB 2.7.0 and 3.3.4, with 3.1.5 where it differs;
+  the README's "ORM behaviour: SurrealDB 2.x vs 3.x" table gains eleven rows.
+
 ## [0.22.2] - 2026-10-13
 
 Change-feed fixes: history replayed by `changes(since=None)` on SurrealDB 3.x, and a timed-out
