@@ -11,6 +11,7 @@ from ._sdk import RecordID, ServerError
 from .constants import LOOKUP_OPERATORS
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, Var
+from .wire import encode_wire
 
 if TYPE_CHECKING:
     from .model_base import BaseSurrealModel
@@ -176,7 +177,9 @@ def build_set_clause(merged: Mapping[str, Any], param_prefix: str = "_sv_") -> t
 
     A :class:`~surreal_orm_lite.functions.SurrealFunc` value is **inlined** as a raw
     SurrealQL expression so the server evaluates it; every other value is **bound** to a
-    ``$<param_prefix><field>`` query variable, which is the injection boundary::
+    ``$<param_prefix><field>`` query variable, which is the injection boundary, encoded for a
+    write (:func:`~surreal_orm_lite.wire.encode_wire`, ``stored=True``, v0.23.0 — idempotent on a
+    payload already encoded)::
 
         build_set_clause({"name": "Alice", "joined": SurrealFunc("time::now()")})
         # ("name = $_sv_name, joined = time::now()", {"_sv_name": "Alice"})
@@ -189,7 +192,9 @@ def build_set_clause(merged: Mapping[str, Any], param_prefix: str = "_sv_") -> t
 
     Raises:
         ValueError: If ``merged`` is empty (``SET`` with no assignment is a parse error on
-            both server lines), or if a field name is not a plain identifier.
+            both server lines), if a field name is not a plain identifier, or if a value has no
+            SurrealDB form (an ``int`` beyond 64 bits, a negative duration…).
+        TypeError: If a value is of a type SurrealDB cannot store (a ``time``).
     """
     if not merged:
         raise ValueError("build_set_clause() needs at least one field: an empty SET clause is invalid SurrealQL.")
@@ -202,7 +207,7 @@ def build_set_clause(merged: Mapping[str, Any], param_prefix: str = "_sv_") -> t
         else:
             var_name = f"{param_prefix}{field}"
             parts.append(f"{field} = ${var_name}")
-            variables[var_name] = value
+            variables[var_name] = encode_wire(value, stored=True)
     return ", ".join(parts), variables
 
 
@@ -222,11 +227,17 @@ def merge_extra_vars(
     overwriting it. ``reserved`` additionally rejects names the statement owns but may not
     have bound on this particular branch, so validation does not vary by code path.
 
+    The ``extra_vars`` values feed the expressions of a write, so they are encoded like the
+    written values (:func:`~surreal_orm_lite.wire.encode_wire`, ``stored=True``, v0.23.0): a
+    ``timedelta`` is sent as a duration, a ``date`` as midnight UTC.
+
     Returns:
         A new dict with both sets of bindings (``variables`` is left unmodified).
 
     Raises:
-        ValueError: If any ``extra_vars`` key collides with an internal or reserved binding.
+        ValueError: If any ``extra_vars`` key collides with an internal or reserved binding, or a
+            value has no SurrealDB form.
+        TypeError: If a value is of a type SurrealDB cannot store (a ``time``).
     """
     if not extra_vars:
         return dict(variables)
@@ -235,7 +246,7 @@ def merge_extra_vars(
         raise ValueError(
             f"extra_vars keys collide with internal query bindings: {conflicting}. Rename them (e.g. add a suffix)."
         )
-    return {**variables, **extra_vars}
+    return {**variables, **{key: encode_wire(value, stored=True) for key, value in extra_vars.items()}}
 
 
 def validate_alias_name(alias: str) -> None:

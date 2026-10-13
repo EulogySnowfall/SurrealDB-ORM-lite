@@ -44,6 +44,7 @@ from .utils import (
     validate_thing,
     warn_on_multiple_statements,
 )
+from .wire import encode_wire, field_input, restore_native, rich_kinds
 
 if TYPE_CHECKING:
     from .edge import BaseSurrealEdge
@@ -58,6 +59,14 @@ _E = TypeVar("_E", bound="BaseSurrealEdge")
 # object, which is what makes them inheritance-correct — a subclass gets its own entry.
 _ALIAS_MAPS: dict[type, tuple[dict[str, str], dict[str, str]]] = {}
 _SERVER_FIELDS: dict[type, frozenset[str]] = {}
+# v0.23.0: input key (field name, column, string ``validation_alias``) → ``(annotation, deep kinds,
+# shallow kinds)`` of the fields whose annotation holds a rich type (``wire.rich_kinds``).
+_RICH_FIELDS: dict[type, dict[str, tuple[Any, frozenset[str], frozenset[str]]]] = {}
+
+# The rich kinds ``set_data`` converts before validation: the SDK forms Pydantic cannot validate
+# into these types (an SDK ``Duration``, an SDK ``Datetime``, a SurrealQL duration string).
+# ``Duration``, ``Range[T]`` and the other kinds validate the SDK forms themselves.
+_INPUT_KINDS = frozenset({"timedelta", "datetime", "date"})
 
 # Pydantic's metaclass sits between ``__pydantic_init_subclass__`` and the user's ``class``
 # statement; a warning raised there must skip its frames to land on the user's line (v0.22.0).
@@ -437,6 +446,57 @@ class BaseSurrealModel(BaseModel):
         return {cls.to_db_field(key): value for key, value in data.items()}
 
     @classmethod
+    def _wire_columns(cls, data: Mapping[str, Any] | None) -> dict[str, Any]:
+        """Re-key a Python-named mapping to its columns and encode its values for a write (v0.23.0).
+
+        :meth:`_columns_for`, then :func:`~surreal_orm_lite.wire.encode_wire` with ``stored=True``:
+        a ``timedelta``/``Duration`` becomes a duration, a ``date`` midnight UTC, a ``Range`` a range,
+        a ``set`` an array, a ``Decimal`` a fixed-point decimal — forms both server lines accept.
+        Used where a write payload comes from keyword arguments (``merge(**data)``,
+        ``server_values=``) rather than from the instance (:meth:`_write_payload`).
+
+        Raises:
+            ValueError: a value no SurrealDB type can hold (an ``int`` beyond 64 bits, a negative
+                duration…), before anything is sent.
+            TypeError: a value of a type SurrealDB has no form for (a ``time``).
+        """
+        columns: dict[str, Any] = encode_wire(cls._columns_for(data), stored=True)
+        return columns
+
+    @classmethod
+    def _rich_fields(cls) -> dict[str, tuple[Any, frozenset[str], frozenset[str]]]:
+        """Return this model's fields that hold a rich type, by every key a row may use (v0.23.0).
+
+        ``{key: (annotation, deep_kinds, shallow_kinds)}``, cached per class like
+        :meth:`_alias_maps`. ``deep_kinds`` is :func:`~surreal_orm_lite.wire.rich_kinds` of the
+        annotation (nested models entered), ``shallow_kinds`` the same without entering nested
+        models. Only fields with at least one kind are listed, each under its Python name, its
+        column (``Field(alias=…)``, ``in`` for an edge's ``in_``) and a string ``validation_alias``;
+        a Python name wins over an alias spelled the same. The annotation is
+        ``model_fields[name].annotation``, resolved by Pydantic (PEP 649-safe).
+
+        The columns are read here rather than through :meth:`_alias_maps`, whose ambiguity check
+        belongs to the write paths: validating an instance must not start raising it.
+        """
+        cached = _RICH_FIELDS.get(cls)
+        if cached is None:
+            implicit = cls._implicit_aliases()
+            entries: dict[str, tuple[Any, frozenset[str], frozenset[str]]] = {}
+            by_alias: dict[str, tuple[Any, frozenset[str], frozenset[str]]] = {}
+            for name, info in cls.model_fields.items():
+                deep = rich_kinds(info.annotation)
+                if not deep:
+                    continue
+                entry = (info.annotation, deep, rich_kinds(info.annotation, into_models=False))
+                entries[name] = entry
+                for alias in (implicit.get(name), info.alias, info.validation_alias):
+                    if isinstance(alias, str):
+                        by_alias.setdefault(alias, entry)
+            cached = {**by_alias, **entries}
+            _RICH_FIELDS[cls] = cached
+        return cached
+
+    @classmethod
     def _py_fields(cls, payload: Mapping[str, Any]) -> list[str]:
         """Name a column-keyed payload's fields the way a signal handler expects them.
 
@@ -580,6 +640,15 @@ class BaseSurrealModel(BaseModel):
         """
         Pre-process data before model validation.
         Extracts the ID from RecordID if present, unless the field accepts RecordID natively.
+
+        Then (v0.23.0) converts the SDK forms Pydantic cannot validate, only where a field's
+        annotation asks for them (:func:`~surreal_orm_lite.wire.field_input`): an SDK
+        ``Duration`` or a SurrealQL duration string (``"1h30m"``) at a ``timedelta`` position
+        becomes a ``timedelta`` (floored to the microsecond), an SDK ``Datetime`` at a
+        ``datetime``/``date`` position its ISO text. ``Any``, ``Duration`` and other positions keep
+        their values. Every hydration path runs through here, and so does the constructor. These
+        conversions work on a copy of the dict, made on the first change, so they never mutate
+        the caller's dict. A value beyond ``timedelta.max`` is a ``ValidationError``.
         """
         if isinstance(data, dict) and "id" in data and isinstance(data["id"], RecordID):
             # Only convert to plain string when the id field does not accept RecordID.
@@ -595,7 +664,31 @@ class BaseSurrealModel(BaseModel):
                 # which yields the SurrealQL-escaped form (e.g. "⟨1⟩") for numeric-looking
                 # or special string ids.
                 data["id"] = str(data["id"].id)
+        if isinstance(data, dict):
+            data = cls._convert_rich_inputs(data)
         return data
+
+    @classmethod
+    def _convert_rich_inputs(cls, data: dict[Any, Any]) -> dict[Any, Any]:
+        """``set_data``'s rich-type pass: ``field_input`` on each value whose field needs it (v0.23.0).
+
+        Only the keys naming a field whose deep kinds include ``timedelta``, ``datetime`` or
+        ``date`` (:meth:`_rich_fields`). Copy-on-write: ``data`` itself when nothing changes.
+        """
+        rich = cls._rich_fields()
+        if not rich:
+            return data
+        converted: dict[Any, Any] | None = None
+        for key, value in data.items():
+            entry = rich.get(key)
+            if entry is None or not entry[1] & _INPUT_KINDS:
+                continue
+            new = field_input(entry[0], value)
+            if new is not value:
+                if converted is None:
+                    converted = dict(data)
+                converted[key] = new
+        return data if converted is None else converted
 
     async def refresh(self, tx: Transaction | None = None) -> None:
         """Refresh the model instance from the database.
@@ -667,11 +760,26 @@ class BaseSurrealModel(BaseModel):
                 Only ``*_or_create`` passes it: there the name came from the lookup or from
                 ``defaults``, and omitting it would create a row the same lookup cannot find.
                 A computed field listed here is still excluded.
+
+        Values (v0.23.0) leave in forms both server lines accept: the SDK values an untyped
+        position holds (an SDK ``Duration`` or ``Range`` in a ``dict[str, Any]`` field, an
+        ``extra="allow"`` column…), which ``model_dump()`` flattens into dicts, are put back
+        (:func:`~surreal_orm_lite.wire.restore_native`), then every value is encoded
+        (:func:`~surreal_orm_lite.wire.encode_wire`, ``stored=True``): a ``timedelta``/``Duration``
+        becomes a duration, a ``date`` midnight UTC, a ``Range`` a range, a ``set`` a sorted array,
+        a ``Decimal`` a fixed-point decimal.
+
+        Raises:
+            ValueError: a value no SurrealDB type can hold (an ``int`` beyond 64 bits, a decimal
+                beyond its range, a negative duration…), before anything is sent.
+            TypeError: a value of a type SurrealDB has no form for (a ``time``).
         """
         excluded = {"id", *self.get_computed_fields()}
         if not replace:
             excluded |= self.get_server_fields() - set(keep)
-        return self._columns_for(self.model_dump(exclude=excluded))
+        dumped = restore_native(self.model_dump(exclude=excluded), self)
+        payload: dict[str, Any] = encode_wire(self._columns_for(dumped), stored=True)
+        return payload
 
     @classmethod
     def _is_write_protected(cls, name: str) -> bool:
@@ -970,7 +1078,7 @@ class BaseSurrealModel(BaseModel):
         # _write_payload() is already column-keyed; server_values arrive under Python names, so
         # they are translated here — otherwise an aliased field would compile a SET against a
         # column that does not exist.
-        merged: dict[str, Any] = {**self._write_payload(), **self._columns_for(server_values)}
+        merged: dict[str, Any] = {**self._write_payload(), **self._wire_columns(server_values)}
         clause, variables = build_set_clause(merged)
 
         if record_id is not None:
@@ -1354,7 +1462,7 @@ class BaseSurrealModel(BaseModel):
             raise SurrealDbError(f"No Id for the data to merge: {data}")
 
         # Columns on the wire, Python names in the signal payload and the local apply below.
-        merged: dict[str, Any] = {**self._columns_for(data), **self._columns_for(server_values)}
+        merged: dict[str, Any] = {**self._wire_columns(data), **self._wire_columns(server_values)}
         clause, variables = build_set_clause(merged)
         variables["rid"] = record_id
         variables = merge_extra_vars(variables, extra_vars)
@@ -1445,9 +1553,10 @@ class BaseSurrealModel(BaseModel):
 
         sender = self.__class__
         data_set = dict(data.items())
-        # Keyword arguments name Python fields; the MERGE payload names columns. Everything
-        # that stays on this side of the wire — signals, the local apply — keeps `data_set`.
-        wire_data = self._columns_for(data_set)
+        # Keyword arguments name Python fields; the MERGE payload names columns, its values
+        # encoded for the wire (v0.23.0). Everything that stays on this side of the wire —
+        # signals, the local apply — keeps `data_set`.
+        wire_data = self._wire_columns(data_set)
         record_id = self._record_id()
 
         if record_id is None:

@@ -5,6 +5,7 @@ wire form are suffixed ``E2E``.
 """
 
 import copy
+import dataclasses
 import enum
 import inspect
 import json
@@ -48,6 +49,7 @@ from surreal_orm_lite.wire import (
     duration_ns,
     encode_wire,
     field_input,
+    restore_native,
     rich_kinds,
     sdk_decodes_zero_duration,
 )
@@ -1453,6 +1455,197 @@ class TestSdkCanaries:
             "the SDK now encodes Duration correctly (tag 14): expected on an SDK bump — encode_wire stays "
             "correct; update this canary and open the clean-up issue (spec §12 item 2)"
         )
+
+
+# --- restore_native and model inputs (spec §5.3, §5.4 set_data) ---------------------------------
+
+
+@dataclasses.dataclass
+class _PlainPoint:
+    """A dataclass that is not the SDK's: its dump stays a dict."""
+
+    x: int
+
+
+class _Loose(BaseModel):
+    """Untyped positions: ``model_dump()`` flattens the SDK dataclasses they hold (spec §2.9)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    meta: dict[str, Any] = {}
+    items: list[Any] = []
+    pair: tuple[Any, ...] = ()
+    child: "_Loose | None" = None
+    note: str = ""
+
+
+_Loose.model_rebuild()
+
+
+class TestRestoreNative:
+    def test_sdk_duration_replaces_its_dump(self) -> None:
+        raw = surrealdb.Duration(5)
+        dumped = {"x": {"elapsed": 5}}
+        result = restore_native(dumped, {"x": raw})
+        assert result == {"x": raw}
+        assert result["x"] is raw
+        assert dumped == {"x": {"elapsed": 5}}  # the dump is not mutated
+
+    def test_sdk_ranges_and_bounds_keep_inclusivity(self) -> None:
+        closed = SdkRange(BoundIncluded(1), BoundIncluded(5))
+        half_open = SdkRange(None, BoundExcluded(5))
+        bound = BoundExcluded(3)
+        loose = _Loose(meta={"win": closed, "open": half_open, "bound": bound})
+        dumped = loose.model_dump()
+        assert dumped["meta"]["win"] == {"begin": {"value": 1}, "end": {"value": 5}}  # what Pydantic does
+        result = restore_native(dumped, loose)
+        assert result["meta"]["win"] is closed
+        assert result["meta"]["open"] is half_open
+        assert result["meta"]["bound"] is bound
+
+    def test_list_and_tuple_positions(self) -> None:
+        first, second = surrealdb.Duration(1), surrealdb.Duration(2)
+        loose = _Loose(items=["a", first, {"d": second}], pair=(second, 7))
+        result = restore_native(loose.model_dump(), loose)
+        assert result["items"][0] == "a"
+        assert result["items"][1] is first
+        assert result["items"][2]["d"] is second
+        assert type(result["pair"]) is tuple
+        assert result["pair"][0] is second
+        assert result["pair"][1] == 7
+
+    def test_nested_model_raw_against_dict_dump(self) -> None:
+        inner = surrealdb.Duration(500)
+        loose = _Loose(child=_Loose(meta={"x": inner}, note="c"))
+        dumped = loose.model_dump()
+        assert dumped["child"]["meta"]["x"] == {"elapsed": 500}
+        result = restore_native(dumped, loose)
+        assert result["child"]["meta"]["x"] is inner
+        assert result["child"]["note"] == "c"
+
+    def test_extra_columns(self) -> None:
+        raw = surrealdb.Duration(5400 * 10**9)
+        span = SdkRange(BoundIncluded(1), BoundExcluded(5))
+        loose = _Loose.model_validate({"wait": raw, "span": span})
+        result = restore_native(loose.model_dump(), loose)
+        assert result["wait"] is raw
+        assert result["span"] is span
+
+    def test_other_values_keep_their_dump(self) -> None:
+        # A dataclass that is not the SDK's, and the ORM's Duration (not a dataclass, kept by the dump).
+        point = _PlainPoint(1)
+        orm = Duration(7)
+        loose = _Loose(meta={"p": point, "d": orm, "rid": RecordID("t", 1)})
+        dumped = loose.model_dump()
+        result = restore_native(dumped, loose)
+        assert result["meta"]["p"] == {"x": 1}
+        assert result["meta"]["d"] is dumped["meta"]["d"]
+        assert result["meta"]["rid"] == RecordID("t", 1)
+
+    @pytest.mark.parametrize(
+        ("dumped", "raw"),
+        [
+            ({"x": [1, {"elapsed": 5}]}, {"x": {"0": 1}}),  # list dump, dict raw
+            ({"x": {"elapsed": 5}}, {"x": [surrealdb.Duration(5)]}),  # dict dump, list raw
+            ({"x": [{"elapsed": 5}]}, {"x": [surrealdb.Duration(5), 2]}),  # lengths differ
+            ({"x": [{"elapsed": 5}]}, {"x": {surrealdb.Duration(5).elapsed}}),  # a set: no positions
+            ({"x": {"elapsed": 5}}, {"y": surrealdb.Duration(5)}),  # key missing from raw
+            ({"x": {"elapsed": 5}}, "not a container"),
+        ],
+        ids=["list-vs-dict", "dict-vs-list", "length", "set", "missing-key", "scalar"],
+    )
+    def test_mismatched_shapes_keep_the_dump(self, dumped: Any, raw: Any) -> None:
+        assert restore_native(dumped, raw) is dumped
+
+    def test_copy_on_write(self) -> None:
+        loose = _Loose(meta={"a": 1}, items=[1, 2], note="n")
+        dumped = loose.model_dump()
+        assert restore_native(dumped, loose) is dumped
+        raw = surrealdb.Duration(5)
+        changed = _Loose(meta={"a": 1, "d": raw}, items=[1, 2])
+        dumped = changed.model_dump()
+        before = copy.deepcopy(dumped)
+        result = restore_native(dumped, changed)
+        assert result is not dumped
+        assert result["items"] is dumped["items"]  # untouched branches are shared
+        assert dumped == before
+
+
+class TestConstructorInputs:
+    """``set_data`` runs ``field_input`` on every validation, the constructor included (spec §5.4)."""
+
+    def test_duration_strings_and_sdk_values_become_timedeltas(self) -> None:
+        from tests.test_rich_fields import RfEvent
+
+        ev = RfEvent(ttl="1h30m", ttls=["1h", surrealdb.Duration(1000)])  # type: ignore[arg-type]
+        assert ev.ttl == timedelta(hours=1, minutes=30)
+        assert type(ev.ttl) is timedelta
+        assert ev.ttls == [timedelta(hours=1), timedelta(microseconds=1)]
+
+    def test_sdk_duration_is_floored_to_the_microsecond(self) -> None:
+        from tests.test_rich_fields import RfEvent
+
+        data = {"ttl": surrealdb.Duration(5400 * 10**9 + 1), "ttls": [surrealdb.Duration(1999)]}
+        before = copy.deepcopy(data)
+        ev = RfEvent.model_validate(data)
+        assert ev.ttl == timedelta(hours=1, minutes=30)
+        assert ev.ttls == [timedelta(microseconds=1)]
+        assert data == before  # the caller's dict is never mutated
+        assert type(data["ttl"]) is surrealdb.Duration
+
+    def test_invalid_duration_text_is_a_validation_error(self) -> None:
+        from tests.test_rich_fields import RfEvent
+
+        with pytest.raises(ValidationError):
+            RfEvent(ttl="1.5h")  # type: ignore[arg-type]
+
+    def test_duration_beyond_timedelta_is_a_validation_error(self) -> None:
+        from tests.test_rich_fields import RfEvent
+
+        with pytest.raises(ValidationError, match="Duration"):
+            RfEvent.model_validate({"ttl": surrealdb.Duration(MAX_NS)})
+
+    def test_sdk_datetime_keeps_microseconds(self) -> None:
+        from tests.test_rich_fields import RfEvent
+
+        ev = RfEvent(at=surrealdb.Datetime("2026-01-02T03:04:05.123456789Z"))  # type: ignore[arg-type]
+        assert type(ev.at) is datetime
+        assert ev.at == datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC)
+
+    def test_duration_field_keeps_nanoseconds(self) -> None:
+        from tests.test_rich_fields import RfEvent
+
+        ev = RfEvent.model_validate({"grace": surrealdb.Duration(5400 * 10**9 + 1)})
+        assert type(ev.grace) is Duration
+        assert ev.grace.elapsed == 5400 * 10**9 + 1
+
+    def test_aliased_column_is_converted(self) -> None:
+        from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict
+
+        class _AliasedTtl(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_alias_unit")
+
+            id: str | None = None
+            ttl: timedelta | None = Field(None, alias="ttl_col")
+
+        assert _AliasedTtl.model_validate({"ttl_col": surrealdb.Duration(60 * 10**9)}).ttl == timedelta(minutes=1)
+        assert _AliasedTtl.from_db({"ttl_col": "2h"}).ttl == timedelta(hours=2)  # type: ignore[union-attr]
+        assert _AliasedTtl.model_validate({"ttl": "3h"}).ttl == timedelta(hours=3)  # the Python name too
+
+        class _ValidationAliasedTtl(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_valias_unit")
+
+            id: str | None = None
+            ttl: timedelta | None = Field(None, validation_alias="ttl_in")
+
+        assert _ValidationAliasedTtl.model_validate({"ttl_in": "1h"}).ttl == timedelta(hours=1)
+
+    def test_record_id_handling_is_unchanged(self) -> None:
+        from tests.test_rich_fields import RfEvent
+
+        ev = RfEvent.from_db({"id": RecordID("rf_event", "x"), "ttl": surrealdb.Duration(60 * 10**9)})
+        assert ev.id == "x"  # type: ignore[union-attr]
+        assert ev.ttl == timedelta(minutes=1)  # type: ignore[union-attr]
 
 
 # --- raw SDK E2E: what both server lines do with each encoded form (AC-6, AC-29, AC-32 b) ---------

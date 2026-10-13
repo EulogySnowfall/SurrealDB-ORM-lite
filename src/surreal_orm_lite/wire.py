@@ -21,10 +21,14 @@ This module converts them, **only where the annotation asks for it**:
   rounds it, so the stored value never moves.
 - ``sdk_decodes_zero_duration()`` — whether the installed SDK can read a zero duration back (a local
   probe, no server).
+- ``restore_native(dumped, raw)`` — puts back, into a ``model_dump()``, the SDK values (``Duration``,
+  ``Range``…) an untyped position held and the dump flattened into plain dicts, so a write sends
+  them natively.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from collections.abc import Callable, Mapping, MutableMapping, MutableSequence, MutableSet, Sequence
 from collections.abc import Set as AbstractSet
@@ -60,6 +64,7 @@ __all__ = [
     "duration_ns",
     "encode_wire",
     "field_input",
+    "restore_native",
     "rich_kinds",
     "sdk_decodes_zero_duration",
 ]
@@ -601,3 +606,79 @@ def encode_wire(value: Any, *, stored: bool) -> Any:
     if isinstance(value, Mapping):
         return {key: encode_wire(item, stored=stored) for key, item in value.items()}
     return value
+
+
+# --- restore_native (spec §5.3) -----------------------------------------------------------------
+
+_MISSING = object()
+
+
+def _is_sdk_dataclass(value: object) -> bool:
+    """Whether ``value`` is an instance of a dataclass the ``surrealdb`` package defines.
+
+    The SDK's ``Duration``, ``Range``, ``BoundIncluded``/``BoundExcluded`` and geometries: the values
+    ``model_dump()`` flattens into plain dicts at an untyped position. The ORM's ``Duration`` and
+    ``Range`` are not dataclasses (the dump keeps them), nor are ``RecordID`` and ``Datetime``.
+    """
+    return dataclasses.is_dataclass(value) and not isinstance(value, type) and type(value).__module__.startswith("surrealdb.")
+
+
+def _raw_item(raw: Any, key: Any) -> Any:
+    """The value under ``key`` in ``raw`` (a model: a field by name, else an extra), or ``_MISSING``."""
+    if isinstance(raw, BaseModel):
+        if isinstance(key, str) and key in type(raw).model_fields:
+            return getattr(raw, key)
+        extra = raw.__pydantic_extra__
+        if extra is not None and key in extra:
+            return extra[key]
+        return _MISSING
+    if key in raw:
+        return raw[key]
+    return _MISSING
+
+
+def restore_native(dumped: Any, raw: Any) -> Any:
+    """``dumped`` with the SDK values of ``raw`` put back where ``model_dump()`` flattened them.
+
+    ``model_dump()`` turns a dataclass found at an untyped position (a ``dict[str, Any]`` or
+    ``list[Any]`` field, an ``extra="allow"`` column, the ``Any`` part of a nested model) into a plain
+    dict: an SDK ``Duration`` loaded from the database becomes ``{"elapsed": 5400000000000}``, an SDK
+    ``Range`` ``{"begin": {"value": 1}, "end": …}``, and a write would store those objects instead of
+    the duration and the range. This walks the dump and the instance's own values (``raw``) in
+    parallel (spec §5.3):
+
+    - where the raw value is an instance of a dataclass from the ``surrealdb`` package, the raw value
+      replaces its dump;
+    - a dict dump recurses by key into a raw mapping, or into a raw Pydantic model by field name, then
+      its extras (``__pydantic_extra__``);
+    - a list or tuple dump recurses by position into a raw list or tuple of the same length, and keeps
+      its own container type;
+    - anything else keeps the dump: a dataclass that is not the SDK's, the ORM's ``Duration``/``Range``
+      (not dataclasses: the dump keeps them as they are), mismatched shapes, a key missing from
+      ``raw``, a raw ``set`` (no positions).
+
+    Copy-on-write: when nothing changes, ``dumped`` itself is returned; otherwise new containers along
+    the changed paths only (untouched branches are shared). Neither argument is mutated.
+    """
+    if _is_sdk_dataclass(raw):
+        return raw
+    if isinstance(dumped, dict):
+        if not isinstance(raw, (BaseModel, Mapping)):
+            return dumped
+        result: dict[Any, Any] | None = None
+        for key, item in dumped.items():
+            raw_item = _raw_item(raw, key)
+            if raw_item is _MISSING:
+                continue
+            new = restore_native(item, raw_item)
+            if new is not item:
+                if result is None:
+                    result = dict(dumped)
+                result[key] = new
+        return dumped if result is None else result
+    if isinstance(dumped, (list, tuple)) and isinstance(raw, (list, tuple)) and len(dumped) == len(raw):
+        items = [restore_native(item, raw_item) for item, raw_item in zip(dumped, raw, strict=True)]
+        if all(new is old for new, old in zip(items, dumped, strict=True)):
+            return dumped
+        return items if isinstance(dumped, list) else tuple(items)
+    return dumped
