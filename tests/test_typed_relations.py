@@ -73,7 +73,10 @@ instance or the QuerySet, the ``atomic_*`` helpers, ``bulk_update()``, ``update_
 relate — instances, record ids and ``"table:id"`` strings converge on one row — and
 ``update_or_create`` changes the data, never the endpoints. SurrealDB's own idempotency holds through
 the ORM: a deterministic array id raises "already exists" on a second save, a ``UNIQUE`` index on
-``in, out`` "already contains" on a second relate (the reverse pair is another edge).
+``in, out`` "already contains" on a second relate (the reverse pair is another edge). An array-id
+edge is updated and deleted inside a transaction like any other — ``update(tx=)`` and
+``delete(tx=)`` bind the id as ``$rid`` instead of writing ``tr_follows:[RecordID(…), …]`` into the
+statement, a parse error that failed the whole transaction.
 
 Live queries and change feeds on edge tables (spec §2.5, §4.7): ``live()`` (full and diff) and
 ``changes()`` yield typed edges, and a live filter on an endpoint — a node instance, a ``RecordID``
@@ -116,7 +119,9 @@ from surreal_orm_lite import (
     Var,
     computed,
     post_save,
+    pre_delete,
     pre_save,
+    pre_update,
 )
 from surreal_orm_lite.changefeed import feed_events
 from surreal_orm_lite.enum import LiveAction
@@ -1266,6 +1271,39 @@ class TestEdgeTransactionStatements:
         with pytest.raises(ValueError, match="belongs to table 'other'"):
             await TrPurchased(id=RecordID("other", "x"), in_=ALICE_P, out=WIDGET).save(tx=tx)
         assert tx.statements == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("with_signals", [False, True])
+    async def test_update_and_delete_bind_the_record_id(self, with_signals: bool) -> None:
+        """``update(tx=)`` and ``delete(tx=)`` bind the id as ``$rid``, with or without signal handlers.
+
+        Interpolated, an array id reads ``tr_follows:[RecordID(table_name=…), …]``: a parse error
+        that fails the whole transaction (spec §2.9: the deterministic array id of an idempotent edge).
+        """
+        pair = RecordID("tr_follows", [ALICE_P, BOB_P])
+
+        async def on_pre(sender: Any, instance: Any, **kwargs: Any) -> None:
+            return None
+
+        if with_signals:
+            pre_update.connect(TrFollows)(on_pre)
+            pre_delete.connect(TrFollows)(on_pre)
+        try:
+            tx = BufferedTransaction()
+            edge = TrFollows(id=pair, in_=ALICE_P, out=BOB_P, weight=4)
+            await edge.update(tx=tx)
+            await edge.delete(tx=tx)
+        finally:
+            if with_signals:
+                pre_update.disconnect(on_pre, TrFollows)
+                pre_delete.disconnect(on_pre, TrFollows)
+
+        assert tx.statements == ["UPDATE $t0_rid CONTENT $t0_data;", "DELETE $t1_rid;"]
+        assert tx.variables == {
+            "t0_rid": pair,
+            "t0_data": {"in": ALICE_P, "out": BOB_P, "weight": 4},
+            "t1_rid": pair,
+        }
 
 
 class TestEdgeTransactionsE2E:
@@ -3181,6 +3219,65 @@ class TestNativeIdempotencyE2E:
 
             stored = await _stored(client, "tr_follows")
             assert [(row["id"], row["weight"]) for row in stored] == [(pair, 1)]
+
+    @pytest.mark.asyncio
+    async def test_array_id_edge_update_and_delete_in_interactive_tx(self) -> None:
+        """An array-id edge is updated and deleted inside an interactive transaction (WebSocket + 3.x).
+
+        The id is bound (``$rid``), never written into the statement, where an array id is a parse
+        error that fails the whole transaction.
+        """
+        async with orm_client(*EDGE_TABLES) as client:
+            if not await _native_txn_supported():
+                pytest.skip("requires SurrealDB 3.x native transactions")
+            await _nodes()
+            pair = RecordID("tr_follows", [ALICE_P, BOB_P])
+            edge = await TrFollows(id=pair, in_=ALICE_P, out=BOB_P, weight=1).save()
+
+            edge.weight = 5
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert tx.is_interactive
+                await edge.update(tx=tx)
+                seen = await TrFollows.objects(tx=tx).filter(in_=ALICE_P).exec()
+                assert [(e.id, e.weight) for e in seen] == [(pair, 5)]
+            stored = await _stored(client, "tr_follows")
+            assert [(row["id"], row["in"], row["out"], row["weight"]) for row in stored] == [(pair, ALICE_P, BOB_P, 5)]
+            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
+
+            with pytest.raises(RuntimeError, match="roll back"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await edge.delete(tx=tx)
+                    assert await TrFollows.objects(tx=tx).count() == 0
+                    raise RuntimeError("roll back")
+            assert [row["id"] for row in await _stored(client, "tr_follows")] == [pair]
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await edge.delete(tx=tx)
+            assert await _stored(client, "tr_follows") == []
+            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == []
+
+    @pytest.mark.asyncio
+    async def test_array_id_edge_update_and_delete_in_buffered_tx(self) -> None:
+        """An array-id edge is updated and deleted inside a buffered transaction (HTTP, both lines)."""
+        async with http_orm_client(*EDGE_TABLES) as client:
+            await _nodes()
+            pair = RecordID("tr_follows", [ALICE_P, BOB_P])
+            edge = await TrFollows(id=pair, in_=ALICE_P, out=BOB_P, weight=1).save()
+
+            edge.weight = 5
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert not tx.is_interactive
+                await edge.update(tx=tx)
+                assert [row["weight"] for row in await _stored(client, "tr_follows")] == [1]  # queued, not run
+            stored = await _stored(client, "tr_follows")
+            assert [(row["id"], row["in"], row["out"], row["weight"]) for row in stored] == [(pair, ALICE_P, BOB_P, 5)]
+            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
+
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await edge.delete(tx=tx)
+                assert [row["id"] for row in await _stored(client, "tr_follows")] == [pair]  # queued, not run
+            assert await _stored(client, "tr_follows") == []
+            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == []
 
     @pytest.mark.asyncio
     async def test_unique_in_out_index_second_relate_raises(self) -> None:

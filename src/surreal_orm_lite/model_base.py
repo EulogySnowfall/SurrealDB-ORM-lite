@@ -1281,7 +1281,9 @@ class BaseSurrealModel(BaseModel):
         Update the model instance to the database.
 
         When ``tx`` is provided, the UPDATE statement is buffered onto the
-        transaction instead of being executed immediately.
+        transaction instead of being executed immediately. The record id is bound
+        (``$rid``), never written into the statement, so every id shape works —
+        an array id such as ``follows:[User:alice, User:bob]`` included.
 
         Emits pre_update, post_update, and around_update signals. In tx mode,
         ``around_update`` is skipped (the write is deferred to commit) and
@@ -1296,12 +1298,13 @@ class BaseSurrealModel(BaseModel):
         has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
 
         if tx is not None:
+            variables = {"rid": record_id, "data": data}
             if not has_signals:
-                await tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
+                await tx.add("UPDATE $rid CONTENT $data;", variables)
                 return None
             update_fields = self._py_fields(data)
             await pre_update.send(sender, instance=self, update_fields=update_fields)
-            await tx.add(f"UPDATE {record_id} CONTENT $data;", {"data": data})
+            await tx.add("UPDATE $rid CONTENT $data;", variables)
             tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
             return None
 
@@ -1616,7 +1619,9 @@ class BaseSurrealModel(BaseModel):
         Delete the model instance from the database.
 
         When ``tx`` is provided, the DELETE statement is buffered onto the
-        transaction instead of being executed immediately.
+        transaction instead of being executed immediately. The record id is bound
+        (``$rid``), never written into the statement, so every id shape works —
+        an array id such as ``follows:[User:alice, User:bob]`` included.
 
         Emits pre_delete, post_delete, and around_delete signals. In tx mode,
         ``around_delete`` is skipped (the write is deferred to commit) and
@@ -1631,10 +1636,10 @@ class BaseSurrealModel(BaseModel):
 
         if tx is not None:
             if not has_signals:
-                await tx.add(f"DELETE {record_id};", None)
+                await tx.add("DELETE $rid;", {"rid": record_id})
                 return None
             await pre_delete.send(sender, instance=self)
-            await tx.add(f"DELETE {record_id};", None)
+            await tx.add("DELETE $rid;", {"rid": record_id})
             tx.enqueue_post_commit(lambda: post_delete.send(sender, instance=self))
             return None
 
