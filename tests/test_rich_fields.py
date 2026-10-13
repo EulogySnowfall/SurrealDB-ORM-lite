@@ -33,6 +33,7 @@ import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
@@ -60,7 +61,7 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite.wire import encode_wire, sdk_decodes_zero_duration
 from tests.conftest import orm_client
-from tests.test_rich_types import _server_version
+from tests.test_rich_types import _http_client, _server_version
 
 # ==================== Shared models and values ====================
 
@@ -1613,3 +1614,120 @@ class TestRichLiveCompile:
         for subscribe in (qs.live, qs.watch):
             with pytest.raises(TypeError, match=rf"\$_f0: Cannot inline .*range bound.*{named}"):
                 subscribe()
+
+
+# ==================== Upgrading from v0.22 (AC-27) ====================
+
+# The README's statements, character for character (table and column aside): the unit check below
+# finds the ``event``/``at`` instance of both templates in README section 24, and the E2E test runs them.
+UPGRADE_SELECT = "SELECT id, {col} FROM {table} WHERE {col}.is_string();"
+UPGRADE_UPDATE = "UPDATE (SELECT VALUE id FROM {table} WHERE {col}.is_string()) SET {col} = <{cast}> {col};"
+UPGRADE_COLUMNS = [("at", "datetime"), ("day", "datetime"), ("token", "uuid"), ("price", "decimal"), ("ttl", "duration")]
+UPGRADE_SENTENCE = (
+    "SurrealDB runs each statement in its own transaction: a value the cast cannot read makes its `UPDATE` "
+    "report an error and convert nothing in that column, while the statements for the other columns still run. "
+    "Fix or clear that value, then run the statements again. They only touch values still stored as strings, "
+    "so re-running is safe."
+)
+_UPGRADE_PIN = (
+    "SurrealDB no longer rolls back a failing UPDATE statement: update README section 24 "
+    "'Upgrading from v0.22' and the CHANGELOG note"
+)
+_UPGRADE_SEED = (
+    "REMOVE TABLE IF EXISTS rf_upg;",
+    "CREATE rf_upg:1 SET at = '2026-01-02T03:04:05Z', day = '2026-01-02', "
+    "token = '0190c3d1-5c3b-7cc6-8f8a-2d2b1f0e9a11', price = '1.50', ttl = '1h30m';",
+    "CREATE rf_upg:2 SET at = d'2026-01-02T03:04:05Z', day = d'2026-01-02T00:00:00Z', "
+    "token = u'0190c3d1-5c3b-7cc6-8f8a-2d2b1f0e9a11', price = 1.50dec, ttl = 1h30m;",
+    "CREATE rf_upg:3 SET note = 'x';",
+    "CREATE rf_upg:4 SET at = 'yesterday';",
+)
+
+
+async def _statement(client: Any, sql: str) -> dict[str, Any]:
+    """One statement through ``query_raw``: its ``status`` and ``result``, an ``ERR`` never raised."""
+    raw = await client.query_raw(sql)
+    (stmt,) = raw["result"]
+    assert isinstance(stmt, dict), f"{sql}: {raw!r}"
+    return stmt
+
+
+async def _ok(client: Any, sql: str) -> Any:
+    stmt = await _statement(client, sql)
+    assert stmt["status"] == "OK", f"{sql}: {stmt!r}"
+    return stmt["result"]
+
+
+async def _readme_statements(client: Any) -> tuple[list[Any], list[str]]:
+    """The README's statements as printed, one request each: the listed rows, then each ``UPDATE`` status."""
+    listed = await _ok(client, UPGRADE_SELECT.format(table="rf_upg", col="at"))
+    statuses = [
+        (await _statement(client, UPGRADE_UPDATE.format(table="rf_upg", col=col, cast=cast)))["status"]
+        for col, cast in UPGRADE_COLUMNS
+    ]
+    return listed, statuses
+
+
+def _record_keys(rows: list[dict[str, Any]]) -> list[tuple[str, Any]]:
+    """``(table, id)`` of each row, sorted: the record ids a raw ``SELECT`` returned."""
+    return sorted((row["id"].table_name, row["id"].id) for row in rows)
+
+
+class TestUpgradeFromV022E2E:
+    """README section 24, "Upgrading from v0.22": the one-off conversion of the strings v0.22's keyword
+    writes stored in rich fields (spec §2.12, §4.6; AC-27). The statements are the README's; the server's
+    per-statement rollback the README states is pinned (D15): a failing ``UPDATE`` converts nothing in its
+    column, the other columns' statements still run, and re-running after a fix converts the rest."""
+
+    def test_readme_prints_the_tested_statements(self) -> None:
+        text = " ".join((Path(__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8").split())
+        assert UPGRADE_SELECT.format(table="event", col="at") in text
+        assert UPGRADE_UPDATE.format(table="event", col="at", cast="datetime") in text
+        assert UPGRADE_SENTENCE in text
+
+    async def test_upgrade_statements_convert_v022_strings(self) -> None:
+        client = await _http_client()  # over HTTP: one aiohttp session per request, never closed (SDK 2.0.0)
+        try:
+            for sql in _UPGRADE_SEED:
+                await _ok(client, sql)
+
+            # First pass: the unreadable 'yesterday' makes the <datetime> UPDATE of `at` fail.
+            listed, statuses = await _readme_statements(client)
+            assert _record_keys(listed) == [("rf_upg", 1), ("rf_upg", 4)]
+            assert statuses == ["ERR", "OK", "OK", "OK", "OK"]
+            assert await _ok(client, "SELECT VALUE at FROM ONLY rf_upg:4;") == "yesterday"
+            still_strings = await _ok(client, "SELECT id FROM rf_upg WHERE at.is_string();")
+            assert _record_keys(still_strings) == [("rf_upg", 1), ("rf_upg", 4)], _UPGRADE_PIN
+            row1 = await _ok(client, "SELECT * FROM ONLY rf_upg:1;")
+            assert (type(row1["at"]), type(row1["day"]), type(row1["token"]), type(row1["price"]), type(row1["ttl"])) == (
+                str,
+                datetime,
+                UUID,
+                Decimal,
+                surrealdb.Duration,
+            ), _UPGRADE_PIN
+
+            # Fix the value (still a string), then run the README statements again, as printed.
+            await _ok(client, "UPDATE rf_upg:4 SET at = '2026-01-03T00:00:00Z';")
+            listed, statuses = await _readme_statements(client)
+            assert _record_keys(listed) == [("rf_upg", 1), ("rf_upg", 4)]
+            assert statuses == ["OK"] * len(UPGRADE_COLUMNS)
+
+            assert await _ok(client, "SELECT id FROM rf_upg WHERE at.is_string();") == []
+            rows = {row["id"].id: row for row in await _ok(client, "SELECT * FROM rf_upg;")}
+            assert sorted(rows) == [1, 2, 3, 4]
+            columns = [col for col, _ in UPGRADE_COLUMNS]
+            for n in (1, 2):  # the types the SDK decodes — never `x.is_datetime()`, true on an ISO string
+                row = rows[n]
+                assert type(row["at"]) is datetime
+                assert type(row["day"]) is datetime
+                assert row["day"] == datetime(2026, 1, 2, tzinfo=UTC)
+                assert type(row["token"]) is UUID
+                assert type(row["price"]) is Decimal
+                assert type(row["ttl"]) is surrealdb.Duration
+            assert [rows[1][col] for col in columns] == [rows[2][col] for col in columns]
+            assert set(rows[4]) == {"id", "at"}
+            assert rows[4]["at"] == datetime(2026, 1, 3, tzinfo=UTC)
+            assert set(rows[3]) == {"id", "note"}
+        finally:
+            await client.query_raw("REMOVE TABLE IF EXISTS rf_upg;")
