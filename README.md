@@ -2109,7 +2109,9 @@ await event.atomic_increment("day", timedelta(days=1))      # a date: whole days
 `signup()`/`signin()` of an `AuthenticatedUserMixin` model validate each value addressed to a rich
 field against the field's full annotation, constraints included, so `merge(ttl="2h")` stores a
 duration and sets `event.ttl` to `timedelta(hours=2)`, and `signin(badge="0190…")` matches the
-uuid a `UUID` identifier field holds. A value that
+uuid a `UUID` identifier field holds. A field typed with a sub-model that holds a rich type
+(`profile: Profile | None`, `list[Profile]`) takes a dict or an instance: it is validated into the
+sub-model, then stored as the object `save()` writes, a `date` inside it as a datetime. A value that
 does not fit raises `ValueError` naming the field, before anything is sent; `None` and
 `SurrealFunc` values are written as given. Before v0.23.0 such keyword values were stored as
 strings (see [Upgrading from v0.22](#upgrading-from-v022)).
