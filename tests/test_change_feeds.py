@@ -605,25 +605,45 @@ def _at_ms(ms: int) -> datetime:
     return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(milliseconds=ms)
 
 
-async def _feed_stamps(client: Any) -> list[int]:
-    """Every versionstamp in ``Fed``'s feed (the table is recreated per test, so it is short)."""
-    feed = await client.query(f"SHOW CHANGES FOR TABLE {TABLE} SINCE 0 LIMIT 1000;", {})
-    return [entry["versionstamp"] for entry in feed]
-
-
-async def _require_clock_stamps(client: Any, stamp: int) -> None:
-    """Capability probe: skip unless versionstamps are ``unix_ms << 16 | counter`` (SurrealDB 3.x).
-
-    2.x stamps a counter ``<< 16``, so ``stamp >> 16`` is nowhere near the server's clock there,
-    and ``since=None`` does not read the clock at all (it searches the counter).
-    """
+async def _server_ms(client: Any) -> int:
+    """The server clock's millisecond, the clock SurrealDB 3.x stamps its change feeds with."""
     now = await client.query("RETURN time::now();", {})
     if not isinstance(now, datetime):
         now = datetime.fromisoformat(str(now))
     if now.tzinfo is None:
         now = now.replace(tzinfo=UTC)
-    if abs((stamp >> 16) - _epoch_ms(now)) > 3_600_000:
-        pytest.skip("versionstamps do not follow the server clock here (SurrealDB 2.x counter)")
+    return _epoch_ms(now)
+
+
+async def _require_clock_stamps(client: Any) -> int:
+    """Skip unless ``since=None`` reads the server clock (SurrealDB 3.x); return the clock's millisecond.
+
+    The probe is the stream's own branch: on 3.x a stamp is ``unix_ms << 16 | counter`` and "now" is
+    found from the clock; on 2.x a stamp is a counter ``<< 16`` and "now" is a search of that counter,
+    with no clock to pin. A 3.x server never skips: :func:`_stamps_since` fails if its stamps do not
+    follow the clock.
+    """
+    if await _major(client) < 3:
+        pytest.skip("since=None searches the versionstamp counter here, not the server clock (SurrealDB 2.x)")
+    return await _server_ms(client)
+
+
+async def _stamps_since(client: Any, ms: int, *ids: str) -> list[int]:
+    """The versionstamp of the latest entry for each ``Fed:<id>``, read from the server clock's *ms* on.
+
+    Never ``SINCE 0``: on 3.x ``REMOVE TABLE`` does not purge a table's change feed, those entries
+    outlive ``CHANGEFEED 1h``, and ``SHOW CHANGES`` answers at most 1000 entries, oldest first, so
+    on a long-running server ``SINCE 0`` is other runs' history, not this test's writes. Entries are
+    matched by record, not by position; a second of slack before *ms* absorbs a clock step.
+    """
+    feed = await client.query(f"SHOW CHANGES FOR TABLE {TABLE} SINCE {(ms - 1000) << 16} LIMIT 1000;", {})
+    stamps: dict[str, int] = {}
+    for entry in feed:
+        for event in feed_events(Fed, entry):
+            stamps[_ids([event])[0]] = entry["versionstamp"]
+    missing = [record for record in ids if record not in stamps]
+    assert not missing, f"no feed entry for {missing} since the server clock read {ms}: stamps are not unix_ms << 16"
+    return [stamps[record] for record in ids]
 
 
 def _clock_reading(ms: int) -> Any:
@@ -642,9 +662,9 @@ class TestSinceNoneSameMillisecondE2E:
     @pytest.mark.asyncio
     async def test_an_entry_from_the_clocks_millisecond_is_not_replayed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async with feed_client() as client:
+            clock = await _require_clock_stamps(client)
             await _write(lambda: Fed(id="same_ms").save())
-            stamp = (await _feed_stamps(client))[-1]
-            await _require_clock_stamps(client, stamp)
+            [stamp] = await _stamps_since(client, clock, "same_ms")
             monkeypatch.setattr(ChangeModelStream, "_server_now", _clock_reading(stamp >> 16))
 
             stream = await Fed.objects().changes(poll_interval=0.05).start()
@@ -656,18 +676,17 @@ class TestSinceNoneSameMillisecondE2E:
     @pytest.mark.asyncio
     async def test_skips_every_page_of_history_then_delivers_the_next_write(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async with feed_client() as client:
+            clock = await _require_clock_stamps(client)
             for n in range(3):
                 await _write(lambda n=n: Fed(id=f"h{n}").save())
-            stamps = await _feed_stamps(client)
-            await _require_clock_stamps(client, stamps[-1])
+            first_write, _, last_write = await _stamps_since(client, clock, "h0", "h1", "h2")
             # The clock reads the millisecond of the first write: three entries are at or after it,
             # one page each with batch_size=1.
-            first_write = stamps[-3]
             monkeypatch.setattr(ChangeModelStream, "_server_now", _clock_reading(first_write >> 16))
 
             stream = await Fed.objects().changes(poll_interval=0.05, batch_size=1).start()
             assert isinstance(stream.cursor, int)
-            assert stream.cursor > stamps[-1]
+            assert stream.cursor > last_write
             await _write(lambda: Fed(id="after").save())
 
             [event] = await _take(stream, 1)
