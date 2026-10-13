@@ -742,7 +742,7 @@ class TestEndOfFeed3xUnit:
         stream = await Fed.objects().changes(poll_interval=0).start()
 
         server.write(1)
-        event = await anext(stream)
+        [event] = await _take(stream, 1, timeout=2)
 
         assert event.record_id == f"{TABLE}:c1"
         assert stream.cursor == server.stamps[-1] + 1
@@ -768,5 +768,6 @@ class TestEndOfFeed3xUnit:
 
         assert len(server.shows) == 1
         with pytest.raises(StopAsyncIteration):
-            await anext(stream)
+            async with asyncio.timeout(2):
+                await anext(stream)
         assert len(server.shows) == 1
