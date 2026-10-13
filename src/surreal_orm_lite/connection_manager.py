@@ -32,6 +32,7 @@ from .live import (
     require_websocket,
 )
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
+from .wire import encode_wire
 
 logger = logging.getLogger(__name__)
 
@@ -986,6 +987,11 @@ class SurrealDBConnectionManager:
                 "fn::acquire_lock", params={"pod_id": pod_id, "table_id": table_id},
             )
 
+        Argument values are bound in forms both SurrealDB lines accept (v0.23.0): a
+        ``timedelta`` or ``Duration`` as a duration, a ``date`` as midnight UTC, a ``Range`` as a
+        range, a ``set`` as an array. A zero duration is sent: the ORM cannot tell what the
+        function does with it.
+
         :param function: ``"fn::name"``, ``"name"``, or a nested ``"fn::namespace::name"``.
         :param args: positional arguments, in the function's declaration order.
         :param params: named arguments, ordered by the declared signature. Mutually
@@ -993,7 +999,10 @@ class SurrealDBConnectionManager:
         :param return_type: a type annotation to coerce the result into; ``None`` returns it raw.
         :return: the function's return value; ``None`` when it returns ``NONE``.
         :raises ValueError: if the function name is not an identifier path, if both *args* and
-            *params* are given, or if *params* does not match the declared parameters.
+            *params* are given, if *params* does not match the declared parameters, or if an
+            argument holds a value no SurrealDB type can hold (an ``int`` beyond 64 bits, a
+            negative duration…) — raised before anything is sent.
+        :raises TypeError: if an argument is of a type SurrealDB has no form for (a ``time``).
         :raises SurrealDbNotFoundError: if the server has no such function.
         :raises SurrealDbValidationError: if the result does not fit ``return_type``.
         :raises SurrealDbError: for any other database failure.
@@ -1017,11 +1026,14 @@ class SurrealDBConnectionManager:
             )
 
         name = normalize_function_name(function)
+        # Encoded before any round trip (stored=False: a zero duration is an argument like any
+        # other); the model shortcut delegates here.
+        values: Sequence[Any] = encode_wire(list(args), stored=False) if args is not None else []
+        named = {key: encode_wire(value, stored=False) for key, value in params.items()} if params is not None else None
 
         client = await cls.get_client()
-        values: Sequence[Any] = args if args is not None else []
-        if params is not None:
-            values = await cls._resolve_named_args(client, name, params)
+        if named is not None:
+            values = await cls._resolve_named_args(client, name, named)
 
         statement, variables = build_call_statement(name, values)
 

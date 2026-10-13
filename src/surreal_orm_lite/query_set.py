@@ -28,6 +28,7 @@ from .utils import (
     validate_patch_operations,
     warn_on_multiple_statements,
 )
+from .wire import encode_wire
 
 if TYPE_CHECKING:
     from .aggregations import Aggregation
@@ -123,7 +124,9 @@ class QuerySet:
         """
         Set variables for the query.
 
-        Variables can be used in parameterized queries to safely inject values.
+        Variables can be used in parameterized queries to safely inject values. They are bound
+        in forms both SurrealDB lines accept, like filter values (v0.23.0): a ``timedelta`` as a
+        duration, a ``date`` as midnight UTC, a ``set`` as an array.
 
         Args:
             **kwargs: Variable names and their values.
@@ -264,13 +267,25 @@ class QuerySet:
 
     # ==================== Internal query building ====================
 
-    def _build_where(self) -> tuple[str, dict[str, Any]]:
+    def _build_where(self, encode: bool = True) -> tuple[str, dict[str, Any]]:
         """
         Build a parameterized WHERE clause from filters and Q objects.
+
+        Args:
+            encode: ``True`` (default) returns the bound values in forms both SurrealDB lines
+                accept (:func:`~surreal_orm_lite.wire.encode_wire`, ``stored=False``, v0.23.0): a
+                ``timedelta`` as a duration — a zero one included, a filter only compares it — a
+                ``date`` as midnight UTC, a ``set`` as an array. ``False`` keeps the Python values,
+                for :meth:`_compile_live`, which writes them into the statement as literals.
 
         Returns:
             A tuple of (where_clause_string, variables_dict).
             The where_clause_string includes the ``WHERE`` keyword, or is empty if no filters.
+
+        Raises:
+            ValueError: a value no SurrealDB type can hold (an ``int`` beyond 64 bits, a negative
+                duration…), before anything is sent.
+            TypeError: a value of a type SurrealDB has no form for (a ``time``).
         """
         parts: list[str] = []
         variables: dict[str, Any] = {}
@@ -295,7 +310,17 @@ class QuerySet:
         if not parts:
             return "", {}
 
+        if encode:
+            variables = encode_wire(variables, stored=False)
         return " WHERE " + " AND ".join(parts), variables
+
+    def _bound_variables(self, where_vars: dict[str, Any]) -> dict[str, Any]:
+        """The ``.variables()`` values and ``where_vars`` (already encoded), as a statement binds them.
+
+        The ``.variables()`` values are encoded like the WHERE's (``stored=False``, v0.23.0).
+        """
+        variables: dict[str, Any] = {**encode_wire(self._variables, stored=False), **where_vars}
+        return variables
 
     def _compile_query(self) -> tuple[str, dict[str, Any]]:
         """
@@ -327,7 +352,7 @@ class QuerySet:
             query += f" FETCH {', '.join(self._fetch_fields)}"
 
         query += ";"
-        all_variables = {**self._variables, **where_vars}
+        all_variables = self._bound_variables(where_vars)
         return query, all_variables
 
     def _compile_aggregation_query(self, aggregation_expr: str, alias: str | None = None) -> tuple[str, dict[str, Any]]:
@@ -351,7 +376,7 @@ class QuerySet:
         query += where_clause
         query += " GROUP ALL;"
 
-        all_variables = {**self._variables, **where_vars}
+        all_variables = self._bound_variables(where_vars)
         return query, all_variables
 
     def _compile_group_by_query(self) -> tuple[str, dict[str, Any]]:
@@ -386,7 +411,7 @@ class QuerySet:
             query += f" START {self._offset}"
 
         query += ";"
-        all_variables = {**self._variables, **where_vars}
+        all_variables = self._bound_variables(where_vars)
         return query, all_variables
 
     # ==================== Query execution ====================
@@ -807,10 +832,16 @@ class QuerySet:
         Update all records matching the current filters.
 
         Args:
-            **kwargs: Fields and values to update.
+            **kwargs: Fields and values to update. Bound like every write's values (v0.23.0): a
+                ``timedelta`` as a duration, a ``date`` as midnight UTC, a ``set`` as an array.
 
         Returns:
             The number of updated records.
+
+        Raises:
+            ValueError: a value no SurrealDB type can hold (an ``int`` beyond 64 bits, a negative
+                duration, a zero one the installed SDK cannot read back…), before anything is sent.
+            TypeError: a value of a type SurrealDB has no form for (a ``time``).
 
         Example::
 
@@ -828,12 +859,12 @@ class QuerySet:
             validate_field_name(field, "bulk_update field")
             var_name = f"_v{i}"
             set_parts.append(f"{self._column(field)} = ${var_name}")
-            set_vars[var_name] = value
+            set_vars[var_name] = encode_wire(value, stored=True)  # a write (v0.23.0)
 
         set_clause = ", ".join(set_parts)
         query = f"UPDATE {self._model_table} SET {set_clause}{where_clause};"
 
-        all_vars = {**self._variables, **where_vars, **set_vars}
+        all_vars = {**self._bound_variables(where_vars), **set_vars}
         if self._tx is not None:
             rows = await self._tx.add(query, all_vars)
             return len(rows) if isinstance(rows, list) else 0
@@ -855,7 +886,7 @@ class QuerySet:
         """
         where_clause, where_vars = self._build_where()
         query = f"DELETE {self._model_table}{where_clause} RETURN BEFORE;"
-        all_vars = {**self._variables, **where_vars}
+        all_vars = self._bound_variables(where_vars)
         if self._tx is not None:
             rows = await self._tx.add(query, all_vars)
             return len(rows) if isinstance(rows, list) else 0
@@ -870,7 +901,8 @@ class QuerySet:
 
         Whole table if unfiltered. Returns the number of affected rows. Participates in
         ``objects(tx=)`` like the other bulk operations. ``operations`` is validated then bound
-        as ``$_ops`` (never string-interpolated). Emits no signals.
+        as ``$_ops`` (never string-interpolated), each ``value`` encoded like every write's
+        (v0.23.0: a ``timedelta`` as a duration, a ``date`` as midnight UTC). Emits no signals.
 
         Example::
 
@@ -882,7 +914,7 @@ class QuerySet:
         self.model._reject_computed_patch(operations, "patch()")
         where_clause, where_vars = self._build_where()
         query = f"UPDATE {self._model_table} PATCH $_ops{where_clause};"
-        all_vars = {**self._variables, **where_vars, "_ops": self.model._columns_for_patch(operations)}
+        all_vars = {**self._bound_variables(where_vars), "_ops": self.model._columns_for_patch(operations)}
         if self._tx is not None:
             rows = await self._tx.add(query, all_vars)
             return len(rows) if isinstance(rows, list) else 0
@@ -1101,7 +1133,7 @@ class QuerySet:
         :raises TypeError: for a filter value with no SurrealQL literal form.
         """
         self._reject_live_clauses()
-        where_clause, where_vars = self._build_where()
+        where_clause, where_vars = self._build_where(encode=False)  # Python values, for the literals
         # Only the WHERE fragment is rewritten: it is the one place references live, and the
         # table name and FETCH list never pass through the inliner.
         where_clause = inline_variables(where_clause, {**self._variables, **where_vars})
@@ -1279,7 +1311,9 @@ class QuerySet:
 
         Args:
             query: The custom SQL query string to execute.
-            variables: A dictionary of variables to substitute into the query.
+            variables: A dictionary of variables to substitute into the query, bound like
+                :meth:`BaseSurrealModel.raw_query`'s (v0.23.0: in forms both SurrealDB lines
+                accept; a zero duration is sent).
 
         Returns:
             The result of the query, typically model instances.
@@ -1289,12 +1323,14 @@ class QuerySet:
         # Same silent truncation raw_query() warns about: only the first statement's results
         # come back from the SDK (issue #156).
         warn_on_multiple_statements(query)
+        # stored=False, as raw_query(): a zero duration is sent (the statement may only filter).
+        bound: dict[str, Any] = encode_wire(variables or {}, stored=False)
         client = await SurrealDBConnectionManager.get_client()
         try:
             # User-authored SurrealQL is sent verbatim: the caller owns that string and
             # binds their own variables, so rewriting quoted "$word" occurrences inside it
             # would corrupt their string literals (issue #156).
-            results = await client.query(query, variables or {})
+            results = await client.query(query, bound)
         except NotFoundError:
             # SurrealDB 3.x raises for a never-created table; the ORM contract
             # treats a missing table as empty.

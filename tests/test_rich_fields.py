@@ -6,6 +6,11 @@ hydrates the declared Python types, on SurrealDB 2.x and 3.x alike.
   ``wire.encode_wire(…, stored=True)``: a ``timedelta``/``Duration`` becomes a duration, a ``date``
   midnight UTC, a ``Range`` a range, a ``set`` an array, a ``Decimal`` a fixed-point decimal. A raw
   ``SELECT`` reads them back as SDK values (``_assert_native``).
+- **Statement variables** (spec §5.2, D17): ``patch``, the ``atomic_*`` helpers, ``bulk_update`` and
+  ``relate`` encode their bound values for a write (``stored=True``); ``raw_query``,
+  ``QuerySet.query``, ``call_function`` and filter values are encoded with ``stored=False`` — the
+  same conversions, but a zero duration is sent (it may only filter). Values no SurrealDB type can
+  hold are refused before anything is sent, and the client stays the same (spec §4.7).
 - **Untyped positions** (spec §5.3): a ``dict[str, Any]``/``list[Any]`` field, an ``extra="allow"``
   column or the ``Any`` part of a nested model keeps the SDK ``Duration``/``Range`` it was loaded
   with through ``update()``/``save()``/``upsert()`` (``wire.restore_native``), instead of the dict
@@ -18,15 +23,17 @@ E2E tables are dedicated (``rf_*``), dropped on entry and exit by ``orm_client``
 inside the ``async with orm_client(...)`` block.
 """
 
-from collections.abc import Awaitable, Callable
-from datetime import UTC, date, datetime, timedelta
+import contextlib
+import os
+from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Annotated, Any
 from uuid import UUID
 
 import pytest
 import surrealdb
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 from surrealdb import RecordID
 
 from surreal_orm_lite import (
@@ -40,6 +47,7 @@ from surreal_orm_lite import (
     SurrealDBConnectionManager,
     SurrealFunc,
 )
+from surreal_orm_lite.wire import sdk_decodes_zero_duration
 from tests.conftest import orm_client
 
 # ==================== Shared models and values ====================
@@ -389,3 +397,329 @@ class TestRichWritesE2E:
             _assert_sdk_duration(sched["extra"]["x"], 500)
             _assert_sdk_duration(sched["extra"]["y"], _HOUR_NS)
             _assert_sdk_duration(sched["ttl"], 5400 * 10**9)
+
+
+# ==================== Task 6 — statement variables, refusals, transactions, non-finite decimals ====================
+
+
+class RfNan(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_nan")
+
+    id: str | None = None
+    d: Annotated[Decimal, Field(allow_inf_nan=True)] = Decimal(0)
+
+
+_STMT_TABLES = ("rf_event", "rf_rel", "rf_nan")
+_RF_ADD = "DEFINE FUNCTION OVERWRITE fn::rf_add($d: duration) { RETURN $d + 1h; };"
+
+
+@contextlib.asynccontextmanager
+async def _rf_add_function() -> AsyncIterator[None]:
+    """``fn::rf_add($d: duration)`` (returns ``$d + 1h``) for the block, removed afterwards."""
+    client = await SurrealDBConnectionManager.get_client()
+    await client.query(_RF_ADD, {})
+    try:
+        yield
+    finally:
+        with contextlib.suppress(Exception):
+            await (await SurrealDBConnectionManager.get_client()).query("REMOVE FUNCTION IF EXISTS fn::rf_add;", {})
+        SurrealDBConnectionManager.clear_function_signature_cache()
+
+
+async def _saved(rid: str = "w") -> RfEvent:
+    ev = RfEvent(id=rid, **FULL)
+    await ev.save()
+    return ev
+
+
+async def _stmt_model_patch() -> None:
+    ev = await _saved()
+    await ev.patch([{"op": "replace", "path": "/ttl", "value": timedelta(minutes=5)}])
+    _assert_sdk_duration((await _raw("w"))["ttl"], 300 * 10**9)
+
+
+async def _stmt_queryset_patch() -> None:
+    await _saved()
+    count = await RfEvent.objects().filter(id="w").patch([{"op": "replace", "path": "/ttl", "value": timedelta(minutes=5)}])
+    assert count == 1
+    _assert_sdk_duration((await _raw("w"))["ttl"], 300 * 10**9)
+
+
+async def _stmt_atomic_append() -> None:
+    ev = await _saved()
+    await ev.atomic_append("ttls", timedelta(hours=2))
+    ttls = (await _raw("w"))["ttls"]
+    assert [d.elapsed for d in ttls] == [_HOUR_NS, 2 * _HOUR_NS]
+    assert all(type(d) is surrealdb.Duration for d in ttls)
+
+
+async def _stmt_atomic_append_many() -> None:
+    ev = await _saved()
+    await ev.atomic_append_many("ttls", [timedelta(hours=2), timedelta(hours=3)])
+    ttls = (await _raw("w"))["ttls"]
+    assert [d.elapsed for d in ttls] == [_HOUR_NS, 2 * _HOUR_NS, 3 * _HOUR_NS]
+    assert all(type(d) is surrealdb.Duration for d in ttls)
+
+
+async def _stmt_bulk_update() -> None:
+    await _saved()
+    count = await (
+        RfEvent.objects()
+        .filter(id="w")
+        .bulk_update(ttl=timedelta(hours=3), day=date(2026, 2, 3), price=Decimal("0.0000005"))  # 5E-7: 2.x exponent case
+    )
+    assert count == 1
+    row = await _raw("w")
+    _assert_sdk_duration(row["ttl"], 3 * _HOUR_NS)
+    assert row["day"] == datetime(2026, 2, 3, tzinfo=UTC)
+    assert isinstance(row["price"], Decimal)
+    assert row["price"] == Decimal("0.0000005")
+
+
+async def _relate_and_check(**relate_kwargs: Any) -> None:
+    a = await _saved("a")
+    b = RfEvent(id="b")
+    await b.save()
+    created = await a.relate("rf_rel", b, **relate_kwargs)
+    assert len(created) == 1
+    client = await SurrealDBConnectionManager.get_client()
+    rows = await client.query("SELECT * FROM rf_rel;", {})
+    assert len(rows) == 1
+    _assert_sdk_duration(rows[0]["ttl"], 60 * 10**9)
+    assert isinstance(rows[0]["win"], surrealdb.Range)
+    assert rows[0]["win"].end is None  # the open side
+    assert Range(BoundIncluded(1), None) == rows[0]["win"]
+
+
+async def _stmt_relate_data() -> None:
+    await _relate_and_check(data={"ttl": timedelta(minutes=1), "win": Range(BoundIncluded(1), None)})
+
+
+async def _stmt_relate_edge_kwargs() -> None:
+    await _relate_and_check(ttl=timedelta(minutes=1), win=Range(BoundIncluded(1), None))
+
+
+async def _stmt_merge_extra_vars_int() -> None:
+    ev = await _saved()
+    await ev.merge(server_values={"n": SurrealFunc("$t")}, extra_vars={"t": 7})
+    assert (await _raw("w"))["n"] == 7
+
+
+async def _stmt_merge_extra_vars_duration() -> None:
+    ev = await _saved()
+    await ev.merge(server_values={"ttl": SurrealFunc("$d")}, extra_vars={"d": timedelta(hours=1)})
+    _assert_sdk_duration((await _raw("w"))["ttl"], _HOUR_NS)
+
+
+async def _stmt_raw_query() -> None:
+    await _saved()
+    await RfEvent.raw_query("UPDATE $rid SET ttl = $t;", variables={"rid": RecordID("rf_event", "w"), "t": timedelta(hours=4)})
+    _assert_sdk_duration((await _raw("w"))["ttl"], 4 * _HOUR_NS)
+
+
+async def _stmt_queryset_query() -> None:
+    await _saved()
+    await RfEvent.objects().query(
+        "UPDATE (SELECT VALUE id FROM rf_event WHERE id = $rid) SET ttl = $t;",
+        variables={"rid": RecordID("rf_event", "w"), "t": timedelta(hours=4)},
+    )
+    _assert_sdk_duration((await _raw("w"))["ttl"], 4 * _HOUR_NS)
+
+
+async def _stmt_call_function() -> None:
+    async with _rf_add_function():
+        _assert_sdk_duration(await SurrealDBConnectionManager.call_function("fn::rf_add", [timedelta(hours=1)]), 2 * _HOUR_NS)
+        _assert_sdk_duration(
+            await SurrealDBConnectionManager.call_function("fn::rf_add", params={"d": Duration.parse("1h")}), 2 * _HOUR_NS
+        )
+        _assert_sdk_duration(await RfEvent.call_function("rf_add", (timedelta(hours=1),)), 2 * _HOUR_NS)  # model shortcut
+
+
+_STATEMENT_WRITES: list[tuple[str, Callable[[], Awaitable[None]]]] = [
+    ("model-patch", _stmt_model_patch),
+    ("queryset-patch", _stmt_queryset_patch),
+    ("atomic_append", _stmt_atomic_append),
+    ("atomic_append_many", _stmt_atomic_append_many),
+    ("bulk_update", _stmt_bulk_update),
+    ("relate-data", _stmt_relate_data),
+    ("relate-edge-kwargs", _stmt_relate_edge_kwargs),
+    ("merge-extra-vars-int", _stmt_merge_extra_vars_int),
+    ("merge-extra-vars-duration", _stmt_merge_extra_vars_duration),
+    ("raw_query", _stmt_raw_query),
+    ("queryset-query", _stmt_queryset_query),
+    ("call_function", _stmt_call_function),
+]
+
+
+def _resave(**changes: Any) -> Callable[[RfEvent], Awaitable[Any]]:
+    """A ``save()`` of record ``r`` with ``FULL`` and ``changes`` (a full replace, were it sent)."""
+    return lambda _ev: RfEvent(id="r", **{**FULL, **changes}).save()
+
+
+# (label, the refused call on the saved record ``r``, the exception, needs a probe that cannot decode 0ns)
+_REFUSALS: list[tuple[str, Callable[[RfEvent], Awaitable[Any]], type[Exception], bool]] = [
+    ("save-zero-duration", _resave(ttl=timedelta(0)), ValueError, True),
+    ("save-decimal-1E+29", _resave(price=Decimal("1E+29")), ValueError, False),
+    ("save-decimal-beyond-96-bits", _resave(price=Decimal("79228162514264337593543950335.5")), ValueError, False),
+    ("save-int-2**63", _resave(n=2**63), ValueError, False),
+    ("merge-negative-duration", lambda ev: ev.merge(ttl=timedelta(seconds=-1)), ValueError, False),
+    ("filter-int-2**70", lambda _ev: RfEvent.objects().filter(n__gt=2**70).exec(), ValueError, False),
+    ("raw_query-time", lambda _ev: RfEvent.raw_query("RETURN $t;", {"t": time(1)}), TypeError, False),
+    ("raw_query-int-2**64", lambda _ev: RfEvent.raw_query("RETURN $n;", {"n": 2**64}), ValueError, False),
+    ("bulk_update-zero-duration", lambda _ev: RfEvent.objects().filter(id="r").bulk_update(ttl=Duration(0)), ValueError, True),
+    ("atomic_append-zero-duration", lambda ev: ev.atomic_append("ttls", timedelta(0)), ValueError, True),
+]
+
+
+async def _native_txn_supported() -> bool:
+    """True if the server exposes the SDK's native transaction RPC (SurrealDB 3.x)."""
+    client = await SurrealDBConnectionManager.get_client()
+    try:
+        txn = await client.begin()
+    except Exception:
+        return False
+    with contextlib.suppress(Exception):
+        await client.cancel(txn)
+    return True
+
+
+@contextlib.asynccontextmanager
+async def _http_orm_client(*tables: str) -> AsyncIterator[Any]:
+    """``orm_client`` over HTTP: transactions there are buffered (sent at commit) on both lines."""
+    host, port = os.environ.get("SURREALDB_HOST", "localhost"), os.environ.get("SURREALDB_PORT", "8000")
+    SurrealDBConnectionManager.set_connection(
+        url=f"http://{host}:{port}", user="root", password="root", namespace="ns", database="db"
+    )
+    client = await SurrealDBConnectionManager.get_client()
+    for table in tables:
+        with contextlib.suppress(Exception):
+            await client.query(f"REMOVE TABLE {table};", {})
+    try:
+        yield client
+    finally:
+        for table in tables:
+            with contextlib.suppress(Exception):
+                await client.query(f"REMOVE TABLE {table};", {})
+        await SurrealDBConnectionManager.close_connection()
+
+
+def _assert_full_declared(ev: RfEvent) -> None:
+    """A hydrated ``FULL`` row: the declared Python types and the values written."""
+    assert type(ev.at) is datetime
+    assert ev.at == FULL["at"]
+    assert type(ev.day) is date
+    assert ev.day == FULL["day"]
+    assert type(ev.ttl) is timedelta
+    assert ev.ttl == FULL["ttl"]
+    assert type(ev.grace) is Duration
+    assert ev.grace == FULL["grace"]
+    assert ev.price == Decimal("12.5")
+    assert type(ev.token) is UUID
+    assert ev.token == _TOKEN
+    assert type(ev.hours) is Range
+    assert ev.hours == FULL["hours"]
+    assert type(ev.period) is Range
+    assert ev.period == FULL["period"]
+    assert ev.blob == FULL["blob"]
+    assert type(ev.tags) is set
+    assert ev.tags == {"a", "b"}
+    assert ev.ttls == FULL["ttls"]
+    assert all(type(d) is timedelta for d in ev.ttls)
+    assert ev.n == 5
+
+
+class TestRichStatementWritesE2E:
+    @pytest.mark.parametrize("write", [case for _, case in _STATEMENT_WRITES], ids=[name for name, _ in _STATEMENT_WRITES])
+    async def test_statement_writes_store_native_types(self, write: Callable[[], Awaitable[None]]) -> None:
+        async with orm_client(*_STMT_TABLES):
+            await write()
+
+    @pytest.mark.parametrize(
+        ("call", "error", "needs_zero_refusal"),
+        [(call, error, zero) for _, call, error, zero in _REFUSALS],
+        ids=[name for name, _, _, _ in _REFUSALS],
+    )
+    async def test_refusals_leave_the_client_untouched(
+        self, call: Callable[[RfEvent], Awaitable[Any]], error: type[Exception], needs_zero_refusal: bool
+    ) -> None:
+        if needs_zero_refusal and sdk_decodes_zero_duration():
+            pytest.skip("the installed SDK decodes a zero duration: storing one is allowed")
+        async with orm_client(*_STMT_TABLES):
+            ev = await _saved("r")
+            before = await _raw("r")
+            client_before = await SurrealDBConnectionManager.get_client()
+
+            with pytest.raises(error):
+                await call(ev)
+
+            assert (await SurrealDBConnectionManager.get_client()) is client_before
+            assert await client_before.query("RETURN 1;", {}) == 1
+            assert await _raw("r") == before
+
+    async def test_zero_duration_filter_is_allowed(self) -> None:
+        async with orm_client(*_STMT_TABLES):
+            await _saved("z")
+            rows = await RfEvent.objects().filter(ttl__gt=timedelta(0)).exec()  # filters are stored=False
+            assert [row.id for row in rows] == ["z"]
+
+    async def test_non_finite_decimal_round_trip(self) -> None:
+        async with orm_client(*_STMT_TABLES) as client:
+            for key, value in (("nan", Decimal("NaN")), ("inf", Decimal("Infinity")), ("ninf", Decimal("-Infinity"))):
+                await RfNan(id=key, d=value).save()  # sent unchanged, as in v0.22.1
+
+                got = (await RfNan.objects().get(key)).d
+                assert type(got) is Decimal
+                if value.is_nan():
+                    assert got.is_nan()
+                else:
+                    assert got == value
+                stored = await client.query("SELECT VALUE d FROM ONLY $rid;", {"rid": RecordID("rf_nan", key)})
+                assert isinstance(stored, float)  # SurrealDB decimals have no NaN/±Infinity: a float
+
+            with pytest.raises(ValidationError):
+                RfEvent(price=Decimal("NaN"))  # a plain Decimal field still refuses it (Pydantic)
+
+    async def test_raw_paths_send_zero_durations(self) -> None:
+        async with orm_client(*_STMT_TABLES) as client:
+            await _saved("z")
+            rows = await RfEvent.raw_query("SELECT * FROM rf_event WHERE ttl > $z;", {"z": timedelta(0)})
+            assert [row.id for row in rows if isinstance(row, RfEvent)] == ["z"]
+
+            async with _rf_add_function():
+                _assert_sdk_duration(await SurrealDBConnectionManager.call_function("fn::rf_add", [timedelta(0)]), _HOUR_NS)
+
+            assert await RfEvent.raw_query("RETURN $x > 1;", {"x": Decimal("NaN")}) == []  # sent, no exception
+            assert await client.query("RETURN 1;", {}) == 1
+
+
+class TestRichTransactionsE2E:
+    async def test_buffered_tx_round_trip(self) -> None:
+        async with _http_orm_client(*_STMT_TABLES):
+            ev, other = RfEvent(id="t", **FULL), RfEvent(id="m")
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert tx.is_interactive is False
+                await ev.save(tx=tx)
+                await other.save(tx=tx)
+                await other.merge(tx=tx, ttl=timedelta(hours=2))
+
+            _assert_native(await _raw("t"))
+            _assert_sdk_duration((await _raw("m"))["ttl"], 2 * _HOUR_NS)
+            _assert_full_declared(await RfEvent.objects().get("t"))
+            assert (await RfEvent.objects().get("m")).ttl == timedelta(hours=2)
+
+    async def test_interactive_tx_round_trip(self) -> None:
+        async with orm_client(*_STMT_TABLES):
+            if not await _native_txn_supported():
+                pytest.skip("requires SurrealDB 3.x native transactions")
+            ev, other = RfEvent(id="t", **FULL), RfEvent(id="m")
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert tx.is_interactive is True
+                await ev.save(tx=tx)
+                await other.save(tx=tx)
+                await other.merge(tx=tx, ttl=timedelta(hours=2))
+                _assert_full_declared(await RfEvent.objects(tx=tx).get("t"))  # a read inside the transaction
+                assert (await RfEvent.objects(tx=tx).get("m")).ttl == timedelta(hours=2)
+
+            _assert_native(await _raw("t"))
+            _assert_sdk_duration((await _raw("m"))["ttl"], 2 * _HOUR_NS)
+            _assert_full_declared(await RfEvent.objects().get("t"))

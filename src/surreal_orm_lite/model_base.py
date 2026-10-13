@@ -958,6 +958,15 @@ class BaseSurrealModel(BaseModel):
 
         ``path`` and ``from`` are rewritten; a whole-document operation (``path == ""``) has
         its object ``value`` re-keyed instead. The caller's list and dicts are not mutated.
+
+        Each ``value`` is then encoded for a write (:func:`~surreal_orm_lite.wire.encode_wire`,
+        ``stored=True``, v0.23.0): a ``timedelta`` is sent as a duration, a ``date`` as midnight
+        UTC, as in every other write.
+
+        Raises:
+            ValueError: a value no SurrealDB type can hold (an ``int`` beyond 64 bits, a negative
+                duration…), before anything is sent.
+            TypeError: a value of a type SurrealDB has no form for (a ``time``).
         """
         rewritten: list[dict[str, Any]] = []
         for op in operations:
@@ -967,6 +976,8 @@ class BaseSurrealModel(BaseModel):
                 copy["from"] = cls._pointer_to_column(op["from"])
             if op["path"] == "" and isinstance(op.get("value"), dict):
                 copy["value"] = cls._columns_for(op["value"])
+            if "value" in copy:
+                copy["value"] = encode_wire(copy["value"], stored=True)
             rewritten.append(copy)
         return rewritten
 
@@ -1604,7 +1615,9 @@ class BaseSurrealModel(BaseModel):
         Unlike ``merge``/``save`` this emits NO signals: it is a low-level atomic primitive.
         ``operations`` is validated then bound as data, never string-interpolated. Pointers may
         name a field either way — ``/password`` or its column ``/password_hash`` — and are
-        rewritten to the column before they are sent.
+        rewritten to the column before they are sent. Each ``value`` is bound like every write's
+        (v0.23.0): a ``timedelta`` as a duration, a ``date`` as midnight UTC, a ``set`` as an
+        array.
         """
         validate_patch_operations(operations)
         self._reject_computed_patch(operations, "patch()")
@@ -1626,13 +1639,16 @@ class BaseSurrealModel(BaseModel):
 
         Shared by the atomic helpers. ``$rid`` and every value in ``variables`` are bound
         (robust for any id type; anti-injection); only the validated ``set_expr`` is inlined.
+        The values are encoded for a write (:func:`~surreal_orm_lite.wire.encode_wire`,
+        ``stored=True``, v0.23.0), so a ``ValueError``/``TypeError`` for a value SurrealDB cannot
+        hold is raised before anything is sent.
         Non-tx and interactive-tx apply the returned row to ``self``; a buffered tx leaves
         ``self`` stale (the new value is computed server-side, unknown until commit).
         """
         record_id = self._record_id()
         if record_id is None:
             raise SurrealDbError("atomic operations require an explicit id.")
-        vars_: dict[str, Any] = {"rid": record_id, **variables}
+        vars_: dict[str, Any] = {"rid": record_id, **encode_wire(variables, stored=True)}
         statement = f"UPDATE $rid SET {set_expr};"
         if tx is not None:
             rows = await tx.add(statement, vars_)
@@ -2028,9 +2044,11 @@ class BaseSurrealModel(BaseModel):
         Raises:
             TypeError: ``edge`` is a model class that is not an edge model, or neither a class
                 nor a string; ``target`` is of another type; a field is given both in ``data``
-                and as a keyword argument.
+                and as a keyword argument; a field value of a type SurrealDB has no form for
+                (a ``time``).
             ValueError: a malformed name or ``"table:id"`` string; the fields name an endpoint
-                or a computed field (typed form).
+                or a computed field (typed form); a field value no SurrealDB type can hold (an
+                ``int`` beyond 64 bits, a negative duration…) — v0.23.0, nothing sent.
             SurrealDbError: an unsaved source or target; the fields name an undeclared field
                 (typed form); the write is refused.
             pydantic.ValidationError: the fields are invalid for the edge model (nothing
@@ -2062,7 +2080,8 @@ class BaseSurrealModel(BaseModel):
             validate_field_name(key, "relation data field")
             var_name = f"_rd{i}"
             set_parts.append(f"{key} = ${var_name}")
-            variables[var_name] = value
+            # Encoded for a write, like a saved edge's fields (v0.23.0): a timedelta is a duration.
+            variables[var_name] = encode_wire(value, stored=True)
         set_clause = (" SET " + ", ".join(set_parts)) if set_parts else ""
         query = f"RELATE {start}->{edge_name}->{end}{set_clause};"
 
@@ -2407,11 +2426,21 @@ class BaseSurrealModel(BaseModel):
         Args:
             query: The SurrealQL query string to execute.
             variables: Optional dictionary of variables to substitute into the query.
-                      Use $variable_name syntax in the query string.
+                      Use $variable_name syntax in the query string. Their values are
+                      bound in forms both SurrealDB lines accept (v0.23.0): a ``timedelta``
+                      or ``Duration`` as a duration, a ``date`` as midnight UTC, a
+                      ``Range`` as a range, a ``set`` as an array. Unlike the ORM's own
+                      writes, a zero duration is sent (``WHERE ttl > $zero`` must work):
+                      storing one through a raw statement is the caller's choice.
 
         Returns:
             list[Self] | list[dict]: A list of model instances if the results match
             the model schema, otherwise a list of dictionaries.
+
+        Raises:
+            ValueError: a variable no SurrealDB type can hold (an ``int`` beyond 64 bits, a
+                negative duration…), before anything is sent.
+            TypeError: a variable of a type SurrealDB has no form for (a ``time``).
 
         Example:
             ```python
@@ -2433,11 +2462,14 @@ class BaseSurrealModel(BaseModel):
             ```
         """
         warn_on_multiple_statements(query)
+        # stored=False: the ORM cannot tell whether a raw statement writes or only filters, so a
+        # zero duration is sent (`WHERE ttl > $zero`); the other refusals protect the connection.
+        bound: dict[str, Any] = encode_wire(variables or {}, stored=False)
 
         # Sent verbatim: this is the caller's own SurrealQL, so the ORM does not rewrite it
         # (unquoting "$word" occurrences used to corrupt string literals — issue #156).
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.query(query, variables or {})
+        results = await client.query(query, bound)
 
         # SDK 2.0 returns the rows list directly from query()
         if isinstance(results, list):
