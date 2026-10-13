@@ -23,6 +23,7 @@ from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbAuthenticationError, SurrealDbError
 from .transaction import Transaction
 from .utils import apply_ddl_statements, validate_alias_name, validate_field_name
+from .wire import encode_wire
 
 if TYPE_CHECKING:  # pragma: no cover
     from typing import Self
@@ -348,7 +349,7 @@ class AuthenticatedUserMixin:
 
         Every field named in the SIGNUP clause must be bound, or the server has no value for a
         ``$variable`` it references — so absent optional fields are sent as ``None`` explicitly
-        rather than omitted.
+        rather than omitted. The values then go through :meth:`_wire_auth_variables` (v0.23.0).
         """
         known = set(cls._signup_fields())
         unknown = sorted(set(values) - known)
@@ -369,7 +370,7 @@ class AuthenticatedUserMixin:
                 raise ValueError(f"{cls.__name__}.{action}() requires {required}=.")
 
         if not require_all:
-            return {identifier: values[identifier], password: values[password]}
+            return cls._wire_auth_variables(action, {identifier: values[identifier], password: values[password]}, stored=False)
 
         # Every field the SIGNUP clause names must be bound. Resolving that here — against the
         # model's own defaults, and refusing an omitted required field *before* the exchange —
@@ -397,7 +398,31 @@ class AuthenticatedUserMixin:
                 f"They have no default, so the instance could not be built from the record "
                 f"the server would create."
             )
-        return payload
+        return cls._wire_auth_variables(action, payload, stored=True)
+
+    @classmethod
+    def _wire_auth_variables(cls, action: str, variables: dict[str, Any], *, stored: bool) -> dict[str, Any]:
+        """Validate each value addressed to a rich field, then encode the variables (v0.23.0).
+
+        The SIGNUP clause writes the record, and the SIGNIN clause compares the identifier with the
+        stored column, so both get what a keyword write gets: each value goes through
+        ``_coerce_field_value`` — the validation of ``merge(**data)``, named after *action* in its
+        error — so ``signup(joined="2026-01-01T00:00:00Z")`` stores a datetime rather than the
+        string, and ``signin(badge="0190…")`` matches the uuid a ``UUID`` field holds. Then
+        :func:`~surreal_orm_lite.wire.encode_wire`: a ``date``, a ``timedelta`` or a ``Decimal``
+        sent as given is rejected by the server, which drops the connection and reads as a failed
+        authentication. ``stored`` is ``True`` for a signup (a zero duration is refused, as on every
+        write path) and ``False`` for a signin, whose values are only compared.
+
+        Raises:
+            ValueError: a value that does not fit its field (``"signup(bday=…): 'someday' is not a
+                valid date (…)"``), or that no SurrealDB type can hold — before any request.
+            TypeError: a value of a type SurrealDB has no form for (a ``datetime.time``).
+        """
+        coerce = cls._coerce_field_value  # type: ignore[attr-defined]
+        checked = {name: coerce(name, value, context=action) for name, value in variables.items()}
+        encoded: dict[str, Any] = encode_wire(checked, stored=stored)
+        return encoded
 
     @classmethod
     async def _authenticate_session(
@@ -522,8 +547,14 @@ class AuthenticatedUserMixin:
             An :class:`AuthResult` pairing the hydrated instance with its tokens. The
             instance's password field holds the **hash**, since that is what the server stores.
 
+        A value addressed to a rich field (``datetime``, ``date``, ``timedelta``, ``Decimal``,
+        ``UUID``, ``Range[T]``…) is validated against the field, as in ``merge()``, and stored as
+        the server's own type (v0.23.0): ``signup(…, joined="2026-01-01T00:00:00Z")`` stores a
+        datetime.
+
         Raises:
-            ValueError: for an unknown field or a missing required one — before any request.
+            ValueError: for an unknown field, a missing required one, or a value that does not fit
+                its field — before any request.
             SurrealDbAuthenticationError: if the server refuses the signup, or returns no
                 record for the new session (the message says how to grant the permission).
         """
@@ -540,10 +571,12 @@ class AuthenticatedUserMixin:
             result = await User.signin(email="ada@example.com", password="s3cret")
 
         Only the identifier and password fields are sent — the SIGNIN clause matches on those.
-        Isolation and ``bind=`` behave exactly as in :meth:`signup`.
+        Isolation, ``bind=`` and the validation of rich fields behave exactly as in
+        :meth:`signup`, so a ``UUID`` identifier may be passed as its text.
 
         Raises:
-            ValueError: for an unknown or missing field — before any request.
+            ValueError: for an unknown or missing field, or a value that does not fit its field —
+                before any request.
             SurrealDbAuthenticationError: if the credentials are refused. Both DB lines are
                 normalised here: the same wrong password surfaces as ``NotFoundError`` on 3.x
                 and ``InternalError`` on 2.6.x.

@@ -655,8 +655,13 @@ class SurrealDBConnectionManager:
             session changes either way; that is the SDK's behaviour and the ORM does not hide it.
         :return: the access token, plus the refresh token on SurrealDB 3.x when the access
             method declares ``WITH REFRESH`` (always ``None`` on 2.6.x).
-        :raises ValueError: for an invalid credential combination — raised **before** any
-            request is issued.
+        ``variables`` are encoded like the variables of ``raw_query()`` (v0.23.0): a ``date``,
+        ``timedelta``, ``Decimal``, ``set`` or ``Range`` is sent in a form both server lines accept.
+
+        :raises ValueError: for an invalid credential combination, or a variable no SurrealDB type
+            can hold (an ``int`` beyond 64 bits…) — raised **before** any request is issued.
+        :raises TypeError: for a variable SurrealDB has no type for (a ``datetime.time``), before
+            any request.
         :raises SurrealDbAuthenticationError: if the server refuses the credentials.
         """
         payload = build_auth_payload(
@@ -703,7 +708,13 @@ class SurrealDBConnectionManager:
         raises a :class:`ValueError` explaining what is missing, rather than a bare
         ``TypeError``. Both are required in practice.
 
-        :raises ValueError: if ``access`` or ``variables`` is missing — before any request.
+        ``variables`` are encoded as in :meth:`signin`, so a ``date`` or ``timedelta`` the SIGNUP
+        clause stores reaches the server as a datetime or a duration (v0.23.0).
+
+        :raises ValueError: if ``access`` or ``variables`` is missing, or a variable no SurrealDB
+            type can hold — before any request.
+        :raises TypeError: for a variable SurrealDB has no type for (a ``datetime.time``), before
+            any request.
         :raises SurrealDbAuthenticationError: if the server refuses the signup.
         """
         payload = build_auth_payload(

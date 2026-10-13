@@ -6,9 +6,10 @@ trip), and the error normalisation. ``connection_manager.py`` holds the async me
 them.
 
 Keeping this module I/O-free mirrors how ``functions.py`` backs ``call_function()``: it
-imports only :mod:`.exceptions`, so it stays cycle-free. v0.17.0's
-``AuthenticatedUserMixin`` therefore lives in :mod:`.model_auth` instead: it needs
-``connection_manager``, which already imports this module.
+imports only :mod:`.exceptions` and :mod:`.wire` (which imports neither this module nor
+``connection_manager``), so it stays cycle-free. v0.17.0's ``AuthenticatedUserMixin`` therefore
+lives in :mod:`.model_auth` instead: it needs ``connection_manager``, which already imports this
+module.
 """
 
 from collections.abc import Mapping
@@ -16,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .exceptions import SurrealDbAuthenticationError
+from .wire import encode_wire
 
 __all__ = ["AuthTokens", "build_auth_payload", "wrap_auth_error"]
 
@@ -82,8 +84,16 @@ def build_auth_payload(
     neither level, and sending them would silently turn a root signin into a database-user
     signin against a user the server does not have.
 
-    :raises ValueError: for any invalid combination — raised here, before the caller issues a
+    The ``variables`` are encoded like the variables of ``raw_query()`` (v0.23.0,
+    :func:`~surreal_orm_lite.wire.encode_wire` with ``stored=False``): a ``date`` becomes midnight
+    UTC, a ``timedelta`` a duration, a ``Decimal`` a fixed-point decimal, a ``set`` an array —
+    forms both server lines accept. Sent as they are, the server rejects some of them and drops
+    the WebSocket, which the caller would see as a failed signin.
+
+    :raises ValueError: for any invalid combination, or a variable no SurrealDB type can hold (an
+        ``int`` beyond 64 bits, a negative duration…) — raised here, before the caller issues a
         request, so a mistake never costs a round trip or a half-changed session.
+    :raises TypeError: for a variable of a type SurrealDB has no form for (a ``datetime.time``).
     """
     has_system = username is not None or password is not None
     has_record = access is not None or variables is not None or refresh is not None
@@ -146,7 +156,7 @@ def build_auth_payload(
         # NotAllowedError (measured on 3.2.4).
         payload["refresh"] = refresh
     else:
-        payload["variables"] = dict(variables) if variables is not None else {}
+        payload["variables"] = encode_wire(dict(variables), stored=False) if variables is not None else {}
     return payload
 
 

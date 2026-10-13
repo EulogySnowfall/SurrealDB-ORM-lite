@@ -38,11 +38,13 @@ from typing import Annotated, Any
 from uuid import UUID
 
 import pytest
+import pytest_asyncio
 import surrealdb
 from pydantic import BaseModel, Field, ValidationError
 from surrealdb import RecordID
 
 from surreal_orm_lite import (
+    AuthenticatedUserMixin,
     BaseSurrealEdge,
     BaseSurrealModel,
     BoundExcluded,
@@ -59,6 +61,8 @@ from surreal_orm_lite import (
     computed,
     retry_on_conflict,
 )
+from surreal_orm_lite._sdk import TAG_DECIMAL_STRING, TAG_DURATION_COMPACT, CBORTag
+from surreal_orm_lite.auth import build_auth_payload
 from surreal_orm_lite.wire import encode_wire, sdk_decodes_zero_duration
 from tests.conftest import orm_client
 from tests.test_rich_types import _http_client, _server_version
@@ -1731,3 +1735,206 @@ class TestUpgradeFromV022E2E:
             assert set(rows[3]) == {"id", "note"}
         finally:
             await client.query_raw("REMOVE TABLE IF EXISTS rf_upg;")
+
+
+# ==================== Auth variables: signup / signin ====================
+
+
+class RfMember(AuthenticatedUserMixin, BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_member", access_name="rf_member_access")
+
+    id: str | None = None
+    email: str
+    password: str
+    bday: date | None = None
+    trial: timedelta | None = None
+    credit: Decimal | None = None
+    joined: datetime | None = None
+
+
+class RfBadge(AuthenticatedUserMixin, BaseSurrealModel):
+    """Signs in with a ``UUID`` identifier."""
+
+    model_config = SurrealConfigDict(table_name="rf_badge", access_name="rf_badge_access", identifier_field="badge")
+
+    id: str | None = None
+    badge: UUID
+    password: str
+
+
+_AUTH_PASSWORD = "s3cret-passphrase"
+_TWO_WEEKS_NS = 14 * 86400 * 10**9
+
+
+@contextlib.asynccontextmanager
+async def _auth_access(model: Any) -> AsyncIterator[Any]:
+    """``orm_client`` on the model's table with its access method defined; root again on exit."""
+    async with orm_client(model.get_table_name()) as client:
+        await model.define_access()
+        try:
+            yield client
+        finally:
+            # A connection-level signup leaves the shared session as the record user.
+            with contextlib.suppress(Exception):
+                await SurrealDBConnectionManager.invalidate()
+            with contextlib.suppress(Exception):
+                await client.query(f"REMOVE ACCESS {model.get_access_name()} ON DATABASE;", {})
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def no_connection(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
+    """A configured connection that must never be opened: the call is refused before any request."""
+
+    async def _forbidden(*_args: Any, **_kwargs: Any) -> Any:
+        raise AssertionError("no connection may be opened for a value refused before sending")
+
+    monkeypatch.setattr(SurrealDBConnectionManager, "_open_client", _forbidden)
+    SurrealDBConnectionManager.set_connection(
+        url="ws://localhost:1/rpc", user="root", password="root", namespace="ns", database="db"
+    )
+    yield
+    await SurrealDBConnectionManager.unset_connection()
+
+
+class TestRichAuthVariables:
+    """``build_auth_payload`` encodes the access method's variables (``stored=False``, like
+    ``raw_query``); a model's ``signup()``/``signin()`` validate each value addressed to a rich field
+    first, as ``merge()`` does — no request is sent for a value that does not fit."""
+
+    def test_build_auth_payload_encodes_the_variables(self) -> None:
+        variables = {
+            "email": "a@b.c",
+            "bday": date(1990, 1, 2),
+            "trial": timedelta(days=14, microseconds=1),
+            "credit": Decimal("1E+3"),
+            "zero": timedelta(0),  # a raw path: the access method may only compare it
+            "tags": {"b", "a"},
+        }
+        payload = build_auth_payload(access="acct", variables=variables, default_namespace="ns", default_database="db")
+        sent = payload["variables"]
+        assert sent["email"] == "a@b.c"
+        assert sent["bday"] == datetime(1990, 1, 2, tzinfo=UTC)
+        assert sent["trial"] == CBORTag(TAG_DURATION_COMPACT, [14 * 86400, 1000])
+        assert sent["credit"] == CBORTag(TAG_DECIMAL_STRING, "1000")
+        assert sent["zero"] == CBORTag(TAG_DURATION_COMPACT, [0, 0])
+        assert sent["tags"] == ["a", "b"]
+        assert variables["bday"] == date(1990, 1, 2)  # the caller's mapping is not mutated
+
+    @pytest.mark.parametrize(("value", "error"), [(2**64, ValueError), (time(1), TypeError)], ids=["int", "time"])
+    async def test_connection_signup_refuses_before_sending(self, no_connection: None, value: Any, error: type) -> None:
+        with pytest.raises(error):
+            await SurrealDBConnectionManager.signup(access="acct", variables={"email": "a@b.c", "n": value})
+
+    def test_signup_variables_are_validated_and_encoded(self) -> None:
+        sent = RfMember._auth_variables(
+            "signup",
+            {
+                "email": "a@b.c",
+                "password": "pw",
+                "bday": "1990-01-02",
+                "trial": "2w",
+                "credit": Decimal("1E+3"),
+                "joined": "2026-01-01T00:00:00Z",
+            },
+            require_all=True,
+        )
+        assert sent == {
+            "email": "a@b.c",
+            "password": "pw",
+            "bday": datetime(1990, 1, 2, tzinfo=UTC),
+            "trial": CBORTag(TAG_DURATION_COMPACT, [14 * 86400, 0]),
+            "credit": CBORTag(TAG_DECIMAL_STRING, "1000"),
+            "joined": _JAN,
+        }
+
+    def test_signin_variables_are_validated(self) -> None:
+        sent = RfBadge._auth_variables("signin", {"badge": str(_TOKEN), "password": "pw"}, require_all=False)
+        assert sent == {"badge": _TOKEN, "password": "pw"}
+        assert type(sent["badge"]) is UUID
+
+    async def test_signup_refuses_a_value_that_does_not_fit(self, no_connection: None) -> None:
+        with pytest.raises(ValueError, match=r"signup\(bday=…\): 'someday' is not a valid date"):
+            await RfMember.signup(email="a@b.c", password="pw", bday="someday")
+
+    async def test_signin_refuses_a_value_that_does_not_fit(self, no_connection: None) -> None:
+        with pytest.raises(ValueError, match=r"signin\(badge=…\): 'nope' is not a valid UUID"):
+            await RfBadge.signin(badge="nope", password="pw")
+
+    async def test_signup_refuses_a_zero_duration(self, no_connection: None) -> None:
+        if sdk_decodes_zero_duration():
+            pytest.skip("this surrealdb SDK reads a zero duration back: nothing to refuse")
+        with pytest.raises(ValueError, match="zero duration"):
+            await RfMember.signup(email="a@b.c", password="pw", trial=timedelta(0))
+
+
+class TestRichAuthE2E:
+    """Rich values reach the server natively through every auth path, on both lines, and the shared
+    WebSocket stays up (before v0.23.0 a ``date`` variable dropped it)."""
+
+    async def test_model_signup_stores_native_values_and_hydrates_declared_types(self) -> None:
+        async with _auth_access(RfMember) as client:
+            email = f"{UUID(int=1).hex}@example.test"
+            result = await RfMember.signup(
+                email=email,
+                password=_AUTH_PASSWORD,
+                bday=date(1990, 1, 2),
+                trial=timedelta(days=14),
+                credit=Decimal("1E+3"),
+                joined="2026-01-01T00:00:00Z",
+            )
+            user = result.user
+            assert type(user.bday) is date
+            assert user.bday == date(1990, 1, 2)
+            assert type(user.trial) is timedelta
+            assert user.trial == timedelta(days=14)
+            assert type(user.credit) is Decimal
+            assert user.credit == Decimal(1000)
+            assert type(user.joined) is datetime
+            assert user.joined == _JAN
+
+            row = await client.query("SELECT * FROM ONLY rf_member WHERE email = $email LIMIT 1;", {"email": email})
+            assert row["bday"] == datetime(1990, 1, 2, tzinfo=UTC)
+            _assert_sdk_duration(row["trial"], _TWO_WEEKS_NS)
+            assert isinstance(row["credit"], Decimal)
+            assert row["credit"] == Decimal(1000)
+            assert isinstance(row["joined"], datetime)  # a datetime, not the string passed
+            assert row["joined"] == _JAN
+
+            again = await RfMember.signin(email=email, password=_AUTH_PASSWORD)
+            assert again.user.get_id() == user.get_id()
+            assert again.user.trial == timedelta(days=14)
+            await _assert_client_usable(client)
+
+    async def test_model_signin_validates_the_identifier(self) -> None:
+        """A ``UUID`` column matched with the text of the UUID: a string never equals a uuid."""
+        async with _auth_access(RfBadge) as client:
+            created = await RfBadge.signup(badge=_TOKEN, password=_AUTH_PASSWORD)
+            row = await client.query("SELECT * FROM ONLY rf_badge LIMIT 1;", {})
+            assert type(row["badge"]) is UUID
+
+            again = await RfBadge.signin(badge=str(_TOKEN), password=_AUTH_PASSWORD)
+            assert again.user.get_id() == created.user.get_id()
+            assert again.user.badge == _TOKEN
+
+    async def test_connection_signup_keeps_the_shared_client(self) -> None:
+        async with _auth_access(RfMember) as client:
+            email = f"{UUID(int=2).hex}@example.test"
+            tokens = await SurrealDBConnectionManager.signup(
+                access=RfMember.get_access_name(),
+                variables={
+                    "email": email,
+                    "password": _AUTH_PASSWORD,
+                    "bday": date(1990, 1, 2),
+                    "trial": timedelta(days=14),
+                    "credit": Decimal("1E+3"),
+                },
+            )
+            assert tokens.access
+            await _assert_client_usable(client)
+
+            record = await client.info()  # the record user's own row, as the SDK decodes it
+            assert record["email"] == email
+            assert record["bday"] == datetime(1990, 1, 2, tzinfo=UTC)
+            _assert_sdk_duration(record["trial"], _TWO_WEEKS_NS)
+            assert isinstance(record["credit"], Decimal)
+            assert record["credit"] == Decimal(1000)
