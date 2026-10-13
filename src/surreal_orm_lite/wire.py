@@ -18,8 +18,9 @@ This module converts them, **only where the annotation asks for it**:
   ``declared_kind(annotation)`` — a field's rich kind without ``Optional``/``Annotated``.
 - ``encode_wire(value, stored=…)`` — the other direction: every value the ORM sends, turned into a
   form the SDK encodes and **both** server lines accept (a compact duration tag, a fixed-point
-  decimal text, ``undefined`` for an open range side, UTC datetimes, arrays for sets), or refused
-  before anything is sent when no such form exists (an ``int`` beyond 64 bits, a ``time``…).
+  decimal text, ``undefined`` for an open range side, UTC datetimes, arrays for sets, objects for
+  Pydantic sub-models), or refused before anything is sent when no such form exists (an ``int``
+  beyond 64 bits, a ``time``…).
 - ``decimal_text(value)`` — the fixed-point text of a ``Decimal``, rounded once the way the server
   rounds it, so the stored value never moves.
 - ``sdk_decodes_zero_duration()`` — whether the installed SDK can read a zero duration back (a local
@@ -651,7 +652,7 @@ def encode_wire(value: Any, *, stored: bool) -> Any:
     for filter values and raw paths; the two modes differ only for a zero duration (below).
 
     - ``None``, ``bool``, ``float``, ``str``, ``bytes``, ``UUID``, ``CBORTag``, ``undefined``,
-      ``SurrealFunc`` and any other object: unchanged (the same object).
+      ``SurrealFunc`` and any other object not listed below: unchanged (the same object).
     - ``int``: unchanged in signed 64 bits, else ``ValueError`` (the server silently wraps ``2**63``
       and rejects ``2**64``, dropping the WebSocket). ``RecordID``: unchanged, its key checked the same way.
     - ``datetime``: in UTC (a naive value is taken as UTC, as the SDK sends it). ``date``: midnight UTC
@@ -667,6 +668,10 @@ def encode_wire(value: Any, *, stored: bool) -> Any:
     - ``list``/``tuple``: a ``list`` of encoded items. ``set``/``frozenset``: a ``list`` (an array, never
       a native set), sorted first when the items are orderable. A mapping: a ``dict``, same keys,
       encoded values.
+    - a Pydantic model (a sub-model ``merge(profile={…})`` validated into, a ``list[Profile]`` item…):
+      the object a model write sends for it — ``model_dump()`` by Python field name, the SDK values
+      of its untyped positions put back (:func:`restore_native`), then encoded like a mapping. The
+      SDK has no encoder for a Pydantic model.
     """
     if value is None or value is undefined or isinstance(value, (bool, float, str, bytes, UUID, CBORTag, SurrealFunc)):
         return value
@@ -698,6 +703,8 @@ def encode_wire(value: Any, *, stored: bool) -> Any:
         return [encode_wire(item, stored=stored) for item in _set_items(value)]
     if isinstance(value, Mapping):
         return {key: encode_wire(item, stored=stored) for key, item in value.items()}
+    if isinstance(value, BaseModel):
+        return encode_wire(restore_native(value.model_dump(), value), stored=stored)
     return value
 
 

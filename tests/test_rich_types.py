@@ -1361,6 +1361,42 @@ class TestEncodeWire:
         assert encode_wire(once, stored=False) == once
         assert value == before
 
+    @_BOTH_MODES
+    def test_pydantic_models_are_dumped_then_encoded(self, stored: bool) -> None:
+        """A sub-model (the value ``merge(profile={…})`` validates into) leaves as the object
+        ``_write_payload`` writes: dumped by Python field name, the SDK values of its untyped
+        positions put back, every value encoded — the SDK has no encoder for a Pydantic model."""
+
+        class Sub(BaseModel):
+            model_config = ConfigDict(extra="allow")
+
+            when: date
+            ttl: timedelta
+            renamed: int = Field(default=0, alias="other")
+            loose: dict[str, Any] = {}
+
+        class Outer(BaseModel):
+            sub: Sub
+            subs: list[Sub] = []
+
+        sub = Sub(
+            when=date(2026, 1, 2), ttl=timedelta(hours=1), other=2, loose={"d": surrealdb.Duration(5)}, more=Decimal("1.5")
+        )
+        expected = {
+            "when": datetime(2026, 1, 2, tzinfo=UTC),
+            "ttl": _tag14(3600, 0),
+            "renamed": 2,
+            "loose": {"d": _tag14(0, 5)},
+            "more": _tag10("1.5"),
+        }
+        assert encode_wire(sub, stored=stored) == expected
+        encoded = encode_wire({"p": sub, "ps": [sub], "o": Outer(sub=sub, subs=[sub])}, stored=stored)
+        assert encoded == {"p": expected, "ps": [expected], "o": {"sub": expected, "subs": [expected]}}
+        assert encode_wire(encoded, stored=stored) == encoded  # idempotent
+        sdk_cbor_encode(encoded)  # the SDK can send it
+        assert sub.when == date(2026, 1, 2)  # never mutated
+        assert type(sub.loose["d"]) is surrealdb.Duration
+
 
 class TestZeroDuration:
     def test_zero_duration_follows_stored_and_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:

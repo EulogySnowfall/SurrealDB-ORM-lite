@@ -4,7 +4,8 @@ hydrates the declared Python types, on SurrealDB 2.x and 3.x alike.
 - **Writes** (spec §5.2): the model payload (``save``, ``update``, ``upsert``, ``bulk_create``, edges,
   ``*_or_create``, ``server_values``) and the keyword payload of ``merge()`` go through
   ``wire.encode_wire(…, stored=True)``: a ``timedelta``/``Duration`` becomes a duration, a ``date``
-  midnight UTC, a ``Range`` a range, a ``set`` an array, a ``Decimal`` a fixed-point decimal. A raw
+  midnight UTC, a ``Range`` a range, a ``set`` an array, a ``Decimal`` a fixed-point decimal, a
+  Pydantic sub-model the object ``model_dump()`` gives (``merge``, ``bulk_update``, ``signup``). A raw
   ``SELECT`` reads them back as SDK values (``_assert_native``).
 - **Statement variables** (spec §5.2, D17): ``patch``, the ``atomic_*`` helpers, ``bulk_update`` and
   ``relate`` encode their bound values for a write (``stored=True``); ``raw_query``,
@@ -1478,6 +1479,120 @@ class TestKeywordWritesE2E:
             await _assert_client_usable(client_before)
 
 
+# ==================== Keyword writes of a sub-model holding a rich type (spec §4.1) ====================
+
+
+class RfProfile(BaseModel):
+    """A plain Pydantic sub-model with a rich field: stored as an object, its ``date`` midnight UTC."""
+
+    bday: date | None = None
+    city: str = ""
+
+
+class RfPerson(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_person")
+
+    id: str | None = None
+    profile: RfProfile | None = None
+    history: list[RfProfile] = []
+    n: int = 0
+
+
+_BDAY = date(1990, 1, 2)
+_PROFILE: dict[str, Any] = {"bday": "1990-01-02", "city": "x"}
+_PROFILE_FORMS = pytest.mark.parametrize("profile", [_PROFILE, RfProfile(bday=_BDAY, city="x")], ids=["dict", "instance"])
+
+
+def _assert_stored_profile(stored: Any, city: str = "x") -> None:
+    """An ``RfProfile`` as the SDK reads it back: an object whose ``bday`` is a datetime, not text."""
+    assert isinstance(stored, dict), f"not an object: {stored!r}"
+    assert isinstance(stored["bday"], datetime), f"bday not stored as a datetime: {stored['bday']!r}"
+    assert stored["bday"] == datetime(1990, 1, 2, tzinfo=UTC)
+    assert stored["city"] == city
+
+
+def _assert_profile(profile: Any, city: str = "x") -> None:
+    """An ``RfProfile`` on an instance: the sub-model, its ``bday`` a ``date``."""
+    assert type(profile) is RfProfile, f"not an RfProfile: {profile!r}"
+    assert type(profile.bday) is date
+    assert profile.bday == _BDAY
+    assert profile.city == city
+
+
+class TestNestedModelKeywordWritesE2E:
+    """A keyword write on a field typed with a sub-model that holds a rich type: the value is validated
+    into the sub-model (``_coerce_field_value``), then sent as the object ``save()`` would write —
+    ``encode_wire`` dumps a Pydantic model, which the SDK cannot encode — on both lines.
+
+    The instance then holds what the write applied: the validated sub-model when it is applied
+    locally (``refresh=False``), the returned row's object when the row is synced
+    (``_apply_record`` does not enter nested models, v0.18.0); a read hydrates the sub-model."""
+
+    @_PROFILE_FORMS
+    @pytest.mark.parametrize("refresh", [True, False], ids=["refresh", "no-refresh"])
+    async def test_merge(self, profile: Any, refresh: bool) -> None:
+        async with orm_client("rf_person") as client:
+            person = RfPerson(id="m")
+            await person.save()
+            await person.merge(refresh=refresh, profile=profile)
+
+            _assert_stored_profile((await _raw("m", "rf_person"))["profile"])
+            if refresh:
+                _assert_stored_profile(person.profile)  # the row's object
+            else:
+                _assert_profile(person.profile)  # the validated keyword value
+            _assert_profile((await RfPerson.objects().get("m")).profile)
+            await _assert_client_usable(client)
+
+    async def test_merge_a_list_of_sub_models(self) -> None:
+        async with orm_client("rf_person") as client:
+            person = RfPerson(id="l")
+            await person.save()
+            await person.merge(history=[_PROFILE, RfProfile(bday=_BDAY, city="y")])
+
+            stored = (await _raw("l", "rf_person"))["history"]
+            assert len(stored) == 2
+            _assert_stored_profile(stored[0])
+            _assert_stored_profile(stored[1], city="y")
+            loaded = (await RfPerson.objects().get("l")).history
+            assert len(loaded) == 2
+            _assert_profile(loaded[0])
+            _assert_profile(loaded[1], city="y")
+            await _assert_client_usable(client)
+
+    async def test_bulk_update(self) -> None:
+        async with orm_client("rf_person") as client:
+            await RfPerson(id="a", n=1).save()
+            await RfPerson(id="b", n=2).save()
+
+            updated = await RfPerson.objects().filter(n=1).bulk_update(profile=_PROFILE, history=[_PROFILE])
+            assert updated == 1
+
+            row = await _raw("a", "rf_person")
+            _assert_stored_profile(row["profile"])
+            assert len(row["history"]) == 1
+            _assert_stored_profile(row["history"][0])
+            assert (await _raw("b", "rf_person")).get("profile") is None
+            _assert_profile((await RfPerson.objects().get("a")).profile)
+            await _assert_client_usable(client)
+
+    async def test_update_or_create_both_branches(self) -> None:
+        async with orm_client("rf_person") as client:
+            created_obj, created = await RfPerson.objects().update_or_create(id="u", defaults={"profile": _PROFILE})
+            assert created
+            _assert_profile(created_obj.profile)
+            _assert_stored_profile((await _raw("u", "rf_person"))["profile"])
+
+            updated_obj, created_again = await RfPerson.objects().update_or_create(
+                id="u", defaults={"profile": {**_PROFILE, "city": "z"}}
+            )
+            assert not created_again  # the merge branch: the instance holds the returned row's object
+            _assert_stored_profile(updated_obj.profile, city="z")
+            _assert_stored_profile((await _raw("u", "rf_person"))["profile"], city="z")
+            _assert_profile((await RfPerson.objects().get("u")).profile, city="z")
+            await _assert_client_usable(client)
+
+
 # ==================== Task 10 — live-query filters on rich fields (spec §5.5) ====================
 
 _FEB = datetime(2026, 2, 1, tzinfo=UTC)
@@ -1762,6 +1877,18 @@ class RfBadge(AuthenticatedUserMixin, BaseSurrealModel):
     password: str
 
 
+class RfProfiled(AuthenticatedUserMixin, BaseSurrealModel):
+    """Signs up with sub-models that hold a rich type."""
+
+    model_config = SurrealConfigDict(table_name="rf_profiled", access_name="rf_profiled_access")
+
+    id: str | None = None
+    email: str
+    password: str
+    profile: RfProfile | None = None
+    history: list[RfProfile] = []
+
+
 _AUTH_PASSWORD = "s3cret-passphrase"
 _TWO_WEEKS_NS = 14 * 86400 * 10**9
 
@@ -1847,6 +1974,16 @@ class TestRichAuthVariables:
             "joined": _JAN,
         }
 
+    @_PROFILE_FORMS
+    def test_signup_sub_models_are_validated_and_sent_as_objects(self, profile: Any) -> None:
+        sent = RfProfiled._auth_variables(
+            "signup",
+            {"email": "a@b.c", "password": "pw", "profile": profile, "history": [_PROFILE]},
+            require_all=True,
+        )
+        stored = {"bday": datetime(1990, 1, 2, tzinfo=UTC), "city": "x"}
+        assert sent == {"email": "a@b.c", "password": "pw", "profile": stored, "history": [stored]}
+
     def test_signin_variables_are_validated(self) -> None:
         sent = RfBadge._auth_variables("signin", {"badge": str(_TOKEN), "password": "pw"}, require_all=False)
         assert sent == {"badge": _TOKEN, "password": "pw"}
@@ -1903,6 +2040,27 @@ class TestRichAuthE2E:
             again = await RfMember.signin(email=email, password=_AUTH_PASSWORD)
             assert again.user.get_id() == user.get_id()
             assert again.user.trial == timedelta(days=14)
+            await _assert_client_usable(client)
+
+    @_PROFILE_FORMS
+    async def test_model_signup_writes_sub_models(self, profile: Any) -> None:
+        """A sub-model holding a ``date`` is stored as an object, its ``bday`` a datetime — not a
+        failed authentication (``no encoder for type``) — and hydrates back into the sub-model."""
+        async with _auth_access(RfProfiled) as client:
+            email = f"{UUID(int=3).hex}@example.test"
+            result = await RfProfiled.signup(email=email, password=_AUTH_PASSWORD, profile=profile, history=[_PROFILE])
+            _assert_profile(result.user.profile)
+            assert len(result.user.history) == 1
+            _assert_profile(result.user.history[0])
+
+            row = await client.query("SELECT * FROM ONLY rf_profiled WHERE email = $email LIMIT 1;", {"email": email})
+            _assert_stored_profile(row["profile"])
+            assert len(row["history"]) == 1
+            _assert_stored_profile(row["history"][0])
+
+            again = await RfProfiled.signin(email=email, password=_AUTH_PASSWORD)
+            assert again.user.get_id() == result.user.get_id()
+            _assert_profile(again.user.profile)
             await _assert_client_usable(client)
 
     async def test_model_signin_validates_the_identifier(self) -> None:
