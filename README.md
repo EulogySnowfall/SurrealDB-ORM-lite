@@ -1759,7 +1759,9 @@ except SurrealDbError as exc:
 For a symmetric relation (a friendship, where alice–carol and carol–alice are one edge), sort the
 pair first (`sorted([a, c], key=str)`) and use that order for the id and for `in_`/`out`. A raw
 `RELATE` that names an existing edge id silently **overwrites** it on both lines, so create these
-edges with `save()` or `bulk_create()`, which go through the guard.
+edges with `save()` or `bulk_create()`, which go through the guard. Such an edge is then updated
+and deleted like any other, `update(tx=)` and `delete(tx=)` included: the ORM binds the record id
+as a query parameter, never writes it into the statement.
 
 **A `UNIQUE` index on `in, out`**: the server refuses a second edge for the same ordered pair,
 whatever its id.
