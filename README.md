@@ -1994,6 +1994,17 @@ fields) follow the same rules. The conversion follows the annotation position by
 an `Any` keeps the SDK's value. `Computed[timedelta]` works too, e.g.
 `length: Computed[timedelta] = computed("ends - starts")`.
 
+Pydantic's `AwareDatetime`, `NaiveDatetime`, `PastDatetime` and `FutureDatetime` are `datetime`
+fields, and its `PastDate` and `FutureDate` are `date` fields: they are stored, read back,
+validated in keyword writes and shifted by `atomic_increment()` the same way, their own checks
+included (`merge(at=datetime(2027, 1, 1))` raises `ValueError` on an `AwareDatetime` field, as
+the constructor does). A filter value is validated as a plain `datetime` or `date`, because a
+bound is not a value of the field: `filter(expires__lt=now)` works on a `FutureDatetime` field.
+The past and future types check the current time on every validation, reads included, as
+Pydantic does. Prefer `AwareDatetime` to `NaiveDatetime`, which cannot read SurrealDB's
+datetimes back: the server returns them in UTC with a time zone, and Pydantic refuses a time
+zone for a `NaiveDatetime`.
+
 #### `Duration`
 
 ```python
@@ -2115,6 +2126,8 @@ duration and sets `event.ttl` to `timedelta(hours=2)`, and `signin(badge="0190�
 uuid a `UUID` identifier field holds. A value that does not fit raises `ValueError` naming the
 field, before anything is sent; `None` and `SurrealFunc` values are written as given. Before
 v0.23.0 such keyword values were stored as strings (see [Upgrading from v0.22](#upgrading-from-v022)).
+On a model with `arbitrary_types_allowed=True` the validation takes that setting too; a field
+Pydantic cannot build a validator for is written as given, as before v0.23.0.
 
 Sub-models and table models in keyword writes:
 
@@ -2136,11 +2149,25 @@ Sub-models and table models in keyword writes:
   `merge(profile=Profile(city="y"))` removes a stored `bday`.
 - `bulk_update()` and `signup()` replace the field, so a dict is validated there as the whole
   sub-model: a missing required sub-field raises `ValueError`.
-- Sub-fields are written under the key their validation reads: the alias, or the first string of
-  an `AliasChoices`. `seen: datetime | None = Field(default=None, alias="lastSeen")` is stored as
-  `lastSeen` by `save()`, by an instance in a keyword write and by a `merge()` dict, whether the
-  dict names it `seen` or `lastSeen`, so a read gives it back. A dict that names one sub-field
-  twice (`{"seen": …, "lastSeen": …}`) raises `ValueError`.
+- Each sub-field is written under the key a read takes it from, by `save()`, `update()`,
+  `upsert()`, an instance in a keyword write and a keyword write's dict alike, whether or not the
+  sub-model holds a rich type:
+  - A sub-model that also validates by name (`populate_by_name=True` or `validate_by_name=True`,
+    and a table model used as a sub-model) keeps each sub-field under its **name**, the format of
+    v0.22 and earlier and of a schema written for it (`DEFINE FIELD profile.first_name`).
+    `merge(profile={"firstName": …})` is sent as `{"first_name": …}`.
+  - A sub-model that validates by alias only (Pydantic's default) writes each aliased sub-field
+    under its **alias**, or the first string of an `AliasChoices`.
+    `seen: datetime | None = Field(default=None, alias="lastSeen")` is stored as `lastSeen`,
+    whether a `merge()` dict names it `seen` or `lastSeen`, so a read gives it back. Before
+    v0.23.0 it was written under its name, which no read takes; rows written then keep that key.
+    On a `SCHEMAFULL` table, declare the alias (`DEFINE FIELD activity.lastSeen`).
+  - A dict that names one sub-field twice (`{"seen": …, "lastSeen": …}`) raises `ValueError`; a
+    key that names no sub-field is sent as given. A dict for a sub-model without a rich type keeps
+    its values as given: only its keys change.
+  - This differs from the full SurrealDB-ORM, whose `model_dump(by_alias=True)` writes every
+    aliased sub-field under its alias. A row that holds both spellings of a sub-field is read by
+    the alias first, Pydantic's priority, and an `update()` or `upsert()` rewrites it with one key.
 - A table-model instance is written as its record id: `merge(author=alice)` stores alice's
   `RecordID`, in a raw query's variables too. On a declared field, rich or not, the value is
   checked at every position an instance can take (the value itself, a list or tuple item, a dict
@@ -2169,11 +2196,11 @@ A number keeps the `field += $amount` statement.
 
 - **Datetimes** are sent in UTC and read back as aware UTC `datetime`s. A naive value is kept as
   given on the instance and sent as UTC (the SDK's rule); use Pydantic's `AwareDatetime` to forbid
-  naive values. The server keeps nanoseconds but the SDK hands the ORM microseconds: a datetime
-  written with sub-microsecond digits (`time::now()`, a `d'…05.123456789Z'` literal) reads back
-  truncated, so it does not match an `exact` filter with itself (use `gte`/`lte`), and `update()`
-  (a full replace) writes the truncated value back, while a `merge()` of other fields leaves it
-  intact.
+  naive values (not `NaiveDatetime`, which refuses the aware datetimes a read returns). The server
+  keeps nanoseconds but the SDK hands the ORM microseconds: a datetime written with
+  sub-microsecond digits (`time::now()`, a `d'…05.123456789Z'` literal) reads back truncated, so
+  it does not match an `exact` filter with itself (use `gte`/`lte`), and `update()` (a full
+  replace) writes the truncated value back, while a `merge()` of other fields leaves it intact.
 - **Durations**: a `timedelta` field truncates sub-microsecond digits on read; a `Duration` field
   keeps them.
 - **Decimals**: a SurrealDB decimal holds at most 28 fractional digits and a 96-bit coefficient. A
@@ -2276,6 +2303,11 @@ still stored as strings, so re-running is safe.
 on 3.x). Check a conversion with `is_string()` or with the type your client decodes, never with
 `is_datetime()` or `is_uuid()`: on a string they test its format, and answer `true` for an
 ISO-8601 or UUID text.
+
+Sub-models: one that also validates by name (`populate_by_name=True`, `validate_by_name=True`)
+is written as v0.22 wrote it, each sub-field under its name. In one that validates by alias only,
+an aliased sub-field is now written under its alias. v0.22 wrote it under its name, which no read
+takes: a row written then still reads that sub-field as its default, as it did under v0.22.
 
 #### Coming from the full SurrealDB-ORM
 
@@ -2491,6 +2523,7 @@ Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v
 | Integers beyond signed 64-bit                                                                                                               | raw: `2**63` silently wraps to `-2**63`, larger values are rejected (WebSocket lost). ORM: refused before sending (`ValueError`)                                                                       | same on both lines                                                                                                                                                                                                                                                                                                                              | v0.23.0 |
 | Native sets (`TYPE set<…>` column, `<set>` value) and `set[X]` fields                                                                       | an array, read back as a list (the ORM returns the declared set)                                                                                                                                       | 3.3.x: a native set (CBOR tag 56) the surrealdb SDK 2.0.0 cannot decode: HTTP `BufferError`, WebSocket `KeyError` and connection lost, also on the row a write returns. 3.1.5: a `set<…>` column refuses the array the ORM sends. On both lines `set[X]` fields work on schemaless tables and `array<…>` columns (the ORM sends sets as arrays) | v0.23.0 |
 | Sub-model dict in `merge(server_values=…)` (an `UPDATE … SET`)                                                                              | raw: `SET profile = {…}` replaces the stored object, and `object::extend` is a parse error. ORM: one `SET profile.city = $…` per key, so the other stored keys stay, as with `MERGE`                   | raw: `SET profile = {…}` replaces the stored object. ORM: same as 2.x (`object::extend` exists but is not used)                                                                                                                                                                                                                                 | v0.23.0 |
+| Sub-model key a `SCHEMAFULL` table does not declare (`DEFINE FIELD profile.first_name`, an object written with `firstName`)                 | raw: dropped silently, the object is stored without it. ORM: a sub-model that also validates by name is written under its names, as up to v0.22; for an alias-only sub-model, declare the aliases      | raw: the write fails (`Found field 'profile.firstName', but no such field exists`). ORM: same rule as 2.x                                                                                                                                                                                                                                       | v0.23.0 |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                          | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                                            | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                                                                                                                                                                                     | v0.19.1 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.

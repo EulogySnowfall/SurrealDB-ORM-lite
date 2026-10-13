@@ -51,6 +51,9 @@ and the official SDK, on every write and read path, with the same behaviour on S
   event.ttl   # timedelta(seconds=5400): a duration on the server, a timedelta here
   ```
 
+- Pydantic's `AwareDatetime`, `NaiveDatetime`, `PastDatetime` and `FutureDatetime` are
+  `datetime` fields, and its `PastDate` and `FutureDate` are `date` fields, under all the rules
+  below; a filter value on them is validated as a plain `datetime` or `date`.
 - **`Duration`** — a SurrealDB duration with nanosecond precision, where `timedelta` stops at
   microseconds. It has the API of the SDK's `surrealdb.Duration`, the same members under the same
   names with the same parameters (`elapsed`, `parse(value, nanoseconds=0)`,
@@ -96,14 +99,23 @@ and the official SDK, on every write and read path, with the same behaviour on S
   and store the server's type: `merge(at="2026-01-01T00:00:00Z")` now stores a datetime instead of
   a string and leaves a `datetime` on the instance. A value that does not fit raises `ValueError`
   naming the field before anything is sent; `None` and `SurrealFunc` values are written as given.
-  Rows v0.22 stored as strings still load, but the typed lookups no longer match them: README
-  section 24, "Upgrading from v0.22", gives a one-off conversion that runs on both lines.
+  On a model with `arbitrary_types_allowed=True` the validation takes that setting; a field
+  Pydantic cannot build a validator for is written as given, as before. Rows v0.22 stored as
+  strings still load, but the typed lookups no longer match them: README section 24, "Upgrading
+  from v0.22", gives a one-off conversion that runs on both lines.
 - **Sub-models in keyword writes.** In `merge()` and the update branch of `update_or_create()`,
   a dict for a sub-model field changes only the keys it names, each validated as its sub-field
   (with `server_values=`, one `SET` per key, so the other stored keys stay, as with `MERGE`); an
   instance replaces the whole sub-object; `bulk_update()` and `signup()` validate a dict as the
-  whole sub-model. Sub-fields are written under the key their validation reads (their alias), so
-  an aliased sub-field reads back.
+  whole sub-model.
+- **An aliased sub-field reads back.** In a sub-model that validates by alias only (Pydantic's
+  default), an aliased sub-field is now written under its alias (the first string of an
+  `AliasChoices`) by every write, `save()` included, so a read gives it back; earlier versions
+  wrote it under its name, which no read takes. Rows already written keep the name's key. A
+  sub-model that also validates by name (`populate_by_name=True` or `validate_by_name=True`, and a
+  table model used as a sub-model) keeps the format of earlier versions, each sub-field under its
+  name. A keyword write's dict for a sub-model is re-keyed the same way, whether or not the
+  sub-model holds a rich type; one without a rich type keeps its values as given.
 - **A table-model instance given as a value is written as its record id** in keyword writes, in
   raw-query variables, in the `atomic_*` array helpers and in `patch()`. Where the declared field
   cannot hold a `RecordID` at that position (`list[Plain]`, a sub-model), the write raises
@@ -165,7 +177,7 @@ and the official SDK, on every write and read path, with the same behaviour on S
   planned for v0.24.0; generating `DEFINE FIELD … TYPE` from these annotations belongs to the
   schema and DDL phase (v0.30.0+).
 - Every behaviour above was measured on SurrealDB 2.7.0 and 3.3.4, with 3.1.5 where it differs;
-  the README's "ORM behaviour: SurrealDB 2.x vs 3.x" table gains eleven rows.
+  the README's "ORM behaviour: SurrealDB 2.x vs 3.x" table gains twelve rows.
 
 ## [0.22.2] - 2026-10-13
 
