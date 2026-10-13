@@ -20,6 +20,7 @@ import surrealdb
 from surreal_orm_lite import BoundExcluded, BoundIncluded, Duration, Range
 from surreal_orm_lite._sdk import Bound, RecordID
 from surreal_orm_lite.surql_literal import inline_variables, to_surql_literal
+from surreal_orm_lite.wire import encode_wire
 from tests.conftest import orm_client
 
 ADVERSARIAL = [
@@ -378,6 +379,109 @@ class TestRoundTripE2E:
         async with orm_client() as client:
             result = await client.query(f"RETURN {to_surql_literal(value)} == $p;", {"p": value})
         assert result is True
+
+
+# ==================== v0.23.0 — durations, dates and ranges mean their value, on every line ====================
+
+_JAN_1 = datetime(2026, 1, 1, tzinfo=UTC)
+_FEB_1 = datetime(2026, 2, 1, 0, 0, 0, 123456, tzinfo=UTC)
+
+# Every form of spec §5.5 the encoder can produce. The reference is the value the ORM binds for it
+# everywhere else (``encode_wire(v, stored=False)``): the SDK alone cannot send a ``timedelta``
+# (``BufferError``) nor a ``date`` (the WebSocket drops).
+RICH_ROUND_TRIP: list[Any] = [
+    # durations: composed units, largest first
+    timedelta(hours=1, minutes=30),
+    timedelta(days=15, microseconds=5),
+    timedelta(0),  # ``0ns``: a zero duration may filter, only a zero *result* trips the SDK
+    Duration(1),
+    Duration.parse("1h30m1ns"),
+    Duration.parse("1y2w3d4h5m6s7ms8us9ns"),
+    Duration(10**18 - 1),
+    Duration(Duration.MAX_NANOSECONDS),
+    surrealdb.Duration(5400 * 10**9 + 1),
+    # dates: midnight UTC
+    date(2026, 1, 2),
+    _Day(2026, 1, 2),
+    # ranges: every inclusivity, open sides
+    Range(BoundIncluded(1), BoundExcluded(5)),
+    Range(BoundIncluded(1), BoundIncluded(5)),
+    Range(BoundExcluded(1), BoundExcluded(5)),
+    Range(BoundExcluded(1), BoundIncluded(5)),
+    Range(None, BoundExcluded(5)),
+    Range(None, BoundIncluded(5)),
+    Range(BoundIncluded(1), None),
+    Range(BoundExcluded(1), None),
+    Range(),
+    Range(BoundIncluded(-5), BoundExcluded(-1)),
+    # each bound type of the closed set
+    Range(BoundIncluded(1.5), BoundExcluded(2.5)),
+    Range(BoundIncluded(1e20), BoundExcluded(1e21)),
+    Range(BoundIncluded(-0.0), BoundIncluded(1e-05)),
+    Range(BoundIncluded(Decimal("1.5")), BoundExcluded(Decimal("2"))),
+    Range(BoundIncluded(_JAN_1), BoundExcluded(_FEB_1)),
+    Range(BoundExcluded(_JAN_1), None),
+    Range(BoundIncluded(date(2026, 1, 2)), BoundIncluded(date(2026, 2, 1))),
+    Range(BoundIncluded("a"), BoundExcluded("m")),
+    Range(BoundIncluded("it's"), BoundExcluded("a..b")),
+    Range(BoundIncluded(timedelta(minutes=1)), BoundExcluded(Duration.parse("1h"))),
+    Range(BoundIncluded(Duration.parse("1h30m1ns")), BoundIncluded(Duration(Duration.MAX_NANOSECONDS))),
+    # the SDK's own values
+    surrealdb.Range(BoundExcluded(1), BoundIncluded(5)),
+    surrealdb.Range(BoundIncluded(surrealdb.Duration(60 * 10**9)), Bound()),
+]
+
+# WHERE fragments as the ORM builds them: a range literal is followed by ``AND``/``OR``, so its open
+# end must not swallow what comes next.
+MEMBERSHIP_CLAUSES = [
+    "$x IN $r AND $b",
+    "$b AND $x IN $r",
+    "$x IN $r OR $b",
+    "$x NOT IN $r AND $b",
+    "$x NOT IN $r OR $b",
+    "$x IN $r AND $x IN $s",
+    "($x IN $r OR NOT ($x IN $s)) AND $b",
+]
+MEMBERSHIP_RANGES = [
+    Range(BoundIncluded(3), None),
+    Range(BoundExcluded(3), None),
+    Range(None, BoundIncluded(5)),
+    Range(),
+    Range(BoundExcluded(3), BoundIncluded(5)),
+]
+
+
+def _rich_id(value: Any) -> str:
+    return f"{type(value).__name__}:{to_surql_literal(value)}"
+
+
+class TestRichLiteralsE2E:
+    """v0.23.0 (AC-23): the literal of a duration, a date or a range means exactly the value the ORM
+    binds for it elsewhere, on both lines — a live filter watches the records a query would return."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("value", RICH_ROUND_TRIP, ids=_rich_id)
+    async def test_literal_equals_the_encoded_parameter(self, value: Any) -> None:
+        async with orm_client() as client:
+            result = await client.query(f"RETURN {to_surql_literal(value)} == $p;", {"p": encode_wire(value, stored=False)})
+        assert result is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("clause", MEMBERSHIP_CLAUSES)
+    async def test_range_membership_keeps_its_precedence(self, clause: str) -> None:
+        """The inlined clause evaluates as the bound one does, an open range end included."""
+        mismatches = []
+        async with orm_client() as client:
+            for r in MEMBERSHIP_RANGES:
+                for x in (2, 3, 4, 5, 7):
+                    for b in (True, False):
+                        variables = {"x": x, "r": r, "s": Range(None, BoundExcluded(6)), "b": b}
+                        inlined = inline_variables(clause, variables)
+                        bound = await client.query(f"RETURN {clause};", encode_wire(variables, stored=False))
+                        literal = await client.query(f"RETURN {inlined};", {})
+                        if literal is not bound or not isinstance(bound, bool):
+                            mismatches.append(f"{inlined} -> {literal!r}, bound -> {bound!r}")
+        assert not mismatches, "\n".join(mismatches)
 
 
 # ==================== PR #199 review fixes ====================

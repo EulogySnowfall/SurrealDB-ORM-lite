@@ -48,11 +48,13 @@ from surreal_orm_lite import (
     BoundIncluded,
     Computed,
     Duration,
+    LiveAction,
     Q,
     Range,
     SurrealConfigDict,
     SurrealDBConnectionManager,
     SurrealFunc,
+    Var,
     computed,
     retry_on_conflict,
 )
@@ -1469,3 +1471,145 @@ class TestKeywordWritesE2E:
 
             assert await _raw("z") == before
             await _assert_client_usable(client_before)
+
+
+# ==================== Task 10 — live-query filters on rich fields (spec §5.5) ====================
+
+_FEB = datetime(2026, 2, 1, tzinfo=UTC)
+
+# (filter arguments, the row that must not match, the row that must) — AC-24. The non-matching row is
+# saved first, so the first event is the matching row only if the server applied the filter, and
+# none arrives (timeout) if the filter matched nothing.
+_LIVE_CASES = [
+    pytest.param(
+        (), {"ttl__gte": timedelta(hours=1)}, {"ttl": timedelta(minutes=30)}, {"ttl": timedelta(hours=1)}, id="ttl__gte"
+    ),
+    pytest.param(
+        (), {"ttl__gt": "1h"}, {"ttl": timedelta(hours=1)}, {"ttl": timedelta(hours=1, microseconds=1)}, id="ttl__gt-str"
+    ),
+    pytest.param(
+        (),
+        {"grace": Duration.parse("1h30m1ns")},
+        {"grace": Duration.parse("1h30m")},
+        {"grace": Duration.parse("1h30m1ns")},
+        id="grace-ns",
+    ),
+    pytest.param(
+        (),
+        {"hours__contains": 12},
+        {"hours": Range(BoundIncluded(1), BoundExcluded(5))},
+        {"hours": Range(BoundIncluded(9), BoundExcluded(17))},
+        id="hours__contains",
+    ),
+    pytest.param((), {"n__in": Range(BoundIncluded(3), None)}, {"n": 2}, {"n": 3}, id="n__in-open-end"),
+    pytest.param((), {"n__not_in": Range(None, BoundIncluded(5))}, {"n": 5}, {"n": 6}, id="n__not_in-open-begin"),
+    pytest.param((), {"day": date(2026, 1, 2)}, {"day": date(2026, 1, 3)}, {"day": date(2026, 1, 2)}, id="day"),
+    pytest.param((), {"at__in": Range(BoundIncluded(_JAN), BoundExcluded(_FEB))}, {"at": _FEB}, {"at": _JAN}, id="at__in"),
+    pytest.param(
+        (),
+        {"period__contains": "2026-01-15T00:00:00Z"},
+        {"period": Range(BoundIncluded(_FEB), None)},
+        {"period": Range(BoundIncluded(_JAN), BoundExcluded(_FEB))},
+        id="period__contains-str",
+    ),
+    pytest.param(
+        (), {"ttls__contains": "1h"}, {"ttls": [timedelta(hours=2)]}, {"ttls": [timedelta(hours=1)]}, id="ttls__contains"
+    ),
+    # An open range end followed by ``AND``, and ranges inside an ``OR``.
+    pytest.param(
+        (),
+        {"n__in": Range(BoundIncluded(3), None), "ttl__gte": timedelta(hours=1)},
+        {"n": 5, "ttl": timedelta(minutes=59)},
+        {"n": 5, "ttl": timedelta(hours=1)},
+        id="open-end-then-and",
+    ),
+    pytest.param(
+        (Q(n__in=Range(None, BoundExcluded(0))) | Q(day__in=Range(BoundIncluded(date(2026, 1, 2)), None)),),
+        {},
+        {"day": date(2026, 1, 1)},
+        {"day": date(2026, 1, 2)},
+        id="q-or",
+    ),
+]
+
+_LIVE_ARGS = ("args", "kwargs", "miss", "hit")
+
+
+async def _define_rf_event(client: Any) -> None:
+    # SurrealDB 3.x refuses a live query on an undefined table.
+    await client.query("DEFINE TABLE rf_event SCHEMALESS;", {})
+
+
+async def _save_miss_then_hit(miss: dict[str, Any], hit: dict[str, Any]) -> None:
+    await RfEvent(id="miss", **miss).save()
+    await RfEvent(id="hit", **hit).save()
+
+
+class TestRichLiveE2E:
+    """A live query filtered on rich fields reports the matching write and not the other, on both
+    lines (AC-24): the coerced filter values are inlined as duration, date and range literals."""
+
+    @pytest.mark.parametrize(_LIVE_ARGS, _LIVE_CASES)
+    async def test_live_reports_only_the_matching_write(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any], miss: dict[str, Any], hit: dict[str, Any]
+    ) -> None:
+        async with orm_client("rf_event") as client:
+            await _define_rf_event(client)
+            async with asyncio.timeout(10), RfEvent.objects().filter(*args, **kwargs).live() as stream:
+                await _save_miss_then_hit(miss, hit)
+                event = await anext(stream)
+        assert event.action is LiveAction.CREATE
+        assert event.record_id == "rf_event:hit"
+        assert event.validation_error is None
+        assert {name: getattr(event.instance, name) for name in hit} == hit
+
+    @pytest.mark.parametrize(_LIVE_ARGS, _LIVE_CASES)
+    async def test_watch_reports_only_the_matching_write(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any], miss: dict[str, Any], hit: dict[str, Any]
+    ) -> None:
+        async with orm_client("rf_event") as client:
+            await _define_rf_event(client)
+            async with asyncio.timeout(10), RfEvent.objects().filter(*args, **kwargs).watch() as stream:
+                await _save_miss_then_hit(miss, hit)
+                notif = await anext(stream)
+        assert str(notif["record"]) == "rf_event:hit"
+
+
+class TestRichLiveCompile:
+    """The live statement inlines the coerced Python values (``_build_where(encode=False)``), never
+    the encoded wire forms, and the range bounds stay a closed set."""
+
+    def test_rich_filters_compile_to_literals(self) -> None:
+        qs = RfEvent.objects().filter(
+            Q(n__in=Range(BoundIncluded(3), None)) | ~Q(hours__contains="12"),
+            ttl__gte=timedelta(hours=1),
+            day="2026-01-02",
+            grace__lte="1h30m1ns",
+            n__not_in=Range(),
+        )
+        assert qs._compile_live(False) == (
+            "LIVE SELECT * FROM rf_event WHERE ttl >= 1h AND day = d'2026-01-02T00:00:00Z' AND grace <= 1h30m1ns "
+            "AND n NOT IN .. AND (n IN 3.. OR NOT (hours CONTAINS 12));"
+        )
+
+    def test_variables_are_inlined_too(self) -> None:
+        qs = RfEvent.objects().filter(ttl__gte=Var("t"), period__contains=Var("p"))
+        qs = qs.variables(t=Duration.parse("1h30m1ns"), p=date(2026, 1, 2))
+        assert qs._compile_live(False) == (
+            "LIVE SELECT * FROM rf_event WHERE ttl >= 1h30m1ns AND period CONTAINS d'2026-01-02T00:00:00Z';"
+        )
+
+    @pytest.mark.parametrize(
+        ("kwargs", "named"),
+        [
+            ({"n__in": Range(BoundIncluded(True), None)}, "bool"),
+            ({"token__in": Range(BoundIncluded(_TOKEN), None)}, "UUID"),  # coerced to UUID bounds, still refused
+            ({"n__in": Range(None, BoundExcluded(float("nan")))}, "finite"),
+        ],
+        ids=["bool", "UUID", "nan"],
+    )
+    def test_range_bound_outside_the_closed_set_raises_at_the_call(self, kwargs: dict[str, Any], named: str) -> None:
+        qs = RfEvent.objects().filter(**kwargs)
+        for subscribe in (qs.live, qs.watch):
+            with pytest.raises(TypeError, match=rf"\$_f0: Cannot inline .*range bound.*{named}"):
+                subscribe()

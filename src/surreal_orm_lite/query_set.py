@@ -1142,8 +1142,13 @@ class QuerySet:
         literals, because SurrealDB 2.x evaluates a live query's parameters as ``NONE`` at
         notification time and the filter would silently match nothing (see ``surql_literal``).
 
+        The values inlined are the Python ones — a typed lookup's coerced value, never its wire
+        form (v0.23.0) — so ``ttl__gte="1h"`` becomes ``ttl >= 1h``, ``day=date(2026, 1, 2)``
+        ``day = d'2026-01-02T00:00:00Z'`` and ``n__in=Range(BoundIncluded(3), None)`` ``n IN 3..``.
+
         :raises SurrealDbError: for a clause a live query cannot honour.
-        :raises TypeError: for a filter value with no SurrealQL literal form.
+        :raises TypeError: for a filter value with no SurrealQL literal form, such as a range
+            bound outside the closed set (a ``bool``, a ``UUID``, a non-finite ``float``…).
         """
         self._reject_live_clauses()
         where_clause, where_vars = self._build_where(encode=False)  # Python values, for the literals
