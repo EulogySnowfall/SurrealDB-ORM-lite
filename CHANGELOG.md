@@ -106,17 +106,20 @@ both server lines. The last minor of Tier 1.
 - `relate(<non-str>, …)` raises `TypeError` instead of `AttributeError`.
 - A single model instance given to a sequence lookup (`customer__in=alice`) raises `ValueError`
   instead of being read as a list of `(name, value)` pairs.
-- `update(tx=)` and `delete(tx=)` bind the record id instead of writing it into the statement, so
-  a record with an array id (such as `follows:[User:alice, User:bob]`) can be updated or deleted
-  in a transaction; before, the statement failed to parse and failed the transaction, on both
-  lines.
+- `save(tx=)`, `upsert()`, `update(tx=)` and `delete(tx=)` bind the record id instead of writing
+  it into the statement, so a record with an array id (such as `pair:[User:alice, User:bob]`) can
+  be saved, updated or deleted in a transaction and upserted in or out of one; before, the
+  statement failed to parse on both lines, and inside a transaction it failed the whole
+  transaction.
 
 ### Security
 
-- `get_related()`, `remove_relation()` and `remove_all_relations()` bind the source and target
-  record ids (`$src`, `$dst`, `$id`) instead of interpolating `table:id` text; the only text
-  interpolated is edge names, each validated as an identifier (every item of a list) before any
-  call. `table_name` is validated the same way when the class is defined.
+- Record ids are bound as query parameters instead of being written into the statement as
+  `table:id` text: `save(tx=)`, `upsert()`, `update(tx=)`, `delete(tx=)`, `relate()` (with an edge
+  class or a table name), `get_related()`, `remove_relation()`, `remove_all_relations()` and
+  `traverse()`. The only text written into these statements is identifiers validated before any
+  call: the table name (`table_name`, checked when the class is defined), edge names (every item
+  of a list), field names and the `traverse()` path.
 - An edge write denied by the table's permissions can never look like a success (see Changed).
 
 ### Notes

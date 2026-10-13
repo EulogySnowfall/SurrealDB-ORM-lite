@@ -867,7 +867,9 @@ class BaseSurrealModel(BaseModel):
 
         When ``tx`` is provided the CREATE statement is buffered (deferred to commit)
         and the in-memory instance is returned as-is. Buffered creates require an
-        explicit record id. ``keep`` is forwarded to :meth:`_write_payload`.
+        explicit record id, which is bound (``$rid``), never written into the statement,
+        so every id shape works: a compound id such as ``pair:[User:alice, User:bob]``
+        included. ``keep`` is forwarded to :meth:`_write_payload`.
         """
         record_id = self._record_id()
         data = self._write_payload(keep=keep)
@@ -875,7 +877,7 @@ class BaseSurrealModel(BaseModel):
 
         if tx is not None:
             if record_id is not None:
-                rows = await tx.add(f"CREATE {record_id} CONTENT $data;", {"data": data})
+                rows = await tx.add("CREATE $rid CONTENT $data;", {"rid": record_id, "data": data})
                 # An interactive transaction (3.x/WebSocket) answers with the created row, so
                 # hydrate the server-owned fields exactly as the non-tx path does. A buffered
                 # transaction defers the statement and has nothing to return yet — its
@@ -1211,12 +1213,14 @@ class BaseSurrealModel(BaseModel):
     async def _do_upsert(self, tx: Transaction | None = None) -> tuple[Self, bool]:
         """Internal upsert logic. Returns (self, created).
 
-        Uses the SDK's native ``upsert()`` which runs ``UPSERT $record CONTENT $data`` —
+        Runs ``UPSERT $rid CONTENT $data`` through ``client.query()`` (or the transaction) —
         a full REPLACE: the record is created if absent, or entirely replaced if present
         (fields omitted from the model are dropped). An explicit id is required (there is
-        nothing to match without one). ``created`` is read from the statement's ``$before``
-        (``None`` → the row did not exist), so the ``post_save`` signal reports it truthfully
-        — at no extra round-trip.
+        nothing to match without one); it is bound (``$rid``), never written into the
+        statement, so every id shape works: a compound id such as
+        ``pair:[User:alice, User:bob]`` included. ``created`` is read from the statement's
+        ``$before`` (``None`` → the row did not exist), so the ``post_save`` signal reports it
+        truthfully — at no extra round-trip.
 
         When ``tx`` is provided the ``UPSERT`` statement is buffered (deferred to commit);
         on an interactive transaction the returned row is applied to ``self``.
@@ -1232,16 +1236,17 @@ class BaseSurrealModel(BaseModel):
         # RETURN $before, $after reports both states of the row in a single statement, so
         # `created` is the truth rather than an assumption (issue #156). Verified on
         # SurrealDB 2.6.x and 3.x alike.
-        statement = f"UPSERT {record_id} CONTENT $data RETURN $before AS before, $after AS after;"
+        statement = "UPSERT $rid CONTENT $data RETURN $before AS before, $after AS after;"
+        variables = {"rid": record_id, "data": data}
 
         if tx is not None:
-            rows = await tx.add(statement, {"data": data})
+            rows = await tx.add(statement, variables)
             before, after = self._split_upsert_result(rows)
             self._apply_record(after if after is not None else rows)
             return self, before is None
 
         client = await SurrealDBConnectionManager.get_client()
-        rows = await client.query(statement, {"data": data})
+        rows = await client.query(statement, variables)
         before, after = self._split_upsert_result(rows)
         self._apply_record(after if after is not None else rows)
         return self, before is None
@@ -1263,7 +1268,7 @@ class BaseSurrealModel(BaseModel):
         """
         Insert the model instance, or fully replace it if a record with the same id exists.
 
-        Backed by the SDK's native ``upsert()`` (``UPSERT $record CONTENT $data``): this is
+        Runs ``UPSERT $rid CONTENT $data``, the record id bound as a query parameter: this is
         REPLACE semantics, so any field omitted from the model is removed from the stored
         record. For a partial update use ``merge()`` instead. An explicit id is required.
 
