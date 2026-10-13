@@ -1031,6 +1031,11 @@ trampling each other — the footgun that makes section 18's `signin()` unsuitab
 Pass `bind=True` to _also_ adopt the token process-wide (handy in a script or notebook, wrong in
 a concurrent server).
 
+Field values are validated and stored as in `merge()`: a `datetime`, `date`, `timedelta`,
+`Decimal` or `UUID` field (section 24) gets the server's own type, so
+`signup(…, joined="2026-01-01T00:00:00Z")` stores a datetime, and a value that does not fit raises
+`ValueError` before any request.
+
 The model must declare either an `id` field or a `primary_key`, as every ORM model must. Prefer
 `id` here so the server mints the record id during SIGNUP; configure `primary_key` when identity
 _is_ a column, and the SIGNUP clause targets `type::thing(…)` to match.
@@ -2100,9 +2105,11 @@ await event.atomic_increment("at", timedelta(days=1))       # at = at + $amount
 await event.atomic_increment("day", timedelta(days=1))      # a date: whole days only
 ```
 
-`merge()`, `bulk_update()` and the update branch of `update_or_create(defaults=…)` validate each
-value addressed to a rich field against the field's full annotation, constraints included, so
-`merge(ttl="2h")` stores a duration and sets `event.ttl` to `timedelta(hours=2)`. A value that
+`merge()`, `bulk_update()`, the update branch of `update_or_create(defaults=…)` and the
+`signup()`/`signin()` of an `AuthenticatedUserMixin` model validate each value addressed to a rich
+field against the field's full annotation, constraints included, so `merge(ttl="2h")` stores a
+duration and sets `event.ttl` to `timedelta(hours=2)`, and `signin(badge="0190…")` matches the
+uuid a `UUID` identifier field holds. A value that
 does not fit raises `ValueError` naming the field, before anything is sent; `None` and
 `SurrealFunc` values are written as given. Before v0.23.0 such keyword values were stored as
 strings (see [Upgrading from v0.22](#upgrading-from-v022)).
@@ -2175,17 +2182,17 @@ The surrealdb SDK 2.0.0 cannot read a zero duration (`0ns`) back: over HTTP the 
 `IndexError`, over a WebSocket the SDK raises a bare `KeyError` and the connection is lost (the
 next call reconnects; live streams resubscribe with `auto_resubscribe`). So the ORM refuses to
 store one: its write paths (`save()`, `merge()`, `bulk_update()`, `patch()`, the `atomic_*`
-helpers…) raise `ValueError` before anything is sent. Declare the field optional,
+helpers, a model's `signup()`…) raise `ValueError` before anything is sent. Declare the field optional,
 `ttl: timedelta | None = None`, and store `None` for "no duration". A zero in a filter is fine
-(`filter(ttl__gt=timedelta(0))`). The variables of `raw_query()`, `QuerySet.query()` and
-`call_function()` are not guarded, since a raw statement may use a zero only to filter: storing
-one through them is up to you. The restriction lifts by itself with an SDK release that decodes
+(`filter(ttl__gt=timedelta(0))`). The variables of `raw_query()`, `QuerySet.query()`,
+`call_function()` and `SurrealDBConnectionManager.signin()`/`signup()` are not guarded, since the
+statement they feed may use a zero only to filter: storing one through them is up to you. The restriction lifts by itself with an SDK release that decodes
 zero durations.
 
 #### Values refused before sending
 
-Every value the ORM sends, including `raw_query()` and `call_function()` variables, is converted
-to a form both lines accept (a `date`, a `set`, a `Decimal` such as `1E+3` or `0.0000005`, an open
+Every value the ORM sends, including the variables of `raw_query()`, `call_function()` and
+`SurrealDBConnectionManager.signin()`/`signup()`, is converted to a form both lines accept (a `date`, a `set`, a `Decimal` such as `1E+3` or `0.0000005`, an open
 `Range` side) or refused before anything is sent, so the connection and its live streams stay up:
 
 - an `int` outside signed 64-bit (`2**63`, `2**70`), a record id key included: `ValueError`
