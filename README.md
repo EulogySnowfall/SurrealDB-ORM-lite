@@ -2119,23 +2119,36 @@ v0.23.0 such keyword values were stored as strings (see [Upgrading from v0.22](#
 Sub-models and table models in keyword writes:
 
 - A field typed with a sub-model that holds a rich type (`profile: Profile | None`,
-  `list[Profile]`) takes a dict or an instance.
+  `list[Profile]`) takes a dict or an instance, under the rules below. A dict for a sub-model with
+  no rich type keeps its keys and values as given, as before v0.23.0: only the `server_values=` and
+  table-model rules apply to it.
 - In `merge()` and in the update branch of `update_or_create()`, a dict changes only the keys it
   names. Each key is validated as its sub-field: `merge(profile={"bday": "1995-05-05"})` stores a
   datetime, and a bad value raises `ValueError` naming `profile.bday`. SurrealDB's `MERGE` keeps the
   other stored keys, so a required sub-field does not need to be repeated. An array is replaced
-  whole. With `server_values=`, `merge()` runs an `UPDATE … SET`, which replaces the field with the
-  dict.
+  whole.
+- With `server_values=`, `merge()` runs an `UPDATE … SET`, which replaces each field it assigns.
+  So each key of a sub-model dict is assigned on its own (`profile.city = $…`, one level further
+  for a dict under a sub-model sub-field), and the other stored keys stay, as with `MERGE`. Each
+  key must then be an identifier: `merge(profile={"zip-code": …}, server_values=…)` raises
+  `ValueError` before anything is sent. A server value for the same field wins over the dict.
 - An instance is the whole sub-object, written as `save()` writes it:
   `merge(profile=Profile(city="y"))` removes a stored `bday`.
 - `bulk_update()` and `signup()` replace the field, so a dict is validated there as the whole
   sub-model: a missing required sub-field raises `ValueError`.
-- Sub-fields are written under the key their validation reads (their alias):
-  `seen: datetime | None = Field(default=None, alias="lastSeen")` is stored as `lastSeen` by
-  `save()` and by keyword writes alike, so a read gives it back.
+- Sub-fields are written under the key their validation reads: the alias, or the first string of
+  an `AliasChoices`. `seen: datetime | None = Field(default=None, alias="lastSeen")` is stored as
+  `lastSeen` by `save()`, by an instance in a keyword write and by a `merge()` dict, whether the
+  dict names it `seen` or `lastSeen`, so a read gives it back. A dict that names one sub-field
+  twice (`{"seen": …, "lastSeen": …}`) raises `ValueError`.
 - A table-model instance is written as its record id: `merge(author=alice)` stores alice's
-  `RecordID`, in a raw query's variables too. A field that cannot hold a `RecordID` raises
-  `ValueError`.
+  `RecordID`, in a raw query's variables too. On a declared field, rich or not, the value is
+  checked at every position an instance can take (the value itself, a list or tuple item, a dict
+  value). Where the field cannot hold a `RecordID` there (`plains: list[Plain]`,
+  `dict[str, Plain]`, a sub-model), the write raises `ValueError` before anything is sent. The
+  same check covers the items of `atomic_append()`, `atomic_remove()`, `atomic_set_add()` and
+  their `_many` variants, and the value of a `patch()` `add` or `replace` (`/plains/-` is an item
+  of `plains`). An undeclared field, or a position typed `Any`, stores the record id.
 
 `atomic_increment(field, amount)` also takes a duration (a `timedelta`, a `Duration` or the SDK's
 `Duration`), which must be positive: a decrement could reach a zero or negative duration, so it
@@ -2477,6 +2490,7 @@ Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v
 | Strings compared with datetime, duration or uuid columns                                                                                    | raw: silently wrong. ORM: typed lookups convert them                                                                                                                                                   | same on both lines                                                                                                                                                                                                                                                                                                                              | v0.23.0 |
 | Integers beyond signed 64-bit                                                                                                               | raw: `2**63` silently wraps to `-2**63`, larger values are rejected (WebSocket lost). ORM: refused before sending (`ValueError`)                                                                       | same on both lines                                                                                                                                                                                                                                                                                                                              | v0.23.0 |
 | Native sets (`TYPE set<…>` column, `<set>` value) and `set[X]` fields                                                                       | an array, read back as a list (the ORM returns the declared set)                                                                                                                                       | 3.3.x: a native set (CBOR tag 56) the surrealdb SDK 2.0.0 cannot decode: HTTP `BufferError`, WebSocket `KeyError` and connection lost, also on the row a write returns. 3.1.5: a `set<…>` column refuses the array the ORM sends. On both lines `set[X]` fields work on schemaless tables and `array<…>` columns (the ORM sends sets as arrays) | v0.23.0 |
+| Sub-model dict in `merge(server_values=…)` (an `UPDATE … SET`)                                                                              | raw: `SET profile = {…}` replaces the stored object, and `object::extend` is a parse error. ORM: one `SET profile.city = $…` per key, so the other stored keys stay, as with `MERGE`                   | raw: `SET profile = {…}` replaces the stored object. ORM: same as 2.x (`object::extend` exists but is not used)                                                                                                                                                                                                                                 | v0.23.0 |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                          | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                                            | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                                                                                                                                                                                     | v0.19.1 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
