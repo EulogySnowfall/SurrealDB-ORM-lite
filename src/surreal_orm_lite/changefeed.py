@@ -24,7 +24,8 @@ that millisecond — a 3.x stamp is ``unix_ms << 16 | counter``, so the clock al
 
 Polling is plain ``query()``, so it works over HTTP as well as WebSocket. A dropped connection is
 retried with backoff like a live stream; nothing is lost, because the next poll starts from the
-cursor.
+cursor. A cancelled read (``asyncio.timeout`` around it) is never retried, even when the SDK
+reports the cancellation as a failed request on a dead connection.
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ from .enum import LiveAction
 from .exceptions import SurrealDbConnectionError, SurrealDbError
 from .live import (
     ModelChangeEvent,
+    cancellation_lost,
     cancelled_from_outside,
     hydrate,
     is_connection_failure,
@@ -476,7 +478,12 @@ class ChangeModelStream(Generic[T]):
         return section if isinstance(section, dict) else None
 
     async def _with_retry(self, operation: Callable[[Any], Awaitable[Any]]) -> Any:
-        """Run *operation* on the manager's client, retrying connection failures with backoff."""
+        """Run *operation* on the manager's client, retrying connection failures with backoff.
+
+        A cancellation of the reading task (``asyncio.timeout``, ``wait_for``, ``Task.cancel()``) is
+        never retried, even when the SDK reports it as a failed request: see
+        :func:`~surreal_orm_lite.live.cancellation_lost`.
+        """
         from .connection_manager import SurrealDBConnectionManager
 
         delay = float(self.reconnect_delay)
@@ -494,6 +501,10 @@ class ChangeModelStream(Generic[T]):
                     raise
                 error: Exception = SurrealDbConnectionError("the connection dropped during the request")
             except Exception as exc:
+                if cancellation_lost(exc):
+                    # The SDK raised over this task's cancellation (a timeout around the read):
+                    # retried, the cancellation would be lost and the read would poll on forever.
+                    raise asyncio.CancelledError from exc
                 if not is_connection_failure(exc, client):
                     raise
                 error = exc

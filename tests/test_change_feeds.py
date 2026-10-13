@@ -832,3 +832,81 @@ class TestEndOfFeed3xUnit:
             async with asyncio.timeout(2):
                 await anext(stream)
         assert len(server.shows) == 1
+
+
+# ==================== a cancellation the SDK turns into a KeyError ====================
+
+
+class _CancelRaceClient:
+    """An SDK WebSocket client losing the race the #212 suite hit on 2.x, on demand.
+
+    The first ``SHOW CHANGES`` is cancelled by the caller's timeout in the very loop iteration its
+    answer arrives. The SDK's receive loop (surrealdb 2.0.0) then calls ``set_result()`` on the
+    cancelled future, dies of the ``InvalidStateError`` and clears its pending-request map, so the
+    request's own cleanup (``del self.qry[id]``) raises a ``KeyError`` that *replaces* the
+    ``CancelledError``, on a client that is dead by then. Every later query answers an empty feed.
+    """
+
+    def __init__(self, finished: asyncio.Task[None]) -> None:
+        self._finished = finished
+        self.recv_task: asyncio.Task[None] | None = None  # no receive task: alive, until the race
+        self.raced = False
+        self.shows = 0
+
+    async def version(self) -> str:
+        return "surrealdb-2.7.0"
+
+    async def query(self, sql: str, variables: dict[str, Any]) -> Any:
+        await asyncio.sleep(0)
+        if sql.startswith("INFO FOR DB"):
+            return {"tables": {TABLE: f"DEFINE TABLE {TABLE} TYPE ANY SCHEMALESS CHANGEFEED 1h"}}
+        assert sql.startswith(f"SHOW CHANGES FOR TABLE {TABLE} "), f"unexpected query {sql!r}"
+        self.shows += 1
+        if self.raced:
+            return []
+        qry = {"request": asyncio.get_running_loop().create_future()}
+        try:
+            await qry["request"]  # never answered: only the caller's cancellation ends it
+        finally:
+            self.raced = True
+            self.recv_task = self._finished  # the receive loop died...
+            qry.clear()  # ...and its finally cleared the pending requests
+            del qry["request"]  # KeyError, raised over the CancelledError
+
+
+async def _finished_task() -> asyncio.Task[None]:
+    task = asyncio.ensure_future(asyncio.sleep(0))
+    await task
+    return task
+
+
+class TestCancelledReadUnit:
+    @pytest.mark.asyncio
+    async def test_a_timeout_around_a_read_still_fires_when_the_sdk_raises_over_its_cancellation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The KeyError on a dead client looks like a dropped connection: retrying it swallowed the
+        timeout's cancellation, and the read polled on forever (``_nothing_within`` hung on 2.x)."""
+        client = _CancelRaceClient(await _finished_task())
+
+        async def _get_client(cls: Any) -> Any:
+            return client
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", classmethod(_get_client))
+        stream = _fast(Fed.objects().changes(since=0, poll_interval=0.05))
+
+        async def _read_within(seconds: float) -> None:
+            async with asyncio.timeout(seconds):
+                await anext(stream)
+
+        reading = asyncio.ensure_future(_read_within(0.2))
+        # The guard is a wait on a separate task: a read that swallows its own cancellation cannot
+        # swallow this one too.
+        done, _ = await asyncio.wait({reading}, timeout=3)
+        stream.stop()  # releases a read that lost its cancellation and polls on
+        await asyncio.wait({reading}, timeout=2)
+
+        assert client.raced, "the fake never reproduced the SDK's KeyError"
+        assert done, f"the read swallowed its timeout and kept polling ({client.shows} SHOW CHANGES)"
+        assert isinstance(reading.exception(), TimeoutError)
+        assert client.shows == 1, "nothing may be sent once the read is cancelled"

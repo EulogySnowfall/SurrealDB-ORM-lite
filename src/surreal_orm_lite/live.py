@@ -450,6 +450,34 @@ def cancelled_from_outside() -> bool:
     return task is not None and task.cancelling() > 0
 
 
+def cancellation_lost(exc: BaseException) -> bool:
+    """Whether *exc* replaced a cancellation of the running task, which must then be re-raised.
+
+    The SDK can raise an ordinary error over a ``CancelledError``. When a request is cancelled in
+    the same loop iteration its answer arrives, the SDK's receive loop calls ``set_result()`` on the
+    cancelled future, dies of the ``InvalidStateError`` and clears its pending-request map, so the
+    request's own cleanup (``del self.qry[id]``) raises a ``KeyError`` (surrealdb 2.0.0). On a client
+    that is dead by now, that is what a dropped connection looks like too (see
+    :func:`is_connection_failure`), so a reconnect loop would retry it and lose the cancellation: a
+    timeout around the read would never fire. A drop is told apart by the running task itself,
+    which is being cancelled only in the first case. The cancellation is found in the error's
+    chain (``__cause__``/``__context__``), even when the error was wrapped ``from None``.
+    """
+    if not cancelled_from_outside():
+        return False
+    seen: set[int] = set()
+    chain: list[BaseException] = [exc]
+    while chain:
+        error = chain.pop()
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        if isinstance(error, asyncio.CancelledError):
+            return True
+        chain.extend(link for link in (error.__cause__, error.__context__) if link is not None)
+    return False
+
+
 def require_websocket(url: str | None) -> None:
     """Reject a live query on a transport that cannot carry one.
 
@@ -667,6 +695,8 @@ class LiveStream:
                     raise
                 error: Exception = SurrealDbConnectionError("the connection dropped during the request")
             except Exception as exc:
+                if cancellation_lost(exc):
+                    raise asyncio.CancelledError from exc  # retried, the cancellation would be lost
                 if not self._still_wanted(iterator, queue, old_id):
                     return  # torn down meanwhile: whatever failed, nobody is waiting for it
                 if not is_connection_failure(exc, client):

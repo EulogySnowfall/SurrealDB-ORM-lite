@@ -628,6 +628,99 @@ class TestResubscribeFailuresUnit:
         assert stream._client is fourth
         await stream.stop()
 
+    @pytest.mark.asyncio
+    async def test_a_cancelled_resubscribe_ends_even_when_the_sdk_raises_over_its_cancellation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cancellation that lands as the SDK's answer arrives comes back as a retryable error: its
+        receive loop dies and the request's cleanup raises a ``KeyError``, which the connection
+        manager wraps. Retried, the cancellation was lost and the task resubscribed on — for ever
+        while the server is down, so ``asyncio.run()`` never returned."""
+        first = _FakeWs()
+        stream, _ = self._stream(monkeypatch, [first], [])
+        await stream.start()
+        reached = asyncio.Event()
+        attempts = [0]
+
+        async def _acquire_client(cls: Any, **kwargs: Any) -> Any:
+            attempts[0] += 1
+            if attempts[0] > 1:
+                raise SurrealDbConnectionError("down")  # the server stays unreachable
+            reached.set()
+            try:
+                await asyncio.sleep(3600)  # signing in on the new connection
+            except asyncio.CancelledError:
+                try:
+                    raise KeyError("request-id")  # the SDK's cleanup, raised over the cancellation
+                except KeyError:
+                    error = SurrealDbConnectionError("Can't connect to the database.")
+                    error.retryable = True  # type: ignore[attr-defined]
+                    raise error from None  # what _create_client() makes of it
+            raise AssertionError("unreachable")  # pragma: no cover
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "_acquire_client", classmethod(_acquire_client))
+        first.drop()
+        async with asyncio.timeout(2):
+            await reached.wait()
+        task = stream._resubscribing
+        assert task is not None
+
+        task.cancel()
+        # A wait on the task, not on this one: a task that swallowed its cancellation runs on.
+        done, _ = await asyncio.wait({task}, timeout=2)
+        await stream.stop()  # ends a resubscribe that lost its cancellation
+
+        assert attempts[0] == 1, f"the cancelled resubscribe was retried ({attempts[0]} attempts)"
+        assert done
+        assert task.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_the_lost_cancellation_classifier(self) -> None:
+        """The SDK raises the same ``KeyError`` over a ``CancelledError`` when the socket drops (its
+        receive loop cancels the pending request): only the running task's own cancellation tells
+        the two apart, so a drop is still retried."""
+        from surreal_orm_lite.live import cancellation_lost
+
+        def _sdk_key_error() -> KeyError:
+            """What the SDK's ``_send`` raises: ``del self.qry[id]`` in a finally, over the cancellation."""
+            qry: dict[str, Any] = {}
+            try:
+                try:
+                    raise asyncio.CancelledError
+                finally:
+                    del qry["request-id"]
+            except KeyError as error:
+                return error
+            raise AssertionError("unreachable")  # pragma: no cover
+
+        def _wrapped() -> SurrealDbConnectionError:
+            """What ``_create_client()`` makes of it: a retryable connection error, raised ``from None``."""
+            try:
+                try:
+                    raise _sdk_key_error()
+                except KeyError:
+                    raise SurrealDbConnectionError("Can't connect to the database.") from None
+            except SurrealDbConnectionError as error:
+                return error
+            raise AssertionError("unreachable")  # pragma: no cover
+
+        assert not cancellation_lost(_sdk_key_error()), "a drop, not a cancellation: retried"
+        seen: list[tuple[bool, bool, bool]] = []
+
+        async def _cancelled_task() -> None:
+            current = asyncio.current_task()
+            assert current is not None
+            current.cancel()  # requested, delivered at the next await: cancelling() == 1 meanwhile
+            seen.append((cancellation_lost(_sdk_key_error()), cancellation_lost(_wrapped()), cancellation_lost(KeyError("x"))))
+            await asyncio.sleep(3600)
+
+        task = asyncio.ensure_future(_cancelled_task())
+        await asyncio.wait({task}, timeout=2)
+
+        assert task.cancelled()
+        # The SDK's KeyError and its wrapped form are the cancellation; an unrelated error is not.
+        assert seen == [(True, True, False)]
+
     def test_the_failure_classifier(self) -> None:
         from surreal_orm_lite.live import is_connection_failure
 
