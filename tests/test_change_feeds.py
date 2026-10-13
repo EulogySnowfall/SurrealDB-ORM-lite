@@ -674,15 +674,18 @@ class TestSinceNoneSameMillisecondE2E:
             await _nothing_within(stream)
 
     @pytest.mark.asyncio
-    async def test_skips_every_page_of_history_then_delivers_the_next_write(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_skips_the_history_of_the_clocks_millisecond_then_delivers_the_next_write(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         async with feed_client() as client:
             clock = await _require_clock_stamps(client)
             for n in range(3):
                 await _write(lambda n=n: Fed(id=f"h{n}").save())
-            first_write, _, last_write = await _stamps_since(client, clock, "h0", "h1", "h2")
-            # The clock reads the millisecond of the first write: three entries are at or after it,
-            # one page each with batch_size=1.
-            monkeypatch.setattr(ChangeModelStream, "_server_now", _clock_reading(first_write >> 16))
+            _, _, last_write = await _stamps_since(client, clock, "h0", "h1", "h2")
+            # The clock reads the millisecond of the last write, the earliest a real start() made
+            # after the three writes can read. The writes that share it are read one page each
+            # (batch_size=1); paging is pinned exactly by TestEndOfFeed3xUnit.
+            monkeypatch.setattr(ChangeModelStream, "_server_now", _clock_reading(last_write >> 16))
 
             stream = await Fed.objects().changes(poll_interval=0.05, batch_size=1).start()
             assert isinstance(stream.cursor, int)
@@ -697,9 +700,10 @@ class TestSinceNoneSameMillisecondE2E:
 class _FakeServer3x:
     """A SurrealDB 3.x server in miniature: what ``ChangeModelStream`` asks while it starts and polls.
 
-    Its feed is a list of versionstamps, all in the millisecond its clock reads, so the tests can
-    put a write *after* ``start()`` in the very millisecond ``start()`` read — which a real server
-    only does by chance.
+    Its feed is a list of versionstamps, by default in the millisecond its clock reads, so the tests
+    can put a write *after* ``start()`` in the very millisecond ``start()`` read — which a real
+    server only does by chance; ``write_at`` stamps another millisecond. Like a real server it
+    answers oldest first, and each query yields to the event loop, so a test's timeout can fire.
     """
 
     def __init__(self, ms: int, counters: list[int]) -> None:
@@ -712,12 +716,16 @@ class _FakeServer3x:
         self.on_show: Any = None
 
     def write(self, counter: int) -> None:
-        self.stamps.append((self.ms << 16) | counter)
+        self.write_at(self.ms, counter)
+
+    def write_at(self, ms: int, counter: int) -> None:
+        self.stamps.append((ms << 16) | counter)
 
     async def version(self) -> str:
         return "surrealdb-3.3.3"
 
     async def query(self, sql: str, variables: dict[str, Any]) -> Any:
+        await asyncio.sleep(0)
         if sql.startswith("INFO FOR DB"):
             return {"tables": {TABLE: f"DEFINE TABLE {TABLE} TYPE ANY SCHEMALESS CHANGEFEED 1h"}}
         if sql.startswith("RETURN time::now()"):
@@ -730,7 +738,7 @@ class _FakeServer3x:
             self.on_show()
         return [
             {"versionstamp": stamp, "changes": [{"update": {"id": self._record(TABLE, f"c{stamp & 0xFFFF}")}}]}
-            for stamp in self.stamps
+            for stamp in sorted(self.stamps)
             if stamp >= since
         ][:limit]
 
@@ -752,6 +760,40 @@ class TestEndOfFeed3xUnit:
 
         assert stream.cursor == server.stamps[-1] + 1
         assert server.shows == [(server.ms << 16, 2), ((server.ms << 16) + 2, 2), ((server.ms << 16) + 4, 2)]
+
+    @pytest.mark.asyncio
+    async def test_the_scan_stops_at_the_next_millisecond_under_sustained_writes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The scan reads the clock's millisecond only: a busy table cannot keep ``start()`` from
+        returning, and its first later write is delivered, not skipped as history.
+
+        Every SHOW adds a full page of writes in the next millisecond; the first one also adds a
+        write in the clock's own millisecond, committed while ``start()`` runs (history).
+        """
+        ms = 1_791_868_481_598
+        server = _FakeServer3x(ms=ms, counters=[0, 1, 2])
+        self._serve(monkeypatch, server)
+        later = iter(range(100, 1 << 16))
+
+        def sustained_load() -> None:
+            if len(server.shows) == 1:
+                server.write(3)
+            for _ in range(2):
+                server.write_at(ms + 1, next(later))
+
+        server.on_show = sustained_load
+        stream = Fed.objects().changes(poll_interval=0, batch_size=2)
+
+        async with asyncio.timeout(2):
+            await stream.start()
+
+        assert len(server.shows) <= 3
+        assert stream.cursor == ((ms << 16) | 3) + 1
+
+        server.on_show = None
+        [event] = await _take(stream, 1, timeout=2)
+
+        assert event.record_id == f"{TABLE}:c100"
+        assert stream.cursor == (((ms + 1) << 16) | 100) + 1
 
     @pytest.mark.asyncio
     async def test_a_write_after_start_in_the_same_millisecond_is_delivered(self, monkeypatch: pytest.MonkeyPatch) -> None:
