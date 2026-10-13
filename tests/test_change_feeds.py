@@ -28,6 +28,7 @@ from surreal_orm_lite.changefeed import ChangeModelStream, feed_events, next_cur
 from surreal_orm_lite.enum import LiveAction
 from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.live import is_dead
+from tests._retry import retry_write as _write
 
 TABLE = "Fed"
 
@@ -66,22 +67,6 @@ async def feed_client(definition: str = "CHANGEFEED 1h", *, scheme: str = "ws", 
             cleanup = await SurrealDBConnectionManager.get_client()
             await cleanup.query(f"REMOVE TABLE IF EXISTS {TABLE};", {})
         await SurrealDBConnectionManager.close_connection()
-
-
-async def _write(operation: Any) -> Any:
-    """Run a test write, retrying SurrealDB's retryable conflicts.
-
-    Seen once in CI on a fresh 2.7.0 container: a plain write to a change-feed table failed with
-    "read or write conflict … can be retried", with no concurrent writer in the test (never
-    reproduced locally). The ORM's answer to a retryable conflict is ``retry_on_conflict``.
-    """
-    from surreal_orm_lite import retry_on_conflict
-
-    @retry_on_conflict(max_retries=5)
-    async def _run() -> Any:
-        return await operation()
-
-    return await _run()
 
 
 async def _take(stream: Any, count: int, timeout: float = 5.0) -> list[Any]:
@@ -489,7 +474,7 @@ async def _direct_write(sql: str) -> None:
     try:
         await client.signin({"username": "root", "password": "root"})
         await client.use("ns", "db")
-        await client.query(sql, {})
+        await _write(lambda: client.query(sql, {}))
     finally:
         await client.close()
 

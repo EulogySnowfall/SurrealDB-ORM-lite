@@ -132,6 +132,7 @@ from surreal_orm_lite.live import to_change_event
 from surreal_orm_lite.query_set import QuerySet
 from surreal_orm_lite.transaction import BufferedTransaction
 from surreal_orm_lite.utils import build_filter_condition, coerce_endpoint, parse_lookup
+from tests._retry import retry_write as _write
 from tests.conftest import orm_client
 
 # ==================== Shared models ====================
@@ -3721,9 +3722,9 @@ class TestEdgeLiveE2E:
             alice, bob, widget = await _nodes()
             await client.query("DEFINE TABLE tr_cf TYPE RELATION CHANGEFEED 1h;", {})
             major = (await _server_version())[0]
-            first = await alice.relate(TrCfEdge, widget, data={"quantity": 2})
-            second = await bob.relate(TrCfEdge, widget)
-            await first.delete()
+            first = await _write(lambda: alice.relate(TrCfEdge, widget, data={"quantity": 2}))
+            second = await _write(lambda: bob.relate(TrCfEdge, widget))
+            await _write(lambda: first.delete())
             stream = TrCfEdge.objects().changes(since=0, poll_interval=0.05)
             try:
                 events = await _next_events(stream, 3)
