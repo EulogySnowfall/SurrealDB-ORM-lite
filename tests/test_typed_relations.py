@@ -1708,10 +1708,47 @@ class TestRelateTypedStatements:
         assert await alice.relate("tr_follows", RecordID("tr_person", "carol"), False, tx) == []
 
         assert tx.statements == [
-            "RELATE tr_person:alice->tr_follows->tr_person:bob SET weight = $t0__rd0;",
-            "RELATE tr_person:alice->tr_follows->tr_person:carol;",
+            "RELATE $t0_src->tr_follows->$t0_dst SET weight = $t0__rd0;",
+            "RELATE $t1_src->tr_follows->$t1_dst;",
         ]
-        assert tx.variables == {"t0__rd0": 2}
+        assert tx.variables == {
+            "t0_src": ALICE_P,
+            "t0_dst": BOB_P,
+            "t0__rd0": 2,
+            "t1_src": ALICE_P,
+            "t1_dst": RecordID("tr_person", "carol"),
+        }
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    async def test_string_relate_binds_the_record_ids(self, no_client: list[str]) -> None:
+        """Only the validated edge name is written into the statement: the record ids are bound.
+
+        A ``RecordID`` is bound as is, whatever its table name holds, and a node id that is not an
+        identifier (``joe@x.com``) relates like it saves, as with the typed form.
+        """
+        joe = TrPerson(id="joe@x.com")
+        odd = RecordID("tr_person:x; DELETE tr_person; --", 1)
+        tx = BufferedTransaction()
+
+        await joe.relate("tr_follows", odd, tx=tx)
+        await joe.relate("tr_follows", odd, reverse=True, tx=tx)
+        await TrAnyIdNode(id=odd).relate("tr_follows", joe, tx=tx)
+
+        joe_id = RecordID("tr_person", "joe@x.com")
+        assert tx.statements == [
+            "RELATE $t0_src->tr_follows->$t0_dst;",
+            "RELATE $t1_dst->tr_follows->$t1_src;",
+            "RELATE $t2_src->tr_follows->$t2_dst;",
+        ]
+        assert tx.variables == {
+            "t0_src": joe_id,
+            "t0_dst": odd,
+            "t1_src": joe_id,
+            "t1_dst": odd,
+            "t2_src": odd,
+            "t2_dst": joe_id,
+        }
         assert no_client == []
 
 
@@ -1922,6 +1959,14 @@ class TrGhost(BaseSurrealModel):
     id: str | None = None
 
 
+class TrAnyIdNode(BaseSurrealModel):
+    """A node whose id may be a ``RecordID`` (as on an edge model): it is bound as is."""
+
+    model_config = SurrealConfigDict(table_name="tr_any_node")
+
+    id: str | RecordID | None = None
+
+
 GRAPH_TABLES = (*EDGE_TABLES, "tr_likes", "tr_ghost")
 BLANK_TARGET = (
     "remove_relation() target must not be empty or blank: pass a model instance, a RecordID, "
@@ -2050,6 +2095,42 @@ class TestGraphParityUnit:
             assert calls == [(records_statement, {"src": ALICE_P})]
 
     @pytest.mark.asyncio
+    async def test_string_relate_and_traverse_bind_the_record_ids(self, recording: _RecordingClient) -> None:
+        """Only the validated edge name or path is written into the statement; the ids are bound.
+
+        A ``"table:id"`` string keeps the rule of a model's own id (``"tr_person:1"`` is the string
+        id ``"1"``, as ``TrPerson(id="1")``), a ``RecordID`` or an ``id: int`` node an integer id,
+        and a ``RecordID`` is bound as is, whatever its table name holds — as a target, or as the
+        id of the source.
+        """
+        alice, joe = TrPerson(id="alice"), TrPerson(id="joe@x.com")
+        odd = RecordID("tr_person:x; DELETE tr_person; --", 1)
+        joe_id = RecordID("tr_person", "joe@x.com")
+
+        targets: list[tuple[Any, RecordID]] = [
+            ("tr_person:1", RecordID("tr_person", "1")),
+            ("tr_product:`a-b`", RecordID("tr_product", "a-b")),
+            (RecordID("tr_product", 7), RecordID("tr_product", 7)),
+            (TrIntNode(id=5), RecordID("tr_int_node", 5)),
+            (joe, joe_id),
+            (odd, odd),
+        ]
+        for target, bound in targets:
+            calls, _ = await _recorded(recording, alice.relate("tr_follows", target))
+            assert calls == [("RELATE $src->tr_follows->$dst;", {"src": ALICE_P, "dst": bound})]
+
+        calls, _ = await _recorded(recording, joe.relate("tr_follows", odd, reverse=True, weight=2))
+        assert calls == [("RELATE $dst->tr_follows->$src SET weight = $_rd0;", {"src": joe_id, "dst": odd, "_rd0": 2})]
+
+        source = TrAnyIdNode(id=odd)
+        calls, _ = await _recorded(recording, source.relate("tr_follows", alice))
+        assert calls == [("RELATE $src->tr_follows->$dst;", {"src": odd, "dst": ALICE_P})]
+
+        for node, bound in [(source, odd), (joe, joe_id), (TrIntNode(id=5), RecordID("tr_int_node", 5))]:
+            calls, result = await _recorded(recording, node.traverse("->tr_follows->tr_person"))
+            assert (calls, result) == ([("SELECT VALUE ->tr_follows->tr_person FROM ONLY $src;", {"src": bound})], [])
+
+    @pytest.mark.asyncio
     async def test_positional_calls_match_keyword_forms(self, recording: _RecordingClient) -> None:
         """R2: each positional call records exactly what its keyword form records."""
         alice, bob = TrPerson(id="alice"), TrPerson(id="bob")
@@ -2057,7 +2138,7 @@ class TestGraphParityUnit:
             (
                 lambda: alice.relate("tr_follows", bob, True),
                 lambda: alice.relate("tr_follows", bob, reverse=True),
-                [("RELATE tr_person:bob->tr_follows->tr_person:alice;", {})],
+                [("RELATE $dst->tr_follows->$src;", {"src": ALICE_P, "dst": BOB_P})],
             ),
             (
                 lambda: alice.relate(TrFollows, bob, True, None, weight=3),
@@ -2136,6 +2217,10 @@ class TestGraphParityUnit:
             (lambda a: TrPerson().remove_relation("tr_follows", a), SurrealDbError, "unsaved"),
             (lambda a: TrPerson().remove_all_relations(["tr_follows"]), SurrealDbError, "unsaved"),
             (lambda a: TrPerson().relate("tr_follows", a, True), SurrealDbError, "unsaved"),
+            (lambda a: a.relate("tr_follows", TrPerson()), SurrealDbError, "unsaved"),
+            (lambda a: a.relate("tr_follows", 42), TypeError, "target must be"),
+            (lambda a: TrPerson().traverse("->tr_follows->tr_person"), SurrealDbError, "unsaved"),
+            (lambda a: a.traverse("->tr_follows; DELETE tr_person"), ValueError, "Invalid graph path"),
         ],
     )
     async def test_graph_helpers_validate_before_any_call(
@@ -2188,9 +2273,14 @@ class TestGraphParityUnit:
         assert rows == []
         assert tx.statements == [
             _queued_guarded_insert("tr_follows", 0),
-            "RELATE tr_person:bob->tr_follows->tr_person:alice SET since = $t1__rd0;",
+            "RELATE $t1_dst->tr_follows->$t1_src SET since = $t1__rd0;",
         ]
-        assert tx.variables == {"t0_data": {"in": BOB_P, "out": ALICE_P, "weight": 2}, "t1__rd0": "2025-01-01"}
+        assert tx.variables == {
+            "t0_data": {"in": BOB_P, "out": ALICE_P, "weight": 2},
+            "t1_src": ALICE_P,
+            "t1_dst": BOB_P,
+            "t1__rd0": "2025-01-01",
+        }
         assert recording.calls == []
 
     @pytest.mark.asyncio
@@ -2221,21 +2311,22 @@ class TestGraphParityUnit:
 
         calls, rows = await _recorded(recording, alice.relate("tr_follows", bob, since="2025-01-01"))
         assert rows == []
-        assert calls == [("RELATE tr_person:alice->tr_follows->tr_person:bob SET since = $_rd0;", {"_rd0": "2025-01-01"})]
+        pair = {"src": ALICE_P, "dst": BOB_P}
+        assert calls == [("RELATE $src->tr_follows->$dst SET since = $_rd0;", {**pair, "_rd0": "2025-01-01"})]
 
         calls, _ = await _recorded(recording, alice.relate("tr_follows", bob, reverse=True, since="2025-01-01"))
-        assert calls == [("RELATE tr_person:bob->tr_follows->tr_person:alice SET since = $_rd0;", {"_rd0": "2025-01-01"})]
+        assert calls == [("RELATE $dst->tr_follows->$src SET since = $_rd0;", {**pair, "_rd0": "2025-01-01"})]
 
         calls, _ = await _recorded(recording, alice.relate("tr_follows", bob, since="2025-01-01", data={"weight": 2}))
         assert calls == [
             (
-                "RELATE tr_person:alice->tr_follows->tr_person:bob SET weight = $_rd0, since = $_rd1;",
-                {"_rd0": 2, "_rd1": "2025-01-01"},
+                "RELATE $src->tr_follows->$dst SET weight = $_rd0, since = $_rd1;",
+                {**pair, "_rd0": 2, "_rd1": "2025-01-01"},
             )
         ]
 
         calls, _ = await _recorded(recording, alice.relate("tr_follows", bob, data={"reverse": True}))
-        assert calls == [("RELATE tr_person:alice->tr_follows->tr_person:bob SET reverse = $_rd0;", {"_rd0": True})]
+        assert calls == [("RELATE $src->tr_follows->$dst SET reverse = $_rd0;", {**pair, "_rd0": True})]
 
         calls, edge = await _recorded(recording, alice.relate(TrPurchased, widget, quantity=2, price=9.5))
         assert calls == [("insert_relation", "tr_purchased", {"in": ALICE_P, "out": WIDGET, "quantity": 2, "price": 9.5})]
@@ -2405,6 +2496,32 @@ class TestGraphParityE2E:
             await joe.relate(TrPurchased, widget)
             await joe.remove_all_relations([TrPurchased], "both")
             assert await TrPurchased.objects().count() == 0
+
+    @pytest.mark.asyncio
+    async def test_string_relate_and_traverse_bind_the_record_ids(self) -> None:
+        async with orm_client(*GRAPH_TABLES) as client:
+            alice, bob, widget = await _nodes()
+            odd = RecordID("tr_person:x; DELETE tr_person; --", 1)
+
+            rows = await alice.relate("tr_follows", odd)
+            assert [(row["in"], row["out"]) for row in rows] == [(ALICE_P, odd)]
+            rows = await alice.relate("tr_follows", odd, reverse=True, weight=2)
+            assert [(row["in"], row["out"], row["weight"]) for row in rows] == [(odd, ALICE_P, 2)]
+            people = await client.query("SELECT VALUE id FROM tr_person ORDER BY id;", {})
+            assert people == [ALICE_P, BOB_P]  # the table name was bound, never run
+
+            joe = await TrPerson(id="joe@x.com", name="Joe").save()
+            joe_id = RecordID("tr_person", "joe@x.com")
+            rows = await joe.relate("tr_follows", bob, since="2025-01-01")
+            assert [(row["in"], row["out"], row["since"]) for row in rows] == [(joe_id, BOB_P, "2025-01-01")]
+            await bob.relate("tr_follows", widget)
+            await bob.relate("tr_follows", alice, reverse=True)
+            assert await joe.traverse("->tr_follows->tr_person") == [BOB_P]
+            assert await joe.traverse("->tr_follows->tr_person->tr_follows->tr_product") == [WIDGET]
+            assert sorted(map(str, await bob.traverse("<-tr_follows<-tr_person"))) == sorted(map(str, [ALICE_P, joe_id]))
+
+            source = TrAnyIdNode(id=ALICE_P)  # a RecordID id is bound as is
+            assert await source.traverse("->tr_follows->tr_person") == [BOB_P]  # not odd: another table
 
     @pytest.mark.asyncio
     async def test_missing_edge_table_is_a_silent_noop(self) -> None:

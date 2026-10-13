@@ -398,9 +398,10 @@ async with SurrealDBConnectionManager.transaction() as tx:
   `objects(tx=)` reads and a rollback undoes it. On a buffered one (2.x, or HTTP) it is queued
   and applied at commit, and the string `relate()` returns `[]`. `get_related()` has no `tx=`,
   as in the full ORM.
-- The source and target are bound as record ids (only edge names are written into the
-  statement), so a node whose id is not an identifier, such as `User(id="joe@x.com")`, works
-  with `get_related()`, the `remove_*` helpers and a typed `relate()`.
+- The source and target are bound as record ids (only edge names, field names and the
+  validated `traverse()` path are written into the statement), so a node whose id is not an
+  identifier, such as `User(id="joe@x.com")`, works with every graph helper: `relate()` with an
+  edge class or a table name, `get_related()`, the `remove_*` helpers and `traverse()`.
 
 Coming from the full SurrealDB-ORM? The few remaining differences are listed in
 [Migrating from SurrealDB-ORM (graph API)](#migrating-from-surrealdb-orm-graph-api).

@@ -35,7 +35,6 @@ from .utils import (
     coerce_endpoint,
     format_record_id,
     merge_extra_vars,
-    remove_quotes_for_variables,
     user_stacklevel,
     validate_alias_name,
     validate_edge_name,
@@ -1688,15 +1687,34 @@ class BaseSurrealModel(BaseModel):
 
     # ==================== Relations & Graph ====================
 
+    @staticmethod
+    def _check_thing_table(record_id: RecordID) -> None:
+        """Refuse a ``RecordID`` whose table name is not an identifier, before it becomes text.
+
+        Raises:
+            ValueError: the table name is not an identifier (letters, digits, underscores; not
+                starting with a digit).
+        """
+        if not isinstance(record_id.table_name, str) or not VALID_ALIAS_PATTERN.fullmatch(record_id.table_name):
+            raise ValueError(
+                f"Invalid record identifier: table name {record_id.table_name!r} must be an identifier "
+                "(letters, digits, underscores; not starting with a digit)."
+            )
+
     def _get_thing(self) -> str:
-        """Return ``table:id`` string for this instance."""
+        """Return the ``table:id`` text of this instance.
+
+        The ORM's own graph statements bind the record id instead (:meth:`_graph_source`); this
+        text form is kept for code that reads it. A ``RecordID`` id must name an identifier table.
+        """
         id_val = self.get_id()
         if id_val is None:
             raise SurrealDbError("Cannot use relations on an unsaved model (no id).")
         if isinstance(id_val, RecordID):
-            # A RecordID from the DB is already typed/trusted; its string form may
-            # contain SurrealQL escaping (e.g. "Table:⟨1⟩") which validate_thing
-            # intentionally rejects. Skip validation for trusted RecordID values.
+            # A RecordID from the DB is already typed; its string form may contain SurrealQL
+            # escaping (e.g. "Table:⟨1⟩") which validate_thing intentionally rejects. The SDK's
+            # string form does not escape the table name, though, so that one is checked.
+            self._check_thing_table(id_val)
             return str(id_val)
         table = self.get_table_name()
         validate_thing(f"{table}:{id_val}")
@@ -1712,11 +1730,13 @@ class BaseSurrealModel(BaseModel):
         """Resolve a target to a ``table:id`` string.
 
         A ``"table:id"`` string is quoted by the same rule as a model's own id, so
-        ``a.relate(edge, "M:1")`` and ``M(id="1")`` name the same record; pass a ``RecordID``
-        (or the model instance) to target an integer record id. An id already written
-        backtick-quoted is kept verbatim.
+        ``M:1`` and ``M(id="1")`` name the same record; pass a ``RecordID`` (or the model
+        instance) to target an integer record id. An id already written backtick-quoted is kept
+        verbatim. A ``RecordID`` must name an identifier table. ``relate()`` binds its target
+        instead (:meth:`_graph_target`); this text form is kept for code that reads it.
         """
         if isinstance(target, RecordID):
+            BaseSurrealModel._check_thing_table(target)
             return f"{target.table_name}:{format_record_id(target.id)}"
         if isinstance(target, str):
             validate_thing(target)
@@ -1857,14 +1877,16 @@ class BaseSurrealModel(BaseModel):
         - **An edge model class** (a :class:`~surreal_orm_lite.edge.BaseSurrealEdge` subclass,
           v0.22.0) — the edge is validated, created through the edge's ``save()``
           (``INSERT RELATION``, the ``save`` signals) and returned, typed: ``id`` is the
-          server's ``RecordID``, ``in_``/``out`` the two records. Both are bound as record ids,
-          so a node saved with an id such as ``joe@x.com`` relates like it saves. The edge
-          fields may not name an endpoint (``in``/``in_``/``out``), a computed field or a field
-          the model does not declare (unless it sets ``extra="allow"``); this is checked before
-          any call. A ``server_fields`` field named there is written instead of being left to
-          the server.
+          server's ``RecordID``, ``in_``/``out`` the two records. The edge fields may not name
+          an endpoint (``in``/``in_``/``out``), a computed field or a field the model does not
+          declare (unless it sets ``extra="allow"``); this is checked before any call. A
+          ``server_fields`` field named there is written instead of being left to the server.
         - **An edge table name** — the v0.6.0 ``RELATE`` (any target table), the edge fields
           written with ``SET``; returns the rows the database sent back.
+
+        In both forms the source and the target are bound as record ids (only the edge name and
+        the field names are written into the statement), so a node saved with an id such as
+        ``joe@x.com`` relates like it saves.
 
         Parameters follow the full SurrealDB-ORM's order, each by position or by keyword:
         ``relate(edge, target, reverse, tx)`` is ``relate(edge, target, reverse=…, tx=…)``.
@@ -1916,30 +1938,26 @@ class BaseSurrealModel(BaseModel):
 
         edge_name = self._edge_name(edge)
         fields = self._merge_edge_fields(data, edge_data, str)  # a column name is the field name
-        source = self._get_thing()
-        target_thing = self._resolve_target_thing(target)
-        start, end = (target_thing, source) if reverse else (source, target_thing)
+        # Both record ids are bound, as in the typed form and the other graph helpers: only the
+        # validated edge name and field names are written into the statement.
+        variables: dict[str, Any] = {"src": self._graph_source(), "dst": self._graph_target(target)}
+        start, end = ("$dst", "$src") if reverse else ("$src", "$dst")
 
-        if fields:
-            set_parts: list[str] = []
-            variables: dict[str, Any] = {}
-            for i, (key, value) in enumerate(fields.items()):
-                validate_field_name(key, "relation data field")
-                var_name = f"_rd{i}"
-                set_parts.append(f"{key} = ${var_name}")
-                variables[var_name] = value
-            set_clause = " SET " + ", ".join(set_parts)
-            query = f"RELATE {start}->{edge_name}->{end}{set_clause};"
-        else:
-            variables = {}
-            query = f"RELATE {start}->{edge_name}->{end};"
+        set_parts: list[str] = []
+        for i, (key, value) in enumerate(fields.items()):
+            validate_field_name(key, "relation data field")
+            var_name = f"_rd{i}"
+            set_parts.append(f"{key} = ${var_name}")
+            variables[var_name] = value
+        set_clause = (" SET " + ", ".join(set_parts)) if set_parts else ""
+        query = f"RELATE {start}->{edge_name}->{end}{set_clause};"
 
         if tx is not None:
-            rows = await tx.add(remove_quotes_for_variables(query), variables)
+            rows = await tx.add(query, variables)
             return rows if isinstance(rows, list) else []
 
         client = await SurrealDBConnectionManager.get_client()
-        result = await client.query(remove_quotes_for_variables(query), variables)
+        result = await client.query(query, variables)
         return result if isinstance(result, list) else []
 
     async def _relate_typed(
@@ -2215,11 +2233,18 @@ class BaseSurrealModel(BaseModel):
         """
         Execute a graph traversal from this record.
 
+        The path is validated and written into the statement; this record's id is bound, so a
+        node whose id is not an identifier (``joe@x.com``) traverses like it saves.
+
         Args:
             path: A SurrealQL graph traversal path starting with ``->`` or ``<-``.
 
         Returns:
             A list of records found by the traversal.
+
+        Raises:
+            ValueError: an invalid path.
+            SurrealDbError: an unsaved record.
 
         Example::
 
@@ -2227,11 +2252,11 @@ class BaseSurrealModel(BaseModel):
             fof = await user.traverse("->follows->User->follows->User")
         """
         validate_graph_path(path)
-        thing = self._get_thing()
+        source = self._graph_source()
 
-        query = f"SELECT VALUE {path} FROM ONLY {thing};"
+        query = f"SELECT VALUE {path} FROM ONLY $src;"
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.query(query, {})
+        results = await client.query(query, {"src": source})
 
         if isinstance(results, list):
             return results
