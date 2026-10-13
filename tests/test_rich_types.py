@@ -5,25 +5,53 @@ wire form are suffixed ``E2E``.
 """
 
 import copy
+import enum
 import inspect
 import json
 import math
+import os
+import re
 from collections.abc import Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
-from datetime import UTC, date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from decimal import Decimal
+from types import MappingProxyType
 from typing import Annotated, Any, ForwardRef, Literal, Optional, TypeVar, Union
 from uuid import UUID
 
+import aiohttp
 import pytest
 import surrealdb
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from surrealdb import TAG_DECIMAL_STRING, TAG_DURATION_COMPACT, AsyncSurreal, RecordID
+from surrealdb.cbor import CBORTag, undefined
+from surrealdb.data.cbor import encode as sdk_cbor_encode
 
 import surreal_orm_lite
-from surreal_orm_lite import BoundExcluded, BoundIncluded, Computed, Duration, InvalidDurationError, Range
+from surreal_orm_lite import (
+    BoundExcluded,
+    BoundIncluded,
+    Computed,
+    Duration,
+    InvalidDurationError,
+    Range,
+    SurrealDBConnectionManager,
+    SurrealFunc,
+    _sdk,
+    wire,
+)
 from surreal_orm_lite._sdk import Bound
 from surreal_orm_lite.types import _parse_range_text
-from surreal_orm_lite.wire import MAX_DURATION_NS, duration_ns, field_input, rich_kinds
+from surreal_orm_lite.wire import (
+    MAX_DURATION_NS,
+    decimal_text,
+    duration_ns,
+    encode_wire,
+    field_input,
+    rich_kinds,
+    sdk_decodes_zero_duration,
+)
+from tests.conftest import orm_client
 
 MAX_NS = Duration.MAX_NANOSECONDS
 SdkRange = surrealdb.Range
@@ -964,3 +992,665 @@ class TestFieldInput:
         assert result["child"]["child"]["ttl"] == timedelta(hours=3)
         assert result["child"]["child"]["child"] is None
         assert _Node.model_validate(result).child.child.ttl == timedelta(hours=3)  # type: ignore[union-attr]
+
+
+# --- wire.py, second part: encode_wire, decimal_text, the zero-duration probe (spec §3, §5.1) -----
+
+_INT64_MAX = 2**63 - 1
+_INT64_MIN = -(2**63)
+_UUID = UUID("0190c3d1-5c3b-7cc6-8f8a-2d2b1f0e9a11")
+_PLUS_TWO = timezone(timedelta(hours=2))
+_BOTH_MODES = pytest.mark.parametrize("stored", [True, False], ids=["stored", "filter"])
+
+
+def _tag14(seconds: int, nanoseconds: int) -> CBORTag:
+    return CBORTag(TAG_DURATION_COMPACT, [seconds, nanoseconds])
+
+
+def _tag10(text: str) -> CBORTag:
+    return CBORTag(TAG_DECIMAL_STRING, text)
+
+
+class _SubDate(date):
+    """A ``date`` subclass, as ``pendulum.Date`` is: still a calendar date."""
+
+
+class _Level(enum.IntEnum):
+    HIGH = 3
+
+
+class TestEncodeWire:
+    @_BOTH_MODES
+    @pytest.mark.parametrize(
+        "value",
+        [
+            None,
+            True,
+            False,
+            1.5,
+            float("nan"),
+            float("inf"),
+            "x",
+            b"x",
+            _UUID,
+            SurrealFunc("time::now()"),
+            CBORTag(TAG_DURATION_COMPACT, [1, 0]),
+            CBORTag(TAG_DECIMAL_STRING, "1.5"),
+            undefined,
+            object(),
+        ],
+        ids=repr,
+    )
+    def test_unchanged_scalars(self, value: Any, stored: bool) -> None:
+        assert encode_wire(value, stored=stored) is value
+
+    # ints: signed 64-bit, both modes
+    @_BOTH_MODES
+    @pytest.mark.parametrize("value", [0, -1, 1, _INT64_MAX, _INT64_MIN, _Level.HIGH])
+    def test_int64_unchanged(self, value: int, stored: bool) -> None:
+        assert encode_wire(value, stored=stored) is value
+
+    @_BOTH_MODES
+    @pytest.mark.parametrize(
+        "value",
+        [
+            2**63,
+            -(2**63) - 1,
+            2**64,
+            2**70,
+            -(2**70),
+            # Beyond Python's int-to-str limit: the message must not fail to format.
+            pytest.param(10**5000, id="10**5000"),
+            pytest.param(-(10**5000), id="-10**5000"),
+        ],
+    )
+    def test_int_beyond_64_bits_refused(self, value: int, stored: bool) -> None:
+        with pytest.raises(ValueError, match="64-bit") as info:
+            encode_wire(value, stored=stored)
+        assert "Decimal" in str(info.value)
+
+    def test_record_id_keys_are_checked(self) -> None:
+        for rid in (RecordID("t", 5), RecordID("t", "x"), RecordID("t", [1, {"k": 2}, True, _INT64_MIN])):
+            assert encode_wire(rid, stored=True) is rid
+        for bad in (
+            RecordID("t", 2**63),
+            RecordID("t", [1, {"k": 2**70}]),
+            RecordID("t", {"a": (-(2**63) - 1,)}),
+        ):
+            with pytest.raises(ValueError, match="64-bit"):
+                encode_wire(bad, stored=True)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            [1, 2**63],
+            (2**64,),
+            {"k": 2**70},
+            {2**63},
+            {"rid": RecordID("t", 2**63)},
+            Range(BoundIncluded(2**70), None),
+            surrealdb.Range(BoundIncluded(1), BoundExcluded(2**63)),
+        ],
+        ids=repr,
+    )
+    def test_ints_checked_inside_containers_and_bounds(self, value: Any) -> None:
+        with pytest.raises(ValueError, match="64-bit"):
+            encode_wire(value, stored=True)
+
+    # datetimes and dates
+    def test_aware_datetime_moves_to_utc(self) -> None:
+        value = datetime(2026, 1, 2, 5, 4, 5, 123456, tzinfo=_PLUS_TWO)
+        result = encode_wire(value, stored=True)
+        assert result == value
+        assert result.tzinfo is UTC
+        assert (result.hour, result.microsecond) == (3, 123456)
+
+    def test_naive_datetime_is_taken_as_utc(self) -> None:
+        value = datetime(2026, 1, 2, 3, 4, 5, 123456)
+        result = encode_wire(value, stored=True)
+        assert result == datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC)
+        assert result.tzinfo is UTC
+
+    @pytest.mark.parametrize("value", [date(2026, 1, 2), _SubDate(2026, 1, 2)], ids=["date", "subclass"])
+    def test_date_becomes_midnight_utc(self, value: date) -> None:
+        result = encode_wire(value, stored=True)
+        assert type(result) is datetime
+        assert result == datetime(2026, 1, 2, tzinfo=UTC)
+        assert result.tzinfo is UTC
+
+    def test_datetime_is_not_read_as_a_date(self) -> None:
+        value = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+        result = encode_wire(value, stored=True)
+        assert result == value
+        assert result.hour == 3
+
+    @_BOTH_MODES
+    def test_time_is_refused(self, stored: bool) -> None:
+        with pytest.raises(TypeError, match="time"):
+            encode_wire(time(1), stored=stored)
+        with pytest.raises(TypeError, match="time"):
+            encode_wire([time(1)], stored=stored)
+
+    # durations
+    @_BOTH_MODES
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (timedelta(hours=1, microseconds=5), _tag14(3600, 5000)),
+            (timedelta.max, _tag14(999_999_999 * 86_400 + 86_399, 999_999_000)),
+            (Duration(1), _tag14(0, 1)),
+            (Duration.parse("1h30m1ns"), _tag14(5400, 1)),
+            (surrealdb.Duration(5400 * 10**9 + 1), _tag14(5400, 1)),
+            (Duration(10**18 - 1), _tag14(999_999_999, 999_999_999)),
+            (surrealdb.Duration(10**18 - 1), _tag14(999_999_999, 999_999_999)),
+            (Duration(MAX_NS), _tag14(2**64 - 1, 999_999_999)),
+            (surrealdb.Duration(MAX_NS), _tag14(2**64 - 1, 999_999_999)),
+        ],
+        ids=repr,
+    )
+    def test_durations_become_compact_tags(self, value: Any, expected: CBORTag, stored: bool) -> None:
+        result = encode_wire(value, stored=stored)
+        assert result == expected
+        assert type(result.value) is list
+        # Never the SDK's float ``get_seconds_and_nano()``: the nanosecond part is never negative.
+        assert 0 <= result.value[1] < 10**9
+
+    @_BOTH_MODES
+    @pytest.mark.parametrize(
+        "value",
+        [
+            timedelta(seconds=-1),
+            timedelta(microseconds=-1),
+            surrealdb.Duration(-1),
+            surrealdb.Duration(MAX_NS + 1),
+            pytest.param(surrealdb.Duration(10**5000), id="Duration(10**5000)"),
+            pytest.param(surrealdb.Duration(-(10**5000)), id="Duration(-10**5000)"),
+        ],
+        ids=repr,
+    )
+    def test_durations_out_of_range_refused(self, value: Any, stored: bool) -> None:
+        with pytest.raises(ValueError, match="duration"):
+            encode_wire(value, stored=stored)
+
+    def test_sdk_duration_without_int_elapsed_refused(self) -> None:
+        with pytest.raises(TypeError):
+            encode_wire(surrealdb.Duration(1.5), stored=True)  # type: ignore[arg-type]
+
+    # decimals: one rounding step at the server's final scale (spec §5.1, revision 3)
+    @_BOTH_MODES
+    @pytest.mark.parametrize(
+        ("value", "text"),
+        [
+            (Decimal("12.345"), "12.345"),
+            (Decimal("1E-7"), "0.0000001"),
+            (Decimal("-5E-7"), "-0.0000005"),
+            (Decimal("0E-10"), "0.0000000000"),
+            (Decimal("-0"), "-0"),
+            (Decimal("0E+50"), "0"),
+            (Decimal("1E+3"), "1000"),
+            (Decimal("1E+28"), "1" + "0" * 28),
+            (Decimal("1.50"), "1.50"),
+            (Decimal("0." + "1" * 29), "0." + "1" * 28),
+            (Decimal("0." + "0" * 26 + "125"), "0." + "0" * 26 + "13"),
+            (Decimal("-0." + "0" * 26 + "125"), "-0." + "0" * 26 + "13"),
+            (Decimal("1E-1000000"), "0." + "0" * 28),
+            (Decimal("0.05") / 3, "0.0166666666666666666666666667"),
+            (Decimal("8." + "0" * 27 + "49"), "8." + "0" * 27),
+            (Decimal("-8." + "0" * 27 + "49"), "-8." + "0" * 27),
+            (Decimal("12." + "0" * 27 + "49"), "12." + "0" * 27),
+            (Decimal("8." + "0" * 27 + "5"), "8." + "0" * 26 + "1"),
+            (Decimal("7.9228162514264337593543950336"), "7.922816251426433759354395034"),
+            (Decimal("7922816251426433759354395033.55"), "7922816251426433759354395034"),
+            (Decimal("7922816251426433759354395033.549"), "7922816251426433759354395033.5"),
+            (Decimal("0.792281625142643375935439503355"), "0.7922816251426433759354395034"),
+            (Decimal("9.99999999999999999999999999995"), "10." + "0" * 27),
+            (Decimal("79228162514264337593543950335.4"), "79228162514264337593543950335"),
+            (Decimal("-79228162514264337593543950335"), "-79228162514264337593543950335"),
+        ],
+        ids=str,
+    )
+    def test_decimal_text_one_step(self, value: Decimal, text: str, stored: bool) -> None:
+        assert decimal_text(value) == text
+        assert encode_wire(value, stored=stored) == _tag10(text)
+        assert "E" not in text and "e" not in text
+
+    @_BOTH_MODES
+    @pytest.mark.parametrize(
+        "value",
+        [
+            Decimal("79228162514264337593543950335.5"),
+            Decimal("-79228162514264337593543950335.5"),
+            Decimal("79228162514264337593543950336"),
+            Decimal("1E+29"),
+            Decimal("9" * 40),
+        ],
+        ids=str,
+    )
+    def test_decimal_beyond_96_bits_refused(self, value: Decimal, stored: bool) -> None:
+        with pytest.raises(ValueError, match="decimal"):
+            encode_wire(value, stored=stored)
+        with pytest.raises(ValueError, match="decimal"):
+            decimal_text(value)
+
+    def test_decimal_text_needs_a_finite_value(self) -> None:
+        with pytest.raises(ValueError, match="finite"):
+            decimal_text(Decimal("NaN"))
+
+    def test_decimal_text_ignores_the_callers_context(self) -> None:
+        import decimal
+
+        third = Decimal("0.05") / 3
+        # A low precision and trapped rounding signals in the caller's context change nothing.
+        with decimal.localcontext(prec=5, traps=[decimal.Inexact, decimal.Rounded]):
+            assert decimal_text(Decimal("8." + "0" * 27 + "49")) == "8." + "0" * 27
+            assert decimal_text(third) == "0.0166666666666666666666666667"
+            assert decimal_text(Decimal("0." + "1" * 29)) == "0." + "1" * 28
+
+    @_BOTH_MODES
+    @pytest.mark.parametrize(
+        "value",
+        [Decimal("NaN"), Decimal("-Infinity"), Decimal("Infinity"), Decimal("sNaN")],
+        ids=str,
+    )
+    def test_non_finite_decimal_unchanged(self, value: Decimal, stored: bool) -> None:
+        assert encode_wire(value, stored=stored) is value
+        assert encode_wire([value], stored=stored)[0] is value
+        assert encode_wire({"k": value}, stored=stored)["k"] is value
+
+    # ranges
+    @_BOTH_MODES
+    def test_open_sides_become_undefined(self, stored: bool) -> None:
+        result = encode_wire(Range(BoundIncluded(1), None), stored=stored)
+        assert type(result) is surrealdb.Range
+        assert result.begin == BoundIncluded(1)
+        assert result.end is undefined
+        both_open = encode_wire(Range(), stored=stored)
+        assert both_open.begin is undefined and both_open.end is undefined
+        for open_side in (None, Bound(), undefined):
+            sdk = encode_wire(surrealdb.Range(open_side, BoundExcluded(5)), stored=stored)
+            assert sdk.begin is undefined
+            assert type(sdk.end) is BoundExcluded and sdk.end.value == 5
+
+    def test_bound_values_are_encoded(self) -> None:
+        result = encode_wire(surrealdb.Range(None, BoundIncluded(timedelta(minutes=1))), stored=True)
+        assert result.begin is undefined
+        assert type(result.end) is BoundIncluded
+        assert result.end.value == _tag14(60, 0)
+        mixed = encode_wire(Range(BoundExcluded(Decimal("1E-7")), BoundIncluded(date(2026, 1, 2))), stored=True)
+        assert type(mixed.begin) is BoundExcluded and mixed.begin.value == _tag10("0.0000001")
+        assert type(mixed.end) is BoundIncluded and mixed.end.value == datetime(2026, 1, 2, tzinfo=UTC)
+
+    def test_bound_values_are_not_restricted(self) -> None:
+        # Bound paths accept any bound value on both lines (spec §2.2); only live literals restrict them.
+        result = encode_wire(Range(BoundIncluded(_UUID), BoundExcluded([1, {"a": True}])), stored=True)
+        assert result.begin.value is _UUID
+        assert result.end.value == [1, {"a": True}]
+        assert encode_wire(Range(BoundIncluded(None), None), stored=True).begin == BoundIncluded(None)
+
+    def test_a_side_that_is_not_a_bound_is_refused(self) -> None:
+        with pytest.raises(TypeError, match="bound"):
+            encode_wire(surrealdb.Range("x", None), stored=True)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="bound"):
+            encode_wire(surrealdb.Range(BoundIncluded(1), 5), stored=True)  # type: ignore[arg-type]
+
+    def test_range_input_is_not_mutated(self) -> None:
+        sdk = surrealdb.Range(None, BoundIncluded(timedelta(minutes=1)))
+        encode_wire(sdk, stored=True)
+        assert sdk.begin is None
+        assert sdk.end.value == timedelta(minutes=1)
+
+    # containers
+    def test_sets_become_sorted_lists(self) -> None:
+        assert encode_wire({"b", "a"}, stored=True) == ["a", "b"]
+        assert encode_wire(frozenset({"b", "a"}), stored=True) == ["a", "b"]
+        # Sorted before encoding (encoded CBOR tags are not orderable): deterministic.
+        assert encode_wire({timedelta(hours=2), timedelta(hours=1)}, stored=True) == [_tag14(3600, 0), _tag14(7200, 0)]
+        unorderable = encode_wire({1, "a"}, stored=True)
+        assert type(unorderable) is list
+        assert sorted(unorderable, key=str) == [1, "a"]
+
+    def test_nested_containers(self) -> None:
+        value = {"k": [timedelta(1), {"d": date(2026, 1, 2)}], "t": (Decimal("1E+3"), 2), "s": {"x"}}
+        assert encode_wire(value, stored=True) == {
+            "k": [_tag14(86_400, 0), {"d": datetime(2026, 1, 2, tzinfo=UTC)}],
+            "t": [_tag10("1000"), 2],
+            "s": ["x"],
+        }
+
+    def test_tuples_and_mappings_become_lists_and_dicts(self) -> None:
+        assert encode_wire((1, "a"), stored=True) == [1, "a"]
+        assert type(encode_wire((1, "a"), stored=True)) is list
+        result = encode_wire(MappingProxyType({"a": timedelta(seconds=1)}), stored=True)
+        assert type(result) is dict
+        assert result == {"a": _tag14(1, 0)}
+
+    def test_idempotent_and_never_mutates(self) -> None:
+        value = {
+            "none": None,
+            "bool": True,
+            "float": 1.5,
+            "str": "x",
+            "bytes": b"x",
+            "uuid": _UUID,
+            "func": SurrealFunc("time::now()"),
+            "tag": _tag14(1, 0),
+            "undefined": undefined,
+            "int": _INT64_MAX,
+            "rid": RecordID("t", [1, 2]),
+            "aware": datetime(2026, 1, 2, 5, tzinfo=_PLUS_TWO),
+            "naive": datetime(2026, 1, 2, 3),
+            "date": date(2026, 1, 2),
+            "timedelta": timedelta(hours=1, microseconds=5),
+            "duration": Duration.parse("1h30m1ns"),
+            "sdk_duration": surrealdb.Duration(5),
+            "decimal": Decimal("1E-7"),
+            "range": Range(BoundIncluded(1), None),
+            "sdk_range": surrealdb.Range(None, BoundExcluded(timedelta(minutes=1))),
+            "list": [timedelta(hours=1)],
+            "tuple": (1, "a"),
+            "set": {"b", "a"},
+            "nested": {"k": [{"d": date(2026, 1, 2)}]},
+        }
+        before = copy.deepcopy(value)
+        once = encode_wire(value, stored=True)
+        assert encode_wire(once, stored=True) == once
+        assert encode_wire(once, stored=False) == once
+        assert value == before
+
+
+class TestZeroDuration:
+    def test_zero_duration_follows_stored_and_probe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        zeros = (timedelta(0), Duration(0), surrealdb.Duration(0))
+        monkeypatch.setattr(wire, "sdk_decodes_zero_duration", lambda: False)
+        for zero in zeros:
+            with pytest.raises(ValueError, match="0ns") as info:
+                encode_wire(zero, stored=True)
+            assert "None" in str(info.value)
+            assert encode_wire(zero, stored=False) == _tag14(0, 0)
+        with pytest.raises(ValueError, match="0ns"):
+            encode_wire(Range(BoundIncluded(timedelta(0)), None), stored=True)
+        with pytest.raises(ValueError, match="0ns"):
+            encode_wire({"ttls": [timedelta(0)]}, stored=True)
+        assert encode_wire(Range(BoundIncluded(timedelta(0)), None), stored=False).begin.value == _tag14(0, 0)
+
+        monkeypatch.setattr(wire, "sdk_decodes_zero_duration", lambda: True)
+        for zero in zeros:
+            assert encode_wire(zero, stored=True) == _tag14(0, 0)
+        assert encode_wire(Range(BoundIncluded(timedelta(0)), None), stored=True).begin.value == _tag14(0, 0)
+
+    def test_probe_is_local_and_cached(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def no_server(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("the zero-duration probe must not reach a server")
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", no_server)
+        sdk_decodes_zero_duration.cache_clear()
+        try:
+            assert isinstance(sdk_decodes_zero_duration(), bool)
+            first = sdk_decodes_zero_duration.cache_info()
+            assert (first.misses, first.hits) == (1, 0)
+            sdk_decodes_zero_duration()
+            second = sdk_decodes_zero_duration.cache_info()
+            assert (second.misses, second.hits) == (1, 1)
+        finally:
+            sdk_decodes_zero_duration.cache_clear()
+
+    def test_probe_false_without_codec(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        sdk_decodes_zero_duration.cache_clear()
+        try:
+            monkeypatch.setattr(_sdk, "cbor_decode", None)
+            assert sdk_decodes_zero_duration() is False
+        finally:
+            sdk_decodes_zero_duration.cache_clear()
+
+    @pytest.mark.parametrize(
+        ("decoded", "expected"),
+        [(surrealdb.Duration(0), True), (surrealdb.Duration(1), False), (0, False), ([], False)],
+        ids=repr,
+    )
+    def test_probe_reads_what_the_codec_returns(self, monkeypatch: pytest.MonkeyPatch, decoded: Any, expected: bool) -> None:
+        sdk_decodes_zero_duration.cache_clear()
+        try:
+            monkeypatch.setattr(_sdk, "cbor_decode", lambda _data: decoded)
+            assert sdk_decodes_zero_duration() is expected
+        finally:
+            sdk_decodes_zero_duration.cache_clear()
+
+    def test_probe_matches_the_installed_sdk(self) -> None:
+        try:
+            decoded = surrealdb.data.cbor.decode(sdk_cbor_encode(CBORTag(TAG_DURATION_COMPACT, [])))
+        except Exception:
+            expected = False
+        else:
+            expected = isinstance(decoded, surrealdb.Duration) and decoded.elapsed == 0
+        sdk_decodes_zero_duration.cache_clear()
+        assert sdk_decodes_zero_duration() is expected
+
+
+def _sdk_decodes_native_set() -> bool:
+    """Whether the installed SDK decodes CBOR tag 56 (a 3.x native set) — local, no server.
+
+    A test helper only (spec §3): the ORM's behaviour never depends on it.
+    """
+    try:
+        _sdk.cbor_decode(_sdk.cbor_encode(CBORTag(56, [1])))
+    except Exception:
+        return False
+    return True
+
+
+class TestSdkCanaries:
+    """Pins on SDK 2.0.0 behaviour that public text depends on (spec D15, §12): they fail on the SDK bump."""
+
+    def test_sdk_still_cannot_decode_native_sets(self) -> None:
+        assert not _sdk_decodes_native_set(), (
+            "the SDK now decodes native sets (CBOR tag 56): update README behaviour row 10 and the "
+            "`array<…>` advice of section 24 (spec §12 item 5)"
+        )
+
+    def test_sdk_still_encodes_duration_under_tag_13(self) -> None:
+        # CBOR tag 13 is the single byte 0xcd (major type 6, value 13).
+        assert sdk_cbor_encode(surrealdb.Duration(1)).startswith(b"\xcd"), (
+            "the SDK now encodes Duration correctly (tag 14): expected on an SDK bump — encode_wire stays "
+            "correct; update this canary and open the clean-up issue (spec §12 item 2)"
+        )
+
+
+# --- raw SDK E2E: what both server lines do with each encoded form (AC-6, AC-29, AC-32 b) ---------
+
+
+def _http_url() -> str:
+    return f"http://{os.environ.get('SURREALDB_HOST', 'localhost')}:{os.environ.get('SURREALDB_PORT', '8000')}"
+
+
+async def _http_client() -> Any:
+    """A fresh HTTP client signed in on ``ns``/``db``.
+
+    Never closed: SDK 2.0.0's HTTP ``close()`` raises ``NotImplementedError``, and the client opens
+    one ``aiohttp`` session per request, so there is nothing to release.
+    """
+    client = AsyncSurreal(_http_url())
+    await client.signin({"username": "root", "password": "root"})
+    await client.use("ns", "db")
+    return client
+
+
+async def _server_version() -> tuple[int, int, int]:
+    """The connected server's version: ``"surrealdb-3.3.4"`` → ``(3, 3, 4)`` (ORM client, set up first)."""
+    raw = str(await (await SurrealDBConnectionManager.get_client()).version())
+    major, minor, patch = (int(n) for n in re.findall(r"\d+", raw)[:3])
+    return major, minor, patch
+
+
+# (label, value encoded with stored=True, expected read-back, expected type). Ranges are compared with
+# the ORM ``Range`` on the left: the SDK's ``Range.__eq__`` answers False to anything else.
+_WIRE_CASES: list[tuple[str, Any, Any, type]] = [
+    ("1ns ORM", Duration(1), surrealdb.Duration(1), surrealdb.Duration),
+    ("1ns SDK", surrealdb.Duration(1), surrealdb.Duration(1), surrealdb.Duration),
+    ("1h30m timedelta", timedelta(hours=1, minutes=30), surrealdb.Duration(5400 * 10**9), surrealdb.Duration),
+    ("1h30m ORM", Duration.parse("1h30m"), surrealdb.Duration(5400 * 10**9), surrealdb.Duration),
+    ("1h30m SDK", surrealdb.Duration(5400 * 10**9), surrealdb.Duration(5400 * 10**9), surrealdb.Duration),
+    ("1e18-1 ORM", Duration(10**18 - 1), surrealdb.Duration(10**18 - 1), surrealdb.Duration),
+    ("1e18-1 SDK", surrealdb.Duration(10**18 - 1), surrealdb.Duration(10**18 - 1), surrealdb.Duration),
+    ("max ORM", Duration(MAX_NS), surrealdb.Duration(MAX_NS), surrealdb.Duration),
+    ("max SDK", surrealdb.Duration(MAX_NS), surrealdb.Duration(MAX_NS), surrealdb.Duration),
+    ("[1,5)", Range(BoundIncluded(1), BoundExcluded(5)), Range(BoundIncluded(1), BoundExcluded(5)), surrealdb.Range),
+    ("[1,5]", Range(BoundIncluded(1), BoundIncluded(5)), Range(BoundIncluded(1), BoundIncluded(5)), surrealdb.Range),
+    ("(1,5]", Range(BoundExcluded(1), BoundIncluded(5)), Range(BoundExcluded(1), BoundIncluded(5)), surrealdb.Range),
+    ("..5", Range(None, BoundExcluded(5)), Range(None, BoundExcluded(5)), surrealdb.Range),
+    ("1..", Range(BoundIncluded(1), None), Range(BoundIncluded(1), None), surrealdb.Range),
+    ("..", Range(), Range(), surrealdb.Range),
+    ("..=5 SDK", surrealdb.Range(None, BoundIncluded(5)), Range(None, BoundIncluded(5)), surrealdb.Range),
+    ("float", Range(BoundIncluded(1.5), BoundExcluded(2.5)), Range(BoundIncluded(1.5), BoundExcluded(2.5)), surrealdb.Range),
+    (
+        "decimal bounds",
+        Range(BoundIncluded(Decimal("1.5")), BoundExcluded(Decimal("1E+3"))),
+        Range(BoundIncluded(Decimal("1.5")), BoundExcluded(Decimal(1000))),
+        surrealdb.Range,
+    ),
+    ("str", Range(BoundIncluded("a"), BoundExcluded("m")), Range(BoundIncluded("a"), BoundExcluded("m")), surrealdb.Range),
+    (
+        "datetime bounds",
+        Range(BoundIncluded(_JAN), BoundExcluded(datetime(2026, 2, 1, 2, tzinfo=_PLUS_TWO))),
+        Range(BoundIncluded(_JAN), BoundExcluded(_FEB)),
+        surrealdb.Range,
+    ),
+    (
+        "duration bounds",
+        Range(BoundIncluded(timedelta(minutes=1)), BoundExcluded(Duration.parse("1h"))),
+        Range(BoundIncluded(surrealdb.Duration(60 * 10**9)), BoundExcluded(surrealdb.Duration(3600 * 10**9))),
+        surrealdb.Range,
+    ),
+    ("date", date(2026, 1, 2), datetime(2026, 1, 2, tzinfo=UTC), datetime),
+    ("naive datetime", datetime(2026, 1, 2, 3, 4, 5, 123456), datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC), datetime),
+    ("aware +02:00", datetime(2026, 1, 2, 5, tzinfo=_PLUS_TWO), datetime(2026, 1, 2, 3, tzinfo=UTC), datetime),
+    ("1E+3", Decimal("1E+3"), Decimal(1000), Decimal),
+    ("1E-7", Decimal("1E-7"), Decimal("1E-7"), Decimal),
+    ("-5E-7", Decimal("-5E-7"), Decimal("-5E-7"), Decimal),
+    ("0E-10", Decimal("0E-10"), Decimal(0), Decimal),
+    ("1.50", Decimal("1.50"), Decimal("1.5"), Decimal),
+    ("28 digits", Decimal("123456789.0123456789012345678"), Decimal("123456789.0123456789012345678"), Decimal),
+    ("0.05/3", Decimal("0.05") / 3, Decimal("0.0166666666666666666666666667"), Decimal),
+    ("...335.4", Decimal("79228162514264337593543950335.4"), Decimal("79228162514264337593543950335"), Decimal),
+    ("8.<27 zeros>49", Decimal("8." + "0" * 27 + "49"), Decimal(8), Decimal),
+    ("7.92...336", Decimal("7.9228162514264337593543950336"), Decimal("7.922816251426433759354395034"), Decimal),
+    ("uuid", _UUID, _UUID, UUID),
+    ("bytes", b"\x00\x01\xff", b"\x00\x01\xff", bytes),
+    ("set", {"b", "a"}, ["a", "b"], list),
+    ("int64 max", _INT64_MAX, _INT64_MAX, int),
+    ("int64 min", _INT64_MIN, _INT64_MIN, int),
+]
+
+
+class TestWireFormsE2E:
+    @pytest.mark.parametrize("scheme", ["ws", "http"])
+    async def test_every_encoded_form_round_trips(self, scheme: str) -> None:
+        async with orm_client("rf_wire") as ws_client:
+            client = ws_client if scheme == "ws" else await _http_client()
+            for index, (label, value, expected, kind) in enumerate(_WIRE_CASES):
+                rid = RecordID("rf_wire", index)
+                await client.query("CREATE $rid SET v = $v RETURN NONE;", {"rid": rid, "v": encode_wire(value, stored=True)})
+                got = await client.query("SELECT VALUE v FROM ONLY $rid;", {"rid": rid})
+                assert isinstance(got, kind), f"{label}: read back {got!r}"
+                assert expected == got, f"{label}: read back {got!r}, expected {expected!r}"
+            # Nothing above dropped the connection: the same client still answers.
+            assert await client.query("RETURN 1;", {}) == 1
+            if scheme == "ws":
+                assert await SurrealDBConnectionManager.get_client() is ws_client
+
+
+_AGREEMENT_TEXTS = [
+    "8." + "0" * 27 + "49",
+    "8." + "0" * 27 + "5",
+    "12." + "0" * 27 + "49",
+    "-8." + "0" * 27 + "49",
+    "7.9228162514264337593543950336",
+    "7922816251426433759354395033.55",
+    "7922816251426433759354395033.549",
+    "0.792281625142643375935439503355",
+    "9.99999999999999999999999999995",
+    "0." + "0" * 26 + "125",
+    "79228162514264337593543950335.5",
+    "79228162514264337593543950336",
+]
+_REFUSED = object()
+
+
+class TestServerAgreementE2E:
+    """HTTP only: a refused value or an undecodable result must not cost a WebSocket."""
+
+    async def test_decimal_text_agrees_with_server(self) -> None:
+        client = await _http_client()
+        message = "decimal_text no longer matches the server's rounding — see spec §2.3 / §5.1"
+        for text in _AGREEMENT_TEXTS:
+            raw: Any
+            try:
+                raw = await client.query("RETURN $v;", {"v": _tag10(text)})
+            except aiohttp.ClientResponseError as exc:
+                assert exc.status == 400, f"{text}: {exc!r}"
+                raw = _REFUSED
+            encoded: Any
+            try:
+                encoded = encode_wire(Decimal(text), stored=True)
+            except ValueError:
+                encoded = _REFUSED
+            if raw is _REFUSED or encoded is _REFUSED:
+                assert raw is encoded, (
+                    f"{message}: {text} is {'refused' if raw is _REFUSED else 'accepted'} by the server "
+                    f"but {'refused' if encoded is _REFUSED else 'accepted'} by encode_wire"
+                )
+                continue
+            got = await client.query("RETURN $v;", {"v": encoded})
+            assert isinstance(raw, Decimal) and isinstance(got, Decimal), f"{text}: {raw!r} / {got!r}"
+            assert got == raw, f"{message}: {text} → server {raw}, encode_wire {got}"
+
+    async def test_probe_matches_server(self) -> None:
+        client = await _http_client()
+        sdk_decodes_zero_duration.cache_clear()
+        if sdk_decodes_zero_duration():
+            assert await client.query("RETURN 0ns;", {}) == surrealdb.Duration(0)
+        else:
+            with pytest.raises(IndexError):
+                await client.query("RETURN 0ns;", {})
+
+
+class TestNativeSetsE2E:
+    """3.x native sets (CBOR tag 56): HTTP only — a decode failure on a WebSocket loses the connection."""
+
+    async def test_native_set_reads_by_line(self) -> None:
+        async with orm_client("rf_setcol"):
+            version = await _server_version()
+            probe = _sdk_decodes_native_set()
+            client = await _http_client()
+
+            if version >= (3, 0, 0):
+                if probe:
+                    assert sorted(await client.query("RETURN <set>[2, 1, 1];", {})) == [1, 2]
+                else:
+                    with pytest.raises(BufferError):
+                        await client.query("RETURN <set>[2, 1, 1];", {})
+            else:
+                result = await client.query("RETURN <set>[2, 1, 1];", {})
+                assert isinstance(result, list)
+                assert sorted(result) == [1, 2]
+
+            await client.query("DEFINE FIELD tags ON rf_setcol TYPE set<string>;", {})
+            tags = encode_wire({"b", "a"}, stored=True)
+            assert tags == ["a", "b"]
+            create = "CREATE rf_setcol:1 SET tags = $t RETURN NONE;"
+            if version >= (3, 0, 0):
+                try:
+                    await client.query(create, {"t": tags})
+                except surrealdb.SurrealError as exc:
+                    # 3.1.5 refuses an array into a ``set<…>`` column (measured); 3.3.x stores a set.
+                    assert "set" in str(exc), repr(exc)
+                    assert version < (3, 3, 0), f"{version} refused the array: {exc!r}"
+                    return
+                if probe:
+                    rows = await client.query("SELECT * FROM rf_setcol;", {})
+                    assert sorted(rows[0]["tags"]) == ["a", "b"]
+                else:
+                    with pytest.raises(BufferError):
+                        await client.query("SELECT * FROM rf_setcol;", {})
+            else:
+                await client.query(create, {"t": tags})
+                assert await client.query("SELECT VALUE tags FROM ONLY rf_setcol:1;", {}) == ["a", "b"]
