@@ -2397,6 +2397,159 @@ class TestSubModelStoredKeysE2E:
             await _assert_client_usable(client)
 
 
+# ==================== Models that allow arbitrary types ====================
+
+
+class RfOpaque:
+    """A class Pydantic has no schema for: only a model with ``arbitrary_types_allowed`` declares it."""
+
+
+class RfArbitrary(BaseSurrealModel):
+    """Rich fields next to an arbitrary type: their ``TypeAdapter`` needs the model's config."""
+
+    model_config = SurrealConfigDict(table_name="rf_arbitrary", arbitrary_types_allowed=True)
+
+    id: str | None = None
+    span: tuple[int, int] | RfOpaque | None = None
+    at: datetime | RfOpaque | None = None
+
+
+_ARBITRARY_ROW = {"span": [1, 2], "at": datetime(2026, 1, 2, tzinfo=UTC)}
+
+
+class _ArbitraryClient:
+    """The SDK calls behind ``save()`` without id, ``upsert()``, ``refresh()`` and ``merge()``: each answers a row."""
+
+    def __init__(self) -> None:
+        self.rid = RecordID("rf_arbitrary", "x")
+
+    def _row(self, **changes: Any) -> dict[str, Any]:
+        return {"id": self.rid, **_ARBITRARY_ROW, **changes}
+
+    async def create(self, _what: Any, _data: Any) -> dict[str, Any]:
+        return self._row()
+
+    async def query(self, _statement: str, _variables: Any) -> list[dict[str, Any]]:
+        return [{"before": None, "after": self._row()}]
+
+    async def select(self, _rid: Any) -> dict[str, Any]:
+        return self._row()
+
+    async def merge(self, _rid: Any, data: dict[str, Any]) -> dict[str, Any]:
+        return self._row(**data)
+
+
+class TestArbitraryTypeFields:
+    """A model with ``arbitrary_types_allowed`` builds its rich fields' ``TypeAdapter`` with that
+    setting (no database): without it, Pydantic could not build one for ``tuple[int, int] | RfOpaque``
+    and ``save()`` without id raised after writing the row, as did ``upsert()``, ``refresh()`` and
+    ``merge(at=…)``. When an adapter still cannot be built, nothing is validated: the value is kept,
+    sent or bound as given, as before v0.23.0."""
+
+    @pytest.fixture
+    def client(self, monkeypatch: pytest.MonkeyPatch) -> _ArbitraryClient:
+        fake = _ArbitraryClient()
+
+        async def get_client() -> _ArbitraryClient:
+            return fake
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+        return fake
+
+    @staticmethod
+    def _assert_typed(item: RfArbitrary) -> None:
+        assert type(item.span) is tuple, item.span
+        assert item.span == (1, 2)
+        assert item.at == datetime(2026, 1, 2, tzinfo=UTC)
+
+    async def test_save_upsert_refresh_and_merge(self, client: _ArbitraryClient) -> None:
+        saved = RfArbitrary(span=(1, 2))
+        await saved.save()  # no id: the row the server sends back is applied
+        assert saved.id == client.rid
+        self._assert_typed(saved)
+
+        upserted = RfArbitrary(id="x", span=(1, 2))
+        await upserted.upsert()
+        self._assert_typed(upserted)
+
+        refreshed = RfArbitrary(id="x")
+        await refreshed.refresh()
+        self._assert_typed(refreshed)
+
+        later = datetime(2027, 1, 1, tzinfo=UTC)
+        await refreshed.merge(at=later)
+        assert refreshed.at == later
+        assert RfArbitrary._coerce_field_value("at", "2027-01-01T00:00:00Z") == later
+        assert RfArbitrary._coerce_field_value("span", [3, 4], context="bulk_update") == (3, 4)
+
+    def test_adapters_take_the_model_setting_but_not_on_their_own_config(self) -> None:
+        """Pydantic refuses a ``config`` for a type that has its own (a model, a dataclass, a
+        ``TypedDict``): such an annotation is built without it, so it still validates."""
+
+        class Holder(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_arbitrary_holder", arbitrary_types_allowed=True)
+
+            id: str | None = None
+            profile: RfProfile = RfProfile()
+            plains: list[RfPlain] = []
+
+        assert Holder._coerce_field_value("profile", {"bday": "2026-01-02"}, context="bulk_update") == RfProfile(
+            bday=date(2026, 1, 2)
+        )
+        with pytest.raises(ValueError, match=r"^atomic_append\(plains=…\): the RfPlain instance is written as its record id"):
+            Holder._check_item_links("atomic_append", "plains", [RfPlain(id="o1")])
+
+    def test_an_adapter_that_cannot_be_built_validates_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The four fallbacks: ``_apply_record`` keeps the raw value, a keyword write sends the value
+        as given, the ``atomic_*`` check accepts it (as for ``Any``), a filter binds it as given."""
+        from surreal_orm_lite import model_base
+
+        plain = RfPlain(id="o1")
+        event = RfArbitrary(id="x")
+
+        def refuse(*_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("no schema")
+
+        for cache in ("_APPLY_ADAPTERS", "_LOOKUP_ADAPTERS", "_WRITE_ADAPTERS"):
+            monkeypatch.setattr(model_base, cache, {})
+        monkeypatch.setattr(model_base.pydantic, "TypeAdapter", refuse)
+
+        event._apply_record({"span": [1, 2]})
+        assert event.span == [1, 2]  # type: ignore[comparison-overlap]  # kept as it came
+        assert RfArbitrary._coerce_field_value("at", "soon") == "soon"
+        assert RfEvent._coerce_field_value("ttl", "not a duration") == "not a duration"
+        RfPerson._check_item_links("atomic_append", "plains", [plain])  # nothing checked
+        assert RfEvent._coerce_lookup_value("at", "gt", "soon") == "soon"
+
+
+class TestArbitraryTypeFieldsE2E:
+    """``save()`` without id, ``upsert()``, ``refresh()`` and ``merge()`` on a model that allows
+    arbitrary types, on both lines."""
+
+    async def test_writes_and_reads(self) -> None:
+        async with orm_client("rf_arbitrary") as client:
+            item = RfArbitrary(span=(1, 2), at=datetime(2026, 1, 2, tzinfo=UTC))
+            await item.save()
+            assert isinstance(item.id, RecordID)
+            assert type(item.span) is tuple
+            assert item.span == (1, 2)
+
+            later = datetime(2027, 1, 1, tzinfo=UTC)
+            await item.merge(at=later)
+            assert item.at == later
+            row = await _raw(item.id)
+            assert row["at"] == later
+            assert row["span"] == [1, 2]
+
+            await item.refresh()
+            assert item.span == (1, 2)
+            other = RfArbitrary(id="u", span=(3, 4))
+            await other.upsert()
+            assert other.span == (3, 4)
+            assert (await RfArbitrary.objects().get("u")).span == (3, 4)
+            await _assert_client_usable(client)
+
+
 class TestTableInstanceValuesE2E:
     """A table-model instance given as a value is its record id (v0.22.0's filter rule, the full
     ORM's link rule): stored as a record link where the field accepts a ``RecordID``, refused before

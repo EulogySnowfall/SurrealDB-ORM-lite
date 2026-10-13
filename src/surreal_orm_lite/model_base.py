@@ -1,4 +1,5 @@
 import contextlib
+import dataclasses
 import functools
 import logging
 import math
@@ -15,6 +16,7 @@ import pydantic
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_core import ValidationError
+from typing_extensions import is_typeddict
 
 from ._sdk import NotFoundError, RecordID, SdkDuration, ServerError
 from .connection_manager import SurrealDBConnectionManager
@@ -94,26 +96,67 @@ _INPUT_KINDS = frozenset({"timedelta", "datetime", "date"})
 # ``tuple``. Matched on the *shallow* kinds: nested models are not entered (they arrive as dicts,
 # v0.18.0). A ``datetime``, ``Decimal`` or ``UUID`` already arrives as the declared type.
 _APPLY_KINDS = frozenset({"timedelta", "date", "duration", "range", "set", "frozenset", "tuple"})
-# (model class, field name) → the ``TypeAdapter`` of the field's annotation, built on first use.
-_APPLY_ADAPTERS: dict[tuple[type, str], pydantic.TypeAdapter[Any]] = {}
-# Typed lookups (v0.23.0): the type a filter value is validated as (``wire.lookup_type`` — the
-# field's type without ``Optional``/``Annotated``, ``Range[S]``, an item type…) → its ``TypeAdapter``,
-# shared by every model, built on first use.
-_LOOKUP_ADAPTERS: dict[Any, pydantic.TypeAdapter[Any]] = {}
+# Every ``TypeAdapter`` below is built from a user's annotation on first use (:func:`_new_adapter`)
+# and cached; ``None`` caches an annotation Pydantic cannot build one for (nothing is validated).
+# (model class, field name) → the ``TypeAdapter`` of the field's annotation.
+_APPLY_ADAPTERS: dict[tuple[type, str], pydantic.TypeAdapter[Any] | None] = {}
+# Typed lookups (v0.23.0): (the type a filter value is validated as — ``wire.lookup_type``: the
+# field's type without ``Optional``/``Annotated``, ``Range[S]``, an item type… —, whether the owner
+# allows arbitrary types) → its ``TypeAdapter``, shared by every model.
+_LOOKUP_ADAPTERS: dict[tuple[Any, bool], pydantic.TypeAdapter[Any] | None] = {}
 # Keyword writes (v0.23.0): (model class, field name) → the ``TypeAdapter`` of the field's annotation
-# with its constraints (``Field(ge=…)``, ``allow_inf_nan``…), built on first use.
-_WRITE_ADAPTERS: dict[tuple[type, str], pydantic.TypeAdapter[Any]] = {}
+# with its constraints (``Field(ge=…)``, ``allow_inf_nan``…).
+_WRITE_ADAPTERS: dict[tuple[type, str], pydantic.TypeAdapter[Any] | None] = {}
+_ARBITRARY_TYPES = ConfigDict(arbitrary_types_allowed=True)
 _NS_PER_DAY = 86_400 * 10**9
 
 
-def _lookup_adapter(annotation: Any) -> pydantic.TypeAdapter[Any]:
-    """The cached ``TypeAdapter`` of ``annotation``; an unhashable annotation gets an uncached one."""
+def _allows_arbitrary_types(owner: type[BaseModel] | None) -> bool:
+    """Whether model ``owner`` declares ``arbitrary_types_allowed=True`` (its annotations may name any class)."""
+    return owner is not None and owner.model_config.get("arbitrary_types_allowed") is True
+
+
+def _has_own_config(annotation: Any) -> bool:
+    """Whether Pydantic refuses a ``config`` for ``annotation``: a ``BaseModel``, a dataclass or a
+    ``TypedDict`` (one ``Annotated`` layer stripped, as Pydantic does), which carry their own."""
+    if typing.get_origin(annotation) is Annotated:
+        annotation = typing.get_args(annotation)[0]
+    return isinstance(annotation, type) and (
+        issubclass(annotation, BaseModel) or dataclasses.is_dataclass(annotation) or is_typeddict(annotation)
+    )
+
+
+def _new_adapter(annotation: Any, arbitrary_types: bool) -> pydantic.TypeAdapter[Any] | None:
+    """A ``TypeAdapter`` of a user's ``annotation``, or ``None`` when Pydantic cannot build one (v0.23.0).
+
+    ``arbitrary_types``: the annotation comes from a model with ``arbitrary_types_allowed=True``, so
+    it may name a class Pydantic has no schema for (``tuple[int, int] | Foo``); the adapter gets that
+    setting too, unless the annotation is a type with its own config (:func:`_has_own_config`). No
+    other key of the model's config is carried over. Any exception while building — Pydantic's
+    ``PydanticSchemaGenerationError``, a ``RuntimeError``, or another — means "cannot validate":
+    ``None``, and each caller then keeps, sends or binds the value as given, as before v0.23.0.
+    Only the construction is guarded, never a validation.
+    """
     try:
-        adapter = _LOOKUP_ADAPTERS.get(annotation)
-    except TypeError:
+        if arbitrary_types and not _has_own_config(annotation):
+            return pydantic.TypeAdapter(annotation, config=_ARBITRARY_TYPES)
         return pydantic.TypeAdapter(annotation)
-    if adapter is None:
-        adapter = _LOOKUP_ADAPTERS[annotation] = pydantic.TypeAdapter(annotation)
+    except Exception:
+        return None
+
+
+def _lookup_adapter(annotation: Any, owner: type[BaseModel] | None) -> pydantic.TypeAdapter[Any] | None:
+    """The cached ``TypeAdapter`` of ``annotation`` from model ``owner`` (:func:`_new_adapter`), or ``None``.
+
+    An unhashable annotation gets an uncached one.
+    """
+    key = (annotation, _allows_arbitrary_types(owner))
+    try:
+        if key in _LOOKUP_ADAPTERS:
+            return _LOOKUP_ADAPTERS[key]
+    except TypeError:
+        return _new_adapter(*key)
+    adapter = _LOOKUP_ADAPTERS[key] = _new_adapter(*key)
     return adapter
 
 
@@ -152,32 +195,39 @@ def _lookup_as_given(value: Any) -> bool:
     return False
 
 
-def _lookup_value(key: str, annotation: Any, value: Any) -> Any:
-    """``value`` validated as ``annotation`` for the filter ``key`` (``"at__gt"``); ``ValueError`` if it does not fit."""
+def _lookup_value(key: str, annotation: Any, value: Any, owner: type[BaseModel]) -> Any:
+    """``value`` validated as ``annotation`` for the filter ``key`` (``"at__gt"``) of model ``owner``.
+
+    ``ValueError`` if it does not fit. Bound as given when no ``TypeAdapter`` can be built for
+    ``annotation`` (:func:`_new_adapter`).
+    """
     if _lookup_as_given(value):
         return value
+    adapter = _lookup_adapter(annotation, owner)
+    if adapter is None:
+        return value
     try:
-        return _lookup_adapter(annotation).validate_python(field_input(annotation, value))
+        return adapter.validate_python(field_input(annotation, value))
     except (ValueError, TypeError) as exc:
         detail = "; ".join(str(error["msg"]) for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
         raise ValueError(f"filter({key}=…): {value!r} is not a valid {_type_label(annotation)} ({detail})") from exc
 
 
-def _write_adapter(owner: type[BaseModel], name: str, info: FieldInfo) -> pydantic.TypeAdapter[Any]:
+def _write_adapter(owner: type[BaseModel], name: str, info: FieldInfo) -> pydantic.TypeAdapter[Any] | None:
     """The ``TypeAdapter`` of field ``name`` of ``owner`` **with its constraints**, cached (v0.23.0).
 
     ``Field(ge=…)``, ``allow_inf_nan``… live in ``info.metadata``, which ``info.annotation`` lacks:
-    the adapter validates what the model's constructor would. ``owner`` is a table model or a
-    sub-model (the sub-fields of a ``merge()`` dict).
+    the adapter validates what the model's constructor would, with ``owner``'s
+    ``arbitrary_types_allowed`` (:func:`_new_adapter`). ``owner`` is a table model or a sub-model
+    (the sub-fields of a ``merge()`` dict). ``None`` when Pydantic cannot build one.
     """
-    adapter = _WRITE_ADAPTERS.get((owner, name))
-    if adapter is None:
+    if (owner, name) not in _WRITE_ADAPTERS:
         target: Any = info.annotation
         if info.metadata:
             annotated: Any = Annotated
             target = annotated[(target, *info.metadata)]
-        adapter = _WRITE_ADAPTERS[(owner, name)] = pydantic.TypeAdapter(target)
-    return adapter
+        _WRITE_ADAPTERS[(owner, name)] = _new_adapter(target, _allows_arbitrary_types(owner))
+    return _WRITE_ADAPTERS[(owner, name)]
 
 
 def _keyword_value(context: str, path: str, owner: type[BaseModel], name: str, info: FieldInfo, value: Any) -> Any:
@@ -188,8 +238,10 @@ def _keyword_value(context: str, path: str, owner: type[BaseModel], name: str, i
     so only the caller's keys are sent. Anything else is validated as the field — the caller's
     table-model instances replaced by their record ids first (:func:`_link_instances`), so the field
     itself says whether it holds a ``RecordID`` there — and the sub-models the validation built
-    take their object form (:func:`_object_forms`). ``path`` names the value in the error:
-    ``profile``, ``profile.bday``.
+    take their object form (:func:`_object_forms`). A field Pydantic cannot build a ``TypeAdapter``
+    for (:func:`_new_adapter`) is not validated: the value is sent as given, as before v0.23.0
+    (``encode_wire`` still encodes it). ``path`` names the value in the error: ``profile``,
+    ``profile.bday``.
     """
     if value is None or isinstance(value, SurrealFunc):
         return value
@@ -198,8 +250,11 @@ def _keyword_value(context: str, path: str, owner: type[BaseModel], name: str, i
         if model is not None:
             return _partial_object(context, path, model, value)
     linked = _link_instances(context, path, value)
+    adapter = _write_adapter(owner, name, info)
+    if adapter is None:
+        return value
     try:
-        validated = _write_adapter(owner, name, info).validate_python(field_input(info.annotation, linked))
+        validated = adapter.validate_python(field_input(info.annotation, linked))
     except (ValueError, TypeError) as exc:
         raise ValueError(f"{context}({path}=…): {_refusal(info.annotation, value, linked, exc)}") from exc
     return _object_forms(validated)
@@ -220,7 +275,7 @@ def _refusal(annotation: Any, value: Any, linked: Any, exc: Exception) -> str:
     return message
 
 
-def _check_links(context: str, path: str, annotation: Any, value: Any) -> None:
+def _check_links(context: str, path: str, annotation: Any, value: Any, owner: type[BaseModel]) -> None:
     """Refuse a table-model instance in ``value`` where ``annotation`` cannot hold its record id (v0.23.0).
 
     For the writes that send ``value`` without validating it as a field — the ``atomic_*`` helpers
@@ -230,7 +285,8 @@ def _check_links(context: str, path: str, annotation: Any, value: Any) -> None:
     :func:`_link_instances` walks) is checked, the instances replaced by their record ids first.
 
     ``Any`` and an annotation Pydantic has not resolved (a string, a ``ForwardRef``, a
-    ``TypeVar``) declare nothing to check against.
+    ``TypeVar``) declare nothing to check against, nor does one Pydantic cannot build a
+    ``TypeAdapter`` for (:func:`_new_adapter`, with model ``owner``'s ``arbitrary_types_allowed``).
 
     Raises:
         ValueError: ``"atomic_append(plains=…): the Plain instance is written as its record id, which
@@ -239,8 +295,11 @@ def _check_links(context: str, path: str, annotation: Any, value: Any) -> None:
     linked = _link_instances(context, path, value)
     if linked is value or annotation is Any or isinstance(annotation, (str, typing.ForwardRef, TypeVar)):
         return
+    adapter = _lookup_adapter(annotation, owner)
+    if adapter is None:
+        return
     try:
-        _lookup_adapter(annotation).validate_python(field_input(annotation, linked))
+        adapter.validate_python(field_input(annotation, linked))
     except (ValueError, TypeError) as exc:
         raise ValueError(f"{context}({path}=…): {_refusal(annotation, value, linked, exc)}") from exc
 
@@ -875,8 +934,8 @@ class BaseSurrealModel(BaseModel):
         each, annotation = target
         key = name if lookup == "exact" else f"{name}__{lookup}"
         if each:
-            return [_lookup_value(key, annotation, item) for item in value]
-        return _lookup_value(key, annotation, value)
+            return [_lookup_value(key, annotation, item, cls) for item in value]
+        return _lookup_value(key, annotation, value, cls)
 
     @classmethod
     def _coerce_field_value(cls, name: str, value: Any, *, context: str = "merge") -> Any:
@@ -994,7 +1053,7 @@ class BaseSurrealModel(BaseModel):
         if item is None:
             return
         for value in values:
-            _check_links(context, field, item, value)
+            _check_links(context, field, item, value, cls)
 
     @classmethod
     def _py_fields(cls, payload: Mapping[str, Any]) -> list[str]:
@@ -1462,12 +1521,12 @@ class BaseSurrealModel(BaseModel):
                 for key, item in value.items():
                     annotation = cls._annotation_at([str(key)])
                     if annotation is not None:
-                        _check_links("patch", f"/{key}", annotation, item)
+                        _check_links("patch", f"/{key}", annotation, item, cls)
             return
         segments = [segment.replace("~1", "/").replace("~0", "~") for segment in pointer[1:].split("/")]
         annotation = cls._annotation_at(segments)
         if annotation is not None:
-            _check_links("patch", pointer, annotation, value)
+            _check_links("patch", pointer, annotation, value, cls)
 
     @classmethod
     def _columns_for_patch(cls, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1769,15 +1828,19 @@ class BaseSurrealModel(BaseModel):
         """``value`` validated as field ``name``'s annotation, or ``value`` itself if it does not fit (v0.23.0).
 
         :meth:`_apply_record`'s re-validation of a rich field: :func:`~surreal_orm_lite.wire.field_input`
-        (an SDK ``Duration`` at a ``timedelta`` position…), then the field's ``TypeAdapter``,
-        cached per (class, field). A ``ValueError`` (Pydantic's ``ValidationError`` included — a
-        duration beyond ``timedelta.max``, a ``datetime`` that is not a midnight for a ``date``),
-        ``TypeError`` or ``OverflowError`` keeps the raw value, as before v0.23.0.
+        (an SDK ``Duration`` at a ``timedelta`` position…), then the field's ``TypeAdapter``, built
+        with the model's ``arbitrary_types_allowed`` (:func:`_new_adapter`) and cached per (class,
+        field). A ``ValueError`` (Pydantic's ``ValidationError`` included — a duration beyond
+        ``timedelta.max``, a ``datetime`` that is not a midnight for a ``date``), ``TypeError`` or
+        ``OverflowError`` keeps the raw value, as before v0.23.0, and so does an annotation Pydantic
+        cannot build a ``TypeAdapter`` for: this never raises.
         """
+        if (cls, name) not in _APPLY_ADAPTERS:
+            _APPLY_ADAPTERS[(cls, name)] = _new_adapter(annotation, _allows_arbitrary_types(cls))
+        adapter = _APPLY_ADAPTERS[(cls, name)]
+        if adapter is None:
+            return value
         try:
-            adapter = _APPLY_ADAPTERS.get((cls, name))
-            if adapter is None:
-                adapter = _APPLY_ADAPTERS[(cls, name)] = pydantic.TypeAdapter(annotation)
             return adapter.validate_python(field_input(annotation, value))
         except (ValueError, TypeError, OverflowError):
             return value
