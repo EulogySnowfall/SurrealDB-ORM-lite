@@ -13,6 +13,8 @@ This module converts them, **only where the annotation asks for it**:
   ``timedelta`` position, an SDK ``Datetime`` its ISO string at a ``datetime``/``date`` position,
   and nothing changes anywhere else (an ``Any``, ``object`` or ``Duration`` position keeps the SDK
   value and its nanoseconds).
+- ``lookup_type(annotation, lookup, value)`` — what a filter value on a rich field is validated as
+  (``ttl__gt="1h"`` → ``timedelta``, ``at__in=Range(…)`` → ``Range[datetime]``…) before it is bound.
 - ``encode_wire(value, stored=…)`` — the other direction: every value the ORM sends, turned into a
   form the SDK encodes and **both** server lines accept (a compact duration tag, a fixed-point
   decimal text, ``undefined`` for an open range side, UTC datetimes, arrays for sets), or refused
@@ -64,6 +66,7 @@ __all__ = [
     "duration_ns",
     "encode_wire",
     "field_input",
+    "lookup_type",
     "restore_native",
     "rich_kinds",
     "sdk_decodes_zero_duration",
@@ -402,6 +405,84 @@ def field_input(annotation: Any, value: Any) -> Any:
         annotations = _model_annotations(annotation)
         return _mapping_input(value, annotations.get)
     return value
+
+
+# --- lookup_type (spec §4.5) --------------------------------------------------------------------
+
+# The rich scalars a filter value is validated as ("S" in spec §4.5).
+_LOOKUP_SCALAR_KINDS = frozenset({"datetime", "date", "timedelta", "decimal", "uuid", "duration"})
+_COMPARISON_LOOKUPS = frozenset({"exact", "gt", "gte", "lt", "lte"})
+_MEMBERSHIP_LOOKUPS = frozenset({"in", "not_in"})
+_CONTAINS_LOOKUPS = frozenset({"contains", "not_contains"})
+_CONTAINS_ITEMS_LOOKUPS = frozenset({"containsall", "containsany"})
+
+
+def _strip_optional(annotation: Any) -> Any:
+    """``Annotated[X, …]`` → ``X``, and a union of ``X`` and ``None`` → ``X``, at every layer."""
+    annotation = _unwrap(annotation)
+    if _is_union(get_origin(annotation)):
+        members = [member for member in get_args(annotation) if member is not NoneType]
+        if len(members) == 1:
+            return _strip_optional(members[0])
+    return annotation
+
+
+def _is_lookup_scalar(annotation: Any) -> bool:
+    return _scalar_kind(annotation) in _LOOKUP_SCALAR_KINDS
+
+
+def _collection_item(annotation: Any) -> Any:
+    """``X`` of ``list[X]``/``set[X]``/``frozenset[X]``/``Sequence[X]``/``AbstractSet[X]``/``tuple[X, ...]``, else ``None``."""
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin is tuple:
+        return _strip_optional(args[0]) if len(args) == 2 and args[1] is Ellipsis else None
+    if origin in _SEQUENCE_ORIGINS and args:
+        return _strip_optional(args[0])
+    return None
+
+
+def lookup_type(annotation: Any, lookup: str, value: Any) -> tuple[bool, Any] | None:
+    """What a filter value on a field declared ``annotation`` is validated as (spec §4.5).
+
+    ``(False, X)``: the value as ``X``; ``(True, X)``: each item of the value (an iterable) as ``X``;
+    ``None``: the value is bound as given. ``Annotated`` and ``Optional`` are stripped first, so
+    ``Computed[S]`` qualifies. ``S`` is a rich scalar: ``datetime``, ``date``, ``timedelta``,
+    ``Decimal``, ``UUID`` or ``Duration``.
+
+    - ``S`` with ``exact``/``gt``/``gte``/``lt``/``lte`` → ``S``; with ``in``/``not_in`` → each item as
+      ``S``, or ``Range[S]`` when ``value`` is an ORM or SDK ``Range`` (range membership);
+    - ``Range[T]`` or a bare ``Range`` with ``exact`` → the annotation itself (a range, its literal
+      text or a builtin ``range``); ``Range[T]`` with ``contains``/``not_contains`` → ``T``;
+    - ``list[S]``, ``set[S]``, ``frozenset[S]``, ``tuple[S, ...]`` (or ``Sequence``/``AbstractSet``) with
+      ``contains``/``not_contains`` → ``S``; with ``containsall``/``containsany`` → each item as ``S``;
+    - anything else → ``None``: another annotation, another lookup, a ``Range`` given to ``in`` on a
+      field that is not ``S``, a union of several types, ``Range[Any]`` with ``contains``.
+    """
+    core = _strip_optional(annotation)
+    if _is_lookup_scalar(core):
+        if lookup in _COMPARISON_LOOKUPS:
+            return False, core
+        if lookup in _MEMBERSHIP_LOOKUPS:
+            if isinstance(value, (Range, SdkRange)):
+                range_of: Any = Range
+                return False, range_of[core]
+            return True, core
+        return None
+    if _is_subclass(core, Range) or _is_subclass(get_origin(core), Range):
+        if lookup == "exact":
+            return False, core
+        args = get_args(core)
+        if lookup in _CONTAINS_LOOKUPS and args and args[0] is not Any and not isinstance(args[0], TypeVar):
+            return False, args[0]
+        return None
+    item = _collection_item(core)
+    if item is not None and _is_lookup_scalar(item):
+        if lookup in _CONTAINS_LOOKUPS:
+            return False, item
+        if lookup in _CONTAINS_ITEMS_LOOKUPS:
+            return True, item
+    return None
 
 
 # --- encode_wire (spec §5.1) --------------------------------------------------------------------

@@ -35,9 +35,11 @@ from surreal_orm_lite import (
     Computed,
     Duration,
     InvalidDurationError,
+    Q,
     Range,
     SurrealDBConnectionManager,
     SurrealFunc,
+    Var,
     _sdk,
     wire,
 )
@@ -1762,6 +1764,244 @@ class TestReturnType:
             SurrealDBConnectionManager._coerce_result(surrealdb.Duration(MAX_NS), timedelta, "'fn::x'")
         with pytest.raises(SurrealDbValidationError, match="does not fit"):
             SurrealDBConnectionManager._coerce_result("1.5h", timedelta, "'fn::x'")
+
+
+# --- typed lookups (spec §4.5; AC-18) -------------------------------------------------------------
+
+_TOKEN_TEXT = "0190c3d1-5c3b-7cc6-8f8a-2d2b1f0e9a11"
+
+
+def _where(model: Any = None, *args: Any, **kwargs: Any) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """``(sql, coerced, encoded)`` of ``model.objects().filter(*args, **kwargs)`` (default ``RfEvent``).
+
+    ``coerced`` is ``_build_where(encode=False)`` — the Python values the lookups were validated
+    into — and ``encoded`` the bound values a statement sends (``_build_where()``).
+    """
+    if model is None:
+        from tests.test_rich_fields import RfEvent
+
+        model = RfEvent
+    queryset = model.objects().filter(*args, **kwargs)
+    sql, encoded = queryset._build_where()
+    _sql, coerced = queryset._build_where(encode=False)
+    return sql, coerced, encoded
+
+
+def _one(**kwargs: Any) -> tuple[Any, Any]:
+    """The single bound value of one ``RfEvent`` filter: ``(coerced, encoded)``."""
+    _sql, coerced, encoded = _where(None, **kwargs)
+    assert list(coerced) == ["_f0"], coerced
+    return coerced["_f0"], encoded["_f0"]
+
+
+class _AliasedLookup(surreal_orm_lite.BaseSurrealModel):
+    model_config = surreal_orm_lite.SurrealConfigDict(table_name="rf_alias_lookup")
+
+    id: str | None = None
+    ttl: timedelta | None = Field(default=None, alias="ttl_col")
+
+
+class TestTypedLookups:
+    """A filter value on a rich field is validated against the field's type, then encoded (spec §4.5)."""
+
+    def test_datetime_string(self) -> None:
+        sql, _coerced, _encoded = _where(None, at__gt="2026-01-01T00:00:00Z")
+        assert sql == " WHERE at > $_f0"
+        coerced, encoded = _one(at__gt="2026-01-01T00:00:00Z")
+        assert type(coerced) is datetime
+        assert coerced.utcoffset() == timedelta(0)
+        assert coerced == datetime(2026, 1, 1, tzinfo=UTC)
+        assert encoded == datetime(2026, 1, 1, tzinfo=UTC)
+        assert encoded.tzinfo is UTC
+
+    def test_date(self) -> None:
+        coerced, encoded = _one(day=date(2026, 1, 2))
+        assert coerced == date(2026, 1, 2)
+        assert encoded == datetime(2026, 1, 2, tzinfo=UTC)  # midnight UTC, as stored
+        coerced, encoded = _one(day__gte="2026-01-02")
+        assert type(coerced) is date
+        assert coerced == date(2026, 1, 2)
+        assert encoded == datetime(2026, 1, 2, tzinfo=UTC)
+
+    def test_timedelta_string(self) -> None:
+        coerced, encoded = _one(ttl__gte="1h")
+        assert coerced == timedelta(hours=1)
+        assert encoded == _tag14(3600, 0)
+
+    def test_duration_string(self) -> None:
+        coerced, encoded = _one(grace="1h30m1ns")
+        assert type(coerced) is Duration
+        assert coerced.elapsed == 5400 * 10**9 + 1
+        assert encoded == _tag14(5400, 1)
+
+    def test_decimal_from_float(self) -> None:
+        coerced, encoded = _one(price__lte=9.99)
+        assert type(coerced) is Decimal
+        assert coerced == Decimal("9.99")
+        assert encoded == _tag10("9.99")
+
+    def test_uuid_string(self) -> None:
+        coerced, encoded = _one(token=_TOKEN_TEXT)
+        assert type(coerced) is UUID
+        assert coerced == _UUID
+        assert encoded == _UUID
+
+    @pytest.mark.parametrize("lookup", ["in", "not_in"])
+    def test_uuid_items(self, lookup: str) -> None:
+        coerced, encoded = _one(**{f"token__{lookup}": [_TOKEN_TEXT, UUID(int=1)]})
+        assert coerced == [_UUID, UUID(int=1)]
+        assert all(type(item) is UUID for item in coerced)
+        assert encoded == [_UUID, UUID(int=1)]
+
+    @pytest.mark.parametrize("lookup", ["in", "not_in"])
+    def test_range_membership_on_a_plain_field(self, lookup: str) -> None:
+        open_end = Range(BoundIncluded(1), None)
+        sql, coerced, encoded = _where(None, **{f"n__{lookup}": open_end})
+        assert sql == f" WHERE n {'IN' if lookup == 'in' else 'NOT IN'} $_f0"
+        assert coerced["_f0"] is open_end  # not a rich field: the range as given
+        assert isinstance(encoded["_f0"], SdkRange)
+        assert encoded["_f0"].begin == BoundIncluded(1)
+        assert encoded["_f0"].end is undefined  # an open side
+        sdk_range = SdkRange(BoundIncluded(1), BoundExcluded(4))
+        coerced, encoded = _one(**{f"n__{lookup}": sdk_range})
+        assert coerced is sdk_range
+        assert Range(BoundIncluded(1), BoundExcluded(4)) == encoded
+
+    def test_range_membership_on_a_rich_field(self) -> None:
+        coerced, encoded = _one(at__in=Range(BoundIncluded("2026-01-01"), None))
+        assert type(coerced) is Range
+        assert coerced.begin is not None
+        assert type(coerced.begin.value) is datetime
+        assert coerced.begin.value == datetime(2026, 1, 1)
+        assert encoded.begin == BoundIncluded(datetime(2026, 1, 1, tzinfo=UTC))
+        assert encoded.end is undefined
+        coerced, _encoded = _one(ttl__not_in=SdkRange(BoundIncluded("1m"), BoundExcluded("1h")))
+        assert coerced == Range(BoundIncluded(timedelta(minutes=1)), BoundExcluded(timedelta(hours=1)))
+
+    def test_range_contains(self) -> None:
+        coerced, encoded = _one(hours__contains="12")
+        assert coerced == 12
+        assert type(coerced) is int
+        assert encoded == 12
+        coerced, encoded = _one(period__not_contains="2026-01-05T00:00:00Z")
+        assert type(coerced) is datetime
+        assert encoded == datetime(2026, 1, 5, tzinfo=UTC)
+
+    @pytest.mark.parametrize("value", [range(9, 17), "9..17", SdkRange(BoundIncluded(9), BoundExcluded(17))])
+    def test_range_exact(self, value: Any) -> None:
+        coerced, encoded = _one(hours=value)
+        assert type(coerced) is Range
+        assert coerced == Range(BoundIncluded(9), BoundExcluded(17))
+        assert isinstance(encoded, SdkRange)
+        assert Range(BoundIncluded(9), BoundExcluded(17)) == encoded
+
+    def test_collection_items(self) -> None:
+        coerced, encoded = _one(ttls__contains="1h")
+        assert coerced == timedelta(hours=1)
+        assert encoded == _tag14(3600, 0)
+        coerced, encoded = _one(ttls__not_contains="2h")
+        assert encoded == _tag14(7200, 0)
+        coerced, encoded = _one(ttls__containsany=["1h", "2h"])
+        assert coerced == [timedelta(hours=1), timedelta(hours=2)]
+        assert encoded == [_tag14(3600, 0), _tag14(7200, 0)]
+        coerced, encoded = _one(ttls__containsall=("1h", timedelta(hours=2)))
+        assert encoded == [_tag14(3600, 0), _tag14(7200, 0)]
+
+    def test_q_objects_nested_and_negated(self) -> None:
+        sql, coerced, encoded = _where(None, Q(ttl__gt="1h") | ~(Q(price__lt="1.5") & Q(token=_TOKEN_TEXT)))
+        assert sql == " WHERE (ttl > $_f0 OR NOT ((price < $_f1 AND token = $_f2)))"
+        assert coerced == {"_f0": timedelta(hours=1), "_f1": Decimal("1.5"), "_f2": _UUID}
+        assert encoded == {"_f0": _tag14(3600, 0), "_f1": _tag10("1.5"), "_f2": _UUID}
+
+    def test_computed_field(self) -> None:
+        from tests.test_rich_fields import RfComp
+
+        _sql, coerced, encoded = _where(RfComp, length__gt="1h30m")
+        assert coerced == {"_f0": timedelta(hours=1, minutes=30)}
+        assert encoded == {"_f0": _tag14(5400, 0)}
+
+    def test_aliased_field(self) -> None:
+        sql, coerced, _encoded = _where(_AliasedLookup, ttl__lt="2h")
+        assert sql == " WHERE ttl_col < $_f0"
+        assert coerced == {"_f0": timedelta(hours=2)}
+
+    def test_lookups_outside_the_table_are_unchanged(self) -> None:
+        # Text lookups on a rich field, and a list given to exact: v0.22.1 binding (then encoded).
+        coerced, _encoded = _one(token__startswith="0190")
+        assert coerced == "0190"
+        coerced, encoded = _one(ttls=["1h"])
+        assert coerced == ["1h"]
+        assert encoded == ["1h"]
+
+    def test_untouched_values(self) -> None:
+        from tests.test_rich_fields import RfEvent, RfLoose, RfNest
+
+        infinity = Decimal("Infinity")
+        coerced, encoded = _one(price__lt=infinity)
+        assert coerced is infinity  # never coerced (spec §4.5, D4): no ValueError
+        assert encoded is infinity
+        float_infinity = float("inf")
+        coerced, encoded = _one(price__lt=float_infinity)
+        assert coerced is float_infinity
+        assert encoded is float_infinity
+        nan = Decimal("NaN")
+        coerced, _encoded = _one(price__in=[nan, 1, float("nan")])
+        assert coerced[0] is nan
+        assert coerced[1] == Decimal("1")
+        assert type(coerced[1]) is Decimal
+        assert math.isnan(coerced[2])
+
+        _sql, coerced_loose, _encoded = _where(RfLoose, note="2026-01-01")
+        assert coerced_loose == {"_f0": "2026-01-01"}  # a str field
+        _sql, coerced_loose, _encoded = _where(RfLoose, **{"meta.ttl": "1h"})
+        assert coerced_loose == {"_f0": "1h"}  # a dotted path
+        _sql, coerced_nest, _encoded = _where(RfNest, **{"sched.ttl": "1h"})
+        assert coerced_nest == {"_f0": "1h"}  # a dotted path into a rich nested field
+
+        assert _where(None, at=Var("x"))[:2] == (" WHERE at = $x", {})
+        with pytest.warns(DeprecationWarning, match="Var"):
+            assert _where(None, at="$x")[:2] == (" WHERE at = $x", {})
+        assert _where(None, at="$$x")[1] == {"_f0": "$x"}  # the escape, no coercion attempted
+        assert _where(None, at=None)[1] == {"_f0": None}
+        assert _where(None, at__isnull=True)[:2] == (" WHERE at IS NULL", {})
+        assert _where(None, id="abc")[1] == {"_f0": RecordID("rf_event", "abc")}
+        assert _where(None, n__in=range(1, 4))[1] == {"_f0": [1, 2, 3]}  # a builtin range: its integers (D14)
+        assert _where(None, price__in=range(1, 3))[1] == {"_f0": [Decimal(1), Decimal(2)]}
+
+        # A model instance is its record id (v0.22.0), never validated as the field type.
+        linked = RfEvent(id="x")
+        assert _where(None, token=linked)[1] == {"_f0": RecordID("rf_event", "x")}
+        assert _where(None, token__in=[linked, _TOKEN_TEXT])[1] == {"_f0": [RecordID("rf_event", "x"), _UUID]}
+        assert _where(None, token__in=[None])[1] == {"_f0": [None]}
+
+    def test_invalid_lookup_value_raises(self) -> None:
+        from tests.test_rich_fields import RfEvent
+
+        queryset = RfEvent.objects().filter(at__gt="yesterday")
+        with pytest.raises(ValueError, match=r"filter\(at__gt=…\): 'yesterday' is not a valid datetime \(.+\)"):
+            queryset._build_where()
+        with pytest.raises(ValueError, match=r"filter\(token=…\): 'nope' is not a valid UUID"):
+            RfEvent.objects().filter(token="nope")._build_where()
+        with pytest.raises(ValueError, match=r"filter\(token__in=…\): 'nope' is not a valid UUID"):
+            RfEvent.objects().filter(token__in=[_TOKEN_TEXT, "nope"])._build_where()
+        with pytest.raises(ValueError, match=r"filter\(ttl__gt=…\): '1\.5h' is not a valid timedelta"):
+            RfEvent.objects().filter(ttl__gt="1.5h")._build_where()
+        with pytest.raises(ValueError, match=r"filter\(hours__contains=…\): 'x' is not a valid int"):
+            RfEvent.objects().filter(Q(hours__contains="x"))._build_where()
+        with pytest.raises(ValueError, match=r"filter\(at__in=…\): .* is not a valid Range\[datetime\]"):
+            RfEvent.objects().filter(at__in=Range(BoundIncluded("soon"), None))._build_where()
+        with pytest.raises(ValueError, match="Duration"):  # beyond timedelta.max
+            RfEvent.objects().filter(ttl=surrealdb.Duration(MAX_NS))._build_where()
+
+    def test_range_is_bound_as_one_value_only_for_membership(self) -> None:
+        from surreal_orm_lite.utils import build_filter_condition
+
+        one_to_five = Range(BoundIncluded(1), BoundIncluded(5))
+        sql, variables, counter = build_filter_condition("n", "not_in", one_to_five, 3)
+        assert (sql, variables, counter) == ("n NOT IN $_f3", {"_f3": one_to_five}, 4)
+        assert Q(n__in=one_to_five).to_sql() == ("n IN $_f0", {"_f0": one_to_five}, 1)
+        with pytest.raises(ValueError, match="iterable"):
+            build_filter_condition("n", "containsany", one_to_five, 0)
 
 
 # --- raw SDK E2E: what both server lines do with each encoded form (AC-6, AC-29, AC-32 b) ---------

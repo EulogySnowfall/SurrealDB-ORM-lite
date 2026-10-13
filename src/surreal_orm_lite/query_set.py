@@ -271,6 +271,10 @@ class QuerySet:
         """
         Build a parameterized WHERE clause from filters and Q objects.
 
+        A value compared with a rich field is first validated against the field's type
+        (:meth:`BaseSurrealModel._coerce_lookup_value`, v0.23.0): ``ttl__gt="1h"`` compares with a
+        duration, ``token="0190…"`` with a UUID, ``n__in=Range(…)`` is range membership.
+
         Args:
             encode: ``True`` (default) returns the bound values in forms both SurrealDB lines
                 accept (:func:`~surreal_orm_lite.wire.encode_wire`, ``stored=False``, v0.23.0): a
@@ -283,7 +287,8 @@ class QuerySet:
             The where_clause_string includes the ``WHERE`` keyword, or is empty if no filters.
 
         Raises:
-            ValueError: a value no SurrealDB type can hold (an ``int`` beyond 64 bits, a negative
+            ValueError: a filter value that is not valid for its rich field (``at__gt="yesterday"``),
+                or a value no SurrealDB type can hold (an ``int`` beyond 64 bits, a negative
                 duration…), before anything is sent.
             TypeError: a value of a type SurrealDB has no form for (a ``time``).
         """
@@ -291,18 +296,19 @@ class QuerySet:
         variables: dict[str, Any] = {}
         counter = 0
         endpoint_columns = self.model._endpoint_columns()
+        coerce = self.model._coerce_lookup_value  # typed lookups on rich fields (v0.23.0)
 
         # Regular keyword filters (AND-joined)
         for field_name, lookup_name, value in self._filters:
             sql, vars_, counter = build_filter_condition(
-                field_name, lookup_name, value, counter, self._model_table, endpoint_columns=endpoint_columns
+                field_name, lookup_name, value, counter, self._model_table, endpoint_columns=endpoint_columns, coerce=coerce
             )
             parts.append(sql)
             variables.update(vars_)
 
         # Q object filters
         for q in self._q_filters:
-            sql, vars_, counter = q.to_sql(counter, self._model_table, self.model.to_db_field, endpoint_columns)
+            sql, vars_, counter = q.to_sql(counter, self._model_table, self.model.to_db_field, endpoint_columns, coerce)
             if sql:
                 parts.append(sql)
                 variables.update(vars_)

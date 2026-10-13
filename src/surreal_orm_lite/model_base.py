@@ -1,6 +1,7 @@
 import contextlib
 import functools
 import logging
+import math
 import os
 import typing
 import warnings
@@ -15,7 +16,7 @@ from pydantic_core import ValidationError
 from ._sdk import NotFoundError, RecordID, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
-from .functions import SurrealFunc, _ComputedDefault
+from .functions import SurrealFunc, Var, _ComputedDefault
 from .signals import (
     around_delete,
     around_save,
@@ -29,6 +30,7 @@ from .signals import (
 )
 from .transaction import Transaction
 from .utils import (
+    RECORD_ID_COLUMN,
     VALID_ALIAS_PATTERN,
     apply_ddl_statements,
     build_set_clause,
@@ -44,7 +46,7 @@ from .utils import (
     validate_thing,
     warn_on_multiple_statements,
 )
-from .wire import encode_wire, field_input, restore_native, rich_kinds
+from .wire import encode_wire, field_input, lookup_type, restore_native, rich_kinds
 
 if TYPE_CHECKING:
     from .edge import BaseSurrealEdge
@@ -76,6 +78,59 @@ _INPUT_KINDS = frozenset({"timedelta", "datetime", "date"})
 _APPLY_KINDS = frozenset({"timedelta", "date", "duration", "range", "set", "frozenset", "tuple"})
 # (model class, field name) → the ``TypeAdapter`` of the field's annotation, built on first use.
 _APPLY_ADAPTERS: dict[tuple[type, str], pydantic.TypeAdapter[Any]] = {}
+# Typed lookups (v0.23.0): the type a filter value is validated as (``wire.lookup_type`` — the
+# field's type without ``Optional``/``Annotated``, ``Range[S]``, an item type…) → its ``TypeAdapter``,
+# shared by every model, built on first use.
+_LOOKUP_ADAPTERS: dict[Any, pydantic.TypeAdapter[Any]] = {}
+
+
+def _lookup_adapter(annotation: Any) -> pydantic.TypeAdapter[Any]:
+    """The cached ``TypeAdapter`` of ``annotation``; an unhashable annotation gets an uncached one."""
+    try:
+        adapter = _LOOKUP_ADAPTERS.get(annotation)
+    except TypeError:
+        return pydantic.TypeAdapter(annotation)
+    if adapter is None:
+        adapter = _LOOKUP_ADAPTERS[annotation] = pydantic.TypeAdapter(annotation)
+    return adapter
+
+
+def _type_label(annotation: Any) -> str:
+    """An annotation as an error message names it: ``datetime``, ``UUID``, ``Range[int]``…"""
+    origin = typing.get_origin(annotation)
+    if origin is not None:
+        return f"{_type_label(origin)}[{', '.join(_type_label(arg) for arg in typing.get_args(annotation))}]"
+    return str(getattr(annotation, "__name__", annotation))
+
+
+def _lookup_as_given(value: Any) -> bool:
+    """Whether a filter value (or item) is never validated against its field's type (spec §4.5).
+
+    ``None``; a ``Var`` and a string starting with ``$`` (the v0.14.3 reference and escape rules);
+    a model instance (its record id, v0.22.0); a non-finite ``float`` or ``Decimal`` — bound as in
+    v0.22.1, since the field's ``allow_inf_nan`` constraint is not part of the type compared with.
+    """
+    if value is None or isinstance(value, (Var, BaseSurrealModel)):
+        return True
+    if isinstance(value, str):
+        return value.startswith("$")
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, Decimal):
+        return not value.is_finite()
+    return False
+
+
+def _lookup_value(key: str, annotation: Any, value: Any) -> Any:
+    """``value`` validated as ``annotation`` for the filter ``key`` (``"at__gt"``); ``ValueError`` if it does not fit."""
+    if _lookup_as_given(value):
+        return value
+    try:
+        return _lookup_adapter(annotation).validate_python(field_input(annotation, value))
+    except (ValueError, TypeError) as exc:
+        detail = "; ".join(str(error["msg"]) for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
+        raise ValueError(f"filter({key}=…): {value!r} is not a valid {_type_label(annotation)} ({detail})") from exc
+
 
 # Pydantic's metaclass sits between ``__pydantic_init_subclass__`` and the user's ``class``
 # statement; a warning raised there must skip its frames to land on the user's line (v0.22.0).
@@ -504,6 +559,49 @@ class BaseSurrealModel(BaseModel):
             cached = {**by_alias, **entries}
             _RICH_FIELDS[cls] = cached
         return cached
+
+    @classmethod
+    def _coerce_lookup_value(cls, column: str, lookup: str, value: Any) -> Any:
+        """Validate a filter value against the type of the rich field it is compared with (v0.23.0).
+
+        The QuerySet's typed-lookup hook (spec §4.5), called by
+        :func:`~surreal_orm_lite.utils.build_filter_condition` for every lookup it compiles —
+        ``filter()``, ``Q`` at any depth, the lookups of ``get_or_create``/``update_or_create``, the
+        WHERE of ``bulk_update``/``bulk_delete``/``patch``/``live()`` — with the column, the lookup
+        and the value (the list of items for ``in``/``not_in``/``containsall``/``containsany``, the
+        range for range membership). On a field whose annotation holds a rich type,
+        :func:`~surreal_orm_lite.wire.lookup_type` names the type the value is validated as —
+        :func:`~surreal_orm_lite.wire.field_input` then that type's ``TypeAdapter`` — so a string,
+        a ``float`` or a builtin ``range`` becomes the value the column stores: ``ttl__gt="1h"`` a
+        ``timedelta``, ``token="0190…"`` a ``UUID``, ``price__lte=9.99`` ``Decimal("9.99")``,
+        ``at__in=Range(BoundIncluded("2026-01-01"), None)`` a ``Range[datetime]``,
+        ``hours__contains="12"`` an ``int`` on a ``Range[int]`` field. The caller encodes and binds
+        the result (a string compared with a duration or a UUID column silently matches the wrong
+        rows, or none).
+
+        Returned unchanged: a dotted path (``meta.ttl``), the ``id`` column (its record id rules),
+        ``isnull``, a field without a rich type, a lookup outside the table of spec §4.5, and the
+        values — or items — that are never validated: ``None``, a ``Var``, a string starting with
+        ``$``, a model instance, a non-finite ``float``/``Decimal``.
+
+        Raises:
+            ValueError: the value does not fit — ``"filter(at__gt=…): 'yesterday' is not a valid
+                datetime (…)"`` with Pydantic's message — before anything is sent.
+        """
+        if lookup == "isnull" or column == RECORD_ID_COLUMN or "." in column:
+            return value
+        name = cls.to_py_field(column)
+        entry = cls._rich_fields().get(name) if name in cls.model_fields else None
+        if entry is None:
+            return value
+        target = lookup_type(entry[0], lookup, value)
+        if target is None:
+            return value
+        each, annotation = target
+        key = name if lookup == "exact" else f"{name}__{lookup}"
+        if each:
+            return [_lookup_value(key, annotation, item) for item in value]
+        return _lookup_value(key, annotation, value)
 
     @classmethod
     def _py_fields(cls, payload: Mapping[str, Any]) -> list[str]:

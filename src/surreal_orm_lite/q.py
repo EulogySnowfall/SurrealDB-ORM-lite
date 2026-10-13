@@ -75,6 +75,7 @@ class Q:
         record_table: str | None = None,
         to_column: Callable[[str], str] | None = None,
         endpoint_columns: Collection[str] = (),
+        coerce: Callable[[str, str, Any], Any] | None = None,
     ) -> tuple[str, dict[str, Any], int]:
         """
         Generate a parameterized SQL WHERE fragment.
@@ -95,6 +96,11 @@ class Q:
                 edge model; v0.22.0), propagated by the QuerySet and passed down to child nodes,
                 so ``Q(out="product:w")`` binds the record id it names. Empty — a node model, or
                 a ``Q`` compiled on its own — leaves strings untouched.
+            coerce: The queried model's typed-lookup hook (v0.23.0), propagated by the QuerySet and
+                passed down to child nodes, so ``Q(ttl__gt="1h")`` binds a ``timedelta`` on a
+                ``timedelta`` field at any depth, negated or not
+                (:func:`~surreal_orm_lite.utils.build_filter_condition`). ``None`` — a ``Q``
+                compiled on its own — leaves values untouched.
 
         Returns:
             A tuple of (sql_fragment, variables_dict, next_counter).
@@ -110,7 +116,7 @@ class Q:
                 if to_column is not None:
                     field = to_column(field)
                 sql, vars_, counter = build_filter_condition(
-                    field, lookup, value, counter, record_table, endpoint_columns=endpoint_columns
+                    field, lookup, value, counter, record_table, endpoint_columns=endpoint_columns, coerce=coerce
                 )
                 filter_parts.append(sql)
                 all_variables.update(vars_)
@@ -121,7 +127,7 @@ class Q:
 
         # Child Q objects
         for child in self.children:
-            sql, vars_, counter = child.to_sql(counter, record_table, to_column, endpoint_columns)
+            sql, vars_, counter = child.to_sql(counter, record_table, to_column, endpoint_columns, coerce)
             if sql:
                 all_parts.append(sql)
                 all_variables.update(vars_)

@@ -48,6 +48,7 @@ from surreal_orm_lite import (
     BoundIncluded,
     Computed,
     Duration,
+    Q,
     Range,
     SurrealConfigDict,
     SurrealDBConnectionManager,
@@ -1083,3 +1084,115 @@ class TestRichReadsE2E:
             message = "2.x changed decimal trailing zeros — update README behaviour row 2 (spec §12 item 2)"
             assert str(got) == expected, message
             assert str(raw) == expected, message
+
+
+# ==================== Task 8 — typed lookups and range membership (spec §4.5) ====================
+
+_TOKEN_A = "0190c3d1-5c3b-7cc6-8f8a-2d2b1f0e9a0a"
+_TOKEN_B = "0190c3d1-5c3b-7cc6-8f8a-2d2b1f0e9a0b"
+_TOKEN_C = "0190c3d1-5c3b-7cc6-8f8a-2d2b1f0e9a0c"
+
+# Three rows written with SurrealQL literals: native types whatever the ORM's write path does.
+_LOOKUP_SEED = (
+    "CREATE rf_event:a SET at = d'2026-01-01T00:00:00Z', day = d'2026-01-01T00:00:00Z', ttl = 30m, grace = 30m, "
+    f"price = 5.00dec, token = u'{_TOKEN_A}', n = 1, hours = 0..8, "
+    "period = d'2026-01-01T00:00:00Z'..d'2026-02-01T00:00:00Z', ttls = [30m], tags = ['x'];",
+    "CREATE rf_event:b SET at = d'2026-06-01T00:00:00Z', day = d'2026-06-01T00:00:00Z', ttl = 1h30m, "
+    f"grace = 1h30m1ns, price = 9.99dec, token = u'{_TOKEN_B}', n = 5, hours = 9..17, "
+    "period = d'2026-06-01T00:00:00Z'.., ttls = [1h, 2h], tags = ['y'];",
+    "CREATE rf_event:c SET at = d'2027-01-01T00:00:00Z', day = d'2027-01-01T00:00:00Z', ttl = 3h, grace = 3h, "
+    f"price = 20dec, token = u'{_TOKEN_C}', n = 10, hours = 18..=23, "
+    "period = d'2027-01-01T00:00:00Z'..d'2027-02-01T00:00:00Z', ttls = [3h], tags = ['z'];",
+)
+
+# (filter arguments, expected ids) — AC-19. A ``Q`` goes in the tuple, keywords in the dict.
+_LOOKUP_CASES: list[tuple[tuple[Any, ...], dict[str, Any], list[str]]] = [
+    ((), {"at__gt": "2026-03-01T00:00:00Z"}, ["b", "c"]),
+    ((), {"at__lte": "2026-06-01T00:00:00Z"}, ["a", "b"]),
+    ((), {"token": _TOKEN_B}, ["b"]),
+    ((), {"price__lte": 9.99}, ["a", "b"]),
+    ((), {"price__gt": "5"}, ["b", "c"]),
+    ((), {"ttl__gt": "1h"}, ["b", "c"]),
+    ((), {"ttl__lt": timedelta(hours=1)}, ["a"]),
+    ((), {"grace": Duration.parse("1h30m1ns")}, ["b"]),
+    ((), {"grace__gte": "1h30m1ns"}, ["b", "c"]),
+    ((), {"day": date(2026, 6, 1)}, ["b"]),
+    ((), {"day__gte": "2026-06-01"}, ["b", "c"]),
+    ((), {"token__in": [_TOKEN_A, _TOKEN_C]}, ["a", "c"]),
+    ((), {"token__not_in": [_TOKEN_A]}, ["b", "c"]),
+    ((), {"n__in": Range(BoundIncluded(1), BoundExcluded(10))}, ["a", "b"]),
+    ((), {"n__in": Range(BoundIncluded(5), None)}, ["b", "c"]),
+    ((), {"n__in": Range(None, BoundIncluded(5))}, ["a", "b"]),
+    ((), {"n__in": surrealdb.Range(BoundIncluded(5), BoundIncluded(10))}, ["b", "c"]),
+    ((), {"n__not_in": Range(BoundIncluded(1), BoundIncluded(5))}, ["c"]),
+    ((), {"n__not_in": Range(BoundExcluded(1), None)}, ["a"]),
+    ((), {"at__in": Range(BoundIncluded("2026-03-01T00:00:00Z"), None)}, ["b", "c"]),
+    ((), {"hours__contains": 12}, ["b"]),
+    ((), {"hours__contains": "23"}, ["c"]),
+    ((), {"hours__contains": 17}, []),
+    ((), {"hours__not_contains": "4"}, ["b", "c"]),
+    ((), {"period__contains": "2026-01-15T00:00:00Z"}, ["a"]),
+    ((), {"period__contains": datetime(2026, 7, 1, tzinfo=UTC)}, ["b"]),
+    ((), {"ttls__contains": "1h"}, ["b"]),
+    ((), {"ttls__containsany": ["30m", "3h"]}, ["a", "c"]),
+    ((), {"ttls__containsall": ["1h", "2h"]}, ["b"]),
+    ((), {"hours": Range(BoundIncluded(9), BoundExcluded(17))}, ["b"]),
+    ((), {"hours": "9..17"}, ["b"]),
+    ((), {"hours": range(9, 17)}, ["b"]),
+    ((), {"hours": "18..=23"}, ["c"]),
+    ((Q(ttl__gt="2h") | ~Q(price__gt="5"),), {}, ["a", "c"]),
+]
+
+
+async def _seed_lookups(client: Any) -> None:
+    for statement in _LOOKUP_SEED:
+        await client.query(statement, {})
+
+
+async def _ids(*args: Any, **kwargs: Any) -> list[str]:
+    return sorted(str(ev.id) for ev in await RfEvent.objects().filter(*args, **kwargs).exec())
+
+
+class TestTypedLookupsE2E:
+    """Filter values on rich fields compare with the stored native values, on both lines (AC-19, AC-20)."""
+
+    async def test_typed_queries_return_the_expected_rows(self) -> None:
+        async with orm_client("rf_event") as client:
+            await _seed_lookups(client)
+            mismatches = []
+            for args, kwargs, expected in _LOOKUP_CASES:
+                got = await _ids(*args, **kwargs)
+                if got != expected:
+                    mismatches.append(f"filter({args or ''}{kwargs or ''}) -> {got}, expected {expected}")
+            assert not mismatches, "\n".join(mismatches)
+            assert await RfEvent.objects().filter(ttl__gte="1h").count() == 2
+            assert await RfEvent.objects().filter(token=_TOKEN_C).exists()
+
+    async def test_typed_filters_drive_queryset_writes(self) -> None:
+        async with orm_client("rf_event") as client:
+            await _seed_lookups(client)
+            assert await RfEvent.objects().filter(ttl__gte="1h").bulk_update(n=9) == 2
+            assert [(await _raw(rid))["n"] for rid in ("a", "b", "c")] == [1, 9, 9]
+
+            patched = await RfEvent.objects().filter(price__gte=10).patch([{"op": "replace", "path": "/n", "value": 42}])
+            assert patched == 1
+            assert (await _raw("c"))["n"] == 42
+
+            assert await RfEvent.objects().filter(token=_TOKEN_A).bulk_delete() == 1
+            assert sorted(str(ev.id) for ev in await RfEvent.objects().all()) == ["b", "c"]
+
+    async def test_get_or_create_with_a_uuid_string_converges(self) -> None:
+        token = "0190c3d1-5c3b-7cc6-8f8a-2d2b1f0e9a99"
+        async with orm_client("rf_event"):
+            first, created = await RfEvent.objects().get_or_create(token=token, defaults={"n": 1})
+            assert created
+            assert first.token == UUID(token)
+            again, created_again = await RfEvent.objects().get_or_create(token=token, defaults={"n": 1})
+            assert not created_again  # the lookup binds the UUID the create stored
+            assert again._record_id() == first._record_id()
+            assert await RfEvent.objects().filter(token=token).count() == 1
+
+            updated, created_update = await RfEvent.objects().update_or_create(token=token, defaults={"n": 2})
+            assert not created_update
+            assert updated.n == 2
+            assert len(await RfEvent.objects().all()) == 1

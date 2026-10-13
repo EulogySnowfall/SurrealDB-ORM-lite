@@ -2,15 +2,16 @@ import inspect
 import os
 import re
 import warnings
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 import pydantic
 
-from ._sdk import RecordID, ServerError
+from ._sdk import RecordID, SdkRange, ServerError
 from .constants import LOOKUP_OPERATORS
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, Var
+from .types import Range
 from .wire import encode_wire
 
 if TYPE_CHECKING:
@@ -507,12 +508,15 @@ def build_filter_condition(
     record_table: str | None = None,
     *,
     endpoint_columns: Collection[str] = (),
+    coerce: Callable[[str, str, Any], Any] | None = None,
 ) -> tuple[str, dict[str, Any], int]:
     """
     Build a single parameterized filter condition.
 
     A model instance given as the value — or as an item of a sequence lookup — is bound as its
-    record id (:func:`as_record_value`, v0.22.0).
+    record id (:func:`as_record_value`, v0.22.0). An ORM or SDK ``Range`` given to ``in``/``not_in``
+    is bound as one value — range membership, ``n IN $r`` (v0.23.0) — except on the ``id`` and
+    endpoint columns, which keep requiring an iterable of record ids.
 
     Args:
         field: The field name.
@@ -527,6 +531,13 @@ def build_filter_condition(
             value goes through :func:`coerce_endpoint`, so ``"person:alice"`` is the record id
             it names, and a text/collection lookup is refused. Node columns are untouched: a
             string column may legitimately hold ``"a:b"``.
+        coerce: The queried model's typed-lookup hook (``_coerce_lookup_value``, v0.23.0),
+            propagated by the QuerySet: ``coerce(field, lookup, value)`` returns the value to bind
+            — validated against the field's type on a rich field (``ttl__gt="1h"`` binds a
+            ``timedelta``). It gets the list of items for a sequence lookup and the range for
+            range membership, and is never called for ``isnull``, a ``Var``, a ``$`` reference or
+            its ``$$`` escape, a model instance, or the ``id`` and endpoint columns. ``None`` — a
+            ``Q`` compiled on its own — leaves values untouched.
 
     Returns:
         A tuple of (sql_fragment, variables_dict, next_counter).
@@ -534,8 +545,8 @@ def build_filter_condition(
     Raises:
         ValueError: If the lookup type is not supported, the field name is invalid, a
             text/collection lookup is applied to the ``id`` column or to an endpoint column,
-            a sequence lookup gets a single model instance, a model instance is unsaved, or
-            an endpoint value is not a record id.
+            a sequence lookup gets a single model instance, a model instance is unsaved, an
+            endpoint value is not a record id, or ``coerce`` refuses the value.
     """
     validate_field_name(field, "filter field")
     op = LOOKUP_OPERATORS.get(lookup)
@@ -554,6 +565,8 @@ def build_filter_condition(
     is_endpoint_column = field in endpoint_columns
     if is_endpoint_column and lookup in _RECORD_ID_INVALID_LOOKUPS:
         raise ValueError(f"'{lookup}' cannot be applied to the edge endpoint column '{field}': it holds a record id, not text.")
+    # Typed lookups (v0.23.0) leave the record id rules of the id and endpoint columns alone.
+    typed = None if is_record_id_column or is_endpoint_column else coerce
 
     if lookup == "isnull":
         if not isinstance(value, bool):
@@ -562,6 +575,13 @@ def build_filter_condition(
             return f"{field} IS NULL", {}, counter
         else:
             return f"{field} IS NOT NULL", {}, counter
+    elif (
+        lookup in ("in", "not_in") and isinstance(value, (Range, SdkRange)) and not (is_record_id_column or is_endpoint_column)
+    ):
+        # Range membership (v0.23.0): one bound range, ``n IN $r``, not a list of items.
+        if typed is not None:
+            value = typed(field, lookup, value)
+        return f"{field} {op} ${var_name}", {var_name: value}, counter + 1
     elif lookup in ("in", "not_in", "containsall", "containsany"):
         if isinstance(value, (str, dict)) or not hasattr(value, "__iter__"):
             raise ValueError(f"'{lookup}' lookup requires an iterable (list, tuple, or set), got {type(value).__name__}")
@@ -571,13 +591,17 @@ def build_filter_condition(
                 f"'{lookup}' lookup requires an iterable (list, tuple, or set), got a single "
                 f"{type(value).__name__} instance; wrap it in a list."
             )
-        items = [as_record_value(item) for item in value]
+        items = list(value)
+        if typed is not None:
+            items = typed(field, lookup, items)
+        items = [as_record_value(item) for item in items]
         if is_record_id_column and lookup in _RECORD_ID_SEQUENCE_LOOKUPS:
             items = [coerce_record_id(item, cast(str, record_table)) for item in items]
         elif is_endpoint_column and lookup in _RECORD_ID_SEQUENCE_LOOKUPS:
             items = [coerce_endpoint(item) for item in items]
         return f"{field} {op} ${var_name}", {var_name: items}, counter + 1
 
+    original = value
     value = as_record_value(value)
     if isinstance(value, Var):
         # The explicit, unambiguous form (v0.14.3).
@@ -608,6 +632,8 @@ def build_filter_condition(
             value = coerce_record_id(value, cast(str, record_table))
         elif is_endpoint_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
             value = coerce_endpoint(value)
+        elif typed is not None and value is original:  # a model instance is its record id, as given
+            value = typed(field, lookup, value)
         return f"{field} {op} ${var_name}", {var_name: value}, counter + 1
 
 
