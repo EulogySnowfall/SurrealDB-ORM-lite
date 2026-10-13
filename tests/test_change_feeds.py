@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -27,6 +28,7 @@ from surreal_orm_lite.changefeed import ChangeModelStream, feed_events, next_cur
 from surreal_orm_lite.enum import LiveAction
 from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.live import is_dead
+from tests._retry import retry_write as _write
 
 TABLE = "Fed"
 
@@ -65,22 +67,6 @@ async def feed_client(definition: str = "CHANGEFEED 1h", *, scheme: str = "ws", 
             cleanup = await SurrealDBConnectionManager.get_client()
             await cleanup.query(f"REMOVE TABLE IF EXISTS {TABLE};", {})
         await SurrealDBConnectionManager.close_connection()
-
-
-async def _write(operation: Any) -> Any:
-    """Run a test write, retrying SurrealDB's retryable conflicts.
-
-    Seen once in CI on a fresh 2.7.0 container: a plain write to a change-feed table failed with
-    "read or write conflict … can be retried", with no concurrent writer in the test (never
-    reproduced locally). The ORM's answer to a retryable conflict is ``retry_on_conflict``.
-    """
-    from surreal_orm_lite import retry_on_conflict
-
-    @retry_on_conflict(max_retries=5)
-    async def _run() -> Any:
-        return await operation()
-
-    return await _run()
 
 
 async def _take(stream: Any, count: int, timeout: float = 5.0) -> list[Any]:
@@ -488,7 +474,7 @@ async def _direct_write(sql: str) -> None:
     try:
         await client.signin({"username": "root", "password": "root"})
         await client.use("ns", "db")
-        await client.query(sql, {})
+        await _write(lambda: client.query(sql, {}))
     finally:
         await client.close()
 
@@ -591,3 +577,321 @@ class TestReviewStoppedStartE2E:
         monkeypatch.setattr(changefeed.ChangeModelStream, "_with_retry", _stopped)
         with pytest.raises(changefeed._StreamStopped):
             await stream._check_changefeed()
+
+
+# ==================== issue #212: "now" on 3.x is a millisecond, not a stamp ====================
+
+
+def _epoch_ms(moment: datetime) -> int:
+    return (moment - datetime(1970, 1, 1, tzinfo=UTC)) // timedelta(milliseconds=1)
+
+
+def _at_ms(ms: int) -> datetime:
+    return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(milliseconds=ms)
+
+
+async def _server_ms(client: Any) -> int:
+    """The server clock's millisecond, the clock SurrealDB 3.x stamps its change feeds with."""
+    now = await client.query("RETURN time::now();", {})
+    if not isinstance(now, datetime):
+        now = datetime.fromisoformat(str(now))
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    return _epoch_ms(now)
+
+
+async def _require_clock_stamps(client: Any) -> int:
+    """Skip unless ``since=None`` reads the server clock (SurrealDB 3.x); return the clock's millisecond.
+
+    The probe is the stream's own branch: on 3.x a stamp is ``unix_ms << 16 | counter`` and "now" is
+    found from the clock; on 2.x a stamp is a counter ``<< 16`` and "now" is a search of that counter,
+    with no clock to pin. A 3.x server never skips: :func:`_stamps_since` fails if its stamps do not
+    follow the clock.
+    """
+    if await _major(client) < 3:
+        pytest.skip("since=None searches the versionstamp counter here, not the server clock (SurrealDB 2.x)")
+    return await _server_ms(client)
+
+
+async def _stamps_since(client: Any, ms: int, *ids: str) -> list[int]:
+    """The versionstamp of the latest entry for each ``Fed:<id>``, read from the server clock's *ms* on.
+
+    Never ``SINCE 0``: on 3.x ``REMOVE TABLE`` does not purge a table's change feed, those entries
+    outlive ``CHANGEFEED 1h``, and ``SHOW CHANGES`` answers at most 1000 entries, oldest first, so
+    on a long-running server ``SINCE 0`` is other runs' history, not this test's writes. Entries are
+    matched by record, not by position; a second of slack before *ms* absorbs a clock step.
+    """
+    feed = await client.query(f"SHOW CHANGES FOR TABLE {TABLE} SINCE {(ms - 1000) << 16} LIMIT 1000;", {})
+    stamps: dict[str, int] = {}
+    for entry in feed:
+        for event in feed_events(Fed, entry):
+            stamps[_ids([event])[0]] = entry["versionstamp"]
+    missing = [record for record in ids if record not in stamps]
+    assert not missing, f"no feed entry for {missing} since the server clock read {ms}: stamps are not unix_ms << 16"
+    return [stamps[record] for record in ids]
+
+
+def _clock_reading(ms: int) -> Any:
+    async def _server_now(self: Any) -> datetime:
+        return _at_ms(ms)
+
+    return _server_now
+
+
+class TestSinceNoneSameMillisecondE2E:
+    """Issue #212: on 3.x a stamp is ``unix_ms << 16 | counter`` and ``SINCE`` is inclusive, so
+    starting "now" at ``versionstamp_at(server_now())`` replayed every entry committed earlier in
+    that same millisecond. The server clock is pinned to the millisecond of an existing entry, which
+    is what CI hit by chance (the fixture's ``DEFINE TABLE``, a ``Fed:x`` written just before)."""
+
+    @pytest.mark.asyncio
+    async def test_an_entry_from_the_clocks_millisecond_is_not_replayed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with feed_client() as client:
+            clock = await _require_clock_stamps(client)
+            await _write(lambda: Fed(id="same_ms").save())
+            [stamp] = await _stamps_since(client, clock, "same_ms")
+            monkeypatch.setattr(ChangeModelStream, "_server_now", _clock_reading(stamp >> 16))
+
+            stream = await Fed.objects().changes(poll_interval=0.05).start()
+
+            assert isinstance(stream.cursor, int)
+            assert stream.cursor > stamp
+            await _nothing_within(stream)
+
+    @pytest.mark.asyncio
+    async def test_skips_the_history_of_the_clocks_millisecond_then_delivers_the_next_write(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with feed_client() as client:
+            clock = await _require_clock_stamps(client)
+            for n in range(3):
+                await _write(lambda n=n: Fed(id=f"h{n}").save())
+            _, _, last_write = await _stamps_since(client, clock, "h0", "h1", "h2")
+            # The clock reads the millisecond of the last write, the earliest a real start() made
+            # after the three writes can read. The writes that share it are read one page each
+            # (batch_size=1); paging is pinned exactly by TestEndOfFeed3xUnit.
+            monkeypatch.setattr(ChangeModelStream, "_server_now", _clock_reading(last_write >> 16))
+
+            stream = await Fed.objects().changes(poll_interval=0.05, batch_size=1).start()
+            assert isinstance(stream.cursor, int)
+            assert stream.cursor > last_write
+            await _write(lambda: Fed(id="after").save())
+
+            [event] = await _take(stream, 1)
+            assert _ids([event]) == ["after"]
+            await _nothing_within(stream)
+
+
+class _FakeServer3x:
+    """A SurrealDB 3.x server in miniature: what ``ChangeModelStream`` asks while it starts and polls.
+
+    Its feed is a list of versionstamps, by default in the millisecond its clock reads, so the tests
+    can put a write *after* ``start()`` in the very millisecond ``start()`` read — which a real
+    server only does by chance; ``write_at`` stamps another millisecond. Like a real server it
+    answers oldest first, and each query yields to the event loop, so a test's timeout can fire.
+    """
+
+    def __init__(self, ms: int, counters: list[int]) -> None:
+        from surreal_orm_lite._sdk import RecordID
+
+        self._record = RecordID
+        self.ms = ms
+        self.stamps = [(ms << 16) | counter for counter in counters]
+        self.shows: list[tuple[int, int]] = []
+        self.on_show: Any = None
+
+    def write(self, counter: int) -> None:
+        self.write_at(self.ms, counter)
+
+    def write_at(self, ms: int, counter: int) -> None:
+        self.stamps.append((ms << 16) | counter)
+
+    async def version(self) -> str:
+        return "surrealdb-3.3.3"
+
+    async def query(self, sql: str, variables: dict[str, Any]) -> Any:
+        await asyncio.sleep(0)
+        if sql.startswith("INFO FOR DB"):
+            return {"tables": {TABLE: f"DEFINE TABLE {TABLE} TYPE ANY SCHEMALESS CHANGEFEED 1h"}}
+        if sql.startswith("RETURN time::now()"):
+            return _at_ms(self.ms)
+        show = re.fullmatch(rf"SHOW CHANGES FOR TABLE {TABLE} SINCE (\d+) LIMIT (\d+);", sql)
+        assert show is not None, f"unexpected query {sql!r}"
+        since, limit = int(show.group(1)), int(show.group(2))
+        self.shows.append((since, limit))
+        if self.on_show is not None:
+            self.on_show()
+        return [
+            {"versionstamp": stamp, "changes": [{"update": {"id": self._record(TABLE, f"c{stamp & 0xFFFF}")}}]}
+            for stamp in sorted(self.stamps)
+            if stamp >= since
+        ][:limit]
+
+
+class TestEndOfFeed3xUnit:
+    @staticmethod
+    def _serve(monkeypatch: pytest.MonkeyPatch, server: _FakeServer3x) -> None:
+        async def _get_client(cls: Any) -> Any:
+            return server
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", classmethod(_get_client))
+
+    @pytest.mark.asyncio
+    async def test_pages_past_every_entry_of_the_clocks_millisecond(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        server = _FakeServer3x(ms=1_791_868_481_598, counters=[0, 1, 2, 3, 4])
+        self._serve(monkeypatch, server)
+
+        stream = await Fed.objects().changes(batch_size=2).start()
+
+        assert stream.cursor == server.stamps[-1] + 1
+        assert server.shows == [(server.ms << 16, 2), ((server.ms << 16) + 2, 2), ((server.ms << 16) + 4, 2)]
+
+    @pytest.mark.asyncio
+    async def test_the_scan_stops_at_the_next_millisecond_under_sustained_writes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The scan reads the clock's millisecond only: a busy table cannot keep ``start()`` from
+        returning, and its first later write is delivered, not skipped as history.
+
+        Every SHOW adds a full page of writes in the next millisecond; the first one also adds a
+        write in the clock's own millisecond, committed while ``start()`` runs (history).
+        """
+        ms = 1_791_868_481_598
+        server = _FakeServer3x(ms=ms, counters=[0, 1, 2])
+        self._serve(monkeypatch, server)
+        later = iter(range(100, 1 << 16))
+
+        def sustained_load() -> None:
+            if len(server.shows) == 1:
+                server.write(3)
+            for _ in range(2):
+                server.write_at(ms + 1, next(later))
+
+        server.on_show = sustained_load
+        stream = Fed.objects().changes(poll_interval=0, batch_size=2)
+
+        async with asyncio.timeout(2):
+            await stream.start()
+
+        assert len(server.shows) <= 3
+        assert stream.cursor == ((ms << 16) | 3) + 1
+
+        server.on_show = None
+        [event] = await _take(stream, 1, timeout=2)
+
+        assert event.record_id == f"{TABLE}:c100"
+        assert stream.cursor == (((ms + 1) << 16) | 100) + 1
+
+    @pytest.mark.asyncio
+    async def test_a_write_after_start_in_the_same_millisecond_is_delivered(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Starting at ``(ms + 1) << 16`` would also hide the history, and lose this write."""
+        server = _FakeServer3x(ms=1_791_868_481_598, counters=[0])
+        self._serve(monkeypatch, server)
+        stream = await Fed.objects().changes(poll_interval=0).start()
+
+        server.write(1)
+        [event] = await _take(stream, 1, timeout=2)
+
+        assert event.record_id == f"{TABLE}:c1"
+        assert stream.cursor == server.stamps[-1] + 1
+
+    @pytest.mark.asyncio
+    async def test_an_empty_millisecond_starts_at_the_clock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        server = _FakeServer3x(ms=1_791_868_481_598, counters=[])
+        self._serve(monkeypatch, server)
+
+        stream = await Fed.objects().changes().start()
+
+        assert stream.cursor == server.ms << 16
+        assert len(server.shows) == 1
+
+    @pytest.mark.asyncio
+    async def test_stop_during_the_scan_sends_nothing_more(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        server = _FakeServer3x(ms=1_791_868_481_598, counters=[0, 1, 2])
+        self._serve(monkeypatch, server)
+        stream = Fed.objects().changes(batch_size=1)
+        server.on_show = stream.stop
+
+        assert await stream.start() is stream
+
+        assert len(server.shows) == 1
+        with pytest.raises(StopAsyncIteration):
+            async with asyncio.timeout(2):
+                await anext(stream)
+        assert len(server.shows) == 1
+
+
+# ==================== a cancellation the SDK turns into a KeyError ====================
+
+
+class _CancelRaceClient:
+    """An SDK WebSocket client losing the race the #212 suite hit on 2.x, on demand.
+
+    The first ``SHOW CHANGES`` is cancelled by the caller's timeout in the very loop iteration its
+    answer arrives. The SDK's receive loop (surrealdb 2.0.0) then calls ``set_result()`` on the
+    cancelled future, dies of the ``InvalidStateError`` and clears its pending-request map, so the
+    request's own cleanup (``del self.qry[id]``) raises a ``KeyError`` that *replaces* the
+    ``CancelledError``, on a client that is dead by then. Every later query answers an empty feed.
+    """
+
+    def __init__(self, finished: asyncio.Task[None]) -> None:
+        self._finished = finished
+        self.recv_task: asyncio.Task[None] | None = None  # no receive task: alive, until the race
+        self.raced = False
+        self.shows = 0
+
+    async def version(self) -> str:
+        return "surrealdb-2.7.0"
+
+    async def query(self, sql: str, variables: dict[str, Any]) -> Any:
+        await asyncio.sleep(0)
+        if sql.startswith("INFO FOR DB"):
+            return {"tables": {TABLE: f"DEFINE TABLE {TABLE} TYPE ANY SCHEMALESS CHANGEFEED 1h"}}
+        assert sql.startswith(f"SHOW CHANGES FOR TABLE {TABLE} "), f"unexpected query {sql!r}"
+        self.shows += 1
+        if self.raced:
+            return []
+        qry = {"request": asyncio.get_running_loop().create_future()}
+        try:
+            await qry["request"]  # never answered: only the caller's cancellation ends it
+        finally:
+            self.raced = True
+            self.recv_task = self._finished  # the receive loop died...
+            qry.clear()  # ...and its finally cleared the pending requests
+            del qry["request"]  # KeyError, raised over the CancelledError
+
+
+async def _finished_task() -> asyncio.Task[None]:
+    task = asyncio.ensure_future(asyncio.sleep(0))
+    await task
+    return task
+
+
+class TestCancelledReadUnit:
+    @pytest.mark.asyncio
+    async def test_a_timeout_around_a_read_still_fires_when_the_sdk_raises_over_its_cancellation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The KeyError on a dead client looks like a dropped connection: retrying it swallowed the
+        timeout's cancellation, and the read polled on forever (``_nothing_within`` hung on 2.x)."""
+        client = _CancelRaceClient(await _finished_task())
+
+        async def _get_client(cls: Any) -> Any:
+            return client
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", classmethod(_get_client))
+        stream = _fast(Fed.objects().changes(since=0, poll_interval=0.05))
+
+        async def _read_within(seconds: float) -> None:
+            async with asyncio.timeout(seconds):
+                await anext(stream)
+
+        reading = asyncio.ensure_future(_read_within(0.2))
+        # The guard is a wait on a separate task: a read that swallows its own cancellation cannot
+        # swallow this one too.
+        done, _ = await asyncio.wait({reading}, timeout=3)
+        stream.stop()  # releases a read that lost its cancellation and polls on
+        await asyncio.wait({reading}, timeout=2)
+
+        assert client.raced, "the fake never reproduced the SDK's KeyError"
+        assert done, f"the read swallowed its timeout and kept polling ({client.shows} SHOW CHANGES)"
+        assert isinstance(reading.exception(), TimeoutError)
+        assert client.shows == 1, "nothing may be sent once the read is cancelled"

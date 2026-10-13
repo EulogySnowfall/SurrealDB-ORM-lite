@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.2] - 2026-10-13
+
+Change-feed fixes: history replayed by `changes(since=None)` on SurrealDB 3.x, and a timed-out
+read that could hang on both lines. No new public API.
+
+### Fixed
+
+- **`changes(since=None)` no longer replays history on SurrealDB 3.x** (#212). On 3.x the stream
+  started at the server clock's millisecond (`unix_ms << 16`), but a 3.x versionstamp is
+  `unix_ms << 16 | counter` and `SINCE` is inclusive, so every entry committed earlier in that
+  same millisecond was delivered as if it were new, and `stream.cursor` did not point at the end
+  of the feed. `start()` now reads the entries stamped in that millisecond, a page of
+  `batch_size` at a time, and moves the cursor past the last one: usually one short read, at most
+  `ceil(n / batch_size) + 1` reads for the `n` entries of that millisecond, however busy the
+  table is. It goes through the same retry and `stop()` path as every other request.
+  - A write committed in that millisecond while `start()` runs is history and is skipped; a write
+    in a later millisecond, or one made after `start()` returns (even in the same millisecond),
+    is delivered.
+  - This was the cause of two intermittent change-feed test failures on SurrealDB 3.x.
+- **A change-feed read under `asyncio.timeout()` or `wait_for()` could hang forever**, on both
+  server lines. When the read was cancelled in the very loop iteration the server's answer
+  arrived, the official SDK (surrealdb 2.0.0) raised a `KeyError` over the `CancelledError` and
+  its connection died, which is what a dropped connection looks like. The stream retried it as one
+  and lost the cancellation: the timeout never fired and the read polled on, for as long as the
+  process ran. A cancellation of the reading task is now re-raised instead of retried, so the read
+  times out as asked and loses nothing (the next read starts from the cursor). A live query's
+  automatic resubscribe gets the same guard, so cancelling it (`asyncio.run()` shutting down, for
+  instance) no longer has it reconnect on.
+
+### Notes
+
+- **`changes(since=None)` on SurrealDB 2.x is unchanged**: there "now" is the end of the feed,
+  found by searching the counter, which never had this problem. The README's "SurrealDB 2.6.x vs
+  3.x" table now says how the 3.x side finds "now". The timed-out read fix is the same on both
+  lines: the race is in the SDK, not in the server.
+- Tested against SurrealDB 3.3.4 and 2.7.0 (the CI pins), plus 3.1.5 for backward compatibility.
+
 ## [0.22.0] - 2026-10-12
 
 Native typed relations: graph edges as Pydantic models, created through the official SDK's

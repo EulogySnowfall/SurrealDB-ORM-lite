@@ -18,11 +18,14 @@ The ORM reads the server line once per stream (``version()``) and always stores 
 ``SINCE`` value, so ``changes(since=stream.cursor)`` is correct on both. ``SINCE <datetime>`` is
 worse still: always empty on 3.x, and on 2.x it also returns changes from before the moment. So a
 datetime is converted to the 3.x stamp layout (``unix_ms << 16``, exact), passed through on 2.x
-(documented as at-least-once), and "from now" on 2.x is found by searching the counter instead.
+(documented as at-least-once). "From now" is, on 2.x, the end of the feed, found by searching the
+counter; on 3.x, the server clock's ``unix_ms << 16``, then past the entries already stamped in
+that millisecond — a 3.x stamp is ``unix_ms << 16 | counter``, so the clock alone would replay them.
 
 Polling is plain ``query()``, so it works over HTTP as well as WebSocket. A dropped connection is
 retried with backoff like a live stream; nothing is lost, because the next poll starts from the
-cursor.
+cursor. A cancelled read (``asyncio.timeout`` around it) is never retried, even when the SDK
+reports the cancellation as a failed request on a dead connection.
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ from .enum import LiveAction
 from .exceptions import SurrealDbConnectionError, SurrealDbError
 from .live import (
     ModelChangeEvent,
+    cancellation_lost,
     cancelled_from_outside,
     hydrate,
     is_connection_failure,
@@ -277,7 +281,9 @@ class ChangeModelStream(Generic[T]):
         """Fix the starting position now rather than at the first read. Idempotent.
 
         With ``since=None`` "now" is the moment of this call, so a write made between ``start()``
-        and the first read is delivered.
+        and the first read is delivered, and nothing already in the feed is. On SurrealDB 3.x "now"
+        is the server clock's millisecond, then past the entries already stamped in it (usually one
+        short read); on 2.x it is the end of the feed, found by a search of the counter.
 
         A stream stopped while starting returns without sending anything more; iterating it ends.
 
@@ -303,7 +309,7 @@ class ChangeModelStream(Generic[T]):
             else:
                 self._since_clause = since_sql(since, major=major)
         elif major >= 3:
-            self._cursor = versionstamp_at(await self._server_now())
+            self._cursor = await self._end_of_feed_3x()
         else:
             self._cursor = await self._end_of_feed_2x()
         self._major = major
@@ -368,6 +374,34 @@ class ChangeModelStream(Generic[T]):
         if not isinstance(now, datetime):
             now = datetime.fromisoformat(str(now))
         return now if now.tzinfo is not None else now.replace(tzinfo=UTC)
+
+    async def _end_of_feed_3x(self) -> int:
+        """The 3.x cursor for "now": past the entries stamped in the server clock's millisecond, and no further.
+
+        The clock gives only a millisecond, ``unix_ms << 16``, while a stamp is ``unix_ms << 16 |
+        counter`` and ``SINCE`` is inclusive: every entry committed earlier in that millisecond is
+        at or after it, and would be replayed as history (issue #212). So the entries of that
+        millisecond, and only those, are read a page of ``batch_size`` at a time, and the cursor
+        moves past the last one. The scan stops at a short page or at the first entry stamped in a
+        later millisecond: at most ``ceil(n / batch_size) + 1`` reads for the ``n`` entries of that
+        millisecond (usually one short read), however busy the table is.
+
+        What counts as history: a write committed in that millisecond while :meth:`start` runs is
+        skipped; a write in a later millisecond is delivered, and so is one made after
+        :meth:`start` returns, even in the same millisecond. Not ``(unix_ms + 1) << 16``: that
+        would also skip a write made after :meth:`start` returns in the same millisecond.
+        """
+        cursor = versionstamp_at(await self._server_now())
+        end = cursor + (1 << 16)  # the first stamp of the next millisecond
+        while True:
+            entries = await self._show(str(cursor), self._batch_size)
+            stamps = [entry.get("versionstamp") for entry in entries]
+            inside = [stamp for stamp in stamps if isinstance(stamp, int) and cursor <= stamp < end]
+            if inside:
+                cursor = next_cursor(max(inside), major=3)
+            later = any(isinstance(stamp, int) and stamp >= end for stamp in stamps)
+            if len(entries) < self._batch_size or later or not inside:  # short, past the millisecond, or stuck
+                return cursor
 
     async def _end_of_feed_2x(self) -> int:
         """The 2.x cursor right after the newest entry, found without reading the feed.
@@ -444,7 +478,12 @@ class ChangeModelStream(Generic[T]):
         return section if isinstance(section, dict) else None
 
     async def _with_retry(self, operation: Callable[[Any], Awaitable[Any]]) -> Any:
-        """Run *operation* on the manager's client, retrying connection failures with backoff."""
+        """Run *operation* on the manager's client, retrying connection failures with backoff.
+
+        A cancellation of the reading task (``asyncio.timeout``, ``wait_for``, ``Task.cancel()``) is
+        never retried, even when the SDK reports it as a failed request: see
+        :func:`~surreal_orm_lite.live.cancellation_lost`.
+        """
         from .connection_manager import SurrealDBConnectionManager
 
         delay = float(self.reconnect_delay)
@@ -462,6 +501,10 @@ class ChangeModelStream(Generic[T]):
                     raise
                 error: Exception = SurrealDbConnectionError("the connection dropped during the request")
             except Exception as exc:
+                if cancellation_lost(exc):
+                    # The SDK raised over this task's cancellation (a timeout around the read):
+                    # retried, the cancellation would be lost and the read would poll on forever.
+                    raise asyncio.CancelledError from exc
                 if not is_connection_failure(exc, client):
                     raise
                 error = exc
