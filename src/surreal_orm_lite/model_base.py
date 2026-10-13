@@ -675,15 +675,50 @@ class BaseSurrealModel(BaseModel):
         return self._columns_for(self.model_dump(exclude=excluded))
 
     @classmethod
+    def _is_write_protected(cls, name: str) -> bool:
+        """Whether ``name`` addresses one of :meth:`_write_protected_fields` (v0.22.0).
+
+        ``name`` is a Python field or its column (``in`` as well as ``in_``), possibly a dotted
+        path, judged on its first segment: ``out.x`` writes inside ``out``.
+        """
+        protected = cls._write_protected_fields()
+        if not protected:
+            return False
+        head = name.split(".", 1)[0]
+        return head in protected or cls.to_py_field(head) in protected
+
+    @classmethod
+    def _reject_endpoint_writes(cls, fields: Iterable[str], context: str) -> None:
+        """Raise if ``fields`` names an edge endpoint (``in_``/``in``/``out``) (v0.22.0).
+
+        SurrealDB ignores a change to an existing edge's endpoints on both lines — ``UPDATE …
+        MERGE``/``SET``/``PATCH`` write the other fields and silently keep ``in``/``out`` — so such
+        a write is an invisible no-op, refused at the call site like a computed-field write. A
+        node protects nothing.
+        """
+        if any(cls._is_write_protected(field) for field in fields):
+            raise ValueError(
+                f"{context}: `in`/`out` are the endpoints of edge `{cls.__name__}`; SurrealDB ignores a change "
+                "to them (both lines), so the ORM refuses it — delete the edge and relate again."
+            )
+
+    @classmethod
     def _reject_computed_writes(cls, fields: Iterable[str], context: str) -> None:
-        """Raise if ``fields`` names a computed field.
+        """Raise if ``fields`` names a computed field — or, on an edge model, an endpoint.
 
         A computed field is set by ``DEFINE FIELD … VALUE``, and the server discards whatever a
         client sends for it — so such a write is an invisible no-op. Raising turns it into an
         error at the call site instead. Update the fields the expression reads.
+
+        An edge's endpoints are the same kind of no-op (v0.22.0, :meth:`_reject_endpoint_writes`),
+        checked first. Every write guard routes through here — ``merge()`` and its
+        ``server_values=``, ``bulk_update()``, both ``patch()`` entry points
+        (:meth:`_reject_computed_patch`) and the atomic helpers (:meth:`_validate_atomic_field`).
         """
+        names = list(fields)
+        cls._reject_endpoint_writes(names, context)
         computed = cls.get_computed_fields()
-        offenders = sorted(field for field in fields if field in computed)
+        offenders = sorted(field for field in names if field in computed)
         if offenders:
             raise ValueError(
                 f"{context}: {', '.join(offenders)} "
@@ -731,7 +766,7 @@ class BaseSurrealModel(BaseModel):
 
     @classmethod
     def _reject_computed_patch(cls, operations: list[dict[str, Any]], context: str) -> None:
-        """Raise if a JSON Patch document writes a computed field.
+        """Raise if a JSON Patch document writes a computed field or an edge endpoint.
 
         ``patch()`` is a write like any other, so it gets the same guard as ``merge()`` —
         without it, ``{"op": "replace", "path": "/full_name", …}`` would be accepted here and
@@ -748,6 +783,10 @@ class BaseSurrealModel(BaseModel):
         instead — replacing the document with an object that omits the computed fields is a
         legitimate write, naming one is not.
 
+        On an edge model the same rules refuse ``/in`` (or ``/in_``) and ``/out``, a pointer below
+        them and a whole-document value naming them (v0.22.0); a ``remove`` of the whole document
+        removes them too, so it is refused.
+
         Call **after** :func:`validate_patch_operations`, which guarantees the shape relied on
         here.
         """
@@ -760,11 +799,12 @@ class BaseSurrealModel(BaseModel):
                 if pointer == "":
                     value = op.get("value")
                     # No inspectable value (e.g. ``remove`` on the whole document) — treat it
-                    # as touching everything the server owns.
+                    # as touching everything the server owns, and an edge's endpoints.
                     if isinstance(value, dict):
                         targets.extend(cls._pointer_segment_field(str(key)) for key in value)
                     else:
                         targets.extend(cls.get_computed_fields())
+                        targets.extend(cls._write_protected_fields())
                     continue
                 targets.append(cls._pointer_segment_field(cls._pointer_head(pointer)))
         cls._reject_computed_writes(targets, context)

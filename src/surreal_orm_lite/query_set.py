@@ -996,10 +996,18 @@ class QuerySet:
         Create builds ``self.model(**payload)``: a key the model does not declare raises
         ``SurrealDbError`` (unless the model sets ``extra="allow"``), and a missing required
         field raises ``ValidationError`` at construction.
+
+        On an edge model (v0.22.0) the endpoints are lookup criteria, never data:
+        ``update_or_create(in_=a, out=b, defaults={"weight": 3})`` finds or relates ``a -> b``
+        and writes ``weight``. ``defaults`` naming an endpoint (``in_``/``in``/``out``) raises
+        ``ValueError`` before the lookup — it would be written on create and silently ignored by
+        the server on update. On update, the endpoints the criteria named (they matched) are left
+        out of the ``merge()``.
         """
         if not criteria:
             raise SurrealDbError("update_or_create() requires at least one lookup criteria.")
         defaults = defaults or {}
+        self.model._reject_endpoint_writes(defaults, "update_or_create(defaults=)")
         matches = await self._lookup_matches(criteria)
         if len(matches) > 1:
             raise SurrealDbError("update_or_create() matched multiple records; the lookup criteria are not unique.")
@@ -1009,7 +1017,9 @@ class QuerySet:
             await obj._save_naming(payload, tx=self._tx)
             return obj, True
         obj = self.model.from_db(matches[0])
-        await obj.merge(tx=self._tx, **payload)
+        # Only the criteria can name an endpoint here (defaults were checked above).
+        changes = {key: value for key, value in payload.items() if not self.model._is_write_protected(key)}
+        await obj.merge(tx=self._tx, **changes)
         return obj, False
 
     async def get_or_create(

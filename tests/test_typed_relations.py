@@ -63,6 +63,18 @@ native no-op on an edge table that was never created, the same in and out of a t
 ``remove_relation()`` target without ``:`` is a bare record id, bound verbatim and compared as a
 string with ``record::id(out)``: it matches that id in any table, never an integer id.
 
+Writes on a stored edge (spec §4.4, §2.9): SurrealDB ignores a change to an edge's endpoints on both
+lines, so every write that names one — ``merge()`` and its ``server_values=``, ``patch()`` on the
+instance or the QuerySet, the ``atomic_*`` helpers, ``bulk_update()``, ``update_or_create(defaults=)``
+— raises ``ValueError`` "endpoints" before any call, under either name (``in_`` or the column
+``in``). ``upsert()`` (a plain record no traversal sees) and ``save(server_values=)`` raise
+``SurrealDbError`` and write nothing; ``update()`` keeps the endpoints in its full replace, which a
+``TYPE RELATION … SCHEMAFULL`` table on 2.x requires. ``get_or_create(in_=a, out=b)`` is an idempotent
+relate — instances, record ids and ``"table:id"`` strings converge on one row — and
+``update_or_create`` changes the data, never the endpoints. SurrealDB's own idempotency holds through
+the ORM: a deterministic array id raises "already exists" on a second save, a ``UNIQUE`` index on
+``in, out`` "already contains" on a second relate (the reverse pair is another edge).
+
 E2E tables are dedicated (``tr_*``), dropped on entry and exit by ``orm_client``; nodes are created
 inside the ``async with orm_client(...)`` block. Same behaviour on SurrealDB 2.x and 3.x, except the
 transaction strategy the server supports (interactive tests skip on 2.x; buffered ones run over HTTP
@@ -92,6 +104,7 @@ from surreal_orm_lite import (
     SurrealDBConnectionManager,
     SurrealDbError,
     SurrealDbNotFoundError,
+    SurrealFunc,
     Var,
     computed,
     post_save,
@@ -2743,3 +2756,436 @@ class TestEdgeBulkCreateE2E:
                         [TrPurchased(in_=alice, out=widget, quantity=7), TrPurchased(id="t1", in_=bob, out=widget)]
                     )
             assert len(await _stored(client, "tr_purchased")) == 2
+
+
+# ==================== Task 8 — writes on an existing edge, *_or_create (spec §4.4, §2.9) ====================
+
+
+class TrFullEdge(BaseSurrealEdge):
+    """Edge on ``tr_rel_full`` (``TYPE RELATION IN tr_person OUT tr_product SCHEMAFULL``)."""
+
+    model_config = SurrealConfigDict(table_name="tr_rel_full")
+
+    quantity: int = 1
+    price: float = 0.0
+
+
+class TrFollowsUq(BaseSurrealEdge):
+    """Edge on ``tr_follows_uq``, made idempotent by a ``UNIQUE`` index on ``in, out``."""
+
+    model_config = SurrealConfigDict(table_name="tr_follows_uq")
+
+
+def _endpoint_guard(context: str, edge: str = "TrPurchased") -> str:
+    """The §4.4 refusal for ``context`` (a regex anchored on its ``{context}:`` prefix)."""
+    return rf"^{re.escape(context)}: `in`/`out` are the endpoints of edge `{edge}`; SurrealDB ignores a change to them"
+
+
+def _saved_edge() -> TrPurchased:
+    """An edge as a read would hydrate it (an id, both endpoints), without a server."""
+    return TrPurchased(id="p1", in_=ALICE_P, out=WIDGET, quantity=2)
+
+
+_ATOMIC_ENDPOINT_CALLS: dict[str, Callable[[TrPurchased], Awaitable[Any]]] = {
+    "append-out": lambda edge: edge.atomic_append("out", BOB_P),
+    "remove-in": lambda edge: edge.atomic_remove("in", BOB_P),
+    "set_add-in_": lambda edge: edge.atomic_set_add("in_", BOB_P),
+    "increment-in_": lambda edge: edge.atomic_increment("in_"),
+    "append_many-out": lambda edge: edge.atomic_append_many("out", [BOB_P]),
+    "set_add_many-out": lambda edge: edge.atomic_set_add_many("out", [BOB_P]),
+    "remove_many-in": lambda edge: edge.atomic_remove_many("in", [BOB_P]),
+    "append-out.nested": lambda edge: edge.atomic_append("out.tags", 1),
+}
+
+
+class TestEdgeWriteGuards:
+    """A write that would change an existing edge's endpoints is refused before any call (no server)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "data",
+        [{"in_": BOB_P}, {"out": BOB_P}, {"in": BOB_P}, {"quantity": 3, "out": BOB_P}],
+        ids=["in_", "out", "in-column", "with-a-data-field"],
+    )
+    async def test_merge_naming_an_endpoint_is_refused(self, no_client: list[str], data: dict[str, Any]) -> None:
+        edge = _saved_edge()
+        with pytest.raises(ValueError, match=_endpoint_guard("merge()")) as raised:
+            await edge.merge(**data)
+        assert str(raised.value).endswith("so the ORM refuses it — delete the edge and relate again.")
+        assert (edge.in_, edge.out, edge.quantity) == (ALICE_P, WIDGET, 2)  # nothing applied locally
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", ["in_", "in", "out"])
+    async def test_merge_server_values_naming_an_endpoint_is_refused(self, no_client: list[str], key: str) -> None:
+        with pytest.raises(ValueError, match=_endpoint_guard("merge(server_values=)")):
+            await _saved_edge().merge(server_values={key: SurrealFunc("NONE")})
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "operations",
+        [
+            [{"op": "replace", "path": "/out", "value": BOB_P}],
+            [{"op": "replace", "path": "/in", "value": BOB_P}],
+            [{"op": "replace", "path": "/in_", "value": BOB_P}],
+            [{"op": "add", "path": "/in/x", "value": 1}],
+            [{"op": "remove", "path": "/out"}],
+            [{"op": "replace", "path": "/quantity", "value": 3}, {"op": "move", "from": "/out", "path": "/old_out"}],
+            [{"op": "replace", "path": "", "value": {"in": BOB_P, "out": WIDGET, "quantity": 3}}],
+            [{"op": "remove", "path": ""}],
+        ],
+        ids=[
+            "replace-out",
+            "replace-in",
+            "replace-in_",
+            "add-in-child",
+            "remove-out",
+            "move-from-out",
+            "whole-doc",
+            "remove-doc",
+        ],
+    )
+    async def test_patch_on_an_endpoint_is_refused(self, no_client: list[str], operations: list[dict[str, Any]]) -> None:
+        with pytest.raises(ValueError, match=_endpoint_guard("patch()")):
+            await _saved_edge().patch(operations)
+        with pytest.raises(ValueError, match=_endpoint_guard("patch()")):
+            await TrPurchased.objects().patch(operations)
+        with pytest.raises(ValueError, match=_endpoint_guard("patch()")):
+            await TrPurchased.objects().filter(in_=ALICE_P).patch(operations)
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("call", list(_ATOMIC_ENDPOINT_CALLS.values()), ids=list(_ATOMIC_ENDPOINT_CALLS))
+    async def test_atomic_operation_on_an_endpoint_is_refused(
+        self, no_client: list[str], call: Callable[[TrPurchased], Awaitable[Any]]
+    ) -> None:
+        with pytest.raises(ValueError, match=_endpoint_guard("atomic operation")):
+            await call(_saved_edge())
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "data",
+        [{"out": BOB_P}, {"in_": BOB_P}, {"in": BOB_P}, {"quantity": 3, "in_": BOB_P}],
+        ids=["out", "in_", "in-column", "with-a-data-field"],
+    )
+    async def test_bulk_update_naming_an_endpoint_is_refused(self, no_client: list[str], data: dict[str, Any]) -> None:
+        with pytest.raises(ValueError, match=_endpoint_guard("bulk_update()")):
+            await TrPurchased.objects().filter(quantity=2).bulk_update(**data)
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    async def test_upsert_is_refused_before_any_call_or_signal(self, no_client: list[str]) -> None:
+        events: list[str] = []
+
+        @pre_save.connect(TrPurchased)
+        async def on_pre(sender: Any, instance: Any, **kwargs: Any) -> None:
+            events.append("pre_save")
+
+        try:
+            message = (
+                r"^upsert\(\) is not available on an edge: UPSERT stores a plain record that no graph traversal "
+                r"sees\. Use save\(\)/relate\(\) to create an edge, merge\(\)/update\(\) to change its data\.$"
+            )
+            with pytest.raises(SurrealDbError, match=message):
+                await _saved_edge().upsert()
+            with pytest.raises(SurrealDbError, match=message):
+                await TrPurchased(in_=ALICE_P, out=WIDGET).upsert()
+            tx = BufferedTransaction(client=None)
+            with pytest.raises(SurrealDbError, match=message):
+                await _saved_edge().upsert(tx=tx)
+            assert tx.statements == []
+        finally:
+            pre_save.disconnect(on_pre, TrPurchased)
+        assert events == []
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    async def test_save_server_values_is_refused(self, no_client: list[str]) -> None:
+        message = r"^save\(server_values=\) is not available on an edge: INSERT RELATION cannot evaluate SET"
+        with pytest.raises(SurrealDbError, match=message):
+            await TrPurchased(in_=ALICE_P, out=WIDGET).save(server_values={"quantity": SurrealFunc("1")})
+        with pytest.raises(SurrealDbError, match=message):
+            await _saved_edge().save(server_values={"price": SurrealFunc("math::max([1, 2])")}, extra_vars={"x": 1})
+        assert no_client == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("key", ["out", "in_", "in"])
+    async def test_update_or_create_refuses_endpoint_defaults_before_the_lookup(self, no_client: list[str], key: str) -> None:
+        with pytest.raises(ValueError, match=_endpoint_guard("update_or_create(defaults=)", "TrFollows")):
+            await TrFollows.objects().update_or_create(in_=ALICE_P, out=BOB_P, defaults={key: WIDGET, "weight": 2})
+        assert no_client == []  # refused before the lookup: no connection was asked for
+
+    def test_data_fields_and_reads_of_an_endpoint_pass_the_guards(self) -> None:
+        TrPurchased._reject_computed_writes(["quantity", "price"], "merge()")
+        assert TrPurchased._validate_atomic_field("quantity") == "quantity"
+        TrPurchased._reject_computed_patch(
+            [
+                {"op": "replace", "path": "/quantity", "value": 3},
+                {"op": "copy", "from": "/out", "path": "/old_out"},  # copy only reads its source
+            ],
+            "patch()",
+        )
+        # A whole-document replace that leaves the endpoints out does not name them.
+        TrPurchased._reject_computed_patch([{"op": "replace", "path": "", "value": {"quantity": 3}}], "patch()")
+
+    def test_node_models_protect_nothing(self) -> None:
+        TrOrder._reject_computed_writes(["in", "in_", "out", "customer"], "merge()")
+        assert TrOrder._validate_atomic_field("out") == "out"
+        TrOrder._reject_computed_patch([{"op": "replace", "path": "/out", "value": 1}, {"op": "remove", "path": ""}], "patch()")
+
+
+WRITE_GUARD_TABLES = (*EDGE_TABLES, "tr_rel_full")
+
+
+def _edge_rows(rows: list[Any], *fields: str) -> list[tuple[Any, ...]]:
+    """``(in, out, *fields)`` of each stored row, endpoints as strings."""
+    return [(str(row["in"]), str(row["out"]), *(row.get(field) for field in fields)) for row in rows]
+
+
+class TestEdgeWriteGuardsE2E:
+    @pytest.mark.asyncio
+    async def test_upsert_on_edge_refused_and_writes_nothing(self) -> None:
+        async with orm_client(*WRITE_GUARD_TABLES) as client:
+            alice, _bob, widget = await _nodes()
+
+            with pytest.raises(SurrealDbError, match=r"upsert\(\) is not available on an edge"):
+                await TrPurchased(id="u1", in_=alice, out=widget, quantity=2).upsert()
+            assert await _stored(client, "tr_purchased") == []
+
+            edge = await alice.relate(TrPurchased, widget, quantity=3)
+            edge.quantity = 4
+            with pytest.raises(SurrealDbError, match=r"upsert\(\) is not available on an edge"):
+                await edge.upsert()
+            stored = await _stored(client, "tr_purchased")
+            assert [row["id"] for row in stored] == [edge.id]
+            assert _edge_rows(stored, "quantity") == [("tr_person:alice", "tr_product:widget", 3)]
+
+    @pytest.mark.asyncio
+    async def test_save_server_values_refused_and_writes_nothing(self) -> None:
+        async with orm_client(*WRITE_GUARD_TABLES) as client:
+            alice, _bob, widget = await _nodes()
+            with pytest.raises(SurrealDbError, match=r"save\(server_values=\) is not available on an edge"):
+                await TrPurchased(in_=alice, out=widget).save(server_values={"quantity": SurrealFunc("1")})
+            with pytest.raises(SurrealDbError, match=r"save\(server_values=\) is not available on an edge"):
+                await TrPurchased(id="s1", in_=alice, out=widget).save(server_values={"quantity": SurrealFunc("1")})
+            assert await _stored(client, "tr_purchased") == []
+
+    @pytest.mark.asyncio
+    async def test_merge_data_field_works(self) -> None:
+        async with orm_client(*WRITE_GUARD_TABLES) as client:
+            alice, bob, widget = await _nodes()
+            edge = await alice.relate(TrPurchased, widget, quantity=2)
+
+            await edge.merge(quantity=5)
+            assert (edge.in_, edge.out, edge.quantity) == (ALICE_P, WIDGET, 5)
+            await edge.merge(server_values={"price": SurrealFunc("math::max([1.5, 2.5])")})
+            assert edge.price == 2.5
+
+            with pytest.raises(ValueError, match="endpoints"):
+                await edge.merge(out=bob, quantity=9)
+            with pytest.raises(ValueError, match="endpoints"):
+                await edge.merge(server_values={"in": SurrealFunc("tr_person:bob")})
+
+            stored = await _stored(client, "tr_purchased")
+            assert _edge_rows(stored, "quantity", "price") == [("tr_person:alice", "tr_product:widget", 5, 2.5)]
+            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
+
+    @pytest.mark.asyncio
+    async def test_patch_atomic_and_bulk_update_on_data_fields_work(self) -> None:
+        async with orm_client(*WRITE_GUARD_TABLES) as client:
+            alice, bob, widget = await _nodes()
+            edge = await alice.relate(TrPurchased, widget, quantity=2)
+
+            await edge.patch([{"op": "replace", "path": "/quantity", "value": 4}])
+            assert edge.quantity == 4
+            await edge.atomic_increment("quantity")
+            assert edge.quantity == 5
+            assert await TrPurchased.objects().filter(in_=alice).patch([{"op": "replace", "path": "/price", "value": 1.5}]) == 1
+            assert await TrPurchased.objects().filter(in_="tr_person:alice").bulk_update(price=2.5) == 1
+
+            # The endpoint forms of the same calls write nothing.
+            with pytest.raises(ValueError, match="endpoints"):
+                await edge.patch([{"op": "replace", "path": "/out", "value": bob.get_id()}])
+            with pytest.raises(ValueError, match="endpoints"):
+                await TrPurchased.objects().filter(in_=alice).patch([{"op": "replace", "path": "/in", "value": BOB_P}])
+            with pytest.raises(ValueError, match="endpoints"):
+                await edge.atomic_set_add("out", BOB_P)
+            with pytest.raises(ValueError, match="endpoints"):
+                await TrPurchased.objects().filter(in_=alice).bulk_update(out=BOB_P)
+
+            stored = await _stored(client, "tr_purchased")
+            assert _edge_rows(stored, "quantity", "price") == [("tr_person:alice", "tr_product:widget", 5, 2.5)]
+            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
+
+    @pytest.mark.asyncio
+    async def test_update_keeps_endpoints_on_schemafull_relation(self) -> None:
+        async with orm_client(*WRITE_GUARD_TABLES) as client:
+            alice, _bob, widget = await _nodes()
+            await client.query(
+                "DEFINE TABLE tr_rel_full TYPE RELATION IN tr_person OUT tr_product SCHEMAFULL; "
+                "DEFINE FIELD quantity ON tr_rel_full TYPE int; "
+                "DEFINE FIELD price ON tr_rel_full TYPE float;",
+                {},
+            )
+            edge = await alice.relate(TrFullEdge, widget, quantity=2, price=1.5)
+
+            # The full replace keeps the endpoints: SurrealDB 2.x refuses a TYPE RELATION … SCHEMAFULL
+            # replace without them ("Found NONE for field `in`"); 3.x keeps them either way.
+            assert set(edge._write_payload(replace=True)) == {"in", "out", "quantity", "price"}
+            edge.quantity = 7
+            await edge.update()
+
+            stored = await _stored(client, "tr_rel_full")
+            assert [row["id"] for row in stored] == [edge.id]
+            assert _edge_rows(stored, "quantity", "price") == [("tr_person:alice", "tr_product:widget", 7, 1.5)]
+            assert await client.query("SELECT VALUE ->tr_rel_full->? FROM ONLY tr_person:alice;", {}) == [WIDGET]
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_is_idempotent_relate(self) -> None:
+        async with orm_client(*WRITE_GUARD_TABLES) as client:
+            alice, bob, _widget = await _nodes()
+
+            edge, created = await TrFollows.objects().get_or_create(in_=alice, out=bob)
+            assert created is True
+            assert isinstance(edge, TrFollows) and isinstance(edge.id, RecordID)
+            assert (edge.in_, edge.out) == (ALICE_P, BOB_P)
+
+            again, created_again = await TrFollows.objects().get_or_create(in_=alice, out=bob)
+            assert created_again is False
+            assert isinstance(again, TrFollows) and again.id == edge.id
+
+            assert [row["id"] for row in await _stored(client, "tr_follows")] == [edge.id]
+            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_with_string_endpoints_is_idempotent(self) -> None:
+        async with orm_client(*WRITE_GUARD_TABLES) as client:
+            alice, bob, _widget = await _nodes()
+
+            edge, created = await TrFollows.objects().get_or_create(in_="tr_person:alice", out="tr_person:bob")
+            assert created is True
+            assert (edge.in_, edge.out) == (ALICE_P, BOB_P)
+
+            again, created_again = await TrFollows.objects().get_or_create(in_="tr_person:alice", out="tr_person:bob")
+            assert (created_again, again.id) == (False, edge.id)
+
+            # Instances, record ids and strings converge on the one row.
+            by_instance, created_by_instance = await TrFollows.objects().get_or_create(in_=alice, out=bob)
+            assert (created_by_instance, by_instance.id) == (False, edge.id)
+            by_record_id, created_by_record_id = await TrFollows.objects().get_or_create(in_=ALICE_P, out="tr_person:bob")
+            assert (created_by_record_id, by_record_id.id) == (False, edge.id)
+
+            stored = await _stored(client, "tr_follows")
+            assert [row["id"] for row in stored] == [edge.id]
+            assert [(row["in"], row["out"]) for row in stored] == [(ALICE_P, BOB_P)]  # record ids, not strings
+            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_defaults_may_name_an_endpoint(self) -> None:
+        async with orm_client(*WRITE_GUARD_TABLES) as client:
+            alice, bob, widget = await _nodes()
+
+            edge, created = await TrFollows.objects().get_or_create(in_=alice, defaults={"out": bob, "weight": 2})
+            assert created is True
+            assert (edge.out, edge.weight) == (BOB_P, 2)
+
+            # On a match the defaults are not applied: the endpoint in them is never a write.
+            again, created_again = await TrFollows.objects().get_or_create(in_=alice, defaults={"out": widget})
+            assert (created_again, again.id, again.out) == (False, edge.id, BOB_P)
+            assert _edge_rows(await _stored(client, "tr_follows"), "weight") == [("tr_person:alice", "tr_person:bob", 2)]
+
+    @pytest.mark.asyncio
+    async def test_update_or_create_changes_data_not_endpoints(self) -> None:
+        async with orm_client(*WRITE_GUARD_TABLES) as client:
+            alice, bob, _widget = await _nodes()
+            existing = await alice.relate(TrFollows, bob, weight=1)
+
+            edge, created = await TrFollows.objects().update_or_create(in_=alice, out=bob, defaults={"weight": 3})
+            assert created is False
+            assert (edge.id, edge.in_, edge.out, edge.weight) == (existing.id, ALICE_P, BOB_P, 3)
+
+            by_string, created_by_string = await TrFollows.objects().update_or_create(
+                in_="tr_person:alice", out="tr_person:bob", defaults={"weight": 4}
+            )
+            assert (created_by_string, by_string.id, by_string.weight) == (False, existing.id, 4)
+            # Endpoints only: nothing is left to write once they are dropped from the merge.
+            same, created_same = await TrFollows.objects().update_or_create(in_=alice, out=bob)
+            assert (created_same, same.id, same.in_, same.out, same.weight) == (False, existing.id, ALICE_P, BOB_P, 4)
+            assert _edge_rows(await _stored(client, "tr_follows"), "weight") == [("tr_person:alice", "tr_person:bob", 4)]
+
+            # No match: the create branch relates the endpoints of the criteria.
+            new, created_new = await TrFollows.objects().update_or_create(in_=bob, out=alice, defaults={"weight": 2})
+            assert created_new is True
+            assert (new.in_, new.out, new.weight) == (BOB_P, ALICE_P, 2)
+            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:bob;", {}) == [ALICE_P]
+            assert len(await _stored(client, "tr_follows")) == 2
+
+    @pytest.mark.asyncio
+    async def test_update_or_create_refuses_endpoint_defaults_either_way(self) -> None:
+        async with orm_client(*WRITE_GUARD_TABLES) as client:
+            alice, bob, widget = await _nodes()
+
+            with pytest.raises(ValueError, match=_endpoint_guard("update_or_create(defaults=)", "TrFollows")):
+                await TrFollows.objects().update_or_create(in_=alice, out=bob, defaults={"out": widget})
+            assert await _stored(client, "tr_follows") == []
+
+            await alice.relate(TrFollows, bob)
+            with pytest.raises(ValueError, match=_endpoint_guard("update_or_create(defaults=)", "TrFollows")):
+                await TrFollows.objects().update_or_create(in_=alice, out=bob, defaults={"out": widget, "weight": 9})
+            assert _edge_rows(await _stored(client, "tr_follows"), "weight") == [("tr_person:alice", "tr_person:bob", 1)]
+
+    @pytest.mark.asyncio
+    async def test_delete_and_refresh_edge(self) -> None:
+        async with orm_client(*WRITE_GUARD_TABLES) as client:
+            alice, _bob, widget = await _nodes()
+            edge = await alice.relate(TrPurchased, widget, quantity=2)
+            await client.query("UPDATE $rid SET quantity = 9;", {"rid": edge.id})
+
+            await edge.refresh()
+            assert (edge.in_, edge.out, edge.quantity) == (ALICE_P, WIDGET, 9)
+
+            await edge.delete()
+            assert await client.query("SELECT VALUE ->tr_purchased->? FROM ONLY tr_person:alice;", {}) == []
+            assert await _stored(client, "tr_purchased") == []
+
+
+class TestNativeIdempotencyE2E:
+    """SurrealDB's own idempotency mechanisms for edges, through the ORM (spec §2.9, §8.14; both lines)."""
+
+    @pytest.mark.asyncio
+    async def test_deterministic_array_id_second_save_raises(self) -> None:
+        async with orm_client(*EDGE_TABLES) as client:
+            await _nodes()
+            pair = RecordID("tr_follows", [ALICE_P, BOB_P])
+
+            edge = await TrFollows(id=RecordID("tr_follows", [ALICE_P, BOB_P]), in_=ALICE_P, out=BOB_P, weight=1).save()
+            assert edge.id == pair
+            assert await client.query("SELECT VALUE ->tr_follows->? FROM ONLY tr_person:alice;", {}) == [BOB_P]
+
+            # A raw INSERT RELATION would silently keep the stored edge on 2.7.0 and 3.1.5: the
+            # guarded statement raises on every line.
+            with pytest.raises(SurrealDbError, match="already exists"):
+                await TrFollows(id=RecordID("tr_follows", [ALICE_P, BOB_P]), in_=ALICE_P, out=BOB_P, weight=2).save()
+
+            stored = await _stored(client, "tr_follows")
+            assert [(row["id"], row["weight"]) for row in stored] == [(pair, 1)]
+
+    @pytest.mark.asyncio
+    async def test_unique_in_out_index_second_relate_raises(self) -> None:
+        async with orm_client(*EDGE_TABLES, "tr_follows_uq") as client:
+            alice, bob, _widget = await _nodes()
+            await client.query("DEFINE INDEX tr_follows_uq_pair ON tr_follows_uq FIELDS in, out UNIQUE;", {})
+
+            first = await alice.relate(TrFollowsUq, bob)
+            assert isinstance(first.id, RecordID)
+            with pytest.raises(SurrealDbError, match="already contains"):
+                await alice.relate(TrFollowsUq, bob)
+            assert [row["id"] for row in await _stored(client, "tr_follows_uq")] == [first.id]
+
+            # The index is directional: the reverse pair is another edge.
+            reverse = await bob.relate(TrFollowsUq, alice)
+            stored = await _stored(client, "tr_follows_uq")
+            assert sorted(str(row["id"]) for row in stored) == sorted([str(first.id), str(reverse.id)])
+            assert await client.query("SELECT VALUE ->tr_follows_uq->? FROM ONLY tr_person:bob;", {}) == [ALICE_P]

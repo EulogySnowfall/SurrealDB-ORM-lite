@@ -152,9 +152,15 @@ class BaseSurrealEdge(BaseSurrealModel):
 
     **Endpoints are immutable.** Assigning ``edge.in_``/``edge.out`` raises
     ``ValidationError``; SurrealDB ignores a change to an edge's endpoints on both lines, so to
-    move an edge, delete it and relate again. A subclass may not redeclare ``in_`` or ``out``
-    (``TypeError`` at the ``class`` statement): the redeclared field would lose both the column
-    mapping and the immutability. ``edge.model_copy(update={"out": …})`` is **not** checked by
+    move an edge, delete it and relate again. Every write that would change them on a stored
+    edge — ``merge()`` (and its ``server_values=``), ``patch()`` and ``objects().patch()``, the
+    ``atomic_*`` helpers, ``objects().bulk_update()``, ``update_or_create(defaults=)`` — raises
+    ``ValueError`` before any call; ``update()`` sends them unchanged. ``upsert()`` is refused
+    (:class:`SurrealDbError`): it would store a plain record.
+
+    A subclass may not redeclare ``in_`` or ``out`` (``TypeError`` at the ``class``
+    statement): the redeclared field would lose both the column mapping and the immutability.
+    ``edge.model_copy(update={"out": …})`` is **not** checked by
     Pydantic — legitimate for a copy meant as a *new* edge
     (``model_copy(update={"id": None, "out": other})``); on a copy that kept the id, the
     endpoint change is one the server silently ignores.
@@ -253,6 +259,22 @@ class BaseSurrealEdge(BaseSurrealModel):
                 "expressions. Use DEFINE FIELD … DEFAULT/VALUE on the edge table."
             )
         return await super().save(tx=tx)
+
+    async def upsert(self, tx: Transaction | None = None) -> Self:
+        """Not available on an edge: always raises :class:`SurrealDbError`, before any call or signal.
+
+        ``UPSERT`` (and ``CREATE``) on an edge table store a plain record carrying ``in``/``out``
+        fields, which no graph traversal sees — on SurrealDB 2.x and 3.x alike. Create an edge
+        with :meth:`save` or ``relate(EdgeModel, …)``; change its data with ``merge()`` or
+        ``update()``.
+
+        Raises:
+            SurrealDbError: always.
+        """
+        raise SurrealDbError(
+            "upsert() is not available on an edge: UPSERT stores a plain record that no graph traversal sees. "
+            "Use save()/relate() to create an edge, merge()/update() to change its data."
+        )
 
     async def _do_save(self, tx: Transaction | None = None, keep: Collection[str] = ()) -> tuple[Self, bool]:
         """Create the edge through :func:`insert_edges`. Returns ``(self, True)``.
