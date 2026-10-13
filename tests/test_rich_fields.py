@@ -42,7 +42,8 @@ from uuid import UUID
 import pytest
 import pytest_asyncio
 import surrealdb
-from pydantic import AliasChoices, AwareDatetime, BaseModel, Field, PastDate, ValidationError
+from pydantic import AliasChoices, AwareDatetime, BaseModel, ConfigDict, Field, PastDate, ValidationError
+from pydantic.alias_generators import to_camel
 from surrealdb import RecordID
 
 from surreal_orm_lite import (
@@ -65,7 +66,7 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite._sdk import TAG_DECIMAL_STRING, TAG_DURATION_COMPACT, CBORTag
 from surreal_orm_lite.auth import build_auth_payload
-from surreal_orm_lite.wire import child_annotation, encode_wire, sdk_decodes_zero_duration
+from surreal_orm_lite.wire import child_annotation, encode_wire, read_keys, sdk_decodes_zero_duration
 from tests.conftest import orm_client
 from tests.test_rich_types import _http_client, _server_version
 
@@ -2184,6 +2185,215 @@ class TestAliasedSubFieldsE2E:
             _assert_stored_seen(row["activity"])
             again = await RfProfiled.signin(email=email, password=_AUTH_PASSWORD)
             _assert_seen(again.user.activity)
+            await _assert_client_usable(client)
+
+
+class RfStreet(BaseModel):
+    """camelCase aliases only: a read takes ``streetName``, never ``street_name``."""
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    street_name: str = ""
+
+
+class RfCamel(BaseModel):
+    """camelCase aliases, validated by name too: stored under the names, the format of v0.22 and before."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    first_name: str = ""
+    home_address: RfStreet | None = None
+
+
+class RfCamelByName(BaseModel):
+    """The same, with Pydantic 2.11's spelling of the setting."""
+
+    model_config = ConfigDict(alias_generator=to_camel, validate_by_name=True)
+
+    first_name: str = ""
+
+
+class RfCamelOnly(BaseModel):
+    """camelCase aliases only: the names are never read back, so a write stores the aliases."""
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    first_name: str = ""
+
+
+class RfNamed(BaseSurrealModel):
+    """Sub-models without a rich type, aliased: their stored keys follow how they validate."""
+
+    model_config = SurrealConfigDict(table_name="rf_named")
+
+    id: str | None = None
+    profile: RfCamel | None = None
+    by_name: RfCamelByName | None = None
+    alias_only: RfCamelOnly | None = None
+    n: int = 0
+
+
+class RfNamedStrict(BaseSurrealModel):
+    """``RfNamed``'s ``profile`` on a SCHEMAFULL table (``TestSubModelStoredKeysE2E``)."""
+
+    model_config = SurrealConfigDict(table_name="rf_named_strict")
+
+    id: str | None = None
+    profile: RfCamel | None = None
+    n: int = 0
+
+
+class TestSubModelStoredKeys:
+    """The keys a write stores a sub-model's fields under, no database. A sub-model that validates by
+    name too (``populate_by_name``/``validate_by_name``) keeps each sub-field under its name, the
+    format v0.22 wrote and the format a ``DEFINE FIELD profile.first_name`` schema declares; one that
+    validates by alias only stores each aliased sub-field under its alias, the only key a read takes.
+    A keyword write's dict for a sub-model is re-keyed the same way, rich or not."""
+
+    def test_read_keys(self) -> None:
+        assert read_keys(RfCamel) == {"first_name": "first_name", "home_address": "home_address"}
+        assert read_keys(RfCamelByName) == {"first_name": "first_name"}
+        assert read_keys(RfCamelOnly) == {"first_name": "firstName"}
+        assert read_keys(RfStreet) == {"street_name": "streetName"}
+        assert read_keys(RfSeen) == {"seen": "lastSeen", "note": "note"}
+        # A table model used as a sub-model validates by name (BaseSurrealModel's populate_by_name).
+        assert read_keys(RfAliasedOwner) == {"id": "id", "since": "since", "label": "label"}
+
+    def test_model_writes(self) -> None:
+        person = RfNamed(
+            id="s",
+            profile=RfCamel(first_name="a", home_address=RfStreet(streetName="x")),
+            by_name=RfCamelByName(first_name="b"),
+            alias_only=RfCamelOnly(firstName="c"),
+        )
+        payload = person._write_payload()
+        assert payload["profile"] == {"first_name": "a", "home_address": {"streetName": "x"}}
+        assert payload["by_name"] == {"first_name": "b"}
+        assert payload["alias_only"] == {"firstName": "c"}
+        assert encode_wire(RfCamel(first_name="a"), stored=True) == {"first_name": "a", "home_address": None}
+        # Each object written reads back into the same sub-model.
+        assert RfCamel.model_validate(payload["profile"]) == person.profile
+        assert RfCamelOnly.model_validate(payload["alias_only"]) == person.alias_only
+
+    @pytest.mark.parametrize("context", ["merge", "bulk_update", "signup", "signin"])
+    def test_keyword_dicts_are_re_keyed(self, context: str) -> None:
+        """Keys only: the values of a sub-model without a rich type are sent as given, as in v0.22."""
+        coerce = RfNamed._coerce_field_value
+        assert coerce("profile", {"firstName": "a"}, context=context) == {"first_name": "a"}
+        assert coerce("profile", {"first_name": "a"}, context=context) == {"first_name": "a"}
+        assert coerce("alias_only", {"first_name": "a"}, context=context) == {"firstName": "a"}
+        assert coerce("alias_only", {"firstName": "a"}, context=context) == {"firstName": "a"}
+        assert coerce("by_name", {"firstName": "a"}, context=context) == {"first_name": "a"}
+        nested = coerce("profile", {"homeAddress": {"street_name": "x"}}, context=context)
+        assert nested == {"home_address": {"streetName": "x"}}  # a dict under a sub-model sub-field
+        assert coerce("profile", {"firstName": 5, "zip": "H0H"}, context=context) == {"first_name": 5, "zip": "H0H"}
+        given = {"firstName": "a"}
+        coerce("profile", given, context=context)
+        assert given == {"firstName": "a"}  # the caller's dict is never mutated
+
+    @pytest.mark.parametrize(
+        ("field", "value", "named"),
+        [
+            (
+                "profile",
+                {"first_name": "a", "firstName": "b"},
+                r"'first_name' and 'firstName' both name the sub-field first_name",
+            ),
+            (
+                "alias_only",
+                {"firstName": "a", "first_name": "b"},
+                r"'firstName' and 'first_name' both name the sub-field first_name",
+            ),
+            ("profile", {"homeAddress": {"streetName": "a", "street_name": "b"}}, r"'streetName' and 'street_name' both name"),
+        ],
+        ids=["by-name", "alias-only", "nested"],
+    )
+    def test_a_sub_field_named_twice_raises(self, field: str, value: dict[str, Any], named: str) -> None:
+        with pytest.raises(ValueError, match=rf"^merge\({field}(\.homeAddress)?=…\): {named}"):
+            RfNamed._coerce_field_value(field, value)
+
+
+class RfAliasedOwner(BaseSurrealModel):
+    """A table model with an aliased column, used as a sub-model by nothing but ``read_keys``."""
+
+    model_config = SurrealConfigDict(table_name="rf_aliased_owner")
+
+    id: str | None = None
+    since: date | None = None
+    label: str = Field(default="", alias="Label")
+
+
+def _stored_keys(stored: Any) -> set[str]:
+    assert isinstance(stored, dict), f"not an object: {stored!r}"
+    return set(stored)
+
+
+class TestSubModelStoredKeysE2E:
+    """What a sub-model's keys look like in the row, on both lines (see ``TestSubModelStoredKeys``).
+
+    A sub-model that validates by name too used to be stored under its aliases by ``save()`` while a
+    ``merge()`` dict kept the caller's keys: ``{"firstName": "old", "first_name": "new"}``, and
+    ``get()`` read the alias first, so the merged value was lost."""
+
+    @pytest.mark.parametrize("server_values", [False, True], ids=["merge", "merge-server-values"])
+    async def test_validated_by_name_keeps_the_names(self, server_values: bool) -> None:
+        async with orm_client("rf_named") as client:
+            person = RfNamed(id="a", profile=RfCamel(first_name="old"))
+            await person.save()
+            stored = (await _raw("a", "rf_named"))["profile"]
+            assert stored["first_name"] == "old"
+            assert "firstName" not in _stored_keys(stored)
+
+            for given, expected in (({"first_name": "new"}, "new"), ({"firstName": "new2"}, "new2")):
+                await person.merge(server_values=_BUMP if server_values else None, profile=given)
+                stored = (await _raw("a", "rf_named"))["profile"]
+                assert stored["first_name"] == expected
+                assert "firstName" not in _stored_keys(stored), stored
+                loaded = (await RfNamed.objects().get("a")).profile
+                assert loaded is not None
+                assert loaded.first_name == expected
+            await _assert_client_usable(client)
+
+    @pytest.mark.parametrize("server_values", [False, True], ids=["merge", "merge-server-values"])
+    async def test_alias_only_takes_the_aliases(self, server_values: bool) -> None:
+        async with orm_client("rf_named") as client:
+            person = RfNamed(id="b", alias_only=RfCamelOnly(firstName="old"))
+            await person.save()
+            assert (await _raw("b", "rf_named"))["alias_only"] == {"firstName": "old"}
+
+            for given, expected in (({"first_name": "new"}, "new"), ({"firstName": "new2"}, "new2")):
+                await person.merge(server_values=_BUMP if server_values else None, alias_only=given)
+                assert (await _raw("b", "rf_named"))["alias_only"] == {"firstName": expected}
+                loaded = (await RfNamed.objects().get("b")).alias_only
+                assert loaded is not None
+                assert loaded.first_name == expected
+            await _assert_client_usable(client)
+
+    async def test_schemafull_sub_field_definitions_by_name(self) -> None:
+        """A schema written for v0.22's rows declares the names: ``DEFINE FIELD profile.first_name``.
+        Keyed by the aliases, the object was refused by 3.x and stored empty by 2.x."""
+        async with orm_client("rf_named_strict") as client:
+            for statement in (
+                "DEFINE TABLE rf_named_strict SCHEMAFULL;",
+                "DEFINE FIELD n ON rf_named_strict TYPE int DEFAULT 0;",
+                "DEFINE FIELD profile ON rf_named_strict TYPE option<object>;",
+                "DEFINE FIELD profile.first_name ON rf_named_strict TYPE option<string>;",
+                "DEFINE FIELD profile.home_address ON rf_named_strict TYPE option<object>;",
+                "DEFINE FIELD profile.home_address.streetName ON rf_named_strict TYPE option<string>;",
+            ):
+                await client.query(statement, {})
+            person = RfNamedStrict(id="c", profile=RfCamel(first_name="old", home_address=RfStreet(streetName="x")))
+            await person.save()
+            row = await _raw("c", "rf_named_strict")
+            assert row["profile"] == {"first_name": "old", "home_address": {"streetName": "x"}}
+
+            await person.merge(profile={"firstName": "new"})
+            await person.merge(profile={"homeAddress": {"street_name": "y"}}, server_values=_BUMP)
+            row = await _raw("c", "rf_named_strict")
+            assert row["profile"] == {"first_name": "new", "home_address": {"streetName": "y"}}
+            assert row["n"] == 1
+            loaded = (await RfNamedStrict.objects().get("c")).profile
+            assert loaded == RfCamel(first_name="new", home_address=RfStreet(streetName="y"))
             await _assert_client_usable(client)
 
 

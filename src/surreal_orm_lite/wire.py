@@ -28,8 +28,9 @@ This module converts them, **only where the annotation asks for it**:
   probe, no server).
 - ``restore_native(dumped, raw, read_keys=…)`` — puts back, into a ``model_dump()``, the SDK values
   (``Duration``, ``Range``…) an untyped position held and the dump flattened into plain dicts, so a
-  write sends them natively; with ``read_keys``, also keys each nested sub-model's fields as their
-  validation reads them (their alias), so the stored object reads back.
+  write sends them natively; with ``read_keys``, also keys each nested sub-model's fields so the
+  stored object reads back (:func:`read_keys`: the names when the sub-model validates by name, else
+  the aliases).
 - ``model_object(model)`` — the object a write sends for a sub-model instance (the same walk, its
   own level re-keyed too).
 - ``field_keys(model)`` / ``sub_model(annotation)`` — the keys a mapping may use for a model's fields
@@ -778,8 +779,8 @@ def encode_wire(value: Any, *, stored: bool) -> Any:
       (keyword writes, the ``atomic_*`` helpers, ``patch()``) and refuse it otherwise.
     - any other Pydantic model (a sub-model ``bulk_update(profile={…})`` validated into, a
       ``list[Profile]`` item…): the object a model write sends for it (:func:`model_object`) — each
-      sub-field under the key its validation reads, the SDK values of its untyped positions put back
-      — then encoded like a mapping. The SDK has no encoder for a Pydantic model.
+      sub-field under :func:`read_keys`' key, the SDK values of its untyped positions put back —
+      then encoded like a mapping. The SDK has no encoder for a Pydantic model.
     """
     if value is None or value is undefined or isinstance(value, (bool, float, str, bytes, UUID, CBORTag, SurrealFunc)):
         return value
@@ -853,15 +854,32 @@ def _read_key(name: str, info: FieldInfo) -> str:
     return name
 
 
+def _validates_by_name(model: type[BaseModel]) -> bool:
+    """Whether ``model`` reads its fields under their names: ``validate_by_name=True``, its older
+    spelling ``populate_by_name=True`` (Pydantic keeps only the key given), or ``validate_by_alias=False``."""
+    config = model.model_config
+    return (
+        config.get("validate_by_name") is True
+        or config.get("populate_by_name") is True
+        or config.get("validate_by_alias", True) is False
+    )
+
+
 @functools.cache
 def read_keys(model: type[BaseModel]) -> Mapping[str, str]:
-    """Field name → the key its validation reads (:func:`_read_key`), cached per class; never mutate it.
+    """Field name → the key a write stores it under, cached per class; never mutate it (v0.23.0).
 
-    The key a write stores each sub-field under — :func:`model_object` for an instance, and each
-    key a ``merge()`` dict resolves (v0.23.0) — so a read gives it back. Every field keeps its
-    name when the model turns validation by alias off (``ConfigDict(validate_by_alias=False)``).
+    The key :func:`model_object` writes each sub-field of an instance under, and each key of a
+    keyword write's dict resolves to, so a read gives it back:
+
+    - every field keeps its **name** when the model validates by name — ``validate_by_name=True``,
+      ``populate_by_name=True`` (a table model's own config) or ``validate_by_alias=False``: the
+      format v0.22 and earlier wrote, and the one a schema of that time declares
+      (``DEFINE FIELD profile.first_name``);
+    - otherwise (validation by alias only) each field takes the key its validation reads
+      (:func:`_read_key`): an aliased sub-field written under its name was never read back.
     """
-    if model.model_config.get("validate_by_alias", True) is False:
+    if _validates_by_name(model):
         return {name: name for name in model.model_fields}
     return {name: _read_key(name, info) for name, info in model.model_fields.items()}
 
@@ -907,10 +925,11 @@ def restore_native(dumped: Any, raw: Any, *, read_keys: bool = False) -> Any:
       ``raw``, a raw ``set`` (no positions).
 
     ``read_keys=True`` (a model write, v0.23.0) also re-keys every **nested** model level — a raw
-    Pydantic model below the top: each declared field goes under the key its validation reads (its
-    ``validation_alias``/``alias``, see :func:`model_object`), so the stored object reads back into
-    the sub-model; extras and the keys of a plain dict are data and keep theirs. The top level keeps
-    its names: a table model's columns come from ``_columns_for``.
+    Pydantic model below the top: each declared field goes under :func:`read_keys`' key (its name
+    when the sub-model validates by name, else the key its validation reads, see
+    :func:`model_object`), so the stored object reads back into the sub-model; extras and the keys
+    of a plain dict are data and keep theirs. The top level keeps its names: a table model's columns
+    come from ``_columns_for``.
 
     Copy-on-write: when nothing changes, ``dumped`` itself is returned; otherwise new containers along
     the changed paths only (untouched branches are shared). Neither argument is mutated.
@@ -922,12 +941,13 @@ def model_object(model: BaseModel) -> dict[str, Any]:
     """The object a write sends for a sub-model instance, before encoding (v0.23.0).
 
     ``model_dump()``, then :func:`restore_native` with ``read_keys`` — the top level re-keyed too:
-    each sub-field, at every depth, under the key its validation reads — its ``validation_alias``
-    when that is a string, the first string of an ``AliasChoices``, else its ``alias``, else its name
-    (also for an ``AliasPath``, and for every field when the sub-model sets
-    ``validate_by_alias=False``), never its ``serialization_alias``. A key nothing reads back would
-    be a value lost; for ``Field(alias=…)`` this is the full ORM's ``model_dump(by_alias=True)``.
-    Extras keep their key; the SDK values of the untyped positions are put back.
+    each sub-field, at every depth, under :func:`read_keys`' key. A sub-model that validates by name
+    (``populate_by_name``/``validate_by_name``, or ``validate_by_alias=False``) keeps the names, as
+    v0.22 wrote them. Otherwise each sub-field goes under the key its validation reads — its
+    ``validation_alias`` when that is a string, the first string of an ``AliasChoices``, else its
+    ``alias``, else its name (also for an ``AliasPath``), never its ``serialization_alias``: a key
+    nothing reads back would be a value lost. Extras keep their key; the SDK values of the untyped
+    positions are put back.
     """
     result: dict[str, Any] = _restore(model.model_dump(), model, True, True)
     return result
