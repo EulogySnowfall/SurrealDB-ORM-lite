@@ -884,6 +884,33 @@ def read_keys(model: type[BaseModel]) -> Mapping[str, str]:
     return {name: _read_key(name, info) for name, info in model.model_fields.items()}
 
 
+@functools.cache
+def masking_keys(model: type[BaseModel]) -> Mapping[str, tuple[str, ...]]:
+    """Field name → the other keys a read takes it from **before** the key a write stores it under (v0.23.0).
+
+    Only a model that validates by name **and** by alias has any (``populate_by_name=True`` or
+    ``validate_by_name=True``, ``validate_by_alias`` left on): a write stores each field under its
+    name (:func:`read_keys`), but Pydantic reads its aliases first. They are the other keys
+    :func:`field_keys` resolves to the field — its string ``alias``/``validation_alias``, the
+    strings of an ``AliasChoices`` —, never a key another field is stored under. v0.22's ``merge()``
+    wrote a dict's keys as given, so a row can hold one of them next to the name, and a read gives
+    that one: ``merge()`` removes them (:func:`~surreal_orm_lite.model_base._stored_keys`).
+
+    Empty for every field of a model that validates by alias only (each field is stored under the
+    first key a read takes) or by name only (``validate_by_alias=False``: no read takes an alias).
+    Cached per class; never mutate the result.
+    """
+    if not _validates_by_name(model) or model.model_config.get("validate_by_alias", True) is False:
+        return dict.fromkeys(model.model_fields, ())
+    stored = read_keys(model)
+    taken = set(stored.values())
+    others: dict[str, list[str]] = {name: [] for name in model.model_fields}
+    for key, name in field_keys(model).items():
+        if key != stored[name] and key not in taken:
+            others[name].append(key)
+    return {name: tuple(keys) for name, keys in others.items()}
+
+
 def _raw_item(raw: Any, key: Any) -> Any:
     """The value under ``key`` in ``raw``, or ``_MISSING``.
 
