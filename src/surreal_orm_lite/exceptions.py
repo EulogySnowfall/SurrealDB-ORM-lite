@@ -3,7 +3,15 @@ Custom exceptions for SurrealDB ORM.
 
 These exceptions provide a consistent error handling interface
 for the ORM, independent of the underlying SDK error types.
+
+``InvalidDurationError`` (v0.23.0) is the one exception built on an SDK class: it carries the
+SDK's name and derives from ``surrealdb.InvalidDurationError``, so code written against the SDK's
+``Duration`` catches the ORM's refusals too.
 """
+
+from typing import TYPE_CHECKING
+
+from ._sdk import SdkInvalidDurationError
 
 
 class SurrealORMError(Exception):
@@ -91,3 +99,21 @@ class SurrealDbAuthenticationError(SurrealDbError):
     """
 
     pass
+
+
+# The SDK's class comes first: a 2.x SDK release may declare its own class a ``ValueError`` too, and
+# with ``ValueError`` first no consistent MRO would exist (``import surreal_orm_lite`` would fail).
+if TYPE_CHECKING or SdkInvalidDurationError is not None:
+
+    class InvalidDurationError(SdkInvalidDurationError, ValueError):
+        """A value ``Duration`` refuses: a ``ValueError`` and a ``surrealdb.InvalidDurationError``.
+
+        Raised by ``Duration(...)``, ``Duration.parse(...)`` and ``Duration.from_timedelta(...)`` for a
+        refused string, more than 256 characters, a negative value or a total beyond
+        ``Duration.MAX_NANOSECONDS``. A wrong argument *type* stays a ``TypeError``.
+        """
+
+else:  # pragma: no cover - only with an SDK that has no InvalidDurationError
+
+    class InvalidDurationError(ValueError):
+        """A value ``Duration`` refuses (the installed SDK has no ``InvalidDurationError``)."""
