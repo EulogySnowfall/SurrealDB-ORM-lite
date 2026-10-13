@@ -5,6 +5,141 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] - 2026-10-12
+
+Native typed relations: graph edges as Pydantic models, created through the official SDK's
+`insert_relation()` and returned as typed instances, with the full SurrealDB-ORM's graph API on
+both server lines. The last minor of Tier 1.
+
+### Added
+
+- **Typed edges — `BaseSurrealEdge`**. An edge table becomes a model whose data is validated by
+  Pydantic, with frozen `in_` (column `in`) and `out` record endpoints that accept a saved
+  instance, a `RecordID` or a `"table:id"` string. `relate()` takes the edge class and returns the
+  created edge:
+
+  ```python
+  from pydantic import Field
+  from surrealdb import RecordID
+  from surreal_orm_lite import BaseSurrealEdge, SurrealConfigDict
+
+  class Purchased(BaseSurrealEdge):
+      model_config = SurrealConfigDict(table_name="purchased")
+      quantity: int = Field(ge=1)
+      price: float
+
+  edge = await alice.relate(Purchased, widget, quantity=2, price=9.5)
+  assert isinstance(edge, Purchased) and edge.in_ == RecordID("User", "alice")
+  ```
+
+  `relate()` is typed with two overloads: the edge class for an edge model, `list[dict]` for a
+  table name (the v0.6.0 form, unchanged).
+
+- **Edge `save()` and `QuerySet.bulk_create()` through `insert_relation()`** — a real relation that
+  graph traversal sees, `id` hydrated from the returned row; `bulk_create()` of N edges without an
+  id is one `insert_relation()` call. An explicit edge id that already exists raises
+  `SurrealDbError` ("already exists") and writes nothing, on every measured version.
+- **Edges in transactions**: `save(tx=)`, `relate(Edge, …, tx=)` and `bulk_create()` under
+  `objects(tx=)`, interactive (3.x over WebSocket) and buffered (2.x, or HTTP); an auto-id edge is
+  allowed in a buffered transaction (its `id` stays `None` until the commit).
+- **`get_or_create(in_=a, out=b)` on an edge model** is an idempotent relate; instances,
+  `RecordID`s and `"table:id"` strings converge on the same row.
+- **`SurrealConfigDict(table_name=…)`** — the full ORM's key for a model's table name, honoured by
+  every path (writes, reads, `QuerySet`, live queries, change feeds, DDL helpers) and validated as
+  an identifier when the class is defined.
+- **Model instances as filter values**, for every model and column: keyword filters, `Q`, every
+  scalar lookup and each item of `in`/`not_in`/`containsany`/`containsall`. The create payload of
+  `get_or_create`/`update_or_create` gets the same conversion, so
+  `Order.objects().get_or_create(customer=alice)` stores a record id.
+- **`"table:id"` strings on edge endpoint columns** in filters (`filter(in_="User:alice")`,
+  `filter(in___in=[alice, "User:bob"])`), live queries included.
+- **Graph helpers in the full SurrealDB-ORM's parameter order**, by position or by keyword:
+  `relate(edge, target, reverse, tx)`, `remove_relation(edge, target, reverse, tx)`,
+  `remove_all_relations(edge, direction, tx)`, `get_related(edge, direction, model_class)`; only
+  the lite's `data=` stays keyword-only. With them:
+  - `reverse=True` on `relate()` and `remove_relation()` (target → edge → self);
+  - edge fields as keyword arguments on `relate()` (`**edge_data`), merged with `data=` (a field
+    given both ways raises `TypeError` before any call);
+  - `tx=` on `relate()`, `remove_relation()` and `remove_all_relations()`;
+  - edge model classes accepted wherever an edge name is, in every helper;
+  - a list or tuple of edges for `remove_all_relations()`;
+  - `get_related(direction="both")`: out-neighbours, then in-neighbours, in one query;
+  - a bare record id as `remove_relation()` target (`"abc123"`): compared as a string with the id
+    of the edge's `out` (`in` with `reverse=True`), it matches that id in any table, as in
+    SurrealDB-ORM. Pass an instance or a `RecordID` to pin the table.
+- `BaseSurrealEdge` is exported from the package root.
+- README section 23, "Typed edges (`BaseSurrealEdge`)", with "Idempotent edges" (a deterministic
+  array id, a `UNIQUE` index on `in, out`) and a "Migrating from SurrealDB-ORM (graph API)" note;
+  example notebook `examples/v0.22.0_native_typed_relations.ipynb`.
+
+### Changed
+
+- **`QuerySet` reads the table from `get_table_name()`**, so a model with the legacy
+  `_table_name` now writes to that table too; before, writes went to the class-name table while
+  `objects()` read the other one.
+- **`remove_relation()` and `remove_all_relations()` run a graph-path `DELETE`** with bound record
+  ids: exactly the edges a traversal sees. A plain record that merely carries `in`/`out` fields is
+  no longer matched, and an edge table that was never created is a native no-op on 3.x too, also
+  inside a transaction.
+- The graph helpers accept nodes whose record id is not an identifier (`joe@x.com`).
+- **Writes that would change an edge's endpoints are refused** with `ValueError` before any call
+  (`merge()`, `patch()` on the instance and the `QuerySet`, the `atomic_*` helpers,
+  `bulk_update()`, `update_or_create(defaults=)`): SurrealDB silently ignores them on both lines.
+  Delete the edge and relate again.
+- **`upsert()` and `save(server_values=)` are refused on an edge** with `SurrealDbError`: an
+  `UPSERT` stores a plain record that no traversal sees, and `INSERT RELATION` cannot evaluate
+  `SET` expressions.
+- An edge write refused by the table's `PERMISSIONS` raises `SurrealDbError`; the server answers it
+  with fewer rows and no error.
+
+### Deprecated
+
+- `_table_name` — use `model_config = SurrealConfigDict(table_name=…)`. It still works and emits a
+  `DeprecationWarning` when the class is defined (`table_name` wins when both are set); it will be
+  removed in a future minor.
+
+### Fixed
+
+- `SurrealConfigDict` keys are optional for type checkers (`total=False`).
+- Filter keys on a field ending in `_` (`type___gt`, `in___in`) no longer raise
+  "Unsupported lookup".
+- `relate(<non-str>, …)` raises `TypeError` instead of `AttributeError`.
+- A single model instance given to a sequence lookup (`customer__in=alice`) raises `ValueError`
+  instead of being read as a list of `(name, value)` pairs.
+- `update(tx=)` and `delete(tx=)` bind the record id instead of writing it into the statement, so
+  a record with an array id (such as `follows:[User:alice, User:bob]`) can be updated or deleted
+  in a transaction; before, the statement failed to parse and failed the transaction, on both
+  lines.
+
+### Security
+
+- `get_related()`, `remove_relation()` and `remove_all_relations()` bind the source and target
+  record ids (`$src`, `$dst`, `$id`) instead of interpolating `table:id` text; the only text
+  interpolated is edge names, each validated as an identifier (every item of a list) before any
+  call. `table_name` is validated the same way when the class is defined.
+- An edge write denied by the table's permissions can never look like a success (see Changed).
+
+### Notes
+
+- **A duplicate explicit edge id differs by version, and the ORM evens it out.** A raw
+  `INSERT RELATION` with an id that already exists silently keeps the old edge on 2.7.0 and on
+  3.1.5 (although the SurrealDB docs announce a record-exists error from 3.1.5), and raises
+  `AlreadyExistsError` on 3.3.3. The ORM sends a guarded statement, so it raises "already exists"
+  and writes nothing on all three; inside a buffered transaction the commit fails.
+- On 2.x, the edge record of a `CREATE`/`UPDATE` live notification or of a change-feed update entry
+  carries `"__": true`. The typed `instance` drops it, so it is identical on both lines;
+  `ModelChangeEvent.raw` stays as the server sent it.
+- A batch of edges partly refused by permissions stays partly written outside a transaction.
+- Idempotent edges: `get_or_create()` has a race window between two concurrent callers; a
+  deterministic array id or a `UNIQUE` index on `in, out` closes it server-side, on both lines
+  (README section 23).
+- Schema-level relation tables (`DEFINE TABLE … TYPE RELATION IN … OUT …`) are defined by hand for
+  now; the DDL helper, with the full ORM's `table_type`/`relation_in`/`relation_out` keys on
+  `BaseSurrealEdge`, is planned for v0.33.0.
+- Every behaviour above was measured on SurrealDB 2.7.0 and 3.3.3, with 3.1.5 where it differs;
+  the README's "ORM behaviour: SurrealDB 2.x vs 3.x" table gains fifteen rows, one of them
+  retroactive (since v0.7.0: an undeclared field on a `SCHEMAFULL` table).
+
 ## [0.21.1] - 2026-10-12
 
 Python 3.15 support. No library code changes; the published package behaves exactly as 0.21.0.

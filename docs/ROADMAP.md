@@ -30,7 +30,7 @@
 | v0.19.0           | Tier 1 — Live queries (base), raw notifications      | Done    |
 | v0.20.0           | Tier 1 — Typed live queries (`LiveModelStream`)      | Done    |
 | v0.21.0           | Tier 1 — Auto-resubscribe & change feeds (cursor)    | Done    |
-| v0.22.0           | Tier 1 — Core (native typed relations)               | Planned |
+| v0.22.0           | Tier 1 — Core (native typed relations)               | Done    |
 | v0.23.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 7 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
@@ -79,7 +79,7 @@ pieces stay out.
 | Live queries (raw notifications)       | `live()` / `subscribe_live()` / `kill()`              | ✅ v0.19.0     |
 | Typed live queries (`LiveModelStream`) | idem + deserialization + `LIVE SELECT [DIFF] … WHERE` | ✅ v0.20.0     |
 | Change Feeds / Auto-Resubscribe        | `recv_task` drop signal + `SHOW CHANGES … SINCE`      | ✅ v0.21.0     |
-| Native typed relations                 | `insert_relation()`                                   | v0.22.0        |
+| Native typed relations                 | `insert_relation()`                                   | ✅ v0.22.0     |
 | Rich field types                       | native `Datetime`/`Duration`/`Decimal`/`Range`/`Uuid` | v0.23.0        |
 | Geospatial fields (`nearby()`)         | native `Geometry` + `geo::*`                          | v0.24.0        |
 | Embedded / in-memory test engine       | `mem://` / `surrealkv://` ²                           | v0.25.0        |
@@ -144,7 +144,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | Live queries (raw notifs)     | yes        | ✅ v0.19.0                  |
 | Typed live queries            | yes        | ✅ v0.20.0                  |
 | Live auto-resubscribe / CDC   | yes        | ✅ v0.21.0                  |
-| Native typed relations        | yes        | v0.22.0                     |
+| Native typed relations        | yes        | ✅ v0.22.0                  |
 | Rich field types              | yes        | v0.23.0                     |
 | Geospatial fields             | yes        | v0.24.0                     |
 | Embedded / versioned engine   | yes        | v0.25 – v0.26               |
@@ -378,6 +378,27 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   at-least-once on 2.x. At-least-once per transaction; works over HTTP; clauses refused; a table
   without `CHANGEFEED` refused
 
+### Version 0.22.0 — Native typed relations
+
+- `BaseSurrealEdge`: an edge table as a Pydantic model with frozen `in_` (column `in`) and `out`
+  record endpoints; `relate(EdgeModel, target, …)` returns the typed edge, and edge `save()` and
+  `bulk_create()` go through the official SDK's `insert_relation()` (one round-trip per batch).
+  Edges work in interactive and buffered transactions, and in live queries and change feeds
+- `SurrealConfigDict(table_name=…)`, the full ORM's key, honoured by every path; `_table_name` is
+  deprecated
+- The graph helpers take the full SurrealDB-ORM's parameters, in its order: `reverse=`, keyword
+  edge fields, `tx=` on every write helper, edge classes and lists of edges,
+  `get_related(direction="both")`, and a bare record id as `remove_relation()` target.
+  `remove_relation()`/`remove_all_relations()` run a graph-path `DELETE` with bound record ids
+- Filters take model instances as values everywhere, and `"table:id"` strings on edge endpoints
+- **The ORM evens out the lines.** A duplicate explicit edge id is silently kept by a raw
+  `INSERT RELATION` on 2.7.0 and 3.1.5 but raises on 3.3.3: the ORM's guarded statement raises
+  "already exists" on all three. A write refused by `PERMISSIONS` comes back empty without an
+  error on both lines: the ORM raises. Endpoint rewrites (ignored by the server) and `upsert()`
+  on an edge (a plain record no traversal sees) are refused
+- Native idempotency documented: a deterministic array id or a `UNIQUE` index on `in, out`.
+  Relation DDL (`TYPE RELATION IN … OUT …`) stays hand-written until v0.33.0
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -542,9 +563,9 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 ### 🟠 Phase E — Graph
 
-| Version | Theme                                                               | SDK 2.0 primitive   |
-| ------- | ------------------------------------------------------------------- | ------------------- |
-| v0.22.0 | Native typed relations: `insert_relation()`, `TYPE RELATION` tables | `insert_relation()` |
+| Version    | Theme                                                               | SDK 2.0 primitive   |
+| ---------- | ------------------------------------------------------------------- | ------------------- |
+| ✅ v0.22.0 | Native typed relations: `insert_relation()`, `TYPE RELATION` tables | `insert_relation()` |
 
 ---
 
@@ -574,12 +595,12 @@ unavailable on PyPI.
 
 ### 🔴 Phase F — Schema & DDL
 
-| Version | Theme                                           | SDK 2.0 realization              |
-| ------- | ----------------------------------------------- | -------------------------------- |
-| v0.30.0 | Schema introspection (inspectdb, read-only)     | `INFO FOR DB` / `INFO FOR TABLE` |
-| v0.31.0 | `DEFINE EVENT` (server-side triggers)           | DDL via `query()`                |
-| v0.32.0 | Materialized views (read-only models)           | `DEFINE TABLE … AS SELECT`       |
-| v0.33.0 | `TYPE RELATION` enforcement (graph constraints) | `DEFINE TABLE … TYPE RELATION`   |
+| Version | Theme                                                                          | SDK 2.0 realization              |
+| ------- | ------------------------------------------------------------------------------ | -------------------------------- |
+| v0.30.0 | Schema introspection (inspectdb, read-only)                                    | `INFO FOR DB` / `INFO FOR TABLE` |
+| v0.31.0 | `DEFINE EVENT` (server-side triggers)                                          | DDL via `query()`                |
+| v0.32.0 | Materialized views (read-only models)                                          | `DEFINE TABLE … AS SELECT`       |
+| v0.33.0 | `TYPE RELATION` enforcement (graph constraints), building on `BaseSurrealEdge` | `DEFINE TABLE … TYPE RELATION`   |
 
 ### 🔎 Phase G — Advanced search
 
