@@ -81,7 +81,9 @@ both server lines. The last minor of Tier 1.
   ids: exactly the edges a traversal sees. A plain record that merely carries `in`/`out` fields is
   no longer matched, and an edge table that was never created is a native no-op on 3.x too, also
   inside a transaction.
-- The graph helpers accept nodes whose record id is not an identifier (`joe@x.com`).
+- `relate()` (with an edge class or a table name), `get_related()`, `remove_relation()`,
+  `remove_all_relations()` and `traverse()` accept a node whose record id is not an identifier
+  (`joe@x.com`).
 - **Writes that would change an edge's endpoints are refused** with `ValueError` before any call
   (`merge()`, `patch()` on the instance and the `QuerySet`, the `atomic_*` helpers,
   `bulk_update()`, `update_or_create(defaults=)`): SurrealDB silently ignores them on both lines.
