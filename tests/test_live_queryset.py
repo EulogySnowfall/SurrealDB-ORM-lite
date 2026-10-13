@@ -102,10 +102,10 @@ class TestCompileLive:
         assert sql == "LIVE SELECT * FROM Ticket WHERE status = 'a' FETCH owner;"
 
     def test_uninlinable_value_raises_type_error(self) -> None:
-        from datetime import timedelta
+        from datetime import time
 
-        with pytest.raises(TypeError, match="timedelta"):
-            Ticket.objects().filter(age=timedelta(1))._compile_live(False)
+        with pytest.raises(TypeError, match="time"):
+            Ticket.objects().filter(age=time(1))._compile_live(False)
 
     @pytest.mark.parametrize(
         ("label", "build"),

@@ -10,7 +10,9 @@ The encoder is deliberately **closed**: a type without a verified literal form r
 ``TypeError`` instead of being stringified, because a guessed literal that parses but means
 something else is a filter that silently watches the wrong records. Every form below was
 checked as ``RETURN <literal> == $p`` against SurrealDB 2.7.0, 3.3.0 and 3.1.5, and
-``tests/test_surql_literal.py`` re-checks it on every run.
+``tests/test_surql_literal.py`` re-checks it on every run. v0.23.0 adds durations
+(``timedelta``, ``Duration``: ``1h30m1ns``), dates (``d'2026-01-02T00:00:00Z'``) and ranges
+(``1..5``, ``1>..=5``, ``d'2026-01-01T00:00:00Z'..``), whose bound values form a closed set too.
 
 Two choices worth knowing:
 
@@ -26,13 +28,15 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 from uuid import UUID
 
-from ._sdk import RecordID
+from ._sdk import Bound, BoundExcluded, BoundIncluded, RecordID, SdkDuration, SdkRange
 from .exceptions import SurrealDbError
+from .types import Duration, Range
+from .wire import MAX_DURATION_NS, duration_ns
 
 __all__ = ["inline_variables", "to_surql_literal"]
 
@@ -52,7 +56,15 @@ _REFERENCE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
 # references allowed to stay unbound: any other one would read as NONE on every notification.
 _SERVER_PARAMETERS = frozenset({"auth", "session", "token", "access", "scope", "this", "parent"})
 
-_SUPPORTED = "None, bool, int, float, str, Decimal, datetime, UUID, RecordID, and lists or dicts of these"
+_SUPPORTED = (
+    "None, bool, int, float, str, Decimal, datetime, date, timedelta, Duration, UUID, RecordID, Range, "
+    "and lists or dicts of these"
+)
+
+# The values a range bound may hold (v0.23.0): each verified as a bound on both lines. ``bool`` is
+# an ``int`` and is refused separately; so are non-finite floats.
+_RANGE_BOUND_TYPES = (int, float, Decimal, str, date, timedelta, Duration, SdkDuration)
+_RANGE_BOUNDS = "int, finite float, Decimal, str, datetime, date, timedelta, Duration"
 
 
 def _reject_nul(text: str) -> str:
@@ -107,12 +119,62 @@ def _decimal(value: Decimal) -> str:
     return f"{text}dec"
 
 
+def _duration(value: timedelta | Duration | SdkDuration) -> str:
+    """Every unit, largest first, from the exact nanoseconds: ``1h30m1ns``; ``0ns`` for zero."""
+    nanoseconds = duration_ns(value)
+    if nanoseconds < 0:
+        raise TypeError(f"Cannot inline {value!r}: SurrealDB has no negative duration.")
+    if nanoseconds > MAX_DURATION_NS:
+        raise TypeError(f"Cannot inline {value!r}: above the largest SurrealDB duration ({MAX_DURATION_NS} ns).")
+    return Duration(nanoseconds).to_string()
+
+
+def _date(value: date) -> str:
+    # ``date.isoformat`` itself, so a subclass cannot change the text; midnight UTC, as the SDK sends it.
+    return f"d'{date.isoformat(value)}T00:00:00Z'"
+
+
+def _range_side(side: object, name: str) -> BoundIncluded | BoundExcluded | None:
+    if side is None or type(side) is Bound:
+        return None
+    if isinstance(side, (BoundIncluded, BoundExcluded)):
+        return side
+    raise TypeError(
+        f"Cannot inline a range whose {name} is of type {type(side).__name__}: "
+        "each side is BoundIncluded, BoundExcluded or open (None)."
+    )
+
+
+def _range_bound(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, _RANGE_BOUND_TYPES):
+        raise TypeError(f"Cannot inline a range bound of type {type(value).__name__}; supported bounds: {_RANGE_BOUNDS}.")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise TypeError(f"Cannot inline the range bound {value!r}: a float bound must be finite.")
+    return to_surql_literal(value)
+
+
+def _range(value: Range[Any] | SdkRange) -> str:
+    """``<begin>..<end>``: an excluded begin adds ``>``, an included end ``=``; an open side is empty."""
+    begin = _range_side(value.begin, "begin")
+    end = _range_side(value.end, "end")
+    text = ""
+    if begin is not None:
+        text = _range_bound(begin.value) + (">" if isinstance(begin, BoundExcluded) else "")
+    text += ".."
+    if end is not None:
+        text += ("=" if isinstance(end, BoundIncluded) else "") + _range_bound(end.value)
+    return text
+
+
 def to_surql_literal(value: Any) -> str:
     """Return the SurrealQL literal that means exactly *value*.
 
     :raises TypeError: for a type with no verified literal form, a string containing ``\\x00``,
         an ``int`` outside signed 64-bit, a ``Decimal`` that is non-finite or beyond SurrealDB's
-        28 fractional digits / 96-bit mantissa, or a non-``str`` dict key.
+        28 fractional digits / 96-bit mantissa, a non-``str`` dict key, a negative duration or
+        one above SurrealDB's largest, or a range bound outside the closed set (``int`` but not
+        ``bool``, finite ``float``, ``Decimal``, ``str``, ``datetime``, ``date``, ``timedelta``,
+        ``Duration``).
     """
     if value is None:
         return "NONE"
@@ -140,6 +202,12 @@ def to_surql_literal(value: Any) -> str:
         # as UTC, so it is taken as UTC too.
         utc = value.astimezone(UTC) if value.tzinfo is not None else value
         return f"d'{utc.replace(tzinfo=None).isoformat()}Z'"
+    if isinstance(value, date):
+        return _date(value)
+    if isinstance(value, timedelta | Duration | SdkDuration):
+        return _duration(value)
+    if isinstance(value, Range | SdkRange):
+        return _range(value)
     if isinstance(value, UUID):
         return f"u'{value}'"
     if isinstance(value, RecordID):

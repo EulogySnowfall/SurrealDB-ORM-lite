@@ -7,9 +7,10 @@ wire form are suffixed ``E2E``.
 import copy
 import inspect
 import json
+import math
 from collections.abc import Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Annotated, Any, ForwardRef, Literal, Optional, TypeVar, Union
 from uuid import UUID
@@ -19,10 +20,13 @@ import surrealdb
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 import surreal_orm_lite
-from surreal_orm_lite import Computed, Duration, InvalidDurationError
+from surreal_orm_lite import BoundExcluded, BoundIncluded, Computed, Duration, InvalidDurationError, Range
+from surreal_orm_lite._sdk import Bound
+from surreal_orm_lite.types import _parse_range_text
 from surreal_orm_lite.wire import MAX_DURATION_NS, duration_ns, field_input, rich_kinds
 
 MAX_NS = Duration.MAX_NANOSECONDS
+SdkRange = surrealdb.Range
 _T = TypeVar("_T")
 
 
@@ -268,6 +272,323 @@ class TestDuration:
         assert "string" in json.dumps(schema)
 
 
+# --- Range[T] (spec §4.3, §5.5) ------------------------------------------------------------------
+
+_JAN = datetime(2026, 1, 1, tzinfo=UTC)
+_FEB = datetime(2026, 2, 1, tzinfo=UTC)
+_ASYMMETRY = "the SDK's `Range.__eq__` now defers to the ORM type: update README section 24 and spec §4.3"
+
+# (range, its SurrealQL text, the range that text parses back to when the bound types differ).
+RANGE_LITERALS: list[tuple[Range[Any], str, Range[Any] | None]] = [
+    (Range(BoundIncluded(1), BoundExcluded(5)), "1..5", None),
+    (Range(BoundIncluded(1), BoundIncluded(5)), "1..=5", None),
+    (Range(BoundExcluded(1), BoundExcluded(5)), "1>..5", None),
+    (Range(BoundExcluded(1), BoundIncluded(5)), "1>..=5", None),
+    (Range(None, BoundExcluded(5)), "..5", None),
+    (Range(None, BoundIncluded(5)), "..=5", None),
+    (Range(BoundIncluded(1), None), "1..", None),
+    (Range(BoundExcluded(1), None), "1>..", None),
+    (Range(), "..", None),
+    (Range(BoundIncluded(-5), BoundExcluded(-1)), "-5..-1", None),
+    (Range(BoundIncluded(1.5), BoundExcluded(2.5)), "1.5..2.5", None),
+    (Range(BoundIncluded(1e20), BoundExcluded(1e21)), "1e+20..1e+21", None),
+    (Range(BoundIncluded(1e-05), BoundExcluded(-0.0)), "1e-05..-0.0", None),
+    (Range(BoundIncluded(Decimal("1.5")), BoundExcluded(Decimal("2"))), "1.5dec..2dec", None),
+    (Range(BoundIncluded(_JAN), BoundExcluded(_FEB)), "d'2026-01-01T00:00:00Z'..d'2026-02-01T00:00:00Z'", None),
+    (
+        Range(BoundExcluded(datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC)), None),
+        "d'2026-01-02T03:04:05.123456Z'>..",
+        None,
+    ),
+    (
+        Range(BoundIncluded(date(2026, 1, 2)), None),
+        "d'2026-01-02T00:00:00Z'..",
+        Range(BoundIncluded(datetime(2026, 1, 2, tzinfo=UTC)), None),
+    ),
+    (Range(BoundIncluded("a"), BoundExcluded("m")), "'a'..'m'", None),
+    (
+        Range(BoundIncluded(timedelta(minutes=1)), BoundExcluded(Duration.parse("1h"))),
+        "1m..1h",
+        Range(BoundIncluded(Duration.parse("1m")), BoundExcluded(Duration.parse("1h"))),
+    ),
+    (
+        Range(BoundIncluded(surrealdb.Duration(5400 * 10**9 + 1)), None),
+        "1h30m1ns..",
+        Range(BoundIncluded(Duration.parse("1h30m1ns")), None),
+    ),
+]
+
+
+class TestRange:
+    def test_construct(self) -> None:
+        r = Range(BoundIncluded(1), BoundExcluded(5))
+        assert r.begin == BoundIncluded(1)
+        assert type(r.begin) is BoundIncluded
+        assert r.end == BoundExcluded(5)
+        assert type(r.end) is BoundExcluded
+        both_open = Range()
+        assert both_open.begin is None
+        assert both_open.end is None
+        end_only = Range(end=BoundIncluded(5))
+        assert end_only.begin is None
+        assert end_only.end == BoundIncluded(5)
+        # A bare SDK ``Bound()`` (the SDK docs' spelling of an open side) is read as open.
+        assert Range(Bound(), BoundExcluded(5)).begin is None  # type: ignore[arg-type]
+        assert Range(BoundIncluded(1), Bound()).end is None  # type: ignore[arg-type]
+        assert repr(r) == "Range(begin=BoundIncluded(value=1), end=BoundExcluded(value=5))"
+        assert repr(both_open) == "Range(begin=None, end=None)"
+        typed = Range[int](BoundIncluded(9), BoundExcluded(17))
+        assert type(typed) is Range
+        assert typed == Range(BoundIncluded(9), BoundExcluded(17))
+        with pytest.raises(AttributeError):
+            r.other = 1  # type: ignore[attr-defined]
+
+    @pytest.mark.parametrize(
+        "args",
+        [(1, 5), ("a",), (BoundIncluded(1), 5), (None, "x"), ([1],), (SdkRange(BoundIncluded(1), None),)],
+    )
+    def test_constructor_refusals(self, args: tuple[Any, ...]) -> None:
+        with pytest.raises(TypeError, match="BoundIncluded"):
+            Range(*args)
+
+    def test_equality(self) -> None:
+        assert Range(BoundIncluded(1), BoundExcluded(5)) == Range(BoundIncluded(1), BoundExcluded(5))
+        assert Range() == Range()
+        assert Range(BoundIncluded(1), BoundExcluded(5)) == SdkRange(BoundIncluded(1), BoundExcluded(5))
+        assert Range(BoundIncluded(1), None) == SdkRange(BoundIncluded(1), None)  # type: ignore[arg-type]
+        assert Range() == SdkRange(None, None)  # type: ignore[arg-type]
+        assert Range(BoundIncluded(1)) == SdkRange(BoundIncluded(1), Bound())
+        assert (SdkRange(BoundIncluded(1), None) == Range(BoundIncluded(1), None)) is False, _ASYMMETRY  # type: ignore[arg-type]
+        assert Range(BoundIncluded(1), BoundExcluded(5)) != Range(BoundExcluded(1), BoundExcluded(5))
+        assert Range(BoundIncluded(1), BoundExcluded(5)) != Range(BoundIncluded(1), BoundIncluded(5))
+        assert Range(BoundIncluded(1), None) != Range(BoundIncluded(1), BoundExcluded(5))
+        assert Range(BoundIncluded(1)) != Range(BoundIncluded(2))
+        assert Range(BoundIncluded(1)) != SdkRange(BoundExcluded(1), None)  # type: ignore[arg-type]
+        assert Range() != ".."
+        assert Range() != None  # noqa: E711
+        with pytest.raises(TypeError):
+            hash(Range())
+        with pytest.raises(TypeError):
+            _ = {Range(BoundIncluded(1))}
+
+    @pytest.mark.parametrize(("value", "text"), [(value, text) for value, text, _ in RANGE_LITERALS])
+    def test_str_is_surrealql(self, value: Range[Any], text: str) -> None:
+        assert str(value) == text
+        assert f"{value}" == text
+
+    @pytest.mark.parametrize(
+        "bound",
+        [True, UUID("0190c4b6-0000-7000-8000-000000000000"), [1], {"a": 1}, None, math.nan, math.inf, Range()],
+    )
+    def test_str_never_raises(self, bound: Any) -> None:
+        for value in (Range(BoundIncluded(bound), None), Range(BoundIncluded(1), BoundExcluded(bound))):
+            assert str(value) == repr(value)
+
+    @pytest.mark.parametrize(("value", "text", "parsed"), RANGE_LITERALS)
+    def test_parse_range_text_reads_every_literal(self, value: Range[Any], text: str, parsed: Range[Any] | None) -> None:
+        result = _parse_range_text(text)
+        assert type(result) is Range
+        assert result == (value if parsed is None else parsed)
+        assert str(result) == text
+
+    def test_parse_range_text_bound_types(self) -> None:
+        def bounds(text: str) -> tuple[Any, Any]:
+            result = _parse_range_text(text)
+            return (
+                None if result.begin is None else result.begin.value,
+                None if result.end is None else result.end.value,
+            )
+
+        begin, end = bounds("1..5")
+        assert type(begin) is int
+        assert type(end) is int
+        begin, end = bounds("1.5..1e+20")
+        assert type(begin) is float
+        assert type(end) is float
+        # ``1dec`` is a decimal, never the duration ``1d`` followed by ``ec``.
+        assert bounds("1dec..2dec") == (Decimal(1), Decimal(2))
+        assert type(bounds("1dec..")[0]) is Decimal
+        # ``1m`` is a duration, never the integer ``1`` followed by ``m``.
+        assert bounds("1m..1h") == (Duration.parse("1m"), Duration.parse("1h"))
+        assert type(bounds("1m..")[0]) is Duration
+        assert bounds("1ms..1us") == (Duration.parse("1ms"), Duration.parse("1us"))
+        # Quotes, escapes and ``..`` inside a string.
+        assert bounds("'a..b'..'it\\'s'") == ("a..b", "it's")
+        assert bounds("'back\\\\slash'..") == ("back\\slash", None)
+        assert bounds("''..") == ("", None)
+        # Datetimes are aware, in UTC.
+        begin, _ = bounds("d'2026-01-02T03:04:05.123456Z'..")
+        assert begin == datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC)
+        assert begin.tzinfo is not None
+        # Without an offset, a datetime is UTC (as the server reads it).
+        begin, _ = bounds("d'2026-01-02'..")
+        assert begin == datetime(2026, 1, 2, tzinfo=UTC)
+        assert begin.tzinfo is not None
+        assert bounds("..=5") == (None, 5)
+        # The cap is 1024 characters.
+        assert bounds("'" + "a" * 1020 + "'..") == ("a" * 1020, None)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "",
+            "1",
+            "1...5",
+            "1....5",
+            "1..5..6",
+            "1..5x",
+            "1..5de",
+            "1.5h..2h",
+            "[1]..[5]",
+            "true..false",
+            "u'0190c4b6-0000-7000-8000-000000000000'..u'0190c4b6-0000-7000-8000-000000000001'",
+            "1..'unterminated",
+            "'unterminated..",
+            "'a\\x'..",
+            ">..5",
+            "1..=",
+            "1>",
+            "-..5",
+            "--1..5",
+            "d'not a date'..",
+            "d'notadate'..",
+            "d''..",
+            "d'2026-01-02",
+            "d'2026-01-02'x..",
+            "d'2026-01-02 03:04:05Z'..",
+            "584942417356y..",
+            "'" + "a" * 1021 + "'..",
+            # The range parser never strips (revision 4): it reads only what the encoder emits.
+            " 1..5",
+            "1..5 ",
+            "1 ..5",
+            "1.. 5",
+            " 1m..1h",
+            "1m ..1h",
+            "\t..",
+        ],
+    )
+    def test_parse_range_text_refusals(self, text: str) -> None:
+        with pytest.raises(ValueError):
+            _parse_range_text(text)
+
+    def test_pydantic_field(self) -> None:
+        class M(BaseModel):
+            r: Range[int] | None = None
+            rd: Range[datetime] | None = None
+            rt: Range[timedelta] | None = None
+            rday: Range[date] | None = None
+            rdur: Range[Duration] | None = None
+            ra: Range | None = None  # type: ignore[type-arg]
+
+        # Accepted forms: ORM Range, SDK Range, builtin range with step 1, the literal text.
+        assert M(r=range(1, 5)).r == Range(BoundIncluded(1), BoundExcluded(5))  # type: ignore[arg-type]
+        with pytest.raises(ValidationError):
+            M(r=range(1, 5, 2))  # type: ignore[arg-type]
+        from_sdk = M(r=SdkRange(BoundIncluded(1), BoundExcluded(5))).r  # type: ignore[arg-type]
+        assert type(from_sdk) is Range
+        assert from_sdk == Range(BoundIncluded(1), BoundExcluded(5))
+        assert M(r=SdkRange(BoundIncluded(1), None)).r == Range(BoundIncluded(1), None)  # type: ignore[arg-type]
+        assert M(r=SdkRange(BoundIncluded(1), Bound())).r == Range(BoundIncluded(1), None)  # type: ignore[arg-type]
+        coerced = M(r=SdkRange(BoundIncluded("1"), None)).r  # type: ignore[arg-type]
+        assert coerced is not None and coerced.begin is not None
+        assert coerced.begin.value == 1
+        assert type(coerced.begin.value) is int
+        assert M(r="9..17").r == Range(BoundIncluded(9), BoundExcluded(17))  # type: ignore[arg-type]
+        assert M(r="..").r == Range()  # type: ignore[arg-type]
+        same = Range(BoundIncluded(1), BoundExcluded(5))
+        assert M(r=same).r == same
+
+        # Bound values validated as T.
+        with pytest.raises(ValidationError):
+            M(r=Range(BoundIncluded("x"), None))
+        with pytest.raises(ValidationError):
+            M(r="'a'..'m'")  # type: ignore[arg-type]
+        with pytest.raises(ValidationError):
+            M(r=Range(BoundIncluded(None), None))
+
+        rd = M(rd=Range(BoundIncluded("2026-01-01T00:00:00Z"), BoundExcluded("2026-02-01T00:00:00+00:00"))).rd
+        assert rd == Range(BoundIncluded(_JAN), BoundExcluded(_FEB))
+        assert rd is not None and rd.begin is not None
+        assert type(rd.begin.value) is datetime
+        assert rd.begin.value.tzinfo is not None
+        rd_text = M(rd="d'2026-01-01T00:00:00Z'..").rd  # type: ignore[arg-type]
+        assert rd_text == Range(BoundIncluded(_JAN), None)
+        sdk_dt = surrealdb.Datetime("2026-01-02T03:04:05.123456789Z")
+        rd_sdk = M(rd=SdkRange(BoundIncluded(sdk_dt), None)).rd  # type: ignore[arg-type]
+        assert rd_sdk is not None and rd_sdk.begin is not None
+        assert rd_sdk.begin.value == datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC)
+
+        sdk_bounds = SdkRange(
+            BoundIncluded(surrealdb.Duration(60 * 10**9)), BoundExcluded(surrealdb.Duration(3600 * 10**9 + 1))
+        )
+        rt = M(rt=sdk_bounds).rt  # type: ignore[arg-type]
+        assert rt == Range(BoundIncluded(timedelta(minutes=1)), BoundExcluded(timedelta(hours=1)))
+        assert rt is not None and rt.begin is not None and rt.end is not None
+        assert type(rt.begin.value) is timedelta
+        assert type(rt.end.value) is timedelta
+        rt_text = M(rt="1m..1h").rt  # type: ignore[arg-type]
+        assert rt_text == Range(BoundIncluded(timedelta(minutes=1)), BoundExcluded(timedelta(hours=1)))
+        assert rt_text is not None and rt_text.begin is not None
+        assert type(rt_text.begin.value) is timedelta
+        assert M(rt=Range(BoundIncluded("1h"), None)).rt == Range(BoundIncluded(timedelta(hours=1)), None)
+
+        rday = M(rday="d'2026-01-02T00:00:00Z'..").rday  # type: ignore[arg-type]
+        assert rday is not None and rday.begin is not None
+        assert rday.begin.value == date(2026, 1, 2)
+        assert type(rday.begin.value) is date
+
+        rdur = M(rdur=Range(BoundIncluded(surrealdb.Duration(5)), BoundExcluded("1h"))).rdur
+        assert rdur == Range(BoundIncluded(Duration(5)), BoundExcluded(Duration.parse("1h")))
+        assert rdur is not None and rdur.begin is not None
+        assert type(rdur.begin.value) is Duration
+
+        # A bare Range keeps the values as given.
+        sdk_duration = surrealdb.Duration(5)
+        ra = M(ra=Range(BoundIncluded(sdk_duration), BoundExcluded("x"))).ra
+        assert ra is not None and ra.begin is not None and ra.end is not None
+        assert ra.begin.value is sdk_duration
+        assert ra.end.value == "x"
+        ra_sdk = M(ra=SdkRange(BoundIncluded("1"), None)).ra  # type: ignore[arg-type]
+        assert type(ra_sdk) is Range
+        assert ra_sdk == Range(BoundIncluded("1"), None)
+
+        for bad in [[1, 5], (1, 5), "1..5x", "x", 5, True, {"begin": 1}, SdkRange(1, 5)]:  # type: ignore[arg-type]
+            with pytest.raises(ValidationError):
+                M(r=bad)
+            with pytest.raises(ValidationError):
+                M(ra=bad)
+
+        # Dumps: the object in Python mode, the literal text in JSON mode.
+        m = M(r=range(1, 5))  # type: ignore[arg-type]
+        assert isinstance(m.model_dump()["r"], Range)
+        assert '"1..5"' in m.model_dump_json()
+        assert m.model_dump(mode="json")["r"] == "1..5"
+        schema = M.model_json_schema()
+        assert "string" in json.dumps(schema["properties"]["r"])
+        assert "1..5" in json.dumps(schema["properties"]["r"])
+
+        # JSON round trip for every bound type with a literal form, and open sides.
+        offset = timezone(timedelta(hours=2))
+        for model in [
+            M(r=Range(BoundExcluded(1), BoundIncluded(5))),
+            M(r=Range(None, BoundExcluded(-5))),
+            M(r=Range()),
+            M(rd=Range(BoundIncluded(datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC)), BoundExcluded(_FEB))),
+            M(rd=Range(None, BoundIncluded(datetime(2026, 1, 2, 3, tzinfo=offset)))),
+            M(rt=Range(BoundIncluded(timedelta(minutes=1)), BoundExcluded(timedelta(hours=1, microseconds=5)))),
+            M(rday=Range(BoundIncluded(date(2026, 1, 2)), BoundIncluded(date(2026, 2, 1)))),
+            M(rdur=Range(BoundIncluded(Duration.parse("1h30m1ns")), None)),
+            M(ra=Range(BoundIncluded(Decimal("1.50")), BoundExcluded(Decimal("-2")))),
+            M(ra=Range(BoundExcluded(1.5), None)),
+            M(ra=Range(BoundIncluded("it's..x"), BoundExcluded("back\\slash"))),
+            M(ra=Range(BoundIncluded(Duration.parse("1h30m1ns")), None)),
+            M(ra=Range(BoundIncluded(7), None)),
+            M(ra=Range()),
+        ]:
+            assert M.model_validate_json(model.model_dump_json()) == model, model.model_dump_json()
+
+
 # --- wire.py, first part: duration_ns, rich_kinds, field_input (spec §5.1, §5.4) ------------------
 
 
@@ -336,6 +657,10 @@ class TestRichKinds:
             (Sequence[datetime], {"datetime"}),
             (AbstractSet[int], {"set"}),
             (Duration, {"duration"}),
+            (Range, {"range"}),
+            (Range[int], {"range"}),
+            (Range[timedelta] | None, {"range", "timedelta"}),
+            (list[Range[datetime]], {"range", "datetime"}),
             (datetime, {"datetime"}),
             (date, {"date"}),
             (set, {"set"}),
@@ -447,7 +772,23 @@ class TestFieldInput:
     # Rules 3 and 11
     @pytest.mark.parametrize(
         "annotation",
-        [Any, object, Duration, Decimal, UUID, dict[str, Any], list[Any], int, str, _T, "timedelta", ForwardRef("timedelta")],
+        [
+            Any,
+            object,
+            Duration,
+            Range,
+            Range[int],
+            Range[timedelta],
+            Decimal,
+            UUID,
+            dict[str, Any],
+            list[Any],
+            int,
+            str,
+            _T,
+            "timedelta",
+            ForwardRef("timedelta"),
+        ],
     )
     def test_never_converts_elsewhere(self, annotation: Any) -> None:
         sdk = surrealdb.Duration(5)

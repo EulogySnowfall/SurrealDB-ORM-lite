@@ -29,7 +29,7 @@ from pydantic import BaseModel
 
 from ._sdk import SdkDatetime, SdkDuration
 from .exceptions import InvalidDurationError
-from .types import Duration
+from .types import Duration, Range
 
 __all__ = ["MAX_DURATION_NS", "duration_ns", "field_input", "rich_kinds"]
 
@@ -98,6 +98,8 @@ def _scalar_kind(annotation: Any) -> str | None:
         return None
     if annotation is Duration:
         return "duration"
+    if issubclass(annotation, Range):
+        return "range"
     # ``datetime`` before ``date``: a datetime is a date.
     for cls, kind in (
         (timedelta, "timedelta"),
@@ -118,10 +120,11 @@ def rich_kinds(annotation: Any, *, into_models: bool = True) -> frozenset[str]:
     """The rich kinds an annotation contains, at any depth.
 
     Kinds: ``"timedelta"``, ``"date"``, ``"datetime"``, ``"decimal"``, ``"uuid"``, ``"duration"``
-    (the ORM's ``Duration``) and the containers that need re-validating after a raw read — ``"set"``,
-    ``"frozenset"``, ``"tuple"``. The walk enters ``Annotated``, unions (``Optional`` included),
-    ``list``/``set``/``frozenset``/``tuple``/``Sequence``/``AbstractSet`` items and ``dict``/``Mapping``
-    values (keys are never converted) and, with ``into_models`` (the default), the fields of a nested
+    (the ORM's ``Duration``), ``"range"`` (the ORM's ``Range``) and the containers that need
+    re-validating after a raw read — ``"set"``, ``"frozenset"``, ``"tuple"``. The walk enters
+    ``Annotated``, unions (``Optional`` included), ``list``/``set``/``frozenset``/``tuple``/``Sequence``/
+    ``AbstractSet`` items, ``dict``/``Mapping`` values (keys are never converted), the ``T`` of
+    ``Range[T]`` and, with ``into_models`` (the default), the fields of a nested
     Pydantic model — a self-referencing model is entered once. ``Any``, a ``TypeVar``, a string or
     ``ForwardRef`` annotation and plain types have no kind: an empty set.
     """
@@ -136,7 +139,11 @@ def _walk_kinds(annotation: Any, into_models: bool, visiting: set[type]) -> set[
         return {kind for arg in args for kind in _walk_kinds(arg, into_models, visiting)}
     if origin is not None:
         kinds: set[str] = set()
-        if origin in _SEQUENCE_ORIGINS or origin is tuple:
+        if _is_subclass(origin, Range):
+            # ``Range[T]``: the range itself, then what its bound values hold.
+            kinds.add("range")
+            members = args
+        elif origin in _SEQUENCE_ORIGINS or origin is tuple:
             if origin is tuple:
                 kinds.add("tuple")
             elif origin is frozenset:
@@ -320,7 +327,8 @@ def field_input(annotation: Any, value: Any) -> Any:
     10. A Pydantic model with a mapping → each key matched to a field by name or string
         ``alias``/``validation_alias``, its value as that field's annotation; other keys unchanged.
         A model instance is unchanged.
-    11. Anything else (``Duration``, ``Decimal``, ``UUID``, ``Literal``, a dataclass…) → unchanged.
+    11. Anything else → unchanged: ``Duration``, ``Range``/``Range[T]`` (its own validator converts
+        each bound), ``Decimal``, ``UUID``, ``Literal``, a dataclass…
 
     Copy-on-write: when nothing changes, ``value`` itself is returned; otherwise a new container of
     the value's own type (``list``/``tuple``/``set``/``frozenset``/``dict``). The input is never mutated.

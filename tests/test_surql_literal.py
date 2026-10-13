@@ -7,15 +7,18 @@ keeps the inlining from becoming an injection or a silent mismatch.
 """
 
 import math
-from datetime import UTC, datetime, timedelta, timezone
+import re
+from datetime import UTC, date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import IntEnum, StrEnum
 from typing import Any
 from uuid import UUID
 
 import pytest
+import surrealdb
 
-from surreal_orm_lite._sdk import RecordID
+from surreal_orm_lite import BoundExcluded, BoundIncluded, Duration, Range
+from surreal_orm_lite._sdk import Bound, RecordID
 from surreal_orm_lite.surql_literal import inline_variables, to_surql_literal
 from tests.conftest import orm_client
 
@@ -146,8 +149,8 @@ class TestContainers:
             to_surql_literal({1: "a"})
 
     def test_unknown_type_is_refused_by_name(self) -> None:
-        with pytest.raises(TypeError, match="timedelta"):
-            to_surql_literal(timedelta(hours=1))
+        with pytest.raises(TypeError, match="time"):
+            to_surql_literal(time(1))
 
 
 class TestInlineVariables:
@@ -173,7 +176,151 @@ class TestInlineVariables:
 
     def test_error_names_the_variable(self) -> None:
         with pytest.raises(TypeError, match=r"\$a"):
-            inline_variables("x = $a", {"a": timedelta(1)})
+            inline_variables("x = $a", {"a": time(1)})
+
+
+class _Day(date):
+    """A ``date`` subclass: rendered as the date it is, never as something else."""
+
+
+MAX_DURATION_TEXT = "584942417355y3w5d7h15s999ms999us999ns"
+
+
+class TestRichLiteralText:
+    """v0.23.0: durations, dates and ranges (spec §5.5); the round trip is ``TestRichLiteralsE2E``."""
+
+    @pytest.mark.parametrize(
+        ("value", "text"),
+        [
+            (timedelta(hours=1, minutes=30), "1h30m"),
+            (timedelta(days=1, microseconds=5), "1d5us"),
+            (timedelta(days=15), "2w1d"),
+            (timedelta(0), "0ns"),
+            (Duration(1), "1ns"),
+            (Duration(0), "0ns"),
+            (Duration.parse("1y2w3d4h5m6s7ms8us9ns"), "1y2w3d4h5m6s7ms8us9ns"),
+            (Duration(Duration.MAX_NANOSECONDS), MAX_DURATION_TEXT),
+            (surrealdb.Duration(5400 * 10**9), "1h30m"),
+            (surrealdb.Duration(5400 * 10**9 + 1), "1h30m1ns"),
+            # Through ``duration_ns``: exact integers, never the SDK's float arithmetic.
+            (surrealdb.Duration(Duration.MAX_NANOSECONDS), MAX_DURATION_TEXT),
+            (surrealdb.Duration(0), "0ns"),
+        ],
+    )
+    def test_durations(self, value: Any, text: str) -> None:
+        assert to_surql_literal(value) == text
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            timedelta(seconds=-1),
+            timedelta(microseconds=-1),
+            surrealdb.Duration(-1),
+            surrealdb.Duration(Duration.MAX_NANOSECONDS + 1),
+            surrealdb.Duration(1.5),  # type: ignore[arg-type]
+        ],
+    )
+    def test_durations_outside_the_server_range_are_refused(self, value: Any) -> None:
+        with pytest.raises(TypeError):
+            to_surql_literal(value)
+
+    def test_dates(self) -> None:
+        assert to_surql_literal(date(2026, 1, 2)) == "d'2026-01-02T00:00:00Z'"
+        assert to_surql_literal(_Day(2026, 1, 2)) == "d'2026-01-02T00:00:00Z'"
+        assert to_surql_literal(date(1, 1, 1)) == "d'0001-01-01T00:00:00Z'"
+        # A datetime still renders as before (v0.20.0), never as its date.
+        assert to_surql_literal(datetime(2026, 1, 2, 3, 4, 5, 6, tzinfo=UTC)) == "d'2026-01-02T03:04:05.000006Z'"
+        assert to_surql_literal(datetime(2026, 1, 1)) == "d'2026-01-01T00:00:00Z'"
+
+    @pytest.mark.parametrize(
+        ("value", "text"),
+        [
+            (Range(BoundIncluded(1), BoundExcluded(5)), "1..5"),
+            (Range(BoundIncluded(1), BoundIncluded(5)), "1..=5"),
+            (Range(BoundExcluded(1), BoundExcluded(5)), "1>..5"),
+            (Range(BoundExcluded(1), BoundIncluded(5)), "1>..=5"),
+            (Range(None, BoundExcluded(5)), "..5"),
+            (Range(None, BoundIncluded(5)), "..=5"),
+            (Range(BoundIncluded(1), None), "1.."),
+            (Range(BoundExcluded(1), None), "1>.."),
+            (Range(), ".."),
+            (Range(BoundIncluded(-5), BoundExcluded(-1)), "-5..-1"),
+            (Range(BoundIncluded(1.5), BoundExcluded(2.5)), "1.5..2.5"),
+            (Range(BoundIncluded(1e20), BoundExcluded(1e21)), "1e+20..1e+21"),
+            (Range(BoundIncluded(Decimal("1.5")), BoundExcluded(Decimal("2"))), "1.5dec..2dec"),
+            (
+                Range(BoundIncluded(datetime(2026, 1, 1, tzinfo=UTC)), BoundExcluded(datetime(2026, 2, 1, tzinfo=UTC))),
+                "d'2026-01-01T00:00:00Z'..d'2026-02-01T00:00:00Z'",
+            ),
+            (Range(BoundIncluded(date(2026, 1, 2)), None), "d'2026-01-02T00:00:00Z'.."),
+            (Range(BoundIncluded("a"), BoundExcluded("m")), "'a'..'m'"),
+            (Range(BoundIncluded("it's"), BoundExcluded("a..b")), "'it\\'s'..'a..b'"),
+            (Range(BoundIncluded(timedelta(minutes=1)), BoundExcluded(Duration.parse("1h"))), "1m..1h"),
+            (Range(BoundIncluded(surrealdb.Duration(60 * 10**9)), None), "1m.."),
+            # The SDK's own Range, open sides as ``None`` or a bare ``Bound()``.
+            (surrealdb.Range(BoundIncluded(1), BoundExcluded(5)), "1..5"),
+            (surrealdb.Range(BoundExcluded(1), BoundIncluded(5)), "1>..=5"),
+            (surrealdb.Range(None, BoundIncluded(5)), "..=5"),  # type: ignore[arg-type]
+            (surrealdb.Range(BoundIncluded(1), Bound()), "1.."),
+            (surrealdb.Range(Bound(), Bound()), ".."),
+        ],
+    )
+    def test_ranges(self, value: Any, text: str) -> None:
+        assert to_surql_literal(value) == text
+
+    @pytest.mark.parametrize(
+        "bound",
+        [
+            True,
+            UUID("0190c4b6-0000-7000-8000-000000000000"),
+            RecordID("user", 1),
+            [1],
+            {"a": 1},
+            Range(),
+            None,
+            math.nan,
+            math.inf,
+            -math.inf,
+            time(1),
+        ],
+        ids=repr,
+    )
+    def test_range_bounds_outside_the_closed_set_are_refused(self, bound: Any) -> None:
+        name = re.escape(type(bound).__name__)
+        for value in (
+            Range(BoundIncluded(bound), None),
+            Range(None, BoundExcluded(bound)),
+            Range(BoundIncluded(1), BoundIncluded(bound)),
+            surrealdb.Range(BoundExcluded(bound), None),  # type: ignore[arg-type]
+        ):
+            with pytest.raises(TypeError, match=name):
+                to_surql_literal(value)
+
+    def test_sdk_range_with_non_bound_sides_is_refused(self) -> None:
+        with pytest.raises(TypeError, match="int"):
+            to_surql_literal(surrealdb.Range(1, 5))  # type: ignore[arg-type]
+
+    def test_range_bounds_keep_the_scalar_refusals(self) -> None:
+        with pytest.raises(TypeError, match="64-bit"):
+            to_surql_literal(Range(BoundIncluded(2**63), None))
+        with pytest.raises(TypeError, match="NUL"):
+            to_surql_literal(Range(BoundIncluded("a\x00"), None))
+        with pytest.raises(TypeError, match="finite"):
+            to_surql_literal(Range(BoundIncluded(Decimal("NaN")), None))
+        with pytest.raises(TypeError, match="negative"):
+            to_surql_literal(Range(BoundIncluded(timedelta(seconds=-1)), None))
+
+    def test_containers_and_variables(self) -> None:
+        assert to_surql_literal([timedelta(hours=1), date(2026, 1, 2)]) == "[1h, d'2026-01-02T00:00:00Z']"
+        assert to_surql_literal({"ttl": Duration(1)}) == "{'ttl': 1ns}"
+        assert inline_variables("n IN $a", {"a": Range(BoundIncluded(1), BoundExcluded(5))}) == "n IN 1..5"
+        assert inline_variables("ttl >= $a", {"a": timedelta(hours=1)}) == "ttl >= 1h"
+
+    def test_unsupported_message_names_the_new_types(self) -> None:
+        with pytest.raises(TypeError) as info:
+            to_surql_literal(time(1))
+        for name in ("timedelta", "Duration", "date", "Range"):
+            assert re.search(rf"\b{name}\b", str(info.value)), name
 
 
 # ==================== E2E — the literal means the value, on every line ====================
