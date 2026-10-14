@@ -5,6 +5,7 @@ import os
 import typing
 import warnings
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
+from datetime import timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Self, TypeVar, overload
 
@@ -13,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic_core import ValidationError
 
 from . import encoding as _encoding
-from ._sdk import NotFoundError, RecordID, ServerError
+from ._sdk import NotFoundError, RecordID, SdkDuration, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, _ComputedDefault
@@ -29,6 +30,7 @@ from .signals import (
     pre_update,
 )
 from .transaction import Transaction
+from .types import Duration
 from .utils import (
     VALID_ALIAS_PATTERN,
     apply_ddl_statements,
@@ -1570,7 +1572,16 @@ class BaseSurrealModel(BaseModel):
         ``amount`` to decrement. ``amount`` may be a ``decimal.Decimal`` for exact arithmetic
         (the value is bound, not interpolated); adding a ``Decimal`` to an int/float field
         coerces the stored field to SurrealDB ``decimal``. Emits no signals.
+
+        A duration amount raises ``TypeError`` (v0.23.0): SurrealDB 2.x ignores ``+=`` with a
+        duration.
         """
+        if isinstance(amount, (timedelta, SdkDuration, Duration)):
+            raise TypeError(
+                f"atomic_increment() adds a number, not a duration ({amount!r}): SurrealDB 2.x ignores += with a "
+                "duration, so the result would differ between server lines. "
+                f"Set the new value with merge({field}=…) instead."
+            )
         column = self._validate_atomic_field(field)
         return await self._atomic_update(f"{column} += $amount", {"amount": amount}, tx)
 
