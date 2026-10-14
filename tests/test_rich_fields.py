@@ -2285,7 +2285,9 @@ class TestSubModelStoredKeys:
     name too (``populate_by_name``/``validate_by_name``) keeps each sub-field under its name, the
     format v0.22 wrote and the format a ``DEFINE FIELD profile.first_name`` schema declares; one that
     validates by alias only stores each aliased sub-field under its alias, the only key a read takes.
-    A keyword write's dict for a sub-model is re-keyed the same way, rich or not."""
+    A keyword write's dict for a sub-model is re-keyed the same way, rich or not, except a ``merge()``
+    dict for a sub-model that validates by name and by alias: it keeps the caller's keys, as in v0.22
+    (``TestMergeDictKeysAsGiven``)."""
 
     def test_read_keys(self) -> None:
         assert read_keys(RfCamel) == {"first_name": "first_name", "home_address": "home_address"}
@@ -2325,83 +2327,67 @@ class TestSubModelStoredKeys:
     @pytest.mark.parametrize("context", ["merge", "bulk_update", "signup", "signin"])
     def test_keyword_dicts_are_re_keyed(self, context: str) -> None:
         """Keys only: the values of a sub-model without a rich type are sent as given, as in v0.22.
-        Only ``merge()`` also removes the other spellings of a sub-model that validates by name and
-        by alias (``test_merge_removes_the_other_spellings``): the other writes replace the field."""
+        ``merge()`` keeps the caller's keys for a sub-model that validates by name and by alias, as
+        v0.22.2 did (``test_merge_keeps_the_keys_read_by_name_and_alias``); the other writes replace
+        the field, so they re-key it."""
 
-        def removed(*keys: str) -> dict[str, None]:
-            return dict.fromkeys(keys) if context == "merge" else {}
+        def keyed(given: dict[str, Any], renamed: dict[str, Any]) -> dict[str, Any]:
+            return given if context == "merge" else renamed
 
         coerce = RfNamed._coerce_field_value
-        assert coerce("profile", {"firstName": "a"}, context=context) == {"first_name": "a", **removed("firstName")}
-        assert coerce("profile", {"first_name": "a"}, context=context) == {"first_name": "a", **removed("firstName")}
+        assert coerce("profile", {"firstName": "a"}, context=context) == keyed({"firstName": "a"}, {"first_name": "a"})
+        assert coerce("profile", {"first_name": "a"}, context=context) == {"first_name": "a"}
         assert coerce("alias_only", {"first_name": "a"}, context=context) == {"firstName": "a"}
         assert coerce("alias_only", {"firstName": "a"}, context=context) == {"firstName": "a"}
-        assert coerce("by_name", {"firstName": "a"}, context=context) == {"first_name": "a", **removed("firstName")}
+        assert coerce("by_name", {"firstName": "a"}, context=context) == keyed({"firstName": "a"}, {"first_name": "a"})
+        assert coerce("name_only", {"firstName": "a"}, context=context) == {"first_name": "a"}
+        # A dict under a sub-model sub-field: RfStreet validates by alias only, at any level.
         nested = coerce("profile", {"homeAddress": {"street_name": "x"}}, context=context)
-        # A dict under a sub-model sub-field.
-        assert nested == {"home_address": {"streetName": "x"}, **removed("homeAddress")}
+        assert nested == keyed({"homeAddress": {"streetName": "x"}}, {"home_address": {"streetName": "x"}})
         assert coerce("profile", {"firstName": 5, "zip": "H0H"}, context=context) == {
-            "first_name": 5,
-            **removed("firstName"),
+            **keyed({"firstName": 5}, {"first_name": 5}),
             "zip": "H0H",
         }
         given = {"firstName": "a"}
         coerce("profile", given, context=context)
         assert given == {"firstName": "a"}  # the caller's dict is never mutated
 
-    def test_merge_removes_the_other_spellings(self) -> None:
-        """In ``merge()``, a sub-model that validates by name **and** by alias sends ``None`` (NONE: the
-        key is removed) for every other spelling of each sub-field its dict names. v0.22's ``merge()``
-        kept the caller's key, so a row can hold ``{"first_name": …, "firstName": …}``, and a read takes
-        the alias first: the name just merged would be hidden."""
+    def test_merge_keeps_the_keys_read_by_name_and_alias(self) -> None:
+        """In ``merge()``, a sub-model that validates by name **and** by alias keeps each key of the
+        caller's, as v0.22.2 did: none renamed, none removed, none refused for naming a sub-field
+        twice. A read takes the alias before the name."""
         coerce = RfNamed._coerce_field_value
-        # A rich sub-model, converted key by key.
+        # A rich sub-model, converted key by key: its values only.
         assert coerce("dated", {"seenAt": "2026-01-02T03:04:05Z", "firstName": "a"}) == {
-            "seen_at": datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
-            "seenAt": None,
-            "first_name": "a",
-            "firstName": None,
+            "seenAt": datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
+            "firstName": "a",
         }
-        # Every string of an AliasChoices, and an alias that is not an identifier.
-        assert coerce("nicknamed", {"handle": "a", "home_town": "b"}) == {
-            "nick": "a",
-            "nickName": None,
-            "handle": None,
-            "home_town": "b",
-            "home-town": None,
-        }
+        # Every string of an AliasChoices, an alias that is not an identifier, one sub-field twice.
+        given = {"handle": "a", "home-town": "b", "home_town": "c"}
+        assert coerce("nicknamed", given) == given
+        assert coerce("profile", {"first_name": "a", "firstName": "b"}) == {"first_name": "a", "firstName": "b"}
         # A read never takes the aliases of a sub-model that validates by name only; one that
         # validates by alias only stores each sub-field under the first key a read takes.
         assert coerce("name_only", {"firstName": "a"}) == {"first_name": "a"}
         assert coerce("alias_only", {"first_name": "a"}) == {"firstName": "a"}
 
-    def test_server_values_assign_the_removals(self) -> None:
-        """Under ``server_values`` each removal is its own ``SET`` assignment (``nicknamed.nickName =
-        NONE``); a spelling that is not an identifier cannot be a ``SET`` path, so it is skipped, where
-        a caller's key that is not one still raises."""
-        value = RfNamed._coerce_field_value("nicknamed", {"handle": "a", "home-town": "b"})
+    def test_server_values_assign_the_given_keys(self) -> None:
+        """Under ``server_values`` each key is its own ``SET`` assignment, under the key the dict
+        sends; a key that is not an identifier cannot be a ``SET`` path, so it raises."""
+        value = RfNamed._coerce_field_value("nicknamed", {"handle": "a", "home_town": "b"})
         assert _set_paths("nicknamed", ("nicknamed",), RfNicknamed, value) == [
-            (("nicknamed", "nick"), "a"),
-            (("nicknamed", "nickName"), None),
-            (("nicknamed", "handle"), None),
+            (("nicknamed", "handle"), "a"),
             (("nicknamed", "home_town"), "b"),
         ]
         nested = RfNamed._coerce_field_value("profile", {"homeAddress": {"street_name": "x"}})
-        assert _set_paths("profile", ("profile",), RfCamel, nested) == [
-            (("profile", "home_address", "streetName"), "x"),
-            (("profile", "homeAddress"), None),
-        ]
-        with pytest.raises(ValueError, match=r"^merge\(nicknamed=…\): the key 'zip-code' is not an identifier"):
-            _set_paths("nicknamed", ("nicknamed",), RfNicknamed, {"zip-code": "H0H"})
+        assert _set_paths("profile", ("profile",), RfCamel, nested) == [(("profile", "homeAddress", "streetName"), "x")]
+        for key in ("zip-code", "home-town"):  # an alias that is not an identifier too
+            with pytest.raises(ValueError, match=rf"^merge\(nicknamed=…\): the key '{key}' is not an identifier"):
+                _set_paths("nicknamed", ("nicknamed",), RfNicknamed, {key: "H0H"})
 
     @pytest.mark.parametrize(
         ("field", "value", "named"),
         [
-            (
-                "profile",
-                {"first_name": "a", "firstName": "b"},
-                r"'first_name' and 'firstName' both name the sub-field first_name",
-            ),
             (
                 "alias_only",
                 {"firstName": "a", "first_name": "b"},
@@ -2409,7 +2395,7 @@ class TestSubModelStoredKeys:
             ),
             ("profile", {"homeAddress": {"streetName": "a", "street_name": "b"}}, r"'streetName' and 'street_name' both name"),
         ],
-        ids=["by-name", "alias-only", "nested"],
+        ids=["alias-only", "nested"],
     )
     def test_a_sub_field_named_twice_raises(self, field: str, value: dict[str, Any], named: str) -> None:
         with pytest.raises(ValueError, match=rf"^merge\({field}(\.homeAddress)?=…\): {named}"):
@@ -2434,9 +2420,9 @@ def _stored_keys(stored: Any) -> set[str]:
 class TestSubModelStoredKeysE2E:
     """What a sub-model's keys look like in the row, on both lines (see ``TestSubModelStoredKeys``).
 
-    A sub-model that validates by name too used to be stored under its aliases by ``save()`` while a
-    ``merge()`` dict kept the caller's keys: ``{"firstName": "old", "first_name": "new"}``, and
-    ``get()`` read the alias first, so the merged value was lost."""
+    A sub-model that validates by name too is stored under its names by ``save()``, as in v0.22, while
+    a ``merge()`` dict keeps the caller's keys, as in v0.22: ``{"first_name": "old", "firstName":
+    "new"}``, which a read gives as ``"new"`` (the alias first)."""
 
     @pytest.mark.parametrize("server_values", [False, True], ids=["merge", "merge-server-values"])
     async def test_validated_by_name_keeps_the_names(self, server_values: bool) -> None:
@@ -2444,25 +2430,27 @@ class TestSubModelStoredKeysE2E:
             person = RfNamed(id="a", profile=RfCamel(first_name="old"))
             await person.save()
             stored = (await _raw("a", "rf_named"))["profile"]
-            assert stored["first_name"] == "old"
-            assert "firstName" not in _stored_keys(stored)
+            assert stored == {"first_name": "old"}
 
-            for given, expected in (({"first_name": "new"}, "new"), ({"firstName": "new2"}, "new2")):
+            for given, expected in (
+                ({"first_name": "new"}, {"first_name": "new"}),
+                ({"firstName": "new2"}, {"first_name": "new", "firstName": "new2"}),
+            ):
                 await person.merge(server_values=_BUMP if server_values else None, profile=given)
-                stored = (await _raw("a", "rf_named"))["profile"]
-                assert stored["first_name"] == expected
-                assert "firstName" not in _stored_keys(stored), stored
+                assert (await _raw("a", "rf_named"))["profile"] == expected
                 loaded = (await RfNamed.objects().get("a")).profile
                 assert loaded is not None
-                assert loaded.first_name == expected
+                assert loaded.first_name == given.get("firstName", given.get("first_name"))
             await _assert_client_usable(client)
 
     @pytest.mark.parametrize("server_values", [False, True], ids=["merge", "merge-server-values"])
     async def test_a_v022_row_with_both_spellings(self, server_values: bool) -> None:
-        """v0.22's ``merge()`` kept the caller's key: ``save()`` then ``merge(profile={"firstName": …})``
-        left both spellings in the row, and a read takes the alias first. Writing the name alone, the
-        next ``merge()`` was hidden behind that alias and lost without an error; it now removes the
-        other spellings of each sub-field it names, so the value merged is the value read."""
+        """v0.22's ``merge()`` kept the caller's key, and a ``merge()`` dict for a sub-model that
+        validates by name and by alias still does (v0.22.2's behaviour): ``save()`` then
+        ``merge(profile={"firstName": …})`` leaves both spellings in the row, and a read takes the alias
+        first. A value merged under the key a read takes first reads back; one merged under a key a
+        read takes later (``handle``, the second string of an ``AliasChoices``) stays behind the stored
+        ``nickName``, as in v0.22.2."""
         async with orm_client("rf_named") as client:
             before, after = datetime(2026, 1, 1, tzinfo=UTC), datetime(2026, 1, 2, tzinfo=UTC)
             await client.query(
@@ -2494,7 +2482,7 @@ class TestSubModelStoredKeysE2E:
             expected = {
                 "profile": RfCamel(first_name="Annie", home_address=RfStreet(streetName="z")),
                 "dated": RfCamelDated(first_name="Ann", seen_at=after),
-                "nicknamed": RfNicknamed(nick="h2"),
+                "nicknamed": RfNicknamed(nick="nn"),  # handle is read after nickName
             }
             loaded = await RfNamed.objects().get("d")
             for field, value in expected.items():
@@ -2503,16 +2491,22 @@ class TestSubModelStoredKeysE2E:
                 assert type(value).model_validate(getattr(person, field)) == value
             assert loaded.n == person.n == (1 if server_values else 0)
             row = await _raw("d", "rf_named")
-            assert row["profile"] == {"first_name": "Annie", "home_address": {"streetName": "z"}}
-            assert row["dated"] == {"first_name": "Ann", "seen_at": after}
-            assert row["nicknamed"] == {"nick": "h2"}
+            assert row["profile"] == {
+                "first_name": "Ann",
+                "firstName": "Annie",
+                "home_address": {"streetName": "x"},
+                "homeAddress": {"streetName": "z"},
+            }
+            assert row["dated"] == {"first_name": "Ann", "seen_at": before, "seenAt": after}
+            assert row["nicknamed"] == {"nick": "n", "nickName": "nn", "handle": "h2"}
             await _assert_client_usable(client)
 
     @pytest.mark.parametrize("server_values", [False, True], ids=["merge", "merge-server-values"])
     async def test_an_instance_on_a_v022_row_with_both_spellings(self, server_values: bool) -> None:
         """An instance is the whole sub-object. ``MERGE`` merges its object into the stored one, so it
-        removes every alias a read takes before a name, at each level, as a dict does for its keys;
-        ``UPDATE … SET`` (``server_values``) assigns it whole."""
+        removes every alias a read takes before a name, at each level (a dict keeps its keys,
+        ``test_a_v022_row_with_both_spellings``); ``UPDATE … SET`` (``server_values``) assigns it
+        whole."""
         async with orm_client("rf_named") as client:
             await client.query(
                 "CREATE $rid CONTENT $row;",
@@ -2535,10 +2529,10 @@ class TestSubModelStoredKeysE2E:
 
     @pytest.mark.parametrize("server_values", [False, True], ids=["merge", "merge-server-values"])
     @pytest.mark.parametrize("in_tx", [False, True], ids=["no-refresh", "transaction"])
-    async def test_a_local_apply_holds_no_removal(self, server_values: bool, in_tx: bool) -> None:
+    async def test_a_local_apply_takes_the_dict_sent(self, server_values: bool, in_tx: bool) -> None:
         """Applied locally (``refresh=False``, a buffered transaction on 2.x), the instance takes the
-        dict sent, as converted, without the ``None`` that removes an alias from the row: that is not a
-        value. An interactive transaction (3.x) syncs the row's object, the same dict."""
+        dict sent, as converted: the caller's keys, as in v0.22.2. An interactive transaction (3.x)
+        syncs the row's object."""
         async with orm_client("rf_named") as client:
             person = RfNamed(id="f", profile=RfCamel(first_name="Ann"))
             await person.save()
@@ -2547,38 +2541,44 @@ class TestSubModelStoredKeysE2E:
                 "profile": {"firstName": "Annie", "homeAddress": {"street_name": "z"}},
                 "nicknamed": {"handle": "h"},
             }
+            synced = False
             if in_tx:
                 async with SurrealDBConnectionManager.transaction() as tx:
+                    synced = tx.is_interactive
                     await person.merge(tx=tx, **change)
             else:
                 await person.merge(refresh=False, **change)
 
-            profile = {"first_name": "Annie", "home_address": {"streetName": "z"}}
-            assert person.profile == profile
-            assert person.nicknamed == {"nick": "h"}
-            assert RfCamel.model_validate(person.profile) == RfCamel(first_name="Annie", home_address=RfStreet(streetName="z"))
+            sent = {"firstName": "Annie", "homeAddress": {"streetName": "z"}}
             row = await _raw("f", "rf_named")
-            assert (row["profile"], row["nicknamed"]) == (profile, {"nick": "h"})
+            assert row["profile"] == {"first_name": "Ann", **sent}
+            assert row["nicknamed"] == {"handle": "h"}
+            assert person.profile == (row["profile"] if synced else sent)
+            assert person.nicknamed == {"handle": "h"}
+            assert RfCamel.model_validate(person.profile) == RfCamel(first_name="Annie", home_address=RfStreet(streetName="z"))
             await _assert_client_usable(client)
 
     @pytest.mark.parametrize("server_values", [False, True], ids=["merge", "merge-server-values"])
     async def test_a_spelling_that_is_not_an_identifier(self, server_values: bool) -> None:
-        """``merge()`` removes it from the object it merges; an ``UPDATE … SET`` path cannot name it, so
-        ``merge(server_values=)`` leaves it in place (and a read still takes it first) without failing."""
+        """A ``merge()`` dict keeps the key, as in v0.22.2: ``home-town`` is merged into the stored
+        object, and a read takes it first. An ``UPDATE … SET`` path (``server_values``) cannot name a
+        key that is not an identifier: ``ValueError`` before anything is sent."""
         async with orm_client("rf_named") as client:
             await client.query(
                 "CREATE $rid CONTENT $row;",
                 {"rid": RecordID("rf_named", "e"), "row": {"n": 0, "nicknamed": {"home_town": "a", "home-town": "b"}}},
             )
             person = await RfNamed.objects().get("e")
-            await person.merge(server_values=_BUMP if server_values else None, nicknamed={"home-town": "c"})
-            row = await _raw("e", "rf_named")
             if server_values:
-                assert row["nicknamed"] == {"home_town": "c", "home-town": "b"}
-                assert (await RfNamed.objects().get("e")).nicknamed == RfNicknamed(home_town="b")
+                with pytest.raises(ValueError, match=r"^merge\(nicknamed=…\): the key 'home-town' is not an identifier"):
+                    await person.merge(server_values=_BUMP, nicknamed={"home-town": "c"})
+                expected = {"home_town": "a", "home-town": "b"}
             else:
-                assert row["nicknamed"] == {"home_town": "c"}
-                assert (await RfNamed.objects().get("e")).nicknamed == RfNicknamed(home_town="c")
+                await person.merge(nicknamed={"home-town": "c"})
+                expected = {"home_town": "a", "home-town": "c"}
+            row = await _raw("e", "rf_named")
+            assert (row["nicknamed"], row["n"]) == (expected, 0)
+            assert (await RfNamed.objects().get("e")).nicknamed == RfNicknamed(home_town=expected["home-town"])
             await _assert_client_usable(client)
 
     @pytest.mark.parametrize("server_values", [False, True], ids=["merge", "merge-server-values"])
@@ -2598,7 +2598,9 @@ class TestSubModelStoredKeysE2E:
 
     async def test_schemafull_sub_field_definitions_by_name(self) -> None:
         """A schema written for v0.22's rows declares the names: ``DEFINE FIELD profile.first_name``.
-        Keyed by the aliases, the object was refused by 3.x and stored empty by 2.x."""
+        Keyed by the aliases, the object was refused by 3.x and stored empty by 2.x. A ``merge()`` dict
+        keeps the caller's keys, as in v0.22.2: an alias the schema does not declare is refused by 3.x
+        and dropped by 2.x, so name the sub-fields there."""
         async with orm_client("rf_named_strict") as client:
             for statement in (
                 "DEFINE TABLE rf_named_strict SCHEMAFULL;",
@@ -2614,13 +2616,20 @@ class TestSubModelStoredKeysE2E:
             row = await _raw("c", "rf_named_strict")
             assert row["profile"] == {"first_name": "old", "home_address": {"streetName": "x"}}
 
-            await person.merge(profile={"firstName": "new"})
-            await person.merge(profile={"homeAddress": {"street_name": "y"}}, server_values=_BUMP)
+            await person.merge(profile={"first_name": "new"})
+            await person.merge(profile={"home_address": {"street_name": "y"}}, server_values=_BUMP)
             row = await _raw("c", "rf_named_strict")
             assert row["profile"] == {"first_name": "new", "home_address": {"streetName": "y"}}
             assert row["n"] == 1
             loaded = (await RfNamedStrict.objects().get("c")).profile
             assert loaded == RfCamel(first_name="new", home_address=RfStreet(streetName="y"))
+
+            if await _server_version() >= (3, 0, 0):
+                with pytest.raises(surrealdb.ServerError, match=r"Found field 'profile\.firstName', but no such field exists"):
+                    await person.merge(profile={"firstName": "newer"})
+            else:
+                await person.merge(profile={"firstName": "newer"})
+            assert (await _raw("c", "rf_named_strict"))["profile"] == row["profile"]
             await _assert_client_usable(client)
 
 
@@ -2701,13 +2710,15 @@ class _CapturingClient:
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
+        self.statements: list[str] = []
 
     @property
     def sent(self) -> Any:
         """The ``$data`` of the last ``UPDATE … MERGE $data``."""
         return self.calls[-1]["data"]
 
-    async def query(self, _statement: str, variables: dict[str, Any]) -> None:
+    async def query(self, statement: str, variables: dict[str, Any]) -> None:
+        self.statements.append(statement)
         self.calls.append(variables)
 
 
@@ -2718,8 +2729,10 @@ class TestMergeRemovalsAtObjectPositions:
     """What ``merge()`` sends for a sub-model reached through another object position than a sub-model
     field, no database. SurrealDB's MERGE merges an object into the stored one at every depth and
     replaces an array whole, so each sub-model instance at an object position is sent with the aliases
-    a read takes before its names as ``None`` (NONE: the key is removed), as for a sub-model field.
-    Before, only an instance or a dict sent to a field typed by the sub-model itself had them."""
+    a read takes before its names as ``None`` (NONE: the key is removed), as an instance given to a
+    sub-model field is. A dict given to a field typed by the sub-model itself keeps the caller's keys,
+    as in v0.22.2 (``TestMergeDictKeysAsGiven``); a dict a rich field validates into an instance (a
+    ``dict[str, Profile]`` value, a union member) is that instance."""
 
     @pytest.fixture
     def client(self, monkeypatch: pytest.MonkeyPatch) -> _CapturingClient:
@@ -2793,9 +2806,9 @@ class TestMergeRemovalsAtObjectPositions:
             assert client.sent == {"contacts": {"a": sent}}
             assert holder.contacts == {"a": annie}
 
-        # A dict for the field itself is converted key by key: the name, its alias removed.
+        # A dict for the field itself keeps the caller's keys, as in v0.22.2 (TestMergeDictKeysAsGiven).
         await holder.merge(refresh=False, profile={"firstName": "Annie"})
-        assert client.sent == {"profile": {"first_name": "Annie", "firstName": None}}
+        assert client.sent == {"profile": {"firstName": "Annie"}}
 
     async def test_a_serialization_alias_no_read_takes_removes_nothing(self, client: _CapturingClient) -> None:
         """The dump's ``firstName`` names no sub-field (a read takes ``fn`` or ``first_name``): nothing
@@ -2808,8 +2821,9 @@ class TestMergeRemovalsAtObjectPositionsE2E:
     """A v0.22 row whose objects hold both spellings, at the object positions
     ``TestMergeRemovalsAtObjectPositions`` covers, on both lines. v0.22's ``merge()`` stored a dict's
     keys as given, so ``save()`` then ``merge(contacts={"a": {"firstName": "Anna"}})`` left
-    ``{"first_name": "Ann", "firstName": "Anna"}``; v0.23.0 writes the name, and without the removal
-    every later merge of that sub-field was hidden behind the alias and lost without an error."""
+    ``{"first_name": "Ann", "firstName": "Anna"}``; a sub-model instance writes the name (here, the
+    instances a rich field validates the caller's dicts into too), and without the removal every later
+    merge of that sub-field was hidden behind the alias and lost without an error."""
 
     @pytest.mark.parametrize("given", ["dict", "instance"])
     @pytest.mark.parametrize("mode", ["merge", "no-refresh", "transaction"])
@@ -2945,6 +2959,197 @@ class TestMergeRemovalsAtObjectPositionsE2E:
             # locally (refresh=False, a buffered transaction on 2.x).
             assert RfDumpedByAlias.model_validate(holder.profile).first_name == "Annie"
             assert RfDumpedByAlias.model_validate(holder.contacts["a"]).first_name == "Annie"
+            await _assert_client_usable(client)
+
+
+# ==================== merge() dicts for sub-models that validate by name and by alias ====================
+
+
+class RfAddr(BaseModel):
+    """camelCase aliases, validated by name too, dumped by name: ``save()`` stores ``zip_code``."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    zip_code: str = ""
+    city_name: str = ""
+
+
+class RfProf(BaseModel):
+    """Validated by name and by alias, **dumped** by alias: ``save()`` stores ``firstName``,
+    ``homeAddr`` and ``metaData``, as v0.22.2 did. No rich type: a ``merge()`` dict is sent as given."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, serialize_by_alias=True)
+
+    first_name: str = ""
+    home_addr: RfAddr | None = None
+    meta_data: dict[str, Any] = {}
+
+
+class RfProfDated(RfProf):
+    """``RfProf`` with a rich sub-field: a ``merge()`` dict's values are validated key by key."""
+
+    seen_at: datetime | None = None
+
+
+class RfProfHolder(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_prof_holder")
+
+    id: str | None = None
+    plain: RfProf | None = None
+    dated: RfProfDated | None = None
+    n: int = 0
+
+
+_PROF_FIELDS = pytest.mark.parametrize("field", ["plain", "dated"], ids=["no-rich-type", "rich-type"])
+# The object v0.22.2's save() stored, then its row after merge(field=_PROF_CHANGE): MERGE merged the
+# caller's keys into the stored objects, so the city and ``metaData.b`` stayed.
+_PROF_SAVED: dict[str, Any] = {"firstName": "Ann", "homeAddr": {"city_name": "Paris", "zip_code": "1"}, "metaData": {"b": 2}}
+_PROF_CHANGE: dict[str, Any] = {"homeAddr": {"zipCode": "3"}, "metaData": {"a": 1}}
+_PROF_MERGED: dict[str, Any] = {
+    "firstName": "Ann",
+    "homeAddr": {"city_name": "Paris", "zip_code": "1", "zipCode": "3"},
+    "metaData": {"a": 1, "b": 2},
+}
+
+
+def _saved_prof_holder(field: str) -> RfProfHolder:
+    sub = RfProf if field == "plain" else RfProfDated
+    value = sub(first_name="Ann", home_addr=RfAddr(zip_code="1", city_name="Paris"), meta_data={"b": 2})
+    return RfProfHolder(id="p", **{field: value})
+
+
+class TestMergeDictKeysAsGiven:
+    """A ``merge()`` dict for a sub-model that validates by name **and** by alias (``populate_by_name``
+    or ``validate_by_name``) is sent with the caller's keys, at every level, as v0.22.2 sent it: no
+    key is renamed and none removed. No database. The values of a sub-model with a rich type are still
+    validated (v0.23.0); those of a sub-model without one are sent as given."""
+
+    @pytest.fixture
+    def client(self, monkeypatch: pytest.MonkeyPatch) -> _CapturingClient:
+        fake = _CapturingClient()
+
+        async def get_client() -> _CapturingClient:
+            return fake
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+        return fake
+
+    @_PROF_FIELDS
+    async def test_the_payload_of_v0_22_2(self, client: _CapturingClient, field: str) -> None:
+        holder = RfProfHolder(id="p")
+        for change in (
+            _PROF_CHANGE,
+            {"home_addr": {"zip_code": "3"}, "meta_data": {"a": 1}},
+            {"firstName": "A", "first_name": "B"},
+        ):
+            await holder.merge(refresh=False, **{field: change})
+            assert client.sent == {field: change}
+            assert getattr(holder, field) == change  # applied locally as sent
+
+    async def test_rich_values_are_still_validated(self, client: _CapturingClient) -> None:
+        holder = RfProfHolder(id="p")
+        await holder.merge(refresh=False, dated={"seenAt": "2026-01-01T00:00:00Z", "home_addr": {"zipCode": "3"}})
+        assert client.sent == {"dated": {"seenAt": _JAN, "home_addr": {"zipCode": "3"}}}
+        assert holder.dated == {"seenAt": _JAN, "home_addr": {"zipCode": "3"}}
+        with pytest.raises(ValueError, match=r"^merge\(dated\.seenAt=…\): 'soon' is not a valid datetime"):
+            await holder.merge(refresh=False, dated={"seenAt": "soon"})
+
+    async def test_server_values_assign_the_given_keys(self, client: _CapturingClient) -> None:
+        """``UPDATE … SET``: one assignment per key of the caller's, under its own spelling."""
+        await RfProfHolder(id="p").merge(refresh=False, server_values=_BUMP, plain=_PROF_CHANGE)
+        statement = client.statements[-1]
+        assert "plain.homeAddr.zipCode = $" in statement
+        assert "plain.metaData = $" in statement
+        assert "home_addr" not in statement
+        assert "NONE," not in statement
+        bound = list(client.calls[-1].values())
+        assert "3" in bound
+        assert {"a": 1} in bound
+        assert _set_paths("plain", ("plain",), RfProf, _PROF_CHANGE) == [
+            (("plain", "homeAddr", "zipCode"), "3"),
+            (("plain", "metaData"), {"a": 1}),
+        ]
+
+
+class TestMergeDictKeysAsGivenE2E:
+    """The rows of ``TestMergeDictKeysAsGiven`` on both lines, against v0.22.2's. The previous v0.23.0
+    candidate wrote such a dict's keys under the sub-field names and removed their aliases (NONE): on a
+    sub-model dumped by alias (``serialize_by_alias=True``), that removed the whole object ``save()``
+    stored under ``homeAddr``, and only the merged keys survived, without an error (follow-up: #219)."""
+
+    @_PROF_FIELDS
+    @pytest.mark.parametrize("mode", ["merge", "no-refresh", "transaction"])
+    async def test_a_dict_keeps_the_other_stored_keys(self, field: str, mode: str) -> None:
+        async with orm_client("rf_prof_holder") as client:
+            holder = _saved_prof_holder(field)
+            await holder.save()
+            assert (await _raw("p", "rf_prof_holder"))[field] == _PROF_SAVED
+
+            if mode == "transaction":
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await holder.merge(tx=tx, **{field: _PROF_CHANGE})
+            else:
+                await holder.merge(refresh=mode == "merge", **{field: _PROF_CHANGE})
+
+            assert (await _raw("p", "rf_prof_holder"))[field] == _PROF_MERGED
+            loaded = getattr(await RfProfHolder.objects().get("p"), field)
+            assert loaded.first_name == "Ann"
+            assert loaded.home_addr == RfAddr(zip_code="3", city_name="Paris")  # a read takes zipCode first
+            assert loaded.meta_data == {"a": 1, "b": 2}
+            await _assert_client_usable(client)
+
+    @_PROF_FIELDS
+    async def test_update_or_create_update_branch(self, field: str) -> None:
+        async with orm_client("rf_prof_holder") as client:
+            await _saved_prof_holder(field).save()
+            obj, created = await RfProfHolder.objects().update_or_create(id="p", defaults={field: _PROF_CHANGE})
+
+            assert not created
+            assert (await _raw("p", "rf_prof_holder"))[field] == _PROF_MERGED
+            assert getattr(obj, field) == _PROF_MERGED  # the returned row's object
+            await _assert_client_usable(client)
+
+    async def test_a_rich_value_is_stored_natively(self) -> None:
+        async with orm_client("rf_prof_holder") as client:
+            holder = _saved_prof_holder("dated")
+            await holder.save()
+            await holder.merge(dated={**_PROF_CHANGE, "seenAt": "2026-01-01T00:00:00Z"})
+
+            assert (await _raw("p", "rf_prof_holder"))["dated"] == {**_PROF_MERGED, "seenAt": _JAN}
+            loaded = (await RfProfHolder.objects().get("p")).dated
+            assert loaded is not None
+            assert (loaded.seen_at, loaded.home_addr) == (_JAN, RfAddr(zip_code="3", city_name="Paris"))
+            await _assert_client_usable(client)
+
+    @_PROF_FIELDS
+    async def test_server_values_keep_the_other_stored_keys(self, field: str) -> None:
+        """One ``SET`` per key: ``homeAddr.zipCode`` keeps the stored city; ``metaData`` is not a
+        sub-model, so it is assigned whole. v0.22.2 assigned the whole object (``firstName`` lost)."""
+        async with orm_client("rf_prof_holder") as client:
+            holder = _saved_prof_holder(field)
+            await holder.save()
+            await holder.merge(server_values=_BUMP, **{field: _PROF_CHANGE})
+
+            row = await _raw("p", "rf_prof_holder")
+            assert row[field] == {**_PROF_MERGED, "metaData": {"a": 1}}
+            assert row["n"] == 1
+            loaded = getattr(await RfProfHolder.objects().get("p"), field)
+            assert (loaded.first_name, loaded.home_addr) == ("Ann", RfAddr(zip_code="3", city_name="Paris"))
+            await _assert_client_usable(client)
+
+    @_PROF_FIELDS
+    async def test_the_names_are_sent_as_given_too(self, field: str) -> None:
+        """v0.22.2's behaviour, unchanged: a dict naming the sub-fields stores ``home_addr`` next to the
+        ``homeAddr`` ``save()`` stored, and a read takes the alias first, so it still gives the stored
+        object. Name the keys a read takes first (here, the aliases ``save()`` writes)."""
+        async with orm_client("rf_prof_holder") as client:
+            holder = _saved_prof_holder(field)
+            await holder.save()
+            await holder.merge(**{field: {"home_addr": {"zip_code": "3"}}})
+
+            assert (await _raw("p", "rf_prof_holder"))[field] == {**_PROF_SAVED, "home_addr": {"zip_code": "3"}}
+            loaded = getattr(await RfProfHolder.objects().get("p"), field)
+            assert loaded.home_addr == RfAddr(zip_code="1", city_name="Paris")
             await _assert_client_usable(client)
 
 

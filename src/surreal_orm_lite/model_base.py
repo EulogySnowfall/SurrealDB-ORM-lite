@@ -64,6 +64,7 @@ from .wire import (
     masking_keys,
     model_object,
     read_keys,
+    reads_aliases_first,
     restore_native,
     rich_kinds,
     sub_model,
@@ -309,13 +310,14 @@ def _partial_object(context: str, path: str, model: type[BaseModel], value: Mapp
     """A ``merge()`` dict addressed to sub-model ``model``, converted key by key (v0.23.0).
 
     MERGE merges the object into the stored one (and replaces arrays), so this sends only the
-    caller's keys, re-keyed as :func:`_stored_keys` says (with ``None`` for the other spellings it
-    removes), each value converted as its sub-field (:func:`_keyword_value`, recursively for a dict
-    under a sub-model sub-field). No default is added and no required sub-field asked for.
+    caller's keys, keyed as :func:`_stored_keys` says, each value converted as its sub-field
+    (:func:`_keyword_value`, recursively for a dict under a sub-model sub-field). No default is
+    added and no required sub-field asked for.
 
     Raises:
-        ValueError: two keys name the same sub-field (``{"seen": …, "lastSeen": …}``), or a value
-            does not fit its sub-field (``profile.bday``).
+        ValueError: two keys name the same sub-field of a model that validates by alias only or by
+            name only (``{"seen": …, "lastSeen": …}``), or a value does not fit its sub-field
+            (``profile.bday``).
     """
     return _stored_keys(
         context,
@@ -329,12 +331,12 @@ def _partial_object(context: str, path: str, model: type[BaseModel], value: Mapp
 def _rekeyed_object(context: str, path: str, model: type[BaseModel], value: Mapping[Any, Any]) -> dict[Any, Any]:
     """A keyword write's dict for sub-model ``model`` of a field without a rich type, keys only (v0.23.0).
 
-    Re-keyed as :func:`_stored_keys` says (in ``merge``, with ``None`` for the other spellings it
-    removes), recursively for a dict under a sub-model sub-field; the values are sent as given, not
-    validated, as in v0.22.
+    Keyed as :func:`_stored_keys` says, recursively for a dict under a sub-model sub-field; the
+    values are sent as given, not validated, as in v0.22.
 
     Raises:
-        ValueError: two keys name the same sub-field (``{"first_name": …, "firstName": …}``).
+        ValueError: two keys name the same sub-field (``{"first_name": …, "firstName": …}``) where
+            :func:`_stored_keys` re-keys them.
     """
 
     def rekey(sub_path: str, name: str, item: Any) -> Any:
@@ -365,21 +367,21 @@ def _stored_keys(
     read takes. Its value is ``convert(path.key, sub-field name, value)``. An unknown key is sent as
     given, as in v0.22.x. A new dict: the caller's is never mutated.
 
-    In ``merge`` (``context``), where the dict is merged into the stored object, each other spelling
-    a read takes before the name of a sub-field the dict names is sent as ``None`` — NONE, which
-    removes the key (:func:`~surreal_orm_lite.wire.masking_keys`: the aliases of a sub-model that
-    validates by name and by alias). v0.22's ``merge()`` wrote a dict's keys as given, so a row can
-    hold ``{"first_name": "Ann", "firstName": "Anna"}``; merged under the name alone,
-    ``{"firstName": "Annie"}`` would be hidden behind the alias and lost without an error. So
-    ``{"firstName": "Annie"}`` is sent as ``{"first_name": "Annie", "firstName": None}``. The other
-    writes (``bulk_update``, ``signup``, ``signin``) replace the field and send nothing more.
+    Except in ``merge`` (``context``) for a model that validates by name **and** by alias
+    (:func:`~surreal_orm_lite.wire.reads_aliases_first`): each key stays the caller's, as in v0.22,
+    and only its value is converted. MERGE merges the dict into the stored object, and a read takes
+    the alias before the name, which ``save()`` writes for a sub-model dumped by alias
+    (``serialize_by_alias=True``): a name merged next to a stored alias would be hidden behind it,
+    and removing the alias would drop the object stored under it. The other writes (``bulk_update``,
+    ``signup``, ``signin``) replace the field, so they re-key it whatever the model.
 
     Raises:
-        ValueError: two keys name the same sub-field (``{"seen": …, "lastSeen": …}``).
+        ValueError: two keys name the same sub-field (``{"seen": …, "lastSeen": …}``) of a dict this
+            re-keys.
     """
     keys = field_keys(model)
+    as_given = context == "merge" and reads_aliases_first(model)
     stored_as = read_keys(model)
-    masked = masking_keys(model) if context == "merge" else {}
     named: dict[str, Any] = {}  # sub-field → the caller's key for it
     converted: dict[Any, Any] = {}
     for key, item in value.items():
@@ -387,14 +389,15 @@ def _stored_keys(
         if name is None:
             converted[key] = item
             continue
+        if as_given:
+            converted[key] = convert(f"{path}.{key}", name, item)
+            continue
         if name in named:
             raise ValueError(
                 f"{context}({path}=…): {named[name]!r} and {key!r} both name the sub-field {name}; pass one of them"
             )
         named[name] = key
         converted[stored_as[name]] = convert(f"{path}.{key}", name, item)
-        for other in masked.get(name, ()):
-            converted[other] = None
     return converted
 
 
@@ -407,26 +410,20 @@ def _set_paths(
     the dict is its own assignment, ``segments`` + the key (``profile.city = $…``), recursively for
     a dict under a sub-model sub-field (``outer.inner.when``), and the other stored keys stay — as
     with ``MERGE``. A value of any other kind (an array, an instance, a plain ``dict`` field) is
-    assigned whole. ``value`` is the dict as converted (:func:`_partial_object`): its keys are the
-    read keys of the sub-fields, plus the other spellings :func:`_stored_keys` removes, each
-    assigned ``None`` (``profile.firstName = NONE``); an empty dict assigns nothing. ``path`` names
-    the value in the error (``profile``, ``outer.inner``).
-
-    A spelling to remove that is not an identifier (``Field(alias="home-town")``) is skipped: no
-    path can name it, so it stays in the row — ``merge()`` without ``server_values`` removes it.
+    assigned whole. ``value`` is the dict as converted (:func:`_partial_object`), under the keys
+    :func:`_stored_keys` gives (the caller's, for a sub-model that validates by name and by alias);
+    an empty dict assigns nothing. ``path`` names the value in the error (``profile``,
+    ``outer.inner``).
 
     Raises:
-        ValueError: a key of the caller's that is not an identifier (``"zip-code"``): the path of an
-            assignment is SurrealQL text. ``merge()`` without ``server_values`` takes it.
+        ValueError: a key that is not an identifier (``"zip-code"``, ``Field(alias="home-town")``):
+            the path of an assignment is SurrealQL text. ``merge()`` without ``server_values`` takes it.
     """
     keys = field_keys(model)
-    masked = masking_keys(model)
     assignments: list[tuple[tuple[str, ...], Any]] = []
     for key, item in value.items():
         name = keys.get(key) if isinstance(key, str) else None
         if not isinstance(key, str) or not VALID_ALIAS_PATTERN.fullmatch(key):
-            if name is not None and key in masked[name]:
-                continue
             raise ValueError(
                 f"merge({path}=…): the key {key!r} is not an identifier, which the path of an UPDATE … SET "
                 "assignment needs (server_values=); merge it without server_values"
@@ -439,43 +436,20 @@ def _set_paths(
     return assignments
 
 
-def _without_removals(model: type[BaseModel], value: Mapping[Any, Any]) -> Mapping[Any, Any]:
-    """A ``merge()`` dict for sub-model ``model``, as converted, without the spellings it removes (v0.23.0).
-
-    The ``None`` :func:`_stored_keys` sends for an alias a read takes before the name means "remove
-    this key" in the row, not a value: the local apply (``refresh=False``, a buffered transaction)
-    drops it, at every sub-model level, so the instance holds what the row holds under the keys
-    merged. Copy-on-write.
-    """
-    keys = field_keys(model)
-    masked = masking_keys(model)
-    kept: dict[Any, Any] = {}
-    for key, item in value.items():
-        name = keys.get(key) if isinstance(key, str) else None
-        if name is not None and key in masked[name]:
-            continue
-        child = None if name is None else sub_model(model.model_fields[name].annotation)
-        kept[key] = _without_removals(child, item) if child is not None and isinstance(item, Mapping) else item
-    if len(kept) == len(value) and all(kept[key] is item for key, item in value.items()):
-        return value
-    return kept
-
-
 def _with_removals(value: Any, obj: Any) -> Any:
     """``obj``, the wire form of a ``merge()`` value ``value``, with the removals MERGE needs (v0.23.0).
 
     SurrealDB's MERGE merges an object into the stored one at every depth, and replaces an array
     whole. So each sub-model instance ``value`` holds at an object position — the value itself, a
     mapping's values (``dict[str, Profile]``), a sub-model's sub-fields, at any depth, never inside
-    an array — has its object merged into a stored one, which a v0.22 row may hold under both
-    spellings (:func:`_stored_keys`). As :func:`_stored_keys` does for a dict's keys, every alias a
-    read takes before a stored name (:func:`~surreal_orm_lite.wire.masking_keys` of the instance's
-    own class: the union member the validation chose, the ``Profile`` of a ``dict[str, Profile]``)
-    is sent as ``None`` — NONE, which removes it — for every sub-field that instance's object
-    writes; otherwise the value merged would be hidden behind the alias and lost without an error. A
-    table-model class the validation built from a dict is reached through its object form
-    (:class:`_SubObject`). A dict :func:`_stored_keys` converted carries its own removals; its
-    values are walked.
+    an array — has its object merged into a stored one, which a row may hold under both spellings
+    (``merge()`` sends a dict's keys as given, :func:`_stored_keys`). Every alias a read takes before
+    a stored name (:func:`~surreal_orm_lite.wire.masking_keys` of the instance's own class: the union
+    member the validation chose, the ``Profile`` of a ``dict[str, Profile]``) is sent as ``None`` —
+    NONE, which removes it — for every sub-field that instance's object writes; otherwise the value
+    merged would be hidden behind the alias and lost without an error. A table-model class the
+    validation built from a dict is reached through its object form (:class:`_SubObject`). A dict is
+    sent under the keys :func:`_stored_keys` gives, with no removal; its values are walked.
 
     ``obj`` is ``value`` as :func:`~surreal_orm_lite.wire.encode_wire` sends it: a mapping under the
     same keys; for an instance, its dump keyed by :func:`~surreal_orm_lite.wire.read_keys` — or by
@@ -486,8 +460,9 @@ def _with_removals(value: Any, obj: Any) -> Any:
     under such a key — omitted, or dumped under a ``serialization_alias`` no read takes — gets
     nothing, as before v0.23.0. The invariant: the walk never overwrites a key ``obj`` carries (it
     only adds removals inside the objects under it), and never removes a spelling of a sub-field
-    ``obj`` does not write, so a value stored for an excluded sub-field stays. ``UPDATE … SET`` (``server_values``) assigns each field whole and
-    needs none. The ``data`` the local apply uses holds none either. Copy-on-write.
+    ``obj`` does not write, so a value stored for an excluded sub-field stays. ``UPDATE … SET``
+    (``server_values``) assigns each field whole and needs none. The ``data`` the local apply uses
+    holds none either. Copy-on-write.
     """
     if not isinstance(obj, dict):
         return obj
@@ -1073,12 +1048,11 @@ class BaseSurrealModel(BaseModel):
 
         - in ``merge`` a **dict** is converted key by key: only the caller's keys are sent, each
           resolved to a sub-field by name or alias, validated as it (recursively for a dict under a
-          sub-model sub-field; an array whole) and sent under the key ``save()`` writes it under
-          (:func:`_stored_keys`: ``{"seen": …}`` → ``{"lastSeen": …}`` for
-          ``Field(alias="lastSeen")``, ``{"firstName": …}`` → ``{"first_name": …, "firstName":
-          None}`` on a sub-model that validates by name too: the aliases a read takes first are
-          removed; two keys for one sub-field raise); no default is added and no required
-          sub-field asked for — SurrealDB's MERGE keeps the other stored keys, and
+          sub-model sub-field; an array whole) and keyed as :func:`_stored_keys` says — the
+          caller's key, as in v0.22, on a sub-model that validates by name and by alias; on one that
+          validates by alias only, the key ``save()`` writes (``{"seen": …}`` → ``{"lastSeen": …}``
+          for ``Field(alias="lastSeen")``; two keys for one sub-field raise); no default is added
+          and no required sub-field asked for — SurrealDB's MERGE keeps the other stored keys, and
           ``merge(server_values=)`` assigns each key on its own (``profile.city = $…``) for the
           same result; an unknown key is sent as given;
         - in ``bulk_update``/``signup``/``signin``, which replace the field, a dict is validated as
@@ -1091,11 +1065,11 @@ class BaseSurrealModel(BaseModel):
         (:func:`_with_removals`).
 
         A dict for a field typed with a sub-model **without** a rich type keeps its values as given
-        (not validated, as in v0.22), but its keys are resolved the same way, at every sub-model
-        level (:func:`_rekeyed_object`): each goes under the key ``save()`` writes the sub-field
-        under — its name when the sub-model validates by name too (``populate_by_name``), else the
-        key its validation reads — so a write never adds a second key for a sub-field; in
-        ``merge`` the other spellings a read takes first are removed too, as above.
+        (not validated, as in v0.22), and its keys follow the same rule, at every sub-model level
+        (:func:`_rekeyed_object`): under the key ``save()`` writes the sub-field under — its name
+        when the sub-model validates by name too (``populate_by_name``), else the key its validation
+        reads —, except in ``merge`` on a sub-model that validates by name and by alias, where the
+        caller's key stays, as in v0.22.
 
         A **table-model instance** (``BaseSurrealModel``) is written as its record id
         (``encode_wire``), so on a declared field — rich or not: this runs before the early return
@@ -1109,7 +1083,7 @@ class BaseSurrealModel(BaseModel):
 
         ``name`` is a Python field name or its column. Returned unchanged: ``None``, a
         :class:`~surreal_orm_lite.functions.SurrealFunc` (evaluated by the server), a dotted path,
-        and — unless it holds a table-model instance or is a sub-model dict (re-keyed) — a value for
+        and — unless it holds a table-model instance or is a sub-model dict (keyed as above) — a value for
         a field without a rich type (written as before v0.23.0); also any value for an undeclared
         field (an instance there is its record id: no annotation says otherwise).
 
@@ -1999,15 +1973,12 @@ class BaseSurrealModel(BaseModel):
         The fallback whenever no row comes back: a buffered transaction (nothing has run yet)
         or ``refresh=False`` (the row was deliberately not requested). A kwarg that
         ``server_values`` overrode is skipped — writing it would leave the instance holding a
-        value that never reached the database. Keys here are Python field names. A sub-model
-        dict is applied without the aliases its merge removes (:func:`_without_removals`); those
-        removed for an instance (:func:`_with_removals`) only ever were in the wire form.
+        value that never reached the database. Keys here are Python field names. The aliases
+        ``merge()`` removes for a sub-model instance (:func:`_with_removals`) only ever are in the
+        wire form.
         """
         for key, value in data.items():
             if key not in server_values and hasattr(self, key):
-                model = self._sub_model_of(key)
-                if model is not None and isinstance(value, Mapping):
-                    value = _without_removals(model, value)
                 object.__setattr__(self, key, value)
 
     async def _run_update(
@@ -2224,10 +2195,9 @@ class BaseSurrealModel(BaseModel):
 
         ``SET`` replaces each field it assigns, where ``MERGE`` merges objects, so a dict
         addressed to a sub-model field is compiled into one assignment per key
-        (:func:`_set_paths`: ``profile.city = $…``) and the other stored keys stay (v0.23.0);
-        an alias a read takes before the name is assigned NONE (``profile.firstName = NONE``),
-        unless it is not an identifier. A server value for the same field wins over the dict, as
-        over any other keyword.
+        (:func:`_set_paths`: ``profile.city = $…``, under the keys :func:`_stored_keys` gives) and
+        the other stored keys stay (v0.23.0). A server value for the same field wins over the dict,
+        as over any other keyword.
         """
         sender = self.__class__
         record_id = self._record_id()
@@ -2313,25 +2283,23 @@ class BaseSurrealModel(BaseModel):
 
         A field typed with a sub-model that holds a rich type (``profile: Profile | None``) takes a
         dict or an instance. A **dict** changes only the keys it names: each key is resolved to a
-        sub-field by name or alias, validated as it (``merge(profile={"bday": "1995-05-05"})`` sends
-        a date) and sent under the key ``save()`` writes it under: its name when the sub-model
-        validates by name too (``populate_by_name``), else the key its validation reads
-        (``{"seen": …}`` is sent as ``{"lastSeen": …}`` for ``Field(alias="lastSeen")``, the second
-        string of an ``AliasChoices`` as the first); two keys for one sub-field raise. On a
-        sub-model that validates by name and by alias, the aliases of each sub-field the dict names
-        are removed from the stored object (sent as NONE): v0.22's ``merge()`` stored the caller's
-        key, and a read takes the alias before the name, so ``merge(profile={"firstName": "Annie"})``
-        is sent as ``{"first_name": "Annie", "firstName": None}``. A dict under a sub-model
-        sub-field goes the same way, and nothing else is sent — SurrealDB's MERGE keeps the other
-        stored keys, so a required sub-field need not be repeated; an array is replaced whole; an
-        unknown key is sent as given. With ``server_values`` the statement is an ``UPDATE … SET``,
-        which replaces each field it assigns: a sub-model dict is compiled into one assignment per
-        key (``profile.city = $…``, ``profile.firstName = NONE``, nested for a dict under a
-        sub-model sub-field), so the other stored keys stay there too, and each key of the caller's
-        must be an identifier (an alias to remove that is not one is left in place). An
-        **instance** is the whole sub-object, written as ``save()`` writes it:
+        sub-field by name or alias and validated as it (``merge(profile={"bday": "1995-05-05"})``
+        sends a date). On a sub-model that validates by name and by alias (``populate_by_name``),
+        each key is sent as given, as in v0.22: ``merge(profile={"firstName": "Annie"})`` sends
+        ``{"firstName": "Annie"}``, and a read takes the alias before the name. On one that
+        validates by alias only, each key is sent under the key its validation reads, the key
+        ``save()`` writes (``{"seen": …}`` is sent as ``{"lastSeen": …}`` for
+        ``Field(alias="lastSeen")``, the second string of an ``AliasChoices`` as the first; two
+        keys for one sub-field raise); on one that validates by name only, under the name. A dict
+        under a sub-model sub-field goes the same way, and nothing else is sent — SurrealDB's MERGE
+        keeps the other stored keys, so a required sub-field need not be repeated; an array is
+        replaced whole; an unknown key is sent as given. With ``server_values`` the statement is an
+        ``UPDATE … SET``, which replaces each field it assigns: a sub-model dict is compiled into
+        one assignment per key (``profile.city = $…``, nested for a dict under a sub-model
+        sub-field), so the other stored keys stay there too, and each key must be an identifier.
+        An **instance** is the whole sub-object, written as ``save()`` writes it:
         ``merge(profile=Profile(city="y"))`` drops a stored ``bday``. A dict for a sub-model
-        without a rich type keeps its values as given, its keys resolved the same way (keys
+        without a rich type keeps its values as given, its keys following the same rule (keys
         assigned one by one under ``server_values``).
 
         Sent as ``MERGE``, which merges objects at every depth (and replaces an array whole), a
@@ -2364,9 +2332,9 @@ class BaseSurrealModel(BaseModel):
             refresh: ``True`` (default) resyncs the instance from the row the write returns.
                 ``False`` compiles the write with ``RETURN NONE``: it still happens, but the
                 server sends no row back and only the literal ``data`` is applied locally, as
-                sent once converted (a sub-model dict stays that partial dict, without the
-                aliases it removes). Use it for fire-and-forget updates such as a presence ping
-                or a counter bump, where the row is not worth its bytes.
+                sent once converted (a sub-model dict stays that partial dict). Use it for
+                fire-and-forget updates such as a presence ping or a counter bump, where the row
+                is not worth its bytes.
 
                 **The missing-record check goes with it.** That check *is* the returned row, so
                 under ``refresh=False`` a merge against a record that no longer exists is a
@@ -2377,9 +2345,10 @@ class BaseSurrealModel(BaseModel):
         Raises:
             ValueError: a keyword value that does not validate as its rich field
                 (``merge(at="yesterday")``; ``merge(profile={"bday": "someday"})`` names
-                ``profile.bday``), a sub-model dict naming one sub-field twice, a table-model
-                instance where the field cannot hold its record id, or, with ``server_values``, a
-                sub-model dict key that is not an identifier — before anything is sent.
+                ``profile.bday``), a dict naming one sub-field twice for a sub-model that
+                validates by alias only or by name only, a table-model instance where the field
+                cannot hold its record id, or, with ``server_values``, a sub-model dict key that
+                is not an identifier — before anything is sent.
 
         Example:
             >>> await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})

@@ -91,6 +91,7 @@ __all__ = [
     "lookup_type",
     "model_object",
     "read_keys",
+    "reads_aliases_first",
     "restore_native",
     "rich_kinds",
     "sdk_decodes_zero_duration",
@@ -872,8 +873,10 @@ def read_keys(model: type[BaseModel]) -> Mapping[str, str]:
     """Field name → the key a write stores it under, cached per class; never mutate it (v0.23.0).
 
     The key :func:`model_object` writes each sub-field of an instance under (unless the dump is
-    by alias, ``serialize_by_alias=True``), and each key of a keyword write's dict resolves to, so
-    a read gives it back:
+    by alias, ``serialize_by_alias=True``), and each key of a keyword write's dict resolves to —
+    except a ``merge()`` dict for a model a read takes the aliases of first
+    (:func:`reads_aliases_first`), sent with the caller's keys as in v0.22 —, so a read gives it
+    back:
 
     - every field keeps its **name** when the model validates by name — ``validate_by_name=True``,
       ``populate_by_name=True`` (a table model's own config) or ``validate_by_alias=False``: the
@@ -887,23 +890,36 @@ def read_keys(model: type[BaseModel]) -> Mapping[str, str]:
     return {name: _read_key(name, info) for name, info in model.model_fields.items()}
 
 
+def reads_aliases_first(model: type[BaseModel]) -> bool:
+    """Whether ``model`` validates by name **and** by alias, so a read takes a field's aliases before
+    its name (v0.23.0).
+
+    ``populate_by_name=True`` or ``validate_by_name=True``, ``validate_by_alias`` left on — a table
+    model used as a sub-model among them. A write stores each field under its name
+    (:func:`read_keys`), or under its alias with ``serialize_by_alias=True``, so the key a read takes
+    first is not always the key a write stores: a ``merge()`` dict for such a model is sent with the
+    caller's keys, as in v0.22 (:func:`~surreal_orm_lite.model_base._stored_keys`).
+    """
+    return _validates_by_name(model) and model.model_config.get("validate_by_alias", True) is not False
+
+
 @functools.cache
 def masking_keys(model: type[BaseModel]) -> Mapping[str, tuple[str, ...]]:
     """Field name → the other keys a read takes it from **before** the key a write stores it under (v0.23.0).
 
-    Only a model that validates by name **and** by alias has any (``populate_by_name=True`` or
-    ``validate_by_name=True``, ``validate_by_alias`` left on): a write stores each field under its
-    name (:func:`read_keys`), but Pydantic reads its aliases first. They are the other keys
-    :func:`field_keys` resolves to the field — its string ``alias``/``validation_alias``, the
-    strings of an ``AliasChoices`` —, never a key another field is stored under. v0.22's ``merge()``
-    wrote a dict's keys as given, so a row can hold one of them next to the name, and a read gives
-    that one: ``merge()`` removes them (:func:`~surreal_orm_lite.model_base._stored_keys`).
+    Only a model that validates by name **and** by alias has any (:func:`reads_aliases_first`): a
+    write stores each field under its name (:func:`read_keys`), but Pydantic reads its aliases
+    first. They are the other keys :func:`field_keys` resolves to the field — its string
+    ``alias``/``validation_alias``, the strings of an ``AliasChoices`` —, never a key another field
+    is stored under. v0.22's ``merge()`` wrote a dict's keys as given, so a row can hold one of them
+    next to the name, and a read gives that one: a ``merge()`` of a sub-model **instance** removes
+    those of each sub-field its object writes (:func:`~surreal_orm_lite.model_base._with_removals`).
 
     Empty for every field of a model that validates by alias only (each field is stored under the
     first key a read takes) or by name only (``validate_by_alias=False``: no read takes an alias).
     Cached per class; never mutate the result.
     """
-    if not _validates_by_name(model) or model.model_config.get("validate_by_alias", True) is False:
+    if not reads_aliases_first(model):
         return dict.fromkeys(model.model_fields, ())
     stored = read_keys(model)
     taken = set(stored.values())
