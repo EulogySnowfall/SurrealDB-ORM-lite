@@ -20,7 +20,7 @@ from uuid import UUID
 import pytest
 import surrealdb
 import surrealdb.data.types.range
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, PlainSerializer, ValidationError
 from pydantic_core import PydanticSerializationError
 from surrealdb import AsyncSurreal, RecordID
 from surrealdb import Range as SdkRange
@@ -100,6 +100,16 @@ def _assert_type_error(call: Callable[[], Any]) -> None:
     with pytest.raises(TypeError) as info:
         call()
     assert not isinstance(info.value, surrealdb.InvalidDurationError)
+
+
+def _dump_without_warnings(model: BaseModel) -> tuple[dict[str, Any], str]:
+    """``model_dump()`` and ``model_dump_json()`` of ``model``, asserting that neither emits a warning."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        dumped = model.model_dump()
+        text = model.model_dump_json()
+    assert [str(w.message) for w in caught] == []
+    return dumped, text
 
 
 class TestDuration:
@@ -370,6 +380,59 @@ class TestDuration:
         assert dumped["d"].elapsed == -5
         with pytest.raises(PydanticSerializationError, match="negative"):
             m.model_dump_json()
+
+    def test_union_member_after_duration_serializes_other_values(self) -> None:
+        """A value that is no duration goes to the union's next member, in both modes, without a warning."""
+
+        class M(BaseModel):
+            n: Duration | int
+            td: Duration | timedelta
+
+        m = M(n=5, td="PT1H")  # type: ignore[arg-type]
+        assert type(m.n) is int
+        assert type(m.td) is timedelta
+        dumped, text = _dump_without_warnings(m)
+        assert dumped == {"n": 5, "td": timedelta(hours=1)}
+        assert type(dumped["n"]) is int
+        assert type(dumped["td"]) is timedelta
+        assert text == '{"n":5,"td":"PT1H"}'
+        assert M.model_validate_json(text) == m
+
+        # A duration in the same unions still serializes as one.
+        m = M(n="5s", td=Duration(7))  # type: ignore[arg-type]
+        dumped, text = _dump_without_warnings(m)
+        assert type(dumped["n"]) is Duration
+        assert dumped["n"] == Duration.parse("5s")
+        assert type(dumped["td"]) is Duration
+        assert dumped["td"].elapsed == 7
+        assert text == '{"n":"5s","td":"7ns"}'
+        assert M.model_validate_json(text) == m
+
+    def test_union_member_after_duration_keeps_its_own_serializer(self) -> None:
+        """Python mode (the write path's ``model_dump``) runs the sibling member's serializer too."""
+
+        class M(BaseModel):
+            v: Duration | Annotated[str, PlainSerializer(str.upper)]
+
+        dumped, text = _dump_without_warnings(M(v="xyz"))
+        assert dumped == {"v": "XYZ"}
+        assert text == '{"v":"XYZ"}'
+        dumped, text = _dump_without_warnings(M(v="1h"))
+        assert type(dumped["v"]) is Duration
+        assert dumped["v"] == Duration.parse("1h")
+        assert text == '{"v":"1h"}'
+
+    def test_stray_value_in_a_duration_field_warns_and_never_raises(self) -> None:
+        """A non-duration set without validation is written as inferred, with Pydantic's warning."""
+
+        class M(BaseModel):
+            d: Duration
+
+        m = M.model_construct(d="1h")
+        with pytest.warns(UserWarning, match="Expected `Duration`, got `str`"):
+            assert m.model_dump() == {"d": "1h"}
+        with pytest.warns(UserWarning, match="Expected `Duration`, got `str`"):
+            assert m.model_dump_json() == '{"d":"1h"}'
 
 
 class TestNanoseconds:
@@ -875,6 +938,64 @@ class TestRange:
         # Fed back to validation, that side is refused like any other bad input (never AttributeError).
         with pytest.raises(ValidationError):
             M.model_validate(dumped)
+
+    def test_union_member_after_range_serializes_other_values(self) -> None:
+        """A value that is no range goes to the union's next member, in both modes, without a warning."""
+
+        class Shift(BaseModel):
+            hours: Range[int] | int
+            slots: Range[int] | list[int]
+
+        m = Shift(hours=7, slots=[1, 2])
+        dumped, text = _dump_without_warnings(m)
+        assert dumped == {"hours": 7, "slots": [1, 2]}
+        assert text == '{"hours":7,"slots":[1,2]}'
+        assert Shift.model_validate_json(text) == m
+
+        # A range in the same unions still serializes as one.
+        r = Range(BoundIncluded(1), BoundExcluded(3))
+        m = Shift(hours=r, slots=r)
+        dumped, text = _dump_without_warnings(m)
+        assert type(dumped["hours"]) is Range
+        assert dumped["hours"] == r
+        assert type(dumped["slots"]) is Range
+        assert dumped["slots"] == r
+        assert text == '{"hours":"1..3","slots":"1..3"}'
+        assert Shift.model_validate_json(text) == m
+
+    def test_union_member_after_range_keeps_its_own_serializer(self) -> None:
+        """A nested model stays an object, and python mode runs the sibling member's serializer."""
+
+        class Pt(BaseModel):
+            x: int
+
+        class P(BaseModel):
+            v: Range[int] | Pt
+
+        m = P(v=Pt(x=1))
+        dumped, text = _dump_without_warnings(m)
+        assert dumped == {"v": {"x": 1}}
+        assert text == '{"v":{"x":1}}'
+        assert P.model_validate_json(text) == m
+
+        class U(BaseModel):
+            v: Range[int] | Annotated[str, PlainSerializer(str.upper)]
+
+        dumped, text = _dump_without_warnings(U(v="abc"))
+        assert dumped == {"v": "ABC"}
+        assert text == '{"v":"ABC"}'
+
+    def test_stray_value_in_a_range_field_warns_and_never_raises(self) -> None:
+        """A non-range set without validation is written as inferred, with Pydantic's warning."""
+
+        class M(BaseModel):
+            r: Range[int]
+
+        m = M.model_construct(r="raw")
+        with pytest.warns(UserWarning, match="Expected `Range`, got `str`"):
+            assert m.model_dump() == {"r": "raw"}
+        with pytest.warns(UserWarning, match="Expected `Range`, got `str`"):
+            assert m.model_dump_json() == '{"r":"raw"}'
 
 
 class TestOpenSides:

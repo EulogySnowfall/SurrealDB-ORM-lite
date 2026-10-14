@@ -22,7 +22,7 @@ from typing import Annotated, Any, ClassVar, Generic, Self, TypeVar, Union, get_
 
 from pydantic import GetCoreSchemaHandler, GetJsonSchemaHandler, TypeAdapter
 from pydantic.json_schema import JsonSchemaValue
-from pydantic_core import core_schema
+from pydantic_core import PydanticSerializationUnexpectedValue, core_schema
 
 from ._sdk import Bound, BoundExcluded, BoundIncluded, CBORSimpleValue, SdkDuration, SdkRange, undefined
 from .exceptions import InvalidDurationError
@@ -320,7 +320,15 @@ def _serialize_duration(value: Any, info: core_schema.SerializationInfo[Any]) ->
     **unchecked**, so it never raises and never hands Pydantic an SDK dataclass to flatten into
     ``{"elapsed": …}``. JSON mode writes the lossless SurrealQL text; a raw SDK value is checked
     there (an out-of-range one raises, which Pydantic reports as a serialization error).
+
+    Any other value is handed back to Pydantic (``PydanticSerializationUnexpectedValue``, in both
+    modes): in a union field Pydantic then tries the next member, so ``Duration | int`` writes an
+    ``int`` as one and a sibling member's own serializer runs; in a field that is not a union (a
+    stray value set through ``model_construct``) it emits its standard serializer warning and
+    writes the inferred value.
     """
+    if not isinstance(value, (Duration, SdkDuration)):
+        raise PydanticSerializationUnexpectedValue(f"Expected `Duration`, got `{type(value).__name__}`")
     if info.mode_is_json():
         if type(value) is SdkDuration:
             return Duration(value.elapsed).to_string()
@@ -548,7 +556,15 @@ def _serialize_range(value: Any, info: core_schema.SerializationInfo[Any]) -> An
     ``None``, any other side is kept), so ``model_dump()`` never raises and never flattens it into a
     dict. Python mode returns that ``Range``; JSON mode its ``str()`` — the text the field reads
     back, or the ``repr`` when there is none.
+
+    Any other value is handed back to Pydantic (``PydanticSerializationUnexpectedValue``, in both
+    modes): in a union field Pydantic then tries the next member, so ``Range[int] | list[int]``
+    writes a list as a list and a sibling member's own serializer runs; in a field that is not a
+    union (a stray value set through ``model_construct``) it emits its standard serializer warning
+    and writes the inferred value.
     """
+    if not isinstance(value, (Range, SdkRange)):
+        raise PydanticSerializationUnexpectedValue(f"Expected `Range`, got `{type(value).__name__}`")
     if isinstance(value, SdkRange):
         value = Range._unchecked(value.begin, value.end)
     if info.mode_is_json():
