@@ -842,7 +842,9 @@ def _read_key(name: str, info: FieldInfo) -> str:
 
     Its ``validation_alias`` when that is a string; the first string of an ``AliasChoices``; its
     ``alias`` when no validation alias is set; else its name — also for an ``AliasPath``, which
-    names a position, not a key. Never its ``serialization_alias``: nothing reads that key back.
+    names a position, not a key. Never its ``serialization_alias``: nothing reads that key back. A
+    sub-model with ``serialize_by_alias=True`` is still written under the keys its dump holds
+    (:func:`model_object`), a ``serialization_alias`` among them.
     """
     alias = info.validation_alias
     if isinstance(alias, str):
@@ -869,8 +871,9 @@ def _validates_by_name(model: type[BaseModel]) -> bool:
 def read_keys(model: type[BaseModel]) -> Mapping[str, str]:
     """Field name → the key a write stores it under, cached per class; never mutate it (v0.23.0).
 
-    The key :func:`model_object` writes each sub-field of an instance under, and each key of a
-    keyword write's dict resolves to, so a read gives it back:
+    The key :func:`model_object` writes each sub-field of an instance under (unless the dump is
+    by alias, ``serialize_by_alias=True``), and each key of a keyword write's dict resolves to, so
+    a read gives it back:
 
     - every field keeps its **name** when the model validates by name — ``validate_by_name=True``,
       ``populate_by_name=True`` (a table model's own config) or ``validate_by_alias=False``: the
@@ -973,8 +976,11 @@ def model_object(model: BaseModel) -> dict[str, Any]:
     v0.22 wrote them. Otherwise each sub-field goes under the key its validation reads — its
     ``validation_alias`` when that is a string, the first string of an ``AliasChoices``, else its
     ``alias``, else its name (also for an ``AliasPath``), never its ``serialization_alias``: a key
-    nothing reads back would be a value lost. Extras keep their key; the SDK values of the untyped
-    positions are put back.
+    nothing reads back would be a value lost. A sub-model with ``serialize_by_alias=True`` keeps
+    the keys Pydantic dumps it under, as v0.22 wrote them and as ``model_dump(by_alias=True)``
+    does: its aliases, which a read takes first, but also a ``serialization_alias`` no read takes,
+    which does not read back. Extras keep their key; the SDK values of the untyped positions are
+    put back.
     """
     result: dict[str, Any] = _restore(model.model_dump(), model, True, True)
     return result

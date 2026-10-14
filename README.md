@@ -2148,18 +2148,27 @@ Sub-models and table models in keyword writes:
 - An instance is the whole sub-object, written as `save()` writes it:
   `merge(profile=Profile(city="y"))` removes a stored `bday`, and the aliases a read would take
   instead of a sub-field's name, as an instance does wherever `merge()` holds one outside an
-  array (see below).
+  array (see below). It never removes a key it writes, nor a sub-field its dump omits
+  (`Field(exclude=True)`): a value stored for that one stays.
 - `bulk_update()` and `signup()` replace the field, so a dict is validated there as the whole
   sub-model: a missing required sub-field raises `ValueError`.
 - Each sub-field is written under the key a read takes it from, by `save()`, `update()`,
   `upsert()`, an instance in a keyword write and a keyword write's dict alike, whether or not the
-  sub-model holds a rich type:
+  sub-model holds a rich type (an instance with `serialize_by_alias=True` is written as Pydantic
+  dumps it, see below):
   - A sub-model that also validates by name (`populate_by_name=True` or `validate_by_name=True`,
     and a table model used as a sub-model) keeps each sub-field under its **name**, the format of
     v0.22 and earlier and of a schema written for it (`DEFINE FIELD profile.first_name`).
     `merge(profile={"firstName": …})` is sent as `{"first_name": …, "firstName": None}`: a
     `merge()` dict also removes each alias of the sub-fields it names (`None` is NONE, which
     removes the key), because a read takes the alias before the name (see the last point).
+  - With `serialize_by_alias=True` as well, `save()`, `update()`, `upsert()` and an instance in a
+    keyword write store each sub-field under the key Pydantic serializes it under, its alias, as
+    v0.22 did and as the full SurrealDB-ORM does (`model_dump(by_alias=True)`); a read takes the
+    alias first. A `merge()` dict for it still writes the name and removes the alias, and both
+    read back. A `serialization_alias` that no read takes
+    (`Field(validation_alias="fn", serialization_alias="firstName")`) is stored under that key and
+    does not read back, as before v0.23.0.
   - A sub-model that validates by alias only (Pydantic's default) writes each aliased sub-field
     under its **alias**, or the first string of an `AliasChoices`.
     `seen: datetime | None = Field(default=None, alias="lastSeen")` is stored as `lastSeen`,
@@ -2170,16 +2179,19 @@ Sub-models and table models in keyword writes:
     key that names no sub-field is sent as given. A dict for a sub-model without a rich type keeps
     its values as given: only its keys change.
   - This differs from the full SurrealDB-ORM, whose `model_dump(by_alias=True)` writes every
-    aliased sub-field under its alias. A row that holds both spellings of a sub-field is read by
-    the alias first, Pydantic's priority. v0.22's `merge()` left such rows (see
-    [Upgrading from v0.22](#upgrading-from-v022)). `merge()` without `server_values=` runs
-    `MERGE`, which merges objects at every depth, so it removes those aliases wherever it merges
-    a sub-model into a stored object, and the value merged is the value read. A dict for a
-    sub-model field removes the alias of each sub-field it names. A sub-model instance removes
-    those of all its sub-fields, wherever it sits outside an array: the field itself, the values
-    of a `dict[str, Profile]`, the member of a union (`Profile | Other`) the value was validated
-    as, a sub-model's own sub-fields. On a field with a rich type your dicts there are validated
-    into instances, so `merge(contacts={"a": {"firstName": "Annie"}})` removes
+    aliased sub-field under its alias (here, only a sub-model with `serialize_by_alias=True`). A
+    row that holds both spellings of a sub-field is read by the alias first, Pydantic's priority.
+    v0.22's `merge()` left such rows (see [Upgrading from v0.22](#upgrading-from-v022)).
+    `merge()` without `server_values=` runs `MERGE`, which merges objects at every depth, so it
+    removes those aliases wherever it merges a sub-model into a stored object, and the value
+    merged is the value read. A dict for a sub-model field removes the alias of each sub-field it
+    names. A sub-model instance removes those of every sub-field its object writes, wherever it
+    sits outside an array: the field itself, the values of a `dict[str, Profile]`, the member of
+    a union (`Profile | Other`) the value was validated as, a sub-model's own sub-fields.
+    `merge()` never removes a key the object it sends writes (with `serialize_by_alias=True`,
+    that key is the alias), nor any spelling of a sub-field the dump omits (`exclude=True`), whose
+    stored value stays. On a field with a rich type your dicts there are validated into
+    instances, so `merge(contacts={"a": {"firstName": "Annie"}})` removes
     `contacts.a.firstName`; elsewhere such a dict is sent as given, as in v0.22. Inside an array
     nothing is removed: `MERGE` replaces an array whole. With `server_values=`, a dict's removal
     is a `profile.firstName = NONE` assignment, which an alias that is not an identifier
