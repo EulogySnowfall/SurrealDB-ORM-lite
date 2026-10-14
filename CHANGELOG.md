@@ -20,7 +20,11 @@ and the official SDK, on every write and read path, with the same behaviour on S
   `merge()`, `patch()` and the `atomic_*` helpers return, `raw_query()` rows, reads inside an
   interactive transaction, live and change-feed instances, and edges. Optionals and containers
   (`X | None`, `list[X]`, `dict[str, X]`, nested `BaseModel` fields) follow the same rules,
-  position by position, and `Computed[timedelta]` works too:
+  position by position, and `Computed[timedelta]` works too. In a union, a value the union accepts
+  as it is keeps the member Pydantic picks, as before: with `Literal["1h", "24h"] | timedelta`,
+  `"24h"` stays the literal (read, constructor, `merge()`, filters), and so does `"1d"` for a
+  `StrEnum | timedelta` and `["1h"]` for `list[timedelta] | list[str]`; only a value the union
+  refuses (`"2h"`, a stored duration) becomes a `timedelta`:
 
   ```python
   from datetime import date, datetime, timedelta
@@ -99,9 +103,9 @@ and the official SDK, on every write and read path, with the same behaviour on S
 ### Changed
 
 - **Keyword writes validate the values addressed to rich fields.** `merge()`, `bulk_update()`,
-  the update branch of `update_or_create(defaults=)` and `AuthenticatedUserMixin.signup()`/
-  `signin()` validate each such value against the field's full annotation, constraints included,
-  and store the server's type: `merge(at="2026-01-01T00:00:00Z")` now stores a datetime instead of
+  the update branch of `update_or_create(defaults=)` and `AuthenticatedUserMixin.signup()`
+  validate each such value against the field's full annotation, constraints included, and store
+  the server's type: `merge(at="2026-01-01T00:00:00Z")` now stores a datetime instead of
   a string and leaves a `datetime` on the instance. A value that does not fit raises `ValueError`
   naming the field before anything is sent; `None` and `SurrealFunc` values are written as given.
   On a model with `arbitrary_types_allowed=True` the validation takes that setting; a field
@@ -111,10 +115,16 @@ and the official SDK, on every write and read path, with the same behaviour on S
   the model validates with code of its own (`merge(at="2026/03/04")` with a validator that reads
   that format; the field's type alone would refuse it). Rows v0.22 stored as strings still load,
   but the typed lookups no longer match them: README section 24, "Upgrading from v0.22", gives a
-  one-off conversion that runs on both lines.
+  one-off conversion that runs on both lines. The identifier of `signup()` and `signin()` is sent
+  as given, as before (validated by `signup()`): the SIGNIN clause compares it with the stored
+  value, and a string never equals a uuid, so `signin(badge="0190…")` still finds the accounts
+  v0.22 created from that text, and an account created from a `UUID` signs in with the `UUID`.
+  `signin()` validates nothing, as before.
 - **Sub-models in keyword writes.** In `merge()` and the update branch of `update_or_create()`,
   a dict for a sub-model field changes only the keys it names, each validated as its sub-field
-  (with `server_values=`, one `SET` per key, so the other stored keys stay, as with `MERGE`); so
+  (with `server_values=`, one `SET` per key, so the other stored keys stay, as with `MERGE`; a key
+  that is not an identifier is written between backticks, so `{"zip-code": …}` works as before,
+  and a dict with a key SurrealQL text cannot hold, a NUL character, is assigned whole); so
   does a dict merged anywhere else into a stored object, as before: a value of a
   `dict[str, Profile]` (each of its keys validated as `Profile`'s sub-field), and a dict for a
   union of models, sent as given. An instance replaces the whole sub-object; `bulk_update()` and
@@ -132,8 +142,8 @@ and the official SDK, on every write and read path, with the same behaviour on S
   keyword write's dict for a sub-model that validates by alias only is re-keyed the same way,
   whether or not the sub-model holds a rich type; one without a rich type keeps its values as
   given. A dict for a sub-model that also validates by name keeps your keys, as in v0.22: in
-  `merge()`, and in `bulk_update()`, `signup()` and `signin()` when the sub-model holds no rich
-  type (with one, those validate the dict as the whole sub-model and write it as `save()` does).
+  `merge()`, and in `bulk_update()` and `signup()` when the sub-model holds no rich type (with
+  one, those validate the dict as the whole sub-model and write it as `save()` does).
 - **A table-model instance given as a value is written as its record id** in keyword writes, in
   raw-query variables, in the `atomic_*` array helpers and in `patch()`. Where the declared field
   cannot hold a `RecordID` at that position (`list[Plain]`, a sub-model), the write raises
@@ -172,6 +182,10 @@ and the official SDK, on every write and read path, with the same behaviour on S
   value types for range bounds; any other raises `TypeError` at the call.
 - Text input is bounded and parsed strictly: `Duration.parse()` refuses more than 256 characters
   and the range text more than 1024, with no whitespace inside a range.
+- The keys of a sub-model dict that `merge(server_values=)` assigns one by one are written as
+  path segments: one that is not an identifier is quoted with backticks, its backslashes and
+  backticks escaped (backslashes first), and each value is bound. A key with a NUL character,
+  which no SurrealQL text can hold, makes the whole dict a bound value instead.
 
 ### Notes
 
@@ -198,7 +212,7 @@ and the official SDK, on every write and read path, with the same behaviour on S
   planned for v0.24.0; generating `DEFINE FIELD … TYPE` from these annotations belongs to the
   schema and DDL phase (v0.30.0+).
 - Every behaviour above was measured on SurrealDB 2.7.0 and 3.3.4, with 3.1.5 where it differs;
-  the README's "ORM behaviour: SurrealDB 2.x vs 3.x" table gains twelve rows.
+  the README's "ORM behaviour: SurrealDB 2.x vs 3.x" table gains fifteen rows.
 
 ## [0.22.2] - 2026-10-13
 
