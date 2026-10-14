@@ -31,7 +31,8 @@
 | v0.20.0           | Tier 1 — Typed live queries (`LiveModelStream`)      | Done    |
 | v0.21.0           | Tier 1 — Auto-resubscribe & change feeds (cursor)    | Done    |
 | v0.22.0           | Tier 1 — Core (native typed relations)               | Done    |
-| v0.23.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 7 minors         | Planned |
+| v0.23.0           | Tier 2 — Rich field types                            | Done    |
+| v0.24.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 6 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | Planned |
@@ -80,7 +81,7 @@ pieces stay out.
 | Typed live queries (`LiveModelStream`) | idem + deserialization + `LIVE SELECT [DIFF] … WHERE` | ✅ v0.20.0     |
 | Change Feeds / Auto-Resubscribe        | `recv_task` drop signal + `SHOW CHANGES … SINCE`      | ✅ v0.21.0     |
 | Native typed relations                 | `insert_relation()`                                   | ✅ v0.22.0     |
-| Rich field types                       | native `Datetime`/`Duration`/`Decimal`/`Range`/`Uuid` | v0.23.0        |
+| Rich field types                       | native `Datetime`/`Duration`/`Decimal`/`Range`/`Uuid` | ✅ v0.23.0     |
 | Geospatial fields (`nearby()`)         | native `Geometry` + `geo::*`                          | v0.24.0        |
 | Embedded / in-memory test engine       | `mem://` / `surrealkv://` ²                           | v0.25.0        |
 | Versioned storage (time-travel)        | `surrealkv+versioned://` ²                            | v0.26.0        |
@@ -145,7 +146,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | Typed live queries            | yes        | ✅ v0.20.0                  |
 | Live auto-resubscribe / CDC   | yes        | ✅ v0.21.0                  |
 | Native typed relations        | yes        | ✅ v0.22.0                  |
-| Rich field types              | yes        | v0.23.0                     |
+| Rich field types              | yes        | ✅ v0.23.0                  |
 | Geospatial fields             | yes        | v0.24.0                     |
 | Embedded / versioned engine   | yes        | v0.25 – v0.26               |
 | Subqueries                    | yes        | v0.27.0                     |
@@ -399,6 +400,36 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - Native idempotency documented: a deterministic array id or a `UNIQUE` index on `in, out`.
   Relation DDL (`TYPE RELATION IN … OUT …`) stays hand-written until v0.33.0
 
+### Version 0.23.0 — Rich field types
+
+- `timedelta`, `date` and `set[X]`/`frozenset[X]` fields, plus the ORM's own `Duration` and
+  `Range[T]`: every write stores SurrealDB's native value (a duration, a `datetime` at midnight
+  UTC, an array, a range) and every read returns the declared type. `datetime`, `Decimal`, `UUID`
+  and `bytes` keep working as before. Nested values (`list[timedelta]`, sub-model fields) are sent
+  the same way at any depth
+- `Duration` keeps the server's nanoseconds and mirrors the SDK 2.0.0 `surrealdb.Duration` API
+  with exact results and a strict `parse()`; `InvalidDurationError` is both a `ValueError` and a
+  `surrealdb.InvalidDurationError`. `Range[T]` takes the SDK's `BoundIncluded`/`BoundExcluded`
+  (now exported) or `None` for an open side, validates each bound value as `T` and has a SurrealQL
+  text form in JSON
+- **One encoding boundary**: every payload the ORM hands the official SDK (fields, filter values,
+  `call_function()` arguments, transaction statements, auth variables) goes through one internal
+  function, checked over `src/` by an AST test. A value the server would reject (a negative, zero
+  or oversized duration, a `Decimal` beyond `2**96 - 1`, an `int` outside signed 64-bit) is refused
+  with a plain `ValueError` before anything is sent; a `Decimal` written with an exponent goes out
+  in fixed-point notation
+- Filters: `in`/`not_in` bind a `Range` as one value (refused on `id` and edge endpoints);
+  `contains` on a range column tests membership; filter values on rich fields must be typed. Live
+  queries write durations, dates, sets and ranges as SurrealQL literals
+- Reads: SDK durations become `timedelta` or `Duration` in top-level fields, including on rows
+  applied after a write, so an instance written back stores a duration. `atomic_increment()`
+  refuses a duration amount (2.x ignores `+=` with a duration)
+- Same on both lines, measured on 2.7.0, 3.1.5 and 3.3.4, with one divergence: a `TYPE set<…>`
+  column holds a native set on 3.3 that the surrealdb SDK 2.0.0 cannot read (3.1 refuses the
+  array), so such columns are declared `array<…>`. The SDK 2.0.0 limits (zero durations, 3.x
+  native sets) wait for SDK 3.0 (#205); typed string filters (#220), validated keyword writes
+  (#221) and validating returned rows like the full ORM are follow-ups
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -573,15 +604,15 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 > Still official-SDK only; also absorbs spillover from the heavy core themes.
 
-| Version | Theme                                                                | SDK 2.0 realization               |
-| ------- | -------------------------------------------------------------------- | --------------------------------- |
-| v0.23.0 | Rich field types: `Datetime`, `Duration`, `Decimal`, `Range`, `Uuid` | typed Pydantic ↔ native SDK types |
-| v0.24.0 | Geospatial fields: `Geometry` + `nearby()` / distance                | native `Geometry` + `geo::*`      |
-| v0.25.0 | Embedded test engine: `mem://` / `surrealkv://` + base fixtures ¹    | SDK embedded connection           |
-| v0.26.0 | Versioned storage / time-travel: `surrealkv+versioned://` ²          | embedded versioned engine         |
-| v0.27.0 | Subqueries (nested QuerySets in `filter`/`in`)                       | nested `SELECT` via `query()`     |
-| v0.28.0 | Query cache (TTL + invalidation), client-side                        | client cache                      |
-| v0.29.0 | Multi-database: named connection registry                            | N × `AsyncSurreal` instances      |
+| Version    | Theme                                                                | SDK 2.0 realization               |
+| ---------- | -------------------------------------------------------------------- | --------------------------------- |
+| ✅ v0.23.0 | Rich field types: `Datetime`, `Duration`, `Decimal`, `Range`, `Uuid` | typed Pydantic ↔ native SDK types |
+| v0.24.0    | Geospatial fields: `Geometry` + `nearby()` / distance                | native `Geometry` + `geo::*`      |
+| v0.25.0    | Embedded test engine: `mem://` / `surrealkv://` + base fixtures ¹    | SDK embedded connection           |
+| v0.26.0    | Versioned storage / time-travel: `surrealkv+versioned://` ²          | embedded versioned engine         |
+| v0.27.0    | Subqueries (nested QuerySets in `filter`/`in`)                       | nested `SELECT` via `query()`     |
+| v0.28.0    | Query cache (TTL + invalidation), client-side                        | client cache                      |
+| v0.29.0    | Multi-database: named connection registry                            | N × `AsyncSurreal` instances      |
 
 ¹ To confirm against the targeted SDK build; reclassified to Future if the embedded extra is
 unavailable on PyPI.

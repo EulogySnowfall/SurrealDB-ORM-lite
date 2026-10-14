@@ -133,54 +133,58 @@ results = await User.objects().query(
 
 ## Features
 
-| Feature                         | Status |
-| ------------------------------- | ------ |
-| Async/await support             | ✅     |
-| Pydantic validation             | ✅     |
-| CRUD operations                 | ✅     |
-| QuerySet with filters           | ✅     |
-| Django-style lookups            | ✅     |
-| Custom primary keys             | ✅     |
-| HTTP connections                | ✅     |
-| WebSocket connections           | ✅     |
-| Aggregations                    | ✅     |
-| GROUP BY                        | ✅     |
-| Model Signals                   | ✅     |
-| Raw SurrealQL queries           | ✅     |
-| Q Objects (OR/AND/NOT)          | ✅     |
-| Parameterized filters           | ✅     |
-| Bulk operations                 | ✅     |
-| `-field` ordering               | ✅     |
-| Relations & Graph               | ✅     |
-| FETCH clause                    | ✅     |
-| Transactions (`tx=`)            | ✅     |
-| upsert / get_or_create          | ✅     |
-| patch / atomic ops              | ✅     |
-| Retry on conflict               | ✅     |
-| Server-side functions           | ✅     |
-| Computed fields                 | ✅     |
-| Stored `fn::` calls             | ✅     |
-| JWT / record auth               | ✅     |
-| Model-level auth mixin          | ✅     |
-| Field aliases & DX              | ✅     |
-| Live queries (raw)              | ✅     |
-| Typed live queries              | ✅     |
-| Live auto-resubscribe           | ✅     |
-| Change feeds (CDC)              | ✅     |
-| Typed edges (`insert_relation`) | ✅     |
-| Custom table name               | ✅     |
+| Feature                                                                       | Status |
+| ----------------------------------------------------------------------------- | ------ |
+| Async/await support                                                           | ✅     |
+| Pydantic validation                                                           | ✅     |
+| CRUD operations                                                               | ✅     |
+| QuerySet with filters                                                         | ✅     |
+| Django-style lookups                                                          | ✅     |
+| Custom primary keys                                                           | ✅     |
+| HTTP connections                                                              | ✅     |
+| WebSocket connections                                                         | ✅     |
+| Aggregations                                                                  | ✅     |
+| GROUP BY                                                                      | ✅     |
+| Model Signals                                                                 | ✅     |
+| Raw SurrealQL queries                                                         | ✅     |
+| Q Objects (OR/AND/NOT)                                                        | ✅     |
+| Parameterized filters                                                         | ✅     |
+| Bulk operations                                                               | ✅     |
+| `-field` ordering                                                             | ✅     |
+| Relations & Graph                                                             | ✅     |
+| FETCH clause                                                                  | ✅     |
+| Transactions (`tx=`)                                                          | ✅     |
+| upsert / get_or_create                                                        | ✅     |
+| patch / atomic ops                                                            | ✅     |
+| Retry on conflict                                                             | ✅     |
+| Server-side functions                                                         | ✅     |
+| Computed fields                                                               | ✅     |
+| Stored `fn::` calls                                                           | ✅     |
+| JWT / record auth                                                             | ✅     |
+| Model-level auth mixin                                                        | ✅     |
+| Field aliases & DX                                                            | ✅     |
+| Live queries (raw)                                                            | ✅     |
+| Typed live queries                                                            | ✅     |
+| Live auto-resubscribe                                                         | ✅     |
+| Change feeds (CDC)                                                            | ✅     |
+| Typed edges (`insert_relation`)                                               | ✅     |
+| Custom table name                                                             | ✅     |
+| Rich field types (datetime, date, duration, decimal, uuid, bytes, set, range) | ✅     |
 
 ### Supported Filter Lookups
 
 - `exact` (default)
 - `gt`, `gte`, `lt`, `lte`
-- `in`, `not_in`
-- `contains`, `not_contains`
+- `in`, `not_in` (a list, or a `Range` bound as one value: see [section 24](#24-rich-field-types))
+- `contains`, `not_contains` (`contains` on a range column tests membership)
 - `containsall`, `containsany`
 - `startswith`, `endswith`
 - `like`, `ilike`
 - `match`, `regex`
 - `isnull`
+
+Filter values on rich fields must be typed: `filter(trial__gte=timedelta(days=7))`, not
+`"7d"`. Strings are not converted (see [section 24](#24-rich-field-types)).
 
 #### Filtering on the record id
 
@@ -1261,13 +1265,15 @@ into a live query: `LIVE SELECT … WHERE status = $s` is accepted, then `$s` ev
 at notification time and the filter matches nothing, silently. So for live queries only, the ORM
 writes each value as a SurrealQL literal — the same approach as the full SurrealDB-ORM — and the
 filter behaves identically on both lines. The encoder is closed: `None`, `bool`, `int`, `float`,
-`str`, `Decimal`, `datetime` (written in UTC), `UUID`, `RecordID`, and lists or dicts of these.
-Anything else, a string containing a NUL character, an integer beyond 64 bits or a `Decimal`
-SurrealDB would round raises `TypeError` when you call `live()`, before anything is sent. A
-`Var` must be supplied through `variables()` — an unbound reference would read as `NONE` on every
-notification, so `age > $min_age` would match every record; it raises `SurrealDbError` instead
-(server parameters such as `$auth` and `$session` are allowed). Every other query keeps binding
-parameters.
+`str`, `Decimal`, `datetime` (written in UTC), `UUID`, `RecordID`, and lists or dicts of these;
+since v0.23.0 also `timedelta` and `Duration` (`1h30m`), `date` (`d'2026-02-01T00:00:00Z'`), sets
+(sorted arrays) and `Range` (`9..17`, `65..`), see [section 24](#24-rich-field-types). Anything
+else, a string containing a NUL character, an integer beyond 64 bits, a `Decimal` SurrealDB would
+round or a zero, negative or oversized duration raises `TypeError` when you call `live()`, before
+anything is sent. A `Var` must be supplied through `variables()` — an unbound reference would read
+as `NONE` on every notification, so `age > $min_age` would match every record; it raises
+`SurrealDbError` instead (server parameters such as `$auth` and `$session` are allowed). Every
+other query keeps binding parameters.
 
 #### Diff mode
 
@@ -1896,6 +1902,294 @@ its table as the `remove_relation()` target): change the import from `surreal_or
    the full ORM returns the records as dicts (`SELECT VALUE out.*`). Pass `model_class` to get
    instances. Changing it would break lite's v0.6.0 API.
 
+### 24. Rich field types
+
+Since v0.23.0 a model can declare `timedelta`, `date` and `set[X]`/`frozenset[X]` fields, and the
+ORM's own `Duration` and `Range[T]`: every write stores them as SurrealDB's native values and every
+read returns the declared type, with the same behaviour on SurrealDB 2.x and 3.x (one exception:
+`TYPE set<…>` columns, see [Sets](#sets)). `datetime`, `Decimal`, `UUID` and `bytes` fields keep
+working as before.
+
+```python
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
+from uuid import UUID
+
+from surreal_orm_lite import (
+    BaseSurrealModel,
+    BoundExcluded,
+    BoundIncluded,
+    Duration,
+    Range,
+    SurrealConfigDict,
+)
+
+
+class Subscription(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="subscription")
+
+    id: str | None = None
+    started_at: datetime
+    renews_on: date
+    trial: timedelta
+    grace: Duration | None = None
+    price: Decimal
+    token: UUID
+    active_hours: Range[int]
+    period: Range[datetime] | None = None
+    logo: bytes | None = None
+    tags: set[str] = set()
+
+
+await Subscription(
+    id="acme",
+    started_at=datetime(2026, 1, 2, 9, 30, tzinfo=UTC),
+    renews_on=date(2026, 2, 1),
+    trial=timedelta(days=14),
+    grace=Duration.parse("1h30m1ns"),                         # nanoseconds kept
+    price=Decimal("9.99"),
+    token=UUID("0190c3d1-5c3b-7cc6-8f8a-2d2b1f0e9a11"),
+    active_hours=Range(BoundIncluded(9), BoundExcluded(17)),  # 9..17: 9 included, 17 excluded
+    period=Range(BoundIncluded(datetime(2026, 1, 1, tzinfo=UTC)), None),  # open end
+    logo=b"\x89PNG",
+    tags={"pro", "annual"},
+).save()
+
+sub = await Subscription.objects().get("acme")
+sub.trial         # timedelta(days=14): a duration on the server
+sub.renews_on     # date(2026, 2, 1): a datetime at midnight UTC on the server
+sub.tags          # {'annual', 'pro'}: an array on the server
+sub.active_hours  # Range(begin=BoundIncluded(value=9), end=BoundExcluded(value=17))
+```
+
+| Annotation                   | Sent as                                                                      | Stored as        | Read back as                                |
+| ---------------------------- | ---------------------------------------------------------------------------- | ---------------- | ------------------------------------------- |
+| `datetime`                   | as before (a naive value is taken as UTC)                                    | `datetime` (UTC) | an aware UTC `datetime`, to the microsecond |
+| `Decimal`                    | as before; a value written with an exponent goes out in fixed-point notation | `decimal`        | `Decimal`                                   |
+| `UUID`                       | as before                                                                    | `uuid`           | `UUID`                                      |
+| `bytes`                      | as before                                                                    | `bytes`          | `bytes`                                     |
+| `timedelta`                  | a duration                                                                   | `duration`       | `timedelta`, floored to the microsecond     |
+| `date` (subclasses included) | a `datetime` at midnight UTC                                                 | `datetime`       | `date`                                      |
+| `set[X]`, `frozenset[X]`     | an array, sorted when its items can be ordered                               | `array`          | the set or frozenset (see [Sets](#sets))    |
+| `Duration`                   | a duration                                                                   | `duration`       | `Duration`, to the nanosecond               |
+| `Range[T]`, `Range`          | a range; an open side as SurrealDB's null bound                              | `range`          | `Range`, each bound value validated as `T`  |
+
+Optional fields (`ttl: timedelta | None = None`) behave the same. Values nested in containers
+(`list[timedelta]`, `dict[str, date]`, a sub-model's fields) are sent the same way at any depth. On
+reads, a `timedelta` is converted from the SDK's duration in a top-level field only: deeper down
+(`list[timedelta]`, a sub-model's `timedelta` field) it fails validation as it did before v0.23.0,
+so declare `Duration` there, which reads the SDK's value at any depth. A naive `datetime` stays
+naive on the instance and is read back as an aware UTC `datetime`, as before.
+
+#### `Duration`
+
+```python
+from datetime import timedelta
+
+import surrealdb
+from surreal_orm_lite import Duration, InvalidDurationError
+
+d = Duration.parse("1h30m1ns")
+d.elapsed                 # 5400000000001: nanoseconds
+d.to_string()             # '1h30m1ns': every unit, lossless (str(d) too)
+d.to_compact()            # [5400, 1]: [seconds, nanoseconds]
+d.get_seconds_and_nano()  # (5400, 1)
+d.to_timedelta()          # timedelta(seconds=5400): floored to the microsecond
+Duration.parse(90, 5)     # Duration(elapsed=90000000005): an int is seconds, then nanoseconds
+Duration.from_timedelta(timedelta(days=7))            # Duration(elapsed=604800000000000)
+Duration.parse(" 1h30m ") == Duration.parse("1h30m")  # True: surrounding whitespace is ignored
+
+try:
+    Duration.parse("1h 30m")             # "1.5h" is refused too
+except InvalidDurationError as exc:      # a ValueError and a surrealdb.InvalidDurationError
+    print(exc)
+
+Duration(5) == surrealdb.Duration(5)     # True
+surrealdb.Duration(5) == Duration(5)     # False: keep the ORM value on the left
+```
+
+`timedelta` stops at microseconds: declare a field `Duration` to keep the server's nanoseconds.
+`Duration` is the ORM's own class, not the SDK's `surrealdb.Duration`, but it mirrors the SDK
+2.0.0 class: the same members under the same names and parameters (`elapsed`,
+`parse(value, nanoseconds=0)` with an `int` in seconds, `get_seconds_and_nano()`, `to_compact()`,
+`to_string()` and the unit properties `seconds`, `minutes`, `hours`, `days`, …), with exact
+results: `get_seconds_and_nano()` uses integer arithmetic, `to_compact()` keeps the nanoseconds
+(SDK 2.0.0 returns `[seconds]`) and `to_string()` writes every unit (SDK 2.0.0 writes `"1h"` for
+`1h30m1ns`). `parse(str)` reads the server's syntax strictly: surrounding whitespace is accepted,
+`"1h 30m"` and `"1.5h"` are refused. A refused value raises `InvalidDurationError`, which is both a
+`ValueError` and a `surrealdb.InvalidDurationError`; a wrong argument type raises `TypeError`.
+`Duration` adds `MAX_NANOSECONDS` (the largest SurrealDB duration), `from_timedelta()`,
+`to_timedelta()`, hashing and ordering.
+
+As a field, `Duration` accepts a `Duration`, the SDK's `Duration`, a non-negative `timedelta` or a
+SurrealQL duration string (`"1h30m"`), and refuses a bare number, which does not say its unit. In
+JSON it is its SurrealQL text: `model_dump_json()` writes `"1h30m1ns"`, which
+`model_validate_json()` reads back.
+
+**Equality with the SDK's values is one-way.** `Duration(5) == surrealdb.Duration(5)` is `True`,
+but `surrealdb.Duration(5) == Duration(5)` is `False`: the SDK's `__eq__` answers `False` for any
+other type, so Python never asks the ORM's. The same holds for `Range` and the SDK's `Range`. Keep
+the ORM value on the left, or compare `elapsed`.
+
+#### `Range[T]`
+
+```python
+from pydantic import TypeAdapter
+
+from surreal_orm_lite import BoundExcluded, BoundIncluded, Range
+
+str(Range(BoundIncluded(9), BoundExcluded(17)))  # '9..17'
+str(Range(BoundExcluded(1), BoundIncluded(5)))   # '1>..=5'
+str(Range(begin=BoundIncluded(65)))              # '65..': None is an open side
+str(Range())                                     # '..'
+
+hours = TypeAdapter(Range[int])
+hours.validate_python(range(9, 17))  # Range(begin=BoundIncluded(value=9), end=BoundExcluded(value=17))
+hours.validate_json('"9..17"')       # the same range: in JSON a Range is its SurrealQL text
+```
+
+A `Range` has two bounds, each `BoundIncluded(value)` or `BoundExcluded(value)` (the SDK's
+classes, exported by the ORM) or `None` for an open side; `Range(1, 5)` raises `TypeError`. The
+SDK's own spellings of an open side, a bare `Bound()`, `surrealdb.cbor.undefined` and a CBOR null,
+are accepted too and stored as `None`. Whatever its spelling, an open side is sent as SurrealDB's
+null bound, the form its protocol defines.
+
+As a field, `Range[int]`, `Range[datetime]`, `Range[timedelta]`… validate each bound value as `T`
+(a bare `Range` keeps them as given) and accept the SDK's `Range`, a builtin `range` with step 1
+(`range(9, 17)` is `9..17`) or the SurrealQL text `str()` writes (`"9..17"`,
+`"d'2026-01-01T00:00:00Z'.."`, `"1m..1h"`). A `Range[timedelta]` turns the SDK's duration bounds
+into `timedelta`s (floored to the microsecond) and a `Range[date]` accepts midnight `datetime`
+bounds. In JSON a `Range` is that text, which `model_validate_json()` reads back: every bound is
+written exactly, a zero duration as `0ns` and a `Decimal` with all its digits, even where a live
+query filter refuses the value. A `Range` is not hashable, like the SDK's.
+
+#### Filters
+
+```python
+class Slot(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="slot")
+
+    id: str | None = None
+    hour: int
+
+
+for hour in (8, 9, 12, 17):
+    await Slot(id=f"h{hour}", hour=hour).save()
+
+# in / not_in with a Range: bound as one value (hour IN $_f0), never expanded
+working = await Slot.objects().filter(hour__in=Range(BoundIncluded(9), BoundExcluded(17))).exec()  # 9, 12
+late = await Slot.objects().filter(hour__not_in=Range(end=BoundExcluded(17))).exec()              # 17
+
+# Filter values are sent like field values
+trials = await Subscription.objects().filter(trial__gte=timedelta(days=7), renews_on=date(2026, 2, 1)).exec()
+cheap = await Subscription.objects().filter(price__lte=Decimal("9.99"), tags__containsall={"pro"}).exec()
+open_at_noon = await Subscription.objects().filter(active_hours__contains=12).exec()  # 12 in 9..17
+graced = await Subscription.objects().filter(grace__lte=Duration.parse("2h")).exec()
+```
+
+Filter values on rich fields **must be typed**: they are sent exactly like field values, and
+strings are not converted. `filter(trial__gte="7d")` compares the stored duration with a string,
+which does not give the result you want: pass `timedelta(days=7)`.
+
+`in` and `not_in` take a `Range`, the ORM's or the SDK's, and bind it as one value; a builtin
+`range` keeps its meaning, the list of its integers. On the record-id column `id` and on an edge's
+`in`/`out` columns a `Range` raises `ValueError`, since a record id never falls inside a value
+range. `contains` on a range column tests membership (`active_hours__contains=12`). Live queries
+([section 21](#21-live-queries-real-time-notifications)) write these values into the statement as
+SurrealQL literals (`1w`, `d'2026-02-01T00:00:00Z'`, `['pro']`, `9..17`), with the same results on
+both lines.
+
+#### Precision and `Decimal`
+
+- `datetime`: to the microsecond. The SDK truncates the server's nanoseconds, so a stored
+  `d'2026-01-02T03:04:05.123456789Z'` reads `…05.123456`.
+- `timedelta`: floored to the microsecond on read (`1h30m1ns` reads `timedelta(seconds=5400)`).
+- `Duration`: exact, to the nanosecond.
+- `Decimal`: a value whose `str()` writes no exponent is sent as before. A value written with an
+  exponent (`Decimal("1E-7")`, `Decimal("1E+3")`) goes out in fixed-point notation (`0.0000001`,
+  `1000`), cut after the 29th fractional digit: the server keeps at most 28 fractional digits,
+  rounding half away from zero as before, so the stored value is the same. A finite value whose
+  integer part, rounded, exceeds `2**96 - 1` (the largest SurrealDB decimal) is refused before
+  sending. On reads, SurrealDB 2.x keeps trailing zeros (`Decimal("12.50")` reads `12.50`) where
+  3.x normalises them (`12.5`); the values are equal. `NaN` and `±Infinity` are stored as floats,
+  as before: declare `Annotated[Decimal, Field(allow_inf_nan=True)]` to read them back.
+
+#### Sets
+
+`set[X]`/`frozenset[X]` fields are stored as arrays. On SurrealDB 3.x a `TYPE set<…>` column
+holds a native set that the surrealdb SDK 2.0.0 cannot read (every read of the column fails with an
+SDK decoding error), and 3.1 refuses an array in it; declare such columns `array<…>`, optionally
+with `VALUE $value.distinct()`:
+
+```sql
+DEFINE FIELD tags ON subscription TYPE array<string> VALUE $value.distinct();
+```
+
+On a schemaless or `array<…>` column the field reads back as the declared `set` or `frozenset`, on
+both lines. The array is sorted when its items can be ordered, so a set is written the same way
+every time.
+
+#### Values refused before sending
+
+Every value the ORM sends (a field, a filter value, a `call_function()` argument, an auth
+variable) goes through the same check. A value SurrealDB would reject is refused before anything
+is sent, with a plain `ValueError` that says why, never re-wrapped in a `SurrealDbError`:
+
+| Value                                                                                           | Raised                       |
+| ----------------------------------------------------------------------------------------------- | ---------------------------- |
+| A negative duration (a `timedelta`, the SDK's `Duration`)                                       | `ValueError`                 |
+| A duration of `2**64` seconds or more                                                           | `ValueError`                 |
+| A zero duration, while the installed SDK cannot read one back (SDK 2.0.0)                       | `ValueError`                 |
+| A finite `Decimal` whose integer part, rounded, exceeds `2**96 - 1`                             | `ValueError`                 |
+| An `int` outside the signed 64-bit range                                                        | `ValueError` (use `Decimal`) |
+| A `Range` side that is neither `BoundIncluded`/`BoundExcluded` nor an open side                 | `ValueError`                 |
+| `id__in=Range(…)`, `id__not_in=Range(…)`, or the same on an edge's `in`/`out`                   | `ValueError`                 |
+| `atomic_increment(field, <a duration>)`                                                         | `TypeError` (use `merge()`)  |
+| In a live filter, a zero, negative or oversized duration, or a range bound with no literal form | `TypeError` from `live()`    |
+| A `Duration` or `Range` field given a value it does not accept                                  | Pydantic's `ValidationError` |
+
+For a zero duration, store `None` instead (declare the field optional) and filter "longer than
+zero" with `__gte=Duration(1)`. `atomic_increment()` adds numbers only: SurrealDB 2.x ignores `+=`
+with a duration, so the ORM refuses it on both lines; set the new value with `merge()`:
+
+```python
+nonzero = await Subscription.objects().filter(trial__gte=Duration(1)).exec()  # longer than zero
+await sub.merge(trial=sub.trial + timedelta(days=7))                          # not atomic_increment()
+```
+
+#### After a write that returns the row
+
+`save()` without an id, `refresh()`, `merge()`, `upsert()`, `patch()` and the `atomic_*` helpers
+apply the row the server returns as received, without validation, as before v0.23.0. `timedelta`
+and `Duration` fields are converted on the way, but `date`, `set` and `Range` fields hold the SDK's
+value (a midnight `datetime`, a `list`, the SDK's `Range`) until the record is loaded again
+(`get()`, `filter()`, …). Writing such an instance back is safe, since those values are stored the
+same way, although Pydantic warns (`PydanticSerializationUnexpectedValue`) about the `date` and
+`set` fields while serialising them.
+
+#### Values the SDK cannot read
+
+The surrealdb SDK 2.0.0 cannot decode a zero duration or a SurrealDB 3.x native set. The ORM never
+sends a zero duration and sends sets as arrays, but a record another client wrote, or a
+`TYPE set<…>` column on SurrealDB 3.3 (see [Sets](#sets)), may hold one: reading it fails with an
+SDK decoding error. A later SDK lifts both limits
+([#205](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/205)).
+
+#### Authentication
+
+Rich values in the fields of an `AuthenticatedUserMixin` model's `signup()`, its defaults included
+(`trial: timedelta = timedelta(days=7)`), and in the `variables=` of
+`SurrealDBConnectionManager.signin()`/`signup()` are sent like any other write: a `date` reaches
+the `SIGNUP` clause as a midnight UTC `datetime` and a `timedelta` as a duration, on both lines. A
+refused value raises `ValueError` before anything is sent.
+
+#### Coming from the full SurrealDB-ORM
+
+Plain `datetime`, `Decimal` and `UUID` annotations work as they do there. The full ORM has no
+`timedelta` or `Range` fields and its `Duration` is a string: `timedelta`, `Duration` and
+`Range[T]` fields are lite additions. The full ORM also validates the rows its writes return,
+where lite converts only durations (see [After a write that returns the row](#after-a-write-that-returns-the-row)).
+
 ---
 
 ## Configuration Options
@@ -2004,95 +2298,98 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs.
 
-| ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                              | SurrealDB 3.2.x / 3.3.x                                                                                                                                                           | Since   |
-| -------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------- |
-| Transaction strategy auto-selected by `transaction()`                                                                                  | buffered batch (`BEGIN…COMMIT`)                                                                                                                      | native interactive on WebSocket                                                                                                                                                   | v0.9.0  |
-| Reads inside a transaction (`objects(tx=)`)                                                                                            | raise (buffered cannot read)                                                                                                                         | see uncommitted writes                                                                                                                                                            | v0.9.0  |
-| `save(tx=)` with an auto-generated id                                                                                                  | raises — explicit id required                                                                                                                        | supported                                                                                                                                                                         | v0.9.0  |
-| `refresh(tx=)` inside a transaction                                                                                                    | raises                                                                                                                                               | works                                                                                                                                                                             | v0.9.0  |
-| `bulk_update` / `bulk_delete` / `QuerySet.patch` row count inside a tx                                                                 | returns `0` (not knowable pre-commit)                                                                                                                | real count                                                                                                                                                                        | v0.9.0  |
-| "Already exists" error on create                                                                                                       | normalised to `SurrealDbError`                                                                                                                       | normalised to `SurrealDbError`                                                                                                                                                    | v0.7.0  |
-| Cleanup on a missing target (`delete_table`)                                                                                           | native no-op                                                                                                                                         | ORM makes it a silent no-op                                                                                                                                                       | v0.7.0  |
-| Aggregation over an empty set (`NaN` / `±inf`)                                                                                         | returns `0.0` / `None`                                                                                                                               | ORM normalises to `0.0` / `None`                                                                                                                                                  | v0.7.0  |
-| Namespace/db selection (`use()` ordering)                                                                                              | lenient (auto-creates)                                                                                                                               | strict — ORM signs in before `use()`                                                                                                                                              | v0.7.0  |
-| Writing a field a `SCHEMAFULL` table does not define (`CREATE`, `INSERT`, `INSERT RELATION`)                                           | silently dropped: the record is stored without it                                                                                                    | rejected ("Found field …, but no such field exists"): nothing is stored                                                                                                           | v0.7.0  |
-| `upsert()` / `update_or_create()` / `get_or_create()`                                                                                  | same on both lines                                                                                                                                   | same on both lines                                                                                                                                                                | v0.10.0 |
-| `patch()` / `atomic_append` / `atomic_set_add` / `atomic_remove` / `atomic_increment`                                                  | same on both lines (portable `array::*` fns chosen over divergent `+=`/`-=`)                                                                         | same on both lines                                                                                                                                                                | v0.11.0 |
-| `retry_on_conflict` / `SurrealDbConflictError` (retryable conflict)                                                                    | same type + decorator; conflicts rarer (engine serialises more)                                                                                      | same type + decorator; conflicts are the normal optimistic-MVCC failure                                                                                                           | v0.12.0 |
-| `SurrealFunc` / `server_values=` / `extra_vars=` on `save`/`merge`                                                                     | same on both lines (compiled to portable `CREATE`/`UPDATE … SET`)                                                                                    | same on both lines                                                                                                                                                                | v0.13.0 |
-| Shipped function-name enums (`SurrealTimeFunction`, `SurrealCryptoFunction`, …)                                                        | every catalogued member verified on 2.7.0                                                                                                            | every catalogued member verified on 3.3.4                                                                                                                                         | v0.13.0 |
-| `server_values` inside a transaction — when the instance sees the computed value                                                       | only after commit (buffered; `refresh()` to read it)                                                                                                 | immediately (interactive returns the row)                                                                                                                                         | v0.13.0 |
-| `merge(server_values=)` on a missing record / never-created table                                                                      | server returns no rows → ORM raises `SurrealDbError`                                                                                                 | server raises `NotFound` for a missing table → ORM raises the same error                                                                                                          | v0.13.0 |
-| Computed fields (`Computed[...]` → `DEFINE FIELD … VALUE`)                                                                             | same on both lines (DDL, recompute triggers, precedence over client data)                                                                            | same on both lines                                                                                                                                                                | v0.14.0 |
-| DDL run inside a transaction, then rolled back                                                                                         | definition rolled back with the transaction                                                                                                          | same on both lines                                                                                                                                                                | v0.14.0 |
-| Invalid computed-field expression — raw SDK exception                                                                                  | `InternalError`                                                                                                                                      | `ValidationError`                                                                                                                                                                 | v0.14.0 |
-| Invalid computed-field expression — through the ORM                                                                                    | `SurrealDbError` (normalised)                                                                                                                        | `SurrealDbError` (normalised)                                                                                                                                                     | v0.14.0 |
-| Issue #156 correctness fixes (`Var`/`$$`, `first()`, `*_or_create` strictness, `created` on upsert, quoted ids, one-hop `get_related`) | same on both lines (each fix reproduced and verified on 2.6.5)                                                                                       | same on both lines (verified on 3.2.4)                                                                                                                                            | v0.14.3 |
-| Record-id lookups (`filter(id=…)`, `id__in`, `get(…)`, `*_or_create(id=…)`) coerced to `RecordID`                                      | same on both lines (int/str typing verified on 2.6.5)                                                                                                | same on both lines (verified on 3.2.4)                                                                                                                                            | v0.14.4 |
-| Per-event-loop client cache (`get_client`, `close_connection`, `close_all_connections`)                                                | same on both lines (loop binding is an asyncio/SDK property, not a server one)                                                                       | same on both lines (verified on 3.2.4)                                                                                                                                            | v0.14.5 |
-| `call_function()` — the call itself (`args`, `params`, `return_type`, nested `fn::a::b`)                                               | same on both lines (bare call form chosen so it is portable)                                                                                         | same on both lines (verified on 3.2.4)                                                                                                                                            | v0.15.0 |
-| `call_function(tx=)` — return value                                                                                                    | `None` (buffered: queued until commit)                                                                                                               | the function's value (interactive returns it immediately)                                                                                                                         | v0.15.0 |
-| `call_function(tx=, return_type=)`                                                                                                     | raises `ValueError` (no value to coerce yet)                                                                                                         | coerces the returned value                                                                                                                                                        | v0.15.0 |
-| Missing function called inside a transaction                                                                                           | surfaces at COMMIT as `SurrealDbError` (buffered: the call is only queued)                                                                           | raises `SurrealDbNotFoundError` at call time                                                                                                                                      | v0.15.0 |
-| Declared parameter name that collides with a reserved word, as echoed by `INFO FOR DB`                                                 | quoted: `` $`by` `` — parser accepts it                                                                                                              | bare: `$by`                                                                                                                                                                       | v0.15.0 |
-| Auth methods (`signin`, `signup`, `authenticate`, `invalidate`, `info`)                                                                | same on both lines (native SDK primitives, verified on 2.6.5)                                                                                        | same on both lines (verified on 3.2.4)                                                                                                                                            | v0.16.0 |
-| Auth failure — raw SDK exception for a wrong password                                                                                  | `InternalError`                                                                                                                                      | `NotFoundError`                                                                                                                                                                   | v0.16.0 |
-| Auth failure — through the ORM                                                                                                         | `SurrealDbAuthenticationError` (normalised)                                                                                                          | `SurrealDbAuthenticationError` (normalised)                                                                                                                                       | v0.16.0 |
-| `DEFINE ACCESS … WITH REFRESH` and `AuthTokens.refresh`                                                                                | not supported — the clause does not parse; `refresh` is always `None`                                                                                | supported; `refresh` populated                                                                                                                                                    | v0.16.0 |
-| `signin(access=…, refresh=…)` renewal                                                                                                  | raises `SurrealDbAuthenticationError` (no such access method is definable)                                                                           | returns a fresh, rotated token pair; the spent one is rejected                                                                                                                    | v0.16.0 |
-| Session token replayed on reconnect (`get_client`, `reconnect`)                                                                        | same on both lines                                                                                                                                   | same on both lines                                                                                                                                                                | v0.16.0 |
-| `info()` when the record's table denies it `select` on itself                                                                          | returns `None` (no error)                                                                                                                            | returns `None` (no error)                                                                                                                                                         | v0.16.0 |
-| Signing in as a system user while a record session is open                                                                             | permissions change, `$auth` still points at the record — only `invalidate()` clears it                                                               | 3.2.x: same as 2.x. **3.3.0**: the identity is cleared and `info()` returns `None`; `invalidate()` stays the portable log-out                                                     | v0.16.0 |
-| Duplicate signin identifier in the record table                                                                                        | signin fails (`No record was returned`)                                                                                                              | signin succeeds, picking one record                                                                                                                                               | v0.16.0 |
-| Model auth (`signup`/`signin`/`authenticate`, `access_ddl`/`define_access`)                                                            | same on both lines (verified on 2.6.5)                                                                                                               | same on both lines (verified on 3.2.4)                                                                                                                                            | v0.17.0 |
-| Model auth session isolation (each call on its own ephemeral connection)                                                               | same on both lines (an SDK/connection property, not a server one)                                                                                    | same on both lines (verified on 3.2.4)                                                                                                                                            | v0.17.0 |
-| Hydrated instance's password field after `signup`/`signin`                                                                             | holds the stored **hash**, never the plaintext                                                                                                       | same on both lines                                                                                                                                                                | v0.17.0 |
-| Model config `with_refresh=True` → `define_access()`                                                                                   | raises `SurrealDbError` (clause does not parse; message names the 3.x requirement)                                                                   | applies, and `AuthResult.tokens.refresh` is populated                                                                                                                             | v0.17.0 |
-| `Model.refresh(token)` renewal                                                                                                         | unavailable — no refresh token can exist                                                                                                             | returns a fresh, rotated pair; the spent token is rejected                                                                                                                        | v0.17.0 |
-| Field aliases (`Field(alias=…)`) across writes, hydration and every QuerySet clause                                                    | same on both lines (pure Pydantic + client-side name translation)                                                                                    | same on both lines (verified on 3.2.4)                                                                                                                                            | v0.18.0 |
-| `server_fields` — excluded from creates, kept on replaces, hydrated back                                                               | same on both lines; a `DEFAULT` is a create-time default on 2.6.5                                                                                    | same on both lines; a `DEFAULT` is a create-time default on 3.2.4                                                                                                                 | v0.18.0 |
-| A server column omitted from a REPLACE (`UPDATE`/`UPSERT … CONTENT`)                                                                   | an optional column is deleted; a required one raises `Found NONE for field …`                                                                        | same on both lines — which is why the ORM keeps it in replace payloads                                                                                                            | v0.18.0 |
-| `merge(refresh=False)` — skipped resync, `RETURN NONE`, forfeited missing-record check                                                 | same on both lines                                                                                                                                   | same on both lines (verified on 3.2.4)                                                                                                                                            | v0.18.0 |
-| `merge()` on a table that was never created                                                                                            | server returns no rows → ORM raises `SurrealDbError` ("no record found")                                                                             | server raises `NotFoundError` → normalised to the same `SurrealDbError`                                                                                                           | v0.18.0 |
-| Live queries (`live()`, `subscribe_live()`, `kill()`) — the subscription itself                                                        | supported over WebSocket (verified on 2.6.5)                                                                                                         | supported over WebSocket (verified on 3.2.4)                                                                                                                                      | v0.19.0 |
-| `live()` on a table that does not exist                                                                                                | succeeds; the stream simply never fires                                                                                                              | server raises `NotFound` → ORM raises `SurrealDbNotFoundError`                                                                                                                    | v0.19.0 |
-| Server notification after `kill()`                                                                                                     | none is sent                                                                                                                                         | a final envelope whose action is `KILLED`                                                                                                                                         | v0.19.0 |
-| End of a `subscribe_live()` stream after `kill()`                                                                                      | ORM pushes its own sentinel so the `async for` ends                                                                                                  | ends on the sentinel or the `KILLED` envelope, whichever lands first                                                                                                              | v0.19.0 |
-| `session` key in a live notification envelope                                                                                          | absent                                                                                                                                               | present (the SDK session uuid)                                                                                                                                                    | v0.19.0 |
-| Live queries over HTTP                                                                                                                 | refused by the ORM with a message naming the WebSocket requirement                                                                                   | same on both lines                                                                                                                                                                | v0.19.0 |
-| Filtered live query (`live()`/`watch()` with `filter()`, `Q`, `Var`)                                                                   | bound parameters never reach a `LIVE SELECT` (they read as `NONE`, the filter matches nothing); the ORM inlines each value as a literal, so it works | parameters would work; the ORM inlines too, for one code path — same result on both lines                                                                                         | v0.20.0 |
-| A record entering / leaving a live filter                                                                                              | entering → `UPDATE`; leaving → nothing (nor its later `DELETE`)                                                                                      | same on both lines                                                                                                                                                                | v0.20.0 |
-| `fetch()` inside a live query                                                                                                          | links resolved in every notification                                                                                                                 | same on both lines                                                                                                                                                                | v0.20.0 |
-| Raw diff payload (`watch(diff=True)`): root patch path                                                                                 | `"/"`                                                                                                                                                | `""`                                                                                                                                                                              | v0.20.0 |
-| Raw diff payload (`watch(diff=True)`): `DELETE`                                                                                        | the whole last record (a dict, not a patch list)                                                                                                     | `[{op: replace, path: "", value: None}]`                                                                                                                                          | v0.20.0 |
-| Typed diff `DELETE` (`live(diff=True)`): `event.instance`                                                                              | the last state of the record                                                                                                                         | an instance holding only the `id`                                                                                                                                                 | v0.20.0 |
-| Diff patch format                                                                                                                      | extended JSON Patch: a changed string is an `op: change` with diff-match-patch text                                                                  | same on both lines                                                                                                                                                                | v0.20.0 |
-| A WebSocket that drops (detection, server-side cleanup)                                                                                | the SDK's receive task ends within milliseconds; the server removes the session's live queries                                                       | same on both lines                                                                                                                                                                | v0.21.0 |
-| Live stream after a drop (`auto_resubscribe=True`)                                                                                     | resubscribed on a new connection; `live_id` changes, `on_reconnect` runs                                                                             | same on both lines                                                                                                                                                                | v0.21.0 |
-| A request in flight when the socket drops                                                                                              | fails with the SDK's `KeyError` (not normalised; the next call reconnects)                                                                           | same on both lines                                                                                                                                                                | v0.21.0 |
-| Change-feed entry shape                                                                                                                | `{versionstamp, changes}`; a create is reported as `update`                                                                                          | same on both lines                                                                                                                                                                | v0.21.0 |
-| Change-feed `SINCE <n>` — what `n` is                                                                                                  | the counter, `versionstamp >> 16` (the raw stamp silently returns nothing); `ChangeModelStream.cursor` normalises it                                 | the versionstamp, inclusive; `cursor` normalises it                                                                                                                               | v0.21.0 |
-| `changes(since=<datetime>)`                                                                                                            | the server also returns some earlier changes → at-least-once                                                                                         | the server returns nothing → the ORM converts to a versionstamp → exact                                                                                                           | v0.21.0 |
-| `changes(since=None)` — finding "now"                                                                                                  | the ORM searches the counter (no history replayed)                                                                                                   | the ORM reads the server clock's millisecond, then skips the entries already stamped in it (no history replayed); before v0.22.2 the entries of that millisecond were replayed    | v0.21.0 |
-| `INCLUDE ORIGINAL` delete in a change feed                                                                                             | the id only → an instance holding only the `id`                                                                                                      | 3.3.x: carries `original` → the last state of the record; 3.1.5: as 2.x                                                                                                           | v0.21.0 |
-| `SHOW CHANGES` on a table without a change feed                                                                                        | returns `[]`; `changes()` raises `SurrealDbError` instead                                                                                            | same on both lines                                                                                                                                                                | v0.21.0 |
-| Typed edges (`relate(Edge, …)`, edge `save()` and `bulk_create()`) through `insert_relation()`                                         | same on both lines: a real relation that graph traversal sees, `id` hydrated from the returned row                                                   | same on both lines                                                                                                                                                                | v0.22.0 |
-| Explicit edge id that already exists: raw `INSERT RELATION`, then through the ORM (edge `save()`, `bulk_create()`)                     | raw: 2.7.0 silently keeps the old edge and returns it. ORM: `SurrealDbError` ("already exists"), nothing written                                     | raw: 3.3.3 raises `AlreadyExistsError`; 3.1.5 silently keeps the old edge, although the SurrealDB docs announce a record-exists error from 3.1.5. ORM: as 2.x, on 3.1.5 and 3.3.3 | v0.22.0 |
-| Explicit edge id given as a `RecordID` of another table                                                                                | raw: silently moved into the edge table. ORM: `ValueError` before anything is sent                                                                   | raw: raises. ORM: `ValueError` before anything is sent                                                                                                                            | v0.22.0 |
-| `TYPE RELATION … ENFORCED` with an endpoint record that does not exist                                                                 | raw: `InternalError` ("The record … does not exist"). ORM: `SurrealDbNotFoundError`                                                                  | raw: `NotFoundError`. ORM: `SurrealDbNotFoundError`                                                                                                                               | v0.22.0 |
-| Changing `in`/`out` of an existing edge (`UPDATE … CONTENT`/`MERGE`/`SET`, `PATCH`)                                                    | silently ignored by the server (the other fields are written); the ORM refuses it (`ValueError`, frozen fields)                                      | same on both lines                                                                                                                                                                | v0.22.0 |
-| `UPSERT` / `CREATE` carrying `in`/`out` on an edge table                                                                               | stores a plain record that no graph traversal sees; the ORM refuses `upsert()` on an edge, and `save()` uses `INSERT RELATION`                       | same on both lines                                                                                                                                                                | v0.22.0 |
-| Replacing an edge without `in`/`out` on a `TYPE RELATION … SCHEMAFULL` table                                                           | raises `Found NONE for field in …`; the ORM's `update()` always sends the endpoints                                                                  | keeps the endpoints; the ORM sends them anyway                                                                                                                                    | v0.22.0 |
-| Edge record in a `CREATE`/`UPDATE` live notification or a change-feed update entry                                                     | `raw` carries `"__": true`, the typed `instance` drops it; `DELETE` notifications and change-feed delete entries carry no marker                     | no marker; the typed `instance` is identical                                                                                                                                      | v0.22.0 |
-| `table_name`, model instances as filter values, `"table:id"` strings on edge endpoints in filters                                      | same on both lines                                                                                                                                   | same on both lines                                                                                                                                                                | v0.22.0 |
-| Edge write refused by the table's `PERMISSIONS` (record user)                                                                          | fewer rows come back and no error (a batch keeps its accepted rows); the ORM raises `SurrealDbError`                                                 | same on both lines                                                                                                                                                                | v0.22.0 |
-| `remove_relation` / `remove_all_relations` on an edge table that was never created, with or without `tx=`                              | native no-op (graph-path `DELETE`)                                                                                                                   | native no-op (graph-path `DELETE`); before v0.22.0 it raised "table does not exist", which the ORM suppressed outside a transaction                                               | v0.22.0 |
-| `remove_relation` / `remove_all_relations` under `tx=` when the source record's own table does not exist                               | no-op                                                                                                                                                | the statement fails, and the transaction with it (outside a transaction the ORM keeps it a silent no-op on both lines)                                                            | v0.22.0 |
-| `get_related(direction="both")`                                                                                                        | out-neighbours, then in-neighbours; the order inside each group differs between versions                                                             | same on both lines                                                                                                                                                                | v0.22.0 |
-| `UNIQUE` index on an edge table's `in, out`: a second edge for the same ordered pair                                                   | raises ("index … already contains"), through `insert_relation()` and `RELATE`; the reverse pair is allowed                                           | same on both lines                                                                                                                                                                | v0.22.0 |
-| Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                          | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                       | v0.19.1 |
+| ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
+| -------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| Transaction strategy auto-selected by `transaction()`                                                                                  | buffered batch (`BEGIN…COMMIT`)                                                                                                                                               | native interactive on WebSocket                                                                                                                                                     | v0.9.0                               |
+| Reads inside a transaction (`objects(tx=)`)                                                                                            | raise (buffered cannot read)                                                                                                                                                  | see uncommitted writes                                                                                                                                                              | v0.9.0                               |
+| `save(tx=)` with an auto-generated id                                                                                                  | raises — explicit id required                                                                                                                                                 | supported                                                                                                                                                                           | v0.9.0                               |
+| `refresh(tx=)` inside a transaction                                                                                                    | raises                                                                                                                                                                        | works                                                                                                                                                                               | v0.9.0                               |
+| `bulk_update` / `bulk_delete` / `QuerySet.patch` row count inside a tx                                                                 | returns `0` (not knowable pre-commit)                                                                                                                                         | real count                                                                                                                                                                          | v0.9.0                               |
+| "Already exists" error on create                                                                                                       | normalised to `SurrealDbError`                                                                                                                                                | normalised to `SurrealDbError`                                                                                                                                                      | v0.7.0                               |
+| Cleanup on a missing target (`delete_table`)                                                                                           | native no-op                                                                                                                                                                  | ORM makes it a silent no-op                                                                                                                                                         | v0.7.0                               |
+| Aggregation over an empty set (`NaN` / `±inf`)                                                                                         | returns `0.0` / `None`                                                                                                                                                        | ORM normalises to `0.0` / `None`                                                                                                                                                    | v0.7.0                               |
+| Namespace/db selection (`use()` ordering)                                                                                              | lenient (auto-creates)                                                                                                                                                        | strict — ORM signs in before `use()`                                                                                                                                                | v0.7.0                               |
+| Writing a field a `SCHEMAFULL` table does not define (`CREATE`, `INSERT`, `INSERT RELATION`)                                           | silently dropped: the record is stored without it                                                                                                                             | rejected ("Found field …, but no such field exists"): nothing is stored                                                                                                             | v0.7.0                               |
+| `upsert()` / `update_or_create()` / `get_or_create()`                                                                                  | same on both lines                                                                                                                                                            | same on both lines                                                                                                                                                                  | v0.10.0                              |
+| `patch()` / `atomic_append` / `atomic_set_add` / `atomic_remove` / `atomic_increment`                                                  | same on both lines (portable `array::*` fns chosen over divergent `+=`/`-=`)                                                                                                  | same on both lines                                                                                                                                                                  | v0.11.0                              |
+| `retry_on_conflict` / `SurrealDbConflictError` (retryable conflict)                                                                    | same type + decorator; conflicts rarer (engine serialises more)                                                                                                               | same type + decorator; conflicts are the normal optimistic-MVCC failure                                                                                                             | v0.12.0                              |
+| `SurrealFunc` / `server_values=` / `extra_vars=` on `save`/`merge`                                                                     | same on both lines (compiled to portable `CREATE`/`UPDATE … SET`)                                                                                                             | same on both lines                                                                                                                                                                  | v0.13.0                              |
+| Shipped function-name enums (`SurrealTimeFunction`, `SurrealCryptoFunction`, …)                                                        | every catalogued member verified on 2.7.0                                                                                                                                     | every catalogued member verified on 3.3.4                                                                                                                                           | v0.13.0                              |
+| `server_values` inside a transaction — when the instance sees the computed value                                                       | only after commit (buffered; `refresh()` to read it)                                                                                                                          | immediately (interactive returns the row)                                                                                                                                           | v0.13.0                              |
+| `merge(server_values=)` on a missing record / never-created table                                                                      | server returns no rows → ORM raises `SurrealDbError`                                                                                                                          | server raises `NotFound` for a missing table → ORM raises the same error                                                                                                            | v0.13.0                              |
+| Computed fields (`Computed[...]` → `DEFINE FIELD … VALUE`)                                                                             | same on both lines (DDL, recompute triggers, precedence over client data)                                                                                                     | same on both lines                                                                                                                                                                  | v0.14.0                              |
+| DDL run inside a transaction, then rolled back                                                                                         | definition rolled back with the transaction                                                                                                                                   | same on both lines                                                                                                                                                                  | v0.14.0                              |
+| Invalid computed-field expression — raw SDK exception                                                                                  | `InternalError`                                                                                                                                                               | `ValidationError`                                                                                                                                                                   | v0.14.0                              |
+| Invalid computed-field expression — through the ORM                                                                                    | `SurrealDbError` (normalised)                                                                                                                                                 | `SurrealDbError` (normalised)                                                                                                                                                       | v0.14.0                              |
+| Issue #156 correctness fixes (`Var`/`$$`, `first()`, `*_or_create` strictness, `created` on upsert, quoted ids, one-hop `get_related`) | same on both lines (each fix reproduced and verified on 2.6.5)                                                                                                                | same on both lines (verified on 3.2.4)                                                                                                                                              | v0.14.3                              |
+| Record-id lookups (`filter(id=…)`, `id__in`, `get(…)`, `*_or_create(id=…)`) coerced to `RecordID`                                      | same on both lines (int/str typing verified on 2.6.5)                                                                                                                         | same on both lines (verified on 3.2.4)                                                                                                                                              | v0.14.4                              |
+| Per-event-loop client cache (`get_client`, `close_connection`, `close_all_connections`)                                                | same on both lines (loop binding is an asyncio/SDK property, not a server one)                                                                                                | same on both lines (verified on 3.2.4)                                                                                                                                              | v0.14.5                              |
+| `call_function()` — the call itself (`args`, `params`, `return_type`, nested `fn::a::b`)                                               | same on both lines (bare call form chosen so it is portable)                                                                                                                  | same on both lines (verified on 3.2.4)                                                                                                                                              | v0.15.0                              |
+| `call_function(tx=)` — return value                                                                                                    | `None` (buffered: queued until commit)                                                                                                                                        | the function's value (interactive returns it immediately)                                                                                                                           | v0.15.0                              |
+| `call_function(tx=, return_type=)`                                                                                                     | raises `ValueError` (no value to coerce yet)                                                                                                                                  | coerces the returned value                                                                                                                                                          | v0.15.0                              |
+| Missing function called inside a transaction                                                                                           | surfaces at COMMIT as `SurrealDbError` (buffered: the call is only queued)                                                                                                    | raises `SurrealDbNotFoundError` at call time                                                                                                                                        | v0.15.0                              |
+| Declared parameter name that collides with a reserved word, as echoed by `INFO FOR DB`                                                 | quoted: `` $`by` `` — parser accepts it                                                                                                                                       | bare: `$by`                                                                                                                                                                         | v0.15.0                              |
+| Auth methods (`signin`, `signup`, `authenticate`, `invalidate`, `info`)                                                                | same on both lines (native SDK primitives, verified on 2.6.5)                                                                                                                 | same on both lines (verified on 3.2.4)                                                                                                                                              | v0.16.0                              |
+| Auth failure — raw SDK exception for a wrong password                                                                                  | `InternalError`                                                                                                                                                               | `NotFoundError`                                                                                                                                                                     | v0.16.0                              |
+| Auth failure — through the ORM                                                                                                         | `SurrealDbAuthenticationError` (normalised)                                                                                                                                   | `SurrealDbAuthenticationError` (normalised)                                                                                                                                         | v0.16.0                              |
+| `DEFINE ACCESS … WITH REFRESH` and `AuthTokens.refresh`                                                                                | not supported — the clause does not parse; `refresh` is always `None`                                                                                                         | supported; `refresh` populated                                                                                                                                                      | v0.16.0                              |
+| `signin(access=…, refresh=…)` renewal                                                                                                  | raises `SurrealDbAuthenticationError` (no such access method is definable)                                                                                                    | returns a fresh, rotated token pair; the spent one is rejected                                                                                                                      | v0.16.0                              |
+| Session token replayed on reconnect (`get_client`, `reconnect`)                                                                        | same on both lines                                                                                                                                                            | same on both lines                                                                                                                                                                  | v0.16.0                              |
+| `info()` when the record's table denies it `select` on itself                                                                          | returns `None` (no error)                                                                                                                                                     | returns `None` (no error)                                                                                                                                                           | v0.16.0                              |
+| Signing in as a system user while a record session is open                                                                             | permissions change, `$auth` still points at the record — only `invalidate()` clears it                                                                                        | 3.2.x: same as 2.x. **3.3.0**: the identity is cleared and `info()` returns `None`; `invalidate()` stays the portable log-out                                                       | v0.16.0                              |
+| Duplicate signin identifier in the record table                                                                                        | signin fails (`No record was returned`)                                                                                                                                       | signin succeeds, picking one record                                                                                                                                                 | v0.16.0                              |
+| Model auth (`signup`/`signin`/`authenticate`, `access_ddl`/`define_access`)                                                            | same on both lines (verified on 2.6.5)                                                                                                                                        | same on both lines (verified on 3.2.4)                                                                                                                                              | v0.17.0                              |
+| Model auth session isolation (each call on its own ephemeral connection)                                                               | same on both lines (an SDK/connection property, not a server one)                                                                                                             | same on both lines (verified on 3.2.4)                                                                                                                                              | v0.17.0                              |
+| Hydrated instance's password field after `signup`/`signin`                                                                             | holds the stored **hash**, never the plaintext                                                                                                                                | same on both lines                                                                                                                                                                  | v0.17.0                              |
+| Model config `with_refresh=True` → `define_access()`                                                                                   | raises `SurrealDbError` (clause does not parse; message names the 3.x requirement)                                                                                            | applies, and `AuthResult.tokens.refresh` is populated                                                                                                                               | v0.17.0                              |
+| `Model.refresh(token)` renewal                                                                                                         | unavailable — no refresh token can exist                                                                                                                                      | returns a fresh, rotated pair; the spent token is rejected                                                                                                                          | v0.17.0                              |
+| Field aliases (`Field(alias=…)`) across writes, hydration and every QuerySet clause                                                    | same on both lines (pure Pydantic + client-side name translation)                                                                                                             | same on both lines (verified on 3.2.4)                                                                                                                                              | v0.18.0                              |
+| `server_fields` — excluded from creates, kept on replaces, hydrated back                                                               | same on both lines; a `DEFAULT` is a create-time default on 2.6.5                                                                                                             | same on both lines; a `DEFAULT` is a create-time default on 3.2.4                                                                                                                   | v0.18.0                              |
+| A server column omitted from a REPLACE (`UPDATE`/`UPSERT … CONTENT`)                                                                   | an optional column is deleted; a required one raises `Found NONE for field …`                                                                                                 | same on both lines — which is why the ORM keeps it in replace payloads                                                                                                              | v0.18.0                              |
+| `merge(refresh=False)` — skipped resync, `RETURN NONE`, forfeited missing-record check                                                 | same on both lines                                                                                                                                                            | same on both lines (verified on 3.2.4)                                                                                                                                              | v0.18.0                              |
+| `merge()` on a table that was never created                                                                                            | server returns no rows → ORM raises `SurrealDbError` ("no record found")                                                                                                      | server raises `NotFoundError` → normalised to the same `SurrealDbError`                                                                                                             | v0.18.0                              |
+| Live queries (`live()`, `subscribe_live()`, `kill()`) — the subscription itself                                                        | supported over WebSocket (verified on 2.6.5)                                                                                                                                  | supported over WebSocket (verified on 3.2.4)                                                                                                                                        | v0.19.0                              |
+| `live()` on a table that does not exist                                                                                                | succeeds; the stream simply never fires                                                                                                                                       | server raises `NotFound` → ORM raises `SurrealDbNotFoundError`                                                                                                                      | v0.19.0                              |
+| Server notification after `kill()`                                                                                                     | none is sent                                                                                                                                                                  | a final envelope whose action is `KILLED`                                                                                                                                           | v0.19.0                              |
+| End of a `subscribe_live()` stream after `kill()`                                                                                      | ORM pushes its own sentinel so the `async for` ends                                                                                                                           | ends on the sentinel or the `KILLED` envelope, whichever lands first                                                                                                                | v0.19.0                              |
+| `session` key in a live notification envelope                                                                                          | absent                                                                                                                                                                        | present (the SDK session uuid)                                                                                                                                                      | v0.19.0                              |
+| Live queries over HTTP                                                                                                                 | refused by the ORM with a message naming the WebSocket requirement                                                                                                            | same on both lines                                                                                                                                                                  | v0.19.0                              |
+| Filtered live query (`live()`/`watch()` with `filter()`, `Q`, `Var`)                                                                   | bound parameters never reach a `LIVE SELECT` (they read as `NONE`, the filter matches nothing); the ORM inlines each value as a literal, so it works                          | parameters would work; the ORM inlines too, for one code path — same result on both lines                                                                                           | v0.20.0                              |
+| A record entering / leaving a live filter                                                                                              | entering → `UPDATE`; leaving → nothing (nor its later `DELETE`)                                                                                                               | same on both lines                                                                                                                                                                  | v0.20.0                              |
+| `fetch()` inside a live query                                                                                                          | links resolved in every notification                                                                                                                                          | same on both lines                                                                                                                                                                  | v0.20.0                              |
+| Raw diff payload (`watch(diff=True)`): root patch path                                                                                 | `"/"`                                                                                                                                                                         | `""`                                                                                                                                                                                | v0.20.0                              |
+| Raw diff payload (`watch(diff=True)`): `DELETE`                                                                                        | the whole last record (a dict, not a patch list)                                                                                                                              | `[{op: replace, path: "", value: None}]`                                                                                                                                            | v0.20.0                              |
+| Typed diff `DELETE` (`live(diff=True)`): `event.instance`                                                                              | the last state of the record                                                                                                                                                  | an instance holding only the `id`                                                                                                                                                   | v0.20.0                              |
+| Diff patch format                                                                                                                      | extended JSON Patch: a changed string is an `op: change` with diff-match-patch text                                                                                           | same on both lines                                                                                                                                                                  | v0.20.0                              |
+| A WebSocket that drops (detection, server-side cleanup)                                                                                | the SDK's receive task ends within milliseconds; the server removes the session's live queries                                                                                | same on both lines                                                                                                                                                                  | v0.21.0                              |
+| Live stream after a drop (`auto_resubscribe=True`)                                                                                     | resubscribed on a new connection; `live_id` changes, `on_reconnect` runs                                                                                                      | same on both lines                                                                                                                                                                  | v0.21.0                              |
+| A request in flight when the socket drops                                                                                              | fails with the SDK's `KeyError` (not normalised; the next call reconnects)                                                                                                    | same on both lines                                                                                                                                                                  | v0.21.0                              |
+| Change-feed entry shape                                                                                                                | `{versionstamp, changes}`; a create is reported as `update`                                                                                                                   | same on both lines                                                                                                                                                                  | v0.21.0                              |
+| Change-feed `SINCE <n>` — what `n` is                                                                                                  | the counter, `versionstamp >> 16` (the raw stamp silently returns nothing); `ChangeModelStream.cursor` normalises it                                                          | the versionstamp, inclusive; `cursor` normalises it                                                                                                                                 | v0.21.0                              |
+| `changes(since=<datetime>)`                                                                                                            | the server also returns some earlier changes → at-least-once                                                                                                                  | the server returns nothing → the ORM converts to a versionstamp → exact                                                                                                             | v0.21.0                              |
+| `changes(since=None)` — finding "now"                                                                                                  | the ORM searches the counter (no history replayed)                                                                                                                            | the ORM reads the server clock's millisecond, then skips the entries already stamped in it (no history replayed); before v0.22.2 the entries of that millisecond were replayed      | v0.21.0                              |
+| `INCLUDE ORIGINAL` delete in a change feed                                                                                             | the id only → an instance holding only the `id`                                                                                                                               | 3.3.x: carries `original` → the last state of the record; 3.1.5: as 2.x                                                                                                             | v0.21.0                              |
+| `SHOW CHANGES` on a table without a change feed                                                                                        | returns `[]`; `changes()` raises `SurrealDbError` instead                                                                                                                     | same on both lines                                                                                                                                                                  | v0.21.0                              |
+| Typed edges (`relate(Edge, …)`, edge `save()` and `bulk_create()`) through `insert_relation()`                                         | same on both lines: a real relation that graph traversal sees, `id` hydrated from the returned row                                                                            | same on both lines                                                                                                                                                                  | v0.22.0                              |
+| Explicit edge id that already exists: raw `INSERT RELATION`, then through the ORM (edge `save()`, `bulk_create()`)                     | raw: 2.7.0 silently keeps the old edge and returns it. ORM: `SurrealDbError` ("already exists"), nothing written                                                              | raw: 3.3.3 raises `AlreadyExistsError`; 3.1.5 silently keeps the old edge, although the SurrealDB docs announce a record-exists error from 3.1.5. ORM: as 2.x, on 3.1.5 and 3.3.3   | v0.22.0                              |
+| Explicit edge id given as a `RecordID` of another table                                                                                | raw: silently moved into the edge table. ORM: `ValueError` before anything is sent                                                                                            | raw: raises. ORM: `ValueError` before anything is sent                                                                                                                              | v0.22.0                              |
+| `TYPE RELATION … ENFORCED` with an endpoint record that does not exist                                                                 | raw: `InternalError` ("The record … does not exist"). ORM: `SurrealDbNotFoundError`                                                                                           | raw: `NotFoundError`. ORM: `SurrealDbNotFoundError`                                                                                                                                 | v0.22.0                              |
+| Changing `in`/`out` of an existing edge (`UPDATE … CONTENT`/`MERGE`/`SET`, `PATCH`)                                                    | silently ignored by the server (the other fields are written); the ORM refuses it (`ValueError`, frozen fields)                                                               | same on both lines                                                                                                                                                                  | v0.22.0                              |
+| `UPSERT` / `CREATE` carrying `in`/`out` on an edge table                                                                               | stores a plain record that no graph traversal sees; the ORM refuses `upsert()` on an edge, and `save()` uses `INSERT RELATION`                                                | same on both lines                                                                                                                                                                  | v0.22.0                              |
+| Replacing an edge without `in`/`out` on a `TYPE RELATION … SCHEMAFULL` table                                                           | raises `Found NONE for field in …`; the ORM's `update()` always sends the endpoints                                                                                           | keeps the endpoints; the ORM sends them anyway                                                                                                                                      | v0.22.0                              |
+| Edge record in a `CREATE`/`UPDATE` live notification or a change-feed update entry                                                     | `raw` carries `"__": true`, the typed `instance` drops it; `DELETE` notifications and change-feed delete entries carry no marker                                              | no marker; the typed `instance` is identical                                                                                                                                        | v0.22.0                              |
+| `table_name`, model instances as filter values, `"table:id"` strings on edge endpoints in filters                                      | same on both lines                                                                                                                                                            | same on both lines                                                                                                                                                                  | v0.22.0                              |
+| Edge write refused by the table's `PERMISSIONS` (record user)                                                                          | fewer rows come back and no error (a batch keeps its accepted rows); the ORM raises `SurrealDbError`                                                                          | same on both lines                                                                                                                                                                  | v0.22.0                              |
+| `remove_relation` / `remove_all_relations` on an edge table that was never created, with or without `tx=`                              | native no-op (graph-path `DELETE`)                                                                                                                                            | native no-op (graph-path `DELETE`); before v0.22.0 it raised "table does not exist", which the ORM suppressed outside a transaction                                                 | v0.22.0                              |
+| `remove_relation` / `remove_all_relations` under `tx=` when the source record's own table does not exist                               | no-op                                                                                                                                                                         | the statement fails, and the transaction with it (outside a transaction the ORM keeps it a silent no-op on both lines)                                                              | v0.22.0                              |
+| `get_related(direction="both")`                                                                                                        | out-neighbours, then in-neighbours; the order inside each group differs between versions                                                                                      | same on both lines                                                                                                                                                                  | v0.22.0                              |
+| `UNIQUE` index on an edge table's `in, out`: a second edge for the same ordered pair                                                   | raises ("index … already contains"), through `insert_relation()` and `RELATE`; the reverse pair is allowed                                                                    | same on both lines                                                                                                                                                                  | v0.22.0                              |
+| Rich field types (`datetime`, `date`, `timedelta`/`Duration`, `Decimal`, `UUID`, `bytes`, `Range`, `set[X]`)                           | same on both lines: stored natively (sets as arrays) and read back as the declared type; a value the server would reject is refused with `ValueError` before anything is sent | same on both lines (verified on 3.3.4 and 3.1.5)                                                                                                                                    | v0.23.0                              |
+| `TYPE set<…>` columns (a `set[X]` or `frozenset[X]` field)                                                                             | an array: the ORM reads back the declared set                                                                                                                                 | 3.1: writing the array is refused. 3.3: stored as a native set the surrealdb SDK 2.0.0 cannot read (reads fail with an SDK decoding error). Declare `array<…>` columns (section 24) | v0.23.0                              |
+| Reading a `Decimal`                                                                                                                    | trailing zeros kept (`Decimal("12.50")` reads `12.50`)                                                                                                                        | normalised (`12.5`); the values are equal                                                                                                                                           | pre-existing (documented in v0.23.0) |
+| Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
 
@@ -2131,7 +2428,8 @@ Contributions are welcome! Please:
 | v0.20.0           | Typed live queries: `LiveModelStream`, diff, filters | ✅ Released |
 | v0.21.0           | Auto-resubscribe & change feeds (`changes()`)        | ✅ Released |
 | v0.22.0           | Tier 1 — Native typed relations                      | ✅ Released |
-| v0.23.0 – v0.29.0 | Tier 2 — Extended (rich types, geo, subqueries)      | 📋 Planned  |
+| v0.23.0           | Rich field types                                     | ✅ Released |
+| v0.24.0 – v0.29.0 | Tier 2 — Extended (geo, subqueries)                  | 📋 Planned  |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)     | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | 📋 Planned  |
@@ -2178,7 +2476,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Typed live queries            | ✅ v0.20.0                                                            | ✅                               |
 | Live auto-resubscribe / CDC   | ✅ v0.21.0                                                            | ✅                               |
 | Native typed relations        | ✅ v0.22.0 (typed edge models; relation DDL in v0.33.0)               | ✅ DDL only (TableType.RELATION) |
-| Rich field types              | v0.23.0                                                               | ✅                               |
+| Rich field types              | ✅ v0.23.0                                                            | ✅                               |
 | Geospatial Fields             | v0.24.0                                                               | ✅                               |
 | Subqueries & Query Cache      | v0.27 – v0.28                                                         | ✅                               |
 | Multi-database                | v0.29.0                                                               | ✅                               |

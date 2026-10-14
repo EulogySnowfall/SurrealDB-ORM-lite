@@ -10,6 +10,7 @@ from uuid import UUID
 
 from pydantic import TypeAdapter, ValidationError
 
+from . import encoding as _encoding
 from ._sdk import AsyncSurreal, NotFoundError
 from .auth import AuthTokens, build_auth_payload, wrap_auth_error
 from .exceptions import (
@@ -213,6 +214,7 @@ class SurrealDBConnectionManager:
         url, namespace, database = cls.__url, cls.__namespace, cls.__database
         user, password = cls.__user, cls.__password
         client: Any = None
+        credentials = _encoding.encode({"username": user, "password": password})
         try:
             client = AsyncSurreal(url)
             # WebSocket connections require explicit connect()
@@ -221,7 +223,7 @@ class SurrealDBConnectionManager:
             if signin_as_configured:
                 assert user is not None
                 assert password is not None
-                await client.signin({"username": user, "password": password})
+                await client.signin(credentials)
             await client.use(namespace, database)
         except Exception as e:
             logger.warning(f"Can't get connection: {e}")
@@ -658,16 +660,18 @@ class SurrealDBConnectionManager:
             request is issued.
         :raises SurrealDbAuthenticationError: if the server refuses the credentials.
         """
-        payload = build_auth_payload(
-            username=username,
-            password=password,
-            access=access,
-            variables=variables,
-            refresh=refresh,
-            namespace=namespace,
-            database=database,
-            default_namespace=cls.__namespace,
-            default_database=cls.__database,
+        payload = _encoding.encode(
+            build_auth_payload(
+                username=username,
+                password=password,
+                access=access,
+                variables=variables,
+                refresh=refresh,
+                namespace=namespace,
+                database=database,
+                default_namespace=cls.__namespace,
+                default_database=cls.__database,
+            )
         )
         client = await cls._acquire_client(restoring_identity=True)
         try:
@@ -705,13 +709,15 @@ class SurrealDBConnectionManager:
         :raises ValueError: if ``access`` or ``variables`` is missing — before any request.
         :raises SurrealDbAuthenticationError: if the server refuses the signup.
         """
-        payload = build_auth_payload(
-            access=access,
-            variables=variables,
-            namespace=namespace,
-            database=database,
-            default_namespace=cls.__namespace,
-            default_database=cls.__database,
+        payload = _encoding.encode(
+            build_auth_payload(
+                access=access,
+                variables=variables,
+                namespace=namespace,
+                database=database,
+                default_namespace=cls.__namespace,
+                default_database=cls.__database,
+            )
         )
         client = await cls._acquire_client(restoring_identity=True)
         try:
@@ -835,8 +841,9 @@ class SurrealDBConnectionManager:
 
         cls.clear_session()
 
+        credentials = _encoding.encode({"username": cls.__user, "password": cls.__password})
         try:
-            await client.signin({"username": cls.__user, "password": cls.__password})
+            await client.signin(credentials)
             if cls.__namespace is not None and cls.__database is not None:
                 await client.use(cls.__namespace, cls.__database)
             # Back at the configured identity — exactly what a reconnect restores.
@@ -1024,6 +1031,7 @@ class SurrealDBConnectionManager:
             values = await cls._resolve_named_args(client, name, params)
 
         statement, variables = build_call_statement(name, values)
+        variables = _encoding.encode(variables)
 
         if tx is not None:
             try:

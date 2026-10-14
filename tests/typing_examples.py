@@ -8,6 +8,7 @@ Deliberately named ``typing_examples`` rather than ``test_*`` so pytest does not
 the assertions here are made by mypy, not at runtime.
 """
 
+from datetime import timedelta
 from typing import Any
 
 from surrealdb import RecordID
@@ -15,7 +16,11 @@ from surrealdb import RecordID
 from surreal_orm_lite import (
     BaseSurrealEdge,
     BaseSurrealModel,
+    BoundExcluded,
+    BoundIncluded,
     Computed,
+    Duration,
+    Range,
     SurrealConfigDict,
     SurrealFunc,
     Transaction,
@@ -143,3 +148,50 @@ async def both(a: Person) -> list[Any]:
 async def related_positional(a: Person) -> list[Any]:
     """``get_related(edge, direction, model_class)`` by position, the full ORM's order."""
     return await a.get_related("follows", "in", Person)
+
+
+class Timed(BaseSurrealModel):
+    """v0.23.0: a ``Duration`` field keeps the server's nanoseconds."""
+
+    ttl: Duration | None = None
+
+
+def make_duration() -> Duration:
+    """``parse`` is a classmethod returning ``Self``: typed ``Duration``, not the SDK's class."""
+    return Duration.parse("1h30m")
+
+
+def from_seconds() -> Duration:
+    """The SDK's signature: an ``int`` of seconds, plus nanoseconds."""
+    return Duration.parse(90, 5)
+
+
+def compact(d: Duration) -> list[int]:
+    return d.to_compact()
+
+
+def as_td(d: Duration) -> timedelta:
+    return d.to_timedelta()
+
+
+class Shift(BaseSurrealModel):
+    """v0.23.0: a ``Range[int]`` field validates its bounds as ``int``."""
+
+    hours: Range[int] | None = None
+
+
+def nine_to_five() -> Range[int]:
+    """``Range`` is generic: ``Range[int](...)`` is typed ``Range[int]``."""
+    return Range[int](BoundIncluded(9), BoundExcluded(17))
+
+
+def one_to_five() -> Range[int]:
+    return Range[int](BoundIncluded(1), BoundExcluded(5))
+
+
+def open_end(start: int) -> Range[int]:
+    """An open side is ``None``; the bound attributes are optional."""
+    shift = Range[int](BoundIncluded(start), None)
+    begin: BoundIncluded | BoundExcluded | None = shift.begin
+    assert begin is not None
+    return shift

@@ -19,6 +19,7 @@ from typing import Any, ClassVar, Self
 
 from pydantic import AliasChoices, Field, field_validator
 
+from . import encoding as _encoding
 from ._sdk import NotFoundError, RecordID, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
@@ -104,9 +105,9 @@ async def insert_edges(table: str, rows: list[dict[str, Any]], *, tx: Transactio
         client = await SurrealDBConnectionManager.get_client()
         try:
             if any("id" in row for row in rows):
-                result = await client.query(_GUARDED_INSERT.format(table=table), {"data": data})
+                result = await client.query(_GUARDED_INSERT.format(table=table), _encoding.encode({"data": data}))
             else:
-                result = await client.insert_relation(table, data)
+                result = await client.insert_relation(table, _encoding.encode(data))
         except ServerError as exc:
             message = f"There was a problem with the database: {exc}"
             if isinstance(exc, NotFoundError) or "does not exist" in str(exc).lower():

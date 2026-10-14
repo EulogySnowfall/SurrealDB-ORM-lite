@@ -639,6 +639,12 @@ class TestTeardownEndsStreamsE2E:
 class TestLiveErrorPathsE2E:
     @pytest.mark.asyncio
     async def test_subscribe_live_without_a_connection_explains_itself(self) -> None:
+        from tests.conftest import _ws_url
+
+        # A WebSocket URL configured here, not inherited: an earlier test may have unset the
+        # connection or left an http:// URL, and the message under test is the one for a ws://
+        # URL with no client on this event loop.
+        SurrealDBConnectionManager.set_connection(url=_ws_url(), user="root", password="root", namespace="ns", database="db")
         await SurrealDBConnectionManager.close_connection()
         with pytest.raises(SurrealDbError) as excinfo:
             SurrealDBConnectionManager.subscribe_live("00000000-0000-0000-0000-000000000000")

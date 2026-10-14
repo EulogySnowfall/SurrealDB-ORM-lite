@@ -5,14 +5,17 @@ import os
 import typing
 import warnings
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
+from datetime import timedelta
 from decimal import Decimal
+from types import UnionType
 from typing import TYPE_CHECKING, Any, Self, TypeVar, overload
 
 import pydantic
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic_core import ValidationError
 
-from ._sdk import NotFoundError, RecordID, ServerError
+from . import encoding as _encoding
+from ._sdk import NotFoundError, RecordID, SdkDuration, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, _ComputedDefault
@@ -28,6 +31,7 @@ from .signals import (
     pre_update,
 )
 from .transaction import Transaction
+from .types import Duration, _duration_from_sdk, _timedelta_from_sdk
 from .utils import (
     VALID_ALIAS_PATTERN,
     apply_ddl_statements,
@@ -58,6 +62,8 @@ _E = TypeVar("_E", bound="BaseSurrealEdge")
 # object, which is what makes them inheritance-correct — a subclass gets its own entry.
 _ALIAS_MAPS: dict[type, tuple[dict[str, str], dict[str, str]]] = {}
 _SERVER_FIELDS: dict[type, frozenset[str]] = {}
+# The read kinds of v0.23.0 (``BaseSurrealModel._read_kinds``), filled once Pydantic completed the class.
+_READ_KINDS: dict[type, dict[str, str]] = {}
 
 # Pydantic's metaclass sits between ``__pydantic_init_subclass__`` and the user's ``class``
 # statement; a warning raised there must skip its frames to land on the user's line (v0.22.0).
@@ -91,6 +97,29 @@ def _check_table_name(cls: type, key: str, name: Any) -> None:
             f"{cls.__name__}: {key} {name!r} must be an identifier (letters, digits, underscores; "
             "not starting with a digit): it is interpolated into SurrealQL."
         )
+
+
+def _read_kind(annotation: Any) -> str | None:
+    """Return the read kind of a field annotation: ``"timedelta"``, ``"duration"`` or ``None`` (v0.23.0).
+
+    Unwraps ``Annotated``, then a union of exactly one non-``None`` member with ``None``, then
+    ``Annotated`` again. Only exactly ``timedelta`` or exactly the ORM's ``Duration`` has a kind:
+    ``timedelta | str``, ``list[timedelta]``, a ``timedelta`` subclass or ``Range[timedelta]`` has none.
+    """
+    if typing.get_origin(annotation) is typing.Annotated:
+        annotation = typing.get_args(annotation)[0]
+    if typing.get_origin(annotation) in (typing.Union, UnionType):
+        members = typing.get_args(annotation)
+        if len(members) != 2 or type(None) not in members:
+            return None
+        annotation = members[0] if members[1] is type(None) else members[1]
+        if typing.get_origin(annotation) is typing.Annotated:
+            annotation = typing.get_args(annotation)[0]
+    if annotation is timedelta:
+        return "timedelta"
+    if annotation is Duration:
+        return "duration"
+    return None
 
 
 def _own_annotation_names(cls: type) -> set[str]:
@@ -359,6 +388,35 @@ class BaseSurrealModel(BaseModel):
         return cached
 
     @classmethod
+    def _read_kinds(cls) -> dict[str, str]:
+        """Return the read kind of each top-level ``timedelta``/``Duration`` field, cached per class (v0.23.0).
+
+        ``{"ttl": "timedelta", "grace": "duration"}``, keyed by the Python field name **and** by
+        its column when the field is aliased: :meth:`set_data` receives rows keyed by column and
+        calls keyed by name. The columns are those of :meth:`_alias_maps`, read without its
+        ambiguity check so that a read never raises here. Only a field annotated exactly
+        ``timedelta`` or ``Duration`` (through ``Annotated`` and ``X | None``) has a kind; a model
+        without one gets ``{}``, and both read rules are then no-ops. Cached once Pydantic has
+        completed the class, like the alias maps; never mutate the returned dict.
+        """
+        cached = _READ_KINDS.get(cls)
+        if cached is not None:
+            return cached
+        implicit = cls._implicit_aliases()
+        kinds: dict[str, str] = {}
+        for name, info in cls.model_fields.items():
+            kind = _read_kind(info.annotation)
+            if kind is None:
+                continue
+            kinds[name] = kind
+            column = info.alias or implicit.get(name)
+            if column:
+                kinds[column] = kind
+        if cls.__pydantic_complete__:
+            _READ_KINDS[cls] = kinds
+        return kinds
+
+    @classmethod
     def _reject_ambiguous_aliases(cls, forward: Mapping[str, str]) -> None:
         """Raise if the alias map is not a bijection between field names and columns.
 
@@ -580,6 +638,12 @@ class BaseSurrealModel(BaseModel):
         """
         Pre-process data before model validation.
         Extracts the ID from RecordID if present, unless the field accepts RecordID natively.
+
+        A top-level ``timedelta`` field given the SDK's ``Duration`` (what every read returns for a
+        SurrealDB ``duration``) gets a ``timedelta``, floored to the microsecond (v0.23.0). The dict is
+        copied on that first change, never mutated by it; a value this rule cannot convert (beyond
+        ``timedelta.max``, a subclass, any other type) is left as received for Pydantic to judge,
+        so the rule itself never raises.
         """
         if isinstance(data, dict) and "id" in data and isinstance(data["id"], RecordID):
             # Only convert to plain string when the id field does not accept RecordID.
@@ -595,6 +659,18 @@ class BaseSurrealModel(BaseModel):
                 # which yields the SurrealQL-escaped form (e.g. "⟨1⟩") for numeric-looking
                 # or special string ids.
                 data["id"] = str(data["id"].id)
+        kinds = cls._read_kinds()
+        if kinds and isinstance(data, dict):
+            received = data
+            for key, kind in kinds.items():
+                if kind != "timedelta" or key not in data:
+                    continue
+                value = data[key]
+                converted = _timedelta_from_sdk(value)
+                if converted is not value:
+                    if data is received:
+                        data = dict(data)
+                    data[key] = converted
         return data
 
     async def refresh(self, tx: Transaction | None = None) -> None:
@@ -902,7 +978,7 @@ class BaseSurrealModel(BaseModel):
             # ServerError, so catch the base and match on the message to stay
             # faithful to the original "already exists" contract across versions.
             try:
-                record = await client.create(record_id, data)
+                record = await client.create(record_id, _encoding.encode(data))
             except ServerError as e:
                 if "already exists" in str(e).lower():
                     raise SurrealDbError(f"There was a problem with the database: {e}") from e
@@ -916,7 +992,7 @@ class BaseSurrealModel(BaseModel):
             return self, True
 
         # Auto-generate the ID
-        record = await client.create(table, data)  # pragma: no cover
+        record = await client.create(table, _encoding.encode(data))  # pragma: no cover
 
         if isinstance(record, list):
             raise SurrealDbError("Can't save data, multiple records returned.")  # pragma: no cover
@@ -997,7 +1073,7 @@ class BaseSurrealModel(BaseModel):
 
         client = await SurrealDBConnectionManager.get_client()
         try:
-            rows = await client.query(statement, variables)
+            rows = await client.query(statement, _encoding.encode(variables))
         except ServerError as e:
             # Same normalisation as the native path: "already exists" is an ORM error.
             if "already exists" in str(e).lower():
@@ -1086,6 +1162,9 @@ class BaseSurrealModel(BaseModel):
         name first (v0.18.0). ``only`` is therefore matched on Python names — the same
         vocabulary the callers use, since they pass things like ``get_server_fields()``.
 
+        Top-level ``timedelta`` and ``Duration`` fields get the SDK's ``Duration`` converted
+        (v0.23.0); every other value is applied as received.
+
         Args:
             only: restrict the copy to these field names. ``None`` (default) applies every field
                 in the row.
@@ -1095,10 +1174,16 @@ class BaseSurrealModel(BaseModel):
         if not isinstance(record, dict):
             return
         allowed = None if only is None else set(only)
+        kinds = self._read_kinds()
         for column, value in record.items():
             key = self.to_py_field(column)
             if allowed is not None and key not in allowed:
                 continue
+            kind = kinds.get(key)
+            if kind == "timedelta":
+                value = _timedelta_from_sdk(value)
+            elif kind == "duration":
+                value = _duration_from_sdk(value)
             if hasattr(self, key):
                 object.__setattr__(self, key, value)
 
@@ -1154,7 +1239,7 @@ class BaseSurrealModel(BaseModel):
         """
         client = await SurrealDBConnectionManager.get_client()
         try:
-            rows = await client.query(statement, variables)
+            rows = await client.query(statement, _encoding.encode(variables))
         except NotFoundError as e:
             raise SurrealDbError("Can't merge data, no record found.") from e
         self._sync_after_merge(rows, refresh, data, server_values)
@@ -1173,7 +1258,7 @@ class BaseSurrealModel(BaseModel):
             return
         client = await SurrealDBConnectionManager.get_client()
         try:
-            row = await client.merge(record_id, wire_data)
+            row = await client.merge(record_id, _encoding.encode(wire_data))
         except NotFoundError as e:
             raise SurrealDbError("Can't merge data, no record found.") from e
         self._sync_after_merge(row, True, data, {})
@@ -1246,7 +1331,7 @@ class BaseSurrealModel(BaseModel):
             return self, before is None
 
         client = await SurrealDBConnectionManager.get_client()
-        rows = await client.query(statement, variables)
+        rows = await client.query(statement, _encoding.encode(variables))
         before, after = self._split_upsert_result(rows)
         self._apply_record(after if after is not None else rows)
         return self, before is None
@@ -1315,13 +1400,13 @@ class BaseSurrealModel(BaseModel):
         client = await SurrealDBConnectionManager.get_client()
 
         if not has_signals:
-            return await client.update(record_id, data)
+            return await client.update(record_id, _encoding.encode(data))
 
         update_fields = self._py_fields(data)
         await pre_update.send(sender, instance=self, update_fields=update_fields)
 
         async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-            result = await client.update(record_id, data)
+            result = await client.update(record_id, _encoding.encode(data))
 
         await post_update.send(sender, instance=self, update_fields=update_fields)
 
@@ -1508,7 +1593,7 @@ class BaseSurrealModel(BaseModel):
             self._apply_record(rows)  # interactive: applies; buffered: add() returns None → no-op (stale)
             return self
         client = await SurrealDBConnectionManager.get_client()
-        record = await client.patch(record_id, operations)
+        record = await client.patch(record_id, _encoding.encode(operations))
         self._apply_record(record)
         return self
 
@@ -1530,7 +1615,7 @@ class BaseSurrealModel(BaseModel):
             self._apply_record(rows)
             return self
         client = await SurrealDBConnectionManager.get_client()
-        rows = await client.query(statement, vars_)
+        rows = await client.query(statement, _encoding.encode(vars_))
         self._apply_record(rows)
         return self
 
@@ -1569,7 +1654,16 @@ class BaseSurrealModel(BaseModel):
         ``amount`` to decrement. ``amount`` may be a ``decimal.Decimal`` for exact arithmetic
         (the value is bound, not interpolated); adding a ``Decimal`` to an int/float field
         coerces the stored field to SurrealDB ``decimal``. Emits no signals.
+
+        A duration amount raises ``TypeError`` (v0.23.0): SurrealDB 2.x ignores ``+=`` with a
+        duration.
         """
+        if isinstance(amount, (timedelta, SdkDuration, Duration)):
+            raise TypeError(
+                f"atomic_increment() adds a number, not a duration ({amount!r}): SurrealDB 2.x ignores += with a "
+                "duration, so the result would differ between server lines. "
+                f"Set the new value with merge({field}=…) instead."
+            )
         column = self._validate_atomic_field(field)
         return await self._atomic_update(f"{column} += $amount", {"amount": amount}, tx)
 
@@ -1962,7 +2056,7 @@ class BaseSurrealModel(BaseModel):
             return rows if isinstance(rows, list) else []
 
         client = await SurrealDBConnectionManager.get_client()
-        result = await client.query(query, variables)
+        result = await client.query(query, _encoding.encode(variables))
         return result if isinstance(result, list) else []
 
     async def _relate_typed(
@@ -2031,7 +2125,7 @@ class BaseSurrealModel(BaseModel):
             return
         client = await SurrealDBConnectionManager.get_client()
         with contextlib.suppress(NotFoundError):
-            await client.query(statement, variables)
+            await client.query(statement, _encoding.encode(variables))
 
     async def remove_relation(
         self,
@@ -2207,7 +2301,7 @@ class BaseSurrealModel(BaseModel):
         query = f"SELECT VALUE {selected} FROM ONLY $src;"
 
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.query(query, {"src": source})
+        results = await client.query(query, _encoding.encode({"src": source}))
 
         if not isinstance(results, list) or len(results) == 0:
             return []
@@ -2223,7 +2317,7 @@ class BaseSurrealModel(BaseModel):
                 # injection risk and the SurrealQL-escaped string form (e.g. "Table:⟨1⟩")
                 # that validate_thing would reject.
                 fetch_query = "SELECT * FROM $ids;"
-                records = await client.query(fetch_query, {"ids": list(records)})
+                records = await client.query(fetch_query, _encoding.encode({"ids": list(records)}))
                 if not isinstance(records, list):
                     return []
 
@@ -2261,7 +2355,7 @@ class BaseSurrealModel(BaseModel):
 
         query = f"SELECT VALUE {path} FROM ONLY $src;"
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.query(query, {"src": source})
+        results = await client.query(query, _encoding.encode({"src": source}))
 
         if isinstance(results, list):
             return results
@@ -2328,7 +2422,7 @@ class BaseSurrealModel(BaseModel):
         # Sent verbatim: this is the caller's own SurrealQL, so the ORM does not rewrite it
         # (unquoting "$word" occurrences used to corrupt string literals — issue #156).
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.query(query, variables or {})
+        results = await client.query(query, _encoding.encode(variables or {}))
 
         # SDK 2.0 returns the rows list directly from query()
         if isinstance(results, list):

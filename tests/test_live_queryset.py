@@ -102,10 +102,10 @@ class TestCompileLive:
         assert sql == "LIVE SELECT * FROM Ticket WHERE status = 'a' FETCH owner;"
 
     def test_uninlinable_value_raises_type_error(self) -> None:
-        from datetime import timedelta
+        from datetime import time
 
-        with pytest.raises(TypeError, match="timedelta"):
-            Ticket.objects().filter(age=timedelta(1))._compile_live(False)
+        with pytest.raises(TypeError, match=r"type time\b"):
+            Ticket.objects().filter(age=time(1))._compile_live(False)
 
     @pytest.mark.parametrize(
         ("label", "build"),
@@ -548,7 +548,12 @@ class TestExplicitFormE2E:
     @pytest.mark.asyncio
     async def test_subscribe_live_without_a_connection_points_at_the_current_api(self) -> None:
         from surreal_orm_lite import SurrealDBConnectionManager as Manager
+        from tests.conftest import _ws_url
 
+        # A WebSocket URL configured here, not inherited: an earlier test may have unset the
+        # connection or left an http:// URL, and the pointer under test is the one for a ws://
+        # URL with no client.
+        Manager.set_connection(url=_ws_url(), user="root", password="root", namespace="ns", database="db")
         await Manager.close_connection()
         with pytest.raises(SurrealDbError) as excinfo:
             Manager.subscribe_live("00000000-0000-0000-0000-000000000000")

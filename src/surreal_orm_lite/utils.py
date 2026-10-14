@@ -7,10 +7,11 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pydantic
 
-from ._sdk import RecordID, ServerError
+from ._sdk import RecordID, SdkRange, ServerError
 from .constants import LOOKUP_OPERATORS
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, Var
+from .types import Range
 
 if TYPE_CHECKING:
     from .model_base import BaseSurrealModel
@@ -503,6 +504,9 @@ def build_filter_condition(
     A model instance given as the value — or as an item of a sequence lookup — is bound as its
     record id (:func:`as_record_value`, v0.22.0).
 
+    A ``Range`` (ORM or SDK) given to ``in``/``not_in`` is bound as one value (v0.23.0); on the
+    ``id`` column and on edge endpoint columns it raises ``ValueError``.
+
     Args:
         field: The field name.
         lookup: The lookup type (e.g. ``"exact"``, ``"gt"``, ``"in"``).
@@ -524,7 +528,8 @@ def build_filter_condition(
         ValueError: If the lookup type is not supported, the field name is invalid, a
             text/collection lookup is applied to the ``id`` column or to an endpoint column,
             a sequence lookup gets a single model instance, a model instance is unsaved, or
-            an endpoint value is not a record id.
+            an endpoint value is not a record id — or an ``in``/``not_in`` lookup gets a
+            ``Range`` on the ``id`` column or on an endpoint column (v0.23.0).
     """
     validate_field_name(field, "filter field")
     op = LOOKUP_OPERATORS.get(lookup)
@@ -552,6 +557,18 @@ def build_filter_condition(
         else:
             return f"{field} IS NOT NULL", {}, counter
     elif lookup in ("in", "not_in", "containsall", "containsany"):
+        if lookup in ("in", "not_in") and isinstance(value, (Range, SdkRange)):
+            if field == RECORD_ID_COLUMN:
+                raise ValueError(
+                    f"'{lookup}' with a Range cannot be applied to the record id column '{field}': a record id "
+                    "never falls inside a value range. Filter on a regular column."
+                )
+            if is_endpoint_column:
+                raise ValueError(
+                    f"'{lookup}' with a Range cannot be applied to the edge endpoint column '{field}': it holds "
+                    "a record id, which never falls inside a value range."
+                )
+            return f"{field} {op} ${var_name}", {var_name: value}, counter + 1
         if isinstance(value, (str, dict)) or not hasattr(value, "__iter__"):
             raise ValueError(f"'{lookup}' lookup requires an iterable (list, tuple, or set), got {type(value).__name__}")
         if isinstance(value, pydantic.BaseModel):

@@ -7,7 +7,7 @@ keeps the inlining from becoming an injection or a silent mismatch.
 """
 
 import math
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime, time, timedelta, timezone
 from decimal import Decimal
 from enum import IntEnum, StrEnum
 from typing import Any
@@ -146,8 +146,8 @@ class TestContainers:
             to_surql_literal({1: "a"})
 
     def test_unknown_type_is_refused_by_name(self) -> None:
-        with pytest.raises(TypeError, match="timedelta"):
-            to_surql_literal(timedelta(hours=1))
+        with pytest.raises(TypeError, match=r"type time\b"):
+            to_surql_literal(time(1))
 
 
 class TestInlineVariables:
@@ -169,11 +169,11 @@ class TestInlineVariables:
         assert inline_variables("x = $a", {"a": "\\t"}) == "x = '\\\\t'"
 
     def test_unused_unsupported_value_does_not_raise(self) -> None:
-        assert inline_variables("x = $a", {"a": 1, "unused": timedelta(1)}) == "x = 1"
+        assert inline_variables("x = $a", {"a": 1, "unused": time(1)}) == "x = 1"
 
     def test_error_names_the_variable(self) -> None:
         with pytest.raises(TypeError, match=r"\$a"):
-            inline_variables("x = $a", {"a": timedelta(1)})
+            inline_variables("x = $a", {"a": time(1)})
 
 
 # ==================== E2E — the literal means the value, on every line ====================

@@ -21,6 +21,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from . import encoding as _encoding
 from .exceptions import SurrealDbConflictError, SurrealDbError
 
 _NOT_EXECUTED_FILLER = "The query was not executed due to a failed transaction"
@@ -161,6 +162,7 @@ class BufferedTransaction(Transaction):
         is a prefix of another is not corrupted). Returns None: nothing executes until
         commit, so buffered writes cannot return rows.
         """
+        variables = _encoding.encode(variables)
         prefix = f"t{self._counter}_"
         renamed = statement
         if variables:
@@ -190,7 +192,7 @@ class BufferedTransaction(Transaction):
             return
         # query_raw (NOT query): query() returns None on a failed tx; query_raw gives
         # per-statement status for raise_for_status.
-        raw = await self._client.query_raw(self.build_query(), self.variables)
+        raw = await self._client.query_raw(self.build_query(), _encoding.encode(self.variables))
         self.raise_for_status(raw)
 
     async def cancel(self) -> None:
@@ -219,8 +221,9 @@ class InteractiveTransaction(Transaction):
 
     async def add(self, statement: str, variables: dict[str, Any] | None = None) -> Any:
         """Run a write inside the transaction; inspect status; return its rows."""
+        payload = _encoding.encode(variables or {})
         try:
-            raw = await self._client.query_raw(statement, variables or {}, txn_id=self._txn_id)
+            raw = await self._client.query_raw(statement, payload, txn_id=self._txn_id)
         except Exception as exc:
             raise _as_conflict(exc) from exc
         self.raise_for_status(raw)
@@ -229,8 +232,9 @@ class InteractiveTransaction(Transaction):
 
     async def run_read(self, statement: str, variables: dict[str, Any] | None = None) -> Any:
         """Run a read inside the transaction and return rows directly."""
+        payload = _encoding.encode(variables or {})
         try:
-            return await self._client.query(statement, variables or {}, txn_id=self._txn_id)
+            return await self._client.query(statement, payload, txn_id=self._txn_id)
         except Exception as exc:
             raise _as_conflict(exc) from exc
 

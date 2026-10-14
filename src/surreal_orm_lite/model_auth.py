@@ -18,6 +18,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
+from . import encoding as _encoding
 from .auth import AuthTokens, build_auth_payload, wrap_auth_error
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbAuthenticationError, SurrealDbError
@@ -422,6 +423,7 @@ class AuthenticatedUserMixin:
                 should not be told that "signin" failed.
         """
         label = label or action
+        payload = _encoding.encode(payload)
         async with SurrealDBConnectionManager.ephemeral_client() as client:
             try:
                 tokens: AuthTokens | None = None
