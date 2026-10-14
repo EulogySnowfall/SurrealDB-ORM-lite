@@ -4,11 +4,23 @@ Unit tests, no database: one test per row of ``encode`` with its edges, the prop
 relies on (identity on every value v0.22.2 could send, idempotence, no mutation of the input) and
 the local zero-duration probe. The raw-SDK round trips of the encoded forms, over WebSocket and
 HTTP on both server lines, live in ``tests/test_rich_types.py``.
+
+The hand-off itself — every SDK call of ``src/`` given ``_encoding.encode(…)`` of its payload, and
+never inside a ``try`` that would re-wrap the ``ValueError`` of a refused value — is checked here
+by an AST scan of the package (``TestBoundary``) and by fakes that stand in for the client
+(``TestHandOff``). The ORM-level round trips are in ``tests/test_rich_fields.py``.
 """
 
+import ast
+import contextlib
 import copy
+import dataclasses
 import decimal
+import pathlib
+import re
+import textwrap
 import time
+from collections.abc import AsyncIterator, Callable, Coroutine
 from datetime import UTC, date, datetime, timedelta, timezone
 from datetime import time as dt_time
 from decimal import Decimal
@@ -22,7 +34,21 @@ from surrealdb import Range as SdkRange
 from surrealdb import RecordID
 from surrealdb.cbor import CBORSimpleValue, CBORTag, undefined
 
-from surreal_orm_lite import BoundExcluded, BoundIncluded, Duration, Range, _sdk, encoding
+import surreal_orm_lite
+from surreal_orm_lite import (
+    AuthenticatedUserMixin,
+    BaseSurrealModel,
+    BoundExcluded,
+    BoundIncluded,
+    BufferedTransaction,
+    Duration,
+    InteractiveTransaction,
+    Range,
+    SurrealConfigDict,
+    SurrealDBConnectionManager,
+    _sdk,
+    encoding,
+)
 from surreal_orm_lite._sdk import Bound
 from tests.test_rich_types import _DECIMAL_FIXED, _decimal_corpus
 
@@ -720,3 +746,647 @@ class TestZeroProbe:
         finally:
             monkeypatch.undo()
             probe.cache_clear()
+
+
+# --- the hand-off: every SDK call of src/ goes through encode() (spec §6.2) ----------------------
+
+#: SDK client methods that carry data to the server.
+_SDK_METHODS = frozenset(
+    {"query", "query_raw", "create", "update", "upsert", "merge", "patch", "insert", "insert_relation"}
+    | {"signin", "signup", "run", "let"}
+)
+#: Their payload is the first positional argument; for every other method, the second.
+_AUTH_METHODS = frozenset({"signin", "signup"})
+#: Receivers that call one of those names but are not SDK clients, reviewed at ``cc2cfa3``: dict
+#: ``.update()`` calls (``collected``, ``all_variables``, ``self._variables``, ``variables``,
+#: ``self._annotations``) and ``obj.merge()`` on a model instance (``QuerySet.bulk_update``).
+#: Extend it only after checking that the new receiver is not an SDK client.
+_NON_SDK_RECEIVERS = frozenset({"collected", "all_variables", "self._variables", "variables", "self._annotations", "obj"})
+#: A handler naming one of these catches a plain ``ValueError``.
+_CATCHES_VALUE_ERROR = frozenset({"Exception", "BaseException", "ValueError"})
+_ENCODE = "_encoding.encode"
+_CLIENT = re.compile(r"client$")
+_TX = re.compile(r"(^|[._])tx$")
+_FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef)
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+_NESTED_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
+@dataclasses.dataclass
+class _BoundaryReport:
+    """What the checker found in one module (or, summed, in the package)."""
+
+    offenders: list[str] = dataclasses.field(default_factory=list)
+    inline: int = 0
+    named: int = 0
+    bare: int = 0
+
+    def add(self, other: "_BoundaryReport") -> None:
+        self.offenders.extend(other.offenders)
+        self.inline += other.inline
+        self.named += other.named
+        self.bare += other.bare
+
+
+def _is_encode_call(node: ast.AST | None) -> bool:
+    return isinstance(node, ast.Call) and ast.unparse(node.func) == _ENCODE
+
+
+def _is_bare(node: ast.AST | None) -> bool:
+    return node is None or (isinstance(node, ast.Dict) and not node.keys)
+
+
+def _names_a_value_error_base(expr: ast.expr) -> bool:
+    name = expr.id if isinstance(expr, ast.Name) else expr.attr if isinstance(expr, ast.Attribute) else None
+    return name in _CATCHES_VALUE_ERROR
+
+
+def _catches_value_error(handler_type: ast.expr | None) -> bool:
+    """A bare ``except:``, or a type (alone or in a tuple) that a plain ``ValueError`` matches."""
+    if handler_type is None:
+        return True
+    items = handler_type.elts if isinstance(handler_type, ast.Tuple) else [handler_type]
+    return any(_names_a_value_error_base(item) for item in items)
+
+
+def _suppresses_value_error(item: ast.withitem) -> bool:
+    call = item.context_expr
+    return (
+        isinstance(call, ast.Call)
+        and ast.unparse(call.func) in {"suppress", "contextlib.suppress"}
+        and any(_catches_value_error(arg) for arg in call.args)
+    )
+
+
+def _guard_around(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> ast.AST | None:
+    """The innermost ``try`` body (or ``suppress`` block) around *node* that swallows a ``ValueError``."""
+    child, parent = node, parents.get(node)
+    while parent is not None and not isinstance(parent, _FUNCTIONS):
+        in_body = any(child is statement for statement in getattr(parent, "body", ()))
+        catching = isinstance(parent, ast.Try | ast.TryStar) and any(
+            _catches_value_error(handler.type) for handler in parent.handlers
+        )
+        suppressing = isinstance(parent, ast.With | ast.AsyncWith) and any(
+            _suppresses_value_error(item) for item in parent.items
+        )
+        if in_body and (catching or suppressing):
+            return parent
+        child, parent = parent, parents.get(parent)
+    return None
+
+
+def _binds(target: ast.AST, name: str) -> bool:
+    if isinstance(target, ast.Name):
+        return target.id == name
+    if isinstance(target, ast.Tuple | ast.List):
+        return any(_binds(element, name) for element in target.elts)
+    if isinstance(target, ast.Starred):
+        return _binds(target.value, name)
+    return False
+
+
+def _end(node: ast.AST) -> tuple[int, int]:
+    return (getattr(node, "end_lineno", 0) or 0, getattr(node, "end_col_offset", 0) or 0)
+
+
+def _walk_scope(scope: ast.AST) -> list[ast.AST]:
+    """Every node of *scope*, without descending into the functions or classes it defines."""
+    found: list[ast.AST] = []
+    pending = list(ast.iter_child_nodes(scope))
+    while pending:
+        node = pending.pop()
+        found.append(node)
+        if not isinstance(node, _NESTED_SCOPES):
+            pending.extend(ast.iter_child_nodes(node))
+    return found
+
+
+def _bindings(scope: ast.AST, name: str) -> list[tuple[tuple[int, int], ast.AST]]:
+    """Every binding of *name* in *scope*, keyed by the position where it takes effect."""
+    found: list[tuple[tuple[int, int], ast.AST]] = []
+    if isinstance(scope, _SCOPES):
+        args = scope.args
+        for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs, args.vararg, args.kwarg]:
+            if arg is not None and arg.arg == name:
+                found.append(((arg.lineno, arg.col_offset), arg))
+    for node in _walk_scope(scope):
+        if isinstance(node, ast.Assign):
+            targets: list[ast.AST] = list(node.targets)
+        elif isinstance(node, ast.AnnAssign | ast.AugAssign | ast.NamedExpr):
+            targets = [node.target]
+        else:
+            targets = []
+        if any(_binds(target, name) for target in targets):
+            # An assignment takes effect once its whole statement has run.
+            found.append((_end(node), node))
+        elif isinstance(node, ast.For | ast.AsyncFor) and _binds(node.target, name):
+            found.append((_end(node.target), node))
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None and _binds(node.optional_vars, name):
+            found.append((_end(node.optional_vars), node))
+        elif isinstance(node, ast.ExceptHandler) and node.name == name:
+            found.append(((node.lineno, node.col_offset), node))
+    return found
+
+
+def _boundary_report(source: str, filename: str) -> _BoundaryReport:
+    """Check one module against every rule of spec §6.2, with ``ast`` only.
+
+    1. A *data call* is ``<R>.<m>(…)`` with ``m`` in ``_SDK_METHODS`` and ``R`` ending in
+       ``client`` (payload: 1st argument for ``signin``/``signup``, else the 2nd), or
+       ``getattr(<R>, …)(…)`` with ``R`` ending in ``client`` (every positional argument). It
+       passes no ``*args`` and no keyword but ``txn_id=``.
+    2. Each payload is **bare** (absent, or ``{}``), **inline** (``_encoding.encode(…)``) or an
+       **encoded name** (a name whose last binding before the call, in the same function, is
+       ``name = _encoding.encode(…)``).
+    3. No ``_encoding.encode(…)`` sits in the body of a ``try`` catching ``ValueError`` (bare
+       ``except:``, ``Exception``, ``BaseException``, ``ValueError``) or of a ``with suppress(…)``
+       naming one of them: the refusal would be re-wrapped.
+    4. A ``<R>.add``/``<R>.run_read`` call with ``R`` ending in ``tx`` inside such a ``try`` passes
+       nothing, ``{}`` or an encoded name.
+    5. A call of one of the methods on a receiver that does not end in ``client`` must be on a
+       reviewed non-SDK receiver; a ``getattr(<R>, …)(…)`` call must be on a client.
+    """
+    tree = ast.parse(source, filename)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    report = _BoundaryReport()
+
+    def offend(node: ast.AST, reason: str) -> None:
+        report.offenders.append(f"{filename}:{getattr(node, 'lineno', 0)}: {reason}")
+
+    def scope_of(node: ast.AST) -> ast.AST:
+        parent = parents.get(node)
+        while parent is not None and not isinstance(parent, _SCOPES):
+            parent = parents.get(parent)
+        return parent if parent is not None else tree
+
+    def encoded_name(arg: ast.AST, call: ast.Call) -> bool:
+        if not isinstance(arg, ast.Name):
+            return False
+        at = (call.lineno, call.col_offset)
+        before = [binding for binding in _bindings(scope_of(call), arg.id) if binding[0] <= at]
+        if not before:
+            return False
+        last = max(before, key=lambda binding: binding[0])[1]
+        return isinstance(last, ast.Assign | ast.AnnAssign) and _is_encode_call(last.value)
+
+    def well_formed(call: ast.Call, what: str) -> bool:
+        ok = True
+        if any(isinstance(arg, ast.Starred) for arg in call.args):
+            offend(call, f"shape: {what} passes *args")
+            ok = False
+        for keyword in call.keywords:
+            if keyword.arg != "txn_id":
+                offend(call, f"shape: {what} passes the keyword {keyword.arg or '**'}= (only txn_id= is allowed)")
+                ok = False
+        return ok
+
+    def check_payload(call: ast.Call, arg: ast.AST | None, what: str) -> None:
+        if _is_bare(arg):
+            report.bare += 1
+        elif _is_encode_call(arg):
+            report.inline += 1
+        elif arg is not None and encoded_name(arg, call):
+            report.named += 1
+        else:
+            offend(
+                call,
+                f"payload: {what} sends {ast.unparse(arg) if arg is not None else '?'!s}, which is neither bare, "
+                f"{_ENCODE}(…) nor a name last assigned from {_ENCODE}(…)",
+            )
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if _is_encode_call(node):
+            guard = _guard_around(node, parents)
+            if guard is not None:
+                offend(
+                    node,
+                    f"placement: {_ENCODE}(…) inside the try/suppress of line {getattr(guard, 'lineno', 0)}, "
+                    "which catches ValueError: encode into a name before it",
+                )
+        elif isinstance(func, ast.Attribute):
+            receiver = ast.unparse(func.value)
+            what = f"{receiver}.{func.attr}()"
+            if func.attr in _SDK_METHODS:
+                if not _CLIENT.search(receiver):
+                    if receiver not in _NON_SDK_RECEIVERS:
+                        offend(node, f"guard: {what} is on a receiver that is not a client nor a reviewed non-SDK receiver")
+                elif well_formed(node, what):
+                    index = 0 if func.attr in _AUTH_METHODS else 1
+                    check_payload(node, node.args[index] if len(node.args) > index else None, what)
+            elif func.attr in {"add", "run_read"} and _TX.search(receiver) and _guard_around(node, parents) is not None:
+                given = [kw.value for kw in node.keywords if kw.arg == "variables"]
+                arg = node.args[1] if len(node.args) > 1 else given[0] if given else None
+                starred = any(isinstance(a, ast.Starred) for a in node.args) or any(kw.arg is None for kw in node.keywords)
+                if starred or not (_is_bare(arg) or (arg is not None and encoded_name(arg, node))):
+                    offend(node, f"transaction: {what} inside a try catching ValueError must pass an encoded name")
+        elif isinstance(func, ast.Call) and isinstance(func.func, ast.Name) and func.func.id == "getattr":
+            receiver = ast.unparse(func.args[0]) if func.args else ""
+            what = f"getattr({receiver}, …)()"
+            if not _CLIENT.search(receiver):
+                offend(node, f"guard: {what} is not on a client")
+            elif well_formed(node, what):
+                if not node.args:
+                    report.bare += 1
+                for arg in node.args:
+                    check_payload(node, arg, what)
+    return report
+
+
+def _package_report() -> _BoundaryReport:
+    report = _BoundaryReport()
+    package = pathlib.Path(surreal_orm_lite.__file__).parent
+    for path in sorted(package.glob("*.py")):
+        report.add(_boundary_report(path.read_text(encoding="utf-8"), path.name))
+    return report
+
+
+def _report(snippet: str) -> _BoundaryReport:
+    return _boundary_report(textwrap.dedent(snippet), "snippet.py")
+
+
+_REJECTED = {
+    "inline encode in try/except Exception": (
+        """
+        async def f(client, v):
+            try:
+                await client.query("q", _encoding.encode(v))
+            except Exception as exc:
+                raise RuntimeError() from exc
+        """,
+        "placement",
+    ),
+    "inline encode in except (KeyError, ValueError)": (
+        """
+        async def f(client, v):
+            try:
+                await client.query("q", _encoding.encode(v))
+            except (KeyError, ValueError):
+                pass
+        """,
+        "placement",
+    ),
+    "inline encode in a bare except": (
+        """
+        async def f(client, v):
+            try:
+                await client.query("q", _encoding.encode(v))
+            except:
+                pass
+        """,
+        "placement",
+    ),
+    "inline encode in contextlib.suppress(Exception)": (
+        """
+        async def f(client, v):
+            with contextlib.suppress(Exception):
+                await client.query("q", _encoding.encode(v))
+        """,
+        "placement",
+    ),
+    "a name last assigned from something else": (
+        """
+        async def f(client, x, y):
+            payload = _encoding.encode(x)
+            payload = y
+            await client.query("q", payload)
+        """,
+        "payload",
+    ),
+    "a receiver that is not a client": (
+        """
+        async def f(v):
+            await (await get_client()).query("q", _encoding.encode(v))
+        """,
+        "guard",
+    ),
+    "a connection that is not called client": (
+        """
+        async def f(self, v):
+            await self._conn.query("q", _encoding.encode(v))
+        """,
+        "guard",
+    ),
+    "getattr on something else": (
+        """
+        async def f(conn, v):
+            await getattr(conn, "query")("q", _encoding.encode(v))
+        """,
+        "guard",
+    ),
+    "a payload given by keyword": (
+        """
+        async def f(client, v):
+            await client.query("q", vars=_encoding.encode(v))
+        """,
+        "shape",
+    ),
+    "*args": (
+        """
+        async def f(client, args):
+            await client.query(*args)
+        """,
+        "shape",
+    ),
+    "an unwrapped signin payload": (
+        """
+        async def f(client):
+            await client.signin({"a": 1})
+        """,
+        "payload",
+    ),
+    "an unencoded tx.add inside try/except Exception": (
+        """
+        async def f(tx, s, variables):
+            try:
+                await tx.add(s, variables)
+            except Exception as exc:
+                raise RuntimeError() from exc
+        """,
+        "transaction",
+    ),
+}
+
+_ACCEPTED = {
+    "inline outside any try": (
+        """
+        async def f(client, v):
+            await client.query("q", _encoding.encode(v))
+        """,
+        (1, 0, 0),
+    ),
+    "inline in try/except ServerError": (
+        """
+        async def f(client, v):
+            try:
+                await client.query("q", _encoding.encode(v))
+            except ServerError:
+                pass
+        """,
+        (1, 0, 0),
+    ),
+    "an encoded name before try/except Exception": (
+        """
+        async def f(client, v):
+            payload = _encoding.encode(v)
+            try:
+                await client.signin(payload)
+            except Exception as exc:
+                raise RuntimeError() from exc
+        """,
+        (0, 1, 0),
+    ),
+    "an empty dict": (
+        """
+        async def f(client):
+            await client.query("q", {})
+        """,
+        (0, 0, 1),
+    ),
+    "no payload": (
+        """
+        async def f(client):
+            await client.query("q")
+        """,
+        (0, 0, 1),
+    ),
+    "query_raw with txn_id": (
+        """
+        async def f(self, s, variables):
+            payload = _encoding.encode(variables or {})
+            try:
+                return await self._client.query_raw(s, payload, txn_id=self._txn_id)
+            except Exception as exc:
+                raise RuntimeError() from exc
+        """,
+        (0, 1, 0),
+    ),
+    "getattr on a client": (
+        """
+        async def f(client, action, payload):
+            payload = _encoding.encode(payload)
+            try:
+                return await getattr(client, action)(payload)
+            except Exception as exc:
+                raise RuntimeError() from exc
+        """,
+        (0, 1, 0),
+    ),
+    "an encoded tx.add inside try/except Exception": (
+        """
+        async def f(tx, s, variables):
+            variables = _encoding.encode(variables)
+            try:
+                await tx.add(s, variables)
+            except Exception as exc:
+                raise RuntimeError() from exc
+        """,
+        (0, 0, 0),
+    ),
+    "a dict update": (
+        """
+        def f(collected, x):
+            collected.update(x)
+        """,
+        (0, 0, 0),
+    ),
+}
+
+
+class TestBoundary:
+    """Spec §6.2 (AC-13): the AST scan of ``src/surreal_orm_lite/*.py``."""
+
+    def test_every_sdk_call_is_encoded(self) -> None:
+        report = _package_report()
+        assert report.offenders == [], "SDK calls outside the encoding boundary:\n" + "\n".join(report.offenders)
+        # The inventory of spec §6.2 at cc2cfa3: the scan is not vacuous.
+        counts = f"inline={report.inline} named={report.named} bare={report.bare}"
+        assert report.inline >= 22, counts
+        assert report.named >= 8, counts
+        assert report.inline + report.named >= 30, counts
+        assert report.bare >= 6, counts
+
+    @pytest.mark.parametrize(("snippet", "rule"), list(_REJECTED.values()), ids=list(_REJECTED))
+    def test_checker_rejects(self, snippet: str, rule: str) -> None:
+        offenders = _report(snippet).offenders
+        assert offenders, "the checker accepted a form the boundary forbids"
+        assert any(f": {rule}:" in offender for offender in offenders), offenders
+
+    @pytest.mark.parametrize(("snippet", "counts"), list(_ACCEPTED.values()), ids=list(_ACCEPTED))
+    def test_checker_accepts(self, snippet: str, counts: tuple[int, int, int]) -> None:
+        report = _report(snippet)
+        assert report.offenders == []
+        assert (report.inline, report.named, report.bare) == counts
+
+    def test_encode_is_never_imported_by_name(self) -> None:
+        package = pathlib.Path(surreal_orm_lite.__file__).parent
+        wrapping = []
+        for path in sorted(package.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"), path.name)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and (node.module or "").split(".")[-1] == "encoding":
+                    assert not any(alias.name in {"encode", "*"} for alias in node.names), (
+                        f"{path.name}:{node.lineno} imports encode by name: call it as {_ENCODE}(…)"
+                    )
+            if any(_is_encode_call(node) for node in ast.walk(tree)):
+                wrapping.append(path.name)
+                assert any(
+                    isinstance(node, ast.ImportFrom)
+                    and node.level == 1
+                    and node.module is None
+                    and any(alias.name == "encoding" and alias.asname == "_encoding" for alias in node.names)
+                    for node in ast.walk(tree)
+                ), f"{path.name} wraps payloads without 'from . import encoding as _encoding'"
+        assert len(wrapping) >= 6, wrapping
+
+
+# --- the hand-off at run time, with fakes standing in for the client ----------------------------
+
+_NEG = timedelta(seconds=-1)
+
+
+class _RecordingClient:
+    """Records what reaches the SDK: ``query_raw`` answers like one successful statement."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, Any, Any]] = []
+
+    async def query_raw(self, statement: str, variables: Any = None, txn_id: Any = None) -> Any:
+        self.calls.append(("query_raw", statement, variables, txn_id))
+        return {"result": [{"status": "OK", "result": []}]}
+
+    async def query(self, statement: str, variables: Any = None, txn_id: Any = None) -> Any:
+        self.calls.append(("query", statement, variables, txn_id))
+        return []
+
+
+class _UntouchableClient:
+    """A client that must never be reached."""
+
+    async def query(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("nothing may reach the client")
+
+    async def query_raw(self, *args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("nothing may reach the client")
+
+
+class _AuthUnit(AuthenticatedUserMixin, BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_unit", access_name="rf_unit")
+
+    id: str | None = None
+    email: str
+    password: str
+    grace: Duration | None = None
+
+
+async def _refused(call: Callable[[], Coroutine[Any, Any, Any]]) -> None:
+    """*call* raises a plain ``ValueError`` (never a subclass the ORM re-wrapped it into)."""
+    with pytest.raises(ValueError, match="negative duration") as excinfo:
+        await call()
+    assert type(excinfo.value) is ValueError, f"re-wrapped into {type(excinfo.value).__name__}"
+
+
+def _no_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def get_client() -> Any:
+        return _UntouchableClient()
+
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(get_client))
+
+
+async def _call_function_without_tx(monkeypatch: pytest.MonkeyPatch) -> None:
+    _no_client(monkeypatch)
+    await _refused(lambda: SurrealDBConnectionManager.call_function("fn::x", [_NEG]))
+
+
+async def _call_function_buffered(monkeypatch: pytest.MonkeyPatch) -> None:
+    _no_client(monkeypatch)
+    tx = BufferedTransaction(client=None)
+    await _refused(lambda: SurrealDBConnectionManager.call_function("fn::x", [_NEG], tx=tx))
+    assert tx.statements == [] and tx.variables == {}
+
+
+async def _call_function_interactive(monkeypatch: pytest.MonkeyPatch) -> None:
+    _no_client(monkeypatch)
+    fake = _RecordingClient()
+    await _refused(lambda: SurrealDBConnectionManager.call_function("fn::x", [_NEG], tx=InteractiveTransaction(fake, "x")))
+    assert fake.calls == []
+
+
+async def _no_acquire(*args: Any, **kwargs: Any) -> Any:
+    raise AssertionError("no client may be acquired")
+
+
+async def _manager_signin(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(SurrealDBConnectionManager, "_acquire_client", staticmethod(_no_acquire))
+    await _refused(lambda: SurrealDBConnectionManager.signin(access="a", variables={"g": _NEG}, namespace="ns", database="db"))
+
+
+async def _manager_signup(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(SurrealDBConnectionManager, "_acquire_client", staticmethod(_no_acquire))
+    await _refused(lambda: SurrealDBConnectionManager.signup(access="a", variables={"g": _NEG}, namespace="ns", database="db"))
+
+
+@contextlib.asynccontextmanager
+async def _no_ephemeral_client() -> AsyncIterator[Any]:
+    raise AssertionError("no connection may be opened")
+    yield  # pragma: no cover
+
+
+async def _model_signup(monkeypatch: pytest.MonkeyPatch) -> None:
+    SurrealDBConnectionManager.set_connection("ws://127.0.0.1:1/rpc", "root", "root", "ns", "db")  # no I/O
+    try:
+        monkeypatch.setattr(SurrealDBConnectionManager, "ephemeral_client", staticmethod(_no_ephemeral_client))
+        await _refused(lambda: _AuthUnit.signup(email="a@b.c", password="pw", grace=_NEG))
+    finally:
+        await SurrealDBConnectionManager.unset_connection()
+
+
+_REFUSAL_PATHS: dict[str, Callable[[pytest.MonkeyPatch], Coroutine[Any, Any, None]]] = {
+    "call_function": _call_function_without_tx,
+    "call_function-buffered-tx": _call_function_buffered,
+    "call_function-interactive-tx": _call_function_interactive,
+    "manager-signin": _manager_signin,
+    "manager-signup": _manager_signup,
+    "model-signup": _model_signup,
+}
+
+
+class TestHandOff:
+    """Spec §5.7, §6.2 (AC-13, D11): encoded at the hand-off, refused before anything is sent."""
+
+    @pytest.mark.asyncio
+    async def test_buffered_add_encodes_at_entry(self) -> None:
+        tx = BufferedTransaction(client=None)
+        await tx.add("UPDATE $rid SET v = $v;", {"rid": RecordID("t", 1), "v": timedelta(hours=1)})
+        assert tx.variables["t0_v"] == CBORTag(_DUR, [3600, 0])
+        assert tx.variables["t0_rid"] == RecordID("t", 1)
+
+        with pytest.raises(ValueError, match="negative duration") as excinfo:
+            await tx.add("UPDATE $rid SET v = $v;", {"v": _NEG})
+        assert type(excinfo.value) is ValueError
+        assert len(tx.statements) == 1
+        assert tx._counter == 1
+
+    @pytest.mark.asyncio
+    async def test_interactive_add_and_read_encode(self) -> None:
+        fake = _RecordingClient()
+        tx = InteractiveTransaction(fake, "x")
+        await tx.add("UPDATE t:1 SET d = $d;", {"d": date(2026, 1, 2)})
+        await tx.run_read("SELECT * FROM t WHERE s = $s;", {"s": {"b", "a"}})
+        assert fake.calls == [
+            ("query_raw", "UPDATE t:1 SET d = $d;", {"d": _MIDNIGHT}, "x"),
+            ("query", "SELECT * FROM t WHERE s = $s;", {"s": ["a", "b"]}, "x"),
+        ]
+        assert type(fake.calls[0][2]["d"]) is datetime
+
+        fake.calls.clear()
+        await _refused(lambda: tx.add("UPDATE t:1 SET v = $v;", {"v": _NEG}))
+        await _refused(lambda: tx.run_read("SELECT * FROM t WHERE v = $v;", {"v": _NEG}))
+        assert fake.calls == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", list(_REFUSAL_PATHS))
+    async def test_refusals_are_plain_value_errors(self, path: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        await _REFUSAL_PATHS[path](monkeypatch)

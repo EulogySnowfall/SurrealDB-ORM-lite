@@ -12,6 +12,7 @@ import pydantic
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic_core import ValidationError
 
+from . import encoding as _encoding
 from ._sdk import NotFoundError, RecordID, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
@@ -902,7 +903,7 @@ class BaseSurrealModel(BaseModel):
             # ServerError, so catch the base and match on the message to stay
             # faithful to the original "already exists" contract across versions.
             try:
-                record = await client.create(record_id, data)
+                record = await client.create(record_id, _encoding.encode(data))
             except ServerError as e:
                 if "already exists" in str(e).lower():
                     raise SurrealDbError(f"There was a problem with the database: {e}") from e
@@ -916,7 +917,7 @@ class BaseSurrealModel(BaseModel):
             return self, True
 
         # Auto-generate the ID
-        record = await client.create(table, data)  # pragma: no cover
+        record = await client.create(table, _encoding.encode(data))  # pragma: no cover
 
         if isinstance(record, list):
             raise SurrealDbError("Can't save data, multiple records returned.")  # pragma: no cover
@@ -997,7 +998,7 @@ class BaseSurrealModel(BaseModel):
 
         client = await SurrealDBConnectionManager.get_client()
         try:
-            rows = await client.query(statement, variables)
+            rows = await client.query(statement, _encoding.encode(variables))
         except ServerError as e:
             # Same normalisation as the native path: "already exists" is an ORM error.
             if "already exists" in str(e).lower():
@@ -1154,7 +1155,7 @@ class BaseSurrealModel(BaseModel):
         """
         client = await SurrealDBConnectionManager.get_client()
         try:
-            rows = await client.query(statement, variables)
+            rows = await client.query(statement, _encoding.encode(variables))
         except NotFoundError as e:
             raise SurrealDbError("Can't merge data, no record found.") from e
         self._sync_after_merge(rows, refresh, data, server_values)
@@ -1173,7 +1174,7 @@ class BaseSurrealModel(BaseModel):
             return
         client = await SurrealDBConnectionManager.get_client()
         try:
-            row = await client.merge(record_id, wire_data)
+            row = await client.merge(record_id, _encoding.encode(wire_data))
         except NotFoundError as e:
             raise SurrealDbError("Can't merge data, no record found.") from e
         self._sync_after_merge(row, True, data, {})
@@ -1246,7 +1247,7 @@ class BaseSurrealModel(BaseModel):
             return self, before is None
 
         client = await SurrealDBConnectionManager.get_client()
-        rows = await client.query(statement, variables)
+        rows = await client.query(statement, _encoding.encode(variables))
         before, after = self._split_upsert_result(rows)
         self._apply_record(after if after is not None else rows)
         return self, before is None
@@ -1315,13 +1316,13 @@ class BaseSurrealModel(BaseModel):
         client = await SurrealDBConnectionManager.get_client()
 
         if not has_signals:
-            return await client.update(record_id, data)
+            return await client.update(record_id, _encoding.encode(data))
 
         update_fields = self._py_fields(data)
         await pre_update.send(sender, instance=self, update_fields=update_fields)
 
         async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-            result = await client.update(record_id, data)
+            result = await client.update(record_id, _encoding.encode(data))
 
         await post_update.send(sender, instance=self, update_fields=update_fields)
 
@@ -1508,7 +1509,7 @@ class BaseSurrealModel(BaseModel):
             self._apply_record(rows)  # interactive: applies; buffered: add() returns None → no-op (stale)
             return self
         client = await SurrealDBConnectionManager.get_client()
-        record = await client.patch(record_id, operations)
+        record = await client.patch(record_id, _encoding.encode(operations))
         self._apply_record(record)
         return self
 
@@ -1530,7 +1531,7 @@ class BaseSurrealModel(BaseModel):
             self._apply_record(rows)
             return self
         client = await SurrealDBConnectionManager.get_client()
-        rows = await client.query(statement, vars_)
+        rows = await client.query(statement, _encoding.encode(vars_))
         self._apply_record(rows)
         return self
 
@@ -1962,7 +1963,7 @@ class BaseSurrealModel(BaseModel):
             return rows if isinstance(rows, list) else []
 
         client = await SurrealDBConnectionManager.get_client()
-        result = await client.query(query, variables)
+        result = await client.query(query, _encoding.encode(variables))
         return result if isinstance(result, list) else []
 
     async def _relate_typed(
@@ -2031,7 +2032,7 @@ class BaseSurrealModel(BaseModel):
             return
         client = await SurrealDBConnectionManager.get_client()
         with contextlib.suppress(NotFoundError):
-            await client.query(statement, variables)
+            await client.query(statement, _encoding.encode(variables))
 
     async def remove_relation(
         self,
@@ -2207,7 +2208,7 @@ class BaseSurrealModel(BaseModel):
         query = f"SELECT VALUE {selected} FROM ONLY $src;"
 
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.query(query, {"src": source})
+        results = await client.query(query, _encoding.encode({"src": source}))
 
         if not isinstance(results, list) or len(results) == 0:
             return []
@@ -2223,7 +2224,7 @@ class BaseSurrealModel(BaseModel):
                 # injection risk and the SurrealQL-escaped string form (e.g. "Table:⟨1⟩")
                 # that validate_thing would reject.
                 fetch_query = "SELECT * FROM $ids;"
-                records = await client.query(fetch_query, {"ids": list(records)})
+                records = await client.query(fetch_query, _encoding.encode({"ids": list(records)}))
                 if not isinstance(records, list):
                     return []
 
@@ -2261,7 +2262,7 @@ class BaseSurrealModel(BaseModel):
 
         query = f"SELECT VALUE {path} FROM ONLY $src;"
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.query(query, {"src": source})
+        results = await client.query(query, _encoding.encode({"src": source}))
 
         if isinstance(results, list):
             return results
@@ -2328,7 +2329,7 @@ class BaseSurrealModel(BaseModel):
         # Sent verbatim: this is the caller's own SurrealQL, so the ORM does not rewrite it
         # (unquoting "$word" occurrences used to corrupt string literals — issue #156).
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.query(query, variables or {})
+        results = await client.query(query, _encoding.encode(variables or {}))
 
         # SDK 2.0 returns the rows list directly from query()
         if isinstance(results, list):

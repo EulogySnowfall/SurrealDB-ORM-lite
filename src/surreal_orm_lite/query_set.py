@@ -8,6 +8,7 @@ from uuid import UUID
 from pydantic_core import ValidationError
 
 from . import BaseSurrealModel, SurrealDBConnectionManager
+from . import encoding as _encoding
 from ._sdk import NotFoundError
 from .changefeed import ChangeModelStream, Since
 from .edge import _check_edge_id, insert_edges
@@ -406,7 +407,7 @@ class QuerySet:
                 return []
         client = await SurrealDBConnectionManager.get_client()
         try:
-            return await client.query(compiled, vars_)  # type: ignore
+            return await client.query(compiled, _encoding.encode(vars_))  # type: ignore
         except NotFoundError:
             return []
 
@@ -774,7 +775,7 @@ class QuerySet:
             return models  # buffered: not executed until commit; return inputs
 
         client = await SurrealDBConnectionManager.get_client()
-        results = await client.insert(self._model_table, data_list)
+        results = await client.insert(self._model_table, _encoding.encode(data_list))
 
         if isinstance(results, list):
             return self.model.from_db(results)  # type: ignore
@@ -1294,7 +1295,7 @@ class QuerySet:
             # User-authored SurrealQL is sent verbatim: the caller owns that string and
             # binds their own variables, so rewriting quoted "$word" occurrences inside it
             # would corrupt their string literals (issue #156).
-            results = await client.query(query, variables or {})
+            results = await client.query(query, _encoding.encode(variables or {}))
         except NotFoundError:
             # SurrealDB 3.x raises for a never-created table; the ORM contract
             # treats a missing table as empty.
