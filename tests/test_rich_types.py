@@ -1185,8 +1185,13 @@ class TestRichLiterals:
         assert differences == []
 
     def test_decimal_beyond_the_int_string_limit(self) -> None:
-        """The one intended change (D8): v0.20.0 raised ``int()``'s ``ValueError`` there."""
-        d = Decimal("1" * 5000 + "E-10")
+        """The one intended change (D8): v0.20.0 raised ``int()``'s ``ValueError`` there.
+
+        Built from a tuple: the pure-Python ``decimal`` parses ``Decimal(str)`` through ``int()`` and
+        would refuse those 5 000 digits before the ORM sees them.
+        """
+        d = Decimal((0, (1,) * 5000, -10))
+        assert str(d) == "1" * 4990 + "." + "1" * 10
         assert _outcome(_v020_decimal, d)[0] == "ValueError"
         with pytest.raises(TypeError, match="96-bit mantissa"):
             to_surql_literal(d)

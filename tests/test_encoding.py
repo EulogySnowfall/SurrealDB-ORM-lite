@@ -18,6 +18,8 @@ import dataclasses
 import decimal
 import pathlib
 import re
+import subprocess
+import sys
 import textwrap
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine
@@ -253,8 +255,9 @@ class TestEncodeRows:
             assert _encode(seventy_digits) is seventy_digits  # no false refusal (``copy_abs()``)
             with pytest.raises(ValueError, match=r"2\*\*96 - 1"):
                 _encode(Decimal("79228162514264337593543950335.5"))
-            assert ctx.flags[decimal.Inexact] is False
-            assert ctx.flags[decimal.Rounded] is False
+            # ``not``, never ``is False``: the pure-Python ``decimal`` keeps its flags as 0/1.
+            assert not ctx.flags[decimal.Inexact]
+            assert not ctx.flags[decimal.Rounded]
 
     def test_decimal_notation_matches_str(self) -> None:
         """Returned unchanged exactly when ``str()`` writes no exponent (default context)."""
@@ -650,6 +653,45 @@ def _encodable_outputs() -> list[Any]:
         _SubDict(z=1, y=date(2026, 1, 2)),
         [{"deep": ({"set": {"b", "a"}},)}],
     ]
+
+
+# --- the pure-Python ``decimal`` ------------------------------------------------------------------
+
+
+class TestPurePythonDecimal:
+    """The decimal unit tests also hold where ``decimal`` is ``_pydecimal``, the pure-Python fallback.
+
+    CPython falls back to it when its ``_decimal`` C module is missing, as on the CI's Python 3.15
+    runners. Its context flags are ``0``/``1``, not ``False``/``True``, and its ``Decimal(str)`` goes
+    through ``int()``, so it refuses a coefficient beyond Python's 4 300-digit int-string limit. A
+    local interpreter usually has ``_decimal``: this runs the unit tests that name ``decimal`` once
+    more, in a fresh interpreter where ``_decimal`` cannot be imported.
+    """
+
+    def test_decimal_unit_tests_pass_on_the_pure_python_decimal(self) -> None:
+        if sys.modules.get("_decimal") is None:
+            pytest.skip("this interpreter already runs the pure-Python decimal: the tests themselves are the check")
+        script = """
+            import sys
+
+            sys.modules["_decimal"] = None  # ``import decimal`` falls back to ``_pydecimal``
+            import _pydecimal
+            import decimal
+
+            assert decimal.Decimal is _pydecimal.Decimal
+            import pytest
+
+            sys.exit(pytest.main(["--no-cov", "-p", "no:cacheprovider", "-k", "decimal and not E2E", "tests"]))
+        """
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", textwrap.dedent(script)],
+            cwd=pathlib.Path(__file__).resolve().parent.parent,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert result.returncode == 0, result.stdout[-6000:] + result.stderr[-2000:]
+        assert re.search(r"\b\d+ passed\b", result.stdout), result.stdout[-2000:]
 
 
 class TestEncodeProperties:
