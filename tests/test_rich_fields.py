@@ -30,14 +30,19 @@ from surreal_orm_lite import (
     Computed,
     Count,
     Duration,
+    LiveAction,
+    Q,
     Range,
     SurrealConfigDict,
     SurrealDBConnectionManager,
     SurrealFunc,
+    _sdk,
     computed,
     encoding,
 )
+from surreal_orm_lite._sdk import Bound
 from surreal_orm_lite.live import hydrate
+from surreal_orm_lite.utils import build_filter_condition
 from tests._retry import retry_write
 from tests.conftest import orm_client
 from tests.test_model_auth import AUTH_PASSWORD, _connect, _unique_email
@@ -1095,3 +1100,276 @@ class TestNativeContractE2E:
             await RfArr(id="x", tags={"b", "a"}).save()
             got = await RfArr.objects().get("x")
         assert type(got.tags) is set and got.tags == {"a", "b"}
+
+
+# --- filters and live queries (spec §5.5, §5.6, §6.5; AC-22, AC-23; D12) --------------------------
+
+_WORKING_AGE = Range(BoundIncluded(18), BoundExcluded(65))
+_SDK_WORKING_AGE = surrealdb.Range(BoundIncluded(18), BoundExcluded(65))
+_ID_REFUSAL = "'{lookup}' with a Range cannot be applied to the record id column 'id': a record id never falls inside a value range. Filter on a regular column."
+_ENDPOINT_REFUSAL = (
+    "'{lookup}' with a Range cannot be applied to the edge endpoint column '{field}': it holds a record id, "
+    "which never falls inside a value range."
+)
+
+
+class _RecordingClient:
+    """Stands in for the SDK client: records what ``query()`` is handed, answers no rows."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def query(self, statement: str, variables: dict[str, Any] | None = None) -> list[Any]:
+        self.calls.append((statement, dict(variables or {})))
+        return []
+
+
+class TestRangeLookup:
+    """AC-22 (unit), D12: a ``Range`` given to ``in``/``not_in`` is one bound value, never expanded."""
+
+    @pytest.mark.parametrize("value", [_WORKING_AGE, _SDK_WORKING_AGE], ids=["orm", "sdk"])
+    @pytest.mark.parametrize(("lookup", "op"), [("in", "IN"), ("not_in", "NOT IN")])
+    def test_bound_as_is(self, value: Any, lookup: str, op: str) -> None:
+        sql, variables, counter = build_filter_condition("age", lookup, value, 0)
+        assert (sql, counter) == (f"age {op} $_f0", 1)
+        assert list(variables) == ["_f0"] and variables["_f0"] is value
+
+    def test_counter_names_the_variable(self) -> None:
+        sql, variables, counter = build_filter_condition("age", "in", _WORKING_AGE, 3)
+        assert (sql, counter) == ("age IN $_f3", 4) and variables["_f3"] is _WORKING_AGE
+
+    def test_through_q(self) -> None:
+        sql, variables, counter = Q(age__in=_WORKING_AGE).to_sql()
+        assert (sql, counter) == ("age IN $_f0", 1) and variables["_f0"] is _WORKING_AGE
+        sql, variables, _ = (~Q(age__not_in=_SDK_WORKING_AGE)).to_sql()
+        assert "age NOT IN $_f0" in sql and variables["_f0"] is _SDK_WORKING_AGE
+
+    def test_through_the_queryset(self) -> None:
+        where, variables = RfEvent.objects().filter(n__in=_WORKING_AGE)._build_where()
+        assert where == " WHERE n IN $_f0" and variables == {"_f0": _WORKING_AGE}
+        assert variables["_f0"] is _WORKING_AGE
+        where, variables = RfEvent.objects().filter(Q(n__not_in=_SDK_WORKING_AGE))._build_where()
+        assert where == " WHERE n NOT IN $_f0" and variables["_f0"] is _SDK_WORKING_AGE
+
+    def test_builtin_range_is_still_a_list(self) -> None:
+        _, variables = RfEvent.objects().filter(n__in=range(1, 5))._build_where()
+        assert variables == {"_f0": [1, 2, 3, 4]} and type(variables["_f0"]) is list
+
+    @pytest.mark.parametrize("lookup", ["containsall", "containsany"])
+    @pytest.mark.parametrize("value", [_WORKING_AGE, _SDK_WORKING_AGE], ids=["orm", "sdk"])
+    def test_collection_lookups_keep_their_refusal(self, value: Any, lookup: str) -> None:
+        with pytest.raises(ValueError, match=rf"'{lookup}' lookup requires an iterable \(list, tuple, or set\), got Range"):
+            build_filter_condition("tags", lookup, value, 0)
+
+    def test_live_literals(self) -> None:
+        live = RfEvent.objects().filter(n__in=_WORKING_AGE)._compile_live(False)
+        assert live == "LIVE SELECT * FROM rf_event WHERE n IN 18..65;"
+        live = RfEvent.objects().filter(n__not_in=Range(BoundIncluded(65)))._compile_live(False)
+        assert live == "LIVE SELECT * FROM rf_event WHERE n NOT IN 65..;"
+        live = RfEvent.objects().filter(n__in=surrealdb.Range(_sdk.CBOR_NULL, BoundIncluded(5)))._compile_live(False)
+        assert live == "LIVE SELECT * FROM rf_event WHERE n IN ..=5;"
+
+    # D12: a value range never contains a record id.
+
+    @pytest.mark.parametrize("value", [_WORKING_AGE, _SDK_WORKING_AGE], ids=["orm", "sdk"])
+    @pytest.mark.parametrize("lookup", ["in", "not_in"])
+    @pytest.mark.parametrize("record_table", ["rf_event", None], ids=["queryset", "bare-q"])
+    def test_refused_on_the_record_id_column(self, value: Any, lookup: str, record_table: str | None) -> None:
+        with pytest.raises(ValueError, match=re.escape(_ID_REFUSAL.format(lookup=lookup))):
+            build_filter_condition("id", lookup, value, 0, record_table)
+
+    @pytest.mark.parametrize("value", [_WORKING_AGE, _SDK_WORKING_AGE], ids=["orm", "sdk"])
+    @pytest.mark.parametrize(("field", "lookup"), [("in", "in"), ("out", "not_in")])
+    def test_refused_on_edge_endpoint_columns(self, value: Any, field: str, lookup: str) -> None:
+        message = re.escape(_ENDPOINT_REFUSAL.format(lookup=lookup, field=field))
+        with pytest.raises(ValueError, match=message):
+            build_filter_condition(field, lookup, value, 0, "rf_link", endpoint_columns=("in", "out"))
+
+    def test_refused_when_the_query_is_built(self) -> None:
+        queryset = RfEvent.objects().filter(id__in=_WORKING_AGE)  # filter() only records the lookup
+        with pytest.raises(ValueError, match="record id column"):
+            queryset._build_where()
+        with pytest.raises(ValueError, match="record id column"):
+            Q(id__not_in=_SDK_WORKING_AGE).to_sql()
+        with pytest.raises(ValueError, match="edge endpoint column 'in'"):
+            RfLink.objects().filter(in___in=_WORKING_AGE)._build_where()
+        with pytest.raises(ValueError, match="record id column"):
+            RfLink.objects().filter(id__in=_WORKING_AGE)._build_where()
+
+    def test_builtin_range_on_the_id_column_keeps_its_coercion(self) -> None:
+        _, variables = RfEvent.objects().filter(id__in=range(1, 3))._build_where()
+        assert variables == {"_f0": [RecordID("rf_event", 1), RecordID("rf_event", 2)]}
+
+    # AC-22, C1: what the SDK client is handed.
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("value", "open_side"),
+        [
+            (Range(BoundExcluded(1), None), "end"),
+            (surrealdb.Range(undefined, BoundIncluded(5)), "begin"),
+            (surrealdb.Range(None, BoundIncluded(5)), "begin"),
+            (surrealdb.Range(Bound(), BoundIncluded(5)), "begin"),
+        ],
+        ids=["orm-none-end", "sdk-undefined-begin", "sdk-none-begin", "sdk-bound-begin"],
+    )
+    async def test_exec_hands_the_sdk_a_cbor_null_open_side(
+        self, value: Any, open_side: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake = _RecordingClient()
+
+        async def get_client() -> Any:
+            return fake
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(get_client))
+        assert await RfEvent.objects().filter(n__in=value).exec() == []
+
+        [(statement, variables)] = fake.calls
+        assert "WHERE n IN $_f0" in statement
+        sent = variables["_f0"]
+        assert type(sent) is surrealdb.Range
+        closed_side = "begin" if open_side == "end" else "end"
+        assert getattr(sent, open_side) is _sdk.CBOR_NULL
+        expected_bound = BoundExcluded(1) if open_side == "end" else BoundIncluded(5)
+        assert getattr(sent, closed_side) == expected_bound
+        assert _sdk.cbor_encode(sent).count(b"\xf6") == 1 and b"\xc6\xf6" not in _sdk.cbor_encode(sent)
+
+
+_FILTER_ROWS: dict[str, dict[str, Any]] = {
+    "e1": {
+        "n": 1,
+        "ttl": timedelta(minutes=30),
+        "grace": Duration.parse("10m"),
+        "day": date(2026, 1, 1),
+        "price": Decimal("1.50"),
+        "token": UUID(int=1),
+        "at": datetime(2026, 1, 1, tzinfo=UTC),
+        "tags": {"a"},
+        "hours": Range(BoundIncluded(0), BoundExcluded(8)),
+    },
+    "e5": {
+        "n": 5,
+        "ttl": timedelta(hours=1),
+        "grace": Duration.parse("1h30m1ns"),
+        "day": date(2026, 1, 2),
+        "price": Decimal("12.50"),
+        "token": UUID(int=5),
+        "at": datetime(2026, 1, 2, tzinfo=UTC),
+        "tags": {"a", "b"},
+        "hours": Range(BoundIncluded(9), BoundExcluded(17)),
+    },
+    "e9": {
+        "n": 9,
+        "ttl": timedelta(hours=2),
+        "grace": Duration.parse("1h30m2ns"),
+        "day": date(2026, 1, 3),
+        "price": Decimal("99"),
+        "token": UUID(int=9),
+        "at": datetime(2026, 1, 3, tzinfo=UTC),
+        "tags": {"b", "c"},
+        "hours": Range(BoundExcluded(12), None),
+    },
+}
+
+_ALL = {"e1", "e5", "e9"}
+
+#: (label, positional ``Q`` filters, keyword filters, the ids they must return).
+_FILTER_CASES: list[tuple[str, tuple[Q, ...], dict[str, Any], set[str]]] = [
+    ("ttl__gt=timedelta", (), {"ttl__gt": timedelta(minutes=45)}, {"e5", "e9"}),
+    ("grace__lte=Duration (ns)", (), {"grace__lte": Duration.parse("1h30m1ns")}, {"e1", "e5"}),
+    ("day=date", (), {"day": date(2026, 1, 2)}, {"e5"}),
+    ("price__lte=Decimal", (), {"price__lte": Decimal("12.5")}, {"e1", "e5"}),
+    ("token=UUID", (), {"token": UUID(int=5)}, {"e5"}),
+    ("at__gte=datetime", (), {"at__gte": datetime(2026, 1, 2, tzinfo=UTC)}, {"e5", "e9"}),
+    ("tags__containsall=set", (), {"tags__containsall": {"b", "a"}}, {"e5"}),
+    ("hours=Range", (), {"hours": Range(BoundIncluded(9), BoundExcluded(17))}, {"e5"}),
+    ("hours__contains=12", (), {"hours__contains": 12}, {"e5"}),
+    ("n__in 1..5", (), {"n__in": Range(BoundIncluded(1), BoundExcluded(5))}, {"e1"}),
+    ("n__in 1..=5", (), {"n__in": Range(BoundIncluded(1), BoundIncluded(5))}, {"e1", "e5"}),
+    ("n__in 1>..", (), {"n__in": Range(BoundExcluded(1), None)}, {"e5", "e9"}),
+    ("n__in ..", (), {"n__in": Range()}, _ALL),
+    ("n__in sdk 1>..9", (), {"n__in": surrealdb.Range(BoundExcluded(1), BoundExcluded(9))}, {"e5"}),
+    ("n__in sdk None..=5", (), {"n__in": surrealdb.Range(None, BoundIncluded(5))}, {"e1", "e5"}),
+    ("n__in sdk undefined..=5", (), {"n__in": surrealdb.Range(undefined, BoundIncluded(5))}, {"e1", "e5"}),
+    ("n__in sdk CBOR_NULL..=5", (), {"n__in": surrealdb.Range(_sdk.CBOR_NULL, BoundIncluded(5))}, {"e1", "e5"}),
+    ("n__in sdk Bound()..=5", (), {"n__in": surrealdb.Range(Bound(), BoundIncluded(5))}, {"e1", "e5"}),
+    ("n__in sdk None..None", (), {"n__in": surrealdb.Range(None, None)}, _ALL),
+    ("n__not_in 5..", (), {"n__not_in": Range(BoundIncluded(5))}, {"e1"}),
+    ("n__not_in ..", (), {"n__not_in": Range()}, set()),
+    ("n__not_in sdk 1..5", (), {"n__not_in": surrealdb.Range(BoundIncluded(1), BoundExcluded(5))}, {"e5", "e9"}),
+    ("n__not_in sdk CBOR_NULL..=5", (), {"n__not_in": surrealdb.Range(_sdk.CBOR_NULL, BoundIncluded(5))}, {"e9"}),
+    (
+        "Q(n__in) | Q(n__in)",
+        (Q(n__in=Range(BoundIncluded(1), BoundExcluded(5))) | Q(n__in=Range(BoundExcluded(8), None)),),
+        {},
+        {"e1", "e9"},
+    ),
+    ("n__in=range(1, 5)", (), {"n__in": range(1, 5)}, {"e1"}),
+]
+
+
+class TestFiltersE2E:
+    """AC-22: bound filter values of every rich type, and ``Range`` lookups, on both lines."""
+
+    @pytest.mark.asyncio
+    async def test_bound_filters_match(self) -> None:
+        async with orm_client("rf_event"):
+            for rid, values in _FILTER_ROWS.items():
+                await RfEvent(id=rid, **values).save()
+            wrong: dict[str, set[str]] = {}
+            for label, args, kwargs, expected in _FILTER_CASES:
+                got = {event.id for event in await RfEvent.objects().filter(*args, **kwargs).exec()}
+                if got != expected:
+                    wrong[label] = got
+        assert not wrong, f"filters returned the wrong rows: {wrong!r}"
+
+    @pytest.mark.asyncio
+    async def test_zero_duration_filter_is_refused_before_sending(self) -> None:
+        if encoding.sdk_decodes_zero_duration():
+            pytest.skip("the installed SDK decodes a zero duration: the refusal does not apply")
+        async with orm_client("rf_event"):
+            client = await SurrealDBConnectionManager.get_client()
+            with pytest.raises(ValueError, match="zero duration") as excinfo:
+                await RfEvent.objects().filter(ttl__gt=timedelta(0)).exec()
+            assert type(excinfo.value) is ValueError
+            await _assert_client_untouched(client)
+
+
+class TestLiveFiltersE2E:
+    """AC-23: a live filter inlines duration, range and date literals; order proves the filtering."""
+
+    @pytest.mark.asyncio
+    async def test_stream_reports_the_matching_write_only(self) -> None:
+        hit: dict[str, Any] = {
+            "ttl": timedelta(hours=1),
+            "hours": Range(BoundIncluded(9), BoundExcluded(17)),
+            "n": 5,
+            "day": date(2026, 1, 2),
+        }
+        misses = {  # each row fails exactly one condition
+            "short": {**hit, "ttl": timedelta(minutes=5)},
+            "no12": {**hit, "hours": Range(BoundIncluded(0), BoundExcluded(8))},
+            "n10": {**hit, "n": 10},
+            "day3": {**hit, "day": date(2026, 1, 3)},
+        }
+        queryset = RfEvent.objects().filter(
+            ttl__gte=timedelta(hours=1),
+            hours__contains=12,
+            n__in=Range(BoundIncluded(1), BoundExcluded(10)),
+            day=date(2026, 1, 2),
+        )
+        async with orm_client("rf_event") as client:
+            await client.query("DEFINE TABLE rf_event SCHEMALESS;", {})
+            async with queryset.live() as stream:
+                for rid, values in misses.items():
+                    await RfEvent(id=rid, **values).save()
+                await RfEvent(id="hit", **hit).save()
+                [event] = await _take(stream, 1)
+        assert event.action == LiveAction.CREATE and event.record_id == "rf_event:hit", (
+            f"a non-matching write reached the stream first: {event.record_id}"
+        )
+        assert event.validation_error is None, event.validation_error
+        instance = event.instance
+        assert type(instance.ttl) is timedelta and instance.ttl == timedelta(hours=1)
+        assert type(instance.day) is date and instance.day == date(2026, 1, 2)
+        assert type(instance.hours) is Range and instance.hours == hit["hours"]
