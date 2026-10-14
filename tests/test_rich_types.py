@@ -529,6 +529,88 @@ class TestRange:
         for value in (Range(BoundIncluded(bound), None), Range(BoundIncluded(1), BoundExcluded(bound))):
             assert str(value) == repr(value)
 
+    @pytest.mark.parametrize(
+        ("value", "text"),
+        [
+            (Range(BoundIncluded(Duration(0)), BoundExcluded(Duration.parse("1h"))), "0ns..1h"),
+            (Range(None, BoundIncluded(surrealdb.Duration(0))), "..=0ns"),
+            (
+                Range(BoundIncluded(Decimal("0.12345678901234567890123456789")), None),
+                "0.12345678901234567890123456789dec..",
+            ),
+            (
+                Range(BoundExcluded(Decimal("-79228162514264337593543950336.5")), BoundIncluded(Decimal("1E+30"))),
+                "-79228162514264337593543950336.5dec>..=1000000000000000000000000000000dec",
+            ),
+            (Range(BoundIncluded("nul\x00it's"), None), "'nul\x00it\\'s'.."),
+            (Range(BoundIncluded(-(2**63) - 1), BoundIncluded(2**70)), "-9223372036854775809..=1180591620717411303424"),
+        ],
+        ids=repr,
+    )
+    def test_text_form_keeps_what_the_live_literal_refuses(
+        self, value: Range[Any], text: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``str()`` and JSON write every bound they can read back; only live filters need the strict literal.
+
+        A zero duration (refused while the SDK cannot decode one), a ``Decimal`` past 28 fractional
+        digits or 96 bits, a string holding ``\\x00`` and an ``int`` past 64 bits have no live-filter
+        literal, yet the text never reaches the server and reads back exactly.
+        """
+        monkeypatch.setattr(encoding, "sdk_decodes_zero_duration", lambda: False)
+        with pytest.raises(TypeError):
+            to_surql_literal(value)
+        assert str(value) == text
+        assert _parse_range_text(text) == value
+
+        class M(BaseModel):
+            r: Range | None = None  # type: ignore[type-arg]
+
+        dumped = M(r=value).model_dump_json()
+        assert json.loads(dumped) == {"r": text}
+        assert M.model_validate_json(dumped).r == value
+
+    @pytest.mark.parametrize(
+        "bound",
+        [
+            Decimal("1E-1000000"),
+            Decimal("1E+1000000"),
+            Decimal("1." + "1" * 1100),
+            10**1300,
+            "x" * 1100,
+        ],
+        ids=["decimal-1E-1000000", "decimal-1E+1000000", "decimal-1101-digits", "int-1301-digits", "str-1100"],
+    )
+    def test_text_form_past_the_parser_limit_is_the_repr(self, bound: Any) -> None:
+        """A text the parser would refuse (over 1024 characters) is never built: ``str()`` gives the repr."""
+        value = Range(BoundIncluded(bound), None)
+        assert str(value) == repr(value)
+
+    def test_text_form_of_a_zero_timedelta(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``Range[timedelta]`` reads ``0ns..1h`` back as timedeltas (a bare ``Range`` as ORM durations)."""
+        monkeypatch.setattr(encoding, "sdk_decodes_zero_duration", lambda: False)
+
+        class M(BaseModel):
+            rt: Range[timedelta] | None = None
+
+        m = M(rt=Range(BoundIncluded(timedelta(0)), BoundExcluded(timedelta(hours=1))))
+        assert m.rt is not None
+        with pytest.raises(TypeError, match="zero duration"):
+            to_surql_literal(m.rt)
+        assert str(m.rt) == "0ns..1h"
+        assert json.loads(m.model_dump_json()) == {"rt": "0ns..1h"}
+        back = M.model_validate_json(m.model_dump_json()).rt
+        assert back == m.rt
+        assert back is not None and back.begin is not None
+        assert type(back.begin.value) is timedelta
+
+    def test_text_form_of_zero_decimals(self) -> None:
+        """A zero is written in full too: its exponent adds no digit (``0E+1000000``) or only its own places."""
+        assert str(Range(BoundIncluded(Decimal("0E+1000000")), None)) == "0dec.."
+        long_zero = Range(BoundIncluded(Decimal("-0E-40")), None)
+        assert to_surql_literal(long_zero) == "-0dec.."  # the live literal drops the places past 28
+        assert str(long_zero) == "-0." + "0" * 40 + "dec.."
+        assert _parse_range_text(str(long_zero)) == long_zero
+
     @pytest.mark.parametrize(("value", "text", "parsed"), RANGE_LITERALS)
     def test_parse_range_text_reads_every_literal(self, value: Range[Any], text: str, parsed: Range[Any] | None) -> None:
         result = _parse_range_text(text)
@@ -712,6 +794,10 @@ class TestRange:
             M(ra=Range(BoundIncluded(Duration.parse("1h30m1ns")), None)),
             M(ra=Range(BoundIncluded(7), None)),
             M(ra=Range()),
+            # Bounds the live-filter literal refuses, which the text form still writes exactly.
+            M(rt=Range(BoundIncluded(timedelta(0)), BoundExcluded(timedelta(hours=1)))),
+            M(rdur=Range(BoundIncluded(Duration(0)), BoundIncluded(Duration.parse("1h")))),
+            M(ra=Range(BoundIncluded(Decimal("0.12345678901234567890123456789")), None)),
         ]:
             assert M.model_validate_json(model.model_dump_json()) == model, model.model_dump_json()
 

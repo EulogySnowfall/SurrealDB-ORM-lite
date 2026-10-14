@@ -2059,8 +2059,9 @@ As a field, `Range[int]`, `Range[datetime]`, `Range[timedelta]`… validate each
 (`range(9, 17)` is `9..17`) or the SurrealQL text `str()` writes (`"9..17"`,
 `"d'2026-01-01T00:00:00Z'.."`, `"1m..1h"`). A `Range[timedelta]` turns the SDK's duration bounds
 into `timedelta`s (floored to the microsecond) and a `Range[date]` accepts midnight `datetime`
-bounds. In JSON a `Range` is that text, which `model_validate_json()` reads back. A `Range` is not
-hashable, like the SDK's.
+bounds. In JSON a `Range` is that text, which `model_validate_json()` reads back: every bound is
+written exactly, a zero duration as `0ns` and a `Decimal` with all its digits, even where a live
+query filter refuses the value. A `Range` is not hashable, like the SDK's.
 
 #### Filters
 

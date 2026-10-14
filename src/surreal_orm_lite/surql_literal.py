@@ -15,6 +15,12 @@ checked as ``RETURN <literal> == $p`` against SurrealDB 2.7.0, 3.3.0 and 3.1.5, 
 sorted when the items can be) and ranges (``1..5``, ``1>..=5``, ``d'2026-01-01T00:00:00Z'..``),
 whose bound values form a closed set too; ``tests/test_rich_types.py`` re-checks those.
 
+A ``Range`` also has a text form, ``_range_text``: what its ``str()`` and its JSON write and a
+``Range`` field reads back. It never reaches the server, so it writes every bound value exactly and
+drops the refusals that only protect a live filter: a zero duration is ``0ns`` whatever the SDK
+decodes, a ``Decimal`` keeps all its digits, an ``int`` may exceed 64 bits and a string may hold
+``\\x00``.
+
 Two choices worth knowing:
 
 * Strings use single quotes with backslash and quote escaped — backslash first, so an escape
@@ -37,7 +43,7 @@ from uuid import UUID
 from . import encoding as _encoding
 from ._sdk import BoundExcluded, BoundIncluded, RecordID, SdkDuration, SdkRange
 from .exceptions import SurrealDbError
-from .types import Duration, Range, _is_open_side, _nanoseconds
+from .types import _MAX_RANGE_TEXT, Duration, Range, _is_open_side, _nanoseconds
 
 __all__ = ["inline_variables", "to_surql_literal"]
 
@@ -80,9 +86,14 @@ def _reject_nul(text: str) -> str:
     return text
 
 
-def _string(text: str) -> str:
-    escaped = _reject_nul(text).replace("\\", "\\\\").replace("'", "\\'")
+def _quoted(text: str) -> str:
+    """``'<text>'`` with backslash, then quote, escaped (no ``\\x00`` check: see ``_string``)."""
+    escaped = text.replace("\\", "\\\\").replace("'", "\\'")
     return f"'{escaped}'"
+
+
+def _string(text: str) -> str:
+    return _quoted(_reject_nul(text))
 
 
 def _identifier(text: str) -> str:
@@ -154,8 +165,30 @@ def _decimal(value: Decimal) -> str:
     return f"{text}dec"
 
 
-def _duration(value: timedelta | Duration | SdkDuration) -> str:
-    """Every unit, largest first, from the exact nanoseconds: ``1h30m1ns`` (ASCII ``us``)."""
+def _decimal_text(value: Decimal) -> str:
+    """A range bound's text form: any finite ``Decimal`` in full, ``<fixed-point>dec``.
+
+    No 28-fractional-digit or 96-bit limit: those keep a live-filter boundary from being rounded,
+    and this text never reaches the server. ``TypeError`` for a non-finite value, and — decided from
+    ``as_tuple()``, before any text is built — for one whose text would pass the 1024 characters the
+    range parser reads (``Decimal("1E-1000000")`` would be a million). A zero with a positive exponent
+    is ``0``, so its exponent does not count.
+    """
+    if not value.is_finite():
+        raise TypeError(f"Decimal({str(value)!r}) has no range text: only finite decimals have one.")
+    _, digits, raw_exponent = value.as_tuple()
+    exponent = int(raw_exponent)  # a finite decimal: always an int
+    if (any(digits) or exponent < 0) and max(len(digits), abs(exponent)) > _MAX_RANGE_TEXT:
+        raise TypeError(f"Decimal({str(value)!r}) has no range text: it would exceed {_MAX_RANGE_TEXT} characters.")
+    return f"{format(value, 'f')}dec"
+
+
+def _duration(value: timedelta | Duration | SdkDuration, *, text: bool = False) -> str:
+    """Every unit, largest first, from the exact nanoseconds: ``1h30m1ns`` (ASCII ``us``).
+
+    With ``text``, a zero duration is ``0ns`` whatever the installed SDK decodes: the range text form
+    never reaches the server.
+    """
     try:
         nanoseconds = _nanoseconds(value)
     except ValueError:
@@ -164,7 +197,7 @@ def _duration(value: timedelta | Duration | SdkDuration) -> str:
         raise TypeError(f"Cannot inline a negative duration ({value!r}): SurrealDB durations are never negative.")
     if nanoseconds // 10**9 >= _DURATION_SECONDS_LIMIT:
         raise TypeError(f"Cannot inline {value!r}: a SurrealDB duration holds at most 2**64 - 1 seconds.")
-    if nanoseconds == 0 and not _encoding.sdk_decodes_zero_duration():
+    if nanoseconds == 0 and not text and not _encoding.sdk_decodes_zero_duration():
         raise TypeError(
             f"Cannot inline a zero duration ({value!r}): the installed surrealdb SDK cannot read a zero "
             "duration back. Filter with __gte=Duration(1) instead."
@@ -188,25 +221,58 @@ def _range_side(side: object, name: str) -> BoundIncluded | BoundExcluded | None
     )
 
 
-def _range_bound(value: Any) -> str:
+def _range_bound(value: Any, *, text: bool = False) -> str:
+    """A bound value's literal; with ``text``, its text form (see ``_range_text``)."""
     if isinstance(value, bool) or not isinstance(value, _RANGE_BOUND_TYPES):
         raise TypeError(f"Cannot inline a range bound of type {type(value).__name__}; supported bounds: {_RANGE_BOUNDS}.")
     if isinstance(value, float) and not math.isfinite(value):
         raise TypeError(f"Cannot inline the range bound {value!r} (type float): a float bound must be finite.")
+    if text:
+        if isinstance(value, int):
+            # Past 4096 bits (1233 digits) the text could not be read back, and ``int.__repr__``
+            # itself refuses past 4300 digits: refused before any text is built.
+            if value.bit_length() > 4 * _MAX_RANGE_TEXT:
+                raise TypeError(f"An int of {value.bit_length()} bits has no range text: over {_MAX_RANGE_TEXT} characters.")
+            return int.__repr__(value)
+        if isinstance(value, str):
+            return _quoted(value)
+        if isinstance(value, Decimal):
+            return _decimal_text(value)
+        if isinstance(value, timedelta | Duration | SdkDuration):
+            return _duration(value, text=True)
     return to_surql_literal(value)
 
 
-def _range(value: Range[Any] | SdkRange) -> str:
+def _range(value: Range[Any] | SdkRange, *, text: bool = False) -> str:
     """``<begin>..<end>``: an excluded begin adds ``>``, an included end ``=``; an open side is empty."""
     begin = _range_side(value.begin, "begin")
     end = _range_side(value.end, "end")
-    text = ""
+    rendered = ""
     if begin is not None:
-        text = _range_bound(begin.value) + (">" if isinstance(begin, BoundExcluded) else "")
-    text += ".."
+        rendered = _range_bound(begin.value, text=text) + (">" if isinstance(begin, BoundExcluded) else "")
+    rendered += ".."
     if end is not None:
-        text += ("=" if isinstance(end, BoundIncluded) else "") + _range_bound(end.value)
-    return text
+        rendered += ("=" if isinstance(end, BoundIncluded) else "") + _range_bound(end.value, text=text)
+    return rendered
+
+
+def _range_text(value: Range[Any] | SdkRange) -> str:
+    """The text form of a range: what ``str(Range)`` and a ``Range`` field's JSON write (v0.23.0).
+
+    Exactly the grammar ``types._parse_range_text`` reads, so the text reads back to an equal
+    ``Range``. Unlike the live-filter literal it never reaches the server, so it keeps every bound
+    value whole: a zero duration is ``0ns`` whatever the installed SDK decodes, a ``Decimal`` is
+    written in full (no 28-fractional-digit or 96-bit limit), an ``int`` may exceed 64 bits and a
+    string may hold ``\\x00``. Otherwise the same text as ``to_surql_literal``.
+
+    :raises TypeError: for a side that is not a bound, a bound value outside the closed set (or a
+        ``bool``, a non-finite ``float``, a negative or too long duration) — none has a text — and
+        for a text past the 1024 characters the parser reads.
+    """
+    rendered = _range(value, text=True)
+    if len(rendered) > _MAX_RANGE_TEXT:
+        raise TypeError(f"This range has no text form: {len(rendered)} characters, the parser reads {_MAX_RANGE_TEXT}.")
+    return rendered
 
 
 def to_surql_literal(value: Any) -> str:

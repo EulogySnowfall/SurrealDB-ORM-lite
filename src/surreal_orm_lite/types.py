@@ -8,7 +8,7 @@ signature, converts from it and compares equal to it.
 
 ``Range[T]`` is a SurrealDB ``range`` (``9..17``, ``d'2026-01-01T00:00:00Z'..``): two bounds, each
 the SDK's ``BoundIncluded``/``BoundExcluded`` or ``None`` for an open side. As a Pydantic field it
-validates each bound value as ``T`` and reads the SurrealQL literal text it writes in JSON mode.
+validates each bound value as ``T`` and reads back the SurrealQL text it writes in JSON mode.
 """
 
 from __future__ import annotations
@@ -433,8 +433,11 @@ class Range(Generic[T]):
     side (``Range(BoundIncluded(1))`` is ``1..``, ``Range()`` is ``..``). The bound classes are the
     SDK's, re-exported by ``surreal_orm_lite``. The SDK's other spellings of an open side — a bare
     ``Bound()``, ``surrealdb.cbor.undefined`` and a CBOR null — are accepted too and stored as
-    ``None``. ``str()`` gives the SurrealQL literal (``"1..5"``, ``"1..=5"``, ``"1>..5"``,
-    ``"1m..1h"``), or ``repr()`` when a bound has no literal form.
+    ``None``. ``str()`` gives the SurrealQL text (``"1..5"``, ``"1..=5"``, ``"1>..5"``,
+    ``"1m..1h"``, ``"0ns..1h"``) with every bound value written exactly, which a ``Range`` field
+    reads back; ``repr()`` when a bound has no text (a type outside the bound set, a non-finite
+    ``float``, a negative duration) or the text would pass 1024 characters. Live-query filters use
+    the stricter ``to_surql_literal``.
 
     Equal to an ORM or SDK ``Range`` with the same bounds, every open-side marker counting as open
     (the SDK's own ``__eq__`` answers ``False`` the other way round, so keep the ORM value on the
@@ -444,7 +447,7 @@ class Range(Generic[T]):
     value as ``T``; a bare ``Range`` keeps them as given. Accepted: a ``Range``, an SDK ``Range``, a
     builtin ``range`` with step 1 (``range(9, 17)`` is ``9..17``) and the SurrealQL text ``str()``
     writes (``"9..17"``). ``model_dump()`` returns a ``Range`` — also when the attribute holds a raw
-    SDK ``Range``, which is never flattened into a dict; JSON mode writes the literal text.
+    SDK ``Range``, which is never flattened into a dict; JSON mode writes the ``str()`` text.
     """
 
     __slots__ = ("begin", "end")
@@ -492,11 +495,11 @@ class Range(Generic[T]):
         return f"Range(begin={self.begin!r}, end={self.end!r})"
 
     def __str__(self) -> str:
-        """The SurrealQL literal (``"1..5"``); ``repr(self)`` when a bound has no literal form."""
-        from .surql_literal import to_surql_literal
+        """The SurrealQL text (``"1..5"``) a ``Range`` field reads back; ``repr(self)`` when there is none."""
+        from .surql_literal import _range_text
 
         try:
-            return to_surql_literal(self)
+            return _range_text(self)
         except TypeError:
             return repr(self)
 
@@ -543,8 +546,8 @@ def _serialize_range(value: Any, info: core_schema.SerializationInfo[Any]) -> An
     A raw SDK ``Range`` (``model_construct``, ``_apply_record``, ``hydrate()``'s fallback) first
     becomes an ORM ``Range`` built **unchecked** (``Range._unchecked``: its open-side markers become
     ``None``, any other side is kept), so ``model_dump()`` never raises and never flattens it into a
-    dict. Python mode returns that ``Range``; JSON mode its ``str()`` — the literal, or the ``repr``
-    when a bound has no literal form.
+    dict. Python mode returns that ``Range``; JSON mode its ``str()`` — the text the field reads
+    back, or the ``repr`` when there is none.
     """
     if isinstance(value, SdkRange):
         value = Range._unchecked(value.begin, value.end)
@@ -604,7 +607,7 @@ class _RangeValidator:
 
 _MAX_RANGE_TEXT = 1024
 
-# Each bound literal ``to_surql_literal`` writes, tried in exactly this order at the current
+# Each bound literal the range text form writes, tried in exactly this order at the current
 # position: datetime, string, decimal, duration, float, int — so ``1dec`` is never read as the
 # duration ``1d`` followed by ``ec``, nor ``1m`` as the integer ``1``. ASCII digits only.
 _DECIMAL_LITERAL = re.compile(r"-?[0-9]+(?:\.[0-9]+)?dec")
@@ -673,7 +676,7 @@ def _read_bound(text: str, start: int) -> tuple[Any, int] | None:
 
 
 def _parse_range_text(text: str) -> Range[Any]:
-    """The ``Range`` a SurrealQL range literal means — exactly the grammar the encoder writes.
+    """The ``Range`` a SurrealQL range text means — exactly the grammar ``str(Range)`` writes.
 
     ``[<lit>][>]..[=][<lit>]``: ``>`` excludes the begin (after a begin literal only), ``=``
     includes the end (before an end literal only). A ``<lit>`` is ``d'<ISO-8601>'`` (an aware
