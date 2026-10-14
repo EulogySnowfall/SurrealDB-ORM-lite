@@ -471,15 +471,23 @@ def _with_removals(value: Any, obj: Any) -> Any:
     spellings (:func:`_stored_keys`). As :func:`_stored_keys` does for a dict's keys, every alias a
     read takes before a stored name (:func:`~surreal_orm_lite.wire.masking_keys` of the instance's
     own class: the union member the validation chose, the ``Profile`` of a ``dict[str, Profile]``)
-    is sent as ``None`` — NONE, which removes it — for every sub-field of that instance; otherwise
-    the value merged would be hidden behind the alias and lost without an error. A table-model class
-    the validation built from a dict is reached through its object form (:class:`_SubObject`). A
-    dict :func:`_stored_keys` converted carries its own removals; its values are walked.
+    is sent as ``None`` — NONE, which removes it — for every sub-field that instance's object
+    writes; otherwise the value merged would be hidden behind the alias and lost without an error. A
+    table-model class the validation built from a dict is reached through its object form
+    (:class:`_SubObject`). A dict :func:`_stored_keys` converted carries its own removals; its
+    values are walked.
 
     ``obj`` is ``value`` as :func:`~surreal_orm_lite.wire.encode_wire` sends it: a mapping under the
-    same keys, an instance keyed by :func:`~surreal_orm_lite.wire.read_keys`. ``UPDATE … SET``
-    (``server_values``) assigns each field whole and needs none. The ``data`` the local apply uses
-    holds none either. Copy-on-write.
+    same keys; for an instance, its dump keyed by :func:`~surreal_orm_lite.wire.read_keys` — or by
+    the aliases Pydantic serializes with ``serialize_by_alias=True``, without the sub-fields the dump
+    omits (``exclude=True``, ``exclude_if``). A sub-field is written under the keys of ``obj`` a read
+    takes it from (:func:`~surreal_orm_lite.wire.field_keys`); the walk goes down into each of them,
+    and sends ``None`` only for the sub-field's other spellings. A sub-field ``obj`` does not write
+    under such a key — omitted, or dumped under a ``serialization_alias`` no read takes — gets
+    nothing, as before v0.23.0. The invariant: the walk never overwrites a key ``obj`` carries (it
+    only adds removals inside the objects under it), and never removes a spelling of a sub-field
+    ``obj`` does not write, so a value stored for an excluded sub-field stays. ``UPDATE … SET`` (``server_values``) assigns each field whole and
+    needs none. The ``data`` the local apply uses holds none either. Copy-on-write.
     """
     if not isinstance(obj, dict):
         return obj
@@ -488,18 +496,21 @@ def _with_removals(value: Any, obj: Any) -> Any:
     result = obj
     if isinstance(value, BaseModel):
         model = type(value)
-        stored_as = read_keys(model)
+        keys = field_keys(model)
         masked = masking_keys(model)
         for name in model.model_fields:
-            key = stored_as[name]
-            if key in obj:
+            written = [key for key in obj if isinstance(key, str) and keys.get(key) == name]
+            if not written:
+                continue
+            for key in written:
                 new = _with_removals(getattr(value, name, None), obj[key])
                 if new is not obj[key]:
                     result = dict(obj) if result is obj else result
                     result[key] = new
             for other in masked[name]:
-                result = dict(obj) if result is obj else result
-                result[other] = None
+                if other not in obj:
+                    result = dict(obj) if result is obj else result
+                    result[other] = None
     elif isinstance(value, Mapping):
         for key, item in value.items():
             if key in obj:
@@ -2331,8 +2342,10 @@ class BaseSurrealModel(BaseModel):
         depth, never inside an array. So ``merge(contacts={"a": {"firstName": "Annie"}})``, which
         a ``dict[str, Profile]`` validates into a ``Profile``, is sent as
         ``{"a": {"first_name": "Annie", …, "firstName": None, …}}``, and a v0.22 row's
-        ``contacts.a.firstName`` no longer hides it. ``server_values`` assigns such a field whole,
-        which needs none.
+        ``contacts.a.firstName`` no longer hides it. It never removes a key the object sent writes
+        (the alias, for a sub-model with ``serialize_by_alias=True``), nor a spelling of a
+        sub-field that object omits (``exclude=True``: the stored value stays). ``server_values``
+        assigns such a field whole, which needs none.
 
         A **table-model instance** is written as its record id. On a declared field, rich or not,
         a value holding one — at the top, in a list or tuple, among a mapping's values — is

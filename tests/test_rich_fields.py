@@ -2654,6 +2654,48 @@ class RfNamedDeep(BaseSurrealModel):
     n: int = 0
 
 
+class RfZip(BaseModel):
+    """camelCase aliases, validated by name too, dumped by name: stored under the names."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    zip_code: str = ""
+
+
+class RfDumpedByAlias(BaseModel):
+    """Validated by name and by alias, and **dumped** by alias (``serialize_by_alias=True``): ``save()``
+    and an instance write each sub-field under the key Pydantic dumps it under, its alias, as v0.22
+    did. A sub-field the dump excludes is never written, so a value stored for it stays. ``seen_at``
+    is rich, so a dict in a ``dict[str, RfDumpedByAlias]`` is validated into an instance."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, serialize_by_alias=True)
+
+    first_name: str = ""
+    seen_at: datetime | None = None
+    home_addr: RfZip | None = None
+    secret_note: str = Field(default="", exclude=True)
+
+
+class RfSplitAlias(BaseModel):
+    """Dumped by a ``serialization_alias`` that no read takes: the dump's key names no sub-field."""
+
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
+
+    first_name: str = Field(default="", validation_alias="fn", serialization_alias="firstName")
+
+
+class RfDumped(BaseSurrealModel):
+    """Sub-models dumped by alias, as a field and as the values of a dict."""
+
+    model_config = SurrealConfigDict(table_name="rf_dumped")
+
+    id: str | None = None
+    profile: RfDumpedByAlias | None = None
+    contacts: dict[str, RfDumpedByAlias] = {}
+    split: RfSplitAlias | None = None
+    n: int = 0
+
+
 class _CapturingClient:
     """Records the variables of each statement ``merge(refresh=False)`` sends; answers no row."""
 
@@ -2734,6 +2776,32 @@ class TestMergeRemovalsAtObjectPositions:
         """``UPDATE … SET`` replaces each field it assigns: a dict field is assigned whole, no removal."""
         await RfNamedDeep(id="x").merge(refresh=False, server_values=_BUMP, contacts={"a": {"firstName": "Annie"}})
         assert {"a": {"first_name": "Annie", "seen_at": None}} in client.calls[-1].values()
+
+    async def test_an_instance_dumped_by_alias_keeps_the_keys_it_writes(self, client: _CapturingClient) -> None:
+        """``serialize_by_alias=True``: the dump writes the aliases, which are also the keys a read
+        takes first. The walk never overwrites a key the object carries with a removal, never removes a
+        spelling of a sub-field the dump omits (``exclude=True``: its stored value stays), and goes
+        down into a sub-model written under its alias (``homeAddr``)."""
+        sent = {"firstName": "Annie", "seenAt": None, "homeAddr": {"zip_code": "2", "zipCode": None}}
+        annie = RfDumpedByAlias(first_name="Annie", home_addr=RfZip(zip_code="2"))
+        holder = RfDumped(id="x")
+        await holder.merge(refresh=False, profile=annie)
+        assert client.sent == {"profile": sent}
+
+        for contact in ({"firstName": "Annie", "homeAddr": {"zipCode": "2"}}, annie):
+            await holder.merge(refresh=False, contacts={"a": contact})
+            assert client.sent == {"contacts": {"a": sent}}
+            assert holder.contacts == {"a": annie}
+
+        # A dict for the field itself is converted key by key: the name, its alias removed.
+        await holder.merge(refresh=False, profile={"firstName": "Annie"})
+        assert client.sent == {"profile": {"first_name": "Annie", "firstName": None}}
+
+    async def test_a_serialization_alias_no_read_takes_removes_nothing(self, client: _CapturingClient) -> None:
+        """The dump's ``firstName`` names no sub-field (a read takes ``fn`` or ``first_name``): nothing
+        is removed for that sub-field, and ``fn`` is not sent."""
+        await RfDumped(id="x").merge(refresh=False, split=RfSplitAlias(fn="Annie"))
+        assert client.sent == {"split": {"firstName": "Annie"}}
 
 
 class TestMergeRemovalsAtObjectPositionsE2E:
@@ -2828,6 +2896,55 @@ class TestMergeRemovalsAtObjectPositionsE2E:
             assert row["either"] == {"first_name": "E"}
             loaded = await RfNamedDeep.objects().get("s")
             assert loaded.contacts["b"] == RfCamelDated(first_name="Bob", seen_at=at)
+            await _assert_client_usable(client)
+
+    @pytest.mark.parametrize("given", ["dict", "instance"])
+    @pytest.mark.parametrize("mode", ["merge", "no-refresh", "transaction"])
+    async def test_a_sub_model_dumped_by_alias_keeps_its_keys(self, mode: str, given: str) -> None:
+        """``serialize_by_alias=True``: the aliases ``save()`` writes are the keys a read takes, and a
+        ``merge()`` of an instance writes them again, never removed by the same statement; a value
+        stored under the alias of a sub-field the dump excludes (``secretNote``) stays."""
+        async with orm_client("rf_dumped") as client:
+            holder = RfDumped(
+                id="k",
+                profile=RfDumpedByAlias(first_name="Ann", home_addr=RfZip(zip_code="1")),
+                contacts={"a": RfDumpedByAlias(first_name="Ann")},
+            )
+            await holder.save()
+            row = await _raw("k", "rf_dumped")
+            assert row["profile"] == {"firstName": "Ann", "homeAddr": {"zip_code": "1"}}
+            assert row["contacts"] == {"a": {"firstName": "Ann"}}
+            await client.query(
+                "UPDATE $rid MERGE $data;",
+                {
+                    "rid": RecordID("rf_dumped", "k"),
+                    "data": {"profile": {"secretNote": "keep"}, "contacts": {"a": {"secretNote": "keep"}}},
+                },
+            )
+
+            annie = RfDumpedByAlias(first_name="Annie", home_addr=RfZip(zip_code="2"))
+            contact = {"firstName": "Annie", "homeAddr": {"zipCode": "2"}} if given == "dict" else annie
+            if mode == "transaction":
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await holder.merge(tx=tx, profile=annie)
+                    await holder.merge(tx=tx, contacts={"a": contact})
+            else:
+                await holder.merge(refresh=mode == "merge", profile=annie)
+                await holder.merge(refresh=mode == "merge", contacts={"a": contact})
+
+            row = await _raw("k", "rf_dumped")
+            stored = {"firstName": "Annie", "homeAddr": {"zip_code": "2"}, "secretNote": "keep"}
+            assert row["profile"] == stored
+            assert row["contacts"] == {"a": stored}
+            loaded = await RfDumped.objects().get("k")
+            assert loaded.profile is not None
+            for sub in (loaded.profile, loaded.contacts["a"]):
+                assert (sub.first_name, sub.secret_note, sub.home_addr) == ("Annie", "keep", RfZip(zip_code="2"))
+
+            # The instance holds the value merged: the row it was resynced from, or the values applied
+            # locally (refresh=False, a buffered transaction on 2.x).
+            assert RfDumpedByAlias.model_validate(holder.profile).first_name == "Annie"
+            assert RfDumpedByAlias.model_validate(holder.contacts["a"]).first_name == "Annie"
             await _assert_client_usable(client)
 
 
