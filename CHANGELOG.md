@@ -72,7 +72,10 @@ and the official SDK, on every write and read path, with the same behaviour on S
 - **Typed lookups on rich fields.** A filter value compared with a `datetime`, `date`,
   `timedelta`, `Duration`, `Decimal` or `UUID` field is validated as that type, then bound:
   `filter(ttl__gt="1h")` compares with a duration and `filter(token="…")` with a UUID. A value
-  that does not fit raises `ValueError` before anything is sent. It applies to `filter()`, `Q`,
+  that does not fit raises `ValueError` before anything is sent. A `float` compared with a
+  `Decimal` field is bound as given, as before, when its `Decimal` is not a SurrealDB decimal as it
+  stands (`1e30`, beyond 96 bits; `1e-30`, more than 28 fractional digits): the server compares
+  the float, where the converted value would be refused or rounded. It applies to `filter()`, `Q`,
   the lookups of `get_or_create()`/`update_or_create()` and the filters of `bulk_update()`,
   `bulk_delete()`, `patch()`, `live()` and `watch()`.
 - **Range membership**: `in`/`not_in` with a `Range` (the ORM's or the SDK's) binds one range
@@ -117,9 +120,11 @@ and the official SDK, on every write and read path, with the same behaviour on S
   sub-model that also validates by name (`populate_by_name=True` or `validate_by_name=True`, and a
   table model used as a sub-model) keeps the format of earlier versions, each sub-field under its
   name (under its serialization alias with `serialize_by_alias=True`, as Pydantic dumps it). A
-  keyword write's dict for a sub-model is re-keyed the same way, whether or not the sub-model
-  holds a rich type; one without a rich type keeps its values as given. A `merge()` dict for a
-  sub-model that also validates by name keeps your keys, as in v0.22.
+  keyword write's dict for a sub-model that validates by alias only is re-keyed the same way,
+  whether or not the sub-model holds a rich type; one without a rich type keeps its values as
+  given. A dict for a sub-model that also validates by name keeps your keys, as in v0.22: in
+  `merge()`, and in `bulk_update()`, `signup()` and `signin()` when the sub-model holds no rich
+  type (with one, those validate the dict as the whole sub-model and write it as `save()` does).
 - **A table-model instance given as a value is written as its record id** in keyword writes, in
   raw-query variables, in the `atomic_*` array helpers and in `patch()`. Where the declared field
   cannot hold a `RecordID` at that position (`list[Plain]`, a sub-model), the write raises

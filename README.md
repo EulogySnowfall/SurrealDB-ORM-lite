@@ -2101,6 +2101,12 @@ of `bulk_update()`, `bulk_delete()`, `patch()`, `live()` and `watch()`:
   field: as `S` (`containsall`/`containsany`: each item).
 - Never converted: `None`, `Var(...)`, a `$` reference, a model instance, `isnull`, the `id`
   column, a NaN or infinite number, a dotted path (`meta.ttl`) and every other field.
+- A `float` on a `Decimal` field is compared as a `Decimal` (`price__lte=9.99` is
+  `Decimal("9.99")`), unless that `Decimal` is not a SurrealDB decimal as it stands: beyond 96
+  bits (`1e30`) or with more than 28 fractional digits (`1e-30`). That float is bound as given, as
+  before v0.23.0, and the server compares it with the stored decimals, where the converted value
+  would be refused or rounded (`1e-30` to `0`). A `Decimal` or a string beyond the server's range
+  still raises.
 
 A value that does not fit raises `ValueError` before anything is sent: `filter(at__gt="yesterday")`
 raises `filter(at__gt=…): 'yesterday' is not a valid datetime (…)`.
@@ -2155,16 +2161,18 @@ Sub-models and table models in keyword writes:
 - Each sub-field is written under the key a read takes it from, by `save()`, `update()`,
   `upsert()`, an instance in a keyword write and a keyword write's dict alike, whether or not the
   sub-model holds a rich type (an instance with `serialize_by_alias=True` is written as Pydantic
-  dumps it, see below). The exception is a `merge()` dict for a sub-model that also validates by
-  name, which keeps your keys, as in v0.22:
+  dumps it, see below). The exception is a dict for a sub-model that also validates by name, which
+  keeps your keys, as in v0.22: in `merge()`, and in `bulk_update()`, `signup()` and `signin()`
+  when the sub-model holds no rich type (with one, those validate the dict as the whole sub-model
+  and write it as `save()` does):
   - A sub-model that also validates by name (`populate_by_name=True` or `validate_by_name=True`,
     and a table model used as a sub-model) keeps each sub-field under its **name**, the format of
-    v0.22 and earlier and of a schema written for it (`DEFINE FIELD profile.first_name`).
-    `bulk_update()`, `signup()` and `signin()` write a dict's keys under the names too. A `merge()`
-    dict keeps your keys, as v0.22's `merge()` did: `merge(profile={"firstName": …})` sends
-    `{"firstName": …}`, which a read takes before the name (see the last point), and on a
+    v0.22 and earlier and of a schema written for it (`DEFINE FIELD profile.first_name`). A
+    `merge()` dict keeps your keys, as v0.22's `merge()` did: `merge(profile={"firstName": …})`
+    sends `{"firstName": …}`, which a read takes before the name (see the last point), and on a
     `SCHEMAFULL` table that declares the names, 3.x refuses that key and 2.x drops it: name the
-    sub-fields there.
+    sub-fields there. The same goes for a `bulk_update()`, `signup()` or `signin()` dict for a
+    sub-model without a rich type.
   - With `serialize_by_alias=True` as well, `save()`, `update()`, `upsert()` and an instance in a
     keyword write store each sub-field under the key Pydantic serializes it under, its alias, as
     v0.22 did and as the full SurrealDB-ORM does (`model_dump(by_alias=True)`); a read takes the
@@ -2172,6 +2180,9 @@ Sub-models and table models in keyword writes:
     `save()` wrote (`merge(profile={"homeAddr": {"zipCode": …}})`), and `MERGE` merges them into
     the stored object, keeping its other keys. A dict naming the names (`{"home_addr": …}`) adds
     them next to the stored aliases, and a read still gives the aliases' values. A
+    `bulk_update()`, `signup()` or `signin()` dict for it without a rich type keeps your keys too:
+    `bulk_update(profile={"firstName": …, "lastName": …})` stores the keys `save()` writes, which a
+    `SCHEMAFULL` table declares for its rows (`DEFINE FIELD profile.firstName`). A
     `serialization_alias` that no read takes
     (`Field(validation_alias="fn", serialization_alias="firstName")`) is stored under that key and
     does not read back, as before v0.23.0.
@@ -2182,9 +2193,9 @@ Sub-models and table models in keyword writes:
     v0.23.0 it was written under its name, which no read takes; rows written then keep that key.
     On a `SCHEMAFULL` table, declare the alias (`DEFINE FIELD activity.lastSeen`).
   - A dict that names one sub-field twice (`{"seen": …, "lastSeen": …}`) raises `ValueError`,
-    except a `merge()` dict for a sub-model that also validates by name, sent as given; a key that
-    names no sub-field is sent as given. A dict for a sub-model without a rich type keeps its
-    values as given: only its keys change.
+    except a dict that keeps your keys (above), sent as given; a key that names no sub-field is
+    sent as given. A dict for a sub-model without a rich type keeps its values as given: only its
+    keys change.
   - This differs from the full SurrealDB-ORM, whose `model_dump(by_alias=True)` writes every
     aliased sub-field under its alias (here, only a sub-model with `serialize_by_alias=True`). A
     row that holds both spellings of a sub-field is read by the alias first, Pydantic's priority.
@@ -2588,10 +2599,11 @@ Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v
 | Zero duration (`0ns`) in a result                                                                                                           | the surrealdb SDK 2.0.0 cannot decode it (HTTP `IndexError`, WebSocket `KeyError` and connection lost); the ORM refuses to store one through its write paths                                                                                                                   | same on both lines                                                                                                                                                                                                                                                                                                                              | v0.23.0 |
 | Values the server rejects at decode (a `date`, a `set`, an SDK `Duration`, an open `Range` bound sent as `None`, an out-of-range `Decimal`) | raw: rejected, WebSocket lost. ORM: converted or refused before sending                                                                                                                                                                                                        | same on both lines                                                                                                                                                                                                                                                                                                                              | v0.23.0 |
 | Strings compared with datetime, duration or uuid columns                                                                                    | raw: silently wrong. ORM: typed lookups convert them                                                                                                                                                                                                                           | same on both lines                                                                                                                                                                                                                                                                                                                              | v0.23.0 |
+| `float` filter on a `Decimal` column beyond a SurrealDB decimal (`price__lt=1e30`, `price__gte=1e-30`)                                      | raw: the server compares the float with the decimals. ORM: bound as the float, as up to v0.22; a float that is a decimal as it stands is compared as a `Decimal`                                                                                                               | same on both lines                                                                                                                                                                                                                                                                                                                              | v0.23.0 |
 | Integers beyond signed 64-bit                                                                                                               | raw: `2**63` silently wraps to `-2**63`, larger values are rejected (WebSocket lost). ORM: refused before sending (`ValueError`)                                                                                                                                               | same on both lines                                                                                                                                                                                                                                                                                                                              | v0.23.0 |
 | Native sets (`TYPE set<…>` column, `<set>` value) and `set[X]` fields                                                                       | an array, read back as a list (the ORM returns the declared set)                                                                                                                                                                                                               | 3.3.x: a native set (CBOR tag 56) the surrealdb SDK 2.0.0 cannot decode: HTTP `BufferError`, WebSocket `KeyError` and connection lost, also on the row a write returns. 3.1.5: a `set<…>` column refuses the array the ORM sends. On both lines `set[X]` fields work on schemaless tables and `array<…>` columns (the ORM sends sets as arrays) | v0.23.0 |
 | Sub-model dict in `merge(server_values=…)` (an `UPDATE … SET`)                                                                              | raw: `SET profile = {…}` replaces the stored object, and `object::extend` is a parse error. ORM: one `SET profile.city = $…` per key, so the other stored keys stay, as with `MERGE`                                                                                           | raw: `SET profile = {…}` replaces the stored object. ORM: same as 2.x (`object::extend` exists but is not used)                                                                                                                                                                                                                                 | v0.23.0 |
-| Sub-model key a `SCHEMAFULL` table does not declare (`DEFINE FIELD profile.first_name`, an object written with `firstName`)                 | raw: dropped silently, the object is stored without it. ORM: a sub-model that also validates by name is written under its names, but a `merge()` dict keeps your keys (aliases dropped), as up to v0.22; for an alias-only sub-model, declare the aliases. NONE is accepted    | raw: the write fails (`Found field 'profile.firstName', but no such field exists`), but NONE for that key is accepted, as on 2.x. ORM: same rules as 2.x, except that an alias in a `merge()` dict fails the write                                                                                                                              | v0.23.0 |
+| Sub-model key a `SCHEMAFULL` table does not declare (`DEFINE FIELD profile.first_name`, an object written with `firstName`)                 | raw: dropped silently. ORM: a sub-model that also validates by name is written under its names, but a `merge()` dict, or a `bulk_update()`/`signup()` dict with no rich type, keeps your keys, as up to v0.22; alias-only sub-models: declare the aliases. NONE is accepted    | raw: the write fails (`Found field 'profile.firstName', but no such field exists`), but NONE for that key is accepted, as on 2.x. ORM: same rules as 2.x, except that a key the table does not declare in such a dict fails the write                                                                                                           | v0.23.0 |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                          | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                                                                                                                    | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                                                                                                                                                                                     | v0.19.1 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
