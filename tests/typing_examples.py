@@ -16,8 +16,11 @@ from surrealdb import RecordID
 from surreal_orm_lite import (
     BaseSurrealEdge,
     BaseSurrealModel,
+    BoundExcluded,
+    BoundIncluded,
     Computed,
     Duration,
+    Range,
     SurrealConfigDict,
     SurrealFunc,
     Transaction,
@@ -169,3 +172,26 @@ def compact(d: Duration) -> list[int]:
 
 def as_td(d: Duration) -> timedelta:
     return d.to_timedelta()
+
+
+class Shift(BaseSurrealModel):
+    """v0.23.0: a ``Range[int]`` field validates its bounds as ``int``."""
+
+    hours: Range[int] | None = None
+
+
+def nine_to_five() -> Range[int]:
+    """``Range`` is generic: ``Range[int](...)`` is typed ``Range[int]``."""
+    return Range[int](BoundIncluded(9), BoundExcluded(17))
+
+
+def one_to_five() -> Range[int]:
+    return Range[int](BoundIncluded(1), BoundExcluded(5))
+
+
+def open_end(start: int) -> Range[int]:
+    """An open side is ``None``; the bound attributes are optional."""
+    shift = Range[int](BoundIncluded(start), None)
+    begin: BoundIncluded | BoundExcluded | None = shift.begin
+    assert begin is not None
+    return shift

@@ -51,7 +51,7 @@ from .signals import (
     pre_update,
 )
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
-from .types import Duration
+from .types import Duration, Range
 
 __all__ = [
     "__version__",
@@ -117,6 +117,7 @@ __all__ = [
     "Var",
     # Rich field types
     "Duration",
+    "Range",
     "BoundIncluded",
     "BoundExcluded",
     # Exceptions
