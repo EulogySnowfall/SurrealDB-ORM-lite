@@ -102,3 +102,30 @@ async def orm_client(*tables: str) -> AsyncIterator[Any]:
             with contextlib.suppress(Exception):
                 await client.query(f"REMOVE TABLE {table};", {})
         await SurrealDBConnectionManager.close_connection()
+
+
+@contextlib.asynccontextmanager
+async def change_feed_database(database: str) -> AsyncIterator[Any]:
+    """Connected ORM client on ``ns``/``database``, removed and redefined on entry, removed on exit.
+
+    **Every change-feed table outside ``tests/test_change_feeds.py`` lives in a database of its
+    own, through this helper — never in ``ns``/``db``.** Measured on 2026-10-12 and again on
+    2026-10-14: SurrealDB 2.7.0 applies the ``LIMIT`` of ``SHOW CHANGES FOR TABLE t …`` to the
+    whole database's feed before keeping ``t``'s entries, and ``REMOVE TABLE`` keeps a table's
+    feed history (on 3.3.3 too). An entry of another change-feed table in ``ns``/``db`` therefore
+    misleads the 2.x end-of-feed search of ``changes()`` and makes the feed of
+    ``tests/test_change_feeds.py`` replay old writes — on a long-running server, or in a random
+    order. ``REMOVE DATABASE`` clears the feed on both lines.
+
+    ``database`` is a constant identifier of the calling test module, never user input.
+    """
+    SurrealDBConnectionManager.set_connection(url=_ws_url(), user="root", password="root", namespace="ns", database=database)
+    client = await SurrealDBConnectionManager.get_client()
+    await client.query(f"REMOVE DATABASE IF EXISTS {database}; DEFINE DATABASE {database};", {})
+    try:
+        yield client
+    finally:
+        with contextlib.suppress(Exception):
+            cleanup = await SurrealDBConnectionManager.get_client()
+            await cleanup.query(f"REMOVE DATABASE IF EXISTS {database};", {})
+        await SurrealDBConnectionManager.close_connection()

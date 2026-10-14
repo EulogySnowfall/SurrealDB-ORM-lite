@@ -47,7 +47,7 @@ from surreal_orm_lite._sdk import Bound
 from surreal_orm_lite.live import hydrate
 from surreal_orm_lite.utils import build_filter_condition
 from tests._retry import retry_write
-from tests.conftest import orm_client
+from tests.conftest import change_feed_database, orm_client
 from tests.test_model_auth import AUTH_PASSWORD, _connect, _unique_email
 from tests.test_rich_types import _http_client, _http_url, _server_version
 from tests.test_transactions import _native_txn_supported
@@ -658,6 +658,10 @@ _BEYOND_TIMEDELTA = "584942417355y"
 _SDK_BEYOND_TIMEDELTA = surrealdb.Duration(86400 * 10**18)  # 10**9 days: 1 µs past timedelta.max
 
 
+#: The database of this module's change-feed tables: never ``ns``/``db`` (see ``change_feed_database``).
+RF_CF_DATABASE = "rf_change_feed"
+
+
 async def _take(stream: Any, count: int, timeout: float = 10.0) -> list[Any]:
     """The next *count* events of a live or change-feed stream, under ``asyncio.timeout``."""
     events: list[Any] = []
@@ -823,7 +827,7 @@ class TestHydrateNeverRaisesE2E:
 
     @pytest.mark.asyncio
     async def test_change_feed_moves_its_cursor_past_it(self) -> None:
-        async with orm_client("rf_cf") as client:
+        async with change_feed_database(RF_CF_DATABASE) as client:
             await client.query("DEFINE TABLE rf_cf SCHEMALESS CHANGEFEED 1h;", {})
             stream = await RfCf.objects().changes(poll_interval=0.05).start()
             try:
@@ -904,6 +908,7 @@ async def _read_live_event(client: Any) -> Any:
 
 
 async def _read_change_feed(client: Any) -> Any:
+    # In ``RF_CF_DATABASE``, never ``ns``/``db``: see ``_read_context``.
     await client.query("DEFINE TABLE rf_event SCHEMALESS CHANGEFEED 1h;", {})
     stream = await RfEvent.objects().changes(poll_interval=0.05).start()
     try:
@@ -929,13 +934,20 @@ _READ_CASES: dict[str, Callable[[Any], Awaitable[Any]]] = {
 }
 
 
+def _read_context(case: str) -> contextlib.AbstractAsyncContextManager[Any]:
+    """The client a read case runs on: a change feed in a database of its own, the rest in ``ns``/``db``."""
+    if case == "change-feed-entry":
+        return change_feed_database(RF_CF_DATABASE)
+    return orm_client("rf_event")
+
+
 class TestReadMatrixE2E:
     """AC-17: a row the server wrote from literals hydrates the declared types on every read path."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("case", list(_READ_CASES))
     async def test_read_path_returns_declared_types(self, case: str) -> None:
-        async with orm_client("rf_event") as client:
+        async with _read_context(case) as client:
             event = await _READ_CASES[case](client)
             assert isinstance(event, RfEvent), event
             _assert_declared(event)

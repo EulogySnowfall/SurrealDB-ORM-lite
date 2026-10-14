@@ -133,7 +133,7 @@ from surreal_orm_lite.query_set import QuerySet
 from surreal_orm_lite.transaction import BufferedTransaction
 from surreal_orm_lite.utils import build_filter_condition, coerce_endpoint, parse_lookup
 from tests._retry import retry_write as _write
-from tests.conftest import orm_client
+from tests.conftest import change_feed_database, orm_client
 
 # ==================== Shared models ====================
 
@@ -3524,31 +3524,9 @@ class TrCfEdge(BaseSurrealEdge):
 
 
 LIVE_TABLES = (*EDGE_TABLES, "tr_live")
+#: The database of ``tr_cf`` (``change_feed_database``): there ``since=0`` replays this module's changes only.
 CF_DATABASE = "tr_edge_cf"
 WIDGET_P = RecordID("tr_product", "widget")
-
-
-@contextlib.asynccontextmanager
-async def _change_feed_database() -> AsyncIterator[Any]:
-    """A root WebSocket client on ``ns``/``tr_edge_cf``, a database removed and redefined on entry, removed on exit.
-
-    Measured on 2026-10-12: SurrealDB 2.7.0 applies the ``LIMIT`` of ``SHOW CHANGES FOR TABLE t …`` to
-    the whole database's feed before keeping ``t``'s entries, and ``REMOVE TABLE`` keeps a table's
-    feed history (on 3.3.3 too). A second change-feed table in ``ns``/``db`` would therefore leak
-    into the feed of ``tests/test_change_feeds.py``. ``REMOVE DATABASE`` clears the feed on both
-    lines, so here ``since=0`` replays this test's changes only.
-    """
-    host, port = os.environ.get("SURREALDB_HOST", "localhost"), os.environ.get("SURREALDB_PORT", "8000")
-    SurrealDBConnectionManager.set_connection(f"ws://{host}:{port}/rpc", "root", "root", "ns", CF_DATABASE)
-    client = await SurrealDBConnectionManager.get_client()
-    await client.query(f"REMOVE DATABASE IF EXISTS {CF_DATABASE}; DEFINE DATABASE {CF_DATABASE};", {})
-    try:
-        yield client
-    finally:
-        with contextlib.suppress(Exception):
-            cleanup = await SurrealDBConnectionManager.get_client()
-            await cleanup.query(f"REMOVE DATABASE IF EXISTS {CF_DATABASE};", {})
-        await SurrealDBConnectionManager.close_connection()
 
 
 async def _next_events(stream: Any, count: int) -> list[Any]:
@@ -3718,7 +3696,7 @@ class TestEdgeLiveE2E:
     @pytest.mark.asyncio
     async def test_changes_on_edge_table(self) -> None:
         """``changes()`` on a ``TYPE RELATION CHANGEFEED`` table yields typed edges (in a database of its own)."""
-        async with _change_feed_database() as client:
+        async with change_feed_database(CF_DATABASE) as client:
             alice, bob, widget = await _nodes()
             await client.query("DEFINE TABLE tr_cf TYPE RELATION CHANGEFEED 1h;", {})
             major = (await _server_version())[0]
