@@ -47,6 +47,7 @@ from surreal_orm_lite.types import (
     _parse_range_text,
     _timedelta_from_sdk,
 )
+from tests.conftest import orm_client
 
 MAX_NS = Duration.MAX_NANOSECONDS
 
@@ -75,6 +76,15 @@ async def _server_version() -> tuple[int, int, int]:
     raw = str(await (await SurrealDBConnectionManager.get_client()).version())
     major, minor, patch = (int(n) for n in re.findall(r"\d+", raw)[:3])
     return major, minor, patch
+
+
+def _sdk_decodes_native_set() -> bool:
+    """Whether the installed SDK decodes a native set (CBOR tag 56, SurrealDB 3.3's ``set``); 2.0.0 does not."""
+    try:
+        _sdk.cbor_decode(_sdk.cbor_encode(CBORTag(56, [1])))
+    except Exception:
+        return False
+    return True
 
 
 def _assert_invalid_duration(call: Callable[[], Any]) -> None:
@@ -1249,3 +1259,131 @@ class TestRichLiteralsE2E:
         assert await client.query(f"RETURN 3 IN {one_to_five} AND 9 NOT IN {one_to_five};", {}) is True
         assert await client.query(f"RETURN 5 IN {up_to_five} OR false;", {}) is True
         assert await client.query(f"RETURN 7 IN {to_surql_literal(Range(BoundIncluded(5)))};", {}) is True
+
+
+# --- encode(): what the servers store (spec §6.1; AC-9, AC-10, AC-12) -------------------------------
+
+_SD = surrealdb.Duration
+_EXPONENT_DECIMALS = ["1E+3", "1E-7", "-5E-7", "0E-10", "1E-31", "1.234567890123456789012345E-7", "0E+30", "-0E-30"]
+
+# (id, value given to ``encode``, what the server gives back, ``RETURN <string> $v`` or None)
+_WIRE_FORMS: list[tuple[str, Any, Any, str | None]] = [
+    ("Duration(1)", Duration(1), _SD(1), "1ns"),
+    ("timedelta", timedelta(hours=1, minutes=30), _SD(5400 * 10**9), "1h30m"),
+    ("Duration(MAX)", Duration(MAX_NS), _SD(MAX_NS), "584942417355y3w5d7h15s999ms999µs999ns"),
+    ("sdk-Duration", surrealdb.Duration(5400 * 10**9 + 1), _SD(5400 * 10**9 + 1), "1h30m1ns"),
+    ("1E+3", Decimal("1E+3"), Decimal("1000"), None),
+    ("1E-7", Decimal("1E-7"), Decimal("0.0000001"), None),
+    ("-5E-7", Decimal("-5E-7"), Decimal("-0.0000005"), None),
+    ("0E-10", Decimal("0E-10"), Decimal(0), None),
+    ("1E-31", Decimal("1E-31"), Decimal(0), None),
+    ("cut", Decimal("1.234567890123456789012345E-7"), Decimal("0.0000001234567890123456789012"), None),
+    ("0E+30", Decimal("0E+30"), Decimal(0), None),
+    ("-0E-30", Decimal("-0E-30"), Decimal(0), None),
+    (
+        "70-digits",
+        Decimal("79228162514264337593543950335.4" + "9" * 40),
+        Decimal("79228162514264337593543950335"),
+        None,
+    ),
+    ("date", date(2026, 1, 2), datetime(2026, 1, 2, tzinfo=UTC), None),
+    ("set", {"b", "a"}, ["a", "b"], None),
+    ("1..5", Range(BoundIncluded(1), BoundExcluded(5)), SdkRange(BoundIncluded(1), BoundExcluded(5)), "1..5"),
+    ("..5", Range(None, BoundExcluded(5)), SdkRange(None, BoundExcluded(5)), "..5"),
+    ("1..", Range(BoundIncluded(1)), SdkRange(BoundIncluded(1), None), "1.."),
+    ("..", Range(), SdkRange(None, None), ".."),
+    ("1>..", Range(BoundExcluded(1)), SdkRange(BoundExcluded(1), None), "1>.."),
+    ("..=5", Range(None, BoundIncluded(5)), SdkRange(None, BoundIncluded(5)), "..=5"),
+    (
+        "1m..1h",
+        Range(BoundIncluded(timedelta(minutes=1)), BoundExcluded(timedelta(hours=1))),
+        SdkRange(BoundIncluded(_SD(60 * 10**9)), BoundExcluded(_SD(3600 * 10**9))),
+        "1m..1h",
+    ),
+    ("1m..", Range(BoundIncluded(timedelta(minutes=1))), SdkRange(BoundIncluded(_SD(60 * 10**9)), None), "1m.."),
+]
+
+
+class TestWireFormsE2E:
+    """Each encoded value is stored and read back as the server's own type — raw SDK, WS and HTTP, both lines."""
+
+    @pytest.mark.parametrize("transport", ["ws", "http"])
+    @pytest.mark.parametrize(("value", "expected", "text"), [case[1:] for case in _WIRE_FORMS], ids=[c[0] for c in _WIRE_FORMS])
+    async def test_round_trip(self, transport: str, value: Any, expected: Any, text: str | None) -> None:
+        async with orm_client("rf_wire") as ws:
+            client = ws if transport == "ws" else await _http_client()
+            encoded = encoding.encode(value)
+            assert await client.query("CREATE rf_wire:1 SET v = $v RETURN NONE;", {"v": encoded}) == []
+            read = await client.query("SELECT VALUE v FROM ONLY rf_wire:1;", {})
+            assert type(read) is type(expected)
+            assert read == expected
+            if isinstance(expected, SdkRange):
+                assert (read.begin is None) == (expected.begin is None)
+                assert (read.end is None) == (expected.end is None)
+            if text is not None:
+                assert await client.query("RETURN <string> $v;", {"v": encoded}) == text
+            assert await client.query("RETURN 1;", {}) == 1
+
+    @pytest.mark.parametrize("text", _EXPONENT_DECIMALS)
+    async def test_decimal_cut_agrees_with_server(self, text: str) -> None:
+        """The server reads the encoded (cut) text exactly as it reads the full fixed-point text."""
+        value = Decimal(text)
+        encoded = encoding.encode(value)
+        assert isinstance(encoded, CBORTag)
+        full = CBORTag(_sdk.TAG_DECIMAL_STRING, format(value, "f"))
+        client = await _http_client()
+        ours = await client.query("RETURN <string> $v;", {"v": encoded})
+        theirs = await client.query("RETURN <string> $v;", {"v": full})
+        assert ours == theirs
+
+
+class TestZeroProbeE2E:
+    async def test_probe_matches_server(self) -> None:
+        """``RETURN 0ns`` fails to decode (``IndexError``) exactly when the local probe answers ``False``."""
+        client = await _http_client()
+        if encoding.sdk_decodes_zero_duration():
+            result = await client.query("RETURN 0ns;", {})
+            assert isinstance(result, surrealdb.Duration) and result.elapsed == 0
+        else:
+            with pytest.raises(IndexError):
+                await client.query("RETURN 0ns;", {})
+
+
+class TestNativeSetsE2E:
+    """A Python set goes out as a sorted array; what a ``TYPE set<…>`` column does with it depends on the line."""
+
+    def test_sdk_still_cannot_decode_native_sets(self) -> None:
+        assert not _sdk_decodes_native_set(), (
+            "the SDK now decodes native sets (CBOR tag 56): update README behaviour row "
+            "'TYPE set<…> columns' and section 24's array<…> advice"
+        )
+
+    async def test_set_column_by_line(self) -> None:
+        async with orm_client("rf_set"):
+            version = await _server_version()
+            client = await _http_client()
+            await client.query("DEFINE FIELD tags ON rf_set TYPE set<string>;", {})
+            tags = encoding.encode({"b", "a"})
+            assert tags == ["a", "b"]
+            write = "CREATE rf_set:1 SET tags = $t RETURN NONE;"
+            read = "SELECT VALUE tags FROM ONLY rf_set:1;"
+            if version < (3, 0, 0):
+                await client.query(write, {"t": tags})
+                assert await client.query(read, {}) == ["a", "b"]
+            elif version < (3, 3, 0):
+                with pytest.raises(_sdk.ServerError, match=r"\bset\b"):
+                    await client.query(write, {"t": tags})
+            else:
+                await client.query(write, {"t": tags})
+                if _sdk_decodes_native_set():
+                    assert sorted(await client.query(read, {})) == ["a", "b"]
+                else:
+                    with pytest.raises(BufferError):
+                        await client.query(read, {})
+
+    async def test_array_column_everywhere(self) -> None:
+        async with orm_client("rf_arr"):
+            client = await _http_client()
+            await client.query("DEFINE FIELD tags ON rf_arr TYPE array<string> VALUE $value.distinct();", {})
+            await client.query("CREATE rf_arr:1 SET tags = $t RETURN NONE;", {"t": encoding.encode({"b", "a"})})
+            assert await client.query("SELECT VALUE tags FROM ONLY rf_arr:1;", {}) == ["a", "b"]
