@@ -1,5 +1,6 @@
 __version__ = "0.22.2"
 
+from ._sdk import BoundExcluded, BoundIncluded
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
 from .auth import AuthTokens
 from .changefeed import ChangeModelStream
@@ -8,6 +9,7 @@ from .connection_manager import SurrealDBConnectionManager
 from .edge import BaseSurrealEdge
 from .enum import LiveAction, OrderBy
 from .exceptions import (
+    InvalidDurationError,
     SurrealDbAuthenticationError,
     SurrealDbConflictError,
     SurrealDbConnectionError,
@@ -49,6 +51,7 @@ from .signals import (
     pre_update,
 )
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
+from .types import Duration
 
 __all__ = [
     "__version__",
@@ -112,6 +115,10 @@ __all__ = [
     "SurrealRandFunction",
     # Query variables
     "Var",
+    # Rich field types
+    "Duration",
+    "BoundIncluded",
+    "BoundExcluded",
     # Exceptions
     "SurrealORMError",
     "SurrealDbError",
@@ -120,4 +127,5 @@ __all__ = [
     "SurrealDbValidationError",
     "SurrealDbNotFoundError",
     "SurrealDbAuthenticationError",
+    "InvalidDurationError",
 ]
