@@ -173,6 +173,37 @@ def validate_field_name(field: str, context: str = "field") -> None:
         )
 
 
+# What a query variable's name may hold; ``build_set_clause`` replaces anything else in a path with ``_``.
+_NON_VARIABLE_CHARACTER = re.compile(r"[^A-Za-z0-9_]")
+
+
+def is_path_segment(key: object) -> bool:
+    """Whether ``key`` can be a segment of a ``SET`` path (v0.23.0): a string without a NUL character,
+    which SurrealQL text cannot hold on either line (:func:`path_segment`)."""
+    return isinstance(key, str) and "\x00" not in key
+
+
+def path_segment(segment: str) -> str:
+    """A segment of a ``SET`` path as SurrealQL text (v0.23.0).
+
+    An identifier as it is (``city``); anything else between backticks, each backslash and each
+    backtick in it escaped by a backslash — the backslashes first, so an escape the key holds can
+    never combine with one added here. The rule
+    :mod:`~surreal_orm_lite.surql_literal` applies to record ids; checked as ``UPDATE … SET
+    profile.<segment> = $v`` on SurrealDB 2.7.0, 3.3.4 and 3.1.5 with empty, dotted, spaced,
+    unicode, backtick, backslash and injection-shaped keys, each stored as that key.
+
+    Raises:
+        ValueError: a segment :func:`is_path_segment` refuses.
+    """
+    if not is_path_segment(segment):
+        raise ValueError(f"Invalid SET path segment {segment!r}: it must be a string without a NUL character.")
+    if VALID_ALIAS_PATTERN.fullmatch(segment):
+        return segment
+    escaped = segment.replace("\\", "\\\\").replace("`", "\\`")
+    return f"`{escaped}`"
+
+
 def build_set_clause(
     merged: Mapping[str, Any],
     param_prefix: str = "_sv_",
@@ -193,8 +224,11 @@ def build_set_clause(
     Field names are validated as plain identifiers before being interpolated (a dotted
     string is rejected here). A nested assignment goes in ``paths`` instead (v0.23.0, the keys
     of a sub-model dict in ``merge(server_values=)``): each ``(segments, value)`` compiles to
-    ``a.b.c = $<param_prefix><n>_a_b_c``, appended after ``merged``'s assignments. Every segment
-    must be an identifier; ``n`` is the path's position, so the variable never collides with a
+    ``a.b.c = $<param_prefix><n>_a_b_c``, appended after ``merged``'s assignments. A segment that
+    is not an identifier (``home-town``, ``""``, any key a dict holds) is written between backticks
+    (:func:`path_segment`), and stands for that key whatever it holds; in
+    the variable's name, each character other than an ASCII letter, a digit or ``_`` becomes ``_``.
+    ``n`` is the path's position, so the variable never collides with another path's or with a
     field's (an identifier does not start with a digit). The value is inlined or bound as above.
 
     Returns:
@@ -202,9 +236,9 @@ def build_set_clause(
 
     Raises:
         ValueError: If there is no assignment at all (``SET`` with none is a parse error on both
-            server lines), if a field name or a path segment is not a plain identifier (or a
-            path is empty), or if a value has no SurrealDB form (an ``int`` beyond 64 bits, a
-            negative duration…).
+            server lines), if a field name is not a plain identifier, if a path is empty or one of
+            its segments is not a string or holds a NUL character (:func:`is_path_segment`), or if
+            a value has no SurrealDB form (an ``int`` beyond 64 bits, a negative duration…).
         TypeError: If a value is of a type SurrealDB cannot store (a ``time``).
     """
     assignments: list[tuple[str, str, Any]] = []
@@ -212,11 +246,11 @@ def build_set_clause(
         validate_alias_name(field)
         assignments.append((field, f"{param_prefix}{field}", value))
     for index, (segments, value) in enumerate(paths):
-        if not segments or not all(isinstance(segment, str) and VALID_ALIAS_PATTERN.fullmatch(segment) for segment in segments):
-            raise ValueError(
-                f"Invalid SET path {tuple(segments)!r}: each segment must be an identifier (letters, digits, underscores)."
-            )
-        assignments.append((".".join(segments), f"{param_prefix}{index}_{'_'.join(segments)}", value))
+        if not segments or not all(is_path_segment(segment) for segment in segments):
+            raise ValueError(f"Invalid SET path {tuple(segments)!r}: each segment must be a string without a NUL character.")
+        target = ".".join(path_segment(segment) for segment in segments)
+        suffix = _NON_VARIABLE_CHARACTER.sub("_", "_".join(segments))
+        assignments.append((target, f"{param_prefix}{index}_{suffix}", value))
     if not assignments:
         raise ValueError("build_set_clause() needs at least one field: an empty SET clause is invalid SurrealQL.")
     parts: list[str] = []

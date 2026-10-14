@@ -30,7 +30,7 @@ from surreal_orm_lite.functions import (
     SurrealStringFunction,
     SurrealTimeFunction,
 )
-from surreal_orm_lite.utils import build_set_clause, merge_extra_vars
+from surreal_orm_lite.utils import build_set_clause, is_path_segment, merge_extra_vars, path_segment
 
 ALL_FUNCTION_ENUMS: list[type[SurrealFunction]] = [
     SurrealTimeFunction,
@@ -282,10 +282,56 @@ class TestBuildSetClause:
         clause, variables = build_set_clause({}, paths=[(("a", "b"), 1)])
         assert (clause, variables) == ("a.b = $_sv_0_a_b", {"_sv_0_a_b": 1})
 
-    def test_invalid_path_segment_raises(self) -> None:
-        for bad in (("a", "b c"), ("a", "b;c"), ("a", "b.c"), ("1a", "b"), ("a", ""), ("a", "b\n"), ()):
-            with pytest.raises(ValueError):
-                build_set_clause({}, paths=[(bad, 1)])
+    def test_a_segment_that_is_not_an_identifier_is_quoted(self) -> None:
+        """A dict key is data: a segment that is not an identifier is written between backticks,
+        backslashes and backticks escaped (backslashes first), and the variable keeps only ASCII
+        letters, digits and ``_`` — so no key can end the segment or the statement."""
+        evil = "x`; REMOVE TABLE User; `"
+        clause, variables = build_set_clause(
+            {},
+            paths=[
+                (("profile", "home-town"), 1),
+                (("a", ""), 2),
+                (("a", "b c", "é"), 3),
+                (("a", evil), 4),
+                (("a", "x\\"), 5),
+                (("a", "\\`"), 6),
+                (("1a", "b.c"), 7),
+            ],
+        )
+        assert clause.split(", ") == [
+            "profile.`home-town` = $_sv_0_profile_home_town",
+            "a.`` = $_sv_1_a_",
+            "a.`b c`.`é` = $_sv_2_a_b_c__",
+            "a.`x\\`; REMOVE TABLE User; \\`` = $_sv_3_a_x___REMOVE_TABLE_User___",
+            "a.`x\\\\` = $_sv_4_a_x_",
+            "a.`\\\\\\`` = $_sv_5_a___",
+            "`1a`.`b.c` = $_sv_6_1a_b_c",
+        ]
+        assert variables == {
+            "_sv_0_profile_home_town": 1,
+            "_sv_1_a_": 2,
+            "_sv_2_a_b_c__": 3,
+            "_sv_3_a_x___REMOVE_TABLE_User___": 4,
+            "_sv_4_a_x_": 5,
+            "_sv_5_a___": 6,
+            "_sv_6_1a_b_c": 7,
+        }
+
+    def test_path_segment(self) -> None:
+        assert path_segment("city") == "city"
+        assert path_segment("home-town") == "`home-town`"
+        assert path_segment("a`b\\c") == "`a\\`b\\\\c`"
+        assert is_path_segment("") is True
+        assert is_path_segment("a\x00b") is False
+        assert is_path_segment(1) is False
+        with pytest.raises(ValueError, match="NUL"):
+            path_segment("a\x00b")
+
+    def test_invalid_path_raises(self) -> None:
+        for bad in ((), ("a", "b\x00"), ("a", 1)):
+            with pytest.raises(ValueError, match="Invalid SET path"):
+                build_set_clause({}, paths=[(bad, 1)])  # type: ignore[list-item]
 
 
 class TestMergeExtraVars:

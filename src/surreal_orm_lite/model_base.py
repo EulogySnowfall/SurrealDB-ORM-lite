@@ -43,6 +43,7 @@ from .utils import (
     build_set_clause,
     coerce_endpoint,
     format_record_id,
+    is_path_segment,
     merge_extra_vars,
     user_stacklevel,
     validate_alias_name,
@@ -594,35 +595,33 @@ def _stored_keys(
 
 
 def _set_paths(
-    path: str, segments: tuple[str, ...], model: type[BaseModel], value: Mapping[Any, Any]
+    segments: tuple[str, ...], model: type[BaseModel], value: Mapping[Any, Any]
 ) -> list[tuple[tuple[str, ...], Any]]:
     """The ``SET`` assignments of a dict addressed to sub-model ``model`` in ``merge(server_values=)`` (v0.23.0).
 
     ``UPDATE … SET`` replaces each field it assigns, where ``MERGE`` merges objects; so each key of
     the dict is its own assignment, ``segments`` + the key (``profile.city = $…``), recursively for
     a dict under a sub-model sub-field (``outer.inner.when``), and the other stored keys stay — as
-    with ``MERGE``. A value of any other kind (an array, an instance, a plain ``dict`` field) is
-    assigned whole. ``value`` is the dict as converted (:func:`_partial_object`), under the keys
+    with ``MERGE``. A key that is not an identifier (``"zip-code"``, ``Field(alias="home-town")``)
+    is a segment too, written between backticks (:func:`~surreal_orm_lite.utils.path_segment`). A
+    value of any other kind (an array, an instance, a plain ``dict`` field) is assigned whole.
+    ``value`` is the dict as converted (:func:`_partial_object`), under the keys
     :func:`_stored_keys` gives (the caller's, for a sub-model that validates by name and by alias);
-    an empty dict assigns nothing. ``path`` names the value in the error (``profile``,
-    ``outer.inner``).
+    an empty dict assigns nothing.
 
-    Raises:
-        ValueError: a key that is not an identifier (``"zip-code"``, ``Field(alias="home-town")``):
-            the path of an assignment is SurrealQL text. ``merge()`` without ``server_values`` takes it.
+    A dict with a key no path can name (not a string, or holding a NUL character, which SurrealQL
+    text cannot hold) is assigned whole at ``segments``, as v0.22.2 assigned every one: the other
+    keys stored at that level go.
     """
+    if not all(is_path_segment(key) for key in value):
+        return [(segments, value)]
     keys = field_keys(model)
     assignments: list[tuple[tuple[str, ...], Any]] = []
     for key, item in value.items():
-        name = keys.get(key) if isinstance(key, str) else None
-        if not isinstance(key, str) or not VALID_ALIAS_PATTERN.fullmatch(key):
-            raise ValueError(
-                f"merge({path}=…): the key {key!r} is not an identifier, which the path of an UPDATE … SET "
-                "assignment needs (server_values=); merge it without server_values"
-            )
+        name = keys.get(key)
         child = None if name is None else sub_model(model.model_fields[name].annotation)
         if child is not None and isinstance(item, Mapping):
-            assignments.extend(_set_paths(f"{path}.{key}", (*segments, key), child, item))
+            assignments.extend(_set_paths((*segments, key), child, item))
         else:
             assignments.append(((*segments, key), item))
     return assignments
@@ -2426,7 +2425,7 @@ class BaseSurrealModel(BaseModel):
                 continue
             model = self._sub_model_of(key)
             if model is not None and isinstance(value, Mapping):
-                paths.extend(_set_paths(key, (column,), model, value))
+                paths.extend(_set_paths((column,), model, value))
             else:
                 fields[key] = value
         merged: dict[str, Any] = {**self._wire_columns(fields), **server_columns}
@@ -2564,9 +2563,10 @@ class BaseSurrealModel(BaseModel):
             ValueError: a keyword value that does not validate as its rich field
                 (``merge(at="yesterday")``; ``merge(profile={"bday": "someday"})`` names
                 ``profile.bday``), a dict naming one sub-field twice for a sub-model that
-                validates by alias only or by name only, a table-model instance where the field
-                cannot hold its record id, or, with ``server_values``, a sub-model dict key that
-                is not an identifier — before anything is sent.
+                validates by alias only or by name only, or a table-model instance where the field
+                cannot hold its record id — before anything is sent. With ``server_values``, a
+                sub-model dict key that is not an identifier is assigned between backticks
+                (``profile.`zip-code` = $…``), as v0.22.2 took it.
 
         Example:
             >>> await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})

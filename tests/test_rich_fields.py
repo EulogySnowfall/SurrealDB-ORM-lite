@@ -2115,16 +2115,16 @@ class TestSubModelMergeServerValuesE2E:
             assert (await _raw("p", "rf_person"))["profile"] == {"city": "z"}
             await _assert_client_usable(client)
 
-    async def test_a_key_that_is_not_an_identifier_is_refused_before_sending(self) -> None:
-        """The path of a ``SET`` assignment is SurrealQL text: each key must be an identifier."""
+    async def test_a_key_that_is_not_an_identifier_is_one_quoted_segment(self) -> None:
+        """The path of a ``SET`` assignment is SurrealQL text: a key that is not an identifier is
+        written between backticks (``profile.`zip-code` = $…``), as v0.22.2 took it."""
         async with orm_client("rf_person") as client:
             person = await _seeded_person(client)
-            with pytest.raises(ValueError, match=r"^merge\(profile=…\): the key 'zip-code' is not an identifier"):
-                await person.merge(server_values=_BUMP, profile={"zip-code": "H0H"})
+            await person.merge(server_values=_BUMP, profile={"zip-code": "H0H"})
 
             row = await _raw("p", "rf_person")
-            assert row["n"] == 1
-            assert row["profile"] == {"bday": datetime(1990, 1, 2, tzinfo=UTC), "city": "x"}
+            assert row["n"] == 2
+            assert row["profile"] == {"bday": datetime(1990, 1, 2, tzinfo=UTC), "city": "x", "zip-code": "H0H"}
             await _assert_client_usable(client)
 
 
@@ -2273,7 +2273,7 @@ class RfCamelDated(BaseModel):
 
 class RfNicknamed(BaseModel):
     """Validated by name and by alias: an ``AliasChoices`` (both read before the name) and an alias
-    that is not an identifier (no ``SET`` path can name it)."""
+    that is not an identifier (a ``SET`` path quotes it)."""
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -2405,17 +2405,28 @@ class TestSubModelStoredKeys:
 
     def test_server_values_assign_the_given_keys(self) -> None:
         """Under ``server_values`` each key is its own ``SET`` assignment, under the key the dict
-        sends; a key that is not an identifier cannot be a ``SET`` path, so it raises."""
+        sends, an identifier or not (``build_set_clause`` quotes it); a dict with a key no path can
+        name (not a string, a NUL character) is assigned whole, as v0.22.2 assigned every one."""
         value = RfNamed._coerce_field_value("nicknamed", {"handle": "a", "home_town": "b"})
-        assert _set_paths("nicknamed", ("nicknamed",), RfNicknamed, value) == [
+        assert _set_paths(("nicknamed",), RfNicknamed, value) == [
             (("nicknamed", "handle"), "a"),
             (("nicknamed", "home_town"), "b"),
         ]
         nested = RfNamed._coerce_field_value("profile", {"homeAddress": {"street_name": "x"}})
-        assert _set_paths("profile", ("profile",), RfCamel, nested) == [(("profile", "homeAddress", "streetName"), "x")]
-        for key in ("zip-code", "home-town"):  # an alias that is not an identifier too
-            with pytest.raises(ValueError, match=rf"^merge\(nicknamed=…\): the key '{key}' is not an identifier"):
-                _set_paths("nicknamed", ("nicknamed",), RfNicknamed, {key: "H0H"})
+        assert _set_paths(("profile",), RfCamel, nested) == [(("profile", "homeAddress", "streetName"), "x")]
+        for key in ("zip-code", "home-town", ""):  # an alias that is not an identifier too
+            assert _set_paths(("nicknamed",), RfNicknamed, {key: "H0H", "handle": "h"}) == [
+                (("nicknamed", key), "H0H"),
+                (("nicknamed", "handle"), "h"),
+            ]
+        for whole in ({"a\x00b": 1, "handle": "h"}, {1: "x", "handle": "h"}):
+            assert _set_paths(("nicknamed",), RfNicknamed, whole) == [(("nicknamed",), whole)]
+        deep = {"homeAddress": {"zip\x00": "1"}, "first_name": "a"}
+        assert _set_paths(("profile",), RfCamel, deep) == [
+            (("profile", "homeAddress"), {"zip\x00": "1"}),
+            (("profile", "first_name"), "a"),
+        ]
+        assert _set_paths(("profile",), RfCamel, {}) == []
 
     @pytest.mark.parametrize(
         ("field", "value", "named"),
@@ -2593,8 +2604,8 @@ class TestSubModelStoredKeysE2E:
     @pytest.mark.parametrize("server_values", [False, True], ids=["merge", "merge-server-values"])
     async def test_a_spelling_that_is_not_an_identifier(self, server_values: bool) -> None:
         """A ``merge()`` dict keeps the key, as in v0.22.2: ``home-town`` is merged into the stored
-        object, and a read takes it first. An ``UPDATE … SET`` path (``server_values``) cannot name a
-        key that is not an identifier: ``ValueError`` before anything is sent."""
+        object, and a read takes it first. An ``UPDATE … SET`` path (``server_values``) names it
+        between backticks, with the same result."""
         async with orm_client("rf_named") as client:
             await client.query(
                 "CREATE $rid CONTENT $row;",
@@ -2602,14 +2613,12 @@ class TestSubModelStoredKeysE2E:
             )
             person = await RfNamed.objects().get("e")
             if server_values:
-                with pytest.raises(ValueError, match=r"^merge\(nicknamed=…\): the key 'home-town' is not an identifier"):
-                    await person.merge(server_values=_BUMP, nicknamed={"home-town": "c"})
-                expected = {"home_town": "a", "home-town": "b"}
+                await person.merge(server_values=_BUMP, nicknamed={"home-town": "c"})
             else:
                 await person.merge(nicknamed={"home-town": "c"})
-                expected = {"home_town": "a", "home-town": "c"}
+            expected = {"home_town": "a", "home-town": "c"}
             row = await _raw("e", "rf_named")
-            assert (row["nicknamed"], row["n"]) == (expected, 0)
+            assert (row["nicknamed"], row["n"]) == (expected, 1 if server_values else 0)
             assert (await RfNamed.objects().get("e")).nicknamed == RfNicknamed(home_town=expected["home-town"])
             await _assert_client_usable(client)
 
@@ -3131,7 +3140,7 @@ class TestMergeDictKeysAsGiven:
         bound = list(client.calls[-1].values())
         assert "3" in bound
         assert {"a": 1} in bound
-        assert _set_paths("plain", ("plain",), RfProf, _PROF_CHANGE) == [
+        assert _set_paths(("plain",), RfProf, _PROF_CHANGE) == [
             (("plain", "homeAddr", "zipCode"), "3"),
             (("plain", "metaData"), {"a": 1}),
         ]
@@ -4555,4 +4564,69 @@ class TestUnionStringsE2E:
             _assert_sdk_duration(row["period"], 3 * _HOUR_NS)
             loaded = await RfPlan.objects().get("b")
             assert (loaded.window, loaded.period) == (timedelta(hours=2), timedelta(hours=3))
+            await _assert_client_usable(client)
+
+
+class RfHomeTown(BaseModel):
+    """No rich type; an alias that is not an identifier, validated by alias only (Pydantic's default)."""
+
+    home_town: str = Field(default="", alias="home-town")
+
+
+class RfTown(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_town")
+
+    id: str | None = None
+    subh: RfHomeTown | None = None
+    n: int = 0
+
+
+_INJECTION_KEY = "x`; REMOVE TABLE rf_town; `"
+
+
+class TestServerValuesKeysE2E:
+    """``merge(server_values=…)`` assigns each key of a sub-model dict on its own (v0.23.0), and a key
+    that is not an identifier is written as a quoted path segment (``subh.`home-town``` ) instead of
+    being refused, so every call v0.22.2 took still succeeds and stores the same key, on both lines.
+    Only the other stored keys differ: they stay, where v0.22.2 replaced the object."""
+
+    @pytest.mark.parametrize("given", [{"home-town": "y"}, {"home_town": "y"}], ids=["alias", "name"])
+    @_REFRESH
+    async def test_an_alias_that_is_not_an_identifier(self, given: dict[str, Any], refresh: bool) -> None:
+        async with orm_client("rf_town") as client:
+            await client.query("CREATE rf_town:a CONTENT {subh: {'home-town': 'x', keep: 1}, n: 0};", {})
+            town = await RfTown.objects().get("a")
+            await town.merge(refresh=refresh, server_values=_BUMP, subh=given)
+
+            row = await _raw("a", "rf_town")
+            assert (row["subh"], row["n"]) == ({"home-town": "y", "keep": 1}, 1)
+            assert (await RfTown.objects().get("a")).subh == RfHomeTown.model_validate({"home-town": "y"})
+            await _assert_client_usable(client)
+
+    @pytest.mark.parametrize(
+        "key",
+        ["zip code", "a.b", "1st", "", "é", "a`b", "a\\b", "x\\", _INJECTION_KEY],
+        ids=["space", "dot", "digit", "empty", "unicode", "backtick", "backslash", "trailing-backslash", "injection"],
+    )
+    async def test_any_key_is_one_quoted_segment(self, key: str) -> None:
+        """A key is data, never SurrealQL: each one, injection-shaped included, lands as that key."""
+        async with orm_client("rf_town") as client:
+            await client.query("CREATE rf_town:a CONTENT {subh: {'home-town': 'x'}, n: 0};", {})
+            town = await RfTown.objects().get("a")
+            await town.merge(server_values=_BUMP, subh={key: 1})
+
+            row = await _raw("a", "rf_town")
+            assert (row["subh"], row["n"]) == ({"home-town": "x", key: 1}, 1)
+            await _assert_client_usable(client)
+
+    async def test_a_key_no_path_can_name_assigns_the_object(self) -> None:
+        """A key holding a NUL character cannot be written in SurrealQL: that dict is assigned whole,
+        as v0.22.2 assigned every one."""
+        async with orm_client("rf_town") as client:
+            await client.query("CREATE rf_town:a CONTENT {subh: {'home-town': 'x'}, n: 0};", {})
+            town = await RfTown.objects().get("a")
+            await town.merge(server_values=_BUMP, subh={"a\x00b": 1})
+
+            row = await _raw("a", "rf_town")
+            assert (row["subh"], row["n"]) == ({"a\x00b": 1}, 1)
             await _assert_client_usable(client)
