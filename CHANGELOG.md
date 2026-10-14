@@ -73,11 +73,13 @@ and the official SDK, on every write and read path, with the same behaviour on S
   `timedelta`, `Duration`, `Decimal` or `UUID` field is validated as that type, then bound:
   `filter(ttl__gt="1h")` compares with a duration and `filter(token="…")` with a UUID. A value
   that does not fit raises `ValueError` before anything is sent. A `float` compared with a
-  `Decimal` field is bound as given, as before, when its `Decimal` is not a SurrealDB decimal as it
-  stands (`1e30`, beyond 96 bits; `1e-30`, more than 28 fractional digits): the server compares
-  the float, where the converted value would be refused or rounded. It applies to `filter()`, `Q`,
-  the lookups of `get_or_create()`/`update_or_create()` and the filters of `bulk_update()`,
-  `bulk_delete()`, `patch()`, `live()` and `watch()`.
+  `Decimal` field is bound as given, as before (an item of `in` and a range bound too): SurrealDB
+  compares a float by its binary value (`9.99f = 9.99dec` is false), so `filter(price=9.99)` still
+  finds the floats earlier keyword writes stored; `filter(price="9.99")` or a `Decimal` compares
+  with a decimal. A field the model validates with code of its own (a `@field_validator`, a
+  `@model_validator(mode="before")`, an `Annotated` validator) is bound as given, as before. It
+  applies to `filter()`, `Q`, the lookups of `get_or_create()`/`update_or_create()` and the filters
+  of `bulk_update()`, `bulk_delete()`, `patch()`, `live()` and `watch()`.
 - **Range membership**: `in`/`not_in` with a `Range` (the ORM's or the SDK's) binds one range
   (`capacity IN $r`), its bounds validated as the field's type; `contains`/`not_contains` on a
   `Range[T]` field validate the value as `T`, and on a `list[S]`/`set[S]` field as `S`.
@@ -103,16 +105,23 @@ and the official SDK, on every write and read path, with the same behaviour on S
   a string and leaves a `datetime` on the instance. A value that does not fit raises `ValueError`
   naming the field before anything is sent; `None` and `SurrealFunc` values are written as given.
   On a model with `arbitrary_types_allowed=True` the validation takes that setting; a field
-  Pydantic cannot build a validator for is written as given, as before. Rows v0.22 stored as
-  strings still load, but the typed lookups no longer match them: README section 24, "Upgrading
-  from v0.22", gives a one-off conversion that runs on both lines.
+  Pydantic cannot build a validator for is written as given, as before. Written as given, as
+  before, so that a filter written the same way still finds them: a `float` for a `Decimal` field
+  (`merge(price=9.99)` stores `9.99f`, which `filter(price=9.99)` finds), and any value of a field
+  the model validates with code of its own (`merge(at="2026/03/04")` with a validator that reads
+  that format; the field's type alone would refuse it). Rows v0.22 stored as strings still load,
+  but the typed lookups no longer match them: README section 24, "Upgrading from v0.22", gives a
+  one-off conversion that runs on both lines.
 - **Sub-models in keyword writes.** In `merge()` and the update branch of `update_or_create()`,
   a dict for a sub-model field changes only the keys it names, each validated as its sub-field
-  (with `server_values=`, one `SET` per key, so the other stored keys stay, as with `MERGE`); an
-  instance replaces the whole sub-object; `bulk_update()` and `signup()` validate a dict as the
-  whole sub-model. A sub-model instance merged into a stored object removes (NONE) the aliases a
-  read would take before a sub-field's name, those v0.22 rows leave, without ever touching a key
-  it writes.
+  (with `server_values=`, one `SET` per key, so the other stored keys stay, as with `MERGE`); so
+  does a dict merged anywhere else into a stored object, as before: a value of a
+  `dict[str, Profile]` (each of its keys validated as `Profile`'s sub-field), and a dict for a
+  union of models, sent as given. An instance replaces the whole sub-object; `bulk_update()` and
+  `signup()` validate a dict as the whole sub-model. A sub-model instance merged into a stored
+  object removes (NONE) the aliases a read would take before a sub-field's name, those v0.22 rows
+  leave, without ever touching a key it writes; a dict keeps your keys and removes nothing, as
+  before.
 - **An aliased sub-field reads back.** In a sub-model that validates by alias only (Pydantic's
   default), an aliased sub-field is now written under its alias (the first string of an
   `AliasChoices`) by every write, `save()` included, so a read gives it back; earlier versions
@@ -143,9 +152,12 @@ and the official SDK, on every write and read path, with the same behaviour on S
   of `raw_query()`, `call_function()` and `signin()`/`signup()` included (a variable of one of
   these types used to surface as a failed authentication).
 - **Untyped fields keep SurrealDB values.** `update()` and `save()` of a loaded record flattened
-  an SDK `Duration` or `Range` held by a `dict[str, Any]` or `list[Any]` field, an extra column or
-  the `Any` part of a nested model into a dict (`{"elapsed": …}`), silently corrupting the row;
-  they are written back as the duration and the range they were.
+  an SDK `Duration`, `Range` or geometry held by a `dict[str, Any]` or `list[Any]` field, an extra
+  column or the `Any` part of a nested model into a dict (`{"elapsed": …}`), silently corrupting
+  the row; they are written back as the duration, the range and the geometry they were. A field
+  declared with one of the SDK's classes (`surrealdb.Duration`, `GeometryPoint`,
+  `surrealdb.Tokens`…) is written as Pydantic dumps it, as before, and so are a
+  `surrealdb.Tokens` and a lone `BoundIncluded`/`BoundExcluded` at an untyped position.
 - **Strings compared with datetime, duration or uuid columns** silently matched the wrong rows, or
   none (see typed lookups).
 - **Values no SurrealDB type can hold are refused before sending**: an `int` outside signed 64-bit
