@@ -402,26 +402,43 @@ class AuthenticatedUserMixin:
 
     @classmethod
     def _wire_auth_variables(cls, action: str, variables: dict[str, Any], *, stored: bool) -> dict[str, Any]:
-        """Validate each value addressed to a rich field, then encode the variables (v0.23.0).
+        """Validate the values of a signup, then encode the variables (v0.23.0).
 
-        The SIGNUP clause writes the record, and the SIGNIN clause compares the identifier with the
-        stored column, so both get what a keyword write gets: each value goes through
-        ``_coerce_field_value`` — the validation of ``merge(**data)``, named after *action* in its
-        error — so ``signup(joined="2026-01-01T00:00:00Z")`` stores a datetime rather than the
-        string, and ``signin(badge="0190…")`` matches the uuid a ``UUID`` field holds. Then
-        :func:`~surreal_orm_lite.wire.encode_wire`: a ``date``, a ``timedelta`` or a ``Decimal``
-        sent as given is rejected by the server, which drops the connection and reads as a failed
-        authentication. ``stored`` is ``True`` for a signup (a zero duration is refused, as on every
-        write path) and ``False`` for a signin, whose values are only compared.
+        ``stored`` is ``True`` for a signup, whose SIGNUP clause writes the record, and ``False`` for
+        a signin, whose SIGNIN clause only compares the identifier and the password with the stored
+        ones.
+
+        A signup's values get what a keyword write gets: each goes through ``_coerce_field_value`` —
+        the validation of ``merge(**data)``, named after *action* in its error — so
+        ``signup(joined="2026-01-01T00:00:00Z")`` stores a datetime rather than the string; a value
+        that does not fit raises before the account is created.
+
+        **The identifier is sent as given**, by a signup (validated all the same) and a signin alike,
+        as in v0.22.2: the SIGNIN clause compares it with the stored value, and a string never equals
+        a uuid, a datetime or a decimal. ``signup(badge="0190…")`` stores that text, as v0.22.2
+        did, and ``signin(badge="0190…")`` finds it — the accounts v0.22.2 created included; an
+        account created from a ``UUID`` signs in with the ``UUID``. A signin's values are not
+        validated: one that does not fit is a failed signin, as in v0.22.2.
+
+        Then :func:`~surreal_orm_lite.wire.encode_wire`, which leaves a string or a ``UUID`` as it
+        is: a ``date``, a ``timedelta`` or a ``Decimal`` sent as given is rejected by the server,
+        which drops the connection and reads as a failed authentication. A signup refuses a zero
+        duration, as every write path does.
 
         Raises:
-            ValueError: a value that does not fit its field (``"signup(bday=…): 'someday' is not a
-                valid date (…)"``), or that no SurrealDB type can hold — before any request.
+            ValueError: a signup value that does not fit its field (``"signup(bday=…): 'someday' is
+                not a valid date (…)"``), or a value no SurrealDB type can hold — before any request.
             TypeError: a value of a type SurrealDB has no form for (a ``datetime.time``).
         """
-        coerce = cls._coerce_field_value  # type: ignore[attr-defined]
-        checked = {name: coerce(name, value, context=action) for name, value in variables.items()}
-        encoded: dict[str, Any] = encode_wire(checked, stored=stored)
+        if stored:
+            identifier = cls.get_identifier_field()
+            coerce = cls._coerce_field_value  # type: ignore[attr-defined]
+            checked: dict[str, Any] = {}
+            for name, value in variables.items():
+                coerced = coerce(name, value, context=action)
+                checked[name] = value if name == identifier else coerced
+            variables = checked
+        encoded: dict[str, Any] = encode_wire(variables, stored=stored)
         return encoded
 
     @classmethod
@@ -552,7 +569,9 @@ class AuthenticatedUserMixin:
         the server's own type (v0.23.0): ``signup(…, joined="2026-01-01T00:00:00Z")`` stores a
         datetime. As in ``merge()``, a ``float`` for a ``Decimal`` and any value of a field the model
         validates with code of its own (a ``@field_validator``…) are sent as given, as in v0.22.2.
-        The record is created whole, so a dict for a sub-model field is validated as the
+        So is the identifier, validated all the same: :meth:`signin` compares it with the stored
+        value, so ``signup(badge="0190…")`` stores the text, as v0.22.2 did, and the same text signs
+        in. The record is created whole, so a dict for a sub-model field is validated as the
         whole sub-model (a missing required sub-field raises), and a table-model instance is
         written as its record id where the field accepts a ``RecordID``.
 
@@ -575,12 +594,14 @@ class AuthenticatedUserMixin:
             result = await User.signin(email="ada@example.com", password="s3cret")
 
         Only the identifier and password fields are sent — the SIGNIN clause matches on those.
-        Isolation, ``bind=`` and the validation of rich fields behave exactly as in
-        :meth:`signup`, so a ``UUID`` identifier may be passed as its text.
+        Isolation and ``bind=`` behave exactly as in :meth:`signup`. Both values are sent as given,
+        as in v0.22.2 (a ``date``, a ``timedelta`` or a ``Decimal`` in a form the server accepts): the
+        clause compares the identifier with the stored value, and a string never equals a uuid. Pass
+        it in the form the account was created with — the text for an account created from the text
+        (by v0.22.2 or :meth:`signup`), a ``UUID`` for one created from a ``UUID``.
 
         Raises:
-            ValueError: for an unknown or missing field, or a value that does not fit its field —
-                before any request.
+            ValueError: for an unknown or missing field — before any request.
             SurrealDbAuthenticationError: if the credentials are refused. Both DB lines are
                 normalised here: the same wrong password surfaces as ``NotFoundError`` on 3.x
                 and ``InternalError`` on 2.6.x.

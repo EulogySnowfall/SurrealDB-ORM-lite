@@ -562,9 +562,9 @@ def _stored_keys(
     the alias first, and ``save()`` writes the name, or the alias for a sub-model dumped by alias
     (``serialize_by_alias=True``), so no key is the one to rename to. In ``merge``, MERGE merges the
     dict into the stored object: a name merged next to a stored alias would be hidden behind it,
-    and removing the alias would drop the object stored under it. ``bulk_update``, ``signup`` and
-    ``signin`` replace the field (they reach this only through :func:`_rekeyed_object`, for a
-    sub-model without a rich type): renamed to the names, the aliases ``save()`` writes would no
+    and removing the alias would drop the object stored under it. ``bulk_update`` and ``signup``
+    replace the field (they reach this only through :func:`_rekeyed_object`, for a sub-model
+    without a rich type): renamed to the names, the aliases ``save()`` writes would no
     longer be in the row, and a schema declaring them (``DEFINE FIELD profile.firstName``) would
     refuse it on 3.x and store an empty object on 2.x.
 
@@ -1230,7 +1230,8 @@ class BaseSurrealModel(BaseModel):
         """Validate a keyword write's value against the field it is written to (v0.23.0).
 
         The hook of ``merge(**data)`` — hence of ``update_or_create``'s update branch —,
-        ``bulk_update(**kwargs)`` and ``signup()``/``signin()`` (spec §4.6). On a field whose
+        ``bulk_update(**kwargs)`` and ``signup()`` (spec §4.6; ``signin()`` sends its values as
+        given, as in v0.22.2). On a field whose
         annotation holds a rich type at any depth (``timedelta``, ``datetime``, ``date``, ``Decimal``,
         ``UUID``, ``Duration``, ``Range[T]``, ``set``…, ``list[timedelta]`` included), the value goes
         through :func:`~surreal_orm_lite.wire.field_input` then a ``TypeAdapter`` of the field's
@@ -1258,7 +1259,7 @@ class BaseSurrealModel(BaseModel):
           and no required sub-field asked for — SurrealDB's MERGE keeps the other stored keys, and
           ``merge(server_values=)`` assigns each key on its own (``profile.city = $…``) for the
           same result; an unknown key is sent as given;
-        - in ``bulk_update``/``signup``/``signin``, which replace the field, a dict is validated as
+        - in ``bulk_update``/``signup``, which replace the field, a dict is validated as
           the whole sub-model: a missing required sub-field raises;
         - an **instance** is the whole sub-object, sent as ``save()`` writes it.
 
@@ -1298,7 +1299,7 @@ class BaseSurrealModel(BaseModel):
 
         Args:
             context: the call named in the error: ``"merge"`` (the key-by-key dict rule),
-                ``"bulk_update"``, ``"signup"`` or ``"signin"``.
+                ``"bulk_update"`` or ``"signup"``.
 
         Raises:
             ValueError: the value does not fit — ``"merge(at=…): 'yesterday' is not a valid

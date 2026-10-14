@@ -70,6 +70,7 @@ from surreal_orm_lite import (
     Q,
     Range,
     SurrealConfigDict,
+    SurrealDbAuthenticationError,
     SurrealDBConnectionManager,
     SurrealFunc,
     Var,
@@ -1867,7 +1868,7 @@ class TestSubModelKeywordValues:
         with pytest.raises(ValueError, match=rf"^{context}\(author=…\): .*unsaved RfPerson has no record id"):
             coerce("author", RfPerson(), context=context)
 
-    @pytest.mark.parametrize("context", ["merge", "bulk_update", "signup", "signin"])
+    @pytest.mark.parametrize("context", ["merge", "bulk_update", "signup"])
     def test_table_instance_inside_a_field_that_is_not_rich(self, context: str) -> None:
         """At any position ``_link_instances`` walks — a list or tuple item, a mapping value — whatever
         the field: ``plains: list[RfPlain]`` holds no rich type, and its record id still does not fit."""
@@ -2321,7 +2322,7 @@ class TestSubModelStoredKeys:
     validates by alias only stores each aliased sub-field under its alias, the only key a read takes.
     A keyword write's dict for a sub-model is re-keyed the same way, except a dict for a sub-model
     that validates by name and by alias: it keeps the caller's keys, as in v0.22 — in ``merge()``
-    (``TestMergeDictKeysAsGiven``), and in ``bulk_update()``/``signup()``/``signin()`` when the
+    (``TestMergeDictKeysAsGiven``), and in ``bulk_update()``/``signup()`` when the
     sub-model holds no rich type (``TestReplacingWritesKeepDictKeysE2E``)."""
 
     def test_read_keys(self) -> None:
@@ -2359,7 +2360,7 @@ class TestSubModelStoredKeys:
         assert RfCamel.model_validate(payload["profile"]) == person.profile
         assert RfCamelOnly.model_validate(payload["alias_only"]) == person.alias_only
 
-    @pytest.mark.parametrize("context", ["merge", "bulk_update", "signup", "signin"])
+    @pytest.mark.parametrize("context", ["merge", "bulk_update", "signup"])
     def test_keyword_dict_keys(self, context: str) -> None:
         """Keys only: the values of a sub-model without a rich type are sent as given, as in v0.22.
         Every keyword write keeps the caller's keys for a sub-model that validates by name and by
@@ -3944,7 +3945,7 @@ class RfMember(AuthenticatedUserMixin, BaseSurrealModel):
 
 
 class RfBadge(AuthenticatedUserMixin, BaseSurrealModel):
-    """Signs in with a ``UUID`` identifier."""
+    """Signs in with a ``UUID`` identifier, sent as given (a string never equals a uuid)."""
 
     model_config = SurrealConfigDict(table_name="rf_badge", access_name="rf_badge_access", identifier_field="badge")
 
@@ -4002,8 +4003,9 @@ async def no_connection(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[None]:
 
 class TestRichAuthVariables:
     """``build_auth_payload`` encodes the access method's variables (``stored=False``, like
-    ``raw_query``); a model's ``signup()``/``signin()`` validate each value addressed to a rich field
-    first, as ``merge()`` does — no request is sent for a value that does not fit."""
+    ``raw_query``); a model's ``signup()`` validates each value addressed to a rich field first, as
+    ``merge()`` does — no request is sent for a value that does not fit —, and sends the identifier
+    as given; ``signin()`` sends its values as given, as in v0.22.2."""
 
     def test_build_auth_payload_encodes_the_variables(self) -> None:
         variables = {
@@ -4061,18 +4063,31 @@ class TestRichAuthVariables:
         stored = {"bday": datetime(1990, 1, 2, tzinfo=UTC), "city": "x"}
         assert sent == {"email": "a@b.c", "password": "pw", "profile": stored, "history": [stored], "activity": None}
 
-    def test_signin_variables_are_validated(self) -> None:
-        sent = RfBadge._auth_variables("signin", {"badge": str(_TOKEN), "password": "pw"}, require_all=False)
+    def test_signin_variables_are_sent_as_given(self) -> None:
+        """The SIGNIN clause compares the identifier with the stored value: the text matches the text
+        v0.22.2 stored, a ``UUID`` a uuid. Nothing is validated, as in v0.22.2."""
+        for badge in (str(_TOKEN), _TOKEN, "nope"):
+            sent = RfBadge._auth_variables("signin", {"badge": badge, "password": "pw"}, require_all=False)
+            assert sent == {"badge": badge, "password": "pw"}
+            assert type(sent["badge"]) is type(badge)
+        # Only the forms the server would refuse are encoded.
+        sent = RfMember._auth_variables("signin", {"email": date(2026, 1, 2), "password": "pw"}, require_all=False)
+        assert sent == {"email": _JAN.replace(day=2), "password": "pw"}
+
+    def test_signup_sends_the_identifier_as_given(self) -> None:
+        """Validated, as every signup value, but sent as given, so the same text signs in."""
+        sent = RfBadge._auth_variables("signup", {"badge": str(_TOKEN), "password": "pw"}, require_all=True)
+        assert sent == {"badge": str(_TOKEN), "password": "pw"}
+        sent = RfBadge._auth_variables("signup", {"badge": _TOKEN, "password": "pw"}, require_all=True)
         assert sent == {"badge": _TOKEN, "password": "pw"}
-        assert type(sent["badge"]) is UUID
 
     async def test_signup_refuses_a_value_that_does_not_fit(self, no_connection: None) -> None:
         with pytest.raises(ValueError, match=r"signup\(bday=…\): 'someday' is not a valid date"):
             await RfMember.signup(email="a@b.c", password="pw", bday="someday")
 
-    async def test_signin_refuses_a_value_that_does_not_fit(self, no_connection: None) -> None:
-        with pytest.raises(ValueError, match=r"signin\(badge=…\): 'nope' is not a valid UUID"):
-            await RfBadge.signin(badge="nope", password="pw")
+    async def test_signup_refuses_an_identifier_that_does_not_fit(self, no_connection: None) -> None:
+        with pytest.raises(ValueError, match=r"signup\(badge=…\): 'nope' is not a valid UUID"):
+            await RfBadge.signup(badge="nope", password="pw")
 
     async def test_signup_refuses_a_zero_duration(self, no_connection: None) -> None:
         if sdk_decodes_zero_duration():
@@ -4140,16 +4155,21 @@ class TestRichAuthE2E:
             _assert_profile(again.user.profile)
             await _assert_client_usable(client)
 
-    async def test_model_signin_validates_the_identifier(self) -> None:
-        """A ``UUID`` column matched with the text of the UUID: a string never equals a uuid."""
+    async def test_model_signin_with_a_uuid_identifier(self) -> None:
+        """An account created from a ``UUID`` stores a uuid and signs in with the ``UUID``; its text
+        does not match, as in v0.22.2: the identifier is sent as given, and a string never equals a
+        uuid."""
         async with _auth_access(RfBadge) as client:
             created = await RfBadge.signup(badge=_TOKEN, password=_AUTH_PASSWORD)
             row = await client.query("SELECT * FROM ONLY rf_badge LIMIT 1;", {})
             assert type(row["badge"]) is UUID
 
-            again = await RfBadge.signin(badge=str(_TOKEN), password=_AUTH_PASSWORD)
+            again = await RfBadge.signin(badge=_TOKEN, password=_AUTH_PASSWORD)
             assert again.user.get_id() == created.user.get_id()
             assert again.user.badge == _TOKEN
+            with pytest.raises(SurrealDbAuthenticationError):
+                await RfBadge.signin(badge=str(_TOKEN), password=_AUTH_PASSWORD)
+            await _assert_client_usable(client)
 
     async def test_connection_signup_keeps_the_shared_client(self) -> None:
         async with _auth_access(RfMember) as client:
@@ -4629,4 +4649,33 @@ class TestServerValuesKeysE2E:
 
             row = await _raw("a", "rf_town")
             assert (row["subh"], row["n"]) == ({"a\x00b": 1}, 1)
+            await _assert_client_usable(client)
+
+
+class TestAuthIdentifierAsGivenE2E:
+    """``signup()`` and ``signin()`` send the identifier as given, as v0.22.2 did: the SIGNIN clause
+    compares it with the stored value, and a string never equals a uuid. So an account v0.22.2
+    created from the text still signs in with it, and one created from a ``UUID`` signs in with the
+    ``UUID``. Both lines."""
+
+    async def test_an_account_v022_created_from_the_text(self) -> None:
+        async with _auth_access(RfBadge) as client:
+            await client.query(
+                "CREATE rf_badge:old CONTENT {badge: $badge, password: crypto::argon2::generate($password)};",
+                {"badge": str(_TOKEN), "password": _AUTH_PASSWORD},
+            )
+            again = await RfBadge.signin(badge=str(_TOKEN), password=_AUTH_PASSWORD)
+            assert str(again.user.id) == "old"
+            assert again.user.badge == _TOKEN
+            await _assert_client_usable(client)
+
+    async def test_signup_then_signin_with_the_text(self) -> None:
+        async with _auth_access(RfBadge) as client:
+            created = await RfBadge.signup(badge=str(_TOKEN), password=_AUTH_PASSWORD)
+            assert created.user.badge == _TOKEN
+            row = await client.query("SELECT * FROM ONLY rf_badge LIMIT 1;", {})
+            assert row["badge"] == str(_TOKEN)  # the text, as v0.22.2 stored it
+
+            again = await RfBadge.signin(badge=str(_TOKEN), password=_AUTH_PASSWORD)
+            assert again.user.get_id() == created.user.get_id()
             await _assert_client_usable(client)
