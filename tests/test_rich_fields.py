@@ -5,12 +5,15 @@ Every class here is E2E (suffixed ``E2E``) unless it says otherwise. Tables are 
 and created inside ``orm_client(...)``, which drops them before and after the test.
 """
 
+import ast
 import asyncio
 import contextlib
+import inspect
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Annotated, Any, Optional
 from uuid import UUID
 
@@ -1373,3 +1376,155 @@ class TestLiveFiltersE2E:
         assert type(instance.ttl) is timedelta and instance.ttl == timedelta(hours=1)
         assert type(instance.day) is date and instance.day == date(2026, 1, 2)
         assert type(instance.hours) is Range and instance.hours == hit["hours"]
+
+
+# --- README (spec §11, AC-25; D9, D10) -----------------------------------------------------------
+
+_README = Path(__file__).resolve().parents[1] / "README.md"
+
+#: Section 24's example tables and the test tables they run against: everything else runs as written.
+_README_TABLES = {"subscription": "rf_subscription", "slot": "rf_slot"}
+
+#: D10: the public docs never describe what happens to the client when the SDK cannot read a value.
+_D10_PHRASES = ("connection lost", "connection is lost", "drops the connection")
+
+#: The ``TYPE set<…>`` advice of spec §11, as the README must state it (whitespace normalised).
+_SET_ADVICE = (
+    "`set[X]`/`frozenset[X]` fields are stored as arrays. On SurrealDB 3.x a `TYPE set<…>` column holds a "
+    "native set that the surrealdb SDK 2.0.0 cannot read (every read of the column fails with an SDK decoding "
+    "error), and 3.1 refuses an array in it; declare such columns `array<…>`, optionally with "
+    "`VALUE $value.distinct()`"
+)
+
+_D9_SINCE = "pre-existing (documented in v0.23.0)"
+
+
+def _readme_part(heading: str) -> str:
+    """The README text from the ``heading`` line up to the next ``##``/``###`` heading."""
+    text = _README.read_text(encoding="utf-8")
+    match = re.search(rf"^{re.escape(heading)}\n.*?(?=^#{{2,3}} )", text, re.MULTILINE | re.DOTALL)
+    assert match, f"README has no {heading!r} section"
+    return match.group(0)
+
+
+def _section_24() -> str:
+    return _readme_part("### 24. Rich field types")
+
+
+def _normalised(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _behaviour_rows() -> list[tuple[str, list[str]]]:
+    """Each row of the "ORM behaviour: SurrealDB 2.x vs 3.x" table: its raw line and its cells."""
+    table = _readme_part("### ORM behaviour: SurrealDB 2.x vs 3.x")
+    lines = [line.strip() for line in table.splitlines() if line.startswith("|")]
+    return [(line, [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip("|"))]) for line in lines[2:]]
+
+
+def _v0_23_0_rows() -> list[tuple[str, list[str]]]:
+    """The behaviour-table rows v0.23.0 adds: the two ``v0.23.0`` rows and the retroactive D9 row."""
+    return [(line, cells) for line, cells in _behaviour_rows() if cells[-1] in ("v0.23.0", _D9_SINCE)]
+
+
+def _section_24_examples() -> list[tuple[str, str]]:
+    """Section 24's ``python`` and ``sql`` blocks in order, ``(language, code)``, on the ``rf_`` tables."""
+    blocks: list[tuple[str, str]] = re.findall(r"^```(python|sql)\n(.*?)^```$", _section_24(), re.MULTILINE | re.DOTALL)
+    assert blocks, "README section 24 has no example"
+    examples: list[tuple[str, str]] = []
+    renamed = dict.fromkeys(_README_TABLES, 0)
+    for language, code in blocks:
+        for table, test_table in _README_TABLES.items():
+            pattern = rf'table_name="{table}"' if language == "python" else rf"\bON {table}\b"
+            replacement = f'table_name="{test_table}"' if language == "python" else f"ON {test_table}"
+            code, count = re.subn(pattern, replacement, code)
+            renamed[table] += count
+        examples.append((language, code))
+    assert all(renamed.values()), f"section 24 no longer names these example tables: {renamed!r}"
+    return examples
+
+
+class TestReadmeExamplesE2E:
+    """AC-25: every example of README section 24 runs as written (its table names aside), on both lines."""
+
+    @pytest.mark.asyncio
+    async def test_section_24_examples(self) -> None:
+        namespace: dict[str, Any] = {"__name__": "readme_section_24"}
+        async with orm_client(*_README_TABLES.values()) as client:
+            for language, code in _section_24_examples():
+                if language == "sql":
+                    await client.query(code, {})
+                    continue
+                compiled = compile(code, "<README section 24>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                # A doctest of this repository's own README (trusted text), top-level awaits included.
+                outcome = eval(compiled, namespace)
+                if inspect.iscoroutine(outcome):
+                    await outcome
+
+            # What the examples' comments say.
+            subscription = namespace["Subscription"]
+            loaded = await subscription.objects().get("acme")
+            assert type(loaded.started_at) is datetime and loaded.started_at.tzinfo is not None
+            assert type(loaded.renews_on) is date and loaded.renews_on == date(2026, 2, 1)
+            assert type(loaded.trial) is timedelta
+            assert type(loaded.grace) is Duration and loaded.grace == Duration.parse("1h30m1ns")
+            assert type(loaded.price) is Decimal and loaded.price == Decimal("9.99")
+            assert type(loaded.token) is UUID
+            assert type(loaded.active_hours) is Range
+            assert loaded.active_hours == Range(BoundIncluded(9), BoundExcluded(17))
+            assert loaded.period is not None and loaded.period.end is None
+            assert type(loaded.logo) is bytes
+            assert type(loaded.tags) is set and loaded.tags == {"annual", "pro"}
+            assert namespace["sub"].trial == timedelta(days=21) and type(namespace["sub"].trial) is timedelta
+
+            assert sorted(slot.hour for slot in namespace["working"]) == [9, 12]
+            assert [slot.hour for slot in namespace["late"]] == [17]
+            for name in ("trials", "cheap", "open_at_noon", "graced", "nonzero"):
+                assert [found.get_raw_id() for found in namespace[name]] == ["acme"], name
+
+            # The array<…> column of the sets example keeps the declared set (3.1 would refuse a set<…> one).
+            await loaded.update()
+            stored = await client.query("SELECT VALUE tags FROM ONLY $rid;", {"rid": loaded._record_id()})
+            assert sorted(stored) == ["annual", "pro"]
+            assert (await subscription.objects().get("acme")).tags == {"annual", "pro"}
+
+
+class TestReadmeWording:
+    """Unit: what README must (and must not) say about v0.23.0 (spec §11, D9, D10)."""
+
+    def test_section_24_never_describes_the_connection(self) -> None:
+        texts = {"section 24": _section_24(), **{cells[0]: line for line, cells in _v0_23_0_rows()}}
+        for where, text in texts.items():
+            lowered = text.lower()
+            assert not [phrase for phrase in _D10_PHRASES if phrase in lowered], where
+            assert not re.search(r"\bconnections?\b", text, re.IGNORECASE), f"D10: {where} mentions the connection"
+
+    def test_set_columns_advice_and_array_example(self) -> None:
+        section = _section_24()
+        assert _SET_ADVICE in _normalised(section)
+        sql = re.findall(r"^```sql\n(.*?)^```$", section, re.MULTILINE | re.DOTALL)
+        assert any(
+            re.fullmatch(r"DEFINE FIELD \w+ ON \w+ TYPE array<\w+> VALUE \$value\.distinct\(\);\n", block) for block in sql
+        ), sql
+
+    def test_behaviour_table_rows(self) -> None:
+        rows = _v0_23_0_rows()
+        assert all(len(cells) == 4 and "\\|" not in line for line, cells in rows), rows
+        added = [cells for _, cells in rows if cells[-1] == "v0.23.0"]
+        assert len(added) == 2, added
+        assert any(cells[0].startswith("Rich field types") for cells in added), added
+        assert any("`TYPE set<…>`" in cells[0] for cells in added), added
+        [decimal] = [cells for _, cells in rows if cells[-1] == _D9_SINCE]
+        assert decimal[0] == "Reading a `Decimal`", decimal
+        assert "`12.50`" in decimal[1] and "`12.5`" in decimal[2], decimal
+
+    def test_section_24_tables_have_no_raw_pipe_in_a_cell(self) -> None:
+        tables = re.findall(r"(?:^\|.*\n)+", _section_24(), re.MULTILINE)
+        assert len(tables) == 2, tables  # the annotation table and the refusal table
+        for table in tables:
+            widths = {len(re.split(r"(?<!\\)\|", line.strip().strip("|"))) for line in table.splitlines()}
+            assert len(widths) == 1 and "\\|" not in table, table
+
+    def test_behaviour_table_header_names_the_v0_23_0_versions(self) -> None:
+        header = _normalised(_readme_part("### ORM behaviour: SurrealDB 2.x vs 3.x").split("\n|", 1)[0])
+        assert "rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs" in header
