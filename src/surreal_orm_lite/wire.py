@@ -874,8 +874,8 @@ def read_keys(model: type[BaseModel]) -> Mapping[str, str]:
 
     The key :func:`model_object` writes each sub-field of an instance under (unless the dump is
     by alias, ``serialize_by_alias=True``), and each key of a keyword write's dict resolves to —
-    except a ``merge()`` dict for a model a read takes the aliases of first
-    (:func:`reads_aliases_first`), sent with the caller's keys as in v0.22 —, so a read gives it
+    except the dict of a keyword write for a model a read takes the aliases of first
+    (:func:`reads_aliases_first`), sent with the caller's keys as in v0.22.2 —, so a read gives it
     back:
 
     - every field keeps its **name** when the model validates by name — ``validate_by_name=True``,
@@ -897,8 +897,8 @@ def reads_aliases_first(model: type[BaseModel]) -> bool:
     ``populate_by_name=True`` or ``validate_by_name=True``, ``validate_by_alias`` left on — a table
     model used as a sub-model among them. A write stores each field under its name
     (:func:`read_keys`), or under its alias with ``serialize_by_alias=True``, so the key a read takes
-    first is not always the key a write stores: a ``merge()`` dict for such a model is sent with the
-    caller's keys, as in v0.22 (:func:`~surreal_orm_lite.model_base._stored_keys`).
+    first is not always the key a write stores: a keyword write's dict for such a model is sent with
+    the caller's keys, as in v0.22.2 (:func:`~surreal_orm_lite.model_base._stored_keys`).
     """
     return _validates_by_name(model) and model.model_config.get("validate_by_alias", True) is not False
 

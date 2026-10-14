@@ -331,11 +331,12 @@ def _partial_object(context: str, path: str, model: type[BaseModel], value: Mapp
 def _rekeyed_object(context: str, path: str, model: type[BaseModel], value: Mapping[Any, Any]) -> dict[Any, Any]:
     """A keyword write's dict for sub-model ``model`` of a field without a rich type, keys only (v0.23.0).
 
-    Keyed as :func:`_stored_keys` says, recursively for a dict under a sub-model sub-field; the
-    values are sent as given, not validated, as in v0.22.
+    Keyed as :func:`_stored_keys` says — the caller's keys for a sub-model that validates by name
+    and by alias, as in v0.22.2 —, recursively for a dict under a sub-model sub-field; the values are
+    sent as given, not validated, as in v0.22.
 
     Raises:
-        ValueError: two keys name the same sub-field (``{"first_name": …, "firstName": …}``) where
+        ValueError: two keys name the same sub-field (``{"seen": …, "lastSeen": …}``) where
             :func:`_stored_keys` re-keys them.
     """
 
@@ -367,20 +368,24 @@ def _stored_keys(
     read takes. Its value is ``convert(path.key, sub-field name, value)``. An unknown key is sent as
     given, as in v0.22.x. A new dict: the caller's is never mutated.
 
-    Except in ``merge`` (``context``) for a model that validates by name **and** by alias
-    (:func:`~surreal_orm_lite.wire.reads_aliases_first`): each key stays the caller's, as in v0.22,
-    and only its value is converted. MERGE merges the dict into the stored object, and a read takes
-    the alias before the name, which ``save()`` writes for a sub-model dumped by alias
-    (``serialize_by_alias=True``): a name merged next to a stored alias would be hidden behind it,
-    and removing the alias would drop the object stored under it. The other writes (``bulk_update``,
-    ``signup``, ``signin``) replace the field, so they re-key it whatever the model.
+    Except for a model that validates by name **and** by alias
+    (:func:`~surreal_orm_lite.wire.reads_aliases_first`), in every keyword write (``context``): each
+    key stays the caller's, as in v0.22.2, and only its value is converted. A read takes either key,
+    the alias first, and ``save()`` writes the name, or the alias for a sub-model dumped by alias
+    (``serialize_by_alias=True``), so no key is the one to rename to. In ``merge``, MERGE merges the
+    dict into the stored object: a name merged next to a stored alias would be hidden behind it,
+    and removing the alias would drop the object stored under it. ``bulk_update``, ``signup`` and
+    ``signin`` replace the field (they reach this only through :func:`_rekeyed_object`, for a
+    sub-model without a rich type): renamed to the names, the aliases ``save()`` writes would no
+    longer be in the row, and a schema declaring them (``DEFINE FIELD profile.firstName``) would
+    refuse it on 3.x and store an empty object on 2.x.
 
     Raises:
         ValueError: two keys name the same sub-field (``{"seen": …, "lastSeen": …}``) of a dict this
             re-keys.
     """
     keys = field_keys(model)
-    as_given = context == "merge" and reads_aliases_first(model)
+    as_given = reads_aliases_first(model)
     stored_as = read_keys(model)
     named: dict[str, Any] = {}  # sub-field → the caller's key for it
     converted: dict[Any, Any] = {}
@@ -1065,11 +1070,11 @@ class BaseSurrealModel(BaseModel):
         (:func:`_with_removals`).
 
         A dict for a field typed with a sub-model **without** a rich type keeps its values as given
-        (not validated, as in v0.22), and its keys follow the same rule, at every sub-model level
-        (:func:`_rekeyed_object`): under the key ``save()`` writes the sub-field under — its name
-        when the sub-model validates by name too (``populate_by_name``), else the key its validation
-        reads —, except in ``merge`` on a sub-model that validates by name and by alias, where the
-        caller's key stays, as in v0.22.
+        (not validated, as in v0.22), and its keys follow the same rule in every keyword write, at
+        every sub-model level (:func:`_rekeyed_object`): the caller's key, as in v0.22.2, on a
+        sub-model that validates by name and by alias; on one that validates by alias only, the key
+        its validation reads; on one that validates by name only (``validate_by_alias=False``), the
+        name.
 
         A **table-model instance** (``BaseSurrealModel``) is written as its record id
         (``encode_wire``), so on a declared field — rich or not: this runs before the early return

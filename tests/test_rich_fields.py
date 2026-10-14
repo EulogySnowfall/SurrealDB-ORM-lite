@@ -2285,9 +2285,10 @@ class TestSubModelStoredKeys:
     name too (``populate_by_name``/``validate_by_name``) keeps each sub-field under its name, the
     format v0.22 wrote and the format a ``DEFINE FIELD profile.first_name`` schema declares; one that
     validates by alias only stores each aliased sub-field under its alias, the only key a read takes.
-    A keyword write's dict for a sub-model is re-keyed the same way, rich or not, except a ``merge()``
-    dict for a sub-model that validates by name and by alias: it keeps the caller's keys, as in v0.22
-    (``TestMergeDictKeysAsGiven``)."""
+    A keyword write's dict for a sub-model is re-keyed the same way, except a dict for a sub-model
+    that validates by name and by alias: it keeps the caller's keys, as in v0.22 — in ``merge()``
+    (``TestMergeDictKeysAsGiven``), and in ``bulk_update()``/``signup()``/``signin()`` when the
+    sub-model holds no rich type (``TestReplacingWritesKeepDictKeysE2E``)."""
 
     def test_read_keys(self) -> None:
         assert read_keys(RfCamel) == {"first_name": "first_name", "home_address": "home_address"}
@@ -2325,29 +2326,26 @@ class TestSubModelStoredKeys:
         assert RfCamelOnly.model_validate(payload["alias_only"]) == person.alias_only
 
     @pytest.mark.parametrize("context", ["merge", "bulk_update", "signup", "signin"])
-    def test_keyword_dicts_are_re_keyed(self, context: str) -> None:
+    def test_keyword_dict_keys(self, context: str) -> None:
         """Keys only: the values of a sub-model without a rich type are sent as given, as in v0.22.
-        ``merge()`` keeps the caller's keys for a sub-model that validates by name and by alias, as
-        v0.22.2 did (``test_merge_keeps_the_keys_read_by_name_and_alias``); the other writes replace
-        the field, so they re-key it."""
-
-        def keyed(given: dict[str, Any], renamed: dict[str, Any]) -> dict[str, Any]:
-            return given if context == "merge" else renamed
-
+        Every keyword write keeps the caller's keys for a sub-model that validates by name and by
+        alias, as v0.22.2 did (``test_merge_keeps_the_keys_read_by_name_and_alias``,
+        ``TestReplacingWritesKeepDictKeysE2E``); a sub-model that validates by alias only, or by name
+        only, has each key re-keyed to the one a read takes."""
         coerce = RfNamed._coerce_field_value
-        assert coerce("profile", {"firstName": "a"}, context=context) == keyed({"firstName": "a"}, {"first_name": "a"})
+        assert coerce("profile", {"firstName": "a"}, context=context) == {"firstName": "a"}
         assert coerce("profile", {"first_name": "a"}, context=context) == {"first_name": "a"}
         assert coerce("alias_only", {"first_name": "a"}, context=context) == {"firstName": "a"}
         assert coerce("alias_only", {"firstName": "a"}, context=context) == {"firstName": "a"}
-        assert coerce("by_name", {"firstName": "a"}, context=context) == keyed({"firstName": "a"}, {"first_name": "a"})
+        assert coerce("by_name", {"firstName": "a"}, context=context) == {"firstName": "a"}
         assert coerce("name_only", {"firstName": "a"}, context=context) == {"first_name": "a"}
         # A dict under a sub-model sub-field: RfStreet validates by alias only, at any level.
         nested = coerce("profile", {"homeAddress": {"street_name": "x"}}, context=context)
-        assert nested == keyed({"homeAddress": {"streetName": "x"}}, {"home_address": {"streetName": "x"}})
-        assert coerce("profile", {"firstName": 5, "zip": "H0H"}, context=context) == {
-            **keyed({"firstName": 5}, {"first_name": 5}),
-            "zip": "H0H",
-        }
+        assert nested == {"homeAddress": {"streetName": "x"}}
+        assert coerce("profile", {"firstName": 5, "zip": "H0H"}, context=context) == {"firstName": 5, "zip": "H0H"}
+        # One sub-field under both spellings: sent as given, as in v0.22.2.
+        both = {"first_name": "a", "firstName": "b"}
+        assert coerce("profile", both, context=context) == both
         given = {"firstName": "a"}
         coerce("profile", given, context=context)
         assert given == {"firstName": "a"}  # the caller's dict is never mutated
@@ -3150,6 +3148,108 @@ class TestMergeDictKeysAsGivenE2E:
             assert (await _raw("p", "rf_prof_holder"))[field] == {**_PROF_SAVED, "home_addr": {"zip_code": "3"}}
             loaded = getattr(await RfProfHolder.objects().get("p"), field)
             assert loaded.home_addr == RfAddr(zip_code="1", city_name="Paris")
+            await _assert_client_usable(client)
+
+
+# ==================== bulk_update() / signup() dicts for sub-models that validate by name and by alias ====================
+
+
+class RfFullName(BaseModel):
+    """Validated by name and by alias, **dumped** by alias, no rich type: ``save()`` stores ``firstName``
+    and ``lastName``, as v0.22.2 did."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True, serialize_by_alias=True)
+
+    first_name: str = ""
+    last_name: str = ""
+
+
+class RfFullNameStrict(BaseSurrealModel):
+    """``RfFullName`` on a SCHEMAFULL table that declares the keys ``save()`` writes."""
+
+    model_config = SurrealConfigDict(table_name="rf_full_name_strict")
+
+    id: str | None = None
+    profile: RfFullName | None = None
+    n: int = 0
+
+
+class RfFullNameMember(AuthenticatedUserMixin, BaseSurrealModel):
+    """Signs up with ``RfFullName``, a sub-model without a rich type."""
+
+    model_config = SurrealConfigDict(table_name="rf_full_name_member", access_name="rf_full_name_member_access")
+
+    id: str | None = None
+    email: str
+    password: str
+    profile: RfFullName | None = None
+
+
+_FULL_NAME_SAVED: dict[str, Any] = {"firstName": "Ann", "lastName": "Lee"}
+_FULL_NAME_GIVEN: dict[str, Any] = {"firstName": "Bob", "lastName": "Ray"}
+
+
+class TestReplacingWritesKeepDictKeysE2E:
+    """``bulk_update()`` and ``signup()`` send a dict for a sub-model without a rich type that validates
+    by name **and** by alias with the caller's keys, as v0.22.2 did: here the aliases, the keys
+    ``save()`` writes for a sub-model dumped by alias (``serialize_by_alias=True``). A v0.23.0
+    candidate renamed them to the sub-field names: a SCHEMAFULL table declaring ``profile.firstName``
+    refused the row on 3.x and stored an empty object on 2.x, and a schemaless row no longer held the
+    keys ``save()`` writes, so a filter on ``profile.firstName`` missed it."""
+
+    async def test_bulk_update_on_a_schemafull_table(self) -> None:
+        async with orm_client("rf_full_name_strict") as client:
+            for statement in (
+                "DEFINE TABLE rf_full_name_strict SCHEMAFULL;",
+                "DEFINE FIELD n ON rf_full_name_strict TYPE int DEFAULT 0;",
+                "DEFINE FIELD profile ON rf_full_name_strict TYPE option<object>;",
+                "DEFINE FIELD profile.firstName ON rf_full_name_strict TYPE option<string>;",
+                "DEFINE FIELD profile.lastName ON rf_full_name_strict TYPE option<string>;",
+            ):
+                await client.query(statement, {})
+            await RfFullNameStrict(id="a", profile=RfFullName(first_name="Ann", last_name="Lee")).save()
+            assert (await _raw("a", "rf_full_name_strict"))["profile"] == _FULL_NAME_SAVED
+
+            assert await RfFullNameStrict.objects().filter(n=0).bulk_update(profile=_FULL_NAME_GIVEN) == 1
+
+            assert (await _raw("a", "rf_full_name_strict"))["profile"] == _FULL_NAME_GIVEN
+            loaded = await RfFullNameStrict.objects().get("a")
+            assert loaded.profile == RfFullName(first_name="Bob", last_name="Ray")
+            assert await RfFullNameStrict.objects().filter(**{"profile.firstName": "Bob"}).count() == 1
+            await _assert_client_usable(client)
+
+    async def test_bulk_update_on_a_schemaless_table(self) -> None:
+        """The caller's keys, whichever they are (v0.22.2). With the aliases ``save()`` writes, the
+        row holds the same keys as one written through a sub-model with a rich type, which
+        ``bulk_update()`` validates whole and writes as ``save()`` does."""
+        async with orm_client("rf_prof_holder") as client:
+            await RfProfHolder(id="p", plain=RfProf(first_name="Ann"), dated=RfProfDated(first_name="Ann")).save()
+            given: dict[str, Any] = {"firstName": "Bob", "homeAddr": {"zipCode": "3"}}
+            assert await RfProfHolder.objects().filter(n=0).bulk_update(plain=given, dated=given) == 1
+
+            row = await _raw("p", "rf_prof_holder")
+            assert row["plain"] == given
+            assert row["dated"]["firstName"] == "Bob"
+            assert "first_name" not in row["dated"]
+            loaded = await RfProfHolder.objects().get("p")
+            assert loaded.plain == RfProf(first_name="Bob", home_addr=RfAddr(zip_code="3"))
+            assert await RfProfHolder.objects().filter(**{"plain.firstName": "Bob"}).count() == 1
+
+            assert await RfProfHolder.objects().filter(n=0).bulk_update(plain={"first_name": "Cy"}) == 1
+            assert (await _raw("p", "rf_prof_holder"))["plain"] == {"first_name": "Cy"}
+            assert (await RfProfHolder.objects().get("p")).plain == RfProf(first_name="Cy")
+            await _assert_client_usable(client)
+
+    async def test_signup(self) -> None:
+        async with _auth_access(RfFullNameMember) as client:
+            email = f"{UUID(int=5).hex}@example.test"
+            result = await RfFullNameMember.signup(email=email, password=_AUTH_PASSWORD, profile=_FULL_NAME_GIVEN)
+            assert result.user.profile == RfFullName(first_name="Bob", last_name="Ray")
+
+            row = await client.query("SELECT * FROM ONLY rf_full_name_member WHERE email = $email LIMIT 1;", {"email": email})
+            assert row["profile"] == _FULL_NAME_GIVEN
+            again = await RfFullNameMember.signin(email=email, password=_AUTH_PASSWORD)
+            assert again.user.profile == RfFullName(first_name="Bob", last_name="Ray")
             await _assert_client_usable(client)
 
 
