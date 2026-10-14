@@ -23,7 +23,8 @@ This module converts them, **only where the annotation asks for it**:
   sent when no such form exists (an ``int`` beyond 64 bits, a ``time``, an unsaved table-model
   instance…).
 - ``decimal_text(value)`` — the fixed-point text of a ``Decimal``, rounded once the way the server
-  rounds it, so the stored value never moves.
+  rounds it, so the stored value never moves; ``exact_decimal(value)`` — whether a ``Decimal`` is a
+  SurrealDB decimal as it stands, with nothing to round.
 - ``sdk_decodes_zero_duration()`` — whether the installed SDK can read a zero duration back (a local
   probe, no server).
 - ``restore_native(dumped, raw, read_keys=…)`` — puts back, into a ``model_dump()``, the SDK values
@@ -86,6 +87,7 @@ __all__ = [
     "declared_kind",
     "duration_ns",
     "encode_wire",
+    "exact_decimal",
     "field_input",
     "field_keys",
     "lookup_type",
@@ -705,6 +707,34 @@ def decimal_text(value: Decimal) -> str:
         if abs(int(rounded.scaleb(scale, _DECIMAL_CONTEXT))) <= _DECIMAL_MAX_COEFFICIENT:
             return format(rounded, "f")
     raise out_of_range
+
+
+def exact_decimal(value: Decimal) -> bool:
+    """Whether ``value`` is a SurrealDB decimal as it stands, with nothing to round.
+
+    A finite value with at most 28 fractional digits once its trailing zeros are dropped
+    (``1.50``, ``1E+3``, ``1.000…0`` with 40 zeros) and a coefficient within 96 bits at that scale:
+    :func:`decimal_text` sends it unrounded and a live literal inlines it. ``False`` for
+    ``Decimal("1E+30")`` (beyond 96 bits), ``Decimal("1E-30")`` (30 fractional digits) and a NaN or
+    an infinity.
+    """
+    if not value.is_finite():
+        return False
+    if not value:
+        return True
+    # A cheap first bound (2**96 - 1 has 29 digits), which also bounds the integer built below.
+    if value.adjusted() > _DECIMAL_MAX_SCALE:
+        return False
+    digits, exponent = value.as_tuple()[1:]
+    assert isinstance(exponent, int)  # a finite value's exponent is an int
+    kept = list(digits)
+    while exponent < 0 and kept[-1] == 0:
+        kept.pop()
+        exponent += 1
+    if exponent < -_DECIMAL_MAX_SCALE:
+        return False
+    coefficient = int("".join(map(str, kept)) + "0" * max(exponent, 0))
+    return coefficient <= _DECIMAL_MAX_COEFFICIENT
 
 
 def _encode_duration(value: timedelta | Duration | SdkDuration, stored: bool) -> CBORTag:

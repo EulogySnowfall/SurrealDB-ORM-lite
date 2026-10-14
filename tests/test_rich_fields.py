@@ -1198,6 +1198,23 @@ class TestTypedLookupsE2E:
             assert await RfEvent.objects().filter(token=_TOKEN_A).bulk_delete() == 1
             assert sorted(str(ev.id) for ev in await RfEvent.objects().all()) == ["b", "c"]
 
+    async def test_floats_without_an_exact_decimal_compare_as_floats(self) -> None:
+        """v0.22.2 bound a float as given, and the server compares it with a decimal. A float whose
+        ``Decimal`` is no SurrealDB decimal (beyond 96 bits, more than 28 fractional digits) still
+        is: converted, it was refused (``1e30``) or rounded (``1e-30`` to ``0``, which ``0dec``
+        then matched)."""
+        async with orm_client("rf_event") as client:
+            await client.query("CREATE rf_event:zero SET price = 0dec, n = 1;", {})
+            await client.query("CREATE rf_event:five SET price = 5.00dec, n = 2;", {})
+            assert await _ids(price__lt=1e30) == ["five", "zero"]
+            assert await _ids(price__gt=-1e30) == ["five", "zero"]
+            assert await _ids(price__lte=1e300) == ["five", "zero"]
+            assert await _ids(price__gte=1e-30) == ["five"]
+            assert await _ids(price__in=[1e30, 5.0]) == ["five"]
+            assert await _ids(Q(price__gt=1e-30) | Q(price__lt=-1e30)) == ["five"]
+            assert await RfEvent.objects().filter(price__lt=1e30).bulk_update(n=9) == 2
+            await _assert_client_usable(client)
+
     async def test_get_or_create_with_a_uuid_string_converges(self) -> None:
         token = "0190c3d1-5c3b-7cc6-8f8a-2d2b1f0e9a99"
         async with orm_client("rf_event"):
@@ -3647,6 +3664,8 @@ _LIVE_CASES = [
         {"day": date(2026, 1, 2)},
         id="q-or",
     ),
+    # Floats without an exact SurrealDB decimal are inlined as floats, as in v0.22.2.
+    pytest.param((), {"price__gt": 1e-30, "price__lt": 1e30}, {"price": Decimal(0)}, {"price": Decimal(5)}, id="price-floats"),
 ]
 
 _LIVE_ARGS = ("args", "kwargs", "miss", "hit")

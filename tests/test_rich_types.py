@@ -66,6 +66,7 @@ from surreal_orm_lite.wire import (
     decimal_text,
     duration_ns,
     encode_wire,
+    exact_decimal,
     field_input,
     restore_native,
     rich_kinds,
@@ -1265,6 +1266,39 @@ class TestEncodeWire:
         with pytest.raises(ValueError, match="finite"):
             decimal_text(Decimal("NaN"))
 
+    @pytest.mark.parametrize(
+        ("value", "exact"),
+        [
+            (Decimal(0), True),
+            (Decimal("-0E-50"), True),
+            (Decimal("0E+50"), True),
+            (Decimal("1.50"), True),
+            (Decimal("1E+3"), True),
+            (Decimal("1." + "0" * 40), True),  # trailing zeros carry no value
+            (Decimal("0." + "0" * 27 + "1"), True),
+            (Decimal("-79228162514264337593543950335"), True),
+            (Decimal("7.9228162514264337593543950335"), True),
+            (Decimal("1E-29"), False),
+            (Decimal("1E-30"), False),
+            (Decimal("0." + "1" * 29), False),
+            (Decimal("7.9228162514264337593543950336"), False),
+            (Decimal("79228162514264337593543950336"), False),
+            (Decimal("1E+30"), False),
+            (Decimal("-1E+300"), False),
+            (Decimal("1E-1000000"), False),
+            (Decimal("NaN"), False),
+            (Decimal("-Infinity"), False),
+        ],
+        ids=str,
+    )
+    def test_exact_decimal(self, value: Decimal, exact: bool) -> None:
+        """A SurrealDB decimal as it stands: at most 28 fractional digits once trailing zeros are
+        dropped, a coefficient within 96 bits; what ``decimal_text`` sends unrounded and a live
+        literal inlines."""
+        assert exact_decimal(value) is exact
+        if exact:
+            assert Decimal(decimal_text(value)) == value
+
     def test_decimal_text_ignores_the_callers_context(self) -> None:
         import decimal
 
@@ -2067,6 +2101,38 @@ class TestTypedLookups:
         assert type(coerced) is Decimal
         assert coerced == Decimal("9.99")
         assert encoded == _tag10("9.99")
+
+    @pytest.mark.parametrize("value", [1e30, -1e30, 1e300, 1e-30, -5e-324, 1.2345678901234567e-20])
+    def test_float_without_an_exact_decimal_is_bound_as_given(self, value: float) -> None:
+        """A float whose ``Decimal`` is no SurrealDB decimal as it stands (beyond 96 bits, more than 28
+        fractional digits) is bound as given, as in v0.22.2: the server compares a float with a
+        decimal, where the conversion would raise (``1e30``) or round (``1e-30`` to ``0``)."""
+        from tests.test_rich_fields import RfEvent
+
+        coerced, encoded = _one(price__lt=value)
+        assert type(coerced) is float
+        assert coerced == value
+        assert type(encoded) is float
+        assert encoded == value
+        coerced, encoded = _one(price__in=[value, 2.5])
+        assert coerced == [value, Decimal("2.5")]
+        assert type(coerced[0]) is float
+        assert encoded == [value, _tag10("2.5")]
+        live = RfEvent.objects().filter(price__gt=value)._compile_live(False)
+        assert live == f"LIVE SELECT * FROM rf_event WHERE price > {value!r};"
+
+    def test_a_decimal_without_a_surrealdb_form_still_raises(self) -> None:
+        """Only a float the caller passed is bound as given: a ``Decimal`` (or a string) beyond the
+        server's range is refused, in a bound filter and in a live literal."""
+        from tests.test_rich_fields import RfEvent
+
+        for value in (Decimal("1E+30"), "1e30"):
+            with pytest.raises(ValueError, match="does not fit a SurrealDB decimal"):
+                RfEvent.objects().filter(price__lt=value)._build_where()
+            with pytest.raises(TypeError, match="96-bit mantissa"):
+                RfEvent.objects().filter(price__lt=value)._compile_live(False)
+        with pytest.raises(TypeError, match="at most 28 fractional digits"):
+            RfEvent.objects().filter(price__gt=Decimal("1E-30"))._compile_live(False)
 
     def test_uuid_string(self) -> None:
         coerced, encoded = _one(token=_TOKEN_TEXT)

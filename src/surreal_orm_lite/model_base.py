@@ -58,6 +58,7 @@ from .wire import (
     declared_kind,
     duration_ns,
     encode_wire,
+    exact_decimal,
     field_input,
     field_keys,
     lookup_type,
@@ -201,7 +202,11 @@ def _lookup_value(key: str, annotation: Any, value: Any, owner: type[BaseModel])
     """``value`` validated as ``annotation`` for the filter ``key`` (``"at__gt"``) of model ``owner``.
 
     ``ValueError`` if it does not fit. Bound as given when no ``TypeAdapter`` can be built for
-    ``annotation`` (:func:`_new_adapter`).
+    ``annotation`` (:func:`_new_adapter`), and for a ``float`` validated into a ``Decimal`` that is
+    no SurrealDB decimal as it stands (:func:`~surreal_orm_lite.wire.exact_decimal`: ``1e30``,
+    beyond 96 bits; ``1e-30``, 30 fractional digits): the server compares a float with a decimal,
+    as v0.22.2 bound it, where the converted value would be refused, or rounded (``1e-30`` to
+    ``0``), which moves the filter's boundary.
     """
     if _lookup_as_given(value):
         return value
@@ -209,10 +214,13 @@ def _lookup_value(key: str, annotation: Any, value: Any, owner: type[BaseModel])
     if adapter is None:
         return value
     try:
-        return adapter.validate_python(field_input(annotation, value))
+        validated = adapter.validate_python(field_input(annotation, value))
     except (ValueError, TypeError) as exc:
         detail = "; ".join(str(error["msg"]) for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
         raise ValueError(f"filter({key}=…): {value!r} is not a valid {_type_label(annotation)} ({detail})") from exc
+    if isinstance(value, float) and isinstance(validated, Decimal) and not exact_decimal(validated):
+        return value
+    return validated
 
 
 def _write_adapter(owner: type[BaseModel], name: str, info: FieldInfo) -> pydantic.TypeAdapter[Any] | None:
