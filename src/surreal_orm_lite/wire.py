@@ -23,19 +23,21 @@ This module converts them, **only where the annotation asks for it**:
   sent when no such form exists (an ``int`` beyond 64 bits, a ``time``, an unsaved table-model
   instance…).
 - ``decimal_text(value)`` — the fixed-point text of a ``Decimal``, rounded once the way the server
-  rounds it, so the stored value never moves; ``exact_decimal(value)`` — whether a ``Decimal`` is a
-  SurrealDB decimal as it stands, with nothing to round.
+  rounds it, so the stored value never moves.
 - ``sdk_decodes_zero_duration()`` — whether the installed SDK can read a zero duration back (a local
   probe, no server).
 - ``restore_native(dumped, raw, read_keys=…)`` — puts back, into a ``model_dump()``, the SDK values
-  (``Duration``, ``Range``…) an untyped position held and the dump flattened into plain dicts, so a
-  write sends them natively; with ``read_keys``, also keys each nested sub-model's fields so the
+  (``Duration``, ``Range``, geometries) an untyped position held and the dump flattened into plain
+  dicts, so a write sends them natively — a typed position keeps its dump, as in v0.22.2; with
+  ``read_keys``, also keys each nested sub-model's fields so the
   stored object reads back (:func:`read_keys`: the names when the sub-model validates by name, else
   the aliases).
 - ``model_object(model)`` — the object a write sends for a sub-model instance (the same walk, its
   own level re-keyed too).
 - ``field_keys(model)`` / ``sub_model(annotation)`` — the keys a mapping may use for a model's fields
-  (name and string aliases), and the model class an annotation declares (``Profile | None``).
+  (name and string aliases), and the model class an annotation declares (``Profile | None``);
+  ``mapping_values(annotation)`` / ``holds_objects(annotation)`` — the ``V`` of a ``dict[K, V]``, and
+  whether a value may be stored as an object (what ``merge()`` merges key by key).
 """
 
 from __future__ import annotations
@@ -61,6 +63,7 @@ from pydantic import (
     PastDatetime,
 )
 from pydantic.fields import FieldInfo
+from typing_extensions import is_typeddict
 
 from . import _sdk
 from ._sdk import (
@@ -73,6 +76,8 @@ from ._sdk import (
     RecordID,
     SdkDatetime,
     SdkDuration,
+    SdkGeometry,
+    SdkGeometryCollection,
     SdkRange,
     undefined,
 )
@@ -87,10 +92,11 @@ __all__ = [
     "declared_kind",
     "duration_ns",
     "encode_wire",
-    "exact_decimal",
     "field_input",
     "field_keys",
+    "holds_objects",
     "lookup_type",
+    "mapping_values",
     "model_object",
     "read_keys",
     "reads_aliases_first",
@@ -425,6 +431,37 @@ def sub_model(annotation: Any) -> type[BaseModel] | None:
     return core if _is_model(core) else None
 
 
+def mapping_values(annotation: Any) -> Any:
+    """``V`` of an annotation that declares ``dict[K, V]`` or ``Mapping[K, V]``, ``Annotated`` and
+    ``Optional`` stripped, else ``None`` (a bare ``dict``, a union of several types…)."""
+    core = _strip_optional(annotation)
+    args = get_args(core)
+    if get_origin(core) in _MAPPING_ORIGINS and len(args) == 2:
+        return args[1]
+    return None
+
+
+def holds_objects(annotation: Any) -> bool:
+    """Whether a value declared ``annotation`` may be stored as an object, which SurrealDB's MERGE
+    merges into the stored one (v0.23.0).
+
+    ``Any``, ``object``, a ``TypeVar`` or an unresolved annotation, a Pydantic model, a mapping
+    (``dict``, ``dict[K, V]``, ``Mapping``), a dataclass or a ``TypedDict`` — or a union with one
+    such member (``Card | Cash``, ``Profile | int``). ``Annotated`` and ``Optional`` stripped.
+    """
+    core = _strip_optional(annotation)
+    if core is Any or core is object or isinstance(core, (TypeVar, ForwardRef, str)):
+        return True
+    origin = get_origin(core)
+    if _is_union(origin):
+        return any(holds_objects(member) for member in get_args(core))
+    if origin in _MAPPING_ORIGINS:
+        return True
+    if not isinstance(core, type):
+        return False
+    return core in _MAPPING_ORIGINS or _is_model(core) or dataclasses.is_dataclass(core) or is_typeddict(core)
+
+
 def field_input(annotation: Any, value: Any) -> Any:
     """Convert the SDK forms Pydantic cannot validate, at the positions ``annotation`` asks for them.
 
@@ -709,34 +746,6 @@ def decimal_text(value: Decimal) -> str:
     raise out_of_range
 
 
-def exact_decimal(value: Decimal) -> bool:
-    """Whether ``value`` is a SurrealDB decimal as it stands, with nothing to round.
-
-    A finite value with at most 28 fractional digits once its trailing zeros are dropped
-    (``1.50``, ``1E+3``, ``1.000…0`` with 40 zeros) and a coefficient within 96 bits at that scale:
-    :func:`decimal_text` sends it unrounded and a live literal inlines it. ``False`` for
-    ``Decimal("1E+30")`` (beyond 96 bits), ``Decimal("1E-30")`` (30 fractional digits) and a NaN or
-    an infinity.
-    """
-    if not value.is_finite():
-        return False
-    if not value:
-        return True
-    # A cheap first bound (2**96 - 1 has 29 digits), which also bounds the integer built below.
-    if value.adjusted() > _DECIMAL_MAX_SCALE:
-        return False
-    digits, exponent = value.as_tuple()[1:]
-    assert isinstance(exponent, int)  # a finite value's exponent is an int
-    kept = list(digits)
-    while exponent < 0 and kept[-1] == 0:
-        kept.pop()
-        exponent += 1
-    if exponent < -_DECIMAL_MAX_SCALE:
-        return False
-    coefficient = int("".join(map(str, kept)) + "0" * max(exponent, 0))
-    return coefficient <= _DECIMAL_MAX_COEFFICIENT
-
-
 def _encode_duration(value: timedelta | Duration | SdkDuration, stored: bool) -> CBORTag:
     """A ``timedelta`` or ORM/SDK ``Duration`` → ``CBORTag(TAG_DURATION_COMPACT, [seconds, nanoseconds])``.
 
@@ -856,16 +865,72 @@ def encode_wire(value: Any, *, stored: bool) -> Any:
 # --- restore_native (spec §5.3) -----------------------------------------------------------------
 
 _MISSING = object()
+# The annotation of a position nothing declares: an extra column (``extra="allow"``), a value of a
+# mapping given to :func:`restore_native` directly. Untyped, like ``Any``.
+_UNDECLARED = object()
+# The annotation of a position inside a declared value whose type the walk does not follow (a union
+# of several types, a ``TypedDict``…): typed, so the dump is kept there.
+_DECLARED = object()
+
+# The SDK values :func:`restore_native` puts back: those the SDK encodes and both server lines store
+# as the value they are — a duration (once ``encode_wire`` has made it a compact one), a range and a
+# geometry. A bound on its own and ``surrealdb.Tokens`` are not among them: the server drops the
+# WebSocket on a bound, and the SDK has no encoder for ``Tokens``; their dumps are written, as in
+# v0.22.2.
+_SDK_VALUES: tuple[type, ...] = tuple(
+    cls for cls in (SdkDuration, SdkRange, SdkGeometry, SdkGeometryCollection) if isinstance(cls, type)
+)
 
 
 def _is_sdk_dataclass(value: object) -> bool:
     """Whether ``value`` is an instance of a dataclass the ``surrealdb`` package defines.
 
-    The SDK's ``Duration``, ``Range``, ``BoundIncluded``/``BoundExcluded`` and geometries: the values
-    ``model_dump()`` flattens into plain dicts at an untyped position. The ORM's ``Duration`` and
-    ``Range`` are not dataclasses (the dump keeps them), nor are ``RecordID`` and ``Datetime``.
+    The SDK's ``Duration``, ``Range``, ``BoundIncluded``/``BoundExcluded``, geometries and ``Tokens``:
+    the values ``model_dump()`` flattens into plain dicts. The ORM's ``Duration`` and ``Range`` are
+    not dataclasses (the dump keeps them), nor are ``RecordID`` and ``Datetime``.
     """
     return dataclasses.is_dataclass(value) and not isinstance(value, type) and type(value).__module__.startswith("surrealdb.")
+
+
+def _untyped(annotation: Any) -> bool:
+    """Whether a position declared ``annotation`` holds any value: nothing declared, ``Any``, ``object``,
+    a ``TypeVar`` or an unresolved annotation (a string, a ``ForwardRef``), ``Optional``/``Annotated``
+    stripped. A union of several types is not: one of its members may be the value's class."""
+    if annotation is _UNDECLARED:
+        return True
+    core = _strip_optional(annotation)
+    return core is Any or core is object or isinstance(core, (TypeVar, ForwardRef, str))
+
+
+def _value_annotation(annotation: Any) -> Any:
+    """The annotation of the values of a mapping declared ``annotation`` (``V`` of ``dict[K, V]``)."""
+    if _untyped(annotation):
+        return _UNDECLARED
+    core = _strip_optional(annotation)
+    if isinstance(core, type) and core in _MAPPING_ORIGINS:  # a bare ``dict``: ``dict[Any, Any]``
+        return _UNDECLARED
+    args = get_args(core)
+    if get_origin(core) in _MAPPING_ORIGINS and len(args) == 2:
+        return args[1]
+    return _DECLARED
+
+
+def _item_annotation(annotation: Any, position: int) -> Any:
+    """The annotation of the item at ``position`` of a list or tuple declared ``annotation``."""
+    if _untyped(annotation):
+        return _UNDECLARED
+    core = _strip_optional(annotation)
+    if isinstance(core, type) and (core in _SEQUENCE_ORIGINS or core is tuple):  # a bare ``list``: ``list[Any]``
+        return _UNDECLARED
+    origin = get_origin(core)
+    args = get_args(core)
+    if origin is tuple:
+        if len(args) == 2 and args[1] is Ellipsis:
+            return args[0]
+        return args[position] if position < len(args) else _DECLARED
+    if origin in _SEQUENCE_ORIGINS and args:
+        return args[0]
+    return _DECLARED
 
 
 def _read_key(name: str, info: FieldInfo) -> str:
@@ -960,24 +1025,27 @@ def masking_keys(model: type[BaseModel]) -> Mapping[str, tuple[str, ...]]:
     return {name: tuple(keys) for name, keys in others.items()}
 
 
-def _raw_item(raw: Any, key: Any) -> Any:
-    """The value under ``key`` in ``raw``, or ``_MISSING``.
+def _raw_item(raw: Any, key: Any, annotation: Any) -> tuple[Any, Any]:
+    """The value under ``key`` in ``raw`` (``_MISSING`` when there is none) and its annotation.
 
     A model: the field of that name, else the field that key aliases (:func:`field_keys` — a dump
-    keyed by the read keys still finds the raw values behind them), else an extra.
+    keyed by the read keys still finds the raw values behind them), with the field's annotation;
+    else an extra, which nothing declares. A mapping declared ``annotation``: the value and the
+    annotation of the mapping's values.
     """
     if isinstance(raw, BaseModel):
         if isinstance(key, str):
-            name = key if key in type(raw).model_fields else field_keys(type(raw)).get(key)
+            fields = type(raw).model_fields
+            name = key if key in fields else field_keys(type(raw)).get(key)
             if name is not None:
-                return getattr(raw, name)
+                return getattr(raw, name), fields[name].annotation
         extra = raw.__pydantic_extra__
         if extra is not None and key in extra:
-            return extra[key]
-        return _MISSING
+            return extra[key], _UNDECLARED
+        return _MISSING, _UNDECLARED
     if key in raw:
-        return raw[key]
-    return _MISSING
+        return raw[key], _value_annotation(annotation)
+    return _MISSING, _UNDECLARED
 
 
 def restore_native(dumped: Any, raw: Any, *, read_keys: bool = False) -> Any:
@@ -988,17 +1056,23 @@ def restore_native(dumped: Any, raw: Any, *, read_keys: bool = False) -> Any:
     dict: an SDK ``Duration`` loaded from the database becomes ``{"elapsed": 5400000000000}``, an SDK
     ``Range`` ``{"begin": {"value": 1}, "end": …}``, and a write would store those objects instead of
     the duration and the range. This walks the dump and the instance's own values (``raw``) in
-    parallel (spec §5.3):
+    parallel, with the annotation each position is declared with (spec §5.3):
 
-    - where the raw value is an instance of a dataclass from the ``surrealdb`` package, the raw value
-      replaces its dump;
-    - a dict dump recurses by key into a raw mapping, or into a raw Pydantic model by field name (or
-      a key that aliases it), then its extras (``__pydantic_extra__``);
-    - a list or tuple dump recurses by position into a raw list or tuple of the same length, and keeps
-      its own container type;
-    - anything else keeps the dump: a dataclass that is not the SDK's, the ORM's ``Duration``/``Range``
-      (not dataclasses: the dump keeps them as they are), mismatched shapes, a key missing from
-      ``raw``, a raw ``set`` (no positions).
+    - where the raw value is an SDK ``Duration``, ``Range`` or geometry at an **untyped** position —
+      nothing declared (an extra, a value of a mapping given directly), ``Any``, ``object``, a
+      ``TypeVar``, an unresolved annotation, or the values or items of a bare ``dict``/``list`` —, the
+      raw value replaces its dump;
+    - a dict dump recurses by key into a raw mapping (its values declared as the mapping's ``V``), or
+      into a raw Pydantic model by field name (or a key that aliases it, declared as the field), then
+      its extras (``__pydantic_extra__``, untyped);
+    - a list or tuple dump recurses by position into a raw list or tuple of the same length (each item
+      declared as the sequence's item type), and keeps its own container type;
+    - anything else keeps the dump, as in v0.22.2: an SDK value at a **typed** position (a field
+      declared ``surrealdb.Duration``, ``GeometryPoint``…, a union of several types), an SDK value the
+      server does not store as one (a ``BoundIncluded``/``BoundExcluded`` on its own, which drops the
+      WebSocket) or the SDK cannot encode (``surrealdb.Tokens``), a dataclass that is not the SDK's,
+      the ORM's ``Duration``/``Range`` (not dataclasses: the dump keeps them as they are), mismatched
+      shapes, a key missing from ``raw``, a raw ``set`` (no positions).
 
     ``read_keys=True`` (a model write, v0.23.0) also re-keys every **nested** model level — a raw
     Pydantic model below the top: each declared field goes under :func:`read_keys`' key (its name
@@ -1010,7 +1084,7 @@ def restore_native(dumped: Any, raw: Any, *, read_keys: bool = False) -> Any:
     Copy-on-write: when nothing changes, ``dumped`` itself is returned; otherwise new containers along
     the changed paths only (untouched branches are shared). Neither argument is mutated.
     """
-    return _restore(dumped, raw, False, read_keys)
+    return _restore(dumped, raw, False, read_keys, _UNDECLARED)
 
 
 def model_object(model: BaseModel) -> dict[str, Any]:
@@ -1028,14 +1102,15 @@ def model_object(model: BaseModel) -> dict[str, Any]:
     which does not read back. Extras keep their key; the SDK values of the untyped positions are
     put back.
     """
-    result: dict[str, Any] = _restore(model.model_dump(), model, True, True)
+    result: dict[str, Any] = _restore(model.model_dump(), model, True, True, _UNDECLARED)
     return result
 
 
-def _restore(dumped: Any, raw: Any, rekey: bool, rekey_nested: bool) -> Any:
-    """:func:`restore_native`'s walk; ``rekey``: re-key this level when ``raw`` is a model, ``rekey_nested`` the levels below."""
+def _restore(dumped: Any, raw: Any, rekey: bool, rekey_nested: bool, annotation: Any) -> Any:
+    """:func:`restore_native`'s walk; ``rekey``: re-key this level when ``raw`` is a model, ``rekey_nested``
+    the levels below; ``annotation``: what this position is declared as."""
     if _is_sdk_dataclass(raw):
-        return raw
+        return raw if isinstance(raw, _SDK_VALUES) and _untyped(annotation) else dumped
     if isinstance(dumped, dict):
         if not isinstance(raw, (BaseModel, Mapping)):
             return dumped
@@ -1043,14 +1118,17 @@ def _restore(dumped: Any, raw: Any, rekey: bool, rekey_nested: bool) -> Any:
         changed = False
         items: list[tuple[Any, Any]] = []
         for key, item in dumped.items():
-            raw_item = _raw_item(raw, key)
-            new = item if raw_item is _MISSING else _restore(item, raw_item, rekey_nested, rekey_nested)
+            raw_item, item_annotation = _raw_item(raw, key, annotation)
+            new = item if raw_item is _MISSING else _restore(item, raw_item, rekey_nested, rekey_nested, item_annotation)
             new_key = keys.get(key, key) if keys is not None and isinstance(key, str) else key
             changed = changed or new is not item or new_key != key
             items.append((new_key, new))
         return dict(items) if changed else dumped
     if isinstance(dumped, (list, tuple)) and isinstance(raw, (list, tuple)) and len(dumped) == len(raw):
-        restored = [_restore(item, raw_item, rekey, rekey_nested) for item, raw_item in zip(dumped, raw, strict=True)]
+        restored = [
+            _restore(item, raw_item, rekey, rekey_nested, _item_annotation(annotation, position))
+            for position, (item, raw_item) in enumerate(zip(dumped, raw, strict=True))
+        ]
         if all(new is old for new, old in zip(restored, dumped, strict=True)):
             return dumped
         return restored if isinstance(dumped, list) else tuple(restored)

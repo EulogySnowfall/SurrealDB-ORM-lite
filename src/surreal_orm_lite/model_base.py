@@ -13,12 +13,12 @@ from types import NoneType, UnionType
 from typing import TYPE_CHECKING, Annotated, Any, Self, TypeVar, overload
 
 import pydantic
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, PlainValidator, WrapValidator, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_core import ValidationError
 from typing_extensions import is_typeddict
 
-from ._sdk import NotFoundError, RecordID, SdkDuration, ServerError
+from ._sdk import BoundExcluded, BoundIncluded, NotFoundError, RecordID, SdkDuration, SdkRange, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, Var, _ComputedDefault
@@ -34,7 +34,7 @@ from .signals import (
     pre_update,
 )
 from .transaction import Transaction
-from .types import Duration
+from .types import Duration, Range
 from .utils import (
     RECORD_ID_COLUMN,
     VALID_ALIAS_PATTERN,
@@ -58,10 +58,11 @@ from .wire import (
     declared_kind,
     duration_ns,
     encode_wire,
-    exact_decimal,
     field_input,
     field_keys,
+    holds_objects,
     lookup_type,
+    mapping_values,
     masking_keys,
     model_object,
     read_keys,
@@ -202,11 +203,8 @@ def _lookup_value(key: str, annotation: Any, value: Any, owner: type[BaseModel])
     """``value`` validated as ``annotation`` for the filter ``key`` (``"at__gt"``) of model ``owner``.
 
     ``ValueError`` if it does not fit. Bound as given when no ``TypeAdapter`` can be built for
-    ``annotation`` (:func:`_new_adapter`), and for a ``float`` validated into a ``Decimal`` that is
-    no SurrealDB decimal as it stands (:func:`~surreal_orm_lite.wire.exact_decimal`: ``1e30``,
-    beyond 96 bits; ``1e-30``, 30 fractional digits): the server compares a float with a decimal,
-    as v0.22.2 bound it, where the converted value would be refused, or rounded (``1e-30`` to
-    ``0``), which moves the filter's boundary.
+    ``annotation`` (:func:`_new_adapter`). A ``float`` given for a ``Decimal`` stays that float
+    (:func:`_floats_kept`), as v0.22.2 bound it.
     """
     if _lookup_as_given(value):
         return value
@@ -218,18 +216,61 @@ def _lookup_value(key: str, annotation: Any, value: Any, owner: type[BaseModel])
     except (ValueError, TypeError) as exc:
         detail = "; ".join(str(error["msg"]) for error in exc.errors()) if isinstance(exc, ValidationError) else str(exc)
         raise ValueError(f"filter({key}=…): {value!r} is not a valid {_type_label(annotation)} ({detail})") from exc
-    if isinstance(value, float) and isinstance(validated, Decimal) and not exact_decimal(validated):
-        return value
+    return _floats_kept(value, validated)
+
+
+def _floats_kept(given: Any, validated: Any) -> Any:
+    """``validated`` with each ``float`` the caller gave for a ``Decimal`` put back (v0.23.0).
+
+    v0.22.2 sent and bound a ``float`` as given: ``merge(price=9.99)`` stored ``9.99f`` in a
+    ``Decimal`` field and ``filter(price=9.99)`` compared with ``9.99f``. SurrealDB's
+    ``9.99f = 9.99dec`` is ``false`` (a float is its binary value), so the converted ``Decimal`` would
+    no longer find the rows those writes stored, and a write of it would not be found by a float
+    filter. So a typed lookup and a keyword write keep the float wherever the validation turned it
+    into a ``Decimal``: the value itself, an item of a list or tuple (same length), a mapping's value
+    (same key) and a range bound. An ``int`` and a string still become a ``Decimal`` (an ``int`` is
+    exact; a string was a string in v0.22.2). Copy-on-write.
+    """
+    if isinstance(given, float) and isinstance(validated, Decimal):
+        return given
+    if isinstance(given, (list, tuple)) and isinstance(validated, (list, tuple)) and len(given) == len(validated):
+        items = [_floats_kept(old, new) for old, new in zip(given, validated, strict=True)]
+        if all(kept is new for kept, new in zip(items, validated, strict=True)):
+            return validated
+        return items if isinstance(validated, list) else tuple(items)
+    if isinstance(given, Mapping) and type(validated) is dict:
+        kept_items = {key: _floats_kept(given[key], new) if key in given else new for key, new in validated.items()}
+        if all(kept_items[key] is new for key, new in validated.items()):
+            return validated
+        return kept_items
+    if isinstance(validated, Range) and isinstance(given, (Range, SdkRange)):
+        begin, end = _bound_kept(given.begin, validated.begin), _bound_kept(given.end, validated.end)
+        if begin is validated.begin and end is validated.end:
+            return validated
+        return Range(begin, end)
     return validated
+
+
+def _bound_kept(given: Any, side: Any) -> Any:
+    """A range side of :func:`_floats_kept`: the caller's ``float`` bound value where it became a ``Decimal``."""
+    if (
+        isinstance(side, (BoundIncluded, BoundExcluded))
+        and isinstance(given, (BoundIncluded, BoundExcluded))
+        and isinstance(given.value, float)
+        and isinstance(side.value, Decimal)
+    ):
+        return type(side)(given.value)
+    return side
 
 
 def _write_adapter(owner: type[BaseModel], name: str, info: FieldInfo) -> pydantic.TypeAdapter[Any] | None:
     """The ``TypeAdapter`` of field ``name`` of ``owner`` **with its constraints**, cached (v0.23.0).
 
     ``Field(ge=…)``, ``allow_inf_nan``… live in ``info.metadata``, which ``info.annotation`` lacks:
-    the adapter validates what the model's constructor would, with ``owner``'s
-    ``arbitrary_types_allowed`` (:func:`_new_adapter`). ``owner`` is a table model or a sub-model
-    (the sub-fields of a ``merge()`` dict). ``None`` when Pydantic cannot build one.
+    the adapter validates what the model's constructor would for a field the model has no
+    validator of its own for (:func:`_validates_itself`; such a field is never validated here), with
+    ``owner``'s ``arbitrary_types_allowed`` (:func:`_new_adapter`). ``owner`` is a table model or a
+    sub-model (the sub-fields of a ``merge()`` dict). ``None`` when Pydantic cannot build one.
     """
     if (owner, name) not in _WRITE_ADAPTERS:
         target: Any = info.annotation
@@ -240,34 +281,172 @@ def _write_adapter(owner: type[BaseModel], name: str, info: FieldInfo) -> pydant
     return _WRITE_ADAPTERS[(owner, name)]
 
 
+_FUNCTION_VALIDATORS = (AfterValidator, BeforeValidator, PlainValidator, WrapValidator)
+_ORM_PACKAGE = __name__.rpartition(".")[0] + "."
+
+
+def _defined_by_orm(owner: type, attribute: str) -> bool:
+    """Whether the class attribute ``attribute`` of ``owner`` comes from this package (``set_data``, an
+    edge's endpoint check), not from the user's model."""
+    for klass in owner.__mro__:
+        if attribute in vars(klass):
+            return klass.__module__.startswith(_ORM_PACKAGE)
+    return False
+
+
+@functools.cache
+def _own_validation(owner: type[BaseModel]) -> frozenset[str] | None:
+    """The fields model ``owner`` validates with code of its own; ``None`` for all of them (v0.23.0).
+
+    Read from ``__pydantic_decorators__``: a ``@field_validator`` (or a deprecated ``@validator``),
+    any mode, names its fields (``"*"``: all of them); a ``@model_validator`` in ``before`` or
+    ``wrap`` mode (or a ``@root_validator(pre=True)``) sees the whole input, so every field. An
+    ``after`` model validator checks the instance the constructor built and changes no field's
+    input. The validators this package defines (``set_data``, an edge's endpoint check) are not
+    counted.
+    """
+    decorators = owner.__pydantic_decorators__
+    whole_input = [(decorator.cls_var_name, decorator.info.mode) for decorator in decorators.model_validators.values()] + [
+        (decorator.cls_var_name, decorator.info.mode) for decorator in decorators.root_validators.values()
+    ]
+    for attribute, mode in whole_input:
+        if mode in ("before", "wrap") and not _defined_by_orm(owner, attribute):
+            return None
+    per_field = [(decorator.cls_var_name, decorator.info.fields) for decorator in decorators.field_validators.values()] + [
+        (decorator.cls_var_name, decorator.info.fields) for decorator in decorators.validators.values()
+    ]
+    fields: set[str] = set()
+    for attribute, names in per_field:
+        if _defined_by_orm(owner, attribute):
+            continue
+        if "*" in names:
+            return None
+        fields.update(names)
+    return frozenset(fields)
+
+
+def _has_function_validator(annotation: Any) -> bool:
+    """Whether ``annotation`` carries a ``BeforeValidator``, ``AfterValidator``, ``WrapValidator`` or
+    ``PlainValidator`` in an ``Annotated`` layer, at any depth (unions and generic arguments entered,
+    nested models not: they validate as their own class)."""
+    if typing.get_origin(annotation) is Annotated:
+        args = typing.get_args(annotation)
+        if any(isinstance(meta, _FUNCTION_VALIDATORS) for meta in args[1:]):
+            return True
+        return _has_function_validator(args[0])
+    return any(_has_function_validator(arg) for arg in typing.get_args(annotation) if arg is not Ellipsis)
+
+
+@functools.cache
+def _validates_itself(owner: type[BaseModel], name: str) -> bool:
+    """Whether field ``name`` of model ``owner`` is validated by code of the model's own (v0.23.0).
+
+    A ``@field_validator`` naming it (or ``"*"``), a ``@model_validator`` in ``before``/``wrap`` mode
+    (:func:`_own_validation`), or a ``BeforeValidator``/``AfterValidator``/``WrapValidator``/
+    ``PlainValidator`` in its annotation or ``Field`` metadata. The ORM validates a keyword write or a
+    filter value by the field's type alone (a ``TypeAdapter``), which cannot run such code as the
+    constructor does — it has no instance, no ``info.data`` —, so it would refuse a value the
+    constructor accepts (a validator that reads ``"2026/03/04"``): such a field's values are written
+    and bound as given, as in v0.22.2. Cached per (model, field).
+    """
+    fields = _own_validation(owner)
+    if fields is None or name in fields:
+        return True
+    info = owner.model_fields.get(name)
+    if info is None:
+        return False
+    return any(isinstance(meta, _FUNCTION_VALIDATORS) for meta in info.metadata) or _has_function_validator(info.annotation)
+
+
 def _keyword_value(context: str, path: str, owner: type[BaseModel], name: str, info: FieldInfo, value: Any) -> Any:
     """``value`` written to field ``name`` of ``owner`` by a keyword write, in the form it is sent (v0.23.0).
 
-    ``None`` and a ``SurrealFunc`` as given. In ``merge`` (``context``), a mapping addressed to a
-    sub-model is converted key by key (:func:`_partial_object`): SurrealDB's MERGE merges objects,
-    so only the caller's keys are sent. Anything else is validated as the field — the caller's
-    table-model instances replaced by their record ids first (:func:`_link_instances`), so the field
-    itself says whether it holds a ``RecordID`` there — and the sub-models the validation built
-    take their object form (:func:`_object_forms`). A field Pydantic cannot build a ``TypeAdapter``
-    for (:func:`_new_adapter`) is not validated: the value is sent as given, as before v0.23.0
-    (``encode_wire`` still encodes it). ``path`` names the value in the error: ``profile``,
-    ``profile.bday``.
+    As given: ``None``, a ``SurrealFunc``, and any value of a field the model validates with code of
+    its own (:func:`_validates_itself`), as in v0.22.2. In ``merge`` (``context``), a mapping goes
+    through :func:`_merged_value`: SurrealDB's MERGE merges an object into the stored one, so only
+    the caller's keys are sent. Anything else is validated as the field (:func:`_validated_value`,
+    with the field's constraints: :func:`_write_adapter`). ``path`` names the value in the error:
+    ``profile``, ``profile.bday``.
+    """
+    if value is None or isinstance(value, SurrealFunc) or _validates_itself(owner, name):
+        return value
+    if context == "merge":
+        merged = _merged_value(context, path, owner, info.annotation, value)
+        if merged is not _WHOLE:
+            return merged
+    return _validated_value(context, path, info.annotation, _write_adapter(owner, name, info), value)
+
+
+# What :func:`_merged_value` answers for a value ``merge()`` validates whole.
+_WHOLE = object()
+
+
+def _merged_value(context: str, path: str, owner: type[BaseModel], annotation: Any, value: Any) -> Any:
+    """A ``merge()`` mapping at a position declared ``annotation``, as MERGE merges it, else ``_WHOLE`` (v0.23.0).
+
+    SurrealDB's MERGE merges an object into the stored one at every depth (an array is replaced
+    whole), so a dict there changes only the keys it names, as in v0.22.2 — a missing required
+    sub-field is not asked for and no default overwrites a stored value:
+
+    - addressed to a sub-model (``profile: Profile | None``): converted key by key
+      (:func:`_partial_object`);
+    - addressed to a ``dict[K, V]``: each value as a value of ``V`` (:func:`_merged_item`: a dict again
+      goes this way, any other value is validated as ``V``), keys as given;
+    - addressed to any other annotation that may hold an object — a union with a model or mapping
+      member (``Card | Cash``), a dataclass, a ``TypedDict``…
+      (:func:`~surreal_orm_lite.wire.holds_objects`): sent as given, as in v0.22.2 (which member a
+      partial dict belongs to is unknown).
+
+    ``_WHOLE`` for a value that is not a mapping (a sub-model instance included: it is the whole
+    sub-object), or a mapping at a position that holds no object (a ``Range``…).
+    """
+    if not isinstance(value, Mapping):
+        return _WHOLE
+    model = sub_model(annotation)
+    if model is not None:
+        return _partial_object(context, path, model, value)
+    values = mapping_values(annotation)
+    if values is not None:
+        return {key: _merged_item(context, f"{path}.{key}", owner, values, item) for key, item in value.items()}
+    if holds_objects(annotation):
+        return value
+    return _WHOLE
+
+
+def _merged_item(context: str, path: str, owner: type[BaseModel], annotation: Any, value: Any) -> Any:
+    """A value of a ``merge()`` dict addressed to a ``dict[K, V]`` (``annotation``: ``V``) (v0.23.0).
+
+    ``None`` (NONE: MERGE removes the key) and a ``SurrealFunc`` as given; a mapping as MERGE merges
+    it (:func:`_merged_value`); anything else validated as ``V`` (:func:`_validated_value`).
     """
     if value is None or isinstance(value, SurrealFunc):
         return value
-    if context == "merge" and isinstance(value, Mapping):
-        model = sub_model(info.annotation)
-        if model is not None:
-            return _partial_object(context, path, model, value)
+    merged = _merged_value(context, path, owner, annotation, value)
+    if merged is not _WHOLE:
+        return merged
+    return _validated_value(context, path, annotation, _lookup_adapter(annotation, owner), value)
+
+
+def _validated_value(context: str, path: str, annotation: Any, adapter: pydantic.TypeAdapter[Any] | None, value: Any) -> Any:
+    """``value`` validated by ``adapter`` (of ``annotation``), in the form a keyword write sends it (v0.23.0).
+
+    The caller's table-model instances replaced by their record ids first (:func:`_link_instances`),
+    so the annotation itself says whether it holds a ``RecordID`` there; a ``float`` given for a
+    ``Decimal`` kept (:func:`_floats_kept`); the sub-models the validation built in their object
+    form (:func:`_object_forms`). No ``adapter`` (Pydantic cannot build one, :func:`_new_adapter`):
+    the value is sent as given, as before v0.23.0 (``encode_wire`` still encodes it).
+
+    Raises:
+        ValueError: the value does not fit — ``"merge(at=…): 'yesterday' is not a valid datetime (…)"``.
+    """
     linked = _link_instances(context, path, value)
-    adapter = _write_adapter(owner, name, info)
     if adapter is None:
         return value
     try:
-        validated = adapter.validate_python(field_input(info.annotation, linked))
+        validated = adapter.validate_python(field_input(annotation, linked))
     except (ValueError, TypeError) as exc:
-        raise ValueError(f"{context}({path}=…): {_refusal(info.annotation, value, linked, exc)}") from exc
-    return _object_forms(validated)
+        raise ValueError(f"{context}({path}=…): {_refusal(annotation, value, linked, exc)}") from exc
+    return _object_forms(_floats_kept(linked, validated))
 
 
 def _refusal(annotation: Any, value: Any, linked: Any, exc: Exception) -> str:
@@ -1012,18 +1191,21 @@ class BaseSurrealModel(BaseModel):
         and the value (the list of items for ``in``/``not_in``/``containsall``/``containsany``, the
         range for range membership). On a field whose annotation holds a rich type,
         :func:`~surreal_orm_lite.wire.lookup_type` names the type the value is validated as —
-        :func:`~surreal_orm_lite.wire.field_input` then that type's ``TypeAdapter`` — so a string,
-        a ``float`` or a builtin ``range`` becomes the value the column stores: ``ttl__gt="1h"`` a
-        ``timedelta``, ``token="0190…"`` a ``UUID``, ``price__lte=9.99`` ``Decimal("9.99")``,
+        :func:`~surreal_orm_lite.wire.field_input` then that type's ``TypeAdapter`` — so a string or
+        a builtin ``range`` becomes the value the column stores: ``ttl__gt="1h"`` a ``timedelta``,
+        ``token="0190…"`` a ``UUID``, ``price__lte="9.99"`` ``Decimal("9.99")``,
         ``at__in=Range(BoundIncluded("2026-01-01"), None)`` a ``Range[datetime]``,
         ``hours__contains="12"`` an ``int`` on a ``Range[int]`` field. The caller encodes and binds
         the result (a string compared with a duration or a UUID column silently matches the wrong
-        rows, or none).
+        rows, or none). A ``float`` given for a ``Decimal`` stays that float, as v0.22.2 bound it
+        (:func:`_floats_kept`: ``9.99f = 9.99dec`` is false on the server, and v0.22's keyword writes
+        stored floats).
 
         Returned unchanged: a dotted path (``meta.ttl``), the ``id`` column (its record id rules),
-        ``isnull``, a field without a rich type, a lookup outside the table of spec §4.5, and the
-        values — or items — that are never validated: ``None``, a ``Var``, a string starting with
-        ``$``, a model instance, a non-finite ``float``/``Decimal``.
+        ``isnull``, a field without a rich type, a field the model validates with code of its own
+        (:func:`_validates_itself`: bound as given, as in v0.22.2), a lookup outside the table of
+        spec §4.5, and the values — or items — that are never validated: ``None``, a ``Var``, a
+        string starting with ``$``, a model instance, a non-finite ``float``/``Decimal``.
 
         Raises:
             ValueError: the value does not fit — ``"filter(at__gt=…): 'yesterday' is not a valid
@@ -1033,7 +1215,7 @@ class BaseSurrealModel(BaseModel):
             return value
         name = cls.to_py_field(column)
         entry = cls._rich_fields().get(name) if name in cls.model_fields else None
-        if entry is None:
+        if entry is None or _validates_itself(cls, name):
             return value
         target = lookup_type(entry[0], lookup, value)
         if target is None:
@@ -1054,8 +1236,17 @@ class BaseSurrealModel(BaseModel):
         ``UUID``, ``Duration``, ``Range[T]``, ``set``…, ``list[timedelta]`` included), the value goes
         through :func:`~surreal_orm_lite.wire.field_input` then a ``TypeAdapter`` of the field's
         annotation **with its constraints** (``Field(ge=…)``, ``allow_inf_nan``…) — the validation the
-        model's constructor applies to that field. So ``merge(ttl="1h30m")`` stores a duration and
-        leaves ``timedelta(hours=1, minutes=30)`` on the instance, where v0.22.1 stored the string.
+        model's constructor applies to a field it has no validator of its own for. So
+        ``merge(ttl="1h30m")`` stores a duration and leaves ``timedelta(hours=1, minutes=30)`` on the
+        instance, where v0.22.1 stored the string. A ``float`` given for a ``Decimal`` is sent as
+        given, as in v0.22.2 (:func:`_floats_kept`), so a float filter still finds the row.
+
+        A field the model validates with code of its own — a ``@field_validator`` naming it, a
+        ``@model_validator(mode="before")`` (or ``"wrap"``), a ``BeforeValidator``/``AfterValidator``…
+        in its annotation (:func:`_validates_itself`) — is written as given, as in v0.22.2: its type
+        alone would refuse what that code accepts (``merge(at="2026/03/04")`` with a validator that
+        reads that format), and the code cannot run without the instance the constructor builds. The
+        read back runs it.
 
         A field typed with a sub-model that holds a rich type (``profile: Profile | None``):
 
@@ -1072,10 +1263,15 @@ class BaseSurrealModel(BaseModel):
           the whole sub-model: a missing required sub-field raises;
         - an **instance** is the whole sub-object, sent as ``save()`` writes it.
 
-        Any other value of a rich field (``dict[str, Profile]``, ``Profile | Other``) is validated
-        whole, so its sub-models come back as instances; the removal of their aliases that
-        ``merge()`` sends for each one at an object position is added to the wire form, not here
-        (:func:`_with_removals`).
+        In ``merge``, a dict at any other position MERGE merges into a stored object changes only
+        its keys too, as in v0.22.2 (:func:`_merged_value`): a value of a ``dict[str, Profile]`` is
+        converted key by key as a ``Profile`` (``merge(contacts={"a": {"seen": …}})`` keeps the
+        stored ``contacts.a.name``), each value of a ``dict[str, timedelta]`` as a ``timedelta``; a
+        dict for a union of models (``Card | Cash``) or another type that holds objects is sent as
+        given (which member it belongs to is unknown). An instance there is the whole sub-object,
+        and ``merge()`` adds to its wire form the removal of the aliases a v0.22 row may hold
+        (:func:`_with_removals`). Any other value (an array, a scalar) is validated whole; outside
+        ``merge``, every value is.
 
         A dict for a field typed with a sub-model **without** a rich type keeps its values as given
         (not validated, as in v0.22), and its keys follow the same rule in every keyword write, at
@@ -1096,6 +1292,7 @@ class BaseSurrealModel(BaseModel):
 
         ``name`` is a Python field name or its column. Returned unchanged: ``None``, a
         :class:`~surreal_orm_lite.functions.SurrealFunc` (evaluated by the server), a dotted path,
+        any value of a field the model validates with code of its own,
         and — unless it holds a table-model instance or is a sub-model dict (keyed as above) — a value for
         a field without a rich type (written as before v0.23.0); also any value for an undeclared
         field (an instance there is its record id: no annotation says otherwise).
@@ -1106,14 +1303,14 @@ class BaseSurrealModel(BaseModel):
 
         Raises:
             ValueError: the value does not fit — ``"merge(at=…): 'yesterday' is not a valid
-                datetime (…)"`` with Pydantic's message, ``"merge(profile.bday=…): …"`` for a
-                sub-field — before anything is sent.
+                datetime (…)"`` with Pydantic's message, ``"merge(profile.bday=…): …"`` or
+                ``"merge(contacts.a.seen=…): …"`` for a value inside a dict — before anything is sent.
         """
         if value is None or isinstance(value, SurrealFunc) or "." in name:
             return value
         field = name if name in cls.model_fields else cls.to_py_field(name)
         info = cls.model_fields.get(field)
-        if info is None:
+        if info is None or _validates_itself(cls, field):
             return value
         if field not in cls._rich_fields() and _link_instances(context, name, value) is value:
             model = sub_model(info.annotation)
@@ -1434,9 +1631,11 @@ class BaseSurrealModel(BaseModel):
                 A computed field listed here is still excluded.
 
         Values (v0.23.0) leave in forms both server lines accept: the SDK values an untyped
-        position holds (an SDK ``Duration`` or ``Range`` in a ``dict[str, Any]`` field, an
+        position holds (an SDK ``Duration``, ``Range`` or geometry in a ``dict[str, Any]`` field, an
         ``extra="allow"`` column…), which ``model_dump()`` flattens into dicts, are put back
-        (:func:`~surreal_orm_lite.wire.restore_native`), each nested sub-model's fields go under the
+        (:func:`~surreal_orm_lite.wire.restore_native`) — a field declared with an SDK class
+        (``surrealdb.Duration``, ``GeometryPoint``, ``surrealdb.Tokens``…) keeps that dump, as in
+        v0.22.2 —, each nested sub-model's fields go under the
         key a read takes them from (:func:`~surreal_orm_lite.wire.read_keys`: the names on a
         sub-model that validates by name too, as v0.22 wrote them, else the key their validation
         reads, ``Field(alias="lastSeen")`` → ``lastSeen``; as a keyword write sends them; the
@@ -2290,9 +2489,12 @@ class BaseSurrealModel(BaseModel):
 
         A keyword addressed to a field with a rich type (``datetime``, ``date``, ``timedelta``,
         ``Decimal``, ``UUID``, ``Duration``, ``Range[T]``, ``set``…, at any depth) is validated
-        as that field first (v0.23.0), exactly as the constructor would: ``merge(ttl="1h30m")``
-        stores a duration and sets ``ttl`` to ``timedelta(hours=1, minutes=30)``. ``None`` and a
-        ``SurrealFunc`` are written as given.
+        as that field's type and constraints first (v0.23.0): ``merge(ttl="1h30m")`` stores a
+        duration and sets ``ttl`` to ``timedelta(hours=1, minutes=30)``. ``None`` and a
+        ``SurrealFunc`` are written as given, and so are, as in v0.22.2, a ``float`` for a ``Decimal``
+        (``9.99f``: a float filter still finds it) and any value of a field the model validates with
+        code of its own (a ``@field_validator``, a ``@model_validator(mode="before")``, an
+        ``Annotated`` validator), which its type alone could refuse.
 
         A field typed with a sub-model that holds a rich type (``profile: Profile | None``) takes a
         dict or an instance. A **dict** changes only the keys it names: each key is resolved to a
@@ -2306,7 +2508,10 @@ class BaseSurrealModel(BaseModel):
         keys for one sub-field raise); on one that validates by name only, under the name. A dict
         under a sub-model sub-field goes the same way, and nothing else is sent — SurrealDB's MERGE
         keeps the other stored keys, so a required sub-field need not be repeated; an array is
-        replaced whole; an unknown key is sent as given. With ``server_values`` the statement is an
+        replaced whole; an unknown key is sent as given. So does a dict MERGE merges anywhere else,
+        as in v0.22.2: a value of a ``dict[str, Profile]`` (``merge(contacts={"a": {"seen": now}})``
+        keeps the stored ``contacts.a.name``), each of its values converted as a ``Profile``; a dict
+        for a union of models (``Card | Cash``) is sent as given. With ``server_values`` the statement is an
         ``UPDATE … SET``, which replaces each field it assigns: a sub-model dict is compiled into
         one assignment per key (``profile.city = $…``, nested for a dict under a sub-model
         sub-field), so the other stored keys stay there too, and each key must be an identifier.
@@ -2318,12 +2523,12 @@ class BaseSurrealModel(BaseModel):
         Sent as ``MERGE``, which merges objects at every depth (and replaces an array whole), a
         value also removes the aliases a read takes before the name of every sub-field of each
         sub-model **instance** it holds at an object position (:func:`_with_removals`): the field
-        itself, the values of a ``dict[str, Profile]``, the union member the validation chose
-        (``Profile | Other``, by the class of the instance), a sub-model's sub-fields — at any
-        depth, never inside an array. So ``merge(contacts={"a": {"firstName": "Annie"}})``, which
-        a ``dict[str, Profile]`` validates into a ``Profile``, is sent as
+        itself, the values of a ``dict[str, Profile]``, a union member (``Profile | Other``, by the
+        class of the instance), a sub-model's sub-fields — at any depth, never inside an array. So
+        ``merge(contacts={"a": Profile(first_name="Annie")})`` is sent as
         ``{"a": {"first_name": "Annie", …, "firstName": None, …}}``, and a v0.22 row's
-        ``contacts.a.firstName`` no longer hides it. It never removes a key the object sent writes
+        ``contacts.a.firstName`` no longer hides it; a dict removes nothing (it keeps the caller's
+        keys, as in v0.22). It never removes a key the object sent writes
         (the alias, for a sub-model with ``serialize_by_alias=True``), nor a spelling of a
         sub-field that object omits (``exclude=True``: the stored value stays). ``server_values``
         assigns such a field whole, which needs none.

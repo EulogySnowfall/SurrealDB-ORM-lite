@@ -42,9 +42,20 @@ from uuid import UUID
 import pytest
 import pytest_asyncio
 import surrealdb
-from pydantic import AliasChoices, AwareDatetime, BaseModel, ConfigDict, Field, PastDate, ValidationError
+from pydantic import (
+    AliasChoices,
+    AwareDatetime,
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    PastDate,
+    ValidationError,
+    field_validator,
+)
 from pydantic.alias_generators import to_camel
 from surrealdb import RecordID
+from surrealdb.data.types.geometry import GeometryPoint
 
 from surreal_orm_lite import (
     AuthenticatedUserMixin,
@@ -1866,11 +1877,16 @@ class TestSubModelKeywordValues:
             ("plains", (plain,), r"list\[RfPlain\]"),
             ("plain_map", {"a": plain}, r"dict\[str, RfPlain\]"),
         ):
+            if context == "merge" and field == "plain_map":
+                continue  # merge() takes a dict value by value: below
             with pytest.raises(
                 ValueError,
                 match=rf"^{context}\({field}=…\): .* is not a valid {label} .*; a table-model instance in it is written as its record id",
             ):
                 coerce(field, value, context=context)
+        if context == "merge":  # MERGE merges the dict into the stored one: each value is checked as RfPlain
+            with pytest.raises(ValueError, match=r"^merge\(plain_map\.a=…\): the RfPlain instance is written as its record id"):
+                coerce("plain_map", {"a": plain}, context=context)
         alice = RfPerson(id="alice")
         assert coerce("links", [alice], context=context) == [RecordID("rf_person", "alice")]
         given = [{"name": "x"}]
@@ -2745,9 +2761,8 @@ class TestMergeRemovalsAtObjectPositions:
     field, no database. SurrealDB's MERGE merges an object into the stored one at every depth and
     replaces an array whole, so each sub-model instance at an object position is sent with the aliases
     a read takes before its names as ``None`` (NONE: the key is removed), as an instance given to a
-    sub-model field is. A dict given to a field typed by the sub-model itself keeps the caller's keys,
-    as in v0.22.2 (``TestMergeDictKeysAsGiven``); a dict a rich field validates into an instance (a
-    ``dict[str, Profile]`` value, a union member) is that instance."""
+    sub-model field is. A dict at such a position changes only the keys it names and keeps the
+    caller's keys, as in v0.22.2 (``TestMergeDictKeysAsGiven``, ``TestMergePartialObjects``)."""
 
     @pytest.fixture
     def client(self, monkeypatch: pytest.MonkeyPatch) -> _CapturingClient:
@@ -2760,6 +2775,9 @@ class TestMergeRemovalsAtObjectPositions:
         return fake
 
     async def test_dicts_unions_and_nested_dicts(self, client: _CapturingClient) -> None:
+        """A dict is merged as given, key by key — a ``dict[str, Profile]`` value, a dict under a
+        sub-model's dict, a table-model class's dict; a union member's dict whole, as given (which
+        member it belongs to is unknown) —, so it removes nothing. An array is replaced whole."""
         person = RfNamedDeep(id="x")
         await person.merge(
             refresh=False,
@@ -2770,18 +2788,17 @@ class TestMergeRemovalsAtObjectPositions:
             crowd=[{"firstName": "Annie"}],
         )
         assert client.sent == {
-            "contacts": {"a": {"first_name": "Annie", "seen_at": None, **_REMOVED}},
-            "either": {"first_name": "Annie", "seen_at": None, **_REMOVED},
-            "circle": {"members": {"a": {"first_name": "Annie", "seen_at": None, **_REMOVED}}},
-            # A table-model class validated from the caller's dict is written as an object.
-            "owners": {"a": {"id": None, "since": None, "label": "Annie", "Label": None}},
+            "contacts": {"a": {"firstName": "Annie"}},
+            "either": {"first_name": "Annie"},
+            "circle": {"members": {"a": {"firstName": "Annie"}}},
+            "owners": {"a": {"label": "Annie"}},
             "crowd": [{"first_name": "Annie", "seen_at": None}],  # an array is replaced whole
         }
-        # The local apply takes the values merged, never a removal.
-        assert person.contacts == {"a": RfCamelDated(first_name="Annie")}
-        assert person.either == RfCamelDated(first_name="Annie")
-        assert person.circle == {"members": {"a": RfCamelDated(first_name="Annie")}}
-        assert person.owners == {"a": {"id": None, "since": None, "label": "Annie"}}
+        # The local apply takes the values merged.
+        assert person.contacts == {"a": {"firstName": "Annie"}}
+        assert person.either == {"first_name": "Annie"}
+        assert person.circle == {"members": {"a": {"firstName": "Annie"}}}
+        assert person.owners == {"a": {"label": "Annie"}}
         assert person.crowd == [RfCamelDated(first_name="Annie")]
 
     async def test_instances(self, client: _CapturingClient) -> None:
@@ -2803,7 +2820,7 @@ class TestMergeRemovalsAtObjectPositions:
     async def test_server_values_assign_them_whole(self, client: _CapturingClient) -> None:
         """``UPDATE … SET`` replaces each field it assigns: a dict field is assigned whole, no removal."""
         await RfNamedDeep(id="x").merge(refresh=False, server_values=_BUMP, contacts={"a": {"firstName": "Annie"}})
-        assert {"a": {"first_name": "Annie", "seen_at": None}} in client.calls[-1].values()
+        assert {"a": {"firstName": "Annie"}} in client.calls[-1].values()
 
     async def test_an_instance_dumped_by_alias_keeps_the_keys_it_writes(self, client: _CapturingClient) -> None:
         """``serialize_by_alias=True``: the dump writes the aliases, which are also the keys a read
@@ -2816,10 +2833,14 @@ class TestMergeRemovalsAtObjectPositions:
         await holder.merge(refresh=False, profile=annie)
         assert client.sent == {"profile": sent}
 
-        for contact in ({"firstName": "Annie", "homeAddr": {"zipCode": "2"}}, annie):
-            await holder.merge(refresh=False, contacts={"a": contact})
-            assert client.sent == {"contacts": {"a": sent}}
-            assert holder.contacts == {"a": annie}
+        await holder.merge(refresh=False, contacts={"a": annie})
+        assert client.sent == {"contacts": {"a": sent}}
+        assert holder.contacts == {"a": annie}
+        # A dict merged into a dict's value keeps the caller's keys, as in v0.22.2.
+        contact = {"firstName": "Annie", "homeAddr": {"zipCode": "2"}}
+        await holder.merge(refresh=False, contacts={"a": contact})
+        assert client.sent == {"contacts": {"a": contact}}
+        assert holder.contacts == {"a": contact}
 
         # A dict for the field itself keeps the caller's keys, as in v0.22.2 (TestMergeDictKeysAsGiven).
         await holder.merge(refresh=False, profile={"firstName": "Annie"})
@@ -2836,65 +2857,91 @@ class TestMergeRemovalsAtObjectPositionsE2E:
     """A v0.22 row whose objects hold both spellings, at the object positions
     ``TestMergeRemovalsAtObjectPositions`` covers, on both lines. v0.22's ``merge()`` stored a dict's
     keys as given, so ``save()`` then ``merge(contacts={"a": {"firstName": "Anna"}})`` left
-    ``{"first_name": "Ann", "firstName": "Anna"}``; a sub-model instance writes the name (here, the
-    instances a rich field validates the caller's dicts into too), and without the removal every later
-    merge of that sub-field was hidden behind the alias and lost without an error."""
+    ``{"first_name": "Ann", "firstName": "Anna"}``; a sub-model instance writes the name, and without
+    the removal every later merge of that sub-field was hidden behind the alias and lost without an
+    error. A dict is still merged as given, as in v0.22.2."""
 
-    @pytest.mark.parametrize("given", ["dict", "instance"])
-    @pytest.mark.parametrize("mode", ["merge", "no-refresh", "transaction"])
-    async def test_a_v022_row_with_both_spellings(self, mode: str, given: str) -> None:
-        async with orm_client("rf_named_deep") as client:
-            both = {"first_name": "Ann", "firstName": "Anna"}
-            await client.query(
-                "CREATE $rid CONTENT $row;",
-                {
-                    "rid": RecordID("rf_named_deep", "v"),
-                    "row": {
-                        "n": 0,
-                        "contacts": {"a": both, "b": {"first_name": "Bob"}},
-                        "either": both,
-                        "circle": {"members": {"a": both}},
-                        "owners": {"a": {"label": "Ann", "Label": "Anna"}},
-                        "crowd": [both],
-                    },
+    @staticmethod
+    async def _v022_row(client: Any) -> RfNamedDeep:
+        both = {"first_name": "Ann", "firstName": "Anna"}
+        await client.query(
+            "CREATE $rid CONTENT $row;",
+            {
+                "rid": RecordID("rf_named_deep", "v"),
+                "row": {
+                    "n": 0,
+                    "contacts": {"a": both, "b": {"first_name": "Bob"}},
+                    "either": both,
+                    "circle": {"members": {"a": both}},
+                    "owners": {"a": {"label": "Ann", "Label": "Anna"}},
+                    "crowd": [both],
                 },
-            )
-            person = await RfNamedDeep.objects().get("v")
-            assert person.contacts["a"].first_name == "Anna"  # the alias, under v0.22 and v0.23.0 alike
-            assert person.either == RfCamelDated(first_name="Anna")
+            },
+        )
+        person = await RfNamedDeep.objects().get("v")
+        assert person.contacts["a"].first_name == "Anna"  # the alias, under v0.22 and v0.23.0 alike
+        assert person.either == RfCamelDated(first_name="Anna")
+        return person
 
+    @staticmethod
+    async def _merge(person: RfNamedDeep, mode: str, change: dict[str, Any]) -> None:
+        if mode == "transaction":
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await person.merge(tx=tx, **change)
+        else:
+            await person.merge(refresh=mode == "merge", **change)
+
+    @pytest.mark.parametrize("mode", ["merge", "no-refresh", "transaction"])
+    async def test_a_v022_row_with_both_spellings(self, mode: str) -> None:
+        async with orm_client("rf_named_deep") as client:
+            person = await self._v022_row(client)
             annie = RfCamelDated(first_name="Annie")
-            change: dict[str, Any] = {
-                "contacts": {"a": {"firstName": "Annie"}},
-                "either": {"first_name": "Annie"},
-                "circle": {"members": {"a": {"firstName": "Annie"}}},
-                "owners": {"a": {"label": "Annie"}},
-                "crowd": [{"first_name": "Annie"}],
-            }
-            if given == "instance":  # an RfAliasedOwner instance would be its record id
-                change.update(contacts={"a": annie}, either=annie, circle=RfCircle(members={"a": annie}), crowd=[annie])
-            if mode == "transaction":
-                async with SurrealDBConnectionManager.transaction() as tx:
-                    await person.merge(tx=tx, **change)
-            else:
-                await person.merge(refresh=mode == "merge", **change)
+            await self._merge(
+                person,
+                mode,
+                {"contacts": {"a": annie}, "either": annie, "circle": RfCircle(members={"a": annie}), "crowd": [annie]},
+            )
 
             row = await _raw("v", "rf_named_deep")
             assert row["contacts"] == {"a": {"first_name": "Annie"}, "b": {"first_name": "Bob"}}
             assert row["either"] == {"first_name": "Annie"}
             assert row["circle"] == {"members": {"a": {"first_name": "Annie"}}}
-            assert row["owners"] == {"a": {"label": "Annie"}}
             loaded = await RfNamedDeep.objects().get("v")
             assert (loaded.contacts, loaded.either) == ({"a": annie, "b": RfCamelDated(first_name="Bob")}, annie)
             assert (loaded.circle, loaded.crowd) == (RfCircle(members={"a": annie}), [annie])
-            assert loaded.owners["a"].label == "Annie"
 
             # The instance holds the value merged: the row it was resynced from, or the values applied
             # locally (refresh=False, a buffered transaction on 2.x), which hold no removal.
             assert RfCamelDated.model_validate(person.contacts["a"]) == annie
             assert RfCamelDated.model_validate(person.either) == annie
             assert RfCircle.model_validate(person.circle) == RfCircle(members={"a": annie})
-            assert RfAliasedOwner.model_validate(person.owners["a"]).label == "Annie"
+            await _assert_client_usable(client)
+
+    @pytest.mark.parametrize("mode", ["merge", "no-refresh", "transaction"])
+    async def test_dicts_are_merged_as_given(self, mode: str) -> None:
+        """Each dict is merged with the caller's keys, as v0.22.2 did: a key a read takes first
+        (``firstName``) gives the value merged, a name next to a stored alias stays behind it."""
+        async with orm_client("rf_named_deep") as client:
+            person = await self._v022_row(client)
+            change = {
+                "contacts": {"a": {"firstName": "Annie"}},
+                "either": {"first_name": "Annie"},
+                "circle": {"members": {"a": {"firstName": "Annie"}}},
+                "owners": {"a": {"label": "Annie"}},
+                "crowd": [{"first_name": "Annie"}],
+            }
+            await self._merge(person, mode, change)
+
+            row = await _raw("v", "rf_named_deep")
+            assert row["contacts"] == {"a": {"first_name": "Ann", "firstName": "Annie"}, "b": {"first_name": "Bob"}}
+            assert row["either"] == {"first_name": "Annie", "firstName": "Anna"}
+            assert row["circle"] == {"members": {"a": {"first_name": "Ann", "firstName": "Annie"}}}
+            assert row["owners"] == {"a": {"label": "Annie", "Label": "Anna"}}
+            loaded = await RfNamedDeep.objects().get("v")
+            annie = RfCamelDated(first_name="Annie")
+            assert (loaded.contacts["a"], loaded.circle, loaded.crowd) == (annie, RfCircle(members={"a": annie}), [annie])
+            assert loaded.either == RfCamelDated(first_name="Anna")  # behind the stored alias
+            assert loaded.owners["a"].label == "Anna"
             await _assert_client_usable(client)
 
     async def test_schemafull_takes_the_removals(self) -> None:
@@ -2919,7 +2966,7 @@ class TestMergeRemovalsAtObjectPositionsE2E:
             person = RfNamedDeep(id="s", contacts={"a": RfCamelDated(first_name="Ann")})
             await person.save()
             at = datetime(2026, 1, 2, tzinfo=UTC)
-            await person.merge(contacts={"b": {"firstName": "Bob", "seenAt": at}}, either={"firstName": "E"})
+            await person.merge(contacts={"b": RfCamelDated(first_name="Bob", seen_at=at)}, either=RfCamelDated(first_name="E"))
             row = await _raw("s", "rf_named_deep")
             assert row["contacts"] == {"a": {"first_name": "Ann"}, "b": {"first_name": "Bob", "seen_at": at}}
             assert row["either"] == {"first_name": "E"}
@@ -2964,7 +3011,10 @@ class TestMergeRemovalsAtObjectPositionsE2E:
             row = await _raw("k", "rf_dumped")
             stored = {"firstName": "Annie", "homeAddr": {"zip_code": "2"}, "secretNote": "keep"}
             assert row["profile"] == stored
-            assert row["contacts"] == {"a": stored}
+            if given == "dict":  # merged with the caller's keys, as in v0.22.2
+                assert row["contacts"] == {"a": {**stored, "homeAddr": {"zipCode": "2"}}}
+            else:
+                assert row["contacts"] == {"a": stored}
             loaded = await RfDumped.objects().get("k")
             assert loaded.profile is not None
             for sub in (loaded.profile, loaded.contacts["a"]):
@@ -3576,7 +3626,7 @@ class TestTableInstanceInPlainFieldsE2E:
                 "patch-field": lambda: person.patch([{"op": "replace", "path": "/plains", "value": [plain]}]),
                 "queryset-patch": lambda: RfPerson.objects().filter(n=5).patch(add),
             }
-            with pytest.raises(ValueError, match=r"\(/?plain(s|_map)[-/0-9]*=…\): .*record id"):
+            with pytest.raises(ValueError, match=r"\(/?plain(s|_map)(\.a)?[-/0-9]*=…\): .*record id"):
                 await calls[write]()
 
             row = await _raw("q", "rf_person")
@@ -4113,3 +4163,331 @@ class TestRichAuthE2E:
             _assert_sdk_duration(record["trial"], _TWO_WEEKS_NS)
             assert isinstance(record["credit"], Decimal)
             assert record["credit"] == Decimal(1000)
+
+
+# ==================== Keyword writes and filters as v0.22.2 sent them ====================
+
+
+class RfContact(BaseModel):
+    name: str
+    seen: datetime | None = None
+
+
+class RfContactDefault(BaseModel):
+    name: str = "anon"
+    seen: datetime | None = None
+
+
+class RfCard(BaseModel):
+    holder: str = "?"
+    exp: datetime | None = None
+
+
+class RfCash(BaseModel):
+    amount: int = 0
+
+
+class RfBook(BaseModel):
+    contacts: dict[str, RfContactDefault] = {}
+
+
+class RfLedger(BaseSurrealModel):
+    """Sub-models MERGE reaches through another object position than a sub-model field: a value of a
+    ``dict[str, Model]``, a member of a union of models, a ``dict`` under a sub-model."""
+
+    model_config = SurrealConfigDict(table_name="rf_ledger")
+
+    id: str | None = None
+    contacts: dict[str, RfContact] = {}
+    pay: RfCard | RfCash | None = None
+    book: RfBook | None = None
+    n: int = 0
+
+
+_T1 = datetime(2026, 1, 1, tzinfo=UTC)
+_T2 = datetime(2026, 2, 2, tzinfo=UTC)
+
+
+async def _saved_ledger() -> RfLedger:
+    ledger = RfLedger(
+        id="l",
+        contacts={"a": RfContact(name="Ann", seen=_T1), "b": RfContact(name="Bob")},
+        pay=RfCard(holder="Ann", exp=_T1),
+        book=RfBook(contacts={"k": RfContactDefault(name="Kim", seen=_T1)}),
+    )
+    await ledger.save()
+    return ledger
+
+
+class TestMergePartialObjectsE2E:
+    """A ``merge()`` dict changes only the keys it names wherever MERGE merges it into a stored object,
+    as in v0.22.2, on both lines: never validated as a whole sub-model, which asked for a required
+    sub-field the caller left out, or wrote a default over the stored value."""
+
+    @pytest.mark.parametrize("mode", ["merge", "no-refresh", "transaction"])
+    async def test_partial_dicts_keep_the_other_stored_keys(self, mode: str) -> None:
+        async with orm_client("rf_ledger") as client:
+            ledger = await _saved_ledger()
+            change: dict[str, Any] = {
+                "contacts": {"a": {"seen": _T2}},  # RfContact.name is required
+                "pay": {"exp": _T2},  # a member of a union of models
+                "book": {"contacts": {"k": {"seen": _T2}}},  # RfContactDefault.name has a default
+            }
+            if mode == "transaction":
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await ledger.merge(tx=tx, **change)
+            else:
+                await ledger.merge(refresh=mode == "merge", **change)
+
+            row = await _raw("l", "rf_ledger")
+            assert row["contacts"] == {"a": {"name": "Ann", "seen": _T2}, "b": {"name": "Bob"}}
+            assert row["pay"] == {"holder": "Ann", "exp": _T2}
+            assert row["book"] == {"contacts": {"k": {"name": "Kim", "seen": _T2}}}
+            loaded = await RfLedger.objects().get("l")
+            assert loaded.contacts == {"a": RfContact(name="Ann", seen=_T2), "b": RfContact(name="Bob")}
+            assert loaded.pay == RfCard(holder="Ann", exp=_T2)
+            assert loaded.book == RfBook(contacts={"k": RfContactDefault(name="Kim", seen=_T2)})
+            await _assert_client_usable(client)
+
+    async def test_update_or_create_merges_the_defaults(self) -> None:
+        async with orm_client("rf_ledger") as client:
+            await _saved_ledger()
+            _obj, created = await RfLedger.objects().update_or_create(
+                id="l", defaults={"contacts": {"a": {"seen": _T2}}, "pay": {"exp": _T2}}
+            )
+            assert created is False
+            row = await _raw("l", "rf_ledger")
+            assert row["contacts"]["a"] == {"name": "Ann", "seen": _T2}
+            assert row["pay"] == {"holder": "Ann", "exp": _T2}
+            await _assert_client_usable(client)
+
+    async def test_values_are_still_converted_and_checked(self) -> None:
+        """Each value of the dict is validated as the sub-field it names (a string becomes a
+        datetime); ``None`` removes a key, as MERGE does with NONE; a value that does not fit is
+        refused before anything is sent, named by its path."""
+        async with orm_client("rf_ledger") as client:
+            ledger = await _saved_ledger()
+            await ledger.merge(contacts={"c": {"name": "Cy", "seen": "2026-02-02T00:00:00Z"}, "b": None})
+            row = await _raw("l", "rf_ledger")
+            assert row["contacts"] == {"a": {"name": "Ann", "seen": _T1}, "c": {"name": "Cy", "seen": _T2}}
+            with pytest.raises(ValueError, match=r"^merge\(contacts\.a\.seen=…\): 'someday' is not a valid datetime"):
+                await ledger.merge(contacts={"a": {"seen": "someday"}})
+            with pytest.raises(ValueError, match=r"^merge\(book\.contacts\.k\.seen=…\): 'someday'"):
+                await ledger.merge(book={"contacts": {"k": {"seen": "someday"}}})
+            assert (await _raw("l", "rf_ledger"))["contacts"] == row["contacts"]
+            await _assert_client_usable(client)
+
+
+class TestMergePartialObjects:
+    """What ``merge()`` sends for those dicts, no database."""
+
+    @pytest.fixture
+    def client(self, monkeypatch: pytest.MonkeyPatch) -> _CapturingClient:
+        fake = _CapturingClient()
+
+        async def get_client() -> _CapturingClient:
+            return fake
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+        return fake
+
+    async def test_only_the_callers_keys_are_sent(self, client: _CapturingClient) -> None:
+        ledger = RfLedger(id="l")
+        await ledger.merge(
+            refresh=False,
+            contacts={"a": {"seen": "2026-02-02T00:00:00Z"}},
+            pay={"exp": "2026-02-02"},
+            book={"contacts": {"k": {"seen": _T2}}},
+        )
+        assert client.sent == {
+            "contacts": {"a": {"seen": _T2}},
+            "pay": {"exp": "2026-02-02"},  # which member it belongs to is unknown: as given, as in v0.22.2
+            "book": {"contacts": {"k": {"seen": _T2}}},
+        }
+        # The local apply takes the dicts merged.
+        assert ledger.contacts == {"a": {"seen": _T2}}
+        assert ledger.pay == {"exp": "2026-02-02"}
+
+    async def test_an_instance_is_the_whole_sub_object(self, client: _CapturingClient) -> None:
+        await RfLedger(id="l").merge(refresh=False, contacts={"a": RfContact(name="Al")}, pay=RfCash(amount=3))
+        assert client.sent == {"contacts": {"a": {"name": "Al", "seen": None}}, "pay": {"amount": 3}}
+
+
+class RfSlashed(BaseSurrealModel):
+    """Fields the model validates with code of its own: the constructor takes ``"2026/03/04"`` and
+    ``"a,b"``, which their types alone refuse."""
+
+    model_config = SurrealConfigDict(table_name="rf_slashed")
+
+    id: str | None = None
+    at: datetime | None = None
+    tags: set[str] = set()
+    when: Annotated[datetime | None, BeforeValidator(lambda value: _slashed(value))] = None
+    n: int = 0
+
+    @field_validator("at", mode="before")
+    @classmethod
+    def _at_slashed(cls, value: Any) -> Any:
+        return _slashed(value)
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _split_tags(cls, value: Any) -> Any:
+        return set(value.split(",")) if isinstance(value, str) else value
+
+
+def _slashed(value: Any) -> Any:
+    if isinstance(value, str) and "/" in value:
+        return datetime.strptime(value, "%Y/%m/%d").replace(tzinfo=UTC)
+    return value
+
+
+class RfSlashedBadge(AuthenticatedUserMixin, BaseSurrealModel):
+    """Signs up and in with fields validated by the model's own code."""
+
+    model_config = SurrealConfigDict(
+        table_name="rf_slashed_badge", access_name="rf_slashed_badge_access", identifier_field="badge"
+    )
+
+    id: str | None = None
+    badge: UUID
+    password: str
+    joined: datetime | None = None
+
+    @field_validator("badge", mode="before")
+    @classmethod
+    def _unprefixed(cls, value: Any) -> Any:
+        return value.removeprefix("badge:") if isinstance(value, str) else value
+
+    @field_validator("joined", mode="before")
+    @classmethod
+    def _joined_slashed(cls, value: Any) -> Any:
+        return _slashed(value)
+
+
+_MARCH = datetime(2026, 3, 4, tzinfo=UTC)
+
+
+class TestOwnValidatorsE2E:
+    """A field the model validates with code of its own is written and filtered as given, as in
+    v0.22.2, on both lines: its type alone would refuse what the constructor accepts."""
+
+    async def test_merge_bulk_update_and_update_or_create(self) -> None:
+        async with orm_client("rf_slashed") as client:
+            row = RfSlashed(id="s", at="2026/01/02", tags="x,y")  # type: ignore[arg-type]
+            assert row.at == datetime(2026, 1, 2, tzinfo=UTC)
+            await row.save()
+            await row.merge(at="2026/03/04", tags="a,b", when="2026/03/04")
+            stored = await _raw("s", "rf_slashed")
+            assert (stored["at"], stored["tags"], stored["when"]) == ("2026/03/04", "a,b", "2026/03/04")
+            loaded = await RfSlashed.objects().get("s")
+            assert (loaded.at, loaded.tags, loaded.when) == (_MARCH, {"a", "b"}, _MARCH)
+            # The filter binds the value as given too, and finds what the write stored.
+            assert [str(found.id) for found in await RfSlashed.objects().filter(at="2026/03/04").exec()] == ["s"]
+
+            assert await RfSlashed.objects().filter(n=0).bulk_update(at="2026/05/06", tags="c") == 1
+            assert (await _raw("s", "rf_slashed"))["at"] == "2026/05/06"
+            assert (await RfSlashed.objects().get("s")).tags == {"c"}
+
+            _obj, created = await RfSlashed.objects().update_or_create(id="s", defaults={"at": "2026/07/08"})
+            assert created is False
+            assert (await RfSlashed.objects().get("s")).at == datetime(2026, 7, 8, tzinfo=UTC)
+            await _assert_client_usable(client)
+
+    async def test_signup_and_signin(self) -> None:
+        async with _auth_access(RfSlashedBadge) as client:
+            badge = f"badge:{_TOKEN}"
+            created = await RfSlashedBadge.signup(badge=badge, password=_AUTH_PASSWORD, joined="2026/03/04")
+            assert created.user.badge == _TOKEN
+            assert created.user.joined == _MARCH
+            again = await RfSlashedBadge.signin(badge=badge, password=_AUTH_PASSWORD)
+            assert again.user.get_id() == created.user.get_id()
+            await _assert_client_usable(client)
+
+
+class RfSdkTyped(BaseSurrealModel):
+    """Fields declared with the SDK's own dataclasses, and an untyped field holding them."""
+
+    model_config = SurrealConfigDict(table_name="rf_sdk_typed")
+
+    id: str | None = None
+    tok: surrealdb.Tokens | None = None
+    loc: GeometryPoint | None = None
+    wait: surrealdb.Duration | None = None
+    meta: dict[str, Any] = {}
+
+
+class TestSdkDataclassFieldsE2E:
+    """``save()`` writes a field declared with an SDK dataclass as v0.22.2 did, the object Pydantic
+    dumps, on both lines; only an untyped position gets an SDK duration, range or geometry back."""
+
+    async def test_tokens_are_written_as_their_object(self) -> None:
+        async with orm_client("rf_sdk_typed") as client:
+            tokens = surrealdb.Tokens(access="a.b.c", refresh="r")
+            await RfSdkTyped(id="t", tok=tokens, meta={"tok": tokens}).save()
+            row = await _raw("t", "rf_sdk_typed")
+            assert row["tok"] == {"access": "a.b.c", "refresh": "r"}
+            assert row["meta"] == {"tok": {"access": "a.b.c", "refresh": "r"}}
+            assert (await RfSdkTyped.objects().get("t")).tok == tokens
+            await _assert_client_usable(client)
+
+    async def test_a_v022_schema_takes_typed_geometry_and_duration(self) -> None:
+        async with orm_client("rf_sdk_typed") as client:
+            for statement in (
+                "DEFINE FIELD loc ON rf_sdk_typed TYPE option<object>;",
+                "DEFINE FIELD wait ON rf_sdk_typed TYPE option<object>;",
+            ):
+                await client.query(statement, {})
+            point = GeometryPoint(1.5, 2.5)
+            await RfSdkTyped(id="g", loc=point, wait=surrealdb.Duration(0)).save()
+            row = await _raw("g", "rf_sdk_typed")
+            assert row["loc"] == {"longitude": 1.5, "latitude": 2.5}
+            assert row["wait"] == {"elapsed": 0}
+            loaded = await RfSdkTyped.objects().get("g")
+            assert (loaded.loc, loaded.wait) == (point, surrealdb.Duration(0))
+            await loaded.update()  # a loaded record written whole: the same objects again
+            assert await _raw("g", "rf_sdk_typed") == row
+            await _assert_client_usable(client)
+
+    async def test_untyped_positions_keep_the_sdk_values(self) -> None:
+        async with orm_client("rf_sdk_typed") as client:
+            point = GeometryPoint(1.5, 2.5)
+            await RfSdkTyped(id="u", meta={"p": point, "d": surrealdb.Duration(5)}).save()
+            row = await _raw("u", "rf_sdk_typed")
+            assert row["meta"]["p"] == point
+            _assert_sdk_duration(row["meta"]["d"], 5)
+            await _assert_client_usable(client)
+
+
+class TestDecimalFloatsE2E:
+    """A ``float`` given for a ``Decimal`` field is written and filtered as given, as in v0.22.2, on
+    both lines: SurrealDB's ``9.99f = 9.99dec`` is false, so the ``Decimal`` would not find the floats
+    v0.22's keyword writes stored, nor be found by a float filter."""
+
+    async def test_filters_find_the_floats_v022_stored(self) -> None:
+        async with orm_client("rf_event") as client:
+            await client.query("CREATE rf_event:f SET price = 9.99f, n = 1;", {})  # what v0.22's merge() stored
+            await RfEvent(id="d", price=Decimal("9.99"), n=2).save()  # what save() stores
+            assert await _ids(price=9.99) == ["f"]
+            assert await _ids(price__lte=9.99) == ["d", "f"]
+            assert await _ids(price__gt=9.99) == []
+            assert await _ids(price__in=[9.99]) == ["f"]
+            assert await _ids(price=Decimal("9.99")) == ["d"]
+            assert await _ids(price="9.99") == ["d"]
+            assert await RfEvent.objects().filter(price=9.99).count() == 1
+            await _assert_client_usable(client)
+
+    async def test_keyword_writes_store_the_float(self) -> None:
+        async with orm_client("rf_event") as client:
+            first, second = RfEvent(id="m", n=1), RfEvent(id="b", n=2)
+            await first.save()
+            await second.save()
+            await first.merge(price=9.99)
+            assert await RfEvent.objects().filter(n=2).bulk_update(price=9.99) == 1
+            await RfEvent.objects().update_or_create(id="m", defaults={"price": 9.99, "n": 3})
+            for rid in ("m", "b"):
+                price = (await _raw(rid))["price"]
+                assert type(price) is float
+                assert price == 9.99
+            assert await _ids(price=9.99) == ["b", "m"]
+            await _assert_client_usable(client)

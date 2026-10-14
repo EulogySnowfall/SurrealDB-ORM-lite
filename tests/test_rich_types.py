@@ -27,10 +27,12 @@ import aiohttp
 import pytest
 import surrealdb
 from pydantic import (
+    AfterValidator,
     AliasChoices,
     AliasPath,
     AwareDatetime,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     FutureDate,
@@ -39,10 +41,13 @@ from pydantic import (
     PastDate,
     PastDatetime,
     ValidationError,
+    field_validator,
+    model_validator,
 )
 from surrealdb import TAG_DECIMAL_STRING, TAG_DURATION_COMPACT, AsyncSurreal, RecordID
 from surrealdb.cbor import CBORTag, undefined
 from surrealdb.data.cbor import encode as sdk_cbor_encode
+from surrealdb.data.types.geometry import GeometryCollection, GeometryPoint
 
 import surreal_orm_lite
 from surreal_orm_lite import (
@@ -66,7 +71,6 @@ from surreal_orm_lite.wire import (
     decimal_text,
     duration_ns,
     encode_wire,
-    exact_decimal,
     field_input,
     restore_native,
     rich_kinds,
@@ -1266,39 +1270,6 @@ class TestEncodeWire:
         with pytest.raises(ValueError, match="finite"):
             decimal_text(Decimal("NaN"))
 
-    @pytest.mark.parametrize(
-        ("value", "exact"),
-        [
-            (Decimal(0), True),
-            (Decimal("-0E-50"), True),
-            (Decimal("0E+50"), True),
-            (Decimal("1.50"), True),
-            (Decimal("1E+3"), True),
-            (Decimal("1." + "0" * 40), True),  # trailing zeros carry no value
-            (Decimal("0." + "0" * 27 + "1"), True),
-            (Decimal("-79228162514264337593543950335"), True),
-            (Decimal("7.9228162514264337593543950335"), True),
-            (Decimal("1E-29"), False),
-            (Decimal("1E-30"), False),
-            (Decimal("0." + "1" * 29), False),
-            (Decimal("7.9228162514264337593543950336"), False),
-            (Decimal("79228162514264337593543950336"), False),
-            (Decimal("1E+30"), False),
-            (Decimal("-1E+300"), False),
-            (Decimal("1E-1000000"), False),
-            (Decimal("NaN"), False),
-            (Decimal("-Infinity"), False),
-        ],
-        ids=str,
-    )
-    def test_exact_decimal(self, value: Decimal, exact: bool) -> None:
-        """A SurrealDB decimal as it stands: at most 28 fractional digits once trailing zeros are
-        dropped, a coefficient within 96 bits; what ``decimal_text`` sends unrounded and a live
-        literal inlines."""
-        assert exact_decimal(value) is exact
-        if exact:
-            assert Decimal(decimal_text(value)) == value
-
     def test_decimal_text_ignores_the_callers_context(self) -> None:
         import decimal
 
@@ -1700,6 +1671,7 @@ class _Loose(BaseModel):
     pair: tuple[Any, ...] = ()
     child: "_Loose | None" = None
     note: str = ""
+    tok: surrealdb.Tokens | None = None
 
 
 _Loose.model_rebuild()
@@ -1714,17 +1686,84 @@ class TestRestoreNative:
         assert result["x"] is raw
         assert dumped == {"x": {"elapsed": 5}}  # the dump is not mutated
 
-    def test_sdk_ranges_and_bounds_keep_inclusivity(self) -> None:
+    def test_sdk_ranges_keep_inclusivity(self) -> None:
         closed = SdkRange(BoundIncluded(1), BoundIncluded(5))
         half_open = SdkRange(None, BoundExcluded(5))
-        bound = BoundExcluded(3)
-        loose = _Loose(meta={"win": closed, "open": half_open, "bound": bound})
+        loose = _Loose(meta={"win": closed, "open": half_open})
         dumped = loose.model_dump()
         assert dumped["meta"]["win"] == {"begin": {"value": 1}, "end": {"value": 5}}  # what Pydantic does
         result = restore_native(dumped, loose)
         assert result["meta"]["win"] is closed
         assert result["meta"]["open"] is half_open
-        assert result["meta"]["bound"] is bound
+
+    def test_values_the_server_does_not_store_keep_their_dump(self) -> None:
+        """A bound on its own drops the WebSocket on both lines, and the SDK has no encoder for
+        ``surrealdb.Tokens`` (``BufferError``): their dumps are written, as in v0.22.2."""
+        tokens = surrealdb.Tokens(access="a.b.c", refresh="r")
+        loose = _Loose(meta={"bound": BoundExcluded(3), "tok": tokens}, items=[tokens], tok=tokens)
+        dumped = loose.model_dump()
+        result = restore_native(dumped, loose)
+        assert result is dumped
+        assert result["meta"] == {"bound": {"value": 3}, "tok": {"access": "a.b.c", "refresh": "r"}}
+        assert result["items"] == [{"access": "a.b.c", "refresh": "r"}]
+        assert result["tok"] == {"access": "a.b.c", "refresh": "r"}
+
+    def test_geometries_at_an_untyped_position(self) -> None:
+        point = GeometryPoint(1.5, 2.5)
+        collection = GeometryCollection(point)
+        loose = _Loose(meta={"p": point, "c": collection}, items=[point])
+        result = restore_native(loose.model_dump(), loose)
+        assert result["meta"]["p"] is point
+        assert result["meta"]["c"] is collection
+        assert result["items"][0] is point
+
+    def test_typed_positions_keep_their_dump(self) -> None:
+        """A field declared with an SDK dataclass stores what Pydantic dumps, as in v0.22.2: a
+        ``surrealdb.Duration`` field ``{"elapsed": …}`` (a zero included), a ``GeometryPoint`` field
+        ``{"longitude": …, "latitude": …}``, at every depth the annotation declares — only the untyped
+        positions get the SDK value back."""
+
+        class Typed(BaseModel):
+            model_config = ConfigDict(arbitrary_types_allowed=True)  # the SDK Range's bounds
+
+            wait: surrealdb.Duration | None = None
+            loc: GeometryPoint | None = None
+            path: list[GeometryPoint] = []
+            pair: tuple[surrealdb.Duration, Any] | None = None
+            spans: dict[str, SdkRange] = {}
+            either: surrealdb.Duration | int | None = None
+            loose: dict[str, Any] = {}
+            bare: dict = {}  # type: ignore[type-arg]
+
+        zero, five = surrealdb.Duration(0), surrealdb.Duration(5)
+        point = GeometryPoint(1.5, 2.5)
+        span = SdkRange(BoundIncluded(1), BoundExcluded(5))
+        typed = Typed(
+            wait=zero,
+            loc=point,
+            path=[point],
+            pair=(five, five),
+            spans={"s": span},
+            either=five,
+            loose={"d": five, "p": point},
+            bare={"d": five},
+        )
+        dumped = typed.model_dump()
+        result = restore_native(dumped, typed, read_keys=True)
+        assert result["wait"] == {"elapsed": 0}
+        assert result["loc"] == {"longitude": 1.5, "latitude": 2.5}
+        assert result["path"] == [{"longitude": 1.5, "latitude": 2.5}]
+        assert result["pair"][0] == {"elapsed": 5}
+        assert result["pair"][1] is five  # the Any item of a fixed-length tuple
+        assert result["spans"] == {"s": {"begin": {"value": 1}, "end": {"value": 5}}}
+        assert result["either"] == {"elapsed": 5}  # a union of several types is typed
+        assert result["loose"]["d"] is five
+        assert result["loose"]["p"] is point
+        assert result["bare"]["d"] is five
+        # Encoded as save() sends it: the dumps stay objects, a zero duration included.
+        encoded = encode_wire(result, stored=True)
+        assert encoded["wait"] == {"elapsed": 0}
+        assert encoded["loc"] == {"longitude": 1.5, "latitude": 2.5}
 
     def test_list_and_tuple_positions(self) -> None:
         first, second = surrealdb.Duration(1), surrealdb.Duration(2)
@@ -2096,17 +2135,21 @@ class TestTypedLookups:
         assert coerced.elapsed == 5400 * 10**9 + 1
         assert encoded == _tag14(5400, 1)
 
-    def test_decimal_from_float(self) -> None:
-        coerced, encoded = _one(price__lte=9.99)
+    def test_decimal_from_a_string_or_an_int(self) -> None:
+        coerced, encoded = _one(price__lte="9.99")
         assert type(coerced) is Decimal
         assert coerced == Decimal("9.99")
         assert encoded == _tag10("9.99")
+        coerced, encoded = _one(price__lte=10)
+        assert type(coerced) is Decimal
+        assert encoded == _tag10("10")
 
-    @pytest.mark.parametrize("value", [1e30, -1e30, 1e300, 1e-30, -5e-324, 1.2345678901234567e-20])
-    def test_float_without_an_exact_decimal_is_bound_as_given(self, value: float) -> None:
-        """A float whose ``Decimal`` is no SurrealDB decimal as it stands (beyond 96 bits, more than 28
-        fractional digits) is bound as given, as in v0.22.2: the server compares a float with a
-        decimal, where the conversion would raise (``1e30``) or round (``1e-30`` to ``0``)."""
+    @pytest.mark.parametrize("value", [9.99, 0.1, 2.5, 1e30, -1e30, 1e300, 1e-30, -5e-324, 1.2345678901234567e-20])
+    def test_a_float_is_bound_as_given(self, value: float) -> None:
+        """A float on a ``Decimal`` field is bound as given, as in v0.22.2 — never its ``Decimal``:
+        SurrealDB's ``9.99f = 9.99dec`` is false, so the converted value would no longer find the
+        floats v0.22's keyword writes stored (and a ``1e30`` would be refused, a ``1e-30`` rounded to
+        ``0``). An item of ``in``, and a live literal, alike."""
         from tests.test_rich_fields import RfEvent
 
         coerced, encoded = _one(price__lt=value)
@@ -2114,12 +2157,30 @@ class TestTypedLookups:
         assert coerced == value
         assert type(encoded) is float
         assert encoded == value
-        coerced, encoded = _one(price__in=[value, 2.5])
+        coerced, encoded = _one(price__in=[value, "2.5"])
         assert coerced == [value, Decimal("2.5")]
         assert type(coerced[0]) is float
         assert encoded == [value, _tag10("2.5")]
         live = RfEvent.objects().filter(price__gt=value)._compile_live(False)
         assert live == f"LIVE SELECT * FROM rf_event WHERE price > {value!r};"
+
+    def test_float_range_bounds_are_bound_as_given(self) -> None:
+        """Range membership on a ``Decimal`` field: a float bound stays a float, a string bound becomes
+        a ``Decimal`` — an ORM or an SDK range."""
+        for given in (
+            Range(BoundIncluded(1.5), BoundIncluded("9.99")),
+            SdkRange(BoundIncluded(1.5), BoundIncluded("9.99")),
+        ):
+            coerced, _encoded = _one(price__in=given)
+            assert isinstance(coerced, Range)
+            assert type(coerced.begin) is BoundIncluded
+            assert type(coerced.begin.value) is float
+            assert coerced.begin.value == 1.5
+            assert type(coerced.end.value) is Decimal
+        open_end = _one(price__in=Range(BoundExcluded(9.99), None))[0]
+        assert type(open_end.begin) is BoundExcluded
+        assert open_end.begin.value == 9.99
+        assert open_end.end is None
 
     def test_a_decimal_without_a_surrealdb_form_still_raises(self) -> None:
         """Only a float the caller passed is bound as given: a ``Decimal`` (or a string) beyond the
@@ -2311,6 +2372,14 @@ class _Constrained(surreal_orm_lite.BaseSurrealModel):
     meta: dict[str, Any] = {}
 
 
+class _DecimalBag(surreal_orm_lite.BaseSurrealModel):
+    model_config = surreal_orm_lite.SurrealConfigDict(table_name="rf_decimal_bag")
+
+    id: str | None = None
+    prices: list[Decimal] = []
+    by_key: dict[str, Decimal] = {}
+
+
 class TestKeywordWriteValues:
     """``_coerce_field_value``: a keyword value on a rich field is validated as the field (spec §4.6)."""
 
@@ -2352,6 +2421,27 @@ class TestKeywordWriteValues:
         same = timedelta(hours=1)
         assert coerce("ttl", same) == same
 
+    def test_a_float_for_a_decimal_is_sent_as_given(self) -> None:
+        """As in v0.22.2 (``9.99f = 9.99dec`` is false on the server): a float stays a float, at the top,
+        in a list, among a dict's values; an ``int`` and a string become a ``Decimal``. The field's
+        constraints still apply."""
+        from tests.test_rich_fields import RfEvent
+
+        price = RfEvent._coerce_field_value("price", 9.99, context="bulk_update")
+        assert type(price) is float
+        assert price == 9.99
+        assert type(RfEvent._coerce_field_value("price", "9.99")) is Decimal
+        assert type(RfEvent._coerce_field_value("price", 10)) is Decimal
+        assert _Constrained._coerce_field_value("price", 1.5) == 1.5
+        with pytest.raises(ValueError, match=r"merge\(price=…\): -1.5 is not a valid Decimal"):
+            _Constrained._coerce_field_value("price", -1.5)
+        prices = _DecimalBag._coerce_field_value("prices", [9.99, "1.5"])
+        assert prices == [9.99, Decimal("1.5")]
+        assert type(prices[0]) is float
+        by_key = _DecimalBag._coerce_field_value("by_key", {"a": 9.99, "b": 2})
+        assert by_key == {"a": 9.99, "b": Decimal(2)}
+        assert type(by_key["a"]) is float
+
     def test_aliased_field_by_name_and_column(self) -> None:
         assert _AliasedLookup._coerce_field_value("ttl", "1h") == timedelta(hours=1)
         assert _AliasedLookup._coerce_field_value("ttl_col", "1h") == timedelta(hours=1)
@@ -2380,6 +2470,121 @@ class TestKeywordWriteValues:
             RfEvent._coerce_field_value("ttls", ["soon"])
         with pytest.raises(ValueError, match=r"is not a valid Range\[int\]"):
             RfEvent._coerce_field_value("hours", "x..y")
+
+
+class _OwnFields(surreal_orm_lite.BaseSurrealModel):
+    """Fields validated by the model's own code, in each form Pydantic offers, and one that is not."""
+
+    model_config = surreal_orm_lite.SurrealConfigDict(table_name="rf_own_unit")
+
+    id: str | None = None
+    before: datetime | None = None
+    after: datetime | None = None
+    tagged: Annotated[datetime | None, AfterValidator(lambda value: value)] = None
+    ranged: Annotated[datetime | None, Field(description="x")] = None
+    deep: list[Annotated[datetime, BeforeValidator(lambda value: value)]] = []
+    plain: datetime | None = None
+
+    @field_validator("before", mode="before")
+    @classmethod
+    def _before(cls, value: Any) -> Any:
+        return value
+
+    @field_validator("after")
+    @classmethod
+    def _after(cls, value: Any) -> Any:
+        return value
+
+
+class _AllFieldsValidated(surreal_orm_lite.BaseSurrealModel):
+    model_config = surreal_orm_lite.SurrealConfigDict(table_name="rf_own_star")
+
+    id: str | None = None
+    at: datetime | None = None
+
+    @field_validator("*", mode="before")
+    @classmethod
+    def _every(cls, value: Any) -> Any:
+        return value
+
+
+class _WholeInputBefore(surreal_orm_lite.BaseSurrealModel):
+    model_config = surreal_orm_lite.SurrealConfigDict(table_name="rf_own_model")
+
+    id: str | None = None
+    at: datetime | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _whole(cls, data: Any) -> Any:
+        return data
+
+
+class _WholeInstanceAfter(surreal_orm_lite.BaseSurrealModel):
+    model_config = surreal_orm_lite.SurrealConfigDict(table_name="rf_own_after")
+
+    id: str | None = None
+    at: datetime | None = None
+
+    @model_validator(mode="after")
+    def _checked(self) -> "_WholeInstanceAfter":
+        return self
+
+
+class TestOwnValidators:
+    """A field the model validates with code of its own is written and bound as given, as in v0.22.2:
+    its type alone would refuse what that code accepts (``_validates_itself``)."""
+
+    def test_which_fields(self) -> None:
+        from surreal_orm_lite.model_base import _validates_itself
+
+        for name in ("before", "after", "tagged", "deep"):
+            assert _validates_itself(_OwnFields, name), name
+        for name in ("ranged", "plain", "undeclared"):
+            assert not _validates_itself(_OwnFields, name), name
+        assert _validates_itself(_AllFieldsValidated, "at")  # "*"
+        assert _validates_itself(_WholeInputBefore, "at")  # a model validator sees every field's input
+        assert not _validates_itself(_WholeInstanceAfter, "at")  # it checks the instance built
+
+    def test_the_orms_own_validators_do_not_count(self) -> None:
+        from surreal_orm_lite.model_base import _validates_itself
+        from tests.test_rich_fields import RfEvent, RfLink
+
+        assert not any(_validates_itself(RfEvent, name) for name in RfEvent.model_fields)  # set_data
+        assert not any(_validates_itself(RfLink, name) for name in RfLink.model_fields)  # the endpoint check
+
+    def test_values_are_written_and_bound_as_given(self) -> None:
+        coerce = _OwnFields._coerce_field_value
+        for name in ("before", "after", "tagged"):
+            assert coerce(name, "2026/03/04") == "2026/03/04"
+            assert coerce(name, "2026/03/04", context="bulk_update") == "2026/03/04"
+        assert coerce("deep", ["2026/03/04"]) == ["2026/03/04"]
+        with pytest.raises(ValueError, match=r"merge\(plain=…\): '2026/03/04' is not a valid datetime"):
+            coerce("plain", "2026/03/04")
+        assert coerce("plain", "2026-03-04T00:00:00Z") == datetime(2026, 3, 4, tzinfo=UTC)
+        _sql, variables = _OwnFields.objects().filter(before="2026/03/04", plain__gt="2026-01-01")._build_where()
+        assert variables == {"_f0": "2026/03/04", "_f1": datetime(2026, 1, 1, tzinfo=UTC)}
+
+    def test_a_sub_models_own_validators(self) -> None:
+        """The sub-fields of a ``merge()`` dict follow the sub-model's validators."""
+
+        class Slashed(BaseModel):
+            at: datetime | None = None
+            plain: datetime | None = None
+
+            @field_validator("at", mode="before")
+            @classmethod
+            def _slashes(cls, value: Any) -> Any:
+                return value
+
+        class Holder(surreal_orm_lite.BaseSurrealModel):
+            model_config = surreal_orm_lite.SurrealConfigDict(table_name="rf_own_holder")
+
+            id: str | None = None
+            sub: Slashed | None = None
+
+        coerced = Holder._coerce_field_value("sub", {"at": "2026/03/04", "plain": "2026-03-04T00:00:00Z"})
+        assert coerced == {"at": "2026/03/04", "plain": datetime(2026, 3, 4, tzinfo=UTC)}
 
 
 class TestAtomicIncrementStatement:

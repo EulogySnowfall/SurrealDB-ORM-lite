@@ -840,7 +840,9 @@ class QuerySet:
         Args:
             **kwargs: Fields and values to update. A value addressed to a field with a rich type
                 is validated as that field first, like ``merge()``'s (v0.23.0):
-                ``bulk_update(ttl="2h")`` stores a duration. The ``SET`` replaces each field, so a
+                ``bulk_update(ttl="2h")`` stores a duration; as in v0.22.2, a ``float`` for a
+                ``Decimal`` and any value of a field the model validates with code of its own (a
+                ``@field_validator``…) are sent as given. The ``SET`` replaces each field, so a
                 dict for a sub-model field is validated as the **whole** sub-model (a missing
                 required sub-field raises, unlike ``merge()``'s key-by-key dict). A table-model
                 instance is written as its record id: a value holding one (at the top, in a list
@@ -1049,7 +1051,8 @@ class QuerySet:
         ``SurrealDbError`` (unless the model sets ``extra="allow"``), and a missing required
         field raises ``ValidationError`` at construction. Both branches validate a value written
         to a field with a rich type (v0.23.0) — the constructor on create, ``merge()`` on update —
-        so ``defaults={"ttl": "3h"}`` stores a duration either way.
+        so ``defaults={"ttl": "3h"}`` stores a duration either way. On update a ``defaults`` dict
+        for an object changes only the keys it names (MERGE), as in v0.22.2.
 
         On an edge model (v0.22.0) the endpoints are lookup criteria, never data:
         ``update_or_create(in_=a, out=b, defaults={"weight": 3})`` finds or relates ``a -> b``

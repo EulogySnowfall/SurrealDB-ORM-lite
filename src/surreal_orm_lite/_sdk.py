@@ -53,6 +53,8 @@ def _first_of(attr: str, *modules: str, required: bool = True) -> Any:
 if TYPE_CHECKING:
     from surrealdb.data.cbor import decode as cbor_decode
     from surrealdb.data.cbor import encode as cbor_encode
+    from surrealdb.data.types.geometry import Geometry as SdkGeometry
+    from surrealdb.data.types.geometry import GeometryCollection as SdkGeometryCollection
     from surrealdb.data.types.range import Bound, BoundExcluded, BoundIncluded
     from surrealdb.errors import InvalidDurationError as SdkInvalidDurationError
 else:
@@ -65,6 +67,10 @@ else:
     # ``None`` when the installed SDK has no such class: the ORM's class then derives from
     # ``ValueError`` alone (``exceptions.py``).
     SdkInvalidDurationError = _first_of("InvalidDurationError", "surrealdb", "surrealdb.errors", required=False)
+    # The SDK's geometries, which ``wire.restore_native`` puts back at an untyped position: the base
+    # class of all but the collection. ``None`` when the installed SDK has no such class.
+    SdkGeometry = _first_of("Geometry", "surrealdb", "surrealdb.data.types.geometry", required=False)
+    SdkGeometryCollection = _first_of("GeometryCollection", "surrealdb", "surrealdb.data.types.geometry", required=False)
 
 __all__ = [
     "AsyncSurreal",
@@ -87,4 +93,6 @@ __all__ = [
     "cbor_encode",
     "cbor_decode",
     "SdkInvalidDurationError",
+    "SdkGeometry",
+    "SdkGeometryCollection",
 ]
