@@ -61,8 +61,10 @@ step. The first minor of Tier 2.
 - **`Range[T]`**: a SurrealDB range whose sides are the SDK's `BoundIncluded`/`BoundExcluded` (now
   exported by the ORM) or `None` for an open side; the SDK's own spellings of an open side
   (`Bound()`, `surrealdb.cbor.undefined`, a CBOR null) are accepted too. `str()` is the SurrealQL
-  literal (`9..17`, `1>..=5`, `65..`). As a field it validates each bound value as `T` and accepts
-  the SDK's `Range`, a builtin `range` with step 1 and the literal text; in JSON it is that text.
+  range text (`9..17`, `1>..=5`, `65..`), which a `Range` field reads back, and which writes every
+  bound exactly, including values a live-query filter refuses. As a field it validates each bound
+  value as `T` and accepts the SDK's `Range`, a builtin `range` with step 1 and that text; in JSON
+  it is that text.
 - **`in`/`not_in` with a `Range`** (the ORM's or the SDK's) bind it as one value (`hour IN $_f0`)
   instead of refusing it as a non-iterable; a builtin `range` keeps its meaning, the list of its
   integers. On the record-id column `id` and on an edge's `in`/`out` columns it raises
