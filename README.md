@@ -2147,7 +2147,8 @@ Sub-models and table models in keyword writes:
   `ValueError` before anything is sent. A server value for the same field wins over the dict.
 - An instance is the whole sub-object, written as `save()` writes it:
   `merge(profile=Profile(city="y"))` removes a stored `bday`, and the aliases a read would take
-  instead of a sub-field's name (see below).
+  instead of a sub-field's name, as an instance does wherever `merge()` holds one outside an
+  array (see below).
 - `bulk_update()` and `signup()` replace the field, so a dict is validated there as the whole
   sub-model: a missing required sub-field raises `ValueError`.
 - Each sub-field is written under the key a read takes it from, by `save()`, `update()`,
@@ -2171,12 +2172,19 @@ Sub-models and table models in keyword writes:
   - This differs from the full SurrealDB-ORM, whose `model_dump(by_alias=True)` writes every
     aliased sub-field under its alias. A row that holds both spellings of a sub-field is read by
     the alias first, Pydantic's priority. v0.22's `merge()` left such rows (see
-    [Upgrading from v0.22](#upgrading-from-v022)). A `merge()` dict removes the alias of each
-    sub-field it names, and an instance those of every sub-field, so the value merged is the
-    value read. With `server_values=`, a dict's removal is a `profile.firstName = NONE`
-    assignment, which an alias that is not an identifier (`alias="home-town"`) cannot take: it
-    stays; an instance is assigned whole. An `update()` or `upsert()` rewrites the whole
-    sub-object with one key per sub-field.
+    [Upgrading from v0.22](#upgrading-from-v022)). `merge()` without `server_values=` runs
+    `MERGE`, which merges objects at every depth, so it removes those aliases wherever it merges
+    a sub-model into a stored object, and the value merged is the value read. A dict for a
+    sub-model field removes the alias of each sub-field it names. A sub-model instance removes
+    those of all its sub-fields, wherever it sits outside an array: the field itself, the values
+    of a `dict[str, Profile]`, the member of a union (`Profile | Other`) the value was validated
+    as, a sub-model's own sub-fields. On a field with a rich type your dicts there are validated
+    into instances, so `merge(contacts={"a": {"firstName": "Annie"}})` removes
+    `contacts.a.firstName`; elsewhere such a dict is sent as given, as in v0.22. Inside an array
+    nothing is removed: `MERGE` replaces an array whole. With `server_values=`, a dict's removal
+    is a `profile.firstName = NONE` assignment, which an alias that is not an identifier
+    (`alias="home-town"`) cannot take: it stays; any other value is assigned whole. An `update()`
+    or `upsert()` rewrites the whole sub-object with one key per sub-field.
 - A table-model instance is written as its record id: `merge(author=alice)` stores alice's
   `RecordID`, in a raw query's variables too. On a declared field, rich or not, the value is
   checked at every position an instance can take (the value itself, a list or tuple item, a dict
@@ -2316,18 +2324,33 @@ ISO-8601 or UUID text.
 Sub-models that also validate by name (`populate_by_name=True`, `validate_by_name=True`): `save()`,
 `update()` and `upsert()` write each sub-field under its name, as v0.22 did. v0.22's `merge()`,
 though, stored a dict's keys as given, so `save()` then `merge(profile={"firstName": "Anna"})`
-left both spellings in the row: `{"first_name": "Ann", "firstName": "Anna"}`. A read takes the
-alias first and gives `"Anna"`, under v0.22 and v0.23.0 alike. v0.23.0's `merge()` writes the name
-and removes the aliases of each sub-field its dict names (of every sub-field for an instance), so
-such a row reads the value merged. A sub-field a merge dict does not name keeps both keys until an
-`update()` or `upsert()` rewrites the sub-object. To find these rows, and to keep the value a read
-gives under the name only (one statement per table and per aliased sub-field, on both lines):
+left both spellings in the row: `{"first_name": "Ann", "firstName": "Anna"}`. So did a dict merged
+into any other object: a value of a `dict[str, Profile]` field (`contacts.a`), a union member. A
+read takes the alias first and gives `"Anna"`, under v0.22 and v0.23.0 alike. v0.23.0's `merge()`
+writes the name and removes the aliases of each sub-model it merges into a stored object (see
+[Keyword writes](#keyword-writes-and-atomic_increment)): of each sub-field its dict names, of
+every sub-field of an instance, the instances a rich field validates your dicts into included
+(`merge(contacts={"a": {"firstName": "Annie"}})`). Such an object then reads the value merged. A
+sub-field no merge reaches keeps both keys until an `update()` or `upsert()` rewrites the
+sub-object; an array keeps them until it is written again. To find these rows, and to keep the
+value a read gives under the name only (one statement per table and per aliased sub-field, on both
+lines):
 
 ```surql
+-- A sub-model field, or a union of sub-models
 SELECT id, profile FROM person WHERE profile.firstName != NONE;
 UPDATE person SET profile.first_name = profile.firstName, profile.firstName = NONE
     WHERE profile.firstName != NONE;
+-- The values of a dict[str, Profile] field
+SELECT id, contacts FROM person WHERE object::values(contacts ?? {})[WHERE firstName != NONE] != [];
+UPDATE person MERGE {
+    contacts: object::from_entries(object::entries(contacts)[WHERE $this[1].firstName != NONE]
+        .map(|$e| [$e[0], { first_name: $e[1].firstName, firstName: NONE }]))
+} WHERE object::values(contacts ?? {})[WHERE firstName != NONE] != [];
 ```
+
+Reach a dict's values with `object::values()`: on 3.x, `contacts.*` is the object itself, so
+`contacts.*.firstName` finds nothing there.
 
 In a sub-model that validates by alias only, an aliased sub-field is now written under its alias.
 v0.22 wrote it under its name, which no read takes: a row written then still reads that sub-field
@@ -2547,7 +2570,7 @@ Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v
 | Integers beyond signed 64-bit                                                                                                               | raw: `2**63` silently wraps to `-2**63`, larger values are rejected (WebSocket lost). ORM: refused before sending (`ValueError`)                                                                                                                                               | same on both lines                                                                                                                                                                                                                                                                                                                              | v0.23.0 |
 | Native sets (`TYPE set<…>` column, `<set>` value) and `set[X]` fields                                                                       | an array, read back as a list (the ORM returns the declared set)                                                                                                                                                                                                               | 3.3.x: a native set (CBOR tag 56) the surrealdb SDK 2.0.0 cannot decode: HTTP `BufferError`, WebSocket `KeyError` and connection lost, also on the row a write returns. 3.1.5: a `set<…>` column refuses the array the ORM sends. On both lines `set[X]` fields work on schemaless tables and `array<…>` columns (the ORM sends sets as arrays) | v0.23.0 |
 | Sub-model dict in `merge(server_values=…)` (an `UPDATE … SET`)                                                                              | raw: `SET profile = {…}` replaces the stored object, and `object::extend` is a parse error. ORM: one `SET profile.city = $…` per key, so the other stored keys stay, as with `MERGE`                                                                                           | raw: `SET profile = {…}` replaces the stored object. ORM: same as 2.x (`object::extend` exists but is not used)                                                                                                                                                                                                                                 | v0.23.0 |
-| Sub-model key a `SCHEMAFULL` table does not declare (`DEFINE FIELD profile.first_name`, an object written with `firstName`)                 | raw: dropped silently, the object is stored without it. ORM: a sub-model that also validates by name is written under its names, as up to v0.22; for an alias-only sub-model, declare the aliases. NONE for an undeclared key (the alias a `merge()` dict removes) is accepted | raw: the write fails (`Found field 'profile.firstName', but no such field exists`), but NONE for that key is accepted, as on 2.x. ORM: same rules as 2.x                                                                                                                                                                                        | v0.23.0 |
+| Sub-model key a `SCHEMAFULL` table does not declare (`DEFINE FIELD profile.first_name`, an object written with `firstName`)                 | raw: dropped silently, the object is stored without it. ORM: a sub-model that also validates by name is written under its names, as up to v0.22; for an alias-only sub-model, declare the aliases. NONE for any undeclared key (an alias `merge()` removes) is accepted        | raw: the write fails (`Found field 'profile.firstName', but no such field exists`), but NONE for that key is accepted, as on 2.x. ORM: same rules as 2.x                                                                                                                                                                                        | v0.23.0 |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                          | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                                                                                                                    | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                                                                                                                                                                                     | v0.19.1 |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
