@@ -5,17 +5,18 @@ Every class here is E2E (suffixed ``E2E``) unless it says otherwise. Tables are 
 and created inside ``orm_client(...)``, which drops them before and after the test.
 """
 
+import asyncio
 import contextlib
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Annotated, Any, Optional
 from uuid import UUID
 
 import pytest
 import surrealdb
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 from surrealdb import RecordID
 from surrealdb.cbor import undefined
 
@@ -26,16 +27,21 @@ from surreal_orm_lite import (
     BoundExcluded,
     BoundIncluded,
     BufferedTransaction,
+    Computed,
+    Count,
     Duration,
     Range,
     SurrealConfigDict,
     SurrealDBConnectionManager,
     SurrealFunc,
+    computed,
     encoding,
 )
+from surreal_orm_lite.live import hydrate
+from tests._retry import retry_write
 from tests.conftest import orm_client
 from tests.test_model_auth import AUTH_PASSWORD, _connect, _unique_email
-from tests.test_rich_types import _http_client, _http_url
+from tests.test_rich_types import _http_client, _http_url, _server_version
 from tests.test_transactions import _native_txn_supported
 
 # --- shared fixtures (later tasks reuse them) ----------------------------------------------------
@@ -169,9 +175,9 @@ async def _auth_model(model: Any, scheme: str) -> AsyncIterator[Any]:
             await SurrealDBConnectionManager.unset_connection()
 
 
-async def _stored_user(email: str) -> dict[str, Any]:
+async def _stored_user(email: str, table: str = "rf_user") -> dict[str, Any]:
     root = await _http_client()
-    rows = await root.query("SELECT * FROM rf_user WHERE email = $e;", {"e": email})
+    rows = await root.query(f"SELECT * FROM {table} WHERE email = $e;", {"e": email})
     assert isinstance(rows, list) and len(rows) == 1, rows
     row: dict[str, Any] = rows[0]
     return row
@@ -253,18 +259,6 @@ async def _nodes() -> tuple[RfEvent, RfEvent]:
     return a, b
 
 
-@contextlib.contextmanager
-def _returned_ttl_not_read_yet() -> Iterator[None]:
-    """``bulk_create()`` wrote its rows; hydrating the rows it returns still refuses ``ttl``.
-
-    The server answers with an SDK ``Duration``, which a ``timedelta`` field accepts only once the
-    read rule for top-level ``timedelta`` fields (spec §6.3) is in place. That rule replaces this
-    pin with an assertion on the returned instances: this ``pytest.raises`` fails as soon as it lands.
-    """
-    with pytest.raises(ValidationError, match=r"ttl\n\s+Input should be a valid timedelta"):
-        yield
-
-
 async def _save_explicit_id() -> _Written:
     await RfEvent(id="w", **FULL).save()
     return _W, FULL
@@ -332,8 +326,11 @@ async def _atomic_append() -> _Written:
 
 
 async def _bulk_create() -> _Written:
-    with _returned_ttl_not_read_yet():
-        await RfEvent.objects().bulk_create([RfEvent(id="w", **FULL)])
+    [created] = await RfEvent.objects().bulk_create([RfEvent(id="w", **FULL)])
+    # The returned rows are hydrated through the model: the read rule gives ``ttl`` back as a timedelta.
+    assert isinstance(created, RfEvent)
+    assert type(created.ttl) is timedelta and created.ttl == FULL["ttl"]
+    assert type(created.day) is date and created.day == FULL["day"]
     return _W, FULL
 
 
@@ -365,8 +362,10 @@ async def _edge_save() -> _Written:
 
 async def _edge_bulk_create() -> _Written:
     await _nodes()
-    with _returned_ttl_not_read_yet():
-        await RfLink.objects().bulk_create([RfLink(id="w", in_=_A, out=_B, ttl=FULL["ttl"], day=FULL["day"])])
+    [created] = await RfLink.objects().bulk_create([RfLink(id="w", in_=_A, out=_B, ttl=FULL["ttl"], day=FULL["day"])])
+    assert isinstance(created, RfLink)
+    assert type(created.ttl) is timedelta and created.ttl == FULL["ttl"]
+    assert type(created.day) is date and created.day == FULL["day"]
     return RecordID("rf_link", "w"), _EDGE_KEYS
 
 
@@ -579,3 +578,520 @@ class TestAtomicIncrementGuardE2E:
             assert after["n"] == 7 and event.n == 7
             assert type(after["price"]) is Decimal and after["price"] == Decimal("14.75")
             assert after["ttl"] == before["ttl"] and after["grace"] == before["grace"]
+
+
+# --- the read path (spec §6.3, AC-17 … AC-21, AC-27 second half; D1) ----------------------------
+
+
+class _SubTimedelta(timedelta):
+    """A ``timedelta`` subclass: not exactly ``timedelta``, so no read rule applies to its field."""
+
+
+class RfKinds(BaseSurrealModel):
+    """Every annotation shape the read rules must recognise — or leave alone."""
+
+    model_config = SurrealConfigDict(table_name="rf_plain", arbitrary_types_allowed=True)
+
+    id: str | None = None
+    ttl: Optional[Annotated[timedelta, Field(ge=timedelta(0))]] = None  # noqa: UP045 (typing.Union on purpose)
+    pause: timedelta | None = Field(default=None, alias="pauseCol")
+    grace: Duration | None = Field(default=None, alias="graceTime")
+    computed_ttl: Computed[timedelta] = computed("1h")
+    either: timedelta | str | None = None
+    many: list[timedelta] = []
+    by_key: dict[str, timedelta] = {}
+    sub: _SubTimedelta | None = None
+    window: Range[timedelta] | None = None
+
+
+class RfPlain(BaseSurrealModel):
+    """A model without any rich field: both read hooks are the identity on it (AC-20)."""
+
+    model_config = SurrealConfigDict(table_name="rf_plain")
+
+    id: str | None = None
+    name: str = ""
+    tags: list[str] = []
+    meta: dict[str, Any] = {}
+
+
+class RfCf(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_cf")
+
+    id: str | None = None
+    ttl: timedelta | None = None
+
+
+class RfUserTd(AuthenticatedUserMixin, BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_user_td", access_name="rf_acct_td")
+
+    id: str | None = None
+    email: str
+    password: str
+    trial: timedelta = timedelta(days=7)
+
+
+class RfNan(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_nan")
+
+    id: str | None = None
+    price: Annotated[Decimal, Field(allow_inf_nan=True)]
+
+
+class RfArr(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_arr")
+
+    id: str | None = None
+    tags: set[str] = set()
+
+
+#: A duration beyond ``timedelta.max`` that SurrealDB still stores (its maximum is ``584942417355y3w5d…``).
+_BEYOND_TIMEDELTA = "584942417355y"
+_SDK_BEYOND_TIMEDELTA = surrealdb.Duration(86400 * 10**18)  # 10**9 days: 1 µs past timedelta.max
+
+
+async def _take(stream: Any, count: int, timeout: float = 10.0) -> list[Any]:
+    """The next *count* events of a live or change-feed stream, under ``asyncio.timeout``."""
+    events: list[Any] = []
+    async with asyncio.timeout(timeout):
+        while len(events) < count:
+            events.append(await anext(stream))
+    return events
+
+
+class TestReadKinds:
+    """§6.3 item 4: the fields the read rules apply to, keyed by Python name and by column."""
+
+    def test_shared_model(self) -> None:
+        assert RfEvent._read_kinds() == {"ttl": "timedelta", "grace": "duration"}
+
+    def test_unwrapping_aliases_and_refused_shapes(self) -> None:
+        # Optional[Annotated[...]] and Computed[...] unwrap; an alias adds the column. Unions with another
+        # type, containers, a subclass and Range[timedelta] get no entry.
+        assert RfKinds._read_kinds() == {
+            "ttl": "timedelta",
+            "pause": "timedelta",
+            "pauseCol": "timedelta",
+            "grace": "duration",
+            "graceTime": "duration",
+            "computed_ttl": "timedelta",
+        }
+
+    def test_edge_model(self) -> None:
+        assert RfLink._read_kinds() == {"ttl": "timedelta"}
+
+    def test_model_without_rich_fields(self) -> None:
+        assert RfPlain._read_kinds() == {}
+
+    def test_cached_per_class(self) -> None:
+        assert RfEvent._read_kinds() is RfEvent._read_kinds()
+
+        class RfEventChild(RfEvent):
+            pause: timedelta | None = None
+
+        assert RfEventChild._read_kinds() == {"ttl": "timedelta", "grace": "duration", "pause": "timedelta"}
+        assert RfEvent._read_kinds() == {"ttl": "timedelta", "grace": "duration"}
+
+
+class TestSetDataRule:
+    """§6.3 item 2: an SDK ``Duration`` in a top-level ``timedelta`` field becomes a ``timedelta``."""
+
+    def test_sdk_duration_becomes_a_floored_timedelta(self) -> None:
+        data = {"id": "x", "ttl": surrealdb.Duration(5400 * 10**9 + 999)}
+        before = dict(data)
+        out = RfEvent.set_data(data)
+        assert type(out["ttl"]) is timedelta and out["ttl"] == timedelta(hours=1, minutes=30)
+        assert out is not data, "the dict is copied on the first change"
+        assert data == before and type(data["ttl"]) is surrealdb.Duration, "the caller's dict is not mutated"
+
+    def test_column_key(self) -> None:
+        out = RfKinds.set_data({"pauseCol": surrealdb.Duration(60 * 10**9)})
+        assert out == {"pauseCol": timedelta(minutes=1)}
+        row = {"id": RecordID("rf_plain", "k"), "pauseCol": surrealdb.Duration(60 * 10**9)}
+        kinds = RfKinds.from_db(row)
+        assert isinstance(kinds, RfKinds) and kinds.pause == timedelta(minutes=1)
+
+    @pytest.mark.parametrize(
+        "value",
+        ["1h", Duration(5), _SDK_BEYOND_TIMEDELTA, surrealdb.Duration(-1), surrealdb.Duration(1.5), None],
+        ids=["text", "orm-duration", "beyond-timedelta-max", "negative", "float-elapsed", "none"],
+    )
+    def test_other_values_are_left_as_received(self, value: Any) -> None:
+        data = {"ttl": value}
+        out = RfEvent.set_data(data)
+        assert out is data and out["ttl"] is value
+
+    def test_duration_fields_are_left_to_their_validator(self) -> None:
+        data = {"grace": surrealdb.Duration(5), "durs": [surrealdb.Duration(1)]}
+        assert RfEvent.set_data(data) is data
+
+    def test_model_without_rich_fields_is_the_identity(self) -> None:
+        data = {"id": "p", "name": "n", "tags": ["a"], "meta": {"d": surrealdb.Duration(1)}}
+        assert RfPlain.set_data(data) is data
+        assert data["meta"] == {"d": surrealdb.Duration(1)}
+
+    def test_not_a_dict(self) -> None:
+        event = RfEvent(id="x")
+        assert RfEvent.set_data(event) is event
+
+
+class TestApplyRecordRule:
+    """§6.3 item 3 (D1): top-level durations are converted; every other value is applied as received."""
+
+    def test_durations_converted_other_values_raw(self) -> None:
+        event = RfEvent(id="x")
+        day = datetime(2026, 1, 2, tzinfo=UTC)
+        tags = ["a"]
+        hours = surrealdb.Range(BoundIncluded(9), BoundExcluded(17))
+        durs = [surrealdb.Duration(1)]
+        event._apply_record(
+            {
+                "id": RecordID("rf_event", "x"),
+                "ttl": surrealdb.Duration(5400 * 10**9 + 999),
+                "grace": surrealdb.Duration(5400 * 10**9 + 1),
+                "day": day,
+                "tags": tags,
+                "hours": hours,
+                "durs": durs,
+            }
+        )
+        assert type(event.ttl) is timedelta and event.ttl == timedelta(hours=1, minutes=30)
+        assert type(event.grace) is Duration and event.grace.elapsed == 5400 * 10**9 + 1
+        assert event.day is day and event.tags is tags and event.hours is hours and event.durs is durs
+
+    def test_out_of_range_values_are_kept(self) -> None:
+        event = RfEvent(id="x")
+        negative = surrealdb.Duration(-1)
+        event._apply_record({"ttl": _SDK_BEYOND_TIMEDELTA, "grace": negative})
+        assert event.ttl is _SDK_BEYOND_TIMEDELTA and event.grace is negative
+
+    def test_only_still_filters(self) -> None:
+        event = RfEvent(id="x", ttl=timedelta(minutes=1))
+        event._apply_record({"ttl": surrealdb.Duration(3600 * 10**9), "grace": surrealdb.Duration(1)}, only={"grace"})
+        assert event.ttl == timedelta(minutes=1) and event.grace == Duration(1)
+
+    def test_column_key(self) -> None:
+        kinds = RfKinds(id="k")
+        kinds._apply_record({"pauseCol": surrealdb.Duration(60 * 10**9), "graceTime": surrealdb.Duration(7)})
+        assert kinds.pause == timedelta(minutes=1) and type(kinds.grace) is Duration and kinds.grace.elapsed == 7
+
+    def test_model_without_rich_fields_sets_the_row_objects(self) -> None:
+        plain = RfPlain(id="p")
+        row = {"id": RecordID("rf_plain", "p"), "name": "n", "tags": ["a"], "meta": {"d": surrealdb.Duration(1)}}
+        plain._apply_record(row)
+        assert plain.id is row["id"] and plain.name is row["name"]
+        assert plain.tags is row["tags"] and plain.meta is row["meta"]
+
+
+class TestHydrateNeverRaises:
+    """AC-19: a duration a ``timedelta`` cannot hold leaves the instance unvalidated, with the error."""
+
+    def test_out_of_range_timedelta(self) -> None:
+        instance, error = hydrate(RfEvent, {"id": RecordID("rf_event", "x"), "ttl": _SDK_BEYOND_TIMEDELTA})
+        assert isinstance(instance, RfEvent) and isinstance(error, ValidationError)
+        assert [e["loc"] for e in error.errors()] == [("ttl",)]
+        assert instance.id == "x" and instance.ttl is _SDK_BEYOND_TIMEDELTA
+
+    def test_valid_row(self) -> None:
+        instance, error = hydrate(RfEvent, {"id": RecordID("rf_event", "y"), "ttl": surrealdb.Duration(60 * 10**9)})
+        assert error is None and type(instance.ttl) is timedelta and instance.ttl == timedelta(minutes=1)
+
+
+class TestHydrateNeverRaisesE2E:
+    """AC-19: a live stream and a change feed both carry on past such a row."""
+
+    @pytest.mark.asyncio
+    async def test_live_stream_goes_on(self) -> None:
+        async with orm_client("rf_event") as client:
+            await client.query("DEFINE TABLE rf_event SCHEMALESS;", {})
+            async with RfEvent.objects().live() as stream:
+                await client.query(f"CREATE rf_event:big SET ttl = {_BEYOND_TIMEDELTA};", {})
+                await client.query("CREATE rf_event:ok SET ttl = 1h;", {})
+                big, ok = await _take(stream, 2)
+        assert big.record_id == "rf_event:big" and isinstance(big.validation_error, ValidationError)
+        assert type(big.instance.ttl) is surrealdb.Duration
+        assert ok.record_id == "rf_event:ok" and ok.validation_error is None
+        assert type(ok.instance.ttl) is timedelta and ok.instance.ttl == timedelta(hours=1)
+
+    @pytest.mark.asyncio
+    async def test_change_feed_moves_its_cursor_past_it(self) -> None:
+        async with orm_client("rf_cf") as client:
+            await client.query("DEFINE TABLE rf_cf SCHEMALESS CHANGEFEED 1h;", {})
+            stream = await RfCf.objects().changes(poll_interval=0.05).start()
+            try:
+                await retry_write(lambda: client.query(f"CREATE rf_cf:big SET ttl = {_BEYOND_TIMEDELTA};", {}))
+                await retry_write(lambda: client.query("CREATE rf_cf:ok SET ttl = 1h;", {}))
+                [big] = await _take(stream, 1)
+                past_big = stream.cursor
+                [ok] = await _take(stream, 1)
+            finally:
+                stream.stop()
+            assert big.record_id == "rf_cf:big" and isinstance(big.validation_error, ValidationError)
+            assert ok.record_id == "rf_cf:ok" and ok.validation_error is None
+            assert type(ok.instance.ttl) is timedelta
+
+            assert isinstance(past_big, int)
+            resumed = RfCf.objects().changes(since=past_big, poll_interval=0.05)
+            try:
+                [again] = await _take(resumed, 1)
+            finally:
+                resumed.stop()
+            assert again.record_id == "rf_cf:ok", "resuming from the cursor replayed the refused entry"
+
+
+async def _read_get(client: Any) -> Any:
+    await client.query(SEED, {})
+    return await RfEvent.objects().get("s")
+
+
+async def _read_filter_exec(client: Any) -> Any:
+    await client.query(SEED, {})
+    rows = await RfEvent.objects().filter(n=1).exec()
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+async def _read_all(client: Any) -> Any:
+    await client.query(SEED, {})
+    rows = await RfEvent.objects().all()
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+async def _read_first(client: Any) -> Any:
+    await client.query(SEED, {})
+    return await RfEvent.objects().first()
+
+
+async def _read_get_or_create(client: Any) -> Any:
+    await client.query(SEED, {})
+    event, created = await RfEvent.objects().get_or_create(id="s", defaults={})
+    assert not created
+    return event
+
+
+async def _read_raw_query(client: Any) -> Any:
+    await client.query(SEED, {})
+    rows = await RfEvent.raw_query("SELECT * FROM rf_event:s;")
+    assert len(rows) == 1, rows
+    return rows[0]
+
+
+async def _read_in_transaction(client: Any) -> Any:
+    if not await _native_txn_supported():
+        pytest.skip("requires SurrealDB 3.x native transactions")
+    await client.query(SEED, {})
+    async with SurrealDBConnectionManager.transaction() as tx:
+        return await RfEvent.objects(tx=tx).get("s")
+
+
+async def _read_live_event(client: Any) -> Any:
+    await client.query("DEFINE TABLE rf_event SCHEMALESS;", {})
+    async with RfEvent.objects().live() as stream:
+        await client.query(SEED, {})
+        [event] = await _take(stream, 1)
+    assert event.validation_error is None, event.validation_error
+    assert type(event.raw["ttl"]) is surrealdb.Duration and type(event.raw["grace"]) is surrealdb.Duration
+    return event.instance
+
+
+async def _read_change_feed(client: Any) -> Any:
+    await client.query("DEFINE TABLE rf_event SCHEMALESS CHANGEFEED 1h;", {})
+    stream = await RfEvent.objects().changes(poll_interval=0.05).start()
+    try:
+        await retry_write(lambda: client.query(SEED, {}))
+        [event] = await _take(stream, 1)
+    finally:
+        stream.stop()
+    assert event.validation_error is None, event.validation_error
+    assert type(event.raw["ttl"]) is surrealdb.Duration and type(event.raw["grace"]) is surrealdb.Duration
+    return event.instance
+
+
+_READ_CASES: dict[str, Callable[[Any], Awaitable[Any]]] = {
+    "get": _read_get,
+    "filter-exec": _read_filter_exec,
+    "all": _read_all,
+    "first": _read_first,
+    "get-or-create-existing": _read_get_or_create,
+    "raw-query": _read_raw_query,
+    "transaction-get": _read_in_transaction,
+    "live-event": _read_live_event,
+    "change-feed-entry": _read_change_feed,
+}
+
+
+class TestReadMatrixE2E:
+    """AC-17: a row the server wrote from literals hydrates the declared types on every read path."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("case", list(_READ_CASES))
+    async def test_read_path_returns_declared_types(self, case: str) -> None:
+        async with orm_client("rf_event") as client:
+            event = await _READ_CASES[case](client)
+            assert isinstance(event, RfEvent), event
+            _assert_declared(event)
+
+    @pytest.mark.asyncio
+    async def test_edge_model_get(self) -> None:
+        async with orm_client("rf_event", "rf_link") as client:
+            await client.query("RELATE rf_event:a->rf_link:l->rf_event:b SET ttl = 1h, day = d'2026-01-02T00:00:00Z';", {})
+            link = await RfLink.objects().get("l")
+        assert isinstance(link, RfLink)
+        assert type(link.ttl) is timedelta and link.ttl == timedelta(hours=1)
+        assert type(link.day) is date and link.day == date(2026, 1, 2)
+
+    @pytest.mark.asyncio
+    async def test_grouped_values_keep_sdk_values(self) -> None:
+        async with orm_client("rf_event") as client:
+            await client.query(SEED, {})
+            rows = await RfEvent.objects().values("ttl", "grace").annotate(count=Count("id")).exec()
+        assert len(rows) == 1, rows
+        [row] = rows
+        assert type(row["ttl"]) is surrealdb.Duration and row["ttl"].elapsed == 5400 * 10**9 + 1
+        assert type(row["grace"]) is surrealdb.Duration and row["grace"].elapsed == 5400 * 10**9 + 1
+        assert row["count"] == 1
+
+
+#: Every ``FULL`` key that a write-back must keep native (``n`` and ``durs`` change in some cases).
+_WRITE_BACK_KEYS = tuple(key for key in FULL if key not in ("n", "durs"))
+
+
+async def _saved(**extra: Any) -> RfEvent:
+    event = RfEvent(id="w", **FULL, **extra)
+    await event.save()
+    return event
+
+
+async def _apply_save_without_id() -> RfEvent:
+    event = RfEvent(**FULL)
+    await event.save()
+    return event
+
+
+async def _apply_refresh() -> RfEvent:
+    event = await _saved()
+    await event.refresh()
+    return event
+
+
+async def _apply_merge() -> RfEvent:
+    event = await _saved()
+    await event.merge(n=2)
+    return event
+
+
+async def _apply_upsert() -> RfEvent:
+    event = RfEvent(id="w", **FULL)
+    await event.upsert()
+    return event
+
+
+async def _apply_patch() -> RfEvent:
+    event = await _saved()
+    await event.patch([{"op": "replace", "path": "/n", "value": 2}])
+    return event
+
+
+async def _apply_atomic_append() -> RfEvent:
+    event = await _saved()
+    await event.atomic_append("durs", Duration(1))
+    return event
+
+
+_APPLY_CASES: dict[str, Callable[[], Awaitable[RfEvent]]] = {
+    "save-without-id": _apply_save_without_id,
+    "refresh": _apply_refresh,
+    "merge": _apply_merge,
+    "upsert": _apply_upsert,
+    "patch": _apply_patch,
+    "atomic-append": _apply_atomic_append,
+}
+
+
+class TestApplyRecordE2E:
+    """AC-18 (D1): rows applied without validation keep durations, so a write-back stays native."""
+
+    # D1 converts durations only: ``day`` and ``tags`` hold the server's datetime and list after a returned
+    # row is applied, as in v0.22.2, and Pydantic warns when ``update()`` serialises them (README section 24).
+    @pytest.mark.filterwarnings("ignore:Pydantic serializer warnings:UserWarning")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("case", list(_APPLY_CASES))
+    async def test_returned_rows_keep_durations(self, case: str) -> None:
+        async with orm_client("rf_event"):
+            event = await _APPLY_CASES[case]()
+            assert type(event.ttl) is timedelta and event.ttl == FULL["ttl"]
+            assert type(event.grace) is Duration and event.grace == FULL["grace"]
+            if case == "refresh":
+                message = "D1 scope changed: update README section 24"
+                assert type(event.day) is datetime, message
+                assert type(event.tags) is list, message
+                assert type(event.hours) is surrealdb.Range, message
+
+            await event.update()  # the §3.7 regression: durations written back as {elapsed: …}
+            rid = event._record_id()
+            assert rid is not None
+            row = await _raw(rid)
+            assert type(row["ttl"]) is surrealdb.Duration and type(row["grace"]) is surrealdb.Duration, row
+            _assert_native(row, _WRITE_BACK_KEYS)
+
+
+class TestAuthReadE2E:
+    """AC-27 (second half): a ``timedelta`` default goes out as a duration and comes back a ``timedelta``."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scheme", ["ws", "http"])
+    async def test_signup_timedelta_default(self, scheme: str) -> None:
+        async with _auth_model(RfUserTd, scheme):
+            email = _unique_email()
+            result = await RfUserTd.signup(email=email, password=AUTH_PASSWORD)
+            assert type(result.user.trial) is timedelta and result.user.trial == timedelta(days=7)
+            row = await _stored_user(email, "rf_user_td")
+            assert type(row["trial"]) is surrealdb.Duration and row["trial"].elapsed == 7 * 86400 * 10**9
+
+
+class TestNativeContractE2E:
+    """AC-21: what the SDK and SurrealDB keep or change in each type, pinned on both lines."""
+
+    @pytest.mark.asyncio
+    async def test_precision_of_server_literals(self) -> None:
+        async with orm_client("rf_event") as client:
+            await client.query(SEED, {})
+            event = await RfEvent.objects().get("s")
+        assert type(event.ttl) is timedelta and event.ttl == timedelta(hours=1, minutes=30), "1h30m1ns floors to µs"
+        assert type(event.grace) is Duration and event.grace.elapsed == 5400 * 10**9 + 1, "a Duration keeps the ns"
+        assert event.at == datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC), "nanoseconds floor to µs"
+
+    @pytest.mark.asyncio
+    async def test_naive_datetime_reads_back_aware_utc(self) -> None:
+        async with orm_client("rf_event"):
+            await RfEvent(id="naive", at=datetime(2026, 1, 2, 3, 4, 5)).save()
+            event = await RfEvent.objects().get("naive")
+        assert event.at is not None and event.at.tzinfo is not None
+        assert event.at == datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+
+    @pytest.mark.asyncio
+    async def test_decimal_trailing_zeros_by_line(self) -> None:
+        async with orm_client("rf_event"):
+            await RfEvent(id="d", price=Decimal("12.50")).save()
+            event = await RfEvent.objects().get("d")
+            major = (await _server_version())[0]
+        expected = "12.50" if major < 3 else "12.5"
+        assert str(event.price) == expected, "SurrealDB changed decimal trailing zeros: update README section 24"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("text", ["NaN", "Infinity", "-Infinity"])
+    async def test_non_finite_decimals_round_trip(self, text: str) -> None:
+        async with orm_client("rf_nan"):
+            await RfNan(id="x", price=Decimal(text)).save()
+            got = await RfNan.objects().get("x")
+        assert type(got.price) is Decimal
+        assert got.price.is_nan() if text == "NaN" else got.price == Decimal(text)
+
+    @pytest.mark.asyncio
+    async def test_set_field_on_an_array_column(self) -> None:
+        async with orm_client("rf_arr") as client:
+            await client.query("DEFINE FIELD tags ON rf_arr TYPE array<string> VALUE $value.distinct();", {})
+            await RfArr(id="x", tags={"b", "a"}).save()
+            got = await RfArr.objects().get("x")
+        assert type(got.tags) is set and got.tags == {"a", "b"}

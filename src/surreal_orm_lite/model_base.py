@@ -7,6 +7,7 @@ import warnings
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from datetime import timedelta
 from decimal import Decimal
+from types import UnionType
 from typing import TYPE_CHECKING, Any, Self, TypeVar, overload
 
 import pydantic
@@ -30,7 +31,7 @@ from .signals import (
     pre_update,
 )
 from .transaction import Transaction
-from .types import Duration
+from .types import Duration, _duration_from_sdk, _timedelta_from_sdk
 from .utils import (
     VALID_ALIAS_PATTERN,
     apply_ddl_statements,
@@ -61,6 +62,8 @@ _E = TypeVar("_E", bound="BaseSurrealEdge")
 # object, which is what makes them inheritance-correct — a subclass gets its own entry.
 _ALIAS_MAPS: dict[type, tuple[dict[str, str], dict[str, str]]] = {}
 _SERVER_FIELDS: dict[type, frozenset[str]] = {}
+# The read kinds of v0.23.0 (``BaseSurrealModel._read_kinds``), filled once Pydantic completed the class.
+_READ_KINDS: dict[type, dict[str, str]] = {}
 
 # Pydantic's metaclass sits between ``__pydantic_init_subclass__`` and the user's ``class``
 # statement; a warning raised there must skip its frames to land on the user's line (v0.22.0).
@@ -94,6 +97,29 @@ def _check_table_name(cls: type, key: str, name: Any) -> None:
             f"{cls.__name__}: {key} {name!r} must be an identifier (letters, digits, underscores; "
             "not starting with a digit): it is interpolated into SurrealQL."
         )
+
+
+def _read_kind(annotation: Any) -> str | None:
+    """Return the read kind of a field annotation: ``"timedelta"``, ``"duration"`` or ``None`` (v0.23.0).
+
+    Unwraps ``Annotated``, then a union of exactly one non-``None`` member with ``None``, then
+    ``Annotated`` again. Only exactly ``timedelta`` or exactly the ORM's ``Duration`` has a kind:
+    ``timedelta | str``, ``list[timedelta]``, a ``timedelta`` subclass or ``Range[timedelta]`` has none.
+    """
+    if typing.get_origin(annotation) is typing.Annotated:
+        annotation = typing.get_args(annotation)[0]
+    if typing.get_origin(annotation) in (typing.Union, UnionType):
+        members = typing.get_args(annotation)
+        if len(members) != 2 or type(None) not in members:
+            return None
+        annotation = members[0] if members[1] is type(None) else members[1]
+        if typing.get_origin(annotation) is typing.Annotated:
+            annotation = typing.get_args(annotation)[0]
+    if annotation is timedelta:
+        return "timedelta"
+    if annotation is Duration:
+        return "duration"
+    return None
 
 
 def _own_annotation_names(cls: type) -> set[str]:
@@ -362,6 +388,35 @@ class BaseSurrealModel(BaseModel):
         return cached
 
     @classmethod
+    def _read_kinds(cls) -> dict[str, str]:
+        """Return the read kind of each top-level ``timedelta``/``Duration`` field, cached per class (v0.23.0).
+
+        ``{"ttl": "timedelta", "grace": "duration"}``, keyed by the Python field name **and** by
+        its column when the field is aliased: :meth:`set_data` receives rows keyed by column and
+        calls keyed by name. The columns are those of :meth:`_alias_maps`, read without its
+        ambiguity check so that a read never raises here. Only a field annotated exactly
+        ``timedelta`` or ``Duration`` (through ``Annotated`` and ``X | None``) has a kind; a model
+        without one gets ``{}``, and both read rules are then no-ops. Cached once Pydantic has
+        completed the class, like the alias maps; never mutate the returned dict.
+        """
+        cached = _READ_KINDS.get(cls)
+        if cached is not None:
+            return cached
+        implicit = cls._implicit_aliases()
+        kinds: dict[str, str] = {}
+        for name, info in cls.model_fields.items():
+            kind = _read_kind(info.annotation)
+            if kind is None:
+                continue
+            kinds[name] = kind
+            column = info.alias or implicit.get(name)
+            if column:
+                kinds[column] = kind
+        if cls.__pydantic_complete__:
+            _READ_KINDS[cls] = kinds
+        return kinds
+
+    @classmethod
     def _reject_ambiguous_aliases(cls, forward: Mapping[str, str]) -> None:
         """Raise if the alias map is not a bijection between field names and columns.
 
@@ -583,6 +638,12 @@ class BaseSurrealModel(BaseModel):
         """
         Pre-process data before model validation.
         Extracts the ID from RecordID if present, unless the field accepts RecordID natively.
+
+        A top-level ``timedelta`` field given the SDK's ``Duration`` (what every read returns for a
+        SurrealDB ``duration``) gets a ``timedelta``, floored to the microsecond (v0.23.0). The dict is
+        copied on that first change, never mutated by it; a value this rule cannot convert (beyond
+        ``timedelta.max``, a subclass, any other type) is left as received for Pydantic to judge,
+        so the rule itself never raises.
         """
         if isinstance(data, dict) and "id" in data and isinstance(data["id"], RecordID):
             # Only convert to plain string when the id field does not accept RecordID.
@@ -598,6 +659,18 @@ class BaseSurrealModel(BaseModel):
                 # which yields the SurrealQL-escaped form (e.g. "⟨1⟩") for numeric-looking
                 # or special string ids.
                 data["id"] = str(data["id"].id)
+        kinds = cls._read_kinds()
+        if kinds and isinstance(data, dict):
+            received = data
+            for key, kind in kinds.items():
+                if kind != "timedelta" or key not in data:
+                    continue
+                value = data[key]
+                converted = _timedelta_from_sdk(value)
+                if converted is not value:
+                    if data is received:
+                        data = dict(data)
+                    data[key] = converted
         return data
 
     async def refresh(self, tx: Transaction | None = None) -> None:
@@ -1089,6 +1162,9 @@ class BaseSurrealModel(BaseModel):
         name first (v0.18.0). ``only`` is therefore matched on Python names — the same
         vocabulary the callers use, since they pass things like ``get_server_fields()``.
 
+        Top-level ``timedelta`` and ``Duration`` fields get the SDK's ``Duration`` converted
+        (v0.23.0); every other value is applied as received.
+
         Args:
             only: restrict the copy to these field names. ``None`` (default) applies every field
                 in the row.
@@ -1098,10 +1174,16 @@ class BaseSurrealModel(BaseModel):
         if not isinstance(record, dict):
             return
         allowed = None if only is None else set(only)
+        kinds = self._read_kinds()
         for column, value in record.items():
             key = self.to_py_field(column)
             if allowed is not None and key not in allowed:
                 continue
+            kind = kinds.get(key)
+            if kind == "timedelta":
+                value = _timedelta_from_sdk(value)
+            elif kind == "duration":
+                value = _duration_from_sdk(value)
             if hasattr(self, key):
                 object.__setattr__(self, key, value)
 
