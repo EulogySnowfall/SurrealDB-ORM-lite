@@ -2624,6 +2624,213 @@ class TestSubModelStoredKeysE2E:
             await _assert_client_usable(client)
 
 
+class RfCode(BaseModel):
+    """A union member a ``firstName`` dict does not validate as: ``code`` is required."""
+
+    code: int
+
+
+class RfCircle(BaseModel):
+    """A sub-model with a dict of sub-models: MERGE merges the dict's values into the stored ones too."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    members: dict[str, RfCamelDated] = {}
+
+
+class RfNamedDeep(BaseSurrealModel):
+    """Sub-models validated by name and by alias at the other object positions MERGE merges: a dict's
+    values, the union member validated, a dict under a sub-model, a table-model class the validation
+    builds from a dict. An array is replaced whole."""
+
+    model_config = SurrealConfigDict(table_name="rf_named_deep")
+
+    id: str | None = None
+    contacts: dict[str, RfCamelDated] = {}
+    either: RfCode | RfCamelDated | None = None
+    circle: RfCircle | None = None
+    owners: dict[str, RfAliasedOwner] = {}
+    crowd: list[RfCamelDated] = []
+    n: int = 0
+
+
+class _CapturingClient:
+    """Records the variables of each statement ``merge(refresh=False)`` sends; answers no row."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    @property
+    def sent(self) -> Any:
+        """The ``$data`` of the last ``UPDATE … MERGE $data``."""
+        return self.calls[-1]["data"]
+
+    async def query(self, _statement: str, variables: dict[str, Any]) -> None:
+        self.calls.append(variables)
+
+
+_REMOVED = {"firstName": None, "seenAt": None}
+
+
+class TestMergeRemovalsAtObjectPositions:
+    """What ``merge()`` sends for a sub-model reached through another object position than a sub-model
+    field, no database. SurrealDB's MERGE merges an object into the stored one at every depth and
+    replaces an array whole, so each sub-model instance at an object position is sent with the aliases
+    a read takes before its names as ``None`` (NONE: the key is removed), as for a sub-model field.
+    Before, only an instance or a dict sent to a field typed by the sub-model itself had them."""
+
+    @pytest.fixture
+    def client(self, monkeypatch: pytest.MonkeyPatch) -> _CapturingClient:
+        fake = _CapturingClient()
+
+        async def get_client() -> _CapturingClient:
+            return fake
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+        return fake
+
+    async def test_dicts_unions_and_nested_dicts(self, client: _CapturingClient) -> None:
+        person = RfNamedDeep(id="x")
+        await person.merge(
+            refresh=False,
+            contacts={"a": {"firstName": "Annie"}},
+            either={"first_name": "Annie"},
+            circle={"members": {"a": {"firstName": "Annie"}}},
+            owners={"a": {"label": "Annie"}},
+            crowd=[{"firstName": "Annie"}],
+        )
+        assert client.sent == {
+            "contacts": {"a": {"first_name": "Annie", "seen_at": None, **_REMOVED}},
+            "either": {"first_name": "Annie", "seen_at": None, **_REMOVED},
+            "circle": {"members": {"a": {"first_name": "Annie", "seen_at": None, **_REMOVED}}},
+            # A table-model class validated from the caller's dict is written as an object.
+            "owners": {"a": {"id": None, "since": None, "label": "Annie", "Label": None}},
+            "crowd": [{"first_name": "Annie", "seen_at": None}],  # an array is replaced whole
+        }
+        # The local apply takes the values merged, never a removal.
+        assert person.contacts == {"a": RfCamelDated(first_name="Annie")}
+        assert person.either == RfCamelDated(first_name="Annie")
+        assert person.circle == {"members": {"a": RfCamelDated(first_name="Annie")}}
+        assert person.owners == {"a": {"id": None, "since": None, "label": "Annie"}}
+        assert person.crowd == [RfCamelDated(first_name="Annie")]
+
+    async def test_instances(self, client: _CapturingClient) -> None:
+        """An instance anywhere at an object position, at every depth: the class of the instance says
+        which aliases to remove, so a union member is the one validated, not the first declared."""
+        annie = RfCamelDated(first_name="Annie")
+        person = RfNamedDeep(id="x")
+        await person.merge(refresh=False, contacts={"a": annie}, either=annie, circle=RfCircle(members={"a": annie}))
+        assert client.sent == {
+            "contacts": {"a": {"first_name": "Annie", "seen_at": None, **_REMOVED}},
+            "either": {"first_name": "Annie", "seen_at": None, **_REMOVED},
+            "circle": {"members": {"a": {"first_name": "Annie", "seen_at": None, **_REMOVED}}},
+        }
+        assert (person.contacts, person.either, person.circle) == ({"a": annie}, annie, RfCircle(members={"a": annie}))
+
+        await person.merge(refresh=False, either={"code": 3})
+        assert client.sent == {"either": {"code": 3}}  # RfCode has no alias: nothing to remove
+
+    async def test_server_values_assign_them_whole(self, client: _CapturingClient) -> None:
+        """``UPDATE … SET`` replaces each field it assigns: a dict field is assigned whole, no removal."""
+        await RfNamedDeep(id="x").merge(refresh=False, server_values=_BUMP, contacts={"a": {"firstName": "Annie"}})
+        assert {"a": {"first_name": "Annie", "seen_at": None}} in client.calls[-1].values()
+
+
+class TestMergeRemovalsAtObjectPositionsE2E:
+    """A v0.22 row whose objects hold both spellings, at the object positions
+    ``TestMergeRemovalsAtObjectPositions`` covers, on both lines. v0.22's ``merge()`` stored a dict's
+    keys as given, so ``save()`` then ``merge(contacts={"a": {"firstName": "Anna"}})`` left
+    ``{"first_name": "Ann", "firstName": "Anna"}``; v0.23.0 writes the name, and without the removal
+    every later merge of that sub-field was hidden behind the alias and lost without an error."""
+
+    @pytest.mark.parametrize("given", ["dict", "instance"])
+    @pytest.mark.parametrize("mode", ["merge", "no-refresh", "transaction"])
+    async def test_a_v022_row_with_both_spellings(self, mode: str, given: str) -> None:
+        async with orm_client("rf_named_deep") as client:
+            both = {"first_name": "Ann", "firstName": "Anna"}
+            await client.query(
+                "CREATE $rid CONTENT $row;",
+                {
+                    "rid": RecordID("rf_named_deep", "v"),
+                    "row": {
+                        "n": 0,
+                        "contacts": {"a": both, "b": {"first_name": "Bob"}},
+                        "either": both,
+                        "circle": {"members": {"a": both}},
+                        "owners": {"a": {"label": "Ann", "Label": "Anna"}},
+                        "crowd": [both],
+                    },
+                },
+            )
+            person = await RfNamedDeep.objects().get("v")
+            assert person.contacts["a"].first_name == "Anna"  # the alias, under v0.22 and v0.23.0 alike
+            assert person.either == RfCamelDated(first_name="Anna")
+
+            annie = RfCamelDated(first_name="Annie")
+            change: dict[str, Any] = {
+                "contacts": {"a": {"firstName": "Annie"}},
+                "either": {"first_name": "Annie"},
+                "circle": {"members": {"a": {"firstName": "Annie"}}},
+                "owners": {"a": {"label": "Annie"}},
+                "crowd": [{"first_name": "Annie"}],
+            }
+            if given == "instance":  # an RfAliasedOwner instance would be its record id
+                change.update(contacts={"a": annie}, either=annie, circle=RfCircle(members={"a": annie}), crowd=[annie])
+            if mode == "transaction":
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await person.merge(tx=tx, **change)
+            else:
+                await person.merge(refresh=mode == "merge", **change)
+
+            row = await _raw("v", "rf_named_deep")
+            assert row["contacts"] == {"a": {"first_name": "Annie"}, "b": {"first_name": "Bob"}}
+            assert row["either"] == {"first_name": "Annie"}
+            assert row["circle"] == {"members": {"a": {"first_name": "Annie"}}}
+            assert row["owners"] == {"a": {"label": "Annie"}}
+            loaded = await RfNamedDeep.objects().get("v")
+            assert (loaded.contacts, loaded.either) == ({"a": annie, "b": RfCamelDated(first_name="Bob")}, annie)
+            assert (loaded.circle, loaded.crowd) == (RfCircle(members={"a": annie}), [annie])
+            assert loaded.owners["a"].label == "Annie"
+
+            # The instance holds the value merged: the row it was resynced from, or the values applied
+            # locally (refresh=False, a buffered transaction on 2.x), which hold no removal.
+            assert RfCamelDated.model_validate(person.contacts["a"]) == annie
+            assert RfCamelDated.model_validate(person.either) == annie
+            assert RfCircle.model_validate(person.circle) == RfCircle(members={"a": annie})
+            assert RfAliasedOwner.model_validate(person.owners["a"]).label == "Annie"
+            await _assert_client_usable(client)
+
+    async def test_schemafull_takes_the_removals(self) -> None:
+        """A schema written for the names declares no alias: NONE for an undeclared key, at any depth,
+        is accepted by both lines (a value there is refused by 3.x)."""
+        async with orm_client("rf_named_deep") as client:
+            for statement in (
+                "DEFINE TABLE rf_named_deep SCHEMAFULL;",
+                "DEFINE FIELD n ON rf_named_deep TYPE int DEFAULT 0;",
+                "DEFINE FIELD contacts ON rf_named_deep TYPE object DEFAULT {};",
+                "DEFINE FIELD contacts.* ON rf_named_deep TYPE object;",
+                "DEFINE FIELD contacts.*.first_name ON rf_named_deep TYPE option<string>;",
+                "DEFINE FIELD contacts.*.seen_at ON rf_named_deep TYPE option<datetime>;",
+                "DEFINE FIELD either ON rf_named_deep TYPE option<object>;",
+                "DEFINE FIELD either.first_name ON rf_named_deep TYPE option<string>;",
+                "DEFINE FIELD either.seen_at ON rf_named_deep TYPE option<datetime>;",
+                "DEFINE FIELD circle ON rf_named_deep TYPE option<object>;",
+                "DEFINE FIELD owners ON rf_named_deep TYPE object DEFAULT {};",
+                "DEFINE FIELD crowd ON rf_named_deep TYPE array DEFAULT [];",
+            ):
+                await client.query(statement, {})
+            person = RfNamedDeep(id="s", contacts={"a": RfCamelDated(first_name="Ann")})
+            await person.save()
+            at = datetime(2026, 1, 2, tzinfo=UTC)
+            await person.merge(contacts={"b": {"firstName": "Bob", "seenAt": at}}, either={"firstName": "E"})
+            row = await _raw("s", "rf_named_deep")
+            assert row["contacts"] == {"a": {"first_name": "Ann"}, "b": {"first_name": "Bob", "seen_at": at}}
+            assert row["either"] == {"first_name": "E"}
+            loaded = await RfNamedDeep.objects().get("s")
+            assert loaded.contacts["b"] == RfCamelDated(first_name="Bob", seen_at=at)
+            await _assert_client_usable(client)
+
+
 # ==================== Models that allow arbitrary types ====================
 
 

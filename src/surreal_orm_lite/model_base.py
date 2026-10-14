@@ -461,28 +461,68 @@ def _without_removals(model: type[BaseModel], value: Mapping[Any, Any]) -> Mappi
     return kept
 
 
-def _with_removals(model: type[BaseModel], obj: Any) -> Any:
-    """The object ``merge()`` sends for an instance of sub-model ``model``, with the removals it needs (v0.23.0).
+def _with_removals(value: Any, obj: Any) -> Any:
+    """``obj``, the wire form of a ``merge()`` value ``value``, with the removals MERGE needs (v0.23.0).
 
-    An instance is the whole sub-object, but MERGE merges its object (``obj``, as encoded: keyed by
-    :func:`~surreal_orm_lite.wire.read_keys`) into the stored one. So, as :func:`_stored_keys` does
-    for a dict's keys, every alias a read takes before a stored name
-    (:func:`~surreal_orm_lite.wire.masking_keys`) is sent as ``None`` — NONE, which removes it — for
-    every sub-field, at every sub-model level: a v0.22 row that holds one would hide the instance's
-    value. ``UPDATE … SET`` (``server_values``) assigns the object whole and needs none. A new dict.
+    SurrealDB's MERGE merges an object into the stored one at every depth, and replaces an array
+    whole. So each sub-model instance ``value`` holds at an object position — the value itself, a
+    mapping's values (``dict[str, Profile]``), a sub-model's sub-fields, at any depth, never inside
+    an array — has its object merged into a stored one, which a v0.22 row may hold under both
+    spellings (:func:`_stored_keys`). As :func:`_stored_keys` does for a dict's keys, every alias a
+    read takes before a stored name (:func:`~surreal_orm_lite.wire.masking_keys` of the instance's
+    own class: the union member the validation chose, the ``Profile`` of a ``dict[str, Profile]``)
+    is sent as ``None`` — NONE, which removes it — for every sub-field of that instance; otherwise
+    the value merged would be hidden behind the alias and lost without an error. A table-model class
+    the validation built from a dict is reached through its object form (:class:`_SubObject`). A
+    dict :func:`_stored_keys` converted carries its own removals; its values are walked.
+
+    ``obj`` is ``value`` as :func:`~surreal_orm_lite.wire.encode_wire` sends it: a mapping under the
+    same keys, an instance keyed by :func:`~surreal_orm_lite.wire.read_keys`. ``UPDATE … SET``
+    (``server_values``) assigns each field whole and needs none. The ``data`` the local apply uses
+    holds none either. Copy-on-write.
     """
     if not isinstance(obj, dict):
         return obj
-    masked = masking_keys(model)
-    stored_as = read_keys(model)
-    result = dict(obj)
-    for name, info in model.model_fields.items():
-        child = sub_model(info.annotation)
-        if child is not None and stored_as[name] in result:
-            result[stored_as[name]] = _with_removals(child, result[stored_as[name]])
-        for other in masked[name]:
-            result[other] = None
+    if isinstance(value, _SubObject):
+        value = value.instance
+    result = obj
+    if isinstance(value, BaseModel):
+        model = type(value)
+        stored_as = read_keys(model)
+        masked = masking_keys(model)
+        for name in model.model_fields:
+            key = stored_as[name]
+            if key in obj:
+                new = _with_removals(getattr(value, name, None), obj[key])
+                if new is not obj[key]:
+                    result = dict(obj) if result is obj else result
+                    result[key] = new
+            for other in masked[name]:
+                result = dict(obj) if result is obj else result
+                result[other] = None
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            if key in obj:
+                new = _with_removals(item, obj[key])
+                if new is not obj[key]:
+                    result = dict(obj) if result is obj else result
+                    result[key] = new
     return result
+
+
+class _SubObject(dict[Any, Any]):
+    """The object form of a table-model instance a keyword write's validation built (v0.23.0).
+
+    What :func:`_object_forms` gives for it: the ``dict`` that is sent (and, in ``merge()``,
+    applied locally), which also keeps the ``instance`` — so ``merge()`` knows the class whose
+    aliases its MERGE removes (:func:`_with_removals`). Equal to the plain ``dict``.
+    """
+
+    __slots__ = ("instance",)
+
+    def __init__(self, obj: Mapping[Any, Any], instance: BaseModel) -> None:
+        super().__init__(obj)
+        self.instance = instance
 
 
 def _link_instances(context: str, path: str, value: Any) -> Any:
@@ -515,11 +555,12 @@ def _object_forms(value: Any) -> Any:
 
     The caller's own instances are record ids by now (:func:`_link_instances`), so a
     ``BaseSurrealModel`` left at the top, in a ``list``/``tuple`` or among a mapping's values is a
-    sub-model the ORM validated: it is written as an object (:func:`~surreal_orm_lite.wire.model_object`),
-    never as the record id ``encode_wire`` gives a table-model instance. Copy-on-write.
+    sub-model the ORM validated: it is written as an object (:func:`~surreal_orm_lite.wire.model_object`,
+    as a :class:`_SubObject` that keeps the instance), never as the record id ``encode_wire`` gives a
+    table-model instance. Copy-on-write.
     """
     if isinstance(value, BaseSurrealModel):
-        return model_object(value)
+        return _SubObject(model_object(value), value)
     if isinstance(value, (list, tuple)):
         items = [_object_forms(item) for item in value]
         if all(new is old for new, old in zip(items, value, strict=True)):
@@ -1032,6 +1073,11 @@ class BaseSurrealModel(BaseModel):
         - in ``bulk_update``/``signup``/``signin``, which replace the field, a dict is validated as
           the whole sub-model: a missing required sub-field raises;
         - an **instance** is the whole sub-object, sent as ``save()`` writes it.
+
+        Any other value of a rich field (``dict[str, Profile]``, ``Profile | Other``) is validated
+        whole, so its sub-models come back as instances; the removal of their aliases that
+        ``merge()`` sends for each one at an object position is added to the wire form, not here
+        (:func:`_with_removals`).
 
         A dict for a field typed with a sub-model **without** a rich type keeps its values as given
         (not validated, as in v0.22), but its keys are resolved the same way, at every sub-model
@@ -1943,7 +1989,8 @@ class BaseSurrealModel(BaseModel):
         or ``refresh=False`` (the row was deliberately not requested). A kwarg that
         ``server_values`` overrode is skipped — writing it would leave the instance holding a
         value that never reached the database. Keys here are Python field names. A sub-model
-        dict is applied without the aliases its merge removes (:func:`_without_removals`).
+        dict is applied without the aliases its merge removes (:func:`_without_removals`); those
+        removed for an instance (:func:`_with_removals`) only ever were in the wire form.
         """
         for key, value in data.items():
             if key not in server_values and hasattr(self, key):
@@ -2272,11 +2319,20 @@ class BaseSurrealModel(BaseModel):
         sub-model sub-field), so the other stored keys stay there too, and each key of the caller's
         must be an identifier (an alias to remove that is not one is left in place). An
         **instance** is the whole sub-object, written as ``save()`` writes it:
-        ``merge(profile=Profile(city="y"))`` drops a stored ``bday``, and — sent as ``MERGE`` —
-        removes the aliases a read takes before the name of every sub-field, at every level
-        (:func:`_with_removals`); ``server_values`` assigns it whole. A dict for a sub-model
+        ``merge(profile=Profile(city="y"))`` drops a stored ``bday``. A dict for a sub-model
         without a rich type keeps its values as given, its keys resolved the same way (keys
         assigned one by one under ``server_values``).
+
+        Sent as ``MERGE``, which merges objects at every depth (and replaces an array whole), a
+        value also removes the aliases a read takes before the name of every sub-field of each
+        sub-model **instance** it holds at an object position (:func:`_with_removals`): the field
+        itself, the values of a ``dict[str, Profile]``, the union member the validation chose
+        (``Profile | Other``, by the class of the instance), a sub-model's sub-fields — at any
+        depth, never inside an array. So ``merge(contacts={"a": {"firstName": "Annie"}})``, which
+        a ``dict[str, Profile]`` validates into a ``Profile``, is sent as
+        ``{"a": {"first_name": "Annie", …, "firstName": None, …}}``, and a v0.22 row's
+        ``contacts.a.firstName`` no longer hides it. ``server_values`` assigns such a field whole,
+        which needs none.
 
         A **table-model instance** is written as its record id. On a declared field, rich or not,
         a value holding one — at the top, in a list or tuple, among a mapping's values — is
@@ -2331,12 +2387,12 @@ class BaseSurrealModel(BaseModel):
         # Keyword arguments name Python fields; the MERGE payload names columns, its values
         # encoded for the wire (v0.23.0). Everything that stays on this side of the wire —
         # signals, the local apply — keeps `data_set`.
+        # MERGE merges objects at every depth: each sub-model at an object position goes with the
+        # removal of the aliases that would hide it in a v0.22 row (v0.23.0).
         wire_data = self._wire_columns(data_set)
         for key, value in data_set.items():
-            model = self._sub_model_of(key)
-            if model is not None and isinstance(value, BaseModel):
-                column = self.to_db_field(key)
-                wire_data[column] = _with_removals(model, wire_data[column])
+            column = self.to_db_field(key)
+            wire_data[column] = _with_removals(value, wire_data[column])
         record_id = self._record_id()
 
         if record_id is None:
