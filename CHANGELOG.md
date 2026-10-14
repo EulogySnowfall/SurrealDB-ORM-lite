@@ -107,8 +107,9 @@ and the official SDK, on every write and read path, with the same behaviour on S
   a dict for a sub-model field changes only the keys it names, each validated as its sub-field
   (with `server_values=`, one `SET` per key, so the other stored keys stay, as with `MERGE`); an
   instance replaces the whole sub-object; `bulk_update()` and `signup()` validate a dict as the
-  whole sub-model. `merge()` removes (NONE) the aliases a read would take before a sub-field's
-  name, those v0.22 rows leave, without ever touching a key it writes.
+  whole sub-model. A sub-model instance merged into a stored object removes (NONE) the aliases a
+  read would take before a sub-field's name, those v0.22 rows leave, without ever touching a key
+  it writes.
 - **An aliased sub-field reads back.** In a sub-model that validates by alias only (Pydantic's
   default), an aliased sub-field is now written under its alias (the first string of an
   `AliasChoices`) by every write, `save()` included, so a read gives it back; earlier versions
@@ -117,7 +118,8 @@ and the official SDK, on every write and read path, with the same behaviour on S
   table model used as a sub-model) keeps the format of earlier versions, each sub-field under its
   name (under its serialization alias with `serialize_by_alias=True`, as Pydantic dumps it). A
   keyword write's dict for a sub-model is re-keyed the same way, whether or not the sub-model
-  holds a rich type; one without a rich type keeps its values as given.
+  holds a rich type; one without a rich type keeps its values as given. A `merge()` dict for a
+  sub-model that also validates by name keeps your keys, as in v0.22.
 - **A table-model instance given as a value is written as its record id** in keyword writes, in
   raw-query variables, in the `atomic_*` array helpers and in `patch()`. Where the declared field
   cannot hold a `RecordID` at that position (`list[Plain]`, a sub-model), the write raises
