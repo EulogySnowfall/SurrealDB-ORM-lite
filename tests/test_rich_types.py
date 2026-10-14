@@ -19,6 +19,7 @@ from collections.abc import Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, date, datetime, time, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Any, ForwardRef, Literal, Optional, TypeVar, Union
 from uuid import UUID
@@ -37,6 +38,7 @@ from pydantic import (
     Field,
     FutureDate,
     FutureDatetime,
+    GetCoreSchemaHandler,
     NaiveDatetime,
     PastDate,
     PastDatetime,
@@ -44,6 +46,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+from pydantic_core import core_schema
 from surrealdb import TAG_DECIMAL_STRING, TAG_DURATION_COMPACT, AsyncSurreal, RecordID
 from surrealdb.cbor import CBORTag, undefined
 from surrealdb.data.cbor import encode as sdk_cbor_encode
@@ -659,6 +662,26 @@ class _Holder(BaseModel):
     ttl: timedelta
 
 
+class _Period(enum.StrEnum):
+    """Values that read like SurrealQL durations (a union with ``timedelta`` must keep them)."""
+
+    HOUR = "1h"
+    DAY = "1d"
+
+
+class _Unit(enum.Enum):
+    HOUR = "1h"
+    DAY = "1d"
+
+
+class _Label(str):
+    """A ``str`` subclass Pydantic validates from a plain string."""
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: Any, handler: GetCoreSchemaHandler) -> core_schema.CoreSchema:
+        return core_schema.no_info_after_validator_function(cls, handler(str))
+
+
 class _Sched(BaseModel):
     """Mixed positions in one model (AC-30): only ``ttl`` and ``when`` convert."""
 
@@ -908,6 +931,66 @@ class TestFieldInput:
         assert field_input(int | str, listed) is listed
         mapping = {"a": "1h"}
         assert field_input(list[timedelta] | None, mapping) is mapping
+
+    @pytest.mark.parametrize(
+        ("annotation", "value"),
+        [
+            (Literal["1h", "24h"] | timedelta, "24h"),
+            (timedelta | Literal["24h"], "24h"),
+            (_Period | timedelta, "1d"),
+            (_Period | timedelta | None, "1h"),
+            (_Unit | timedelta, "1d"),
+            (_Label | timedelta, "2h"),
+            (Annotated[str, Field(max_length=3)] | timedelta, "2h"),
+            (Path | timedelta, "2h"),
+            (list[timedelta] | list[str], ["1h", "24h"]),
+            (list[timedelta] | list[_Period], ("1h",)),
+        ],
+        ids=[
+            "literal",
+            "literal-last",
+            "str-enum",
+            "str-enum-optional",
+            "enum",
+            "str-subclass",
+            "constrained",
+            "path",
+            "list",
+            "tuple",
+        ],
+    )
+    def test_union_keeps_what_it_accepts_as_it_is(self, annotation: Any, value: Any) -> None:
+        """A value the union accepts as it is stays as it is, as v0.22.2 read it, and Pydantic's
+        union validation picks its member (the ``Literal``, the ``StrEnum``…): a string that reads
+        like a duration is not turned into a ``timedelta`` behind their back."""
+        assert field_input(annotation, value) is value
+
+    def test_union_converts_what_it_refuses_as_it_is(self) -> None:
+        annotation = Literal["1h", "24h"] | timedelta
+        assert field_input(annotation, "2h") == timedelta(hours=2)
+        assert field_input(annotation, surrealdb.Duration(3600 * 10**9)) == timedelta(hours=1)
+        assert field_input(_Period | timedelta, "2h") == timedelta(hours=2)
+        # The constraint refuses the text, so it is a duration.
+        assert field_input(Annotated[str, Field(max_length=1)] | timedelta, "2h") == timedelta(hours=2)
+        assert field_input(list[timedelta] | list[str], [surrealdb.Duration(10**9)]) == [timedelta(seconds=1)]
+        assert field_input(list[timedelta] | list[int], ["1h"]) == [timedelta(hours=1)]
+        # Rule 5 too: no member takes the SDK Datetime itself.
+        sdk = surrealdb.Datetime("2026-01-02T00:00:00Z")
+        assert field_input(datetime | Literal["x"], sdk) == "2026-01-02T00:00:00Z"
+
+    def test_union_beyond_timedelta_max(self) -> None:
+        """A duration beyond ``timedelta.max`` raises only when the union refuses the text."""
+        huge = "9999999999999w"
+        assert field_input(Path | timedelta, huge) is huge
+        with pytest.raises(ValueError, match=r"beyond timedelta\.max"):
+            field_input(int | timedelta, huge)
+
+    def test_union_without_a_validator_keeps_the_value(self) -> None:
+        """A union Pydantic cannot build a validator for (a name it cannot resolve inside a member)
+        keeps the value: what it accepts is unknown, as for an unresolved member (rule 3)."""
+        unresolved: Any = list["_NoSuchClass"]  # type: ignore[name-defined]  # noqa: F821
+        text = "1h"
+        assert field_input(unresolved | timedelta, text) is text
 
     # Rules 7 to 9
     def test_sequences(self) -> None:

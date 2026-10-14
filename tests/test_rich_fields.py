@@ -35,8 +35,9 @@ import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 import pytest
@@ -4490,4 +4491,68 @@ class TestDecimalFloatsE2E:
                 assert type(price) is float
                 assert price == 9.99
             assert await _ids(price=9.99) == ["b", "m"]
+            await _assert_client_usable(client)
+
+
+# ==================== Reads and writes as v0.22.2 made them: union strings, SET keys, auth identifiers ====================
+
+
+class RfPeriod(StrEnum):
+    """Values that read like SurrealQL durations."""
+
+    HOUR = "1h"
+    DAY = "1d"
+
+
+class RfPlan(BaseSurrealModel):
+    """Unions of ``timedelta`` with a member that takes the same strings."""
+
+    model_config = SurrealConfigDict(table_name="rf_plan")
+
+    id: str | None = None
+    window: Literal["1h", "24h"] | timedelta = "1h"
+    period: RfPeriod | timedelta | None = None
+    windows: list[timedelta] | list[str] = []
+    n: int = 0
+
+
+class TestUnionStringsE2E:
+    """A string a union of ``timedelta`` and a ``Literal``, a ``StrEnum`` or a ``list[str]`` accepts
+    as it is keeps the member Pydantic picks, as in v0.22.2, on both lines: the rows v0.22.2 wrote
+    read back the same, and the same writes store the same strings. A value the union refuses as it
+    is (``"2h"``, a stored duration) is a ``timedelta``."""
+
+    async def test_rows_v022_wrote_read_back_the_same(self) -> None:
+        async with orm_client("rf_plan") as client:
+            await client.query("CREATE rf_plan:a CONTENT {window: '24h', period: '1d', windows: ['1h', '24h']};", {})
+            plan = await RfPlan.objects().get("a")
+            assert plan.window == "24h"
+            assert plan.period is RfPeriod.DAY
+            assert plan.windows == ["1h", "24h"]
+            found = await RfPlan.objects().filter(window="24h", period="1d").exec()
+            assert [str(row.id) for row in found] == ["a"]
+            await plan.refresh()
+            assert (plan.window, plan.period) == ("24h", RfPeriod.DAY)
+            await _assert_client_usable(client)
+
+    async def test_writes_store_the_strings(self) -> None:
+        async with orm_client("rf_plan") as client:
+            plan = RfPlan(id="b", window="24h", period="1d", windows=["1h"])  # type: ignore[arg-type]
+            assert (plan.window, plan.period, plan.windows) == ("24h", RfPeriod.DAY, ["1h"])
+            await plan.save()
+            await plan.merge(window="1h", period="1h")
+            assert (plan.window, plan.period) == ("1h", RfPeriod.HOUR)
+            row = await _raw("b", "rf_plan")
+            assert (row["window"], row["period"], row["windows"]) == ("1h", "1h", ["1h"])
+            assert await RfPlan.objects().filter(window="1h").bulk_update(window="24h", windows=["24h"]) == 1
+            row = await _raw("b", "rf_plan")
+            assert (row["window"], row["windows"]) == ("24h", ["24h"])
+
+            # What no member but timedelta takes is a duration.
+            await plan.merge(window="2h", period=timedelta(hours=3))
+            row = await _raw("b", "rf_plan")
+            _assert_sdk_duration(row["window"], 2 * _HOUR_NS)
+            _assert_sdk_duration(row["period"], 3 * _HOUR_NS)
+            loaded = await RfPlan.objects().get("b")
+            assert (loaded.window, loaded.period) == (timedelta(hours=2), timedelta(hours=3))
             await _assert_client_usable(client)

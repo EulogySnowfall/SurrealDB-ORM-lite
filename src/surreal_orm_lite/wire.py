@@ -12,7 +12,8 @@ This module converts them, **only where the annotation asks for it**:
   validates a value read from the SDK: an SDK ``Duration`` becomes a ``timedelta`` at a
   ``timedelta`` position, an SDK ``Datetime`` its ISO string at a ``datetime``/``date`` position,
   and nothing changes anywhere else (an ``Any``, ``object`` or ``Duration`` position keeps the SDK
-  value and its nanoseconds).
+  value and its nanoseconds); in a union, a value the union validates as it is stays as it is, as
+  v0.22.2 read it.
 - ``lookup_type(annotation, lookup, value)`` — what a filter value on a rich field is validated as
   (``ttl__gt="1h"`` → ``timedelta``, ``at__in=Range(…)`` → ``Range[datetime]``…) before it is bound;
   ``declared_kind(annotation)`` — a field's rich kind without ``Optional``/``Annotated``.
@@ -56,11 +57,13 @@ from pydantic import (
     AliasChoices,
     AwareDatetime,
     BaseModel,
+    ConfigDict,
     FutureDate,
     FutureDatetime,
     NaiveDatetime,
     PastDate,
     PastDatetime,
+    TypeAdapter,
 )
 from pydantic.fields import FieldInfo
 from typing_extensions import is_typeddict
@@ -318,17 +321,60 @@ def _datetime_text(value: Any) -> Any:
 def _claims(member: Any, value: Any) -> bool:
     """Whether a union member takes ``value`` as it is, which forbids the ``timedelta`` conversion.
 
-    ``Any``, ``object``, a ``TypeVar`` and an unresolved (string or ``ForwardRef``) member claim
-    everything; ``Duration`` claims an ORM or SDK ``Duration``; ``str`` claims a string.
+    The cheap first check of rule 6, before :func:`_union_accepts`: ``Any``, ``object``, a
+    ``TypeVar`` and an unresolved (string or ``ForwardRef``) member claim everything; ``Duration``
+    claims an ORM or SDK ``Duration``; a bare ``str`` claims a string (an ``Annotated`` one, which may
+    refuse it, is left to the union's validation).
     """
-    member = _unwrap(member)
-    if member is Any or member is object or isinstance(member, (TypeVar, ForwardRef, str)):
+    core = _unwrap(member)
+    if core is Any or core is object or isinstance(core, (TypeVar, ForwardRef, str)):
         return True
-    if member is Duration or member is SdkDuration:
+    if core is Duration or core is SdkDuration:
         return isinstance(value, (Duration, SdkDuration))
     if member is str:
         return isinstance(value, str)
     return False
+
+
+# Rule 6's union validators, built with ``arbitrary_types_allowed``: a member that needs it comes from
+# a model that allows it (no other model builds), where Pydantic checks such a value by ``isinstance``.
+_UNION_CONFIG = ConfigDict(arbitrary_types_allowed=True)
+
+
+def _build_union_adapter(members: tuple[Any, ...]) -> TypeAdapter[Any] | None:
+    """The ``TypeAdapter`` of the union of ``members``, or ``None`` when Pydantic cannot build one
+    (an annotation it has no schema for, a name it cannot resolve)."""
+    union: Any = Union[members]  # noqa: UP007 - a tuple of members; `|` refuses a string annotation
+    try:
+        adapter: TypeAdapter[Any] = TypeAdapter(union, config=_UNION_CONFIG)
+    except Exception:
+        return None
+    return adapter if adapter.pydantic_complete else None
+
+
+@functools.cache
+def _cached_union_adapter(members: tuple[Any, ...]) -> TypeAdapter[Any] | None:
+    return _build_union_adapter(members)
+
+
+def _union_accepts(members: tuple[Any, ...], value: Any) -> bool:
+    """Whether the union of ``members`` validates ``value`` as it is — what v0.22.2 read it as (rule 6).
+
+    ``True`` too when Pydantic cannot build the union's validator: what it accepts is unknown, so the
+    value stays as it is, as in v0.22.2. Cached per union (built on each call for one whose members
+    cannot be hashed).
+    """
+    try:
+        adapter = _cached_union_adapter(members)
+    except TypeError:  # an unhashable member (``Annotated`` metadata)
+        adapter = _build_union_adapter(members)
+    if adapter is None:
+        return True
+    try:
+        adapter.validate_python(value)
+    except Exception:  # a ValidationError, or a member's own validator raising something else
+        return False
+    return True
 
 
 def _shape_matches(member: Any, value: Any) -> bool:
@@ -340,8 +386,8 @@ def _shape_matches(member: Any, value: Any) -> bool:
     return origin in _MAPPING_ORIGINS or _is_model(member)
 
 
-def _union_input(members: tuple[Any, ...], value: Any) -> Any:
-    """Rule 6: a union with several members (``None`` already dropped)."""
+def _union_converted(members: tuple[Any, ...], value: Any) -> Any:
+    """Rule 6's conversion of ``value``, before the union is asked whether it accepts ``value`` itself."""
     if isinstance(value, (*_SEQUENCE_VALUES, Mapping)):
         for member in members:
             if _shape_matches(member, value):
@@ -349,11 +395,31 @@ def _union_input(members: tuple[Any, ...], value: Any) -> Any:
         return value
     plain = [_unwrap(member) for member in members]
     result = value
-    if any(_is_subclass(member, timedelta) for member in plain) and not any(_claims(member, value) for member in plain):
+    if any(_is_subclass(member, timedelta) for member in plain) and not any(_claims(member, value) for member in members):
         result = _to_timedelta(result)
     if any(_is_subclass(member, date) for member in plain):
         result = _datetime_text(result)
     return result
+
+
+def _union_input(members: tuple[Any, ...], value: Any) -> Any:
+    """Rule 6: a union with several members (``None`` already dropped).
+
+    The conversion (:func:`_union_converted`) is used only when the union refuses ``value`` as it is
+    (:func:`_union_accepts`): a value it accepts — ``"24h"`` for ``Literal["1h", "24h"] | timedelta``,
+    ``"1d"`` for a ``StrEnum | timedelta``, ``["1h"]`` for ``list[timedelta] | list[str]`` — keeps
+    the member Pydantic's union validation picks, as in v0.22.2. A conversion that fails (a duration
+    beyond ``timedelta.max``) raises only when the union refuses the value too.
+    """
+    try:
+        converted = _union_converted(members, value)
+    except ValueError:
+        if _union_accepts(members, value):
+            return value
+        raise
+    if converted is value or _union_accepts(members, value):
+        return value
+    return converted
 
 
 def _rebuild(value: Any, items: list[Any]) -> Any:
@@ -479,7 +545,12 @@ def field_input(annotation: Any, value: Any) -> Any:
        when ``timedelta`` is a member and no member claims the value as it is (``Any``/``object``
        claim everything, ``Duration`` an ORM/SDK ``Duration``, ``str`` a string), and rule 5 when
        ``datetime`` or ``date`` is a member; a container goes to the first member of its shape
-       (sequence or mapping/model), or stays unchanged.
+       (sequence or mapping/model), or stays unchanged. Whatever changed, the value stays as it is
+       when the union validates it as it is (Pydantic's union validation, built with
+       ``arbitrary_types_allowed``), which is what v0.22.2 read: ``"24h"`` for
+       ``Literal["1h", "24h"] | timedelta``, ``"1d"`` for a ``StrEnum | timedelta``, ``["1h"]`` for
+       ``list[timedelta] | list[str]`` keep the member the union picks; ``"2h"`` or an SDK ``Duration``
+       there is a ``timedelta``. So does a value of a union Pydantic cannot build a validator for.
     7. ``list[X]``/``set[X]``/``frozenset[X]``/``Sequence[X]``/``AbstractSet[X]`` with a list, tuple,
        set or frozenset → each item as ``X``.
     8. ``tuple[X, ...]`` → each item as ``X``; ``tuple[A, B, …]`` → by position when the lengths match.
