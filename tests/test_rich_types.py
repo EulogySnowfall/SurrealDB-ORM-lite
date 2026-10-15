@@ -35,6 +35,7 @@ from surreal_orm_lite import (
     Range,
     SurrealDBConnectionManager,
     _sdk,
+    decoding,
     encoding,
 )
 from surreal_orm_lite._sdk import Bound
@@ -615,11 +616,11 @@ class TestRange:
     ) -> None:
         """``str()`` and JSON write every bound they can read back; only live filters need the strict literal.
 
-        A zero duration (refused while the SDK cannot decode one), a ``Decimal`` past 28 fractional
+        A zero duration (refused while nothing reads one back), a ``Decimal`` past 28 fractional
         digits or 96 bits, a string holding ``\\x00`` and an ``int`` past 64 bits have no live-filter
         literal, yet the text never reaches the server and reads back exactly.
         """
-        monkeypatch.setattr(encoding, "sdk_decodes_zero_duration", lambda: False)
+        monkeypatch.setattr(encoding, "reads_zero_duration", lambda: False)
         with pytest.raises(TypeError):
             to_surql_literal(value)
         assert str(value) == text
@@ -650,7 +651,7 @@ class TestRange:
 
     def test_text_form_of_a_zero_timedelta(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """``Range[timedelta]`` reads ``0ns..1h`` back as timedeltas (a bare ``Range`` as ORM durations)."""
-        monkeypatch.setattr(encoding, "sdk_decodes_zero_duration", lambda: False)
+        monkeypatch.setattr(encoding, "reads_zero_duration", lambda: False)
 
         class M(BaseModel):
             rt: Range[timedelta] | None = None
@@ -1243,10 +1244,10 @@ class TestRichLiterals:
 
     @pytest.mark.parametrize("zero", [timedelta(0), Duration(0), surrealdb.Duration(0)], ids=repr)
     def test_zero_duration_follows_the_probe(self, zero: Any, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(encoding, "sdk_decodes_zero_duration", lambda: False)
+        monkeypatch.setattr(encoding, "reads_zero_duration", lambda: False)
         with pytest.raises(TypeError, match="zero duration"):
             to_surql_literal(zero)
-        monkeypatch.setattr(encoding, "sdk_decodes_zero_duration", lambda: True)
+        monkeypatch.setattr(encoding, "reads_zero_duration", lambda: True)
         assert to_surql_literal(zero) == "0ns"
 
     @pytest.mark.parametrize(
@@ -1457,9 +1458,9 @@ class TestRichLiteralsE2E:
         client = await _http_client()
         assert await client.query(f"RETURN {text} == $p;", {"p": param}) is True
 
-    async def test_zero_literal_when_the_sdk_reads_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The ``0ns`` a fixed SDK would allow means the compact zero (the result is a bool: nothing to decode)."""
-        monkeypatch.setattr(encoding, "sdk_decodes_zero_duration", lambda: True)
+    async def test_zero_literal_when_the_orm_reads_zero(self) -> None:
+        """The ``0ns`` the read hook allows (#235) means the compact zero (the result is a bool: nothing to decode)."""
+        assert encoding.reads_zero_duration()
         text = to_surql_literal(Duration(0))
         client = await _http_client()
         assert await client.query(f"RETURN {text} == $p;", {"p": CBORTag(_TAG, [0, 0])}) is True
@@ -1551,9 +1552,13 @@ class TestWireFormsE2E:
 
 class TestZeroProbeE2E:
     async def test_probe_matches_server(self) -> None:
-        """``RETURN 0ns`` fails to decode (``IndexError``) exactly when the local probe answers ``False``."""
+        """``RETURN 0ns`` fails to decode (``IndexError``) exactly when the local probe answers ``False``.
+
+        ``_http_client()`` is a client built with ``AsyncSurreal``, not by the ORM: it never gets the read
+        hook (#235), so it reads what the SDK itself reads.
+        """
         client = await _http_client()
-        if encoding.sdk_decodes_zero_duration():
+        if decoding.sdk_decodes_zero_duration():
             result = await client.query("RETURN 0ns;", {})
             assert isinstance(result, surrealdb.Duration) and result.elapsed == 0
         else:

@@ -35,6 +35,7 @@ exempt (``_REWRITE_MODULES``). A new test that needs rich values goes into one o
 pre-existing module to that set.
 """
 
+import asyncio
 import contextlib
 import os
 from collections.abc import AsyncIterator, Iterator
@@ -91,6 +92,8 @@ async def orm_client(*tables: str) -> AsyncIterator[Any]:
     An async context manager rather than a fixture: the SDK's WebSocket client is bound to the
     event loop that created it, and fixtures run in a different loop from the test body. Dropping
     a table also drops its field definitions, which is what isolates DDL tests.
+
+    The final drops are bounded (10 s each).
     """
     tables = tables or ("Aliased",)
     SurrealDBConnectionManager.set_connection(url=_ws_url(), user="root", password="root", namespace="ns", database="db")
@@ -103,7 +106,7 @@ async def orm_client(*tables: str) -> AsyncIterator[Any]:
     finally:
         for table in tables:
             with contextlib.suppress(Exception):
-                await client.query(f"REMOVE TABLE {table};", {})
+                await asyncio.wait_for(client.query(f"REMOVE TABLE {table};", {}), 10)
         await SurrealDBConnectionManager.close_connection()
 
 

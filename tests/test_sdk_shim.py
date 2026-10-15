@@ -288,3 +288,44 @@ def test_invalid_geometry_error_with_value_error_sdk_class() -> None:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok", result.stderr
+
+
+_SDK_CONNECTION_CLASSES = {
+    "SdkAsyncWsConnection": "AsyncWsSurrealConnection",
+    "SdkAsyncHttpConnection": "AsyncHttpSurrealConnection",
+    "SdkAsyncEmbeddedConnection": "AsyncEmbeddedSurrealConnection",
+}
+
+
+def test_sdk_shim_read_hook_exports() -> None:
+    """#235: what the read hook (``decoding.py``) takes from the SDK enters through ``_sdk.py``."""
+    import surrealdb
+    import surrealdb.data.cbor
+
+    from surreal_orm_lite import _sdk
+
+    assert _sdk.cbor_tag_decoder is surrealdb.data.cbor.tag_decoder
+    assert "cbor_tag_decoder" in _sdk.__all__
+    for alias, name in _SDK_CONNECTION_CLASSES.items():
+        assert getattr(_sdk, alias) is getattr(surrealdb, name), alias
+        assert alias in _sdk.__all__, alias
+
+
+def test_read_hook_without_the_sdk_symbols() -> None:
+    """#235: an SDK without a ``tag_decoder`` or a connection class still imports; the hook is then off."""
+    result = _run_isolated(
+        """
+        import surrealdb, surrealdb.data.cbor
+        del surrealdb.data.cbor.tag_decoder
+        del surrealdb.AsyncHttpSurrealConnection
+        import surrealdb.connections.async_http as http
+        del http.AsyncHttpSurrealConnection
+        from surreal_orm_lite import _sdk, decoding, encoding
+        assert _sdk.cbor_tag_decoder is None and _sdk.SdkAsyncHttpConnection is None
+        assert decoding.needed() and not decoding.available() and not decoding.active()
+        assert not encoding.reads_zero_duration()
+        print("ok")
+        """
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok", result.stderr

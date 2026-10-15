@@ -538,10 +538,11 @@ class TestRefusalsE2E:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("case", list(_REFUSED_SAVES))
-    async def test_refusals_leave_the_client_untouched(self, case: str) -> None:
+    async def test_refusals_leave_the_client_untouched(self, case: str, monkeypatch: pytest.MonkeyPatch) -> None:
         build, message = _REFUSED_SAVES[case]
-        if case == "zero-timedelta" and encoding.sdk_decodes_zero_duration():
-            pytest.skip("the installed SDK reads a zero duration back: nothing to refuse")
+        if case == "zero-timedelta":
+            # The ORM reads a zero duration back since #235: the refusal is for an SDK nothing reads it with.
+            monkeypatch.setattr(encoding, "reads_zero_duration", lambda: False)
         async with orm_client("rf_event") as client:
             await RfEvent(id="witness").save()
             with pytest.raises(ValueError, match=message) as excinfo:
@@ -2998,15 +2999,92 @@ class TestFiltersE2E:
         assert not wrong, f"filters returned the wrong rows: {wrong!r}"
 
     @pytest.mark.asyncio
-    async def test_zero_duration_filter_is_refused_before_sending(self) -> None:
-        if encoding.sdk_decodes_zero_duration():
-            pytest.skip("the installed SDK decodes a zero duration: the refusal does not apply")
+    async def test_zero_duration_filter_is_refused_before_sending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(encoding, "reads_zero_duration", lambda: False)  # an SDK nothing reads a zero with
         async with orm_client("rf_event"):
             client = await SurrealDBConnectionManager.get_client()
             with pytest.raises(ValueError, match="zero duration") as excinfo:
                 await RfEvent.objects().filter(ttl__gt=timedelta(0)).exec()
             assert type(excinfo.value) is ValueError
             await _assert_client_untouched(client)
+
+
+@contextlib.asynccontextmanager
+async def _scheme_client(scheme: str, *tables: str) -> AsyncIterator[Any]:
+    """``orm_client(*tables)`` over WebSocket, or the same ORM client over HTTP."""
+    if scheme == "ws":
+        async with orm_client(*tables) as client:
+            yield client
+        return
+    root = await _http_client()
+    for table in tables:
+        await root.query(f"REMOVE TABLE IF EXISTS {table};", {})
+    SurrealDBConnectionManager.set_connection(_http_url(), "root", "root", "ns", "db")
+    try:
+        yield await SurrealDBConnectionManager.get_client()
+    finally:
+        for table in tables:
+            await root.query(f"REMOVE TABLE IF EXISTS {table};", {})
+        await SurrealDBConnectionManager.unset_connection()
+
+
+class TestZeroDurationE2E:
+    """#235: a zero duration is written, filtered and read back on both lines, now that the clients the
+    ORM opens read it (SDK 2.0.0 cannot: the read hook of ``decoding.py``)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("scheme", ["ws", "http"])
+    async def test_zero_durations_round_trip(self, scheme: str) -> None:
+        assert encoding.reads_zero_duration()
+        async with _scheme_client(scheme, "rf_event"):
+            await RfEvent(id="zero", ttl=timedelta(0), grace=Duration(0), durs=[Duration(0), Duration(1)]).save()
+            await RfEvent(id="long", ttl=timedelta(hours=1), grace=Duration(1)).save()
+            raw = await _raw(RecordID("rf_event", "zero"))
+            assert type(raw["ttl"]) is surrealdb.Duration and raw["ttl"].elapsed == 0
+            assert type(raw["grace"]) is surrealdb.Duration and raw["grace"].elapsed == 0
+            loaded = await RfEvent.objects().get("zero")
+            assert type(loaded.ttl) is timedelta and loaded.ttl == timedelta(0)
+            assert type(loaded.grace) is Duration and loaded.grace == Duration(0)
+            assert loaded.durs == [Duration(0), Duration(1)]
+            assert [e.id for e in await RfEvent.objects().filter(ttl=timedelta(0)).exec()] == ["zero"]
+            assert [e.id for e in await RfEvent.objects().filter(grace__gt=Duration(0)).exec()] == ["long"]
+            await loaded.merge(ttl=timedelta(0), grace=Duration.parse("1s"))
+            assert loaded.ttl == timedelta(0)
+            assert (await RfEvent.objects().get("zero")).grace == Duration.parse("1s")
+            client = await SurrealDBConnectionManager.get_client()
+            assert await client.query("RETURN 1;", {}) == 1
+
+    @pytest.mark.asyncio
+    async def test_zero_duration_live_filter(self) -> None:
+        async with orm_client("rf_event") as client:
+            await client.query("DEFINE TABLE rf_event SCHEMALESS;", {})
+            async with RfEvent.objects().filter(ttl=timedelta(0)).live() as stream:
+                await RfEvent(id="long", ttl=timedelta(hours=1)).save()
+                await RfEvent(id="zero", ttl=timedelta(0)).save()
+                [event] = await _take(stream, 1)
+        assert event.record_id == "rf_event:zero", event.record_id
+        assert event.validation_error is None, event.validation_error
+        assert type(event.instance.ttl) is timedelta and event.instance.ttl == timedelta(0)
+
+
+class TestSetColumnE2E:
+    """#235: a ``set[X]`` field in a ``TYPE set<…>`` column reads back as the declared set on 2.x and 3.3."""
+
+    @pytest.mark.asyncio
+    async def test_set_column(self) -> None:
+        async with orm_client("rf_event") as client:
+            version = await _server_version()
+            if (3, 0, 0) <= version < (3, 3, 0):
+                pytest.skip("SurrealDB 3.1 refuses an array in a set<…> column")
+            await client.query("DEFINE FIELD tags ON rf_event TYPE set<string>;", {})
+            await RfEvent(id="s", tags={"b", "a"}).save()
+            stored = await client.query("SELECT VALUE <string> tags FROM ONLY rf_event:s;", {})
+            assert stored == ("{'a', 'b'}" if version >= (3, 0, 0) else "['a', 'b']"), stored
+            loaded = await RfEvent.objects().get("s")
+            assert type(loaded.tags) is set and loaded.tags == {"a", "b"}
+            raw = await _raw(RecordID("rf_event", "s"))
+            assert raw["tags"] == ({"a", "b"} if version >= (3, 0, 0) else ["a", "b"]), raw["tags"]
+            assert await client.query("RETURN 1;", {}) == 1
 
 
 class TestLiveFiltersE2E:
@@ -3059,12 +3137,13 @@ _README_TABLES = {"subscription": "rf_subscription", "slot": "rf_slot"}
 #: D10: the public docs never describe what happens to the client when the SDK cannot read a value.
 _D10_PHRASES = ("connection lost", "connection is lost", "drops the connection")
 
-#: The ``TYPE set<…>`` advice of spec §11, as the README must state it (whitespace normalised).
+#: The ``TYPE set<…>`` advice of spec §11, as the README must state it (whitespace normalised); since
+#: #235 the ORM reads the native set of a 3.3 column back.
 _SET_ADVICE = (
-    "`set[X]`/`frozenset[X]` fields are stored as arrays. On SurrealDB 3.x a `TYPE set<…>` column holds a "
-    "native set that the surrealdb SDK 2.0.0 cannot read (every read of the column fails with an SDK decoding "
-    "error), and 3.1 refuses an array in it; declare such columns `array<…>`, optionally with "
-    "`VALUE $value.distinct()`"
+    "`set[X]`/`frozenset[X]` fields are stored as arrays. On SurrealDB 3.3 a `TYPE set<…>` column stores the "
+    "array as a native set, which the field reads back as the declared set (see "
+    "[Values the SDK cannot read](#values-the-sdk-cannot-read)), but 3.1 refuses an array in it; to support "
+    "3.1, declare such columns `array<…>`, optionally with `VALUE $value.distinct()`"
 )
 
 _D9_SINCE = "pre-existing (documented in v0.23.0)"

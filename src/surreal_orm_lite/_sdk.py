@@ -16,6 +16,11 @@ v0.24.0 adds the geometry symbols, aliased ``Sdk…`` so they never clash with t
 classes (``geo.py``). SDK 2.0.0 exports only ``Geometry`` and ``InvalidGeometryError`` at the top
 level and keeps the seven concrete classes in ``surrealdb.data.types.geometry``; they are looked up
 root first, then that submodule, so a release that exports them at the top level needs no change.
+
+#235 adds what the read hook (``decoding.py``) needs: the SDK's CBOR ``tag_decoder``, read from
+``surrealdb.data.cbor`` only like ``encode``/``decode``, and the three async connection classes,
+root first, then their SDK 2.0.0 submodules. Each is ``None`` when the installed SDK has no such
+symbol: the hook is then not installed.
 """
 
 import importlib
@@ -39,7 +44,7 @@ from surrealdb.cbor import CBORSimpleValue, CBORTag, undefined
 # The plain CBOR null (``0xf6``): SurrealDB's open range bound (protocol tag 49). ``None`` would go
 # out as tag 6, NONE. Never mutated by the ORM; recognise a CBOR null with
 # ``isinstance(x, CBORSimpleValue) and x.value == 22``, never with ``==`` (it equals the int 22).
-# With SDK 3.0 (#205) this becomes the SDK's ``Null``.
+# SDK 3.0 (#205): this becomes the SDK's ``Null`` sentinel.
 CBOR_NULL: Final = CBORSimpleValue(22)
 
 
@@ -63,8 +68,12 @@ def _first_of(attr: str, *modules: str, required: bool = True) -> Any:
 
 
 if TYPE_CHECKING:
+    from surrealdb import AsyncEmbeddedSurrealConnection as SdkAsyncEmbeddedConnection
+    from surrealdb import AsyncHttpSurrealConnection as SdkAsyncHttpConnection
+    from surrealdb import AsyncWsSurrealConnection as SdkAsyncWsConnection
     from surrealdb.data.cbor import decode as cbor_decode
     from surrealdb.data.cbor import encode as cbor_encode
+    from surrealdb.data.cbor import tag_decoder as cbor_tag_decoder
     from surrealdb.data.types.geometry import GeometryCollection as SdkGeometryCollection
     from surrealdb.data.types.geometry import GeometryLine as SdkGeometryLine
     from surrealdb.data.types.geometry import GeometryMultiLine as SdkGeometryMultiLine
@@ -83,6 +92,16 @@ else:
     # such codec: the local zero-duration probe then answers False.
     cbor_encode = _first_of("encode", "surrealdb.data.cbor", required=False)
     cbor_decode = _first_of("decode", "surrealdb.data.cbor", required=False)
+    # SDK 3.0 (#205): the read hook (``decoding.py``) wraps this ``tag_decoder`` and the decoding
+    # method of these three classes; re-check both against the stable SDK's layout.
+    cbor_tag_decoder = _first_of("tag_decoder", "surrealdb.data.cbor", required=False)
+    SdkAsyncWsConnection = _first_of("AsyncWsSurrealConnection", "surrealdb", "surrealdb.connections.async_ws", required=False)
+    SdkAsyncHttpConnection = _first_of(
+        "AsyncHttpSurrealConnection", "surrealdb", "surrealdb.connections.async_http", required=False
+    )
+    SdkAsyncEmbeddedConnection = _first_of(
+        "AsyncEmbeddedSurrealConnection", "surrealdb", "surrealdb.connections.async_embedded", required=False
+    )
     # ``None`` when the installed SDK has no such class: the ORM's class then derives from
     # ``ValueError`` alone (``exceptions.py``).
     SdkInvalidDurationError = _first_of("InvalidDurationError", "surrealdb", "surrealdb.errors", required=False)
@@ -121,6 +140,11 @@ __all__ = [
     "cbor_encode",
     "cbor_decode",
     "SdkInvalidDurationError",
+    # Read hook (#235)
+    "cbor_tag_decoder",
+    "SdkAsyncWsConnection",
+    "SdkAsyncHttpConnection",
+    "SdkAsyncEmbeddedConnection",
     # Geometry (v0.24.0)
     "SdkGeometry",
     "SdkGeometryPoint",
