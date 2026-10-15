@@ -8,8 +8,10 @@ and created inside ``orm_client(...)``, which drops them before and after the te
 import ast
 import asyncio
 import contextlib
+import dataclasses
 import inspect
 import re
+import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -19,9 +21,10 @@ from uuid import UUID
 
 import pytest
 import surrealdb
-from pydantic import Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from surrealdb import RecordID
 from surrealdb.cbor import undefined
+from typing_extensions import TypedDict
 
 from surreal_orm_lite import (
     AuthenticatedUserMixin,
@@ -1054,6 +1057,174 @@ class TestApplyRecordE2E:
             row = await _raw(rid)
             assert type(row["ttl"]) is surrealdb.Duration and type(row["grace"]) is surrealdb.Duration, row
             _assert_native(row, _WRITE_BACK_KEYS)
+
+
+# --- sub-models after a write that returns the row (#228) ----------------------------------------
+
+
+class RfSub(BaseModel):
+    """A sub-model holding rich values: a write that syncs the instance must keep them the ORM's."""
+
+    ttl: Duration
+    hours: Range[int]
+    period: Range[datetime] | None = None
+    label: str = ""
+
+
+@dataclasses.dataclass
+class RfSubData:
+    """The same, as a stdlib dataclass."""
+
+    ttl: Duration
+    hours: Range[int]
+
+
+class RfSubDict(TypedDict):
+    """The same, as a ``TypedDict``: it validates into a ``dict`` holding the ORM's values."""
+
+    ttl: Duration
+
+
+class RfPlainSub(BaseModel):
+    """A sub-model without rich values: it comes back an instance too, as after ``get()``."""
+
+    name: str
+    n: int = 0
+
+
+class RfHolder(BaseSurrealModel):
+    """Every shape a sub-model field takes: alone, optional, in a list, in a dict, as a dataclass or a ``TypedDict``."""
+
+    model_config = SurrealConfigDict(table_name="rf_holder")
+
+    id: str | None = None
+    sub: RfSub
+    maybe: RfSub | None = None
+    subs: list[RfSub] = []
+    by_key: dict[str, RfSub] = {}
+    data: RfSubData | None = None
+    datas: list[RfSubData] = []
+    typed: RfSubDict | None = None
+    plain: RfPlainSub | None = None
+    many: list[Duration] = []
+    n: int = 0
+
+
+#: The sub-model every ``RfHolder`` field holds.
+SUB = RfSub(
+    ttl=Duration.parse("1h30m1ns"),
+    hours=Range(BoundIncluded(9), BoundExcluded(17)),
+    period=Range(BoundIncluded(datetime(2026, 1, 1, tzinfo=UTC)), None),
+    label="s",
+)
+#: One value per ``RfHolder`` field.
+HOLDER: dict[str, Any] = {
+    "sub": SUB,
+    "maybe": SUB,
+    "subs": [SUB, SUB.model_copy(update={"label": "t"})],
+    "by_key": {"a": SUB},
+    "data": RfSubData(ttl=Duration(7), hours=Range(BoundIncluded(1), None)),
+    "datas": [RfSubData(ttl=Duration.parse("2m"), hours=Range(None, BoundExcluded(3)))],
+    "typed": {"ttl": Duration(9)},
+    "plain": RfPlainSub(name="p", n=1),
+    "many": [Duration.parse("2m")],
+}
+
+
+def _assert_sub_models(holder: Any) -> None:
+    """Every sub-model field of ``holder`` holds its declared type, with the ORM's rich values, as ``HOLDER``."""
+    assert isinstance(holder, RfHolder), holder
+    assert type(holder.sub) is RfSub and holder.sub == SUB, holder.sub
+    assert (type(holder.sub.ttl), type(holder.sub.hours), type(holder.sub.period)) == (Duration, Range, Range)
+    assert type(holder.maybe) is RfSub and holder.maybe == SUB, holder.maybe
+    assert [type(sub) for sub in holder.subs] == [RfSub, RfSub] and holder.subs == HOLDER["subs"], holder.subs
+    assert type(holder.by_key["a"]) is RfSub and holder.by_key == HOLDER["by_key"], holder.by_key
+    assert type(holder.data) is RfSubData and holder.data == HOLDER["data"], holder.data
+    assert (type(holder.data.ttl), type(holder.data.hours)) == (Duration, Range)
+    assert [type(data) for data in holder.datas] == [RfSubData] and holder.datas == HOLDER["datas"], holder.datas
+    assert holder.typed == HOLDER["typed"] and type(holder.typed["ttl"]) is Duration, holder.typed
+    assert type(holder.plain) is RfPlainSub and holder.plain == HOLDER["plain"], holder.plain
+
+
+def _assert_sub_models_native(row: dict[str, Any]) -> None:
+    """The stored row keeps SurrealDB's native durations and ranges inside every sub-model (never ``{elapsed: …}``)."""
+    subs = [row["sub"], row["maybe"], *row["subs"], row["by_key"]["a"], row["data"], *row["datas"]]
+    for sub in subs:
+        assert type(sub["ttl"]) is surrealdb.Duration and type(sub["hours"]) is surrealdb.Range, sub
+    assert type(row["sub"]["period"]) is surrealdb.Range, row["sub"]
+    assert type(row["typed"]["ttl"]) is surrealdb.Duration, row["typed"]
+
+
+async def _holder_saved() -> RfHolder:
+    holder = RfHolder(id="h", **HOLDER)
+    await holder.save()
+    return holder
+
+
+async def _sync_save_without_id() -> RfHolder:
+    holder = RfHolder(**HOLDER)
+    await holder.save()
+    return holder
+
+
+async def _sync_upsert() -> RfHolder:
+    holder = RfHolder(id="h", **HOLDER)
+    await holder.upsert()
+    return holder
+
+
+async def _sync_refresh() -> RfHolder:
+    holder = await _holder_saved()
+    await holder.refresh()
+    return holder
+
+
+async def _sync_merge() -> RfHolder:
+    holder = await _holder_saved()
+    await holder.merge(n=2)
+    return holder
+
+
+async def _sync_patch() -> RfHolder:
+    holder = await _holder_saved()
+    await holder.patch([{"op": "replace", "path": "/n", "value": 2}])
+    return holder
+
+
+async def _sync_atomic_increment() -> RfHolder:
+    holder = await _holder_saved()
+    await holder.atomic_increment("n", 2)
+    return holder
+
+
+#: The calls that apply the row the server returns, each from a fresh table.
+_SYNC_CASES: dict[str, Callable[[], Awaitable[RfHolder]]] = {
+    "save-without-id": _sync_save_without_id,
+    "upsert": _sync_upsert,
+    "refresh": _sync_refresh,
+    "merge": _sync_merge,
+    "patch": _sync_patch,
+    "atomic-increment": _sync_atomic_increment,
+}
+
+
+class TestSubModelWriteSyncE2E:
+    """#228: after a write that syncs the instance, sub-models hold their declared types and a full write keeps them native."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("write", ["update", "upsert"])
+    @pytest.mark.parametrize("case", list(_SYNC_CASES))
+    async def test_sub_models_survive_a_write_sync(self, case: str, write: str) -> None:
+        async with orm_client("rf_holder"):
+            holder = await _SYNC_CASES[case]()
+            _assert_sub_models(holder)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")  # no PydanticSerializationUnexpectedValue on the full write
+                await getattr(holder, write)()
+            rid = holder._record_id()
+            assert rid is not None
+            _assert_sub_models_native(await _raw(rid))
+            _assert_sub_models(await RfHolder.objects().get(holder.get_raw_id()))
 
 
 class TestAuthReadE2E:
