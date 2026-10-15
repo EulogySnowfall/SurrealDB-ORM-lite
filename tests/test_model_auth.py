@@ -586,6 +586,95 @@ class TestAuthenticateBindE2E:
             assert SurrealDBConnectionManager.get_session_token() == created.tokens.access
 
 
+class E2EMisfit(AuthenticatedUserMixin, BaseSurrealModel):
+    """``E2EUser``'s table and access, with a required field its records lack: they do not fit this model."""
+
+    model_config = SurrealConfigDict(table_name="E2EUser", access_name="e2e_acct")
+
+    id: str | None = None
+    email: str
+    password: str
+    nickname: str
+
+
+#: What the error says about the shared session when the record does not fit the model.
+_NOW_BOUND = "The shared session is now signed in as that record"
+_UNCHANGED = "The shared session keeps its previous identity"
+
+
+class TestMisfitRecordMessage:
+    """The error of a record that does not fit the model says what happened to the shared session."""
+
+    def test_a_bound_exchange_says_the_session_is_signed_in(self) -> None:
+        with pytest.raises(SurrealDbError) as raised:
+            E2EMisfit._hydrate_record({"email": "a@b.c", "password": "x"}, "signin", bound=True)
+        message = str(raised.value)
+        assert "E2EMisfit.signin() succeeded but the returned record does not fit the model" in message
+        assert _NOW_BOUND in message
+        assert _UNCHANGED not in message
+        assert "has been created" not in message
+        assert "reconcile the model with the table rather than retrying" in message
+
+    def test_a_bound_signup_also_says_the_record_exists(self) -> None:
+        with pytest.raises(SurrealDbError) as raised:
+            E2EMisfit._hydrate_record({"email": "a@b.c", "password": "x"}, "signup", bound=True)
+        assert f"{_NOW_BOUND}, and the record has been created" in str(raised.value)
+
+    def test_an_unbound_signup_says_the_session_is_unchanged_but_the_record_exists(self) -> None:
+        with pytest.raises(SurrealDbError) as raised:
+            E2EMisfit._hydrate_record({"email": "a@b.c", "password": "x"}, "signup", bound=False)
+        assert f"{_UNCHANGED}, but the record has been created" in str(raised.value)
+
+    def test_an_authenticate_says_the_session_is_unchanged(self) -> None:
+        with pytest.raises(SurrealDbError) as raised:
+            E2EMisfit._hydrate_record({"email": "a@b.c", "password": "x"}, "authenticate", bound=False)
+        message = str(raised.value)
+        assert _UNCHANGED in message
+        assert _NOW_BOUND not in message
+        assert "has been created" not in message
+        assert "The session is authenticated" not in message
+
+
+class TestMisfitRecordE2E:
+    """On a server: what the error says about the shared session is what the session holds."""
+
+    @pytest.mark.asyncio
+    async def test_authenticate_bind_true_keeps_the_previous_identity(self) -> None:
+        async with auth_model() as model:
+            created = await model.signup(email=_unique_email(), password=AUTH_PASSWORD)
+            before = SurrealDBConnectionManager.get_session_token()
+            with pytest.raises(SurrealDbError, match=_UNCHANGED):
+                await E2EMisfit.authenticate(created.tokens.access, bind=True)
+            assert SurrealDBConnectionManager.get_session_token() == before
+
+    @pytest.mark.asyncio
+    async def test_signin_bind_false_keeps_the_previous_identity(self) -> None:
+        async with auth_model() as model:
+            email = _unique_email()
+            await model.signup(email=email, password=AUTH_PASSWORD)
+            before = SurrealDBConnectionManager.get_session_token()
+            with pytest.raises(SurrealDbError, match=_UNCHANGED):
+                await E2EMisfit.signin(email=email, password=AUTH_PASSWORD)
+            assert SurrealDBConnectionManager.get_session_token() == before
+
+    @pytest.mark.asyncio
+    async def test_signin_bind_true_says_the_session_is_signed_in(self) -> None:
+        async with auth_model() as model:
+            email = _unique_email()
+            await model.signup(email=email, password=AUTH_PASSWORD)
+            before = SurrealDBConnectionManager.get_session_token()
+            try:
+                with pytest.raises(SurrealDbError, match=_NOW_BOUND):
+                    await E2EMisfit.signin(email=email, password=AUTH_PASSWORD, bind=True)
+                assert SurrealDBConnectionManager.get_session_token() not in (None, before)
+                me = await SurrealDBConnectionManager.info()
+                assert me is not None
+                assert me["email"] == email
+            finally:
+                with contextlib.suppress(Exception):
+                    await SurrealDBConnectionManager.invalidate()
+
+
 class TestBindKeepsTheRefreshTokenE2E:
     """`bind=True` must not drop a refresh token it actually holds — SurrealDB 3.x only."""
 

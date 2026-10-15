@@ -2143,8 +2143,9 @@ class TestFailedBindEmbeddedE2E:
         async with _embedded_auth() as client:
             created = await EmbUser.signup(email="b@x", password="p", bind=True)
             await SurrealDBConnectionManager.invalidate()
-            with pytest.raises(SurrealDbError, match="does not fit the model"):
+            with pytest.raises(SurrealDbError, match="does not fit the model") as raised:
                 await EmbMisfit.authenticate(created.tokens.access, bind=True)
+            assert "The shared session keeps its previous identity" in str(raised.value)
             assert SurrealDBConnectionManager.get_session_token() is None
             assert await SurrealDBConnectionManager.info() is None
             assert await _is_owner(client)
@@ -2155,12 +2156,27 @@ class TestFailedBindEmbeddedE2E:
             t1 = (await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)).access
             other = await EmbUser.signup(email="b@x", password="p", bind=True)
             await SurrealDBConnectionManager.authenticate(t1)
-            with pytest.raises(SurrealDbError, match="does not fit the model"):
+            with pytest.raises(SurrealDbError, match="does not fit the model") as raised:
                 await EmbMisfit.authenticate(other.tokens.access, bind=True)
+            assert "The shared session keeps its previous identity" in str(raised.value)
             assert SurrealDBConnectionManager.get_session_token() == t1
             me = await SurrealDBConnectionManager.info()
             assert me is not None
             assert me["email"] == "a@x"
+
+    async def test_a_signin_whose_record_does_not_fit_the_model_leaves_the_session_signed_in(self) -> None:
+        """As on a server, a ``signin(bind=True)`` exchange that succeeded stays bound when the record does not fit
+        the model, and the error says so."""
+        async with _embedded_auth():
+            await EmbUser.signup(email="b@x", password="p", bind=True)
+            await SurrealDBConnectionManager.invalidate()
+            with pytest.raises(SurrealDbError, match="does not fit the model") as raised:
+                await EmbMisfit.signin(email="b@x", password="p", bind=True)
+            assert "The shared session is now signed in as that record" in str(raised.value)
+            assert SurrealDBConnectionManager.get_session_token() is not None
+            me = await SurrealDBConnectionManager.info()
+            assert me is not None
+            assert me["email"] == "b@x"
 
 
 def _slow_info(monkeypatch: pytest.MonkeyPatch, delays: list[float]) -> asyncio.Event:

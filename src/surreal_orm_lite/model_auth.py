@@ -481,7 +481,8 @@ class AuthenticatedUserMixin:
             # silently dropped.
             await SurrealDBConnectionManager.authenticate(tokens.access, refresh=tokens.refresh)
 
-        user = cls._hydrate_record(record, label)
+        # Bound only when a signup/signin/refresh token was adopted above; authenticate() adopts below.
+        user = cls._hydrate_record(record, label, bound=bind and tokens is not None)
         if bind and token is not None:
             # authenticate(): the caller's own token, adopted once it resolved to an instance.
             await SurrealDBConnectionManager.authenticate(token)
@@ -535,7 +536,7 @@ class AuthenticatedUserMixin:
             cls._require_record(record, label)
             # authenticate(): as on a server, the caller's token is adopted only once it resolved to an
             # instance, so a record that does not fit the model puts the previous session back too.
-            user = cls._hydrate_record(record, label) if token is not None else None
+            user = cls._hydrate_record(record, label, bound=False) if token is not None else None
         except BaseException:
             await cls._restore_shared_session(client, label)
             raise
@@ -548,7 +549,7 @@ class AuthenticatedUserMixin:
             return user, tokens
         # signup()/signin(): as on a server, a record that does not fit the model leaves the session
         # bound: the exchange itself succeeded, and for a signup the account exists (the error says so).
-        return cls._hydrate_record(record, label), tokens
+        return cls._hydrate_record(record, label, bound=True), tokens
 
     @classmethod
     async def _restore_shared_session(cls, client: Any, label: str) -> None:
@@ -587,18 +588,31 @@ class AuthenticatedUserMixin:
             )
 
     @classmethod
-    def _hydrate_record(cls, record: Any, label: str) -> Any:
-        """Build the model instance from the record the session reports."""
+    def _hydrate_record(cls, record: Any, label: str, *, bound: bool) -> Any:
+        """Build the model instance from the record the session reports.
+
+        :param bound: whether the shared session holds the exchange's new identity when the record
+            turns out not to fit: ``signup()``/``signin()``/``refresh()`` with ``bind=True``, whose
+            token is adopted first. ``authenticate()`` adopts its token only once the instance is
+            built (on the embedded engine, a failure puts the previous session back), and
+            ``bind=False`` never touches the shared session: both pass ``False``.
+        """
         try:
             return cls.from_db(dict(record))  # type: ignore[attr-defined]
         except Exception as exc:
             # The exchange already succeeded, so on signup the account now exists and a token
             # was issued — both of which a bare pydantic ValidationError would hide. Say so, or
-            # the caller retries a signup that will then fail as a duplicate.
+            # the caller retries a signup that will then fail as a duplicate; and say what the
+            # shared session holds, since that differs from one path to the other.
+            if bound:
+                session = "The shared session is now signed in as that record"
+                created = ", and the record has been created" if label == "signup" else ""
+            else:
+                session = "The shared session keeps its previous identity"
+                created = ", but the record has been created" if label == "signup" else ""
             raise SurrealDbError(
-                f"{cls.__name__}.{label}() succeeded on the server but the returned record does "
-                f"not fit the model, so no instance could be built: {exc}. The session is "
-                f"authenticated and, for a signup, the record has been created — reconcile the "
+                f"{cls.__name__}.{label}() succeeded but the returned record does not fit the "
+                f"model, so no instance could be built: {exc}. {session}{created} — reconcile the "
                 f"model with the table rather than retrying."
             ) from exc
 
