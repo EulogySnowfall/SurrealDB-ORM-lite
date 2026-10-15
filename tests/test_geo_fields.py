@@ -6,11 +6,14 @@ after the test; the change-feed table lives in a database of its own (``GEO_CF_D
 reference values come from ``tests/test_geo_types.py``.
 """
 
+import ast
+import inspect
 import math
 import re
 from datetime import timedelta
 from decimal import Decimal
 from fractions import Fraction
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -1501,3 +1504,250 @@ class TestSpatialLookupLiveE2E:
         assert event.validation_error is None, event.validation_error
         assert event.instance.id == "near1"
         assert type(event.instance.location) is GeometryPoint and event.instance.location == GeometryPoint(*A)
+
+
+# --- README (spec §11, AC-15; P1, P2) --------------------------------------------------------------------
+
+_README = Path(__file__).resolve().parents[1] / "README.md"
+
+#: Section 25's example tables and the test tables they run against: everything else runs as written.
+_README_TABLES = {"restaurant": "geo_readme_restaurant", "zone": "geo_readme_zone", "route": "geo_readme_route"}
+
+#: D16: the public docs never describe what happens to the client when the SDK cannot read a value.
+#: The phrases v0.23.0's README test bans, joined here so that the source itself never spells them.
+_D16_PHRASES = tuple(
+    " ".join(words) for words in (("connection", "lost"), ("connection", "is", "lost"), ("drops", "the", "connection"))
+)
+
+#: The last cell of the behaviour-table rows v0.24.0 adds.
+_V0_24_0_SINCE = ("v0.24.0", "pre-existing (documented in v0.24.0)")
+
+#: The subsections of section 25 that section 24 links (P2): each heading exists exactly once.
+_LINKED_HEADINGS = ("#### Rich values inside sub-models", "#### Geometries the SDK cannot read")
+
+#: What the README's distance example shows: SurrealDB's ``geo::distance`` from Times Square, rounded.
+_CLOSEST = [("Corner Pizza", 411), ("Park Burgers", 1826), ("Village Deli", 3365)]
+
+
+def _readme() -> str:
+    return _README.read_text(encoding="utf-8")
+
+
+def _readme_part(heading: str) -> str:
+    """The README text from the ``heading`` line up to the next ``##``/``###`` heading."""
+    match = re.search(rf"^{re.escape(heading)}\n.*?(?=^#{{2,3}} )", _readme(), re.MULTILINE | re.DOTALL)
+    assert match, f"README has no {heading!r} section"
+    return match.group(0)
+
+
+def _section_25() -> str:
+    return _readme_part("### 25. Geospatial fields")
+
+
+def _subsection(heading: str, text: str | None = None) -> str:
+    """The ``heading`` line of ``text`` (the README by default) up to the next heading of level 2 to 4, or the end."""
+    source = _readme() if text is None else text
+    match = re.search(rf"^{re.escape(heading)}\n.*?(?=^#{{2,4}} |\Z)", source, re.MULTILINE | re.DOTALL)
+    assert match, f"README has no {heading!r} part"
+    return match.group(0)
+
+
+def _normalised(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _table_rows(text: str) -> list[tuple[str, list[str]]]:
+    """The body rows of the first table in ``text``: each raw line and its cells."""
+    tables = re.findall(r"(?:^\|.*\n)+", text, re.MULTILINE)
+    assert tables, "no table"
+    lines = [line.strip() for line in tables[0].splitlines()]
+    return [(line, [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip("|"))]) for line in lines[2:]]
+
+
+def _v0_24_0_rows() -> list[tuple[str, list[str]]]:
+    """The behaviour-table rows v0.24.0 adds: the two ``v0.24.0`` rows and the retroactive untyped-field row."""
+    rows = _table_rows(_readme_part("### ORM behaviour: SurrealDB 2.x vs 3.x"))
+    return [(line, cells) for line, cells in rows if cells[-1] in _V0_24_0_SINCE]
+
+
+def _section_25_examples() -> list[str]:
+    """Section 25's ``python`` blocks in order, on the ``geo_readme_`` tables."""
+    blocks: list[str] = re.findall(r"^```python\n(.*?)^```$", _section_25(), re.MULTILINE | re.DOTALL)
+    assert blocks, "README section 25 has no example"
+    examples: list[str] = []
+    renamed = dict.fromkeys(_README_TABLES, 0)
+    for code in blocks:
+        for table, test_table in _README_TABLES.items():
+            code, count = re.subn(rf'table_name="{table}"', f'table_name="{test_table}"', code)
+            renamed[table] += count
+        examples.append(code)
+    assert all(renamed.values()), f"section 25 no longer names these example tables: {renamed!r}"
+    return examples
+
+
+def _names(rows: Any) -> list[str]:
+    return sorted(row.name for row in rows)
+
+
+class TestReadmeGeoExamplesE2E:
+    """AC-15: every example of README section 25 runs as written (its table names aside), on both lines."""
+
+    async def test_section_25_examples(self) -> None:
+        namespace: dict[str, Any] = {"__name__": "readme_section_25"}
+        async with orm_client(*_README_TABLES.values()) as client:
+            for code in _section_25_examples():
+                compiled = compile(code, "<README section 25>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                # A doctest of this repository's own README (trusted text), top-level awaits included.
+                outcome = eval(compiled, namespace)
+                if inspect.iscoroutine(outcome):
+                    await outcome
+
+            # What the examples' comments say.
+            restaurant, zone, route = namespace["Restaurant"], namespace["Zone"], namespace["Route"]
+            times_square = namespace["times_square"]
+            assert times_square.to_geojson() == {"type": "Point", "coordinates": [-73.9855, 40.758]}
+            assert str(times_square) == "{type: 'Point', coordinates: [-73.9855, 40.758]}"
+            assert Geometry.from_geojson({"type": "Point", "coordinates": [-73.9855, 40.758]}) == times_square
+
+            # Every way of giving a point stored a native one, read back as the ORM's class.
+            for key in ("pizza", "burgers", "deli", "bistro"):
+                loaded = await restaurant.objects().get(key)
+                assert type(loaded.location) is GeometryPoint, key
+                rid = loaded._record_id()
+                assert await client.query("SELECT VALUE location.is_point() FROM ONLY $rid;", {"rid": rid}) is True, key
+            deli = await restaurant.objects().get("deli")
+            assert deli.location == GeometryPoint(-73.9969, 40.729)
+            assert deli.model_dump()["location"] is deli.location
+            assert deli.model_dump(mode="json")["location"] == {"type": "Point", "coordinates": [-73.9969, 40.729]}
+            assert (await restaurant.objects().get("truck")).location is None
+
+            assert _names(namespace["near"]) == ["Corner Pizza", "Park Burgers"]
+            closest = namespace["closest"]
+            assert [(r.name, round(r.dist)) for r in closest] == _CLOSEST
+            for found in closest:
+                # The raw client sends SDK values only: the ORM's are converted by the ORM's own calls.
+                points = {"a": SdkPoint(*times_square.get_coordinates()), "b": SdkPoint(*found.location.get_coordinates())}
+                metres = await client.query("RETURN geo::distance($a, $b);", points)
+                assert type(found.dist) is float and found.dist == pytest.approx(metres, abs=1e-6)
+            farthest_first = namespace["farthest_first"]
+            assert farthest_first[0].name == "Paris Bistro"
+            assert (farthest_first[-1].name, farthest_first[-1].dist) == ("Food Truck", None)
+
+            assert _names(namespace["inside"]) == ["Corner Pizza"]
+            assert _names(namespace["outside"]) == ["Food Truck", "Paris Bistro", "Park Burgers", "Village Deli"]
+            assert _names(namespace["zones"]) == ["Midtown"]
+            assert _names(namespace["crossing"]) == ["Broadway"]
+
+            event = namespace["event"]
+            assert event.validation_error is None and event.instance.name == "Hot Dog Cart"
+            assert type(event.instance.location) is GeometryPoint
+
+            assert _names(namespace["same_spot"]) == ["Corner Pizza"]
+            pizza = await restaurant.objects().get("pizza")
+            assert pizza.location == GeometryPoint(-73.9876, 40.7548)
+            assert type(pizza.entrance) is GeometryPoint and pizza.entrance == GeometryPoint(-73.9877, 40.7546)
+
+            broadway = await route.objects().get("broadway")
+            assert type(broadway.path) is GeometryLine and broadway.path == namespace["broadway"]
+            assert [type(stop) for stop in broadway.stops] == [GeometryPoint]
+
+            midtown = await zone.objects().get("midtown")
+            assert type(midtown.centroid) is GeometryPoint
+            assert midtown.centroid.get_coordinates() == pytest.approx((-73.985, 40.755), abs=1e-9)
+            assert (await zone.objects().get("unmapped")).centroid is None
+
+            # The migration loop left every stored location a native point.
+            truck = RecordID("geo_readme_restaurant", "truck")
+            points = await client.query(
+                "SELECT VALUE location.is_point() FROM geo_readme_restaurant WHERE id != $truck;", {"truck": truck}
+            )
+            assert len(points) == 6 and all(points), points
+
+
+class TestReadmeGeoWording:
+    """Unit: what README must (and must not) say about v0.24.0 (spec §11, D16, P1)."""
+
+    def test_section_25_never_describes_the_connection(self) -> None:
+        texts = {"section 25": _section_25(), **{cells[0]: line for line, cells in _v0_24_0_rows()}}
+        for where, text in texts.items():
+            lowered = text.lower()
+            assert not [phrase for phrase in _D16_PHRASES if phrase in lowered], where
+            assert not re.search(r"\bconnections?\b", text, re.IGNORECASE), f"D16: {where} uses a banned word"
+
+    def test_behaviour_table_rows(self) -> None:
+        rows = _v0_24_0_rows()
+        assert all(len(cells) == 4 and "\\|" not in line for line, cells in rows), rows
+        added = [cells for _, cells in rows if cells[-1] == "v0.24.0"]
+        assert len(added) == 2, added
+        assert any(cells[0].startswith("Geometry fields") for cells in added), added
+        assert any("`Decimal` coordinate" in cells[0] for cells in added), added
+        [untyped] = [cells for _, cells in rows if cells[-1] == "pre-existing (documented in v0.24.0)"]
+        assert "GeoJSON" in untyped[0] and "untyped" in untyped[0], untyped
+
+    def test_behaviour_table_header_names_the_versions(self) -> None:
+        header = _normalised(_readme_part("### ORM behaviour: SurrealDB 2.x vs 3.x").split("\n|", 1)[0])
+        assert "rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs" in header
+        assert "rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5" in header
+
+    def test_filter_lookups_list_names_the_spatial_lookups(self) -> None:
+        bullets = [line for line in _readme_part("### Supported Filter Lookups").splitlines() if line.startswith("- ")]
+        for lookup in ("inside", "outside", "intersects"):
+            assert any(f"`{lookup}`" in bullet for bullet in bullets), lookup
+
+    def test_features_roadmap_and_comparison_rows(self) -> None:
+        features = [cells for _, cells in _table_rows(_readme_part("## Features"))]
+        assert any(cells[0].startswith("Geospatial fields") and cells[1] == "✅" for cells in features), features
+        roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
+        assert ["v0.24.0", "Geospatial fields", "✅ Released"] in roadmap, roadmap
+        comparison = [cells for _, cells in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        assert ["Geospatial Fields", "✅ v0.24.0", "✅"] in comparison, comparison
+
+    def test_section_25_tables_have_no_raw_pipe_in_a_cell(self) -> None:
+        tables = re.findall(r"(?:^\|.*\n)+", _section_25(), re.MULTILINE)
+        assert tables, "section 25 has no table"
+        for table in tables:
+            widths = {len(re.split(r"(?<!\\)\|", line.strip().strip("|"))) for line in table.splitlines()}
+            assert len(widths) == 1 and "\\|" not in table, table
+
+    def test_section_25_examples_are_all_python(self) -> None:
+        """Every fenced block of section 25 is a ``python`` block, so the E2E test runs them all."""
+        fences = re.findall(r"^```(\S*)$", _section_25(), re.MULTILINE)
+        assert len(fences) % 2 == 0 and fences[0::2] == ["python"] * (len(fences) // 2), fences
+
+    def test_coming_from_the_full_orm(self) -> None:
+        """P1: section 25 ends with what a full SurrealDB-ORM user meets."""
+        section = _section_25()
+        assert re.search(r"^#### Coming from the full SurrealDB-ORM$", section, re.MULTILINE), "P1 heading missing"
+        text = _subsection("#### Coming from the full SurrealDB-ORM", section)
+        for needle in ("to_geojson", '"line"', "nearby()"):
+            assert needle in text, needle
+
+
+class TestReadmeSection24Consistency:
+    """P2: section 24 says what v0.24.0 converts and links section 25's notes (prose only)."""
+
+    def test_after_a_write_names_geometries_and_links_the_sub_model_note(self) -> None:
+        text = _normalised(_subsection("#### After a write that returns the row"))
+        assert "geometry" in text, text
+        assert "top-level" in text, text
+        assert "(#rich-values-inside-sub-models)" in text, text
+
+    def test_values_the_sdk_cannot_read_links_the_geometry_note(self) -> None:
+        text = _normalised(_subsection("#### Values the SDK cannot read"))
+        assert "(#geometries-the-sdk-cannot-read)" in text, text
+
+    def test_linked_headings_exist_once_in_section_25(self) -> None:
+        readme, section = _readme(), _section_25()
+        for heading in _LINKED_HEADINGS:
+            assert len(re.findall(rf"^{re.escape(heading)}$", readme, re.MULTILINE)) == 1, heading
+            assert re.search(rf"^{re.escape(heading)}$", section, re.MULTILINE), heading
+
+    def test_section_25_follows_section_24(self) -> None:
+        readme = _readme()
+        start_24 = readme.index("\n### 24. Rich field types\n")
+        start_25 = readme.index("\n### 25. Geospatial fields\n")
+        configuration = readme.index("\n## Configuration Options\n")
+        assert start_24 < start_25 < configuration
+        # Section 24 keeps all its subsections, and section 25 runs up to "Configuration Options".
+        assert re.findall(r"^#{2,3} .*$", readme[start_24 + 1 : start_25], re.MULTILINE) == ["### 24. Rich field types"]
+        assert re.findall(r"^#{2,3} .*$", readme[start_25 + 1 : configuration], re.MULTILINE) == ["### 25. Geospatial fields"]
