@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.2] - 2026-10-15
+
+Sub-models keep their rich values after a write that returns the row, and a `timedelta` below the
+top level reads the server's duration. No new public API.
+
+### Fixed
+
+- **A sub-model's durations, ranges and geometries were written back as plain objects** (#228).
+  `save()` without an id, `upsert()`, `refresh()`, `merge()`, `patch()` and the `atomic_*` helpers
+  applied the returned row without validation, so a sub-model field (a Pydantic model, a dataclass
+  or a `TypedDict`, also inside `list[...]`, `dict[..., ...]` or `X | None`) held the row's `dict`
+  with the SDK's values. The next full write (`update()`, `upsert()`) stored their fields
+  (`{elapsed: 300000000000}`) instead of SurrealDB's durations, ranges and geometries, warned
+  `PydanticSerializationUnexpectedValue`, and the next `get()` of the record failed validation.
+  These calls now give a sub-model field the value a read gives: its model instance, with the ORM's
+  `Duration`, `timedelta`, `Range` and geometry values inside, so writing the instance back is safe.
+  - The returned row goes through the model's validation, as in `get()`, so the model's own
+    validators (`field_validator`, `model_validator`, `model_post_init`) run on it too.
+  - When the row as a whole does not validate, each sub-model field is validated on its own, except
+    one that the model's own validators could reshape; that one, like a value that does not
+    validate, is applied as received. These calls raise nothing new.
+  - A GeoJSON object stored in a top-level geometry field (the full SurrealDB-ORM's format) now
+    becomes the ORM geometry after `refresh()`, `merge()` and `patch()`, as after `get()`.
+- **A `timedelta` below the top level failed to read the server's duration.** A sub-model's
+  `timedelta` field, `list[timedelta]`, `dict[str, timedelta]` or `timedelta | str` refused the
+  SDK's `Duration` on every read, as before v0.23.0. They now read a `timedelta`, floored to the
+  microsecond (declare `Duration` to keep the nanoseconds), in a read and in the row a write
+  returns. A row holding many such values is converted in one pass, without mutating the data.
+
+### Notes
+
+- **Identical on SurrealDB 2.x and 3.x**: the cause was in how the ORM applied the SDK's values,
+  not in the server. The README's "Rich values inside sub-models" limitation of section 25 is
+  removed, and "After a write that returns the row" describes the new behaviour; top-level `date`,
+  `set` and `Range` fields still hold the SDK's value until the record is loaded again.
+- Tested against SurrealDB 3.3.4 and 2.7.0 (the CI pins), plus 3.1.5 for backward compatibility.
+
 ## [0.24.0] - 2026-10-15
 
 Geospatial fields: a model can declare geometry fields stored as SurrealDB's native geometries and
