@@ -8,20 +8,39 @@ and created inside ``orm_client(...)``, which drops them before and after the te
 import ast
 import asyncio
 import contextlib
+import copy
+import dataclasses
 import inspect
 import re
+import sys
+import threading
+import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any, ForwardRef, Literal, Optional, Self
 from uuid import UUID
 
+import pydantic
 import pytest
 import surrealdb
-from pydantic import Field, ValidationError
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    PlainValidator,
+    ValidationError,
+    WrapValidator,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
+from pydantic.dataclasses import dataclass as pydantic_dataclass
 from surrealdb import RecordID
 from surrealdb.cbor import undefined
+from typing_extensions import TypeAliasType, TypedDict
 
 from surreal_orm_lite import (
     AuthenticatedUserMixin,
@@ -33,6 +52,8 @@ from surreal_orm_lite import (
     Computed,
     Count,
     Duration,
+    Geometry,
+    GeometryPoint,
     LiveAction,
     Q,
     Range,
@@ -42,6 +63,7 @@ from surreal_orm_lite import (
     _sdk,
     computed,
     encoding,
+    model_base,
 )
 from surreal_orm_lite._sdk import Bound
 from surreal_orm_lite.live import hydrate
@@ -1054,6 +1076,1643 @@ class TestApplyRecordE2E:
             row = await _raw(rid)
             assert type(row["ttl"]) is surrealdb.Duration and type(row["grace"]) is surrealdb.Duration, row
             _assert_native(row, _WRITE_BACK_KEYS)
+
+
+# --- sub-models after a write that returns the row (#228) ----------------------------------------
+
+
+class RfSub(BaseModel):
+    """A sub-model holding rich values (``Duration``, ``timedelta``, ``Range``, geometry): a write sync keeps them the ORM's."""
+
+    ttl: Duration
+    hours: Range[int]
+    period: Range[datetime] | None = None
+    td: timedelta | None = None
+    where: GeometryPoint | None = None
+    label: str = ""
+
+
+@dataclasses.dataclass
+class RfSubData:
+    """The same, as a stdlib dataclass."""
+
+    ttl: Duration
+    hours: Range[int]
+    td: timedelta
+
+
+class RfSubDict(TypedDict):
+    """The same, as a ``TypedDict``: it validates into a ``dict`` holding the ORM's values."""
+
+    ttl: Duration
+    td: timedelta
+
+
+class RfPlainSub(BaseModel):
+    """A sub-model without rich values: it comes back an instance too, as after ``get()``."""
+
+    name: str
+    n: int = 0
+
+
+class RfHolder(BaseSurrealModel):
+    """Every shape a sub-model field takes: alone, optional, in a list, in a dict, as a dataclass or a ``TypedDict``."""
+
+    model_config = SurrealConfigDict(table_name="rf_holder")
+
+    id: str | None = None
+    sub: RfSub
+    maybe: RfSub | None = None
+    subs: list[RfSub] = []
+    by_key: dict[str, RfSub] = {}
+    data: RfSubData | None = None
+    datas: list[RfSubData] = []
+    typed: RfSubDict | None = None
+    plain: RfPlainSub | None = None
+    many: list[Duration] = []
+    tds: list[timedelta] = []
+    n: int = 0
+
+
+#: The sub-model every ``RfHolder`` field holds.
+SUB = RfSub(
+    ttl=Duration.parse("1h30m1ns"),
+    hours=Range(BoundIncluded(9), BoundExcluded(17)),
+    period=Range(BoundIncluded(datetime(2026, 1, 1, tzinfo=UTC)), None),
+    td=timedelta(minutes=5, microseconds=1),
+    where=GeometryPoint(-73.57, 45.5),
+    label="s",
+)
+#: One value per ``RfHolder`` field.
+HOLDER: dict[str, Any] = {
+    "sub": SUB,
+    "maybe": SUB,
+    "subs": [SUB, SUB.model_copy(update={"label": "t"})],
+    "by_key": {"a": SUB},
+    "data": RfSubData(ttl=Duration(7), hours=Range(BoundIncluded(1), None), td=timedelta(seconds=3)),
+    "datas": [RfSubData(ttl=Duration.parse("2m"), hours=Range(None, BoundExcluded(3)), td=timedelta(hours=2))],
+    "typed": {"ttl": Duration(9), "td": timedelta(seconds=9)},
+    "plain": RfPlainSub(name="p", n=1),
+    "many": [Duration.parse("2m")],
+    "tds": [timedelta(seconds=90), timedelta(microseconds=1)],
+}
+
+
+def _assert_sub_models(holder: Any) -> None:
+    """Every sub-model field of ``holder`` holds its declared type, with the ORM's rich values, as ``HOLDER``."""
+    assert isinstance(holder, RfHolder), holder
+    assert type(holder.sub) is RfSub and holder.sub == SUB, holder.sub
+    assert (type(holder.sub.ttl), type(holder.sub.hours), type(holder.sub.period)) == (Duration, Range, Range)
+    assert (type(holder.sub.td), type(holder.sub.where)) == (timedelta, GeometryPoint), holder.sub
+    assert type(holder.maybe) is RfSub and holder.maybe == SUB, holder.maybe
+    assert [type(sub) for sub in holder.subs] == [RfSub, RfSub] and holder.subs == HOLDER["subs"], holder.subs
+    assert type(holder.by_key["a"]) is RfSub and holder.by_key == HOLDER["by_key"], holder.by_key
+    assert type(holder.data) is RfSubData and holder.data == HOLDER["data"], holder.data
+    assert (type(holder.data.ttl), type(holder.data.hours), type(holder.data.td)) == (Duration, Range, timedelta)
+    assert [type(data) for data in holder.datas] == [RfSubData] and holder.datas == HOLDER["datas"], holder.datas
+    assert holder.typed == HOLDER["typed"] and type(holder.typed["ttl"]) is Duration, holder.typed
+    assert type(holder.typed["td"]) is timedelta, holder.typed
+    assert type(holder.plain) is RfPlainSub and holder.plain == HOLDER["plain"], holder.plain
+    assert [type(td) for td in holder.tds] == [timedelta, timedelta] and holder.tds == HOLDER["tds"], holder.tds
+
+
+def _assert_sub_models_native(row: dict[str, Any]) -> None:
+    """The stored row keeps SurrealDB's native durations, ranges and geometries inside every sub-model (never ``{elapsed: …}``)."""
+    subs = [row["sub"], row["maybe"], *row["subs"], row["by_key"]["a"], row["data"], *row["datas"]]
+    for sub in subs:
+        assert type(sub["ttl"]) is surrealdb.Duration and type(sub["hours"]) is surrealdb.Range, sub
+        assert type(sub["td"]) is surrealdb.Duration, sub
+    assert type(row["sub"]["period"]) is surrealdb.Range, row["sub"]
+    assert type(row["sub"]["where"]) is _sdk.SdkGeometryPoint, row["sub"]
+    assert type(row["typed"]["ttl"]) is surrealdb.Duration and type(row["typed"]["td"]) is surrealdb.Duration, row["typed"]
+    assert [type(td) for td in row["tds"]] == [surrealdb.Duration] * len(HOLDER["tds"]), row["tds"]
+
+
+async def _holder_saved() -> RfHolder:
+    holder = RfHolder(id="h", **HOLDER)
+    await holder.save()
+    return holder
+
+
+async def _sync_save_without_id() -> RfHolder:
+    holder = RfHolder(**HOLDER)
+    await holder.save()
+    return holder
+
+
+async def _sync_upsert() -> RfHolder:
+    holder = RfHolder(id="h", **HOLDER)
+    await holder.upsert()
+    return holder
+
+
+async def _sync_refresh() -> RfHolder:
+    holder = await _holder_saved()
+    await holder.refresh()
+    return holder
+
+
+async def _sync_merge() -> RfHolder:
+    holder = await _holder_saved()
+    await holder.merge(n=2)
+    return holder
+
+
+async def _sync_patch() -> RfHolder:
+    holder = await _holder_saved()
+    await holder.patch([{"op": "replace", "path": "/n", "value": 2}])
+    return holder
+
+
+async def _sync_atomic_increment() -> RfHolder:
+    holder = await _holder_saved()
+    await holder.atomic_increment("n", 2)
+    return holder
+
+
+#: The calls that apply the row the server returns, each from a fresh table.
+_SYNC_CASES: dict[str, Callable[[], Awaitable[RfHolder]]] = {
+    "save-without-id": _sync_save_without_id,
+    "upsert": _sync_upsert,
+    "refresh": _sync_refresh,
+    "merge": _sync_merge,
+    "patch": _sync_patch,
+    "atomic-increment": _sync_atomic_increment,
+}
+
+
+def _sdk_values(value: Any) -> Any:
+    """``value`` with the ORM's durations, ranges and geometries as the SDK reads them back, at any depth."""
+    if isinstance(value, Duration):
+        return surrealdb.Duration(value.elapsed)
+    if isinstance(value, timedelta):
+        return surrealdb.Duration(value // timedelta(microseconds=1) * 1000)
+    if isinstance(value, Geometry):
+        return value._to_sdk()
+    if isinstance(value, Range):
+        return surrealdb.Range(value.begin, value.end)
+    if isinstance(value, dict):
+        return {key: _sdk_values(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sdk_values(item) for item in value]
+    return value
+
+
+def _sdk_row(holder: BaseSurrealModel) -> dict[str, Any]:
+    """The row a write of ``holder`` returns, as the SDK reads it: sub-models as dicts holding the SDK's values."""
+    row: dict[str, Any] = _sdk_values(holder.model_dump(exclude={"id"}))
+    return row
+
+
+class RfTdSub(BaseModel):
+    """A sub-model ``timedelta``: a read converts the SDK's duration there (README section 24), and so does a write sync."""
+
+    td: timedelta
+
+
+class RfAliasedSub(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    ttl: Duration = Field(alias="ttlCol")
+
+
+class RfStrictAliasedSub(BaseModel):
+    ttl: Duration = Field(alias="ttlCol")
+
+
+class RfBoomSub(BaseModel):
+    """A sub-model whose validator raises something else than a ``ValueError``."""
+
+    n: int
+
+    @field_validator("n")
+    @classmethod
+    def _boom(cls, value: int) -> int:
+        raise RuntimeError("boom")
+
+
+@dataclasses.dataclass
+class RfStdData:
+    """A stdlib dataclass: it takes the config of the model it sits in, in a read and in a write sync alike."""
+
+    name: str
+
+
+class RfCat(BaseModel):
+    kind: Literal["cat"] = "cat"
+    ttl: Duration
+
+
+class RfDog(BaseModel):
+    kind: Literal["dog"]
+    ttl: Duration
+
+
+@pydantic_dataclass
+class RfPydData:
+    """A Pydantic dataclass: a dataclass too, with its own config."""
+
+    ttl: Duration
+
+
+class RfOddHolder(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_odd", str_strip_whitespace=True)
+
+    id: str | None = None
+    td_sub: RfTdSub | None = None
+    aliased: RfAliasedSub | None = None
+    strict_aliased: RfStrictAliasedSub | None = None
+    boom: RfBoomSub | None = None
+    std: RfStdData | None = None
+    std_column: RfStdData | None = Field(default=None, alias="stdCol")
+    picked: Annotated[RfPlainSub | RfSub | None, Field(union_mode="left_to_right")] = None
+    pet: RfCat | RfDog | None = Field(default=None, discriminator="kind")
+    n: int = 0
+
+
+#: Row additions for the tests that cover both paths of a write sync: the whole row validates (``{}``), or it
+#: does not (``n``) and each sub-model field is validated alone, against its own annotation.
+_ROW_PATHS = pytest.mark.parametrize("extra", [{}, {"n": "x"}], ids=["whole-row", "field-alone"])
+
+
+class TestSubModelSyncRule:
+    """#228 (unit): the fields a write sync validates, and the fallback to the value as received."""
+
+    def test_fields_validated_on_sync(self) -> None:
+        expected = {"sub", "maybe", "subs", "by_key", "data", "datas", "typed", "plain", "tds"}
+        assert set(RfHolder._sync_fields()) == expected
+        assert RfHolder._sync_fields() is RfHolder._sync_fields(), "cached per class"
+        assert RfEvent._sync_fields() == {} and RfPlain._sync_fields() == {}
+        # A ``timedelta`` below the top level, never one the top-level rule converts (nor a subclass).
+        assert set(RfKinds._sync_fields()) == {"either", "many", "by_key", "window"}
+        # Python names only: ``_apply_record`` translates each column first.
+        assert "stdCol" not in RfOddHolder._sync_fields() and "std_column" in RfOddHolder._sync_fields()
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            RfSub,
+            RfSubData,
+            RfSubDict,
+            RfPydData,
+            RfSub | None,
+            Optional[RfSub],  # noqa: UP045 (typing.Union on purpose)
+            list[RfSub],
+            dict[str, RfSub],
+            tuple[int, RfSub],
+            list[RfSub | None],
+            Annotated[RfSub, Field(description="x")],
+            Range[RfSub],
+            TypeAliasType("RfSubs", list[RfSub]),
+        ],
+    )
+    def test_structured_annotations(self, annotation: Any) -> None:
+        assert model_base._has_structured_type(annotation)
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            int,
+            Any,
+            list[int],
+            dict[str, Any],
+            Duration,
+            Range[int],
+            timedelta,
+            datetime,
+            Literal["a", "b"],
+            type[RfSub],
+            "RfSub",
+            ForwardRef("RfSub"),
+            Annotated[int, RfSub],
+            TypeAliasType("RfInts", list[int]),
+        ],
+    )
+    def test_other_annotations(self, annotation: Any) -> None:
+        assert not model_base._has_structured_type(annotation)
+
+    @pytest.mark.skipif(sys.version_info < (3, 12), reason="the type statement needs Python 3.12")
+    def test_type_statement_aliases(self) -> None:
+        namespace: dict[str, Any] = {"RfSub": RfSub}
+        # Recursive, resolvable, and one whose value cannot be evaluated (NameError on access).
+        exec("type Loop = list[Loop] | int\ntype Subs = list[RfSub]\ntype Bad = list[Undefined]", namespace)
+        assert not model_base._has_structured_type(namespace["Loop"])
+        assert model_base._has_structured_type(namespace["Subs"])
+        assert not model_base._has_structured_type(namespace["Bad"])
+
+    def test_a_returned_row_gives_the_declared_instances(self) -> None:
+        holder = RfHolder.model_construct(id="h", sub=None)
+        row = _sdk_row(RfHolder(id="h", **HOLDER))
+        assert type(row["sub"]["ttl"]) is surrealdb.Duration and type(row["data"]["hours"]) is surrealdb.Range
+        holder._apply_record(row)
+        _assert_sub_models(holder)
+        # A typed container of scalars keeps the SDK's values (out of the rule), and its serializer converts them.
+        assert [type(d) for d in holder.many] == [surrealdb.Duration]
+        assert holder.model_dump()["many"] == HOLDER["many"]
+
+    def test_only_still_filters(self) -> None:
+        holder = RfHolder(id="h", **HOLDER)
+        before = holder.sub
+        holder._apply_record({"sub": {"ttl": surrealdb.Duration(1)}, "n": 4}, only={"n"})
+        assert holder.sub is before and holder.n == 4
+
+    @pytest.mark.parametrize(
+        "raw",
+        [{"ttl": "1h"}, {"hours": surrealdb.Range(None, None)}, "text", 3, None],
+        ids=["bad-duration", "missing-ttl", "text", "number", "none"],
+    )
+    def test_a_row_that_does_not_validate_is_applied_as_received(self, raw: Any) -> None:
+        holder = RfHolder(id="h", **HOLDER)
+        holder._apply_record({"sub": raw, "maybe": raw})
+        assert holder.sub is raw
+        assert holder.maybe is None if raw is None else holder.maybe is raw
+
+    @_ROW_PATHS
+    def test_a_sub_model_timedelta_follows_the_read(self, extra: dict[str, Any]) -> None:
+        """README section 24: a sub-model ``timedelta`` reads the SDK's duration, floored to the microsecond, and so does the sync."""
+        raw = {"td": surrealdb.Duration(5 * 10**9 + 1999)}
+        expected = RfTdSub(td=timedelta(seconds=5, microseconds=1))
+        assert RfOddHolder.model_validate({"td_sub": raw}).td_sub == expected
+        odd = RfOddHolder()
+        odd._apply_record({"td_sub": raw, **extra})
+        assert type(odd.td_sub) is RfTdSub and odd.td_sub == expected
+        assert type(odd.td_sub.td) is timedelta
+        assert type(raw["td"]) is surrealdb.Duration, "the row is not mutated"
+
+    # ``pause`` refuses ``"x"``: the row fails and each field is validated alone.
+    @pytest.mark.parametrize("extra", [{}, {"pauseCol": "x"}], ids=["whole-row", "field-alone"])
+    def test_a_timedelta_below_the_top_level_follows_the_read(self, extra: dict[str, Any]) -> None:
+        """``list[timedelta]``, ``dict[str, timedelta]``, ``timedelta | str`` and ``Range[timedelta]`` hold what a read gives."""
+        sdk = surrealdb.Duration(90 * 10**9 + 1)
+        row = {
+            "many": [sdk, surrealdb.Duration(1000)],
+            "by_key": {"a": sdk},
+            "either": sdk,
+            "window": surrealdb.Range(BoundIncluded(sdk), None),
+        }
+        read = RfKinds.model_validate(row)
+        kinds = RfKinds(id="k")
+        kinds._apply_record({**row, **extra})
+        for got in (read, kinds):
+            assert got.many == [timedelta(seconds=90), timedelta(microseconds=1)]
+            assert [type(td) for td in got.many] == [timedelta, timedelta]
+            assert type(got.by_key["a"]) is timedelta and got.by_key == {"a": timedelta(seconds=90)}
+            assert type(got.either) is timedelta and got.either == timedelta(seconds=90)
+            assert type(got.window) is Range and got.window == Range(BoundIncluded(timedelta(seconds=90)), None)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # the full write serialises timedeltas, not the SDK's dataclass
+            dumped = kinds.model_dump(include={"many", "by_key", "either"})
+        assert dumped == {"many": read.many, "by_key": read.by_key, "either": read.either}
+
+    @_ROW_PATHS
+    @pytest.mark.parametrize("key", ["ttl", "ttlCol"])
+    def test_aliased_sub_model_keys_follow_the_read(self, key: str, extra: dict[str, Any]) -> None:
+        """What ``get()`` accepts in a sub-model, under its alias or its name, the sync accepts; nothing else."""
+        raw = {key: surrealdb.Duration(5)}
+        for field in ("aliased", "strict_aliased"):
+            try:
+                expected: Any = getattr(RfOddHolder.model_validate({field: raw}), field)
+            except ValidationError:
+                expected = raw
+            odd = RfOddHolder()
+            odd._apply_record({field: raw, **extra})
+            got = getattr(odd, field)
+            assert got == expected and type(got) is type(expected), (field, got)
+            if type(got) is not dict:
+                assert type(got.ttl) is Duration and got.ttl == Duration(5)
+        assert type(RfOddHolder.model_validate({"strict_aliased": {"ttlCol": surrealdb.Duration(5)}}).strict_aliased) is (
+            RfStrictAliasedSub
+        )
+
+    def test_a_validator_that_raises_anything_never_escapes(self) -> None:
+        raw = {"n": 1}
+        with pytest.raises(RuntimeError):
+            RfOddHolder.model_validate({"boom": raw})
+        odd = RfOddHolder()
+        odd._apply_record({"boom": raw})
+        assert odd.boom is raw
+
+    @_ROW_PATHS
+    def test_the_model_config_reaches_a_stdlib_dataclass(self, extra: dict[str, Any]) -> None:
+        """A stdlib dataclass takes the model's config (``str_strip_whitespace``) in a read and in a write sync alike."""
+        assert RfOddHolder.model_validate({"std": {"name": "  ada  "}}).std == RfStdData("ada")
+        odd = RfOddHolder()
+        odd._apply_record({"std": {"name": "  ada  "}, "stdCol": {"name": " bob "}, **extra})
+        assert odd.std == RfStdData("ada") and odd.std_column == RfStdData("bob")
+
+    @_ROW_PATHS
+    def test_field_metadata_is_kept(self, extra: dict[str, Any]) -> None:
+        """The field's own metadata reaches the adapter: ``left_to_right`` picks the first member that validates.
+
+        The smart mode would pick ``RfSub``, which sets more fields from the row.
+        """
+        assert RfOddHolder.model_fields["picked"].metadata, "the union mode lives in the field's metadata"
+        raw = {"name": "p", "ttl": surrealdb.Duration(5), "hours": surrealdb.Range(None, None)}
+        odd = RfOddHolder()
+        odd._apply_record({"picked": raw, **extra})
+        assert type(odd.picked) is RfPlainSub and odd.picked == RfOddHolder.model_validate({"picked": raw}).picked
+
+    @_ROW_PATHS
+    def test_the_discriminator_is_kept(self, extra: dict[str, Any]) -> None:
+        """A tagged union reads the tag, as in a read: the smart mode would take an untagged row for a cat."""
+        dog = {"kind": "dog", "ttl": surrealdb.Duration(5)}
+        odd = RfOddHolder()
+        odd._apply_record({"pet": dog, **extra})
+        assert type(odd.pet) is RfDog and type(odd.pet.ttl) is Duration
+        untagged = {"ttl": surrealdb.Duration(5)}
+        with pytest.raises(ValidationError):
+            RfOddHolder.model_validate({"pet": untagged})
+        odd._apply_record({"pet": untagged, **extra})
+        assert odd.pet is untagged
+
+    def test_adapters_are_built_once_on_first_use(self) -> None:
+        class RfLazy(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_lazy")
+
+            id: str | None = None
+            sub: RfPlainSub | None = None
+            n: int = 0
+
+        lazy = RfLazy()
+        lazy._apply_record({"sub": {"name": "a"}})
+        assert type(lazy.sub) is RfPlainSub and lazy.sub == RfPlainSub(name="a")
+        assert RfLazy not in model_base._SYNC_ADAPTERS, "a row that validates needs no adapter"
+        lazy._apply_record({"sub": {"name": "b"}, "n": "x"})  # the row fails (``n``): ``sub`` is validated alone
+        assert type(lazy.sub) is RfPlainSub and lazy.sub == RfPlainSub(name="b") and lazy.n == "x"
+        adapter = model_base._SYNC_ADAPTERS[RfLazy]["sub"]
+        assert adapter is not None and RfLazy._sync_adapter("sub") is adapter
+        assert RfLazy._sync_adapter("id") is None, "a field the sync does not validate has no adapter"
+
+    def test_an_adapter_that_cannot_be_built_keeps_the_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class RfUnbuildable(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_unbuildable")
+
+            id: str | None = None
+            sub: RfPlainSub | None = None
+            n: int = 0
+
+        def refuse(*args: Any, **kwargs: Any) -> Any:
+            raise TypeError("no adapter")
+
+        monkeypatch.setattr(model_base, "TypeAdapter", refuse)
+        raw = {"name": "a"}
+        unbuildable = RfUnbuildable()
+        unbuildable._apply_record({"sub": raw, "n": "x"})
+        assert unbuildable.sub is raw and RfUnbuildable._sync_adapter("sub") is None
+
+    def test_an_unresolved_sub_model_keeps_the_value(self) -> None:
+        class RfLater(BaseModel):
+            y: "RfUndefined"  # type: ignore[name-defined]  # noqa: F821 (never defined: the model stays incomplete)
+
+        class RfIncomplete(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_incomplete")
+
+            id: str | None = None
+            later: RfLater | None = None
+
+        assert not RfIncomplete.__pydantic_complete__
+        incomplete = RfIncomplete.model_construct()
+        raw = {"y": 1}
+        incomplete._apply_record({"later": raw})
+        assert incomplete.later is raw
+        assert RfIncomplete not in model_base._SYNC_FIELDS and RfIncomplete not in model_base._SYNC_ADAPTERS
+
+
+class TestSubModelWriteSyncE2E:
+    """#228: after a write that syncs the instance, sub-models hold their declared types and a full write keeps them native."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("write", ["update", "upsert"])
+    @pytest.mark.parametrize("case", list(_SYNC_CASES))
+    async def test_sub_models_survive_a_write_sync(self, case: str, write: str) -> None:
+        async with orm_client("rf_holder"):
+            holder = await _SYNC_CASES[case]()
+            _assert_sub_models(holder)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")  # no PydanticSerializationUnexpectedValue on the full write
+                await getattr(holder, write)()
+            rid = holder._record_id()
+            assert rid is not None
+            _assert_sub_models_native(await _raw(rid))
+            _assert_sub_models(await RfHolder.objects().get(holder.get_raw_id()))
+
+    @pytest.mark.asyncio
+    async def test_the_issue_reproduction(self) -> None:
+        """#228's own reproduction: ``upsert()``, then ``update()``, then ``get()``."""
+        sub = RfIssueSub(ttl=Duration.parse("1h"), td=timedelta(minutes=5))
+        async with orm_client("rf_issue_holder"):
+            holder = RfIssueHolder(id="h", sub=sub, many=[Duration.parse("2m")])
+            await holder.upsert()
+            assert type(holder.sub) is RfIssueSub and holder.sub == sub, holder.sub
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")  # no PydanticSerializationUnexpectedValue
+                await holder.update()
+            row = await _raw(RecordID("rf_issue_holder", "h"))
+            assert type(row["sub"]["ttl"]) is surrealdb.Duration and type(row["sub"]["td"]) is surrealdb.Duration, row
+            got = await RfIssueHolder.objects().get("h")
+            assert got.sub == sub and got.many == [Duration.parse("2m")], got
+            assert (type(got.sub.ttl), type(got.sub.td)) == (Duration, timedelta)
+
+
+class RfIssueSub(BaseModel):
+    """The sub-model of #228's reproduction."""
+
+    ttl: Duration
+    td: timedelta
+
+
+class RfIssueHolder(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_issue_holder")
+
+    id: str | None = None
+    sub: RfIssueSub
+    many: list[Duration]
+
+
+# --- a ``timedelta`` below the top level reads the SDK's duration (#228) ---------------------------
+
+
+@dataclasses.dataclass
+class RfTdData:
+    td: timedelta
+
+
+class RfTdDict(TypedDict):
+    td: timedelta
+
+
+class RfTdAliasedSub(BaseModel):
+    # A write stores a sub-model under its field names: ``populate_by_name`` reads them back.
+    model_config = ConfigDict(populate_by_name=True)
+
+    td: timedelta = Field(alias="tdCol")
+
+
+class RfTdHolder(BaseSurrealModel):
+    """Every position below the top level where a ``timedelta`` reads the SDK's duration."""
+
+    model_config = SurrealConfigDict(table_name="rf_td_holder")
+
+    id: str | None = None
+    sub: RfTdSub | None = None
+    subs: list[RfTdSub] = []
+    data: RfTdData | None = None
+    typed: RfTdDict | None = None
+    aliased: RfTdAliasedSub | None = None
+    picked: RfPlainSub | RfTdSub | None = None  # a union of models: Pydantic tags the error with the member
+    tds: list[timedelta] = []
+    pair: tuple[timedelta, ...] = ()
+    by_key: dict[str, timedelta] = {}
+    either: timedelta | str | None = None  # a union: Pydantic tags the error with ``timedelta``
+    n: int = 0
+
+
+#: An SDK duration that is not a whole number of microseconds, and the ``timedelta`` it reads as (floored).
+_SDK_TD = surrealdb.Duration(5400 * 10**9 + 1999)
+_TD = timedelta(hours=1, minutes=30, microseconds=1)
+
+#: ``field: (value in the row, value read)`` for every position of ``RfTdHolder``.
+_TD_POSITIONS: dict[str, tuple[Any, Any]] = {
+    "sub": ({"td": _SDK_TD}, RfTdSub(td=_TD)),
+    "subs": (
+        [{"td": _SDK_TD}, {"td": surrealdb.Duration(1000)}],
+        [RfTdSub(td=_TD), RfTdSub(td=timedelta(microseconds=1))],
+    ),
+    "data": ({"td": _SDK_TD}, RfTdData(td=_TD)),
+    "typed": ({"td": _SDK_TD}, {"td": _TD}),
+    "aliased": ({"tdCol": _SDK_TD}, RfTdAliasedSub(tdCol=_TD)),
+    "picked": ({"td": _SDK_TD}, RfTdSub(td=_TD)),
+    "tds": ([_SDK_TD, surrealdb.Duration(1000)], [_TD, timedelta(microseconds=1)]),
+    "pair": ([_SDK_TD], (_TD,)),
+    "by_key": ({"a": _SDK_TD}, {"a": _TD}),
+    "either": (_SDK_TD, _TD),
+}
+
+
+def _assert_td_positions(holder: Any) -> None:
+    """Every ``RfTdHolder`` position holds its declared type with ``timedelta`` values, as ``_TD_POSITIONS`` says."""
+    assert isinstance(holder, RfTdHolder), holder
+    for field, (_, expected) in _TD_POSITIONS.items():
+        got = getattr(holder, field)
+        assert got == expected and type(got) is type(expected), (field, got)
+
+
+class TestNestedTimedeltaRead:
+    """#228 (unit): a ``timedelta`` below the top level reads the SDK's duration, floored to the microsecond."""
+
+    @pytest.mark.parametrize("field", list(_TD_POSITIONS))
+    def test_each_position(self, field: str) -> None:
+        raw, expected = _TD_POSITIONS[field]
+        got = getattr(RfTdHolder.model_validate({field: raw}), field)
+        assert got == expected and type(got) is type(expected), got
+
+    def test_every_position_at_once_without_touching_the_row(self) -> None:
+        row = {field: raw for field, (raw, _) in _TD_POSITIONS.items()}
+        before = copy.deepcopy(row)
+        _assert_td_positions(RfTdHolder.model_validate(row))
+        assert row == before and row["sub"]["td"] is _SDK_TD, "the caller's row is not mutated"
+
+    def test_every_way_to_build_the_model(self) -> None:
+        row = {"id": RecordID("rf_td_holder", "k"), "sub": {"td": _SDK_TD}, "tds": [_SDK_TD]}
+        for holder in (RfTdHolder.from_db(dict(row)), RfTdHolder(**row), RfTdHolder.model_validate(row)):
+            assert isinstance(holder, RfTdHolder) and holder.id == "k", holder
+            assert holder.sub == RfTdSub(td=_TD) and holder.tds == [_TD], holder
+
+    @pytest.mark.parametrize(
+        "value",
+        [surrealdb.Duration(-1), _SDK_BEYOND_TIMEDELTA, surrealdb.Duration(1.5), Duration(5), "x"],
+        ids=["negative", "beyond-timedelta-max", "float-elapsed", "orm-duration", "text"],
+    )
+    def test_a_value_the_rule_cannot_convert_is_refused_as_before(self, value: Any) -> None:
+        with pytest.raises(ValidationError) as caught:
+            RfTdHolder.model_validate({"sub": {"td": value}, "tds": [value]})
+        assert [(e["loc"], e["input"] is value) for e in caught.value.errors()] == [(("sub", "td"), True), (("tds", 0), True)]
+
+    def test_another_error_is_reported_alone(self) -> None:
+        """The durations convert and the row still fails: the error names what is really wrong."""
+        with pytest.raises(ValidationError) as caught:
+            RfTdHolder.model_validate({"sub": {"td": _SDK_TD}, "tds": [_SDK_TD], "n": "x"})
+        assert [e["loc"] for e in caught.value.errors()] == [("n",)]
+
+    def test_a_row_a_validator_rebuilt_is_refused_as_before(self) -> None:
+        """A ``mode="before"`` validator that rebuilds the row's sub-dicts hides the SDK's values: refused, never guessed."""
+
+        class RfRebuilt(RfTdHolder):
+            @model_validator(mode="before")
+            @classmethod
+            def _rebuild(cls, data: Any) -> Any:
+                return copy.deepcopy(data)
+
+        with pytest.raises(ValidationError):
+            RfRebuilt.model_validate({"sub": {"td": _SDK_TD}})
+        assert RfRebuilt.model_validate({"sub": {"td": _TD}}).sub == RfTdSub(td=_TD)
+
+    def test_a_shared_duration_converts_where_a_timedelta_is_declared_only(self) -> None:
+        """One SDK object at two positions: a ``Duration`` keeps its nanoseconds, the ``timedelta`` is floored."""
+
+        class RfBoth(BaseModel):
+            ttl: Duration
+            td: timedelta
+
+        class RfShared(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_shared")
+
+            id: str | None = None
+            both: RfBoth | None = None
+
+        shared = RfShared.model_validate({"both": {"ttl": _SDK_TD, "td": _SDK_TD}})
+        assert shared.both is not None and shared.both.ttl == Duration(_SDK_TD.elapsed) and shared.both.td == _TD
+
+    @pytest.mark.parametrize(
+        ("annotation", "expected"),
+        [
+            (list[timedelta], True),
+            (dict[str, timedelta], True),
+            (timedelta | str, True),
+            (Range[timedelta], True),
+            (Annotated[list[timedelta], Field(min_length=1)], True),
+            (TypeAliasType("RfTds", list[timedelta]), True),
+            (timedelta, True),  # a top-level one has its own rule: ``_sync_fields`` leaves it out by its read kind
+            (_SubTimedelta, False),
+            (list[_SubTimedelta], False),
+            (RfTdSub, False),  # a sub-model counts as a structured type instead
+            (Duration, False),
+            (list[int], False),
+        ],
+    )
+    def test_annotations_holding_a_timedelta(self, annotation: Any, expected: bool) -> None:
+        assert model_base._holds_timedelta(annotation) is expected
+
+    def test_the_path_must_end_on_the_refused_value(self) -> None:
+        value = surrealdb.Duration(5)
+        assert model_base._path_to({"f": [value]}, ("f", 0), value) == ["f", 0]
+        assert model_base._path_to({"f": {"td": value}}, ("f", "RfTdSub", "td"), value) == ["f", "td"]
+        assert model_base._path_to({"f": value}, ("f", "timedelta"), value) == ["f"]
+        assert model_base._path_to((value,), (0,), value) == [0]
+        # A union tag that happens to be a key leads elsewhere; an index out of range; a scalar on the way.
+        assert model_base._path_to({"f": {"RfTdSub": {"td": 1}, "td": value}}, ("f", "RfTdSub", "td"), value) is None
+        assert model_base._path_to({"f": [value]}, ("f", 1), value) is None
+        assert model_base._path_to({"f": 3}, ("f", 0), value) is None
+
+    def test_the_conversion_never_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def boom(*args: Any) -> Any:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(model_base, "_path_to", boom)
+        with pytest.raises(ValidationError):
+            RfTdHolder.model_validate({"sub": {"td": _SDK_TD}})
+
+    def test_assignment_validation_is_unchanged(self) -> None:
+        class RfAssigned(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_assigned", validate_assignment=True)
+
+            id: str | None = None
+            sub: RfTdSub | None = None
+
+        assigned = RfAssigned(sub={"td": _SDK_TD})  # type: ignore[arg-type]
+        assert assigned.sub == RfTdSub(td=_TD)
+        assigned.sub = RfTdSub(td=timedelta(seconds=1))
+        assert assigned.sub == RfTdSub(td=timedelta(seconds=1))
+
+
+class RfTdOther(BaseModel):
+    """A second sub-model with a ``timedelta`` named ``td``: in a union with ``RfTdSub``, both refuse the same value."""
+
+    td: timedelta
+    label: str = ""
+
+
+class RfTdMany(BaseSurrealModel):
+    """Many SDK durations below the top level: in a ``list[timedelta]`` and in sub-models."""
+
+    model_config = SurrealConfigDict(table_name="rf_td_many")
+
+    id: str | None = None
+    tds: list[timedelta] = []
+    subs: list[RfTdSub] = []
+    either: RfTdSub | RfTdOther | None = None
+
+
+def _count_copies(monkeypatch: pytest.MonkeyPatch) -> list[tuple[type, int]]:
+    """Record ``(type, id)`` of each container the duration conversion copies (``model_base._copy_with``)."""
+    copied: list[tuple[type, int]] = []
+    real = model_base._copy_with
+
+    def counting(node: Any, items: Any) -> Any:
+        copied.append((type(node), id(node)))
+        return real(node, items)
+
+    monkeypatch.setattr(model_base, "_copy_with", counting)
+    return copied
+
+
+def _sdk_durations(n: int) -> list[Any]:
+    """``n`` distinct SDK durations, of 1 to ``n`` microseconds."""
+    return [surrealdb.Duration(i * 1000) for i in range(1, n + 1)]
+
+
+class TestNestedTimedeltaCopies:
+    """#228 (unit): the conversion copies each container on a converted path once, whatever the number of durations."""
+
+    def test_a_read_copies_each_container_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        copied = _count_copies(monkeypatch)
+        counts: dict[int, int] = {}
+        for n in (10, 2000):
+            copied.clear()
+            tds = _sdk_durations(n)
+            subs = [{"td": value} for value in _sdk_durations(3)]
+            row = {"tds": tds, "subs": subs}
+            got = RfTdMany.model_validate(row)
+            # The row, ``tds``, ``subs`` and the 3 sub-models: each copied once, nothing else.
+            containers = {id(row), id(tds), id(subs), *(id(sub) for sub in subs)}
+            assert sorted(i for _, i in copied) == sorted(containers), copied
+            counts[n] = len(copied)
+            assert got.tds == [timedelta(microseconds=i) for i in range(1, n + 1)]
+            assert got.subs == [RfTdSub(td=timedelta(microseconds=i)) for i in range(1, 4)]
+            assert row["tds"] is tds and type(tds[0]) is surrealdb.Duration, "the caller's row is not mutated"
+        assert counts == {10: 6, 2000: 6}
+
+    def test_a_field_validated_alone_copies_the_tuple_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        copied = _count_copies(monkeypatch)
+        for n in (10, 2000):
+            copied.clear()
+            tds = _sdk_durations(n)
+            got = RfTdMany._validated_on_sync("tds", tds)
+            # The 1-tuple that holds the value and the list: each copied once, nothing else.
+            assert len(copied) == 2 and (list, id(tds)) in copied and [t for t, _ in copied].count(tuple) == 1, copied
+            assert got == [timedelta(microseconds=i) for i in range(1, n + 1)]
+            assert type(tds[0]) is surrealdb.Duration, "the value is not mutated"
+
+    def test_one_position_refused_twice_is_converted_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A union of two models with the same field: both errors lead to one position, converted once."""
+        copied = _count_copies(monkeypatch)
+        either = {"td": _SDK_TD}
+        row = {"either": either}
+        got = RfTdMany.model_validate(row)
+        assert isinstance(got.either, RfTdSub | RfTdOther) and got.either.td == _TD, got
+        assert sorted(i for _, i in copied) == sorted([id(row), id(either)]), copied
+        assert row == {"either": {"td": _SDK_TD}} and either["td"] is _SDK_TD
+
+
+class TestNestedTimedeltaReadE2E:
+    """#228: a ``timedelta`` below the top level reads the duration the server stores, and a write keeps it native."""
+
+    @pytest.mark.asyncio
+    async def test_read_then_write_back(self) -> None:
+        rid = RecordID("rf_td_holder", "k")
+        async with orm_client("rf_td_holder") as client:
+            # ``encoding.encode``: the SDK's own encoder sends its ``Duration`` in a form the server refuses.
+            row = encoding.encode({field: raw for field, (raw, _) in _TD_POSITIONS.items()})
+            await client.query("CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": row})
+            got = await RfTdHolder.objects().get("k")
+            [listed] = await RfTdHolder.objects().all()
+            for holder in (got, listed):
+                _assert_td_positions(holder)
+            await got.merge(n=1)  # a write sync: every position keeps what a read gives
+            _assert_td_positions(got)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                await got.update()
+            stored = await _raw(rid)
+            assert type(stored["sub"]["td"]) is surrealdb.Duration and type(stored["tds"][0]) is surrealdb.Duration
+            assert type(stored["by_key"]["a"]) is surrealdb.Duration and type(stored["either"]) is surrealdb.Duration
+            _assert_td_positions(await RfTdHolder.objects().get("k"))
+
+
+# --- the duration conversion never runs the user's code twice on one input (#228) -----------------
+
+
+def _read_cents(data: Any) -> Any:
+    """Read stored cents as a price, in the dict itself: a ``mode="before"`` validator that is not idempotent."""
+    if isinstance(data, dict) and "price" in data:
+        data["price"] = Decimal(data["price"]) / 100
+    return data
+
+
+def _prepend_all(value: Any) -> Any:
+    """Insert ``"all"`` in the list itself: a ``mode="before"`` validator that is not idempotent."""
+    if isinstance(value, list):
+        value.insert(0, "all")
+    return value
+
+
+class RfCentsSub(BaseModel):
+    """A sub-model whose own ``mode="before"`` validator reads its cents in place, next to a ``timedelta``."""
+
+    price: Decimal = Decimal(0)
+    td: timedelta
+    qty: int = 0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _cents(cls, data: Any) -> Any:
+        return _read_cents(data)
+
+
+class RfCents(BaseSurrealModel):
+    """Code of the user's that changes its input in place, at each level a read runs it."""
+
+    model_config = SurrealConfigDict(table_name="rf_cents")
+
+    id: str | None = None
+    price: Decimal = Decimal(0)
+    tags: list[str] = []
+    labels: Annotated[list[str], BeforeValidator(_prepend_all)] = []
+    sub: RfCentsSub | None = None
+    tds: list[timedelta] = []
+    anything: Any = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _cents(cls, data: Any) -> Any:
+        return _read_cents(data)
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _tags(cls, value: Any) -> Any:
+        return _prepend_all(value)
+
+
+class RfCentsHolder(BaseSurrealModel):
+    """The user's code sits in a sub-model only: a write sync may validate the field alone (``_validated_on_sync``)."""
+
+    model_config = SurrealConfigDict(table_name="rf_cents_holder")
+
+    id: str | None = None
+    sub: RfCentsSub | None = None
+    n: int = 0
+
+
+class RfAfterOnly(BaseSurrealModel):
+    """The user's code runs on validated values only: an ``after`` validator, a serializer."""
+
+    model_config = SurrealConfigDict(table_name="rf_after_only")
+
+    id: str | None = None
+    sub: RfTdSub | None = None
+    name: str = ""
+
+    @field_validator("name", mode="after")
+    @classmethod
+    def _strip(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        return self
+
+    @field_serializer("name")
+    def _upper(self, value: str) -> str:
+        return value.upper()
+
+
+def _cents_row(td: Any) -> dict[str, Any]:
+    """A fresh ``RfCents`` row (the validators change it in place) whose durations below the top level are ``td``."""
+    return {"price": 1999, "tags": ["a"], "labels": ["b"], "sub": {"price": 250, "td": td}, "tds": [td]}
+
+
+def _assert_sub_read_once(sub: Any) -> None:
+    """``sub`` is the ``RfCentsSub`` of ``_cents_row``: its validator was applied once (the row stores 250 cents)."""
+    assert type(sub) is RfCentsSub and sub == RfCentsSub(price=250, td=_TD), sub
+    assert sub.price == Decimal("2.5") and sub.td == _TD, sub
+
+
+def _assert_cents_read_once(cents: RfCents) -> None:
+    """Each validator of ``RfCents`` was applied once to what the instance holds."""
+    assert cents.price == Decimal("19.99") and cents.tags == ["all", "a"] and cents.labels == ["all", "b"], cents
+    assert cents.tds == [_TD], cents
+    _assert_sub_read_once(cents.sub)
+
+
+# Code of the user's that runs on a value Pydantic passes through (``Any``): the row's own object.
+
+
+class RfStep(BaseModel):
+    """A ``timedelta`` below the top level: the SDK's duration fails the first run there."""
+
+    wait: timedelta | None = None
+
+
+def _append_x(value: Any) -> None:
+    """Append ``"x"`` to a list in place: not idempotent."""
+    if isinstance(value, list):
+        value.append("x")
+
+
+def _bump(value: Any) -> Any:
+    """Count in a dict in place: not idempotent."""
+    if isinstance(value, dict):
+        value["n"] = value.get("n", 0) + 1
+    return value
+
+
+class RfTaggedSub(BaseModel):
+    """A sub-model whose ``after`` validator changes the row's own list (``Any`` passes it through)."""
+
+    extra: Any = None
+
+    @model_validator(mode="after")
+    def _tag(self) -> Self:
+        _append_x(self.extra)
+        return self
+
+
+class RfTagged(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_tagged")
+
+    id: str | None = None
+    sub: RfTaggedSub | None = None
+    steps: list[RfStep] = []
+    n: int = 0
+
+
+class RfCountedSub(BaseModel):
+    """A sub-model whose ``model_post_init`` changes the row's own dict."""
+
+    extra: Any = None
+
+    def model_post_init(self, context: Any, /) -> None:
+        _bump(self.extra)
+
+
+class RfCounted(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_counted")
+
+    id: str | None = None
+    sub: RfCountedSub | None = None
+    steps: list[RfStep] = []
+    n: int = 0
+
+
+class RfBumped(BaseSurrealModel):
+    """An ``AfterValidator`` on the holder's own ``Any`` field."""
+
+    model_config = SurrealConfigDict(table_name="rf_bumped")
+
+    id: str | None = None
+    meta: Annotated[Any, pydantic.AfterValidator(_bump)] = None
+    steps: list[RfStep] = []
+
+
+class RfMarkA(BaseModel):
+    kind: Literal["a"] = "a"
+    marks: list[int] = []
+
+
+class RfMarkB(BaseModel):
+    kind: Literal["b"] = "b"
+
+
+def _pick_and_mark(value: Any) -> str:
+    """A callable discriminator that changes its input in place: not idempotent."""
+    if isinstance(value, dict):
+        value["marks"].append(1)
+        return str(value.get("kind", "a"))
+    return str(getattr(value, "kind", "a"))
+
+
+class RfMarked(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_marked")
+
+    id: str | None = None
+    pick: (
+        Annotated[
+            Annotated[RfMarkA, pydantic.Tag("a")] | Annotated[RfMarkB, pydantic.Tag("b")],
+            pydantic.Discriminator(_pick_and_mark),
+        ]
+        | None
+    ) = None
+    steps: list[RfStep] = []
+
+
+def _derived_from(data: dict[str, Any]) -> dict[str, Any]:
+    """A ``default_factory`` that takes the validated data and changes a value of it in place."""
+    _bump(data.get("meta"))
+    return {}
+
+
+class RfFactory(BaseSurrealModel):
+    """The factory field is declared before the failing one, so the first run calls it."""
+
+    model_config = SurrealConfigDict(table_name="rf_factory")
+
+    id: str | None = None
+    meta: Any = None
+    derived: dict[str, Any] = Field(default_factory=_derived_from)
+    steps: list[RfStep] = []
+
+
+@dataclasses.dataclass
+class RfPostDc:
+    """A dataclass whose ``__post_init__`` changes the row's own list."""
+
+    extra: Any = None
+
+    def __post_init__(self) -> None:
+        _append_x(self.extra)
+
+
+class RfPostDcHolder(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_post_dc_holder")
+
+    id: str | None = None
+    dc: RfPostDc | None = None
+    steps: list[RfStep] = []
+
+
+class RfTaggedStep(BaseModel):
+    """An ``after`` validator and a ``timedelta`` in one sub-model, held in a list."""
+
+    extra: Any = None
+    wait: timedelta | None = None
+
+    @model_validator(mode="after")
+    def _tag(self) -> Self:
+        _append_x(self.extra)
+        return self
+
+
+class RfTaggedSteps(BaseSurrealModel):
+    """No validator of its own: when the row fails, ``subs`` is validated alone (``_validated_on_sync``)."""
+
+    model_config = SurrealConfigDict(table_name="rf_tagged_steps")
+
+    id: str | None = None
+    subs: list[RfTaggedStep] = []
+    n: int = 0
+
+
+class RfPrivSub(BaseModel):
+    _seen: int = pydantic.PrivateAttr(0)
+    a: int = 0
+
+
+class RfPrivate(BaseSurrealModel):
+    """Pydantic's own ``model_post_init`` (private attributes), on the holder and on a sub-model."""
+
+    model_config = SurrealConfigDict(table_name="rf_private")
+
+    id: str | None = None
+    sub: RfPrivSub | None = None
+    tds: list[timedelta] = []
+    _cache: dict[str, Any] = pydantic.PrivateAttr(default_factory=dict)
+
+
+class RfSerializedOnly(BaseSurrealModel):
+    """Code of the user's that only serializes."""
+
+    model_config = SurrealConfigDict(table_name="rf_serialized_only")
+
+    id: str | None = None
+    tds: list[timedelta] = []
+    name: str = ""
+
+    @field_serializer("name")
+    def _upper(self, value: str) -> str:
+        return value.upper()
+
+
+class RfOwner(BaseModel):
+    name: str = ""
+
+
+class RfOwned(BaseSurrealModel):
+    """No ``timedelta`` below the top level, and code of the user's on its input."""
+
+    model_config = SurrealConfigDict(table_name="rf_owned")
+
+    id: str | None = None
+    owner: RfOwner | None = None
+    meta: Any = None
+    ttl: Duration | None = None
+
+    @field_validator("meta", mode="before")
+    @classmethod
+    def _keep(cls, value: Any) -> Any:
+        return value
+
+
+def _steps_row(model: type[BaseSurrealModel], **fields: Any) -> dict[str, Any]:
+    """A fresh row of ``model`` whose ``steps`` hold the SDK's duration, which fails the first run."""
+    return {
+        "id": RecordID(model.get_table_name(), "k"),
+        **copy.deepcopy(fields),
+        "steps": [{"wait": surrealdb.Duration(10**9)}],
+    }
+
+
+#: ``(model, fields of the row, how to read the value the user's code changed, the value read)``.
+_ONCE_CASES = [
+    pytest.param(RfTagged, {"sub": {"extra": []}}, lambda m: m.sub.extra, ["x"], id="sub-model-after-validator"),
+    pytest.param(RfCounted, {"sub": {"extra": {}}}, lambda m: m.sub.extra, {"n": 1}, id="sub-model-post-init"),
+    pytest.param(RfBumped, {"meta": {}}, lambda m: m.meta, {"n": 1}, id="holder-after-validator"),
+    pytest.param(RfMarked, {"pick": {"kind": "a", "marks": []}}, lambda m: m.pick.marks, [1], id="callable-discriminator"),
+    pytest.param(RfFactory, {"meta": {}}, lambda m: m.meta, {"n": 1}, id="default-factory-taking-data"),
+    pytest.param(RfPostDcHolder, {"dc": {"extra": []}}, lambda m: m.dc.extra, ["x"], id="dataclass-post-init"),
+]
+
+
+class TestNestedTimedeltaRunsUserCodeOnce:
+    """#228 (unit): reading the SDK's duration below the top level never applies the user's code twice."""
+
+    def test_the_row_reads_as_without_the_sdk_duration(self) -> None:
+        expected = RfCents.model_validate(_cents_row(_TD))
+        _assert_cents_read_once(expected)
+        for got in (RfCents.model_validate(_cents_row(_SDK_TD)), RfCents.from_db(_cents_row(_SDK_TD))):
+            assert isinstance(got, RfCents) and got.model_dump() == expected.model_dump(), got
+            _assert_cents_read_once(got)
+
+    def test_a_sub_model_whose_validator_changes_its_input(self) -> None:
+        """No code of the user's on the holder itself: the sub-model's validator changes its own dict."""
+        _assert_sub_read_once(RfCentsHolder.model_validate({"sub": {"price": 250, "td": _SDK_TD}}).sub)
+
+    @_ROW_PATHS
+    def test_a_write_sync_applies_the_sub_model_validator_once(self, extra: dict[str, Any]) -> None:
+        holder = RfCentsHolder(id="k")
+        holder._apply_record({"id": RecordID("rf_cents_holder", "k"), "sub": {"price": 250, "td": _SDK_TD}, **extra})
+        _assert_sub_read_once(holder.sub)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            {"price": 1999, "td": "soon"},  # refused before any conversion
+            {"price": 1999, "td": _SDK_TD, "qty": "x"},  # the duration converts, the value is still refused
+        ],
+        ids=["no-conversion", "after-the-conversion"],
+    )
+    def test_a_value_that_does_not_validate_is_applied_as_received(self, value: dict[str, Any]) -> None:
+        received = copy.deepcopy(value)
+        assert RfCentsHolder._validated_on_sync("sub", value) is value
+        assert value == received, "the sub-model's validator did not change the value applied"
+
+    def test_a_row_that_cannot_be_copied_is_refused_as_before(self) -> None:
+        """No copy to validate first, so no second run: the SDK's duration is refused, as without the conversion."""
+        with pytest.raises(ValidationError) as caught:
+            RfCents.model_validate({"sub": {"td": _SDK_TD}, "anything": threading.Lock()})
+        assert [e["loc"] for e in caught.value.errors()] == [("sub", "td")]
+
+    def test_a_duration_a_validator_moved_is_refused_as_before(self) -> None:
+        """The second run starts from the row as received: a value the first run found elsewhere is not guessed."""
+
+        class RfShifted(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_shifted")
+
+            id: str | None = None
+            tds: list[timedelta] = []
+
+            @field_validator("tds", mode="before")
+            @classmethod
+            def _shift(cls, value: Any) -> Any:
+                value.insert(0, timedelta(0))
+                return value
+
+        with pytest.raises(ValidationError):
+            RfShifted.model_validate({"tds": [_SDK_TD, surrealdb.Duration(1000)]})
+        assert RfShifted.model_validate({"tds": [_TD]}).tds == [timedelta(0), _TD]
+
+    def test_only_a_model_running_input_code_on_an_sdk_duration_copies_the_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        copied: list[int] = []
+        real = copy.deepcopy
+
+        def counting(value: Any, *args: Any) -> Any:
+            copied.append(id(value))
+            return real(value, *args)
+
+        monkeypatch.setattr(model_base.copy, "deepcopy", counting)
+        plain = {"sub": {"td": _SDK_TD}, "tds": [_SDK_TD]}
+        assert RfTdHolder.model_validate(plain).tds == [_TD] and id(plain) not in copied
+        without_duration = _cents_row(_TD)
+        _assert_cents_read_once(RfCents.model_validate(without_duration))
+        assert id(without_duration) not in copied
+        with_duration = _cents_row(_SDK_TD)
+        _assert_cents_read_once(RfCents.model_validate(with_duration))
+        assert copied.count(id(with_duration)) == 1
+
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            (RfTdHolder, False),
+            (RfIssueHolder, False),  # the ORM's ``Duration`` validator is the ORM's own
+            (RfLink, False),  # so is an edge's endpoint validator
+            (RfPrivate, False),  # Pydantic's own ``model_post_init`` (private attributes)
+            (RfSerializedOnly, False),  # a serializer never sees the input
+            (RfAfterOnly, True),  # an ``after`` validator gets the input itself when Pydantic passes it through
+            (RfCents, True),  # a model ``mode="before"`` validator, a field one, a ``BeforeValidator``
+            (RfCentsHolder, True),  # a sub-model's ``mode="before"`` validator
+            (RfTagged, True),  # a sub-model's ``after`` validator
+            (RfCounted, True),  # a sub-model's ``model_post_init``
+            (RfBumped, True),  # an ``AfterValidator``
+            (RfMarked, True),  # a callable discriminator
+            (RfFactory, True),  # a ``default_factory`` that takes the data
+            (RfPostDcHolder, True),  # a dataclass ``__post_init__``
+        ],
+    )
+    def test_models_that_run_code_on_their_input(self, model: type[BaseSurrealModel], expected: bool) -> None:
+        assert model._runs_input_code() is expected
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            Annotated[list[str], BeforeValidator(_prepend_all)],
+            Annotated[list[str], WrapValidator(lambda value, handler: handler(value))],
+            Annotated[list[str], PlainValidator(_prepend_all)],
+            Annotated[list[str], pydantic.AfterValidator(_prepend_all)],
+        ],
+        ids=["before", "wrap", "plain", "after"],
+    )
+    def test_each_kind_of_input_code(self, annotation: Any) -> None:
+        model = pydantic.create_model("RfInputCode", __base__=BaseSurrealModel, id=(str | None, None), f=(annotation, []))
+        assert model._runs_input_code() is True
+
+    def test_anything_unexpected_counts_as_input_code(self) -> None:
+        assert model_base._schema_runs_input_code({"type": "function-before", "function": None}) is True
+        assert model_base._schema_runs_input_code({"type": "function-after", "function": {"function": _bump}}) is True
+        assert model_base._schema_runs_input_code("not a schema") is True
+        assert model_base._schema_runs_input_code({"type": "model", "cls": RfOwner, "post_init": "missing"}) is True
+        assert model_base._schema_runs_input_code({"type": "model", "cls": RfOwner, "custom_init": True}) is True
+        assert model_base._schema_runs_input_code({"type": "dataclass", "cls": RfOwner, "post_init": True}) is True
+        assert model_base._schema_runs_input_code({"type": "tagged-union", "discriminator": "kind"}) is False
+        assert model_base._schema_runs_input_code({"type": "default", "default_factory": _derived_from}) is False
+
+    def test_an_incomplete_model_is_not_cached(self) -> None:
+        class RfIncompleteInput(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_incomplete_input")
+
+            id: str | None = None
+            later: "RfMissingInput | None" = None  # type: ignore[name-defined]  # noqa: F821
+
+        assert RfIncompleteInput._runs_input_code() is True
+        assert RfIncompleteInput not in model_base._INPUT_CODE
+
+    # Code of the user's that receives the row's own object: ``after`` code on a passed-through value.
+
+    @pytest.mark.parametrize(("model", "fields", "read", "expected"), _ONCE_CASES)
+    def test_a_read_applies_the_code_once(
+        self, model: type[BaseSurrealModel], fields: dict[str, Any], read: Callable[[Any], Any], expected: Any
+    ) -> None:
+        got = model.from_db(_steps_row(model, **fields))
+        assert read(got) == expected
+        assert got.steps == [RfStep(wait=timedelta(seconds=1))]  # type: ignore[union-attr]
+
+    @pytest.mark.parametrize(("model", "fields", "read", "expected"), _ONCE_CASES[:2])
+    def test_a_write_sync_of_the_row_applies_the_code_once(
+        self, model: type[BaseSurrealModel], fields: dict[str, Any], read: Callable[[Any], Any], expected: Any
+    ) -> None:
+        row = _steps_row(model, **fields)
+        received = copy.deepcopy(row)
+        assert read(model._validated_row(row)) == expected
+        holder = model(id="k")
+        holder._apply_record(row)
+        assert read(holder) == expected and row == received, "the row stays as received"
+
+    def test_a_list_of_sub_models_validated_alone_applies_the_code_once(self) -> None:
+        value = [{"extra": []}, {"wait": surrealdb.Duration(10**9)}]
+        received = copy.deepcopy(value)
+        expected = [(RfTaggedStep, ["x"], None), (RfTaggedStep, None, timedelta(seconds=1))]
+        got = RfTaggedSteps._validated_on_sync("subs", value)
+        assert [(type(s), s.extra, s.wait) for s in got] == expected
+        assert value == received, "the value stays as received"
+        holder = RfTaggedSteps(id="k")
+        holder._apply_record({"id": RecordID("rf_tagged_steps", "k"), "subs": value, "n": "x"})  # the row fails
+        assert [(type(s), s.extra, s.wait) for s in holder.subs] == expected and value == received
+
+    def test_a_pydantic_post_init_is_not_the_users(self) -> None:
+        schema = RfPrivate.__pydantic_core_schema__
+        assert model_base._schema_runs_input_code(schema) is False
+        assert RfPrivate._may_refuse_sdk_durations() is True and RfPrivate.model_validate({"tds": [_SDK_TD]}).tds == [_TD]
+
+    # Only a model whose validation can refuse the SDK's duration takes the retry (#228).
+
+    @pytest.mark.parametrize(
+        ("annotation", "expected"),
+        [
+            (timedelta, False),  # ``set_data`` converts a top-level one
+            (timedelta | None, False),
+            (Optional[Annotated[timedelta, Field(ge=timedelta(0))]], False),  # noqa: UP045 (typing.Union on purpose)
+            (Duration | None, False),  # the ORM's ``Duration`` reads the SDK's own
+            (RfOwner | None, False),
+            (timedelta | str, True),
+            (list[timedelta], True),
+            (dict[str, timedelta], True),
+            (RfStep | None, True),  # a sub-model with a ``timedelta``
+            (RfTdData | None, True),  # a dataclass
+            (RfTdDict | None, True),  # a ``TypedDict``
+            (Annotated[timedelta, pydantic.AfterValidator(lambda value: value)], True),  # not reached through defaults only
+        ],
+    )
+    def test_models_that_may_refuse_the_sdk_duration(self, annotation: Any, expected: bool) -> None:
+        model = pydantic.create_model("RfRefuses", __base__=BaseSurrealModel, id=(str | None, None), f=(annotation, None))
+        assert model._may_refuse_sdk_durations() is expected
+        assert model._may_refuse_sdk_durations() is model_base._MAY_REFUSE_DURATIONS[model], "cached per class"
+
+    def test_an_aliased_top_level_timedelta_does_not_refuse(self) -> None:
+        model = pydantic.create_model(
+            "RfAliasedTop", __base__=BaseSurrealModel, id=(str | None, None), t=(timedelta | None, Field(None, alias="tCol"))
+        )
+        assert model._may_refuse_sdk_durations() is False
+        assert model.model_validate({"tCol": _SDK_TD}).t == _TD  # type: ignore[attr-defined]
+
+    def test_a_timedelta_in_a_sub_model_aliased_column(self) -> None:
+        assert RfTdHolder._may_refuse_sdk_durations() is True and RfKinds._may_refuse_sdk_durations() is True
+
+    def test_anything_unexpected_may_refuse(self) -> None:
+        assert model_base._schema_refuses_sdk_durations("not a schema", RfOwned, frozenset()) is True
+        assert model_base._schema_refuses_sdk_durations({"type": "timedelta"}, RfOwned, frozenset()) is True
+        assert model_base._schema_refuses_sdk_durations({"type": "any"}, RfOwned, frozenset()) is False
+        # The class's ``model-fields`` cannot be found, or its node is not what Pydantic builds.
+        td: dict[str, Any] = {"type": "timedelta"}
+        fields = {"type": "model-fields", "fields": {"t": {"type": "model-field", "schema": td}}}
+        model = {"type": "model", "cls": RfOwned, "schema": {"type": "function-wrap", "schema": fields}}
+        assert model_base._schema_refuses_sdk_durations(model, RfOwned, frozenset({"t"})) is True
+        assert model_base._schema_refuses_sdk_durations({**model, "schema": fields}, RfOwned, frozenset({"t"})) is False
+        assert model_base._schema_refuses_sdk_durations({"type": "model", "cls": RfOwned}, RfOwned, frozenset({"t"})) is True
+
+    def test_an_incomplete_model_may_refuse_and_is_not_cached(self) -> None:
+        class RfIncompleteRefuses(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_incomplete_refuses")
+
+            id: str | None = None
+            later: "RfMissingRefuses | None" = None  # type: ignore[name-defined]  # noqa: F821
+
+        assert RfIncompleteRefuses._may_refuse_sdk_durations() is True
+        assert RfIncompleteRefuses not in model_base._MAY_REFUSE_DURATIONS
+
+    def test_a_model_that_cannot_refuse_keeps_what_the_caller_passed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        owner, meta = RfOwner(name="o"), {"k": [1]}
+        owned = RfOwned(owner=owner, meta=meta, ttl=surrealdb.Duration(10**9))  # type: ignore[arg-type]
+        assert owned.owner is owner and owned.meta is meta and owned.ttl == Duration(10**9)
+        calls: list[Any] = []
+        real = copy.deepcopy
+
+        def counting(value: Any, *args: Any) -> Any:
+            calls.append(value)
+            return real(value, *args)
+
+        monkeypatch.setattr(model_base.copy, "deepcopy", counting)
+        row = {"id": RecordID("rf_owned", "k"), "owner": {"name": "o"}, "meta": {"k": [1]}, "ttl": surrealdb.Duration(10**9)}
+        read = RfOwned.from_db(row)
+        assert isinstance(read, RfOwned) and read.ttl == Duration(10**9) and read.owner == RfOwner(name="o")
+        assert calls == [], "a read copies nothing"
+
+
+class TestNestedTimedeltaRunsUserCodeOnceE2E:
+    """#228: a model whose validators change their input in place reads a stored duration below the top level."""
+
+    @pytest.mark.asyncio
+    async def test_get_and_a_write_sync(self) -> None:
+        rid = RecordID("rf_cents", "k")
+        async with orm_client("rf_cents") as client:
+            # ``encoding.encode``: the SDK's own encoder sends its ``Duration`` in a form the server refuses.
+            await client.query("CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": encoding.encode(_cents_row(_SDK_TD))})
+            got = await RfCents.objects().get("k")
+            [listed] = await RfCents.objects().all()
+            for cents in (got, listed):
+                _assert_cents_read_once(cents)
+            await got.merge(anything=1)  # a write sync: the sub-model gets what a read gives
+            _assert_sub_read_once(got.sub)
+            stored = await _raw(rid)
+            assert stored["price"] == 1999 and stored["tags"] == ["a"] and type(stored["sub"]["td"]) is surrealdb.Duration
+
+    @pytest.mark.asyncio
+    async def test_an_after_validator_on_a_passed_through_value(self) -> None:
+        rid = RecordID("rf_tagged", "k")
+        async with orm_client("rf_tagged") as client:
+            row = {k: v for k, v in _steps_row(RfTagged, sub={"extra": []}).items() if k != "id"}
+            await client.query("CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": encoding.encode(row)})
+            got = await RfTagged.objects().get("k")
+            assert got.sub is not None and got.sub.extra == ["x"], got
+            assert got.steps == [RfStep(wait=timedelta(seconds=1))]
+            await got.merge(n=1)  # a write sync: the sub-model gets what a read gives
+            assert got.sub is not None and got.sub.extra == ["x"] and got.n == 1, got
+            stored = await _raw(rid)
+            assert stored["sub"] == {"extra": []} and type(stored["steps"][0]["wait"]) is surrealdb.Duration
+
+
+# --- a write sync runs the model's own validators, as a read does (#228) --------------------------
+
+
+class RfSettings(BaseModel):
+    """Settings stored under ``theme`` by an older version of the app; the holding model migrates them."""
+
+    color_theme: str = "light"
+    font: int = 12
+
+
+class RfProfile(BaseSurrealModel):
+    """A model that migrates its sub-model's old shape in a ``mode="before"`` validator, in place, as is common."""
+
+    model_config = SurrealConfigDict(table_name="rf_profile")
+
+    id: str | None = None
+    settings: RfSettings = RfSettings()
+    name: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_theme(cls, data: Any) -> Any:
+        if isinstance(data, dict) and isinstance(data.get("settings"), dict) and "theme" in data["settings"]:
+            data["settings"]["color_theme"] = data["settings"].pop("theme")
+        return data
+
+
+class RfClamped(BaseModel):
+    n: int
+
+
+class RfClamping(BaseSurrealModel):
+    """A model whose own ``field_validator`` reshapes its sub-model after Pydantic built it."""
+
+    model_config = SurrealConfigDict(table_name="rf_clamping")
+
+    id: str | None = None
+    sub: RfClamped | None = None
+    name: str = ""
+
+    @field_validator("sub", mode="after")
+    @classmethod
+    def _clamp(cls, value: RfClamped | None) -> RfClamped | None:
+        return value if value is None or value.n <= 10 else RfClamped(n=10)
+
+
+class RfNamed(BaseSurrealModel):
+    """A model whose own validators touch other fields only: its sub-model is validated alone when the row fails."""
+
+    model_config = SurrealConfigDict(table_name="rf_named")
+
+    id: str | None = None
+    sub: RfPlainSub | None = None
+    name: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def _no_bad_name(cls, value: str) -> str:
+        if value == "bad":
+            raise ValueError("bad name")
+        return value
+
+
+class RfStarred(BaseSurrealModel):
+    """A ``field_validator("*")`` reaches the sub-model field too."""
+
+    model_config = SurrealConfigDict(table_name="rf_starred")
+
+    id: str | None = None
+    sub: RfPlainSub | None = None
+    n: int = 0
+
+    @field_validator("*")
+    @classmethod
+    def _keep(cls, value: Any) -> Any:
+        return value
+
+
+class RfPostInit(BaseSurrealModel):
+    """A ``model_post_init`` hook may reshape any field, as a model validator does."""
+
+    model_config = SurrealConfigDict(table_name="rf_post_init")
+
+    id: str | None = None
+    sub: RfPlainSub | None = None
+    n: int = 0
+
+    def model_post_init(self, context: Any, /) -> None:
+        if self.sub is not None and not self.sub.name:
+            self.sub = self.sub.model_copy(update={"name": "unnamed"})
+
+
+#: A stored ``RfProfile`` row in the old shape.
+_OLD_SETTINGS: dict[str, Any] = {"theme": "dark", "font": 14}
+
+
+class TestSubModelSyncFollowsTheRead:
+    """#228 (unit): the sync gives what ``get()`` gives, and keeps the value as received when it cannot know it."""
+
+    def test_a_migrating_model_validator_runs(self) -> None:
+        profile = RfProfile(id="p")
+        row = {"id": RecordID("rf_profile", "p"), "settings": dict(_OLD_SETTINGS), "name": "x"}
+        profile._apply_record(row)
+        expected = RfProfile.model_validate({"settings": dict(_OLD_SETTINGS)}).settings
+        assert profile.settings == RfSettings(color_theme="dark", font=14) == expected
+        # The row is neither mutated by the validators nor rid of its native id.
+        assert row == {"id": RecordID("rf_profile", "p"), "settings": _OLD_SETTINGS, "name": "x"}
+        assert type(profile.id) is RecordID and profile.name == "x"
+
+    def test_a_field_validator_of_the_model_runs(self) -> None:
+        clamping = RfClamping()
+        clamping._apply_record({"sub": {"n": 50}})
+        assert clamping.sub == RfClamped(n=10) == RfClamping.model_validate({"sub": {"n": 50}}).sub
+
+    def test_a_row_that_fails_keeps_what_a_model_validator_may_reshape(self) -> None:
+        """The row fails (``name``), and the model's own ``mode="before"`` validator may reshape anything: as received."""
+        profile = RfProfile()
+        profile._apply_record({"settings": dict(_OLD_SETTINGS), "name": 3})
+        assert profile.settings == _OLD_SETTINGS and profile.name == 3
+
+    def test_a_row_that_fails_keeps_what_a_field_validator_may_reshape(self) -> None:
+        clamping = RfClamping()
+        clamping._apply_record({"sub": {"n": 50}, "name": 3})
+        assert clamping.sub == {"n": 50}
+        starred = RfStarred()
+        starred._apply_record({"sub": {"name": "a"}, "n": "x"})
+        assert starred.sub == {"name": "a"}
+
+    def test_a_row_that_fails_keeps_what_model_post_init_may_reshape(self) -> None:
+        assert RfPostInit.model_validate({"sub": {"name": ""}}).sub == RfPlainSub(name="unnamed")
+        post_init = RfPostInit()
+        post_init._apply_record({"sub": {"name": ""}})
+        assert post_init.sub == RfPlainSub(name="unnamed"), "the row validates: the hook ran"
+        post_init._apply_record({"sub": {"name": ""}, "n": "x"})
+        assert post_init.sub == {"name": ""}
+
+    def test_a_row_that_fails_still_validates_the_other_sub_models(self) -> None:
+        """Validators on other fields, and the ORM's own (``set_data``, ``check_config``), leave the field to its adapter."""
+        named = RfNamed()
+        named._apply_record({"sub": {"name": "a"}, "name": "bad"})
+        assert named.sub == RfPlainSub(name="a") and named.name == "bad"
+        holder = RfHolder(id="h", **HOLDER)
+        holder._apply_record({"id": RecordID("rf_holder", "h"), "plain": {"name": "q"}, "n": "x"})
+        assert holder.plain == RfPlainSub(name="q") and holder.n == "x"
+
+    def test_reshaping_validators_are_found_once_per_class(self) -> None:
+        assert RfProfile._sync_reshaped() is model_base._ALL_FIELDS
+        assert RfPostInit._sync_reshaped() is model_base._ALL_FIELDS
+        assert RfStarred._sync_reshaped() is model_base._ALL_FIELDS
+        assert RfClamping._sync_reshaped() == frozenset({"sub"})
+        assert RfNamed._sync_reshaped() == frozenset({"name"})
+        assert RfHolder._sync_reshaped() == frozenset() and RfHolder._sync_reshaped() is RfHolder._sync_reshaped()
+
+
+class TestSubModelSyncValidatorsE2E:
+    """#228: a write sync gives what ``get()`` gives when the model's own validators reshape a sub-model."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sync", ["refresh", "merge"])
+    async def test_a_migrating_model_validator_keeps_the_stored_choice(self, sync: str) -> None:
+        async with orm_client("rf_profile") as client:
+            rid = RecordID("rf_profile", "p")
+            await client.query("CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": {"settings": _OLD_SETTINGS}})
+            profile = await RfProfile.objects().get("p")
+            assert profile.settings == RfSettings(color_theme="dark", font=14)
+            if sync == "refresh":
+                await profile.refresh()
+            else:
+                await profile.merge(name="x")
+            assert profile.settings == RfSettings(color_theme="dark", font=14)
+            await profile.update()
+            assert (await _raw(rid))["settings"] == {"color_theme": "dark", "font": 14}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sync", ["refresh", "merge"])
+    async def test_a_field_validator_of_the_model_gives_what_a_read_gives(self, sync: str) -> None:
+        async with orm_client("rf_clamping") as client:
+            rid = RecordID("rf_clamping", "c")
+            await client.query("CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": {"sub": {"n": 50}}})
+            clamping = await RfClamping.objects().get("c")
+            if sync == "refresh":
+                await clamping.refresh()
+            else:
+                await clamping.merge(name="x")
+            assert clamping.sub == (await RfClamping.objects().get("c")).sub == RfClamped(n=10)
 
 
 class TestAuthReadE2E:

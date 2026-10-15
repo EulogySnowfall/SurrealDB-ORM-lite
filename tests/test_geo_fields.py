@@ -10,6 +10,8 @@ import ast
 import inspect
 import math
 import re
+import warnings
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from decimal import Decimal
 from fractions import Fraction
@@ -17,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 from surrealdb import RecordID
 from surrealdb.data import GeometryCollection as SdkCollection
 from surrealdb.data import GeometryLine as SdkLine
@@ -221,11 +223,11 @@ def _all_orm(value: Any) -> bool:
 def _assert_geo(place: Any, *, nested: bool = True, **changes: Any) -> None:
     """``place`` holds ``FULL`` (with ``changes``) and every top-level geometry attribute is an ORM value.
 
-    ``nested=True`` (a validated read) also checks the ``list[GeometryPoint]`` items and the
-    sub-model's point. ``nested=False`` (after a write that syncs the instance from the returned
-    row) checks what ``model_dump()`` gives for the list instead, and skips the sub-model, which
-    holds the row's dict there (spec §6.6). Only ``many`` is dumped: the synced ``id`` and ``sub``
-    are not this check's business.
+    The sub-model holds a ``GeoSub`` with an ORM point either way: a write that syncs the instance
+    validates it, as a read does (#228). ``nested=True`` (a validated read) also checks the
+    ``list[GeometryPoint]`` items. ``nested=False`` (after a write that syncs the instance from the
+    returned row, where a typed container keeps the SDK's values) checks what ``model_dump()`` gives
+    for the list instead. Only ``many`` is dumped: the synced ``id`` is not this check's business.
     """
     expected = {**FULL, **changes}
     assert isinstance(place, GeoPlace), place
@@ -236,11 +238,11 @@ def _assert_geo(place: Any, *, nested: bool = True, **changes: Any) -> None:
             wrong[key] = value
     assert not wrong, f"not the expected ORM geometries: {wrong!r}"
     assert (place.name, place.n) == (expected["name"], expected["n"])
+    assert type(place.sub) is GeoSub, place.sub
+    assert type(place.sub.where) is GeometryPoint and place.sub.where == expected["sub"].where
     if nested:
         assert [type(p) for p in place.many] == [GeometryPoint] * len(expected["many"])
         assert place.many == expected["many"]
-        assert isinstance(place.sub, GeoSub), place.sub
-        assert type(place.sub.where) is GeometryPoint and place.sub.where == expected["sub"].where
     else:
         dumped = place.model_dump(include={"many"})["many"]
         assert [type(p) for p in dumped] == [GeometryPoint] * len(expected["many"])
@@ -374,9 +376,10 @@ class TestGeometryApplyRecord:
             assert type(getattr(place, key)) is GeometryPoint and getattr(place, key) == GeometryPoint(*value)
         assert type(place.area) is GeometryPolygon and _all_orm(place.area)
         assert place.area == GeometryPolygon.parse_coordinates([RING, HOLE])
-        # Containers and sub-models keep the row's values: their own serializers or validators handle them.
+        # A typed container keeps the row's values (its serializer converts them); a sub-model is validated (#228).
         assert type(place.many[0]) is SdkPoint
-        assert type(place.sub) is dict and type(place.sub["where"]) is SdkPoint
+        assert type(place.sub) is GeoSub and type(place.sub.where) is GeometryPoint
+        assert place.sub.where == GeometryPoint(*NEAR)
         assert (place.name, place.n) == ("r", 3)
 
     @pytest.mark.parametrize("kind", KINDS)
@@ -398,10 +401,11 @@ class TestGeometryApplyRecord:
             _bad_ring,
             _bad_point,
             lambda: _nest(SdkPoint(*A), 40, SdkCollection),
-            lambda: _SdkPin(1.0, 2.0),
             lambda: GeometryPoint(*A),
-            lambda: {"type": "Point", "coordinates": [1.0, 2.0]},
-            lambda: [1.0, 2.0],
+            lambda: {"type": "LineString", "coordinates": [[1.0, 2.0]]},
+            lambda: {"type": "Point", "coordinates": [math.nan, 2.0]},
+            lambda: {"type": "Nowhere", "coordinates": [1.0, 2.0]},
+            lambda: [1.0, 2.0, 3.0],
             lambda: "x",
             lambda: None,
         ],
@@ -410,20 +414,44 @@ class TestGeometryApplyRecord:
             "short-ring",
             "text-coordinate",
             "too-deep",
-            "sdk-subclass",
             "orm",
-            "geojson",
-            "pair",
+            "geojson-short-line",
+            "geojson-nan",
+            "geojson-unknown-type",
+            "triple",
             "text",
             "none",
         ],
     )
     def test_other_values_are_applied_as_received(self, make: Any) -> None:
+        """What the field's validator refuses (or keeps) is applied as received, without raising (#228)."""
         value = make()
         place = GeoPlace.model_construct()
         place._apply_record({"anything": value})
         assert place.anything is value
         assert geo._geometry_from_sdk(value) is value
+
+    @pytest.mark.parametrize(
+        "make",
+        [lambda: _SdkPin(*A), lambda: {"type": "Point", "coordinates": list(A)}, lambda: list(A)],
+        ids=["sdk-subclass", "geojson", "pair"],
+    )
+    def test_values_a_read_accepts_are_validated(self, make: Any) -> None:
+        """#228: what ``get()`` reads into a geometry field (a stored GeoJSON object…), a write sync reads the same."""
+        value = make()
+        place = GeoPlace.model_construct()
+        place._apply_record({"anything": value, "location": make()})
+        for got in (place.anything, place.location):
+            assert type(got) is GeometryPoint and got == GeometryPoint(*A), got
+        assert geo._geometry_from_sdk(value) is value, "the fast path itself is unchanged"
+        assert GeoPlace._sync_adapter("anything") is GeoPlace._sync_adapter("anything"), "built once"
+
+    def test_geojson_of_another_kind_is_applied_as_received(self) -> None:
+        """A valid GeoJSON polygon in a point field is refused there, as by ``get()``: kept as received (#228)."""
+        polygon = {"type": "Polygon", "coordinates": [[list(p) for p in RING]]}
+        place = GeoPlace.model_construct()
+        place._apply_record({"location": polygon, "position": polygon})
+        assert place.location is polygon and place.pos is polygon
 
     def test_a_valid_sdk_value_is_converted_checked(self) -> None:
         line = SdkLine(SdkPoint(*A), SdkPoint(*B))
@@ -432,6 +460,52 @@ class TestGeometryApplyRecord:
 
 
 # --- models through the server (E2E) ---------------------------------------------------------------------
+
+
+async def _geo_saved() -> GeoPlace:
+    place = _place("s")
+    await place.save()
+    return place
+
+
+async def _geo_save_without_id() -> GeoPlace:
+    place = GeoPlace(**FULL)
+    await place.save()
+    return place
+
+
+async def _geo_refresh() -> GeoPlace:
+    place = await _geo_saved()
+    await place.refresh()
+    return place
+
+
+async def _geo_merge() -> GeoPlace:
+    place = await _geo_saved()
+    await place.merge(n=3)
+    return place
+
+
+async def _geo_patch() -> GeoPlace:
+    place = await _geo_saved()
+    await place.patch([{"op": "replace", "path": "/n", "value": 3}])
+    return place
+
+
+async def _geo_atomic_increment() -> GeoPlace:
+    place = await _geo_saved()
+    await place.atomic_increment("n", 2)
+    return place
+
+
+#: The calls that apply the row the server returns, ``upsert()`` aside (its own test above keeps its name).
+_GEO_SYNC_CASES: dict[str, Callable[[], Awaitable[GeoPlace]]] = {
+    "save-without-id": _geo_save_without_id,
+    "refresh": _geo_refresh,
+    "merge": _geo_merge,
+    "patch": _geo_patch,
+    "atomic-increment": _geo_atomic_increment,
+}
 
 
 class TestGeoRoundTripE2E:
@@ -460,7 +534,7 @@ class TestGeoRoundTripE2E:
             await place.upsert()
             _assert_geo(place, nested=False)
             _assert_geo(await GeoPlace.objects().get("u"))
-            # The replace starts from a validated read, the documented way (see the sub-model tests).
+            # The replace starts from a validated read here; the synced instance works too (#228, see the sub-model tests).
             fresh = await GeoPlace.objects().get("u")
             fresh.location = near
             await fresh.upsert()
@@ -581,17 +655,28 @@ class TestGeoRoundTripE2E:
             await fresh.update()
             _assert_geo(await GeoPlace.objects().get("w"))
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=ValidationError,
-        reason="pre-existing: a write sync leaves sub-models as the row's dict; tracked in #228",
-    )
     async def test_update_after_upsert_keeps_sub_model_geometries(self) -> None:
         async with orm_client("geo_place"):
             place = _place("x")
             await place.upsert()
             await place.update()
             _assert_geo(await GeoPlace.objects().get("x"))
+
+    @pytest.mark.parametrize("write", ["update", "upsert"])
+    @pytest.mark.parametrize("case", list(_GEO_SYNC_CASES))
+    async def test_sub_model_geometries_survive_a_write_sync(self, case: str, write: str) -> None:
+        """#228: after each call that applies the returned row, a full write keeps the sub-model's point native."""
+        changes = {"n": 3} if case in ("merge", "patch", "atomic-increment") else {}
+        async with orm_client("geo_place"):
+            place = await _GEO_SYNC_CASES[case]()
+            _assert_geo(place, nested=False, **changes)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")  # no PydanticSerializationUnexpectedValue on the full write
+                await getattr(place, write)()
+            rid = place._record_id()
+            assert rid is not None
+            _assert_native(await _raw(rid), **changes)
+            _assert_geo(await GeoPlace.objects().get(place.get_raw_id()), **changes)
 
 
 class TestGeoStreamsE2E:
@@ -635,6 +720,28 @@ class TestLegacyGeoJsonE2E:
             await loaded.update()
             assert await client.query("SELECT VALUE location.is_point() FROM ONLY $rid;", {"rid": rid}) is True
             again = await GeoLegacy.objects().get("x")
+            assert type(again.location) is GeometryPoint and again.location == GeometryPoint(*A)
+
+    @pytest.mark.parametrize("call", ["refresh", "merge", "patch"])
+    async def test_a_write_sync_reads_the_geojson_object(self, call: str) -> None:
+        """#228: ``refresh()``, ``merge()`` and ``patch()`` read a stored GeoJSON object as ``get()`` does."""
+        geojson = {"type": "Point", "coordinates": list(A)}
+        rid = RecordID("geo_legacy", "s")
+        async with orm_client("geo_legacy") as client:
+            await client.query("CREATE $rid SET location = $map, blob = {};", {"rid": rid, "map": geojson})
+            legacy = GeoLegacy(id="s")
+            if call == "refresh":
+                await legacy.refresh()
+            elif call == "merge":
+                await legacy.merge(blob={"k": 1})
+            else:
+                await legacy.patch([{"op": "replace", "path": "/blob", "value": {"k": 1}}])
+            assert type(legacy.location) is GeometryPoint and legacy.location == GeometryPoint(*A), legacy.location
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")  # the geometry serializer gets a geometry, not a dict
+                await legacy.update()
+            assert await client.query("SELECT VALUE location.is_point() FROM ONLY $rid;", {"rid": rid}) is True
+            again = await GeoLegacy.objects().get("s")
             assert type(again.location) is GeometryPoint and again.location == GeometryPoint(*A)
 
     async def test_a_dict_field_keeps_geojson_an_object(self) -> None:
@@ -1523,7 +1630,7 @@ _D16_PHRASES = tuple(
 _V0_24_0_SINCE = ("v0.24.0", "pre-existing (documented in v0.24.0)")
 
 #: The subsections of section 25 that section 24 links (P2): each heading exists exactly once.
-_LINKED_HEADINGS = ("#### Rich values inside sub-models", "#### Geometries the SDK cannot read")
+_LINKED_HEADINGS = ("#### Geometries the SDK cannot read",)
 
 #: What the README's distance example shows: SurrealDB's ``geo::distance`` from Times Square, rounded.
 _CLOSEST = [("Corner Pizza", 411), ("Park Burgers", 1826), ("Village Deli", 3365)]
@@ -1726,11 +1833,24 @@ class TestReadmeGeoWording:
 class TestReadmeSection24Consistency:
     """P2: section 24 says what v0.24.0 converts and links section 25's notes (prose only)."""
 
-    def test_after_a_write_names_geometries_and_links_the_sub_model_note(self) -> None:
+    def test_after_a_write_names_geometries_and_sub_models(self) -> None:
         text = _normalised(_subsection("#### After a write that returns the row"))
         assert "geometry" in text, text
         assert "top-level" in text, text
-        assert "(#rich-values-inside-sub-models)" in text, text
+        # #228: sub-models get what a read gives, the model's own validators included, so writing the
+        # instance back is safe for them too.
+        assert "gets the value a read gives" in text, text
+        assert "the model's own validators included" in text, text
+        assert "applied as received, so these calls never fail on it" in text, text
+        assert "Writing such an instance back is safe, sub-models included" in text, text
+
+    def test_the_sub_model_limitation_is_gone(self) -> None:
+        """#228: the "Rich values inside sub-models" note and its full-ORM bullet are removed, with every link to them."""
+        readme = _readme()
+        assert "#### Rich values inside sub-models" not in readme
+        assert "(#rich-values-inside-sub-models)" not in readme
+        assert "Sub-models after a write that returns the row" not in readme
+        assert "converts only durations and geometries" not in readme
 
     def test_values_the_sdk_cannot_read_links_the_geometry_note(self) -> None:
         text = _normalised(_subsection("#### Values the SDK cannot read"))
