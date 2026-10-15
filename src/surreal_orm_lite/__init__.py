@@ -32,6 +32,16 @@ from .functions import (
     Var,
     computed,
 )
+from .geo import (
+    Geometry,
+    GeometryCollection,
+    GeometryLine,
+    GeometryMultiLine,
+    GeometryMultiPoint,
+    GeometryMultiPolygon,
+    GeometryPoint,
+    GeometryPolygon,
+)
 from .live import LiveModelStream, LiveStream, ModelChangeEvent, ReconnectCallback
 from .model_auth import AuthenticatedUserMixin, AuthResult
 from .model_base import BaseSurrealModel, SurrealConfigDict
@@ -121,6 +131,15 @@ __all__ = [
     "Range",
     "BoundIncluded",
     "BoundExcluded",
+    # Geometry (v0.24.0)
+    "Geometry",
+    "GeometryPoint",
+    "GeometryLine",
+    "GeometryPolygon",
+    "GeometryMultiPoint",
+    "GeometryMultiLine",
+    "GeometryMultiPolygon",
+    "GeometryCollection",
     # Exceptions
     "SurrealORMError",
     "SurrealDbError",
