@@ -77,6 +77,8 @@ _SYNC_ADAPTERS: dict[type, dict[str, TypeAdapter[Any] | None]] = {}
 _SYNC_RESHAPED: dict[type, frozenset[str]] = {}
 # ``_sync_reshaped()`` of a model whose own validators may reshape every field.
 _ALL_FIELDS: frozenset[str] = frozenset({"*"})
+# The key under which a node of ``_with_sdk_timedeltas``'s trie holds the value that replaces it (#228).
+_LEAF = object()
 
 # ``tuple`` and ``Annotated`` subscripted with annotations known at run time (mypy takes them for types).
 _TUPLE: Any = tuple
@@ -231,21 +233,32 @@ def _path_to(data: Any, loc: Sequence[int | str], value: Any) -> list[int | str]
     return path if node is value else None
 
 
-def _replaced(data: Any, path: Sequence[int | str], new: Any) -> Any:
-    """``data`` with the item at ``path`` replaced by ``new``, each container on the way copied (#228).
+def _copy_with(node: Any, items: Mapping[int | str, Any]) -> Any:
+    """A copy of the container ``node`` with ``items`` set in it, of the same type: ``dict``, ``list`` or ``tuple`` (#228).
 
-    ``path`` comes from :func:`_path_to`, so it holds only plain ``dict``, ``list`` and ``tuple``
-    containers; ``data`` itself is never mutated.
+    The only place :func:`_rebuilt` copies a container, once per container on a converted path;
+    ``node`` itself is never mutated, and its other items are kept by identity.
     """
-    if not path:
-        return new
-    key, rest = path[0], path[1:]
-    if type(data) is dict:
-        return {**data, key: _replaced(data[key], rest, new)}
-    items = list(data)
-    index = typing.cast(int, key)
-    items[index] = _replaced(items[index], rest, new)
-    return items if type(data) is list else tuple(items)
+    if type(node) is dict:
+        return {**node, **items}
+    copied = list(node)
+    for index, value in items.items():
+        copied[typing.cast(int, index)] = value
+    return copied if type(node) is list else tuple(copied)
+
+
+def _rebuilt(node: Any, trie: Mapping[Any, Any]) -> Any:
+    """``node`` with the values the ``trie`` of :func:`_with_sdk_timedeltas` names replaced, in one pass (#228).
+
+    A ``trie`` node maps a key or index of ``node`` to the ``trie`` of the item found there, or
+    holds the new value under ``_LEAF`` when ``node`` itself is replaced. The paths come from
+    :func:`_path_to`, so they enter only plain ``dict``, ``list`` and ``tuple`` containers: each
+    one on a path is copied once (:func:`_copy_with`), and every item off the paths is kept by
+    identity.
+    """
+    if _LEAF in trie:
+        return trie[_LEAF]
+    return _copy_with(node, {part: _rebuilt(node[part], child) for part, child in trie.items()})
 
 
 def _with_sdk_timedeltas(data: Any, error: ValidationError) -> Any:
@@ -253,23 +266,29 @@ def _with_sdk_timedeltas(data: Any, error: ValidationError) -> Any:
 
     Pydantic's ``timedelta`` refuses the SDK's ``Duration`` (``time_delta_type``), the value every
     read returns for a SurrealDB ``duration``. For each such error whose input is exactly the SDK's
-    class, the input found at the error's ``loc`` (:func:`_path_to`) is replaced by
-    ``_timedelta_from_sdk(input)``, floored to the microsecond, on a copy of ``data``
-    (:func:`_replaced`). An input that rule leaves alone (negative, beyond ``timedelta.max``) and
-    an input the ``loc`` does not lead to (a ``mode="before"`` validator rebuilt the data…) are
-    not converted. Never raises.
+    class, the input found in ``data`` at the error's ``loc`` (:func:`_path_to`) is replaced by
+    ``_timedelta_from_sdk(input)``, floored to the microsecond. The paths are gathered first, then
+    ``data`` is rebuilt in one pass (:func:`_rebuilt`): each container on a path is copied once,
+    whatever the number of values below it, and ``data`` itself is never mutated. Two errors that
+    lead to one position (a union of models with the same field) convert it once. An input that
+    rule leaves alone (negative, beyond ``timedelta.max``) and an input the ``loc`` does not lead
+    to (a ``mode="before"`` validator rebuilt the data…) are not converted. Never raises.
     """
     try:
-        fixed = data
+        trie: dict[Any, Any] = {}
         for detail in error.errors(include_url=False, include_context=False):
             value = detail.get("input")
             if detail["type"] != "time_delta_type" or type(value) is not SdkDuration:
                 continue
             converted = _timedelta_from_sdk(value)
-            path = None if converted is value else _path_to(fixed, detail["loc"], value)
-            if path is not None:
-                fixed = _replaced(fixed, path, converted)
-        return None if fixed is data else fixed
+            path = None if converted is value else _path_to(data, detail["loc"], value)
+            if path is None:
+                continue
+            node = trie
+            for part in path:
+                node = node.setdefault(part, {})
+            node.setdefault(_LEAF, converted)
+        return _rebuilt(data, trie) if trie else None
     except Exception:
         return None
 

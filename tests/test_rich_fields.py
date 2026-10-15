@@ -1802,6 +1802,85 @@ class TestNestedTimedeltaRead:
         assert assigned.sub == RfTdSub(td=timedelta(seconds=1))
 
 
+class RfTdOther(BaseModel):
+    """A second sub-model with a ``timedelta`` named ``td``: in a union with ``RfTdSub``, both refuse the same value."""
+
+    td: timedelta
+    label: str = ""
+
+
+class RfTdMany(BaseSurrealModel):
+    """Many SDK durations below the top level: in a ``list[timedelta]`` and in sub-models."""
+
+    model_config = SurrealConfigDict(table_name="rf_td_many")
+
+    id: str | None = None
+    tds: list[timedelta] = []
+    subs: list[RfTdSub] = []
+    either: RfTdSub | RfTdOther | None = None
+
+
+def _count_copies(monkeypatch: pytest.MonkeyPatch) -> list[tuple[type, int]]:
+    """Record ``(type, id)`` of each container the duration conversion copies (``model_base._copy_with``)."""
+    copied: list[tuple[type, int]] = []
+    real = model_base._copy_with
+
+    def counting(node: Any, items: Any) -> Any:
+        copied.append((type(node), id(node)))
+        return real(node, items)
+
+    monkeypatch.setattr(model_base, "_copy_with", counting)
+    return copied
+
+
+def _sdk_durations(n: int) -> list[Any]:
+    """``n`` distinct SDK durations, of 1 to ``n`` microseconds."""
+    return [surrealdb.Duration(i * 1000) for i in range(1, n + 1)]
+
+
+class TestNestedTimedeltaCopies:
+    """#228 (unit): the conversion copies each container on a converted path once, whatever the number of durations."""
+
+    def test_a_read_copies_each_container_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        copied = _count_copies(monkeypatch)
+        counts: dict[int, int] = {}
+        for n in (10, 2000):
+            copied.clear()
+            tds = _sdk_durations(n)
+            subs = [{"td": value} for value in _sdk_durations(3)]
+            row = {"tds": tds, "subs": subs}
+            got = RfTdMany.model_validate(row)
+            # The row, ``tds``, ``subs`` and the 3 sub-models: each copied once, nothing else.
+            containers = {id(row), id(tds), id(subs), *(id(sub) for sub in subs)}
+            assert sorted(i for _, i in copied) == sorted(containers), copied
+            counts[n] = len(copied)
+            assert got.tds == [timedelta(microseconds=i) for i in range(1, n + 1)]
+            assert got.subs == [RfTdSub(td=timedelta(microseconds=i)) for i in range(1, 4)]
+            assert row["tds"] is tds and type(tds[0]) is surrealdb.Duration, "the caller's row is not mutated"
+        assert counts == {10: 6, 2000: 6}
+
+    def test_a_field_validated_alone_copies_the_tuple_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        copied = _count_copies(monkeypatch)
+        for n in (10, 2000):
+            copied.clear()
+            tds = _sdk_durations(n)
+            got = RfTdMany._validated_on_sync("tds", tds)
+            # The 1-tuple that holds the value and the list: each copied once, nothing else.
+            assert len(copied) == 2 and (list, id(tds)) in copied and [t for t, _ in copied].count(tuple) == 1, copied
+            assert got == [timedelta(microseconds=i) for i in range(1, n + 1)]
+            assert type(tds[0]) is surrealdb.Duration, "the value is not mutated"
+
+    def test_one_position_refused_twice_is_converted_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A union of two models with the same field: both errors lead to one position, converted once."""
+        copied = _count_copies(monkeypatch)
+        either = {"td": _SDK_TD}
+        row = {"either": either}
+        got = RfTdMany.model_validate(row)
+        assert isinstance(got.either, RfTdSub | RfTdOther) and got.either.td == _TD, got
+        assert sorted(i for _, i in copied) == sorted([id(row), id(either)]), copied
+        assert row == {"either": {"td": _SDK_TD}} and either["td"] is _SDK_TD
+
+
 class TestNestedTimedeltaReadE2E:
     """#228: a ``timedelta`` below the top level reads the duration the server stores, and a write keeps it native."""
 
