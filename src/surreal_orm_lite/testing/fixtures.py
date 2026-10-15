@@ -75,7 +75,7 @@ class SurrealFixture:
         @fixture
         class GameFixtures(SurrealFixture):
             table1 = GameTable(id="t1", name="Table 1", max_players=4)
-            player1 = Player(name="Alice", seat=1)
+            player1 = Player(id="alice", name="Alice", seat=1)
             seated = SeatedAt(in_=RecordID("Player", "alice"), out=RecordID("GameTable", "t1"))
 
         async with GameFixtures.load() as fixtures:
