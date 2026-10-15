@@ -4,8 +4,10 @@ is_conflict_error, and the retry_on_conflict decorator."""
 import asyncio
 import contextlib
 import os
+from typing import Any
 
 import pytest
+from surrealdb.errors import InternalError
 
 from surreal_orm_lite import (
     BaseSurrealModel,
@@ -151,6 +153,96 @@ def test_public_exports() -> None:
     assert m.SurrealDbConflictError is sdce
     for name in ("retry_on_conflict", "is_conflict_error", "SurrealDbConflictError"):
         assert name in m.__all__
+
+
+# --------------------------------------------------------------------------- #
+# A plain write refused with a retryable conflict (issue #216, README section 22)
+# --------------------------------------------------------------------------- #
+
+
+def _sdk_conflict() -> InternalError:
+    """The SDK error a plain ``save()``/``merge()``/``delete()`` gets on a CHANGEFEED table.
+
+    Measured on 2.7.0 (issue #216): about every 10 s, even with a single writer, the server
+    refuses such a write with this message, and the ORM lets the SDK's ``InternalError`` through.
+    Reproducing it against a server takes a write loop of tens of seconds that does not hit a
+    conflict on every period, so these tests replay the measured error instead.
+    """
+    return InternalError(kind="Internal", message=CONFLICT_26)
+
+
+class Order216(BaseSurrealModel):
+    id: str | None = None
+    total: int = 0
+
+
+class _CreateClient:
+    """Stands in for the SDK client: ``create()`` is refused ``failures`` times, then succeeds."""
+
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.calls = 0
+
+    async def create(self, record_id: Any, data: dict[str, Any]) -> dict[str, Any]:
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise _sdk_conflict()
+        return {**data, "id": record_id}
+
+
+def _use_client(monkeypatch: pytest.MonkeyPatch, client: _CreateClient) -> None:
+    async def _get_client() -> _CreateClient:
+        return client
+
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(_get_client))
+
+
+class TestPlainWriteConflict:
+    """README sections 14 and 22: what a caller sees when SurrealDB refuses a plain write."""
+
+    def test_sdk_internal_error_is_a_conflict(self) -> None:
+        assert is_conflict_error(_sdk_conflict()) is True
+
+    @pytest.mark.asyncio
+    async def test_plain_save_lets_the_sdk_error_through(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The ORM neither retries nor converts the conflict of a plain ``save()``."""
+        client = _CreateClient(failures=1)
+        _use_client(monkeypatch, client)
+        with pytest.raises(InternalError, match="This transaction can be retried") as caught:
+            await Order216(id="o1", total=42).save()
+        assert not isinstance(caught.value, SurrealDbError)
+        assert client.calls == 1
+
+    @pytest.mark.asyncio
+    async def test_retry_on_conflict_replays_a_plain_save(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The README section 22 example: the caller's decorator replays the refused save()."""
+        slept = _record_sleep(monkeypatch)
+        client = _CreateClient(failures=1)
+        _use_client(monkeypatch, client)
+
+        @retry_on_conflict()
+        async def save_order(order: Order216) -> Order216:
+            return await order.save()
+
+        order = await save_order(Order216(id="o1", total=42))
+        assert order.total == 42
+        assert client.calls == 2
+        assert len(slept) == 1
+
+    @pytest.mark.asyncio
+    async def test_exhausted_retries_raise_the_orm_conflict(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _record_sleep(monkeypatch)
+        client = _CreateClient(failures=10)
+        _use_client(monkeypatch, client)
+
+        @retry_on_conflict(max_retries=2)
+        async def save_order(order: Order216) -> Order216:
+            return await order.save()
+
+        with pytest.raises(SurrealDbConflictError) as caught:
+            await save_order(Order216(id="o1", total=42))
+        assert isinstance(caught.value.__cause__, InternalError)
+        assert client.calls == 3
 
 
 # --------------------------------------------------------------------------- #
