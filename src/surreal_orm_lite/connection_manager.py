@@ -14,6 +14,7 @@ from . import decoding as _decoding
 from . import encoding as _encoding
 from ._sdk import AsyncSurreal, NotFoundError
 from .auth import AuthTokens, build_auth_payload, wrap_auth_error
+from .embedded import is_embedded_url
 from .exceptions import (
     SurrealDbAuthenticationError,
     SurrealDbConflictError,
@@ -166,6 +167,15 @@ class SurrealDBConnectionManager:
         :return: True if the connection kwargs are set, False otherwise.
         """
         return all([cls.__url, cls.__user, cls.__password, cls.__namespace, cls.__database])
+
+    @classmethod
+    def is_embedded(cls) -> bool:
+        """Whether the configured URL addresses the SDK's in-process engine (``mem://``, ``surrealkv://<path>`` …).
+
+        False when no URL is configured. The capability check for code that must run on both kinds of connection
+        (live queries, model auth without ``bind``, ``changes(since=<datetime>)`` are not available embedded).
+        """
+        return is_embedded_url(cls.__url)
 
     @classmethod
     def __prune_dead_loops(cls) -> None:

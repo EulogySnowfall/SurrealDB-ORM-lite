@@ -21,6 +21,12 @@ root first, then that submodule, so a release that exports them at the top level
 ``surrealdb.data.cbor`` only like ``encode``/``decode``, and the three async connection classes,
 root first, then their SDK 2.0.0 submodules. Each is ``None`` when the installed SDK has no such
 symbol: the hook is then not installed.
+
+v0.25.0 adds the SDK's URL parser (``SdkUrl``, ``SdkUrlScheme``), so the ORM classifies a URL exactly as
+``AsyncSurreal()`` routes it. The SDK's package root imports both but does not list them in its
+``__all__`` (2.0.0 and the 3.0 betas), so type checkers see the static import from
+``surrealdb.connections.url``, the module that defines them; at run time they are looked up root first,
+then that module.
 """
 
 import importlib
@@ -71,6 +77,8 @@ if TYPE_CHECKING:
     from surrealdb import AsyncEmbeddedSurrealConnection as SdkAsyncEmbeddedConnection
     from surrealdb import AsyncHttpSurrealConnection as SdkAsyncHttpConnection
     from surrealdb import AsyncWsSurrealConnection as SdkAsyncWsConnection
+    from surrealdb.connections.url import Url as SdkUrl
+    from surrealdb.connections.url import UrlScheme as SdkUrlScheme
     from surrealdb.data.cbor import decode as cbor_decode
     from surrealdb.data.cbor import encode as cbor_encode
     from surrealdb.data.cbor import tag_decoder as cbor_tag_decoder
@@ -117,6 +125,9 @@ else:
     # ``None`` when the installed SDK has no such class: the ORM's class then derives from
     # ``ValueError`` alone (``exceptions.py``).
     SdkInvalidGeometryError = _first_of("InvalidGeometryError", "surrealdb", "surrealdb.errors", required=False)
+    # URL parser (v0.25.0): root first, then the module that defines it (never in the root's ``__all__``).
+    SdkUrl = _first_of("Url", "surrealdb", "surrealdb.connections.url")
+    SdkUrlScheme = _first_of("UrlScheme", "surrealdb", "surrealdb.connections.url")
 
 __all__ = [
     "AsyncSurreal",
@@ -155,4 +166,7 @@ __all__ = [
     "SdkGeometryMultiPolygon",
     "SdkGeometryCollection",
     "SdkInvalidGeometryError",
+    # Embedded engine (v0.25.0)
+    "SdkUrl",
+    "SdkUrlScheme",
 ]
