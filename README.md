@@ -2238,8 +2238,11 @@ flattens the SDK's `Duration(0)` into an object, like any SDK value there
 ([#222](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/222)).
 
 The hook is installed only while the installed SDK cannot decode these values, and only on the
-ORM's own clients (`SurrealDBConnectionManager.get_client()`, `ephemeral_client()`). An
-`AsyncSurreal` client the application builds itself keeps the SDK's behaviour and fails on them.
+ORM's own clients (`SurrealDBConnectionManager.get_client()`, `ephemeral_client()`), the embedded
+engine's included (see [Embedded engine and test fixtures](#26-embedded-engine-and-test-fixtures)):
+there a zero duration and a degenerate geometry read as on a server, and `<set>[…]` is stored as an
+array, as on 2.x. An `AsyncSurreal` client the application builds itself keeps the SDK's behaviour
+and fails on them.
 A later SDK reads zero durations and native sets itself
 ([#205](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/205)), and the hook then
 leaves them to it.
