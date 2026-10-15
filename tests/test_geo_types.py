@@ -5,9 +5,11 @@ value are suffixed ``E2E``. The reference values below are shared with ``tests/t
 """
 
 import copy
+import functools
 import math
 import pickle
 import warnings
+from collections.abc import Callable, Coroutine
 from decimal import Decimal
 from fractions import Fraction
 from typing import Annotated, Any, Optional
@@ -16,6 +18,7 @@ import pytest
 import surrealdb
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
 from surrealdb import RecordID
+from surrealdb.cbor import CBORTag
 from surrealdb.data import GeometryCollection as SdkCollection
 from surrealdb.data import GeometryLine as SdkLine
 from surrealdb.data import GeometryMultiLine as SdkMultiLine
@@ -47,9 +50,13 @@ from surreal_orm_lite import (
     PointField,
     PolygonField,
     SurrealConfigDict,
+    encoding,
     geo,
     live,
 )
+from tests.conftest import orm_client
+from tests.test_encoding import _no_client
+from tests.test_rich_types import _http_client, _server_version
 
 # Reference points as (longitude, latitude).
 A: tuple[float, float] = (-73.98, 40.74)
@@ -1345,3 +1352,487 @@ class TestGeometryFields:
             dumped = instance.model_dump()
         assert dumped["location"] == "not a point"
         assert dumped["area"] is None
+
+
+# --- the encoding boundary (Task 4) --------------------------------------------------------------
+
+
+class GeoProbe(BaseSurrealModel):
+    """Untyped: keyword writes and raw queries carry SDK values unvalidated."""
+
+    model_config = SurrealConfigDict(table_name="geo_raw")
+
+    id: str | None = None
+    location: Any = None
+
+
+class GeoTypedProbe(BaseSurrealModel):
+    """Typed geometry fields, filled through ``model_construct()`` (no validation, P4)."""
+
+    model_config = SurrealConfigDict(table_name="geo_raw")
+
+    id: str | None = None
+    location: PointField = None
+    area: PolygonField = None
+
+
+class _SdkPin(SdkPoint):
+    """A user subclass of the SDK's point."""
+
+
+def _square() -> tuple[Any, Any, Any, Any]:
+    """Four SDK points of a unit square, for the rings below."""
+    return SdkPoint(0.0, 0.0), SdkPoint(1.0, 0.0), SdkPoint(1.0, 1.0), SdkPoint(0.0, 1.0)
+
+
+def _with(value: Any, attr: str, members: Any) -> Any:
+    """``value`` whose member attribute was replaced after construction."""
+    setattr(value, attr, members)
+    return value
+
+
+def _ring(*points: Any) -> Any:
+    """An SDK polygon whose exterior ring holds exactly ``points`` (mutated after construction)."""
+    polygon = SdkPolygon.parse_coordinates([RING])
+    polygon.geometry_lines[0].geometry_points = list(points)
+    return polygon
+
+
+def _open_hole() -> Any:
+    """An SDK polygon whose hole was mutated, after construction, to leave out its closing point."""
+    polygon = SdkPolygon.parse_coordinates([RING, HOLE])
+    polygon.geometry_lines[1].geometry_points = polygon.geometry_lines[1].geometry_points[:-1]
+    return polygon
+
+
+def _short_hole() -> Any:
+    """An SDK polygon whose hole was mutated to 3 closed points."""
+    polygon = SdkPolygon.parse_coordinates([RING, HOLE])
+    h0, h1 = polygon.geometry_lines[1].geometry_points[:2]
+    polygon.geometry_lines[1].geometry_points = [h0, h1, h0]
+    return polygon
+
+
+#: Valid SDK geometries of spec §3.8's "stored and read back" list: ``encode()`` returns each as is.
+KEPT: dict[str, Callable[[], Any]] = {
+    **{kind: functools.partial(_sdk, kind) for kind in KINDS},
+    "nested-collection": lambda: SdkCollection(SdkCollection(_sdk("point"), _sdk("line")), _sdk("polygon"), SdkMultiPoint()),
+    "empty-multipoint": SdkMultiPoint,
+    "empty-multiline": SdkMultiLine,
+    "empty-multipolygon": SdkMultiPolygon,
+    "empty-collection": SdkCollection,
+    "open-ring-4-points": lambda: _ring(*_square()),
+    "open-ring-3-points": lambda: _ring(*_square()[:3]),
+    "open-hole": _open_hole,
+    "multipolygon-open-ring": lambda: SdkMultiPolygon(_ring(*_square()), _sdk("polygon")),
+    "collection-open-ring": lambda: SdkCollection(_ring(*_square()[:3])),
+    "line-two-equal-points": lambda: SdkLine(SdkPoint(1.0, 2.0), SdkPoint(1.0, 2.0)),
+    "int64-max": lambda: SdkPoint(2**63 - 1, 2**63 - 1),
+    "int64-min": lambda: SdkPoint(-(2**63), -(2**63)),
+    "float-nan": lambda: SdkPoint(math.nan, 1.0),
+    "float-inf": lambda: SdkPoint(math.inf, -math.inf),
+    "decimal": lambda: SdkPoint(Decimal("1.5"), Decimal("-2")),
+    "decimal-nan": lambda: SdkPoint(Decimal("NaN"), 1.0),
+    "decimal-positional-long": lambda: SdkPoint(Decimal("0.1234567890123456789012345678901"), 1.0),
+    "decimal-2**96-1": lambda: SdkPoint(Decimal("7.9228162514264337593543950335E+28"), 1.0),
+    "cbor-tag": lambda: SdkPoint(CBORTag(surrealdb.TAG_DECIMAL_STRING, "1.5"), 1.0),
+    "sdk-subclass": lambda: _SdkPin(*A),
+    "tuple-line": lambda: _with(SdkLine(*_square()[:2]), "geometry_points", tuple(_square()[:2])),
+    "tuple-polygon": lambda: _with(_sdk("polygon"), "geometry_lines", tuple(_sdk("polygon").geometry_lines)),
+    "tuple-multipoint": lambda: _with(SdkMultiPoint(), "geometry_points", (SdkPoint(*A), SdkPoint(*B))),
+    "tuple-collection": lambda: _with(SdkCollection(), "geometries", (_sdk("point"), _sdk("line"))),
+}
+
+#: Decimal coordinates whose ``str()`` writes an exponent: ``encode()`` rewrites them in fixed point.
+EXPONENT_DECIMALS = [d for d in DECIMAL_STORED if "E" in str(d)]
+
+_TINY = Decimal("1E-7")
+
+
+def _rewritten() -> dict[str, Callable[[], Any]]:
+    """SDK geometries ``encode()`` rebuilds: exponent-form decimal coordinates, ORM members."""
+    a, b, c, _ = _square()
+    return {
+        **{f"point-{d}": functools.partial(SdkPoint, d, 1.0) for d in EXPONENT_DECIMALS},
+        "line": lambda: SdkLine(SdkPoint(_TINY, 0.0), b),
+        "open-ring": lambda: _ring(SdkPoint(_TINY, 0.0), b, c),
+        "collection": lambda: SdkCollection(SdkPoint(_TINY, 0.0), _sdk("line")),
+        "sdk-subclass": lambda: _SdkPin(_TINY, 1.0),
+        "orm-in-multipoint": lambda: SdkMultiPoint(GeometryPoint(*A), SdkPoint(*B)),
+        "orm-in-collection": lambda: SdkCollection(_orm("collection"), _sdk("point")),
+    }
+
+
+#: Refused SDK geometries (spec §3.8 "refused by every line") and a part of each message.
+REFUSED: dict[str, tuple[Callable[[], Any], str]] = {
+    "coordinate-bool": (lambda: SdkPoint(True, 1.0), "Cannot send GeometryPoint: a coordinate must be a number, got bool."),
+    "coordinate-str": (lambda: SdkPoint(1.0, "a"), "Cannot send GeometryPoint: a coordinate must be a number, got str."),
+    "coordinate-none": (lambda: SdkPoint(None, 1.0), "Cannot send GeometryPoint: a coordinate must be a number, got NoneType."),
+    "coordinate-2**64": (lambda: SdkPoint(2**64, 1.0), "SurrealDB integers are signed 64-bit"),
+    "coordinate-decimal-8E+28": (lambda: SdkPoint(Decimal("8E+28"), 1.0), "exceeds 2**96 - 1"),
+    "coordinate-decimal-1E+30": (lambda: SdkPoint(1.0, Decimal("1E+30")), "exceeds 2**96 - 1"),
+    "line-1-point": (_bad_line, "Cannot send GeometryLine: a line needs at least 2 points, got 1."),
+    "line-0-points": (
+        lambda: _with(SdkLine(*_square()[:2]), "geometry_points", []),
+        "Cannot send GeometryLine: a line needs at least 2 points, got 0.",
+    ),
+    "polygon-no-ring": (
+        lambda: _with(_sdk("polygon"), "geometry_lines", []),
+        "Cannot send GeometryPolygon: a polygon needs at least 1 ring, got 0.",
+    ),
+    "ring-2-open-points": (
+        lambda: _ring(*_square()[:2]),
+        "Cannot send GeometryPolygon: ring 1 has 3 points once closed; SurrealDB needs at least 4.",
+    ),
+    "ring-3-closed-points": (_bad_ring, "ring 1 has 3 points once closed; SurrealDB needs at least 4."),
+    "ring-2-equal-points": (lambda: _ring(SdkPoint(0.0, 0.0), SdkPoint(0.0, 0.0)), "ring 1 has 2 points once closed"),
+    "ring-1-point": (lambda: _ring(SdkPoint(0.0, 0.0)), "ring 1 has 1 point once closed"),
+    "ring-0-points": (lambda: _ring(), "ring 1 has 0 points once closed"),
+    "hole-3-closed-points": (_short_hole, "ring 2 has 3 points once closed"),
+    "multiline-1-point-line": (lambda: SdkMultiLine(_sdk("line"), _bad_line()), "a line needs at least 2 points, got 1."),
+    "multipolygon-ringless-polygon": (
+        lambda: SdkMultiPolygon(_with(_sdk("polygon"), "geometry_lines", [])),
+        "a polygon needs at least 1 ring, got 0.",
+    ),
+    "line-of-tuples": (
+        lambda: _with(SdkLine(*_square()[:2]), "geometry_points", [(0.0, 0.0), (1.0, 1.0)]),
+        "Cannot send GeometryLine: member 1 is a tuple, not a GeometryPoint.",
+    ),
+    "line-with-a-tuple": (
+        lambda: _with(SdkLine(*_square()[:2]), "geometry_points", [SdkPoint(0.0, 0.0), (1.0, 1.0)]),
+        "Cannot send GeometryLine: member 2 is a tuple, not a GeometryPoint.",
+    ),
+    "ring-of-tuples": (
+        lambda: _ring((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 0.0)),
+        "Cannot send GeometryPolygon: ring 1 point 1 is a tuple, not a GeometryPoint.",
+    ),
+    "ring-as-a-list": (
+        lambda: _with(_sdk("polygon"), "geometry_lines", [list(_square())]),
+        "Cannot send GeometryPolygon: ring 1 is a list, not a GeometryLine.",
+    ),
+    "multipoint-of-tuples": (
+        lambda: _with(SdkMultiPoint(), "geometry_points", [(0.0, 0.0)]),
+        "Cannot send GeometryMultiPoint: member 1 is a tuple, not a GeometryPoint.",
+    ),
+    "multipolygon-with-a-line": (
+        lambda: SdkMultiPolygon(_sdk("line")),
+        "Cannot send GeometryMultiPolygon: member 1 is a GeometryLine, not a GeometryPolygon.",
+    ),
+    "multiline-with-an-orm-point": (
+        lambda: SdkMultiLine(GeometryPoint(*A)),
+        "Cannot send GeometryMultiLine: member 1 is a GeometryPoint, not a GeometryLine.",
+    ),
+    "collection-dict": (
+        lambda: SdkCollection({"type": "Point", "coordinates": [0.0, 0.0]}),
+        "Cannot send GeometryCollection: member 1 is a dict, not a geometry.",
+    ),
+    "collection-tuple": (
+        lambda: SdkCollection(_sdk("point"), (0.0, 0.0)),
+        "Cannot send GeometryCollection: member 2 is a tuple, not a geometry.",
+    ),
+    "collection-int": (lambda: SdkCollection(1), "Cannot send GeometryCollection: member 1 is an int, not a geometry."),
+    "collection-none": (lambda: SdkCollection(None), "Cannot send GeometryCollection: member 1 is None, not a geometry."),
+    "nested-bad-coordinate": (lambda: SdkCollection(SdkCollection(SdkPoint("a", 1.0))), "got str."),
+    "members-not-a-sequence": (
+        lambda: _with(SdkLine(*_square()[:2]), "geometry_points", "ab"),
+        "Cannot send GeometryLine: geometry_points must be a list, got str.",
+    ),
+}
+
+_SDK_OF: dict[type[Geometry], type[Any]] = {ORM_CLASSES[kind]: SDK_CLASSES[kind] for kind in KINDS}
+
+
+def _corpus_ids() -> list[str]:
+    return [f"{index}-{type(value).__name__}" for index, value in enumerate(_corpus())]
+
+
+def _assert_plain_refusal(info: pytest.ExceptionInfo[ValueError]) -> None:
+    """A plain ``ValueError`` (never an ORM or SDK error class) whose message is neutral."""
+    assert type(info.value) is ValueError, f"raised as {type(info.value).__name__}"
+    assert not isinstance(info.value, surrealdb.errors.SurrealError)
+    assert "connection" not in str(info.value).lower()
+
+
+class TestEncodeGeometry:
+    """AC-5: the two geometry rows of ``encode()`` (spec §6.1; D7, D15)."""
+
+    @pytest.mark.parametrize("value", _corpus(), ids=_corpus_ids())
+    def test_orm_geometry_becomes_the_equal_sdk_geometry(self, value: Geometry) -> None:
+        out = encoding.encode(value)
+        assert type(out) is _SDK_OF[type(value)]
+        assert value == out
+        assert _all_sdk(out)
+        assert _all_lists(out)
+
+    def test_orm_geometry_inside_a_payload(self) -> None:
+        point = GeometryPoint(*A)
+        value = {"a": [point], "b": 1}
+        out = encoding.encode(value)
+        assert out is not value and out["a"] is not value["a"]
+        assert value == {"a": [point], "b": 1} and value["a"][0] is point
+        assert type(out["a"][0]) is SdkPoint and out["a"][0] == SdkPoint(*A)
+        assert encoding.encode(out) is out
+
+    def test_orm_subclass_becomes_the_sdk_class(self) -> None:
+        out = encoding.encode(_Pin(*A))
+        assert type(out) is SdkPoint and out == SdkPoint(*A)
+
+    @pytest.mark.parametrize("make", list(KEPT.values()), ids=list(KEPT))
+    def test_valid_sdk_geometry_is_the_same_object(self, make: Callable[[], Any]) -> None:
+        value = make()
+        assert encoding.encode(value) is value
+        assert encoding.encode({"v": [value]})["v"][0] is value
+
+    def test_bare_sdk_geometry_is_unchanged(self) -> None:
+        value = surrealdb.Geometry()
+        assert encoding.encode(value) is value
+
+    def test_encode_sdk_geometry_leaves_anything_else_alone(self) -> None:
+        value = object()
+        assert encoding._encode_sdk_geometry(value) is value
+
+    @pytest.mark.parametrize("d", EXPONENT_DECIMALS, ids=str)
+    def test_exponent_decimal_coordinate_is_rewritten_in_fixed_point(self, d: Decimal) -> None:
+        point = SdkPoint(d, 1.0)
+        out = encoding.encode(point)
+        assert type(out) is SdkPoint and out is not point
+        assert out.longitude == encoding._encode_decimal(d)
+        assert isinstance(out.longitude, CBORTag) and out.longitude.tag == surrealdb.TAG_DECIMAL_STRING
+        assert "E" not in out.longitude.value
+        assert out.latitude == 1.0
+        assert point.longitude is d  # the original is untouched
+        flipped = encoding.encode(SdkPoint(1.0, d))
+        assert flipped.longitude == 1.0 and flipped.latitude == encoding._encode_decimal(d)
+
+    @pytest.mark.parametrize("d", [d for d in DECIMAL_STORED if d not in EXPONENT_DECIMALS], ids=str)
+    def test_positional_decimal_coordinate_is_kept(self, d: Decimal) -> None:
+        point = SdkPoint(d, 1.0)
+        assert encoding.encode(point) is point
+
+    def test_rewritten_members_rebuild_their_containers(self) -> None:
+        fixed = encoding._encode_decimal(_TINY)
+        a, b, c, _ = _square()
+        line = SdkLine(SdkPoint(_TINY, 0.0), b)
+        out = encoding.encode(line)
+        assert type(out) is SdkLine and out is not line
+        assert out.geometry_points[0].longitude == fixed and out.geometry_points[1] is b
+        assert line.geometry_points[0].longitude is _TINY
+
+        polygon = _ring(SdkPoint(_TINY, 0.0), b, c)  # open: SurrealDB closes it
+        out = encoding.encode(polygon)
+        ring = out.geometry_lines[0]
+        assert type(out) is SdkPolygon and type(ring) is SdkLine
+        assert len(ring.geometry_points) == 3
+        assert ring.geometry_points[0].longitude == fixed
+        assert ring.geometry_points[1] is b and ring.geometry_points[2] is c
+        assert polygon.geometry_lines[0].geometry_points[0].longitude is _TINY
+
+        kept = _sdk("line")
+        collection = SdkCollection(SdkPoint(_TINY, 0.0), kept)
+        out = encoding.encode(collection)
+        assert type(out) is SdkCollection
+        assert out.geometries[0].longitude == fixed and out.geometries[1] is kept
+        assert collection.geometries[0].longitude is _TINY
+
+        multi = SdkMultiPolygon(_sdk("polygon"), _ring(SdkPoint(_TINY, 0.0), b, c, a))
+        out = encoding.encode(multi)
+        assert out.geometry_polygons[0] is multi.geometry_polygons[0]
+        assert out.geometry_polygons[1].geometry_lines[0].geometry_points[0].longitude == fixed
+
+    def test_a_ring_of_signalling_nan_points_is_compared_without_raising(self) -> None:
+        snan = SdkPoint(Decimal("sNaN"), 0.0)
+        polygon = _ring(snan, SdkPoint(1.0, 0.0), snan)  # not provably closed: 4 points once closed
+        assert encoding.encode(polygon) is polygon
+
+    def test_a_rebuilt_tuple_container_stays_a_tuple(self) -> None:
+        b = SdkPoint(*B)
+        line = _with(SdkLine(SdkPoint(*A), b), "geometry_points", (SdkPoint(_TINY, 0.0), b))
+        out = encoding.encode(line)
+        assert type(out.geometry_points) is tuple
+        assert out.geometry_points[1] is b
+
+    def test_an_sdk_subclass_keeps_its_type(self) -> None:
+        out = encoding.encode(_SdkPin(_TINY, 1.0))
+        assert type(out) is _SdkPin
+        assert out.longitude == encoding._encode_decimal(_TINY)
+
+    def test_orm_members_of_sdk_geometries_become_sdk_values(self) -> None:
+        a, b = SdkPoint(*A), SdkPoint(*B)
+        cases: list[tuple[Any, Any]] = [
+            (SdkMultiPoint(GeometryPoint(*A), b), SdkMultiPoint(a, b)),
+            (SdkLine(GeometryPoint(*A), b), SdkLine(a, b)),
+            (
+                _with(SdkPolygon.parse_coordinates([RING]), "geometry_lines", [GeometryLine.parse_coordinates(RING)]),
+                SdkPolygon.parse_coordinates([RING]),
+            ),
+            (SdkMultiLine(GeometryLine(GeometryPoint(*A), GeometryPoint(*B))), SdkMultiLine(SdkLine(a, b))),
+            (SdkMultiPolygon(_orm("polygon")), SdkMultiPolygon(_sdk("polygon"))),
+            (SdkCollection(_orm("collection"), b), SdkCollection(_sdk("collection"), b)),
+        ]
+        for value, expected in cases:
+            out = encoding.encode(value)
+            assert type(out) is type(expected)
+            assert out == expected
+            assert _all_sdk(out)
+            assert encoding.encode(out) is out
+        multi = cases[0][0]
+        assert type(multi.geometry_points[0]) is GeometryPoint  # the original is untouched
+        assert encoding.encode(multi).geometry_points[1] is b
+
+    def test_idempotent(self) -> None:
+        values: list[Any] = [
+            *(make() for make in KEPT.values()),
+            *(make() for make in _rewritten().values()),
+            *_corpus(),
+            {"a": [GeometryPoint(*A), SdkPoint(_TINY, 1.0)]},
+        ]
+        for value in values:
+            once = encoding.encode(value)
+            assert encoding.encode(once) is once, repr(value)
+
+    @pytest.mark.parametrize(("make", "message"), list(REFUSED.values()), ids=list(REFUSED))
+    def test_refused_with_a_plain_value_error(self, make: Callable[[], Any], message: str) -> None:
+        value = make()
+        with pytest.raises(ValueError) as info:
+            encoding.encode(value)
+        _assert_plain_refusal(info)
+        assert message in str(info.value)
+        with pytest.raises(ValueError) as nested:
+            encoding.encode({"v": [value]})
+        _assert_plain_refusal(nested)
+
+    @pytest.mark.parametrize(
+        "make",
+        [_bad_line, functools.partial(SdkPoint, 2**64, 1.0), _bad_ring],
+        ids=["line-1-point", "coordinate-2**64", "ring-3-closed-points"],
+    )
+    async def test_refusals_never_reach_the_client(self, make: Callable[[], Any], monkeypatch: pytest.MonkeyPatch) -> None:
+        _no_client(monkeypatch)
+        calls: list[Callable[[], Coroutine[Any, Any, Any]]] = [
+            lambda: GeoProbe.objects().filter(location=make()).exec(),
+            lambda: GeoProbe.raw_query("RETURN $p;", {"p": make()}),
+            lambda: GeoProbe(id="x").merge(location=make(), refresh=False),
+        ]
+        for call in calls:
+            with pytest.raises(ValueError) as info:
+                await call()
+            _assert_plain_refusal(info)
+
+
+class TestUncheckedOrmGeometry:
+    """P4: an ORM geometry built unchecked from a malformed SDK value is refused by ``encode()``."""
+
+    @pytest.mark.parametrize("make", [_bad_ring, _bad_line, _bad_point], ids=["ring", "line", "point"])
+    def test_encode_refuses_with_a_plain_value_error(self, make: Callable[[], Any]) -> None:
+        unchecked = geo._from_sdk(make(), checked=False)
+        assert isinstance(unchecked, Geometry)
+        with pytest.raises(ValueError) as info:
+            encoding.encode(unchecked)
+        _assert_plain_refusal(info)
+        assert unchecked._to_sdk() is not None  # still converts without raising
+
+    @pytest.mark.parametrize(
+        ("field", "make", "message"),
+        [("area", _bad_ring, "ring 1 has 3 points once closed"), ("location", _bad_point, "got str")],
+        ids=["area", "location"],
+    )
+    async def test_upsert_of_a_constructed_model_is_refused_before_anything_is_sent(
+        self, field: str, make: Callable[[], Any], message: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _no_client(monkeypatch)
+        probe = GeoTypedProbe.model_construct(id="x", **{field: make()})
+        with pytest.raises(ValueError, match=message) as info:
+            await probe.upsert()
+        _assert_plain_refusal(info)
+
+
+#: Each SDK value the raw round trip stores and reads back as the same class (spec §3.1).
+ROUND_TRIP: dict[str, Callable[[], Any]] = {
+    **{kind: functools.partial(_sdk, kind) for kind in KINDS},
+    "nested-collection": KEPT["nested-collection"],
+    "empty-multipoint": SdkMultiPoint,
+    "empty-multiline": SdkMultiLine,
+    "empty-multipolygon": SdkMultiPolygon,
+    "empty-collection": SdkCollection,
+    "tiny-floats": lambda: SdkPoint(1e-05, -2.5e-07),
+}
+
+
+class TestRawGeometryE2E:
+    """AC-6: what SurrealDB does with SDK geometries sent by the raw SDK client (both lines)."""
+
+    @pytest.mark.parametrize("make", list(ROUND_TRIP.values()), ids=list(ROUND_TRIP))
+    async def test_round_trip_over_websocket_and_http(self, make: Callable[[], Any]) -> None:
+        value = make()
+        async with orm_client("geo_raw") as client:
+            rid = RecordID("geo_raw", "ws")
+            await client.query("CREATE $rid SET v = $v;", {"rid": rid, "v": value})
+            back = await client.query("SELECT VALUE v FROM ONLY $rid;", {"rid": rid})
+            assert type(back) is type(value)
+            assert back == value
+            http = await _http_client()
+            rid = RecordID("geo_raw", "http")
+            await http.query("CREATE $rid SET v = $v;", {"rid": rid, "v": value})
+            back = await http.query("SELECT VALUE v FROM ONLY $rid;", {"rid": rid})
+            assert type(back) is type(value)
+            assert back == value
+
+    async def test_a_geojson_map_stays_an_object(self) -> None:
+        geojson = {"type": "Point", "coordinates": [-73.98, 40.74]}
+        async with orm_client("geo_raw") as client:
+            rid = RecordID("geo_raw", "map")
+            await client.query("CREATE $rid SET v = $v;", {"rid": rid, "v": geojson})
+            back = await client.query("SELECT VALUE v FROM ONLY $rid;", {"rid": rid})
+            assert type(back) is dict and back == geojson
+            assert await client.query("RETURN $v.is_geometry();", {"v": geojson}) is False
+            assert await client.query("RETURN $v.is_geometry();", {"v": SdkPoint(*A)}) is True
+            await client.query("DEFINE FIELD loc ON geo_raw TYPE option<geometry<point>>;", {})
+            with pytest.raises(surrealdb.ServerError, match="geometry<point>"):
+                await client.query("CREATE geo_raw:x SET loc = $map;", {"map": geojson})
+
+    async def test_distance_of_the_reference_points(self) -> None:
+        async with orm_client("geo_raw") as client:
+            metres = await client.query("RETURN geo::distance($a, $b);", {"a": SdkPoint(*A), "b": SdkPoint(*B)})
+            assert metres == pytest.approx(AB_METRES, abs=1e-6)
+
+
+DECIMAL_CASES = [pytest.param(k, d, stored, id=str(d)) for k, (d, stored) in enumerate(DECIMAL_STORED.items())]
+
+
+class TestDecimalCoordinatesE2E:
+    """AC-6, D7: decimal coordinates of SDK geometries sent through the ORM, as every line stores them."""
+
+    @pytest.mark.parametrize(("k", "d", "stored"), DECIMAL_CASES)
+    async def test_raw_query_variable(self, k: int, d: Decimal, stored: float) -> None:
+        async with orm_client("geo_raw") as client:
+            rid = RecordID("geo_raw", k)
+            await GeoProbe.raw_query("CREATE $rid SET v = $v;", {"rid": rid, "v": SdkPoint(d, 1.0)})
+            back = await client.query("SELECT VALUE v FROM ONLY $rid;", {"rid": rid})
+            assert type(back) is SdkPoint
+            assert type(back.longitude) is float
+            assert back.longitude == stored
+            assert back.latitude == 1.0
+
+    @pytest.mark.parametrize(("k", "d", "stored"), DECIMAL_CASES)
+    async def test_merge_keyword(self, k: int, d: Decimal, stored: float) -> None:
+        async with orm_client("geo_raw") as client:
+            probe = GeoProbe(id=f"m{k}")
+            await probe.save()
+            await probe.merge(location=SdkPoint(d, 1.0))
+            back = await client.query("SELECT VALUE location FROM ONLY $rid;", {"rid": RecordID("geo_raw", f"m{k}")})
+            assert type(back) is SdkPoint
+            assert back.longitude == stored
+
+    async def test_short_exponent_forms_match_the_raw_value(self) -> None:
+        async with orm_client("geo_raw") as client:
+            if await _server_version() < (3, 0, 0):
+                pytest.skip("SurrealDB 2.x refuses the raw exponent form")
+            for k, text in enumerate(("1E-7", "1.5E-7", "1E+2", "1.2E+2")):
+                d = Decimal(text)
+                orm_rid, raw_rid = RecordID("geo_raw", f"orm{k}"), RecordID("geo_raw", f"raw{k}")
+                await GeoProbe.raw_query("CREATE $rid SET v = $v;", {"rid": orm_rid, "v": SdkPoint(d, 1.0)})
+                await client.query("CREATE $rid SET v = $v;", {"rid": raw_rid, "v": SdkPoint(d, 1.0)})
+                via_orm = await client.query("SELECT VALUE v FROM ONLY $rid;", {"rid": orm_rid})
+                raw = await client.query("SELECT VALUE v FROM ONLY $rid;", {"rid": raw_rid})
+                assert via_orm == raw, text
+                assert via_orm.longitude == DECIMAL_STORED[d], text

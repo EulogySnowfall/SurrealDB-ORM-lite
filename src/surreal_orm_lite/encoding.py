@@ -1,4 +1,4 @@
-"""Internal: the boundary between the ORM and the SDK (v0.23.0).
+"""Internal: the boundary between the ORM and the SDK (v0.23.0; geometries v0.24.0).
 
 Not part of the public API — nothing here is exported by ``surreal_orm_lite``.
 
@@ -21,6 +21,18 @@ refuses with a plain ``ValueError``, before anything is sent: an ``int`` outside
 zero duration while the installed SDK cannot read one back, and a range side that is neither a
 bound nor an open side. Anything else comes back unchanged: the SDK decides, as in v0.22.2.
 
+Geometries (v0.24.0) take two rows. An ORM geometry (``surreal_orm_lite.geo``) becomes the equal
+SDK geometry — built without any SDK constructor — and then takes the SDK row. An SDK geometry
+comes back as **the same object** when it is valid. Its coordinates go through the scalar rows
+above, so a ``Decimal`` coordinate in exponent form goes out in fixed point; ORM geometries among
+its members become SDK ones. The geometry is then rebuilt as a copy of the same class, with only
+the changed coordinate or member list replaced; the original is untouched. An open polygon ring
+with enough points is sent as given (SurrealDB closes it). The SDK row refuses with a plain
+``ValueError``, before anything is sent, exactly the geometries SurrealDB refuses on every line:
+a coordinate that is not a number (``bool``, ``str``, ``None``…) or that the scalar rows refuse,
+a line of fewer than 2 points, a polygon without a ring, a ring of fewer than 4 points once
+closed, and a member of the wrong kind.
+
 The ORM calls it through this module (``_encoding.encode(x)``), never by a name imported from it.
 
 ``sdk_decodes_zero_duration()`` is the one local SDK capability the rich field types depend on:
@@ -32,15 +44,17 @@ module (``encoding.sdk_decodes_zero_duration()``) so a test can replace it.
 
 from __future__ import annotations
 
+import copy
 import decimal
 import functools
 import itertools
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import Any, Final, cast
 from uuid import UUID
 
-from . import _sdk
+from . import _sdk, geo
 from .types import Duration, Range, _is_open_side, _nanoseconds
 
 __all__ = ["encode", "sdk_decodes_zero_duration"]
@@ -77,10 +91,23 @@ _PASSTHROUGH: Final = frozenset(
     }
 )
 
+# The seven SDK geometry classes, subclasses included (v0.24.0).
+_SDK_GEOMETRIES: Final = (
+    _sdk.SdkGeometryPoint,
+    _sdk.SdkGeometryLine,
+    _sdk.SdkGeometryPolygon,
+    _sdk.SdkGeometryMultiPoint,
+    _sdk.SdkGeometryMultiLine,
+    _sdk.SdkGeometryMultiPolygon,
+    _sdk.SdkGeometryCollection,
+)
+
 
 def encode(value: Any) -> Any:
     """The form of ``value`` the ORM hands the SDK — the object itself whenever nothing changes.
 
+    That includes the same object for a valid SDK geometry; an ORM geometry becomes the equal SDK
+    one, and a ``Decimal`` coordinate in exponent form goes out in fixed point (v0.24.0).
     ``ValueError`` (plain, never an ORM error class) for a value SurrealDB cannot hold; nothing has
     been sent at that point. The rules are in the module docstring.
     """
@@ -107,6 +134,12 @@ def _encode(value: Any) -> Any:
         return datetime(value.year, value.month, value.day, tzinfo=UTC)
     if isinstance(value, (Range, _sdk.SdkRange)):
         return _encode_range(value)
+    if isinstance(value, geo.Geometry):
+        # Built without any SDK constructor: a value the serializer built unchecked reaches the SDK
+        # row as it is, and only that row's plain ``ValueError`` can come out of here.
+        return _encode_sdk_geometry(value._to_sdk())
+    if isinstance(value, _SDK_GEOMETRIES):
+        return _encode_sdk_geometry(value)
     if isinstance(value, dict):
         return _encode_dict(value)
     if isinstance(value, (list, tuple)):
@@ -192,6 +225,176 @@ def _encode_range(value: Range[Any] | _sdk.SdkRange) -> Any:
     if isinstance(value, _sdk.SdkRange) and begin is value.begin and end is value.end:
         return value
     return _sdk.SdkRange(begin, end)
+
+
+# --- geometries (v0.24.0) -------------------------------------------------------------------------
+
+# The members each kind holds: the SDK class, or the ORM class (converted to the SDK's first).
+_POINT_MEMBERS: Final = (_sdk.SdkGeometryPoint, geo.GeometryPoint)
+_LINE_MEMBERS: Final = (_sdk.SdkGeometryLine, geo.GeometryLine)
+_POLYGON_MEMBERS: Final = (_sdk.SdkGeometryPolygon, geo.GeometryPolygon)
+_GEOMETRY_MEMBERS: Final = (*_SDK_GEOMETRIES, geo.Geometry)
+
+
+def _encode_sdk_geometry(value: Any) -> Any:
+    """An SDK geometry as SurrealDB stores it: **the same object** when nothing changes (v0.24.0).
+
+    Coordinates go through the scalar rows (an exponent-form ``Decimal`` goes out in fixed point),
+    ORM members become SDK ones, and a changed geometry is rebuilt with ``copy.copy`` and only the
+    changed coordinate or member list replaced — never through an SDK constructor, so an open ring
+    stays as given (SurrealDB closes it) and a subclass keeps its type. A plain ``ValueError`` for
+    exactly the geometries every SurrealDB line refuses (module docstring). No depth limit: a value
+    nested beyond Python's recursion limit raises ``RecursionError``, as the SDK's own encoder
+    does. Anything that is not an SDK geometry comes back as it is.
+
+    Private; ``surql_literal`` reaches it as ``_encoding._encode_sdk_geometry``.
+    """
+    if isinstance(value, _sdk.SdkGeometryPoint):
+        return _encode_point(value)
+    if isinstance(value, _sdk.SdkGeometryLine):
+        return _encode_line(value)
+    if isinstance(value, _sdk.SdkGeometryPolygon):
+        return _encode_polygon(value)
+    if isinstance(value, _sdk.SdkGeometryMultiPoint):
+        return _encode_members(
+            value, "geometry_points", "GeometryMultiPoint", "member", "a GeometryPoint", _POINT_MEMBERS, _point_member
+        )
+    if isinstance(value, _sdk.SdkGeometryMultiLine):
+        return _encode_members(
+            value, "geometry_lines", "GeometryMultiLine", "member", "a GeometryLine", _LINE_MEMBERS, _line_member
+        )
+    if isinstance(value, _sdk.SdkGeometryMultiPolygon):
+        return _encode_members(
+            value, "geometry_polygons", "GeometryMultiPolygon", "member", "a GeometryPolygon", _POLYGON_MEMBERS, _polygon_member
+        )
+    if isinstance(value, _sdk.SdkGeometryCollection):
+        return _encode_members(
+            value, "geometries", "GeometryCollection", "member", "a geometry", _GEOMETRY_MEMBERS, _geometry_member
+        )
+    return value
+
+
+def _described(value: Any) -> str:
+    """``value``'s type for a message: ``None``, ``an int``, ``a tuple``."""
+    if value is None:
+        return "None"
+    name = type(value).__name__
+    return f"{'an' if name[:1].lower() in 'aeiou' else 'a'} {name}"
+
+
+def _coordinate(value: Any) -> Any:
+    """A coordinate through the scalar rows: an ``int``, a ``float``, a ``Decimal`` or a ``CBORTag``."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal, _sdk.CBORTag)):
+        raise ValueError(f"Cannot send GeometryPoint: a coordinate must be a number, got {type(value).__name__}.")
+    return _encode(value)
+
+
+def _encode_point(value: Any) -> Any:
+    longitude = _coordinate(value.longitude)
+    latitude = _coordinate(value.latitude)
+    if longitude is value.longitude and latitude is value.latitude:
+        return value
+    rebuilt = copy.copy(value)
+    rebuilt.longitude = longitude
+    rebuilt.latitude = latitude
+    return rebuilt
+
+
+def _encode_members(
+    value: Any,
+    attr: str,
+    owner: str,
+    label: str,
+    expected: str,
+    accepted: tuple[type[Any], ...],
+    encode_member: Callable[[Any, int], Any],
+) -> Any:
+    """``value`` with each member of ``attr`` checked and encoded, ORM members converted first.
+
+    The members must be a ``list`` or a ``tuple`` of ``accepted`` instances, else a plain
+    ``ValueError`` naming the member's position. The same object comes back when no member changed;
+    otherwise a copy of ``value`` holding a new container of the same type (``list`` or ``tuple``).
+    """
+    members = getattr(value, attr)
+    if not isinstance(members, (list, tuple)):
+        raise ValueError(f"Cannot send {owner}: {attr} must be a list, got {type(members).__name__}.")
+    out: list[Any] | None = None
+    for index, member in enumerate(members):
+        if not isinstance(member, accepted):
+            raise ValueError(f"Cannot send {owner}: {label} {index + 1} is {_described(member)}, not {expected}.")
+        sdk = member._to_sdk() if isinstance(member, geo.Geometry) else member
+        encoded = encode_member(sdk, index + 1)
+        if out is None and encoded is not member:
+            out = list(members[:index])
+        if out is not None:
+            out.append(encoded)
+    if out is None:
+        return value
+    rebuilt = copy.copy(value)
+    setattr(rebuilt, attr, tuple(out) if isinstance(members, tuple) else out)
+    return rebuilt
+
+
+def _encode_line(value: Any) -> Any:
+    encoded = _encode_members(
+        value, "geometry_points", "GeometryLine", "member", "a GeometryPoint", _POINT_MEMBERS, _point_member
+    )
+    count = len(value.geometry_points)
+    if count < 2:
+        raise ValueError(f"Cannot send GeometryLine: a line needs at least 2 points, got {count}.")
+    return encoded
+
+
+def _same_point(first: Any, last: Any) -> bool:
+    """Whether a ring's first point equals its last, compared as the SDK compares its points."""
+    first = first._to_sdk() if isinstance(first, geo.Geometry) else first
+    last = last._to_sdk() if isinstance(last, geo.Geometry) else last
+    try:
+        return bool(first == last)
+    except ArithmeticError:  # a signalling ``Decimal`` NaN cannot be compared
+        return False
+
+
+def _encode_ring(value: Any, position: int) -> Any:
+    """A polygon ring: a line whose closed form has at least 4 points; an open ring is kept open.
+
+    The closed form is the ring itself when its first point equals its last, else the ring plus
+    its first point (what SurrealDB stores for an open ring).
+    """
+    encoded = _encode_members(
+        value, "geometry_points", "GeometryPolygon", f"ring {position} point", "a GeometryPoint", _POINT_MEMBERS, _point_member
+    )
+    points = value.geometry_points
+    closed = len(points) if not points or _same_point(points[0], points[-1]) else len(points) + 1
+    if closed < 4:
+        raise ValueError(
+            f"Cannot send GeometryPolygon: ring {position} has {closed} point{'' if closed == 1 else 's'} once closed; "
+            "SurrealDB needs at least 4."
+        )
+    return encoded
+
+
+def _encode_polygon(value: Any) -> Any:
+    encoded = _encode_members(value, "geometry_lines", "GeometryPolygon", "ring", "a GeometryLine", _LINE_MEMBERS, _encode_ring)
+    if not value.geometry_lines:
+        raise ValueError("Cannot send GeometryPolygon: a polygon needs at least 1 ring, got 0.")
+    return encoded
+
+
+def _point_member(value: Any, position: int) -> Any:
+    return _encode_point(value)
+
+
+def _line_member(value: Any, position: int) -> Any:
+    return _encode_line(value)
+
+
+def _polygon_member(value: Any, position: int) -> Any:
+    return _encode_polygon(value)
+
+
+def _geometry_member(value: Any, position: int) -> Any:
+    return _encode_sdk_geometry(value)
 
 
 def _encode_dict(value: dict[Any, Any]) -> Any:
