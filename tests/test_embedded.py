@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import enum
 import inspect
+import logging
 import re
 import sys
 import uuid
@@ -26,6 +27,8 @@ from surrealdb import RecordID
 from surrealdb.connections.async_embedded import AsyncEmbeddedSurrealConnection
 
 from surreal_orm_lite import (
+    AuthenticatedUserMixin,
+    AuthTokens,
     Avg,
     BaseSurrealEdge,
     BaseSurrealModel,
@@ -151,12 +154,20 @@ def _failing(monkeypatch: pytest.MonkeyPatch, method: str) -> list[bool]:
 
 
 @contextlib.asynccontextmanager
-async def embedded(url: str = "mem://", *, namespace: str = "t", database: str = "t") -> AsyncIterator[Any]:
-    """Configure *url* without credentials, yield the slot's client, and unset everything afterwards.
+async def embedded(
+    url: str = "mem://",
+    *,
+    namespace: str = "t",
+    database: str = "t",
+    user: str | None = None,
+    password: str | None = None,
+) -> AsyncIterator[Any]:
+    """Configure *url* (without credentials unless given: they are never sent), yield the slot's client, and
+    unset everything afterwards.
 
     A test that reopens a ``surrealkv://`` path drops its ``as client`` binding first (``del client``).
     """
-    SurrealDBConnectionManager.set_connection(url=url, namespace=namespace, database=database)
+    SurrealDBConnectionManager.set_connection(url=url, user=user, password=password, namespace=namespace, database=database)
     try:
         yield await SurrealDBConnectionManager.get_client()
     finally:
@@ -1530,3 +1541,365 @@ class TestKillAfterSwitchE2E:
                 SurrealDBConnectionManager.set_connection(**settings)
         finally:
             await SurrealDBConnectionManager.unset_connection()
+
+
+# ----------------------------------------------------------------------
+# Authentication on the engine (spec §5.2.8, §6.3 invalidate, §6.6; AC-10, AC-22, AC-19's model-auth case)
+# ----------------------------------------------------------------------
+
+
+class EmbUser(AuthenticatedUserMixin, BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="emb_user", access_name="emb_user_access")
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+class EmbRefreshUser(AuthenticatedUserMixin, BaseSurrealModel):
+    """Only for E3 on ``refresh()``: the refusal comes before any request, so its access is never defined."""
+
+    model_config = SurrealConfigDict(table_name="emb_refresh_user", access_name="emb_refresh_access", with_refresh=True)
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+class EmbLocked(AuthenticatedUserMixin, BaseSurrealModel):
+    """A record that cannot select itself: its signup succeeds and ``info()`` returns nothing (spec AC-22)."""
+
+    model_config = SurrealConfigDict(table_name="emb_locked", access_name="emb_locked_access")
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+@contextlib.asynccontextmanager
+async def _embedded_auth() -> AsyncIterator[Any]:
+    """:func:`embedded` with ``EmbUser``'s access method and table defined by the in-process owner."""
+    async with embedded() as client:
+        await EmbUser.define_access()
+        yield client
+
+
+async def _define_locked(client: Any) -> None:
+    await client.query("DEFINE TABLE emb_locked SCHEMALESS PERMISSIONS NONE;")
+    await EmbLocked.define_access(with_table=False)
+
+
+async def _is_owner(client: Any, table: str = "secret") -> bool:
+    """Whether the shared session writes like the in-process owner: a record session cannot create a table
+    (spec M28), so the raw ``CREATE`` fails for it."""
+    try:
+        await client.query(f"CREATE {table} SET at = time::now();")
+    except Exception:
+        return False
+    return True
+
+
+class TestAuthEmbeddedE2E:
+    """AC-10, connection level (D14, D18), no server: the auth methods work on the engine, for the whole process;
+    ``invalidate()`` returns the session to the in-process owner without signing anyone in."""
+
+    async def test_signup_then_info_is_the_record(self) -> None:
+        async with embedded() as client:
+            await client.query(_ACCOUNT_DDL)
+            tokens = await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)
+            assert SurrealDBConnectionManager.get_session_token() == tokens.access
+            me = await SurrealDBConnectionManager.info()
+            assert me is not None
+            assert me["email"] == "a@x"
+
+    async def test_the_identity_is_process_wide(self) -> None:
+        async with embedded() as client:
+            await client.query(_ACCOUNT_DDL)
+            await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)
+            me = await _in_new_loop(SurrealDBConnectionManager.info)
+            assert me is not None
+            assert me["email"] == "a@x"
+
+    async def test_invalidate_returns_to_the_owner_without_a_signin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with embedded(user="root", password="root") as client:
+            await client.query(_ACCOUNT_DDL)
+            await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)
+            assert not await _is_owner(client)
+            calls = _record_calls(monkeypatch, "signin", "invalidate", "use", "close")
+            await SurrealDBConnectionManager.invalidate()
+            assert _calls_of(calls, client) == [("invalidate", ()), ("use", ("t", "t"))]
+            assert SurrealDBConnectionManager.get_session_token() is None
+            assert await SurrealDBConnectionManager.info() is None
+            assert await _is_owner(client)
+            rows = await client.query("SELECT email FROM user;")
+            assert [row["email"] for row in rows] == ["a@x"]
+            # Selected and stamped: the next call takes the fast path, no second reset.
+            assert await SurrealDBConnectionManager.get_client() is client
+            assert len(_calls_of(calls, client)) == 2
+
+    async def test_a_wrong_password_is_refused(self) -> None:
+        async with embedded() as client:
+            await client.query(_ACCOUNT_DDL)
+            tokens = await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)
+            with pytest.raises(SurrealDbAuthenticationError):
+                await SurrealDBConnectionManager.signin(access="account", variables={"email": "a@x", "pass": "wrong"})
+            assert SurrealDBConnectionManager.get_session_token() == tokens.access
+
+    async def test_authenticate_resumes_the_record(self) -> None:
+        async with embedded() as client:
+            await client.query(_ACCOUNT_DDL)
+            tokens = await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)
+            await SurrealDBConnectionManager.invalidate()
+            assert await SurrealDBConnectionManager.info() is None
+            await SurrealDBConnectionManager.authenticate(tokens.access)
+            assert SurrealDBConnectionManager.get_session_token() == tokens.access
+            me = await SurrealDBConnectionManager.info()
+            assert me is not None
+            assert me["email"] == "a@x"
+
+    async def test_a_database_user_signs_in(self) -> None:
+        async with embedded() as client:
+            await client.query("DEFINE USER viewer ON DATABASE PASSWORD 'pw' ROLES VIEWER;")
+            tokens = await SurrealDBConnectionManager.signin(username="viewer", password="pw", namespace="t", database="t")
+            assert isinstance(tokens, AuthTokens)
+            assert tokens.access
+            assert SurrealDBConnectionManager.get_session_token() == tokens.access
+            await SurrealDBConnectionManager.invalidate()
+            assert await _is_owner(client)
+
+    async def test_a_failed_invalidate_changes_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with embedded() as client:
+            await client.query(_ACCOUNT_DDL)
+            tokens = await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)
+            failing = _failing(monkeypatch, "invalidate")
+            with pytest.raises(SurrealDbAuthenticationError, match="during invalidate: boom"):
+                await SurrealDBConnectionManager.invalidate()
+            failing[0] = False
+            assert SurrealDBConnectionManager.get_session_token() == tokens.access
+            assert await SurrealDBConnectionManager.get_client() is client
+            me = await SurrealDBConnectionManager.info()
+            assert me is not None
+            assert me["email"] == "a@x"
+
+    async def test_a_failed_reselection_keeps_the_engine(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """D18: the session is already the owner; the selection is marked stale instead of closing anything."""
+        calls = _record_calls(monkeypatch, "use", "close")
+        async with embedded() as client:
+            await client.query(_ACCOUNT_DDL)
+            await Person(id="ada", name="Ada").save()
+            await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)
+            await SurrealDBConnectionManager.signin(access="account", variables=_ACCOUNT)
+            selections = len(_calls_of(calls, client, "use"))
+            failing = _failing(monkeypatch, "use")
+            with pytest.raises(SurrealDbAuthenticationError, match="restoring the configured identity") as info:
+                await SurrealDBConnectionManager.invalidate()
+            assert isinstance(info.value.__cause__, RuntimeError)
+            assert _calls_of(calls, client, "close") == []
+            assert SurrealDBConnectionManager.is_connected() is True
+            assert _slot_client() is client
+            assert SurrealDBConnectionManager.get_session_token() is None
+
+            failing[0] = False
+            assert await SurrealDBConnectionManager.get_client() is client
+            assert len(_calls_of(calls, client, "use")) == selections + 1  # selected again
+            assert await SurrealDBConnectionManager.info() is None
+            assert (await Person.objects().get("ada")).name == "Ada"
+            assert _calls_of(calls, client, "close") == []
+
+
+class TestModelAuthEmbeddedE2E:
+    """AC-10, model level (D4, D17), and AC-19's model-auth case, no server: ``bind=False`` is refused (E3);
+    ``bind=True`` signs the shared session in."""
+
+    @pytest.mark.parametrize(
+        ("call", "model", "label"),
+        [
+            pytest.param(lambda: EmbUser.signup(email="b@x", password="p"), "EmbUser", "signup", id="signup"),
+            pytest.param(lambda: EmbUser.signin(email="b@x", password="p"), "EmbUser", "signin", id="signin"),
+            pytest.param(lambda: EmbUser.authenticate("a-token"), "EmbUser", "authenticate", id="authenticate"),
+            pytest.param(lambda: EmbRefreshUser.refresh("a-refresh-token"), "EmbRefreshUser", "refresh", id="refresh"),
+        ],
+    )
+    async def test_bind_false_is_refused_with_e3(
+        self, monkeypatch: pytest.MonkeyPatch, call: Callable[[], Coroutine[Any, Any, Any]], model: str, label: str
+    ) -> None:
+        async with _embedded_auth() as client:
+            urls = _count_constructions(monkeypatch)
+            calls = _record_calls(monkeypatch, "signup", "signin", "authenticate", "info", "invalidate")
+            with pytest.raises(SurrealDbError) as info:
+                await call()
+            exc = info.value
+            assert type(exc) is SurrealDbError
+            assert str(exc) == embedded_module.model_auth_unsupported(model, label, "mem://")
+            assert "bind=True" in str(exc)
+            assert "embedded engine" in str(exc)
+            assert urls == []
+            assert _calls_of(calls, client) == []
+            assert SurrealDBConnectionManager.get_session_token() is None
+
+    async def test_signup_with_bind_signs_the_shared_session_in(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _embedded_auth() as client:
+            urls = _count_constructions(monkeypatch)
+            result = await EmbUser.signup(email="b@x", password="p", bind=True)
+            assert isinstance(result.user, EmbUser)
+            assert result.user.id is not None
+            assert result.user.email == "b@x"
+            assert result.user.password != "p"  # the stored hash
+            assert SurrealDBConnectionManager.get_session_token() == result.tokens.access
+            me = await SurrealDBConnectionManager.info()
+            assert me is not None
+            assert me["email"] == "b@x"
+            assert urls == []
+            assert await SurrealDBConnectionManager.get_client() is client
+
+    async def test_signin_with_bind_after_invalidate(self) -> None:
+        async with _embedded_auth():
+            created = await EmbUser.signup(email="b@x", password="p", bind=True)
+            await SurrealDBConnectionManager.invalidate()
+            assert await SurrealDBConnectionManager.info() is None
+            result = await EmbUser.signin(email="b@x", password="p", bind=True)
+            assert isinstance(result.user, EmbUser)
+            assert result.user.get_id() == created.user.get_id()
+            assert SurrealDBConnectionManager.get_session_token() == result.tokens.access
+            me = await SurrealDBConnectionManager.info()
+            assert me is not None
+            assert me["email"] == "b@x"
+
+    async def test_authenticate_with_bind_makes_one_sdk_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _embedded_auth() as client:
+            created = await EmbUser.signup(email="b@x", password="p", bind=True)
+            await SurrealDBConnectionManager.invalidate()
+            calls = _record_calls(monkeypatch, "authenticate")
+            me = await EmbUser.authenticate(created.tokens.access, bind=True)
+            assert isinstance(me, EmbUser)
+            assert me.get_id() == created.user.get_id()
+            assert _calls_of(calls, client) == [("authenticate", (created.tokens.access,))]
+            assert SurrealDBConnectionManager.get_session_token() == created.tokens.access
+            assert SurrealDBConnectionManager.get_refresh_token() is None
+            info = await SurrealDBConnectionManager.info()
+            assert info is not None
+            assert info["email"] == "b@x"
+
+    async def test_a_wrong_password_with_bind_keeps_the_stored_session(self) -> None:
+        async with _embedded_auth() as client:
+            created = await EmbUser.signup(email="b@x", password="p", bind=True)
+            with pytest.raises(SurrealDbAuthenticationError):
+                await EmbUser.signin(email="b@x", password="wrong", bind=True)
+            assert SurrealDBConnectionManager.get_session_token() == created.tokens.access
+            me = await SurrealDBConnectionManager.info()
+            assert me is not None
+            assert me["email"] == "b@x"
+            assert await SurrealDBConnectionManager.get_client() is client
+
+    async def test_a_wrong_password_with_bind_as_owner_stays_the_owner(self) -> None:
+        async with _embedded_auth() as client:
+            await EmbUser.signup(email="b@x", password="p", bind=True)
+            await SurrealDBConnectionManager.invalidate()
+            with pytest.raises(SurrealDbAuthenticationError):
+                await EmbUser.signin(email="b@x", password="wrong", bind=True)
+            assert SurrealDBConnectionManager.get_session_token() is None
+            assert await SurrealDBConnectionManager.info() is None
+            assert await _is_owner(client)
+
+    async def test_a_refused_token_with_bind_keeps_the_stored_session(self) -> None:
+        async with _embedded_auth():
+            created = await EmbUser.signup(email="b@x", password="p", bind=True)
+            with pytest.raises(SurrealDbAuthenticationError):
+                await EmbUser.authenticate("not-a-jwt", bind=True)
+            assert SurrealDBConnectionManager.get_session_token() == created.tokens.access
+            me = await SurrealDBConnectionManager.info()
+            assert me is not None
+            assert me["email"] == "b@x"
+
+    @pytest.mark.parametrize("credentials", [False, True], ids=["no-credentials", "credentials"])
+    async def test_a_refused_url_gets_e11(self, monkeypatch: pytest.MonkeyPatch, credentials: bool) -> None:
+        """AC-19: model auth reports a URL the SDK refuses with E11, before anything is constructed."""
+        urls = _count_constructions(monkeypatch)
+        try:
+            _set_refused("rocksdb:///x", credentials=credentials)
+            for call in (
+                lambda: EmbUser.signin(email="b@x", password="p"),
+                lambda: EmbUser.signin(email="b@x", password="p", bind=True),
+                lambda: EmbUser.authenticate("a-token"),
+            ):
+                with pytest.raises(SurrealDbConnectionError) as info:
+                    await call()
+                _assert_e11(info.value, rocksdb=True)
+            assert urls == []
+        finally:
+            await SurrealDBConnectionManager.unset_connection()
+
+
+class TestFailedBindEmbeddedE2E:
+    """AC-22 (D17), no server: a failed ``bind=True`` checks the record before adopting the token and puts the
+    previous session back, so the process never keeps running as the refused user."""
+
+    async def test_as_owner_the_session_stays_the_owner(self) -> None:
+        async with embedded() as client:
+            await _define_locked(client)
+            with pytest.raises(SurrealDbAuthenticationError, match="no record"):
+                await EmbLocked.signup(email="l@x", password="p", bind=True)
+            assert SurrealDBConnectionManager.get_session_token() is None
+            assert await SurrealDBConnectionManager.info() is None
+            assert await _is_owner(client)
+            rows = await client.query("SELECT email FROM emb_locked;")
+            assert [row["email"] for row in rows] == ["l@x"]  # the signup ran: only the bind was undone
+
+    async def test_a_stored_record_session_is_put_back(self) -> None:
+        async with embedded() as client:
+            await client.query(_ACCOUNT_DDL)
+            await _define_locked(client)
+            t1 = (await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)).access
+            with pytest.raises(SurrealDbAuthenticationError, match="no record"):
+                await EmbLocked.signup(email="l@x", password="p", bind=True)
+            assert SurrealDBConnectionManager.get_session_token() == t1
+            me = await SurrealDBConnectionManager.info()
+            assert me is not None
+            assert me["email"] == "a@x"
+
+    async def test_a_cancelled_exchange_puts_the_session_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _embedded_auth() as client:
+            await client.query(_ACCOUNT_DDL)
+            t1 = (await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)).access
+            real_info = AsyncEmbeddedSurrealConnection.info
+
+            async def cancelled_info(self: Any) -> Any:
+                monkeypatch.setattr(AsyncEmbeddedSurrealConnection, "info", real_info)  # once
+                raise asyncio.CancelledError()
+
+            monkeypatch.setattr(AsyncEmbeddedSurrealConnection, "info", cancelled_info)
+            with pytest.raises(asyncio.CancelledError):
+                await EmbUser.signup(email="b@x", password="p", bind=True)
+            assert SurrealDBConnectionManager.get_session_token() == t1
+            me = await SurrealDBConnectionManager.info()
+            assert me is not None
+            assert me["email"] == "a@x"
+
+    async def test_a_failed_restore_is_logged_and_retried_by_the_next_call(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        async with embedded() as client:
+            await client.query(_ACCOUNT_DDL)
+            await _define_locked(client)
+            t1 = (await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)).access
+            failing = _failing(monkeypatch, "use")
+            with (
+                caplog.at_level(logging.WARNING, logger="surreal_orm_lite.model_auth"),
+                pytest.raises(SurrealDbAuthenticationError, match="no record"),
+            ):
+                await EmbLocked.signup(email="l@x", password="p", bind=True)
+            warnings = [record for record in caplog.records if record.name == "surreal_orm_lite.model_auth"]
+            assert [record.levelno for record in warnings] == [logging.WARNING]
+            assert warnings[0].getMessage() == (
+                "EmbLocked.signup() failed and the previous embedded session could not be restored "
+                "(SurrealDbConnectionError); the next get_client() retries"
+            )
+            assert t1 not in caplog.text
+            assert _slot_client() is client
+
+            failing[0] = False
+            assert await SurrealDBConnectionManager.get_client() is client
+            assert SurrealDBConnectionManager.get_session_token() == t1
+            me = await SurrealDBConnectionManager.info()
+            assert me is not None
+            assert me["email"] == "a@x"

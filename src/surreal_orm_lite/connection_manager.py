@@ -724,7 +724,14 @@ class SurrealDBConnectionManager:
     async def _restore_embedded_session(cls) -> None:
         """Put the stored identity back on the embedded engine's shared session (owner, selection,
         stored token) — what model-level auth does after a failed ``bind=True``. A no-op when the
-        slot is empty."""
+        slot is empty.
+
+        The selection is marked stale before waiting for the guard: should this call be cancelled
+        while it waits, the next :meth:`get_client` still resets the session before handing the
+        client out, so the process never keeps running as the refused identity.
+        """
+        if cls.__embedded_client is not None:
+            cls.__embedded_selection = None
         async with cls._embedded_guard():
             client = cls.__embedded_client
             if client is not None:
@@ -959,7 +966,9 @@ class SurrealDBConnectionManager:
             client per event loop and every model shares it, so every subsequent ORM
             operation runs as the identity signed in here — not just the caller's. An
             application serving concurrent users must not route them through a single
-            connection manager identity.
+            connection manager identity. On the embedded engine (``mem://``,
+            ``surrealkv://<path>`` …) it is the identity of the whole process — every event
+            loop and thread — since one in-process client serves them all.
 
         .. warning::
             **Refresh tokens rotate.** A successful ``refresh=`` exchange kills the token it
@@ -1017,7 +1026,8 @@ class SurrealDBConnectionManager:
 
         Only record access is accepted — SurrealDB has no signup for system users. On success
         the connection is left authenticated as the newly created record, exactly as
-        :meth:`signin` leaves it; the warnings there apply here too.
+        :meth:`signin` leaves it; the warnings there apply here too — on the embedded engine,
+        for the whole process (every event loop and thread).
 
         ``access`` and ``variables`` are declared optional in the signature so that omitting one
         raises a :class:`ValueError` explaining what is missing, rather than a bare
@@ -1091,7 +1101,8 @@ class SurrealDBConnectionManager:
 
         .. warning::
             Like :meth:`signin`, this changes the identity of the whole connection — every
-            model shares it.
+            model shares it. On the embedded engine, of the whole process — every event loop
+            and thread.
 
         A failure changes nothing: the previously stored token is left in place, because the
         call that failed never took effect. (Only the reconnect replay drops a stored token,
@@ -1148,15 +1159,29 @@ class SurrealDBConnectionManager:
         credentials given to :meth:`set_connection` are signed in again: "log the record user
         out, back to the application's own identity", not "break the connection".
 
+        On the embedded engine (``mem://``, ``surrealkv://<path>`` …) nobody is signed in: the
+        anonymous session *is* the in-process owner, with full access, so the stored token is
+        forgotten, the configured namespace and database are selected again, and :meth:`info`
+        then returns ``None``. It is the session of the whole process — every event loop and
+        thread. If that selection fails, nothing is closed (no ``mem://`` data is lost): the
+        session is already the owner, and the next :meth:`get_client` selects again.
+
         :raises SurrealDbAuthenticationError: if the server refuses either step.
         """
         client = await cls._acquire_client(restoring_identity=True)
+        # Decided with the client, before any await: the session to restore is the one of the
+        # connection the client came from.
+        embedded = is_embedded_url(cls.__url)
         try:
             await client.invalidate()
         except Exception as exc:
             raise wrap_auth_error(exc, "invalidate") from exc
 
         cls.clear_session()
+
+        if embedded:
+            await cls._reselect_after_invalidate(client)
+            return
 
         credentials = _encoding.encode({"username": cls.__user, "password": cls.__password})
         try:
@@ -1173,6 +1198,33 @@ class SurrealDBConnectionManager:
             with contextlib.suppress(Exception):
                 await cls.close_connection()
             raise wrap_auth_error(exc, "invalidate (restoring the configured identity)") from exc
+
+    @classmethod
+    async def _reselect_after_invalidate(cls, client: Any) -> None:
+        """The embedded half of :meth:`invalidate`, once the SDK's ``invalidate()`` succeeded: the
+        session is the in-process owner, and only the selection is left to restore.
+
+        No configured sign-in (the engine has no system user on a fresh database, and the owner is
+        what a reconnect restores). The slot's selection is stale until ``use()`` succeeds, so
+        nobody takes the fast path meanwhile; on failure it stays stale — the next
+        :meth:`get_client` selects again — and nothing is closed: :meth:`close_connection` would
+        discard a ``mem://`` database and close this loop's unrelated server client (spec D18).
+        """
+        async with cls._embedded_guard():
+            held = cls.__embedded_client is client
+            if held:
+                cls.__embedded_selection = None
+            namespace, database = cls.__namespace, cls.__database
+            try:
+                if namespace is not None and database is not None:
+                    await client.use(namespace, database)
+            except Exception as exc:
+                raise wrap_auth_error(exc, "invalidate (restoring the configured identity)") from exc
+            if held:
+                cls.__embedded_selection = (namespace, database)
+            # Back at the configured identity — exactly what a reopen restores.
+            cls._stamp_identity(client, replayable=True)
+            cls._identity_restored()
 
     @classmethod
     def clear_session(cls) -> None:
@@ -1234,7 +1286,9 @@ class SurrealDBConnectionManager:
 
         ``None`` means "no record to report", and it has **two** causes worth telling apart:
 
-        - the session is a system user (root, namespace or database), which is not a record;
+        - the session is a system user (root, namespace or database), which is not a record —
+          or, on the embedded engine, the anonymous in-process owner (no sign-in, or after
+          :meth:`invalidate`);
         - the session *is* a record user, but the record's table does not grant it ``select``
           on itself, so the server returns nothing. This one is quiet and catches people out:
           the signin succeeded and ``$auth`` is set, yet ``info()`` reports nothing. Grant the
@@ -1252,8 +1306,8 @@ class SurrealDBConnectionManager:
 
         :param return_type: a type annotation to coerce the record into — a Pydantic model, a
             dataclass, or anything else Pydantic can adapt. ``None`` returns the raw mapping.
-        :raises SurrealDbAuthenticationError: if the session is anonymous (after
-            ``invalidate()``), or the server otherwise refuses.
+        :raises SurrealDbAuthenticationError: if the session is anonymous on a server (the
+            embedded engine's anonymous session returns ``None``), or the server otherwise refuses.
         :raises SurrealDbValidationError: if a non-``None`` record does not fit *return_type*.
         """
         client = await cls.get_client()
