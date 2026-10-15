@@ -1837,8 +1837,11 @@ class TestReadmeSection24Consistency:
         text = _normalised(_subsection("#### After a write that returns the row"))
         assert "geometry" in text, text
         assert "top-level" in text, text
-        # #228: sub-models are validated, so writing the instance back is safe for them too.
-        assert "is validated as a read validates it" in text, text
+        # #228: sub-models get what a read gives, the model's own validators included, so writing the
+        # instance back is safe for them too.
+        assert "gets the value a read gives" in text, text
+        assert "the model's own validators included" in text, text
+        assert "applied as received, so these calls never fail on it" in text, text
         assert "Writing such an instance back is safe, sub-models included" in text, text
 
     def test_the_sub_model_limitation_is_gone(self) -> None:

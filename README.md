@@ -2193,9 +2193,13 @@ await sub.merge(trial=sub.trial + timedelta(days=7))                          # 
 apply the row the server returns to the instance. Top-level `timedelta`, `Duration` and geometry
 fields (since v0.24.0, see [section 25](#25-geospatial-fields)) are converted on the way. A field
 that holds a sub-model (a Pydantic model, a dataclass or a `TypedDict`, also inside `list[...]`,
-`dict[..., ...]` or `X | None`) is validated as a read validates it: it holds its model instance,
-not the row's `dict`, with the ORM's durations, ranges and geometries inside. A value that does
-not validate is applied as received, so these calls never fail on it. Top-level `date`, `set` and
+`dict[..., ...]` or `X | None`) gets the value a read gives: the row goes through the model's
+validation, the model's own validators included, and the field holds its model instance, not the
+row's `dict`, with the ORM's durations, ranges and geometries inside. When the row as a whole does
+not validate, each such field is validated on its own, except one that the model's own validators
+could reshape (a `field_validator` on that field, a `model_validator`, a `model_post_init`): that
+one, like a value that does not validate, is applied as received, so these calls never fail on it.
+Top-level `date`, `set` and
 `Range` fields hold the SDK's value (a midnight `datetime`, a `list`, the SDK's `Range`) until the
 record is loaded again (`get()`, `filter()`, …). Writing such an instance back is safe, sub-models
 included, since those values are stored the same way, although Pydantic warns
