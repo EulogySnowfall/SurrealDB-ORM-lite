@@ -536,7 +536,7 @@ class QuerySet:
             return [self._py_keyed(row) for row in results] if isinstance(results, list) else []
 
     async def _exec_with_distances(self) -> Any:
-        """Run the per-record ``SELECT`` of the ``GeoDistance`` annotations (v0.24.0, spec §6.4).
+        """Run the per-record ``SELECT`` of the ``GeoDistance`` annotations (v0.24.0).
 
         The alias keys are taken out of each row before validation, so they never reach a field, an
         ``extra="allow"`` model's extras or a later write, then set on the instance with
@@ -749,7 +749,7 @@ class QuerySet:
         return self
 
     def _geo_distance_snapshot(self, alias: str, distance: GeoDistance) -> tuple[str, GeometryPoint]:
-        """Check a ``GeoDistance`` annotation against the model; return its column and point (spec §5.4, D14).
+        """Check a ``GeoDistance`` annotation against the model; return its column and point.
 
         The alias must not shadow anything a record or an instance already has: ``SELECT *, … AS
         <alias>`` replaces a stored column of that name in the result (``AS id`` replaces the id),
@@ -781,7 +781,7 @@ class QuerySet:
 
     @staticmethod
     def _reject_geo_distance_mixing(annotations: Mapping[str, Any], *, grouped: bool) -> None:
-        """Refuse a ``GeoDistance`` next to an ``Aggregation`` or a ``values()`` grouping (spec §5.4)."""
+        """Refuse a ``GeoDistance`` next to an ``Aggregation`` or a ``values()`` grouping."""
         kinds = {isinstance(value, GeoDistance) for value in annotations.values()}
         if True in kinds and (False in kinds or grouped):
             raise ValueError(_GEO_DISTANCE_PER_RECORD)
@@ -1516,7 +1516,7 @@ class QuerySet:
         return self.model.from_db(data.get("result", []))
 
 
-#: The refusal of a ``GeoDistance`` combined with ``values()`` or an ``Aggregation`` (spec §5.4).
+#: The refusal of a ``GeoDistance`` combined with ``values()`` or an ``Aggregation``.
 _GEO_DISTANCE_PER_RECORD = (
     "annotate(): a GeoDistance is computed per record; it cannot be combined with GROUP BY aggregations or values()"
 )

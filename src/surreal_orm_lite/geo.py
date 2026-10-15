@@ -91,7 +91,8 @@ __all__ = [
 
 _G = TypeVar("_G", bound="Geometry")
 
-#: The deepest nesting of collections an ORM ``GeometryCollection`` holds (spec D15).
+#: The deepest nesting of collections an ORM ``GeometryCollection`` holds: every supported line
+#: accepts it with headroom. SDK values are not capped by the encoding boundary.
 _MAX_COLLECTION_LEVELS = 32
 
 #: The seven SDK classes (subclasses included), for ``isinstance``.
@@ -380,8 +381,9 @@ class _Composite(Geometry):
         return [member._geojson_coordinates() for member in self._members()]
 
     def _to_sdk(self) -> Any:
-        # No SDK constructor (P4): a value built unchecked converts as it is, and the encoding
-        # boundary refuses what SurrealDB refuses. Members that are not ORM geometries stay as they are.
+        # No SDK constructor, so this never raises: a value built unchecked converts as it is, and
+        # the encoding boundary refuses what SurrealDB refuses. Members that are not ORM geometries
+        # stay as they are.
         sdk = object.__new__(self._SDK_CLASS)
         setattr(sdk, self._ATTR, [m._to_sdk() if isinstance(m, Geometry) else m for m in self._members()])
         return sdk
@@ -752,7 +754,7 @@ def _from_sdk(value: Any, *, checked: bool) -> Any:
 
 
 def _geometry_from_sdk(value: Any) -> Any:
-    """The read rule of a top-level geometry field (spec §6.6): an SDK geometry → the ORM value.
+    """The read rule of a top-level geometry field: an SDK geometry → the ORM value.
 
     Used by ``BaseSurrealModel._apply_record``, which copies a returned row onto the instance
     without validation. Only an instance of exactly one of the seven SDK classes is converted,
@@ -1050,7 +1052,7 @@ def _parse_kinds(kinds: object) -> frozenset[str]:
 
 
 class _GeoValidator:
-    """The field validator of one set of kinds (spec §6.2): a refusal is a ``ValueError``.
+    """The field validator of one set of kinds: a refusal is a ``ValueError``.
 
     An ORM value of an accepted kind is returned as it is; the SDK's is converted through the
     constructors (checked); a mapping is read as GeoJSON; a 2-item ``tuple``/``list`` is a
@@ -1103,7 +1105,7 @@ def _validator(kinds: frozenset[str]) -> _GeoValidator:
 
 
 def _serialize_geometry(value: Any, info: core_schema.SerializationInfo[Any]) -> Any:
-    """The geometry field serializer (spec §5.2).
+    """The geometry field serializer.
 
     Python mode returns an ORM geometry: the value itself, or — when the attribute holds a raw
     SDK geometry (``model_construct``, a read sync, ``hydrate()``'s fallback) — one built
