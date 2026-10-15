@@ -4,14 +4,15 @@ Custom exceptions for SurrealDB ORM.
 These exceptions provide a consistent error handling interface
 for the ORM, independent of the underlying SDK error types.
 
-``InvalidDurationError`` (v0.23.0) is the one exception built on an SDK class: it carries the
-SDK's name and derives from ``surrealdb.InvalidDurationError``, so code written against the SDK's
-``Duration`` catches the ORM's refusals too.
+``InvalidDurationError`` (v0.23.0) and ``InvalidGeometryError`` (v0.24.0) are the two exceptions
+built on SDK classes: each carries the SDK's name and derives from the SDK's class
+(``surrealdb.InvalidDurationError``, ``surrealdb.InvalidGeometryError``), so code written against
+the SDK's ``Duration`` or geometries catches the ORM's refusals too.
 """
 
 from typing import TYPE_CHECKING
 
-from ._sdk import SdkInvalidDurationError
+from ._sdk import SdkInvalidDurationError, SdkInvalidGeometryError
 
 
 class SurrealORMError(Exception):
@@ -117,3 +118,25 @@ else:  # pragma: no cover - only with an SDK that has no InvalidDurationError
 
     class InvalidDurationError(ValueError):
         """A value ``Duration`` refuses (the installed SDK has no ``InvalidDurationError``)."""
+
+
+# Same construction as ``InvalidDurationError``: the SDK's class first, for the same MRO reason.
+if TYPE_CHECKING or SdkInvalidGeometryError is not None:
+
+    class InvalidGeometryError(SdkInvalidGeometryError, ValueError):
+        """A geometry the ORM refuses: a ``ValueError`` and a ``surrealdb.InvalidGeometryError``.
+
+        Raised by the geometry classes (``GeometryPoint(...)`` … ``GeometryCollection(...)`` and their
+        ``parse_coordinates()``) for a non-finite coordinate or one too large for a ``float``, a polygon
+        ring with fewer than 4 points or whose first point is not its last, and collections nested
+        deeper than 32 levels; by ``Geometry.from_geojson(...)`` for malformed GeoJSON; when an SDK
+        geometry given as a component holds such a value; and for such a point given to
+        ``QuerySet.nearby()`` or ``GeoDistance``. A wrong argument *type* stays a ``TypeError``, and a
+        geometry field reports both as a ``pydantic.ValidationError``. The SDK geometries SurrealDB
+        refuses are refused by the encoding boundary with a plain ``ValueError``, not this class.
+        """
+
+else:  # pragma: no cover - only with an SDK that has no InvalidGeometryError
+
+    class InvalidGeometryError(ValueError):
+        """A geometry the ORM refuses (the installed SDK has no ``InvalidGeometryError``)."""

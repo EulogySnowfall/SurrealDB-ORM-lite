@@ -175,3 +175,116 @@ def test_invalid_duration_error_with_value_error_sdk_class() -> None:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok", result.stderr
+
+
+_SDK_GEOMETRY_CLASSES = [
+    "GeometryPoint",
+    "GeometryLine",
+    "GeometryPolygon",
+    "GeometryMultiPoint",
+    "GeometryMultiLine",
+    "GeometryMultiPolygon",
+    "GeometryCollection",
+]
+
+
+def test_sdk_shim_geometry_exports() -> None:
+    """v0.24.0 AC-1: the SDK's geometry classes, base class and error enter through ``_sdk.py``."""
+    import surrealdb
+    import surrealdb.data
+
+    from surreal_orm_lite import _sdk
+
+    for name in _SDK_GEOMETRY_CLASSES:
+        assert getattr(_sdk, f"Sdk{name}") is getattr(surrealdb.data, name), name
+        assert f"Sdk{name}" in _sdk.__all__, name
+    assert _sdk.SdkGeometry is surrealdb.Geometry
+    assert _sdk.SdkInvalidGeometryError is surrealdb.InvalidGeometryError
+    assert "SdkGeometry" in _sdk.__all__
+    assert "SdkInvalidGeometryError" in _sdk.__all__
+
+
+def test_geometry_classes_prefer_the_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    """v0.24.0 AC-1: a geometry class the SDK's top level exports wins over its submodule."""
+    import surrealdb.data.types.geometry
+
+    from surreal_orm_lite import _sdk
+
+    submodule = "surrealdb.data.types.geometry"
+    root = types.ModuleType("fake_geometry_root")
+    monkeypatch.setitem(sys.modules, "fake_geometry_root", root)
+    for name in _SDK_GEOMETRY_CLASSES:
+        # SDK 2.0.0 layout: the root lacks the class, the submodule has it.
+        assert _sdk._first_of(name, "fake_geometry_root", submodule) is getattr(surrealdb.data.types.geometry, name)
+        in_root = type(name, (), {})
+        setattr(root, name, in_root)
+        assert _sdk._first_of(name, "fake_geometry_root", submodule) is in_root, name
+
+
+def test_geometry_classes_taken_from_the_root_when_exported() -> None:
+    """v0.24.0 AC-1: when the SDK's top level exports the classes (SDK 3.0 layout), the shim uses them."""
+    result = _run_isolated(
+        """
+        import surrealdb, surrealdb.data.types.geometry as g
+        names = ["GeometryPoint", "GeometryLine", "GeometryPolygon", "GeometryMultiPoint",
+                 "GeometryMultiLine", "GeometryMultiPolygon", "GeometryCollection"]
+        marked = {}
+        for name in names:
+            marked[name] = type(name, (getattr(g, name),), {})
+            setattr(surrealdb, name, marked[name])
+        import surreal_orm_lite
+        from surreal_orm_lite import _sdk
+        for name in names:
+            assert getattr(_sdk, "Sdk" + name) is marked[name], name
+        print("ok")
+        """
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok", result.stderr
+
+
+def test_invalid_geometry_error_without_sdk_class() -> None:
+    """v0.24.0 AC-2: an SDK without ``InvalidGeometryError`` still imports; the ORM's class is a ``ValueError``."""
+    result = _run_isolated(
+        """
+        import surrealdb, surrealdb.errors
+        del surrealdb.InvalidGeometryError, surrealdb.errors.InvalidGeometryError
+        import surreal_orm_lite
+        from surreal_orm_lite import InvalidGeometryError, _sdk
+        assert _sdk.SdkInvalidGeometryError is None, _sdk.SdkInvalidGeometryError
+        assert InvalidGeometryError.__bases__ == (ValueError,), InvalidGeometryError.__bases__
+        try:
+            raise InvalidGeometryError("x")
+        except ValueError as exc:
+            assert str(exc) == "x"
+        print("ok")
+        """
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok", result.stderr
+
+
+def test_invalid_geometry_error_with_value_error_sdk_class() -> None:
+    """v0.24.0 AC-2: an SDK whose class is already a ``ValueError`` — the SDK's base first keeps the MRO valid."""
+    result = _run_isolated(
+        """
+        import surrealdb, surrealdb.errors
+        Fake = type("InvalidGeometryError", (surrealdb.errors.SurrealError, ValueError), {})
+        surrealdb.InvalidGeometryError = Fake
+        surrealdb.errors.InvalidGeometryError = Fake
+        import surreal_orm_lite
+        from surreal_orm_lite import InvalidGeometryError
+        assert issubclass(InvalidGeometryError, Fake)
+        assert issubclass(InvalidGeometryError, ValueError)
+        assert InvalidGeometryError.__mro__.index(Fake) < InvalidGeometryError.__mro__.index(ValueError)
+        try:
+            raise InvalidGeometryError("x")
+        except Fake:
+            pass
+        else:
+            raise AssertionError("not caught by the SDK class")
+        print("ok")
+        """
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok", result.stderr

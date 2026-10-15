@@ -11,6 +11,11 @@ some of them at the top level, so those are looked up **root first, then the sub
 CBOR codec (``encode``/``decode``) is read from ``surrealdb.data.cbor`` **only**: names that
 generic are never taken from the package root, where a later release could export an unrelated
 symbol. Type checkers see the static 2.0.0 imports instead of ``Any``.
+
+v0.24.0 adds the geometry symbols, aliased ``Sdk…`` so they never clash with the ORM's own geometry
+classes (``geo.py``). SDK 2.0.0 exports only ``Geometry`` and ``InvalidGeometryError`` at the top
+level and keeps the seven concrete classes in ``surrealdb.data.types.geometry``; they are looked up
+root first, then that submodule, so a release that exports them at the top level needs no change.
 """
 
 import importlib
@@ -27,6 +32,7 @@ from surrealdb import (  # noqa: F401
     SurrealError,
 )
 from surrealdb import Duration as SdkDuration
+from surrealdb import Geometry as SdkGeometry
 from surrealdb import Range as SdkRange
 from surrealdb.cbor import CBORSimpleValue, CBORTag, undefined
 
@@ -59,8 +65,16 @@ def _first_of(attr: str, *modules: str, required: bool = True) -> Any:
 if TYPE_CHECKING:
     from surrealdb.data.cbor import decode as cbor_decode
     from surrealdb.data.cbor import encode as cbor_encode
+    from surrealdb.data.types.geometry import GeometryCollection as SdkGeometryCollection
+    from surrealdb.data.types.geometry import GeometryLine as SdkGeometryLine
+    from surrealdb.data.types.geometry import GeometryMultiLine as SdkGeometryMultiLine
+    from surrealdb.data.types.geometry import GeometryMultiPoint as SdkGeometryMultiPoint
+    from surrealdb.data.types.geometry import GeometryMultiPolygon as SdkGeometryMultiPolygon
+    from surrealdb.data.types.geometry import GeometryPoint as SdkGeometryPoint
+    from surrealdb.data.types.geometry import GeometryPolygon as SdkGeometryPolygon
     from surrealdb.data.types.range import Bound, BoundExcluded, BoundIncluded
     from surrealdb.errors import InvalidDurationError as SdkInvalidDurationError
+    from surrealdb.errors import InvalidGeometryError as SdkInvalidGeometryError
 else:
     Bound = _first_of("Bound", "surrealdb", "surrealdb.data.types.range")
     BoundIncluded = _first_of("BoundIncluded", "surrealdb", "surrealdb.data.types.range")
@@ -72,6 +86,18 @@ else:
     # ``None`` when the installed SDK has no such class: the ORM's class then derives from
     # ``ValueError`` alone (``exceptions.py``).
     SdkInvalidDurationError = _first_of("InvalidDurationError", "surrealdb", "surrealdb.errors", required=False)
+    # Geometry (v0.24.0): the seven concrete classes, root first, then the submodule of SDK 2.0.0.
+    _GEOMETRY_MODULE = "surrealdb.data.types.geometry"
+    SdkGeometryPoint = _first_of("GeometryPoint", "surrealdb", _GEOMETRY_MODULE)
+    SdkGeometryLine = _first_of("GeometryLine", "surrealdb", _GEOMETRY_MODULE)
+    SdkGeometryPolygon = _first_of("GeometryPolygon", "surrealdb", _GEOMETRY_MODULE)
+    SdkGeometryMultiPoint = _first_of("GeometryMultiPoint", "surrealdb", _GEOMETRY_MODULE)
+    SdkGeometryMultiLine = _first_of("GeometryMultiLine", "surrealdb", _GEOMETRY_MODULE)
+    SdkGeometryMultiPolygon = _first_of("GeometryMultiPolygon", "surrealdb", _GEOMETRY_MODULE)
+    SdkGeometryCollection = _first_of("GeometryCollection", "surrealdb", _GEOMETRY_MODULE)
+    # ``None`` when the installed SDK has no such class: the ORM's class then derives from
+    # ``ValueError`` alone (``exceptions.py``).
+    SdkInvalidGeometryError = _first_of("InvalidGeometryError", "surrealdb", "surrealdb.errors", required=False)
 
 __all__ = [
     "AsyncSurreal",
@@ -95,4 +121,14 @@ __all__ = [
     "cbor_encode",
     "cbor_decode",
     "SdkInvalidDurationError",
+    # Geometry (v0.24.0)
+    "SdkGeometry",
+    "SdkGeometryPoint",
+    "SdkGeometryLine",
+    "SdkGeometryPolygon",
+    "SdkGeometryMultiPoint",
+    "SdkGeometryMultiLine",
+    "SdkGeometryMultiPolygon",
+    "SdkGeometryCollection",
+    "SdkInvalidGeometryError",
 ]

@@ -10,6 +10,7 @@ from .edge import BaseSurrealEdge
 from .enum import LiveAction, OrderBy
 from .exceptions import (
     InvalidDurationError,
+    InvalidGeometryError,
     SurrealDbAuthenticationError,
     SurrealDbConflictError,
     SurrealDbConnectionError,
@@ -129,4 +130,5 @@ __all__ = [
     "SurrealDbNotFoundError",
     "SurrealDbAuthenticationError",
     "InvalidDurationError",
+    "InvalidGeometryError",
 ]
