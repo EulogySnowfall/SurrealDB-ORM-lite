@@ -1,4 +1,4 @@
-__version__ = "0.23.0"
+__version__ = "0.24.0"
 
 from ._sdk import BoundExcluded, BoundIncluded
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
@@ -10,6 +10,7 @@ from .edge import BaseSurrealEdge
 from .enum import LiveAction, OrderBy
 from .exceptions import (
     InvalidDurationError,
+    InvalidGeometryError,
     SurrealDbAuthenticationError,
     SurrealDbConflictError,
     SurrealDbConnectionError,
@@ -30,6 +31,26 @@ from .functions import (
     SurrealTimeFunction,
     Var,
     computed,
+)
+from .geo import (
+    GeoDistance,
+    GeoField,
+    Geometry,
+    GeometryCollection,
+    GeometryCollectionField,
+    GeometryField,
+    GeometryLine,
+    GeometryMultiLine,
+    GeometryMultiPoint,
+    GeometryMultiPolygon,
+    GeometryPoint,
+    GeometryPolygon,
+    LineStringField,
+    MultiLineStringField,
+    MultiPointField,
+    MultiPolygonField,
+    PointField,
+    PolygonField,
 )
 from .live import LiveModelStream, LiveStream, ModelChangeEvent, ReconnectCallback
 from .model_auth import AuthenticatedUserMixin, AuthResult
@@ -120,6 +141,25 @@ __all__ = [
     "Range",
     "BoundIncluded",
     "BoundExcluded",
+    # Geometry (v0.24.0)
+    "Geometry",
+    "GeometryPoint",
+    "GeometryLine",
+    "GeometryPolygon",
+    "GeometryMultiPoint",
+    "GeometryMultiLine",
+    "GeometryMultiPolygon",
+    "GeometryCollection",
+    "GeoField",
+    "GeometryField",
+    "PointField",
+    "LineStringField",
+    "PolygonField",
+    "MultiPointField",
+    "MultiLineStringField",
+    "MultiPolygonField",
+    "GeometryCollectionField",
+    "GeoDistance",
     # Exceptions
     "SurrealORMError",
     "SurrealDbError",
@@ -129,4 +169,5 @@ __all__ = [
     "SurrealDbNotFoundError",
     "SurrealDbAuthenticationError",
     "InvalidDurationError",
+    "InvalidGeometryError",
 ]

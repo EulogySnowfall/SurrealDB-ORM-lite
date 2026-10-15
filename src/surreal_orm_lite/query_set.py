@@ -1,7 +1,8 @@
 import contextlib
 import logging
 import math
-from collections.abc import Awaitable, Callable
+import numbers
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Self, cast
 from uuid import UUID
 
@@ -9,12 +10,14 @@ from pydantic_core import ValidationError
 
 from . import BaseSurrealModel, SurrealDBConnectionManager
 from . import encoding as _encoding
-from ._sdk import NotFoundError
+from . import geo as _geo
+from ._sdk import NotFoundError, SdkGeometryPoint
 from .changefeed import ChangeModelStream, Since
 from .edge import _check_edge_id, insert_edges
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import Var
+from .geo import GeoDistance, GeometryPoint
 from .live import LiveModelStream, LiveStream, ReconnectCallback, missing_table_error, require_websocket
 from .q import Q
 from .surql_literal import inline_variables
@@ -62,7 +65,11 @@ class QuerySet:
         self._variables: dict = {}
         self._fetch_fields: list[str] = []
         self._group_by_fields: list[str] = []
-        self._annotations: dict[str, Aggregation] = {}
+        self._annotations: dict[str, Aggregation | GeoDistance] = {}
+        # GeoDistance annotations (v0.24.0), as annotate() checked them: alias -> column, reference point.
+        self._geo_annotations: dict[str, tuple[str, GeometryPoint]] = {}
+        # nearby() conditions (v0.24.0): column, reference point, distance in metres.
+        self._nearby: list[tuple[str, GeometryPoint, float]] = []
         self._tx: Any = None
 
     def _py_keyed(self, row: Any) -> Any:
@@ -263,11 +270,77 @@ class QuerySet:
         self._fetch_fields.extend(self._column(field) for field in fields)
         return self
 
+    def nearby(
+        self,
+        field: str,
+        point: GeometryPoint | SdkGeometryPoint | tuple[float, float] | Sequence[float] | Mapping[str, Any],
+        max_distance: float,
+    ) -> Self:
+        """Keep the records whose ``field`` is a point within ``max_distance`` metres of ``point`` (v0.24.0).
+
+        Same name and arguments as the full SurrealDB-ORM::
+
+            restaurants = await Restaurant.objects().nearby(
+                "location", (-73.98, 40.74), max_distance=5000,
+            ).exec()
+
+        ``point`` is a ``GeometryPoint`` (the ORM's or the SDK's), a ``(longitude, latitude)`` pair
+        (GeoJSON order) or a GeoJSON ``Point`` object; the distance is SurrealDB's ``geo::distance``,
+        in metres. Both are bound as query variables, never written into the statement. A record
+        whose ``field`` is not a point (missing, ``NULL``, another geometry, a string, a GeoJSON
+        object stored as a plain object) is left out, on SurrealDB 2.x and 3.x alike.
+
+        Several calls are AND-ed, and the condition joins ``filter()`` wherever it applies:
+        ``exec()``, ``first()``, ``get()`` without an id, ``count()`` and the other aggregations,
+        ``values()``/``annotate()`` groups, ``bulk_update()``, ``bulk_delete()``, ``patch()``, and
+        ``live()``/``watch()``. ``all()`` ignores it, as it ignores ``filter()``; ``changes()``
+        refuses it.
+
+        Args:
+            field: A Python field name (an aliased field compiles its column) or a dotted path.
+            point: The reference point.
+            max_distance: The largest distance kept, in metres: finite and ``>= 0``.
+
+        Returns:
+            Self: The current instance for method chaining.
+
+        Raises:
+            TypeError: ``field`` is not a string; ``point`` is none of the forms above, or a pair
+                that does not hold 2 real numbers; ``max_distance`` is not a real number (``bool``
+                included).
+            ValueError: ``field`` is not a valid field name, or the model declares it as a
+                geometry field that holds no point (``PolygonField``, ``GeoField["line"]``…);
+                ``max_distance`` is negative, not finite or too large for a float;
+                ``InvalidGeometryError`` for a non-finite coordinate or a GeoJSON object that is
+                not a valid ``Point``.
+        """
+        if not isinstance(field, str):
+            raise TypeError(f"nearby() takes a field name (str), not {type(field).__name__}")
+        validate_field_name(field, "nearby field")
+        self._check_point_field(field, "nearby()")
+        reference = _geo._as_point(point)
+        distance = _metres(max_distance)
+        self._nearby.append((self._column(field), reference, distance))
+        return self
+
+    def _check_point_field(self, field: str, caller: str) -> None:
+        """Refuse a top-level field the model declares as a geometry field that holds no point.
+
+        ``geo::distance`` measures between points. Any other declaration (``Any``, ``dict``,
+        ``str``…), an undeclared name and a dotted path are accepted: the ``is_point()`` guard
+        leaves out their values that are not points, as a lookup on a mismatched type matches
+        nothing.
+        """
+        info = self.model.model_fields.get(field)
+        kinds = None if info is None else _geo._geo_kinds(info.annotation)
+        if kinds is not None and "point" not in kinds:
+            raise ValueError(f"{caller} measures distances between points; field {field!r} is declared as {_geo._info(kinds)}")
+
     # ==================== Internal query building ====================
 
     def _build_where(self) -> tuple[str, dict[str, Any]]:
         """
-        Build a parameterized WHERE clause from filters and Q objects.
+        Build a parameterized WHERE clause from filters, Q objects and ``nearby()`` conditions.
 
         Returns:
             A tuple of (where_clause_string, variables_dict).
@@ -293,6 +366,16 @@ class QuerySet:
                 parts.append(sql)
                 variables.update(vars_)
 
+        # nearby() conditions: the point and the distance are bound. The is_point() guard keeps
+        # geo::distance away from values that are not points: it refuses a string or an object,
+        # and returns NONE for another geometry, which a "<=" comparison would keep.
+        for column, point, distance in self._nearby:
+            point_var, distance_var = f"_f{counter}", f"_f{counter + 1}"
+            parts.append(f"({column}.is_point() AND geo::distance({column}, ${point_var}) <= ${distance_var})")
+            variables[point_var] = point
+            variables[distance_var] = distance
+            counter += 2
+
         if not parts:
             return "", {}
 
@@ -307,11 +390,15 @@ class QuerySet:
         """
         where_clause, where_vars = self._build_where()
 
-        if self.select_item:
-            fields = ", ".join(self.select_item)
-            query = f"SELECT {fields} FROM {self._model_table}"
-        else:
-            query = f"SELECT * FROM {self._model_table}"
+        projection = list(self.select_item) or ["*"]
+        # GeoDistance annotations (v0.24.0): one projection each, the point bound. The is_point() guard
+        # gives NONE for a value that is not a point: geo::distance refuses a string or an object.
+        distance_vars: dict[str, Any] = {}
+        for index, (alias, (column, point)) in enumerate(self._geo_annotations.items()):
+            variable = f"_gd{index}"
+            projection.append(f"IF {column}.is_point() THEN geo::distance({column}, ${variable}) END AS {alias}")
+            distance_vars[variable] = point
+        query = f"SELECT {', '.join(projection)} FROM {self._model_table}"
 
         query += where_clause
 
@@ -328,7 +415,7 @@ class QuerySet:
             query += f" FETCH {', '.join(self._fetch_fields)}"
 
         query += ";"
-        all_variables = {**self._variables, **where_vars}
+        all_variables = {**self._variables, **where_vars, **distance_vars}
         return query, all_variables
 
     def _compile_aggregation_query(self, aggregation_expr: str, alias: str | None = None) -> tuple[str, dict[str, Any]]:
@@ -361,13 +448,18 @@ class QuerySet:
 
         Returns:
             A tuple of (query_string, variables_dict).
+
+        Raises:
+            ValueError: a ``GeoDistance`` annotation is present: it is computed per record.
         """
+        if self._geo_annotations:
+            raise ValueError(_GEO_DISTANCE_PER_RECORD)
         self._reject_annotation_collisions()
         where_clause, where_vars = self._build_where()
 
         select_parts = list(self._group_by_fields)
         for alias, agg in self._annotations.items():
-            select_parts.append(f"{agg.to_sql(self.model.to_db_field)} AS {alias}")
+            select_parts.append(f"{cast('Aggregation', agg).to_sql(self.model.to_db_field)} AS {alias}")
 
         query = f"SELECT {', '.join(select_parts)} FROM {self._model_table}"
         query += where_clause
@@ -416,11 +508,15 @@ class QuerySet:
         Execute the compiled query and return the results.
 
         When ``values()`` and ``annotate()`` are used, returns a list of dictionaries with
-        the grouped fields and aggregation results.
+        the grouped fields and aggregation results. With ``GeoDistance`` annotations, returns the
+        model instances, each carrying its distances as attributes (see :meth:`annotate`).
 
         Returns:
             list[BaseSurrealModel] | list[dict]: Model instances or dictionaries for GROUP BY queries.
         """
+        if self._geo_annotations:
+            return await self._exec_with_distances()
+
         if self._annotations:
             query, variables = self._compile_group_by_query()
             results = await self._execute_query(query, variables)
@@ -438,6 +534,34 @@ class QuerySet:
         except ValidationError as e:
             logger.info(f"Pydantic invalid format for the class, returning dict value: {e}")
             return [self._py_keyed(row) for row in results] if isinstance(results, list) else []
+
+    async def _exec_with_distances(self) -> Any:
+        """Run the per-record ``SELECT`` of the ``GeoDistance`` annotations (v0.24.0).
+
+        The alias keys are taken out of each row before validation, so they never reach a field, an
+        ``extra="allow"`` model's extras or a later write, then set on the instance with
+        ``object.__setattr__``. Rows that do not validate (a ``select()`` that omits a required
+        field…) come back as dicts, alias keys included, as ``exec()`` returns them today.
+        """
+        self._reject_geo_distance_mixing(self._annotations, grouped=bool(self._group_by_fields))
+        query, variables = self._compile_query()
+        results = await self._execute_query(query, variables)
+        rows = results if isinstance(results, list) else []
+        stripped: list[dict[str, Any]] = []
+        distances: list[dict[str, Any]] = []
+        for row in rows:
+            record = dict(row)
+            distances.append({alias: record.pop(alias, None) for alias in self._geo_annotations})
+            stripped.append(record)
+        try:
+            instances = cast(list[Any], self.model.from_db(stripped))
+        except ValidationError as e:
+            logger.info(f"Pydantic invalid format for the class, returning dict value: {e}")
+            return [self._py_keyed(row) for row in rows]
+        for instance, values in zip(instances, distances, strict=True):
+            for alias, value in values.items():
+                object.__setattr__(instance, alias, value)
+        return instances
 
     async def first(self) -> Any:
         """
@@ -551,31 +675,116 @@ class QuerySet:
 
         Returns:
             Self: The current QuerySet instance for method chaining.
+
+        Raises:
+            ValueError: a field name is invalid, or a ``GeoDistance`` annotation is present (it is
+                computed per record, not per group).
         """
         for field in fields:
             validate_field_name(field, "GROUP BY field")
+        self._reject_geo_distance_mixing(self._annotations, grouped=bool(fields))
         self._group_by_fields = [self._column(field) for field in fields]
         return self
 
-    def annotate(self, **annotations: "Aggregation") -> Self:
+    def annotate(self, **annotations: "Aggregation | GeoDistance") -> Self:
         """
-        Add aggregation annotations to the query.
+        Add aggregation annotations, or per-record distances, to the query.
+
+        An ``Aggregation`` (``Count``, ``Sum``, ``Avg``, ``Min``, ``Max``) groups the records with
+        ``values()``, and ``exec()`` returns one dict per group.
+
+        A ``GeoDistance`` (v0.24.0, same API as the full SurrealDB-ORM) is computed per record::
+
+            near = await (
+                Restaurant.objects()
+                .nearby("location", (-73.9855, 40.7580), max_distance=2_000)
+                .annotate(dist=GeoDistance("location", (-73.9855, 40.7580)))
+                .order_by("dist")
+                .exec()
+            )
+            near[0].dist  # metres, a float; None for a record whose field is not a point
+
+        ``exec()``, ``first()`` and ``get()`` return model instances carrying the value as an
+        attribute named after the alias; it is never written back (``model_dump()``, ``update()``,
+        ``upsert()`` leave it out). Rows that do not validate (a ``select()`` that omits a required
+        field) come back as dicts holding the alias. ``order_by("dist")``/``order_by("-dist")`` sort
+        on it (ascending puts the ``None`` values first). The alias is a projection, not a stored
+        column: ``filter(dist__lt=...)`` filters a column named ``dist``; bound the distance with
+        ``nearby()``. On an ``extra="allow"`` model, a stored undeclared column with the alias's
+        name is replaced by the distance in the results, and a later ``update()`` removes it: choose
+        an alias no record stores. The field and the point are checked and copied here: changing
+        the ``GeoDistance`` afterwards does not change this queryset.
 
         Args:
-            **annotations: Keyword arguments where the key is the alias and the value
-                          is an Aggregation instance (Count, Sum, Avg, Min, Max).
+            **annotations: The alias of each value, and an ``Aggregation`` or a ``GeoDistance``.
 
         Returns:
             Self: The current QuerySet instance for method chaining.
+
+        Raises:
+            TypeError: a value is neither an ``Aggregation`` nor a ``GeoDistance``.
+            ValueError: an invalid alias; for a ``GeoDistance``, an alias that names a declared field
+                or its column, ``id``, ``in``, ``out``, a name starting with ``_`` or ``model_`` or an
+                attribute of the model (``save``, ``objects``…), an invalid field name or a field
+                declared as a geometry that holds no point; a ``GeoDistance`` combined with an
+                ``Aggregation`` or with ``values()``.
         """
         from .aggregations import Aggregation as AggregationClass
 
-        for alias, agg in annotations.items():
+        distances: dict[str, tuple[str, GeometryPoint]] = {}
+        for alias, value in annotations.items():
             validate_alias_name(alias)
-            if not isinstance(agg, AggregationClass):
-                raise TypeError(f"annotate() argument '{alias}' must be an Aggregation instance, got {type(agg).__name__}")
+            if isinstance(value, GeoDistance):
+                distances[alias] = self._geo_distance_snapshot(alias, value)
+            elif not isinstance(value, AggregationClass):
+                raise TypeError(
+                    f"annotate() argument '{alias}' must be an Aggregation instance or a GeoDistance, "
+                    f"got {type(value).__name__}"
+                )
+        self._reject_geo_distance_mixing({**self._annotations, **annotations}, grouped=bool(self._group_by_fields))
         self._annotations.update(annotations)
+        # An alias given again is replaced, an Aggregation included: keep the snapshots of the others.
+        kept = {alias: snapshot for alias, snapshot in self._geo_annotations.items() if alias not in annotations}
+        self._geo_annotations = {**kept, **distances}
         return self
+
+    def _geo_distance_snapshot(self, alias: str, distance: GeoDistance) -> tuple[str, GeometryPoint]:
+        """Check a ``GeoDistance`` annotation against the model; return its column and point.
+
+        The alias must not shadow anything a record or an instance already has: ``SELECT *, … AS
+        <alias>`` replaces a stored column of that name in the result (``AS id`` replaces the id),
+        and the value is set on the instance as an attribute.
+        """
+        reason = self._reserved_distance_alias(alias)
+        if reason is not None:
+            raise ValueError(f"annotate() alias {alias!r} {reason}; choose another alias for the GeoDistance")
+        field = _geo._distance_field(distance.field)
+        validate_field_name(field, "GeoDistance field")
+        self._check_point_field(field, "GeoDistance")
+        return self._column(field), _geo._as_point(distance.point)
+
+    def _reserved_distance_alias(self, alias: str) -> str | None:
+        """Why ``alias`` cannot name a ``GeoDistance`` on this model, or ``None`` when it can."""
+        if alias in ("id", "in", "out"):
+            return "is reserved: it names the record's id or an edge endpoint"
+        if alias.startswith(("_", "model_")):
+            return "is reserved: names starting with '_' or 'model_' belong to Pydantic"
+        model = self.model
+        if alias in model.model_fields:
+            return f"is a field of {model.__name__}: the distance would replace its value in the results"
+        for name in model.model_fields:
+            if model.to_db_field(name) == alias:
+                return f"is the column of field {name!r}: the distance would replace its value in the results"
+        if hasattr(model, alias):
+            return f"is an attribute of {model.__name__}: the distance would shadow it on the instances"
+        return None
+
+    @staticmethod
+    def _reject_geo_distance_mixing(annotations: Mapping[str, Any], *, grouped: bool) -> None:
+        """Refuse a ``GeoDistance`` next to an ``Aggregation`` or a ``values()`` grouping."""
+        kinds = {isinstance(value, GeoDistance) for value in annotations.values()}
+        if True in kinds and (False in kinds or grouped):
+            raise ValueError(_GEO_DISTANCE_PER_RECORD)
 
     async def count(self) -> int:
         """
@@ -1154,9 +1363,9 @@ class QuerySet:
                         case LiveAction.UPDATE: print("updated", event.instance)
                         case LiveAction.DELETE: print("removed", event.record_id)
 
-        ``filter()``, ``variables()`` and ``fetch()`` are applied by the server, identically on
-        SurrealDB 2.x and 3.x (values are inlined — see ``surql_literal``). With ``diff=True``
-        the server sends patches: ``changed_fields`` lists what changed, and only ``CREATE``
+        ``filter()``, ``nearby()``, ``variables()`` and ``fetch()`` are applied by the server,
+        identically on SurrealDB 2.x and 3.x (values are inlined — see ``surql_literal``). With
+        ``diff=True`` the server sends patches: ``changed_fields`` lists what changed, and only ``CREATE``
         carries a whole record. The live query is killed when the ``async with`` exits.
 
         ``await qs.live()`` — the v0.19.0 form returning the uuid — still works and is
@@ -1199,7 +1408,7 @@ class QuerySet:
                 async for notif in stream:
                     print(notif["action"], notif["result"])
 
-        ``filter()``, ``variables()`` and ``fetch()`` are applied by the server. With
+        ``filter()``, ``nearby()``, ``variables()`` and ``fetch()`` are applied by the server. With
         ``diff=True`` each ``result`` is a list of patches instead of a record. For model
         instances, use :meth:`live`. ``auto_resubscribe`` and ``on_reconnect`` behave as for
         :meth:`live`.
@@ -1219,6 +1428,7 @@ class QuerySet:
         """
         unsupported = {
             "filter()": bool(self._filters or self._q_filters),
+            "nearby()": bool(self._nearby),
             "variables()": bool(self._variables),
             "select()": bool(self.select_item),
             "limit()": self._limit is not None,
@@ -1304,3 +1514,24 @@ class QuerySet:
             return self.model.from_db(results)
         data = cast(dict, results[0])
         return self.model.from_db(data.get("result", []))
+
+
+#: The refusal of a ``GeoDistance`` combined with ``values()`` or an ``Aggregation``.
+_GEO_DISTANCE_PER_RECORD = (
+    "annotate(): a GeoDistance is computed per record; it cannot be combined with GROUP BY aggregations or values()"
+)
+
+
+def _metres(value: Any) -> float:
+    """``nearby()``'s ``max_distance`` as a float: a real number (not ``bool``), finite and ``>= 0``."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise TypeError(f"nearby() max_distance must be a real number of metres, not {type(value).__name__}")
+    try:
+        distance = float(value)
+    except OverflowError as exc:
+        raise ValueError(
+            "nearby() max_distance must be a finite number of metres, >= 0; this one is too large for a float"
+        ) from exc
+    if not math.isfinite(distance) or distance < 0:
+        raise ValueError(f"nearby() max_distance must be a finite number of metres, >= 0, got {distance!r}")
+    return distance

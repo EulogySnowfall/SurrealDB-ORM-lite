@@ -7,8 +7,9 @@ from typing import TYPE_CHECKING, Any, cast
 
 import pydantic
 
+from . import geo as _geo
 from ._sdk import RecordID, SdkRange, ServerError
-from .constants import LOOKUP_OPERATORS
+from .constants import GEOMETRY_LOOKUP_OPERATORS, LOOKUP_OPERATORS
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, Var
 from .types import Range
@@ -489,6 +490,30 @@ def parse_lookup(key: str) -> tuple[str, str]:
     return field_name, lookup_name
 
 
+def _spatial_condition(
+    field: str, lookup: str, op: str, value: Any, counter: int, endpoint_columns: Collection[str]
+) -> tuple[str, dict[str, Any], int]:
+    """The condition of a spatial lookup (``inside``, ``outside``, ``intersects``; v0.24.0).
+
+    One geometry, bound as ``$_f<n>`` (``geo._as_geometry``), or a ``Var`` reference. Refused on the
+    ``id`` column and on edge endpoint columns, which hold record ids.
+    """
+    if field == RECORD_ID_COLUMN:
+        raise ValueError(
+            f"'{lookup}' cannot be applied to the record id column '{field}': a record id is not a "
+            "geometry. Filter on a geometry field."
+        )
+    if field in endpoint_columns:
+        raise ValueError(
+            f"'{lookup}' cannot be applied to the edge endpoint column '{field}': it holds a record id, "
+            "and a record id is not a geometry."
+        )
+    if isinstance(value, Var):
+        return f"{field} {op} {value.reference}", {}, counter
+    var_name = f"_f{counter}"
+    return f"{field} {op} ${var_name}", {var_name: _geo._as_geometry(value, lookup)}, counter + 1
+
+
 def build_filter_condition(
     field: str,
     lookup: str,
@@ -506,6 +531,12 @@ def build_filter_condition(
 
     A ``Range`` (ORM or SDK) given to ``in``/``not_in`` is bound as one value (v0.23.0); on the
     ``id`` column and on edge endpoint columns it raises ``ValueError``.
+
+    The spatial lookups ``inside``, ``outside`` and ``intersects`` (v0.24.0,
+    ``GEOMETRY_LOOKUP_OPERATORS``) compile to SurrealQL's ``INSIDE``, ``OUTSIDE`` and
+    ``INTERSECTS`` with one geometry bound as one value: an ORM or SDK geometry as it is, a GeoJSON
+    geometry object as the ORM value, or a ``Var`` reference. ``outside`` keeps SurrealQL's
+    semantics: it also holds for a record whose field is missing or holds no geometry.
 
     Args:
         field: The field name.
@@ -529,9 +560,15 @@ def build_filter_condition(
             text/collection lookup is applied to the ``id`` column or to an endpoint column,
             a sequence lookup gets a single model instance, a model instance is unsaved, or
             an endpoint value is not a record id — or an ``in``/``not_in`` lookup gets a
-            ``Range`` on the ``id`` column or on an endpoint column (v0.23.0).
+            ``Range`` on the ``id`` column or on an endpoint column (v0.23.0) — or a spatial
+            lookup gets a value that is not a geometry, or is applied to the ``id`` column or
+            to an endpoint column (v0.24.0). ``InvalidGeometryError`` (a ``ValueError``) for a
+            malformed GeoJSON object.
     """
     validate_field_name(field, "filter field")
+    spatial_op = GEOMETRY_LOOKUP_OPERATORS.get(lookup)
+    if spatial_op is not None:
+        return _spatial_condition(field, lookup, spatial_op, value, counter, endpoint_columns)
     op = LOOKUP_OPERATORS.get(lookup)
     if op is None:
         raise ValueError(f"Unsupported lookup type: '{lookup}'")
