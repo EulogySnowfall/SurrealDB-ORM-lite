@@ -15,10 +15,11 @@ T = TypeVar("T")
 async def retry_write(operation: Callable[[], Awaitable[T]]) -> T:
     """Run a test write, retrying SurrealDB's retryable conflicts.
 
-    SurrealDB 2.x (measured on 2.7.0) fails a write to a CHANGEFEED table with a retryable
-    "read or write conflict … can be retried" about every 10 s, caused by a server background
-    task, even with a single writer. Measured: none on a plain table, none on 3.3.4. A refused
-    transaction writes nothing, so replaying the write is safe.
+    SurrealDB 2.x (measured on 2.7.0) refuses concurrent writes to a CHANGEFEED table with a
+    retryable "read or write conflict … can be retried", even on different records (2.5 to 4 %
+    with 8 writers); a single writer is refused at most once per change-feed GC cycle (10 s by
+    default). Measured: none on a plain table, none on 3.3.4. A refused transaction writes
+    nothing, so replaying the write is safe for the data.
 
     *operation* is called once per attempt, so it must create a new coroutine each time (a
     ``lambda`` does). The ORM's answer to a retryable conflict is ``retry_on_conflict``.
