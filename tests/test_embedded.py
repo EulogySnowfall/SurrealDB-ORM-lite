@@ -13,6 +13,7 @@ import inspect
 import logging
 import re
 import sys
+import types
 import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from datetime import UTC, date, datetime, timedelta
@@ -47,6 +48,7 @@ from surreal_orm_lite import (
     _sdk,
     computed,
     connection_manager,
+    decoding,
     retry_on_conflict,
 )
 from surreal_orm_lite import embedded as embedded_module
@@ -1288,6 +1290,102 @@ class TestRichAndGeoEmbeddedE2E:
             assert rows[0].dist == pytest.approx(697.5104962226121, abs=1e-3)
             assert rows[1].dist == pytest.approx(1395.0401142718986, abs=1e-3)
             assert rows[2].dist > 5_000_000
+
+
+class EmbReadAny(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="emb_read")
+
+    id: str | None = None
+    v: Any = None
+
+
+class EmbReadDelta(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="emb_read")
+
+    id: str | None = None
+    v: timedelta | None = None
+
+
+def _require_read_hook() -> None:
+    """Skip unless the clients the ORM opens get the read hook of ``decoding.py`` (#235): the installed SDK
+    cannot decode a zero duration, a native set or a degenerate geometry, and has the layout the hook knows."""
+    if not decoding.active():
+        pytest.skip("the installed surrealdb SDK reads these values itself: no read hook to install")
+
+
+def _is_sdk_zero(value: Any) -> bool:
+    """Whether *value* is the SDK's ``Duration(0)``: what the read hook gives for a zero duration."""
+    return type(value) is surrealdb.Duration and value.elapsed == 0
+
+
+def _assert_read_hook_on(client: Any) -> None:
+    """*client*, an embedded client the ORM opened, decodes its responses through the read hook (#235): its
+    ``_send`` is the SDK's own code, set on the instance, with the hooked ``decode`` as its module global."""
+    assert isinstance(client, AsyncEmbeddedSurrealConnection)
+    bound = vars(client).get("_send")
+    assert isinstance(bound, types.MethodType), "the read hook is not installed on the embedded client"
+    assert bound.__self__ is client
+    assert bound.__func__.__code__ is AsyncEmbeddedSurrealConnection._send.__code__, "not the SDK's own code"
+    assert bound.__func__.__globals__["decode"] is decoding._hooked_decode()
+
+
+class TestReadHookEmbeddedE2E:
+    """#235 on the embedded engine, no server: the client ``get_client()`` opens on an embedded URL, and the one
+    of an ``embedded_database()`` block, read what the surrealdb SDK 2.0.0 cannot decode, as a server's do.
+
+    The embedded core of SDK 2.0.0 stores ``<set>[…]`` as an array, like a 2.x server: it produces no native
+    set, so that case is covered on the 3.x server only (``tests/test_decoding.py``).
+    """
+
+    async def test_get_client_installs_the_hook(self) -> None:
+        _require_read_hook()
+        async with embedded() as client:
+            _assert_read_hook_on(client)
+            assert _is_sdk_zero(await client.query("RETURN 0ns;", {}))
+
+    async def test_embedded_database_block_installs_the_hook(self) -> None:
+        _require_read_hook()
+        async with embedded_database() as client:
+            _assert_read_hook_on(client)
+            assert _is_sdk_zero(await client.query("RETURN 0s;", {}))
+
+    @pytest.mark.parametrize("literal", ["0s", "0ns"])
+    async def test_zero_duration_written_raw_reads_back(self, literal: str) -> None:
+        _require_read_hook()
+        async with embedded() as client:
+            await client.query(f"CREATE emb_read:one SET v = {literal} RETURN NONE;", {})
+            assert _is_sdk_zero((await EmbReadAny.objects().get("one")).v)
+            assert (await EmbReadDelta.objects().filter(v=timedelta(0)).exec())[0].v == timedelta(0)
+            assert (await EmbReadDelta.raw_query("SELECT * FROM emb_read:one;"))[0].v == timedelta(0)
+
+    async def test_zero_duration_written_by_the_orm_is_stored_as_a_duration(self) -> None:
+        _require_read_hook()
+        async with embedded() as client:
+            await EmbReadDelta(id="zero", v=timedelta(0)).save()
+            assert (await EmbReadDelta.objects().get("zero")).v == timedelta(0)
+            assert await client.query("RETURN type::is::duration((SELECT VALUE v FROM ONLY emb_read:zero));", {}) is True
+
+    @pytest.mark.parametrize(
+        ("literal", "expected"),
+        [
+            ("{type: 'LineString', coordinates: [[1, 2]]}", {"type": "LineString", "coordinates": [[1, 2]]}),
+            (
+                "{type: 'MultiLineString', coordinates: [[[1, 2]], [[3, 4], [5, 6]]]}",
+                {"type": "MultiLineString", "coordinates": [[[1, 2]], [[3, 4], [5, 6]]]},
+            ),
+            (
+                "{type: 'Polygon', coordinates: [[[0, 0], [1, 0], [0, 0]]]}",
+                {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [0, 0]]]},
+            ),
+        ],
+        ids=["line-1-point", "multiline-with-a-1-point-line", "polygon-3-point-ring"],
+    )
+    async def test_degenerate_geometry_reads_as_geojson(self, literal: str, expected: dict[str, Any]) -> None:
+        _require_read_hook()
+        async with embedded() as client:
+            await client.query(f"CREATE emb_read:one SET v = {literal} RETURN NONE;", {})
+            assert (await EmbReadAny.objects().get("one")).v == expected
+            assert (await EmbReadAny.objects().exec())[0].v == expected
 
 
 class TestTransactionsEmbeddedE2E:
