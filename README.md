@@ -2532,7 +2532,8 @@ row's `dict`, as for every type (see [After a write that returns the row](#after
 Geometries, durations and ranges inside it are written back as plain objects by a later `update()`
 or `upsert()`, and the next read of that record fails validation: read the record again with
 `get()` before writing it back. Top-level geometry fields and top-level typed containers
-(`list[GeometryPoint]`) are not affected: they are written back as geometries.
+(`list[GeometryPoint]`) are not affected: they are written back as geometries. A fix is tracked in
+[#228](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/228).
 
 #### Untyped fields
 

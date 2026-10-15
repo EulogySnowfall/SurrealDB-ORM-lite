@@ -584,7 +584,7 @@ class TestGeoRoundTripE2E:
     @pytest.mark.xfail(
         strict=True,
         raises=ValidationError,
-        reason="pre-existing: a write sync leaves sub-models as the row's dict; tracked in a follow-up issue",
+        reason="pre-existing: a write sync leaves sub-models as the row's dict; tracked in #228",
     )
     async def test_update_after_upsert_keeps_sub_model_geometries(self) -> None:
         async with orm_client("geo_place"):
