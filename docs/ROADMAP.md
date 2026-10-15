@@ -32,7 +32,8 @@
 | v0.21.0           | Tier 1 — Auto-resubscribe & change feeds (cursor)    | Done    |
 | v0.22.0           | Tier 1 — Core (native typed relations)               | Done    |
 | v0.23.0           | Tier 2 — Rich field types                            | Done    |
-| v0.24.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 6 minors         | Planned |
+| v0.24.0           | Tier 2 — Geospatial fields                           | Done    |
+| v0.25.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 5 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | Planned |
@@ -82,7 +83,7 @@ pieces stay out.
 | Change Feeds / Auto-Resubscribe        | `recv_task` drop signal + `SHOW CHANGES … SINCE`      | ✅ v0.21.0     |
 | Native typed relations                 | `insert_relation()`                                   | ✅ v0.22.0     |
 | Rich field types                       | native `Datetime`/`Duration`/`Decimal`/`Range`/`Uuid` | ✅ v0.23.0     |
-| Geospatial fields (`nearby()`)         | native `Geometry` + `geo::*`                          | v0.24.0        |
+| Geospatial fields (`nearby()`)         | native `Geometry` + `geo::*`                          | ✅ v0.24.0     |
 | Embedded / in-memory test engine       | `mem://` / `surrealkv://` ²                           | v0.25.0        |
 | Versioned storage (time-travel)        | `surrealkv+versioned://` ²                            | v0.26.0        |
 | Subqueries                             | nested `SELECT` via `query()`                         | v0.27.0        |
@@ -147,7 +148,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | Live auto-resubscribe / CDC   | yes        | ✅ v0.21.0                  |
 | Native typed relations        | yes        | ✅ v0.22.0                  |
 | Rich field types              | yes        | ✅ v0.23.0                  |
-| Geospatial fields             | yes        | v0.24.0                     |
+| Geospatial fields             | yes        | ✅ v0.24.0                  |
 | Embedded / versioned engine   | yes        | v0.25 – v0.26               |
 | Subqueries                    | yes        | v0.27.0                     |
 | Query cache (TTL)             | yes        | v0.28.0                     |
@@ -430,6 +431,28 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   native sets) wait for SDK 3.0 (#205); typed string filters (#220), validated keyword writes
   (#221) and validating returned rows like the full ORM are follow-ups
 
+### Version 0.24.0 — Geospatial fields
+
+- Geometry fields with the full ORM's names: `GeoField["kind"]` and the aliases `PointField`,
+  `LineStringField`, `PolygonField`, `MultiPointField`, `MultiLineStringField`,
+  `MultiPolygonField`, `GeometryCollectionField` and `GeometryField` (nullable, default `None`), or
+  a geometry class annotation. Every write stores a native geometry and every read path (`get()`,
+  `filter()`, live notifications, change feeds, rows a write returns) gives back the ORM's classes.
+  A field also accepts the SDK's value, a GeoJSON object and a `(longitude, latitude)` pair for
+  points, so full-ORM GeoJSON data loads and `update()` migrates it to a native geometry
+- Seven immutable, hashable value classes mirroring the SDK's (`GeometryPoint` …
+  `GeometryCollection`) with GeoJSON in both directions and `InvalidGeometryError` (a `ValueError`
+  and a `surrealdb.InvalidGeometryError`); they exist because `model_dump()` flattens the SDK's
+  dataclasses. The encoding boundary sends them as SDK geometries and refuses, before anything is
+  sent, the SDK geometries every SurrealDB line refuses
+- `QuerySet.nearby(field, point, max_distance)` with the point and distance bound and an
+  `.is_point()` guard; `GeoDistance` for `annotate()` and `order_by()` (metres, never written back);
+  the `inside`, `outside` and `intersects` lookups in `filter()`, `Q` and live queries, which get a
+  GeoJSON literal for every geometry kind
+- Same on both lines, measured on 2.7.0 and 3.3.4, identical on 3.1.5. Geometries inside
+  sub-models after a write that syncs the instance (#228), SDK values in untyped fields (#222) and
+  typed filter values / validated keyword writes (#220, #221) are follow-ups
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -607,7 +630,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 | Version    | Theme                                                                | SDK 2.0 realization               |
 | ---------- | -------------------------------------------------------------------- | --------------------------------- |
 | ✅ v0.23.0 | Rich field types: `Datetime`, `Duration`, `Decimal`, `Range`, `Uuid` | typed Pydantic ↔ native SDK types |
-| v0.24.0    | Geospatial fields: `Geometry` + `nearby()` / distance                | native `Geometry` + `geo::*`      |
+| ✅ v0.24.0 | Geospatial fields: `Geometry` + `nearby()` / distance                | native `Geometry` + `geo::*`      |
 | v0.25.0    | Embedded test engine: `mem://` / `surrealkv://` + base fixtures ¹    | SDK embedded connection           |
 | v0.26.0    | Versioned storage / time-travel: `surrealkv+versioned://` ²          | embedded versioned engine         |
 | v0.27.0    | Subqueries (nested QuerySets in `filter`/`in`)                       | nested `SELECT` via `query()`     |

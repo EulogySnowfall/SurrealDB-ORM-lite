@@ -5,6 +5,116 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.0] - 2026-10-15
+
+Geospatial fields: a model can declare geometry fields stored as SurrealDB's native geometries and
+read back as the ORM's geometry classes, and query them with `nearby()`, a `GeoDistance`
+annotation and the `inside`, `outside` and `intersects` lookups, with the same results and the
+same distances on SurrealDB 2.x and 3.x. The names follow the full SurrealDB-ORM. The second minor
+of Tier 2.
+
+### Added
+
+- **Geometry fields.** `GeoField["kind"]` and the aliases `PointField`, `LineStringField`,
+  `PolygonField`, `MultiPointField`, `MultiLineStringField`, `MultiPolygonField`,
+  `GeometryCollectionField` and `GeometryField` declare nullable geometry fields with a `None`
+  default, as in the full ORM; a geometry class annotation (`entrance: GeometryPoint`) works too.
+  A field accepts the ORM value, the SDK's, a GeoJSON object and, for points, a
+  `(longitude, latitude)` pair. Every write stores a native geometry; `get()`, `filter()`, live
+  notifications, change feeds and the rows a write returns give back the ORM's classes.
+  `model_dump(mode="json")` writes GeoJSON. Edge models and field aliases are supported:
+
+  ```python
+  from surreal_orm_lite import (
+      BaseSurrealModel, GeoDistance, GeometryPoint, PointField, SurrealConfigDict,
+  )
+
+  class Restaurant(BaseSurrealModel):
+      model_config = SurrealConfigDict(table_name="restaurant")
+      id: str | None = None
+      name: str
+      location: PointField = None
+
+  times_square = GeometryPoint(-73.9855, 40.7580)  # longitude, latitude
+  await Restaurant(id="pizza", name="Corner Pizza", location=(-73.9877, 40.7547)).save()
+
+  closest = await (
+      Restaurant.objects()
+      .nearby("location", times_square, max_distance=5_000)  # metres
+      .annotate(dist=GeoDistance("location", times_square))
+      .order_by("dist")
+      .exec()
+  )
+  round(closest[0].dist)  # 411: metres, as SurrealDB's geo::distance measures it
+  ```
+
+- **Geometry value classes**: `Geometry` and `GeometryPoint`, `GeometryLine`, `GeometryPolygon`,
+  `GeometryMultiPoint`, `GeometryMultiLine`, `GeometryMultiPolygon` and `GeometryCollection`, with
+  the names, constructor signatures, attributes and methods of the SDK's classes
+  (`parse_coordinates()`, `get_coordinates()`, …). They are immutable and hashable, keep `float`
+  coordinates, convert to and from GeoJSON (`to_geojson()`, `Geometry.from_geojson()`,
+  `__geo_interface__`), and `str()` gives their SurrealQL text. They exist because Pydantic's
+  `model_dump()` flattens the SDK's dataclasses into plain dicts; the ORM converts them to the
+  SDK's classes when it sends them.
+- **`InvalidGeometryError`**: raised for a geometry the classes refuse (a non-finite coordinate, a
+  polygon ring of fewer than 4 points or not closed, a collection nested more than 32 levels,
+  malformed GeoJSON). It is both a `ValueError` and a `surrealdb.InvalidGeometryError`.
+- **`QuerySet.nearby(field, point, max_distance)`**: keeps the records whose field is a point within
+  `max_distance` metres of `point`. The point and the distance are bound as query variables, a
+  `.is_point()` guard leaves out records whose field holds no point, several calls are AND-ed, and
+  the condition applies wherever `filter()` does, `live()` and `watch()` included.
+- **`GeoDistance(field, point)`** for `annotate()`: each instance gets the distance in metres as an
+  attribute named after the alias (`None` when its field is not a point), `order_by()` sorts by
+  it, and it is never written back.
+- **Spatial lookups** `inside`, `outside` and `intersects` (`filter(location__inside=zone)`),
+  compiled to SurrealQL's `INSIDE`, `OUTSIDE` and `INTERSECTS` with one bound geometry; they work in
+  `filter()`, `Q` objects (`~Q` included) and live queries. `outside` keeps SurrealQL's meaning: a
+  record without a geometry is outside.
+- **Live-query literals** for geometries (GeoJSON object form, every kind and collection member),
+  so `nearby()`, the spatial lookups and geometry filter values give the same notifications on
+  both lines.
+- `is_geo_field()` and `get_geo_info()` in `surreal_orm_lite.geo`; the geometry classes, the field
+  aliases, `GeoField`, `GeoDistance` and `InvalidGeometryError` are exported from the package root.
+- README section 25, "Geospatial fields" (annotations, values and GeoJSON, `nearby()`,
+  `GeoDistance`, spatial lookups, live queries, computed geometry fields, migrating stored GeoJSON,
+  type checkers, a note for users of the full SurrealDB-ORM); example notebook
+  `examples/v0.24.0_geospatial_fields.ipynb`.
+
+### Changed
+
+- **Geometries go through the encoding boundary.** An ORM geometry is sent as the equal SDK
+  geometry; an SDK geometry is sent as it is once checked. An SDK geometry every SurrealDB line
+  refuses (a line of fewer than 2 points, a polygon without a ring, a ring of fewer than 4 points
+  once closed, a coordinate that is not a number, a member of the wrong kind) raises a plain
+  `ValueError` before anything is sent.
+- Rows applied after a write without validation (`save()` without an id, `refresh()`, `merge()`,
+  `upsert()`, `patch()`, the `atomic_*` helpers) turn the SDK's geometries into the ORM's classes
+  in top-level geometry fields, so writing the instance back stores a geometry. Sub-models keep the
+  row's `dict`, as before (#228).
+
+### Fixed
+
+- A `Decimal` coordinate written with an exponent in an SDK geometry is now sent in fixed-point
+  notation, like a top-level `Decimal`: SurrealDB 2.x refused `Decimal("1E-7")` there, and both
+  lines stored a long one with a wrong value. Both lines now store the value.
+
+### Notes
+
+- **Same on both lines**, measured on SurrealDB 2.7.0 and 3.3.4, identical on 3.1.5: storage,
+  reads, `nearby()`, distances, the spatial lookups and live notifications. The README's
+  "SurrealDB 2.6.x vs 3.x" table gains three rows, one of them retroactive: a GeoJSON dict written
+  to an untyped field (`Any`, `dict`) is stored as a plain object, not a geometry.
+- **Migrating from the full SurrealDB-ORM**, which stores geometry fields as GeoJSON dicts (plain
+  objects that `geo::*` functions refuse): a geometry field reads such a value, and `update()`
+  writes it back as a native geometry, so loading and updating every record migrates a table.
+- **Known limits**: the surrealdb SDK 2.0.0 cannot read a degenerate geometry another client
+  wrote (a 1-point line, a ring of fewer than 4 points). Geometries inside sub-models are written
+  back as plain objects after a write that syncs the instance (#228), and ORM geometries in
+  untyped fields read back as the SDK's classes (#222). Filter values of other lookups and keyword
+  writes are not validated against the field: pass geometry objects there (#220, #221).
+  `GeoField["point"]` is not understood by type checkers, as in the full ORM; use the aliases or
+  the classes in type-checked code.
+
 ## [0.23.0] - 2026-10-14
 
 Rich field types: `timedelta`, `date`, sets and the ORM's own `Duration` and `Range[T]` are stored
