@@ -49,10 +49,14 @@ from surreal_orm_lite import (
     SurrealConfigDict,
     SurrealDBConnectionManager,
     SurrealDbError,
+    Var,
     computed,
+    constants,
     geo,
 )
 from surreal_orm_lite.model_base import _read_kind
+from surreal_orm_lite.surql_literal import inline_variables
+from surreal_orm_lite.utils import build_filter_condition
 from tests._retry import retry_write
 from tests.conftest import change_feed_database, orm_client
 from tests.test_geo_types import (
@@ -1233,3 +1237,267 @@ class TestGeoDistanceE2E:
         assert rows[0]["dist"] == pytest.approx(AB_METRES, abs=1e-6)
         assert rows[1]["dist"] == pytest.approx(NEAR_B_METRES, abs=1e-6)
         assert rows[2]["dist"] is None
+
+
+# --- spatial lookups inside / outside / intersects (spec §5.5, §6.8) ------------------------------------
+
+#: The RING polygon (the midtown box) in the three forms a lookup takes, and its live-query literal.
+ZONE = GeometryPolygon.parse_coordinates([RING])
+ZONE_TEXT = "{type: 'Polygon', coordinates: [[[-74.0, 40.7], [-73.9, 40.7], [-73.9, 40.8], [-74.0, 40.8], [-74.0, 40.7]]]}"
+#: A north–south line at longitude -73.993: it crosses the HOLE polygon and no seeded point.
+CROSSING = [(-73.993, 40.70), (-73.993, 40.76)]
+#: The sets the spatial operators give on the mixed seed, measured on 2.7.0, 3.1.5 and 3.3.4 (spec §3.4).
+INSIDE_KEYS = {"near1", "near2", "poly"}
+OUTSIDE_KEYS = {"far", "none", "nullish", "obj", "text"}
+#: ``LOOKUP_OPERATORS`` as v0.23.0 shipped it: the spatial lookups live in a mapping of their own.
+LOOKUP_OPERATORS_V0_23 = {
+    "exact": "=",
+    "gt": ">",
+    "gte": ">=",
+    "lt": "<",
+    "lte": "<=",
+    "in": "IN",
+    "not_in": "NOT IN",
+    "like": "LIKE",
+    "ilike": "ILIKE",
+    "contains": "CONTAINS",
+    "not_contains": "CONTAINSNOT",
+    "containsall": "CONTAINSALL",
+    "containsany": "CONTAINSANY",
+    "startswith": "STARTSWITH",
+    "endswith": "ENDSWITH",
+    "match": "MATCH",
+    "regex": "REGEX",
+    "isnull": "IS",
+}
+SPATIAL = [("inside", "INSIDE"), ("outside", "OUTSIDE"), ("intersects", "INTERSECTS")]
+
+
+def _forms(value: Geometry) -> list[Any]:
+    """``value`` as an ORM geometry, the SDK's equal value and its GeoJSON object."""
+    return [value, value._to_sdk(), value.to_geojson()]
+
+
+class TestSpatialLookupCompile:
+    """AC-13 (unit): the spatial lookups bind one geometry, refuse what is not one and write no ``$`` of their own."""
+
+    def test_the_operator_mappings(self) -> None:
+        assert constants.GEOMETRY_LOOKUP_OPERATORS == {"inside": "INSIDE", "outside": "OUTSIDE", "intersects": "INTERSECTS"}
+        assert constants.LOOKUP_OPERATORS == LOOKUP_OPERATORS_V0_23
+
+    @pytest.mark.parametrize(("lookup", "op"), SPATIAL)
+    def test_one_bound_geometry(self, lookup: str, op: str) -> None:
+        query, variables = GeoPlace.objects().filter(**{f"location__{lookup}": ZONE})._compile_query()
+        assert query == f"SELECT * FROM geo_place WHERE location {op} $_f0;"
+        assert variables == {"_f0": ZONE} and variables["_f0"] is ZONE
+
+    @pytest.mark.parametrize(("lookup", "op"), SPATIAL)
+    def test_after_other_filters(self, lookup: str, op: str) -> None:
+        query, variables = GeoPlace.objects().filter(name="a", **{f"area__{lookup}": ZONE}, n=2)._compile_query()
+        assert query == f"SELECT * FROM geo_place WHERE name = $_f0 AND area {op} $_f1 AND n = $_f2;"
+        assert variables == {"_f0": "a", "_f1": ZONE, "_f2": 2}
+
+    def test_aliased_field_compiles_its_column(self) -> None:
+        query, _ = GeoPlace.objects().filter(pos__inside=ZONE)._compile_query()
+        assert query == "SELECT * FROM geo_place WHERE position INSIDE $_f0;"
+
+    @pytest.mark.parametrize("kind", KINDS)
+    def test_a_geojson_value_becomes_the_orm_value(self, kind: str) -> None:
+        expected = _orm(kind)
+        _, variables = GeoPlace.objects().filter(anything__intersects=expected.to_geojson())._compile_query()
+        assert type(variables["_f0"]) is ORM_CLASSES[kind] and variables["_f0"] == expected
+
+    @pytest.mark.parametrize("kind", KINDS)
+    def test_orm_and_sdk_values_are_kept(self, kind: str) -> None:
+        for value in (_orm(kind), _sdk(kind)):
+            assert geo._as_geometry(value, "inside") is value
+            _, variables = GeoPlace.objects().filter(anything__inside=value)._compile_query()
+            assert variables["_f0"] is value
+
+    def test_a_variable_reference(self) -> None:
+        qs = GeoPlace.objects().filter(location__inside=Var("z")).variables(z=ZONE)
+        query, variables = qs._compile_query()
+        assert query == "SELECT * FROM geo_place WHERE location INSIDE $z;"
+        assert variables == {"z": ZONE}
+
+    def test_q_objects(self) -> None:
+        query, variables = GeoPlace.objects().filter(Q(location__inside=ZONE) | Q(n=3))._compile_query()
+        assert query == "SELECT * FROM geo_place WHERE (location INSIDE $_f0 OR n = $_f1);"
+        assert variables == {"_f0": ZONE, "_f1": 3}
+        query, variables = GeoPlace.objects().filter(~Q(location__inside=ZONE.to_geojson()))._compile_query()
+        assert query == "SELECT * FROM geo_place WHERE NOT (location INSIDE $_f0);"
+        assert type(variables["_f0"]) is GeometryPolygon and variables["_f0"] == ZONE
+        query, _ = GeoPlace.objects().filter(Q(pos__outside=ZONE))._compile_query()
+        assert query == "SELECT * FROM geo_place WHERE position OUTSIDE $_f0;"
+
+    @pytest.mark.parametrize("lookup", ["inside", "outside", "intersects"])
+    @pytest.mark.parametrize(
+        "value",
+        [[1, 2], (1, 2), "x", "$z", None, 3, 1.5, b"xy", {1, 2}, RecordID("geo_zone", "z")],
+        ids=["list", "tuple", "str", "dollar-str", "none", "int", "float", "bytes", "set", "record-id"],
+    )
+    def test_a_value_that_is_not_a_geometry_is_refused(self, lookup: str, value: Any) -> None:
+        message = rf"'{lookup}' needs a geometry .*use __in for membership in a list"
+        with pytest.raises(ValueError, match=message):
+            GeoPlace.objects().filter(**{f"location__{lookup}": value})._compile_query()
+        with pytest.raises(ValueError, match=message):
+            Q(**{f"location__{lookup}": value}).to_sql()
+
+    def test_a_model_instance_is_refused(self) -> None:
+        zone = GeoZone(id="z", area=ZONE)
+        with pytest.raises(ValueError, match="'inside' needs a geometry"):
+            GeoPlace.objects().filter(location__inside=zone)._compile_query()
+
+    @pytest.mark.parametrize(
+        "geojson",
+        [
+            {"type": "Polygon", "coordinates": []},
+            {"type": "Feature", "geometry": {"type": "Point", "coordinates": [1.0, 2.0]}},
+            {"coordinates": [1.0, 2.0]},
+            {"type": "Point", "coordinates": [math.nan, 2.0]},
+        ],
+        ids=["empty-polygon", "feature", "no-type", "nan"],
+    )
+    def test_a_bad_geojson_object_is_refused(self, geojson: dict[str, Any]) -> None:
+        with pytest.raises(InvalidGeometryError):
+            GeoPlace.objects().filter(location__inside=geojson)._compile_query()
+
+    @pytest.mark.parametrize("lookup", ["inside", "outside", "intersects"])
+    @pytest.mark.parametrize("value", [ZONE, Var("z")], ids=["geometry", "var"])
+    def test_refused_on_the_record_id_and_the_endpoints(self, lookup: str, value: Any) -> None:
+        with pytest.raises(ValueError, match=rf"'{lookup}' cannot be applied to the record id column 'id': .*not a geometry"):
+            GeoPlace.objects().filter(**{f"id__{lookup}": value})._compile_query()
+        with pytest.raises(ValueError, match="not a geometry"):
+            Q(**{f"id__{lookup}": value}).to_sql()
+        for key, column in (("in_", "in"), ("out", "out")):
+            with pytest.raises(
+                ValueError, match=rf"'{lookup}' cannot be applied to the edge endpoint column '{column}': .*not a geometry"
+            ):
+                GeoLink.objects().filter(**{f"{key}__{lookup}": value})._compile_query()
+
+    def test_an_edge_geometry_column_is_accepted(self) -> None:
+        query, _ = GeoLink.objects().filter(path__intersects=ZONE)._compile_query()
+        assert query == "SELECT * FROM geo_edge WHERE path INTERSECTS $_f0;"
+
+    def test_a_bad_field_name_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="Invalid filter field"):
+            build_filter_condition("loc; DROP", "inside", ZONE, 0)
+
+    def test_an_unknown_lookup_is_still_refused(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported lookup type: 'within'"):
+            build_filter_condition("location", "within", ZONE, 0)
+        with pytest.raises(ValueError, match="Unsupported lookup type: 'inside_of'"):
+            GeoPlace.objects().filter(location__inside_of=ZONE)._compile_query()
+
+    @pytest.mark.parametrize(("lookup", "op"), SPATIAL)
+    def test_live_inlines_the_geometry(self, lookup: str, op: str) -> None:
+        for value in _forms(ZONE):
+            query = GeoPlace.objects().filter(**{f"location__{lookup}": value})._compile_live(False)
+            assert query == f"LIVE SELECT * FROM geo_place WHERE location {op} {ZONE_TEXT};"
+        query = GeoPlace.objects().filter(~Q(location__inside=ZONE))._compile_live(False)
+        assert query == f"LIVE SELECT * FROM geo_place WHERE NOT (location INSIDE {ZONE_TEXT});"
+
+    def test_where_builders_emit_dollar_only_as_references(self) -> None:
+        """The invariant of ``tests/test_surql_literal.py`` (every lookup writes ``$`` only as a reference), with geometries."""
+        reference = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
+        bound = re.compile(r"\$_f\d+")
+        for lookup in constants.GEOMETRY_LOOKUP_OPERATORS:
+            for value in [*_forms(ZONE), *_forms(GeometryLine.parse_coordinates(CROSSING))]:
+                sql, variables, counter = build_filter_condition("field", lookup, value, 0, "T")
+                assert reference.findall(sql) == ["$_f0"] and counter == 1, (lookup, sql)
+                assert "$" not in reference.sub("", sql), (lookup, sql)
+                inlined = inline_variables(sql, variables)
+                assert not bound.search(inlined) and "$" not in inlined, (lookup, inlined)
+        sql, variables, _ = (Q(field__inside=ZONE) | ~Q(field__outside=ZONE.to_geojson())).to_sql(0, "T")
+        assert reference.findall(sql) == ["$_f0", "$_f1"]
+        assert "$" not in inline_variables(sql, variables)
+
+
+class TestSpatialLookupE2E:
+    """AC-13, both lines: on the mixed seed the spatial lookups give the sets SurrealDB's operators give (spec §3.4).
+
+    ``outside`` keeps SurrealQL's semantics: it also holds for a record without a geometry.
+    """
+
+    async def test_inside(self) -> None:
+        async with orm_client("geo_mixed") as client:
+            await _seed_mixed(client)
+            for zone in _forms(ZONE):
+                assert _ids(await GeoMixed.objects().filter(location__inside=zone).exec()) == INSIDE_KEYS
+            assert await GeoMixed.objects().filter(location__inside=ZONE).count() == len(INSIDE_KEYS)
+
+    async def test_outside_includes_the_rows_without_a_geometry(self) -> None:
+        async with orm_client("geo_mixed") as client:
+            await _seed_mixed(client)
+            for zone in _forms(ZONE):
+                assert _ids(await GeoMixed.objects().filter(location__outside=zone).exec()) == OUTSIDE_KEYS
+
+    async def test_intersects(self) -> None:
+        async with orm_client("geo_mixed") as client:
+            await _seed_mixed(client)
+            for zone in _forms(ZONE):
+                assert _ids(await GeoMixed.objects().filter(location__intersects=zone).exec()) == INSIDE_KEYS
+            for line in _forms(GeometryLine.parse_coordinates(CROSSING)):
+                assert _ids(await GeoMixed.objects().filter(location__intersects=line).exec()) == {"poly"}
+
+    async def test_contains_a_point(self) -> None:
+        async with orm_client("geo_mixed") as client:
+            await _seed_mixed(client)
+            for point in (GeometryPoint(-73.992, 40.747), SdkPoint(-73.992, 40.747)):
+                assert _ids(await GeoMixed.objects().filter(location__contains=point).exec()) == {"poly"}
+
+    async def test_q_objects(self) -> None:
+        async with orm_client("geo_mixed") as client:
+            await _seed_mixed(client)
+            for zone in _forms(ZONE):
+                assert _ids(await GeoMixed.objects().filter(~Q(location__inside=zone)).exec()) == OUTSIDE_KEYS
+            either = Q(location__inside=ZONE) | Q(n=MIXED_KEYS.index("far") + 1)
+            assert _ids(await GeoMixed.objects().filter(either).exec()) == INSIDE_KEYS | {"far"}
+            assert _ids(await GeoMixed.objects().filter(Q(location__inside=ZONE), n=1).exec()) == {"near1"}
+
+    async def test_a_variable_reference(self) -> None:
+        async with orm_client("geo_mixed") as client:
+            await _seed_mixed(client)
+            qs = GeoMixed.objects().filter(location__inside=Var("zone")).variables(zone=ZONE)
+            assert _ids(await qs.exec()) == INSIDE_KEYS
+
+    async def test_combined_with_nearby_and_bulk_update(self) -> None:
+        async with orm_client("geo_mixed") as client:
+            await _seed_mixed(client)
+            assert _ids(await GeoMixed.objects().filter(location__inside=ZONE).nearby("location", B, 1000).exec()) == {"near2"}
+            assert await GeoMixed.objects().filter(location__intersects=ZONE).bulk_update(n=77) == len(INSIDE_KEYS)
+            assert _ids(await GeoMixed.objects().filter(n=77).exec()) == INSIDE_KEYS
+
+    async def test_typed_model(self) -> None:
+        async with orm_client("geo_place", "geo_zone"):
+            entrance = GeometryPoint(*A)
+            await GeoPlace(id="in", entrance=entrance, location=GeometryPoint(*NEAR)).save()
+            await GeoPlace(id="out", entrance=entrance, location=GeometryPoint(*PARIS)).save()
+            [found] = await GeoPlace.objects().filter(location__inside=ZONE).exec()
+            assert isinstance(found, GeoPlace) and found.id == "in"
+            assert type(found.location) is GeometryPoint and found.location == GeometryPoint(*NEAR)
+            await GeoZone(id="midtown", area=ZONE).save()
+            await GeoZone(
+                id="paris", area=GeometryPolygon.parse_coordinates([[(2.3, 48.8), (2.4, 48.8), (2.4, 48.9), (2.3, 48.8)]])
+            ).save()
+            [zone] = await GeoZone.objects().filter(area__contains=found.location).exec()
+            assert zone.id == "midtown" and type(zone.area) is GeometryPolygon and zone.area == ZONE
+            [crossed] = await GeoZone.objects().filter(area__intersects=GeometryLine.parse_coordinates(CROSSING)).exec()
+            assert crossed.id == "midtown"
+
+
+class TestSpatialLookupLiveE2E:
+    """AC-13, both lines: in a live query only a point inside the polygon notifies (the outside write comes first)."""
+
+    async def test_only_the_inside_point_notifies(self) -> None:
+        entrance = GeometryPoint(*A)
+        async with orm_client("geo_place") as client:
+            await client.query("DEFINE TABLE geo_place SCHEMALESS;", {})
+            async with GeoPlace.objects().filter(location__inside=ZONE).live() as stream:
+                await GeoPlace(id="far", entrance=entrance, location=GeometryPoint(*PARIS)).save()
+                await GeoPlace(id="near1", entrance=entrance, location=GeometryPoint(*A)).save()
+                [event] = await _take(stream, 1)
+                await _assert_silent(stream)
+        assert event.validation_error is None, event.validation_error
+        assert event.instance.id == "near1"
+        assert type(event.instance.location) is GeometryPoint and event.instance.location == GeometryPoint(*A)

@@ -32,8 +32,10 @@ for points, a ``(longitude, latitude)`` pair; ``model_dump()`` returns the ORM v
 its GeoJSON object. Inside containers (``list[GeometryPoint]``) use the classes.
 ``is_geo_field()`` and ``get_geo_info()`` tell a geometry field's kinds.
 
-In queries: ``QuerySet.nearby()`` keeps the records within a distance of a point, and
-``GeoDistance(field, point)`` given to ``QuerySet.annotate()`` attaches each record's distance.
+In queries: ``QuerySet.nearby()`` keeps the records within a distance of a point,
+``GeoDistance(field, point)`` given to ``QuerySet.annotate()`` attaches each record's distance, and
+the ``inside``, ``outside`` and ``intersects`` lookups (``filter(location__inside=zone)``) compare a
+field with a geometry through SurrealQL's operators.
 """
 
 from __future__ import annotations
@@ -789,6 +791,24 @@ def _as_point(value: Any) -> GeometryPoint:
     raise TypeError(
         "a point is a GeometryPoint (the ORM's or the SDK's), a (longitude, latitude) pair or a GeoJSON Point "
         f"object, not {type(value).__name__}"
+    )
+
+
+def _as_geometry(value: Any, lookup: str) -> Any:
+    """The geometry a spatial lookup (``inside``, ``outside``, ``intersects``) binds.
+
+    An ORM or SDK geometry of any kind is returned as it is (the encoding boundary converts the
+    ORM's and checks the SDK's); a GeoJSON geometry object becomes the ORM value
+    (``Geometry.from_geojson``: ``InvalidGeometryError`` for a malformed one). ``ValueError`` for
+    anything else — a list, a tuple, a string, ``None``… — naming ``lookup``.
+    """
+    if isinstance(value, (Geometry, *_SDK_GEOMETRIES)):
+        return value
+    if isinstance(value, Mapping):
+        return Geometry.from_geojson(value)
+    raise ValueError(
+        f"'{lookup}' needs a geometry (the ORM's or the SDK's, or a GeoJSON geometry object), not "
+        f"{type(value).__name__}; use __in for membership in a list"
     )
 
 
