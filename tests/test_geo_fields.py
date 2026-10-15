@@ -6,7 +6,11 @@ after the test; the change-feed table lives in a database of its own (``GEO_CF_D
 reference values come from ``tests/test_geo_types.py``.
 """
 
+import math
+import re
 from datetime import timedelta
+from decimal import Decimal
+from fractions import Fraction
 from typing import Any
 
 import pytest
@@ -21,6 +25,7 @@ from surreal_orm_lite import (
     BaseSurrealEdge,
     BaseSurrealModel,
     Computed,
+    Count,
     GeoField,
     Geometry,
     GeometryCollection,
@@ -32,14 +37,17 @@ from surreal_orm_lite import (
     GeometryMultiPolygon,
     GeometryPoint,
     GeometryPolygon,
+    InvalidGeometryError,
     LineStringField,
     MultiLineStringField,
     MultiPointField,
     MultiPolygonField,
     PointField,
     PolygonField,
+    Q,
     SurrealConfigDict,
     SurrealDBConnectionManager,
+    SurrealDbError,
     computed,
     geo,
 )
@@ -58,11 +66,12 @@ from tests.test_geo_types import (
     _bad_line,
     _bad_point,
     _bad_ring,
+    _model,
     _nest,
     _orm,
     _sdk,
 )
-from tests.test_live_queryset import _take
+from tests.test_live_queryset import _assert_silent, _take
 from tests.test_rich_types import _http_client
 from tests.test_transactions import _connect_http, _native_txn_supported
 
@@ -229,6 +238,46 @@ def _assert_native(row: dict[str, Any], **changes: Any) -> None:
     assert not wrong, f"not stored as native geometries: {wrong!r}"
     assert [type(p) for p in row["many"]] == [SdkPoint] * len(expected["many"])
     assert type(row["sub"]["where"]) is SdkPoint
+
+
+#: The keys of the mixed seed, in the order ``_seed_mixed`` writes them; ``n`` is the 1-based position.
+MIXED_KEYS: tuple[str, ...] = ("near1", "near2", "far", "none", "nullish", "text", "obj", "poly")
+
+
+async def _seed_mixed(client: Any) -> None:
+    """Write the mixed seed (spec §3.4) through the raw SDK client; ``n`` is each record's place in ``MIXED_KEYS``.
+
+    ``near1`` at A (1395 m from B), ``near2`` at NEAR (698 m from B), ``far`` at PARIS, ``none`` without
+    ``location``, ``nullish`` with ``NULL``, ``text`` with ``'x'``, ``obj`` with a GeoJSON object at A
+    (stored as a plain object, not a geometry) and ``poly`` with the HOLE polygon.
+    """
+    values: dict[str, Any] = {
+        "near1": SdkPoint(*A),
+        "near2": SdkPoint(*NEAR),
+        "far": SdkPoint(*PARIS),
+        "text": "x",
+        "obj": {"type": "Point", "coordinates": list(A)},
+        "poly": SdkPolygon.parse_coordinates([HOLE]),
+    }
+    for n, key in enumerate(MIXED_KEYS, start=1):
+        rid = RecordID("geo_mixed", key)
+        if key == "none":
+            await client.query("CREATE $rid SET n = $n;", {"rid": rid, "n": n})
+        elif key == "nullish":
+            await client.query("CREATE $rid SET n = $n, location = NULL;", {"rid": rid, "n": n})
+        else:
+            await client.query("CREATE $rid SET n = $n, location = $v;", {"rid": rid, "n": n, "v": values[key]})
+
+
+def _record_key(row: Any) -> str:
+    """The record key of a result: an instance's ``id`` or a dict's ``"id"`` (a ``RecordID`` or its key)."""
+    value = row["id"] if isinstance(row, dict) else row.id
+    return str(value.id) if isinstance(value, RecordID) else str(value)
+
+
+def _ids(rows: Any) -> set[str]:
+    """The record keys of a list of results (instances or dicts)."""
+    return {_record_key(row) for row in rows}
 
 
 class _SdkPin(SdkPoint):
@@ -570,3 +619,288 @@ class TestLegacyGeoJsonE2E:
             assert await client.query("SELECT VALUE blob.is_geometry() FROM ONLY $rid;", {"rid": rid}) is False
             loaded = await GeoLegacy.objects().get("d")
             assert type(loaded.blob) is dict and loaded.blob == geojson
+
+
+# --- nearby() (spec §5.3, §6.3) --------------------------------------------------------------------------
+
+
+def _nearby_sql(column: str, n: int) -> str:
+    """The condition ``nearby()`` adds for ``column``, its two variables numbered from ``n``."""
+    return f"({column}.is_point() AND geo::distance({column}, $_f{n}) <= $_f{n + 1})"
+
+
+class TestNearbyCompile:
+    """AC-11 (unit): the point and the distance are bound, the condition is guarded and every refusal comes first.
+
+    ``nearby()`` checks its arguments when it is called, before anything reaches a server.
+    """
+
+    def test_bound_point_and_distance(self) -> None:
+        qs = GeoPlace.objects().filter(name="a")
+        assert qs.nearby("location", B, 5000) is qs
+        query, variables = qs._compile_query()
+        assert query == f"SELECT * FROM geo_place WHERE name = $_f0 AND {_nearby_sql('location', 1)};"
+        assert variables["_f0"] == "a"
+        assert type(variables["_f1"]) is GeometryPoint and variables["_f1"] == GeometryPoint(*B)
+        assert type(variables["_f2"]) is float and variables["_f2"] == 5000.0
+
+    def test_no_coordinate_in_the_text(self) -> None:
+        query, _ = GeoPlace.objects().nearby("location", B, 5000)._compile_query()
+        assert query == f"SELECT * FROM geo_place WHERE {_nearby_sql('location', 0)};"
+        assert not re.search(r"\d", re.sub(r"\$_f\d+", "", query)), query
+
+    def test_aliased_field_compiles_its_column(self) -> None:
+        query, _ = GeoPlace.objects().nearby("pos", B, 10)._compile_query()
+        assert query == f"SELECT * FROM geo_place WHERE {_nearby_sql('position', 0)};"
+
+    def test_dotted_path(self) -> None:
+        query, _ = GeoPlace.objects().nearby("addr.loc", B, 10)._compile_query()
+        assert query == f"SELECT * FROM geo_place WHERE {_nearby_sql('addr.loc', 0)};"
+
+    def test_two_calls_are_and_ed(self) -> None:
+        query, variables = GeoPlace.objects().nearby("location", B, 5000).nearby("pos", A, 10)._compile_query()
+        assert query == f"SELECT * FROM geo_place WHERE {_nearby_sql('location', 0)} AND {_nearby_sql('position', 2)};"
+        assert (variables["_f0"], variables["_f1"]) == (GeometryPoint(*B), 5000.0)
+        assert (variables["_f2"], variables["_f3"]) == (GeometryPoint(*A), 10.0)
+
+    def test_after_keyword_filters_and_q_objects(self) -> None:
+        query, variables = GeoPlace.objects().nearby("location", B, 1.5).filter(Q(n=1) | Q(n=2), name="a")._compile_query()
+        assert query.endswith(f" AND {_nearby_sql('location', 3)};"), query
+        assert query.startswith("SELECT * FROM geo_place WHERE name = $_f0 AND "), query
+        assert (variables["_f3"], variables["_f4"]) == (GeometryPoint(*B), 1.5)
+
+    def test_condition_reaches_every_where(self) -> None:
+        qs = GeoPlace.objects().nearby("location", B, 5000)
+        query, _ = qs._compile_aggregation_query("count()")
+        assert query == f"SELECT count() FROM geo_place WHERE {_nearby_sql('location', 0)} GROUP ALL;"
+        query, _ = GeoPlace.objects().values("name").annotate(c=Count()).nearby("location", B, 5000)._compile_group_by_query()
+        assert f" WHERE {_nearby_sql('location', 0)} GROUP BY name;" in query
+
+    @pytest.mark.parametrize(
+        "point",
+        [
+            GeometryPoint(*B),
+            SdkPoint(*B),
+            B,
+            list(B),
+            {"type": "Point", "coordinates": list(B)},
+            (Fraction(-7399, 100), Fraction(4075, 100)),
+        ],
+        ids=["orm", "sdk", "tuple", "list", "geojson", "fractions"],
+    )
+    def test_point_forms(self, point: Any) -> None:
+        converted = geo._as_point(point)
+        assert type(converted) is GeometryPoint and converted == GeometryPoint(*B)
+        _, variables = GeoPlace.objects().nearby("location", point, 5000)._compile_query()
+        assert type(variables["_f0"]) is GeometryPoint and variables["_f0"] == GeometryPoint(*B)
+
+    def test_an_orm_point_is_kept(self) -> None:
+        point = GeometryPoint(*B)
+        assert geo._as_point(point) is point
+
+    @pytest.mark.parametrize(
+        ("model", "field"),
+        [
+            (GeoPlace, "location"),
+            (GeoPlace, "entrance"),
+            (GeoPlace, "anything"),
+            (GeoPlace, "pos"),
+            (GeoPlace, "name"),
+            (GeoPlace, "many"),
+            (GeoPlace, "undeclared"),
+            (GeoPlace, "area.inner"),
+            (GeoMixed, "location"),
+        ],
+        ids=["point", "class-point", "feature", "alias", "str", "list", "undeclared", "dotted", "any"],
+    )
+    def test_fields_accepted(self, model: Any, field: str) -> None:
+        query, _ = model.objects().nearby(field, B, 5000)._compile_query()
+        assert "geo::distance(" in query
+
+    def test_a_field_accepting_points_and_polygons(self) -> None:
+        model = _model(BaseSurrealModel, GeoField["point|polygon"])
+        query, _ = model.objects().nearby("loc", B, 5000)._compile_query()
+        assert _nearby_sql("loc", 0) in query
+
+    @pytest.mark.parametrize(
+        ("field", "kind"),
+        [("area", "polygon"), ("path", "line"), ("stops", "multipoint"), ("zones", "multipolygon"), ("bag", "collection")],
+    )
+    def test_a_declared_non_point_field_is_refused(self, field: str, kind: str) -> None:
+        qs = GeoPlace.objects()
+        with pytest.raises(
+            ValueError, match=rf"nearby\(\) measures distances between points; field '{field}' is declared as {kind}"
+        ):
+            qs.nearby(field, B, 5000)
+        assert qs._nearby == []
+
+    @pytest.mark.parametrize("field", ["loc; DROP", "", "location--", "a..b", "$x"])
+    def test_a_bad_field_name_is_refused(self, field: str) -> None:
+        with pytest.raises(ValueError, match="nearby field"):
+            GeoPlace.objects().nearby(field, B, 5000)
+
+    def test_a_field_name_must_be_a_string(self) -> None:
+        with pytest.raises(TypeError, match="nearby"):
+            GeoPlace.objects().nearby(3, B, 5000)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize(
+        ("point", "error"),
+        [
+            ("x", TypeError),
+            (b"xy", TypeError),
+            (None, TypeError),
+            (3, TypeError),
+            ((1,), TypeError),
+            ((1, 2, 3), TypeError),
+            ((True, 1), TypeError),
+            (("1", "2"), TypeError),
+            ((Decimal("1"), 2), TypeError),
+            (GeometryPolygon.parse_coordinates([RING]), TypeError),
+            (SdkPolygon.parse_coordinates([RING]), TypeError),
+            ({"type": "Polygon", "coordinates": [[list(p) for p in RING]]}, InvalidGeometryError),
+            ({"type": "Point", "coordinates": [1.0, 2.0, 3.0]}, InvalidGeometryError),
+            ({"coordinates": [1.0, 2.0]}, InvalidGeometryError),
+            ((math.nan, 1.0), InvalidGeometryError),
+            ((math.inf, 1.0), InvalidGeometryError),
+            ((10**400, 1.0), InvalidGeometryError),
+        ],
+        ids=[
+            "str",
+            "bytes",
+            "none",
+            "int",
+            "one-item",
+            "three-items",
+            "bool",
+            "text-pair",
+            "decimal",
+            "orm-polygon",
+            "sdk-polygon",
+            "geojson-polygon",
+            "geojson-3d",
+            "geojson-no-type",
+            "nan",
+            "inf",
+            "too-large",
+        ],
+    )
+    def test_a_bad_point_is_refused(self, point: Any, error: type[Exception]) -> None:
+        qs = GeoPlace.objects()
+        with pytest.raises(error) as caught:
+            qs.nearby("location", point, 5000)
+        assert issubclass(error, ValueError) == isinstance(caught.value, ValueError)
+        assert qs._nearby == []
+
+    @pytest.mark.parametrize(
+        ("distance", "error"),
+        [
+            (True, TypeError),
+            ("5", TypeError),
+            (None, TypeError),
+            (Decimal("5"), TypeError),
+            (-1, ValueError),
+            (-0.5, ValueError),
+            (math.nan, ValueError),
+            (math.inf, ValueError),
+            (-math.inf, ValueError),
+            (10**400, ValueError),
+        ],
+        ids=["bool", "str", "none", "decimal", "negative", "negative-float", "nan", "inf", "minus-inf", "too-large"],
+    )
+    def test_a_bad_distance_is_refused(self, distance: Any, error: type[Exception]) -> None:
+        qs = GeoPlace.objects()
+        with pytest.raises(error, match="max_distance"):
+            qs.nearby("location", B, distance)
+        assert qs._nearby == []
+
+    @pytest.mark.parametrize("distance", [0, 0.0, Fraction(1, 2), 10**6])
+    def test_distances_accepted(self, distance: Any) -> None:
+        _, variables = GeoPlace.objects().nearby("location", B, distance)._compile_query()
+        assert type(variables["_f1"]) is float and variables["_f1"] == float(distance)
+
+    def test_changes_refuses_it(self) -> None:
+        with pytest.raises(SurrealDbError, match=r"nearby\(\)"):
+            GeoPlace.objects().nearby("location", B, 5000).changes(since=0)
+
+    def test_live_inlines_the_point_and_the_distance(self) -> None:
+        query = GeoPlace.objects().nearby("location", B, 5000)._compile_live(False)
+        assert query == (
+            "LIVE SELECT * FROM geo_place WHERE (location.is_point() AND geo::distance(location, "
+            "{type: 'Point', coordinates: [-73.99, 40.75]}) <= 5000.0);"
+        )
+
+
+class TestNearbyE2E:
+    """AC-11, both lines: on the mixed seed, ``nearby()`` returns exactly the points within the distance."""
+
+    async def test_exactly_the_near_points(self) -> None:
+        async with orm_client("geo_mixed") as client:
+            await _seed_mixed(client)
+            for point in (GeometryPoint(*B), SdkPoint(*B), B, {"type": "Point", "coordinates": list(B)}):
+                assert _ids(await GeoMixed.objects().nearby("location", point, 5000).exec()) == {"near1", "near2"}
+            assert await GeoMixed.objects().nearby("location", B, 5000).count() == 2
+            assert _ids(await GeoMixed.objects().nearby("location", B, 5000).nearby("location", B, 1000).exec()) == {"near2"}
+            assert _record_key(await GeoMixed.objects().nearby("location", B, 1000).get()) == "near2"
+            assert await GeoMixed.objects().nearby("location", B, 100).exec() == []
+
+    async def test_combined_with_filter_q_order_and_limit(self) -> None:
+        async with orm_client("geo_mixed") as client:
+            await _seed_mixed(client)
+
+            def near() -> Any:
+                return GeoMixed.objects().nearby("location", B, 5000)
+
+            assert _ids(await near().filter(n=1).exec()) == {"near1"}
+            assert _ids(await GeoMixed.objects().filter(Q(n=2) | Q(n=3)).nearby("location", B, 5000).exec()) == {"near2"}
+            assert [_record_key(r) for r in await near().order_by("-n").exec()] == ["near2", "near1"]
+            assert [_record_key(r) for r in await near().order_by("n").limit(1).exec()] == ["near1"]
+            assert _record_key(await near().order_by("-n").first()) == "near2"
+
+    async def test_bulk_update(self) -> None:
+        async with orm_client("geo_mixed") as client:
+            await _seed_mixed(client)
+            assert await GeoMixed.objects().nearby("location", B, 5000).bulk_update(n=99) == 2
+            assert _ids(await GeoMixed.objects().filter(n=99).exec()) == {"near1", "near2"}
+            assert await GeoMixed.objects().count() == len(MIXED_KEYS)
+
+    async def test_queryset_patch(self) -> None:
+        async with orm_client("geo_mixed") as client:
+            await _seed_mixed(client)
+            patch = [{"op": "replace", "path": "/n", "value": 42}]
+            assert await GeoMixed.objects().nearby("location", B, 5000).patch(patch) == 2
+            assert _ids(await GeoMixed.objects().filter(n=42).exec()) == {"near1", "near2"}
+
+    async def test_bulk_delete(self) -> None:
+        async with orm_client("geo_mixed") as client:
+            await _seed_mixed(client)
+            assert await GeoMixed.objects().nearby("location", B, 5000).bulk_delete() == 2
+            assert _ids(await GeoMixed.objects().all()) == set(MIXED_KEYS) - {"near1", "near2"}
+
+    async def test_typed_model(self) -> None:
+        async with orm_client("geo_place"):
+            entrance = GeometryPoint(*A)
+            await GeoPlace(id="near", entrance=entrance, location=GeometryPoint(*NEAR)).save()
+            await GeoPlace(id="far", entrance=entrance, location=GeometryPoint(*PARIS), pos=GeometryPoint(*NEAR)).save()
+            await GeoPlace(id="nowhere", entrance=entrance).save()
+            [found] = await GeoPlace.objects().nearby("location", B, 5000).exec()
+            assert isinstance(found, GeoPlace) and found.id == "near"
+            assert type(found.location) is GeometryPoint and found.location == GeometryPoint(*NEAR)
+            [aliased] = await GeoPlace.objects().nearby("pos", B, 5000).exec()
+            assert aliased.id == "far" and type(aliased.pos) is GeometryPoint
+
+
+class TestNearbyLiveE2E:
+    """AC-11, both lines: in a live query only a point within the distance notifies (the far write comes first)."""
+
+    async def test_only_the_near_point_notifies(self) -> None:
+        entrance = GeometryPoint(*A)
+        async with orm_client("geo_place") as client:
+            await client.query("DEFINE TABLE geo_place SCHEMALESS;", {})
+            async with GeoPlace.objects().nearby("location", B, 5000).live() as stream:
+                await GeoPlace(id="far", entrance=entrance, location=GeometryPoint(*PARIS)).save()
+                await GeoPlace(id="near1", entrance=entrance, location=GeometryPoint(*A)).save()
+                [event] = await _take(stream, 1)
+                await _assert_silent(stream)
+        assert event.validation_error is None, event.validation_error
+        assert event.instance.id == "near1"
+        assert type(event.instance.location) is GeometryPoint and event.instance.location == GeometryPoint(*A)

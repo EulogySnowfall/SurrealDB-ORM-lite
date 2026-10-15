@@ -762,6 +762,32 @@ def _geometry_from_sdk(value: Any) -> Any:
         return value
 
 
+# --- query arguments -------------------------------------------------------------------------------
+
+
+def _as_point(value: Any) -> GeometryPoint:
+    """The point a query takes (``QuerySet.nearby()``, ``GeoDistance``), as an ORM ``GeometryPoint``.
+
+    Accepted: an ORM ``GeometryPoint`` (returned as it is), the SDK's (converted, checked), a
+    ``(longitude, latitude)`` pair of real numbers (a ``tuple``, a ``list`` or another sequence that
+    is not a string) and a GeoJSON ``Point`` object. ``TypeError`` for any other type and for a pair
+    with other than 2 items or a non-number; ``InvalidGeometryError`` for a non-finite coordinate, one
+    too large for a float, and a GeoJSON object that is not a valid ``Point``.
+    """
+    if isinstance(value, GeometryPoint):
+        return value
+    if isinstance(value, SdkGeometryPoint):
+        return GeometryPoint(value.longitude, value.latitude)
+    if isinstance(value, Mapping):
+        return GeometryPoint.from_geojson(value)
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return GeometryPoint.parse_coordinates(value)
+    raise TypeError(
+        "a point is a GeometryPoint (the ORM's or the SDK's), a (longitude, latitude) pair or a GeoJSON Point "
+        f"object, not {type(value).__name__}"
+    )
+
+
 # --- SurrealQL text --------------------------------------------------------------------------------
 
 #: GeoJSON type → the GeoJSON type of its members (the kinds whose members are coordinate arrays).

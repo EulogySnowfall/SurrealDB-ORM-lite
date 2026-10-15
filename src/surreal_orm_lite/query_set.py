@@ -1,7 +1,8 @@
 import contextlib
 import logging
 import math
-from collections.abc import Awaitable, Callable
+import numbers
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Self, cast
 from uuid import UUID
 
@@ -9,12 +10,14 @@ from pydantic_core import ValidationError
 
 from . import BaseSurrealModel, SurrealDBConnectionManager
 from . import encoding as _encoding
-from ._sdk import NotFoundError
+from . import geo as _geo
+from ._sdk import NotFoundError, SdkGeometryPoint
 from .changefeed import ChangeModelStream, Since
 from .edge import _check_edge_id, insert_edges
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import Var
+from .geo import GeometryPoint
 from .live import LiveModelStream, LiveStream, ReconnectCallback, missing_table_error, require_websocket
 from .q import Q
 from .surql_literal import inline_variables
@@ -63,6 +66,8 @@ class QuerySet:
         self._fetch_fields: list[str] = []
         self._group_by_fields: list[str] = []
         self._annotations: dict[str, Aggregation] = {}
+        # nearby() conditions (v0.24.0): column, reference point, distance in metres.
+        self._nearby: list[tuple[str, GeometryPoint, float]] = []
         self._tx: Any = None
 
     def _py_keyed(self, row: Any) -> Any:
@@ -263,11 +268,77 @@ class QuerySet:
         self._fetch_fields.extend(self._column(field) for field in fields)
         return self
 
+    def nearby(
+        self,
+        field: str,
+        point: GeometryPoint | SdkGeometryPoint | tuple[float, float] | Sequence[float] | Mapping[str, Any],
+        max_distance: float,
+    ) -> Self:
+        """Keep the records whose ``field`` is a point within ``max_distance`` metres of ``point`` (v0.24.0).
+
+        Same name and arguments as the full SurrealDB-ORM::
+
+            restaurants = await Restaurant.objects().nearby(
+                "location", (-73.98, 40.74), max_distance=5000,
+            ).exec()
+
+        ``point`` is a ``GeometryPoint`` (the ORM's or the SDK's), a ``(longitude, latitude)`` pair
+        (GeoJSON order) or a GeoJSON ``Point`` object; the distance is SurrealDB's ``geo::distance``,
+        in metres. Both are bound as query variables, never written into the statement. A record
+        whose ``field`` is not a point (missing, ``NULL``, another geometry, a string, a GeoJSON
+        object stored as a plain object) is left out, on SurrealDB 2.x and 3.x alike.
+
+        Several calls are AND-ed, and the condition joins ``filter()`` wherever it applies:
+        ``exec()``, ``first()``, ``get()`` without an id, ``count()`` and the other aggregations,
+        ``values()``/``annotate()`` groups, ``bulk_update()``, ``bulk_delete()``, ``patch()``, and
+        ``live()``/``watch()``. ``all()`` ignores it, as it ignores ``filter()``; ``changes()``
+        refuses it.
+
+        Args:
+            field: A Python field name (an aliased field compiles its column) or a dotted path.
+            point: The reference point.
+            max_distance: The largest distance kept, in metres: finite and ``>= 0``.
+
+        Returns:
+            Self: The current instance for method chaining.
+
+        Raises:
+            TypeError: ``field`` is not a string; ``point`` is none of the forms above, or a pair
+                that does not hold 2 real numbers; ``max_distance`` is not a real number (``bool``
+                included).
+            ValueError: ``field`` is not a valid field name, or the model declares it as a
+                geometry field that holds no point (``PolygonField``, ``GeoField["line"]``…);
+                ``max_distance`` is negative, not finite or too large for a float;
+                ``InvalidGeometryError`` for a non-finite coordinate or a GeoJSON object that is
+                not a valid ``Point``.
+        """
+        if not isinstance(field, str):
+            raise TypeError(f"nearby() takes a field name (str), not {type(field).__name__}")
+        validate_field_name(field, "nearby field")
+        self._check_point_field(field, "nearby()")
+        reference = _geo._as_point(point)
+        distance = _metres(max_distance)
+        self._nearby.append((self._column(field), reference, distance))
+        return self
+
+    def _check_point_field(self, field: str, caller: str) -> None:
+        """Refuse a top-level field the model declares as a geometry field that holds no point.
+
+        ``geo::distance`` measures between points. Any other declaration (``Any``, ``dict``,
+        ``str``…), an undeclared name and a dotted path are accepted: the ``is_point()`` guard
+        leaves out their values that are not points, as a lookup on a mismatched type matches
+        nothing.
+        """
+        info = self.model.model_fields.get(field)
+        kinds = None if info is None else _geo._geo_kinds(info.annotation)
+        if kinds is not None and "point" not in kinds:
+            raise ValueError(f"{caller} measures distances between points; field {field!r} is declared as {_geo._info(kinds)}")
+
     # ==================== Internal query building ====================
 
     def _build_where(self) -> tuple[str, dict[str, Any]]:
         """
-        Build a parameterized WHERE clause from filters and Q objects.
+        Build a parameterized WHERE clause from filters, Q objects and ``nearby()`` conditions.
 
         Returns:
             A tuple of (where_clause_string, variables_dict).
@@ -292,6 +363,16 @@ class QuerySet:
             if sql:
                 parts.append(sql)
                 variables.update(vars_)
+
+        # nearby() conditions: the point and the distance are bound. The is_point() guard keeps
+        # geo::distance away from values that are not points: it refuses a string or an object,
+        # and returns NONE for another geometry, which a "<=" comparison would keep.
+        for column, point, distance in self._nearby:
+            point_var, distance_var = f"_f{counter}", f"_f{counter + 1}"
+            parts.append(f"({column}.is_point() AND geo::distance({column}, ${point_var}) <= ${distance_var})")
+            variables[point_var] = point
+            variables[distance_var] = distance
+            counter += 2
 
         if not parts:
             return "", {}
@@ -1154,9 +1235,9 @@ class QuerySet:
                         case LiveAction.UPDATE: print("updated", event.instance)
                         case LiveAction.DELETE: print("removed", event.record_id)
 
-        ``filter()``, ``variables()`` and ``fetch()`` are applied by the server, identically on
-        SurrealDB 2.x and 3.x (values are inlined — see ``surql_literal``). With ``diff=True``
-        the server sends patches: ``changed_fields`` lists what changed, and only ``CREATE``
+        ``filter()``, ``nearby()``, ``variables()`` and ``fetch()`` are applied by the server,
+        identically on SurrealDB 2.x and 3.x (values are inlined — see ``surql_literal``). With
+        ``diff=True`` the server sends patches: ``changed_fields`` lists what changed, and only ``CREATE``
         carries a whole record. The live query is killed when the ``async with`` exits.
 
         ``await qs.live()`` — the v0.19.0 form returning the uuid — still works and is
@@ -1199,7 +1280,7 @@ class QuerySet:
                 async for notif in stream:
                     print(notif["action"], notif["result"])
 
-        ``filter()``, ``variables()`` and ``fetch()`` are applied by the server. With
+        ``filter()``, ``nearby()``, ``variables()`` and ``fetch()`` are applied by the server. With
         ``diff=True`` each ``result`` is a list of patches instead of a record. For model
         instances, use :meth:`live`. ``auto_resubscribe`` and ``on_reconnect`` behave as for
         :meth:`live`.
@@ -1219,6 +1300,7 @@ class QuerySet:
         """
         unsupported = {
             "filter()": bool(self._filters or self._q_filters),
+            "nearby()": bool(self._nearby),
             "variables()": bool(self._variables),
             "select()": bool(self.select_item),
             "limit()": self._limit is not None,
@@ -1304,3 +1386,18 @@ class QuerySet:
             return self.model.from_db(results)
         data = cast(dict, results[0])
         return self.model.from_db(data.get("result", []))
+
+
+def _metres(value: Any) -> float:
+    """``nearby()``'s ``max_distance`` as a float: a real number (not ``bool``), finite and ``>= 0``."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise TypeError(f"nearby() max_distance must be a real number of metres, not {type(value).__name__}")
+    try:
+        distance = float(value)
+    except OverflowError as exc:
+        raise ValueError(
+            "nearby() max_distance must be a finite number of metres, >= 0; this one is too large for a float"
+        ) from exc
+    if not math.isfinite(distance) or distance < 0:
+        raise ValueError(f"nearby() max_distance must be a finite number of metres, >= 0, got {distance!r}")
+    return distance
