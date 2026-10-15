@@ -13,7 +13,7 @@ from types import UnionType
 from typing import TYPE_CHECKING, Any, Self, TypeVar, overload
 
 import pydantic
-from pydantic import BaseModel, ConfigDict, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, ModelWrapValidatorHandler, TypeAdapter, model_validator
 from pydantic_core import ValidationError
 
 from . import encoding as _encoding
@@ -58,6 +58,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _E = TypeVar("_E", bound="BaseSurrealEdge")
+_V = TypeVar("_V")
 
 # Per-class derivations of v0.18.0, computed once on first use. They cannot be built in
 # ``__init_subclass__``: that runs inside ``type.__new__``, before Pydantic has finished
@@ -146,23 +147,22 @@ def _read_kind(annotation: Any) -> str | None:
     return None
 
 
-def _has_structured_type(annotation: Any, _aliases: frozenset[int] = frozenset()) -> bool:
-    """Whether a field annotation holds a structured type at any depth: a ``BaseModel``, a dataclass or a ``TypedDict``.
+def _annotation_holds(annotation: Any, leaf: Callable[[type], bool], _aliases: frozenset[int] = frozenset()) -> bool:
+    """Whether a field annotation holds, at any depth, a class for which ``leaf`` is true.
 
     Walks ``Annotated`` (its first argument), unions, the arguments of generic types
     (``list[Sub]``, ``dict[str, Sub]``, ``Sub | None``, ``Range[Sub]``…) and the value of a
     ``type`` alias (each alias once, so a recursive one ends). A string or ``ForwardRef``, the
-    values of a ``Literal`` and ``type[...]`` hold none. A ``TypedDict`` is recognised by its
-    shape, since ``typing.is_typeddict`` misses ``typing_extensions.TypedDict``, the form Pydantic
-    requires before Python 3.12. Used by :meth:`BaseSurrealModel._sync_fields` (#228).
+    values of a ``Literal`` and ``type[...]`` hold none. Used by :func:`_has_structured_type`
+    and :func:`_holds_timedelta` (#228).
     """
     origin = typing.get_origin(annotation)
     if origin is typing.Annotated:
-        return _has_structured_type(typing.get_args(annotation)[0], _aliases)
+        return _annotation_holds(typing.get_args(annotation)[0], leaf, _aliases)
     if origin is typing.Literal or origin is type:
         return False
     if origin is not None:
-        return any(_has_structured_type(arg, _aliases) for arg in typing.get_args(annotation))
+        return any(_annotation_holds(arg, leaf, _aliases) for arg in typing.get_args(annotation))
     if not isinstance(annotation, type):
         if not hasattr(annotation, "__type_params__") or id(annotation) in _aliases:
             return False
@@ -170,10 +170,127 @@ def _has_structured_type(annotation: Any, _aliases: frozenset[int] = frozenset()
             value = annotation.__value__  # a ``type`` alias, evaluated lazily
         except Exception:
             return False
-        return _has_structured_type(value, _aliases | {id(annotation)})
-    if issubclass(annotation, BaseModel) or dataclasses.is_dataclass(annotation):
+        return _annotation_holds(value, leaf, _aliases | {id(annotation)})
+    return leaf(annotation)
+
+
+def _is_structured(cls: type) -> bool:
+    """Whether ``cls`` is a ``BaseModel``, a dataclass or a ``TypedDict``.
+
+    A ``TypedDict`` is recognised by its shape, since ``typing.is_typeddict`` misses
+    ``typing_extensions.TypedDict``, the form Pydantic requires before Python 3.12.
+    """
+    if issubclass(cls, BaseModel) or dataclasses.is_dataclass(cls):
         return True
-    return issubclass(annotation, dict) and hasattr(annotation, "__required_keys__")
+    return issubclass(cls, dict) and hasattr(cls, "__required_keys__")
+
+
+def _has_structured_type(annotation: Any) -> bool:
+    """Whether a field annotation holds a structured type at any depth: a ``BaseModel``, a dataclass or a ``TypedDict``.
+
+    See :func:`_annotation_holds` for the walk. Used by :meth:`BaseSurrealModel._sync_fields` (#228).
+    """
+    return _annotation_holds(annotation, _is_structured)
+
+
+def _holds_timedelta(annotation: Any) -> bool:
+    """Whether a field annotation holds exactly ``timedelta`` at any depth (``list[timedelta]``, ``timedelta | str``…).
+
+    A ``timedelta`` subclass does not count: Pydantic validates it by instance, so the SDK's
+    ``Duration`` is never converted for it (see :func:`_with_sdk_timedeltas`). Used by
+    :meth:`BaseSurrealModel._sync_fields` (#228).
+    """
+    return _annotation_holds(annotation, lambda cls: cls is timedelta)
+
+
+def _path_to(data: Any, loc: Sequence[int | str], value: Any) -> list[int | str] | None:
+    """The keys and indexes that lead from ``data`` to ``value`` along an error's ``loc``, or ``None`` (#228).
+
+    ``loc`` names ``dict`` keys and ``list`` or ``tuple`` indexes, mixed with the tags Pydantic
+    adds for a union member (``"RfSub"``, ``"timedelta"``…), which name nothing in the data: a
+    ``str`` that is not a key of the current ``dict``, or that meets a ``list`` or ``tuple``, is
+    skipped, and so is the rest of ``loc`` once ``value`` itself is reached. Only plain ``dict``,
+    ``list`` and ``tuple`` containers are entered. A path is returned only when it ends on
+    ``value`` itself (identity), so a tag that happens to be a key never leads to another value.
+    """
+    path: list[int | str] = []
+    node = data
+    for part in loc:
+        if node is value:
+            break
+        container = type(node)
+        key = container is dict and part in node
+        index = container in (list, tuple) and type(part) is int and 0 <= part < len(node)
+        if key or index:
+            node = node[part]
+        elif type(part) is str and container in (dict, list, tuple):
+            continue
+        else:
+            return None
+        path.append(part)
+    return path if node is value else None
+
+
+def _replaced(data: Any, path: Sequence[int | str], new: Any) -> Any:
+    """``data`` with the item at ``path`` replaced by ``new``, each container on the way copied (#228).
+
+    ``path`` comes from :func:`_path_to`, so it holds only plain ``dict``, ``list`` and ``tuple``
+    containers; ``data`` itself is never mutated.
+    """
+    if not path:
+        return new
+    key, rest = path[0], path[1:]
+    if type(data) is dict:
+        return {**data, key: _replaced(data[key], rest, new)}
+    items = list(data)
+    index = typing.cast(int, key)
+    items[index] = _replaced(items[index], rest, new)
+    return items if type(data) is list else tuple(items)
+
+
+def _with_sdk_timedeltas(data: Any, error: ValidationError) -> Any:
+    """``data`` with the SDK's ``Duration`` values a ``timedelta`` refused converted, or ``None`` when there is none (#228).
+
+    Pydantic's ``timedelta`` refuses the SDK's ``Duration`` (``time_delta_type``), the value every
+    read returns for a SurrealDB ``duration``. For each such error whose input is exactly the SDK's
+    class, the input found at the error's ``loc`` (:func:`_path_to`) is replaced by
+    ``_timedelta_from_sdk(input)``, floored to the microsecond, on a copy of ``data``
+    (:func:`_replaced`). An input that rule leaves alone (negative, beyond ``timedelta.max``) and
+    an input the ``loc`` does not lead to (a ``mode="before"`` validator rebuilt the data…) are
+    not converted. Never raises.
+    """
+    try:
+        fixed = data
+        for detail in error.errors(include_url=False, include_context=False):
+            value = detail.get("input")
+            if detail["type"] != "time_delta_type" or type(value) is not SdkDuration:
+                continue
+            converted = _timedelta_from_sdk(value)
+            path = None if converted is value else _path_to(fixed, detail["loc"], value)
+            if path is not None:
+                fixed = _replaced(fixed, path, converted)
+        return None if fixed is data else fixed
+    except Exception:
+        return None
+
+
+def _validated_with_sdk_timedeltas(validate: Callable[[Any], _V], data: Any) -> _V:
+    """``validate(data)``, run once more with the SDK's durations converted when a ``timedelta`` refused them (#228).
+
+    A ``timedelta`` below the top level of a model (a sub-model's field, ``list[timedelta]``,
+    ``timedelta | str``…) then reads the SDK's ``Duration`` as a top-level one does
+    (:meth:`BaseSurrealModel.set_data`), floored to the microsecond. Without such a value
+    (:func:`_with_sdk_timedeltas`), the error of ``validate(data)`` is raised; otherwise the second
+    run gives the result, so an error then names what is really wrong with the data. ``data``
+    itself is never mutated by the conversion.
+    """
+    try:
+        return validate(data)
+    except ValidationError as exc:
+        fixed = _with_sdk_timedeltas(data, exc)
+        if fixed is None:
+            raise
+    return validate(fixed)
 
 
 def _is_library_callable(func: Any) -> bool:
@@ -490,7 +607,9 @@ class BaseSurrealModel(BaseModel):
         ``{"sub": Sub | None, "location": Annotated[GeometryPoint | None, GeoField['point']]}``: every
         field whose annotation holds a structured type at any depth (a ``BaseModel``, a dataclass or a
         ``TypedDict``, alone or in ``list[...]``, ``dict[..., ...]``, ``X | None``…, see
-        ``_has_structured_type``) and every geometry field (``_read_kind``). Each maps to its full
+        ``_has_structured_type``), every geometry field (``_read_kind``) and every field holding a
+        ``timedelta`` below the top level (``list[timedelta]``, ``timedelta | str``…, see
+        ``_holds_timedelta``; a top-level one has its own rule). Each maps to its full
         annotation, ``Annotated`` constraints included (``FieldInfo.rebuild_annotation()``), plus the
         field's discriminator. :meth:`_apply_record` receives rows keyed by column but translates each
         key to its Python name first, so the map needs no column keys. Cached once Pydantic has
@@ -501,7 +620,9 @@ class BaseSurrealModel(BaseModel):
             return cached
         fields: dict[str, Any] = {}
         for name, info in cls.model_fields.items():
-            if _read_kind(info.annotation) != "geometry" and not _has_structured_type(info.annotation):
+            kind = _read_kind(info.annotation)
+            nested_timedelta = kind is None and _holds_timedelta(info.annotation)
+            if kind != "geometry" and not nested_timedelta and not _has_structured_type(info.annotation):
                 continue
             annotation = info.rebuild_annotation()
             if info.discriminator is not None:
@@ -593,10 +714,12 @@ class BaseSurrealModel(BaseModel):
         The fallback of :meth:`_apply_record` when the whole row does not validate
         (:meth:`_validated_row`). A sub-model's ``dict`` becomes the declared instance, with the
         ORM's durations, ranges and geometries; a stored GeoJSON object in a geometry field becomes
-        the ORM's geometry. That is what a read gives unless the model's own validators reshape the
-        field, which a field validated alone cannot run: a field in :meth:`_sync_reshaped` gives
-        ``value`` back unchanged. So do a value that does not validate, a validator that raises
-        anything else and a field without an adapter (see :meth:`_sync_adapter`): never raises.
+        the ORM's geometry; a ``timedelta`` below the top level reads the SDK's ``Duration``, as in
+        a read (``_validated_with_sdk_timedeltas``). That is what a read gives unless the model's
+        own validators reshape the field, which a field validated alone cannot run: a field in
+        :meth:`_sync_reshaped` gives ``value`` back unchanged. So do a value that does not
+        validate, a validator that raises anything else and a field without an adapter (see
+        :meth:`_sync_adapter`): never raises.
         """
         reshaped = cls._sync_reshaped()
         if reshaped is _ALL_FIELDS or name in reshaped:
@@ -605,7 +728,7 @@ class BaseSurrealModel(BaseModel):
         if adapter is None:
             return value
         try:
-            return adapter.validate_python((value,))[0]
+            return _validated_with_sdk_timedeltas(adapter.validate_python, (value,))[0]
         except Exception:
             return value
 
@@ -836,7 +959,8 @@ class BaseSurrealModel(BaseModel):
         SurrealDB ``duration``) gets a ``timedelta``, floored to the microsecond (v0.23.0). The dict is
         copied on that first change, never mutated by it; a value this rule cannot convert (beyond
         ``timedelta.max``, a subclass, any other type) is left as received for Pydantic to judge,
-        so the rule itself never raises.
+        so the rule itself never raises. A ``timedelta`` below the top level reads the SDK's
+        ``Duration`` through :meth:`_read_nested_timedeltas` (#228).
         """
         if isinstance(data, dict) and "id" in data and isinstance(data["id"], RecordID):
             # Only convert to plain string when the id field does not accept RecordID.
@@ -865,6 +989,22 @@ class BaseSurrealModel(BaseModel):
                         data = dict(data)
                     data[key] = converted
         return data
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def _read_nested_timedeltas(cls, data: Any, handler: ModelWrapValidatorHandler[Self]) -> Self:
+        """Read the SDK's ``Duration`` in a ``timedelta`` below the top level, as :meth:`set_data` does at the top (#228).
+
+        A sub-model's ``timedelta`` field, ``list[timedelta]``, ``dict[str, timedelta]``,
+        ``timedelta | str``…: Pydantic refuses the SDK's ``Duration`` there, which every read
+        returns for a SurrealDB ``duration``. When the validation fails on such values, it runs
+        once more with each of them converted where Pydantic refused it, floored to the
+        microsecond (see ``_validated_with_sdk_timedeltas``), on a copy: the caller's data is
+        never mutated. A value the top-level rule would leave alone stays refused, and a model
+        without such a value fails as before. A ``wrap`` validator runs outside every
+        ``mode="before"`` one, the model's own included, so they run again on the second try.
+        """
+        return _validated_with_sdk_timedeltas(handler, data)
 
     async def refresh(self, tx: Transaction | None = None) -> None:
         """Refresh the model instance from the database.
@@ -1359,18 +1499,20 @@ class BaseSurrealModel(BaseModel):
         Top-level ``timedelta`` and ``Duration`` fields get the SDK's ``Duration`` converted
         (v0.23.0), and top-level geometry fields the SDK's geometries, as the ORM's geometry
         classes (v0.24.0). A field that holds a sub-model (a ``BaseModel``, a dataclass or a
-        ``TypedDict``, at any depth of its annotation) and a geometry field holding anything other
-        than an SDK geometry (a stored GeoJSON object…) get the value a read gives (#228): when the
-        row holds such a field, the whole row is validated as :meth:`from_db` validates it, the
-        model's own validators included (:meth:`_validated_row`), and those fields take their
-        validated value. A sub-model field then holds its declared instance, with the ORM's
-        durations, ranges and geometries. When the row does not validate, each such field is
-        validated alone (:meth:`_validated_on_sync`), unless the model's own validators may
-        reshape it, and a value that still does not validate is applied as received, so this
-        never raises. Every other value is applied as received: a typed container of scalars such
-        as ``list[Duration]`` or ``list[GeometryPoint]`` keeps the SDK's values, which its
-        serializer converts at the next ``model_dump()``, and top-level ``date``, ``set`` and
-        ``Range`` fields hold the SDK's value.
+        ``TypedDict``, at any depth of its annotation), a field that holds a ``timedelta`` below
+        the top level (``list[timedelta]``, ``timedelta | str``…) and a geometry field holding
+        anything other than an SDK geometry (a stored GeoJSON object…) get the value a read gives
+        (#228, see :meth:`_sync_fields`): when the row holds such a field, the whole row is
+        validated as :meth:`from_db` validates it, the model's own validators included
+        (:meth:`_validated_row`), and those fields take their validated value. A sub-model field
+        then holds its declared instance, with the ORM's durations, ``timedelta``s, ranges and
+        geometries (:meth:`_read_nested_timedeltas`). When the row does not validate, each such
+        field is validated alone (:meth:`_validated_on_sync`), unless the model's own validators
+        may reshape it, and a value that still does not validate is applied as received, so this
+        never raises. Every other value is applied as received: a typed container of other
+        scalars such as ``list[Duration]`` or ``list[GeometryPoint]`` keeps the SDK's values,
+        which its serializer converts at the next ``model_dump()``, and top-level ``date``,
+        ``set`` and ``Range`` fields hold the SDK's value.
 
         Args:
             only: restrict the copy to these field names. ``None`` (default) applies every field
