@@ -58,6 +58,7 @@ from surreal_orm_lite.embedded import (
 from surreal_orm_lite.enum import LiveAction
 from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError, SurrealDbError
 from surreal_orm_lite.live import require_websocket
+from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.transaction import BufferedTransaction
 from tests.conftest import _REWRITE_MODULES, _ws_url, orm_client
 
@@ -1539,6 +1540,38 @@ class TestKillAfterSwitchE2E:
                 assert stream.live_id is None
                 assert _slot_client() is None  # the KILL did not open the engine
                 SurrealDBConnectionManager.set_connection(**settings)
+        finally:
+            await SurrealDBConnectionManager.unset_connection()
+
+    async def test_a_server_stream_stopped_inside_embedded_database_is_killed_on_its_server_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        try:
+            async with orm_client("emb_watched") as server:
+                await server.query("DEFINE TABLE emb_watched SCHEMALESS;", {})
+                stream = await EmbWatched.objects().watch().start()
+                live_id = stream.live_id
+                assert live_id is not None
+                killed: list[Any] = []
+                real_kill = server.kill
+
+                async def recording_kill(query_uuid: Any, *args: Any, **kwargs: Any) -> Any:
+                    killed.append(query_uuid)
+                    return await real_kill(query_uuid, *args, **kwargs)
+
+                monkeypatch.setattr(server, "kill", recording_kill)
+                async with embedded_database() as engine:
+                    assert engine is not server
+                    assert SurrealDBConnectionManager.is_embedded()
+
+                    await stream.stop()
+
+                    assert killed == [live_id]
+                    assert stream.live_id is None
+                # The block put the server settings back, and the server client was neither closed nor replaced.
+                assert SurrealDBConnectionManager.get_connection_string() == _ws_url()
+                assert await SurrealDBConnectionManager.get_client() is server
+                assert await server.query("RETURN 1;") == 1
         finally:
             await SurrealDBConnectionManager.unset_connection()
 

@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import dataclasses
 import hashlib
 import logging
 import threading
@@ -60,6 +61,28 @@ def _type_adapter(return_type: Any) -> TypeAdapter[Any]:
         return _cached_type_adapter(return_type)
     except TypeError:
         return TypeAdapter(return_type)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ManagerState:
+    """The connection state ``embedded_database()`` puts back after its block. Secrets stay out of the repr.
+
+    Taken and restored by :meth:`SurrealDBConnectionManager._enter_embedded_block` and
+    :meth:`SurrealDBConnectionManager._exit_embedded_block`: the settings, the stored session, the event loops in
+    the lost-identity state and the embedded slot (an outer engine is detached for the block, not closed).
+    """
+
+    url: str | None
+    user: str | None
+    password: str | None = dataclasses.field(repr=False)
+    namespace: str | None
+    database: str | None
+    session_token: str | None = dataclasses.field(repr=False)
+    refresh_token: str | None = dataclasses.field(repr=False)
+    lost_identity: tuple[asyncio.AbstractEventLoop, ...]
+    embedded_client: Any
+    embedded_url: str | None
+    embedded_selection: tuple[str | None, str | None] | None
 
 
 class SurrealDBConnectionManager:
@@ -781,6 +804,71 @@ class SurrealDBConnectionManager:
             return
         async with cls._embedded_guard():
             await cls._forget_embedded()
+
+    @classmethod
+    async def _enter_embedded_block(cls, url: str, namespace: str, database: str) -> _ManagerState:
+        """Point the manager at an isolated embedded database for ``embedded_database()``; return what to put back.
+
+        One guarded step: snapshot the settings, the stored session, the lost-identity loops and the embedded
+        slot; empty the slot **without closing** its client (an outer engine and its data come back after the
+        block); then :meth:`set_connection` (which forgets the stored session, the lost-identity loops and the
+        stored-function signatures for the block). Doing the detach and the re-point under the guard at once
+        means a concurrent first :meth:`get_client` on another thread either completes before the block — its
+        client is detached with the rest — or waits and then opens the block's engine: it can never publish an
+        engine for the outer settings into the block's slot. Per-loop server clients are neither closed nor used.
+
+        Private, for :mod:`surreal_orm_lite.testing`; the caller validates the URL, namespace and database.
+        """
+        async with cls._embedded_guard():
+            state = _ManagerState(
+                url=cls.__url,
+                user=cls.__user,
+                password=cls.__password,
+                namespace=cls.__namespace,
+                database=cls.__database,
+                session_token=cls.__session_token,
+                refresh_token=cls.__refresh_token,
+                lost_identity=tuple(cls.__lost_identity),
+                embedded_client=cls.__embedded_client,
+                embedded_url=cls.__embedded_url,
+                embedded_selection=cls.__embedded_selection,
+            )
+            cls.__embedded_client = None  # first: see the fast path of _acquire_embedded_client()
+            cls.__embedded_url = None
+            cls.__embedded_selection = None
+            cls.set_connection(url=url, namespace=namespace, database=database)
+        return state
+
+    @classmethod
+    async def _exit_embedded_block(cls, state: _ManagerState) -> None:
+        """Close the block's engine and put back everything :meth:`_enter_embedded_block` snapshotted.
+
+        One guarded step. The event loops that were in the lost-identity state before the block are put back in
+        it (unless closed since): the block's :meth:`set_connection` must not silently lift that guard. The
+        stored-function signatures are forgotten (the block's belong to its discarded database). Everything is
+        restored before the block's client is closed, so even an interrupted close leaves the previous state in
+        place; with the surrealdb SDK 2.x the engine itself stops once nothing refers to that client.
+        """
+        async with cls._embedded_guard():
+            block_client = cls.__embedded_client  # whatever the block left in the slot
+            cls.__url = state.url
+            cls.__user = state.user
+            cls.__password = state.password
+            cls.__namespace = state.namespace
+            cls.__database = state.database
+            cls.__session_token = state.session_token
+            cls.__refresh_token = state.refresh_token
+            cls.__lost_identity.clear()
+            for loop in state.lost_identity:
+                if not loop.is_closed():
+                    cls.__lost_identity.add(loop)
+            cls.__embedded_url = state.embedded_url
+            cls.__embedded_selection = state.embedded_selection
+            cls.__embedded_client = state.embedded_client  # last: see the fast path of _acquire_embedded_client()
+            cls.clear_function_signature_cache()
+            if block_client is not None and block_client is not state.embedded_client:
+                with contextlib.suppress(Exception):
+                    await block_client.close()
 
     @classmethod
     async def close_connection(cls) -> None:
