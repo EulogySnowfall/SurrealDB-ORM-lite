@@ -30,9 +30,10 @@ values (durations, dates, sets, ranges, exponent decimals) and must return the v
 given for anything else, so existing payloads keep their exact bytes. The autouse guard below
 proves it on the whole pre-existing suite, on both server lines: for every test of a module that
 existed at v0.22.2 it wraps ``encode`` and fails the test if any call returned a different object.
-Only the three modules written for the rich field types and the two v0.24.0 geometry modules are
-exempt (``_REWRITE_MODULES``). A new test that needs rich values goes into one of them — never add a
-pre-existing module to that set.
+Only the three modules written for the rich field types, the two v0.24.0 geometry modules and the
+v0.24.3 read-hook module are exempt (``_REWRITE_MODULES``), and ``tests/test_embedded.py`` (v0.25.0),
+which writes rich and geo values on the embedded engine. A new test that needs rich values goes into
+one of them — never add a pre-existing module to that set.
 """
 
 import asyncio
@@ -46,9 +47,9 @@ import pytest_asyncio
 
 from surreal_orm_lite import SurrealDBConnectionManager, encoding
 
-#: The test modules written for v0.23.0's rich field types, v0.24.0's geometries and v0.24.3's read
-#: hook: the only ones whose values ``encode()`` may rewrite. Never list a module that existed at
-#: v0.22.2 here.
+#: The test modules written for v0.23.0's rich field types, v0.24.0's geometries, v0.24.3's read
+#: hook and v0.25.0's embedded engine: the only ones whose values ``encode()`` may rewrite. Never list a
+#: module that existed at v0.22.2 here.
 _REWRITE_MODULES = frozenset(
     {
         "tests.test_encoding",
@@ -57,6 +58,7 @@ _REWRITE_MODULES = frozenset(
         "tests.test_geo_types",
         "tests.test_geo_fields",
         "tests.test_decoding",
+        "tests.test_embedded",
     }
 )
 

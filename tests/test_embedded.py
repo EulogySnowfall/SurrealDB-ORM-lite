@@ -10,21 +10,45 @@ import asyncio
 import contextlib
 import enum
 import inspect
+import re
 import sys
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import urlparse
 
 import pytest
 import surrealdb
+from surrealdb import RecordID
 from surrealdb.connections.async_embedded import AsyncEmbeddedSurrealConnection
 
-from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager, _sdk, connection_manager
+from surreal_orm_lite import (
+    Avg,
+    BaseSurrealEdge,
+    BaseSurrealModel,
+    BoundExcluded,
+    BoundIncluded,
+    Computed,
+    Count,
+    GeoDistance,
+    GeometryPoint,
+    PointField,
+    Range,
+    SurrealConfigDict,
+    SurrealDBConnectionManager,
+    SurrealFunc,
+    _sdk,
+    computed,
+    connection_manager,
+    retry_on_conflict,
+)
 from surreal_orm_lite import embedded as embedded_module
 from surreal_orm_lite.embedded import is_embedded_url, require_supported_url, url_kind
-from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError
-from tests.conftest import _ws_url
+from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError, SurrealDbError
+from surreal_orm_lite.transaction import BufferedTransaction
+from tests.conftest import _REWRITE_MODULES, _ws_url
 
 _T = TypeVar("_T")
 
@@ -926,3 +950,332 @@ class TestServerClientsUntouchedE2E:
             assert await Person.objects().count() == 1
         finally:
             await SurrealDBConnectionManager.unset_connection()
+
+
+# --- Task 4: the ORM on the engine (spec §1.5, §7; AC-6, AC-7, AC-11; D5, D7) -----------------------------
+#
+# Every class below writes sequentially, or on tables it defined first (the concurrency rule of spec M27: a
+# fresh engine raises the retryable conflict on concurrent first writes to an undefined table).
+
+
+class EmbBorn(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="emb_born")
+
+    id: str | None = None
+    name: str = ""
+    created: datetime | None = None
+
+
+class EmbFollows(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="emb_follows")
+
+    weight: int = 1
+
+
+class EmbScored(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="emb_scored")
+
+    id: str | None = None
+    a: int = 0
+    b: int = 0
+    total: Computed[int] = computed("a + b")
+
+
+class EmbRich(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="emb_rich")
+
+    id: str | None = None
+    ttl: timedelta | None = None
+    day: date | None = None
+    price: Decimal | None = None
+    seats: set[int] = set()
+    hours: Range[int] | None = None
+
+
+class EmbPlace(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="emb_place")
+
+    id: str | None = None
+    location: PointField = None
+
+
+class Counter(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="counter")
+
+    id: str | None = None
+    n: int = 0
+
+
+class Mark(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="mark")
+
+    id: str | None = None
+    tag: str = ""
+
+
+#: Reference points as (longitude, latitude), the values of ``tests/test_geo_types.py``: NEAR is 697.5 m from
+#: B, A 1395.0 m, PARIS thousands of kilometres.
+_B = (-73.99, 40.75)
+_NEAR = (-73.985, 40.745)
+_A = (-73.98, 40.74)
+_PARIS = (2.35, 48.85)
+
+
+def test_the_boundary_guard_still_covers_every_pre_existing_module() -> None:
+    """The encoding-boundary guard of ``conftest.py`` is lifted for this new module only (v0.25.0)."""
+    assert (
+        frozenset(
+            {
+                "tests.test_encoding",
+                "tests.test_rich_types",
+                "tests.test_rich_fields",
+                "tests.test_geo_types",
+                "tests.test_geo_fields",
+                "tests.test_embedded",
+            }
+        )
+        == _REWRITE_MODULES
+    )
+
+
+class TestCoreOrmEmbeddedE2E:
+    """AC-6, no server: the ORM's core API on ``mem://``, unchanged (spec §1.5)."""
+
+    async def test_crud_queries_and_ordering(self) -> None:
+        async with embedded():
+            ada = await Person(id="ada", name="Ada", age=36).save()
+            assert ada.id == "ada"
+            anon = await Person(name="Anon", age=20).save()
+            assert anon.get_id() is not None
+            await Person(id="bob", name="Bob", age=25).save()
+
+            assert (await Person.objects().get("ada")).name == "Ada"
+            assert (await Person.objects().get(anon.get_id())).name == "Anon"
+            assert {p.name for p in await Person.objects().filter(age__gte=25).exec()} == {"Ada", "Bob"}
+            assert [p.name for p in await Person.objects().order_by("-age").exec()] == ["Ada", "Bob", "Anon"]
+            assert [p.name for p in await Person.objects().order_by("age").limit(2).exec()] == ["Anon", "Bob"]
+            first = await Person.objects().order_by("-age").first()
+            assert first.name == "Ada"
+            assert await Person.objects().count() == 3
+
+            ada.age = 37
+            await ada.update()
+            assert (await Person.objects().get("ada")).age == 37
+            await ada.merge(name="Ada L.")
+            got = await Person.objects().get("ada")
+            assert (got.name, got.age) == ("Ada L.", 37)
+            await got.delete()
+            assert await Person.objects().count() == 2
+
+    async def test_bulk_operations_and_aggregations(self) -> None:
+        async with embedded():
+            created = await Person.objects().bulk_create(
+                [Person(id="a", name="A", age=10), Person(id="b", name="B", age=20), Person(id="c", name="C", age=30)]
+            )
+            assert len(created) == 3
+            assert await Person.objects().count() == 3
+            assert await Person.objects().filter(age__gte=20).bulk_update(name="old") == 2
+            assert sorted(p.id for p in await Person.objects().filter(name="old").exec()) == ["b", "c"]
+            assert await Person.objects().avg("age") == pytest.approx(20)
+            rows = await Person.objects().values("name").annotate(count=Count(), mean=Avg("age")).exec()
+            assert {r["name"]: (r["count"], r["mean"]) for r in rows} == {"A": (1, 10), "old": (2, 25)}
+            assert await Person.objects().filter(name="old").bulk_delete() == 2
+            assert [p.id for p in await Person.objects().exec()] == ["a"]
+
+    async def test_upsert_get_or_create_and_update_or_create(self) -> None:
+        async with embedded():
+            await Person(id="ada", name="Ada", age=36).upsert()
+            await Person(id="ada", name="Ada R.").upsert()  # a full replace
+            got = await Person.objects().get("ada")
+            assert (got.name, got.age) == ("Ada R.", 0)
+
+            made, created = await Person.objects().get_or_create(name="Bob", defaults={"age": 25})
+            assert created is True
+            again, created = await Person.objects().get_or_create(name="Bob", defaults={"age": 99})
+            assert created is False
+            assert again.age == 25
+            assert made.get_id() is not None
+
+            updated, created = await Person.objects().update_or_create(name="Bob", defaults={"age": 26})
+            assert created is False
+            assert updated.age == 26
+            fresh, created = await Person.objects().update_or_create(name="Cy", defaults={"age": 5})
+            assert created is True
+            assert fresh.age == 5
+            assert await Person.objects().count() == 3
+
+    async def test_patch_and_atomic_increment(self) -> None:
+        async with embedded():
+            ada = await Person(id="ada", name="Ada", age=36).save()
+            await ada.patch([{"op": "replace", "path": "/name", "value": "Ada P."}])
+            assert ada.name == "Ada P."
+            await ada.atomic_increment("age", 2)
+            got = await Person.objects().get("ada")
+            assert (got.name, got.age) == ("Ada P.", 38)
+
+    async def test_server_values(self) -> None:
+        async with embedded():
+            before = datetime.now(UTC) - timedelta(minutes=1)
+            born = await EmbBorn(id="b", name="B").save(server_values={"created": SurrealFunc("time::now()")})
+            assert born.created is not None
+            assert born.created > before
+            stored = await EmbBorn.objects().get("b")
+            assert stored.created == born.created
+
+    async def test_relate_and_traverse(self) -> None:
+        async with embedded():
+            alice = await Person(id="alice", name="Alice").save()
+            bob = await Person(id="bob", name="Bob").save()
+            charlie = await Person(id="charlie", name="Charlie").save()
+            assert await alice.relate("knows", bob)
+            assert await bob.relate("knows", charlie)
+            assert await alice.traverse("->knows->person") == [RecordID("person", "bob")]
+            assert await alice.traverse("->knows->person->knows->person") == [RecordID("person", "charlie")]
+            following = await alice.get_related("knows", direction="out", model_class=Person)
+            assert [p.name for p in following] == ["Bob"]
+
+    async def test_a_typed_edge_through_insert_relation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = _record_calls(monkeypatch, "insert_relation")
+        async with embedded() as client:
+            await Person(id="alice", name="Alice").save()
+            await Person(id="bob", name="Bob").save()
+            edge = await EmbFollows(in_=RecordID("person", "alice"), out=RecordID("person", "bob"), weight=3).save()
+            assert isinstance(edge.id, RecordID)
+            assert [name for name, _ in _calls_of(calls, client)] == ["insert_relation"]
+            [stored] = await EmbFollows.objects().exec()
+            assert (stored.in_, stored.out, stored.weight) == (RecordID("person", "alice"), RecordID("person", "bob"), 3)
+            followers = await Person(id="bob", name="Bob").get_related(EmbFollows, direction="in", model_class=Person)
+            assert [p.name for p in followers] == ["Alice"]
+
+    async def test_call_function_with_named_params(self) -> None:
+        async with embedded() as client:
+            await client.query("DEFINE FUNCTION fn::add($a: int, $b: int) { RETURN $a + $b; };")
+            assert await SurrealDBConnectionManager.call_function("fn::add", params={"b": 2, "a": 40}) == 42
+            assert await Person.call_function("fn::add", [1, 2]) == 3
+
+    async def test_define_computed_fields_and_read_back(self) -> None:
+        async with embedded():
+            assert await EmbScored.define_computed_fields() == EmbScored.computed_field_ddl()
+            saved = await EmbScored(id="s", a=2, b=3).save()
+            assert saved.total == 5
+            assert (await EmbScored.objects().get("s")).total == 5
+
+
+class TestRichAndGeoEmbeddedE2E:
+    """AC-6, no server: rich and geometry values cross the encoding boundary on the engine too."""
+
+    async def test_rich_values_round_trip(self) -> None:
+        async with embedded():
+            saved = await EmbRich(
+                id="r",
+                ttl=timedelta(hours=1, minutes=30),
+                day=date(2026, 1, 2),
+                price=Decimal("12.50"),
+                seats={3, 1, 2},
+                hours=Range(BoundIncluded(9), BoundExcluded(17)),
+            ).save()
+            got = await EmbRich.objects().get("r")
+            assert got.model_dump() == saved.model_dump()
+            assert type(got.ttl) is timedelta
+            assert type(got.day) is date
+            assert got.seats == {1, 2, 3}
+            assert got.hours == Range(BoundIncluded(9), BoundExcluded(17))
+
+    async def test_nearby_and_geo_distance(self) -> None:
+        async with embedded():
+            for key, point in (("near", _NEAR), ("a", _A), ("paris", _PARIS)):
+                await EmbPlace(id=key, location=GeometryPoint(*point)).save()
+            found = await EmbPlace.objects().nearby("location", GeometryPoint(*_B), 2000).exec()
+            assert sorted(p.id for p in found) == ["a", "near"]
+            rows = await EmbPlace.objects().annotate(dist=GeoDistance("location", GeometryPoint(*_B))).order_by("dist").exec()
+            assert [r.id for r in rows] == ["near", "a", "paris"]
+            assert rows[0].dist == pytest.approx(697.5104962226121, abs=1e-3)
+            assert rows[1].dist == pytest.approx(1395.0401142718986, abs=1e-3)
+            assert rows[2].dist > 5_000_000
+
+
+class TestTransactionsEmbeddedE2E:
+    """AC-7, no server: the buffered strategy, as on 2.x; a conflicting pair ends committed (P4, spec M33)."""
+
+    async def test_transaction_is_buffered_and_commits_together(self) -> None:
+        async with embedded():
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert isinstance(tx, BufferedTransaction)
+                await Person(id="a", name="A").save(tx=tx)
+                await Person(id="b", name="B").save(tx=tx)
+                assert await Person.objects().count() == 0  # buffered: nothing written yet
+            assert sorted(p.id for p in await Person.objects().exec()) == ["a", "b"]
+
+    async def test_an_exception_in_the_body_leaves_nothing(self) -> None:
+        async with embedded():
+            with pytest.raises(RuntimeError, match="boom"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await Person(id="a", name="A").save(tx=tx)
+                    raise RuntimeError("boom")
+            assert await Person.objects().count() == 0
+
+    async def test_a_read_inside_the_transaction_raises_as_on_2x(self) -> None:
+        async with embedded():
+            with pytest.raises(SurrealDbError):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await Person.objects(tx=tx).exec()
+
+    async def test_a_conflicting_pair_ends_committed(self) -> None:
+        """Both writers touch ``counter:c``: one of the two conflicts (M33) and ``retry_on_conflict`` retries it."""
+        async with embedded() as client:
+            await client.query("DEFINE TABLE counter SCHEMALESS; DEFINE TABLE mark SCHEMALESS;")
+            counter = await Counter(id="c", n=0).save()
+
+            @retry_on_conflict(max_retries=10)  # a budget that cannot run out in practice: M33 needs one retry
+            async def writer(tag: str) -> str:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await counter.atomic_increment("n", 1, tx=tx)  # both writers touch counter:c: the conflict
+                    await Mark(id=tag, tag=tag).save(tx=tx)
+                return tag
+
+            assert await asyncio.gather(writer("a"), writer("b")) == ["a", "b"]
+            assert await Mark.objects().count() == 2
+            # The counter's final value is not asserted: 2.x isolation may lose an update (spec M24).
+
+
+class TestComputedEmbeddedE2E:
+    """AC-11 (D5), no server: the engine's bare ``RuntimeError`` for an unparsable expression is the ORM's
+    ``SurrealDbError``, as a server's ``InternalError``/``ValidationError`` is."""
+
+    async def test_an_invalid_expression_raises_one_orm_error(self) -> None:
+        class EmbBroken(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="emb_broken")
+
+            id: str | None = None
+            oops: Computed[int] = computed("nope::missing(x)")
+
+        async with embedded():
+            with pytest.raises(SurrealDbError, match="DEFINE FIELD") as info:
+                await EmbBroken.define_computed_fields()
+            assert isinstance(info.value.__cause__, RuntimeError)
+
+
+class TestEngineLineGuardE2E:
+    """D7: the change-feed code takes the engine's major from ``version()``; the bundled core must stay 2.x."""
+
+    async def test_the_bundled_engine_is_the_2x_line(self) -> None:
+        async with embedded() as client:
+            assert await client.query("RETURN type::is::string('');") is True
+            match = re.search(r"(\d+)\.", str(await client.version()))
+            assert match is not None
+            assert int(match.group(1)) == 2, (
+                "the surrealdb SDK bundles another engine line: revisit spec D7 (change-feed major from version())"
+            )
+
+
+class TestSurrealKvPersistenceE2E:
+    """AC-6, no server: a ``surrealkv://`` database outlives a close."""
+
+    async def test_a_write_survives_close_connection(self, tmp_path: Path) -> None:
+        async with embedded(f"surrealkv://{tmp_path / 'kv'}") as client:
+            await Person(id="ada", name="Ada", age=36).save()
+            del client  # the closed-client rule: the path is reopened below
+            await SurrealDBConnectionManager.close_connection()
+            assert not SurrealDBConnectionManager.is_connected()
+            got = await Person.objects().get("ada")
+            assert (got.name, got.age) == ("Ada", 36)
