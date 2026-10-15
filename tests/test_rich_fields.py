@@ -8,6 +8,7 @@ and created inside ``orm_client(...)``, which drops them before and after the te
 import ast
 import asyncio
 import contextlib
+import copy
 import dataclasses
 import inspect
 import re
@@ -38,6 +39,8 @@ from surreal_orm_lite import (
     Computed,
     Count,
     Duration,
+    Geometry,
+    GeometryPoint,
     LiveAction,
     Q,
     Range,
@@ -1066,11 +1069,13 @@ class TestApplyRecordE2E:
 
 
 class RfSub(BaseModel):
-    """A sub-model holding rich values: a write that syncs the instance must keep them the ORM's."""
+    """A sub-model holding rich values (``Duration``, ``timedelta``, ``Range``, geometry): a write sync keeps them the ORM's."""
 
     ttl: Duration
     hours: Range[int]
     period: Range[datetime] | None = None
+    td: timedelta | None = None
+    where: GeometryPoint | None = None
     label: str = ""
 
 
@@ -1080,12 +1085,14 @@ class RfSubData:
 
     ttl: Duration
     hours: Range[int]
+    td: timedelta
 
 
 class RfSubDict(TypedDict):
     """The same, as a ``TypedDict``: it validates into a ``dict`` holding the ORM's values."""
 
     ttl: Duration
+    td: timedelta
 
 
 class RfPlainSub(BaseModel):
@@ -1110,6 +1117,7 @@ class RfHolder(BaseSurrealModel):
     typed: RfSubDict | None = None
     plain: RfPlainSub | None = None
     many: list[Duration] = []
+    tds: list[timedelta] = []
     n: int = 0
 
 
@@ -1118,6 +1126,8 @@ SUB = RfSub(
     ttl=Duration.parse("1h30m1ns"),
     hours=Range(BoundIncluded(9), BoundExcluded(17)),
     period=Range(BoundIncluded(datetime(2026, 1, 1, tzinfo=UTC)), None),
+    td=timedelta(minutes=5, microseconds=1),
+    where=GeometryPoint(-73.57, 45.5),
     label="s",
 )
 #: One value per ``RfHolder`` field.
@@ -1126,11 +1136,12 @@ HOLDER: dict[str, Any] = {
     "maybe": SUB,
     "subs": [SUB, SUB.model_copy(update={"label": "t"})],
     "by_key": {"a": SUB},
-    "data": RfSubData(ttl=Duration(7), hours=Range(BoundIncluded(1), None)),
-    "datas": [RfSubData(ttl=Duration.parse("2m"), hours=Range(None, BoundExcluded(3)))],
-    "typed": {"ttl": Duration(9)},
+    "data": RfSubData(ttl=Duration(7), hours=Range(BoundIncluded(1), None), td=timedelta(seconds=3)),
+    "datas": [RfSubData(ttl=Duration.parse("2m"), hours=Range(None, BoundExcluded(3)), td=timedelta(hours=2))],
+    "typed": {"ttl": Duration(9), "td": timedelta(seconds=9)},
     "plain": RfPlainSub(name="p", n=1),
     "many": [Duration.parse("2m")],
+    "tds": [timedelta(seconds=90), timedelta(microseconds=1)],
 }
 
 
@@ -1139,23 +1150,29 @@ def _assert_sub_models(holder: Any) -> None:
     assert isinstance(holder, RfHolder), holder
     assert type(holder.sub) is RfSub and holder.sub == SUB, holder.sub
     assert (type(holder.sub.ttl), type(holder.sub.hours), type(holder.sub.period)) == (Duration, Range, Range)
+    assert (type(holder.sub.td), type(holder.sub.where)) == (timedelta, GeometryPoint), holder.sub
     assert type(holder.maybe) is RfSub and holder.maybe == SUB, holder.maybe
     assert [type(sub) for sub in holder.subs] == [RfSub, RfSub] and holder.subs == HOLDER["subs"], holder.subs
     assert type(holder.by_key["a"]) is RfSub and holder.by_key == HOLDER["by_key"], holder.by_key
     assert type(holder.data) is RfSubData and holder.data == HOLDER["data"], holder.data
-    assert (type(holder.data.ttl), type(holder.data.hours)) == (Duration, Range)
+    assert (type(holder.data.ttl), type(holder.data.hours), type(holder.data.td)) == (Duration, Range, timedelta)
     assert [type(data) for data in holder.datas] == [RfSubData] and holder.datas == HOLDER["datas"], holder.datas
     assert holder.typed == HOLDER["typed"] and type(holder.typed["ttl"]) is Duration, holder.typed
+    assert type(holder.typed["td"]) is timedelta, holder.typed
     assert type(holder.plain) is RfPlainSub and holder.plain == HOLDER["plain"], holder.plain
+    assert [type(td) for td in holder.tds] == [timedelta, timedelta] and holder.tds == HOLDER["tds"], holder.tds
 
 
 def _assert_sub_models_native(row: dict[str, Any]) -> None:
-    """The stored row keeps SurrealDB's native durations and ranges inside every sub-model (never ``{elapsed: …}``)."""
+    """The stored row keeps SurrealDB's native durations, ranges and geometries inside every sub-model (never ``{elapsed: …}``)."""
     subs = [row["sub"], row["maybe"], *row["subs"], row["by_key"]["a"], row["data"], *row["datas"]]
     for sub in subs:
         assert type(sub["ttl"]) is surrealdb.Duration and type(sub["hours"]) is surrealdb.Range, sub
+        assert type(sub["td"]) is surrealdb.Duration, sub
     assert type(row["sub"]["period"]) is surrealdb.Range, row["sub"]
-    assert type(row["typed"]["ttl"]) is surrealdb.Duration, row["typed"]
+    assert type(row["sub"]["where"]) is _sdk.SdkGeometryPoint, row["sub"]
+    assert type(row["typed"]["ttl"]) is surrealdb.Duration and type(row["typed"]["td"]) is surrealdb.Duration, row["typed"]
+    assert [type(td) for td in row["tds"]] == [surrealdb.Duration] * len(HOLDER["tds"]), row["tds"]
 
 
 async def _holder_saved() -> RfHolder:
@@ -1212,9 +1229,13 @@ _SYNC_CASES: dict[str, Callable[[], Awaitable[RfHolder]]] = {
 
 
 def _sdk_values(value: Any) -> Any:
-    """``value`` with the ORM's durations and ranges as the SDK reads them back, at any depth."""
+    """``value`` with the ORM's durations, ranges and geometries as the SDK reads them back, at any depth."""
     if isinstance(value, Duration):
         return surrealdb.Duration(value.elapsed)
+    if isinstance(value, timedelta):
+        return surrealdb.Duration(value // timedelta(microseconds=1) * 1000)
+    if isinstance(value, Geometry):
+        return value._to_sdk()
     if isinstance(value, Range):
         return surrealdb.Range(value.begin, value.end)
     if isinstance(value, dict):
@@ -1231,7 +1252,7 @@ def _sdk_row(holder: BaseSurrealModel) -> dict[str, Any]:
 
 
 class RfTdSub(BaseModel):
-    """A sub-model ``timedelta``: a read refuses the SDK's duration there (README section 24), and so does a write sync."""
+    """A sub-model ``timedelta``: a read converts the SDK's duration there (README section 24), and so does a write sync."""
 
     td: timedelta
 
@@ -1305,9 +1326,12 @@ class TestSubModelSyncRule:
     """#228 (unit): the fields a write sync validates, and the fallback to the value as received."""
 
     def test_fields_validated_on_sync(self) -> None:
-        assert set(RfHolder._sync_fields()) == {"sub", "maybe", "subs", "by_key", "data", "datas", "typed", "plain"}
+        expected = {"sub", "maybe", "subs", "by_key", "data", "datas", "typed", "plain", "tds"}
+        assert set(RfHolder._sync_fields()) == expected
         assert RfHolder._sync_fields() is RfHolder._sync_fields(), "cached per class"
-        assert RfEvent._sync_fields() == {} and RfKinds._sync_fields() == {} and RfPlain._sync_fields() == {}
+        assert RfEvent._sync_fields() == {} and RfPlain._sync_fields() == {}
+        # A ``timedelta`` below the top level, never one the top-level rule converts (nor a subclass).
+        assert set(RfKinds._sync_fields()) == {"either", "many", "by_key", "window"}
         # Python names only: ``_apply_record`` translates each column first.
         assert "stdCol" not in RfOddHolder._sync_fields() and "std_column" in RfOddHolder._sync_fields()
 
@@ -1390,14 +1414,42 @@ class TestSubModelSyncRule:
         assert holder.sub is raw
         assert holder.maybe is None if raw is None else holder.maybe is raw
 
-    def test_a_sub_model_timedelta_keeps_the_row_dict(self) -> None:
-        """README section 24: a sub-model ``timedelta`` cannot read the SDK's duration; the sync keeps the dict, as before."""
-        raw = {"td": surrealdb.Duration(5 * 10**9)}
-        with pytest.raises(ValidationError):
-            RfOddHolder.model_validate({"td_sub": raw})
+    @_ROW_PATHS
+    def test_a_sub_model_timedelta_follows_the_read(self, extra: dict[str, Any]) -> None:
+        """README section 24: a sub-model ``timedelta`` reads the SDK's duration, floored to the microsecond, and so does the sync."""
+        raw = {"td": surrealdb.Duration(5 * 10**9 + 1999)}
+        expected = RfTdSub(td=timedelta(seconds=5, microseconds=1))
+        assert RfOddHolder.model_validate({"td_sub": raw}).td_sub == expected
         odd = RfOddHolder()
-        odd._apply_record({"td_sub": raw})
-        assert odd.td_sub is raw
+        odd._apply_record({"td_sub": raw, **extra})
+        assert type(odd.td_sub) is RfTdSub and odd.td_sub == expected
+        assert type(odd.td_sub.td) is timedelta
+        assert type(raw["td"]) is surrealdb.Duration, "the row is not mutated"
+
+    # ``pause`` refuses ``"x"``: the row fails and each field is validated alone.
+    @pytest.mark.parametrize("extra", [{}, {"pauseCol": "x"}], ids=["whole-row", "field-alone"])
+    def test_a_timedelta_below_the_top_level_follows_the_read(self, extra: dict[str, Any]) -> None:
+        """``list[timedelta]``, ``dict[str, timedelta]``, ``timedelta | str`` and ``Range[timedelta]`` hold what a read gives."""
+        sdk = surrealdb.Duration(90 * 10**9 + 1)
+        row = {
+            "many": [sdk, surrealdb.Duration(1000)],
+            "by_key": {"a": sdk},
+            "either": sdk,
+            "window": surrealdb.Range(BoundIncluded(sdk), None),
+        }
+        read = RfKinds.model_validate(row)
+        kinds = RfKinds(id="k")
+        kinds._apply_record({**row, **extra})
+        for got in (read, kinds):
+            assert got.many == [timedelta(seconds=90), timedelta(microseconds=1)]
+            assert [type(td) for td in got.many] == [timedelta, timedelta]
+            assert type(got.by_key["a"]) is timedelta and got.by_key == {"a": timedelta(seconds=90)}
+            assert type(got.either) is timedelta and got.either == timedelta(seconds=90)
+            assert type(got.window) is Range and got.window == Range(BoundIncluded(timedelta(seconds=90)), None)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")  # the full write serialises timedeltas, not the SDK's dataclass
+            dumped = kinds.model_dump(include={"many", "by_key", "either"})
+        assert dumped == {"many": read.many, "by_key": read.by_key, "either": read.either}
 
     @_ROW_PATHS
     @pytest.mark.parametrize("key", ["ttl", "ttlCol"])
@@ -1530,6 +1582,249 @@ class TestSubModelWriteSyncE2E:
             assert rid is not None
             _assert_sub_models_native(await _raw(rid))
             _assert_sub_models(await RfHolder.objects().get(holder.get_raw_id()))
+
+    @pytest.mark.asyncio
+    async def test_the_issue_reproduction(self) -> None:
+        """#228's own reproduction: ``upsert()``, then ``update()``, then ``get()``."""
+        sub = RfIssueSub(ttl=Duration.parse("1h"), td=timedelta(minutes=5))
+        async with orm_client("rf_issue_holder"):
+            holder = RfIssueHolder(id="h", sub=sub, many=[Duration.parse("2m")])
+            await holder.upsert()
+            assert type(holder.sub) is RfIssueSub and holder.sub == sub, holder.sub
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")  # no PydanticSerializationUnexpectedValue
+                await holder.update()
+            row = await _raw(RecordID("rf_issue_holder", "h"))
+            assert type(row["sub"]["ttl"]) is surrealdb.Duration and type(row["sub"]["td"]) is surrealdb.Duration, row
+            got = await RfIssueHolder.objects().get("h")
+            assert got.sub == sub and got.many == [Duration.parse("2m")], got
+            assert (type(got.sub.ttl), type(got.sub.td)) == (Duration, timedelta)
+
+
+class RfIssueSub(BaseModel):
+    """The sub-model of #228's reproduction."""
+
+    ttl: Duration
+    td: timedelta
+
+
+class RfIssueHolder(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_issue_holder")
+
+    id: str | None = None
+    sub: RfIssueSub
+    many: list[Duration]
+
+
+# --- a ``timedelta`` below the top level reads the SDK's duration (#228) ---------------------------
+
+
+@dataclasses.dataclass
+class RfTdData:
+    td: timedelta
+
+
+class RfTdDict(TypedDict):
+    td: timedelta
+
+
+class RfTdAliasedSub(BaseModel):
+    # A write stores a sub-model under its field names: ``populate_by_name`` reads them back.
+    model_config = ConfigDict(populate_by_name=True)
+
+    td: timedelta = Field(alias="tdCol")
+
+
+class RfTdHolder(BaseSurrealModel):
+    """Every position below the top level where a ``timedelta`` reads the SDK's duration."""
+
+    model_config = SurrealConfigDict(table_name="rf_td_holder")
+
+    id: str | None = None
+    sub: RfTdSub | None = None
+    subs: list[RfTdSub] = []
+    data: RfTdData | None = None
+    typed: RfTdDict | None = None
+    aliased: RfTdAliasedSub | None = None
+    picked: RfPlainSub | RfTdSub | None = None  # a union of models: Pydantic tags the error with the member
+    tds: list[timedelta] = []
+    pair: tuple[timedelta, ...] = ()
+    by_key: dict[str, timedelta] = {}
+    either: timedelta | str | None = None  # a union: Pydantic tags the error with ``timedelta``
+    n: int = 0
+
+
+#: An SDK duration that is not a whole number of microseconds, and the ``timedelta`` it reads as (floored).
+_SDK_TD = surrealdb.Duration(5400 * 10**9 + 1999)
+_TD = timedelta(hours=1, minutes=30, microseconds=1)
+
+#: ``field: (value in the row, value read)`` for every position of ``RfTdHolder``.
+_TD_POSITIONS: dict[str, tuple[Any, Any]] = {
+    "sub": ({"td": _SDK_TD}, RfTdSub(td=_TD)),
+    "subs": (
+        [{"td": _SDK_TD}, {"td": surrealdb.Duration(1000)}],
+        [RfTdSub(td=_TD), RfTdSub(td=timedelta(microseconds=1))],
+    ),
+    "data": ({"td": _SDK_TD}, RfTdData(td=_TD)),
+    "typed": ({"td": _SDK_TD}, {"td": _TD}),
+    "aliased": ({"tdCol": _SDK_TD}, RfTdAliasedSub(tdCol=_TD)),
+    "picked": ({"td": _SDK_TD}, RfTdSub(td=_TD)),
+    "tds": ([_SDK_TD, surrealdb.Duration(1000)], [_TD, timedelta(microseconds=1)]),
+    "pair": ([_SDK_TD], (_TD,)),
+    "by_key": ({"a": _SDK_TD}, {"a": _TD}),
+    "either": (_SDK_TD, _TD),
+}
+
+
+def _assert_td_positions(holder: Any) -> None:
+    """Every ``RfTdHolder`` position holds its declared type with ``timedelta`` values, as ``_TD_POSITIONS`` says."""
+    assert isinstance(holder, RfTdHolder), holder
+    for field, (_, expected) in _TD_POSITIONS.items():
+        got = getattr(holder, field)
+        assert got == expected and type(got) is type(expected), (field, got)
+
+
+class TestNestedTimedeltaRead:
+    """#228 (unit): a ``timedelta`` below the top level reads the SDK's duration, floored to the microsecond."""
+
+    @pytest.mark.parametrize("field", list(_TD_POSITIONS))
+    def test_each_position(self, field: str) -> None:
+        raw, expected = _TD_POSITIONS[field]
+        got = getattr(RfTdHolder.model_validate({field: raw}), field)
+        assert got == expected and type(got) is type(expected), got
+
+    def test_every_position_at_once_without_touching_the_row(self) -> None:
+        row = {field: raw for field, (raw, _) in _TD_POSITIONS.items()}
+        before = copy.deepcopy(row)
+        _assert_td_positions(RfTdHolder.model_validate(row))
+        assert row == before and row["sub"]["td"] is _SDK_TD, "the caller's row is not mutated"
+
+    def test_every_way_to_build_the_model(self) -> None:
+        row = {"id": RecordID("rf_td_holder", "k"), "sub": {"td": _SDK_TD}, "tds": [_SDK_TD]}
+        for holder in (RfTdHolder.from_db(dict(row)), RfTdHolder(**row), RfTdHolder.model_validate(row)):
+            assert isinstance(holder, RfTdHolder) and holder.id == "k", holder
+            assert holder.sub == RfTdSub(td=_TD) and holder.tds == [_TD], holder
+
+    @pytest.mark.parametrize(
+        "value",
+        [surrealdb.Duration(-1), _SDK_BEYOND_TIMEDELTA, surrealdb.Duration(1.5), Duration(5), "x"],
+        ids=["negative", "beyond-timedelta-max", "float-elapsed", "orm-duration", "text"],
+    )
+    def test_a_value_the_rule_cannot_convert_is_refused_as_before(self, value: Any) -> None:
+        with pytest.raises(ValidationError) as caught:
+            RfTdHolder.model_validate({"sub": {"td": value}, "tds": [value]})
+        assert [(e["loc"], e["input"] is value) for e in caught.value.errors()] == [(("sub", "td"), True), (("tds", 0), True)]
+
+    def test_another_error_is_reported_alone(self) -> None:
+        """The durations convert and the row still fails: the error names what is really wrong."""
+        with pytest.raises(ValidationError) as caught:
+            RfTdHolder.model_validate({"sub": {"td": _SDK_TD}, "tds": [_SDK_TD], "n": "x"})
+        assert [e["loc"] for e in caught.value.errors()] == [("n",)]
+
+    def test_a_row_a_validator_rebuilt_is_refused_as_before(self) -> None:
+        """A ``mode="before"`` validator that rebuilds the row's sub-dicts hides the SDK's values: refused, never guessed."""
+
+        class RfRebuilt(RfTdHolder):
+            @model_validator(mode="before")
+            @classmethod
+            def _rebuild(cls, data: Any) -> Any:
+                return copy.deepcopy(data)
+
+        with pytest.raises(ValidationError):
+            RfRebuilt.model_validate({"sub": {"td": _SDK_TD}})
+        assert RfRebuilt.model_validate({"sub": {"td": _TD}}).sub == RfTdSub(td=_TD)
+
+    def test_a_shared_duration_converts_where_a_timedelta_is_declared_only(self) -> None:
+        """One SDK object at two positions: a ``Duration`` keeps its nanoseconds, the ``timedelta`` is floored."""
+
+        class RfBoth(BaseModel):
+            ttl: Duration
+            td: timedelta
+
+        class RfShared(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_shared")
+
+            id: str | None = None
+            both: RfBoth | None = None
+
+        shared = RfShared.model_validate({"both": {"ttl": _SDK_TD, "td": _SDK_TD}})
+        assert shared.both is not None and shared.both.ttl == Duration(_SDK_TD.elapsed) and shared.both.td == _TD
+
+    @pytest.mark.parametrize(
+        ("annotation", "expected"),
+        [
+            (list[timedelta], True),
+            (dict[str, timedelta], True),
+            (timedelta | str, True),
+            (Range[timedelta], True),
+            (Annotated[list[timedelta], Field(min_length=1)], True),
+            (TypeAliasType("RfTds", list[timedelta]), True),
+            (timedelta, True),  # a top-level one has its own rule: ``_sync_fields`` leaves it out by its read kind
+            (_SubTimedelta, False),
+            (list[_SubTimedelta], False),
+            (RfTdSub, False),  # a sub-model counts as a structured type instead
+            (Duration, False),
+            (list[int], False),
+        ],
+    )
+    def test_annotations_holding_a_timedelta(self, annotation: Any, expected: bool) -> None:
+        assert model_base._holds_timedelta(annotation) is expected
+
+    def test_the_path_must_end_on_the_refused_value(self) -> None:
+        value = surrealdb.Duration(5)
+        assert model_base._path_to({"f": [value]}, ("f", 0), value) == ["f", 0]
+        assert model_base._path_to({"f": {"td": value}}, ("f", "RfTdSub", "td"), value) == ["f", "td"]
+        assert model_base._path_to({"f": value}, ("f", "timedelta"), value) == ["f"]
+        assert model_base._path_to((value,), (0,), value) == [0]
+        # A union tag that happens to be a key leads elsewhere; an index out of range; a scalar on the way.
+        assert model_base._path_to({"f": {"RfTdSub": {"td": 1}, "td": value}}, ("f", "RfTdSub", "td"), value) is None
+        assert model_base._path_to({"f": [value]}, ("f", 1), value) is None
+        assert model_base._path_to({"f": 3}, ("f", 0), value) is None
+
+    def test_the_conversion_never_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def boom(*args: Any) -> Any:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(model_base, "_path_to", boom)
+        with pytest.raises(ValidationError):
+            RfTdHolder.model_validate({"sub": {"td": _SDK_TD}})
+
+    def test_assignment_validation_is_unchanged(self) -> None:
+        class RfAssigned(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_assigned", validate_assignment=True)
+
+            id: str | None = None
+            sub: RfTdSub | None = None
+
+        assigned = RfAssigned(sub={"td": _SDK_TD})  # type: ignore[arg-type]
+        assert assigned.sub == RfTdSub(td=_TD)
+        assigned.sub = RfTdSub(td=timedelta(seconds=1))
+        assert assigned.sub == RfTdSub(td=timedelta(seconds=1))
+
+
+class TestNestedTimedeltaReadE2E:
+    """#228: a ``timedelta`` below the top level reads the duration the server stores, and a write keeps it native."""
+
+    @pytest.mark.asyncio
+    async def test_read_then_write_back(self) -> None:
+        rid = RecordID("rf_td_holder", "k")
+        async with orm_client("rf_td_holder") as client:
+            # ``encoding.encode``: the SDK's own encoder sends its ``Duration`` in a form the server refuses.
+            row = encoding.encode({field: raw for field, (raw, _) in _TD_POSITIONS.items()})
+            await client.query("CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": row})
+            got = await RfTdHolder.objects().get("k")
+            [listed] = await RfTdHolder.objects().all()
+            for holder in (got, listed):
+                _assert_td_positions(holder)
+            await got.merge(n=1)  # a write sync: every position keeps what a read gives
+            _assert_td_positions(got)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")
+                await got.update()
+            stored = await _raw(rid)
+            assert type(stored["sub"]["td"]) is surrealdb.Duration and type(stored["tds"][0]) is surrealdb.Duration
+            assert type(stored["by_key"]["a"]) is surrealdb.Duration and type(stored["either"]) is surrealdb.Duration
+            _assert_td_positions(await RfTdHolder.objects().get("k"))
 
 
 # --- a write sync runs the model's own validators, as a read does (#228) --------------------------
