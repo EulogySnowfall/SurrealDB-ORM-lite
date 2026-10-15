@@ -2891,7 +2891,8 @@ async with embedded_database() as client:
   name its records (and an edge its endpoints). It also **cleans up** when a save fails or is
   cancelled mid-load: the instances already saved are deleted before the error propagates.
 - **`@fixture` raises `TypeError`** on a class that is not a `SurrealFixture` subclass (the full
-  ORM accepts any class).
+  ORM accepts any class), and `load()` raises `ValueError` on an undecorated subclass of a
+  fixture that declares instances of its own (the full ORM loads only the parent's).
 - **`load()` is typed** to yield the fixture class, so `fixtures.alice` has its model's type
   (the full ORM yields `Any`).
 - **Lite additions**: `SurrealDBConnectionManager.is_embedded()` and `embedded_database()`.

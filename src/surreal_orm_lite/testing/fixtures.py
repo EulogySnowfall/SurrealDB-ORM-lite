@@ -39,6 +39,8 @@ def fixture(cls: _F) -> _F:
 
     Only the class's own attributes are collected (as in the full ORM, inherited instances are not); every
     other attribute is ignored. The instances are templates: :meth:`SurrealFixture.load` saves copies of them.
+    A subclass that declares instances of its own needs the decorator too; one that declares none loads its
+    decorated parent's.
 
     ::
 
@@ -101,9 +103,18 @@ class SurrealFixture:
         failing ``save()`` or a cancellation deletes the copies already saved before the exception
         propagates (the full ORM leaves them in the database).
 
-        :raises ValueError: if the class declares no instance, or was not decorated with ``@fixture``.
+        :raises ValueError: if the class declares no instance, or was not decorated with ``@fixture`` — including
+            a subclass of a decorated fixture that declares instances of its own (only its parent's would load).
         """
         instances: dict[str, BaseSurrealModel] | None = getattr(cls, "_fixture_instances", None)
+        own = vars(cls)
+        if instances and "_fixture_instances" not in own and any(isinstance(value, BaseSurrealModel) for value in own.values()):
+            # An undecorated subclass of a decorated fixture: it would load the inherited instances and silently
+            # drop its own.
+            raise ValueError(
+                f"{cls.__name__} declares fixture instances but is not decorated with @fixture: only its parent's "
+                f"would load. Did you forget the @fixture decorator?"
+            )
         if not instances:
             raise ValueError(f"{cls.__name__} has no fixture instances. Did you forget the @fixture decorator?")
 

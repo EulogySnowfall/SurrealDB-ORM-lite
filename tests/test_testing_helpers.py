@@ -586,6 +586,24 @@ class TestFixtureDecorator:
             async with Undecorated.load():
                 raise AssertionError("the body never runs")
 
+    async def test_an_undecorated_subclass_declaring_instances_is_refused(self) -> None:
+        """It would inherit its decorated parent's instances and silently drop its own."""
+
+        @fixture
+        class Parent(SurrealFixture):
+            alice = Member(name="Alice")
+
+        class Child(Parent):
+            bob = Member(name="Bob")
+
+        with pytest.raises(
+            ValueError,
+            match=r"Child declares fixture instances but is not decorated with @fixture: only its parent's would "
+            r"load\. Did you forget the @fixture decorator\?",
+        ):
+            async with Child.load():
+                raise AssertionError("the body never runs")
+
     async def test_load_of_a_fixture_without_instances_is_refused(self) -> None:
         @fixture
         class Empty(SurrealFixture):
@@ -621,6 +639,19 @@ class TestSurrealFixtureE2E:
             assert await _counts() == (0, 0)
         # The templates are untouched.
         assert (Team.alice.id, Team.bob.id, Team.carol.id, Team.follows.id) == ("alice", "bob", None, None)
+
+    async def test_an_undecorated_subclass_without_instances_loads_its_parents(self) -> None:
+        """As in the full ORM: a subclass that declares no instance of its own reuses its decorated parent's."""
+
+        class Reused(ServerTeam):
+            note = "x"
+
+        async with _unset_after(), embedded_database():
+            async with Reused.load() as team:
+                assert isinstance(team, Reused)
+                assert team.alice.get_raw_id() == "alice"
+                assert await Member.objects().count() == 3
+            assert await Member.objects().count() == 0
 
     async def test_saved_in_declaration_order_and_deleted_in_reverse(self, monkeypatch: pytest.MonkeyPatch) -> None:
         events = _record_writes(monkeypatch)

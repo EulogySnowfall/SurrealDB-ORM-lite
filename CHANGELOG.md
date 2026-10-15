@@ -74,8 +74,9 @@ third minor of Tier 2.
     copy of each declared instance in declaration order, yields them typed as the fixture class,
     and deletes them on exit. It works on any connection, a server or the engine. Unlike the full
     ORM, an explicit `id` is kept, a save that fails or is cancelled mid-load deletes the copies
-    already saved, and `@fixture` raises `TypeError` on a class that is not a `SurrealFixture`
-    subclass.
+    already saved, `@fixture` raises `TypeError` on a class that is not a `SurrealFixture`
+    subclass, and `load()` raises `ValueError` on an undecorated subclass of a fixture that
+    declares instances of its own (the full ORM loads only the parent's).
 
   ```python
   from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
