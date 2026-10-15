@@ -745,6 +745,23 @@ def _from_sdk(value: Any, *, checked: bool) -> Any:
         return value
 
 
+def _geometry_from_sdk(value: Any) -> Any:
+    """The read rule of a top-level geometry field (spec §6.6): an SDK geometry → the ORM value.
+
+    Used by ``BaseSurrealModel._apply_record``, which copies a returned row onto the instance
+    without validation. Only an instance of exactly one of the seven SDK classes is converted,
+    through the public constructors (checked); a value they refuse, a subclass and any other type
+    are returned as they are. Pure and never raising, so a write that syncs the instance never
+    fails here.
+    """
+    if type(value) not in _SDK_GEOMETRIES:
+        return value
+    try:
+        return _from_sdk(value, checked=True)
+    except Exception:
+        return value
+
+
 # --- SurrealQL text --------------------------------------------------------------------------------
 
 #: GeoJSON type → the GeoJSON type of its members (the kinds whose members are coordinate arrays).

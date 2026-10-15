@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic_core import ValidationError
 
 from . import encoding as _encoding
+from . import geo as _geo
 from ._sdk import NotFoundError, RecordID, SdkDuration, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
@@ -100,12 +101,20 @@ def _check_table_name(cls: type, key: str, name: Any) -> None:
 
 
 def _read_kind(annotation: Any) -> str | None:
-    """Return the read kind of a field annotation: ``"timedelta"``, ``"duration"`` or ``None`` (v0.23.0).
+    """Return the read kind of a field annotation: ``"timedelta"``, ``"duration"``, ``"geometry"`` or ``None``.
 
-    Unwraps ``Annotated``, then a union of exactly one non-``None`` member with ``None``, then
-    ``Annotated`` again. Only exactly ``timedelta`` or exactly the ORM's ``Duration`` has a kind:
-    ``timedelta | str``, ``list[timedelta]``, a ``timedelta`` subclass or ``Range[timedelta]`` has none.
+    A geometry field (v0.24.0) — ``GeoField[...]``, an alias such as ``PointField``, an ORM
+    geometry class or a union of them, with or without ``None`` — is ``"geometry"``. It is checked
+    first, so ``GeoField["point|polygon"]`` has a kind too; ``list[GeometryPoint]``,
+    ``GeometryPoint | str`` and the SDK's classes have none.
+
+    Otherwise (v0.23.0) unwraps ``Annotated``, then a union of exactly one non-``None`` member with
+    ``None``, then ``Annotated`` again. Only exactly ``timedelta`` or exactly the ORM's ``Duration``
+    has a kind: ``timedelta | str``, ``list[timedelta]``, a ``timedelta`` subclass or
+    ``Range[timedelta]`` has none.
     """
+    if _geo._geo_kinds(annotation) is not None:
+        return "geometry"
     if typing.get_origin(annotation) is typing.Annotated:
         annotation = typing.get_args(annotation)[0]
     if typing.get_origin(annotation) in (typing.Union, UnionType):
@@ -389,15 +398,16 @@ class BaseSurrealModel(BaseModel):
 
     @classmethod
     def _read_kinds(cls) -> dict[str, str]:
-        """Return the read kind of each top-level ``timedelta``/``Duration`` field, cached per class (v0.23.0).
+        """Return the read kind of each top-level ``timedelta``/``Duration``/geometry field, cached per class.
 
-        ``{"ttl": "timedelta", "grace": "duration"}``, keyed by the Python field name **and** by
-        its column when the field is aliased: :meth:`set_data` receives rows keyed by column and
-        calls keyed by name. The columns are those of :meth:`_alias_maps`, read without its
-        ambiguity check so that a read never raises here. Only a field annotated exactly
-        ``timedelta`` or ``Duration`` (through ``Annotated`` and ``X | None``) has a kind; a model
-        without one gets ``{}``, and both read rules are then no-ops. Cached once Pydantic has
-        completed the class, like the alias maps; never mutate the returned dict.
+        ``{"ttl": "timedelta", "grace": "duration", "location": "geometry"}``, keyed by the Python
+        field name **and** by its column when the field is aliased: :meth:`set_data` receives rows
+        keyed by column and calls keyed by name. The columns are those of :meth:`_alias_maps`, read
+        without its ambiguity check so that a read never raises here. Only a field annotated exactly
+        ``timedelta`` or ``Duration`` (through ``Annotated`` and ``X | None``, v0.23.0) or a geometry
+        field (v0.24.0, see ``_read_kind``) has a kind; a model without one gets ``{}``, and the read
+        rules are then no-ops. Cached once Pydantic has completed the class, like the alias maps;
+        never mutate the returned dict.
         """
         cached = _READ_KINDS.get(cls)
         if cached is not None:
@@ -1163,7 +1173,11 @@ class BaseSurrealModel(BaseModel):
         vocabulary the callers use, since they pass things like ``get_server_fields()``.
 
         Top-level ``timedelta`` and ``Duration`` fields get the SDK's ``Duration`` converted
-        (v0.23.0); every other value is applied as received.
+        (v0.23.0), and top-level geometry fields the SDK's geometries, as the ORM's geometry
+        classes (v0.24.0; a value the constructors refuse is kept as received). Every other value
+        is applied as received: a typed container such as ``list[GeometryPoint]`` keeps the SDK's
+        values, which its serializer converts at the next ``model_dump()``, and a sub-model keeps
+        the row's dict.
 
         Args:
             only: restrict the copy to these field names. ``None`` (default) applies every field
@@ -1184,6 +1198,8 @@ class BaseSurrealModel(BaseModel):
                 value = _timedelta_from_sdk(value)
             elif kind == "duration":
                 value = _duration_from_sdk(value)
+            elif kind == "geometry":
+                value = _geo._geometry_from_sdk(value)
             if hasattr(self, key):
                 object.__setattr__(self, key, value)
 
