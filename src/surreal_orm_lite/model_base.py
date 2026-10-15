@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import dataclasses
 import functools
 import logging
@@ -70,6 +71,11 @@ _READ_KINDS: dict[type, dict[str, str]] = {}
 # the adapters built from them on first use, ``None`` for one that cannot be built (``_sync_adapter``).
 _SYNC_FIELDS: dict[type, dict[str, Any]] = {}
 _SYNC_ADAPTERS: dict[type, dict[str, TypeAdapter[Any] | None]] = {}
+# The fields the model's own validators may reshape (``BaseSurrealModel._sync_reshaped``), where a
+# field validated alone would differ from a read (#228).
+_SYNC_RESHAPED: dict[type, frozenset[str]] = {}
+# ``_sync_reshaped()`` of a model whose own validators may reshape every field.
+_ALL_FIELDS: frozenset[str] = frozenset({"*"})
 
 # ``tuple`` and ``Annotated`` subscripted with annotations known at run time (mypy takes them for types).
 _TUPLE: Any = tuple
@@ -168,6 +174,18 @@ def _has_structured_type(annotation: Any, _aliases: frozenset[int] = frozenset()
     if issubclass(annotation, BaseModel) or dataclasses.is_dataclass(annotation):
         return True
     return issubclass(annotation, dict) and hasattr(annotation, "__required_keys__")
+
+
+def _is_library_callable(func: Any) -> bool:
+    """Whether a validator or ``model_post_init`` comes from the ORM or Pydantic rather than the user's code.
+
+    Read from the module of the function (a ``classmethod`` validator is bound: its ``__func__``).
+    Pydantic's wrapper of a user ``model_post_init`` copies the user's module (``functools.wraps``),
+    so it counts as the user's. A callable without a module counts as the user's too. Used by
+    :meth:`BaseSurrealModel._sync_reshaped` (#228).
+    """
+    module = getattr(getattr(func, "__func__", func), "__module__", None)
+    return isinstance(module, str) and module.partition(".")[0] in ("surreal_orm_lite", "pydantic")
 
 
 def _own_annotation_names(cls: type) -> set[str]:
@@ -523,14 +541,66 @@ class BaseSurrealModel(BaseModel):
         return adapter
 
     @classmethod
-    def _validated_on_sync(cls, name: str, value: Any) -> Any:
-        """Return ``value`` validated against field ``name`` as a read validates it, else ``value`` itself (#228).
+    def _sync_reshaped(cls) -> frozenset[str]:
+        """Return the fields the model's own validators may reshape, cached per class (#228).
 
-        A sub-model's ``dict`` becomes the declared instance, with the ORM's durations, ranges and
-        geometries; a stored GeoJSON object in a geometry field becomes the ORM's geometry. A value
-        that does not validate, a validator that raises anything else and a field without an
-        adapter (see :meth:`_sync_adapter`) all give ``value`` back unchanged: never raises.
+        A field validated alone (:meth:`_validated_on_sync`) misses the validators and hooks of the
+        model that holds it, which a read runs: a ``field_validator`` (or a v1 ``validator``) aimed
+        at the field, and a ``model_validator`` (any mode), a v1 ``root_validator`` or a
+        ``model_post_init``, which may reshape any field. The result names the fields of the first
+        kind, or is ``_ALL_FIELDS`` when one of the second kind, or a ``field_validator("*")``,
+        exists. The ORM's and Pydantic's own (``set_data``, ``check_config``, the ``in_``/``out``
+        validators of an edge…) do not count (``_is_library_callable``). Read from
+        ``__pydantic_decorators__``; anything unexpected there gives ``_ALL_FIELDS``, the safe
+        answer. Cached once Pydantic has completed the class, like :meth:`_sync_fields`.
         """
+        cached = _SYNC_RESHAPED.get(cls)
+        if cached is not None:
+            return cached
+        reshaped = _ALL_FIELDS
+        try:
+            decorators = cls.__pydantic_decorators__
+            whole: list[Any] = [*decorators.model_validators.values(), *decorators.root_validators.values()]
+            per_field: list[Any] = [*decorators.field_validators.values(), *decorators.validators.values()]
+            if all(_is_library_callable(d.func) for d in whole) and _is_library_callable(cls.model_post_init):
+                names = {field for d in per_field if not _is_library_callable(d.func) for field in d.info.fields}
+                reshaped = _ALL_FIELDS if "*" in names else frozenset(names)
+        except Exception:
+            reshaped = _ALL_FIELDS
+        if cls.__pydantic_complete__:
+            _SYNC_RESHAPED[cls] = reshaped
+        return reshaped
+
+    @classmethod
+    def _validated_row(cls, record: Mapping[str, Any]) -> Self | None:
+        """Return the row validated as a read validates it, or ``None`` when it does not validate (#228).
+
+        ``model_validate`` of the row, as :meth:`from_db` does: the model's own validators run,
+        ``set_data`` and ``model_post_init`` included. It validates a deep copy, since ``set_data``
+        rewrites the ``id`` in place and a ``mode="before"`` validator may rewrite nested dicts in
+        place: the row stays as received. Any exception (a value that does not validate, a
+        validator that raises anything else, a model Pydantic cannot complete) gives ``None``.
+        """
+        try:
+            return cls.model_validate(copy.deepcopy(dict(record)))
+        except Exception:
+            return None
+
+    @classmethod
+    def _validated_on_sync(cls, name: str, value: Any) -> Any:
+        """Return ``value`` validated against field ``name`` alone, else ``value`` itself (#228).
+
+        The fallback of :meth:`_apply_record` when the whole row does not validate
+        (:meth:`_validated_row`). A sub-model's ``dict`` becomes the declared instance, with the
+        ORM's durations, ranges and geometries; a stored GeoJSON object in a geometry field becomes
+        the ORM's geometry. That is what a read gives unless the model's own validators reshape the
+        field, which a field validated alone cannot run: a field in :meth:`_sync_reshaped` gives
+        ``value`` back unchanged. So do a value that does not validate, a validator that raises
+        anything else and a field without an adapter (see :meth:`_sync_adapter`): never raises.
+        """
+        reshaped = cls._sync_reshaped()
+        if reshaped is _ALL_FIELDS or name in reshaped:
+            return value
         adapter = cls._sync_adapter(name)
         if adapter is None:
             return value
@@ -1277,10 +1347,10 @@ class BaseSurrealModel(BaseModel):
         ``None``/empty result is a no-op — callers that must distinguish "no row" from "nothing
         to apply" check first.
 
-        Values are written with ``object.__setattr__``, i.e. without validating the instance as a
-        whole: no model validator runs and a frozen field is still updated. That is why ``only``
-        exists: a caller that needs just a few known fields should say so rather than re-applying
-        the whole row.
+        Values are written with ``object.__setattr__``, i.e. without validating the instance
+        itself: a frozen field is still updated, and only the fields described below go through
+        validation. That is why ``only`` exists: a caller that needs just a few known fields
+        should say so rather than re-applying the whole row.
 
         A row arrives keyed by **column**, so each key is translated back to its Python field
         name first (v0.18.0). ``only`` is therefore matched on Python names — the same
@@ -1290,13 +1360,17 @@ class BaseSurrealModel(BaseModel):
         (v0.23.0), and top-level geometry fields the SDK's geometries, as the ORM's geometry
         classes (v0.24.0). A field that holds a sub-model (a ``BaseModel``, a dataclass or a
         ``TypedDict``, at any depth of its annotation) and a geometry field holding anything other
-        than an SDK geometry (a stored GeoJSON object…) are validated against the field's own
-        annotation, as a read validates them (#228, see :meth:`_validated_on_sync`): a sub-model
-        field holds its declared instance, with the ORM's durations, ranges and geometries. A
-        value that does not validate is applied as received, so this never raises. Every other
-        value is applied as received: a typed container of scalars such as ``list[Duration]`` or
-        ``list[GeometryPoint]`` keeps the SDK's values, which its serializer converts at the next
-        ``model_dump()``, and top-level ``date``, ``set`` and ``Range`` fields hold the SDK's value.
+        than an SDK geometry (a stored GeoJSON object…) get the value a read gives (#228): when the
+        row holds such a field, the whole row is validated as :meth:`from_db` validates it, the
+        model's own validators included (:meth:`_validated_row`), and those fields take their
+        validated value. A sub-model field then holds its declared instance, with the ORM's
+        durations, ranges and geometries. When the row does not validate, each such field is
+        validated alone (:meth:`_validated_on_sync`), unless the model's own validators may
+        reshape it, and a value that still does not validate is applied as received, so this
+        never raises. Every other value is applied as received: a typed container of scalars such
+        as ``list[Duration]`` or ``list[GeometryPoint]`` keeps the SDK's values, which its
+        serializer converts at the next ``model_dump()``, and top-level ``date``, ``set`` and
+        ``Range`` fields hold the SDK's value.
 
         Args:
             only: restrict the copy to these field names. ``None`` (default) applies every field
@@ -1309,6 +1383,8 @@ class BaseSurrealModel(BaseModel):
         allowed = None if only is None else set(only)
         kinds = self._read_kinds()
         validated = self._sync_fields()
+        values: dict[str, Any] = {}
+        pending: list[str] = []
         for column, value in record.items():
             key = self.to_py_field(column)
             if (allowed is not None and key not in allowed) or not hasattr(self, key):
@@ -1321,7 +1397,13 @@ class BaseSurrealModel(BaseModel):
             elif kind == "geometry":
                 value = _geo._geometry_from_sdk(value)
             if key in validated and not (kind == "geometry" and (value is None or isinstance(value, _geo.Geometry))):
-                value = self._validated_on_sync(key, value)
+                pending.append(key)
+            values[key] = value
+        if pending:
+            row = self._validated_row(record)
+            for key in pending:
+                values[key] = getattr(row, key) if row is not None else self._validated_on_sync(key, values[key])
+        for key, value in values.items():
             object.__setattr__(self, key, value)
 
     def _sync_after_merge(
