@@ -81,8 +81,11 @@ _ALL_FIELDS: frozenset[str] = frozenset({"*"})
 _LEAF = object()
 # Whether validating a model may run code of the user's on its input (``BaseSurrealModel._runs_input_code``, #228).
 _INPUT_CODE: dict[type, bool] = {}
-# The core schema types of a function that receives the input itself (``_schema_runs_input_code``).
-_INPUT_FUNCTIONS = frozenset({"function-before", "function-wrap", "function-plain"})
+# Whether validating a model may refuse the SDK's ``Duration`` where ``set_data`` does not convert it
+# (``BaseSurrealModel._may_refuse_sdk_durations``, #228).
+_MAY_REFUSE_DURATIONS: dict[type, bool] = {}
+# The core schema types of a validator function, which may receive the input itself (``_schema_runs_input_code``).
+_INPUT_FUNCTIONS = frozenset({"function-before", "function-after", "function-wrap", "function-plain"})
 
 # ``tuple`` and ``Annotated`` subscripted with annotations known at run time (mypy takes them for types).
 _TUPLE: Any = tuple
@@ -326,13 +329,17 @@ def _validated_with_sdk_timedeltas(validate: Callable[[Any], _V], data: Any, iso
     The second run never starts from input the first one may have changed. ``isolate`` says that
     ``validate`` may run code of the user's on its input (:func:`_schema_runs_input_code`), which
     may change ``data`` in place: a ``mode="before"`` validator that reads stored cents as a price,
-    or inserts into its list, would then be applied twice. The first run then validates a deep copy
-    of ``data``, and the second starts again from ``data``, untouched, converting there only the
-    SDK ``Duration`` whose copy the first run refused (:func:`_path_to`), so that code is applied
-    once to the result. A value that code moved is not found, and stays refused. Nothing is copied
-    when ``data`` holds no SDK ``Duration`` (:func:`_holds_sdk_duration`), since there is nothing
-    to convert; when ``data`` cannot be copied, there is no second run, and the error of the first
-    is raised, as without the conversion.
+    or an ``after`` validator or ``model_post_init`` that appends to a list Pydantic passed through
+    (``Any``), would then be applied twice. The first run then validates a deep copy of ``data``,
+    and the second starts again from ``data``, untouched, converting there only the SDK
+    ``Duration`` whose copy the first run refused (:func:`_path_to`), so that code is applied once
+    to the result. A value that code moved is not found, and stays refused. Nothing is copied when
+    ``data`` holds no SDK ``Duration`` (:func:`_holds_sdk_duration`), since there is nothing to
+    convert; when ``data`` cannot be copied, there is no second run, and the error of the first is
+    raised, as without the conversion. The accepted residual: on a model with such a ``timedelta``
+    and with code of the user's, a first run that succeeds builds the instance from the copy, so
+    objects the caller passed are held as copies when the input also holds the SDK's own
+    ``Duration`` (reads are unaffected, since the row is the SDK's).
     """
     copies: dict[int, Any] | None = None
     first = data
@@ -376,15 +383,21 @@ def _holds_sdk_duration(data: Any) -> bool:
 def _schema_runs_input_code(schema: Any) -> bool:
     """Whether a Pydantic core schema may run code of the user's on its input, at any depth (#228).
 
-    A ``mode="before"``, ``"wrap"`` or ``"plain"`` function receives the input itself: a model or
-    field validator, a ``BeforeValidator`` in ``Annotated``, a custom type's validator… So does a
-    model with its own ``__init__``. Such code may change a ``dict`` or ``list`` of the input in
+    Every hook that runs code of the user's during validation counts, because a value Pydantic
+    passes through (``Any``, ``object``, an arbitrary class) is the input object itself, so even
+    code that runs after its field validated receives it. That is a validator function of any mode
+    (``before``, ``after``, ``wrap``, ``plain``: a model or field validator, a ``BeforeValidator``
+    or ``AfterValidator`` in ``Annotated``, a custom type's validator…), a model with its own
+    ``__init__`` or ``model_post_init``, a dataclass with a ``__post_init__``, a callable
+    ``Discriminator`` and a ``default_factory`` that takes the validated data (see
+    :func:`_node_runs_input_code`). Such code may change a ``dict`` or ``list`` of the input in
     place, which a second validation of that input would apply twice (see
     :func:`_validated_with_sdk_timedeltas`). Every node of the schema is walked, nested models and
-    definitions included. ``after`` validators receive the validated value, and serializers
-    (a ``serialization`` schema, skipped) never see the input, so neither counts; nor do the ORM's
-    and Pydantic's own functions (:func:`_is_library_callable`). Anything unexpected, a schema
-    that is not a ``dict`` included, gives ``True``, the safe answer. Never raises.
+    definitions included, except serializers (a ``serialization`` schema), which never see the
+    input. The ORM's and Pydantic's own functions do not count (:func:`_is_library_callable`):
+    Pydantic's ``model_post_init`` of a model with private attributes, for one. Anything
+    unexpected, a schema that is not a ``dict`` included, gives ``True``, the safe answer. Never
+    raises.
     """
     if not isinstance(schema, dict):
         return True
@@ -399,17 +412,112 @@ def _schema_runs_input_code(schema: Any) -> bool:
             if not isinstance(node, dict):
                 stack.extend(node)
                 continue
-            kind = node.get("type")
-            if kind in _INPUT_FUNCTIONS:
-                function = node.get("function")
-                if not isinstance(function, dict) or not _is_library_callable(function.get("function")):
-                    return True
-            elif kind == "model" and node.get("custom_init"):
+            if _node_runs_input_code(node):
                 return True
             stack.extend(value for key, value in node.items() if key != "serialization")
         return False
     except Exception:
         return True
+
+
+def _node_runs_input_code(node: dict[str, Any]) -> bool:
+    """Whether one node of a core schema runs code of the user's during validation (see :func:`_schema_runs_input_code`).
+
+    A validator function (``function-before``, ``-after``, ``-wrap`` or ``-plain``) that is not
+    library code; a ``model`` with its own ``__init__`` (``custom_init``) or whose ``post_init``
+    hook is not library code; a ``dataclass`` whose ``__post_init__`` is not library code; a
+    ``tagged-union`` whose discriminator is a callable that is not library code; a ``default`` whose
+    ``default_factory`` takes the validated data and is not library code. May raise on an
+    unexpected node, which the caller counts as ``True``.
+    """
+    kind = node.get("type")
+    if kind in _INPUT_FUNCTIONS:
+        function = node.get("function")
+        return not isinstance(function, dict) or not _is_library_callable(function.get("function"))
+    if kind == "model":
+        post_init = node.get("post_init")
+        return bool(node.get("custom_init")) or (
+            post_init is not None and not _is_library_callable(getattr(node["cls"], post_init))
+        )
+    if kind == "dataclass":
+        return bool(node.get("post_init")) and not _is_library_callable(node["cls"].__post_init__)
+    if kind == "tagged-union":
+        discriminator = node.get("discriminator")
+        return callable(discriminator) and not _is_library_callable(discriminator)
+    if kind == "default":
+        return bool(node.get("default_factory_takes_data")) and not _is_library_callable(node.get("default_factory"))
+    return False
+
+
+def _schema_refuses_sdk_durations(schema: Any, cls: type, top_level: Collection[str]) -> bool:
+    """Whether validating ``cls`` may refuse the SDK's ``Duration`` where ``set_data`` does not convert it (#228).
+
+    ``schema`` is the core schema of ``cls`` and ``top_level`` the names of its fields that
+    :meth:`BaseSurrealModel.set_data` converts (read kind ``timedelta``). Pydantic refuses the SDK's
+    ``Duration`` at a ``timedelta`` node, so the answer is whether the schema holds one anywhere
+    except as the direct schema of such a field of ``cls`` (in its own ``model-fields``), reached
+    from the field only through ``default`` and ``nullable`` wrappers: ``ttl: timedelta | None`` does
+    not count, ``timedelta | str``, ``list[timedelta]``, ``Annotated[timedelta, AfterValidator(…)]``
+    and a ``timedelta`` in a sub-model, a dataclass or a ``TypedDict`` do. The ORM's ``Duration``
+    and ``Range`` hold no ``timedelta`` node. Every node is walked, nested models and definitions
+    included, except serializers (a ``serialization`` schema), which never validate. Anything
+    unexpected, a schema that is not a ``dict`` included, gives ``True``, the safe answer. Never
+    raises.
+    """
+    if not isinstance(schema, dict):
+        return True
+    try:
+        allowed: set[int] = set()
+        stack: list[Any] = [schema]
+        seen: set[int] = set()
+        while stack:
+            node = stack.pop()
+            if not isinstance(node, dict | list | tuple):
+                continue
+            if isinstance(node, dict) and node.get("type") == "timedelta":
+                if id(node) not in allowed:
+                    return True
+                allowed.discard(id(node))  # one field holds it: met again elsewhere, it counts
+                continue
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            if not isinstance(node, dict):
+                stack.extend(node)
+                continue
+            if node.get("type") == "model" and node.get("cls") is cls:
+                allowed |= _top_level_timedelta_nodes(node, top_level)
+            stack.extend(value for key, value in node.items() if key != "serialization")
+        return False
+    except Exception:
+        return True
+
+
+def _top_level_timedelta_nodes(model: Mapping[str, Any], top_level: Collection[str]) -> set[int]:
+    """The ``id`` of each ``timedelta`` node that is the direct schema of a field in ``top_level`` (#228).
+
+    ``model`` is the ``model`` node of the class. Its ``model-fields`` sit below the class's own
+    ``mode="before"`` validators (``set_data`` among them) and v1 root validators; each field's
+    schema is followed through ``default`` and ``nullable`` wrappers only. A field whose schema
+    leads anywhere else gives nothing, so its ``timedelta`` node counts
+    (:func:`_schema_refuses_sdk_durations`). May raise on an unexpected node, which the caller
+    counts as ``True``.
+    """
+    fields = model["schema"]
+    while fields.get("type") in ("function-before", "function-after"):
+        fields = fields["schema"]
+    if fields.get("type") != "model-fields":
+        return set()
+    found: set[int] = set()
+    for name, field in fields["fields"].items():
+        if name not in top_level:
+            continue
+        node = field["schema"]
+        while node.get("type") in ("default", "nullable"):
+            node = node["schema"]
+        if node.get("type") == "timedelta":
+            found.add(id(node))
+    return found
 
 
 def _is_library_callable(func: Any) -> bool:
@@ -819,9 +927,11 @@ class BaseSurrealModel(BaseModel):
     def _runs_input_code(cls) -> bool:
         """Whether validating this model may run code of the user's on its input, cached per class (#228).
 
-        :func:`_schema_runs_input_code` of the model's core schema, which holds the validators of its
-        sub-models and of its fields' types too. Such code may change the input in place, so the
-        conversion of the SDK's durations below the top level validates a copy first
+        :func:`_schema_runs_input_code` of the model's core schema, which holds the validators and
+        hooks of its sub-models and of its fields' types too. Every hook that runs code of the user's
+        counts, whatever its mode: a pass-through field (``Any``…) hands the input object itself to
+        an ``after`` validator or a ``model_post_init``. Such code may change the input in place, so
+        the conversion of the SDK's durations below the top level validates a copy first
         (:meth:`_read_nested_timedeltas`). ``True`` while Pydantic has not completed the class (its
         schema is not built yet), and cached only once it has, like :meth:`_sync_fields`.
         """
@@ -833,6 +943,28 @@ class BaseSurrealModel(BaseModel):
         runs = _schema_runs_input_code(cls.__pydantic_core_schema__)
         _INPUT_CODE[cls] = runs
         return runs
+
+    @classmethod
+    def _may_refuse_sdk_durations(cls) -> bool:
+        """Whether validating this model may refuse an SDK ``Duration`` that :meth:`set_data` does not convert, cached per class (#228).
+
+        :func:`_schema_refuses_sdk_durations` of the model's core schema: ``True`` when it holds a
+        ``timedelta`` anywhere but as a top-level field ``set_data`` converts, for instance in a
+        sub-model, a dataclass, a ``TypedDict``, ``list[timedelta]`` or ``timedelta | str``. Only
+        such a model takes the retry of :meth:`_read_nested_timedeltas`; every other one validates
+        as before #228, without a copy. ``True`` while Pydantic has not completed the class, and
+        cached only once it has, like :meth:`_runs_input_code`.
+        """
+        cached = _MAY_REFUSE_DURATIONS.get(cls)
+        if cached is not None:
+            return cached
+        if not cls.__pydantic_complete__:
+            return True
+        kinds = cls._read_kinds()
+        top_level = frozenset(name for name in cls.model_fields if kinds.get(name) == "timedelta")
+        refuses = _schema_refuses_sdk_durations(cls.__pydantic_core_schema__, cls, top_level)
+        _MAY_REFUSE_DURATIONS[cls] = refuses
+        return refuses
 
     @classmethod
     def _validated_row(cls, record: Mapping[str, Any]) -> Self | None:
@@ -1148,11 +1280,18 @@ class BaseSurrealModel(BaseModel):
         microsecond (see ``_validated_with_sdk_timedeltas``), on a copy: the conversion never
         mutates the caller's data. A value the top-level rule would leave alone stays refused, and
         a model without such a value fails as before. A ``wrap`` validator runs outside every
-        ``mode="before"`` one, the model's own included, so they run again on the second try. When
-        the model may run code of the user's on its input (:meth:`_runs_input_code`), the first
-        try validates a deep copy of the data and the second starts again from the data as
-        received, so a validator that changes its input in place is applied once to the result.
+        ``mode="before"`` one, the model's own included, so they run again on the second try, as do
+        the hooks inside the model: its sub-models' validators of any mode, ``model_post_init``,
+        ``__post_init__``… When the model may run code of the user's on its input
+        (:meth:`_runs_input_code`; every hook counts, since a pass-through field such as ``Any``
+        hands the input object itself to ``after`` code), the first try validates a deep copy of
+        the data and the second starts again from the data as received, so code that changes its
+        input in place is applied once to the result. A model whose validation cannot refuse such a
+        value (:meth:`_may_refuse_sdk_durations`: no ``timedelta`` but top-level ones ``set_data``
+        converts) validates as before #228: ``handler(data)``, nothing checked, copied or retried.
         """
+        if not cls._may_refuse_sdk_durations():
+            return handler(data)
         return _validated_with_sdk_timedeltas(handler, data, cls._runs_input_code())
 
     async def refresh(self, tx: Transaction | None = None) -> None:
