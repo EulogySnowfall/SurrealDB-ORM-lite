@@ -1685,6 +1685,17 @@ class EmbLocked(AuthenticatedUserMixin, BaseSurrealModel):
     password: str
 
 
+class EmbMisfit(AuthenticatedUserMixin, BaseSurrealModel):
+    """``EmbUser``'s table and access, with a required field its records lack: they do not fit this model."""
+
+    model_config = SurrealConfigDict(table_name="emb_user", access_name="emb_user_access")
+
+    id: str | None = None
+    email: str
+    password: str
+    nickname: str
+
+
 @contextlib.asynccontextmanager
 async def _embedded_auth() -> AsyncIterator[Any]:
     """:func:`embedded` with ``EmbUser``'s access method and table defined by the in-process owner."""
@@ -2023,6 +2034,31 @@ class TestFailedBindEmbeddedE2E:
 
             failing[0] = False
             assert await SurrealDBConnectionManager.get_client() is client
+            assert SurrealDBConnectionManager.get_session_token() == t1
+            me = await SurrealDBConnectionManager.info()
+            assert me is not None
+            assert me["email"] == "a@x"
+
+    async def test_an_authenticate_whose_record_does_not_fit_the_model_stays_the_owner(self) -> None:
+        """As on a server, ``authenticate(token, bind=True)`` adopts the token only once it resolved to an
+        instance: a record that does not fit the model leaves the session as it was."""
+        async with _embedded_auth() as client:
+            created = await EmbUser.signup(email="b@x", password="p", bind=True)
+            await SurrealDBConnectionManager.invalidate()
+            with pytest.raises(SurrealDbError, match="does not fit the model"):
+                await EmbMisfit.authenticate(created.tokens.access, bind=True)
+            assert SurrealDBConnectionManager.get_session_token() is None
+            assert await SurrealDBConnectionManager.info() is None
+            assert await _is_owner(client)
+
+    async def test_an_authenticate_whose_record_does_not_fit_the_model_puts_the_stored_session_back(self) -> None:
+        async with _embedded_auth() as client:
+            await client.query(_ACCOUNT_DDL)
+            t1 = (await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)).access
+            other = await EmbUser.signup(email="b@x", password="p", bind=True)
+            await SurrealDBConnectionManager.authenticate(t1)
+            with pytest.raises(SurrealDbError, match="does not fit the model"):
+                await EmbMisfit.authenticate(other.tokens.access, bind=True)
             assert SurrealDBConnectionManager.get_session_token() == t1
             me = await SurrealDBConnectionManager.info()
             assert me is not None

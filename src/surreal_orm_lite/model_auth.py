@@ -510,10 +510,10 @@ class AuthenticatedUserMixin:
 
         A failed ``bind=True`` must leave the process as it was — what the server path gets for
         free by running the exchange on a throwaway session. So the record is checked **before**
-        any token is adopted, and on any failure (cancellation included) the previous session is
-        put back before the error propagates: the stored identity, else the in-process owner. An
-        identity set with ``store=False`` before the call is not restored: the manager does not
-        know it.
+        any token is adopted (for ``authenticate()``, built into the instance too, as on a server),
+        and on any failure (cancellation included) the previous session is put back before the
+        error propagates: the stored identity, else the in-process owner. An identity set with
+        ``store=False`` before the call is not restored: the manager does not know it.
         """
         payload = _encoding.encode(payload)
         tokens: AuthTokens | None = None
@@ -533,6 +533,9 @@ class AuthenticatedUserMixin:
             except Exception as exc:
                 raise wrap_auth_error(exc, label) from exc
             cls._require_record(record, label)
+            # authenticate(): as on a server, the caller's token is adopted only once it resolved to an
+            # instance, so a record that does not fit the model puts the previous session back too.
+            user = cls._hydrate_record(record, label) if token is not None else None
         except BaseException:
             await cls._restore_shared_session(client, label)
             raise
@@ -541,8 +544,10 @@ class AuthenticatedUserMixin:
             assert token is not None  # the authenticate() path: the caller's token is the session's
             adopted = AuthTokens(access=token, refresh=None)
         SurrealDBConnectionManager._adopt_tokens(adopted, store=True, operation=label, client=client)
-        # As on a server, a record that does not fit the model leaves the session bound: the
-        # exchange itself succeeded (the error says so).
+        if token is not None:
+            return user, tokens
+        # signup()/signin(): as on a server, a record that does not fit the model leaves the session
+        # bound: the exchange itself succeeded, and for a signup the account exists (the error says so).
         return cls._hydrate_record(record, label), tokens
 
     @classmethod
