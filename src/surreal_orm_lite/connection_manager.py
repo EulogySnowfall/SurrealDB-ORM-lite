@@ -691,14 +691,15 @@ class SurrealDBConnectionManager:
     @classmethod
     @contextlib.asynccontextmanager
     async def _exclusive_embedded_client(cls) -> AsyncIterator[Any]:
-        """Hold the embedded engine's shared session for one identity exchange: model-level ``bind=True``.
+        """Hold the embedded engine's shared session for one identity exchange: model-level ``bind=True``, or a
+        connection-level ``signin``/``signup``/``authenticate``/``invalidate`` (:meth:`_identity_client`).
 
         Yields the slot's client as :meth:`get_client` hands it out, with the guard held for the whole block:
         the exchange, the read-back of its record, the adoption of its token — or the restore after a failure —
         run as one step. Two exchanges on the one session would otherwise interleave, one reading back the
-        record the other signed in; so would a selection reset or an ``embedded_database()`` block. Yields
-        ``None`` when the configured URL stopped being embedded while this call waited (the caller then serves
-        the configuration as it is now).
+        record the other signed in, or storing a token the session no longer holds; so would a selection reset
+        or an ``embedded_database()`` block. Yields ``None`` when the configured URL stopped being embedded while
+        this call waited (the caller then serves the configuration as it is now).
 
         The guard is not re-entrant: inside the block, put a session back with
         :meth:`_reset_embedded_session`, never with a guarded method such as :meth:`get_client`.
@@ -1026,6 +1027,31 @@ class SurrealDBConnectionManager:
     # ------------------------------------------------------------------
 
     @classmethod
+    @contextlib.asynccontextmanager
+    async def _identity_client(cls) -> AsyncIterator[tuple[Any, bool]]:
+        """The client whose identity :meth:`signin`, :meth:`signup`, :meth:`authenticate` or :meth:`invalidate`
+        sets, and whether it is the embedded engine's shared session.
+
+        On a server URL, this event loop's client; a lost-identity state does not block it, since the caller is
+        setting the identity. On an embedded URL, the engine's one session, **held** for the whole block
+        (:meth:`_exclusive_embedded_client`): the SDK exchange and the adoption of its token — for
+        ``invalidate``, the return to the owner and the re-selection — run as one step. A model-level ``bind=True``
+        exchange holds the same session from its sign-in to the adoption of its token, so neither can land in the
+        middle of the other: without that, the exchange would read back the record signed in here, or store a
+        token the session no longer holds. When the URL was re-pointed at a server while this call waited, that
+        server is served, as :meth:`get_client` does.
+
+        The guard is not re-entrant: inside the block, call no guarded method (:meth:`get_client`,
+        :meth:`close_connection` …).
+        """
+        while is_embedded_url(cls.__url):
+            async with cls._exclusive_embedded_client() as shared:
+                if shared is not None:
+                    yield shared, True
+                    return
+        yield await cls._acquire_client(restoring_identity=True), False
+
+    @classmethod
     async def signin(
         cls,
         *,
@@ -1065,7 +1091,10 @@ class SurrealDBConnectionManager:
             application serving concurrent users must not route them through a single
             connection manager identity. On the embedded engine (``mem://``,
             ``surrealkv://<path>`` …) it is the identity of the whole process — every event
-            loop and thread — since one in-process client serves them all.
+            loop and thread — since one in-process client serves them all. There, the call
+            holds that session from the sign-in to the adoption of the token, so it runs
+            one at a time with model-level ``bind=True`` calls and the other connection-level
+            identity methods: the last one wins, and the stored token is the session's.
 
         .. warning::
             **Refresh tokens rotate.** A successful ``refresh=`` exchange kills the token it
@@ -1096,12 +1125,12 @@ class SurrealDBConnectionManager:
                 default_database=cls.__database,
             )
         )
-        client = await cls._acquire_client(restoring_identity=True)
-        try:
-            tokens = await client.signin(payload)
-        except Exception as exc:
-            raise wrap_auth_error(exc, "signin") from exc
-        return cls._adopt_tokens(tokens, store=store, operation="signin", client=client)
+        async with cls._identity_client() as (client, _):
+            try:
+                tokens = await client.signin(payload)
+            except Exception as exc:
+                raise wrap_auth_error(exc, "signin") from exc
+            return cls._adopt_tokens(tokens, store=store, operation="signin", client=client)
 
     @classmethod
     async def signup(
@@ -1143,12 +1172,12 @@ class SurrealDBConnectionManager:
                 default_database=cls.__database,
             )
         )
-        client = await cls._acquire_client(restoring_identity=True)
-        try:
-            tokens = await client.signup(payload)
-        except Exception as exc:
-            raise wrap_auth_error(exc, "signup") from exc
-        return cls._adopt_tokens(tokens, store=store, operation="signup", client=client)
+        async with cls._identity_client() as (client, _):
+            try:
+                tokens = await client.signup(payload)
+            except Exception as exc:
+                raise wrap_auth_error(exc, "signup") from exc
+            return cls._adopt_tokens(tokens, store=store, operation="signup", client=client)
 
     @classmethod
     def _adopt_tokens(cls, tokens: Any, *, store: bool, operation: str, client: Any) -> AuthTokens:
@@ -1199,7 +1228,8 @@ class SurrealDBConnectionManager:
         .. warning::
             Like :meth:`signin`, this changes the identity of the whole connection — every
             model shares it. On the embedded engine, of the whole process — every event loop
-            and thread.
+            and thread — and, as there, the call runs one at a time with model-level
+            ``bind=True`` calls and the other connection-level identity methods.
 
         A failure changes nothing: the previously stored token is left in place, because the
         call that failed never took effect. (Only the reconnect replay drops a stored token,
@@ -1214,27 +1244,27 @@ class SurrealDBConnectionManager:
             A malformed one never reaches the server — the SDK rejects its shape with a plain
             ``ValueError``, which is normalised here like any other authentication failure.
         """
-        client = await cls._acquire_client(restoring_identity=True)
-        # The SDK's HTTP connection assigns `self.token` BEFORE sending, unlike the WebSocket
-        # one. So a rejected token stays stamped on the client and every later request comes
-        # back 401 — and since the manager caches that client for the life of the event loop,
-        # one bad JWT would break the application permanently. Restore what was there.
-        previous = getattr(client, "token", None)
-        try:
-            await client.authenticate(token)
-        except Exception as exc:
-            with contextlib.suppress(Exception):
-                client.token = previous
-            raise wrap_auth_error(exc, "authenticate") from exc
+        async with cls._identity_client() as (client, _):
+            # The SDK's HTTP connection assigns `self.token` BEFORE sending, unlike the WebSocket
+            # one. So a rejected token stays stamped on the client and every later request comes
+            # back 401 — and since the manager caches that client for the life of the event loop,
+            # one bad JWT would break the application permanently. Restore what was there.
+            previous = getattr(client, "token", None)
+            try:
+                await client.authenticate(token)
+            except Exception as exc:
+                with contextlib.suppress(Exception):
+                    client.token = previous
+                raise wrap_auth_error(exc, "authenticate") from exc
 
-        if store:
-            cls.__session_token = token
-            # A JWT handed in from outside brings no refresh token with it, so the previous
-            # session's one is dropped rather than left paired with an identity it cannot
-            # renew. A caller that *does* hold the matching pair passes refresh=.
-            cls.__refresh_token = refresh
-        cls._stamp_identity(client, replayable=store)
-        cls._identity_restored()
+            if store:
+                cls.__session_token = token
+                # A JWT handed in from outside brings no refresh token with it, so the previous
+                # session's one is dropped rather than left paired with an identity it cannot
+                # renew. A caller that *does* hold the matching pair passes refresh=.
+                cls.__refresh_token = refresh
+            cls._stamp_identity(client, replayable=store)
+            cls._identity_restored()
 
     @classmethod
     async def invalidate(cls) -> None:
@@ -1260,25 +1290,26 @@ class SurrealDBConnectionManager:
         anonymous session *is* the in-process owner, with full access, so the stored token is
         forgotten, the configured namespace and database are selected again, and :meth:`info`
         then returns ``None``. It is the session of the whole process — every event loop and
-        thread. If that selection fails, nothing is closed (no ``mem://`` data is lost): the
+        thread — held from the ``invalidate()`` to the new selection, so the call runs one at a
+        time with model-level ``bind=True`` calls and the other connection-level identity
+        methods. If that selection fails, nothing is closed (no ``mem://`` data is lost): the
         session is already the owner, and the next :meth:`get_client` selects again.
 
         :raises SurrealDbAuthenticationError: if the server refuses either step.
         """
-        client = await cls._acquire_client(restoring_identity=True)
-        # Decided with the client, before any await: the session to restore is the one of the
-        # connection the client came from.
-        embedded = is_embedded_url(cls.__url)
-        try:
-            await client.invalidate()
-        except Exception as exc:
-            raise wrap_auth_error(exc, "invalidate") from exc
+        # The kind of session to restore is the one of the connection the client came from.
+        async with cls._identity_client() as (client, embedded):
+            try:
+                await client.invalidate()
+            except Exception as exc:
+                raise wrap_auth_error(exc, "invalidate") from exc
 
-        cls.clear_session()
+            cls.clear_session()
 
-        if embedded:
-            await cls._reselect_after_invalidate(client)
-            return
+            if embedded:
+                # Still holding the session: nobody signs in between the owner and the selection.
+                await cls._reselect_after_invalidate(client)
+                return
 
         credentials = _encoding.encode({"username": cls.__user, "password": cls.__password})
         try:
@@ -1299,7 +1330,9 @@ class SurrealDBConnectionManager:
     @classmethod
     async def _reselect_after_invalidate(cls, client: Any) -> None:
         """The embedded half of :meth:`invalidate`, once the SDK's ``invalidate()`` succeeded: the
-        session is the in-process owner, and only the selection is left to restore.
+        session is the in-process owner, and only the selection is left to restore. Caller holds
+        the guard (:meth:`_identity_client`), from the ``invalidate()`` on: the guard is not
+        re-entrant.
 
         No configured sign-in (the engine has no system user on a fresh database, and the owner is
         what a reconnect restores). The slot's selection is stale until ``use()`` succeeds, so
@@ -1307,21 +1340,20 @@ class SurrealDBConnectionManager:
         :meth:`get_client` selects again — and nothing is closed: :meth:`close_connection` would
         discard a ``mem://`` database and close this loop's unrelated server client (spec D18).
         """
-        async with cls._embedded_guard():
-            held = cls.__embedded_client is client
-            if held:
-                cls.__embedded_selection = None
-            namespace, database = cls.__namespace, cls.__database
-            try:
-                if namespace is not None and database is not None:
-                    await client.use(namespace, database)
-            except Exception as exc:
-                raise wrap_auth_error(exc, "invalidate (restoring the configured identity)") from exc
-            if held:
-                cls.__embedded_selection = (namespace, database)
-            # Back at the configured identity — exactly what a reopen restores.
-            cls._stamp_identity(client, replayable=True)
-            cls._identity_restored()
+        held = cls.__embedded_client is client
+        if held:
+            cls.__embedded_selection = None
+        namespace, database = cls.__namespace, cls.__database
+        try:
+            if namespace is not None and database is not None:
+                await client.use(namespace, database)
+        except Exception as exc:
+            raise wrap_auth_error(exc, "invalidate (restoring the configured identity)") from exc
+        if held:
+            cls.__embedded_selection = (namespace, database)
+        # Back at the configured identity — exactly what a reopen restores.
+        cls._stamp_identity(client, replayable=True)
+        cls._identity_restored()
 
     @classmethod
     def clear_session(cls) -> None:

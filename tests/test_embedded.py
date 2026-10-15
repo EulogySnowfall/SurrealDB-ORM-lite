@@ -97,13 +97,19 @@ _SERVER_URLS = ["ws://h:1/rpc", "wss://h", "http://h:8000", "https://h"]
 _REFUSED_URLS = ["rocksdb:///x", "memory", "not a url", "htp://h"]
 
 
-def _count_constructions(monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Record the URL of every SDK client the connection manager constructs, then construct it as usual."""
+def _count_constructions(monkeypatch: pytest.MonkeyPatch, *, refuse_servers: bool = False) -> list[str]:
+    """Record the URL of every SDK client the connection manager constructs, then construct it as usual.
+
+    With *refuse_servers*, a server URL is refused at once (``ConnectionRefusedError``), as by a host with nothing
+    listening: a test that only checks which URL is served does not wait for a connection timeout.
+    """
     calls: list[str] = []
     real = connection_manager.AsyncSurreal
 
     def recording(url: str, *args: Any, **kwargs: Any) -> Any:
         calls.append(url)
+        if refuse_servers and not is_embedded_url(url):
+            raise ConnectionRefusedError(url)
         return real(url, *args, **kwargs)
 
     monkeypatch.setattr(connection_manager, "AsyncSurreal", recording)
@@ -1931,22 +1937,29 @@ class TestFailedBindEmbeddedE2E:
             assert me["email"] == "a@x"
 
 
-def _slow_info(monkeypatch: pytest.MonkeyPatch, delays: list[float]) -> None:
+def _slow_info(monkeypatch: pytest.MonkeyPatch, delays: list[float]) -> asyncio.Event:
     """Make the embedded client's ``info()`` wait ``delays[n]`` seconds on its n-th call (then none), so that two
-    concurrent exchanges interleave unless something serialises them."""
+    concurrent exchanges interleave unless something serialises them.
+
+    :return: an event set when ``info()`` is first called: a call made once it is set lands inside that exchange.
+    """
     real_info = AsyncEmbeddedSurrealConnection.info
     pending = list(delays)
+    entered = asyncio.Event()
 
     async def slow_info(self: Any) -> Any:
+        entered.set()
         await asyncio.sleep(pending.pop(0) if pending else 0.0)
         return await real_info(self)
 
     monkeypatch.setattr(AsyncEmbeddedSurrealConnection, "info", slow_info)
+    return entered
 
 
 class TestConcurrentBindEmbeddedE2E:
-    """D17 under concurrency, no server: concurrent ``bind=True`` exchanges on the one shared session run one at a
-    time, end to end, so each reads back its own record and the last one wins consistently."""
+    """D17 under concurrency, no server: concurrent ``bind=True`` exchanges on the one shared session, and the
+    connection-level identity methods that hold it too, run one at a time, end to end, so each exchange reads back its
+    own record and the last one wins consistently."""
 
     @pytest.mark.parametrize("delays", [[0.1, 0.0], [0.0, 0.1]], ids=["first-slow", "second-slow"])
     async def test_each_call_returns_its_own_user(self, monkeypatch: pytest.MonkeyPatch, delays: list[float]) -> None:
@@ -1993,6 +2006,84 @@ class TestConcurrentBindEmbeddedE2E:
             assert me is not None
             assert me["email"] == "alice@x"
 
+    @pytest.mark.parametrize("method", ["signin", "authenticate"])
+    async def test_a_connection_level_call_waits_for_the_exchange(self, monkeypatch: pytest.MonkeyPatch, method: str) -> None:
+        """The connection-level identity methods hold the same session: one landing while a ``bind=True`` exchange
+        reads its record back waits for it, then wins — the exchange still returns its own user."""
+        async with _embedded_auth():
+            await EmbUser.signup(email="alice@x", password="p", bind=True)
+            bob_token = (await EmbUser.signup(email="bob@x", password="p", bind=True)).tokens.access
+            await SurrealDBConnectionManager.invalidate()
+            in_info = _slow_info(monkeypatch, [0.1])  # alice's exchange reads its record back last
+
+            async def as_bob() -> str:
+                await in_info.wait()  # lands while alice's exchange waits in info()
+                if method == "signin":
+                    tokens = await SurrealDBConnectionManager.signin(
+                        access="emb_user_access", variables={"email": "bob@x", "password": "p"}
+                    )
+                    return tokens.access
+                await SurrealDBConnectionManager.authenticate(bob_token)
+                return bob_token
+
+            alice, bob_access = await asyncio.gather(EmbUser.signin(email="alice@x", password="p", bind=True), as_bob())
+
+            assert alice.user.email == "alice@x"
+            # Bob's call ran after the exchange, and the stored token is the session's: a replay keeps the identity.
+            assert SurrealDBConnectionManager.get_session_token() == bob_access
+            me = await SurrealDBConnectionManager.info()
+            assert me is not None
+            assert me["email"] == "bob@x"
+
+    async def test_an_invalidate_waits_for_the_exchange(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``invalidate()`` landing while a ``bind=True`` exchange reads its record back waits for it: the exchange
+        succeeds, then the session is the owner and nothing is stored."""
+        async with _embedded_auth():
+            await EmbUser.signup(email="alice@x", password="p", bind=True)
+            await SurrealDBConnectionManager.invalidate()
+            in_info = _slow_info(monkeypatch, [0.1])
+
+            async def log_out() -> None:
+                await in_info.wait()  # lands while alice's exchange waits in info()
+                await SurrealDBConnectionManager.invalidate()
+
+            alice, _ = await asyncio.gather(EmbUser.signin(email="alice@x", password="p", bind=True), log_out())
+
+            assert alice.user.email == "alice@x"
+            assert SurrealDBConnectionManager.get_session_token() is None
+            assert await SurrealDBConnectionManager.info() is None  # the in-process owner, on the configured pair
+            assert await EmbUser.objects().count() == 1
+
+    @pytest.mark.parametrize("method", ["signin", "signup", "authenticate", "invalidate"])
+    async def test_a_connection_level_call_follows_a_url_changed_while_waiting(
+        self, monkeypatch: pytest.MonkeyPatch, method: str
+    ) -> None:
+        """A connection-level identity call whose URL was re-pointed at a server while it waited for the engine
+        serves that server, as :meth:`get_client` does: nothing runs on the embedded session."""
+        real_guard = SurrealDBConnectionManager._embedded_guard
+
+        @contextlib.asynccontextmanager
+        async def switching_guard() -> AsyncIterator[None]:
+            monkeypatch.setattr(SurrealDBConnectionManager, "_embedded_guard", real_guard)  # once
+            SurrealDBConnectionManager.set_connection("ws://127.0.0.1:1/rpc", "root", "root", "ns", "db")
+            async with real_guard():
+                yield
+
+        calls_by_method: dict[str, Callable[[], Coroutine[Any, Any, Any]]] = {
+            "signin": lambda: SurrealDBConnectionManager.signin(access="account", variables=_ACCOUNT),
+            "signup": lambda: SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT),
+            "authenticate": lambda: SurrealDBConnectionManager.authenticate("a.b.c"),
+            "invalidate": SurrealDBConnectionManager.invalidate,
+        }
+        async with embedded() as client:
+            calls = _record_calls(monkeypatch, "signin", "signup", "authenticate", "invalidate", "use")
+            urls = _count_constructions(monkeypatch, refuse_servers=True)
+            monkeypatch.setattr(SurrealDBConnectionManager, "_embedded_guard", switching_guard)
+            with pytest.raises(SurrealDbConnectionError, match="Can't connect to the database"):
+                await calls_by_method[method]()
+            assert urls == ["ws://127.0.0.1:1/rpc"]
+            assert _calls_of(calls, client) == []
+
     async def test_a_url_changed_while_waiting_for_the_engine_is_served_as_configured(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2009,7 +2100,7 @@ class TestConcurrentBindEmbeddedE2E:
 
         async with _embedded_auth() as client:
             calls = _record_calls(monkeypatch, "signin", "info")
-            urls = _count_constructions(monkeypatch)
+            urls = _count_constructions(monkeypatch, refuse_servers=True)
             monkeypatch.setattr(SurrealDBConnectionManager, "_embedded_guard", switching_guard)
             with pytest.raises(SurrealDbConnectionError, match="Can't connect to the database"):
                 await EmbUser.signin(email="b@x", password="p", bind=True)

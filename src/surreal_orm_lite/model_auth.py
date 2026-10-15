@@ -11,8 +11,9 @@ re-identify the client every other model shares — the footgun v0.16.0 document
 
 The embedded engine (v0.25.0: ``mem://``, ``surrealkv://<path>`` …) has a single session per
 database, so it has no short-lived connection to offer: there, ``bind=True`` is required, and the
-exchange runs on the shared session — one call at a time (concurrent calls are serialised, the last
-one wins), the record checked before the token is adopted, the previous session put back when
+exchange runs on the shared session — one call at a time (concurrent calls, and the connection-level
+``signin``/``signup``/``authenticate``/``invalidate`` holding the same session, are serialised; the
+last one wins), the record checked before the token is adopted, the previous session put back when
 anything fails.
 
 This is a leaf module: it imports ``connection_manager`` and ``auth`` at runtime and
@@ -501,8 +502,11 @@ class AuthenticatedUserMixin:
         The caller holds the session exclusively
         (:meth:`SurrealDBConnectionManager._exclusive_embedded_client`), so concurrent ``bind=True``
         calls — any event loop or thread — run one after the other, each reading back the record
-        *it* signed in and adopting the token that matches the session; the last one wins. Without
-        that, one call's ``info()`` could read the session another call had just signed in.
+        *it* signed in and adopting the token that matches the session; the last one wins. The
+        connection-level ``signin``/``signup``/``authenticate``/``invalidate`` hold the same session,
+        so they wait for the exchange too, and it for them. Without that, one call's ``info()``
+        could read the session another call had just signed in, and the token adopted would not
+        be the session's.
 
         A failed ``bind=True`` must leave the process as it was — what the server path gets for
         free by running the exchange on a throwaway session. So the record is checked **before**
@@ -637,17 +641,19 @@ class AuthenticatedUserMixin:
         On the embedded engine (``mem://``, ``surrealkv://<path>`` …) there is no own connection
         to run on — one session per database — so ``bind=True`` is required (without it, a
         :class:`SurrealDbError` before any request): the exchange runs on the shared session,
-        for every event loop and thread of the process. Concurrent ``bind=True`` calls are
-        **serialised** — each one signs in, reads back its own record and adopts its own token
-        before the next starts — so the returned instance is always the caller's, the stored
-        token always matches the session, and the last call wins. The record is checked before
+        for every event loop and thread of the process. Concurrent ``bind=True`` calls — and the
+        connection-level ``signin()``/``signup()``/``authenticate()``/``invalidate()`` of
+        :class:`SurrealDBConnectionManager`, which hold the same session — are **serialised**:
+        each one signs in, reads back its own record and adopts its own token before the next
+        starts, so the returned instance is always the caller's, the stored token matches the
+        session, and the last call wins. The record is checked before
         the token is adopted, and a failure puts the stored identity back (else the in-process
         owner) before raising; an identity set with ``store=False`` is not restored.
 
         Args:
             bind: adopt the resulting token on the shared connection as well. On the embedded
-                engine it is required, and concurrent ``bind=True`` calls run one at a time:
-                the last one wins.
+                engine it is required, and concurrent ``bind=True`` calls (connection-level auth
+                calls included) run one at a time: the last one wins.
             **fields: the model's fields. The identifier and password fields are required; the
                 rest are optional and reach the server as ``None``.
 
