@@ -2190,15 +2190,19 @@ await sub.merge(trial=sub.trial + timedelta(days=7))                          # 
 #### After a write that returns the row
 
 `save()` without an id, `refresh()`, `merge()`, `upsert()`, `patch()` and the `atomic_*` helpers
-apply the row the server returns as received, without validation, as before v0.23.0. `timedelta`,
-`Duration` and geometry fields (since v0.24.0, see [section 25](#25-geospatial-fields)) are
-converted on the way, but `date`, `set` and `Range` fields hold the SDK's value (a midnight
-`datetime`, a `list`, the SDK's `Range`) until the record is loaded again (`get()`, `filter()`, …).
-For top-level fields, writing such an instance back is safe, since those values are stored the
-same way, although Pydantic warns (`PydanticSerializationUnexpectedValue`) about the `date` and
-`set` fields while serialising them. A sub-model field holds the row's `dict` instead: durations,
-ranges and geometries inside it would be written back as plain objects, so read the record again
-first (see [Rich values inside sub-models](#rich-values-inside-sub-models)).
+apply the row the server returns to the instance. Top-level `timedelta`, `Duration` and geometry
+fields (since v0.24.0, see [section 25](#25-geospatial-fields)) are converted on the way. A field
+that holds a sub-model (a Pydantic model, a dataclass or a `TypedDict`, also inside `list[...]`,
+`dict[..., ...]` or `X | None`) is validated as a read validates it: it holds its model instance,
+not the row's `dict`, with the ORM's durations, ranges and geometries inside. A value that does
+not validate is applied as received, so these calls never fail on it. Top-level `date`, `set` and
+`Range` fields hold the SDK's value (a midnight `datetime`, a `list`, the SDK's `Range`) until the
+record is loaded again (`get()`, `filter()`, …). Writing such an instance back is safe, sub-models
+included, since those values are stored the same way, although Pydantic warns
+(`PydanticSerializationUnexpectedValue`) about the top-level `date` and `set` fields while
+serialising them. The exception is a sub-model with a `timedelta` field: a read refuses the SDK's
+duration there (see above) and so does this validation, so the field keeps the row's `dict`, which
+a later write stores as a plain object. Declare `Duration` in sub-models.
 
 #### Values the SDK cannot read
 
@@ -2222,8 +2226,9 @@ refused value raises `ValueError` before anything is sent.
 
 Plain `datetime`, `Decimal` and `UUID` annotations work as they do there. The full ORM has no
 `timedelta` or `Range` fields and its `Duration` is a string: `timedelta`, `Duration` and
-`Range[T]` fields are lite additions. The full ORM also validates the rows its writes return,
-where lite converts only durations and geometries (see [After a write that returns the row](#after-a-write-that-returns-the-row)).
+`Range[T]` fields are lite additions. The full ORM also validates the rows its writes return; lite
+validates the sub-model and geometry fields of those rows and converts durations, while top-level
+`date`, `set` and `Range` fields keep the SDK's value (see [After a write that returns the row](#after-a-write-that-returns-the-row)).
 
 ### 25. Geospatial fields
 
@@ -2521,19 +2526,9 @@ for restaurant in await Restaurant.objects().all():
 SurrealDB keeps a GeoJSON dict as a plain object, not a geometry: the full SurrealDB-ORM stores its
 geometry fields that way, and so does any client that writes GeoJSON dicts. `nearby()` skips such
 objects, `geo::*` functions and `geometry<…>` columns refuse them, and no SurrealQL cast turns them
-into geometries. A geometry field reads them (a GeoJSON object validates), and `update()` writes
-the instance back with a native geometry, so loading and updating every record migrates a table.
-
-#### Rich values inside sub-models
-
-After a call that applies the row the server returns (`refresh()`, `upsert()`, `merge()`,
-`patch()`, the `atomic_*` helpers, `save()` with an auto-generated id), a sub-model field holds the
-row's `dict`, as for every type (see [After a write that returns the row](#after-a-write-that-returns-the-row)).
-Geometries, durations and ranges inside it are written back as plain objects by a later `update()`
-or `upsert()`, and the next read of that record fails validation: read the record again with
-`get()` before writing it back. Top-level geometry fields and top-level typed containers
-(`list[GeometryPoint]`) are not affected: they are written back as geometries. A fix is tracked in
-[#228](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/228).
+into geometries. A geometry field reads them (a GeoJSON object validates, in a read and in the row
+a write returns), and `update()` writes the instance back with a native geometry, so loading and
+updating every record migrates a table.
 
 #### Untyped fields
 
@@ -2591,8 +2586,6 @@ writes one: its classes refuse such values, and so does the check of the SDK geo
   `surreal_orm`, `surreal_orm.fields`, `surreal_orm.geo`); `is_geo_field` and `get_geo_info` come
   from `surreal_orm_lite.geo` (the full ORM: `surreal_orm.fields`). There is no
   `surreal_orm_lite.fields` module.
-- **Sub-models after a write that returns the row** keep the row's `dict` (the full ORM validates
-  those rows): see [Rich values inside sub-models](#rich-values-inside-sub-models).
 
 ---
 
