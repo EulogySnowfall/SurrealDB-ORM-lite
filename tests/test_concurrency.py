@@ -163,10 +163,11 @@ def test_public_exports() -> None:
 def _sdk_conflict() -> InternalError:
     """The SDK error a plain ``save()``/``merge()``/``delete()`` gets on a CHANGEFEED table.
 
-    Measured on 2.7.0 (issue #216): about every 10 s, even with a single writer, the server
-    refuses such a write with this message, and the ORM lets the SDK's ``InternalError`` through.
-    Reproducing it against a server takes a write loop of tens of seconds that does not hit a
-    conflict on every period, so these tests replay the measured error instead.
+    Measured on 2.7.0 (issue #216): concurrent writers on a change-feed table are refused with
+    this message, even on different records, and a single writer is too when the server's
+    change-feed GC runs; the ORM lets the SDK's ``InternalError`` through. How often it happens
+    depends on the load and the GC timing, so these tests replay the measured error instead of
+    waiting for the server to produce it.
     """
     return InternalError(kind="Internal", message=CONFLICT_26)
 
