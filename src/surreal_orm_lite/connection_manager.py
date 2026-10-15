@@ -15,7 +15,7 @@ from . import decoding as _decoding
 from . import encoding as _encoding
 from ._sdk import AsyncSurreal, NotFoundError
 from .auth import AuthTokens, build_auth_payload, wrap_auth_error
-from .embedded import is_embedded_url, require_supported_url
+from .embedded import ephemeral_unsupported, is_embedded_url, require_supported_url
 from .exceptions import (
     SurrealDbAuthenticationError,
     SurrealDbConflictError,
@@ -843,11 +843,18 @@ class SurrealDBConnectionManager:
         Closed on exit, including when the body raises. Closing is best-effort: a connection
         the server already dropped must not turn into an error the caller never caused.
 
+        Not available on the embedded engine (``mem://``, ``surrealkv://<path>`` …): every
+        in-process client is a database of its own, so a second one could not see the configured
+        database. Refused before anything is opened; use :meth:`get_client`.
+
         :raises ValueError: if no connection has been configured.
         :raises SurrealDbConnectionError: if the configured URL is one the installed SDK refuses, or the
             connection cannot be opened.
+        :raises SurrealDbError: if the configured URL addresses the embedded engine.
         """
         cls.require_connection()
+        if cls.is_embedded():
+            raise SurrealDbError(ephemeral_unsupported(cls.__url))
         client = await cls._open_client(signin_as_configured=False)
         try:
             yield client
@@ -1499,8 +1506,8 @@ class SurrealDBConnectionManager:
         this reader without killing the live query.
 
         :param query_uuid: the uuid of a running live query, e.g. ``stream.live_id``.
-        :raises SurrealDbError: on a non-WebSocket connection, or if no client is connected on
-            this event loop.
+        :raises SurrealDbError: on a non-WebSocket connection (the embedded engine included), or
+            if no client is connected on this event loop.
         """
         require_websocket(cls.__url)
         return open_stream(cls._live_client(), query_uuid)
@@ -1546,6 +1553,10 @@ class SurrealDBConnectionManager:
         new connection could not own, and it would turn the ``__aexit__`` of a ``watch()`` block
         that outlived its connection into a network call.
 
+        Never refused on an embedded URL (``mem://`` …), where no live query can start: a server
+        client still cached on this loop — a stream started on a server, stopped after switching
+        to the engine — receives the KILL; otherwise the call is the no-op above.
+
         :param query_uuid: the uuid of a running live query, e.g. ``stream.live_id``.
         :raises SurrealDbError: if the server refuses the kill for a reason other than an
             unknown uuid. The readers are released anyway, but the uuid is **not** recorded as
@@ -1562,7 +1573,8 @@ class SurrealDBConnectionManager:
                     await cls._close_dead_socket(client)
                 mark_killed(query_uuid)
                 return
-            require_websocket(cls.__url)
+            if not is_embedded_url(cls.__url):
+                require_websocket(cls.__url)
             try:
                 await client.kill(query_uuid)
             except Exception as exc:

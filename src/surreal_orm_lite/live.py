@@ -53,6 +53,7 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
+from .embedded import is_embedded_url, live_unsupported
 from .enum import LiveAction
 from .exceptions import (
     SurrealDbAuthenticationError,
@@ -484,7 +485,13 @@ def require_websocket(url: str | None) -> None:
     The SDK's HTTP connection raises a bare ``NotImplementedError`` from ``live()``,
     ``subscribe_live()`` and ``kill()`` alike, which tells the caller nothing about why. The
     ORM checks the configured scheme first and says what to do instead.
+
+    The SDK's in-process engine (``mem://``, ``surrealkv://<path>`` …, v0.25.0) has no
+    notification channel at all: it gets its own message, pointing at the table's change feed.
+    Raised before any client is opened.
     """
+    if is_embedded_url(url):
+        raise SurrealDbError(live_unsupported(url))
     if not (url or "").startswith(("ws://", "wss://")):
         raise SurrealDbError(
             f"Live queries require a WebSocket connection (ws:// or wss://); the configured URL "

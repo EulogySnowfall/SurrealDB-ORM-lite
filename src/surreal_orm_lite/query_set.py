@@ -1380,7 +1380,8 @@ class QuerySet:
         ``close_connection()``…) ends the stream either way.
 
         :raises SurrealDbError: for ``select``/``values``/``annotate``/``order_by``/``limit``/
-            ``offset``/``objects(tx=)``, here; for a non-WebSocket connection, on start.
+            ``offset``/``objects(tx=)``, here; for a non-WebSocket connection (the embedded
+            engine included: read its change feed with :meth:`changes`), on start.
         :raises TypeError: for a filter value with no SurrealQL literal form, here.
         :raises SurrealDbNotFoundError: on SurrealDB 3.x, on start, if the table does not exist.
         """
@@ -1468,11 +1469,13 @@ class QuerySet:
 
         :param since: a cursor from :attr:`ChangeModelStream.cursor`; a ``datetime`` or ISO-8601
             string (naive means UTC; exact on 3.x, at-least-once on 2.x, whose server also returns
-            some earlier changes); or ``None`` for changes made after the stream starts.
+            some earlier changes; refused on the embedded engine of the surrealdb SDK 2.x, which
+            keeps no timestamps for its feed); or ``None`` for changes made after the stream starts.
         :param poll_interval: seconds between two polls when the feed has nothing new.
         :param batch_size: entries read per poll.
         :raises SurrealDbError: for any queryset clause, here; on start, for a table that does not
-            exist or has no change feed (on the table or on its database).
+            exist or has no change feed (on the table or on its database), or for a datetime
+            ``since`` on the embedded engine of the surrealdb SDK 2.x.
         :raises TypeError, ValueError: for an unusable ``since``/``poll_interval``/``batch_size``.
         """
         self._reject_changes_clauses()

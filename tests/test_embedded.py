@@ -12,6 +12,7 @@ import enum
 import inspect
 import re
 import sys
+import uuid
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -45,10 +46,17 @@ from surreal_orm_lite import (
     retry_on_conflict,
 )
 from surreal_orm_lite import embedded as embedded_module
-from surreal_orm_lite.embedded import is_embedded_url, require_supported_url, url_kind
+from surreal_orm_lite.embedded import (
+    changes_since_datetime_unsupported,
+    is_embedded_url,
+    require_supported_url,
+    url_kind,
+)
+from surreal_orm_lite.enum import LiveAction
 from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError, SurrealDbError
+from surreal_orm_lite.live import require_websocket
 from surreal_orm_lite.transaction import BufferedTransaction
-from tests.conftest import _REWRITE_MODULES, _ws_url
+from tests.conftest import _REWRITE_MODULES, _ws_url, orm_client
 
 _T = TypeVar("_T")
 
@@ -1279,3 +1287,246 @@ class TestSurrealKvPersistenceE2E:
             assert not SurrealDBConnectionManager.is_connected()
             got = await Person.objects().get("ada")
             assert (got.name, got.age) == ("Ada", 36)
+
+
+# --- Task 5: what the engine cannot do, refused before any request (spec §5.5 E1, E2, E4; AC-8, AC-9, AC-21) ---
+
+
+class EmbWatched(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="emb_watched")
+
+    id: str | None = None
+    name: str = ""
+
+
+class CfItem(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="cf_item")
+
+    id: str | None = None
+    name: str = ""
+
+
+async def _take(stream: Any, count: int) -> list[Any]:
+    """The next *count* events of *stream*, within five seconds."""
+    events: list[Any] = []
+    async with asyncio.timeout(5):
+        while len(events) < count:
+            events.append(await anext(stream))
+    return events
+
+
+async def _nothing_within(stream: Any, seconds: float = 0.3) -> None:
+    """Assert *stream* yields nothing for *seconds* (a cancelled read loses nothing)."""
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(seconds):
+            event = await anext(stream)
+            pytest.fail(f"unexpected event {event.action} {event.record_id}")  # pragma: no cover
+
+
+class TestUnsupportedEmbeddedE2E:
+    """AC-8 (E1), the ``ephemeral_client`` part of AC-10 (E2), D19, no server: refused before a client is opened."""
+
+    @staticmethod
+    def _assert_e1(exc: BaseException) -> None:
+        assert isinstance(exc, SurrealDbError)
+        assert str(exc) == embedded_module.live_unsupported("mem://")
+        assert "WebSocket" in str(exc)
+        assert "embedded engine" in str(exc)
+
+    @pytest.mark.parametrize(
+        "start",
+        [
+            pytest.param(lambda: EmbWatched.objects().live().start(), id="live-start"),
+            pytest.param(lambda: EmbWatched.objects().watch().start(), id="watch-start"),
+            pytest.param(lambda: EmbWatched.objects().live(diff=True).start(), id="live-diff-start"),
+        ],
+    )
+    async def test_a_live_query_is_refused_before_opening_the_engine(
+        self, monkeypatch: pytest.MonkeyPatch, start: Callable[[], Coroutine[Any, Any, Any]]
+    ) -> None:
+        calls = _count_constructions(monkeypatch)
+        try:
+            SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="t")
+            with pytest.raises(SurrealDbError) as info:
+                await start()
+            self._assert_e1(info.value)
+            assert not SurrealDBConnectionManager.is_connected()
+            assert _slot_client() is None
+            assert calls == []
+        finally:
+            await SurrealDBConnectionManager.unset_connection()
+
+    @pytest.mark.parametrize("build", ["live", "watch"])
+    async def test_the_async_with_forms_are_refused(self, monkeypatch: pytest.MonkeyPatch, build: str) -> None:
+        calls = _count_constructions(monkeypatch)
+        try:
+            SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="t")
+            with pytest.raises(SurrealDbError) as info:
+                async with getattr(EmbWatched.objects(), build)():
+                    pytest.fail("a live query started on the embedded engine")  # pragma: no cover
+            self._assert_e1(info.value)
+            assert not SurrealDBConnectionManager.is_connected()
+            assert calls == []
+        finally:
+            await SurrealDBConnectionManager.unset_connection()
+
+    async def test_subscribe_live_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = _count_constructions(monkeypatch)
+        try:
+            SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="t")
+            with pytest.raises(SurrealDbError) as info:
+                SurrealDBConnectionManager.subscribe_live(uuid.uuid4())
+            self._assert_e1(info.value)
+            assert not SurrealDBConnectionManager.is_connected()
+            assert calls == []
+        finally:
+            await SurrealDBConnectionManager.unset_connection()
+
+    async def test_kill_without_a_server_client_is_a_no_op(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """D19: ``kill()`` never refuses on an embedded URL, never opens the engine, never reaches it."""
+        calls = _count_constructions(monkeypatch)
+        kills = _record_calls(monkeypatch, "kill")
+        try:
+            SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="t")
+            assert await SurrealDBConnectionManager.kill(uuid.uuid4()) is None
+            assert not SurrealDBConnectionManager.is_connected()
+            assert calls == []
+
+            engine = await SurrealDBConnectionManager.get_client()  # the slot holds the engine now
+            assert await SurrealDBConnectionManager.kill(uuid.uuid4()) is None
+            assert _calls_of(kills, engine) == []
+            assert _slot_client() is engine
+        finally:
+            await SurrealDBConnectionManager.unset_connection()
+
+    async def test_ephemeral_client_is_refused_before_opening_anything(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = _count_constructions(monkeypatch)
+        try:
+            SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="t")
+            with pytest.raises(SurrealDbError) as info:
+                async with SurrealDBConnectionManager.ephemeral_client():
+                    pytest.fail("ephemeral_client() opened a second engine")  # pragma: no cover
+            assert str(info.value) == embedded_module.ephemeral_unsupported("mem://")
+            assert "second session" in str(info.value)
+            assert "embedded engine" in str(info.value)
+            assert not SurrealDBConnectionManager.is_connected()
+            assert calls == []
+        finally:
+            await SurrealDBConnectionManager.unset_connection()
+
+    async def test_refusals_leave_an_open_engine_untouched(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """With the engine already open, a refusal constructs no second client and the data stays."""
+        async with embedded() as engine:
+            await Person(id="ada", name="Ada").save()
+            calls = _count_constructions(monkeypatch)
+            with pytest.raises(SurrealDbError, match="second session"):
+                async with SurrealDBConnectionManager.ephemeral_client():
+                    pytest.fail("ephemeral_client() opened a second engine")  # pragma: no cover
+            with pytest.raises(SurrealDbError, match="embedded engine"):
+                await EmbWatched.objects().watch().start()
+            assert calls == []
+            assert _slot_client() is engine
+            assert (await Person.objects().get("ada")).name == "Ada"
+
+    def test_the_http_text_is_unchanged(self) -> None:
+        """Spec §0.1: a non-WebSocket server URL keeps its v0.24.1 text, byte for byte."""
+        with pytest.raises(SurrealDbError) as info:
+            require_websocket("http://h:8000")
+        assert str(info.value) == (
+            "Live queries require a WebSocket connection (ws:// or wss://); the configured URL is "
+            "'http://h:8000'. Call SurrealDBConnectionManager.set_connection() with a ws:// URL."
+        )
+        require_websocket("ws://h:8000/rpc")  # accepted
+        require_websocket("wss://h")
+
+
+class TestChangeFeedEmbeddedE2E:
+    """AC-9 (D6), no server: change feeds work from now and from a cursor; a datetime position is refused (E4)
+    after the one ``version()`` request, before any ``INFO``/``SHOW CHANGES``."""
+
+    async def test_from_now_then_from_the_cursor(self) -> None:
+        async with embedded() as client:
+            await client.query("DEFINE TABLE cf_item CHANGEFEED 1h;")
+            stream = CfItem.objects().changes(poll_interval=0.05)
+            await stream.start()
+            item = await CfItem(id="a", name="first").save()
+            await item.merge(name="second")
+
+            created, updated = await _take(stream, 2)
+            # A change feed records no creation: both entries are updates (changefeed.py, test_change_feeds.py).
+            assert [created.action, updated.action] == [LiveAction.UPDATE, LiveAction.UPDATE]
+            assert [created.record_id, updated.record_id] == ["cf_item:a", "cf_item:a"]
+            assert (created.instance.name, updated.instance.name) == ("first", "second")
+            cursor = stream.cursor
+            assert cursor is not None
+            stream.stop()
+
+            await CfItem(id="b", name="third").save()
+            resumed = CfItem.objects().changes(since=cursor, poll_interval=0.05)
+            [event] = await _take(resumed, 1)
+            assert (event.record_id, event.instance.name) == ("cf_item:b", "third")
+            await _nothing_within(resumed)
+            resumed.stop()
+
+    @pytest.mark.parametrize(
+        "since",
+        [
+            pytest.param(datetime.now(UTC) - timedelta(minutes=1), id="datetime"),
+            pytest.param("2026-01-01T00:00:00Z", id="iso-string"),
+        ],
+    )
+    async def test_a_datetime_position_is_refused_after_version_only(
+        self, monkeypatch: pytest.MonkeyPatch, since: datetime | str
+    ) -> None:
+        async with embedded() as client:
+            await client.query("DEFINE TABLE cf_item CHANGEFEED 1h;")
+            calls = _record_calls(monkeypatch, "query", "query_raw", "version")
+            stream = CfItem.objects().changes(since=since, poll_interval=0.05)
+            with pytest.raises(SurrealDbError, match=r"changes\(since=<datetime>\)") as info:
+                await stream.start()
+            assert str(info.value) == changes_since_datetime_unsupported()
+            assert "embedded engine" in str(info.value)
+            assert _calls_of(calls, client) == [("version", ())]
+            # The first iteration reports it too, still without reading the feed.
+            with pytest.raises(SurrealDbError, match=r"changes\(since=<datetime>\)"):
+                async with asyncio.timeout(5):
+                    await anext(stream)
+            assert [name for name, _ in _calls_of(calls, client)] == ["version", "version"]
+
+
+class TestKillAfterSwitchE2E:
+    """AC-21 (D19), slot server (both lines): a live query started on a server and stopped once an embedded URL
+    is configured is killed on its server client, not refused."""
+
+    async def test_a_server_stream_is_killed_on_its_server_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        settings: dict[str, Any] = {
+            "url": _ws_url(),
+            "user": "root",
+            "password": "root",
+            "namespace": "ns",
+            "database": "db",
+        }
+        try:
+            async with orm_client("emb_watched") as server:
+                await server.query("DEFINE TABLE emb_watched SCHEMALESS;", {})
+                stream = await EmbWatched.objects().watch().start()
+                live_id = stream.live_id
+                assert live_id is not None
+                killed: list[Any] = []
+                real_kill = server.kill
+
+                async def recording_kill(query_uuid: Any, *args: Any, **kwargs: Any) -> Any:
+                    killed.append(query_uuid)
+                    return await real_kill(query_uuid, *args, **kwargs)
+
+                monkeypatch.setattr(server, "kill", recording_kill)
+                SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="t")
+
+                await stream.stop()
+
+                assert killed == [live_id]
+                assert stream.live_id is None
+                assert _slot_client() is None  # the KILL did not open the engine
+                SurrealDBConnectionManager.set_connection(**settings)
+        finally:
+            await SurrealDBConnectionManager.unset_connection()

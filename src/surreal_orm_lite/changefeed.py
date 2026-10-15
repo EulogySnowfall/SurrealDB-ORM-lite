@@ -39,6 +39,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
+from .embedded import changes_since_datetime_unsupported
 from .enum import LiveAction
 from .exceptions import SurrealDbConnectionError, SurrealDbError
 from .live import (
@@ -287,7 +288,9 @@ class ChangeModelStream(Generic[T]):
 
         A stream stopped while starting returns without sending anything more; iterating it ends.
 
-        :raises SurrealDbError: if the table does not exist or has no change feed.
+        :raises SurrealDbError: if the table does not exist or has no change feed, or for a
+            datetime ``since`` on the embedded engine of the surrealdb SDK 2.x (it keeps no
+            timestamps for change-feed positions: pass a cursor or ``since=None``).
         """
         if self._major is not None:
             return self
@@ -296,9 +299,15 @@ class ChangeModelStream(Generic[T]):
         return self
 
     async def _start(self) -> None:
+        from .connection_manager import SurrealDBConnectionManager
+
         version = await self._with_retry(lambda client: client.version())
         match = _VERSION.search(str(version))
         major = int(match.group(1)) if match else 3
+        if isinstance(self._since, datetime) and major < 3 and SurrealDBConnectionManager.is_embedded():
+            # The SDK 2.x engine (a 2.3 core) keeps no timestamps for its feed positions: refused
+            # before any INFO or SHOW CHANGES, rather than an engine error at the first poll.
+            raise SurrealDbError(changes_since_datetime_unsupported())
         await self._check_changefeed()
         since = self._since
         if isinstance(since, int):
