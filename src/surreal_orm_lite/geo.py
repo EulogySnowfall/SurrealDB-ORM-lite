@@ -18,6 +18,9 @@ Equality: a value equals an ORM or SDK value of the same kind with equal coordin
 (``GeometryPoint(1, 2) == surrealdb.data.GeometryPoint(1.0, 2.0)`` is ``True``). The SDK's own
 ``__eq__`` answers ``False`` the other way round: keep the ORM value on the left.
 
+``str()`` gives the value's SurrealQL text, in GeoJSON object form
+(``{type: 'Point', coordinates: [-73.99, 40.75]}``), and never raises; ``repr()`` is the SDK's format.
+
 ``GeometryCollection`` is a ``Geometry`` (the SDK's is not) and nests at most 32 levels of
 collections, a depth every supported SurrealDB line accepts. Refusals raise ``TypeError`` for a
 wrong argument type and ``InvalidGeometryError`` (a ``ValueError``) for a wrong value.
@@ -46,6 +49,8 @@ from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import PydanticSerializationUnexpectedValue, core_schema
 
 from ._sdk import (
+    TAG_DECIMAL_STRING,
+    CBORTag,
     SdkGeometryCollection,
     SdkGeometryLine,
     SdkGeometryMultiLine,
@@ -281,6 +286,17 @@ class Geometry:
             return self._repr()
         except Exception:
             return object.__repr__(self)
+
+    def __str__(self) -> str:
+        """The value's SurrealQL text, in GeoJSON object form: ``{type: 'Point', coordinates: [1.0, 2.0]}``.
+
+        Never raises: a value with no text (built unchecked by the serializer, holding a ``str`` or a
+        non-finite coordinate…) gives its ``repr()``.
+        """
+        try:
+            return _geometry_text(self)
+        except Exception:
+            return repr(self)
 
     @classmethod
     def __get_pydantic_core_schema__(cls, source_type: Any, handler: GetCoreSchemaHandler) -> core_schema.CoreSchema:
@@ -727,6 +743,74 @@ def _from_sdk(value: Any, *, checked: bool) -> Any:
         return _from_sdk_unchecked(value)
     except Exception:
         return value
+
+
+# --- SurrealQL text --------------------------------------------------------------------------------
+
+#: GeoJSON type → the GeoJSON type of its members (the kinds whose members are coordinate arrays).
+_MEMBER_TYPES: dict[str, str] = {
+    "LineString": "Point",
+    "Polygon": "LineString",
+    "MultiPoint": "Point",
+    "MultiLineString": "LineString",
+    "MultiPolygon": "Polygon",
+}
+
+
+def _coordinate_text(value: Any) -> str:
+    """A coordinate's text: ``float.__repr__(float(value))`` for a finite ``int`` (not ``bool``) or ``float``.
+
+    ``TypeError`` for anything else — a ``Decimal`` or a decimal ``CBORTag`` has no verified text, and
+    neither has ``nan``, an infinity, an ``int`` too large for a float or a ``str``.
+    """
+    needed = "a geometry coordinate must be a finite int or float to be written as SurrealQL"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        # The encoding boundary sends an exponent-form ``Decimal`` as a decimal ``CBORTag``.
+        if isinstance(value, Decimal) or (isinstance(value, CBORTag) and value.tag == TAG_DECIMAL_STRING):
+            raise TypeError(f"{needed}, not a decimal: a decimal coordinate has no verified text, use a float")
+        raise TypeError(f"{needed}, not {type(value).__name__}")
+    try:
+        number = float(value)
+    except OverflowError:
+        raise TypeError(f"{needed}: this int is too large for a float") from None
+    if not math.isfinite(number):
+        raise TypeError(f"{needed}, not {number!r}")
+    return float.__repr__(number)
+
+
+def _coordinates_text(value: Any, kind: str) -> str:
+    """The GeoJSON ``coordinates`` array of a point or of a kind made of coordinate arrays, as text."""
+    if kind == "Point":
+        return f"[{_coordinate_text(value.longitude)}, {_coordinate_text(value.latitude)}]"
+    member_type = _MEMBER_TYPES[kind]
+    parts = []
+    for member in _sdk_members(value, _MEMBERS[kind]):
+        if _kind_of(member) != member_type:
+            raise TypeError(f"a {kind} member must be a {member_type} geometry, not {type(member).__name__}")
+        parts.append(_coordinates_text(member, member_type))
+    return f"[{', '.join(parts)}]"
+
+
+def _geometry_text(value: Any) -> str:
+    """The SurrealQL text of an ORM or SDK geometry (and of their members): its GeoJSON **object** form.
+
+    ``{type: 'Point', coordinates: [-73.99, 40.75]}``, ``{type: 'GeometryCollection', geometries:
+    [{type: 'Point', coordinates: [1.0, 2.0]}, …]}``: every kind and every collection member is an
+    object, the form every SurrealDB line parses as a geometry equal to the bound value. Rings are
+    written as given (SurrealDB closes an open ring). Coordinates follow ``_coordinate_text``. No
+    structural check: ``TypeError`` only when a part has no text (a coordinate, a member that is not a
+    geometry of the expected kind, a member list that is not a ``list`` or ``tuple``).
+
+    What ``str()`` of a geometry returns; ``surql_literal.to_surql_literal`` writes it into live
+    filters (an SDK geometry checked by the encoding boundary first).
+    """
+    kind = _kind_of(value)
+    if kind == "GeometryCollection":
+        members = ", ".join(_geometry_text(member) for member in _sdk_members(value, "geometries"))
+        return f"{{type: 'GeometryCollection', geometries: [{members}]}}"
+    if kind == "Point" or kind in _MEMBER_TYPES:
+        return f"{{type: '{kind}', coordinates: {_coordinates_text(value, kind)}}}"
+    raise TypeError(f"not a geometry: {type(value).__name__}")
 
 
 # --- GeoJSON -------------------------------------------------------------------------------------------

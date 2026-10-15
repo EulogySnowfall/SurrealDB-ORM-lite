@@ -54,6 +54,7 @@ from surreal_orm_lite import (
     geo,
     live,
 )
+from surreal_orm_lite.surql_literal import inline_variables, to_surql_literal
 from tests.conftest import orm_client
 from tests.test_encoding import _no_client
 from tests.test_rich_types import _http_client, _server_version
@@ -1836,3 +1837,238 @@ class TestDecimalCoordinatesE2E:
                 raw = await client.query("SELECT VALUE v FROM ONLY $rid;", {"rid": raw_rid})
                 assert via_orm == raw, text
                 assert via_orm.longitude == DECIMAL_STORED[d], text
+
+
+# --- text and live literals (Task 5) -------------------------------------------------------------
+
+_SQUARE_TEXT = "[[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [0.0, 0.0]]"
+_HOLE_TEXT = "[[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0], [1.0, 1.0]]"
+
+
+def _origin_line() -> GeometryLine:
+    return GeometryLine(GeometryPoint(0, 0), GeometryPoint(1, 1))
+
+
+def _square_polygon(*, hole: bool = False) -> GeometryPolygon:
+    rings = [[(0, 0), (4, 0), (4, 4), (0, 4), (0, 0)]]
+    if hole:
+        rings.append([(1, 1), (2, 1), (2, 2), (1, 2), (1, 1)])
+    return GeometryPolygon.parse_coordinates(rings)
+
+
+#: Exact texts (spec §6.5): the GeoJSON object form for every kind and every collection member.
+LITERAL_TEXTS: dict[str, tuple[Callable[[], Geometry], str]] = {
+    "point": (lambda: GeometryPoint(-73.99, 40.75), "{type: 'Point', coordinates: [-73.99, 40.75]}"),
+    "line": (_origin_line, "{type: 'LineString', coordinates: [[0.0, 0.0], [1.0, 1.0]]}"),
+    "polygon-with-a-hole": (
+        lambda: _square_polygon(hole=True),
+        f"{{type: 'Polygon', coordinates: [{_SQUARE_TEXT}, {_HOLE_TEXT}]}}",
+    ),
+    "multipoint": (
+        lambda: GeometryMultiPoint(GeometryPoint(0, 0), GeometryPoint(1, 1)),
+        "{type: 'MultiPoint', coordinates: [[0.0, 0.0], [1.0, 1.0]]}",
+    ),
+    "multiline": (
+        lambda: GeometryMultiLine(_origin_line(), GeometryLine.parse_coordinates([(2, 2), (3, 3)])),
+        "{type: 'MultiLineString', coordinates: [[[0.0, 0.0], [1.0, 1.0]], [[2.0, 2.0], [3.0, 3.0]]]}",
+    ),
+    "multipolygon": (
+        lambda: GeometryMultiPolygon(_square_polygon(hole=True), _square_polygon()),
+        f"{{type: 'MultiPolygon', coordinates: [[{_SQUARE_TEXT}, {_HOLE_TEXT}], [{_SQUARE_TEXT}]]}}",
+    ),
+    "collection": (
+        lambda: GeometryCollection(GeometryPoint(1, 2), _origin_line()),
+        "{type: 'GeometryCollection', geometries: [{type: 'Point', coordinates: [1.0, 2.0]}, "
+        "{type: 'LineString', coordinates: [[0.0, 0.0], [1.0, 1.0]]}]}",
+    ),
+    "nested-collection": (
+        lambda: GeometryCollection(GeometryCollection(GeometryPoint(1, 2)), GeometryMultiPoint()),
+        "{type: 'GeometryCollection', geometries: [{type: 'GeometryCollection', geometries: "
+        "[{type: 'Point', coordinates: [1.0, 2.0]}]}, {type: 'MultiPoint', coordinates: []}]}",
+    ),
+    "empty-multipoint": (GeometryMultiPoint, "{type: 'MultiPoint', coordinates: []}"),
+    "empty-multiline": (GeometryMultiLine, "{type: 'MultiLineString', coordinates: []}"),
+    "empty-multipolygon": (GeometryMultiPolygon, "{type: 'MultiPolygon', coordinates: []}"),
+    "empty-collection": (GeometryCollection, "{type: 'GeometryCollection', geometries: []}"),
+    "tiny-floats": (lambda: GeometryPoint(1e-05, -2.5e-07), "{type: 'Point', coordinates: [1e-05, -2.5e-07]}"),
+    "large-floats": (lambda: GeometryPoint(1e16, -1e300), "{type: 'Point', coordinates: [1e+16, -1e+300]}"),
+    "orm-subclass": (lambda: _Pin(1, 2), "{type: 'Point', coordinates: [1.0, 2.0]}"),
+}
+
+#: SDK coordinates with no verified literal (spec §6.5): decimals, other CBOR tags and non-finite numbers.
+NO_LITERAL_COORDINATES: dict[str, Any] = {
+    "decimal": Decimal("1.5"),
+    "decimal-exponent": Decimal("1E-7"),
+    "decimal-nan": Decimal("NaN"),
+    "cbor-tag": CBORTag(surrealdb.TAG_DECIMAL_STRING, "1.5"),
+    "cbor-tag-not-a-decimal": CBORTag(surrealdb.TAG_DURATION_COMPACT, [1, 0]),
+    "nan": math.nan,
+    "inf": math.inf,
+    "-inf": -math.inf,
+}
+
+
+def _unchecked(make: Callable[[], Any]) -> Geometry:
+    """An ORM value the serializer built unchecked from a (malformed) SDK value."""
+    value = geo._from_sdk(make(), checked=False)
+    assert isinstance(value, Geometry)
+    return value
+
+
+#: ORM values built unchecked whose text cannot be written: ``str()`` falls back to ``repr()``.
+NO_TEXT: dict[str, Callable[[], Geometry]] = {
+    "point-holding-a-str": lambda: _unchecked(_bad_point),
+    "point-holding-nan": lambda: _unchecked(lambda: SdkPoint(math.nan, 1.0)),
+    "point-holding-a-decimal": lambda: _unchecked(lambda: SdkPoint(Decimal("1.5"), 1.0)),
+    "point-holding-a-huge-int": lambda: _unchecked(lambda: SdkPoint(10**400, 1.0)),
+    "multipolygon-holding-a-line": lambda: _unchecked(lambda: SdkMultiPolygon(_sdk("line"))),
+    "collection-holding-a-dict": lambda: _unchecked(lambda: SdkCollection({"type": "Point", "coordinates": [0.0, 0.0]})),
+    "collection-holding-a-member-without-repr": lambda: _unchecked(lambda: SdkCollection(_NoRepr())),
+}
+
+
+class TestGeometryLiteral:
+    """AC-7 and the ``str()`` part of AC-3: GeoJSON object literals and text (spec §6.5)."""
+
+    @pytest.mark.parametrize(("make", "text"), list(LITERAL_TEXTS.values()), ids=list(LITERAL_TEXTS))
+    def test_exact_text(self, make: Callable[[], Geometry], text: str) -> None:
+        assert to_surql_literal(make()) == text
+
+    @pytest.mark.parametrize(("make", "text"), list(LITERAL_TEXTS.values()), ids=list(LITERAL_TEXTS))
+    def test_sdk_value_of_the_boundary_renders_the_same_text(self, make: Callable[[], Geometry], text: str) -> None:
+        sdk = encoding.encode(make())
+        assert _all_sdk(sdk)
+        assert to_surql_literal(sdk) == text
+
+    @pytest.mark.parametrize("kind", KINDS)
+    def test_sdk_twin_renders_the_same_text(self, kind: str) -> None:
+        assert to_surql_literal(_sdk(kind)) == to_surql_literal(_orm(kind))
+
+    def test_sdk_subclass_renders_its_kind(self) -> None:
+        assert to_surql_literal(_SdkPin(*A)) == "{type: 'Point', coordinates: [-73.98, 40.74]}"
+
+    def test_sdk_int_coordinates_render_as_floats(self) -> None:
+        assert to_surql_literal(SdkPoint(1, -2)) == "{type: 'Point', coordinates: [1.0, -2.0]}"
+        assert to_surql_literal(SdkPoint(2**63 - 1, -(2**63))) == (
+            "{type: 'Point', coordinates: [9.223372036854776e+18, -9.223372036854776e+18]}"
+        )
+
+    def test_sdk_open_ring_renders_as_given(self) -> None:
+        assert to_surql_literal(_ring(*_square())) == (
+            "{type: 'Polygon', coordinates: [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]]}"
+        )
+        assert (
+            to_surql_literal(_ring(*_square()[:3])) == "{type: 'Polygon', coordinates: [[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]]}"
+        )
+
+    def test_sdk_tuple_members_render_like_lists(self) -> None:
+        assert to_surql_literal(KEPT["tuple-line"]()) == "{type: 'LineString', coordinates: [[0.0, 0.0], [1.0, 0.0]]}"
+        assert to_surql_literal(KEPT["tuple-collection"]()) == to_surql_literal(SdkCollection(_sdk("point"), _sdk("line")))
+
+    def test_orm_members_of_an_sdk_value_render_and_stay_untouched(self) -> None:
+        orm = GeometryPoint(*A)
+        value = SdkMultiPoint(orm, SdkPoint(*B))
+        assert to_surql_literal(value) == "{type: 'MultiPoint', coordinates: [[-73.98, 40.74], [-73.99, 40.75]]}"
+        assert value.geometry_points[0] is orm
+
+    def test_inside_lists_and_dicts(self) -> None:
+        point = GeometryPoint(1, 2)
+        text = "{type: 'Point', coordinates: [1.0, 2.0]}"
+        assert to_surql_literal([point, SdkPoint(1.0, 2.0)]) == f"[{text}, {text}]"
+        assert to_surql_literal({"at": point}) == f"{{'at': {text}}}"
+
+    @pytest.mark.parametrize("value", _corpus(), ids=_corpus_ids())
+    def test_str_is_the_literal(self, value: Geometry) -> None:
+        assert str(value) == to_surql_literal(value)
+        assert f"{value}" == str(value)
+
+    @pytest.mark.parametrize("make", list(NO_TEXT.values()), ids=list(NO_TEXT))
+    def test_str_never_raises_and_falls_back_to_repr(self, make: Callable[[], Geometry]) -> None:
+        value = make()
+        assert str(value) == repr(value)
+
+    def test_str_of_an_unchecked_point_holding_a_str_is_its_repr(self) -> None:
+        value = _unchecked(_bad_point)
+        assert str(value) == "GeometryPoint(longitude=a, latitude=1.0)"
+
+    @pytest.mark.parametrize("make", list(NO_TEXT.values()), ids=list(NO_TEXT))
+    def test_unchecked_orm_value_without_text_has_no_literal(self, make: Callable[[], Geometry]) -> None:
+        with pytest.raises(TypeError, match="Cannot inline this Geometry"):
+            to_surql_literal(make())
+
+    @pytest.mark.parametrize("coordinate", list(NO_LITERAL_COORDINATES.values()), ids=list(NO_LITERAL_COORDINATES))
+    def test_sdk_coordinate_without_literal_raises_type_error(self, coordinate: Any) -> None:
+        for value in (SdkPoint(coordinate, 1.0), SdkPoint(1.0, coordinate), SdkLine(SdkPoint(coordinate, 1.0), SdkPoint(*A))):
+            with pytest.raises(TypeError, match=f"Cannot inline this {type(value).__name__}") as info:
+                to_surql_literal(value)
+            assert "connection" not in str(info.value).lower()
+
+    def test_decimal_coordinate_message_names_the_decimal(self) -> None:
+        # ``Decimal("1E-7")`` reaches the renderer as the boundary's decimal ``CBORTag``.
+        for coordinate in (Decimal("1.5"), Decimal("1E-7"), CBORTag(surrealdb.TAG_DECIMAL_STRING, "1.5")):
+            with pytest.raises(TypeError, match="not a decimal: a decimal coordinate has no verified text, use a float"):
+                to_surql_literal(SdkPoint(coordinate, 1.0))
+        with pytest.raises(TypeError, match="finite int or float to be written as SurrealQL, not CBORTag.$"):
+            to_surql_literal(SdkPoint(CBORTag(surrealdb.TAG_DURATION_COMPACT, [1, 0]), 1.0))
+        with pytest.raises(TypeError, match="this int is too large for a float"):
+            to_surql_literal(_unchecked(lambda: SdkPoint(10**400, 1.0)))
+
+    @pytest.mark.parametrize(("make", "message"), list(REFUSED.values()), ids=list(REFUSED))
+    def test_malformed_sdk_geometry_raises_type_error(self, make: Callable[[], Any], message: str) -> None:
+        value = make()
+        with pytest.raises(TypeError, match=f"Cannot inline this {type(value).__name__}: SurrealDB refuses it") as info:
+            to_surql_literal(value)
+        assert message in str(info.value)
+        assert type(info.value.__cause__) is ValueError
+        assert "connection" not in str(info.value).lower()
+
+    def test_inline_variables_writes_the_literal(self) -> None:
+        text = "{type: 'Point', coordinates: [-73.99, 40.75]}"
+        assert inline_variables("loc = $p", {"p": GeometryPoint(-73.99, 40.75)}) == f"loc = {text}"
+        assert inline_variables("loc = $p", {"p": SdkPoint(-73.99, 40.75)}) == f"loc = {text}"
+        with pytest.raises(TypeError, match=r"^\$p: Cannot inline this GeometryLine"):
+            inline_variables("loc = $p", {"p": _bad_line()})
+
+    def test_the_unsupported_type_message_lists_geometries(self) -> None:
+        with pytest.raises(TypeError, match="geometries"):
+            to_surql_literal(object())
+
+
+def _closed(polygon: Any) -> Any:
+    """The SDK polygon SurrealDB stores for ``polygon``: every open ring closed with its first point."""
+    rings = []
+    for ring in polygon.geometry_lines:
+        points = list(ring.geometry_points)
+        rings.append(SdkLine(*points) if points[0] == points[-1] else SdkLine(*points, points[0]))
+    return SdkPolygon(*rings)
+
+
+#: Each value of the E2E corpus and the SDK value ``RETURN <literal>`` gives back (``None``: ``encode(value)``).
+LITERAL_CORPUS: dict[str, tuple[Callable[[], Any], Callable[[], Any] | None]] = {
+    **{f"orm-{kind}": (functools.partial(_orm, kind), None) for kind in KINDS},
+    **{f"sdk-{kind}": (functools.partial(_sdk, kind), None) for kind in KINDS},
+    **{name: (make, None) for name, (make, _) in LITERAL_TEXTS.items() if name not in ("point", "line")},
+    "corpus-nested-collection": (_nested_collection, None),
+    "sdk-int-coordinates": (lambda: SdkPoint(1, -2), lambda: SdkPoint(1.0, -2.0)),
+    "sdk-int64-bounds": (lambda: SdkPoint(2**63 - 1, -(2**63)), lambda: SdkPoint(float(2**63 - 1), float(-(2**63)))),
+    "sdk-open-ring-4-points": (lambda: _ring(*_square()), lambda: _closed(_ring(*_square()))),
+    "sdk-open-ring-3-points": (lambda: _ring(*_square()[:3]), lambda: _closed(_ring(*_square()[:3]))),
+    "sdk-open-hole": (_open_hole, lambda: _closed(_open_hole())),
+    "sdk-orm-member": (lambda: SdkMultiPoint(GeometryPoint(*A), SdkPoint(*B)), lambda: _sdk("multipoint")),
+}
+
+
+class TestGeometryLiteralE2E:
+    """AC-7 on both lines: every literal means exactly the value it came from (``RETURN <literal> == $v``)."""
+
+    @pytest.mark.parametrize(("make", "expected"), list(LITERAL_CORPUS.values()), ids=list(LITERAL_CORPUS))
+    async def test_literal_equals_the_bound_value(self, make: Callable[[], Any], expected: Callable[[], Any] | None) -> None:
+        value = make()
+        bound = encoding.encode(value)
+        literal = to_surql_literal(value)
+        async with orm_client("geo_raw") as client:
+            equal, back = await client.query(f"RETURN [{literal} == $v, {literal}];", {"v": bound})
+        assert equal is True, literal
+        twin = bound if expected is None else expected()
+        assert type(back) is type(twin), literal
+        assert back == twin, literal

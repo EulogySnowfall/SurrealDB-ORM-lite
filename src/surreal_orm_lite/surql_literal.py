@@ -14,6 +14,11 @@ checked as ``RETURN <literal> == $p`` against SurrealDB 2.7.0, 3.3.0 and 3.1.5, 
 (``timedelta``, ``Duration``: ``1h30m1ns``), dates (``d'2026-01-02T00:00:00Z'``), sets (an array,
 sorted when the items can be) and ranges (``1..5``, ``1>..=5``, ``d'2026-01-01T00:00:00Z'..``),
 whose bound values form a closed set too; ``tests/test_rich_types.py`` re-checks those.
+v0.24.0 adds geometries, the ORM's and the SDK's, written as GeoJSON objects for every kind and
+every collection member (``{type: 'Point', coordinates: [-73.99, 40.75]}``) with ``float``
+coordinates, checked on 2.7.0, 3.1.5 and 3.3.4; ``tests/test_geo_types.py`` re-checks them. An SDK
+geometry is first checked by the encoding boundary, so one SurrealDB refuses has no literal, and
+neither has a decimal or non-finite coordinate. That form is also a geometry's ``str()``: its text.
 
 A ``Range`` also has a text form, ``_range_text``: what its ``str()`` and its JSON write and a
 ``Range`` field reads back. It never reaches the server, so it writes every bound value exactly and
@@ -43,6 +48,7 @@ from uuid import UUID
 from . import encoding as _encoding
 from ._sdk import BoundExcluded, BoundIncluded, RecordID, SdkDuration, SdkRange
 from .exceptions import SurrealDbError
+from .geo import _SDK_GEOMETRIES, Geometry, _geometry_text
 from .types import _MAX_RANGE_TEXT, Duration, Range, _is_open_side, _nanoseconds
 
 __all__ = ["inline_variables", "to_surql_literal"]
@@ -65,7 +71,7 @@ _SERVER_PARAMETERS = frozenset({"auth", "session", "token", "access", "scope", "
 
 _SUPPORTED = (
     "None, bool, int, float, str, Decimal, datetime, date, timedelta, Duration, UUID, RecordID, Range, "
-    "and lists, sets or dicts of these"
+    "geometries (the ORM's or the SDK's), and lists, sets or dicts of these"
 )
 
 # A SurrealDB duration holds at most 2**64 - 1 seconds (plus its nanoseconds).
@@ -275,6 +281,24 @@ def _range_text(value: Range[Any] | SdkRange) -> str:
     return rendered
 
 
+def _geometry(value: Any) -> str:
+    """An ORM or SDK geometry's GeoJSON object literal, from ``geo._geometry_text`` (v0.24.0).
+
+    An SDK geometry goes through the encoding boundary's geometry row first: one SurrealDB refuses
+    has no literal either. An ORM geometry was checked when it was built.
+    """
+    name = type(value).__name__
+    if not isinstance(value, Geometry):
+        try:
+            value = _encoding._encode_sdk_geometry(value)
+        except ValueError as exc:
+            raise TypeError(f"Cannot inline this {name}: SurrealDB refuses it. {exc}") from exc
+    try:
+        return _geometry_text(value)
+    except TypeError as exc:
+        raise TypeError(f"Cannot inline this {name}: {exc}.") from exc
+
+
 def to_surql_literal(value: Any) -> str:
     """Return the SurrealQL literal that means exactly *value*.
 
@@ -284,7 +308,8 @@ def to_surql_literal(value: Any) -> str:
         of 2**64 seconds or more, a zero duration while the installed SDK cannot read one back,
         or a range whose side is not a bound or whose bound value is outside the closed set
         (``int`` but not ``bool``, finite ``float``, ``Decimal``, ``str``, ``datetime``, ``date``,
-        ``timedelta``, ``Duration``).
+        ``timedelta``, ``Duration``), an SDK geometry SurrealDB refuses, and a geometry with a
+        coordinate that is not a finite ``int`` or ``float``.
     """
     if value is None:
         return "NONE"
@@ -333,6 +358,8 @@ def to_surql_literal(value: Any) -> str:
         except (TypeError, ArithmeticError):
             items = list(value)
         return "[" + ", ".join(to_surql_literal(item) for item in items) + "]"
+    if isinstance(value, (Geometry, *_SDK_GEOMETRIES)):
+        return _geometry(value)
     if isinstance(value, Mapping):
         parts = []
         for key, item in value.items():
