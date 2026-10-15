@@ -2006,10 +2006,11 @@ sub.active_hours  # Range(begin=BoundIncluded(value=9), end=BoundExcluded(value=
 
 Optional fields (`ttl: timedelta | None = None`) behave the same. Values nested in containers
 (`list[timedelta]`, `dict[str, date]`, a sub-model's fields) are sent the same way at any depth. On
-reads, a `timedelta` is converted from the SDK's duration in a top-level field only: deeper down
-(`list[timedelta]`, a sub-model's `timedelta` field) it fails validation as it did before v0.23.0,
-so declare `Duration` there, which reads the SDK's value at any depth. A naive `datetime` stays
-naive on the instance and is read back as an aware UTC `datetime`, as before.
+reads, a `timedelta` is converted from the SDK's duration at any depth too: a top-level field,
+`list[timedelta]`, `dict[str, timedelta]`, `timedelta | str` or a sub-model's `timedelta` field
+all read a `timedelta`, floored to the microsecond (declare `Duration` to keep the nanoseconds). A
+naive `datetime` stays naive on the instance and is read back as an aware UTC `datetime`, as
+before.
 
 #### `Duration`
 
@@ -2193,20 +2194,18 @@ await sub.merge(trial=sub.trial + timedelta(days=7))                          # 
 apply the row the server returns to the instance. Top-level `timedelta`, `Duration` and geometry
 fields (since v0.24.0, see [section 25](#25-geospatial-fields)) are converted on the way. A field
 that holds a sub-model (a Pydantic model, a dataclass or a `TypedDict`, also inside `list[...]`,
-`dict[..., ...]` or `X | None`) gets the value a read gives: the row goes through the model's
-validation, the model's own validators included, and the field holds its model instance, not the
-row's `dict`, with the ORM's durations, ranges and geometries inside. When the row as a whole does
-not validate, each such field is validated on its own, except one that the model's own validators
-could reshape (a `field_validator` on that field, a `model_validator`, a `model_post_init`): that
-one, like a value that does not validate, is applied as received, so these calls never fail on it.
-Top-level `date`, `set` and
-`Range` fields hold the SDK's value (a midnight `datetime`, a `list`, the SDK's `Range`) until the
-record is loaded again (`get()`, `filter()`, …). Writing such an instance back is safe, sub-models
-included, since those values are stored the same way, although Pydantic warns
-(`PydanticSerializationUnexpectedValue`) about the top-level `date` and `set` fields while
-serialising them. The exception is a sub-model with a `timedelta` field: a read refuses the SDK's
-duration there (see above) and so does this validation, so the field keeps the row's `dict`, which
-a later write stores as a plain object. Declare `Duration` in sub-models.
+`dict[..., ...]` or `X | None`) or a `timedelta` below the top level (`list[timedelta]`,
+`timedelta | str`…) gets the value a read gives: the row goes through the model's validation, the
+model's own validators included, and a sub-model field holds its model instance, not the row's
+`dict`, with the ORM's durations, `timedelta`s, ranges and geometries inside. When the row as a
+whole does not validate, each such field is validated on its own, except one that the model's own
+validators could reshape (a `field_validator` on that field, a `model_validator`, a
+`model_post_init`): that one, like a value that does not validate, is applied as received, so
+these calls never fail on it. Other top-level `date`, `set` and `Range` fields hold the SDK's value
+(a midnight `datetime`, a `list`, the SDK's `Range`) until the record is loaded again (`get()`,
+`filter()`, …). Writing such an instance back is safe, sub-models included, since those values are
+stored the same way, although Pydantic warns (`PydanticSerializationUnexpectedValue`) about the
+top-level `date` and `set` fields while serialising them.
 
 #### Values the SDK cannot read
 
@@ -2231,8 +2230,9 @@ refused value raises `ValueError` before anything is sent.
 Plain `datetime`, `Decimal` and `UUID` annotations work as they do there. The full ORM has no
 `timedelta` or `Range` fields and its `Duration` is a string: `timedelta`, `Duration` and
 `Range[T]` fields are lite additions. The full ORM also validates the rows its writes return; lite
-validates the sub-model and geometry fields of those rows and converts durations, while top-level
-`date`, `set` and `Range` fields keep the SDK's value (see [After a write that returns the row](#after-a-write-that-returns-the-row)).
+validates the sub-model, geometry and nested `timedelta` fields of those rows and converts
+top-level durations, while top-level `date`, `set` and `Range` fields keep the SDK's value (see
+[After a write that returns the row](#after-a-write-that-returns-the-row)).
 
 ### 25. Geospatial fields
 
