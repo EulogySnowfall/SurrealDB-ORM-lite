@@ -1,4 +1,5 @@
 import contextlib
+import dataclasses
 import functools
 import logging
 import os
@@ -11,7 +12,7 @@ from types import UnionType
 from typing import TYPE_CHECKING, Any, Self, TypeVar, overload
 
 import pydantic
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, TypeAdapter, model_validator
 from pydantic_core import ValidationError
 
 from . import encoding as _encoding
@@ -65,6 +66,14 @@ _ALIAS_MAPS: dict[type, tuple[dict[str, str], dict[str, str]]] = {}
 _SERVER_FIELDS: dict[type, frozenset[str]] = {}
 # The read kinds of v0.23.0 (``BaseSurrealModel._read_kinds``), filled once Pydantic completed the class.
 _READ_KINDS: dict[type, dict[str, str]] = {}
+# The fields a write sync validates (#228): their annotations (``BaseSurrealModel._sync_fields``) and
+# the adapters built from them on first use, ``None`` for one that cannot be built (``_sync_adapter``).
+_SYNC_FIELDS: dict[type, dict[str, Any]] = {}
+_SYNC_ADAPTERS: dict[type, dict[str, TypeAdapter[Any] | None]] = {}
+
+# ``tuple`` and ``Annotated`` subscripted with annotations known at run time (mypy takes them for types).
+_TUPLE: Any = tuple
+_ANNOTATED: Any = typing.Annotated
 
 # Pydantic's metaclass sits between ``__pydantic_init_subclass__`` and the user's ``class``
 # statement; a warning raised there must skip its frames to land on the user's line (v0.22.0).
@@ -129,6 +138,36 @@ def _read_kind(annotation: Any) -> str | None:
     if annotation is Duration:
         return "duration"
     return None
+
+
+def _has_structured_type(annotation: Any, _aliases: frozenset[int] = frozenset()) -> bool:
+    """Whether a field annotation holds a structured type at any depth: a ``BaseModel``, a dataclass or a ``TypedDict``.
+
+    Walks ``Annotated`` (its first argument), unions, the arguments of generic types
+    (``list[Sub]``, ``dict[str, Sub]``, ``Sub | None``, ``Range[Sub]``…) and the value of a
+    ``type`` alias (each alias once, so a recursive one ends). A string or ``ForwardRef``, the
+    values of a ``Literal`` and ``type[...]`` hold none. A ``TypedDict`` is recognised by its
+    shape, since ``typing.is_typeddict`` misses ``typing_extensions.TypedDict``, the form Pydantic
+    requires before Python 3.12. Used by :meth:`BaseSurrealModel._sync_fields` (#228).
+    """
+    origin = typing.get_origin(annotation)
+    if origin is typing.Annotated:
+        return _has_structured_type(typing.get_args(annotation)[0], _aliases)
+    if origin is typing.Literal or origin is type:
+        return False
+    if origin is not None:
+        return any(_has_structured_type(arg, _aliases) for arg in typing.get_args(annotation))
+    if not isinstance(annotation, type):
+        if not hasattr(annotation, "__type_params__") or id(annotation) in _aliases:
+            return False
+        try:
+            value = annotation.__value__  # a ``type`` alias, evaluated lazily
+        except Exception:
+            return False
+        return _has_structured_type(value, _aliases | {id(annotation)})
+    if issubclass(annotation, BaseModel) or dataclasses.is_dataclass(annotation):
+        return True
+    return issubclass(annotation, dict) and hasattr(annotation, "__required_keys__")
 
 
 def _own_annotation_names(cls: type) -> set[str]:
@@ -425,6 +464,80 @@ class BaseSurrealModel(BaseModel):
         if cls.__pydantic_complete__:
             _READ_KINDS[cls] = kinds
         return kinds
+
+    @classmethod
+    def _sync_fields(cls) -> dict[str, Any]:
+        """Return the fields a write sync validates, by Python name, cached per class (#228).
+
+        ``{"sub": Sub | None, "location": Annotated[GeometryPoint | None, GeoField['point']]}``: every
+        field whose annotation holds a structured type at any depth (a ``BaseModel``, a dataclass or a
+        ``TypedDict``, alone or in ``list[...]``, ``dict[..., ...]``, ``X | None``…, see
+        ``_has_structured_type``) and every geometry field (``_read_kind``). Each maps to its full
+        annotation, ``Annotated`` constraints included (``FieldInfo.rebuild_annotation()``), plus the
+        field's discriminator. :meth:`_apply_record` receives rows keyed by column but translates each
+        key to its Python name first, so the map needs no column keys. Cached once Pydantic has
+        completed the class, like :meth:`_read_kinds`; never mutate the returned dict.
+        """
+        cached = _SYNC_FIELDS.get(cls)
+        if cached is not None:
+            return cached
+        fields: dict[str, Any] = {}
+        for name, info in cls.model_fields.items():
+            if _read_kind(info.annotation) != "geometry" and not _has_structured_type(info.annotation):
+                continue
+            annotation = info.rebuild_annotation()
+            if info.discriminator is not None:
+                annotation = _ANNOTATED[annotation, pydantic.Field(discriminator=info.discriminator)]
+            fields[name] = annotation
+        if cls.__pydantic_complete__:
+            _SYNC_FIELDS[cls] = fields
+        return fields
+
+    @classmethod
+    def _sync_adapter(cls, name: str) -> TypeAdapter[Any] | None:
+        """Return the adapter that validates field ``name`` on a write sync, built on first use and cached per class (#228).
+
+        ``TypeAdapter(tuple[<annotation>], config=<the model's config>)``: the 1-tuple puts the
+        annotation where a field's annotation sits in the model, so a stdlib dataclass or a
+        ``TypedDict`` inherits the model's config as it does in a read, and the config is accepted
+        whatever the annotation (Pydantic refuses one for a bare ``BaseModel``). ``None`` when the
+        field is not in :meth:`_sync_fields` or the adapter cannot be built; an annotation that
+        cannot be resolved may also give an adapter that fails on use, which
+        :meth:`_validated_on_sync` treats like a value that does not validate. Never raises.
+        """
+        adapters = _SYNC_ADAPTERS.get(cls)
+        if adapters is None:
+            adapters = {}
+            if cls.__pydantic_complete__:
+                _SYNC_ADAPTERS[cls] = adapters
+        if name in adapters:
+            return adapters[name]
+        annotation = cls._sync_fields().get(name)
+        adapter: TypeAdapter[Any] | None = None
+        if annotation is not None:
+            try:
+                adapter = TypeAdapter(_TUPLE[annotation], config=typing.cast(ConfigDict, cls.model_config))
+            except Exception:
+                adapter = None
+        adapters[name] = adapter
+        return adapter
+
+    @classmethod
+    def _validated_on_sync(cls, name: str, value: Any) -> Any:
+        """Return ``value`` validated against field ``name`` as a read validates it, else ``value`` itself (#228).
+
+        A sub-model's ``dict`` becomes the declared instance, with the ORM's durations, ranges and
+        geometries; a stored GeoJSON object in a geometry field becomes the ORM's geometry. A value
+        that does not validate, a validator that raises anything else and a field without an
+        adapter (see :meth:`_sync_adapter`) all give ``value`` back unchanged: never raises.
+        """
+        adapter = cls._sync_adapter(name)
+        if adapter is None:
+            return value
+        try:
+            return adapter.validate_python((value,))[0]
+        except Exception:
+            return value
 
     @classmethod
     def _reject_ambiguous_aliases(cls, forward: Mapping[str, str]) -> None:
@@ -995,9 +1108,10 @@ class BaseSurrealModel(BaseModel):
                 raise
             # Pull back the fields the SERVER owns — computed fields (DEFINE FIELD … VALUE) and
             # `server_fields` entries — so they are readable straight after save().
-            # Deliberately narrow: applying the whole row here would bypass Pydantic validation
-            # for every field (see _apply_record), turning nested models into plain dicts. A
-            # model that declares neither is untouched, exactly as before v0.14.0.
+            # Deliberately narrow: the instance already holds the values it just wrote, while the
+            # whole row would leave top-level `date`, `set` and `Range` fields with the SDK's
+            # values (see _apply_record). A model that declares neither is untouched, exactly as
+            # before v0.14.0.
             self._apply_record(record, only=self.get_server_fields())
             return self, True
 
@@ -1163,9 +1277,9 @@ class BaseSurrealModel(BaseModel):
         ``None``/empty result is a no-op — callers that must distinguish "no row" from "nothing
         to apply" check first.
 
-        Values are written with ``object.__setattr__``, i.e. **without** Pydantic validation, so
-        a nested model arrives as the raw ``dict`` the server sent. That is why ``only`` exists:
-        a caller that needs just a few known-scalar fields should say so rather than re-applying
+        Values are written with ``object.__setattr__``, i.e. without validating the instance as a
+        whole: no model validator runs and a frozen field is still updated. That is why ``only``
+        exists: a caller that needs just a few known fields should say so rather than re-applying
         the whole row.
 
         A row arrives keyed by **column**, so each key is translated back to its Python field
@@ -1174,10 +1288,15 @@ class BaseSurrealModel(BaseModel):
 
         Top-level ``timedelta`` and ``Duration`` fields get the SDK's ``Duration`` converted
         (v0.23.0), and top-level geometry fields the SDK's geometries, as the ORM's geometry
-        classes (v0.24.0; a value the constructors refuse is kept as received). Every other value
-        is applied as received: a typed container such as ``list[GeometryPoint]`` keeps the SDK's
-        values, which its serializer converts at the next ``model_dump()``, and a sub-model keeps
-        the row's dict.
+        classes (v0.24.0). A field that holds a sub-model (a ``BaseModel``, a dataclass or a
+        ``TypedDict``, at any depth of its annotation) and a geometry field holding anything other
+        than an SDK geometry (a stored GeoJSON object…) are validated against the field's own
+        annotation, as a read validates them (#228, see :meth:`_validated_on_sync`): a sub-model
+        field holds its declared instance, with the ORM's durations, ranges and geometries. A
+        value that does not validate is applied as received, so this never raises. Every other
+        value is applied as received: a typed container of scalars such as ``list[Duration]`` or
+        ``list[GeometryPoint]`` keeps the SDK's values, which its serializer converts at the next
+        ``model_dump()``, and top-level ``date``, ``set`` and ``Range`` fields hold the SDK's value.
 
         Args:
             only: restrict the copy to these field names. ``None`` (default) applies every field
@@ -1189,9 +1308,10 @@ class BaseSurrealModel(BaseModel):
             return
         allowed = None if only is None else set(only)
         kinds = self._read_kinds()
+        validated = self._sync_fields()
         for column, value in record.items():
             key = self.to_py_field(column)
-            if allowed is not None and key not in allowed:
+            if (allowed is not None and key not in allowed) or not hasattr(self, key):
                 continue
             kind = kinds.get(key)
             if kind == "timedelta":
@@ -1200,8 +1320,9 @@ class BaseSurrealModel(BaseModel):
                 value = _duration_from_sdk(value)
             elif kind == "geometry":
                 value = _geo._geometry_from_sdk(value)
-            if hasattr(self, key):
-                object.__setattr__(self, key, value)
+            if key in validated and not (kind == "geometry" and (value is None or isinstance(value, _geo.Geometry))):
+                value = self._validated_on_sync(key, value)
+            object.__setattr__(self, key, value)
 
     def _sync_after_merge(
         self,

@@ -11,20 +11,22 @@ import contextlib
 import dataclasses
 import inspect
 import re
+import sys
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any, ForwardRef, Literal, Optional
 from uuid import UUID
 
 import pytest
 import surrealdb
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic.dataclasses import dataclass as pydantic_dataclass
 from surrealdb import RecordID
 from surrealdb.cbor import undefined
-from typing_extensions import TypedDict
+from typing_extensions import TypeAliasType, TypedDict
 
 from surreal_orm_lite import (
     AuthenticatedUserMixin,
@@ -45,6 +47,7 @@ from surreal_orm_lite import (
     _sdk,
     computed,
     encoding,
+    model_base,
 )
 from surreal_orm_lite._sdk import Bound
 from surreal_orm_lite.live import hydrate
@@ -1206,6 +1209,294 @@ _SYNC_CASES: dict[str, Callable[[], Awaitable[RfHolder]]] = {
     "patch": _sync_patch,
     "atomic-increment": _sync_atomic_increment,
 }
+
+
+def _sdk_values(value: Any) -> Any:
+    """``value`` with the ORM's durations and ranges as the SDK reads them back, at any depth."""
+    if isinstance(value, Duration):
+        return surrealdb.Duration(value.elapsed)
+    if isinstance(value, Range):
+        return surrealdb.Range(value.begin, value.end)
+    if isinstance(value, dict):
+        return {key: _sdk_values(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_sdk_values(item) for item in value]
+    return value
+
+
+def _sdk_row(holder: BaseSurrealModel) -> dict[str, Any]:
+    """The row a write of ``holder`` returns, as the SDK reads it: sub-models as dicts holding the SDK's values."""
+    row: dict[str, Any] = _sdk_values(holder.model_dump(exclude={"id"}))
+    return row
+
+
+class RfTdSub(BaseModel):
+    """A sub-model ``timedelta``: a read refuses the SDK's duration there (README section 24), and so does a write sync."""
+
+    td: timedelta
+
+
+class RfAliasedSub(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    ttl: Duration = Field(alias="ttlCol")
+
+
+class RfStrictAliasedSub(BaseModel):
+    ttl: Duration = Field(alias="ttlCol")
+
+
+class RfBoomSub(BaseModel):
+    """A sub-model whose validator raises something else than a ``ValueError``."""
+
+    n: int
+
+    @field_validator("n")
+    @classmethod
+    def _boom(cls, value: int) -> int:
+        raise RuntimeError("boom")
+
+
+@dataclasses.dataclass
+class RfStdData:
+    """A stdlib dataclass: it takes the config of the model it sits in, in a read and in a write sync alike."""
+
+    name: str
+
+
+class RfCat(BaseModel):
+    kind: Literal["cat"] = "cat"
+    ttl: Duration
+
+
+class RfDog(BaseModel):
+    kind: Literal["dog"]
+    ttl: Duration
+
+
+@pydantic_dataclass
+class RfPydData:
+    """A Pydantic dataclass: a dataclass too, with its own config."""
+
+    ttl: Duration
+
+
+class RfOddHolder(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_odd", str_strip_whitespace=True)
+
+    id: str | None = None
+    td_sub: RfTdSub | None = None
+    aliased: RfAliasedSub | None = None
+    strict_aliased: RfStrictAliasedSub | None = None
+    boom: RfBoomSub | None = None
+    std: RfStdData | None = None
+    std_column: RfStdData | None = Field(default=None, alias="stdCol")
+    picked: Annotated[RfPlainSub | RfSub | None, Field(union_mode="left_to_right")] = None
+    pet: RfCat | RfDog | None = Field(default=None, discriminator="kind")
+
+
+class TestSubModelSyncRule:
+    """#228 (unit): the fields a write sync validates, and the fallback to the value as received."""
+
+    def test_fields_validated_on_sync(self) -> None:
+        assert set(RfHolder._sync_fields()) == {"sub", "maybe", "subs", "by_key", "data", "datas", "typed", "plain"}
+        assert RfHolder._sync_fields() is RfHolder._sync_fields(), "cached per class"
+        assert RfEvent._sync_fields() == {} and RfKinds._sync_fields() == {} and RfPlain._sync_fields() == {}
+        # Python names only: ``_apply_record`` translates each column first.
+        assert "stdCol" not in RfOddHolder._sync_fields() and "std_column" in RfOddHolder._sync_fields()
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            RfSub,
+            RfSubData,
+            RfSubDict,
+            RfPydData,
+            RfSub | None,
+            Optional[RfSub],  # noqa: UP045 (typing.Union on purpose)
+            list[RfSub],
+            dict[str, RfSub],
+            tuple[int, RfSub],
+            list[RfSub | None],
+            Annotated[RfSub, Field(description="x")],
+            Range[RfSub],
+            TypeAliasType("RfSubs", list[RfSub]),
+        ],
+    )
+    def test_structured_annotations(self, annotation: Any) -> None:
+        assert model_base._has_structured_type(annotation)
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            int,
+            Any,
+            list[int],
+            dict[str, Any],
+            Duration,
+            Range[int],
+            timedelta,
+            datetime,
+            Literal["a", "b"],
+            type[RfSub],
+            "RfSub",
+            ForwardRef("RfSub"),
+            Annotated[int, RfSub],
+            TypeAliasType("RfInts", list[int]),
+        ],
+    )
+    def test_other_annotations(self, annotation: Any) -> None:
+        assert not model_base._has_structured_type(annotation)
+
+    @pytest.mark.skipif(sys.version_info < (3, 12), reason="the type statement needs Python 3.12")
+    def test_type_statement_aliases(self) -> None:
+        namespace: dict[str, Any] = {"RfSub": RfSub}
+        # Recursive, resolvable, and one whose value cannot be evaluated (NameError on access).
+        exec("type Loop = list[Loop] | int\ntype Subs = list[RfSub]\ntype Bad = list[Undefined]", namespace)
+        assert not model_base._has_structured_type(namespace["Loop"])
+        assert model_base._has_structured_type(namespace["Subs"])
+        assert not model_base._has_structured_type(namespace["Bad"])
+
+    def test_a_returned_row_gives_the_declared_instances(self) -> None:
+        holder = RfHolder.model_construct(id="h", sub=None)
+        row = _sdk_row(RfHolder(id="h", **HOLDER))
+        assert type(row["sub"]["ttl"]) is surrealdb.Duration and type(row["data"]["hours"]) is surrealdb.Range
+        holder._apply_record(row)
+        _assert_sub_models(holder)
+        # A typed container of scalars keeps the SDK's values (out of the rule), and its serializer converts them.
+        assert [type(d) for d in holder.many] == [surrealdb.Duration]
+        assert holder.model_dump()["many"] == HOLDER["many"]
+
+    def test_only_still_filters(self) -> None:
+        holder = RfHolder(id="h", **HOLDER)
+        before = holder.sub
+        holder._apply_record({"sub": {"ttl": surrealdb.Duration(1)}, "n": 4}, only={"n"})
+        assert holder.sub is before and holder.n == 4
+
+    @pytest.mark.parametrize(
+        "raw",
+        [{"ttl": "1h"}, {"hours": surrealdb.Range(None, None)}, "text", 3, None],
+        ids=["bad-duration", "missing-ttl", "text", "number", "none"],
+    )
+    def test_a_row_that_does_not_validate_is_applied_as_received(self, raw: Any) -> None:
+        holder = RfHolder(id="h", **HOLDER)
+        holder._apply_record({"sub": raw, "maybe": raw})
+        assert holder.sub is raw
+        assert holder.maybe is None if raw is None else holder.maybe is raw
+
+    def test_a_sub_model_timedelta_keeps_the_row_dict(self) -> None:
+        """README section 24: a sub-model ``timedelta`` cannot read the SDK's duration; the sync keeps the dict, as before."""
+        raw = {"td": surrealdb.Duration(5 * 10**9)}
+        with pytest.raises(ValidationError):
+            RfOddHolder.model_validate({"td_sub": raw})
+        odd = RfOddHolder()
+        odd._apply_record({"td_sub": raw})
+        assert odd.td_sub is raw
+
+    @pytest.mark.parametrize("key", ["ttl", "ttlCol"])
+    def test_aliased_sub_model_keys_follow_the_read(self, key: str) -> None:
+        """What ``get()`` accepts in a sub-model, under its alias or its name, the sync accepts; nothing else."""
+        raw = {key: surrealdb.Duration(5)}
+        for field in ("aliased", "strict_aliased"):
+            try:
+                expected: Any = getattr(RfOddHolder.model_validate({field: raw}), field)
+            except ValidationError:
+                expected = raw
+            odd = RfOddHolder()
+            odd._apply_record({field: raw})
+            got = getattr(odd, field)
+            assert got == expected and type(got) is type(expected), (field, got)
+            if type(got) is not dict:
+                assert type(got.ttl) is Duration and got.ttl == Duration(5)
+        assert type(RfOddHolder.model_validate({"strict_aliased": {"ttlCol": surrealdb.Duration(5)}}).strict_aliased) is (
+            RfStrictAliasedSub
+        )
+
+    def test_a_validator_that_raises_anything_never_escapes(self) -> None:
+        raw = {"n": 1}
+        with pytest.raises(RuntimeError):
+            RfOddHolder.model_validate({"boom": raw})
+        odd = RfOddHolder()
+        odd._apply_record({"boom": raw})
+        assert odd.boom is raw
+
+    def test_the_model_config_reaches_a_stdlib_dataclass(self) -> None:
+        """A stdlib dataclass takes the model's config (``str_strip_whitespace``) in a read and in a write sync alike."""
+        assert RfOddHolder.model_validate({"std": {"name": "  ada  "}}).std == RfStdData("ada")
+        odd = RfOddHolder()
+        odd._apply_record({"std": {"name": "  ada  "}, "stdCol": {"name": " bob "}})
+        assert odd.std == RfStdData("ada") and odd.std_column == RfStdData("bob")
+
+    def test_field_metadata_is_kept(self) -> None:
+        """The field's own metadata reaches the adapter: ``left_to_right`` picks the first member that validates.
+
+        The smart mode would pick ``RfSub``, which sets more fields from the row.
+        """
+        assert RfOddHolder.model_fields["picked"].metadata, "the union mode lives in the field's metadata"
+        raw = {"name": "p", "ttl": surrealdb.Duration(5), "hours": surrealdb.Range(None, None)}
+        odd = RfOddHolder()
+        odd._apply_record({"picked": raw})
+        assert type(odd.picked) is RfPlainSub and odd.picked == RfOddHolder.model_validate({"picked": raw}).picked
+
+    def test_the_discriminator_is_kept(self) -> None:
+        """A tagged union reads the tag, as in a read: the smart mode would take an untagged row for a cat."""
+        dog = {"kind": "dog", "ttl": surrealdb.Duration(5)}
+        odd = RfOddHolder()
+        odd._apply_record({"pet": dog})
+        assert type(odd.pet) is RfDog and type(odd.pet.ttl) is Duration
+        untagged = {"ttl": surrealdb.Duration(5)}
+        with pytest.raises(ValidationError):
+            RfOddHolder.model_validate({"pet": untagged})
+        odd._apply_record({"pet": untagged})
+        assert odd.pet is untagged
+
+    def test_adapters_are_built_once_on_first_use(self) -> None:
+        class RfLazy(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_lazy")
+
+            id: str | None = None
+            sub: RfPlainSub | None = None
+
+        assert RfLazy not in model_base._SYNC_ADAPTERS
+        lazy = RfLazy()
+        lazy._apply_record({"sub": {"name": "a"}})
+        assert type(lazy.sub) is RfPlainSub and lazy.sub == RfPlainSub(name="a")
+        adapter = model_base._SYNC_ADAPTERS[RfLazy]["sub"]
+        assert adapter is not None and RfLazy._sync_adapter("sub") is adapter
+        assert RfLazy._sync_adapter("id") is None, "a field the sync does not validate has no adapter"
+
+    def test_an_adapter_that_cannot_be_built_keeps_the_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class RfUnbuildable(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_unbuildable")
+
+            id: str | None = None
+            sub: RfPlainSub | None = None
+
+        def refuse(*args: Any, **kwargs: Any) -> Any:
+            raise TypeError("no adapter")
+
+        monkeypatch.setattr(model_base, "TypeAdapter", refuse)
+        raw = {"name": "a"}
+        unbuildable = RfUnbuildable()
+        unbuildable._apply_record({"sub": raw})
+        assert unbuildable.sub is raw and RfUnbuildable._sync_adapter("sub") is None
+
+    def test_an_unresolved_sub_model_keeps_the_value(self) -> None:
+        class RfLater(BaseModel):
+            y: "RfUndefined"  # type: ignore[name-defined]  # noqa: F821 (never defined: the model stays incomplete)
+
+        class RfIncomplete(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_incomplete")
+
+            id: str | None = None
+            later: RfLater | None = None
+
+        assert not RfIncomplete.__pydantic_complete__
+        incomplete = RfIncomplete.model_construct()
+        raw = {"y": 1}
+        incomplete._apply_record({"later": raw})
+        assert incomplete.later is raw
+        assert RfIncomplete not in model_base._SYNC_FIELDS and RfIncomplete not in model_base._SYNC_ADAPTERS
 
 
 class TestSubModelWriteSyncE2E:

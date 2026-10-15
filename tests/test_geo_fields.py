@@ -376,9 +376,10 @@ class TestGeometryApplyRecord:
             assert type(getattr(place, key)) is GeometryPoint and getattr(place, key) == GeometryPoint(*value)
         assert type(place.area) is GeometryPolygon and _all_orm(place.area)
         assert place.area == GeometryPolygon.parse_coordinates([RING, HOLE])
-        # Containers and sub-models keep the row's values: their own serializers or validators handle them.
+        # A typed container keeps the row's values (its serializer converts them); a sub-model is validated (#228).
         assert type(place.many[0]) is SdkPoint
-        assert type(place.sub) is dict and type(place.sub["where"]) is SdkPoint
+        assert type(place.sub) is GeoSub and type(place.sub.where) is GeometryPoint
+        assert place.sub.where == GeometryPoint(*NEAR)
         assert (place.name, place.n) == ("r", 3)
 
     @pytest.mark.parametrize("kind", KINDS)
@@ -400,10 +401,11 @@ class TestGeometryApplyRecord:
             _bad_ring,
             _bad_point,
             lambda: _nest(SdkPoint(*A), 40, SdkCollection),
-            lambda: _SdkPin(1.0, 2.0),
             lambda: GeometryPoint(*A),
-            lambda: {"type": "Point", "coordinates": [1.0, 2.0]},
-            lambda: [1.0, 2.0],
+            lambda: {"type": "LineString", "coordinates": [[1.0, 2.0]]},
+            lambda: {"type": "Point", "coordinates": [math.nan, 2.0]},
+            lambda: {"type": "Nowhere", "coordinates": [1.0, 2.0]},
+            lambda: [1.0, 2.0, 3.0],
             lambda: "x",
             lambda: None,
         ],
@@ -412,20 +414,44 @@ class TestGeometryApplyRecord:
             "short-ring",
             "text-coordinate",
             "too-deep",
-            "sdk-subclass",
             "orm",
-            "geojson",
-            "pair",
+            "geojson-short-line",
+            "geojson-nan",
+            "geojson-unknown-type",
+            "triple",
             "text",
             "none",
         ],
     )
     def test_other_values_are_applied_as_received(self, make: Any) -> None:
+        """What the field's validator refuses (or keeps) is applied as received, without raising (#228)."""
         value = make()
         place = GeoPlace.model_construct()
         place._apply_record({"anything": value})
         assert place.anything is value
         assert geo._geometry_from_sdk(value) is value
+
+    @pytest.mark.parametrize(
+        "make",
+        [lambda: _SdkPin(*A), lambda: {"type": "Point", "coordinates": list(A)}, lambda: list(A)],
+        ids=["sdk-subclass", "geojson", "pair"],
+    )
+    def test_values_a_read_accepts_are_validated(self, make: Any) -> None:
+        """#228: what ``get()`` reads into a geometry field (a stored GeoJSON object…), a write sync reads the same."""
+        value = make()
+        place = GeoPlace.model_construct()
+        place._apply_record({"anything": value, "location": make()})
+        for got in (place.anything, place.location):
+            assert type(got) is GeometryPoint and got == GeometryPoint(*A), got
+        assert geo._geometry_from_sdk(value) is value, "the fast path itself is unchanged"
+        assert GeoPlace._sync_adapter("anything") is GeoPlace._sync_adapter("anything"), "built once"
+
+    def test_geojson_of_another_kind_is_applied_as_received(self) -> None:
+        """A valid GeoJSON polygon in a point field is refused there, as by ``get()``: kept as received (#228)."""
+        polygon = {"type": "Polygon", "coordinates": [[list(p) for p in RING]]}
+        place = GeoPlace.model_construct()
+        place._apply_record({"location": polygon, "position": polygon})
+        assert place.location is polygon and place.pos is polygon
 
     def test_a_valid_sdk_value_is_converted_checked(self) -> None:
         line = SdkLine(SdkPoint(*A), SdkPoint(*B))
@@ -508,7 +534,7 @@ class TestGeoRoundTripE2E:
             await place.upsert()
             _assert_geo(place, nested=False)
             _assert_geo(await GeoPlace.objects().get("u"))
-            # The replace starts from a validated read, the documented way (see the sub-model tests).
+            # The replace starts from a validated read here; the synced instance works too (#228, see the sub-model tests).
             fresh = await GeoPlace.objects().get("u")
             fresh.location = near
             await fresh.upsert()
@@ -1604,7 +1630,7 @@ _D16_PHRASES = tuple(
 _V0_24_0_SINCE = ("v0.24.0", "pre-existing (documented in v0.24.0)")
 
 #: The subsections of section 25 that section 24 links (P2): each heading exists exactly once.
-_LINKED_HEADINGS = ("#### Rich values inside sub-models", "#### Geometries the SDK cannot read")
+_LINKED_HEADINGS = ("#### Geometries the SDK cannot read",)
 
 #: What the README's distance example shows: SurrealDB's ``geo::distance`` from Times Square, rounded.
 _CLOSEST = [("Corner Pizza", 411), ("Park Burgers", 1826), ("Village Deli", 3365)]
@@ -1807,11 +1833,21 @@ class TestReadmeGeoWording:
 class TestReadmeSection24Consistency:
     """P2: section 24 says what v0.24.0 converts and links section 25's notes (prose only)."""
 
-    def test_after_a_write_names_geometries_and_links_the_sub_model_note(self) -> None:
+    def test_after_a_write_names_geometries_and_sub_models(self) -> None:
         text = _normalised(_subsection("#### After a write that returns the row"))
         assert "geometry" in text, text
         assert "top-level" in text, text
-        assert "(#rich-values-inside-sub-models)" in text, text
+        # #228: sub-models are validated, so writing the instance back is safe for them too.
+        assert "is validated as a read validates it" in text, text
+        assert "Writing such an instance back is safe, sub-models included" in text, text
+
+    def test_the_sub_model_limitation_is_gone(self) -> None:
+        """#228: the "Rich values inside sub-models" note and its full-ORM bullet are removed, with every link to them."""
+        readme = _readme()
+        assert "#### Rich values inside sub-models" not in readme
+        assert "(#rich-values-inside-sub-models)" not in readme
+        assert "Sub-models after a write that returns the row" not in readme
+        assert "converts only durations and geometries" not in readme
 
     def test_values_the_sdk_cannot_read_links_the_geometry_note(self) -> None:
         text = _normalised(_subsection("#### Values the SDK cannot read"))
