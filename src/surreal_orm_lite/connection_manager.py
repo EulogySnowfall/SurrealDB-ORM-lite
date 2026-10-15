@@ -14,7 +14,7 @@ from . import decoding as _decoding
 from . import encoding as _encoding
 from ._sdk import AsyncSurreal, NotFoundError
 from .auth import AuthTokens, build_auth_payload, wrap_auth_error
-from .embedded import is_embedded_url
+from .embedded import is_embedded_url, require_supported_url
 from .exceptions import (
     SurrealDbAuthenticationError,
     SurrealDbConflictError,
@@ -124,11 +124,35 @@ class SurrealDBConnectionManager:
         return await SurrealDBConnectionManager.get_client()
 
     @classmethod
-    def set_connection(cls, url: str, user: str, password: str, namespace: str, database: str) -> None:
+    def set_connection(
+        cls,
+        url: str,
+        user: str | None = None,
+        password: str | None = None,
+        namespace: str | None = None,
+        database: str | None = None,
+    ) -> None:
         """
         Set the connection kwargs for the SurrealDB instance.
 
-        :param kwargs: The connection kwargs for the SurrealDB instance.
+        Nothing is validated here: a missing setting makes :meth:`is_connection_set` false and the next
+        :meth:`get_client` raise ``ValueError("Connection not been set.")``.
+
+        A server URL (``ws://``, ``wss://``, ``http://``, ``https://``) needs every setting. An **embedded** URL
+        — the official SDK's in-process engine: ``mem://``, ``surrealkv://<path>`` and the other schemes the SDK
+        routes to it (:meth:`is_embedded`) — needs only the namespace and database: ``user`` and ``password``
+        are optional there and **never sent** (the engine has no system user on a fresh database, and its
+        anonymous session is the in-process owner). They are kept, so one configuration switches between a
+        server and ``mem://`` by its URL alone.
+
+        A URL the installed SDK refuses (``rocksdb://`` with SDK 2.0.0, a typo) is accepted here too and
+        reported by the next :meth:`get_client` with a ``SurrealDbConnectionError`` quoting the SDK.
+
+        :param url: The URL of the SurrealDB server, or of the SDK's in-process engine.
+        :param user: The user to sign in as (server URLs; ignored by the embedded engine).
+        :param password: That user's password (server URLs; ignored by the embedded engine).
+        :param namespace: The namespace to use.
+        :param database: The database to use.
         """
         cls.__url = url
         cls.__user = user
@@ -162,11 +186,16 @@ class SurrealDBConnectionManager:
     @classmethod
     def is_connection_set(cls) -> bool:
         """
-        Check if the connection kwargs are set.
+        Check if the connection kwargs are set: URL, namespace and database, and — for a server URL — user
+        and password (the embedded engine signs nobody in).
 
         :return: True if the connection kwargs are set, False otherwise.
         """
-        return all([cls.__url, cls.__user, cls.__password, cls.__namespace, cls.__database])
+        url = cls.__url
+        # bool() on each side: a bare ``and`` chain would return one of the strings, not a bool.
+        return bool(url and cls.__namespace and cls.__database) and (
+            is_embedded_url(url) or bool(cls.__user and cls.__password)
+        )
 
     @classmethod
     def is_embedded(cls) -> bool:
@@ -197,7 +226,14 @@ class SurrealDBConnectionManager:
         One owner for this check, so the wording stays identical everywhere it is raised —
         :meth:`get_client`, :meth:`ephemeral_client` and the model-level auth entry points all
         call it, and the tests match the literal string.
+
+        A URL the installed SDK refuses is reported first, whatever else is missing: the
+        ``SurrealDbConnectionError`` quoting the SDK says what to fix, "not been set" would not.
+
+        :raises SurrealDbConnectionError: the configured URL is one the SDK refuses (never retryable).
+        :raises ValueError: a setting is missing.
         """
+        require_supported_url(cls.__url)
         if not cls.is_connection_set():
             raise ValueError("Connection not been set.")
 
@@ -278,7 +314,11 @@ class SurrealDBConnectionManager:
         authenticate again, ``invalidate()``, or ``reconnect()``/``close_connection()``.
 
         :return: The SurrealDB instance.
+        :raises SurrealDbConnectionError: the configured URL is one the installed SDK refuses
+            (``rocksdb://`` with SDK 2.0.0, a typo) — checked before any cached client is handed back,
+            and never retryable — or the connection cannot be opened.
         :raises SurrealDbAuthenticationError: in that lost-identity state.
+        :raises ValueError: if no connection has been configured.
         """
         return await cls._acquire_client()
 
@@ -299,6 +339,9 @@ class SurrealDBConnectionManager:
         """
         loop = asyncio.get_running_loop()
         cls.__prune_dead_loops()
+        # Before the per-loop fast path: once the URL changed to one the SDK refuses (set_url()),
+        # the client cached for the previous URL must not be handed back as if it were its client.
+        require_supported_url(cls.__url)
         if not restoring_identity and loop in cls.__lost_identity:
             raise cls._lost_identity_error()
 
@@ -554,7 +597,8 @@ class SurrealDBConnectionManager:
         the server already dropped must not turn into an error the caller never caused.
 
         :raises ValueError: if no connection has been configured.
-        :raises SurrealDbConnectionError: if the connection cannot be opened.
+        :raises SurrealDbConnectionError: if the configured URL is one the installed SDK refuses, or the
+            connection cannot be opened.
         """
         cls.require_connection()
         client = await cls._open_client(signin_as_configured=False)
