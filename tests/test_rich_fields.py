@@ -13,17 +13,30 @@ import dataclasses
 import inspect
 import re
 import sys
+import threading
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Any, ForwardRef, Literal, Optional
+from typing import Annotated, Any, ForwardRef, Literal, Optional, Self
 from uuid import UUID
 
+import pydantic
 import pytest
 import surrealdb
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    PlainValidator,
+    ValidationError,
+    WrapValidator,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 from surrealdb import RecordID
 from surrealdb.cbor import undefined
@@ -1904,6 +1917,248 @@ class TestNestedTimedeltaReadE2E:
             assert type(stored["sub"]["td"]) is surrealdb.Duration and type(stored["tds"][0]) is surrealdb.Duration
             assert type(stored["by_key"]["a"]) is surrealdb.Duration and type(stored["either"]) is surrealdb.Duration
             _assert_td_positions(await RfTdHolder.objects().get("k"))
+
+
+# --- the duration conversion never runs the user's code twice on one input (#228) -----------------
+
+
+def _read_cents(data: Any) -> Any:
+    """Read stored cents as a price, in the dict itself: a ``mode="before"`` validator that is not idempotent."""
+    if isinstance(data, dict) and "price" in data:
+        data["price"] = Decimal(data["price"]) / 100
+    return data
+
+
+def _prepend_all(value: Any) -> Any:
+    """Insert ``"all"`` in the list itself: a ``mode="before"`` validator that is not idempotent."""
+    if isinstance(value, list):
+        value.insert(0, "all")
+    return value
+
+
+class RfCentsSub(BaseModel):
+    """A sub-model whose own ``mode="before"`` validator reads its cents in place, next to a ``timedelta``."""
+
+    price: Decimal = Decimal(0)
+    td: timedelta
+    qty: int = 0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _cents(cls, data: Any) -> Any:
+        return _read_cents(data)
+
+
+class RfCents(BaseSurrealModel):
+    """Code of the user's that changes its input in place, at each level a read runs it."""
+
+    model_config = SurrealConfigDict(table_name="rf_cents")
+
+    id: str | None = None
+    price: Decimal = Decimal(0)
+    tags: list[str] = []
+    labels: Annotated[list[str], BeforeValidator(_prepend_all)] = []
+    sub: RfCentsSub | None = None
+    tds: list[timedelta] = []
+    anything: Any = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _cents(cls, data: Any) -> Any:
+        return _read_cents(data)
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def _tags(cls, value: Any) -> Any:
+        return _prepend_all(value)
+
+
+class RfCentsHolder(BaseSurrealModel):
+    """The user's code sits in a sub-model only: a write sync may validate the field alone (``_validated_on_sync``)."""
+
+    model_config = SurrealConfigDict(table_name="rf_cents_holder")
+
+    id: str | None = None
+    sub: RfCentsSub | None = None
+    n: int = 0
+
+
+class RfAfterOnly(BaseSurrealModel):
+    """The user's code runs on validated values only: an ``after`` validator, a serializer."""
+
+    model_config = SurrealConfigDict(table_name="rf_after_only")
+
+    id: str | None = None
+    sub: RfTdSub | None = None
+    name: str = ""
+
+    @field_validator("name", mode="after")
+    @classmethod
+    def _strip(cls, value: str) -> str:
+        return value.strip()
+
+    @model_validator(mode="after")
+    def _check(self) -> Self:
+        return self
+
+    @field_serializer("name")
+    def _upper(self, value: str) -> str:
+        return value.upper()
+
+
+def _cents_row(td: Any) -> dict[str, Any]:
+    """A fresh ``RfCents`` row (the validators change it in place) whose durations below the top level are ``td``."""
+    return {"price": 1999, "tags": ["a"], "labels": ["b"], "sub": {"price": 250, "td": td}, "tds": [td]}
+
+
+def _assert_sub_read_once(sub: Any) -> None:
+    """``sub`` is the ``RfCentsSub`` of ``_cents_row``: its validator was applied once (the row stores 250 cents)."""
+    assert type(sub) is RfCentsSub and sub == RfCentsSub(price=250, td=_TD), sub
+    assert sub.price == Decimal("2.5") and sub.td == _TD, sub
+
+
+def _assert_cents_read_once(cents: RfCents) -> None:
+    """Each validator of ``RfCents`` was applied once to what the instance holds."""
+    assert cents.price == Decimal("19.99") and cents.tags == ["all", "a"] and cents.labels == ["all", "b"], cents
+    assert cents.tds == [_TD], cents
+    _assert_sub_read_once(cents.sub)
+
+
+class TestNestedTimedeltaRunsUserCodeOnce:
+    """#228 (unit): reading the SDK's duration below the top level never applies the user's code twice."""
+
+    def test_the_row_reads_as_without_the_sdk_duration(self) -> None:
+        expected = RfCents.model_validate(_cents_row(_TD))
+        _assert_cents_read_once(expected)
+        for got in (RfCents.model_validate(_cents_row(_SDK_TD)), RfCents.from_db(_cents_row(_SDK_TD))):
+            assert isinstance(got, RfCents) and got.model_dump() == expected.model_dump(), got
+            _assert_cents_read_once(got)
+
+    def test_a_sub_model_whose_validator_changes_its_input(self) -> None:
+        """No code of the user's on the holder itself: the sub-model's validator changes its own dict."""
+        _assert_sub_read_once(RfCentsHolder.model_validate({"sub": {"price": 250, "td": _SDK_TD}}).sub)
+
+    @_ROW_PATHS
+    def test_a_write_sync_applies_the_sub_model_validator_once(self, extra: dict[str, Any]) -> None:
+        holder = RfCentsHolder(id="k")
+        holder._apply_record({"id": RecordID("rf_cents_holder", "k"), "sub": {"price": 250, "td": _SDK_TD}, **extra})
+        _assert_sub_read_once(holder.sub)
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            {"price": 1999, "td": "soon"},  # refused before any conversion
+            {"price": 1999, "td": _SDK_TD, "qty": "x"},  # the duration converts, the value is still refused
+        ],
+        ids=["no-conversion", "after-the-conversion"],
+    )
+    def test_a_value_that_does_not_validate_is_applied_as_received(self, value: dict[str, Any]) -> None:
+        received = copy.deepcopy(value)
+        assert RfCentsHolder._validated_on_sync("sub", value) is value
+        assert value == received, "the sub-model's validator did not change the value applied"
+
+    def test_a_row_that_cannot_be_copied_is_refused_as_before(self) -> None:
+        """No copy to validate first, so no second run: the SDK's duration is refused, as without the conversion."""
+        with pytest.raises(ValidationError) as caught:
+            RfCents.model_validate({"sub": {"td": _SDK_TD}, "anything": threading.Lock()})
+        assert [e["loc"] for e in caught.value.errors()] == [("sub", "td")]
+
+    def test_a_duration_a_validator_moved_is_refused_as_before(self) -> None:
+        """The second run starts from the row as received: a value the first run found elsewhere is not guessed."""
+
+        class RfShifted(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_shifted")
+
+            id: str | None = None
+            tds: list[timedelta] = []
+
+            @field_validator("tds", mode="before")
+            @classmethod
+            def _shift(cls, value: Any) -> Any:
+                value.insert(0, timedelta(0))
+                return value
+
+        with pytest.raises(ValidationError):
+            RfShifted.model_validate({"tds": [_SDK_TD, surrealdb.Duration(1000)]})
+        assert RfShifted.model_validate({"tds": [_TD]}).tds == [timedelta(0), _TD]
+
+    def test_only_a_model_running_input_code_on_an_sdk_duration_copies_the_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        copied: list[int] = []
+        real = copy.deepcopy
+
+        def counting(value: Any, *args: Any) -> Any:
+            copied.append(id(value))
+            return real(value, *args)
+
+        monkeypatch.setattr(model_base.copy, "deepcopy", counting)
+        plain = {"sub": {"td": _SDK_TD}, "tds": [_SDK_TD]}
+        assert RfTdHolder.model_validate(plain).tds == [_TD] and id(plain) not in copied
+        without_duration = _cents_row(_TD)
+        _assert_cents_read_once(RfCents.model_validate(without_duration))
+        assert id(without_duration) not in copied
+        with_duration = _cents_row(_SDK_TD)
+        _assert_cents_read_once(RfCents.model_validate(with_duration))
+        assert copied.count(id(with_duration)) == 1
+
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            (RfTdHolder, False),
+            (RfIssueHolder, False),  # the ORM's ``Duration`` validator is the ORM's own
+            (RfLink, False),  # so is an edge's endpoint validator
+            (RfAfterOnly, False),  # ``after`` validators and serializers never see the input
+            (RfCents, True),  # a model ``mode="before"`` validator, a field one, a ``BeforeValidator``
+            (RfCentsHolder, True),  # a sub-model's ``mode="before"`` validator
+        ],
+    )
+    def test_models_that_run_code_on_their_input(self, model: type[BaseSurrealModel], expected: bool) -> None:
+        assert model._runs_input_code() is expected
+
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            Annotated[list[str], BeforeValidator(_prepend_all)],
+            Annotated[list[str], WrapValidator(lambda value, handler: handler(value))],
+            Annotated[list[str], PlainValidator(_prepend_all)],
+        ],
+        ids=["before", "wrap", "plain"],
+    )
+    def test_each_kind_of_input_code(self, annotation: Any) -> None:
+        model = pydantic.create_model("RfInputCode", __base__=BaseSurrealModel, id=(str | None, None), f=(annotation, []))
+        assert model._runs_input_code() is True
+
+    def test_anything_unexpected_counts_as_input_code(self) -> None:
+        assert model_base._schema_runs_input_code({"type": "function-before", "function": None}) is True
+        assert model_base._schema_runs_input_code("not a schema") is True
+
+    def test_an_incomplete_model_is_not_cached(self) -> None:
+        class RfIncompleteInput(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="rf_incomplete_input")
+
+            id: str | None = None
+            later: "RfMissingInput | None" = None  # type: ignore[name-defined]  # noqa: F821
+
+        assert RfIncompleteInput._runs_input_code() is True
+        assert RfIncompleteInput not in model_base._INPUT_CODE
+
+
+class TestNestedTimedeltaRunsUserCodeOnceE2E:
+    """#228: a model whose validators change their input in place reads a stored duration below the top level."""
+
+    @pytest.mark.asyncio
+    async def test_get_and_a_write_sync(self) -> None:
+        rid = RecordID("rf_cents", "k")
+        async with orm_client("rf_cents") as client:
+            # ``encoding.encode``: the SDK's own encoder sends its ``Duration`` in a form the server refuses.
+            await client.query("CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": encoding.encode(_cents_row(_SDK_TD))})
+            got = await RfCents.objects().get("k")
+            [listed] = await RfCents.objects().all()
+            for cents in (got, listed):
+                _assert_cents_read_once(cents)
+            await got.merge(anything=1)  # a write sync: the sub-model gets what a read gives
+            _assert_sub_read_once(got.sub)
+            stored = await _raw(rid)
+            assert stored["price"] == 1999 and stored["tags"] == ["a"] and type(stored["sub"]["td"]) is surrealdb.Duration
 
 
 # --- a write sync runs the model's own validators, as a read does (#228) --------------------------
