@@ -26,6 +26,7 @@ from surreal_orm_lite import (
     BaseSurrealModel,
     Computed,
     Count,
+    GeoDistance,
     GeoField,
     Geometry,
     GeometryCollection,
@@ -55,9 +56,11 @@ from surreal_orm_lite.model_base import _read_kind
 from tests._retry import retry_write
 from tests.conftest import change_feed_database, orm_client
 from tests.test_geo_types import (
+    AB_METRES,
     HOLE,
     KINDS,
     NEAR,
+    NEAR_B_METRES,
     ORM_CLASSES,
     PARIS,
     RING,
@@ -143,6 +146,24 @@ class GeoLegacy(BaseSurrealModel):
     id: str | None = None
     location: PointField = None
     blob: dict[str, Any] | None = None
+
+
+class GeoLoose(BaseSurrealModel):
+    """Keeps undeclared columns (``extra="allow"``): a distance must never land among them."""
+
+    model_config = SurrealConfigDict(table_name="geo_loose", extra="allow")
+
+    id: str | None = None
+    location: PointField = None
+
+
+class GeoStrict(BaseSurrealModel):
+    """Refuses undeclared columns (``extra="forbid"``): a distance must not make its rows invalid."""
+
+    model_config = SurrealConfigDict(table_name="geo_strict", extra="forbid")
+
+    id: str | None = None
+    location: PointField = None
 
 
 #: One value per ``GeoPlace`` field, built from the reference constants.
@@ -904,3 +925,311 @@ class TestNearbyLiveE2E:
         assert event.validation_error is None, event.validation_error
         assert event.instance.id == "near1"
         assert type(event.instance.location) is GeometryPoint and event.instance.location == GeometryPoint(*A)
+
+
+# --- GeoDistance and per-record annotations (spec §5.4, §6.4) ------------------------------------------
+
+
+def _distance_sql(column: str, n: int, alias: str) -> str:
+    """The projection ``annotate(<alias>=GeoDistance(...))`` adds for ``column``, its point in ``$_gd<n>``."""
+    return f"IF {column}.is_point() THEN geo::distance({column}, $_gd{n}) END AS {alias}"
+
+
+#: Aliases a GeoDistance may not take on ``GeoPlace``, and the reason each refusal names.
+RESERVED_ALIASES: dict[str, str] = {
+    "name": "is a field of GeoPlace",
+    "location": "is a field of GeoPlace",
+    "pos": "is a field of GeoPlace",
+    "position": "is the column of field 'pos'",
+    "id": "record's id or an edge endpoint",
+    "in": "record's id or an edge endpoint",
+    "out": "record's id or an edge endpoint",
+    "_dist": "starting with '_' or 'model_'",
+    "model_dist": "starting with '_' or 'model_'",
+    "model_config": "starting with '_' or 'model_'",
+    "save": "is an attribute of GeoPlace",
+    "objects": "is an attribute of GeoPlace",
+    "get_id": "is an attribute of GeoPlace",
+    "update": "is an attribute of GeoPlace",
+}
+
+
+class TestGeoDistanceCompile:
+    """AC-12 (unit): the distance is a guarded projection with a bound point, snapshotted by ``annotate()``.
+
+    Every refusal comes from ``annotate()`` (or ``values()``), before anything reaches a server.
+    """
+
+    def test_projection_after_the_star(self) -> None:
+        qs = GeoPlace.objects()
+        assert qs.annotate(dist=GeoDistance("location", B)) is qs
+        query, variables = qs.order_by("dist")._compile_query()
+        assert query == f"SELECT *, {_distance_sql('location', 0, 'dist')} FROM geo_place ORDER BY dist ASC;"
+        assert type(variables["_gd0"]) is GeometryPoint and variables["_gd0"] == GeometryPoint(*B)
+        assert not re.search(r"\d", re.sub(r"\$_gd\d+", "", query)), query
+
+    def test_projection_after_the_selected_fields(self) -> None:
+        query, _ = GeoPlace.objects().select("name", "pos").annotate(dist=GeoDistance("location", B))._compile_query()
+        assert query == f"SELECT name, position, {_distance_sql('location', 0, 'dist')} FROM geo_place;"
+
+    def test_with_filter_nearby_order_limit_offset_and_fetch(self) -> None:
+        qs = (
+            GeoPlace.objects()
+            .filter(name="a")
+            .nearby("location", B, 5000)
+            .annotate(dist=GeoDistance("location", A))
+            .order_by("-dist")
+            .limit(5)
+            .offset(1)
+            .fetch("sub")
+        )
+        query, variables = qs._compile_query()
+        assert query == (
+            f"SELECT *, {_distance_sql('location', 0, 'dist')} FROM geo_place WHERE name = $_f0 AND "
+            f"{_nearby_sql('location', 1)} ORDER BY dist DESC LIMIT 5 START 1 FETCH sub;"
+        )
+        assert variables["_gd0"] == GeometryPoint(*A) and variables["_f1"] == GeometryPoint(*B)
+
+    def test_several_annotations_in_order_with_their_columns(self) -> None:
+        qs = GeoPlace.objects().annotate(to_b=GeoDistance("pos", B)).annotate(to_a=GeoDistance("addr.loc", A))
+        query, variables = qs._compile_query()
+        assert query == (
+            f"SELECT *, {_distance_sql('position', 0, 'to_b')}, {_distance_sql('addr.loc', 1, 'to_a')} FROM geo_place;"
+        )
+        assert (variables["_gd0"], variables["_gd1"]) == (GeometryPoint(*B), GeometryPoint(*A))
+
+    @pytest.mark.parametrize("point", [GeometryPoint(*B), SdkPoint(*B), B, {"type": "Point", "coordinates": list(B)}])
+    def test_the_point_is_bound_as_an_orm_point(self, point: Any) -> None:
+        _, variables = GeoPlace.objects().annotate(dist=GeoDistance("location", point))._compile_query()
+        assert type(variables["_gd0"]) is GeometryPoint and variables["_gd0"] == GeometryPoint(*B)
+
+    def test_without_annotations_nothing_changes(self) -> None:
+        assert GeoPlace.objects().select("name")._compile_query() == ("SELECT name FROM geo_place;", {})
+        assert GeoPlace.objects()._compile_query() == ("SELECT * FROM geo_place;", {})
+
+    def test_snapshot(self) -> None:
+        distance = GeoDistance("location", B)
+        qs = GeoPlace.objects().annotate(dist=distance)
+        distance.field = "area"
+        distance.point = GeometryPoint(*PARIS)
+        query, variables = qs._compile_query()
+        assert query == f"SELECT *, {_distance_sql('location', 0, 'dist')} FROM geo_place;"
+        assert variables["_gd0"] == GeometryPoint(*B)
+
+    def test_a_mutated_geodistance_is_checked_again(self) -> None:
+        distance = GeoDistance("location", B)
+        distance.point = "x"  # type: ignore[assignment]
+        with pytest.raises(TypeError, match="point"):
+            GeoPlace.objects().annotate(dist=distance)
+        distance = GeoDistance("location", B)
+        distance.field = 3  # type: ignore[assignment]
+        with pytest.raises(TypeError, match="GeoDistance"):
+            GeoPlace.objects().annotate(dist=distance)
+
+    @pytest.mark.parametrize(
+        "value", [3, "x", None, (-73.99, 40.75), GeometryPoint(*B)], ids=["int", "str", "none", "tuple", "point"]
+    )
+    def test_another_type_is_refused(self, value: Any) -> None:
+        with pytest.raises(TypeError) as caught:
+            GeoPlace.objects().annotate(dist=value)
+        message = str(caught.value)
+        assert "must be an Aggregation instance" in message and "GeoDistance" in message and "'dist'" in message
+
+    @pytest.mark.parametrize(("alias", "reason"), list(RESERVED_ALIASES.items()), ids=list(RESERVED_ALIASES))
+    def test_a_reserved_alias_is_refused(self, alias: str, reason: str) -> None:
+        qs = GeoPlace.objects()
+        with pytest.raises(ValueError, match=re.escape(reason)) as caught:
+            qs.annotate(**{alias: GeoDistance("location", B)})
+        assert repr(alias) in str(caught.value)
+        assert qs._annotations == {} and qs._geo_annotations == {}
+
+    def test_an_edge_reserves_its_endpoints(self) -> None:
+        for alias, reason in (("in", "an edge endpoint"), ("out", "an edge endpoint"), ("in_", "is a field of GeoLink")):
+            with pytest.raises(ValueError, match=re.escape(reason)):
+                GeoLink.objects().annotate(**{alias: GeoDistance("spot", B)})
+
+    def test_an_aggregation_may_still_take_those_aliases(self) -> None:
+        query, _ = GeoPlace.objects().values("n").annotate(save=Count())._compile_group_by_query()
+        assert query == "SELECT n, count() AS save FROM geo_place GROUP BY n;"
+
+    @pytest.mark.parametrize("alias", ["dist", "distance", "d2", "Dist", "naming"])
+    def test_free_aliases(self, alias: str) -> None:
+        query, _ = GeoPlace.objects().annotate(**{alias: GeoDistance("location", B)})._compile_query()
+        assert query.endswith(f" AS {alias} FROM geo_place;"), query
+
+    @pytest.mark.parametrize("alias", ["", "a b", "1x", "x;y", "dist--"])
+    def test_a_bad_alias_is_refused(self, alias: str) -> None:
+        with pytest.raises(ValueError, match="alias"):
+            GeoPlace.objects().annotate(**{alias: GeoDistance("location", B)})
+
+    @pytest.mark.parametrize("field", ["loc; DROP", "", "location--", "a..b", "$x"])
+    def test_a_bad_field_name_is_refused(self, field: str) -> None:
+        qs = GeoPlace.objects()
+        with pytest.raises(ValueError, match="GeoDistance field"):
+            qs.annotate(dist=GeoDistance(field, B))
+        assert qs._annotations == {} and qs._geo_annotations == {}
+
+    @pytest.mark.parametrize(("field", "kind"), [("area", "polygon"), ("path", "line"), ("bag", "collection")])
+    def test_a_declared_non_point_field_is_refused(self, field: str, kind: str) -> None:
+        with pytest.raises(
+            ValueError, match=rf"GeoDistance measures distances between points; field '{field}' is declared as {kind}"
+        ):
+            GeoPlace.objects().annotate(dist=GeoDistance(field, B))
+
+    @pytest.mark.parametrize(
+        ("model", "field"),
+        [
+            (GeoPlace, "anything"),
+            (GeoPlace, "name"),
+            (GeoPlace, "undeclared"),
+            (GeoPlace, "area.inner"),
+            (GeoMixed, "location"),
+        ],
+        ids=["feature", "str", "undeclared", "dotted", "any"],
+    )
+    def test_fields_accepted(self, model: Any, field: str) -> None:
+        query, _ = model.objects().annotate(dist=GeoDistance(field, B))._compile_query()
+        assert _distance_sql(model.to_db_field(field), 0, "dist") in query
+
+    def test_mixing_with_an_aggregation_is_refused(self) -> None:
+        def mixed(qs: Any) -> None:
+            with pytest.raises(ValueError, match="a GeoDistance is computed per record"):
+                qs()
+
+        mixed(lambda: GeoPlace.objects().annotate(n_count=Count(), dist=GeoDistance("location", B)))
+        qs = GeoPlace.objects().annotate(n_count=Count())
+        mixed(lambda: qs.annotate(dist=GeoDistance("location", B)))
+        assert list(qs._annotations) == ["n_count"] and qs._geo_annotations == {}
+        qs = GeoPlace.objects().annotate(dist=GeoDistance("location", B))
+        mixed(lambda: qs.annotate(n_count=Count()))
+        assert list(qs._annotations) == ["dist"] and list(qs._geo_annotations) == ["dist"]
+
+    def test_mixing_with_values_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="a GeoDistance is computed per record"):
+            GeoPlace.objects().values("name").annotate(dist=GeoDistance("location", B))
+        qs = GeoPlace.objects().annotate(dist=GeoDistance("location", B))
+        with pytest.raises(ValueError, match="a GeoDistance is computed per record"):
+            qs.values("name")
+        assert qs._group_by_fields == []
+        with pytest.raises(ValueError, match="a GeoDistance is computed per record"):
+            qs._compile_group_by_query()
+
+    async def test_exec_refuses_a_mixed_queryset(self) -> None:
+        qs = GeoPlace.objects().annotate(dist=GeoDistance("location", B))
+        qs._group_by_fields = ["name"]
+        with pytest.raises(ValueError, match="a GeoDistance is computed per record"):
+            await qs.exec()
+
+    def test_an_aggregation_replacing_a_distance(self) -> None:
+        qs = GeoPlace.objects().annotate(dist=GeoDistance("location", B)).annotate(dist=Count())
+        assert qs._geo_annotations == {}
+        query, _ = qs._compile_group_by_query()
+        assert query == "SELECT count() AS dist FROM geo_place GROUP ALL;"
+
+    def test_aggregations_unchanged(self) -> None:
+        query, _ = GeoPlace.objects().values("name").annotate(c=Count())._compile_group_by_query()
+        assert query == "SELECT name, count() AS c FROM geo_place GROUP BY name;"
+
+    def test_the_alias_is_never_renamed_in_a_dict_row(self) -> None:
+        qs = GeoPlace.objects().annotate(dist=GeoDistance("location", B))
+        assert qs._py_keyed({"position": 1, "dist": 2.0}) == {"pos": 1, "dist": 2.0}
+
+    def test_live_and_changes_refuse_it(self) -> None:
+        qs = GeoPlace.objects().annotate(dist=GeoDistance("location", B))
+        with pytest.raises(SurrealDbError, match=r"annotate\(\)"):
+            qs._compile_live(False)
+        with pytest.raises(SurrealDbError, match=r"annotate\(\)"):
+            qs.changes(since=0)
+
+
+class TestGeoDistanceE2E:
+    """AC-12, both lines: distances in metres, ``None`` off points, ordered by the alias, never written back."""
+
+    async def test_with_nearby_ordered_by_distance(self) -> None:
+        async with orm_client("geo_mixed") as client:
+            await _seed_mixed(client)
+            rows = (
+                await GeoMixed.objects()
+                .annotate(dist=GeoDistance("location", B))
+                .nearby("location", B, 5000)
+                .order_by("dist")
+                .exec()
+            )
+        assert [type(r) for r in rows] == [GeoMixed, GeoMixed]
+        assert [_record_key(r) for r in rows] == ["near2", "near1"]
+        assert rows[0].dist == pytest.approx(NEAR_B_METRES, abs=1e-6)
+        assert rows[1].dist == pytest.approx(AB_METRES, abs=1e-6)
+        assert all(type(r.dist) is float for r in rows)
+
+    async def test_descending_puts_the_non_points_last(self) -> None:
+        async with orm_client("geo_mixed") as client:
+            await _seed_mixed(client)
+            rows = await GeoMixed.objects().annotate(dist=GeoDistance("location", B)).order_by("-dist").exec()
+            ascending = await GeoMixed.objects().annotate(dist=GeoDistance("location", B)).order_by("dist").exec()
+        assert [_record_key(r) for r in rows[:3]] == ["far", "near1", "near2"]
+        assert rows[0].dist > 5_000_000 and rows[1].dist == pytest.approx(AB_METRES, abs=1e-6)
+        assert {_record_key(r) for r in rows[3:]} == {"none", "nullish", "text", "obj", "poly"}
+        assert all(r.dist is None for r in rows[3:])
+        assert all(r.dist is None for r in ascending[:5])
+        assert [_record_key(r) for r in ascending[5:]] == ["near2", "near1", "far"]
+
+    async def test_first_and_get_carry_the_distance(self) -> None:
+        async with orm_client("geo_mixed") as client:
+            await _seed_mixed(client)
+            qs = GeoMixed.objects().annotate(dist=GeoDistance("location", B)).nearby("location", B, 5000).order_by("dist")
+            first = await qs.first()
+            only = await GeoMixed.objects().annotate(dist=GeoDistance("location", B)).filter(n=1).get()
+        assert _record_key(first) == "near2" and first.dist == pytest.approx(NEAR_B_METRES, abs=1e-6)
+        assert _record_key(only) == "near1" and only.dist == pytest.approx(AB_METRES, abs=1e-6)
+
+    async def test_typed_instances_and_no_write_back(self) -> None:
+        async with orm_client("geo_place"):
+            entrance = GeometryPoint(*A)
+            await GeoPlace(id="near", name="near", entrance=entrance, location=GeometryPoint(*NEAR)).save()
+            await GeoPlace(id="a", name="a", entrance=entrance, location=GeometryPoint(*A)).save()
+            near, at_a = await GeoPlace.objects().annotate(dist=GeoDistance("location", B)).order_by("dist").exec()
+            assert isinstance(near, GeoPlace) and (near.id, at_a.id) == ("near", "a")
+            assert type(near.location) is GeometryPoint and near.location == GeometryPoint(*NEAR)
+            assert type(near.dist) is float and near.dist == pytest.approx(NEAR_B_METRES, abs=1e-6)
+            assert at_a.dist == pytest.approx(AB_METRES, abs=1e-6)
+            assert "dist" not in near.model_dump() and "dist" not in near.model_dump(mode="json")
+            near.name = "renamed"
+            await near.update()
+            row = await _raw(RecordID("geo_place", "near"))
+            assert row["name"] == "renamed" and "dist" not in row
+            await at_a.upsert()
+            assert "dist" not in await _raw(RecordID("geo_place", "a"))
+
+    async def test_extra_allow_keeps_the_distance_off_the_record(self) -> None:
+        async with orm_client("geo_loose") as client:
+            await client.query("CREATE geo_loose:p SET location = $v, note = 'kept';", {"v": SdkPoint(*A)})
+            [loose] = await GeoLoose.objects().annotate(dist=GeoDistance("location", B)).exec()
+            assert isinstance(loose, GeoLoose) and loose.dist == pytest.approx(AB_METRES, abs=1e-6)
+            assert loose.model_extra == {"note": "kept"}
+            assert "dist" not in loose.model_dump()
+            await loose.update()
+            row = await _raw(RecordID("geo_loose", "p"))
+            assert row["note"] == "kept" and "dist" not in row
+
+    async def test_extra_forbid_validates(self) -> None:
+        async with orm_client("geo_strict"):
+            await GeoStrict(id="p", location=GeometryPoint(*NEAR)).save()
+            [strict] = await GeoStrict.objects().annotate(dist=GeoDistance("location", B)).exec()
+            assert isinstance(strict, GeoStrict) and strict.dist == pytest.approx(NEAR_B_METRES, abs=1e-6)
+            assert strict.model_extra is None
+            await strict.update()
+            assert "dist" not in await _raw(RecordID("geo_strict", "p"))
+
+    async def test_rows_that_do_not_validate_come_back_as_dicts(self) -> None:
+        async with orm_client("geo_place"):
+            entrance = GeometryPoint(*A)
+            await GeoPlace(id="near", name="near", entrance=entrance, location=GeometryPoint(*NEAR)).save()
+            await GeoPlace(id="a", name="a", entrance=entrance, location=GeometryPoint(*A)).save()
+            await GeoPlace(id="nowhere", name="nowhere", entrance=entrance).save()
+            rows = await GeoPlace.objects().select("name").annotate(dist=GeoDistance("location", B)).order_by("-dist").exec()
+        assert [type(r) for r in rows] == [dict, dict, dict]
+        assert [set(r) for r in rows] == [{"name", "dist"}] * 3
+        assert [r["name"] for r in rows] == ["a", "near", "nowhere"]
+        assert rows[0]["dist"] == pytest.approx(AB_METRES, abs=1e-6)
+        assert rows[1]["dist"] == pytest.approx(NEAR_B_METRES, abs=1e-6)
+        assert rows[2]["dist"] is None

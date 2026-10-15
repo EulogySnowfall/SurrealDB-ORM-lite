@@ -31,6 +31,9 @@ As model fields: a class annotation (``entrance: GeometryPoint``, required unles
 for points, a ``(longitude, latitude)`` pair; ``model_dump()`` returns the ORM value and JSON mode
 its GeoJSON object. Inside containers (``list[GeometryPoint]``) use the classes.
 ``is_geo_field()`` and ``get_geo_info()`` tell a geometry field's kinds.
+
+In queries: ``QuerySet.nearby()`` keeps the records within a distance of a point, and
+``GeoDistance(field, point)`` given to ``QuerySet.annotate()`` attaches each record's distance.
 """
 
 from __future__ import annotations
@@ -79,6 +82,7 @@ __all__ = [
     "MultiLineStringField",
     "MultiPolygonField",
     "GeometryCollectionField",
+    "GeoDistance",
     "is_geo_field",
     "get_geo_info",
 ]
@@ -786,6 +790,69 @@ def _as_point(value: Any) -> GeometryPoint:
         "a point is a GeometryPoint (the ORM's or the SDK's), a (longitude, latitude) pair or a GeoJSON Point "
         f"object, not {type(value).__name__}"
     )
+
+
+class GeoDistance:
+    """The distance from a record's point to a reference point, for ``QuerySet.annotate()`` (v0.24.0).
+
+    Same name and arguments as the full SurrealDB-ORM::
+
+        near = await (
+            Restaurant.objects()
+            .nearby("location", (-73.9855, 40.7580), max_distance=2_000)
+            .annotate(dist=GeoDistance("location", (-73.9855, 40.7580)))
+            .order_by("dist")
+            .exec()
+        )
+        print([(r.name, round(r.dist)) for r in near])
+
+    Each instance ``exec()`` returns carries the value as an attribute named after the alias: SurrealDB's
+    ``geo::distance`` in metres (a ``float``), or ``None`` when that record's field is not a point. The
+    attribute is never written back.
+
+    Args:
+        field: A Python field name (an aliased field compiles its column) or a dotted path; ``annotate()``
+            checks it against the model.
+        point: The reference point: a ``GeometryPoint`` (the ORM's or the SDK's), a
+            ``(longitude, latitude)`` pair or a GeoJSON ``Point`` object; kept as an ORM ``GeometryPoint``.
+
+    Raises:
+        TypeError: ``field`` is not a string; ``point`` is none of the forms above.
+        InvalidGeometryError: a non-finite coordinate, or a GeoJSON object that is not a valid ``Point``.
+    """
+
+    __slots__ = ("field", "point")
+
+    field: str
+    point: GeometryPoint
+
+    def __init__(
+        self,
+        field: str,
+        point: GeometryPoint | SdkGeometryPoint | tuple[float, float] | Sequence[float] | Mapping[str, Any],
+    ) -> None:
+        self.field = _distance_field(field)
+        self.point = _as_point(point)
+
+    def __repr__(self) -> str:
+        point: Any = self.point
+        shown = point.get_coordinates() if isinstance(point, GeometryPoint) else point
+        return f"GeoDistance({self.field!r}, {shown!r})"
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, GeoDistance):
+            return NotImplemented
+        return bool(self.field == other.field and self.point == other.point)
+
+    def __hash__(self) -> int:
+        return hash(("GeoDistance", self.field, self.point))
+
+
+def _distance_field(field: Any) -> str:
+    """``GeoDistance``'s field: a ``str`` (``TypeError`` otherwise); the name itself is checked by ``annotate()``."""
+    if not isinstance(field, str):
+        raise TypeError(f"GeoDistance takes a field name (str), not {type(field).__name__}")
+    return field
 
 
 # --- SurrealQL text --------------------------------------------------------------------------------

@@ -33,6 +33,7 @@ from .functions import (
     computed,
 )
 from .geo import (
+    GeoDistance,
     GeoField,
     Geometry,
     GeometryCollection,
@@ -158,6 +159,7 @@ __all__ = [
     "MultiLineStringField",
     "MultiPolygonField",
     "GeometryCollectionField",
+    "GeoDistance",
     # Exceptions
     "SurrealORMError",
     "SurrealDbError",

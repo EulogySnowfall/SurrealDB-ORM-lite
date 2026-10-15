@@ -31,6 +31,7 @@ import surreal_orm_lite
 from surreal_orm_lite import (
     AuthenticatedUserMixin,
     BaseSurrealModel,
+    GeoDistance,
     GeoField,
     Geometry,
     GeometryCollection,
@@ -67,6 +68,8 @@ AB_METRES = 1395.0401142718986
 TIMES_SQUARE: tuple[float, float] = (-73.9855, 40.7580)
 # 697.5104962226121 metres from B.
 NEAR: tuple[float, float] = (-73.985, 40.745)
+# ``geo::distance`` of NEAR and B, in metres, on SurrealDB 2.7.0, 3.1.5 and 3.3.4.
+NEAR_B_METRES = 697.5104962226121
 PARIS: tuple[float, float] = (2.35, 48.85)
 # A midtown box: A, B and NEAR are inside it, PARIS is outside.
 RING: list[tuple[float, float]] = [(-74.0, 40.7), (-73.9, 40.7), (-73.9, 40.8), (-74.0, 40.8), (-74.0, 40.7)]
@@ -2072,3 +2075,78 @@ class TestGeometryLiteralE2E:
         twin = bound if expected is None else expected()
         assert type(back) is type(twin), literal
         assert back == twin, literal
+
+
+# --- GeoDistance (Task 8, spec §5.4) ---------------------------------------------------------------
+
+
+class TestGeoDistanceValue:
+    """AC-12 (unit): ``GeoDistance`` holds a field name and an ORM point; ``repr``, ``==`` and ``hash`` as the full ORM's."""
+
+    def test_repr_is_the_full_orm_format(self) -> None:
+        assert repr(GeoDistance("location", (-73.98, 40.74))) == "GeoDistance('location', (-73.98, 40.74))"
+        assert repr(GeoDistance("addr.loc", GeometryPoint(1, 2))) == "GeoDistance('addr.loc', (1.0, 2.0))"
+
+    def test_repr_of_a_replaced_point(self) -> None:
+        distance = GeoDistance("location", A)
+        distance.point = "x"  # type: ignore[assignment]
+        assert repr(distance) == "GeoDistance('location', 'x')"
+
+    @pytest.mark.parametrize(
+        "point",
+        [GeometryPoint(*A), SdkPoint(*A), A, list(A), {"type": "Point", "coordinates": list(A)}],
+        ids=["orm", "sdk", "tuple", "list", "geojson"],
+    )
+    def test_point_is_an_orm_point(self, point: Any) -> None:
+        distance = GeoDistance("location", point)
+        assert distance.field == "location"
+        assert type(distance.point) is GeometryPoint and distance.point == GeometryPoint(*A)
+
+    def test_an_orm_point_is_kept(self) -> None:
+        point = GeometryPoint(*A)
+        assert GeoDistance("location", point).point is point
+
+    def test_equality_and_hash(self) -> None:
+        one = GeoDistance("location", A)
+        assert one == GeoDistance("location", GeometryPoint(*A))
+        assert one == GeoDistance("location", SdkPoint(*A))
+        assert hash(one) == hash(GeoDistance("location", list(A)))
+        assert one != GeoDistance("pos", A)
+        assert one != GeoDistance("location", B)
+        assert one != "x"
+        assert one != ("location", A)
+        assert len({one, GeoDistance("location", A), GeoDistance("location", B)}) == 2
+
+    @pytest.mark.parametrize("field", [3, None, b"location", GeometryPoint(*A)], ids=["int", "none", "bytes", "point"])
+    def test_a_field_name_must_be_a_string(self, field: Any) -> None:
+        with pytest.raises(TypeError, match="GeoDistance"):
+            GeoDistance(field, A)
+
+    @pytest.mark.parametrize(
+        ("point", "error"),
+        [
+            ("x", TypeError),
+            (None, TypeError),
+            ((1,), TypeError),
+            ((1, 2, 3), TypeError),
+            ((True, 1), TypeError),
+            ((Decimal("1"), 2), TypeError),
+            (GeometryPolygon.parse_coordinates([RING]), TypeError),
+            ({"type": "Polygon", "coordinates": [[list(p) for p in RING]]}, InvalidGeometryError),
+            ((math.nan, 1.0), InvalidGeometryError),
+            ((10**400, 1.0), InvalidGeometryError),
+        ],
+        ids=["str", "none", "one-item", "three-items", "bool", "decimal", "polygon", "geojson-polygon", "nan", "too-large"],
+    )
+    def test_a_bad_point_is_refused(self, point: Any, error: type[Exception]) -> None:
+        with pytest.raises(error) as caught:
+            GeoDistance("location", point)
+        assert issubclass(error, ValueError) == isinstance(caught.value, ValueError)
+
+    def test_the_identifier_is_checked_by_annotate_not_here(self) -> None:
+        assert GeoDistance("loc; DROP", B).field == "loc; DROP"
+
+    def test_exported(self) -> None:
+        assert "GeoDistance" in surreal_orm_lite.__all__
+        assert "GeoDistance" in geo.__all__
+        assert surreal_orm_lite.GeoDistance is geo.GeoDistance
