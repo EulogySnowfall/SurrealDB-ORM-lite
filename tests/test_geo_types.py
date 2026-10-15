@@ -1,4 +1,4 @@
-"""Geometry types (v0.24.0): the ORM's geometry value classes and their error.
+"""Geometry types (v0.24.0): the ORM's geometry value classes, their field annotations and their error.
 
 Unit tests first (no database); the raw-SDK E2E classes that pin what the servers do with each
 value are suffixed ``E2E``. The reference values below are shared with ``tests/test_geo_fields.py``.
@@ -7,13 +7,15 @@ value are suffixed ``E2E``. The reference values below are shared with ``tests/t
 import copy
 import math
 import pickle
+import warnings
 from decimal import Decimal
 from fractions import Fraction
-from typing import Any
+from typing import Annotated, Any, Optional
 
 import pytest
 import surrealdb
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, create_model
+from surrealdb import RecordID
 from surrealdb.data import GeometryCollection as SdkCollection
 from surrealdb.data import GeometryLine as SdkLine
 from surrealdb.data import GeometryMultiLine as SdkMultiLine
@@ -24,8 +26,13 @@ from surrealdb.data import GeometryPolygon as SdkPolygon
 
 import surreal_orm_lite
 from surreal_orm_lite import (
+    AuthenticatedUserMixin,
+    BaseSurrealModel,
+    GeoField,
     Geometry,
     GeometryCollection,
+    GeometryCollectionField,
+    GeometryField,
     GeometryLine,
     GeometryMultiLine,
     GeometryMultiPoint,
@@ -33,7 +40,15 @@ from surreal_orm_lite import (
     GeometryPoint,
     GeometryPolygon,
     InvalidGeometryError,
+    LineStringField,
+    MultiLineStringField,
+    MultiPointField,
+    MultiPolygonField,
+    PointField,
+    PolygonField,
+    SurrealConfigDict,
     geo,
+    live,
 )
 
 # Reference points as (longitude, latitude).
@@ -789,3 +804,544 @@ class TestToSdkNeverValidates:
             sdk = value._to_sdk()
             assert sdk == twin
             assert _all_sdk(sdk)
+
+
+# --- Pydantic integration (Task 3) ---------------------------------------------------------------
+
+#: Each alias and the one kind it accepts.
+ALIASES: dict[str, Any] = {
+    "point": PointField,
+    "line": LineStringField,
+    "polygon": PolygonField,
+    "multipoint": MultiPointField,
+    "multiline": MultiLineStringField,
+    "multipolygon": MultiPolygonField,
+    "collection": GeometryCollectionField,
+}
+#: A plain Pydantic model and an ORM model that is never saved: geometry fields behave the same.
+BASES = [pytest.param(BaseModel, id="plain"), pytest.param(BaseSurrealModel, id="surreal")]
+
+
+def _ids(base: type[BaseModel]) -> dict[str, Any]:
+    """The ``id`` field an ORM model needs (a plain model has none)."""
+    return {"id": (str | None, None)} if issubclass(base, BaseSurrealModel) else {}
+
+
+def _model(base: type[BaseModel], annotation: Any) -> Any:
+    """A model of ``base`` with the field ``loc: annotation`` (no default written in the body)."""
+    return create_model("GeoUnit", __base__=base, loc=annotation, **_ids(base))
+
+
+def _open_polygon_geojson() -> dict[str, Any]:
+    """A GeoJSON polygon whose 4-point ring is not closed."""
+    return {"type": "Polygon", "coordinates": [[list(p) for p in RING[:-1]]]}
+
+
+class _GeoSub(BaseModel):
+    """A sub-model with a geometry field."""
+
+    where: GeometryPoint
+
+
+def _dumped_model(base: type[BaseModel]) -> Any:
+    """Geometry fields at every position ``model_dump()`` writes: top level, containers, sub-model, aliases."""
+    return create_model(
+        "GeoDumped",
+        __base__=base,
+        loc=GeometryPoint,
+        many=(list[GeometryPoint], []),
+        areas=(dict[str, GeometryPolygon], {}),
+        sub=(_GeoSub | None, None),
+        area=PolygonField,
+        bag=GeometryCollectionField,
+        **_ids(base),
+    )
+
+
+class _PlainDefaults(BaseModel):
+    """D13: alias fields with no default written in the body, one of them aliased."""
+
+    location: PointField
+    aliased: PointField = Field(alias="where")
+
+
+class _SurrealDefaults(BaseSurrealModel):
+    """D13 on an ORM model."""
+
+    model_config = SurrealConfigDict(table_name="geo_unit")
+
+    id: str | None = None
+    location: PointField
+    aliased: PointField = Field(alias="where")
+
+
+class _PointOrText(BaseModel):
+    """A union whose other member is not a geometry."""
+
+    loc: GeometryPoint | str
+
+
+class _GeoAuth(AuthenticatedUserMixin, BaseSurrealModel):
+    """An auth model omitting a ``PointField`` field and with a geometry default (spec §7)."""
+
+    model_config = SurrealConfigDict(table_name="geo_auth", access_name="geo_auth")
+
+    id: str | None = None
+    email: str
+    password: str
+    home: PointField
+    door: GeometryPoint = GeometryPoint(0, 0)
+
+
+class _GeoLive(BaseSurrealModel):
+    """Every field has a default: the live fallbacks build it from any row."""
+
+    model_config = SurrealConfigDict(table_name="geo_live")
+
+    id: str | None = None
+    location: PointField
+    area: PolygonField
+    n: int = 0
+
+
+#: Annotations the helpers know, with the kinds of each (``get_geo_info`` joins them with ``|``,
+#: or answers ``"feature"`` for all seven).
+GEO_ANNOTATIONS: list[Any] = [
+    pytest.param(PointField, "point", id="PointField"),
+    pytest.param(LineStringField, "line", id="LineStringField"),
+    pytest.param(PolygonField, "polygon", id="PolygonField"),
+    pytest.param(MultiPointField, "multipoint", id="MultiPointField"),
+    pytest.param(MultiLineStringField, "multiline", id="MultiLineStringField"),
+    pytest.param(MultiPolygonField, "multipolygon", id="MultiPolygonField"),
+    pytest.param(GeometryCollectionField, "collection", id="GeometryCollectionField"),
+    pytest.param(GeometryField, "feature", id="GeometryField"),
+    pytest.param(GeoField["Point|POLYGON"], "point|polygon", id="GeoField-union"),
+    pytest.param(GeoField["polygon|point"], "point|polygon", id="GeoField-union-order"),
+    pytest.param(GeoField["linestring"], "line", id="GeoField-linestring"),
+    pytest.param(GeoField["MultiLineString"], "multiline", id="GeoField-multilinestring"),
+    pytest.param(GeoField["geometrycollection"], "collection", id="GeoField-geometrycollection"),
+    pytest.param(GeoField["geometry"], "feature", id="GeoField-geometry"),
+    pytest.param(GeoField["point|line|polygon|multipoint|multiline|multipolygon|collection"], "feature", id="GeoField-all"),
+    pytest.param(GeometryPoint, "point", id="GeometryPoint"),
+    pytest.param(GeometryPoint | None, "point", id="GeometryPoint-or-None"),
+    pytest.param(Optional[GeometryPolygon], "polygon", id="Optional-GeometryPolygon"),  # noqa: UP045
+    pytest.param(GeometryPoint | GeometryPolygon, "point|polygon", id="class-union"),
+    pytest.param(GeometryCollection, "collection", id="GeometryCollection"),
+    pytest.param(Geometry, "feature", id="Geometry"),
+    pytest.param(Geometry | None, "feature", id="Geometry-or-None"),
+    pytest.param(Annotated[GeometryPoint, "doc"], "point", id="Annotated-without-marker"),
+    pytest.param(Annotated[GeometryLine | None, "doc"], "line", id="Annotated-optional-without-marker"),
+]
+#: Annotations that are not geometry fields.
+NOT_GEO_ANNOTATIONS: list[Any] = [
+    pytest.param(str, id="str"),
+    pytest.param(dict, id="dict"),
+    pytest.param(dict[str, Any], id="dict-str-any"),
+    pytest.param(Any, id="Any"),
+    pytest.param(None, id="None"),
+    pytest.param(int | None, id="int-or-None"),
+    pytest.param(GeometryPoint | str, id="point-or-str"),
+    pytest.param(list[GeometryPoint], id="list-of-points"),
+    pytest.param(SdkPoint, id="sdk-point"),
+    pytest.param(SdkPoint | None, id="sdk-point-or-None"),
+    pytest.param(Annotated[str, "doc"], id="Annotated-str"),
+    pytest.param(type(None), id="NoneType"),
+]
+
+
+def _kinds(info: str) -> frozenset[str]:
+    return frozenset(KINDS) if info == "feature" else frozenset(info.split("|"))
+
+
+class TestGeometryFields:
+    """AC-4: class annotations, ``GeoField[...]`` and the aliases as Pydantic fields."""
+
+    # --- accepted input -----------------------------------------------------------------------
+
+    @pytest.mark.parametrize("base", BASES)
+    @pytest.mark.parametrize("kind", KINDS)
+    def test_class_annotation_accepts_every_input_form(self, base: type[BaseModel], kind: str) -> None:
+        model = _model(base, ORM_CLASSES[kind])
+        orm = _orm(kind)
+        assert model(loc=orm).loc is orm
+        for value in (_sdk(kind), GEOJSON[kind]):
+            loc = model(loc=value).loc
+            assert type(loc) is ORM_CLASSES[kind]
+            assert loc == orm
+
+    @pytest.mark.parametrize("base", BASES)
+    @pytest.mark.parametrize("pair", [A, list(A)], ids=["tuple", "list"])
+    def test_point_field_accepts_a_longitude_latitude_pair(self, base: type[BaseModel], pair: Any) -> None:
+        loc = _model(base, GeometryPoint)(loc=pair).loc
+        assert type(loc) is GeometryPoint
+        assert loc == GeometryPoint(*A)
+
+    # --- refused input ------------------------------------------------------------------------
+
+    @pytest.mark.parametrize("base", BASES)
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            pytest.param(_orm("line"), id="another-kind"),
+            pytest.param(_sdk("line"), id="another-kind-sdk"),
+            pytest.param(GEOJSON["line"], id="another-kind-geojson"),
+            pytest.param("text", id="text"),
+            pytest.param((1, 2, 3), id="three-numbers"),
+            pytest.param((1,), id="one-number"),
+            pytest.param((True, 1), id="bool"),
+            pytest.param(("1", "2"), id="strings"),
+            pytest.param({"type": "Point", "coordinates": [math.nan, 1]}, id="nan-geojson"),
+            pytest.param({"type": "Feature", "geometry": None}, id="feature-geojson"),
+            pytest.param(SdkPoint(Decimal("1"), 1.0), id="sdk-decimal"),
+            pytest.param(None, id="none-on-a-required-field"),
+            pytest.param(42, id="int"),
+        ],
+    )
+    def test_point_field_refusals_are_validation_errors(self, base: type[BaseModel], bad: Any) -> None:
+        with pytest.raises(ValidationError):
+            _model(base, GeometryPoint)(loc=bad)
+
+    @pytest.mark.parametrize("base", BASES)
+    def test_polygon_field_refuses_an_open_ring(self, base: type[BaseModel]) -> None:
+        with pytest.raises(ValidationError, match="must equal last point"):
+            _model(base, GeometryPolygon)(loc=_open_polygon_geojson())
+
+    @pytest.mark.parametrize("base", BASES)
+    @pytest.mark.parametrize("kind", ["line", "multipoint", "polygon"])
+    def test_only_point_fields_take_a_bare_sequence(self, base: type[BaseModel], kind: str) -> None:
+        with pytest.raises(ValidationError):
+            _model(base, ORM_CLASSES[kind])(loc=[A, B])
+
+    def test_refusal_message_names_the_accepted_forms(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _model(BaseModel, GeometryPoint)(loc="text")
+        message = str(excinfo.value)
+        assert "GeometryPoint" in message
+        assert "GeoJSON" in message
+        assert "(longitude, latitude)" in message
+
+    # --- GeoField and the aliases -------------------------------------------------------------
+
+    @pytest.mark.parametrize("base", BASES)
+    @pytest.mark.parametrize("spelling", ["point", "Point", "POINT", " point "])
+    def test_geofield_point_accepts_points_only(self, base: type[BaseModel], spelling: str) -> None:
+        model = _model(base, GeoField[spelling])
+        point = _orm("point")
+        assert model(loc=point).loc is point
+        assert model(loc=A).loc == point
+        assert model(loc=None).loc is None
+        with pytest.raises(ValidationError):
+            model(loc=_orm("line"))
+
+    @pytest.mark.parametrize("base", BASES)
+    @pytest.mark.parametrize("spelling", ["linestring", "LineString", "line"])
+    def test_geofield_linestring_is_line(self, base: type[BaseModel], spelling: str) -> None:
+        model = _model(base, GeoField[spelling])
+        line = _orm("line")
+        assert model(loc=line).loc is line
+        assert model(loc=GEOJSON["line"]).loc == line
+        assert geo.get_geo_info(GeoField[spelling]) == "line"
+        with pytest.raises(ValidationError):
+            model(loc=_orm("point"))
+
+    @pytest.mark.parametrize("base", BASES)
+    def test_geofield_union_of_kinds(self, base: type[BaseModel]) -> None:
+        model = _model(base, GeoField["point|polygon"])
+        point, polygon = _orm("point"), _orm("polygon")
+        assert model(loc=point).loc is point
+        assert model(loc=A).loc == point
+        assert model(loc=GEOJSON["polygon"]).loc == polygon
+        assert type(model(loc=_sdk("polygon")).loc) is GeometryPolygon
+        for bad in (_orm("line"), GEOJSON["line"], _sdk("line")):
+            with pytest.raises(ValidationError):
+                model(loc=bad)
+
+    @pytest.mark.parametrize("base", BASES)
+    @pytest.mark.parametrize(
+        "annotation",
+        [
+            pytest.param(GeoField["feature"], id="feature"),
+            pytest.param(GeoField["geometry"], id="geometry"),
+            pytest.param(GeometryField, id="GeometryField"),
+            pytest.param(Geometry, id="Geometry"),
+        ],
+    )
+    def test_any_kind_fields_accept_all_seven(self, base: type[BaseModel], annotation: Any) -> None:
+        model = _model(base, annotation)
+        for kind in KINDS:
+            orm = _orm(kind)
+            assert model(loc=orm).loc is orm
+            for value in (_sdk(kind), GEOJSON[kind]):
+                loc = model(loc=value).loc
+                assert type(loc) is ORM_CLASSES[kind]
+                assert loc == orm
+        with pytest.raises(ValidationError):
+            model(loc="text")
+
+    @pytest.mark.parametrize("base", BASES)
+    @pytest.mark.parametrize("kind", KINDS)
+    def test_each_alias_accepts_its_kind(self, base: type[BaseModel], kind: str) -> None:
+        model = _model(base, ALIASES[kind])
+        orm = _orm(kind)
+        assert model(loc=orm).loc is orm
+        assert model(loc=_sdk(kind)).loc == orm
+        assert model(loc=GEOJSON[kind]).loc == orm
+        assert model().loc is None
+        other = _orm("point" if kind != "point" else "line")
+        with pytest.raises(ValidationError):
+            model(loc=other)
+
+    @pytest.mark.parametrize("bad", ["foo", "", "point|", "|point", "point|foo", "point||line", "Feature|x"])
+    def test_unknown_kind_is_a_value_error(self, bad: str) -> None:
+        with pytest.raises(ValueError, match="kind"):
+            GeoField[bad]
+
+    @pytest.mark.parametrize("bad", [3, None, ("point",), GeometryPoint])
+    def test_non_string_kinds_are_a_type_error(self, bad: Any) -> None:
+        with pytest.raises(TypeError, match="GeoField"):
+            GeoField[bad]
+
+    def test_unknown_kind_raises_at_class_definition(self) -> None:
+        kind = "foo"
+        with pytest.raises(ValueError, match="kind"):
+
+            class Bad(BaseModel):
+                loc: GeoField[kind]  # type: ignore[valid-type]
+
+    def test_geofield_cannot_be_instantiated(self) -> None:
+        with pytest.raises(TypeError, match="GeoField"):
+            GeoField()
+
+    # --- defaults (D13) -----------------------------------------------------------------------
+
+    @pytest.mark.parametrize("model", [_PlainDefaults, _SurrealDefaults], ids=["plain", "surreal"])
+    def test_alias_fields_default_to_none(self, model: Any) -> None:
+        instance = model()
+        assert instance.location is None
+        assert instance.aliased is None
+        for name in ("location", "aliased"):
+            field = model.model_fields[name]
+            assert field.is_required() is False
+            assert field.default is None
+            assert field.get_default(call_default_factory=True) is None
+        constructed = model.model_construct()
+        assert constructed.location is None
+        assert constructed.aliased is None
+        assert set(model.model_json_schema().get("required", [])).isdisjoint({"location", "aliased", "where"})
+        assert model(where=A).aliased == GeometryPoint(*A)
+
+    # --- nested positions ---------------------------------------------------------------------
+
+    @pytest.mark.parametrize("base", BASES)
+    def test_containers_of_classes_validate_to_orm_values(self, base: type[BaseModel]) -> None:
+        model = create_model(
+            "GeoNested", __base__=base, many=(list[GeometryPoint], []), areas=(dict[str, GeometryPolygon], {}), **_ids(base)
+        )
+        point, polygon = _orm("point"), _orm("polygon")
+        instance = model(
+            many=[A, list(A), GEOJSON["point"], _sdk("point"), point],
+            areas={"geojson": GEOJSON["polygon"], "sdk": _sdk("polygon"), "orm": polygon},
+        )
+        assert [type(p) for p in instance.many] == [GeometryPoint] * 5
+        assert instance.many == [point] * 5
+        assert {name: type(p) for name, p in instance.areas.items()} == dict.fromkeys(
+            ("geojson", "sdk", "orm"), GeometryPolygon
+        )
+        assert all(p == polygon for p in instance.areas.values())
+        assert model().many == []
+
+    def test_aliases_inside_a_container_validate_and_dump(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+
+            class Loose(BaseModel):
+                many: list[PointField] = []
+
+        instance = Loose(many=[A, _sdk("point"), GEOJSON["point"]])
+        assert [type(p) for p in instance.many] == [GeometryPoint] * 3
+        dumped = instance.model_dump()["many"]
+        assert [type(p) for p in dumped] == [GeometryPoint] * 3
+        assert dumped == [GeometryPoint(*A)] * 3
+        assert instance.model_dump(mode="json")["many"] == [GEOJSON["point"]] * 3
+
+    # --- serialisation ------------------------------------------------------------------------
+
+    @pytest.mark.parametrize("base", BASES)
+    def test_python_dump_returns_orm_values_everywhere(self, base: type[BaseModel]) -> None:
+        model = _dumped_model(base)
+        instance = model(
+            loc=A,
+            many=[A, B],
+            areas={"x": GEOJSON["polygon"]},
+            sub=_GeoSub(where=NEAR),
+            area=_sdk("polygon"),
+            bag=_orm("collection"),
+        )
+        dumped = instance.model_dump()
+        assert type(dumped["loc"]) is GeometryPoint
+        assert dumped["loc"] == GeometryPoint(*A)
+        assert [type(p) for p in dumped["many"]] == [GeometryPoint, GeometryPoint]
+        assert type(dumped["areas"]["x"]) is GeometryPolygon
+        assert type(dumped["sub"]["where"]) is GeometryPoint
+        assert dumped["sub"]["where"] == GeometryPoint(*NEAR)
+        assert type(dumped["area"]) is GeometryPolygon
+        assert type(dumped["bag"]) is GeometryCollection
+        assert dumped["bag"] == _orm("collection")
+
+    @pytest.mark.parametrize("base", BASES)
+    def test_python_dump_converts_raw_sdk_values_without_warning(self, base: type[BaseModel]) -> None:
+        model = _dumped_model(base)
+        constructed = model.model_construct(
+            loc=_sdk("point"), many=[_sdk("point"), _sdk("point")], area=_sdk("polygon"), bag=_sdk("collection")
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            dumped = constructed.model_dump()
+            as_json = constructed.model_dump(mode="json")
+        assert type(dumped["loc"]) is GeometryPoint
+        assert dumped["loc"] == _orm("point")
+        assert [type(p) for p in dumped["many"]] == [GeometryPoint, GeometryPoint]
+        assert type(dumped["area"]) is GeometryPolygon
+        assert type(dumped["bag"]) is GeometryCollection
+        assert dumped["bag"] == _orm("collection")
+        assert as_json["loc"] == GEOJSON["point"]
+        assert as_json["bag"] == GEOJSON["collection"]
+
+    def test_python_dump_of_a_malformed_sdk_value_never_raises(self) -> None:
+        constructed = _dumped_model(BaseModel).model_construct(loc=_bad_point(), area=_bad_ring())
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            dumped = constructed.model_dump()
+        assert type(dumped["loc"]) is GeometryPoint
+        assert dumped["loc"].longitude == "a"
+        assert type(dumped["area"]) is GeometryPolygon
+
+    @pytest.mark.parametrize("base", BASES)
+    def test_json_dump_writes_geojson_and_reads_it_back(self, base: type[BaseModel]) -> None:
+        model = _dumped_model(base)
+        instance = model(
+            loc=A,
+            many=[A, B],
+            areas={"x": GEOJSON["polygon"]},
+            sub=_GeoSub(where=NEAR),
+            area=_orm("polygon"),
+            bag=_orm("collection"),
+        )
+        dumped = instance.model_dump(mode="json")
+        assert dumped["loc"] == GEOJSON["point"]
+        assert dumped["many"] == [GeometryPoint(*A).to_geojson(), GeometryPoint(*B).to_geojson()]
+        assert dumped["areas"] == {"x": GEOJSON["polygon"]}
+        assert dumped["sub"] == {"where": GeometryPoint(*NEAR).to_geojson()}
+        assert dumped["area"] == GEOJSON["polygon"]
+        assert dumped["bag"] == GEOJSON["collection"]
+        restored = model.model_validate_json(instance.model_dump_json())
+        assert restored == instance
+        assert type(restored.bag) is GeometryCollection
+        assert model.model_validate_json(model(loc=A).model_dump_json()).area is None
+
+    @pytest.mark.parametrize("base", BASES)
+    def test_json_schema(self, base: type[BaseModel]) -> None:
+        schema = _dumped_model(base).model_json_schema()
+        loc = schema["properties"]["loc"]
+        assert loc["title"] == "GeoJSON Point"
+        assert loc["type"] == "object"
+        assert loc["properties"]["type"] == {"enum": ["Point"]}
+        assert loc["required"] == ["type", "coordinates"]
+        assert "loc" in schema["required"]
+        assert {"area", "bag"}.isdisjoint(schema["required"])
+        area_choices = schema["properties"]["area"]["anyOf"]
+        assert {"type": "null"} in area_choices
+        assert any(choice.get("title") == "GeoJSON Polygon" for choice in area_choices)
+        bag = next(choice for choice in schema["properties"]["bag"]["anyOf"] if choice.get("type") == "object")
+        assert bag["required"] == ["type", "geometries"]
+
+    def test_json_schema_of_several_kinds_lists_them(self) -> None:
+        schema = _model(BaseModel, GeoField["polygon|point"]).model_json_schema()["properties"]["loc"]
+        geojson = next(choice for choice in schema["anyOf"] if choice.get("type") == "object")
+        assert geojson["properties"]["type"] == {"enum": ["Point", "Polygon"]}
+        schema = _model(BaseModel, Geometry).model_json_schema()["properties"]["loc"]
+        assert schema["properties"]["type"]["enum"] == [ORM_CLASSES[kind]._GEOJSON_TYPE for kind in KINDS]
+        assert schema["required"] == ["type"]
+
+    def test_union_with_a_non_geometry_dumps_each_member_as_itself(self) -> None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            text = _PointOrText(loc="x")
+            point = _PointOrText(loc=A)
+            assert text.loc == "x"
+            assert text.model_dump() == {"loc": "x"}
+            assert text.model_dump(mode="json") == {"loc": "x"}
+            assert type(point.model_dump()["loc"]) is GeometryPoint
+            assert point.model_dump(mode="json") == {"loc": GEOJSON["point"]}
+
+    # --- helpers --------------------------------------------------------------------------------
+
+    @pytest.mark.parametrize(("annotation", "info"), GEO_ANNOTATIONS)
+    def test_geo_helpers_on_geometry_annotations(self, annotation: Any, info: str) -> None:
+        assert geo.is_geo_field(annotation) is True
+        assert geo.get_geo_info(annotation) == info
+        assert geo._geo_kinds(annotation) == _kinds(info)
+
+    @pytest.mark.parametrize("annotation", NOT_GEO_ANNOTATIONS)
+    def test_geo_helpers_on_other_annotations(self, annotation: Any) -> None:
+        assert geo.is_geo_field(annotation) is False
+        assert geo.get_geo_info(annotation) is None
+        assert geo._geo_kinds(annotation) is None
+
+    def test_geo_kinds_of_model_field_annotations(self) -> None:
+        fields = _dumped_model(BaseSurrealModel).model_fields
+        assert geo._geo_kinds(fields["loc"].annotation) == frozenset({"point"})
+        assert geo._geo_kinds(fields["area"].annotation) == frozenset({"polygon"})
+        assert geo._geo_kinds(fields["bag"].annotation) == frozenset({"collection"})
+        assert geo._geo_kinds(fields["many"].annotation) is None
+        assert geo._geo_kinds(_SurrealDefaults.model_fields["aliased"].annotation) == frozenset({"point"})
+        union = _model(BaseModel, GeoField["point|polygon"]).model_fields["loc"].annotation
+        assert geo.get_geo_info(union) == "point|polygon"
+
+    def test_field_info_shows_the_kinds(self) -> None:
+        assert "GeoField['point|polygon']" in repr(_model(BaseModel, GeoField["polygon|point"]).model_fields["loc"])
+        assert "GeoField['feature']" in repr(_model(BaseModel, GeometryField).model_fields["loc"])
+
+    def test_exports(self) -> None:
+        for name in (
+            "GeoField",
+            "GeometryField",
+            "PointField",
+            "LineStringField",
+            "PolygonField",
+            "MultiPointField",
+            "MultiLineStringField",
+            "MultiPolygonField",
+            "GeometryCollectionField",
+        ):
+            assert name in surreal_orm_lite.__all__
+            assert getattr(surreal_orm_lite, name) is getattr(geo, name)
+            assert name in geo.__all__
+        for name in ("is_geo_field", "get_geo_info"):
+            assert name in geo.__all__
+            assert name not in surreal_orm_lite.__all__
+            assert not hasattr(surreal_orm_lite, name)
+
+    # --- model auth and live fallbacks (spec §7) -------------------------------------------------
+
+    def test_signup_binds_none_for_an_omitted_alias_field_and_the_geometry_default(self) -> None:
+        bound = _GeoAuth._auth_variables("signup", {"email": "a@b.c", "password": "x"}, require_all=True)
+        assert bound["home"] is None
+        assert type(bound["door"]) is GeometryPoint
+        assert bound["door"] == GeometryPoint(0, 0)
+
+    def test_minimal_instance_sets_alias_fields_to_none(self) -> None:
+        instance = live.minimal_instance(_GeoLive, RecordID("geo_live", "x"))
+        assert instance.location is None
+        assert instance.area is None
+
+    def test_hydrate_fallback_never_leaves_an_alias_field_unset(self) -> None:
+        instance, error = live.hydrate(_GeoLive, {"id": RecordID("geo_live", "x"), "location": "not a point"})
+        assert isinstance(error, ValidationError)
+        assert instance.location == "not a point"
+        assert instance.area is None
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            dumped = instance.model_dump()
+        assert dumped["location"] == "not a point"
+        assert dumped["area"] is None

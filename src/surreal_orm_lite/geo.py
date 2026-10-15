@@ -21,15 +21,29 @@ Equality: a value equals an ORM or SDK value of the same kind with equal coordin
 ``GeometryCollection`` is a ``Geometry`` (the SDK's is not) and nests at most 32 levels of
 collections, a depth every supported SurrealDB line accepts. Refusals raise ``TypeError`` for a
 wrong argument type and ``InvalidGeometryError`` (a ``ValueError``) for a wrong value.
+
+As model fields: a class annotation (``entrance: GeometryPoint``, required unless ``X | None``) or
+``GeoField["point"]`` / an alias (``location: PointField = None``: ``GeometryPoint | None``, default
+``None``, as in the full SurrealDB-ORM). Both accept the ORM value, the SDK's, a GeoJSON object and,
+for points, a ``(longitude, latitude)`` pair; ``model_dump()`` returns the ORM value and JSON mode
+its GeoJSON object. Inside containers (``list[GeometryPoint]``) use the classes.
+``is_geo_field()`` and ``get_geo_info()`` tell a geometry field's kinds.
 """
 
 from __future__ import annotations
 
+import functools
 import math
 import numbers
+import operator
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from decimal import Decimal
-from typing import Any, ClassVar, Self, TypeVar, cast
+from types import UnionType
+from typing import Annotated, Any, ClassVar, Self, TypeAlias, TypeVar, Union, cast, get_args, get_origin
+
+from pydantic import Field, GetCoreSchemaHandler, GetJsonSchemaHandler
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import PydanticSerializationUnexpectedValue, core_schema
 
 from ._sdk import (
     SdkGeometryCollection,
@@ -51,6 +65,17 @@ __all__ = [
     "GeometryMultiLine",
     "GeometryMultiPolygon",
     "GeometryCollection",
+    "GeoField",
+    "GeometryField",
+    "PointField",
+    "LineStringField",
+    "PolygonField",
+    "MultiPointField",
+    "MultiLineStringField",
+    "MultiPolygonField",
+    "GeometryCollectionField",
+    "is_geo_field",
+    "get_geo_info",
 ]
 
 _G = TypeVar("_G", bound="Geometry")
@@ -256,6 +281,20 @@ class Geometry:
             return self._repr()
         except Exception:
             return object.__repr__(self)
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source_type: Any, handler: GetCoreSchemaHandler) -> core_schema.CoreSchema:
+        """A field annotated with the class takes that kind (``Geometry``: any kind); required unless ``X | None``.
+
+        Accepted input: an ORM value of the kind (kept), the SDK's (converted, checked), its GeoJSON
+        object, and for a point a ``(longitude, latitude)`` pair. Python mode dumps the ORM value,
+        JSON mode its GeoJSON object.
+        """
+        return _field_schema(_class_kinds(cls))
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, schema: core_schema.CoreSchema, handler: GetJsonSchemaHandler) -> JsonSchemaValue:
+        return _geojson_json_schema(_class_kinds(cls))
 
 
 class GeometryPoint(Geometry):
@@ -731,3 +770,306 @@ def _from_geojson(data: Any, depth: int) -> Geometry:
         return _GEOJSON_PARSERS[kind](coordinates)
     except TypeError as exc:
         raise InvalidGeometryError(f"malformed GeoJSON {kind}: {exc}") from exc
+
+
+# --- Pydantic fields ------------------------------------------------------------------------------
+
+#: The kinds, in SurrealDB's ``geometry<…>`` vocabulary and the SDK's order.
+_KINDS: tuple[str, ...] = ("point", "line", "polygon", "multipoint", "multiline", "multipolygon", "collection")
+_ALL_KINDS: frozenset[str] = frozenset(_KINDS)
+_KIND_CLASSES: dict[str, type[Geometry]] = {
+    "point": GeometryPoint,
+    "line": GeometryLine,
+    "polygon": GeometryPolygon,
+    "multipoint": GeometryMultiPoint,
+    "multiline": GeometryMultiLine,
+    "multipolygon": GeometryMultiPolygon,
+    "collection": GeometryCollection,
+}
+#: Every name ``GeoField[...]`` accepts (case-insensitive) and the kinds it stands for: SurrealDB's
+#: names, plus the full SurrealDB-ORM's and GeoJSON's spellings.
+_KIND_NAMES: dict[str, frozenset[str]] = {
+    **{kind: frozenset({kind}) for kind in _KINDS},
+    "linestring": frozenset({"line"}),
+    "multilinestring": frozenset({"multiline"}),
+    "geometrycollection": frozenset({"collection"}),
+    "feature": _ALL_KINDS,
+    "geometry": _ALL_KINDS,
+}
+
+
+def _ordered(kinds: frozenset[str]) -> tuple[str, ...]:
+    return tuple(kind for kind in _KINDS if kind in kinds)
+
+
+def _info(kinds: frozenset[str]) -> str:
+    """``"feature"`` for every kind, else the kinds joined with ``|`` in the canonical order."""
+    return "feature" if kinds == _ALL_KINDS else "|".join(_ordered(kinds))
+
+
+def _class_kinds(cls: type[Geometry]) -> frozenset[str]:
+    """The kinds a class annotation stands for: its own, or every kind for ``Geometry``."""
+    for kind in _KINDS:
+        if issubclass(cls, _KIND_CLASSES[kind]):
+            return frozenset({kind})
+    return frozenset(kind for kind in _KINDS if issubclass(_KIND_CLASSES[kind], cls))
+
+
+def _parse_kinds(kinds: object) -> frozenset[str]:
+    """The kinds of ``GeoField[kinds]``: one string, case-insensitive, ``|``-separated."""
+    if not isinstance(kinds, str):
+        raise TypeError(
+            "GeoField takes one string of geometry kinds, such as GeoField['point'] or GeoField['point|polygon'], "
+            f"not {type(kinds).__name__}"
+        )
+    parsed: set[str] = set()
+    for part in kinds.split("|"):
+        name = part.strip().lower()
+        if name not in _KIND_NAMES:
+            raise ValueError(
+                f"unknown geometry kind {part.strip()!r} in GeoField[{kinds!r}]: expected point, line (or linestring), "
+                "polygon, multipoint, multiline (or multilinestring), multipolygon, collection (or geometrycollection) "
+                "or feature (or geometry: any kind), several joined with '|'"
+            )
+        parsed |= _KIND_NAMES[name]
+    return frozenset(parsed)
+
+
+class _GeoValidator:
+    """The field validator of one set of kinds (spec §6.2): a refusal is a ``ValueError``.
+
+    An ORM value of an accepted kind is returned as it is; the SDK's is converted through the
+    constructors (checked); a mapping is read as GeoJSON; a 2-item ``tuple``/``list`` is a
+    ``(longitude, latitude)`` pair when points are accepted. ``TypeError`` and
+    ``InvalidGeometryError`` raised on the way become ``ValueError``, so Pydantic reports a
+    ``ValidationError``.
+    """
+
+    __slots__ = ("_classes", "_sdk_classes", "_points", "_expected", "_forms")
+
+    def __init__(self, kinds: frozenset[str]) -> None:
+        self._classes: tuple[type[Geometry], ...] = tuple(_KIND_CLASSES[kind] for kind in _ordered(kinds))
+        self._sdk_classes: tuple[type[Any], ...] = tuple(cls._SDK_CLASS for cls in self._classes)
+        self._points = "point" in kinds
+        names = " or ".join(cls.__name__ for cls in self._classes)
+        self._expected = "a geometry" if kinds == _ALL_KINDS else f"a {names}"
+        geojson = "object" if kinds == _ALL_KINDS else " or ".join(cls._GEOJSON_TYPE for cls in self._classes) + " object"
+        pair = ", or a (longitude, latitude) pair" if self._points else ""
+        self._forms = f"{self._expected} (the ORM's or the SDK's class), a GeoJSON {geojson}{pair}"
+
+    def __call__(self, value: Any) -> Geometry:
+        try:
+            return self._validate(value)
+        except (TypeError, InvalidGeometryError) as exc:
+            raise ValueError(str(exc)) from exc
+
+    def _validate(self, value: Any) -> Geometry:
+        if isinstance(value, Geometry):
+            if isinstance(value, self._classes):
+                return value
+            raise ValueError(f"expected {self._expected}, got a {type(value).__name__}")
+        if isinstance(value, _SDK_GEOMETRIES):
+            if isinstance(value, self._sdk_classes):
+                return _from_sdk_checked(value, 1)
+            raise ValueError(f"expected {self._expected}, got the SDK's {type(value).__name__}")
+        if isinstance(value, Mapping):
+            geometry = Geometry.from_geojson(value)
+            if isinstance(geometry, self._classes):
+                return geometry
+            raise ValueError(f"expected {self._expected}, got a GeoJSON {geometry._GEOJSON_TYPE}")
+        if self._points and isinstance(value, (tuple, list)):
+            return GeometryPoint.parse_coordinates(value)
+        raise ValueError(f"expected {self._forms}, not {type(value).__name__}")
+
+
+@functools.cache
+def _validator(kinds: frozenset[str]) -> _GeoValidator:
+    """One validator per set of kinds, shared by every field that accepts them."""
+    return _GeoValidator(kinds)
+
+
+def _serialize_geometry(value: Any, info: core_schema.SerializationInfo[Any]) -> Any:
+    """The geometry field serializer (spec §5.2).
+
+    Python mode returns an ORM geometry: the value itself, or — when the attribute holds a raw
+    SDK geometry (``model_construct``, a read sync, ``hydrate()``'s fallback) — one built
+    **unchecked**, so ``model_dump()`` never raises and never hands Pydantic an SDK dataclass to
+    flatten into a dict. JSON mode writes ``to_geojson()``.
+
+    Any other value is handed back to Pydantic (``PydanticSerializationUnexpectedValue``, in both
+    modes): in a union field Pydantic then tries the next member, so ``GeometryPoint | str`` writes
+    a ``str`` as one; in a field that is not a union (a stray value set through
+    ``model_construct``) it emits its standard serializer warning and writes the inferred value.
+    """
+    if isinstance(value, _SDK_GEOMETRIES):
+        value = _from_sdk(value, checked=False)
+    if not isinstance(value, Geometry):
+        raise PydanticSerializationUnexpectedValue(f"Expected `Geometry`, got `{type(value).__name__}`")
+    if info.mode_is_json():
+        return value.to_geojson()
+    return value
+
+
+def _field_schema(kinds: frozenset[str]) -> core_schema.CoreSchema:
+    """The core schema of a field of these kinds: the validator and the serializer (not nullable)."""
+    return core_schema.no_info_plain_validator_function(
+        _validator(kinds),
+        serialization=core_schema.plain_serializer_function_ser_schema(_serialize_geometry, info_arg=True),
+    )
+
+
+def _geojson_json_schema(kinds: frozenset[str]) -> dict[str, Any]:
+    """The JSON schema of the GeoJSON object of these kinds (``type`` lists them)."""
+    classes = [_KIND_CLASSES[kind] for kind in _ordered(kinds)]
+    types = [cls._GEOJSON_TYPE for cls in classes]
+    title = "GeoJSON geometry" if kinds == _ALL_KINDS else f"GeoJSON {' or '.join(types)}"
+    with_coordinates = any(cls is not GeometryCollection for cls in classes)
+    with_geometries = GeometryCollection in classes
+    properties: dict[str, Any] = {"type": {"enum": types}}
+    required = ["type"]
+    if with_coordinates:
+        properties["coordinates"] = {"type": "array"}
+    if with_geometries:
+        properties["geometries"] = {"type": "array", "items": {"type": "object"}}
+    if not with_geometries:
+        required.append("coordinates")
+    elif not with_coordinates:
+        required.append("geometries")
+    return {"type": "object", "title": title, "properties": properties, "required": required}
+
+
+class _GeoMarker:
+    """The ``Annotated`` metadata of ``GeoField[...]`` and the aliases: the kinds the field accepts.
+
+    Its core schema is the kinds' validator and serializer made nullable; the ``None`` default
+    comes from the alias's ``Field(default=None)``, so Pydantic knows the field is not required.
+    """
+
+    __slots__ = ("kinds",)
+
+    def __init__(self, kinds: frozenset[str]) -> None:
+        self.kinds = kinds
+
+    def __repr__(self) -> str:
+        return f"GeoField[{_info(self.kinds)!r}]"
+
+    def __get_pydantic_core_schema__(self, source_type: Any, handler: GetCoreSchemaHandler) -> core_schema.CoreSchema:
+        return core_schema.nullable_schema(_field_schema(self.kinds))
+
+    def __get_pydantic_json_schema__(self, schema: core_schema.CoreSchema, handler: GetJsonSchemaHandler) -> JsonSchemaValue:
+        return {"anyOf": [_geojson_json_schema(self.kinds), {"type": "null"}]}
+
+
+# ``Annotated`` subscripted with values built at run time (mypy takes it for a type expression).
+_ANNOTATED: Any = Annotated
+
+
+def _annotation(kinds: frozenset[str]) -> Any:
+    """``Annotated[<class or union> | None, _GeoMarker(kinds), Field(default=None)]``."""
+    if kinds == _ALL_KINDS:
+        inner: Any = Geometry
+    else:
+        inner = functools.reduce(operator.or_, (_KIND_CLASSES[kind] for kind in _ordered(kinds)))
+    return _ANNOTATED[inner | None, _GeoMarker(kinds), Field(default=None)]
+
+
+class GeoField:
+    """A geometry field of the given kinds, nullable with default ``None`` (the full SurrealDB-ORM's form).
+
+    ``GeoField["point"]``, ``GeoField["polygon"]``, ``GeoField["point|polygon"]``,
+    ``GeoField["feature"]`` (any kind): one string, case-insensitive, ``|``-separated. The kinds are
+    SurrealDB's ``geometry<…>`` names — ``point``, ``line``, ``polygon``, ``multipoint``,
+    ``multiline``, ``multipolygon``, ``collection``, ``feature`` — and ``linestring``,
+    ``multilinestring``, ``geometrycollection`` and ``geometry`` are accepted for ``line``,
+    ``multiline``, ``collection`` and ``feature``. An unknown kind raises ``ValueError`` and a
+    non-string ``TypeError``, where the class is defined.
+
+    The result is ``Annotated[<class or union> | None, …, Field(default=None)]``: the attribute is
+    a geometry object (``GeometryPoint``, …) or ``None``, the field is not required, and
+    ``model_construct()`` sets ``None``. Type checkers do not understand ``GeoField[...]``: use the
+    aliases (``PointField``…) with ``= None`` in the class body. Inside containers
+    (``list[GeometryPoint]``), use the classes.
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> Self:
+        raise TypeError("GeoField is an annotation, not a value: write `location: GeoField['point']`")
+
+    def __class_getitem__(cls, kinds: str) -> Any:
+        return _annotation(_parse_kinds(kinds))
+
+
+# The aliases: ``GeoField[...]`` spelt out, so type checkers see ``GeometryPoint | None`` and so on.
+# Without the Pydantic mypy plugin, mypy only knows a default written in the class body: declare
+# ``location: PointField = None``. Meant for model fields; at nested positions use the classes.
+
+#: A point field: ``GeometryPoint | None``, default ``None`` (full SurrealDB-ORM).
+PointField: TypeAlias = Annotated[GeometryPoint | None, _GeoMarker(frozenset({"point"})), Field(default=None)]
+#: A line field: ``GeometryLine | None``, default ``None`` (full SurrealDB-ORM).
+LineStringField: TypeAlias = Annotated[GeometryLine | None, _GeoMarker(frozenset({"line"})), Field(default=None)]
+#: A polygon field: ``GeometryPolygon | None``, default ``None`` (full SurrealDB-ORM).
+PolygonField: TypeAlias = Annotated[GeometryPolygon | None, _GeoMarker(frozenset({"polygon"})), Field(default=None)]
+#: A multi-point field: ``GeometryMultiPoint | None``, default ``None`` (full SurrealDB-ORM).
+MultiPointField: TypeAlias = Annotated[GeometryMultiPoint | None, _GeoMarker(frozenset({"multipoint"})), Field(default=None)]
+#: A multi-line field: ``GeometryMultiLine | None``, default ``None``.
+MultiLineStringField: TypeAlias = Annotated[GeometryMultiLine | None, _GeoMarker(frozenset({"multiline"})), Field(default=None)]
+#: A multi-polygon field: ``GeometryMultiPolygon | None``, default ``None``.
+MultiPolygonField: TypeAlias = Annotated[
+    GeometryMultiPolygon | None, _GeoMarker(frozenset({"multipolygon"})), Field(default=None)
+]
+#: A geometry-collection field: ``GeometryCollection | None``, default ``None``.
+GeometryCollectionField: TypeAlias = Annotated[
+    GeometryCollection | None, _GeoMarker(frozenset({"collection"})), Field(default=None)
+]
+#: A field of any geometry kind: ``Geometry | None``, default ``None``.
+GeometryField: TypeAlias = Annotated[Geometry | None, _GeoMarker(_ALL_KINDS), Field(default=None)]
+
+
+def _geo_kinds(annotation: Any) -> frozenset[str] | None:
+    """The geometry kinds a field annotation accepts, or ``None`` when it is not a geometry field.
+
+    Unwraps ``Annotated`` (a ``GeoField`` marker gives its kinds), then ``X | None``, then maps an
+    ORM class, or a union of ORM classes, to its kinds. Works on ``model_fields[name].annotation``
+    too, where Pydantic has removed the marker (``GeometryPoint | None``). Containers, the SDK's
+    classes and unions with a non-geometry member are not geometry fields.
+    """
+    origin = get_origin(annotation)
+    if origin is Annotated:
+        for metadata in getattr(annotation, "__metadata__", ()):
+            if isinstance(metadata, _GeoMarker):
+                return metadata.kinds
+        return _geo_kinds(get_args(annotation)[0])
+    if origin is Union or origin is UnionType:
+        kinds: set[str] = set()
+        for member in get_args(annotation):
+            if member is type(None):
+                continue
+            member_kinds = _geo_kinds(member)
+            if member_kinds is None:
+                return None
+            kinds |= member_kinds
+        return frozenset(kinds) or None
+    if isinstance(annotation, type) and issubclass(annotation, Geometry):
+        return _class_kinds(annotation)
+    return None
+
+
+def is_geo_field(annotation: Any) -> bool:
+    """Whether a field annotation is a geometry field: ``GeoField[...]``, an alias or a geometry class.
+
+    ``GeometryPoint | None`` is one; ``list[GeometryPoint]``, ``GeometryPoint | str`` and the SDK's
+    classes are not.
+    """
+    return _geo_kinds(annotation) is not None
+
+
+def get_geo_info(annotation: Any) -> str | None:
+    """The kinds of a geometry field annotation, or ``None`` when it is not one.
+
+    SurrealDB's kind names joined with ``|`` in a fixed order (``"point"``, ``"point|polygon"``),
+    or ``"feature"`` for any kind: ``get_geo_info(LineStringField)`` is ``"line"`` (the name of
+    ``geometry<line>``; the full SurrealDB-ORM answers ``"linestring"``).
+    """
+    kinds = _geo_kinds(annotation)
+    return None if kinds is None else _info(kinds)

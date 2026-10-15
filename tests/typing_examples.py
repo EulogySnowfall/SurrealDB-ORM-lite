@@ -20,6 +20,15 @@ from surreal_orm_lite import (
     BoundIncluded,
     Computed,
     Duration,
+    GeometryCollectionField,
+    GeometryField,
+    GeometryPoint,
+    LineStringField,
+    MultiLineStringField,
+    MultiPointField,
+    MultiPolygonField,
+    PointField,
+    PolygonField,
     Range,
     SurrealConfigDict,
     SurrealFunc,
@@ -195,3 +204,36 @@ def open_end(start: int) -> Range[int]:
     begin: BoundIncluded | BoundExcluded | None = shift.begin
     assert begin is not None
     return shift
+
+
+class TypedPlace(BaseSurrealModel):
+    """v0.24.0: geometry fields. Without the Pydantic mypy plugin, mypy only sees a default
+    written in the class body, so the aliases are declared ``= None``."""
+
+    name: str
+    entrance: GeometryPoint
+    location: PointField = None
+    path: LineStringField = None
+    area: PolygonField = None
+    pins: MultiPointField = None
+    routes: MultiLineStringField = None
+    zones: MultiPolygonField = None
+    bag: GeometryCollectionField = None
+    anything: GeometryField = None
+    terrace: GeometryPoint | None = None
+    stops: list[GeometryPoint] = []
+
+
+def make_place() -> TypedPlace:
+    """No alias field is passed: each one has its ``= None`` default."""
+    return TypedPlace(name="x", entrance=GeometryPoint(0, 0))
+
+
+def place_longitude(store: TypedPlace) -> float:
+    """An alias types as ``GeometryPoint | None``."""
+    return store.location.longitude if store.location else 0.0
+
+
+def entrance_latitude(store: TypedPlace) -> float:
+    """A class annotation types as the class."""
+    return store.entrance.latitude

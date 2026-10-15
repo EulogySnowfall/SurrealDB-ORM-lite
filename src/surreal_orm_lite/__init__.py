@@ -33,14 +33,23 @@ from .functions import (
     computed,
 )
 from .geo import (
+    GeoField,
     Geometry,
     GeometryCollection,
+    GeometryCollectionField,
+    GeometryField,
     GeometryLine,
     GeometryMultiLine,
     GeometryMultiPoint,
     GeometryMultiPolygon,
     GeometryPoint,
     GeometryPolygon,
+    LineStringField,
+    MultiLineStringField,
+    MultiPointField,
+    MultiPolygonField,
+    PointField,
+    PolygonField,
 )
 from .live import LiveModelStream, LiveStream, ModelChangeEvent, ReconnectCallback
 from .model_auth import AuthenticatedUserMixin, AuthResult
@@ -140,6 +149,15 @@ __all__ = [
     "GeometryMultiLine",
     "GeometryMultiPolygon",
     "GeometryCollection",
+    "GeoField",
+    "GeometryField",
+    "PointField",
+    "LineStringField",
+    "PolygonField",
+    "MultiPointField",
+    "MultiLineStringField",
+    "MultiPolygonField",
+    "GeometryCollectionField",
     # Exceptions
     "SurrealORMError",
     "SurrealDbError",
