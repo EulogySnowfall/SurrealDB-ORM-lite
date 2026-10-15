@@ -48,7 +48,11 @@ third minor of Tier 2.
   same engine, with no data lost; a new URL closes the old engine. Closing
   (`close_connection()`, `close_all_connections()`, `unset_connection()`, `reconnect()`, the exit
   of `async with SurrealDBConnectionManager():`) discards a `mem://` database, and a
-  `surrealkv://` one reopens with its data. `validate_connection()` never discards it.
+  `surrealkv://` one reopens with its data. `validate_connection()` never discards it. Server
+  clients are untouched while an embedded URL is configured: `close_connection()`, `reconnect()`
+  and the `async with` exit then close only the engine, so a server client keeps its live queries
+  and its identity, even one signed in with `store=False`; `close_all_connections()` and
+  `unset_connection()` close it too.
 - **Clear errors, before any request, for what the engine cannot do**: live queries (`live()`,
   `watch()`, `subscribe_live()`: read the table's change feed with `changes()` instead),
   `changes(since=<datetime>)` (pass a cursor or `since=None`), and `AuthenticatedUserMixin` calls

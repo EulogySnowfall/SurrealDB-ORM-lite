@@ -214,6 +214,17 @@ _ACCOUNT_DDL = (
 )
 _ACCOUNT = {"email": "a@x", "pass": "p"}
 
+#: A record access and its table on the slot server's ``ns``/``db``: an identity to sign in with ``store=False``.
+_SERVER_ACCOUNT_ACCESS = "emb_srv_account"
+_SERVER_ACCOUNT_TABLE = "emb_srv_user"
+_SERVER_ACCOUNT_DDL = (
+    f"DEFINE ACCESS OVERWRITE {_SERVER_ACCOUNT_ACCESS} ON DATABASE TYPE RECORD "
+    f"SIGNUP (CREATE {_SERVER_ACCOUNT_TABLE} SET email = $email, pass = crypto::argon2::generate($pass)) "
+    f"SIGNIN (SELECT * FROM {_SERVER_ACCOUNT_TABLE} WHERE email = $email AND crypto::argon2::compare(pass, $pass)) "
+    "DURATION FOR SESSION 1h; "
+    f"DEFINE TABLE OVERWRITE {_SERVER_ACCOUNT_TABLE} SCHEMALESS PERMISSIONS FOR select WHERE id = $auth.id;"
+)
+
 
 class Person(BaseSurrealModel):
     model_config = SurrealConfigDict(table_name="person")
@@ -953,6 +964,87 @@ class TestServerClientsUntouchedE2E:
             assert await SurrealDBConnectionManager.get_client() is engine
             assert await Person.objects().count() == 1
         finally:
+            await SurrealDBConnectionManager.unset_connection()
+
+    @pytest.mark.parametrize("closer", ["close_connection", "reconnect", "async_with"])
+    async def test_closing_the_engine_keeps_the_server_client_and_its_unstored_identity(self, closer: str) -> None:
+        """On an embedded URL, ``close_connection()``, ``reconnect()`` and the exit of ``async with
+        SurrealDBConnectionManager():`` close the engine only. The loop's server client, signed in with
+        ``store=False`` (an identity no reconnect restores), is back after the block as it was: never silently
+        replaced by a new connection as the configured user."""
+        try:
+            async with orm_client(_SERVER_ACCOUNT_TABLE) as server:
+                await server.query(_SERVER_ACCOUNT_DDL, {})
+                try:
+                    await SurrealDBConnectionManager.signup(
+                        access=_SERVER_ACCOUNT_ACCESS, variables={"email": "s@x", "pass": "p"}, store=False
+                    )
+                    assert SurrealDBConnectionManager.get_session_token() is None
+
+                    async with embedded_database():
+                        await Person(id="ada", name="Ada").save()
+                        if closer == "close_connection":
+                            await SurrealDBConnectionManager.close_connection()
+                        elif closer == "reconnect":
+                            await SurrealDBConnectionManager.reconnect()
+                        else:
+                            async with SurrealDBConnectionManager():
+                                pass
+                        assert await Person.objects().count() == 0  # the engine was closed: a new, empty one
+
+                    assert await SurrealDBConnectionManager.get_client() is server
+                    me = await SurrealDBConnectionManager.info()
+                    assert me is not None and me["email"] == "s@x"
+                finally:
+                    await SurrealDBConnectionManager.invalidate()  # back to root for the cleanup
+                    root = await SurrealDBConnectionManager.get_client()
+                    await root.query(f"REMOVE ACCESS {_SERVER_ACCOUNT_ACCESS} ON DATABASE;", {})
+        finally:
+            await SurrealDBConnectionManager.unset_connection()
+
+    async def test_a_server_stream_survives_an_embedded_close(self) -> None:
+        """Its live readers are not released either: the stream still receives once the server is back."""
+        settings: dict[str, Any] = {
+            "url": _ws_url(),
+            "user": "root",
+            "password": "root",
+            "namespace": "ns",
+            "database": "db",
+        }
+        try:
+            async with orm_client("emb_watched") as server:
+                await server.query("DEFINE TABLE emb_watched SCHEMALESS;", {})
+                stream = await EmbWatched.objects().watch().start()
+                try:
+                    SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="t")
+                    await SurrealDBConnectionManager.close_connection()
+
+                    SurrealDBConnectionManager.set_connection(**settings)
+                    assert await SurrealDBConnectionManager.get_client() is server
+                    await EmbWatched(id="w1", name="W").save()
+                    [event] = await _take(stream, 1)
+                    assert event["action"] == LiveAction.CREATE
+                finally:
+                    await stream.stop()
+        finally:
+            await SurrealDBConnectionManager.unset_connection()
+
+    async def test_an_embedded_close_keeps_a_lost_identity(self) -> None:
+        """Nor is a server loop's lost-identity guard lifted: ``close_connection()`` on the engine says nothing
+        about which identity the next server connection should have. (No server: the guard raises first.)"""
+        lost: Any = SurrealDBConnectionManager._SurrealDBConnectionManager__lost_identity  # type: ignore[attr-defined]
+        try:
+            SurrealDBConnectionManager.set_connection(
+                url=_ws_url(), user="root", password="root", namespace="ns", database="db"
+            )
+            lost.add(asyncio.get_running_loop())
+            await SurrealDBConnectionManager.set_url("mem://")
+            await SurrealDBConnectionManager.close_connection()
+            await SurrealDBConnectionManager.set_url(_ws_url())
+            with pytest.raises(SurrealDbAuthenticationError, match="dropped while it was authenticated"):
+                await SurrealDBConnectionManager.get_client()
+        finally:
+            lost.clear()
             await SurrealDBConnectionManager.unset_connection()
 
 

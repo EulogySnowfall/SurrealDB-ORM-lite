@@ -825,7 +825,8 @@ class SurrealDBConnectionManager:
         stored-function signatures for the block). Doing the detach and the re-point under the guard at once
         means a concurrent first :meth:`get_client` on another thread either completes before the block — its
         client is detached with the rest — or waits and then opens the block's engine: it can never publish an
-        engine for the outer settings into the block's slot. Per-loop server clients are neither closed nor used.
+        engine for the outer settings into the block's slot. Per-loop server clients are neither closed nor used,
+        even by a :meth:`close_connection` or :meth:`reconnect` inside the block (they close the engine only).
 
         Private, for :mod:`surreal_orm_lite.testing`; the caller validates the URL, namespace and database.
         """
@@ -896,7 +897,17 @@ class SurrealDBConnectionManager:
         engine: a client obtained before the close is still a running database. Do not use it after
         the close, and drop it (``del client``) before reopening the same ``surrealkv://`` path —
         two engines on one path miss each other's writes.
+
+        While an embedded URL is configured, **only the engine** is closed: the running loop's
+        server client, its live queries and its identity (even one set with ``store=False``) are
+        left as they are, for when a server URL is configured back. :meth:`close_all_connections`
+        and :meth:`unset_connection` close them too.
         """
+        if cls.is_embedded():
+            # Server clients are untouched while an embedded URL is configured: closing the engine says
+            # nothing about the server connection, its live readers or the identity it should come back as.
+            await cls._close_embedded()
+            return
         cls.__prune_dead_loops()
         # Before the socket goes: a live-query reader is parked on a queue nothing will ever
         # feed once the connection is gone, so releasing them has to happen here.
@@ -1338,7 +1349,7 @@ class SurrealDBConnectionManager:
         what a reconnect restores). The slot's selection is stale until ``use()`` succeeds, so
         nobody takes the fast path meanwhile; on failure it stays stale — the next
         :meth:`get_client` selects again — and nothing is closed: :meth:`close_connection` would
-        discard a ``mem://`` database and close this loop's unrelated server client (spec D18).
+        discard a ``mem://`` database (spec D18).
         """
         held = cls.__embedded_client is client
         if held:
@@ -1785,8 +1796,8 @@ class SurrealDBConnectionManager:
         Reconnect to the SurrealDB instance.
 
         On an embedded URL this closes the engine first (:meth:`close_connection`): a ``mem://``
-        database starts empty again. :meth:`validate_connection` checks an embedded connection
-        without discarding it.
+        database starts empty again, and server clients are left as they are.
+        :meth:`validate_connection` checks an embedded connection without discarding it.
         """
         await cls.close_connection()
         return await cls.get_client()

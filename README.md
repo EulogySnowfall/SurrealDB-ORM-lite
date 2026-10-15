@@ -2732,7 +2732,10 @@ assert await Note.objects().count() == 0              # a new, empty one
 - **`validate_connection()`** opens the engine if needed and never discards it, so the
   `set_*(..., reconnect=True)` setters keep a `mem://` database.
 - **Server clients are untouched** while an embedded URL is configured, and are used again when
-  a server URL is configured back.
+  a server URL is configured back. `close_connection()`, `reconnect()` and the exit of
+  `async with SurrealDBConnectionManager():` close only the engine then: a server client keeps
+  its live queries and its identity, even one signed in with `store=False`.
+  `close_all_connections()` and `unset_connection()` close the server clients too.
 
 With the surrealdb SDK 2.x, closing does not stop an in-process engine: a client you obtained
 before `close_connection()` (or inside an `embedded_database()` block) is still a running
@@ -2979,6 +2982,7 @@ Long-lived single-loop applications are unaffected: one loop, one connection, as
 
 An embedded URL is the exception: the engine runs in this process and is not bound to a loop, so
 the manager keeps one client for the whole process ([section 26](#26-embedded-engine-and-test-fixtures)).
+While it is configured, `close_connection()` closes that client only, not the loop's server client.
 
 ---
 
