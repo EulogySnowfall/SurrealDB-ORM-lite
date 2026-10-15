@@ -18,8 +18,8 @@ to a list, sorted when its items can be; an ORM or SDK ``Range`` to an SDK ``Ran
 sides are the protocol's CBOR null; and a ``Decimal`` in exponent form to its fixed-point text. It
 refuses with a plain ``ValueError``, before anything is sent: an ``int`` outside signed 64-bit, a
 ``Decimal`` whose rounded integer part exceeds ``2**96 - 1``, a negative or too long duration, a
-zero duration while the installed SDK cannot read one back, and a range side that is neither a
-bound nor an open side. Anything else comes back unchanged: the SDK decides, as in v0.22.2.
+zero duration while nothing reads one back (``reads_zero_duration()``), and a range side that is
+neither a bound nor an open side. Anything else comes back unchanged: the SDK decides, as in v0.22.2.
 
 Geometries (v0.24.0) take two rows. An ORM geometry (``surreal_orm_lite.geo``) becomes the equal
 SDK geometry — built without any SDK constructor — and then takes the SDK row. An SDK geometry
@@ -35,18 +35,17 @@ closed, and a member of the wrong kind.
 
 The ORM calls it through this module (``_encoding.encode(x)``), never by a name imported from it.
 
-``sdk_decodes_zero_duration()`` is the one local SDK capability the rich field types depend on:
-SDK 2.0.0 cannot decode a zero duration (CBOR tag 14 with an empty compact form raises
-``IndexError``), so the ORM refuses to send one — in a bound parameter or a live-query literal —
-while the probe answers ``False``. A fixed SDK lifts the refusal by itself. Call it through this
-module (``encoding.sdk_decodes_zero_duration()``) so a test can replace it.
+``reads_zero_duration()`` says whether a zero duration the ORM sends can be read back. SDK 2.0.0
+cannot decode one (CBOR tag 14 with an empty compact form raises ``IndexError``), but since #235 the
+clients the ORM opens read it through the read hook (``decoding.py``). The ORM refuses to send a zero
+duration — in a bound parameter or a live-query literal — only when neither the SDK nor the hook
+reads it. Call it through this module (``encoding.reads_zero_duration()``) so a test can replace it.
 """
 
 from __future__ import annotations
 
 import copy
 import decimal
-import functools
 import itertools
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
@@ -54,10 +53,10 @@ from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import Any, Final, cast
 from uuid import UUID
 
-from . import _sdk, geo
+from . import _sdk, decoding, geo
 from .types import Duration, Range, _is_open_side, _nanoseconds
 
-__all__ = ["encode", "sdk_decodes_zero_duration"]
+__all__ = ["encode", "reads_zero_duration"]
 
 # SurrealDB integers are signed 64-bit: a larger one would be stored wrapped, or refused.
 INT64_MIN: Final = -(2**63)
@@ -195,7 +194,8 @@ def _encode_duration(value: timedelta | Duration | _sdk.SdkDuration) -> Any:
     seconds, nanoseconds = divmod(ns, _NS_PER_SECOND)
     if seconds >= DURATION_SECONDS_LIMIT:
         raise ValueError(f"Cannot send {value!r}: a SurrealDB duration holds at most 2**64 - 1 seconds.")
-    if ns == 0 and not sdk_decodes_zero_duration():
+    # SDK 3.0 (#205): goes with ``reads_zero_duration()`` once the SDK reads a zero duration itself.
+    if ns == 0 and not reads_zero_duration():
         raise ValueError(
             f"Cannot send a zero duration ({value!r}): the installed surrealdb SDK cannot read a zero "
             "duration back. Store None instead, or filter with __gte=Duration(1)."
@@ -423,21 +423,13 @@ def _encode_sequence(value: list[Any] | tuple[Any, ...]) -> Any:
     return tuple(out) if isinstance(value, tuple) else out
 
 
-@functools.cache
-def sdk_decodes_zero_duration() -> bool:
-    """Whether the installed SDK reads a zero duration back (computed once per process, no I/O).
+def reads_zero_duration() -> bool:
+    """Whether a zero duration the ORM sends can be read back by the clients the ORM opens.
 
-    Round-trips ``CBORTag(TAG_DURATION_COMPACT, [])`` — the server's compact form of ``0ns`` —
-    through the SDK's own CBOR codec and answers ``True`` only when that gives an SDK ``Duration``
-    equal to zero. ``False`` on any exception, and when the shim found no codec in the installed SDK
-    (``_sdk.cbor_encode``/``_sdk.cbor_decode`` is ``None``); both are read at call time.
+    ``True`` when the installed SDK decodes one, or when the read hook is installed on those clients
+    (``decoding.active()``, SDK 2.0.0). ``False`` only for an SDK that decodes no zero duration and
+    whose layout the hook does not know: the ORM then refuses to send one.
     """
-    encode = _sdk.cbor_encode
-    decode = _sdk.cbor_decode
-    if encode is None or decode is None:
-        return False
-    try:
-        value = decode(encode(_sdk.CBORTag(_sdk.TAG_DURATION_COMPACT, [])))
-        return bool(isinstance(value, _sdk.SdkDuration) and value.elapsed == 0)
-    except Exception:  # any failure means "cannot read it back"
-        return False
+    # SDK 3.0 (#205): the SDK reads a zero duration itself (3.0.0b10 does); this is then
+    # ``decoding.sdk_decodes_zero_duration()`` alone, and the refusals it guards can go.
+    return decoding.sdk_decodes_zero_duration() or decoding.active()

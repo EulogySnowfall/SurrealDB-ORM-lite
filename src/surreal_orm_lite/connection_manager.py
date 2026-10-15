@@ -10,6 +10,7 @@ from uuid import UUID
 
 from pydantic import TypeAdapter, ValidationError
 
+from . import decoding as _decoding
 from . import encoding as _encoding
 from ._sdk import AsyncSurreal, NotFoundError
 from .auth import AuthTokens, build_auth_payload, wrap_auth_error
@@ -202,6 +203,11 @@ class SurrealDBConnectionManager:
         ``use()`` still fail, and leaving that socket behind leaks one live connection per
         attempt against a flaky server.
 
+        Every client opened here reads the values SDK 2.0.0 cannot decode (zero durations, native
+        sets, degenerate geometries) through the read hook of ``decoding.py`` (#235), installed
+        as soon as the client is built, before ``connect()``. Only these clients get it: a client
+        the application builds itself with ``AsyncSurreal`` keeps the SDK's behaviour.
+
         :param signin_as_configured: sign in as the configured user. ``False`` yields an
             **anonymous** client, ready to be authenticated as somebody else.
         """
@@ -217,6 +223,9 @@ class SurrealDBConnectionManager:
         credentials = _encoding.encode({"username": user, "password": password})
         try:
             client = AsyncSurreal(url)
+            # SDK 3.0 (#205): the read hook is a workaround for SDK 2.0.0's decoder; ``install`` is a
+            # no-op once the SDK reads every value itself (capability probes), or has another layout.
+            _decoding.install(client)
             # WebSocket connections require explicit connect()
             if url.startswith(("ws://", "wss://")):
                 await client.connect(url)

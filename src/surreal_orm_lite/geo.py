@@ -183,6 +183,8 @@ def _check_ring(ring: GeometryLine, ring_type: str) -> None:
 # --- the classes ----------------------------------------------------------------------------------
 
 
+# SDK 3.0 (#205): keep these classes. The SDK's geometry dataclasses have no Pydantic schema in
+# 3.0.0b10 either, and ``model_dump()`` flattens them into dicts; re-check at the stable release.
 class Geometry:
     """The abstract base of the seven ORM geometry classes (v0.24.0).
 
@@ -923,6 +925,8 @@ def _coordinates_text(value: Any, kind: str) -> str:
     return f"[{', '.join(parts)}]"
 
 
+# SDK 3.0 (#205): keep this rendering, never the SDK's. SDK 3.0's ``GeometryCollection.__str__`` writes
+# point members as ``(x, y)``, which SurrealDB 3.x reads as a plain object (surrealdb/surrealdb.py#403).
 def _geometry_text(value: Any) -> str:
     """The SurrealQL text of an ORM or SDK geometry (and of their members): its GeoJSON **object** form.
 

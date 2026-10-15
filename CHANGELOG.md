@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.24.3] - 2026-10-15
+
+The clients the ORM opens now read the values the surrealdb SDK 2.0.0 cannot decode (zero
+durations, SurrealDB 3.x native sets, degenerate geometries), and a zero duration can be stored.
+No new public API.
+
+### Fixed
+
+- **Some values SurrealDB returns could not be read** (#235). The surrealdb SDK 2.0.0 cannot
+  decode a zero duration, a SurrealDB 3.x native set (a `TYPE set<…>` column on SurrealDB 3.3) or
+  a degenerate geometry another client wrote (a line of fewer than 2 points, alone or inside
+  another geometry, or a polygon ring of fewer than 4 points): one such value failed the whole
+  response it was in. The clients the ORM opens (`SurrealDBConnectionManager.get_client()`,
+  `ephemeral_client()`) now read them, over WebSocket, HTTP and embedded connections, and later
+  calls on the same client keep working:
+  - a zero duration reads as zero: `timedelta(0)` or `Duration(0)` in a typed field, the SDK's
+    `Duration(0)` in an untyped one;
+  - a native set reads as a Python `set`, which `set[X]` and `frozenset[X]` fields validate, or as
+    a `list` when its items are unhashable (record ids, objects, nested sets) or two of them are
+    equal in Python, like `1` and `true`: every item the server holds comes back;
+  - a degenerate geometry reads as its GeoJSON dict, such as
+    `{"type": "LineString", "coordinates": [[1.0, 2.0]]}`, in an untyped field, `raw_query()` and
+    live notifications; a geometry field refuses it with a `ValidationError` naming the field.
+
+  Every other value reads exactly as the SDK reads it, and a malformed value still raises the
+  SDK's error. The values go through a hook around the SDK's own CBOR decoder, installed only on
+  the ORM's clients and only while the installed SDK cannot decode them: the SDK's modules are not
+  modified, and an `AsyncSurreal` client the application builds itself keeps the SDK's behaviour.
+  Written back through the ORM (`merge()`, or `update()`, which rewrites the whole row), a native
+  set is stored as an array, unless its column is `TYPE set<…>`, and a degenerate geometry's dict
+  as a plain object, on both lines.
+
+- **A zero duration was refused** since v0.23.0 (`ValueError` for a field, a filter value or a
+  bound parameter, `TypeError` from `live()`), because the SDK could not read it back. The ORM's
+  clients now read it, so `timedelta(0)` and `Duration(0)` are written, filtered and read back like
+  any other duration, on both lines; filter "longer than zero" with `__gt=Duration(0)`. The refusal
+  remains only for an SDK that reads no zero duration and whose decoder the ORM cannot hook.
+  Upgrade note: a record the ORM writes can now hold a zero duration, which a reader that does not
+  go through the ORM's clients cannot read (an `AsyncSurreal` client the application builds itself,
+  another service on the SDK 2.0.0).
+
+### Notes
+
+- **SurrealDB 2.x vs 3.x**: zero durations and degenerate geometries read the same on both lines.
+  Native sets exist only on 3.x: on 3.3 a `TYPE set<…>` column stores a `set[X]` field's array as a
+  native set, which now reads back as the declared set; 3.1 still refuses an array in such a
+  column, so declare `array<…>` columns to support 3.1. On 2.x the column holds an array, as
+  before.
+- The README's "Values the SDK cannot read", "Geometries the SDK cannot read" and "Sets" sections,
+  the refusals table and the 2.x/3.x row for `TYPE set<…>` columns describe the new behaviour; the
+  v0.23.0 rich field types notebook stores and reads back a zero duration.
+- A later SDK reads zero durations and native sets itself
+  ([#205](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/205)); the hook then leaves
+  them to it.
+- Tested against SurrealDB 3.3.4 and 2.7.0 (the CI pins), plus 3.1.5 for backward compatibility.
+
 ## [0.24.2] - 2026-10-15
 
 Sub-models keep their rich values after a write that returns the row, and a `timedelta` below the
