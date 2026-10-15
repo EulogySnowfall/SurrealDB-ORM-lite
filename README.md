@@ -660,6 +660,10 @@ except SurrealDbConflictError:
   a non-retryable failure (e.g. a duplicate-key error) is **not** retried.
 - The exception type is identical on 2.6.x and 3.x; conflicts simply arise more often on 3.x
   (optimistic MVCC) than on 2.6.x (see the behaviour table).
+- The decorator wraps any coroutine, not only a `transaction()`: a single `save()`, `merge()` or
+  `delete()` is retried the same way (see [section 22](#22-change-feeds-changes) for change-feed
+  tables on SurrealDB 2.x). The conflict such a write raises outside a transaction is not
+  converted: on 2.7.0 it is the SDK's `InternalError`, which `is_conflict_error()` recognises.
 
 ### 15. Server-side values: `SurrealFunc` + `server_values=`
 
@@ -1565,6 +1569,27 @@ async for event in stream:
 - **Refused:** any queryset clause — `SHOW CHANGES` has no `WHERE`, so `filter()` would silently
   stream the whole table — and a table that is missing or has no change feed (on the table or
   on its database), with the `DEFINE TABLE` to run.
+- **Writing to a change-feed table on SurrealDB 2.x: wrap the write in `retry_on_conflict`.**
+  On 2.x a write to a `CHANGEFEED` table can fail with a retryable conflict about every 10 s,
+  even with a single writer: the other side of the conflict is a background task of the server,
+  not another client. Measured on 2.7.0 with `save()`, `merge()` and `delete()`: the conflicts
+  fall on a strict 10 s period, the default interval of the 2.x server's change-feed garbage
+  collection (`--changefeed-gc-interval`); none on a table without a change feed, and none on
+  3.3.4. The ORM does not retry these writes for you: apply `retry_on_conflict` yourself
+  (see [section 14](#14-optimistic-concurrency-retry_on_conflict)). A refused write stores
+  nothing, so replaying it is safe. Outside a transaction the error is the SDK's own
+  `InternalError` ("… This transaction can be retried"), which `is_conflict_error()`
+  recognises; once the retries run out, `retry_on_conflict` raises `SurrealDbConflictError`.
+
+  ```python
+  from surreal_orm_lite import retry_on_conflict
+
+  @retry_on_conflict()
+  async def save_order(order: Order) -> Order:
+      return await order.save()
+
+  await save_order(Order(id="o1", total=42))
+  ```
 
 **Why the cursor is not the server's `versionstamp`.** SurrealDB 2.x and 3.x number their feeds
 differently: resuming a 2.x feed with the stamp it returned yields nothing at all, and asking
@@ -2372,6 +2397,7 @@ Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v
 | `changes(since=None)` — finding "now"                                                                                                  | the ORM searches the counter (no history replayed)                                                                                                                            | the ORM reads the server clock's millisecond, then skips the entries already stamped in it (no history replayed); before v0.22.2 the entries of that millisecond were replayed      | v0.21.0                              |
 | `INCLUDE ORIGINAL` delete in a change feed                                                                                             | the id only → an instance holding only the `id`                                                                                                                               | 3.3.x: carries `original` → the last state of the record; 3.1.5: as 2.x                                                                                                             | v0.21.0                              |
 | `SHOW CHANGES` on a table without a change feed                                                                                        | returns `[]`; `changes()` raises `SurrealDbError` instead                                                                                                                     | same on both lines                                                                                                                                                                  | v0.21.0                              |
+| Write to a `CHANGEFEED` table (`save()`, `merge()`, `delete()`)                                                                        | measured on 2.7.0: can fail with a retryable conflict about every 10 s, from a server background task, even with a single writer; wrap the write in `retry_on_conflict`       | measured on 3.3.4: no conflict observed                                                                                                                                             | v0.21.0                              |
 | Typed edges (`relate(Edge, …)`, edge `save()` and `bulk_create()`) through `insert_relation()`                                         | same on both lines: a real relation that graph traversal sees, `id` hydrated from the returned row                                                                            | same on both lines                                                                                                                                                                  | v0.22.0                              |
 | Explicit edge id that already exists: raw `INSERT RELATION`, then through the ORM (edge `save()`, `bulk_create()`)                     | raw: 2.7.0 silently keeps the old edge and returns it. ORM: `SurrealDbError` ("already exists"), nothing written                                                              | raw: 3.3.3 raises `AlreadyExistsError`; 3.1.5 silently keeps the old edge, although the SurrealDB docs announce a record-exists error from 3.1.5. ORM: as 2.x, on 3.1.5 and 3.3.3   | v0.22.0                              |
 | Explicit edge id given as a `RecordID` of another table                                                                                | raw: silently moved into the edge table. ORM: `ValueError` before anything is sent                                                                                            | raw: raises. ORM: `ValueError` before anything is sent                                                                                                                              | v0.22.0                              |
