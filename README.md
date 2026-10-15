@@ -2148,10 +2148,10 @@ both lines.
 
 #### Sets
 
-`set[X]`/`frozenset[X]` fields are stored as arrays. On SurrealDB 3.x a `TYPE set<…>` column
-holds a native set that the surrealdb SDK 2.0.0 cannot read (every read of the column fails with an
-SDK decoding error), and 3.1 refuses an array in it; declare such columns `array<…>`, optionally
-with `VALUE $value.distinct()`:
+`set[X]`/`frozenset[X]` fields are stored as arrays. On SurrealDB 3.3 a `TYPE set<…>` column
+stores the array as a native set, which the field reads back as the declared set (see
+[Values the SDK cannot read](#values-the-sdk-cannot-read)), but 3.1 refuses an array in it; to
+support 3.1, declare such columns `array<…>`, optionally with `VALUE $value.distinct()`:
 
 ```sql
 DEFINE FIELD tags ON subscription TYPE array<string> VALUE $value.distinct();
@@ -2167,22 +2167,26 @@ Every value the ORM sends (a field, a filter value, a `call_function()` argument
 variable) goes through the same check. A value SurrealDB would reject is refused before anything
 is sent, with a plain `ValueError` that says why, never re-wrapped in a `SurrealDbError`:
 
-| Value                                                                                           | Raised                       |
-| ----------------------------------------------------------------------------------------------- | ---------------------------- |
-| A negative duration (a `timedelta`, the SDK's `Duration`)                                       | `ValueError`                 |
-| A duration of `2**64` seconds or more                                                           | `ValueError`                 |
-| A zero duration, while the installed SDK cannot read one back (SDK 2.0.0)                       | `ValueError`                 |
-| A finite `Decimal` whose integer part, rounded, exceeds `2**96 - 1`                             | `ValueError`                 |
-| An `int` outside the signed 64-bit range                                                        | `ValueError` (use `Decimal`) |
-| A `Range` side that is neither `BoundIncluded`/`BoundExcluded` nor an open side                 | `ValueError`                 |
-| `id__in=Range(…)`, `id__not_in=Range(…)`, or the same on an edge's `in`/`out`                   | `ValueError`                 |
-| `atomic_increment(field, <a duration>)`                                                         | `TypeError` (use `merge()`)  |
-| In a live filter, a zero, negative or oversized duration, or a range bound with no literal form | `TypeError` from `live()`    |
-| A `Duration` or `Range` field given a value it does not accept                                  | Pydantic's `ValidationError` |
+| Value                                                                                     | Raised                       |
+| ----------------------------------------------------------------------------------------- | ---------------------------- |
+| A negative duration (a `timedelta`, the SDK's `Duration`)                                 | `ValueError`                 |
+| A duration of `2**64` seconds or more                                                     | `ValueError`                 |
+| A zero duration, if neither the SDK nor the ORM reads one back (never with SDK 2.0.0)     | `ValueError`                 |
+| A finite `Decimal` whose integer part, rounded, exceeds `2**96 - 1`                       | `ValueError`                 |
+| An `int` outside the signed 64-bit range                                                  | `ValueError` (use `Decimal`) |
+| A `Range` side that is neither `BoundIncluded`/`BoundExcluded` nor an open side           | `ValueError`                 |
+| `id__in=Range(…)`, `id__not_in=Range(…)`, or the same on an edge's `in`/`out`             | `ValueError`                 |
+| `atomic_increment(field, <a duration>)`                                                   | `TypeError` (use `merge()`)  |
+| In a live filter, a negative or oversized duration, or a range bound with no literal form | `TypeError` from `live()`    |
+| A `Duration` or `Range` field given a value it does not accept                            | Pydantic's `ValidationError` |
 
-For a zero duration, store `None` instead (declare the field optional) and filter "longer than
-zero" with `__gte=Duration(1)`. `atomic_increment()` adds numbers only: SurrealDB 2.x ignores `+=`
-with a duration, so the ORM refuses it on both lines; set the new value with `merge()`:
+A zero duration (`timedelta(0)`, `Duration(0)`) is written, filtered and read back like any
+other, on both lines: the surrealdb SDK 2.0.0 cannot read one, but the clients the ORM opens do
+(see [Values the SDK cannot read](#values-the-sdk-cannot-read)); in the one case where nothing
+reads it back, a live filter refuses it with `TypeError` too. Filter "longer than zero" with
+`__gt=Duration(0)` or `__gte=Duration(1)`. `atomic_increment()` adds numbers only: SurrealDB 2.x
+ignores `+=` with a duration, so the ORM refuses it on both lines; set the new value with
+`merge()`:
 
 ```python
 nonzero = await Subscription.objects().filter(trial__gte=Duration(1)).exec()  # longer than zero
@@ -2210,13 +2214,24 @@ top-level `date` and `set` fields while serialising them.
 
 #### Values the SDK cannot read
 
-The surrealdb SDK 2.0.0 cannot decode a zero duration or a SurrealDB 3.x native set. The ORM never
-sends a zero duration and sends sets as arrays, but a record another client wrote, or a
-`TYPE set<…>` column on SurrealDB 3.3 (see [Sets](#sets)), may hold one: reading it fails with an
-SDK decoding error. A later SDK lifts both limits
-([#205](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/205)). A degenerate geometry
-another client wrote (a 1-point line, a ring of fewer than 4 points) cannot be read either: see
-[Geometries the SDK cannot read](#geometries-the-sdk-cannot-read).
+The surrealdb SDK 2.0.0 cannot decode a zero duration, a SurrealDB 3.x native set (a
+`TYPE set<…>` column on SurrealDB 3.3, see [Sets](#sets)) or a degenerate geometry (see
+[Geometries the SDK cannot read](#geometries-the-sdk-cannot-read)): one such value fails the whole
+response it is in. The clients the ORM opens read them anyway, through a hook around the SDK's own
+CBOR decoder that handles only these values; everything else reads exactly as the SDK reads it:
+
+- a zero duration reads as zero: `timedelta(0)` or `Duration(0)` in a typed field, the SDK's
+  `Duration(0)` in an untyped one;
+- a native set reads as a Python `set`, which `set[X]` and `frozenset[X]` fields validate, or as a
+  `list` when its items are unhashable (record ids, objects, nested sets) or two of them are equal
+  in Python, like `1` and `true`: every item the server holds comes back.
+
+The hook is installed only while the installed SDK cannot decode these values, and only on the
+ORM's own clients (`SurrealDBConnectionManager.get_client()`, `ephemeral_client()`). An
+`AsyncSurreal` client the application builds itself keeps the SDK's behaviour and fails on them.
+A later SDK reads zero durations and native sets itself
+([#205](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/205)), and the hook then
+leaves them to it.
 
 #### Authentication
 
@@ -2558,10 +2573,20 @@ in type-checked code, use the aliases or the classes.
 
 #### Geometries the SDK cannot read
 
-A degenerate geometry written by another client (a 1-point line, a ring of fewer than 4 points)
-cannot be read by the surrealdb SDK 2.0.0: the read fails with an SDK decoding error. The ORM never
-writes one: its classes refuse such values, and so does the check of the SDK geometries it sends
-(see [Decimal coordinates of SDK geometries](#decimal-coordinates-of-sdk-geometries)).
+A degenerate geometry written by another client (a line of fewer than 2 points, alone or inside
+another geometry, or a polygon ring of fewer than 4 points) cannot be decoded by the surrealdb SDK
+2.0.0, nor by its 3.0 pre-releases. The clients the ORM opens read it as its GeoJSON dict, such as
+`{"type": "LineString", "coordinates": [[1.0, 2.0]]}`; a multi-geometry or a collection holding
+one reads as GeoJSON as a whole (see
+[Values the SDK cannot read](#values-the-sdk-cannot-read) for where this applies):
+
+- an untyped field (`Any`, `dict`), `raw_query()` and live notifications give that dict;
+- a geometry field refuses it with a `ValidationError` naming the field, since the ORM's geometry
+  classes refuse degenerate values: `get()` raises it, and `filter().exec()` and `raw_query()`
+  return such rows as dicts, as for any row that does not validate.
+
+The ORM never writes one: its classes refuse such values, and so does the check of the SDK
+geometries it sends (see [Decimal coordinates of SDK geometries](#decimal-coordinates-of-sdk-geometries)).
 
 #### Coming from the full SurrealDB-ORM
 
@@ -2790,7 +2815,7 @@ Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v
 | `get_related(direction="both")`                                                                                                        | out-neighbours, then in-neighbours; the order inside each group differs between versions                                                                                      | same on both lines                                                                                                                                                                  | v0.22.0                              |
 | `UNIQUE` index on an edge table's `in, out`: a second edge for the same ordered pair                                                   | raises ("index … already contains"), through `insert_relation()` and `RELATE`; the reverse pair is allowed                                                                    | same on both lines                                                                                                                                                                  | v0.22.0                              |
 | Rich field types (`datetime`, `date`, `timedelta`/`Duration`, `Decimal`, `UUID`, `bytes`, `Range`, `set[X]`)                           | same on both lines: stored natively (sets as arrays) and read back as the declared type; a value the server would reject is refused with `ValueError` before anything is sent | same on both lines (verified on 3.3.4 and 3.1.5)                                                                                                                                    | v0.23.0                              |
-| `TYPE set<…>` columns (a `set[X]` or `frozenset[X]` field)                                                                             | an array: the ORM reads back the declared set                                                                                                                                 | 3.1: writing the array is refused. 3.3: stored as a native set the surrealdb SDK 2.0.0 cannot read (reads fail with an SDK decoding error). Declare `array<…>` columns (section 24) | v0.23.0                              |
+| `TYPE set<…>` columns (a `set[X]` or `frozenset[X]` field)                                                                             | an array: the ORM reads back the declared set                                                                                                                                 | 3.1: writing the array is refused. 3.3: stored as a native set, read back as the declared set (the SDK 2.0.0 alone cannot read it, section 24). Declare `array<…>` columns on 3.1.x | v0.23.0                              |
 | Reading a `Decimal`                                                                                                                    | trailing zeros kept (`Decimal("12.50")` reads `12.50`)                                                                                                                        | normalised (`12.5`); the values are equal                                                                                                                                           | pre-existing (documented in v0.23.0) |
 | Geometry fields, `nearby()`, `GeoDistance`, the `inside` / `outside` / `intersects` lookups                                            | same on both lines: stored as native geometries, read back as the declared class, distances in metres identical                                                               | same on both lines (verified on 3.3.4 and 3.1.5); an SDK geometry SurrealDB refuses raises `ValueError` before anything is sent                                                     | v0.24.0                              |
 | A `Decimal` coordinate written with an exponent in an SDK geometry                                                                     | raw SDK value: refused, or a wrong value for a long one. ORM: sent in fixed point, stored with its value                                                                      | raw SDK value: stored, a long one with a wrong value. ORM: sent in fixed point, stored with its value                                                                               | v0.24.0                              |
