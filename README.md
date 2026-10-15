@@ -2183,10 +2183,12 @@ is sent, with a plain `ValueError` that says why, never re-wrapped in a `Surreal
 A zero duration (`timedelta(0)`, `Duration(0)`) is written, filtered and read back like any
 other, on both lines: the surrealdb SDK 2.0.0 cannot read one, but the clients the ORM opens do
 (see [Values the SDK cannot read](#values-the-sdk-cannot-read)); in the one case where nothing
-reads it back, a live filter refuses it with `TypeError` too. Filter "longer than zero" with
-`__gt=Duration(0)` or `__gte=Duration(1)`. `atomic_increment()` adds numbers only: SurrealDB 2.x
-ignores `+=` with a duration, so the ORM refuses it on both lines; set the new value with
-`merge()`:
+reads it back, a live filter refuses it with `TypeError` too. Since v0.24.3 the ORM stores zero
+durations, so a record it writes can hold one that a reader outside its clients cannot read: an
+`AsyncSurreal` client the application builds itself, or another service on the SDK 2.0.0. Filter
+"longer than zero" with `__gt=Duration(0)` or `__gte=Duration(1)`. `atomic_increment()` adds
+numbers only: SurrealDB 2.x ignores `+=` with a duration, so the ORM refuses it on both lines; set
+the new value with `merge()`:
 
 ```python
 nonzero = await Subscription.objects().filter(trial__gte=Duration(1)).exec()  # longer than zero
@@ -2225,6 +2227,14 @@ CBOR decoder that handles only these values; everything else reads exactly as th
 - a native set reads as a Python `set`, which `set[X]` and `frozenset[X]` fields validate, or as a
   `list` when its items are unhashable (record ids, objects, nested sets) or two of them are equal
   in Python, like `1` and `true`: every item the server holds comes back.
+
+Written back through the ORM (`merge(v=row.v)`, or `update()`, which rewrites the whole row, the
+untouched fields included), a zero duration stays a duration, but a native set is stored as an
+array, like every set the ORM writes, unless its column is `TYPE set<…>` (see [Sets](#sets)), and
+a degenerate geometry as a plain object (see
+[Geometries the SDK cannot read](#geometries-the-sdk-cannot-read)). In an untyped field, `update()`
+flattens the SDK's `Duration(0)` into an object, like any SDK value there
+([#222](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/222)).
 
 The hook is installed only while the installed SDK cannot decode these values, and only on the
 ORM's own clients (`SurrealDBConnectionManager.get_client()`, `ephemeral_client()`). An
@@ -2587,6 +2597,10 @@ one reads as GeoJSON as a whole (see
 
 The ORM never writes one: its classes refuse such values, and so does the check of the SDK
 geometries it sends (see [Decimal coordinates of SDK geometries](#decimal-coordinates-of-sdk-geometries)).
+Written back, the dict an untyped field holds is stored as a plain object, not a geometry, on both
+lines, like any GeoJSON dict (see [Migrating stored GeoJSON](#migrating-stored-geojson)):
+`merge(v=row.v)` does it, and so does `update()` after a change to another field, since it
+rewrites the whole row.
 
 #### Coming from the full SurrealDB-ORM
 

@@ -724,6 +724,54 @@ class TestUndecodableReadsE2E:
                 assert not anonymous.recv_task.done()
 
 
+async def _stored_is(client: Any, kind: str) -> bool:
+    """Whether ``dc_value:one.v`` is stored as a value of *kind* (``geometry``, ``object``, ``array``).
+
+    SurrealDB 3.x names the check ``type::is_<kind>``, 2.x ``type::is::<kind>``.
+    """
+    version = str(await client.version()).removeprefix("surrealdb-")
+    function = f"type::is::{kind}" if version.startswith("2.") else f"type::is_{kind}"
+    return await client.query(f"RETURN {function}((SELECT VALUE v FROM ONLY dc_value:one));", {}) is True
+
+
+#: The values written back below, and the type the ORM's write stores them as.
+_WRITTEN_BACK_AS: dict[str, str] = {
+    "line-1-point": "object",
+    "multiline-with-a-1-point-line": "object",
+    "polygon-3-point-ring": "object",
+    "native-set": "array",
+}
+
+
+class TestWriteBackE2E:
+    """Written back through the ORM, a value the hook read is stored the way the ORM writes it: a
+    degenerate geometry's GeoJSON dict as a plain object, a native set as an array (the ORM never
+    writes a degenerate geometry or a native set)."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("write", ["merge", "update"])
+    @pytest.mark.parametrize("case", list(_WRITTEN_BACK_AS))
+    async def test_written_back_value_changes_its_stored_type(self, case: str, write: str) -> None:
+        async with _orm("ws") as client:
+            await _write(client, case)
+            kind = _WRITTEN_BACK_AS[case]
+            assert not await _stored_is(client, kind)
+            assert await _stored_is(client, "geometry") is (kind == "object")
+            row = await DcAny.objects().get("one")
+            if write == "merge":
+                await row.merge(v=row.v)
+            else:
+                row.name = "y"  # update() rewrites the whole row, the untouched ``v`` included
+                await row.update()
+            assert await _stored_is(client, kind)
+            assert not await _stored_is(client, "geometry")
+            again = await DcAny.objects().get("one")
+            if kind == "array":
+                assert type(again.v) is list and sorted(again.v) == [1, 2], again.v
+            else:
+                assert _UNTYPED[case](again.v), again.v
+
+
 class TestUndecodableLiveE2E:
     """A live query whose notification carries such a value delivers it, and later calls on the same
     client keep working."""

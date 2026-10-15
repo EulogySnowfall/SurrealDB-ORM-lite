@@ -428,8 +428,9 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - Same on both lines, measured on 2.7.0, 3.1.5 and 3.3.4, with one divergence: a `TYPE set<…>`
   column holds a native set on 3.3 that the surrealdb SDK 2.0.0 cannot read (3.1 refuses the
   array), so such columns are declared `array<…>`. The SDK 2.0.0 limits (zero durations, 3.x
-  native sets) wait for SDK 3.0 (#205); typed string filters (#220), validated keyword writes
-  (#221) and validating returned rows like the full ORM are follow-ups
+  native sets) wait for SDK 3.0 (#205), and are read by the ORM's clients since v0.24.3 (#235);
+  typed string filters (#220), validated keyword writes (#221) and validating returned rows like
+  the full ORM are follow-ups
 
 ### Version 0.24.0 — Geospatial fields
 

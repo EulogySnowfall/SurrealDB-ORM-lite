@@ -33,12 +33,18 @@ No new public API.
   SDK's error. The values go through a hook around the SDK's own CBOR decoder, installed only on
   the ORM's clients and only while the installed SDK cannot decode them: the SDK's modules are not
   modified, and an `AsyncSurreal` client the application builds itself keeps the SDK's behaviour.
+  Written back through the ORM (`merge()`, or `update()`, which rewrites the whole row), a native
+  set is stored as an array, unless its column is `TYPE set<…>`, and a degenerate geometry's dict
+  as a plain object, on both lines.
 
 - **A zero duration was refused** since v0.23.0 (`ValueError` for a field, a filter value or a
   bound parameter, `TypeError` from `live()`), because the SDK could not read it back. The ORM's
   clients now read it, so `timedelta(0)` and `Duration(0)` are written, filtered and read back like
   any other duration, on both lines; filter "longer than zero" with `__gt=Duration(0)`. The refusal
   remains only for an SDK that reads no zero duration and whose decoder the ORM cannot hook.
+  Upgrade note: a record the ORM writes can now hold a zero duration, which a reader that does not
+  go through the ORM's clients cannot read (an `AsyncSurreal` client the application builds itself,
+  another service on the SDK 2.0.0).
 
 ### Notes
 
