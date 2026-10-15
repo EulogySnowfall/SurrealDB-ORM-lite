@@ -79,6 +79,10 @@ _SYNC_RESHAPED: dict[type, frozenset[str]] = {}
 _ALL_FIELDS: frozenset[str] = frozenset({"*"})
 # The key under which a node of ``_with_sdk_timedeltas``'s trie holds the value that replaces it (#228).
 _LEAF = object()
+# Whether validating a model may run code of the user's on its input (``BaseSurrealModel._runs_input_code``, #228).
+_INPUT_CODE: dict[type, bool] = {}
+# The core schema types of a function that receives the input itself (``_schema_runs_input_code``).
+_INPUT_FUNCTIONS = frozenset({"function-before", "function-wrap", "function-plain"})
 
 # ``tuple`` and ``Annotated`` subscripted with annotations known at run time (mypy takes them for types).
 _TUPLE: Any = tuple
@@ -205,7 +209,20 @@ def _holds_timedelta(annotation: Any) -> bool:
     return _annotation_holds(annotation, lambda cls: cls is timedelta)
 
 
-def _path_to(data: Any, loc: Sequence[int | str], value: Any) -> list[int | str] | None:
+def _is_input(node: Any, value: Any, copies: Mapping[int, Any] | None) -> bool:
+    """Whether ``node``, found in the data, is ``value``, the input of an error, or the SDK ``Duration`` whose copy it is (#228).
+
+    ``copies`` is the ``memo`` of the deep copy a first run validated instead of the data
+    (:func:`_validated_with_sdk_timedeltas`), which maps the ``id`` of each copied object to its copy.
+    """
+    if node is value:
+        return True
+    return copies is not None and type(node) is SdkDuration and copies.get(id(node)) is value
+
+
+def _path_to(
+    data: Any, loc: Sequence[int | str], value: Any, copies: Mapping[int, Any] | None = None
+) -> list[int | str] | None:
     """The keys and indexes that lead from ``data`` to ``value`` along an error's ``loc``, or ``None`` (#228).
 
     ``loc`` names ``dict`` keys and ``list`` or ``tuple`` indexes, mixed with the tags Pydantic
@@ -214,11 +231,13 @@ def _path_to(data: Any, loc: Sequence[int | str], value: Any) -> list[int | str]
     skipped, and so is the rest of ``loc`` once ``value`` itself is reached. Only plain ``dict``,
     ``list`` and ``tuple`` containers are entered. A path is returned only when it ends on
     ``value`` itself (identity), so a tag that happens to be a key never leads to another value.
+    When the error comes from a deep copy of ``data`` (``copies``, see :func:`_is_input`), the
+    path must end on the SDK ``Duration`` of ``data`` whose copy ``value`` is.
     """
     path: list[int | str] = []
     node = data
     for part in loc:
-        if node is value:
+        if _is_input(node, value, copies):
             break
         container = type(node)
         key = container is dict and part in node
@@ -230,7 +249,7 @@ def _path_to(data: Any, loc: Sequence[int | str], value: Any) -> list[int | str]
         else:
             return None
         path.append(part)
-    return path if node is value else None
+    return path if _is_input(node, value, copies) else None
 
 
 def _copy_with(node: Any, items: Mapping[int | str, Any]) -> Any:
@@ -261,7 +280,7 @@ def _rebuilt(node: Any, trie: Mapping[Any, Any]) -> Any:
     return _copy_with(node, {part: _rebuilt(node[part], child) for part, child in trie.items()})
 
 
-def _with_sdk_timedeltas(data: Any, error: ValidationError) -> Any:
+def _with_sdk_timedeltas(data: Any, error: ValidationError, copies: Mapping[int, Any] | None = None) -> Any:
     """``data`` with the SDK's ``Duration`` values a ``timedelta`` refused converted, or ``None`` when there is none (#228).
 
     Pydantic's ``timedelta`` refuses the SDK's ``Duration`` (``time_delta_type``), the value every
@@ -272,7 +291,8 @@ def _with_sdk_timedeltas(data: Any, error: ValidationError) -> Any:
     whatever the number of values below it, and ``data`` itself is never mutated. Two errors that
     lead to one position (a union of models with the same field) convert it once. An input that
     rule leaves alone (negative, beyond ``timedelta.max``) and an input the ``loc`` does not lead
-    to (a ``mode="before"`` validator rebuilt the data…) are not converted. Never raises.
+    to (a ``mode="before"`` validator rebuilt the data…) are not converted. ``copies``: the error
+    comes from a deep copy of ``data`` (see :func:`_path_to`). Never raises.
     """
     try:
         trie: dict[Any, Any] = {}
@@ -281,7 +301,7 @@ def _with_sdk_timedeltas(data: Any, error: ValidationError) -> Any:
             if detail["type"] != "time_delta_type" or type(value) is not SdkDuration:
                 continue
             converted = _timedelta_from_sdk(value)
-            path = None if converted is value else _path_to(data, detail["loc"], value)
+            path = None if converted is value else _path_to(data, detail["loc"], value, copies)
             if path is None:
                 continue
             node = trie
@@ -293,7 +313,7 @@ def _with_sdk_timedeltas(data: Any, error: ValidationError) -> Any:
         return None
 
 
-def _validated_with_sdk_timedeltas(validate: Callable[[Any], _V], data: Any) -> _V:
+def _validated_with_sdk_timedeltas(validate: Callable[[Any], _V], data: Any, isolate: bool = False) -> _V:
     """``validate(data)``, run once more with the SDK's durations converted when a ``timedelta`` refused them (#228).
 
     A ``timedelta`` below the top level of a model (a sub-model's field, ``list[timedelta]``,
@@ -302,26 +322,110 @@ def _validated_with_sdk_timedeltas(validate: Callable[[Any], _V], data: Any) -> 
     (:func:`_with_sdk_timedeltas`), the error of ``validate(data)`` is raised; otherwise the second
     run gives the result, so an error then names what is really wrong with the data. ``data``
     itself is never mutated by the conversion.
+
+    The second run never starts from input the first one may have changed. ``isolate`` says that
+    ``validate`` may run code of the user's on its input (:func:`_schema_runs_input_code`), which
+    may change ``data`` in place: a ``mode="before"`` validator that reads stored cents as a price,
+    or inserts into its list, would then be applied twice. The first run then validates a deep copy
+    of ``data``, and the second starts again from ``data``, untouched, converting there only the
+    SDK ``Duration`` whose copy the first run refused (:func:`_path_to`), so that code is applied
+    once to the result. A value that code moved is not found, and stays refused. Nothing is copied
+    when ``data`` holds no SDK ``Duration`` (:func:`_holds_sdk_duration`), since there is nothing
+    to convert; when ``data`` cannot be copied, there is no second run, and the error of the first
+    is raised, as without the conversion.
     """
+    copies: dict[int, Any] | None = None
+    first = data
+    if isolate:
+        if not _holds_sdk_duration(data):
+            return validate(data)
+        copies = {}
+        try:
+            first = copy.deepcopy(data, copies)
+        except Exception:
+            return validate(data)
     try:
-        return validate(data)
+        return validate(first)
     except ValidationError as exc:
-        fixed = _with_sdk_timedeltas(data, exc)
+        fixed = _with_sdk_timedeltas(data, exc, copies)
         if fixed is None:
             raise
     return validate(fixed)
 
 
-def _is_library_callable(func: Any) -> bool:
-    """Whether a validator or ``model_post_init`` comes from the ORM or Pydantic rather than the user's code.
+def _holds_sdk_duration(data: Any) -> bool:
+    """Whether ``data`` is the SDK's ``Duration`` or holds one in its plain ``dict``, ``list`` and ``tuple`` containers (#228).
 
-    Read from the module of the function (a ``classmethod`` validator is bound: its ``__func__``).
-    Pydantic's wrapper of a user ``model_post_init`` copies the user's module (``functools.wraps``),
-    so it counts as the user's. A callable without a module counts as the user's too. Used by
-    :meth:`BaseSurrealModel._sync_reshaped` (#228).
+    At any depth: the places :func:`_with_sdk_timedeltas` can convert one (:func:`_path_to`). The
+    walk does not recurse and enters each container once, so a deep or self-referencing value
+    cannot exhaust it.
     """
+    stack: list[Any] = [data]
+    seen: set[int] = set()
+    while stack:
+        node = stack.pop()
+        kind = type(node)
+        if kind is SdkDuration:
+            return True
+        if (kind is dict or kind is list or kind is tuple) and id(node) not in seen:
+            seen.add(id(node))
+            stack.extend(node.values() if kind is dict else node)
+    return False
+
+
+def _schema_runs_input_code(schema: Any) -> bool:
+    """Whether a Pydantic core schema may run code of the user's on its input, at any depth (#228).
+
+    A ``mode="before"``, ``"wrap"`` or ``"plain"`` function receives the input itself: a model or
+    field validator, a ``BeforeValidator`` in ``Annotated``, a custom type's validator… So does a
+    model with its own ``__init__``. Such code may change a ``dict`` or ``list`` of the input in
+    place, which a second validation of that input would apply twice (see
+    :func:`_validated_with_sdk_timedeltas`). Every node of the schema is walked, nested models and
+    definitions included. ``after`` validators receive the validated value, and serializers
+    (a ``serialization`` schema, skipped) never see the input, so neither counts; nor do the ORM's
+    and Pydantic's own functions (:func:`_is_library_callable`). Anything unexpected, a schema
+    that is not a ``dict`` included, gives ``True``, the safe answer. Never raises.
+    """
+    if not isinstance(schema, dict):
+        return True
+    try:
+        stack: list[Any] = [schema]
+        seen: set[int] = set()
+        while stack:
+            node = stack.pop()
+            if not isinstance(node, dict | list | tuple) or id(node) in seen:
+                continue
+            seen.add(id(node))
+            if not isinstance(node, dict):
+                stack.extend(node)
+                continue
+            kind = node.get("type")
+            if kind in _INPUT_FUNCTIONS:
+                function = node.get("function")
+                if not isinstance(function, dict) or not _is_library_callable(function.get("function")):
+                    return True
+            elif kind == "model" and node.get("custom_init"):
+                return True
+            stack.extend(value for key, value in node.items() if key != "serialization")
+        return False
+    except Exception:
+        return True
+
+
+def _is_library_callable(func: Any) -> bool:
+    """Whether a validator or ``model_post_init`` comes from the ORM, the SDK or Pydantic rather than the user's code.
+
+    The SDK's own validator is its ``RecordID``'s. Read from the module of the function (a
+    ``classmethod`` validator is bound: its ``__func__``;
+    a ``functools.partial``: the function it wraps). Pydantic's wrapper of a user
+    ``model_post_init`` copies the user's module (``functools.wraps``), so it counts as the user's.
+    A callable without a module counts as the user's too. Used by
+    :meth:`BaseSurrealModel._sync_reshaped` and :func:`_schema_runs_input_code` (#228).
+    """
+    while isinstance(func, functools.partial):
+        func = func.func
     module = getattr(getattr(func, "__func__", func), "__module__", None)
-    return isinstance(module, str) and module.partition(".")[0] in ("surreal_orm_lite", "pydantic")
+    return isinstance(module, str) and module.partition(".")[0] in ("surreal_orm_lite", "surrealdb", "pydantic")
 
 
 def _own_annotation_names(cls: type) -> set[str]:
@@ -712,6 +816,25 @@ class BaseSurrealModel(BaseModel):
         return reshaped
 
     @classmethod
+    def _runs_input_code(cls) -> bool:
+        """Whether validating this model may run code of the user's on its input, cached per class (#228).
+
+        :func:`_schema_runs_input_code` of the model's core schema, which holds the validators of its
+        sub-models and of its fields' types too. Such code may change the input in place, so the
+        conversion of the SDK's durations below the top level validates a copy first
+        (:meth:`_read_nested_timedeltas`). ``True`` while Pydantic has not completed the class (its
+        schema is not built yet), and cached only once it has, like :meth:`_sync_fields`.
+        """
+        cached = _INPUT_CODE.get(cls)
+        if cached is not None:
+            return cached
+        if not cls.__pydantic_complete__:
+            return True
+        runs = _schema_runs_input_code(cls.__pydantic_core_schema__)
+        _INPUT_CODE[cls] = runs
+        return runs
+
+    @classmethod
     def _validated_row(cls, record: Mapping[str, Any]) -> Self | None:
         """Return the row validated as a read validates it, or ``None`` when it does not validate (#228).
 
@@ -738,7 +861,9 @@ class BaseSurrealModel(BaseModel):
         own validators reshape the field, which a field validated alone cannot run: a field in
         :meth:`_sync_reshaped` gives ``value`` back unchanged. So do a value that does not
         validate, a validator that raises anything else and a field without an adapter (see
-        :meth:`_sync_adapter`): never raises.
+        :meth:`_sync_adapter`): never raises. When the model may run code of the user's on its
+        input (:meth:`_runs_input_code`), a deep copy of ``value`` is validated, so ``value`` is
+        given back as received, never as that code changed it in place.
         """
         reshaped = cls._sync_reshaped()
         if reshaped is _ALL_FIELDS or name in reshaped:
@@ -746,8 +871,10 @@ class BaseSurrealModel(BaseModel):
         adapter = cls._sync_adapter(name)
         if adapter is None:
             return value
+        isolate = cls._runs_input_code()
         try:
-            return _validated_with_sdk_timedeltas(adapter.validate_python, (value,))[0]
+            received = (copy.deepcopy(value),) if isolate else (value,)
+            return _validated_with_sdk_timedeltas(adapter.validate_python, received, isolate)[0]
         except Exception:
             return value
 
@@ -1018,12 +1145,15 @@ class BaseSurrealModel(BaseModel):
         ``timedelta | str``…: Pydantic refuses the SDK's ``Duration`` there, which every read
         returns for a SurrealDB ``duration``. When the validation fails on such values, it runs
         once more with each of them converted where Pydantic refused it, floored to the
-        microsecond (see ``_validated_with_sdk_timedeltas``), on a copy: the caller's data is
-        never mutated. A value the top-level rule would leave alone stays refused, and a model
-        without such a value fails as before. A ``wrap`` validator runs outside every
-        ``mode="before"`` one, the model's own included, so they run again on the second try.
+        microsecond (see ``_validated_with_sdk_timedeltas``), on a copy: the conversion never
+        mutates the caller's data. A value the top-level rule would leave alone stays refused, and
+        a model without such a value fails as before. A ``wrap`` validator runs outside every
+        ``mode="before"`` one, the model's own included, so they run again on the second try. When
+        the model may run code of the user's on its input (:meth:`_runs_input_code`), the first
+        try validates a deep copy of the data and the second starts again from the data as
+        received, so a validator that changes its input in place is applied once to the result.
         """
-        return _validated_with_sdk_timedeltas(handler, data)
+        return _validated_with_sdk_timedeltas(handler, data, cls._runs_input_code())
 
     async def refresh(self, tx: Transaction | None = None) -> None:
         """Refresh the model instance from the database.
