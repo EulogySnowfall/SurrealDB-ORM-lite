@@ -1936,3 +1936,267 @@ class TestFailedBindEmbeddedE2E:
             me = await SurrealDBConnectionManager.info()
             assert me is not None
             assert me["email"] == "a@x"
+
+
+# README section 26, the comparison tables and the ROADMAP parity notes (spec §11, AC-14; P1, P2, P3, P5)
+
+_REPO = Path(__file__).resolve().parents[1]
+_README = _REPO / "README.md"
+_ROADMAP = _REPO / "docs" / "ROADMAP.md"
+_SECTION_26 = "### 26. Embedded engine and test fixtures"
+_EMBEDDED_BEHAVIOUR = "### ORM behaviour: the embedded engine"
+
+
+def _readme() -> str:
+    return _README.read_text(encoding="utf-8")
+
+
+def _readme_part(heading: str) -> str:
+    """The README text from the ``heading`` line up to the next ``##``/``###`` heading."""
+    match = re.search(rf"^{re.escape(heading)}\n.*?(?=^#{{2,3}} )", _readme(), re.MULTILINE | re.DOTALL)
+    assert match, f"README has no {heading!r} section"
+    return match.group(0)
+
+
+def _section_26() -> str:
+    return _readme_part(_SECTION_26)
+
+
+def _subsection(heading: str, text: str) -> str:
+    """The ``heading`` line of ``text`` up to the next heading of level 2 to 4, or the end."""
+    match = re.search(rf"^{re.escape(heading)}\n.*?(?=^#{{2,4}} |\Z)", text, re.MULTILINE | re.DOTALL)
+    assert match, f"no {heading!r} part"
+    return match.group(0)
+
+
+def _normalised(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _cells(line: str) -> list[str]:
+    return [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip().strip("|"))]
+
+
+def _tables(text: str) -> list[list[str]]:
+    """Every table of ``text``: its lines, header and separator included."""
+    return [block.splitlines() for block in re.findall(r"(?:^\|.*\n)+", text, re.MULTILINE)]
+
+
+def _table_rows(text: str, header: str | None = None) -> list[tuple[str, list[str]]]:
+    """The body rows of the first table of ``text`` (whose header line contains ``header``, when given)."""
+    tables = [lines for lines in _tables(text) if header is None or header in lines[0]]
+    assert tables, f"no table with {header!r} in its header"
+    return [(line, _cells(line)) for line in tables[0][2:]]
+
+
+def _section_26_examples() -> list[str]:
+    """Section 26's ``python`` blocks, in order."""
+    blocks: list[str] = re.findall(r"^```python\n(.*?)^```$", _section_26(), re.MULTILINE | re.DOTALL)
+    assert blocks, "README section 26 has no example"
+    return blocks
+
+
+class TestReadmeEmbeddedExamplesE2E:
+    """AC-14: every example of README section 26 runs as written on ``mem://`` (no server); the pytest recipe,
+    which imports ``pytest_asyncio``, is only compiled."""
+
+    async def test_section_26_examples(self, capsys: pytest.CaptureFixture[str]) -> None:
+        namespace: dict[str, Any] = {"__name__": "readme_section_26"}
+        compiled_only = 0
+        try:
+            for code in _section_26_examples():
+                compiled = compile(code, "<README section 26>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                if "import pytest_asyncio" in code:
+                    compiled_only += 1
+                    continue
+                # A doctest of this repository's own README (trusted text), top-level awaits included.
+                outcome = eval(compiled, namespace)
+                if inspect.iscoroutine(outcome):
+                    await outcome
+        finally:
+            namespace.clear()  # no client of the examples outlives them (closed-client rule)
+            await SurrealDBConnectionManager.unset_connection()
+        assert compiled_only == 1
+
+        # What the examples print: the SDK's refusal of rocksdb:// (E11) and the live-query refusal (E1).
+        printed = capsys.readouterr().out
+        assert "The installed surrealdb SDK cannot open 'rocksdb://" in printed
+        assert "issues/233" in printed
+        assert embedded_module.live_unsupported("mem://") in printed
+        assert not SurrealDBConnectionManager.is_connected()
+
+
+class TestReadmeEmbeddedWording:
+    """Unit: what README section 26, the behaviour tables, the comparison tables and the ROADMAP parity notes say
+    (spec §11, AC-14; P1, P2, P3, P5)."""
+
+    def test_section_26_names(self) -> None:
+        section = _normalised(_section_26())
+        for name in (
+            "is_embedded()",
+            "embedded_database",
+            "SurrealFixture",
+            "2.3.10",
+            "rocksdb://",
+            "#233",
+            "not yet supported by the official SDK",
+            "del client",
+        ):
+            assert name in section, name
+
+    def test_section_26_follows_section_25(self) -> None:
+        """Section 26 comes right after section 25 and runs up to "Configuration Options"."""
+        readme = _readme()
+        start_25 = readme.index("\n### 25. Geospatial fields\n")
+        start_26 = readme.index(f"\n{_SECTION_26}\n")
+        configuration = readme.index("\n## Configuration Options\n")
+        assert start_25 < start_26 < configuration
+        assert re.findall(r"^#{2,3} .*$", readme[start_26 + 1 : configuration], re.MULTILINE) == [_SECTION_26]
+
+    def test_subsections_in_order(self) -> None:
+        headings = re.findall(r"^#### (.*)$", _section_26(), re.MULTILINE)
+        assert headings == [
+            "In-process databases",
+            "One engine per process",
+            "What the embedded engine does not do",
+            "Its SurrealQL is the 2.x line",
+            "Identity on the embedded engine",
+            "Test fixtures",
+            "Coming from the full SurrealDB-ORM",
+        ], headings
+
+    def test_embedded_url_table(self) -> None:
+        rows = _table_rows(_section_26(), "Embedded URL")
+        firsts = [cells[0] for _, cells in rows]
+        for scheme in ("mem://", "memory://", "surrealkv://", "surrealkv+versioned://", "file://", "rocksdb://"):
+            assert any(scheme in first for first in firsts), scheme
+        assert "`memory`" not in firsts, "a bare memory is refused by SDK 2.0.0"
+        [file_row] = [cells for _, cells in rows if "file://" in cells[0]]
+        assert "SurrealKV" in file_row[1], file_row
+        [rocksdb] = [cells for _, cells in rows if "rocksdb://" in cells[0]]
+        assert "not yet supported by the official SDK" in rocksdb[1] and "#233" in rocksdb[1], rocksdb
+        assert rocksdb[1].startswith("❌"), rocksdb
+        assert all(cells[1].startswith("✅") for _, cells in rows if cells is not rocksdb), rows
+        assert all(cells[2].startswith("❌") for _, cells in rows), "the full SurrealDB-ORM has no embedded engine"
+        sentence = _normalised(_section_26())
+        assert "A bare `memory` (no `://`) is refused by SDK 2.0.0 and accepted by the SDK 3.0 line" in sentence
+        assert "keeps no list of embedded schemes" in sentence
+
+    def test_section_26_tables_have_no_raw_pipe_in_a_cell(self) -> None:
+        tables = _tables(_section_26()) + _tables(_readme_part(_EMBEDDED_BEHAVIOUR))
+        assert len(tables) == 2, tables
+        for lines in tables:
+            widths = {len(_cells(line)) for line in lines}
+            assert len(widths) == 1 and "\\|" not in "".join(lines), lines
+
+    def test_closed_client_rule_and_concurrency_advice(self) -> None:
+        section = _section_26()
+        engine = _normalised(_subsection("#### One engine per process", section))
+        assert "closing does not stop an in-process engine" in engine and "`del client`" in engine
+        assert "Never open one path from two processes" in engine
+        fixtures = _normalised(_subsection("#### Test fixtures", section))
+        assert "`DEFINE TABLE`" in fixtures and "@retry_on_conflict()" in fixtures, fixtures
+
+    def test_identity_subsection(self) -> None:
+        identity = _normalised(_subsection("#### Identity on the embedded engine", _section_26()))
+        assert "in-process owner" in identity and "`invalidate()`" in identity and "bind=True" in identity
+
+    def test_pytest_recipe(self) -> None:
+        """P3: the fixture is ``surreal_db`` and yields nothing; the full ORM's ``users(surreal_db)`` follows."""
+        [recipe] = [code for code in _section_26_examples() if "import pytest_asyncio" in code]
+        assert "async def surreal_db():" in recipe and "async def users(surreal_db):" in recipe
+        assert "async with embedded_database():\n        yield\n" in recipe
+        assert "UserFixtures.load()" in recipe
+        assert "#" not in recipe, "the recipe has no inline comment"
+
+    def test_coming_from_the_full_orm(self) -> None:
+        """P5 and spec §11: the bullets of a full SurrealDB-ORM user."""
+        text = _normalised(_subsection("#### Coming from the full SurrealDB-ORM", _section_26()))
+        for word in ("resets", "id", "TypeError", "is_embedded()", "embedded_database()", "v0.39.0"):
+            assert word in text, word
+
+    def test_embedded_behaviour_table(self) -> None:
+        part = _readme_part(_EMBEDDED_BEHAVIOUR)
+        [lines] = _tables(part)
+        assert _cells(lines[0]) == ["ORM capability", "Embedded engine (SDK 2.0.0)", "Servers (2.x and 3.x)", "Since"]
+        rows = [cells for _, cells in _table_rows(part)]
+        assert all(len(cells) == 4 and cells[3] == "v0.25.0" for cells in rows), rows
+        firsts = " ".join(cells[0] for cells in rows).lower()
+        for row in (
+            "live queries",
+            "change feeds",
+            "model auth",
+            "`invalidate()`",
+            "parse errors",
+            "urls the sdk refuses",
+            "namespace/database change",
+            "concurrent first writes",
+            "`ephemeral_client()`",
+            "anonymous session",
+            "transaction()",
+        ):
+            assert row in firsts, row
+
+    def test_behaviour_tables_point_to_each_other(self) -> None:
+        header = _normalised(_readme_part("### ORM behaviour: SurrealDB 2.x vs 3.x").split("\n|", 1)[0])
+        assert "(#orm-behaviour-the-embedded-engine)" in header, header
+        assert "(#26-embedded-engine-and-test-fixtures)" in _readme_part(_EMBEDDED_BEHAVIOUR)
+
+    def test_connections_requirements_compatibility_features_and_roadmap(self) -> None:
+        loops = _normalised(_readme_part("### Connections and event loops"))
+        assert "An embedded URL is the exception" in loops and "one client for the whole process" in loops
+        requirements = [cells for _, cells in _table_rows(_readme_part("## Requirements"))]
+        assert any(cells[0] == "SurrealDB" and "the SDK's embedded engine" in cells[1] for cells in requirements)
+        compatibility = [cells for _, cells in _table_rows(_readme_part("## Compatibility"))]
+        assert ["Embedded engine (SDK 2.0.0: SurrealDB 2.3.10 core)", "2.0", "✅ Tested (in-process)"] in compatibility
+        features = [cells for _, cells in _table_rows(_readme_part("## Features"))]
+        assert ["Embedded engine (mem://, surrealkv://) & test fixtures", "✅"] in features, features
+        roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
+        assert ["v0.25.0", "Embedded test engine", "✅ Released"] in roadmap, roadmap
+
+    def test_readme_comparison_table(self) -> None:
+        """P1: the lite cell is the 2nd; the full SurrealDB-ORM has no embedded engine."""
+        part = _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM")
+        [lines] = _tables(part)
+        assert _cells(lines[0]) == ["Feature", "ORM-lite (official SDK)", "ORM (custom SDK)"]
+        rows = [cells for _, cells in _table_rows(part)]
+        [embedded] = [cells for cells in rows if cells[0] == "Embedded engine"]
+        assert "v0.25.0" in embedded[1] and "❌" in embedded[2], embedded
+        assert embedded == ["Embedded engine", "✅ v0.25.0 (mem://, surrealkv://; rocksdb:// #233)", "❌ (HTTP/WebSocket only)"]
+        [fixtures] = [cells for cells in rows if cells[0] == "Test Fixtures & Factories"]
+        assert "v0.25.0" in fixtures[1] and "v0.39.0" in fixtures[1], fixtures
+        assert fixtures == ["Test Fixtures & Factories", "✅ v0.25.0 SurrealFixture; factories v0.39.0", "✅"]
+        assert [cells[0] for cells in rows].index("Embedded engine") == [cells[0] for cells in rows].index(
+            "Geospatial Fields"
+        ) + 1
+        assert "; the official SDK's in-process engine (section 26) is lite-only." in _readme()
+
+    def test_roadmap_parity_notes(self) -> None:
+        """P2: the full SurrealDB-ORM has no embedded engine; fixtures ship in v0.25.0, factories in v0.39.0."""
+        roadmap = _ROADMAP.read_text(encoding="utf-8")
+        comparison = roadmap.split("\n## SurrealDB-ORM vs SurrealDB-ORM-lite Comparison\n", 1)[1].split("\n#", 1)[0]
+        [lines] = _tables(comparison)
+        assert _cells(lines[0]) == ["Feature", "ORM (full)", "ORM-lite"]
+        [row] = [line for line in lines if line.startswith("| Embedded / versioned engine")]
+        assert "| yes" not in row, row
+        assert _cells(row) == ["Embedded / versioned engine", "no", "v0.25 – v0.26"], row
+        [fixtures] = [line for line in lines if line.startswith("| Test fixtures & factories")]
+        assert _cells(fixtures) == ["Test fixtures & factories", "yes", "v0.25.0 + v0.39.0"], fixtures
+        assert "✅ v0.25" not in comparison, "no status marker: release-manager's"
+        for name in ("rocksdb://", "#233", "2.3.10", "surrealdb[embedded]"):
+            assert name in roadmap, name
+        assert "To confirm" not in roadmap, "footnotes ¹/² are resolved"
+        assert "\n### Embedded URLs\n" in roadmap, "the parity note"
+        raw_note = roadmap.split("\n### Embedded URLs\n", 1)[1].split("\n## ", 1)[0]
+        note = _normalised(raw_note)
+        assert "The full SurrealDB-ORM has no embedded engine (HTTP/WebSocket only)" in note
+        assert "SurrealDB core 2.3.10 with SDK 2.0.0" in note
+        assert (
+            "Base test fixtures (`SurrealFixture`, `@fixture`, `embedded_database()`) ship in v0.25.0; "
+            "factories (`ModelFactory`, `Faker`) in v0.39.0." in note
+        )
+        rows = _table_rows(raw_note, "Embedded URL")
+        firsts = [cells[0] for _, cells in rows]
+        for scheme in ("mem://", "surrealkv://", "surrealkv+versioned://", "file://", "rocksdb://"):
+            assert any(scheme in first for first in firsts), scheme
+        assert all(cells[2].startswith("❌") for _, cells in rows), rows

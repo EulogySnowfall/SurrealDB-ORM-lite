@@ -106,8 +106,8 @@ pieces stay out.
 the bare form `fn::name($args);` — never `RETURN fn::name(…)`, which silently truncates a
 `BEGIN … COMMIT` batch on both DB lines.
 
-² **To confirm** against the targeted SDK build (embedded extra). If unavailable on PyPI,
-v0.25.0/v0.26.0 are reclassified to Future.
+² The embedded engine ships in the SDK 2.0.0 base wheel (engine core 2.3.10); the SDK 3.0 line
+moves it to the `surrealdb[embedded]` extra.
 
 **Still NOT in lite** (full-ORM only, even with SDK 2.0):
 
@@ -149,7 +149,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | Native typed relations        | yes        | ✅ v0.22.0                  |
 | Rich field types              | yes        | ✅ v0.23.0                  |
 | Geospatial fields             | yes        | ✅ v0.24.0                  |
-| Embedded / versioned engine   | yes        | v0.25 – v0.26               |
+| Embedded / versioned engine   | no         | v0.25 – v0.26               |
 | Subqueries                    | yes        | v0.27.0                     |
 | Query cache (TTL)             | yes        | v0.28.0                     |
 | Multi-database                | yes        | v0.29.0                     |
@@ -161,10 +161,28 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | Vector Search (KNN/HNSW)      | yes        | v0.35.0                     |
 | Hybrid Search (RRF)           | yes        | v0.36.0                     |
 | Migrations & CLI              | yes        | v0.37 – v0.38               |
-| Test fixtures & factories     | yes        | v0.39.0                     |
+| Test fixtures & factories     | yes        | v0.25.0 + v0.39.0           |
 | QueryLogger / profiling       | yes        | v0.40.0                     |
 | Custom SDK (`surreal_sdk`)    | yes        | never                       |
 | CBOR protocol internals       | yes        | never                       |
+
+### Embedded URLs
+
+The full SurrealDB-ORM has no embedded engine (HTTP/WebSocket only); surreal-orm-lite runs on the
+official SDK's in-process engine from v0.25.0.
+
+| Embedded URL                   | surreal-orm-lite (official SDK 2.0.0)                                                    | Full SurrealDB-ORM       |
+| ------------------------------ | ---------------------------------------------------------------------------------------- | ------------------------ |
+| `mem://`, `memory://`          | ✅ in memory, gone when the connection closes                                            | ❌ (HTTP/WebSocket only) |
+| `surrealkv://<path>`           | ✅ on disk (SurrealKV)                                                                   | ❌                       |
+| `surrealkv+versioned://<path>` | ✅ on disk; behaves as `surrealkv://` until time travel (v0.26.0)                        | ❌                       |
+| `file://<path>`                | ✅ a **SurrealKV** store, not the RocksDB store `file://` means for the SurrealDB server | ❌                       |
+| `rocksdb://<path>`             | ❌ not yet supported by the official SDK (#233)                                          | ❌                       |
+
+The embedded engine is SurrealDB core 2.3.10 with SDK 2.0.0, not the 2.x/3.x server lines the ORM
+is tested on. A bare `memory` (no `://`) is refused by SDK 2.0.0; write `memory://`. Base test
+fixtures (`SurrealFixture`, `@fixture`, `embedded_database()`) ship in v0.25.0; factories
+(`ModelFactory`, `Faker`) in v0.39.0.
 
 ---
 
@@ -638,8 +656,8 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 | v0.28.0    | Query cache (TTL + invalidation), client-side                        | client cache                      |
 | v0.29.0    | Multi-database: named connection registry                            | N × `AsyncSurreal` instances      |
 
-¹ To confirm against the targeted SDK build; reclassified to Future if the embedded extra is
-unavailable on PyPI.
+¹ The embedded engine ships in the SDK 2.0.0 base wheel (engine core 2.3.10); the SDK 3.0 line
+moves it to the `surrealdb[embedded]` extra.
 
 ---
 

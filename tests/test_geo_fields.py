@@ -1866,8 +1866,8 @@ class TestReadmeSection24Consistency:
         readme = _readme()
         start_24 = readme.index("\n### 24. Rich field types\n")
         start_25 = readme.index("\n### 25. Geospatial fields\n")
-        configuration = readme.index("\n## Configuration Options\n")
-        assert start_24 < start_25 < configuration
-        # Section 24 keeps all its subsections, and section 25 runs up to "Configuration Options".
+        start_26 = readme.index("\n### 26. Embedded engine and test fixtures\n")
+        assert start_24 < start_25 < start_26
+        # Section 24 keeps all its subsections, and so does section 25, up to section 26 (v0.25.0).
         assert re.findall(r"^#{2,3} .*$", readme[start_24 + 1 : start_25], re.MULTILINE) == ["### 24. Rich field types"]
-        assert re.findall(r"^#{2,3} .*$", readme[start_25 + 1 : configuration], re.MULTILINE) == ["### 25. Geospatial fields"]
+        assert re.findall(r"^#{2,3} .*$", readme[start_25 + 1 : start_26], re.MULTILINE) == ["### 25. Geospatial fields"]
