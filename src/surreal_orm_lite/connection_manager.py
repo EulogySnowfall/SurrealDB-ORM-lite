@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import hashlib
 import logging
+import threading
 import weakref
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from functools import lru_cache
@@ -117,6 +118,26 @@ class SurrealDBConnectionManager:
     __client_identities: "weakref.WeakKeyDictionary[Any, tuple[str, bool]]" = weakref.WeakKeyDictionary()
     __lost_identity: "weakref.WeakSet[asyncio.AbstractEventLoop]" = weakref.WeakSet()
 
+    # The SDK's in-process engine (v0.25.0): ONE client for the whole process, in this slot beside
+    # the per-loop cache. Measured with SDK 2.0.0 (spec M6-M8): an embedded client is not bound to a
+    # loop — one client serves every loop and thread — while each new client on ``mem://`` is a new,
+    # empty database, and two clients on one ``surrealkv://`` path are two engines that miss each
+    # other's writes. The per-loop rule of issue #163 would give every loop and thread a database of
+    # its own. The lock serialises opening and resetting across loops and threads; it is taken
+    # cooperatively (_embedded_guard), never by blocking a loop.
+    #
+    # A namespace/database change is a new *selection* on that one engine, and it resets the shared
+    # session — invalidate(), back to the in-process owner, then use() — instead of replaying the
+    # stored token (spec M28, M29): a record session cannot write in another database and reads
+    # nothing there, and replaying a token moves the session back to the database it was issued for,
+    # silently undoing the selection. ``__embedded_selection`` is ``None`` while a client is in the
+    # slot when the selection is *stale* (a reset failed, or is under way): the next get_client()
+    # resets again before handing the client out.
+    __embedded_client: Any = None
+    __embedded_url: str | None = None
+    __embedded_selection: tuple[str | None, str | None] | None = None
+    __embedded_lock: threading.Lock = threading.Lock()
+
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         await SurrealDBConnectionManager.close_connection()
 
@@ -171,7 +192,8 @@ class SurrealDBConnectionManager:
     @classmethod
     async def unset_connection(cls) -> None:
         """
-        Clear all connection settings and close the connection.
+        Clear all connection settings and close the connection (every loop's, and the embedded
+        engine's: a ``mem://`` database is discarded).
         """
         cls.__url = None
         cls.__user = None
@@ -249,13 +271,20 @@ class SurrealDBConnectionManager:
         ``use()`` still fail, and leaving that socket behind leaks one live connection per
         attempt against a flaky server.
 
-        Every client opened here reads the values SDK 2.0.0 cannot decode (zero durations, native
-        sets, degenerate geometries) through the read hook of ``decoding.py`` (#235), installed
-        as soon as the client is built, before ``connect()``. Only these clients get it: a client
-        the application builds itself with ``AsyncSurreal`` keeps the SDK's behaviour.
+        Every client opened here — WebSocket, HTTP and embedded — reads the values SDK 2.0.0 cannot
+        decode (zero durations, native sets, degenerate geometries) through the read hook of
+        ``decoding.py`` (#235), installed as soon as the client is built, before ``connect()``. Only
+        these clients get it: a client the application builds itself with ``AsyncSurreal`` keeps the
+        SDK's behaviour.
 
-        :param signin_as_configured: sign in as the configured user. ``False`` yields an
-            **anonymous** client, ready to be authenticated as somebody else.
+        On an **embedded** URL the SDK's constructor opens the in-process engine and ``connect()``
+        takes no argument; nobody is signed in, whatever *signin_as_configured* says: the engine
+        has no system user on a fresh database, and its anonymous session is the in-process owner.
+
+        :param signin_as_configured: sign in as the configured user (server URLs). ``False`` yields
+            an **anonymous** client, ready to be authenticated as somebody else.
+        :raises SurrealDbConnectionError: the client cannot be opened; on an embedded URL the error
+            quotes the engine's own message and is never retryable (a bad path stays bad).
         """
         assert cls.__url is not None
         assert cls.__namespace is not None
@@ -265,6 +294,7 @@ class SurrealDBConnectionManager:
         # snapshot — the one _connect_for_loop() fingerprints just before calling this.
         url, namespace, database = cls.__url, cls.__namespace, cls.__database
         user, password = cls.__user, cls.__password
+        embedded = is_embedded_url(url)
         client: Any = None
         credentials = _encoding.encode({"username": user, "password": password})
         try:
@@ -272,15 +302,24 @@ class SurrealDBConnectionManager:
             # SDK 3.0 (#205): the read hook is a workaround for SDK 2.0.0's decoder; ``install`` is a
             # no-op once the SDK reads every value itself (capability probes), or has another layout.
             _decoding.install(client)
+            if embedded:
+                await client.connect()
             # WebSocket connections require explicit connect()
-            if url.startswith(("ws://", "wss://")):
+            elif url.startswith(("ws://", "wss://")):
                 await client.connect(url)
-            if signin_as_configured:
+            if signin_as_configured and not embedded:
                 assert user is not None
                 assert password is not None
                 await client.signin(credentials)
             await client.use(namespace, database)
         except Exception as e:
+            if embedded:
+                if client is not None:
+                    with contextlib.suppress(Exception):
+                        await client.close()
+                error = SurrealDbConnectionError(f"Can't open the embedded database {url!r}: {e}")
+                error.retryable = False  # type: ignore[attr-defined]
+                raise error from e
             logger.warning(f"Can't get connection: {e}")
             if client is not None:
                 with contextlib.suppress(Exception):
@@ -313,11 +352,24 @@ class SurrealDBConnectionManager:
         loop is answered as the configured user until the application chooses: sign in or
         authenticate again, ``invalidate()``, or ``reconnect()``/``close_connection()``.
 
+        On an **embedded** URL (:meth:`is_embedded`) the engine runs in this process and is not
+        bound to a loop, so there is **one client for the whole process**, handed to every event
+        loop and thread; concurrent first calls open exactly one engine. It is opened without
+        signing anybody in (the anonymous session is the in-process owner), and the stored session,
+        if any, is replayed as on a server. When the configured namespace or database differs from
+        the one the engine last selected, the shared session is reset on the same engine — back to
+        the owner, then the new selection — and the stored session ends (a token belongs to the
+        database it was issued for): no data is lost. When the configured embedded URL changes, the
+        previous engine is closed and the new one opened.
+
         :return: The SurrealDB instance.
         :raises SurrealDbConnectionError: the configured URL is one the installed SDK refuses
             (``rocksdb://`` with SDK 2.0.0, a typo) — checked before any cached client is handed back,
-            and never retryable — or the connection cannot be opened.
-        :raises SurrealDbAuthenticationError: in that lost-identity state.
+            and never retryable — or the connection cannot be opened (embedded: "Can't open the
+            embedded database …"), or the embedded selection cannot be reset ("Can't select namespace
+            …": the engine is kept, and the next call tries again).
+        :raises SurrealDbAuthenticationError: in that lost-identity state (server URLs), or when the
+            stored session is refused on a new connection (it is then forgotten).
         :raises ValueError: if no connection has been configured.
         """
         return await cls._acquire_client()
@@ -335,13 +387,21 @@ class SurrealDBConnectionManager:
             (signin, signup, authenticate, invalidate), so a lost-identity state does not block it.
         :param still_wanted: for a background reconnect — checked again just before a new client
             is published, so a connection the application closed meanwhile is not reopened behind
-            its back.
+            its back. Not used on an embedded URL: an in-process client never drops.
         """
         loop = asyncio.get_running_loop()
         cls.__prune_dead_loops()
         # Before the per-loop fast path: once the URL changed to one the SDK refuses (set_url()),
         # the client cached for the previous URL must not be handed back as if it were its client.
         require_supported_url(cls.__url)
+        if is_embedded_url(cls.__url):
+            # The lost-identity checks do not apply: an in-process client never drops.
+            client = await cls._acquire_embedded_client()
+            if client is not None:
+                return client
+            # The URL was re-pointed at a server while this call waited for the embedded guard:
+            # serve the configuration as it is now.
+            return await cls._acquire_client(restoring_identity=restoring_identity, still_wanted=still_wanted)
         if not restoring_identity and loop in cls.__lost_identity:
             raise cls._lost_identity_error()
 
@@ -463,35 +523,53 @@ class SurrealDBConnectionManager:
                     await stale.close()
             raise
 
-        # Deliberately after the client is cached and OUTSIDE the except above. A dead token
+        return await cls._replay_then_publish(
+            _client,
+            replayed=replayed,
+            configured=configured,
+            publish=lambda client, fingerprint: cls._publish(loop, client, fingerprint, still_wanted),
+        )
+
+    @classmethod
+    async def _replay_then_publish(
+        cls, client: Any, *, replayed: str, configured: str, publish: Callable[[Any, str], None]
+    ) -> Any:
+        """Replay the stored session on a freshly opened *client*, then publish it with the stamp of
+        the identity it ended up with. Shared by the per-loop cache and the embedded slot.
+
+        :param replayed: the fingerprint of the configured identity *with* the stored token.
+        :param configured: the same without it — what the client is when the token is refused.
+        :param publish: stamps and caches the client under the given fingerprint.
+        """
+        # Deliberately after the client is opened and OUTSIDE the except of the open. A dead token
         # is not a connection failure — the socket is up, the configured credentials worked,
         # only the identity is gone — and collapsing the two would send callers debugging
         # their network. The client stays cached and usable at the configured identity, so
         # the caller can simply sign in again.
-        # Published only once the replay has settled — in a `finally`, so a rejected token
-        # still leaves a usable client behind. Caching it *before* awaiting the replay would
-        # let a concurrent get_client() on this loop take the fast path and run statements as
-        # the configured root user while the record identity is still being established.
+        # Published only once the replay has settled, so a rejected token still leaves a usable
+        # client behind. Caching it *before* awaiting the replay would let a concurrent
+        # get_client() take the fast path and run statements as the configured root user while
+        # the record identity is still being established.
         try:
-            await cls._replay_session(_client)
+            await cls._replay_session(client)
         except SurrealDbConnectionError:
             # The connection itself failed during the replay: nothing is known about the client's
             # identity, and the stored session was kept for the next attempt.
             with contextlib.suppress(Exception):
-                await _client.close()
+                await client.close()
             raise
         except Exception:
             # Refused: the token was forgotten and the client stayed at the configured identity.
-            cls._publish(loop, _client, configured, still_wanted)
+            publish(client, configured)
             raise
         except BaseException:
             # Cancelled mid-replay: nobody knows which identity the client ended up with, so it is
             # neither published nor trusted — closed, and the next caller opens a fresh one.
             with contextlib.suppress(Exception):
-                await _client.close()
+                await client.close()
             raise
-        cls._publish(loop, _client, replayed, still_wanted)
-        return _client
+        publish(client, replayed)
+        return client
 
     @classmethod
     def _publish(
@@ -541,6 +619,162 @@ class SurrealDBConnectionManager:
             cls.__refresh_token = None
             raise wrap_auth_error(exc, "restoring the session on a new connection") from exc
 
+    # ------------------------------------------------------------------
+    # The embedded engine's slot (v0.25.0)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    async def _acquire_embedded_client(cls) -> Any:
+        """The process-wide client of the embedded engine: opened, re-selected or replaced as needed.
+
+        :return: the client, or ``None`` when the configured URL stopped being embedded while this
+            call waited for the guard (the caller then serves the configuration as it is now).
+        """
+        # Lock-free fast path. The slot is published URL and selection first, client last, and
+        # emptied client first; reading the client again last means the URL and selection read in
+        # between belong to it, even if another thread replaced the slot meanwhile.
+        client = cls.__embedded_client
+        if (
+            client is not None
+            and cls.__embedded_url == cls.__url
+            and cls.__embedded_selection == (cls.__namespace, cls.__database)
+            and cls.__embedded_client is client
+        ):
+            return client
+        async with cls._embedded_guard():
+            if not is_embedded_url(cls.__url):
+                return None
+            cls.require_connection()
+            client = cls.__embedded_client
+            if client is not None and cls.__embedded_url == cls.__url:
+                selection = cls.__embedded_selection
+                if selection == (cls.__namespace, cls.__database):
+                    return client  # selected by whoever held the guard before us
+                if selection is not None:
+                    # A real change of namespace/database, not a stale marker: the stored session
+                    # belongs to the previous selection, and replaying it would move the session back.
+                    cls.clear_session()
+                await cls._reset_embedded_session(client)
+                return client
+            await cls._forget_embedded()
+            return await cls._open_embedded()
+
+    @classmethod
+    async def _open_embedded(cls) -> Any:
+        """Open the configured embedded URL, replay the stored session and publish the client in the
+        slot. Caller holds the guard, and the slot is empty."""
+        url, namespace, database = cls.__url, cls.__namespace, cls.__database
+        # Fingerprinted from the settings _open_client() reads before its first await, as in
+        # _connect_for_loop().
+        replayed = cls._fingerprint(url, namespace, database, cls.__user, cls.__session_token)
+        configured = cls._fingerprint(url, namespace, database, cls.__user, None)
+        client = await cls._open_client(signin_as_configured=False)
+
+        def publish(opened: Any, fingerprint: str) -> None:
+            cls._stamp_identity(opened, fingerprint=fingerprint, replayable=True)
+            cls.__embedded_url = url
+            cls.__embedded_selection = (namespace, database)
+            cls.__embedded_client = opened  # last: see the fast path of _acquire_embedded_client()
+
+        return await cls._replay_then_publish(client, replayed=replayed, configured=configured, publish=publish)
+
+    @classmethod
+    async def _reset_embedded_session(cls, client: Any) -> None:
+        """Re-identify the shared embedded session on the configured selection. Caller holds the guard.
+
+        The one place that does it: back to the in-process owner (``invalidate()``), select the
+        configured namespace and database (``use()``), then replay the stored session, if any. Until
+        that succeeds the slot's selection is stale, so nobody takes the fast path meanwhile and the
+        next :meth:`get_client` resets again: the client is never handed out on a new selection with
+        the previous identity, and nothing is closed (no ``mem://`` data lost).
+
+        :raises SurrealDbConnectionError: ``invalidate()`` or ``use()`` failed (never retryable), or
+            the replay hit a connection failure; the selection stays stale.
+        :raises SurrealDbAuthenticationError: the stored session was refused; it is forgotten, and
+            the session is the owner on the configured selection.
+        """
+        url, namespace, database = cls.__url, cls.__namespace, cls.__database
+        assert namespace is not None
+        assert database is not None
+        cls.__embedded_selection = None  # stale until done
+        replayed = cls._fingerprint(url, namespace, database, cls.__user, cls.__session_token)
+        configured = cls._fingerprint(url, namespace, database, cls.__user, None)
+        try:
+            await client.invalidate()  # the in-process owner
+            await client.use(namespace, database)
+        except Exception as exc:
+            error = SurrealDbConnectionError(
+                f"Can't select namespace {namespace!r} and database {database!r} on the embedded database {url!r}: {exc}"
+            )
+            error.retryable = False  # type: ignore[attr-defined]
+            raise error from exc
+        try:
+            await cls._replay_session(client)
+        except SurrealDbConnectionError:
+            raise  # the selection stays stale
+        except Exception:
+            # Refused: the token is forgotten and the session is the owner on the selection — as at open.
+            cls._stamp_identity(client, fingerprint=configured, replayable=True)
+            cls.__embedded_selection = (namespace, database)
+            raise
+        cls._stamp_identity(client, fingerprint=replayed, replayable=True)
+        cls.__embedded_selection = (namespace, database)
+
+    @classmethod
+    async def _restore_embedded_session(cls) -> None:
+        """Put the stored identity back on the embedded engine's shared session (owner, selection,
+        stored token) — what model-level auth does after a failed ``bind=True``. A no-op when the
+        slot is empty."""
+        async with cls._embedded_guard():
+            client = cls.__embedded_client
+            if client is not None:
+                await cls._reset_embedded_session(client)
+
+    @classmethod
+    @contextlib.asynccontextmanager
+    async def _embedded_guard(cls) -> AsyncIterator[None]:
+        """Hold the embedded slot's lock.
+
+        A ``threading.Lock``, because the slot is shared by every loop and thread, acquired
+        **cooperatively** — without blocking, retried after a short sleep — so a second coroutine
+        on the same loop waits without freezing the loop (a blocking acquire would deadlock it).
+        Not re-entrant: no guarded section calls another guarded method.
+        """
+        lock = cls.__embedded_lock
+        while not lock.acquire(blocking=False):
+            await asyncio.sleep(0.001)
+        try:
+            yield
+        finally:
+            lock.release()
+
+    @classmethod
+    async def _forget_embedded(cls) -> None:
+        """Close the embedded slot's client and empty the slot. Caller holds the guard.
+
+        A no-op when the slot is empty, so a close with no engine open changes nothing it did not
+        change before (the stored-function signature cache in particular). Otherwise the slot is
+        emptied first — nobody is handed the client while it closes — and the signature cache is
+        cleared: a new ``mem://`` database may define the same function name differently.
+        """
+        client = cls.__embedded_client
+        if client is None:
+            return
+        cls.__embedded_client = None
+        cls.__embedded_url = None
+        cls.__embedded_selection = None
+        with contextlib.suppress(Exception):
+            await client.close()
+        cls.clear_function_signature_cache()
+
+    @classmethod
+    async def _close_embedded(cls) -> None:
+        """Close the embedded engine's client, if the slot holds one (from any loop or thread)."""
+        if cls.__embedded_client is None:
+            return
+        async with cls._embedded_guard():
+            await cls._forget_embedded()
+
     @classmethod
     async def close_connection(cls) -> None:
         """
@@ -549,6 +783,14 @@ class SurrealDBConnectionManager:
         Only the running loop's client is closed: another loop may still be using its own,
         and closing that one from here is both impossible and wrong. Use
         :meth:`close_all_connections` to tear everything down.
+
+        The embedded engine's client — one for the whole process (:meth:`get_client`) — is closed
+        too, from whichever loop or thread calls this: a ``mem://`` database is discarded with it
+        and the next call opens a new, empty one; a file-backed one (``surrealkv://``, ``file://``)
+        reopens with its data. With the surrealdb SDK 2.x, closing does not stop an in-process
+        engine: a client obtained before the close is still a running database. Do not use it after
+        the close, and drop it (``del client``) before reopening the same ``surrealkv://`` path —
+        two engines on one path miss each other's writes.
         """
         cls.__prune_dead_loops()
         # Before the socket goes: a live-query reader is parked on a queue nothing will ever
@@ -556,6 +798,7 @@ class SurrealDBConnectionManager:
         close_all_subscribers()
         # Closing is an explicit choice: the next connection is the configured identity.
         cls._identity_restored()
+        await cls._close_embedded()
         client = cls.__clients.pop(asyncio.get_running_loop(), None)
         if client is None:
             return
@@ -571,12 +814,16 @@ class SurrealDBConnectionManager:
         A client belonging to another *live* loop cannot be closed from here, so it is
         dropped rather than awaited — the socket is released when that loop is finalised.
         Only the running loop's client is closed properly.
+
+        The embedded engine's client is closed too, as by :meth:`close_connection` (a ``mem://``
+        database is discarded with it).
         """
         loop = asyncio.get_running_loop()
         # Every loop's client is dropped below, so every loop's readers are released too —
         # another loop's through its own thread, since only that loop may wake its queues.
         close_all_subscribers(every_loop=True)
         cls.__lost_identity.clear()
+        await cls._close_embedded()
         client = cls.__clients.pop(loop, None)
         if client is not None:
             with contextlib.suppress(NotImplementedError):
@@ -617,8 +864,8 @@ class SurrealDBConnectionManager:
           ``InteractiveTransaction``: operations run immediately inside the server-side
           transaction (tagged by ``txn_id``); reads inside the transaction see
           uncommitted writes.
-        - HTTP, or WebSocket on SurrealDB 2.6.x (native ``begin()`` absent) →
-          ``BufferedTransaction``: writes are buffered and flushed as one BEGIN…COMMIT at
+        - HTTP, the embedded engine, or WebSocket on SurrealDB 2.x (native ``begin()`` absent)
+          → ``BufferedTransaction``: writes are buffered and flushed as one BEGIN…COMMIT at
           commit (v0.8.0); reads inside the transaction raise.
 
         Exception semantics: an exception in the body triggers ``cancel()`` and re-raises
@@ -1341,6 +1588,10 @@ class SurrealDBConnectionManager:
     async def reconnect(cls) -> Any:
         """
         Reconnect to the SurrealDB instance.
+
+        On an embedded URL this closes the engine first (:meth:`close_connection`): a ``mem://``
+        database starts empty again. :meth:`validate_connection` checks an embedded connection
+        without discarding it.
         """
         await cls.close_connection()
         return await cls.get_client()
@@ -1350,8 +1601,19 @@ class SurrealDBConnectionManager:
         """
         Validate the connection to the SurrealDB instance.
 
-        :return: True if the connection is valid, False otherwise.
+        On a server URL the connection is rebuilt (:meth:`reconnect`). On an embedded URL the
+        engine is opened if needed and **kept**: a ``mem://`` database is never discarded here, so
+        the ``set_*(..., reconnect=True)`` setters keep it too.
+
+        :return: True if the connection is valid, False otherwise — it cannot be opened, the URL is
+            one the installed SDK refuses, or the embedded selection cannot be set.
         """
+        if cls.is_embedded():
+            try:
+                await cls.get_client()
+                return True
+            except SurrealDbConnectionError:
+                return False
         try:
             await cls.reconnect()
             return True
@@ -1443,12 +1705,19 @@ class SurrealDBConnectionManager:
         """
         Set the namespace to use.
 
+        On an embedded URL, a value different from the current one also **ends the stored session**:
+        a token belongs to the namespace and database it was issued for, and the next call resets the
+        engine's shared session to the in-process owner on the new selection (:meth:`get_client`).
+        On a server URL the stored session is kept, as before.
+
         :param namespace: The namespace to use.
         """
 
         if not cls.is_connection_set():
             raise ValueError("You can't change the namespace when the others setting are not already set.")
 
+        if is_embedded_url(cls.__url) and namespace != cls.__namespace:
+            cls.clear_session()
         cls.__namespace = namespace
 
         if reconnect and not await cls.validate_connection():  # pragma: no cover
@@ -1462,11 +1731,16 @@ class SurrealDBConnectionManager:
         """
         Set the database to use.
 
+        On an embedded URL, a value different from the current one also **ends the stored session**
+        (see :meth:`set_namespace`). On a server URL the stored session is kept, as before.
+
         :param database: The database to use.
         """
         if not cls.is_connection_set():
             raise ValueError("You can't change the database when the others setting are not already set.")
 
+        if is_embedded_url(cls.__url) and database != cls.__database:
+            cls.clear_session()
         cls.__database = database
 
         if reconnect and not await cls.validate_connection():  # pragma: no cover
@@ -1529,12 +1803,15 @@ class SurrealDBConnectionManager:
         asking: inside a running loop this reports *that* loop's client, and outside one it
         reports whether any loop still holds a client.
 
+        The embedded engine's client belongs to the whole process: while it is open, this is
+        true from every loop, and outside any loop.
+
         :return: True if the connection is established, False otherwise.
         """
         cls.__prune_dead_loops()
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            return len(cls.__clients) > 0
+            return len(cls.__clients) > 0 or cls.__embedded_client is not None
 
-        return cls.__clients.get(loop) is not None
+        return cls.__clients.get(loop) is not None or cls.__embedded_client is not None
