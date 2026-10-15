@@ -33,7 +33,8 @@ top level reads the server's duration. No new public API.
   SDK's `Duration` on every read, as before v0.23.0. They now read a `timedelta`, floored to the
   microsecond (declare `Duration` to keep the nanoseconds), in a read and in the row a write
   returns. A row holding many such values is converted in one pass, without mutating the data,
-  and a `mode="before"` validator that changes its input in place still applies once.
+  and the model's own validators (any mode) and `model_post_init` still apply once, even when they
+  change the data in place.
 
 ### Notes
 

@@ -2009,8 +2009,8 @@ Optional fields (`ttl: timedelta | None = None`) behave the same. Values nested 
 reads, a `timedelta` is converted from the SDK's duration at any depth too: a top-level field,
 `list[timedelta]`, `dict[str, timedelta]`, `timedelta | str` or a sub-model's `timedelta` field
 all read a `timedelta`, floored to the microsecond (declare `Duration` to keep the nanoseconds).
-Your `mode="before"` validators still apply once to the value read, even one that changes its input
-in place. A naive `datetime` stays naive on the instance and is read back as an aware UTC
+Your validators (any mode) and `model_post_init` still apply once to the value read, even when they
+change it in place. A naive `datetime` stays naive on the instance and is read back as an aware UTC
 `datetime`, as before.
 
 #### `Duration`
