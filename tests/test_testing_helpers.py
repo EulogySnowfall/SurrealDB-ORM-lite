@@ -1,13 +1,15 @@
 """``surreal_orm_lite.testing`` (v0.25.0): test helpers mirroring the full SurrealDB-ORM's ``surreal_orm.testing``.
 
 ``embedded_database()`` runs a block against an isolated in-process database (the official SDK's embedded
-engine) and puts the previous connection back afterwards. The classes that open the engine are suffixed
-``E2E``; none of them needs a server.
+engine) and puts the previous connection back afterwards; ``SurrealFixture``/``@fixture`` declare test data
+that ``load()`` saves for one block and deletes afterwards. The classes that open the engine or a server are
+suffixed ``E2E``; only the ``…ServerE2E`` classes need a server (this worktree's slot, both lines).
 """
 
 import asyncio
 import contextlib
 import dataclasses
+import logging
 import subprocess
 import sys
 import weakref
@@ -16,12 +18,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from surrealdb import RecordID
 from surrealdb.connections.async_embedded import AsyncEmbeddedSurrealConnection
 
 import surreal_orm_lite
-from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager, testing
-from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError
-from surreal_orm_lite.testing import embedded_database
+from surreal_orm_lite import BaseSurrealEdge, BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager, testing
+from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError, SurrealDbError
+from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
+from tests.conftest import orm_client
 from tests.test_embedded import (
     _calls_of,
     _count_constructions,
@@ -97,6 +101,13 @@ class TestTestingPackage:
         assert "embedded_database" in testing.__all__
         assert testing.embedded_database is embedded_database
         assert not hasattr(surreal_orm_lite, "embedded_database")
+
+    def test_the_fixture_helpers_are_exported_from_the_subpackage_only(self) -> None:
+        assert sorted(testing.__all__) == ["SurrealFixture", "embedded_database", "fixture"]
+        assert testing.SurrealFixture is SurrealFixture
+        assert testing.fixture is fixture
+        assert not hasattr(surreal_orm_lite, "SurrealFixture")
+        assert not hasattr(surreal_orm_lite, "fixture")
 
     def test_importing_it_does_not_import_pytest(self) -> None:
         code = (
@@ -426,3 +437,330 @@ class TestEmbeddedDatabaseStateE2E:
                 assert state.embedded_client is seen
                 assert _slot_client() is seen
             assert SurrealDBConnectionManager.get_connection_kwargs()["database"] == "t"
+
+
+# ---------------------------------------------------------------------------
+# SurrealFixture and @fixture (AC-13): declarative test data, saved for one block
+# ---------------------------------------------------------------------------
+
+
+class Member(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="member")
+
+    id: str | None = None
+    name: str = ""
+    role: str = ""
+
+
+class Visitor(BaseSurrealModel):
+    """A second model class on the ``member`` table: the interrupted-load tests patch its ``save`` only."""
+
+    model_config = SurrealConfigDict(table_name="member")
+
+    id: str | None = None
+    name: str = ""
+    role: str = ""
+
+
+class Follows(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="follows")
+
+
+@fixture
+class Team(SurrealFixture):
+    alice = Member(id="alice", name="Alice", role="admin")
+    bob = Member(id="bob", name="Bob", role="player")
+    carol = Member(name="Carol", role="player")  # an id given by the database
+    follows = Follows(in_=RecordID("member", "alice"), out=RecordID("member", "bob"))  # after its nodes
+
+
+@fixture
+class ServerTeam(SurrealFixture):
+    """``Team`` minus the edge, for the server lines."""
+
+    alice = Member(id="alice", name="Alice", role="admin")
+    bob = Member(id="bob", name="Bob", role="player")
+    carol = Member(name="Carol", role="player")
+
+
+@fixture
+class Duplicated(SurrealFixture):
+    """Its third save fails: the same explicit id as the first one."""
+
+    first = Member(id="dup", name="First")
+    other = Member(id="other", name="Other")
+    second = Member(id="dup", name="Second")
+
+
+@fixture
+class Interrupted(SurrealFixture):
+    """A member, then a visitor whose ``save`` the tests patch to be cancelled."""
+
+    member = Member(id="m", name="Member")
+    visitor = Visitor(id="v", name="Visitor")
+
+
+async def _counts() -> tuple[int, int]:
+    """``(members, follows)`` in the current database."""
+    return await Member.objects().count(), await Follows.objects().count()
+
+
+def _label(instance: Any) -> str:
+    return "follows" if isinstance(instance, Follows) else str(instance.name)
+
+
+def _record_writes(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+    """Record ``("save" | "delete", label)`` for every save and delete of ``Member`` and ``Follows``."""
+    events: list[tuple[str, str]] = []
+    for model in (Member, Follows):
+        for method in ("save", "delete"):
+            real = getattr(model, method)
+
+            def recording(real: Any = real, method: str = method) -> Any:
+                async def call(self: Any, *args: Any, **kwargs: Any) -> Any:
+                    events.append((method, _label(self)))
+                    return await real(self, *args, **kwargs)
+
+                return call
+
+            monkeypatch.setattr(model, method, recording())
+    return events
+
+
+async def _cancelled_save(self: Any, *args: Any, **kwargs: Any) -> Any:
+    raise asyncio.CancelledError()
+
+
+class TestFixtureDecorator:
+    """``@fixture`` (E9, what it collects) and E8 of ``load()``: no database."""
+
+    def test_a_plain_class_is_refused(self) -> None:
+        class Plain:
+            alice = Member(name="Alice")
+
+        with pytest.raises(TypeError, match="SurrealFixture subclass"):
+            fixture(Plain)  # type: ignore[type-var]
+        assert not hasattr(Plain, "_fixture_instances")
+
+    def test_something_other_than_a_class_is_refused(self) -> None:
+        with pytest.raises(TypeError, match="SurrealFixture subclass, not Member"):
+            fixture(Member(name="Alice"))  # type: ignore[type-var]
+
+    def test_it_collects_only_the_model_instances_in_declaration_order(self) -> None:
+        @fixture
+        class Mixed(SurrealFixture):
+            alice = Member(name="Alice")
+            note = "x"
+            bob = Member(name="Bob")
+            size = 3
+            follows = Follows(in_=RecordID("member", "alice"), out=RecordID("member", "bob"))
+
+        assert list(Mixed._fixture_instances) == ["alice", "bob", "follows"]
+        assert Mixed._fixture_instances["alice"] is Mixed.alice  # the templates themselves, kept as declared
+
+    def test_it_returns_the_class_itself(self) -> None:
+        class Same(SurrealFixture):
+            alice = Member(name="Alice")
+
+        assert fixture(Same) is Same
+
+    def test_inherited_instances_are_not_collected(self) -> None:
+        """As the full ORM: only the class's own attributes."""
+
+        @fixture
+        class Parent(SurrealFixture):
+            alice = Member(name="Alice")
+
+        @fixture
+        class Child(Parent):
+            bob = Member(name="Bob")
+
+        assert list(Child._fixture_instances) == ["bob"]
+        assert list(Parent._fixture_instances) == ["alice"]
+
+    async def test_load_without_the_decorator_is_refused(self) -> None:
+        class Undecorated(SurrealFixture):
+            alice = Member(name="Alice")
+
+        with pytest.raises(ValueError, match="Undecorated has no fixture instances. Did you forget the @fixture decorator"):
+            async with Undecorated.load():
+                raise AssertionError("the body never runs")
+
+    async def test_load_of_a_fixture_without_instances_is_refused(self) -> None:
+        @fixture
+        class Empty(SurrealFixture):
+            note = "x"
+
+        with pytest.raises(ValueError, match="has no fixture instances"):
+            async with Empty.load():
+                raise AssertionError("the body never runs")
+        with pytest.raises(ValueError, match="has no fixture instances"):
+            async with SurrealFixture.load():
+                raise AssertionError("the body never runs")
+
+
+class TestSurrealFixtureE2E:
+    """AC-13 on the in-process engine, one ``embedded_database()`` per test: no server."""
+
+    async def test_load_yields_saved_copies_and_deletes_them_on_exit(self) -> None:
+        async with _unset_after(), embedded_database():
+            async with Team.load() as team:
+                assert isinstance(team, Team)
+                assert team.alice.get_raw_id() == "alice"  # an explicit id is kept (D9)
+                assert team.bob.get_raw_id() == "bob"
+                assert team.carol.get_id() is not None
+                assert team.follows.get_id() is not None
+                assert team.bob is not Team.bob  # a copy: the template is never saved
+                assert (team.alice.name, team.alice.role) == ("Alice", "admin")
+                assert team.follows.in_ == RecordID("member", "alice")
+                assert await _counts() == (3, 1)
+                admins = await Member.objects().filter(role="admin").exec()
+                assert [admin.get_raw_id() for admin in admins] == ["alice"]
+                carol = await Member.objects().get(team.carol.get_raw_id())
+                assert carol.name == "Carol"
+            assert await _counts() == (0, 0)
+        # The templates are untouched.
+        assert (Team.alice.id, Team.bob.id, Team.carol.id, Team.follows.id) == ("alice", "bob", None, None)
+
+    async def test_saved_in_declaration_order_and_deleted_in_reverse(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        events = _record_writes(monkeypatch)
+        async with _unset_after(), embedded_database():
+            async with Team.load():
+                assert events == [("save", "Alice"), ("save", "Bob"), ("save", "Carol"), ("save", "follows")]
+                events.clear()
+            assert events == [("delete", "follows"), ("delete", "Carol"), ("delete", "Bob"), ("delete", "Alice")]
+
+    async def test_a_body_that_raises_is_cleaned_up_and_the_error_propagates(self) -> None:
+        async with _unset_after(), embedded_database():
+            with pytest.raises(RuntimeError, match="boom"):
+                async with Team.load():
+                    assert await _counts() == (3, 1)
+                    raise RuntimeError("boom")
+            assert await _counts() == (0, 0)
+
+    async def test_a_failing_save_deletes_the_earlier_ones_and_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """D9: the full ORM leaves the earlier saves in place."""
+        events = _record_writes(monkeypatch)
+        async with _unset_after(), embedded_database():
+            with pytest.raises(SurrealDbError, match="already exists"):
+                async with Duplicated.load():
+                    raise AssertionError("the body never runs")
+            assert events[-2:] == [("delete", "Other"), ("delete", "First")]  # in reverse order
+            assert await Member.objects().count() == 0
+
+    async def test_a_failing_cleanup_delete_does_not_hide_the_load_error(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        async def failing_delete(self: Any, *args: Any, **kwargs: Any) -> None:
+            raise SurrealDbError("cannot delete")
+
+        monkeypatch.setattr(Member, "delete", failing_delete)
+        async with _unset_after(), embedded_database():
+            with (
+                caplog.at_level(logging.DEBUG, logger="surreal_orm_lite.testing"),
+                pytest.raises(SurrealDbError, match="already exists"),
+            ):
+                async with Duplicated.load():
+                    raise AssertionError("the body never runs")
+        failed = [r for r in caplog.records if r.name == "surreal_orm_lite.testing" and r.levelno == logging.DEBUG]
+        assert [r.getMessage() for r in failed] == [
+            "Fixture cleanup: failed to delete Member other",
+            "Fixture cleanup: failed to delete Member dup",
+        ]
+        assert all(r.exc_info is not None and "cannot delete" in str(r.exc_info[1]) for r in failed)
+
+    async def test_a_cancelled_load_deletes_the_earlier_saves_and_re_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """D9: the second template's ``save`` is cancelled; the first one's record is deleted."""
+        monkeypatch.setattr(Visitor, "save", _cancelled_save)
+        async with _unset_after(), embedded_database():
+            with pytest.raises(asyncio.CancelledError):
+                async with Interrupted.load():
+                    raise AssertionError("the body never runs")
+            assert await Member.objects().count() == 0
+
+    async def test_a_load_cancelled_from_outside_deletes_the_earlier_saves(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A real ``Task.cancel()`` while the second ``save`` waits: the cleanup still reaches the database."""
+        waiting = asyncio.Event()
+        entered: list[bool] = []
+
+        async def hanging_save(self: Any, *args: Any, **kwargs: Any) -> Any:
+            waiting.set()
+            await asyncio.Event().wait()
+
+        async def load() -> None:
+            async with Interrupted.load():
+                entered.append(True)
+
+        monkeypatch.setattr(Visitor, "save", hanging_save)
+        async with _unset_after(), embedded_database():
+            async with asyncio.timeout(5):
+                task = asyncio.ensure_future(load())
+                await waiting.wait()
+                assert await Member.objects().count() == 1
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            assert entered == []
+            assert await Member.objects().count() == 0
+
+    async def test_a_record_deleted_in_the_body_is_skipped_at_cleanup(self, caplog: pytest.LogCaptureFixture) -> None:
+        """``carol`` has no edge: deleting a node also deletes its edges, which would fail a second delete."""
+        async with _unset_after(), embedded_database():
+            with caplog.at_level(logging.DEBUG, logger="surreal_orm_lite.testing"):
+                async with Team.load() as team:
+                    carol_id = team.carol.get_id()
+                    await team.carol.delete()
+            assert await _counts() == (0, 0)
+        failed = [r for r in caplog.records if r.name == "surreal_orm_lite.testing" and r.levelno == logging.DEBUG]
+        assert len(failed) == 1
+        assert failed[0].getMessage() == f"Fixture cleanup: failed to delete Member {carol_id}"
+        assert failed[0].exc_info is not None and isinstance(failed[0].exc_info[1], SurrealDbError)
+
+    async def test_deleting_a_node_in_the_body_leaves_nothing_behind(self) -> None:
+        """Its edge goes with it (SurrealDB deletes a node's edges); the two failing deletes are skipped."""
+        async with _unset_after(), embedded_database():
+            async with Team.load() as team:
+                await team.bob.delete()
+                assert await _counts() == (2, 0)
+            assert await _counts() == (0, 0)
+
+    async def test_two_loads_in_sequence(self) -> None:
+        async with _unset_after(), embedded_database():
+            async with Team.load() as first:
+                first_alice = first.alice
+            async with Team.load() as second:
+                assert second.alice is not first_alice
+                assert second.alice.get_raw_id() == "alice"
+                assert await _counts() == (3, 1)
+            assert await _counts() == (0, 0)
+
+
+class TestSurrealFixtureServerE2E:
+    """AC-13 on this worktree's slot servers (both lines): the helpers work on any configured connection."""
+
+    async def test_load_saves_and_deletes_on_the_server(self) -> None:
+        async with orm_client("member"):
+            async with ServerTeam.load() as team:
+                assert team.alice.get_raw_id() == "alice"
+                assert team.carol.get_id() is not None
+                assert team.bob is not ServerTeam.bob
+                assert await Member.objects().count() == 3
+                admins = await Member.objects().filter(role="admin").exec()
+                assert [admin.get_raw_id() for admin in admins] == ["alice"]
+            assert await Member.objects().count() == 0
+        assert ServerTeam.carol.id is None
+
+    async def test_a_failing_save_deletes_the_earlier_ones_on_the_server(self) -> None:
+        async with orm_client("member"):
+            with pytest.raises(SurrealDbError, match="already exists"):
+                async with Duplicated.load():
+                    raise AssertionError("the body never runs")
+            assert await Member.objects().count() == 0
+
+    async def test_a_cancelled_load_deletes_the_earlier_saves_on_the_server(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(Visitor, "save", _cancelled_save)
+        async with orm_client("member"):
+            with pytest.raises(asyncio.CancelledError):
+                async with Interrupted.load():
+                    raise AssertionError("the body never runs")
+            assert await Member.objects().count() == 0
