@@ -2800,7 +2800,9 @@ and expect the 2.x column of the
   a token belongs to the database it was issued for, and replaying it would move the session
   back there.
 - Model auth with `bind=True` ([section 19](#19-model-level-authentication-authenticatedusermixin))
-  signs that single session in; a failed `bind=True` puts the previous session back.
+  signs that single session in, one call at a time: concurrent `bind=True` calls are
+  serialised (each reads back its own record and adopts its own token) and the last one wins.
+  A failed `bind=True` puts the previous session back.
 
 ```python
 assert await SurrealDBConnectionManager.info() is None  # anonymous: the in-process owner
@@ -3121,7 +3123,7 @@ line of its own: SurrealDB core 2.3.10, bundled with SDK 2.0.0. Rows measured wi
 | Concurrent first writes to a table that does not exist yet          | retryable conflict, a few % per batch of 20: define the table first                                                                                                             | rare on 2.x, none measured on 3.x                                                                               | v0.25.0 |
 | Live queries (`live()`, `watch()`, `subscribe_live()`)              | `SurrealDbError` before any request: use change feeds                                                                                                                           | WebSocket only                                                                                                  | v0.25.0 |
 | Change feeds (`changes()`)                                          | from now and from a cursor; `since=<datetime>` refused (`SurrealDbError`)                                                                                                       | from now, a cursor or a datetime                                                                                | v0.25.0 |
-| Model auth (`AuthenticatedUserMixin`)                               | `bind=True` only, on the shared session; a failure restores the previous session                                                                                                | a session of its own; `bind=True` also adopts the token                                                         | v0.25.0 |
+| Model auth (`AuthenticatedUserMixin`)                               | `bind=True` only, on the shared session, one call at a time (the last one wins); a failure restores the previous session                                                        | a session of its own; `bind=True` also adopts the token                                                         | v0.25.0 |
 | `ephemeral_client()`                                                | `SurrealDbError`: the engine has a single session per database                                                                                                                  | an anonymous throwaway client                                                                                   | v0.25.0 |
 | Anonymous session                                                   | the in-process owner (full access); `info()` returns `None`                                                                                                                     | not used by the ORM (the configured user signs in); an anonymous `info()` raises `SurrealDbAuthenticationError` | v0.25.0 |
 | `invalidate()`                                                      | back to the in-process owner                                                                                                                                                    | signs in again as the configured user                                                                           | v0.25.0 |
