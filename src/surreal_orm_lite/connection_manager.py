@@ -205,7 +205,7 @@ class SurrealDBConnectionManager:
 
         Every client opened here reads the values SDK 2.0.0 cannot decode (zero durations, native
         sets, degenerate geometries) through the read hook of ``decoding.py`` (#235), installed
-        before ``connect()`` starts the WebSocket receive task. Only these clients get it: a client
+        as soon as the client is built, before ``connect()``. Only these clients get it: a client
         the application builds itself with ``AsyncSurreal`` keeps the SDK's behaviour.
 
         :param signin_as_configured: sign in as the configured user. ``False`` yields an

@@ -646,11 +646,11 @@ async def _write(client: Any, case: str) -> None:
     await client.query(f"CREATE dc_value:one SET name = 'x', v = {literal} RETURN NONE;", {})
 
 
-async def _assert_client_alive(client: Any) -> None:
-    """The ORM's client survived the read: same object, still answering, its receive task running."""
+async def _assert_client_keeps_working(client: Any) -> None:
+    """Later calls on the same client keep working: ``get_client()`` returns it and it still answers."""
     assert (await SurrealDBConnectionManager.get_client()) is client
     task = getattr(client, "recv_task", None)
-    assert task is None or not task.done(), "the SDK's receive task ended"
+    assert task is None or not task.done(), "the client stopped working after the read"
     assert await client.query("RETURN 1;", {}) == 1
 
 
@@ -666,7 +666,7 @@ class TestUndecodableReadsE2E:
             row = await _READS[read](DcAny)
             assert isinstance(row, DcAny), row
             assert _UNTYPED[case](row.v), row.v
-            await _assert_client_alive(client)
+            await _assert_client_keeps_working(client)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("read", list(_READS))
@@ -680,7 +680,7 @@ class TestUndecodableReadsE2E:
             assert isinstance(row, DcAny), row
             assert type(row.v) is list and sorted(row.v, key=repr) == [1, True], row.v
             assert sorted(type(item).__name__ for item in row.v) == ["bool", "int"], row.v
-            await _assert_client_alive(client)
+            await _assert_client_keeps_working(client)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("read", list(_READS))
@@ -702,7 +702,7 @@ class TestUndecodableReadsE2E:
                         await _READS[read](model)
                     assert [error["loc"] for error in info.value.errors()] == [("v",)], info.value
                     assert model.__name__ in str(info.value)
-            await _assert_client_alive(client)
+            await _assert_client_keeps_working(client)
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("case", list(_VALUES))
@@ -711,7 +711,7 @@ class TestUndecodableReadsE2E:
             await _write(client, case)
             row = await DcAny.objects().get("one")
             assert _UNTYPED[case](row.v), row.v
-            await _assert_client_alive(client)
+            await _assert_client_keeps_working(client)
 
     @pytest.mark.asyncio
     async def test_ephemeral_client(self) -> None:
@@ -725,7 +725,8 @@ class TestUndecodableReadsE2E:
 
 
 class TestUndecodableLiveE2E:
-    """A live query whose notification carries such a value delivers it, and the client survives."""
+    """A live query whose notification carries such a value delivers it, and later calls on the same
+    client keep working."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("case", list(_VALUES))
@@ -740,7 +741,7 @@ class TestUndecodableLiveE2E:
                 [event] = await _take(stream, 1)
             assert event.validation_error is None, event.validation_error
             assert _UNTYPED[case](event.instance.v), event.instance.v
-            await _assert_client_alive(client)
+            await _assert_client_keeps_working(client)
 
 
 class TestScopeE2E:
@@ -767,11 +768,11 @@ class TestScopeE2E:
                 await client.query("SELECT VALUE v FROM ONLY dc_value:one;", {})
 
     @pytest.mark.asyncio
-    async def test_ws_read_in_flight_is_not_cancelled(self) -> None:
-        """Several reads in flight at once over one WebSocket all complete."""
+    async def test_ws_concurrent_reads_all_return_the_value(self) -> None:
+        """Several concurrent reads on one WebSocket client each return the value."""
         async with _orm("ws") as client:
             await _write(client, "zero-0ns")
             reads = [client.query("SELECT VALUE v FROM ONLY dc_value:one;", {}) for _ in range(5)]
             results = await asyncio.wait_for(asyncio.gather(*reads), 10)
             assert all(_UNTYPED["zero-0ns"](value) for value in results), results
-            await _assert_client_alive(client)
+            await _assert_client_keeps_working(client)

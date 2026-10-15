@@ -10,9 +10,8 @@ The surrealdb SDK 2.0.0 decodes every response in its connection modules with it
 * a ``LineString`` of fewer than 2 points, alone or inside another geometry: ``TypeError``;
 * a ``Polygon`` ring of fewer than 4 points: ``InvalidGeometryError``.
 
-One such value fails the whole response. Over WebSocket it also ends the SDK's receive loop, which
-cancels every request in flight. ``read_tag_hook`` wraps the SDK's ``tag_decoder``: every tag goes to
-it first, and only these four failures get a value instead of the error — the SDK's
+One such value fails the whole response it is in. ``read_tag_hook`` wraps the SDK's ``tag_decoder``:
+every tag goes to it first, and only these four failures get a value instead of the error — the SDK's
 ``Duration(0)``, a Python ``set`` (a ``list`` when an item is unhashable or two items are equal in
 Python, like ``1`` and ``true``) and the geometry's GeoJSON ``dict`` (``{"type": …, "coordinates":
 …}``, or ``"geometries"`` for a collection), which a geometry field validates or refuses clearly.
