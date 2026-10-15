@@ -11,8 +11,9 @@ re-identify the client every other model shares — the footgun v0.16.0 document
 
 The embedded engine (v0.25.0: ``mem://``, ``surrealkv://<path>`` …) has a single session per
 database, so it has no short-lived connection to offer: there, ``bind=True`` is required, and the
-exchange runs on the shared session — the record checked before the token is adopted, the previous
-session put back when anything fails.
+exchange runs on the shared session — one call at a time (concurrent calls are serialised, the last
+one wins), the record checked before the token is adopted, the previous session put back when
+anything fails.
 
 This is a leaf module: it imports ``connection_manager`` and ``auth`` at runtime and
 ``model_base`` only for typing, which keeps the package acyclic (``connection_manager`` already
@@ -423,11 +424,12 @@ class AuthenticatedUserMixin:
 
         This is the whole isolation story in one place: the client is built, authenticated,
         queried and closed here, so nothing about the shared connection changes unless the
-        caller asked for it with ``bind=True``.
+        caller asked for it with ``bind=True`` — which then adopts the issued tokens, or, for
+        ``authenticate``, the caller's token once it resolved to an instance.
 
         The embedded engine has a single session per database, so there is no throwaway
         connection to run on: ``bind=False`` is refused, and ``bind=True`` runs the exchange on
-        the shared session (:meth:`_authenticate_shared`).
+        the shared session, held exclusively for the whole exchange (:meth:`_authenticate_shared`).
 
         Args:
             action: the **SDK method** to call (``signup`` / ``signin``), or ``authenticate``.
@@ -442,16 +444,22 @@ class AuthenticatedUserMixin:
                 raise SurrealDbError(
                     model_auth_unsupported(cls.__name__, label, SurrealDBConnectionManager.get_connection_string())
                 )
-            return await cls._authenticate_shared(action=action, payload=payload, token=token, label=label)
-        payload = _encoding.encode(payload)
+            # One exchange at a time on the one shared session, end to end: see _authenticate_shared().
+            async with SurrealDBConnectionManager._exclusive_embedded_client() as shared:
+                if shared is not None:
+                    return await cls._authenticate_shared(shared, action=action, payload=payload, token=token, label=label)
+            # The URL was re-pointed at a server while this call waited for the engine: serve the
+            # configuration as it is now, as get_client() does.
+            return await cls._authenticate_session(action=action, payload=payload, token=token, bind=bind, label=label)
+        encoded = _encoding.encode(payload)
         async with SurrealDBConnectionManager.ephemeral_client() as client:
             try:
                 tokens: AuthTokens | None = None
                 if token is not None:
                     await client.authenticate(token)
                 else:
-                    assert payload is not None
-                    raw = await getattr(client, action)(payload)
+                    assert encoded is not None
+                    raw = await getattr(client, action)(encoded)
                     access = getattr(raw, "access", None)
                     if not access:
                         raise SurrealDbAuthenticationError(f"The server returned no access token for {label}.")
@@ -472,11 +480,16 @@ class AuthenticatedUserMixin:
             # silently dropped.
             await SurrealDBConnectionManager.authenticate(tokens.access, refresh=tokens.refresh)
 
-        return cls._hydrate_record(record, label), tokens
+        user = cls._hydrate_record(record, label)
+        if bind and token is not None:
+            # authenticate(): the caller's own token, adopted once it resolved to an instance.
+            await SurrealDBConnectionManager.authenticate(token)
+        return user, tokens
 
     @classmethod
     async def _authenticate_shared(
         cls,
+        client: Any,
         *,
         action: str,
         payload: dict[str, Any] | None,
@@ -484,6 +497,12 @@ class AuthenticatedUserMixin:
         label: str,
     ) -> tuple[Any, AuthTokens | None]:
         """``bind=True`` on the embedded engine: the exchange runs on the shared session itself.
+
+        The caller holds the session exclusively
+        (:meth:`SurrealDBConnectionManager._exclusive_embedded_client`), so concurrent ``bind=True``
+        calls — any event loop or thread — run one after the other, each reading back the record
+        *it* signed in and adopting the token that matches the session; the last one wins. Without
+        that, one call's ``info()`` could read the session another call had just signed in.
 
         A failed ``bind=True`` must leave the process as it was — what the server path gets for
         free by running the exchange on a throwaway session. So the record is checked **before**
@@ -493,7 +512,6 @@ class AuthenticatedUserMixin:
         know it.
         """
         payload = _encoding.encode(payload)
-        client = await SurrealDBConnectionManager.get_client()
         tokens: AuthTokens | None = None
         try:
             try:
@@ -512,7 +530,7 @@ class AuthenticatedUserMixin:
                 raise wrap_auth_error(exc, label) from exc
             cls._require_record(record, label)
         except BaseException:
-            await cls._restore_shared_session(label)
+            await cls._restore_shared_session(client, label)
             raise
         adopted = tokens
         if adopted is None:
@@ -524,16 +542,20 @@ class AuthenticatedUserMixin:
         return cls._hydrate_record(record, label), tokens
 
     @classmethod
-    async def _restore_shared_session(cls, label: str) -> None:
+    async def _restore_shared_session(cls, client: Any, label: str) -> None:
         """Put the embedded engine's shared session back after a failed ``bind=True``.
 
         The owner, the configured selection and the **stored** token — the identity before the
         call, since nothing was adopted. If that fails too, the slot's selection is stale, so the
         next ``get_client()`` resets again before handing the client out: the caller gets the
         original error, and the process never keeps running as the refused user.
+
+        Runs inside the caller's exclusive hold of the session, so it resets directly: the guard
+        is not re-entrant. The reset marks the selection stale before its first await, so a
+        cancellation during the restore still leaves the next ``get_client()`` to finish it.
         """
         try:
-            await SurrealDBConnectionManager._restore_embedded_session()
+            await SurrealDBConnectionManager._reset_embedded_session(client)
         except Exception as exc:
             # Never the token: only the type of what failed.
             logger.warning(
@@ -615,12 +637,17 @@ class AuthenticatedUserMixin:
         On the embedded engine (``mem://``, ``surrealkv://<path>`` …) there is no own connection
         to run on — one session per database — so ``bind=True`` is required (without it, a
         :class:`SurrealDbError` before any request): the exchange runs on the shared session,
-        for every event loop and thread of the process. The record is checked before the token
-        is adopted, and a failure puts the stored identity back (else the in-process owner)
-        before raising; an identity set with ``store=False`` is not restored.
+        for every event loop and thread of the process. Concurrent ``bind=True`` calls are
+        **serialised** — each one signs in, reads back its own record and adopts its own token
+        before the next starts — so the returned instance is always the caller's, the stored
+        token always matches the session, and the last call wins. The record is checked before
+        the token is adopted, and a failure puts the stored identity back (else the in-process
+        owner) before raising; an identity set with ``store=False`` is not restored.
 
         Args:
-            bind: adopt the resulting token on the shared connection as well.
+            bind: adopt the resulting token on the shared connection as well. On the embedded
+                engine it is required, and concurrent ``bind=True`` calls run one at a time:
+                the last one wins.
             **fields: the model's fields. The identifier and password fields are required; the
                 rest are optional and reach the server as ``None``.
 
@@ -680,14 +707,10 @@ class AuthenticatedUserMixin:
                 the server, and is normalised here like any other auth failure.
             SurrealDbError: on the embedded engine without ``bind=True``.
         """
-        if SurrealDBConnectionManager.is_embedded():
-            # The exchange runs on the shared session and adopts the token itself: one SDK
-            # authenticate(), not a second one through the manager.
-            user, _ = await cls._authenticate_session(action="authenticate", payload=None, token=token, bind=bind)
-            return user  # type: ignore[no-any-return]
-        user, _ = await cls._authenticate_session(action="authenticate", payload=None, token=token, bind=False)
-        if bind:
-            await SurrealDBConnectionManager.authenticate(token)
+        # On a server, bind=True adopts the token on the shared connection once it resolved to an
+        # instance; on the embedded engine the exchange runs on the shared session and adopts the
+        # token itself — one SDK authenticate(), not a second one through the manager.
+        user, _ = await cls._authenticate_session(action="authenticate", payload=None, token=token, bind=bind)
         return user  # type: ignore[no-any-return]
 
     @classmethod

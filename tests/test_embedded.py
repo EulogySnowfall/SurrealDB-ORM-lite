@@ -28,6 +28,7 @@ from surrealdb.connections.async_embedded import AsyncEmbeddedSurrealConnection
 
 from surreal_orm_lite import (
     AuthenticatedUserMixin,
+    AuthResult,
     AuthTokens,
     Avg,
     BaseSurrealEdge,
@@ -882,29 +883,6 @@ class TestSelectionResetE2E:
             me = await SurrealDBConnectionManager.info()
             assert me is not None
             assert me["email"] == "a@x"
-
-    async def test_restore_embedded_session_puts_the_stored_identity_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        async with embedded() as client:
-            await client.query(_ACCOUNT_DDL)
-            await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)
-            await client.invalidate()  # what a refused bind=True leaves behind: not the stored identity
-            assert await SurrealDBConnectionManager.info() is None
-            calls = _record_calls(monkeypatch, "invalidate", "use", "authenticate")
-            await SurrealDBConnectionManager._restore_embedded_session()
-            assert [name for name, _ in _calls_of(calls, client)] == ["invalidate", "use", "authenticate"]
-            me = await SurrealDBConnectionManager.info()
-            assert me is not None
-            assert me["email"] == "a@x"
-
-    async def test_restore_embedded_session_without_an_engine_is_a_no_op(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        urls = _count_constructions(monkeypatch)
-        SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="t")
-        try:
-            await SurrealDBConnectionManager._restore_embedded_session()
-            assert urls == []
-            assert SurrealDBConnectionManager.is_connected() is False
-        finally:
-            await SurrealDBConnectionManager.unset_connection()
 
     async def test_a_stale_selection_with_a_refused_token_forgets_it(self) -> None:
         async with embedded() as client:
@@ -1890,6 +1868,21 @@ class TestFailedBindEmbeddedE2E:
             assert me is not None
             assert me["email"] == "a@x"
 
+    async def test_the_restore_resets_the_session_to_the_stored_identity(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Owner, selection, then the stored token — on the same engine, nothing closed or reopened."""
+        async with embedded() as client:
+            await client.query(_ACCOUNT_DDL)
+            await _define_locked(client)
+            t1 = (await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)).access
+            urls = _count_constructions(monkeypatch)
+            calls = _record_calls(monkeypatch, "signup", "info", "invalidate", "use", "authenticate", "close")
+            with pytest.raises(SurrealDbAuthenticationError, match="no record"):
+                await EmbLocked.signup(email="l@x", password="p", bind=True)
+            assert [name for name, _ in _calls_of(calls, client)] == ["signup", "info", "invalidate", "use", "authenticate"]
+            assert _calls_of(calls, client, "authenticate") == [("authenticate", (t1,))]
+            assert urls == []
+            assert _slot_client() is client
+
     async def test_a_cancelled_exchange_puts_the_session_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async with _embedded_auth() as client:
             await client.query(_ACCOUNT_DDL)
@@ -1936,6 +1929,92 @@ class TestFailedBindEmbeddedE2E:
             me = await SurrealDBConnectionManager.info()
             assert me is not None
             assert me["email"] == "a@x"
+
+
+def _slow_info(monkeypatch: pytest.MonkeyPatch, delays: list[float]) -> None:
+    """Make the embedded client's ``info()`` wait ``delays[n]`` seconds on its n-th call (then none), so that two
+    concurrent exchanges interleave unless something serialises them."""
+    real_info = AsyncEmbeddedSurrealConnection.info
+    pending = list(delays)
+
+    async def slow_info(self: Any) -> Any:
+        await asyncio.sleep(pending.pop(0) if pending else 0.0)
+        return await real_info(self)
+
+    monkeypatch.setattr(AsyncEmbeddedSurrealConnection, "info", slow_info)
+
+
+class TestConcurrentBindEmbeddedE2E:
+    """D17 under concurrency, no server: concurrent ``bind=True`` exchanges on the one shared session run one at a
+    time, end to end, so each reads back its own record and the last one wins consistently."""
+
+    @pytest.mark.parametrize("delays", [[0.1, 0.0], [0.0, 0.1]], ids=["first-slow", "second-slow"])
+    async def test_each_call_returns_its_own_user(self, monkeypatch: pytest.MonkeyPatch, delays: list[float]) -> None:
+        async with _embedded_auth():
+            await EmbUser.signup(email="alice@x", password="p", bind=True)
+            await EmbUser.signup(email="bob@x", password="p", bind=True)
+            await SurrealDBConnectionManager.invalidate()
+            _slow_info(monkeypatch, delays)
+
+            alice, bob = await asyncio.gather(
+                EmbUser.signin(email="alice@x", password="p", bind=True),
+                EmbUser.signin(email="bob@x", password="p", bind=True),
+            )
+
+            assert alice.user.email == "alice@x"
+            assert bob.user.email == "bob@x"
+            # The last exchange wins, and the stored token is the session's: a replay keeps the identity.
+            token = SurrealDBConnectionManager.get_session_token()
+            assert token in (alice.tokens.access, bob.tokens.access)
+            winner = alice if token == alice.tokens.access else bob
+            me = await SurrealDBConnectionManager.info()
+            assert me is not None
+            assert me["email"] == winner.user.email
+
+    async def test_a_record_less_bind_cannot_pass_on_another_calls_record(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _embedded_auth() as client:
+            await _define_locked(client)
+            await EmbUser.signup(email="alice@x", password="p", bind=True)
+            await SurrealDBConnectionManager.invalidate()
+            _slow_info(monkeypatch, [0.1, 0.0])  # the locked exchange reads its record last
+
+            locked, alice = await asyncio.gather(
+                EmbLocked.signup(email="l@x", password="p", bind=True),
+                EmbUser.signin(email="alice@x", password="p", bind=True),
+                return_exceptions=True,
+            )
+
+            assert isinstance(locked, SurrealDbAuthenticationError)
+            assert "no record" in str(locked)
+            assert isinstance(alice, AuthResult)
+            assert alice.user.email == "alice@x"
+            assert SurrealDBConnectionManager.get_session_token() == alice.tokens.access
+            me = await SurrealDBConnectionManager.info()
+            assert me is not None
+            assert me["email"] == "alice@x"
+
+    async def test_a_url_changed_while_waiting_for_the_engine_is_served_as_configured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A server URL configured meanwhile (another thread) is served as such: the exchange runs on its own
+        server session, never on the embedded one."""
+        real_guard = SurrealDBConnectionManager._embedded_guard
+
+        @contextlib.asynccontextmanager
+        async def switching_guard() -> AsyncIterator[None]:
+            monkeypatch.setattr(SurrealDBConnectionManager, "_embedded_guard", real_guard)  # once
+            SurrealDBConnectionManager.set_connection("ws://127.0.0.1:1/rpc", "root", "root", "ns", "db")
+            async with real_guard():
+                yield
+
+        async with _embedded_auth() as client:
+            calls = _record_calls(monkeypatch, "signin", "info")
+            urls = _count_constructions(monkeypatch)
+            monkeypatch.setattr(SurrealDBConnectionManager, "_embedded_guard", switching_guard)
+            with pytest.raises(SurrealDbConnectionError, match="Can't connect to the database"):
+                await EmbUser.signin(email="b@x", password="p", bind=True)
+            assert urls == ["ws://127.0.0.1:1/rpc"]
+            assert _calls_of(calls, client) == []
 
 
 # README section 26, the comparison tables and the ROADMAP parity notes (spec §11, AC-14; P1, P2, P3, P5)

@@ -665,22 +665,46 @@ class SurrealDBConnectionManager:
         ):
             return client
         async with cls._embedded_guard():
-            if not is_embedded_url(cls.__url):
-                return None
-            cls.require_connection()
-            client = cls.__embedded_client
-            if client is not None and cls.__embedded_url == cls.__url:
-                selection = cls.__embedded_selection
-                if selection == (cls.__namespace, cls.__database):
-                    return client  # selected by whoever held the guard before us
-                if selection is not None:
-                    # A real change of namespace/database, not a stale marker: the stored session
-                    # belongs to the previous selection, and replaying it would move the session back.
-                    cls.clear_session()
-                await cls._reset_embedded_session(client)
-                return client
-            await cls._forget_embedded()
-            return await cls._open_embedded()
+            return await cls._held_embedded_client()
+
+    @classmethod
+    async def _held_embedded_client(cls) -> Any:
+        """:meth:`_acquire_embedded_client` for a caller that holds the guard: the slot's client, opened,
+        re-selected or replaced as needed, or ``None`` when the configured URL is no longer embedded."""
+        if not is_embedded_url(cls.__url):
+            return None
+        cls.require_connection()
+        client = cls.__embedded_client
+        if client is not None and cls.__embedded_url == cls.__url:
+            selection = cls.__embedded_selection
+            if selection == (cls.__namespace, cls.__database):
+                return client  # selected by whoever held the guard before us
+            if selection is not None:
+                # A real change of namespace/database, not a stale marker: the stored session
+                # belongs to the previous selection, and replaying it would move the session back.
+                cls.clear_session()
+            await cls._reset_embedded_session(client)
+            return client
+        await cls._forget_embedded()
+        return await cls._open_embedded()
+
+    @classmethod
+    @contextlib.asynccontextmanager
+    async def _exclusive_embedded_client(cls) -> AsyncIterator[Any]:
+        """Hold the embedded engine's shared session for one identity exchange: model-level ``bind=True``.
+
+        Yields the slot's client as :meth:`get_client` hands it out, with the guard held for the whole block:
+        the exchange, the read-back of its record, the adoption of its token — or the restore after a failure —
+        run as one step. Two exchanges on the one session would otherwise interleave, one reading back the
+        record the other signed in; so would a selection reset or an ``embedded_database()`` block. Yields
+        ``None`` when the configured URL stopped being embedded while this call waited (the caller then serves
+        the configuration as it is now).
+
+        The guard is not re-entrant: inside the block, put a session back with
+        :meth:`_reset_embedded_session`, never with a guarded method such as :meth:`get_client`.
+        """
+        async with cls._embedded_guard():
+            yield await cls._held_embedded_client()
 
     @classmethod
     async def _open_embedded(cls) -> Any:
@@ -709,7 +733,9 @@ class SurrealDBConnectionManager:
         configured namespace and database (``use()``), then replay the stored session, if any. Until
         that succeeds the slot's selection is stale, so nobody takes the fast path meanwhile and the
         next :meth:`get_client` resets again: the client is never handed out on a new selection with
-        the previous identity, and nothing is closed (no ``mem://`` data lost).
+        the previous identity, and nothing is closed (no ``mem://`` data lost). Model-level auth calls
+        it inside :meth:`_exclusive_embedded_client` to put the stored identity back after a failed
+        ``bind=True``.
 
         :raises SurrealDbConnectionError: ``invalidate()`` or ``use()`` failed (never retryable), or
             the replay hit a connection failure; the selection stays stale.
@@ -742,23 +768,6 @@ class SurrealDBConnectionManager:
             raise
         cls._stamp_identity(client, fingerprint=replayed, replayable=True)
         cls.__embedded_selection = (namespace, database)
-
-    @classmethod
-    async def _restore_embedded_session(cls) -> None:
-        """Put the stored identity back on the embedded engine's shared session (owner, selection,
-        stored token) — what model-level auth does after a failed ``bind=True``. A no-op when the
-        slot is empty.
-
-        The selection is marked stale before waiting for the guard: should this call be cancelled
-        while it waits, the next :meth:`get_client` still resets the session before handing the
-        client out, so the process never keeps running as the refused identity.
-        """
-        if cls.__embedded_client is not None:
-            cls.__embedded_selection = None
-        async with cls._embedded_guard():
-            client = cls.__embedded_client
-            if client is not None:
-                await cls._reset_embedded_session(client)
 
     @classmethod
     @contextlib.asynccontextmanager
