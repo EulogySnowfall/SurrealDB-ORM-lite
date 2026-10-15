@@ -22,7 +22,7 @@ from uuid import UUID
 
 import pytest
 import surrealdb
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 from surrealdb import RecordID
 from surrealdb.cbor import undefined
@@ -1293,6 +1293,12 @@ class RfOddHolder(BaseSurrealModel):
     std_column: RfStdData | None = Field(default=None, alias="stdCol")
     picked: Annotated[RfPlainSub | RfSub | None, Field(union_mode="left_to_right")] = None
     pet: RfCat | RfDog | None = Field(default=None, discriminator="kind")
+    n: int = 0
+
+
+#: Row additions for the tests that cover both paths of a write sync: the whole row validates (``{}``), or it
+#: does not (``n``) and each sub-model field is validated alone, against its own annotation.
+_ROW_PATHS = pytest.mark.parametrize("extra", [{}, {"n": "x"}], ids=["whole-row", "field-alone"])
 
 
 class TestSubModelSyncRule:
@@ -1393,8 +1399,9 @@ class TestSubModelSyncRule:
         odd._apply_record({"td_sub": raw})
         assert odd.td_sub is raw
 
+    @_ROW_PATHS
     @pytest.mark.parametrize("key", ["ttl", "ttlCol"])
-    def test_aliased_sub_model_keys_follow_the_read(self, key: str) -> None:
+    def test_aliased_sub_model_keys_follow_the_read(self, key: str, extra: dict[str, Any]) -> None:
         """What ``get()`` accepts in a sub-model, under its alias or its name, the sync accepts; nothing else."""
         raw = {key: surrealdb.Duration(5)}
         for field in ("aliased", "strict_aliased"):
@@ -1403,7 +1410,7 @@ class TestSubModelSyncRule:
             except ValidationError:
                 expected = raw
             odd = RfOddHolder()
-            odd._apply_record({field: raw})
+            odd._apply_record({field: raw, **extra})
             got = getattr(odd, field)
             assert got == expected and type(got) is type(expected), (field, got)
             if type(got) is not dict:
@@ -1420,14 +1427,16 @@ class TestSubModelSyncRule:
         odd._apply_record({"boom": raw})
         assert odd.boom is raw
 
-    def test_the_model_config_reaches_a_stdlib_dataclass(self) -> None:
+    @_ROW_PATHS
+    def test_the_model_config_reaches_a_stdlib_dataclass(self, extra: dict[str, Any]) -> None:
         """A stdlib dataclass takes the model's config (``str_strip_whitespace``) in a read and in a write sync alike."""
         assert RfOddHolder.model_validate({"std": {"name": "  ada  "}}).std == RfStdData("ada")
         odd = RfOddHolder()
-        odd._apply_record({"std": {"name": "  ada  "}, "stdCol": {"name": " bob "}})
+        odd._apply_record({"std": {"name": "  ada  "}, "stdCol": {"name": " bob "}, **extra})
         assert odd.std == RfStdData("ada") and odd.std_column == RfStdData("bob")
 
-    def test_field_metadata_is_kept(self) -> None:
+    @_ROW_PATHS
+    def test_field_metadata_is_kept(self, extra: dict[str, Any]) -> None:
         """The field's own metadata reaches the adapter: ``left_to_right`` picks the first member that validates.
 
         The smart mode would pick ``RfSub``, which sets more fields from the row.
@@ -1435,19 +1444,20 @@ class TestSubModelSyncRule:
         assert RfOddHolder.model_fields["picked"].metadata, "the union mode lives in the field's metadata"
         raw = {"name": "p", "ttl": surrealdb.Duration(5), "hours": surrealdb.Range(None, None)}
         odd = RfOddHolder()
-        odd._apply_record({"picked": raw})
+        odd._apply_record({"picked": raw, **extra})
         assert type(odd.picked) is RfPlainSub and odd.picked == RfOddHolder.model_validate({"picked": raw}).picked
 
-    def test_the_discriminator_is_kept(self) -> None:
+    @_ROW_PATHS
+    def test_the_discriminator_is_kept(self, extra: dict[str, Any]) -> None:
         """A tagged union reads the tag, as in a read: the smart mode would take an untagged row for a cat."""
         dog = {"kind": "dog", "ttl": surrealdb.Duration(5)}
         odd = RfOddHolder()
-        odd._apply_record({"pet": dog})
+        odd._apply_record({"pet": dog, **extra})
         assert type(odd.pet) is RfDog and type(odd.pet.ttl) is Duration
         untagged = {"ttl": surrealdb.Duration(5)}
         with pytest.raises(ValidationError):
             RfOddHolder.model_validate({"pet": untagged})
-        odd._apply_record({"pet": untagged})
+        odd._apply_record({"pet": untagged, **extra})
         assert odd.pet is untagged
 
     def test_adapters_are_built_once_on_first_use(self) -> None:
@@ -1456,11 +1466,14 @@ class TestSubModelSyncRule:
 
             id: str | None = None
             sub: RfPlainSub | None = None
+            n: int = 0
 
-        assert RfLazy not in model_base._SYNC_ADAPTERS
         lazy = RfLazy()
         lazy._apply_record({"sub": {"name": "a"}})
         assert type(lazy.sub) is RfPlainSub and lazy.sub == RfPlainSub(name="a")
+        assert RfLazy not in model_base._SYNC_ADAPTERS, "a row that validates needs no adapter"
+        lazy._apply_record({"sub": {"name": "b"}, "n": "x"})  # the row fails (``n``): ``sub`` is validated alone
+        assert type(lazy.sub) is RfPlainSub and lazy.sub == RfPlainSub(name="b") and lazy.n == "x"
         adapter = model_base._SYNC_ADAPTERS[RfLazy]["sub"]
         assert adapter is not None and RfLazy._sync_adapter("sub") is adapter
         assert RfLazy._sync_adapter("id") is None, "a field the sync does not validate has no adapter"
@@ -1471,6 +1484,7 @@ class TestSubModelSyncRule:
 
             id: str | None = None
             sub: RfPlainSub | None = None
+            n: int = 0
 
         def refuse(*args: Any, **kwargs: Any) -> Any:
             raise TypeError("no adapter")
@@ -1478,7 +1492,7 @@ class TestSubModelSyncRule:
         monkeypatch.setattr(model_base, "TypeAdapter", refuse)
         raw = {"name": "a"}
         unbuildable = RfUnbuildable()
-        unbuildable._apply_record({"sub": raw})
+        unbuildable._apply_record({"sub": raw, "n": "x"})
         assert unbuildable.sub is raw and RfUnbuildable._sync_adapter("sub") is None
 
     def test_an_unresolved_sub_model_keeps_the_value(self) -> None:
@@ -1516,6 +1530,193 @@ class TestSubModelWriteSyncE2E:
             assert rid is not None
             _assert_sub_models_native(await _raw(rid))
             _assert_sub_models(await RfHolder.objects().get(holder.get_raw_id()))
+
+
+# --- a write sync runs the model's own validators, as a read does (#228) --------------------------
+
+
+class RfSettings(BaseModel):
+    """Settings stored under ``theme`` by an older version of the app; the holding model migrates them."""
+
+    color_theme: str = "light"
+    font: int = 12
+
+
+class RfProfile(BaseSurrealModel):
+    """A model that migrates its sub-model's old shape in a ``mode="before"`` validator, in place, as is common."""
+
+    model_config = SurrealConfigDict(table_name="rf_profile")
+
+    id: str | None = None
+    settings: RfSettings = RfSettings()
+    name: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_theme(cls, data: Any) -> Any:
+        if isinstance(data, dict) and isinstance(data.get("settings"), dict) and "theme" in data["settings"]:
+            data["settings"]["color_theme"] = data["settings"].pop("theme")
+        return data
+
+
+class RfClamped(BaseModel):
+    n: int
+
+
+class RfClamping(BaseSurrealModel):
+    """A model whose own ``field_validator`` reshapes its sub-model after Pydantic built it."""
+
+    model_config = SurrealConfigDict(table_name="rf_clamping")
+
+    id: str | None = None
+    sub: RfClamped | None = None
+    name: str = ""
+
+    @field_validator("sub", mode="after")
+    @classmethod
+    def _clamp(cls, value: RfClamped | None) -> RfClamped | None:
+        return value if value is None or value.n <= 10 else RfClamped(n=10)
+
+
+class RfNamed(BaseSurrealModel):
+    """A model whose own validators touch other fields only: its sub-model is validated alone when the row fails."""
+
+    model_config = SurrealConfigDict(table_name="rf_named")
+
+    id: str | None = None
+    sub: RfPlainSub | None = None
+    name: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def _no_bad_name(cls, value: str) -> str:
+        if value == "bad":
+            raise ValueError("bad name")
+        return value
+
+
+class RfStarred(BaseSurrealModel):
+    """A ``field_validator("*")`` reaches the sub-model field too."""
+
+    model_config = SurrealConfigDict(table_name="rf_starred")
+
+    id: str | None = None
+    sub: RfPlainSub | None = None
+    n: int = 0
+
+    @field_validator("*")
+    @classmethod
+    def _keep(cls, value: Any) -> Any:
+        return value
+
+
+class RfPostInit(BaseSurrealModel):
+    """A ``model_post_init`` hook may reshape any field, as a model validator does."""
+
+    model_config = SurrealConfigDict(table_name="rf_post_init")
+
+    id: str | None = None
+    sub: RfPlainSub | None = None
+    n: int = 0
+
+    def model_post_init(self, context: Any, /) -> None:
+        if self.sub is not None and not self.sub.name:
+            self.sub = self.sub.model_copy(update={"name": "unnamed"})
+
+
+#: A stored ``RfProfile`` row in the old shape.
+_OLD_SETTINGS: dict[str, Any] = {"theme": "dark", "font": 14}
+
+
+class TestSubModelSyncFollowsTheRead:
+    """#228 (unit): the sync gives what ``get()`` gives, and keeps the value as received when it cannot know it."""
+
+    def test_a_migrating_model_validator_runs(self) -> None:
+        profile = RfProfile(id="p")
+        row = {"id": RecordID("rf_profile", "p"), "settings": dict(_OLD_SETTINGS), "name": "x"}
+        profile._apply_record(row)
+        expected = RfProfile.model_validate({"settings": dict(_OLD_SETTINGS)}).settings
+        assert profile.settings == RfSettings(color_theme="dark", font=14) == expected
+        # The row is neither mutated by the validators nor rid of its native id.
+        assert row == {"id": RecordID("rf_profile", "p"), "settings": _OLD_SETTINGS, "name": "x"}
+        assert type(profile.id) is RecordID and profile.name == "x"
+
+    def test_a_field_validator_of_the_model_runs(self) -> None:
+        clamping = RfClamping()
+        clamping._apply_record({"sub": {"n": 50}})
+        assert clamping.sub == RfClamped(n=10) == RfClamping.model_validate({"sub": {"n": 50}}).sub
+
+    def test_a_row_that_fails_keeps_what_a_model_validator_may_reshape(self) -> None:
+        """The row fails (``name``), and the model's own ``mode="before"`` validator may reshape anything: as received."""
+        profile = RfProfile()
+        profile._apply_record({"settings": dict(_OLD_SETTINGS), "name": 3})
+        assert profile.settings == _OLD_SETTINGS and profile.name == 3
+
+    def test_a_row_that_fails_keeps_what_a_field_validator_may_reshape(self) -> None:
+        clamping = RfClamping()
+        clamping._apply_record({"sub": {"n": 50}, "name": 3})
+        assert clamping.sub == {"n": 50}
+        starred = RfStarred()
+        starred._apply_record({"sub": {"name": "a"}, "n": "x"})
+        assert starred.sub == {"name": "a"}
+
+    def test_a_row_that_fails_keeps_what_model_post_init_may_reshape(self) -> None:
+        assert RfPostInit.model_validate({"sub": {"name": ""}}).sub == RfPlainSub(name="unnamed")
+        post_init = RfPostInit()
+        post_init._apply_record({"sub": {"name": ""}})
+        assert post_init.sub == RfPlainSub(name="unnamed"), "the row validates: the hook ran"
+        post_init._apply_record({"sub": {"name": ""}, "n": "x"})
+        assert post_init.sub == {"name": ""}
+
+    def test_a_row_that_fails_still_validates_the_other_sub_models(self) -> None:
+        """Validators on other fields, and the ORM's own (``set_data``, ``check_config``), leave the field to its adapter."""
+        named = RfNamed()
+        named._apply_record({"sub": {"name": "a"}, "name": "bad"})
+        assert named.sub == RfPlainSub(name="a") and named.name == "bad"
+        holder = RfHolder(id="h", **HOLDER)
+        holder._apply_record({"id": RecordID("rf_holder", "h"), "plain": {"name": "q"}, "n": "x"})
+        assert holder.plain == RfPlainSub(name="q") and holder.n == "x"
+
+    def test_reshaping_validators_are_found_once_per_class(self) -> None:
+        assert RfProfile._sync_reshaped() is model_base._ALL_FIELDS
+        assert RfPostInit._sync_reshaped() is model_base._ALL_FIELDS
+        assert RfStarred._sync_reshaped() is model_base._ALL_FIELDS
+        assert RfClamping._sync_reshaped() == frozenset({"sub"})
+        assert RfNamed._sync_reshaped() == frozenset({"name"})
+        assert RfHolder._sync_reshaped() == frozenset() and RfHolder._sync_reshaped() is RfHolder._sync_reshaped()
+
+
+class TestSubModelSyncValidatorsE2E:
+    """#228: a write sync gives what ``get()`` gives when the model's own validators reshape a sub-model."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sync", ["refresh", "merge"])
+    async def test_a_migrating_model_validator_keeps_the_stored_choice(self, sync: str) -> None:
+        async with orm_client("rf_profile") as client:
+            rid = RecordID("rf_profile", "p")
+            await client.query("CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": {"settings": _OLD_SETTINGS}})
+            profile = await RfProfile.objects().get("p")
+            assert profile.settings == RfSettings(color_theme="dark", font=14)
+            if sync == "refresh":
+                await profile.refresh()
+            else:
+                await profile.merge(name="x")
+            assert profile.settings == RfSettings(color_theme="dark", font=14)
+            await profile.update()
+            assert (await _raw(rid))["settings"] == {"color_theme": "dark", "font": 14}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("sync", ["refresh", "merge"])
+    async def test_a_field_validator_of_the_model_gives_what_a_read_gives(self, sync: str) -> None:
+        async with orm_client("rf_clamping") as client:
+            rid = RecordID("rf_clamping", "c")
+            await client.query("CREATE $rid CONTENT $c RETURN NONE;", {"rid": rid, "c": {"sub": {"n": 50}}})
+            clamping = await RfClamping.objects().get("c")
+            if sync == "refresh":
+                await clamping.refresh()
+            else:
+                await clamping.merge(name="x")
+            assert clamping.sub == (await RfClamping.objects().get("c")).sub == RfClamped(n=10)
 
 
 class TestAuthReadE2E:
