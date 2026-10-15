@@ -9,7 +9,7 @@ the assertions here are made by mypy, not at runtime.
 """
 
 from datetime import timedelta
-from typing import Any
+from typing import Any, assert_type
 
 from surrealdb import RecordID
 
@@ -31,10 +31,12 @@ from surreal_orm_lite import (
     PolygonField,
     Range,
     SurrealConfigDict,
+    SurrealDBConnectionManager,
     SurrealFunc,
     Transaction,
     computed,
 )
+from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
 
 
 class Player(BaseSurrealModel):
@@ -237,3 +239,60 @@ def place_longitude(store: TypedPlace) -> float:
 def entrance_latitude(store: TypedPlace) -> float:
     """A class annotation types as the class."""
     return store.entrance.latitude
+
+
+def configure_embedded() -> None:
+    """v0.25.0: an embedded URL needs no credentials — ``user``/``password`` are optional keywords."""
+    SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="t")
+
+
+def configure_server() -> None:
+    """The five positional arguments of earlier versions still type-check."""
+    SurrealDBConnectionManager.set_connection("ws://localhost:8000/rpc", "root", "root", "ns", "db")
+
+
+def embedded_flag() -> bool:
+    """``is_embedded()`` is a classmethod returning a real ``bool``."""
+    flag = SurrealDBConnectionManager.is_embedded()
+    assert_type(flag, bool)
+    return flag
+
+
+async def isolated() -> None:
+    """``embedded_database()`` is an async context manager yielding the SDK client, typed ``Any``."""
+    async with embedded_database() as client:
+        assert_type(client, Any)
+        await client.query("RETURN 1;")
+    async with embedded_database("surrealkv://test.db", namespace="n", database="d"):
+        pass
+
+
+class TypedMember(BaseSurrealModel):
+    """v0.25.0: the model a fixture class declares instances of."""
+
+    id: str | None = None
+    name: str
+
+
+@fixture
+class Typed(SurrealFixture):
+    """``@fixture`` gives the class back unchanged: ``Typed.load()`` stays typed ``Typed``."""
+
+    alice = TypedMember(name="Alice")
+
+
+def fixture_returns_its_argument() -> None:
+    """Called directly, ``fixture()`` returns the class it was given.
+
+    mypy ignores a class decorator's return type, so the decorated form above cannot catch a ``fixture()``
+    annotated to return ``type[SurrealFixture]``; this call can.
+    """
+    assert_type(fixture(Typed), type[Typed])
+
+
+async def uses_fixture() -> str:
+    """``load()`` yields the subclass (``Self``), so a declared instance keeps its model type."""
+    async with Typed.load() as data:
+        assert_type(data, Typed)
+        assert_type(data.alice, TypedMember)
+        return data.alice.name
