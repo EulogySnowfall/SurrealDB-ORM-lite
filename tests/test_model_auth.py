@@ -9,7 +9,17 @@ from typing import Any, Literal
 from uuid import uuid4
 
 import pytest
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    AliasPath,
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_core import PydanticCustomError
 
 from surreal_orm_lite import (
@@ -641,6 +651,22 @@ class ShapedMisfit(AuthenticatedUserMixin, BaseSurrealModel):
         return value
 
 
+class _StrictPrefs(BaseModel):
+    """A sub-model that forbids keys it does not declare: its ``loc`` is ``(field, record key)``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    theme: str = "dark"
+
+
+def _assert_not_quoted(error: BaseException, *secrets: str) -> None:
+    """None of *secrets* reaches the error's text or a formatted traceback of it."""
+    rendered = {"str": str(error), "traceback": "".join(traceback.format_exception(error))}
+    for where, text in rendered.items():
+        for secret in secrets:
+            assert secret not in text, (where, secret)
+
+
 #: What the error says about the shared session when the record does not fit the model.
 _NOW_BOUND = "The shared session is now signed in as that record"
 _UNCHANGED = "The shared session keeps its previous identity"
@@ -760,6 +786,83 @@ class TestMisfitRecordMessage:
         message = str(raised.value)
         assert "(nickname: missing; (undeclared field): extra_forbidden)" in message
         assert "SECRETCOLUMN" not in message and "OTHERCOLUMN" not in message
+
+    def test_a_typed_extra_is_listed_without_its_key(self) -> None:
+        """With ``extra="allow"`` and typed extras, Pydantic's ``loc`` of an extra that does not fit is the
+        record's own key: a key the model does not declare is never named."""
+
+        class TypedExtraMisfit(E2EMisfit):
+            model_config = SurrealConfigDict(table_name="E2EUser", access_name="e2e_acct", extra="allow")
+            __pydantic_extra__: dict[str, int] = Field(init=False)
+
+        record = {"email": "a@b.c", "password": "c2VjcmV0", "nickname": "n", "SECRETCOLUMN": "SECRETVALUE"}
+        with pytest.raises(SurrealDbError) as raised:
+            TypedExtraMisfit._hydrate_record(record, "signin", bound=False)
+        assert "((undeclared field): int_parsing)" in str(raised.value)
+        _assert_not_quoted(raised.value, "SECRETCOLUMN", "SECRETVALUE", "c2VjcmV0", "a@b.c")
+
+    def test_a_model_validator_validating_a_dict_does_not_name_its_keys(self) -> None:
+        """A model validator that validates a dict itself raises errors whose ``loc`` starts with that dict's
+        key, not with a field of the model: it is listed as an undeclared field."""
+
+        class DictCheckMisfit(E2EMisfit):
+            prefs: dict[str, Any] = {}
+
+            @model_validator(mode="after")
+            def _check_prefs(self) -> "DictCheckMisfit":
+                TypeAdapter(dict[str, int]).validate_python(self.prefs)
+                return self
+
+        record = {"email": "a@b.c", "password": "c2VjcmV0", "nickname": "n", "prefs": {"SECRETKEYNAME": "SECRETVALUE"}}
+        with pytest.raises(SurrealDbError) as raised:
+            DictCheckMisfit._hydrate_record(record, "signin", bound=False)
+        assert "((undeclared field): int_parsing)" in str(raised.value)
+        _assert_not_quoted(raised.value, "SECRETKEYNAME", "SECRETVALUE", "c2VjcmV0", "a@b.c")
+
+    def test_a_forbidden_key_of_a_sub_model_is_listed_under_its_field(self) -> None:
+        """A sub-model that forbids a key reports ``(field, record key)``: the declared field is named, the key
+        is not."""
+
+        class SubStrictMisfit(E2EMisfit):
+            prefs: _StrictPrefs | None = None
+
+        record = {
+            "email": "a@b.c",
+            "password": "c2VjcmV0",
+            "nickname": "n",
+            "prefs": {"theme": "light", "SECRETKEYNAME": "SECRETVALUE"},
+        }
+        with pytest.raises(SurrealDbError) as raised:
+            SubStrictMisfit._hydrate_record(record, "signin", bound=False)
+        assert "(prefs: extra_forbidden)" in str(raised.value)
+        _assert_not_quoted(raised.value, "SECRETKEYNAME", "SECRETVALUE", "c2VjcmV0", "a@b.c", "(undeclared field)")
+
+    def test_an_aliased_field_is_listed_under_the_name_it_was_read_by(self) -> None:
+        """Pydantic reports an aliased field under the key it read: an ``alias``, the first key of an
+        ``AliasPath``, the choice of an ``AliasChoices`` (an ``AliasPath`` among them too). Each is a name the
+        model declares, so it is listed; the values are not."""
+
+        class AliasedMisfit(E2EMisfit):
+            nick: int = Field(default=0, alias="nickName")
+            level: int = Field(default=0, validation_alias=AliasPath("meta", "level"))
+            score: int = Field(default=0, validation_alias=AliasChoices("score", "points"))
+            rank: int = Field(default=0, validation_alias=AliasChoices("rank", AliasPath("stats", "rank")))
+
+        record = {
+            "email": "a@b.c",
+            "password": "c2VjcmV0",
+            "nickname": "n",
+            "nickName": "SECRETNICK",
+            "meta": {"level": "SECRETLEVEL"},
+            "points": "SECRETPOINTS",
+            "stats": {"rank": "SECRETRANK"},
+        }
+        with pytest.raises(SurrealDbError) as raised:
+            AliasedMisfit._hydrate_record(record, "signin", bound=False)
+        message = str(raised.value)
+        assert "(nickName: int_parsing; meta: int_parsing; points: int_parsing; stats: int_parsing)" in message
+        assert "(undeclared field)" not in message
+        _assert_not_quoted(raised.value, "SECRETNICK", "SECRETLEVEL", "SECRETPOINTS", "SECRETRANK", "c2VjcmV0", "a@b.c")
 
     def test_another_failure_is_named_by_its_type_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def refuse(record: Any) -> Any:

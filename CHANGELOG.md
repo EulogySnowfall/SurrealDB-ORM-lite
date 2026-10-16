@@ -122,8 +122,9 @@ third minor of Tier 2.
   shared session kept its previous identity or is now signed in as that record (for `refresh()`,
   also that the refresh token passed in is spent and whether the new pair is kept), and it names
   the fields that do not fit and Pydantic's error codes (`nickname: missing; prefs: int_parsing`),
-  and quotes no value from the record. The Pydantic `ValidationError` is its `__context__` instead
-  of its `__cause__`.
+  and quotes nothing from the record: no value, and no key the model does not declare (listed as
+  `(undeclared field)`). The Pydantic `ValidationError` is its `__context__` instead of its
+  `__cause__`.
 
 ### Notes
 

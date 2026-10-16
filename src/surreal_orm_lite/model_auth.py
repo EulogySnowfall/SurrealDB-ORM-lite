@@ -28,7 +28,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from pydantic import ValidationError
+from pydantic import AliasChoices, AliasPath, ValidationError
 
 from . import encoding as _encoding
 from .auth import AuthTokens, build_auth_payload, wrap_auth_error
@@ -59,26 +59,58 @@ _HASH_ALGORITHMS = frozenset({"argon2", "bcrypt", "pbkdf2", "scrypt"})
 _DURATION_RE = re.compile(r"^\d+(ns|us|ms|s|m|h|d|w|y)$")
 
 
-def _misfit_details(exc: Exception) -> str:
-    """Which fields of a record do not fit the model, without anything taken from the record.
+def _alias_keys(alias: str | AliasPath | AliasChoices | None) -> set[str]:
+    """The top-level keys of a record a ``validation_alias`` reads: the string, the first key of an
+    ``AliasPath``, those of each ``AliasChoices`` choice."""
+    if isinstance(alias, str):
+        return {alias}
+    if isinstance(alias, AliasPath):
+        return {alias.path[0]} if alias.path and isinstance(alias.path[0], str) else set()
+    if isinstance(alias, AliasChoices):
+        return {key for choice in alias.choices for key in _alias_keys(choice)}
+    return set()
+
+
+def _declared_keys(model: Any) -> frozenset[str]:
+    """Every top-level key under which *model* reads a field: its name, ``alias`` and validation aliases.
+
+    These come from the model, never from the record, so naming one quotes nothing from the record.
+    """
+    keys: set[str] = set()
+    for name, field in getattr(model, "model_fields", {}).items():
+        keys.add(name)
+        if field.alias:
+            keys.add(field.alias)
+        keys |= _alias_keys(field.validation_alias)
+    return frozenset(keys)
+
+
+def _misfit_details(exc: Exception, model: Any) -> str:
+    """Which fields of a record do not fit *model*, without anything taken from the record.
 
     Each top-level field a Pydantic ``ValidationError`` reports, once and in order, with Pydantic's
-    error codes (``nickname: missing; prefs: int_parsing``); ``(record)`` for an error of the whole
-    record (a model validator) and ``(undeclared field)`` for a key the model forbids
-    (``extra="forbid"``), whose name comes from the record. Nothing else is read from the error: a
-    deeper ``loc`` part can be a key of the record, and a message can quote one of its values (an
-    unknown discriminator tag, a validator's own text). Any other exception is named by its type
-    alone, since its text may quote the record too.
+    error codes (``nickname: missing; prefs: int_parsing``). A field is named only by a key *model*
+    declares (a field name, ``alias`` or validation alias, :func:`_declared_keys`): the first part of
+    ``loc`` is otherwise a key of the record — an extra the model forbids (``extra="forbid"``), a typed
+    extra (``extra="allow"`` with ``__pydantic_extra__``), a dict a model validator validates itself —
+    and is listed as ``(undeclared field)``. A key the model forbids is that placeholder too, even one
+    spelled like a declared name; inside a declared field (a sub-model that forbids it), the field is
+    named. ``(record)`` is an error of the whole record (a model validator). Nothing else is read from
+    the error: a deeper ``loc`` part can be a key of the record, and a message can quote one of its
+    values (an unknown discriminator tag, a validator's own text). Any other exception is named by its
+    type alone, since its text may quote the record too.
     """
     if isinstance(exc, ValidationError):
+        declared = _declared_keys(model)
         codes: dict[str, list[str]] = {}
         for error in exc.errors(include_url=False, include_context=False, include_input=False):
-            if error["type"] == "extra_forbidden":
-                field = "(undeclared field)"
-            elif error["loc"]:
-                field = str(error["loc"][0])
-            else:
+            loc = error["loc"]
+            if not loc:
                 field = "(record)"
+            elif loc[0] in declared and not (error["type"] == "extra_forbidden" and len(loc) == 1):
+                field = str(loc[0])
+            else:
+                field = "(undeclared field)"
             field_codes = codes.setdefault(field, [])
             if error["type"] not in field_codes:
                 field_codes.append(error["type"])
@@ -629,11 +661,12 @@ class AuthenticatedUserMixin:
 
         A record that does not fit raises a :class:`SurrealDbError` that names the fields that do
         not fit and Pydantic's error codes (``nickname: missing; prefs: int_parsing``), and quotes
-        **no value from the record**: Pydantic's own text does (``input_value=…``, the whole record
-        for a missing field; a dict key in ``loc``; an unknown discriminator tag or a validator's
-        own text in the message), and a user's record carries the password hash. For the same
-        reason the validation error is not chained as the cause, so a logged traceback does not
-        print it; it stays reachable as ``__context__``.
+        **nothing from the record** — no value, and no key the model does not declare (listed as
+        ``(undeclared field)``): Pydantic's own text does (``input_value=…``, the whole record for a
+        missing field; a record key in ``loc``; an unknown discriminator tag or a validator's own
+        text in the message), and a user's record carries the password hash. For the same reason
+        the validation error is not chained as the cause, so a logged traceback does not print it;
+        it stays reachable as ``__context__``.
 
         :param bound: whether the shared session holds the exchange's new identity when the record
             turns out not to fit: ``signup()``/``signin()``/``refresh()`` with ``bind=True``, whose
@@ -663,7 +696,7 @@ class AuthenticatedUserMixin:
                 }.get(label, "")
             raise SurrealDbError(
                 f"{cls.__name__}.{label}() succeeded but the returned record does not fit the "
-                f"model, so no instance could be built ({_misfit_details(exc)}). {session}{aftermath} "
+                f"model, so no instance could be built ({_misfit_details(exc, cls)}). {session}{aftermath} "
                 f"— reconcile the model with the table rather than retrying."
             ) from None
 
