@@ -60,7 +60,9 @@ fourth minor of Tier 2.
   request, and `bulk_create()` refuses a snapshot in its list. `refresh()` turns a snapshot back
   into the current record; `Product(**snapshot.model_dump()).update()` (or `.save()` for a record
   deleted since, or `.upsert()`) writes a past state back. `model_copy()` and `pickle` keep the
-  snapshot, and a snapshot is never `==` the current instance (compare `model_dump()`s).
+  snapshot, and a snapshot is never `==` the current instance (compare `model_dump()`s). A record
+  model nested in a snapshot's fields is a snapshot too, such as a link `fetch()` resolves into a
+  model-typed field on SurrealDB 3.x; its own `refresh()` makes it the current record.
 - **Refusals before any request.** On a queryset with `as_of()`: `bulk_create()`, `bulk_update()`,
   `bulk_delete()`, `patch()`, `update_or_create()`, `get_or_create()`, `delete_table()`, `query()`,
   `live()`, `watch()` and `changes()` raise `SurrealDbError`; `Model.objects(tx=...).as_of(...)`
@@ -94,10 +96,10 @@ fourth minor of Tier 2.
   state, and the ORM cannot tell which storage the server runs. Start 2.x with
   `surrealkv+versioned://` for time travel. SurrealDB 2.x on RocksDB refuses `VERSION`
   (`SurrealDbError`).
-- **Record links**: `fetch()` resolves links as they were on SurrealDB 3.x. On SurrealDB 2.x
-  (servers and the SDK 2.x embedded engine) they resolve to their current state, so `exec()`,
-  `first()` and `get()` without an id refuse `fetch()` under `as_of()`; a dotted path through a
-  link reads the current value there.
+- **Record links**: `fetch()` resolves links as they were on SurrealDB 3.x, into read-only
+  snapshots. On SurrealDB 2.x (servers and the SDK 2.x embedded engine) they resolve to their
+  current state, so `exec()`, `first()` and `get()` without an id refuse `fetch()` under
+  `as_of()`; a dotted path through a link reads the current value there.
 - **Writing history at a past moment** is left to raw queries (`CREATE … VERSION d'…'`, one
   statement per `client.query()` call): stored at that moment and readable with `as_of()` on
   SurrealDB 2.x and the embedded engine; accepted but not readable at that moment on SurrealDB 3.x.
