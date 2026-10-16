@@ -4,13 +4,17 @@ SurrealQL's ``SELECT … VERSION $_as_of`` on every QuerySet read, with a per-re
 rows and aggregates right on both server lines; read-only snapshots; clear ORM errors for stores that keep
 no history. Unit tests first (value normalisation, bounds, messages, compiled text: no engine, no server);
 the classes that open an engine or a server are suffixed ``E2E``. Most E2E classes need no server at all:
-the embedded ``surrealkv+versioned://`` engine runs in-process.
+the embedded ``surrealkv+versioned://`` engine runs in-process. The server classes come last: the server of
+``SURREALDB_PORT``, started in memory (no history), and one started with versioned storage, found through
+``SURREALDB_VERSIONED_PORT`` (``SURREALDB_VERSIONED_HOST``, default ``SURREALDB_HOST``), skipped without it.
 """
 
+import asyncio
 import contextlib
 import enum
 import inspect
 import itertools
+import os
 import pickle
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, date, datetime, timedelta, timezone
@@ -49,6 +53,7 @@ from surreal_orm_lite.embedded import history_unsupported, keeps_history, url_ki
 from surreal_orm_lite.model_base import _snapshot_moment
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.time_travel import MAX_MOMENT, MIN_MOMENT, AsOf, in_range, line_major, normalise_as_of
+from tests.conftest import orm_client
 
 # --- shared models and moments (later tasks reuse them) --------------------------------------------
 
@@ -1702,3 +1707,290 @@ class TestFetchByLineE2E:
             with pytest.raises(SurrealDbError, match="keeps none"):
                 await Snap.objects().as_of(M2021).fetch("author").exec()
         assert versions == []
+
+
+# --- server lines: in memory (CI as today) and on versioned storage (AC-12 to AC-15, AC-22 (c) and (d)) ----
+
+
+def _server_host() -> str:
+    return os.environ.get("SURREALDB_HOST", "localhost")
+
+
+def _http_url() -> str:
+    """The in-memory server of ``SURREALDB_PORT`` over HTTP (``_ws_url()`` is the same server over WebSocket)."""
+    return f"http://{_server_host()}:{os.environ.get('SURREALDB_PORT', '8000')}"
+
+
+def _versioned_host() -> str:
+    return os.environ.get("SURREALDB_VERSIONED_HOST") or _server_host()
+
+
+def _versioned_ws_url() -> str | None:
+    """A server started with versioned storage (``SURREALDB_VERSIONED_PORT``); ``None`` when there is none."""
+    port = os.environ.get("SURREALDB_VERSIONED_PORT")
+    return f"ws://{_versioned_host()}:{port}/rpc" if port else None
+
+
+def _versioned_http_url() -> str | None:
+    """The same versioned server over HTTP; ``None`` when there is none."""
+    port = os.environ.get("SURREALDB_VERSIONED_PORT")
+    return f"http://{_versioned_host()}:{port}" if port else None
+
+
+async def _line(client: Any) -> int:
+    """The server's major version (``changes()``'s rule)."""
+    return line_major(await client.version())
+
+
+@contextlib.asynccontextmanager
+async def connected(url: str, database: str, *tables: str) -> AsyncIterator[Any]:
+    """The ORM connected to *url* (``ns``/*database*), *tables* removed before and after.
+
+    Ends with ``unset_connection()``, never ``close_connection()`` alone: the process-wide settings must not
+    stay on this server or database for the next test, in any order (spec §9).
+    """
+    SurrealDBConnectionManager.set_connection(url=url, user="root", password="root", namespace="ns", database=database)
+    try:
+        client = await SurrealDBConnectionManager.get_client()
+        for table in tables:
+            await client.query(f"REMOVE TABLE IF EXISTS {table};")
+        try:
+            yield client
+        finally:
+            for table in tables:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(client.query(f"REMOVE TABLE IF EXISTS {table};"), 10)
+    finally:
+        await SurrealDBConnectionManager.unset_connection()
+
+
+async def _assert_refused_by_the_server(read: Awaitable[Any]) -> None:
+    """T7: the server's refusal of a ``VERSION`` read as an ORM error, chained to the SDK's ``ServerError``."""
+    with pytest.raises(SurrealDbError, match="keeps history") as info:
+        await read
+    cause = info.value.__cause__
+    assert isinstance(cause, _sdk.ServerError), repr(cause)
+    assert time_travel.UNSUPPORTED_MARKER in str(cause)
+    assert str(info.value) == time_travel.server_refused(cause)
+
+
+#: A record saved now, then the three reads AC-12 checks (each resolves ``timedelta(0)`` on the database first).
+_REFUSED_BY_3X: list[tuple[str, Callable[[Any], Awaitable[Any]]]] = [
+    ("exec", lambda qs: qs.exec()),
+    ("count", lambda qs: qs.count()),
+    ("get-id", lambda qs: qs.get("a")),
+]
+
+
+class TestInMemoryServerE2E:
+    """AC-12, AC-13, AC-22 (c): the server of ``SURREALDB_PORT``, started in memory (no history), on each line."""
+
+    async def test_3x_refuses(self) -> None:
+        """AC-12: SurrealDB 3.x refuses ``VERSION`` without versioned storage: T7, over WebSocket and HTTP."""
+        async with orm_client("Snap") as client:
+            if await _line(client) < 3:
+                pytest.skip("SurrealDB 3.x only: a 2.x server answers without an error (AC-13)")
+            await Snap(id="a", n=1).save()
+            for _, read in _REFUSED_BY_3X:
+                await _assert_refused_by_the_server(read(Snap.objects().as_of(timedelta(0))))
+        async with connected(_http_url(), "db", "Snap"):
+            await Snap(id="a", n=1).save()
+            for _, read in _REFUSED_BY_3X:
+                await _assert_refused_by_the_server(read(Snap.objects().as_of(timedelta(0))))
+
+    async def test_2x_answers_without_history(self) -> None:
+        """AC-13 (documented, undetectable): a record last written after the moment is missing, no error."""
+        async with orm_client("Snap") as client:
+            if await _line(client) >= 3:
+                pytest.skip("SurrealDB 2.x only: a 3.x server refuses (AC-12)")
+            a = await Snap(id="a", n=1).save()
+            await Snap(id="b", n=2).save()
+            t1 = await _now(client)
+            await a.merge(n=9)
+            t2 = await _now(client)
+            _strictly_increasing(t1, t2)
+            assert _pairs(await Snap.objects().as_of(t1).order_by("n").exec()) == [("b", 2)]
+            # At or after a record's last write, it is there in its current state.
+            assert _pairs(await Snap.objects().as_of(t2).order_by("n").exec()) == [("b", 2), ("a", 9)]
+
+    @pytest.mark.parametrize(
+        ("expression", "resolved"),
+        [
+            ("d'1900-01-01T00:00:00Z'", datetime(1900, 1, 1, tzinfo=UTC)),
+            ("d'2300-01-01T00:00:00Z'", datetime(2300, 1, 1, tzinfo=UTC)),
+        ],
+        ids=["1900", "2300"],
+    )
+    async def test_resolved_moment_out_of_range(
+        self, monkeypatch: pytest.MonkeyPatch, expression: str, resolved: datetime
+    ) -> None:
+        """AC-22 (c), both lines: T10c after the one ``RETURN``; the read is never sent."""
+        func = SurrealFunc(expression)
+        async with orm_client("Snap") as client:
+            await Snap(id="a", n=1).save()
+            calls = _record_queries(monkeypatch, client)
+            with pytest.raises(SurrealDbError, match="outside the moments SurrealDB versions can address") as info:
+                await Snap.objects().as_of(func).exec()
+            sent = [statement for statement, _ in calls]  # before the cleanup's own statements
+        assert str(info.value) == time_travel.resolved_out_of_range(repr(func), resolved)
+        assert sent == [f"RETURN {expression};"]
+
+    async def test_min_moment_2x_no_current_row(self) -> None:
+        """AC-22 (c), 2.x: 1970-01-01 is addressed as such — no current row (one microsecond earlier would be)."""
+        async with orm_client("Snap") as client:
+            if await _line(client) >= 3:
+                pytest.skip("SurrealDB 2.x only")
+            await Snap(id="a", n=1).save()
+            assert await Snap.objects().as_of(MIN_MOMENT).exec() == []
+
+    async def test_min_moment_3x_relayed(self) -> None:
+        """AC-22 (c), 3.x: the in-memory server's refusal is T7, an ORM error — never its raw ``InternalError``."""
+        async with orm_client("Snap") as client:
+            if await _line(client) < 3:
+                pytest.skip("SurrealDB 3.x only")
+            await Snap(id="a", n=1).save()
+            await _assert_refused_by_the_server(Snap.objects().as_of(MIN_MOMENT).count())
+
+
+#: The tables the versioned-server tests write; removed before and after each test.
+_VERSIONED_TABLES = ("Snap", "SnapAuthor", "snap_bought")
+
+
+@contextlib.asynccontextmanager
+async def versioned_client(transport: str = "ws") -> AsyncIterator[Any]:
+    """The ORM on the versioned server, database ``tt``, over *transport* (``"ws"`` or ``"http"``)."""
+    url = _versioned_ws_url() if transport == "ws" else _versioned_http_url()
+    assert url is not None
+    async with connected(url, "tt", *_VERSIONED_TABLES) as client:
+        yield client
+
+
+_TRANSPORTS = ["ws", "http"]
+
+
+@pytest.mark.skipif(_versioned_ws_url() is None, reason="no versioned SurrealDB server (SURREALDB_VERSIONED_PORT)")
+class TestVersionedServerE2E:
+    """AC-14, AC-15, AC-22 (d): a server started with versioned storage (``SURREALDB_VERSIONED_PORT``), each line.
+
+    These reads are where the servers' own answers are wrong without the ORM's per-record check (spec M5: 3.x
+    table reads return the records deleted before the moment; M6: 2.x miscounts an unfiltered ``count()``).
+    Moments come from the database clock between ORM writes.
+    """
+
+    @pytest.mark.parametrize("transport", _TRANSPORTS)
+    async def test_orm_writes_node(self, transport: str) -> None:
+        """AC-6's flow on a server."""
+        async with versioned_client(transport) as client:
+            record = await Snap(id="p", n=1).save()
+            t1 = await _now(client)
+            await record.merge(n=5)
+            t2 = await _now(client)
+            await record.delete()
+            t3 = await _now(client)
+            _strictly_increasing(t1, t2, t3)
+            assert (await Snap.objects().as_of(t1).get("p")).n == 1
+            assert (await Snap.objects().as_of(t2).get("p")).n == 5
+            with pytest.raises(SurrealDbNotFoundError):
+                await Snap.objects().as_of(t3).get("p")
+            assert [await Snap.objects().as_of(t).count() for t in (t1, t2, t3)] == [1, 1, 0]
+
+    async def test_orm_writes_edge(self) -> None:
+        """AC-6's edge flow on a server."""
+        async with versioned_client() as client:
+            alice = await SnapAuthor(id="alice").save()
+            widget = await SnapAuthor(id="widget").save()
+            edge = await SnapBought(in_=alice, out=widget, quantity=1).save()
+            t1 = await _now(client)
+            await edge.merge(quantity=3)
+            t2 = await _now(client)
+            _strictly_increasing(t1, t2)
+            then = await SnapBought.objects().as_of(t1).filter(in_=alice).exec()
+            later = await SnapBought.objects().as_of(t2).filter(in_=alice).exec()
+        assert [(bought.id, bought.quantity) for bought in then] == [(edge.id, 1)]
+        assert [(bought.id, bought.quantity) for bought in later] == [(edge.id, 3)]
+
+    @pytest.mark.parametrize("transport", _TRANSPORTS)
+    async def test_deleted_and_updated_since(self, transport: str) -> None:
+        """AC-14: rows, counts and aggregates right at each moment, a record deleted since included."""
+        async with versioned_client(transport) as client:
+            a = await Snap(id="a", name="Ada", n=1, g="x").save()
+            await Snap(id="b", name="Bob", n=2, g="x").save()
+            await Snap(id="c", name="Cy", n=3, g="y").save()
+            t1 = await _now(client)
+            await Snap(id="b").delete()
+            await a.merge(n=10)
+            t2 = await _now(client)
+            _strictly_increasing(t1, t2)
+
+            assert _pairs(await Snap.objects().as_of(t2).order_by("n").exec()) == [("c", 3), ("a", 10)]
+            assert await Snap.objects().as_of(t2).count() == 2
+            assert await Snap.objects().as_of(t2).filter(n__gt=0).count() == 2
+            assert await Snap.objects().as_of(t2).sum("n") == 13
+            groups = await Snap.objects().as_of(t2).values("g").annotate(c=Count()).exec()
+            assert {row["g"]: row["c"] for row in groups} == {"x": 1, "y": 1}
+            with pytest.raises(SurrealDbNotFoundError):
+                await Snap.objects().as_of(t2).get("b")
+
+            assert _pairs(await Snap.objects().as_of(t1).order_by("n").exec()) == [("a", 1), ("b", 2), ("c", 3)]
+            assert await Snap.objects().as_of(t1).count() == 3
+            assert await Snap.objects().as_of(t1).filter(n__gt=1).count() == 2
+            assert await Snap.objects().as_of(t1).sum("n") == 6
+            groups = await Snap.objects().as_of(t1).values("g").annotate(c=Count()).exec()
+            assert {row["g"]: row["c"] for row in groups} == {"x": 2, "y": 1}
+            bob = await Snap.objects().as_of(t1).get("b")
+            assert (bob.name, bob.n) == ("Bob", 2)
+
+            assert await Snap.objects().as_of(timedelta(0)).count() == 2
+            assert await Snap.objects().as_of(SurrealFunc("time::now()")).count() == 2
+
+    @pytest.mark.parametrize("transport", _TRANSPORTS)
+    async def test_moment_bounds(self, monkeypatch: pytest.MonkeyPatch, transport: str) -> None:
+        """AC-22 (d): both bounds read as SurrealDB addresses them; a duration reaching 1969 is never read."""
+        async with versioned_client(transport) as client:
+            await Snap(id="a", n=1).save()
+            await Snap(id="b", n=2).save()
+            assert await Snap.objects().as_of(MIN_MOMENT).count() == 0
+            assert await Snap.objects().as_of(MAX_MOMENT).count() == 2
+            ago = await _now(client) - datetime(1969, 1, 1, tzinfo=UTC)
+            calls = _record_queries(monkeypatch, client)
+            with pytest.raises(SurrealDbError, match="outside the moments SurrealDB versions can address") as info:
+                await Snap.objects().as_of(ago).count()
+            sent = [statement for statement, _ in calls]  # before the cleanup's own statements
+        assert f"as_of({ago!r}) gave 1969-" in str(info.value)
+        assert sent == ["RETURN time::now() - $_as_of_ago;"]
+
+    async def test_fetch_as_it_was_on_3x(self) -> None:
+        """AC-15, 3.x: ``fetch()`` resolves the link as it was at the moment."""
+        async with versioned_client() as client:
+            if await _line(client) < 3:
+                pytest.skip("SurrealDB 3.x only: 2.x refuses fetch() under as_of() (T8)")
+            author = await SnapAuthor(id="w", name="old").save()
+            await Snap(id="p", n=1, author=RecordID("SnapAuthor", "w")).save()
+            t1 = await _now(client)
+            await author.merge(name="new")
+            t2 = await _now(client)
+            _strictly_increasing(t1, t2)
+            then = await Snap.objects().as_of(t1).fetch("author").exec()
+            later = await Snap.objects().as_of(t2).fetch("author").exec()
+            current = await Snap.objects().fetch("author").exec()
+        # The fetched author is a record, not a RecordID: the rows do not validate and come back as dicts.
+        assert [row["author"]["name"] for row in then] == ["old"]
+        assert [row["author"]["name"] for row in later] == ["new"]
+        assert [row["author"]["name"] for row in current] == ["new"]
+
+    async def test_fetch_refused_on_2x(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC-15, 2.x: T8 after the one ``version()`` request; the read is never sent."""
+        async with versioned_client() as client:
+            if await _line(client) >= 3:
+                pytest.skip("SurrealDB 2.x only: 3.x honours fetch() under as_of()")
+            await SnapAuthor(id="w", name="old").save()
+            await Snap(id="p", n=1, author=RecordID("SnapAuthor", "w")).save()
+            t1 = await _now(client)
+            versions = _count_versions(monkeypatch, client)
+            calls = _record_queries(monkeypatch, client)
+            with pytest.raises(SurrealDbError, match=r"fetch\(\) under as_of\(\) needs SurrealDB 3\.x") as info:
+                await Snap.objects().as_of(t1).fetch("author").exec()
+            sent = list(calls)  # before the cleanup's own statements
+        assert str(info.value) == time_travel.fetch_refused()
+        assert len(versions) == 1 and line_major(versions[0]) == 2, versions
+        assert sent == []
