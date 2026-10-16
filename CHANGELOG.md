@@ -51,8 +51,10 @@ third minor of Tier 2.
   `surrealkv://` one reopens with its data. `validate_connection()` never discards it. Server
   clients are untouched while an embedded URL is configured: `close_connection()`, `reconnect()`
   and the `async with` exit then close only the engine, so a server client keeps its live queries
-  and its identity, even one signed in with `store=False`; `close_all_connections()` and
-  `unset_connection()` close it too.
+  and its identity, even one signed in with `store=False`, and `is_connected()` stays true on its
+  event loop; `close_all_connections()` and `unset_connection()` close it too. An event loop whose
+  server connection dropped while signed in with `store=False` still raises once a server URL is
+  configured back: neither closing the engine nor an identity set on it ends that state.
 - **Clear errors, before any request, for what the engine cannot do**: live queries (`live()`,
   `watch()`, `subscribe_live()`: read the table's change feed with `changes()` instead),
   `changes(since=<datetime>)` (pass a cursor or `since=None`), and `AuthenticatedUserMixin` calls
@@ -64,7 +66,9 @@ third minor of Tier 2.
   event loop and thread); `invalidate()` and a namespace or database change return it to the
   in-process owner and end the stored session. Model auth with `bind=True` signs that session in,
   one call at a time with the connection-level calls (the last one wins), and a failed call puts
-  the previous session back.
+  the previous session back, with one exception, as on a server: when `signup()`, `signin()` or
+  `refresh()` succeeded but the record does not fit the model, the session stays signed in as
+  that record (the error says so).
 - **`surreal_orm_lite.testing`**, a new module that does not import pytest:
   - `embedded_database(url="mem://", *, namespace="test", database="test")` runs a block against
     an isolated in-process database, yields the block's SDK client (valid inside the block only),
@@ -110,6 +114,12 @@ third minor of Tier 2.
 - The DDL helpers (`define_computed_fields()`, `define_access()`) raise their usual
   `SurrealDbError` for a statement the embedded engine cannot parse, which SDK 2.0.0 reports as a
   bare `RuntimeError`.
+- The `SurrealDbError` of an `AuthenticatedUserMixin` call whose record does not fit the model
+  (since v0.17.0) has a new text, on every path, the server lines included: it says whether the
+  shared session kept its previous identity or is now signed in as that record (for `refresh()`,
+  also that the refresh token passed in is spent and whether the new pair is kept), and it lists
+  the fields that do not fit, with Pydantic's message for each, and no longer quotes the record's
+  values. The Pydantic `ValidationError` is its `__context__` instead of its `__cause__`.
 
 ### Notes
 
@@ -128,6 +138,8 @@ third minor of Tier 2.
   `surrealkv://` path, and never open one path from two processes.
 - A fresh engine raises a retryable write conflict when several writes run concurrently on a table
   that does not exist yet: define the table first, or use `@retry_on_conflict()`.
+- The v0.24.3 read hook (#235) also applies to the embedded engine's client: zero durations and
+  degenerate geometries read as on a server. A `<set>[…]` is stored as an array there, as on 2.x.
 - **Server lines unchanged**: tested against SurrealDB 3.3.4 and 2.7.0 (the CI pins), plus 3.1.5
   for backward compatibility; the embedded tests run in every CI job. `ModelFactory` and
   `Faker` come in v0.39.0.

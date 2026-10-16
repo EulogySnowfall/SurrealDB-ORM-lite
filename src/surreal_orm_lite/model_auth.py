@@ -14,7 +14,8 @@ database, so it has no short-lived connection to offer: there, ``bind=True`` is 
 exchange runs on the shared session — one call at a time (concurrent calls, and the connection-level
 ``signin``/``signup``/``authenticate``/``invalidate`` holding the same session, are serialised; the
 last one wins), the record checked before the token is adopted, the previous session put back when
-anything fails.
+anything fails — except, as on a server, a ``signup``/``signin``/``refresh`` that succeeded but whose
+record does not fit the model: the session stays signed in as that record, and the error says so.
 
 This is a leaf module: it imports ``connection_manager`` and ``auth`` at runtime and
 ``model_base`` only for typing, which keeps the package acyclic (``connection_manager`` already
@@ -533,7 +534,10 @@ class AuthenticatedUserMixin:
         any token is adopted (for ``authenticate()``, built into the instance too, as on a server),
         and on any failure (cancellation included) the previous session is put back before the
         error propagates: the stored identity, else the in-process owner. An identity set with
-        ``store=False`` before the call is not restored: the manager does not know it.
+        ``store=False`` before the call is not restored: the manager does not know it. One
+        exception, as on a server: a ``signup()``/``signin()``/``refresh()`` exchange that succeeded
+        adopts its token first, so when the record then does not fit the model the session stays
+        signed in as that record (the error says so).
         """
         payload = _encoding.encode(payload)
         tokens: AuthTokens | None = None
@@ -699,7 +703,9 @@ class AuthenticatedUserMixin:
         starts, so the returned instance is always the caller's, the stored token matches the
         session, and the last call wins. The record is checked before
         the token is adopted, and a failure puts the stored identity back (else the in-process
-        owner) before raising; an identity set with ``store=False`` is not restored.
+        owner) before raising; an identity set with ``store=False`` is not restored. One
+        exception, as on a server: when the exchange succeeded but the record does not fit the
+        model, the session stays signed in as that record (the error says so).
 
         Args:
             bind: adopt the resulting token on the shared connection as well. On the embedded

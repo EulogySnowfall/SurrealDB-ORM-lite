@@ -904,8 +904,10 @@ class SurrealDBConnectionManager:
 
         While an embedded URL is configured, **only the engine** is closed: the running loop's
         server client, its live queries and its identity (even one set with ``store=False``) are
-        left as they are, for when a server URL is configured back. :meth:`close_all_connections`
-        and :meth:`unset_connection` close them too.
+        left as they are, for when a server URL is configured back (so :meth:`is_connected` stays
+        true on a loop that keeps one), and so is a lost-identity state of the loop's server
+        connection. :meth:`close_all_connections` and :meth:`unset_connection` close the server
+        clients too, and end that state.
         """
         if cls.is_embedded():
             # Server clients are untouched while an embedded URL is configured: closing the engine says
@@ -2023,7 +2025,9 @@ class SurrealDBConnectionManager:
         reports whether any loop still holds a client.
 
         The embedded engine's client belongs to the whole process: while it is open, this is
-        true from every loop, and outside any loop.
+        true from every loop, and outside any loop. A loop's server client counts too, even
+        while an embedded URL is configured: after :meth:`close_connection` on the engine, this
+        stays true on a loop that keeps one.
 
         :return: True if the connection is established, False otherwise.
         """

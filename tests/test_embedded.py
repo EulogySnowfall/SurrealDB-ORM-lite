@@ -2579,6 +2579,16 @@ class TestReadmeEmbeddedWording:
     def test_identity_subsection(self) -> None:
         identity = _normalised(_subsection("#### Identity on the embedded engine", _section_26()))
         assert "in-process owner" in identity and "`invalidate()`" in identity and "bind=True" in identity
+        assert "the record does not fit the model, the session stays signed in as that record" in identity
+
+    def test_server_clients_after_an_embedded_close(self) -> None:
+        """``is_connected()`` stays true on a loop that keeps a server client, and a lost identity stays lost."""
+        engine = _normalised(_subsection("#### One engine per process", _section_26()))
+        assert "`is_connected()` stays `True` on an event loop that keeps one" in engine
+        assert "does not end that state" in engine
+        rows = [cells for _, cells in _table_rows(_readme_part(_EMBEDDED_BEHAVIOUR))]
+        [closing] = [cells for cells in rows if cells[0].startswith("Closing")]
+        assert "`close_connection()` and `reconnect()` leave the server clients open" in closing[1], closing
 
     def test_pytest_recipe(self) -> None:
         """P3: the fixture is ``surreal_db`` and yields nothing; the full ORM's ``users(surreal_db)`` follows."""
