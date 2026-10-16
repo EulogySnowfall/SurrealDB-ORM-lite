@@ -329,3 +329,20 @@ def test_read_hook_without_the_sdk_symbols() -> None:
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "ok", result.stderr
+
+
+def test_sdk_shim_url_exports() -> None:
+    """v0.25.0 AC-1: the SDK's URL parser enters through ``_sdk.py``, from the module that defines it.
+
+    ``surrealdb.Url``/``UrlScheme`` exist at run time but are not in the SDK's ``__all__``, so a root
+    import fails ``mypy src/`` (``no_implicit_reexport``): the static import names
+    ``surrealdb.connections.url``.
+    """
+    import surrealdb.connections.url as sdk_url
+
+    from surreal_orm_lite import _sdk
+
+    assert _sdk.SdkUrl is sdk_url.Url
+    assert _sdk.SdkUrlScheme is sdk_url.UrlScheme
+    assert "SdkUrl" in _sdk.__all__
+    assert "SdkUrlScheme" in _sdk.__all__

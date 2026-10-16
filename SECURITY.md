@@ -6,8 +6,17 @@ The following versions of Surreal-ORM-Lite are currently supported with security
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.24.x  | :white_check_mark: |
-| < 0.24  | :x:                |
+| 0.25.x  | :white_check_mark: |
+| < 0.25  | :x:                |
+
+## Embedded Engine
+
+Since 0.25.0, Surreal-ORM-Lite can run on the official SDK's in-process SurrealDB engine
+(`mem://`, `surrealkv://<path>`). That engine has no authentication of its own: its anonymous
+session owns every namespace and database, and the ORM never sends the configured user and
+password to it. **An embedded database is protected by the file-system permissions of its path,
+not by SurrealDB users.** Record users and table `PERMISSIONS` still apply to a session signed in
+as a record user.
 
 ## Reporting a Vulnerability
 

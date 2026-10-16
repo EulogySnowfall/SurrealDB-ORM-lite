@@ -33,7 +33,8 @@
 | v0.22.0           | Tier 1 — Core (native typed relations)               | Done    |
 | v0.23.0           | Tier 2 — Rich field types                            | Done    |
 | v0.24.0           | Tier 2 — Geospatial fields                           | Done    |
-| v0.25.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 5 minors         | Planned |
+| v0.25.0           | Tier 2 — Embedded test engine                        | Done    |
+| v0.26.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 4 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | Planned |
@@ -84,7 +85,7 @@ pieces stay out.
 | Native typed relations                 | `insert_relation()`                                   | ✅ v0.22.0     |
 | Rich field types                       | native `Datetime`/`Duration`/`Decimal`/`Range`/`Uuid` | ✅ v0.23.0     |
 | Geospatial fields (`nearby()`)         | native `Geometry` + `geo::*`                          | ✅ v0.24.0     |
-| Embedded / in-memory test engine       | `mem://` / `surrealkv://` ²                           | v0.25.0        |
+| Embedded / in-memory test engine       | `mem://` / `surrealkv://` ²                           | ✅ v0.25.0     |
 | Versioned storage (time-travel)        | `surrealkv+versioned://` ²                            | v0.26.0        |
 | Subqueries                             | nested `SELECT` via `query()`                         | v0.27.0        |
 | Query cache (TTL)                      | client-side cache (SDK-independent)                   | v0.28.0        |
@@ -106,8 +107,8 @@ pieces stay out.
 the bare form `fn::name($args);` — never `RETURN fn::name(…)`, which silently truncates a
 `BEGIN … COMMIT` batch on both DB lines.
 
-² **To confirm** against the targeted SDK build (embedded extra). If unavailable on PyPI,
-v0.25.0/v0.26.0 are reclassified to Future.
+² The embedded engine ships in the SDK 2.0.0 base wheel (engine core 2.3.10); the SDK 3.0 line
+moves it to the `surrealdb[embedded]` extra.
 
 **Still NOT in lite** (full-ORM only, even with SDK 2.0):
 
@@ -149,7 +150,7 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | Native typed relations        | yes        | ✅ v0.22.0                  |
 | Rich field types              | yes        | ✅ v0.23.0                  |
 | Geospatial fields             | yes        | ✅ v0.24.0                  |
-| Embedded / versioned engine   | yes        | v0.25 – v0.26               |
+| Embedded / versioned engine   | no         | v0.25 – v0.26               |
 | Subqueries                    | yes        | v0.27.0                     |
 | Query cache (TTL)             | yes        | v0.28.0                     |
 | Multi-database                | yes        | v0.29.0                     |
@@ -161,10 +162,28 @@ v0.25.0/v0.26.0 are reclassified to Future.
 | Vector Search (KNN/HNSW)      | yes        | v0.35.0                     |
 | Hybrid Search (RRF)           | yes        | v0.36.0                     |
 | Migrations & CLI              | yes        | v0.37 – v0.38               |
-| Test fixtures & factories     | yes        | v0.39.0                     |
+| Test fixtures & factories     | yes        | v0.25.0 + v0.39.0           |
 | QueryLogger / profiling       | yes        | v0.40.0                     |
 | Custom SDK (`surreal_sdk`)    | yes        | never                       |
 | CBOR protocol internals       | yes        | never                       |
+
+### Embedded URLs
+
+The full SurrealDB-ORM has no embedded engine (HTTP/WebSocket only); surreal-orm-lite runs on the
+official SDK's in-process engine from v0.25.0.
+
+| Embedded URL                   | surreal-orm-lite (official SDK 2.0.0)                                                    | Full SurrealDB-ORM       |
+| ------------------------------ | ---------------------------------------------------------------------------------------- | ------------------------ |
+| `mem://`, `memory://`          | ✅ in memory, gone when the connection closes                                            | ❌ (HTTP/WebSocket only) |
+| `surrealkv://<path>`           | ✅ on disk (SurrealKV)                                                                   | ❌                       |
+| `surrealkv+versioned://<path>` | ✅ on disk; behaves as `surrealkv://` until time travel (v0.26.0)                        | ❌                       |
+| `file://<path>`                | ✅ a **SurrealKV** store, not the RocksDB store `file://` means for the SurrealDB server | ❌                       |
+| `rocksdb://<path>`             | ❌ not yet supported by the official SDK (#233)                                          | ❌                       |
+
+The embedded engine is SurrealDB core 2.3.10 with SDK 2.0.0, not the 2.x/3.x server lines the ORM
+is tested on. A bare `memory` (no `://`) is refused by SDK 2.0.0; write `memory://`. Base test
+fixtures (`SurrealFixture`, `@fixture`, `embedded_database()`) ship in v0.25.0; factories
+(`ModelFactory`, `Faker`) in v0.39.0.
 
 ---
 
@@ -454,6 +473,28 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   sub-models after a write that syncs the instance (#228), SDK values in untyped fields (#222) and
   typed filter values / validated keyword writes (#220, #221) are follow-ups
 
+### Version 0.25.0 — Embedded test engine
+
+- The ORM runs on the official SDK's in-process engine:
+  `set_connection(url="mem://", namespace=…, database=…)`, credentials optional and never sent,
+  and every ORM call (CRUD, QuerySet, relations, typed edges, rich and geo fields, upsert/patch,
+  server values, computed fields, stored functions, buffered transactions, change feeds,
+  authentication) runs with no server. `mem://`, `memory://`,
+  `surrealkv://`, `surrealkv+versioned://` and `file://` (SurrealKV) are routed by the SDK's own URL
+  parser; `SurrealDBConnectionManager.is_embedded()` tells which kind is configured
+- One engine per process, shared by every event loop and thread; a namespace/database change
+  reselects on the same engine and ends the stored session; closing discards a `mem://` database
+  and keeps a `surrealkv://` one
+- Clear ORM errors before any request for what the engine cannot do (live queries,
+  `changes(since=<datetime>)`, model auth with `bind=False`, `ephemeral_client()`) and for a URL
+  the SDK refuses (`rocksdb://`, #233, quoting the SDK)
+- `surreal_orm_lite.testing`: `embedded_database()` (an isolated in-process database per block,
+  nestable) and the full ORM's `SurrealFixture` / `@fixture`; `ModelFactory` and `Faker` stay in
+  v0.39.0
+- The engine is SurrealDB core 2.3.10 (SDK 2.0.0), so it speaks 2.x SurrealQL; its behaviour is a
+  table of its own in the README. Server lines unchanged (2.7.0 and 3.3.4, 3.1.5 retro). Time travel
+  on `surrealkv+versioned://` is v0.26.0; the SDK 3.0 engine (3.x core, `surrealdb[embedded]`) is #205
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -632,14 +673,14 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 | ---------- | -------------------------------------------------------------------- | --------------------------------- |
 | ✅ v0.23.0 | Rich field types: `Datetime`, `Duration`, `Decimal`, `Range`, `Uuid` | typed Pydantic ↔ native SDK types |
 | ✅ v0.24.0 | Geospatial fields: `Geometry` + `nearby()` / distance                | native `Geometry` + `geo::*`      |
-| v0.25.0    | Embedded test engine: `mem://` / `surrealkv://` + base fixtures ¹    | SDK embedded connection           |
+| ✅ v0.25.0 | Embedded test engine: `mem://` / `surrealkv://` + base fixtures ¹    | SDK embedded connection           |
 | v0.26.0    | Versioned storage / time-travel: `surrealkv+versioned://` ²          | embedded versioned engine         |
 | v0.27.0    | Subqueries (nested QuerySets in `filter`/`in`)                       | nested `SELECT` via `query()`     |
 | v0.28.0    | Query cache (TTL + invalidation), client-side                        | client cache                      |
 | v0.29.0    | Multi-database: named connection registry                            | N × `AsyncSurreal` instances      |
 
-¹ To confirm against the targeted SDK build; reclassified to Future if the embedded extra is
-unavailable on PyPI.
+¹ The embedded engine ships in the SDK 2.0.0 base wheel (engine core 2.3.10); the SDK 3.0 line
+moves it to the `surrealdb[embedded]` extra.
 
 ---
 

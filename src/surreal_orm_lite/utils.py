@@ -731,7 +731,8 @@ async def apply_ddl_statements(
     error handling because the exception type depends on *how* the statement was run:
 
     - directly, or in a **buffered** transaction, the SDK surfaces a ``ServerError``
-      (``InternalError`` on 2.6.x, ``ValidationError`` on 3.x);
+      (``InternalError`` on 2.6.x, ``ValidationError`` on 3.x), and on the embedded engine of
+      SDK 2.0.0, a bare ``RuntimeError`` for a statement the engine cannot parse;
     - in a **native interactive** transaction (WebSocket + SurrealDB 3.x), ``Transaction.add``
       has already inspected the response and raised ``SurrealDbError`` itself.
 
@@ -748,6 +749,6 @@ async def apply_ddl_statements(
                 await tx.add(statement, None)
             else:
                 await client.query(statement, {})
-        except (ServerError, SurrealDbError) as e:
+        except (ServerError, SurrealDbError, RuntimeError) as e:
             raise SurrealDbError(f"Can't apply {what} definition: {statement} -> {e}{hint}") from e
     return statements

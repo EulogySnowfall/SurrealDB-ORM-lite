@@ -5,6 +5,150 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.25.0] - 2026-10-15
+
+Embedded test engine: the ORM also runs on the official SDK's in-process SurrealDB engine
+(`mem://`, `surrealkv://<path>`), with no server and no Docker, and the new
+`surreal_orm_lite.testing` module adds `embedded_database()` and the full SurrealDB-ORM's
+`SurrealFixture` / `@fixture`. The same models and queries run unchanged against a server. The
+third minor of Tier 2.
+
+### Added
+
+- **Embedded URLs.** With
+  `SurrealDBConnectionManager.set_connection(url="mem://", namespace=…, database=…)`, every ORM
+  call runs in-process: CRUD, QuerySet, aggregations, relations, typed edges, rich and geo fields,
+  upsert and patch, server values, computed fields, stored functions, buffered transactions,
+  change feeds and authentication. The SDK sends `mem://`, `memory://`,
+  `surrealkv://<path>`, `surrealkv+versioned://<path>` and `file://<path>` (a SurrealKV store) to
+  its engine; the ORM asks the SDK's own URL parser and keeps no list of schemes. `user` and
+  `password` are optional on an embedded URL and never sent: the engine's anonymous session is the
+  in-process owner. They are kept, so one configuration switches between a server and `mem://` by
+  its URL alone:
+
+  ```python
+  from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
+
+  SurrealDBConnectionManager.set_connection(url="mem://", namespace="app", database="app")
+
+  class Note(BaseSurrealModel):
+      id: str | None = None
+      title: str
+
+  await Note(id="docs", title="Write the docs").save()
+  assert await Note.objects().count() == 1
+  assert SurrealDBConnectionManager.is_embedded()
+  ```
+
+- **`SurrealDBConnectionManager.is_embedded()`**: whether the configured URL addresses the
+  in-process engine, for code that must run on both kinds of connection.
+- **One engine per process.** The manager opens the engine on the first call and hands it to every
+  event loop and thread, so they all see the same database; concurrent first calls open exactly
+  one. A namespace or database change resets the shared session and selects the new pair on the
+  same engine, with no data lost; a new URL closes the old engine. Closing
+  (`close_connection()`, `close_all_connections()`, `unset_connection()`, `reconnect()`, the exit
+  of `async with SurrealDBConnectionManager():`) discards a `mem://` database, and a
+  `surrealkv://` one reopens with its data. `validate_connection()` never discards it. Server
+  clients are untouched while an embedded URL is configured: `close_connection()`, `reconnect()`
+  and the `async with` exit then close only the engine, so a server client keeps its live queries
+  and its identity, even one signed in with `store=False`, and `is_connected()` stays true on its
+  event loop; `close_all_connections()` and `unset_connection()` close it too. An event loop whose
+  server connection dropped while signed in with `store=False` still raises once the server URL is
+  set back with `set_url()`, or after an `embedded_database()` block: neither closing the engine
+  nor an identity set on it ends that state. `set_connection()` does: a new configuration is a
+  choice of identity.
+- **Clear errors, before any request, for what the engine cannot do**: live queries (`live()`,
+  `watch()`, `subscribe_live()`: read the table's change feed with `changes()` instead),
+  `changes(since=<datetime>)` (pass a cursor or `since=None`), and `AuthenticatedUserMixin` calls
+  with `bind=False` and `ephemeral_client()` (the engine has a single session per database). Each
+  raises `SurrealDbError`.
+- **Authentication on the engine.** `signin()`, `signup()`, `authenticate()` and `invalidate()`
+  work with the engine's record access methods and `DEFINE USER`s, and record users and table
+  `PERMISSIONS` apply as on a server. A sign-in changes the session of the whole process (every
+  event loop and thread); `invalidate()` and a namespace or database change return it to the
+  in-process owner and end the stored session. Model auth with `bind=True` signs that session in,
+  one call at a time with the connection-level calls (the last one wins), and a failed call puts
+  the previous session back, with one exception, as on a server: when `signup()` or `signin()`
+  succeeded but the record does not fit the model, the session stays signed in as that record
+  (the error says so). `refresh()` cannot succeed on the engine: its SurrealQL does not parse
+  `WITH REFRESH`.
+- **`surreal_orm_lite.testing`**, a new module that does not import pytest:
+  - `embedded_database(url="mem://", *, namespace="test", database="test")` runs a block against
+    an isolated in-process database, yields the block's SDK client (valid inside the block only),
+    then puts the previous connection back: its settings, stored session and engine. Blocks nest;
+    `surrealkv://<path>` gives an on-disk database. A server URL raises `ValueError`.
+  - `SurrealFixture` and `@fixture`, with the full SurrealDB-ORM's names: `load()` saves a fresh
+    copy of each declared instance in declaration order, yields them typed as the fixture class,
+    and deletes them on exit. It works on any connection, a server or the engine. Unlike the full
+    ORM, an explicit `id` is kept, a save that fails or is cancelled mid-load deletes the copies
+    already saved, `@fixture` raises `TypeError` on a class that is not a `SurrealFixture`
+    subclass, and `load()` raises `ValueError` on an undecorated subclass of a fixture that
+    declares instances of its own (the full ORM loads only the parent's).
+
+  ```python
+  from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
+
+  @fixture
+  class UserFixtures(SurrealFixture):
+      alice = User(name="Alice", role="admin")
+      bob = User(id="bob", name="Bob", role="player")  # an explicit id is kept
+
+  async with embedded_database():  # a fresh, empty in-memory database
+      async with UserFixtures.load() as fixtures:
+          admins = await User.objects().filter(role="admin").exec()
+          assert [admin.name for admin in admins] == ["Alice"]
+      assert await User.objects().count() == 0  # alice and bob are deleted
+  ```
+
+- README section 26, "Embedded engine and test fixtures" (in-process databases and the embedded
+  URL table, one engine per process, what the engine does not do, its SurrealQL line, identity,
+  test fixtures with a pytest recipe, a note for users of the full SurrealDB-ORM), and a new
+  behaviour table, "ORM behaviour: the embedded engine"; example notebook
+  `examples/v0.25.0_embedded_test_engine.ipynb`.
+
+### Changed
+
+- `set_connection()`: `user`, `password`, `namespace` and `database` default to `None`, in the same
+  positional order. `is_connection_set()` needs the user and password for a server URL only.
+- A URL the installed SDK refuses (`rocksdb://`, a typo) is still accepted by `set_connection()`;
+  the first ORM call now raises a `SurrealDbConnectionError` that quotes the SDK, before anything
+  is opened, instead of "Connection not been set." or "Can't connect to the database.". For
+  `rocksdb://` it points to #233.
+- The DDL helpers (`define_computed_fields()`, `define_access()`) raise their usual
+  `SurrealDbError` for a statement the embedded engine cannot parse, which SDK 2.0.0 reports as a
+  bare `RuntimeError`.
+- The `SurrealDbError` of an `AuthenticatedUserMixin` call whose record does not fit the model
+  (since v0.17.0) has a new text, on every path, the server lines included: it says whether the
+  shared session kept its previous identity or is now signed in as that record (for `refresh()`,
+  also that the refresh token passed in is spent and whether the new pair is kept), and it names
+  the fields that do not fit and Pydantic's error codes (`nickname: missing; prefs: int_parsing`),
+  and quotes nothing from the record: no value, and no key the model does not declare (listed as
+  `(undeclared field)`). The Pydantic `ValidationError` is its `__context__` instead of its
+  `__cause__`.
+
+### Notes
+
+- **The engine is SurrealDB core 2.3.10**, bundled with the surrealdb SDK 2.0.0 base wheel (no
+  new dependency, every supported Python version): write 2.x SurrealQL in raw queries and computed
+  fields, and expect the 2.x column of the behaviour table. `client.version()` reports the SDK's
+  version (`surrealdb-2.0.0`). Transactions are buffered, and parse errors in raw queries are a bare
+  `RuntimeError`. The SDK 3.0 line bundles a 3.x engine in the `surrealdb[embedded]` extra (#205).
+- **`rocksdb://` is not yet supported by the official SDK** (#233): the ORM relays the SDK's
+  refusal and will accept the scheme with no change once a released SDK does. A bare `memory` (no
+  `://`) is refused by SDK 2.0.0: write `memory://`. `surrealkv+versioned://` behaves as
+  `surrealkv://` until time travel (v0.26.0).
+- **With the surrealdb SDK 2.x, closing does not stop an in-process engine**: a client obtained
+  before `close_connection()` or inside an `embedded_database()` block is still a running
+  database. Do not use it after the close, drop it (`del client`) before reopening the same
+  `surrealkv://` path, and never open one path from two processes.
+- A fresh engine raises a retryable write conflict when several writes run concurrently on a table
+  that does not exist yet: define the table first, or use `@retry_on_conflict()`.
+- The v0.24.3 read hook (#235) also applies to the embedded engine's client: zero durations and
+  degenerate geometries read as on a server. A `<set>[…]` is stored as an array there, as on 2.x.
+- **Server pins unchanged**: tested against SurrealDB 3.3.4 and 2.7.0 (the CI pins), plus 3.1.5
+  for backward compatibility; the embedded tests run in every CI job. `ModelFactory` and
+  `Faker` come in v0.39.0.
+
 ## [0.24.3] - 2026-10-15
 
 The clients the ORM opens now read the values the surrealdb SDK 2.0.0 cannot decode (zero
