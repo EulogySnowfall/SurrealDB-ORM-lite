@@ -71,6 +71,7 @@ from .signals import (
     pre_save,
     pre_update,
 )
+from .subquery import Subquery
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
 from .types import Duration, Range
 
@@ -88,6 +89,7 @@ __all__ = [
     # QuerySet
     "QuerySet",
     "Q",
+    "Subquery",
     "OrderBy",
     # Live queries
     "LiveAction",
