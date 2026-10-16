@@ -35,7 +35,8 @@
 | v0.24.0           | Tier 2 — Geospatial fields                           | Done    |
 | v0.25.0           | Tier 2 — Embedded test engine                        | Done    |
 | v0.26.0           | Tier 2 — Time travel (versioned storage)             | Done    |
-| v0.27.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 3 minors         | Planned |
+| v0.27.0           | Tier 2 — Subqueries                                  | Done    |
+| v0.28.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 2 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | Planned |
@@ -88,7 +89,7 @@ pieces stay out.
 | Geospatial fields (`nearby()`)         | native `Geometry` + `geo::*`                          | ✅ v0.24.0     |
 | Embedded / in-memory test engine       | `mem://` / `surrealkv://` ²                           | ✅ v0.25.0     |
 | Versioned storage (time-travel)        | `surrealkv+versioned://` ²                            | ✅ v0.26.0     |
-| Subqueries                             | nested `SELECT` via `query()`                         | v0.27.0        |
+| Subqueries                             | nested `SELECT` via `query()`                         | ✅ v0.27.0     |
 | Query cache (TTL)                      | client-side cache (SDK-independent)                   | v0.28.0        |
 | Multi-database                         | multiple `AsyncSurreal` instances                     | v0.29.0        |
 | Schema introspection                   | `INFO FOR DB` / `INFO FOR TABLE`                      | v0.30.0        |
@@ -152,7 +153,7 @@ moves it to the `surrealdb[embedded]` extra.
 | Rich field types              | yes        | ✅ v0.23.0                  |
 | Geospatial fields             | yes        | ✅ v0.24.0                  |
 | Embedded / versioned engine   | no         | ✅ v0.25 – v0.26            |
-| Subqueries                    | yes        | v0.27.0                     |
+| Subqueries                    | yes        | ✅ v0.27.0                  |
 | Query cache (TTL)             | yes        | v0.28.0                     |
 | Multi-database                | yes        | v0.29.0                     |
 | Schema introspection          | yes        | v0.30.0                     |
@@ -518,6 +519,30 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - No equivalent in the full SurrealDB-ORM. CI adds a versioned server per job; server lines
   unchanged (2.7.0 and 3.3.4, 3.1.5 retro, identical)
 
+### Version 0.27.0 — Subqueries
+
+- `Subquery(qs)`, or the queryset itself, is the value of a lookup in `filter()` and `Q`: `in`,
+  `not_in`, `containsall` and `containsany` compare with all its values; `exact`, `gt`, `gte`,
+  `lt`, `lte`, `contains` and `not_contains` with its first value, and match no record when it is
+  empty. The inner queryset selects its record ids (`SELECT VALUE id`) or the one field given to
+  `select()`; its `filter()`, `Q`, `nearby()`, `order_by()`, `limit()`, `offset()` and
+  `variables()` apply, its `fetch()` is ignored
+- One statement per request: a block whose `LET`s bind each subquery once, innermost first,
+  through `query()` (the SDK 2.0.0 `query()` returns the first statement's result only, so the full
+  ORM's `LET` prelude does not fit). An ordered and limited subquery is right on every line: an
+  inline one can return wrong rows on SurrealDB 3.2 and later (surrealdb#7470), and 2.x needs the
+  order fields selected, which the ORM does (`_sqv`)
+- Every read, count, aggregation, `values().annotate()` group, write by filter (`bulk_update()`,
+  `bulk_delete()`, `QuerySet.patch()`), `get_or_create()`/`update_or_create()` lookup,
+  `objects(tx=)` statement and `as_of()` read honours it; subqueries nest; `live()` and `watch()`
+  write the sub-SELECT inline, which the server evaluates again on every change
+- A subquery table that does not exist reads as empty on both lines (3.x: after a table probe
+  confirms it, the statement is sent again with that subquery empty); every combination that
+  cannot compile correctly raises before any request
+- Deferred: `annotate(x=Subquery(...))`, correlated subqueries (`OuterRef`) and `Exists`. Server
+  lines unchanged (2.7.0 and 3.3.4, 3.1.5 retro, which differs only in the error a time-travel
+  subquery raises without versioned storage)
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -698,7 +723,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 | ✅ v0.24.0 | Geospatial fields: `Geometry` + `nearby()` / distance                | native `Geometry` + `geo::*`      |
 | ✅ v0.25.0 | Embedded test engine: `mem://` / `surrealkv://` + base fixtures ¹    | SDK embedded connection           |
 | ✅ v0.26.0 | Versioned storage / time-travel: `surrealkv+versioned://` ²          | embedded versioned engine         |
-| v0.27.0    | Subqueries (nested QuerySets in `filter`/`in`)                       | nested `SELECT` via `query()`     |
+| ✅ v0.27.0 | Subqueries (nested QuerySets in `filter`/`in`)                       | nested `SELECT` via `query()`     |
 | v0.28.0    | Query cache (TTL + invalidation), client-side                        | client cache                      |
 | v0.29.0    | Multi-database: named connection registry                            | N × `AsyncSurreal` instances      |
 
