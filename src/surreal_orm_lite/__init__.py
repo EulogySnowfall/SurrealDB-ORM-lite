@@ -1,4 +1,4 @@
-__version__ = "0.26.0"
+__version__ = "0.27.0"
 
 from ._sdk import BoundExcluded, BoundIncluded
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
@@ -71,6 +71,7 @@ from .signals import (
     pre_save,
     pre_update,
 )
+from .subquery import Subquery
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
 from .types import Duration, Range
 
@@ -88,6 +89,7 @@ __all__ = [
     # QuerySet
     "QuerySet",
     "Q",
+    "Subquery",
     "OrderBy",
     # Live queries
     "LiveAction",

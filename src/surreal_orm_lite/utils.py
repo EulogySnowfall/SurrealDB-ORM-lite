@@ -12,6 +12,7 @@ from ._sdk import RecordID, SdkRange, ServerError
 from .constants import GEOMETRY_LOOKUP_OPERATORS, LOOKUP_OPERATORS
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, Var
+from .subquery import SubqueryCompiler, inside_a_list, lookup_refused, subquery_condition, subquery_of
 from .types import Range
 
 if TYPE_CHECKING:
@@ -514,6 +515,13 @@ def _spatial_condition(
     return f"{field} {op} ${var_name}", {var_name: _geo._as_geometry(value, lookup)}, counter + 1
 
 
+def _list_item(item: Any, field: str, lookup: str) -> Any:
+    """An item of a sequence lookup's list, returned unchanged; a subquery there raises S15 (v0.27.0)."""
+    if subquery_of(item) is not None:
+        raise ValueError(inside_a_list(field, lookup))
+    return item
+
+
 def build_filter_condition(
     field: str,
     lookup: str,
@@ -522,6 +530,7 @@ def build_filter_condition(
     record_table: str | None = None,
     *,
     endpoint_columns: Collection[str] = (),
+    subqueries: SubqueryCompiler | None = None,
 ) -> tuple[str, dict[str, Any], int]:
     """
     Build a single parameterized filter condition.
@@ -538,6 +547,12 @@ def build_filter_condition(
     geometry object as the ORM value, or a ``Var`` reference. ``outside`` keeps SurrealQL's
     semantics: it also holds for a record whose field is missing or holds no geometry.
 
+    A subquery (v0.27.0) — a ``Subquery``, or a ``QuerySet`` read as one — given as the whole value is compiled
+    by *subqueries*, the statement's compiler (``subquery.subquery_condition``): ``in``, ``not_in``,
+    ``containsall`` and ``containsany`` compare with all its values, ``exact``, ``gt``, ``gte``, ``lt``, ``lte``,
+    ``contains`` and ``not_contains`` with its first value (no record when it is empty). Its values are compared
+    as stored: no record-id or endpoint coercion. The ``id`` and endpoint columns keep their refusals.
+
     Args:
         field: The field name.
         lookup: The lookup type (e.g. ``"exact"``, ``"gt"``, ``"in"``).
@@ -551,6 +566,9 @@ def build_filter_condition(
             value goes through :func:`coerce_endpoint`, so ``"person:alice"`` is the record id
             it names, and a text/collection lookup is refused. Node columns are untouched: a
             string column may legitimately hold ``"a:b"``.
+        subqueries: The compiler of the statement the condition goes into (v0.27.0), which binds a subquery
+            value in a ``LET`` (or inline, for a live query). ``None`` — a ``Q`` compiled on its own — refuses a
+            subquery (S8).
 
     Returns:
         A tuple of (sql_fragment, variables_dict, next_counter).
@@ -563,11 +581,16 @@ def build_filter_condition(
             ``Range`` on the ``id`` column or on an endpoint column (v0.23.0) — or a spatial
             lookup gets a value that is not a geometry, or is applied to the ``id`` column or
             to an endpoint column (v0.24.0). ``InvalidGeometryError`` (a ``ValueError``) for a
-            malformed GeoJSON object.
+            malformed GeoJSON object. With a subquery (v0.27.0): a lookup that takes none — ``isnull``, the
+            text and the spatial lookups — (S2); a subquery as an item of a list (S15); no *subqueries* compiler
+            (S8); and the inner queryset's refusals (S3–S7, S12, S13).
     """
     validate_field_name(field, "filter field")
+    sub = subquery_of(value)
     spatial_op = GEOMETRY_LOOKUP_OPERATORS.get(lookup)
     if spatial_op is not None:
+        if sub is not None:
+            raise ValueError(lookup_refused(lookup))
         return _spatial_condition(field, lookup, spatial_op, value, counter, endpoint_columns)
     op = LOOKUP_OPERATORS.get(lookup)
     if op is None:
@@ -585,6 +608,9 @@ def build_filter_condition(
     is_endpoint_column = field in endpoint_columns
     if is_endpoint_column and lookup in _RECORD_ID_INVALID_LOOKUPS:
         raise ValueError(f"'{lookup}' cannot be applied to the edge endpoint column '{field}': it holds a record id, not text.")
+
+    if sub is not None:
+        return subquery_condition(field, lookup, op, sub, counter, subqueries)
 
     if lookup == "isnull":
         if not isinstance(value, bool):
@@ -614,7 +640,7 @@ def build_filter_condition(
                 f"'{lookup}' lookup requires an iterable (list, tuple, or set), got a single "
                 f"{type(value).__name__} instance; wrap it in a list."
             )
-        items = [as_record_value(item) for item in value]
+        items = [as_record_value(_list_item(item, field, lookup)) for item in value]
         if is_record_id_column and lookup in _RECORD_ID_SEQUENCE_LOOKUPS:
             items = [coerce_record_id(item, cast(str, record_table)) for item in items]
         elif is_endpoint_column and lookup in _RECORD_ID_SEQUENCE_LOOKUPS:

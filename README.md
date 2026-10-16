@@ -173,6 +173,7 @@ results = await User.objects().query(
 | Geospatial fields (nearby, distance, spatial lookups)                         | ✅     |
 | Embedded engine (mem://, surrealkv://) & test fixtures                        | ✅     |
 | Time travel (`as_of()`, versioned storage)                                    | ✅     |
+| Subqueries (`Subquery`, a QuerySet as a filter value)                         | ✅     |
 
 ### Supported Filter Lookups
 
@@ -186,6 +187,7 @@ results = await User.objects().query(
 - `match`, `regex`
 - `isnull`
 - `inside`, `outside`, `intersects` (geometry values: see [section 25](#25-geospatial-fields))
+- a subquery — `Subquery(qs)` or the queryset itself — as the value of `in`, `not_in`, `containsall`, `containsany` (all its values) or `exact`, `gt`, `gte`, `lt`, `lte`, `contains`, `not_contains` (its first value): see [section 28](#28-subqueries-subquery)
 
 Filter values on rich fields must be typed: `filter(trial__gte=timedelta(days=7))`, not
 `"7d"`. Strings are not converted (see [section 24](#24-rich-field-types)).
@@ -301,6 +303,13 @@ results = await User.objects().filter(
     Q(role="admin") | Q(role="mod"),
     age__gte=25
 ).exec()
+```
+
+Since v0.27.0 a lookup inside a `Q` takes a subquery as `filter()` does (see
+[section 28](#28-subqueries-subquery)), here with `admins = User.objects().filter(role="admin")`:
+
+```python
+posts = await Post.objects().filter(Q(author__in=Subquery(admins)) | Q(score__gte=9)).exec()
 ```
 
 ### 6. Bulk Operations
@@ -3164,6 +3173,224 @@ not exist then), and a `CREATE` of an id that exists raises.
 - **A snapshot is never `==` the current instance**, even with identical fields: compare
   `model_dump()`s.
 
+### 28. Subqueries (`Subquery`)
+
+Since v0.27.0 a QuerySet can filter another: `Subquery(qs)`, or the queryset itself, is the value
+of a lookup in `filter()` or `Q`. The ORM sends **one request**: the server runs the inner
+queryset inside the outer statement, so both read the same state (one consistent read), and the
+inner queryset's values are bound like any filter value.
+
+```python
+from surrealdb import RecordID
+
+from surreal_orm_lite import BaseSurrealModel, Subquery
+
+
+class Person(BaseSurrealModel):
+    id: str | None = None
+    name: str
+    active: bool = True
+    age: int = 0
+
+
+class Post(BaseSurrealModel):
+    id: str | None = None
+    title: str
+    author: RecordID | None = None  # a record link to a Person
+    score: int = 0
+
+
+people = [("ada", "Ada", True, 36), ("bob", "Bob", True, 50), ("cy", "Cy", False, 20)]
+for key, name, is_active, age in people:
+    await Person(id=key, name=name, active=is_active, age=age).save()
+for key, title, author, score in [
+    ("p1", "one", "ada", 5),
+    ("p2", "two", "bob", 8),
+    ("p3", "three", "cy", 2),
+    ("p4", "four", "ada", 9),
+    ("p5", "five", None, 1),  # no author
+]:
+    link = RecordID("Person", author) if author else None
+    await Post(id=key, title=title, author=link, score=score).save()
+
+active = Person.objects().filter(active=True)
+posts = await Post.objects().filter(author__in=Subquery(active)).exec()  # p1, p2, p4
+same = await Post.objects().filter(author__in=active).exec()  # p1, p2, p4 (a QuerySet is a subquery)
+```
+
+#### What a subquery selects
+
+The inner queryset gives the outer filter **one list of values**: without `select()`, the ids of
+its records (`SELECT VALUE id`); with `select("field")`, the values of that one field (an aliased
+field compiles its column). Here the subquery gives the record links the posts hold:
+
+```python
+top_authors = Post.objects().filter(score__gt=8).select("author")
+writers = await Person.objects().filter(id__in=top_authors).exec()  # ada
+```
+
+`filter()`, `Q`, `nearby()`, `order_by()`, `limit()`, `offset()` and `variables()` apply to the
+inner queryset, and `fetch()` on the inner queryset is ignored, as in the full ORM. `select()` of
+several fields, `values()` and `annotate()` raise `ValueError`: a list of objects would match
+nothing.
+
+Values are compared as stored, never converted: to match records, select `id` or a record link (a
+`"table:key"` string never equals a record id). A record without the selected field gives `NONE`,
+which `in` matches with a record whose field is missing, as a list holding `None` does:
+`Post.objects().filter(author__in=Post.objects().select("author"))` returns p5 too, and
+`author__not_in=active` keeps it.
+
+#### Lookups
+
+| Lookup                                        | Compares the field with                                     |
+| --------------------------------------------- | ----------------------------------------------------------- |
+| `in`, `not_in`                                | all the subquery's values: equal to one of them, or to none |
+| `containsall`, `containsany`                  | all its values: the array field holds all of them, or any   |
+| `exact` (no suffix), `gt`, `gte`, `lt`, `lte` | its **first** value                                         |
+| `contains`, `not_contains`                    | its first value: the array field holds it, or lacks it      |
+
+Order the subquery to choose its first value. A first-value lookup on an empty subquery matches
+**no record**, and `~Q(...)` of it every record: SurrealDB alone would compare with
+`array::first([])`, which is `NONE`, and `score > NONE` holds for every record, so the ORM guards
+the comparison (`$_sq0 != [] AND …`). For `in`, an empty subquery is an empty list: `in` matches
+no record, `not_in` every record. `isnull`, `like`, `ilike`, `startswith`, `endswith`, `match`,
+`regex`, `inside`, `outside` and `intersects` raise `ValueError` with a subquery.
+
+```python
+from surreal_orm_lite import Q
+
+others = await Post.objects().filter(author__not_in=active).exec()  # p3, p5 (p5 has no author)
+how_many = await Post.objects().filter(author__not_in=active).count()  # 2
+
+best = Post.objects().select("score").order_by("-score").limit(1)
+top = await Post.objects().filter(score=Subquery(best)).exec()  # p4 (the top score, 9)
+
+nothing = Post.objects().filter(score__gt=100).select("score")
+above = await Post.objects().filter(score__gt=Subquery(nothing)).exec()  # []
+not_above = await Post.objects().filter(~Q(score__gt=Subquery(nothing))).exec()  # p1, p2, p3, p4, p5
+```
+
+#### Ordered and limited subqueries
+
+`order_by()`, `limit()` and `offset()` choose the values a subquery gives:
+
+```python
+oldest = Person.objects().filter(active=True).order_by("-age").limit(1)
+theirs = await Post.objects().filter(author__in=oldest).exec()  # p2 (Bob is the oldest active person)
+```
+
+A statement with subqueries is one block, whose `LET`s bind each subquery once, innermost first:
+
+```sql
+{ LET $_sq0 = (SELECT id AS _sqv, age FROM Person WHERE active = $_f0 ORDER BY age DESC LIMIT 1)._sqv; (SELECT * FROM Post WHERE author IN $_sq0) };
+```
+
+- **Why a `LET`**: SurrealDB 3.2 and later can return wrong rows for an inline sub-SELECT with
+  `ORDER BY` and `LIMIT`, which gives its value to the first outer record only
+  ([surrealdb/surrealdb#7470](https://github.com/surrealdb/surrealdb/issues/7470)). Bound once,
+  the subquery is right on every line, and the server runs it once instead of once per record.
+- **Why `_sqv`**: an ordered subquery selects its column as `_sqv`, with its order fields, and
+  reads `._sqv` back: SurrealDB 2.x refuses to order a sub-SELECT of one column by another field.
+- **Reserved names**: `$_sq0`, `$_sq1`, … (`_sq<N>`) are the block's `LET`s and hide a
+  `variables()` value of the same name; a subquery can order by `_sqv` only when it selects `_sqv`
+  itself (`ValueError` otherwise).
+- `limit()` and `offset()` of a subquery take an `int >= 0` (`ValueError` otherwise).
+
+#### Where subqueries apply
+
+Every read honours a subquery (`exec()`, `first()`, `get()` with filters, `exists()`, `count()`,
+`sum()`, `avg()`, `min()`, `max()`, `values(…).annotate(…)`, `annotate(GeoDistance)`), and so do
+the writes by filter (`bulk_update()`, `bulk_delete()`, `QuerySet.patch()`) and the lookups of
+`get_or_create()` and `update_or_create()`. Subqueries nest, and combine with `Q` (`&`, `|`, `~`):
+
+```python
+from surreal_orm_lite import Count
+
+wrote_a_top_post = Person.objects().filter(id__in=top_authors)
+by_writers = await Post.objects().filter(author__in=wrote_a_top_post).exec()  # p1, p4
+
+inactive = Person.objects().filter(active=False)
+mixed = await Post.objects().filter(Q(author__in=inactive) | Q(score__gte=9)).exec()  # p3, p4
+
+total = await Post.objects().filter(author__in=active).sum("score")  # 22
+per_author = Post.objects().filter(author__in=active).values("author").annotate(n=Count())
+groups = await per_author.exec()  # ada: 2, bob: 1
+
+updated = await Post.objects().filter(author__in=inactive).bulk_update(score=0)  # 1
+post, created = await Post.objects().get_or_create(author__in=active, title="one")  # p1, False
+```
+
+- **Transactions**: in `Model.objects(tx=tx)` the statement runs in the transaction. An
+  interactive transaction (SurrealDB 3.x over WebSocket) reads its own uncommitted writes in the
+  subquery too; a buffered one (2.x, or HTTP) still cannot read, and applies writes by filter at
+  commit. Build the inner queryset with the same `objects(tx=)`, or with none.
+- **Live queries**: `live()` and `watch()` write the sub-SELECT inline in the `LIVE SELECT`, its
+  values as literals, and the server evaluates it again on every change: a post created once its
+  author is active notifies, even when the author became active after the live query started.
+  Before it starts, a live query reads each subquery table (one request): SurrealDB 3.x would
+  accept a live query whose subquery table does not exist and never notify, so the ORM raises
+  `SurrealDbNotFoundError` there; 2.x reads that table as empty.
+- **Time travel**: under `as_of()` every subquery reads at the same moment (the ORM gives it the
+  moment's `VERSION` and the per-record check of [section 27](#27-time-travel-as_of)). Without
+  versioned storage the read raises section 27's `SurrealDbError`; SurrealDB 3.1.5 raises its own
+  `ThrownError` ("Failed to scan record") instead.
+- **`changes()`** refuses `filter()`, so subqueries too.
+- **A subquery table that does not exist** reads as empty, as the ORM reads any missing table.
+  SurrealDB 2.x and the embedded engine read it so in the same request. SurrealDB 3.x raises: the
+  ORM then asks the server whether that table exists (a table probe) and, once the server confirms
+  it does not, sends the statement again with that subquery empty: three requests (statement,
+  table probe, re-send) for one missing table, and only then. Any other error, even one whose
+  text quotes "The table '…' does not exist", is the server's own: it is relayed, never read as
+  empty. On 3.x a write by filter inside a transaction fails with the server's error
+  (`SurrealDbError`), as any failed write in a transaction does.
+
+#### What a subquery cannot do
+
+Each of these raises when the outer queryset compiles, before any request (`live()` and `watch()`
+at the call):
+
+- a lookup other than the eleven above (`isnull`, `like`, `startswith`, `inside`, …): `ValueError`;
+- a queryset that is its own subquery, directly or through another one: `ValueError`;
+- an inner `values()`, `annotate()` or `select()` of several fields: `ValueError`;
+- an inner `as_of()`: `SurrealDbError` (call `as_of()` on the outer queryset);
+- an inner `objects(tx=)` whose transaction is not the outer queryset's: `SurrealDbError`;
+- an inner `variables()` binding a name of the statement to another value: `ValueError` (the two
+  values must have the same type and be equal: `1` and `True`, or `1` and `1.0`, differ);
+- an inner `limit()` or `offset()` that is not an `int >= 0`, or an inner `order_by()` on `_sqv`
+  (above): `ValueError`;
+- a subquery inside a list (`author__in=[Subquery(qs)]`): `ValueError`, give it as the whole value;
+- `Q(...).to_sql()` called on its own with a subquery lookup: `ValueError` (only a QuerySet binds
+  a subquery);
+- a subquery written as data: `bulk_update(score=Subquery(qs))` raises `ValueError`, and an
+  `exact` criterion or a `defaults=` value of `get_or_create()` or `update_or_create()` raises
+  `SurrealDbError` (use a lookup such as `author__in`, and pass the value to write in `defaults=`);
+- `Subquery(x)` for anything but a QuerySet: `TypeError`.
+
+`annotate(x=Subquery(...))` (a subquery's value on each row), correlated subqueries and `Exists`
+are not available yet.
+
+#### Coming from the full SurrealDB-ORM
+
+- **The same `Subquery(qs)`**, imported from `surreal_orm_lite`; a QuerySet given as the value is
+  accepted too (`author__in=active`).
+- **No `select()` means the record ids** (`SELECT VALUE id`): the full ORM writes `SELECT *`, which
+  `in` never matches. `select()` of several fields is refused instead of matching nothing.
+- **One statement**: a block whose `LET`s bind the subqueries, where the full ORM sends a `LET`
+  prelude, two statements, whose rows the official SDK's `query()` cannot read (it returns the
+  first statement's result only).
+- **A first-value lookup on an empty subquery matches nothing**: the full ORM compares with
+  `array::first()` of it, `NONE`, so `gt` matches every record.
+- **`isnull`, the text lookups and the spatial lookups are refused** with a subquery.
+- **`annotate(x=Subquery(...))` is not available yet.**
+- **`live()` keeps the sub-SELECT inline**, in both.
+- **A subquery table that does not exist reads as empty**, like any missing table in the lite; the
+  full ORM raises `TableNotFoundError` on SurrealDB 3.x.
+- **`Subquery()` raises `TypeError`** for anything but a QuerySet, and has no public `to_surql()`.
+- **The inner queryset's `variables()` are merged** into the statement (a clash raises
+  `ValueError`) and its **`nearby()` applies**, where the full ORM's subquery drops both.
+- **The inner `fetch()` is ignored**, as in the full ORM, while `values()` and `annotate()` are
+  refused.
+
 ---
 
 ## Configuration Options
@@ -3278,7 +3505,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -3379,6 +3606,10 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | `fetch()` and dotted paths through record links under `as_of()`                                                                        | `fetch()` refused (`SurrealDbError`) by `exec()`, `first()`, `get()` without an id; dotted paths in `filter()`, `select()`, `order_by()`, `values()` read the current value   | as they were at the moment                                                                                                                                                          | v0.26.0                              |
 | Writing history with a raw `CREATE … VERSION`                                                                                          | stored at that moment, readable with `as_of()`                                                                                                                                | accepted, not readable at that moment (the table did not exist then)                                                                                                                | v0.26.0                              |
 | `as_of()` moment before 1970-01-01 or after 2262-04-11T23:47:16.854775Z                                                                | refused by the ORM before any read (`ValueError`; `SurrealDbError` for a duration or expression resolving there): the server reads an earlier moment as the current state     | refused by the ORM before any read, same errors: the server would fail with an internal error                                                                                       | v0.26.0                              |
+| Subqueries (`Subquery`, or a QuerySet as a filter value)                                                                               | one statement for every read, count, aggregation, write by filter and live query; reads inside a transaction raise (buffered)                                                 | the same, and reads inside an interactive transaction (`objects(tx=)`) see its uncommitted writes                                                                                   | v0.27.0                              |
+| A subquery with `order_by()` and `limit()`                                                                                             | right; the ORM also selects the order fields, without which 2.x refuses to order by a field other than the one compared                                                       | right: the ORM binds each subquery once, in a `LET`; 3.2 and later can return wrong rows for such an inline sub-SELECT (surrealdb#7470)                                             | v0.27.0                              |
+| A subquery reading a table that does not exist                                                                                         | read as empty, like any missing table                                                                                                                                         | read as empty in three requests (statement, table probe, re-send); other errors, even ones quoting "does not exist", are relayed; transaction writes fail; `live()` raises on start | v0.27.0                              |
+| Subqueries under `as_of()`                                                                                                             | each subquery reads at the same moment: the ORM adds `VERSION` to it (the server would read the current state)                                                                | the same (the server applies the outer `VERSION` to an inline sub-SELECT only); without versioned storage `SurrealDbError`, but 3.1.5 raises the server's own `ThrownError`         | v0.27.0                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
@@ -3450,7 +3681,8 @@ Contributions are welcome! Please:
 | v0.24.0           | Geospatial fields                                    | ✅ Released |
 | v0.25.0           | Embedded test engine                                 | ✅ Released |
 | v0.26.0           | Time travel (versioned storage)                      | ✅ Released |
-| v0.27.0 – v0.29.0 | Tier 2 — Extended (subqueries, cache, multi-db)      | 📋 Planned  |
+| v0.27.0           | Subqueries                                           | ✅ Released |
+| v0.28.0 – v0.29.0 | Tier 2 — Extended (cache, multi-db)                  | 📋 Planned  |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)     | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | 📋 Planned  |
@@ -3501,7 +3733,8 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Geospatial Fields             | ✅ v0.24.0                                                            | ✅                               |
 | Embedded engine               | ✅ v0.25.0 (mem://, surrealkv://; rocksdb:// #233)                    | ❌ (HTTP/WebSocket only)         |
 | Time travel (`VERSION`)       | ✅ v0.26.0 (`as_of()`)                                                | ❌                               |
-| Subqueries & Query Cache      | v0.27 – v0.28                                                         | ✅                               |
+| Subqueries                    | ✅ v0.27.0 (`Subquery`, a QuerySet in `filter()`)                     | ✅                               |
+| Query Cache                   | v0.28.0                                                               | ✅                               |
 | Multi-database                | v0.29.0                                                               | ✅                               |
 | Schema Introspection          | v0.30.0                                                               | ✅                               |
 | DEFINE EVENT                  | v0.31.0                                                               | ✅                               |

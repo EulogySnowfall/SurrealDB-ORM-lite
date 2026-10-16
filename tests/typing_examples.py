@@ -29,8 +29,10 @@ from surreal_orm_lite import (
     MultiPolygonField,
     PointField,
     PolygonField,
+    Q,
     QuerySet,
     Range,
+    Subquery,
     SurrealConfigDict,
     SurrealDBConnectionManager,
     SurrealFunc,
@@ -287,6 +289,14 @@ def time_travel_forms() -> None:
     assert_type(QuerySet(TypedMember).as_of(Duration.parse("1h")), QuerySet)
     assert_type(QuerySet(TypedMember).as_of(SurrealFunc("time::now() - 1h")), QuerySet)
     assert_type(QuerySet(TypedMember).as_of(None), QuerySet)
+
+
+def subquery_forms() -> None:
+    """v0.27.0: ``Subquery`` wraps a QuerySet; a ``Subquery`` or a QuerySet is a filter value in ``filter()`` and ``Q``."""
+    assert_type(Subquery(QuerySet(TypedMember)), Subquery)
+    assert_type(QuerySet(TypedMember).filter(id__in=Subquery(QuerySet(TypedMember))), QuerySet)
+    assert_type(Q(id__in=QuerySet(TypedMember)), Q)
+    assert_type(Subquery(QuerySet(TypedMember)).queryset, QuerySet)
 
 
 @fixture

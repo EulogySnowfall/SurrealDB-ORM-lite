@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Collection
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .utils import build_filter_condition, parse_lookup
+
+if TYPE_CHECKING:
+    from .subquery import SubqueryCompiler
 
 
 class Q:
@@ -23,6 +26,9 @@ class Q:
 
         # Complex combination
         Q(age__gte=18) & Q(age__lte=65) & (Q(role="admin") | Q(role="mod"))
+
+        # A subquery as a value (v0.27.0), as in filter(): compiled by the QuerySet that uses the Q
+        Q(author__in=Subquery(Person.objects().filter(active=True))) | Q(score__gte=9)
     """
 
     AND = "AND"
@@ -75,6 +81,8 @@ class Q:
         record_table: str | None = None,
         to_column: Callable[[str], str] | None = None,
         endpoint_columns: Collection[str] = (),
+        *,
+        subqueries: SubqueryCompiler | None = None,
     ) -> tuple[str, dict[str, Any], int]:
         """
         Generate a parameterized SQL WHERE fragment.
@@ -95,6 +103,9 @@ class Q:
                 edge model; v0.22.0), propagated by the QuerySet and passed down to child nodes,
                 so ``Q(out="product:w")`` binds the record id it names. Empty — a node model, or
                 a ``Q`` compiled on its own — leaves strings untouched.
+            subqueries: The compiler of the statement the QuerySet sends (v0.27.0), propagated to child nodes,
+                which binds a ``Subquery`` value. ``None`` — a ``Q`` compiled on its own — raises ``ValueError``
+                for a subquery value: only the QuerySet that uses the ``Q`` can bind it.
 
         Returns:
             A tuple of (sql_fragment, variables_dict, next_counter).
@@ -110,7 +121,7 @@ class Q:
                 if to_column is not None:
                     field = to_column(field)
                 sql, vars_, counter = build_filter_condition(
-                    field, lookup, value, counter, record_table, endpoint_columns=endpoint_columns
+                    field, lookup, value, counter, record_table, endpoint_columns=endpoint_columns, subqueries=subqueries
                 )
                 filter_parts.append(sql)
                 all_variables.update(vars_)
@@ -121,7 +132,7 @@ class Q:
 
         # Child Q objects
         for child in self.children:
-            sql, vars_, counter = child.to_sql(counter, record_table, to_column, endpoint_columns)
+            sql, vars_, counter = child.to_sql(counter, record_table, to_column, endpoint_columns, subqueries=subqueries)
             if sql:
                 all_parts.append(sql)
                 all_variables.update(vars_)
