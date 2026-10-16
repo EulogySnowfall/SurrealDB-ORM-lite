@@ -10,19 +10,23 @@ use the embedded ``surrealkv+versioned://`` engine and a server started with ver
 ``SURREALDB_VERSIONED_PORT`` (skipped without it).
 """
 
-from collections.abc import Callable
+import contextlib
+import re
+from collections.abc import AsyncIterator, Callable
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from pydantic import Field
-from surrealdb import RecordID
+from surrealdb import RecordID, ThrownError
 
 import surreal_orm_lite
 from surreal_orm_lite import (
     BaseSurrealEdge,
     BaseSurrealModel,
     Count,
+    GeoDistance,
+    GeometryPoint,
     PointField,
     Q,
     Subquery,
@@ -31,9 +35,13 @@ from surreal_orm_lite import (
     SurrealDbError,
     Var,
 )
+from surreal_orm_lite._sdk import NotFoundError, ServerError
 from surreal_orm_lite.query_set import QuerySet
-from surreal_orm_lite.subquery import SubqueryCompiler, _same_value, missing_table, subquery_of
+from surreal_orm_lite.subquery import SubqueryCompiler, _MissingSubqueryTable, _same_value, missing_table, subquery_of
+from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import build_filter_condition
+from tests.conftest import _ws_url
+from tests.test_time_travel import _http_url, _line, _record_queries, connected
 
 M2020 = datetime(2020, 6, 1, tzinfo=UTC)
 M2021 = datetime(2021, 6, 1, tzinfo=UTC)
@@ -980,3 +988,606 @@ class TestSubqueryRefusals:
             "WHERE, projection, ordering or paging, outside any transaction. Call changes() on Model.objects() and "
             "filter the events."
         )
+
+
+# --- the engines and the data (spec §9) ---------------------------------------------------------------
+
+_TABLES = ("sq_person", "sq_post", "sq_aliased", "sq_likes", "sq_ghost")
+#: Where the E2E classes run: the embedded engine, and the server of ``SURREALDB_PORT`` over WebSocket and HTTP.
+_KINDS = ["mem", "ws", "http"]
+_ALL_POSTS = {"p1", "p2", "p3", "p4", "p5"}
+_PARIS = (2.35, 48.85)
+
+
+@contextlib.asynccontextmanager
+async def subquery_db(kind: str) -> AsyncIterator[Any]:
+    """The ORM on *kind*: a fresh ``mem://`` engine, or the server of ``SURREALDB_PORT`` over ``ws`` or ``http``.
+
+    On a server the tables of this module are removed before and after, and the connection settings are unset at
+    the end (``connected()``); yields the SDK client.
+    """
+    if kind == "mem":
+        async with embedded_database("mem://") as client:
+            yield client
+        return
+    async with connected(_ws_url() if kind == "ws" else _http_url(), "db", *_TABLES) as client:
+        yield client
+
+
+async def _line_version(client: Any) -> tuple[int, int]:
+    """The server's ``(major, minor)``; ``(3, 99)`` when its version cannot be read (as ``line_major`` reads 3)."""
+    match = re.search(r"(\d+)\.(\d+)", str(await client.version()))
+    return (int(match.group(1)), int(match.group(2))) if match else (3, 99)
+
+
+async def _interactive_transactions(client: Any) -> bool:
+    """Whether the server has interactive transactions (``begin()``: SurrealDB 3.x), as ``tests/test_transactions.py``
+    probes it: ``begin()``, then ``cancel()``."""
+    try:
+        txn = await client.begin()
+    except Exception:
+        return False
+    with contextlib.suppress(Exception):
+        await client.cancel(txn)
+    return True
+
+
+def _person(key: str) -> RecordID:
+    return RecordID("sq_person", key)
+
+
+async def _seed() -> None:
+    """Spec §9's data through the ORM's ``save()``: three persons, five posts (p5 without an author), two edges."""
+    for key, name, active, age, nick in (
+        ("ada", "Ada", True, 36, "x"),
+        ("bob", "Bob", True, 50, "y"),
+        ("cy", "Cy", False, 20, "z"),
+    ):
+        await SqPerson(id=key, name=name, active=active, age=age, nick=nick).save()
+    for key, title, author, score, tags in (
+        ("p1", "one", "ada", 5, ["x"]),
+        ("p2", "two", "bob", 8, ["y", "z"]),
+        ("p3", "three", "cy", 2, ["q"]),
+        ("p4", "four", "ada", 9, []),
+        ("p5", "five", None, 1, []),
+    ):
+        await SqPost(id=key, title=title, author=_person(author) if author else None, score=score, tags=tags).save()
+    await SqLikes(in_=_person("ada"), out=RecordID("sq_post", "p2")).save()
+    await SqLikes(in_=_person("cy"), out=RecordID("sq_post", "p1")).save()
+
+
+def _ids(rows: Any) -> set[str]:
+    return {row.id for row in rows}
+
+
+def _inactive() -> Any:
+    return SqPerson.objects().filter(active=False)
+
+
+def _nobody() -> Any:
+    """An inner queryset that matches nothing."""
+    return SqPerson.objects().filter(name="Nobody")
+
+
+def _no_score() -> Any:
+    """An inner queryset of one field that matches nothing."""
+    return SqPost.objects().filter(score__gt=100).select("score")
+
+
+def _nicks(**criteria: Any) -> Any:
+    return SqPerson.objects().filter(**criteria).select("nick")
+
+
+# --- AC-5: reads, on every engine -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+class TestSubqueryReadsE2E:
+    """AC-5: every read honours a subquery, in one request, on the embedded engine and on the server (WebSocket
+    and HTTP)."""
+
+    async def test_in_is_one_request(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with subquery_db(kind) as client:
+            await _seed()
+            calls = _record_queries(monkeypatch, client)
+            assert _ids(await SqPost.objects().filter(author__in=Subquery(_active())).exec()) == {"p1", "p2", "p4"}
+            assert len(calls) == 1
+            assert calls[0][0].startswith("{ LET $_sq0 = "), calls[0][0]
+
+    async def test_not_in_and_the_bare_queryset(self, kind: str) -> None:
+        async with subquery_db(kind):
+            await _seed()
+            assert _ids(await SqPost.objects().filter(author__not_in=Subquery(_active())).exec()) == {"p3", "p5"}
+            assert _ids(await SqPost.objects().filter(author__not_in=_active()).exec()) == {"p3", "p5"}
+            assert _ids(await SqPost.objects().filter(author__in=_active()).exec()) == {"p1", "p2", "p4"}
+
+    async def test_count_exists_first_and_get(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with subquery_db(kind) as client:
+            await _seed()
+            calls = _record_queries(monkeypatch, client)
+            assert await SqPost.objects().filter(author__in=Subquery(_active())).count() == 3
+            assert await SqPost.objects().filter(author__in=Subquery(_active())).exists() is True
+            assert await SqPost.objects().filter(author__in=Subquery(_nobody())).exists() is False
+            assert (await SqPost.objects().filter(author__in=Subquery(_active())).order_by("-score").first()).id == "p4"
+            oldest_active = SqPerson.objects().filter(active=True).order_by("-age").limit(1)
+            assert (await SqPost.objects().filter(author__in=Subquery(oldest_active)).get()).id == "p2"
+            assert len(calls) == 5
+            assert all(statement.startswith("{ LET $_sq0 = ") for statement, _ in calls)
+
+    async def test_aggregations(self, kind: str) -> None:
+        async with subquery_db(kind):
+            await _seed()
+            qs = SqPost.objects().filter(author__in=Subquery(_active()))
+            assert await qs.sum("score") == 22
+            assert await qs.avg("score") == pytest.approx(22 / 3)
+            assert await qs.min("score") == 5
+            assert await qs.max("score") == 9
+            rows = await SqPost.objects().filter(author__in=Subquery(_active())).values("author").annotate(n=Count()).exec()
+            assert sorted((str(row["author"]), row["n"]) for row in rows) == [("sq_person:ada", 2), ("sq_person:bob", 1)]
+
+    async def test_nested(self, kind: str) -> None:
+        """C6: the posts of the persons who wrote a post scoring more than 8."""
+        async with subquery_db(kind):
+            await _seed()
+            writers = SqPost.objects().filter(score__gt=8).select("author")
+            qs = SqPost.objects().filter(author__in=Subquery(SqPerson.objects().filter(id__in=Subquery(writers))))
+            assert _ids(await qs.exec()) == {"p1", "p4"}
+
+    async def test_q(self, kind: str) -> None:
+        async with subquery_db(kind):
+            await _seed()
+            either = Q(author__in=Subquery(_inactive())) | Q(score__gte=9)
+            assert _ids(await SqPost.objects().filter(either).exec()) == {"p3", "p4"}
+            assert _ids(await SqPost.objects().filter(~Q(author__in=Subquery(_active()))).exec()) == {"p3", "p5"}
+
+    async def test_collection_lookups_on_an_array_field(self, kind: str) -> None:
+        async with subquery_db(kind):
+            await _seed()
+            posts = SqPost.objects
+            assert _ids(await posts().filter(tags__containsany=Subquery(_nicks(active=True))).exec()) == {"p1", "p2"}
+            assert _ids(await posts().filter(tags__containsall=Subquery(_nicks(name__in=["Bob", "Cy"]))).exec()) == {"p2"}
+            assert _ids(await posts().filter(tags__contains=Subquery(_nicks(name="Cy"))).exec()) == {"p2"}
+            assert _ids(await posts().filter(tags__not_contains=Subquery(_nicks(name="Cy"))).exec()) == {
+                "p1",
+                "p3",
+                "p4",
+                "p5",
+            }
+
+    async def test_first_value(self, kind: str) -> None:
+        async with subquery_db(kind):
+            await _seed()
+            best = SqPost.objects().select("score").order_by("-score").limit(1)
+            assert _ids(await SqPost.objects().filter(score=Subquery(best)).exec()) == {"p4"}
+
+    async def test_an_empty_first_value_matches_no_record(self, kind: str) -> None:
+        """Never every record (``x > NONE``), nor the records without the field (``author = NONE``: p5)."""
+        async with subquery_db(kind):
+            await _seed()
+            assert await SqPost.objects().filter(score__gt=Subquery(_no_score())).exec() == []
+            assert _ids(await SqPost.objects().filter(~Q(score__gt=Subquery(_no_score()))).exec()) == _ALL_POSTS
+            assert await SqPost.objects().filter(title=Subquery(_no_score())).exec() == []
+            assert await SqPost.objects().filter(author=Subquery(_nobody())).exec() == []
+
+    async def test_the_id_column_outside(self, kind: str) -> None:
+        async with subquery_db(kind):
+            await _seed()
+            writers = SqPost.objects().filter(score__gt=4).select("author")
+            assert _ids(await SqPerson.objects().filter(id__in=Subquery(writers)).exec()) == {"ada", "bob"}
+
+    async def test_an_edge_endpoint(self, kind: str) -> None:
+        """C25: the edges whose ``in`` is an inactive person."""
+        async with subquery_db(kind):
+            await _seed()
+            edges = await SqLikes.objects().filter(in___in=Subquery(_inactive())).exec()
+            assert [(str(edge.in_), str(edge.out)) for edge in edges] == [("sq_person:cy", "sq_post:p1")]
+
+    async def test_an_aliased_inner_column(self, kind: str) -> None:
+        """C22: the inner ``select()`` and ``order_by()`` compile the column of an aliased field."""
+        async with subquery_db(kind):
+            await _seed()
+            await SqAliased.model_validate({"id": "a1", "display_name": "one", "rank": 1}).save()
+            await SqAliased.model_validate({"id": "a2", "display_name": "two", "rank": 2}).save()
+            titles = SqAliased.objects().select("display").order_by("-rank")
+            assert _ids(await SqPost.objects().filter(title__in=Subquery(titles)).exec()) == {"p1", "p2"}
+            top = SqAliased.objects().select("display").order_by("-rank").limit(1)
+            assert _ids(await SqPost.objects().filter(title__in=Subquery(top)).exec()) == {"p2"}
+
+    async def test_an_inner_nearby(self, kind: str) -> None:
+        async with subquery_db(kind):
+            await _seed()
+            await SqPost.objects().filter(title="four").bulk_update(spot=GeometryPoint(*_PARIS))
+            near = SqPost.objects().nearby("spot", _PARIS, 1000).select("author")
+            assert _ids(await SqPerson.objects().filter(id__in=Subquery(near)).exec()) == {"ada"}
+
+    async def test_a_geo_distance_annotation(self, kind: str) -> None:
+        async with subquery_db(kind):
+            await _seed()
+            await SqPost.objects().filter(title="four").bulk_update(spot=GeometryPoint(*_PARIS))
+            qs = SqPost.objects().filter(author__in=Subquery(_active())).annotate(d=GeoDistance("spot", _PARIS))
+            distances = {post.id: post.d for post in await qs.exec()}
+            assert distances == {"p1": None, "p2": None, "p4": pytest.approx(0.0)}
+
+    async def test_none_values_of_the_selected_field(self, kind: str) -> None:
+        """M14, documented: the subquery holds p5's missing ``author`` as ``NONE``, which ``in`` matches."""
+        async with subquery_db(kind):
+            await _seed()
+            authors = SqPost.objects().select("author")
+            assert _ids(await SqPost.objects().filter(author__in=Subquery(authors)).exec()) == _ALL_POSTS
+
+
+# --- AC-6: ordered and limited subqueries; surrealdb/surrealdb#7470 ------------------------------------------
+
+_Q_AUTHORS = ("ada", "bob", "cy")
+_RUNS = 12
+_PIN = "SELECT VALUE id FROM sq_post WHERE author IN (SELECT id AS _sqv, age FROM sq_person ORDER BY age DESC LIMIT 1)._sqv;"
+_PIN_FIXED = (
+    "SurrealDB fixed surrealdb/surrealdb#7470: narrow this test's version range to the affected 3.x minors and rewrite "
+    "the README 2.x/3.x row 'A subquery with order_by() and limit()'"
+)
+
+
+async def _seed_ordered() -> None:
+    """Spec §9's persons and 30 posts ``q0…q29`` (no ``p`` post): authors ada, bob, cy in turn, ``score = i``."""
+    for key, name, active, age in (("ada", "Ada", True, 36), ("bob", "Bob", True, 50), ("cy", "Cy", False, 20)):
+        await SqPerson(id=key, name=name, active=active, age=age).save()
+    await SqPost.objects().bulk_create(
+        [SqPost(id=f"q{i}", title=f"q{i}", author=_person(_Q_AUTHORS[i % 3]), score=i) for i in range(30)]
+    )
+
+
+def _posts_of(author: str) -> set[str]:
+    return {f"q{i}" for i in range(30) if _Q_AUTHORS[i % 3] == author}
+
+
+class TestOrderedLimitedE2E:
+    """AC-6: an ordered and limited subquery gives the right rows in 12 of 12 runs on every line, 3.2+ included,
+    and the pin on the server's own inline form (surrealdb/surrealdb#7470)."""
+
+    @pytest.mark.parametrize("kind", ["mem", "ws"])
+    async def test_ordered_and_limited(self, kind: str) -> None:
+        async with subquery_db(kind):
+            await _seed_ordered()
+            oldest = SqPerson.objects().order_by("-age").limit(1)
+            second = SqPerson.objects().order_by("-age").limit(1).offset(1)
+            youngest_active = SqPerson.objects().order_by("-active", "age").limit(1)
+            for _ in range(_RUNS):
+                assert _ids(await SqPost.objects().filter(author__in=Subquery(oldest)).exec()) == _posts_of("bob")
+                assert _ids(await SqPost.objects().filter(author__in=Subquery(second)).exec()) == _posts_of("ada")
+                assert _ids(await SqPost.objects().filter(author__in=Subquery(youngest_active)).exec()) == _posts_of("ada")
+
+    @pytest.mark.parametrize("kind", ["mem", "ws"])
+    async def test_ordered_first_value(self, kind: str) -> None:
+        async with subquery_db(kind):
+            await _seed_ordered()
+            best = SqPost.objects().select("score").order_by("-score").limit(1)
+            for _ in range(_RUNS):
+                assert _ids(await SqPost.objects().filter(score=Subquery(best)).exec()) == {"q29"}
+
+    async def test_7470_pin(self) -> None:
+        """The raw inline form the ORM avoids: wrong rows on 3.2 and later, right on 2.x and 3.1.
+
+        Fails on purpose when an upstream 3.x release fixes surrealdb/surrealdb#7470 (spec D16).
+        """
+        async with subquery_db("ws") as client:
+            await _seed_ordered()
+            counts = [len(await client.query(_PIN)) for _ in range(_RUNS)]
+            if await _line_version(client) >= (3, 2):
+                if min(counts) >= 10:
+                    pytest.fail(_PIN_FIXED)
+            else:
+                assert counts == [10] * _RUNS
+
+
+# --- AC-7 (reads): a subquery table that does not exist ------------------------------------------------------
+
+
+def _ghost() -> Subquery:
+    return Subquery(SqGhost.objects())
+
+
+def _nested_ghost() -> Any:
+    """A ghost two levels deep: the posts of the persons not in the (missing) ghost table — every authored post."""
+    return SqPost.objects().filter(author__in=Subquery(SqPerson.objects().filter(id__not_in=_ghost())))
+
+
+_EMPTY_LET = "LET $_sq0 = [];"
+
+
+class TestMissingSubqueryTableReadsE2E:
+    """AC-7 (reads): a subquery table that does not exist reads as empty on every line — in one request on 2.x
+    and the embedded engine, in two on 3.x, whose server raises and gets the statement again with it empty."""
+
+    async def test_3x_sends_the_statement_again_with_the_subquery_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with subquery_db("ws") as client:
+            if await _line(client) < 3:
+                pytest.skip("SurrealDB 3.x only: 2.x reads a missing subquery table as empty in one request")
+            await _seed()
+            calls = _record_queries(monkeypatch, client)
+            assert _ids(await SqPost.objects().filter(author__not_in=_ghost()).exec()) == _ALL_POSTS
+            assert len(calls) == 2
+            assert _EMPTY_LET not in calls[0][0]
+            assert _EMPTY_LET in calls[1][0]
+            calls.clear()
+            assert await SqPost.objects().filter(author__not_in=_ghost()).count() == 5
+            assert len(calls) == 2
+            calls.clear()
+            assert await SqPost.objects().filter(author__in=_ghost()).exec() == []
+            assert len(calls) == 2
+            calls.clear()
+            assert _ids(await _nested_ghost().exec()) == {"p1", "p2", "p3", "p4"}
+            assert len(calls) == 2
+            assert _EMPTY_LET in calls[1][0]
+
+    @pytest.mark.parametrize("kind", ["mem", "ws"])
+    async def test_2x_reads_it_as_empty_in_one_request(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with subquery_db(kind) as client:
+            if await _line(client) >= 3:
+                pytest.skip("SurrealDB 2.x and the embedded engine only: 3.x raises, and the ORM sends again")
+            await _seed()
+            calls = _record_queries(monkeypatch, client)
+            assert _ids(await SqPost.objects().filter(author__not_in=_ghost()).exec()) == _ALL_POSTS
+            assert await SqPost.objects().filter(author__not_in=_ghost()).count() == 5
+            assert await SqPost.objects().filter(author__in=_ghost()).exec() == []
+            assert _ids(await _nested_ghost().exec()) == {"p1", "p2", "p3", "p4"}
+            assert len(calls) == 4
+            assert not any(_EMPTY_LET in statement for statement, _ in calls)
+
+    async def test_3x_the_outer_table_missing_as_the_subquery_table(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """M17: the ``LET`` fails first and names the table, which is a subquery's: sent again with it empty, where
+        ``x IN []`` reads nothing and ``x NOT IN []`` names the outer table, which reads as empty."""
+        async with subquery_db("ws") as client:
+            if await _line(client) < 3:
+                pytest.skip("SurrealDB 3.x only: 2.x reads both missing tables as empty in one request")
+            calls = _record_queries(monkeypatch, client)
+            for lookup in ("x__in", "x__not_in"):
+                calls.clear()
+                assert await SqGhost.objects().filter(**{lookup: _ghost()}).exec() == []
+                assert len(calls) == 2, lookup
+                assert _EMPTY_LET in calls[1][0]
+                calls.clear()
+                assert await SqGhost.objects().filter(**{lookup: _ghost()}).count() == 0
+                assert len(calls) == 2, lookup
+
+    @pytest.mark.parametrize("kind", ["mem", "ws"])
+    async def test_2x_the_outer_table_missing_as_the_subquery_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with subquery_db(kind) as client:
+            if await _line(client) >= 3:
+                pytest.skip("SurrealDB 2.x and the embedded engine only: 3.x raises, and the ORM sends again")
+            calls = _record_queries(monkeypatch, client)
+            for lookup in ("x__in", "x__not_in"):
+                assert await SqGhost.objects().filter(**{lookup: _ghost()}).exec() == []
+                assert await SqGhost.objects().filter(**{lookup: _ghost()}).count() == 0
+            assert len(calls) == 4
+
+    @pytest.mark.parametrize("kind", ["mem", "ws"])
+    async def test_the_outer_table_missing_alone(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The subquery reads a table that exists: the outer table reads as empty, as without a subquery, in one
+        request on every line."""
+        async with subquery_db(kind) as client:
+            await _seed()
+            calls = _record_queries(monkeypatch, client)
+            assert await SqGhost.objects().filter(x__in=Subquery(SqPerson.objects())).exec() == []
+            assert len(calls) == 1
+            assert await SqGhost.objects().filter(x__in=Subquery(SqPerson.objects())).count() == 0
+            assert len(calls) == 2
+
+    async def test_3x_in_an_interactive_transaction(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """M9: the read is sent again inside the transaction, which still writes and commits."""
+        async with subquery_db("ws") as client:
+            if not await _interactive_transactions(client):
+                pytest.skip("SurrealDB 3.x only: 2.x has no interactive transaction (begin())")
+            await _seed()
+            calls = _record_queries(monkeypatch, client)
+            async with SurrealDBConnectionManager.transaction() as tx:
+                rows = await SqPost.objects(tx=tx).filter(author__not_in=_ghost()).exec()
+                assert _ids(rows) == _ALL_POSTS
+                assert len(calls) == 2
+                assert _EMPTY_LET in calls[1][0]
+                await SqPerson(id="dan", name="Dan", age=40).save(tx=tx)
+            assert (await SqPerson.objects().get("dan")).name == "Dan"
+
+
+# --- the 3.x re-send, without a server ---------------------------------------------------------------------
+
+
+class _RaisingClient:
+    """A client whose ``query`` raises *error*."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
+        raise self.error
+
+
+class _RaisingTx:
+    """A transaction whose ``run_read`` raises *error* (the pattern of ``tests/test_transactions.py::_FakeTx``)."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    @property
+    def is_interactive(self) -> bool:
+        return True
+
+    async def run_read(self, sql: str, variables: dict[str, Any] | None = None) -> Any:
+        raise self.error
+
+    async def add(self, sql: str, variables: dict[str, Any] | None = None) -> Any:
+        raise AssertionError("no write expected")
+
+
+def _raising_queryset(branch: str, monkeypatch: pytest.MonkeyPatch, error: Exception) -> QuerySet:
+    """``SqPost.objects()`` whose reads raise *error*: through the client, or through a transaction."""
+    if branch == "tx":
+        return SqPost.objects(tx=_RaisingTx(error))
+
+    async def _client(*args: Any, **kwargs: Any) -> Any:
+        return _RaisingClient(error)
+
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", _client)
+    return SqPost.objects()
+
+
+_SELECT = "SELECT * FROM sq_post;"
+_READS_SQ_PERSON = frozenset({"sq_person"})
+
+
+@pytest.mark.parametrize("branch", ["client", "tx"])
+class TestExecuteQueryNotFound:
+    """AC-7 (rev. 3, P2): what ``_execute_query`` makes of a server error, on the client and the transaction
+    branches, while a ``LET`` reads subquery tables (``subquery_tables``) and without."""
+
+    async def test_a_not_found_naming_no_table_is_relayed_while_a_let_reads_subquery_tables(
+        self, branch: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        error = NotFoundError("NotFound", "nope")
+        qs = _raising_queryset(branch, monkeypatch, error)
+        with pytest.raises(NotFoundError) as info:
+            await qs._execute_query(_SELECT, {}, subquery_tables=_READS_SQ_PERSON)
+        assert info.value is error
+
+    async def test_without_subquery_tables_a_not_found_reads_as_empty(
+        self, branch: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        qs = _raising_queryset(branch, monkeypatch, NotFoundError("NotFound", "nope"))
+        assert await qs._execute_query(_SELECT, {}, subquery_tables=frozenset()) == []
+        assert await qs._execute_query(_SELECT, {}) == []
+
+    async def test_the_outer_table_missing_reads_as_empty(self, branch: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        qs = _raising_queryset(branch, monkeypatch, NotFoundError("NotFound", "The table 'sq_post' does not exist"))
+        assert await qs._execute_query(_SELECT, {}, subquery_tables=_READS_SQ_PERSON) == []
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            NotFoundError("NotFound", "The table 'sq_person' does not exist"),
+            ThrownError("Thrown", "An error occurred: The table 'sq_person' does not exist"),
+        ],
+        ids=["NotFoundError", "ThrownError"],
+    )
+    async def test_a_missing_subquery_table_asks_for_the_statement_again(
+        self, branch: str, monkeypatch: pytest.MonkeyPatch, error: Exception
+    ) -> None:
+        qs = _raising_queryset(branch, monkeypatch, error)
+        with pytest.raises(_MissingSubqueryTable) as info:
+            await qs._execute_query(_SELECT, {}, subquery_tables=_READS_SQ_PERSON)
+        assert info.value.table == "sq_person"
+        assert info.value.__cause__ is error
+
+    async def test_without_subquery_tables_a_thrown_error_is_relayed(
+        self, branch: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without subquery tables the 3.1 ``ThrownError`` stays the server's error, as today."""
+        error = ThrownError("Thrown", "An error occurred: The table 'sq_person' does not exist")
+        qs = _raising_queryset(branch, monkeypatch, error)
+        with pytest.raises(ThrownError) as info:
+            await qs._execute_query(_SELECT, {})
+        assert info.value is error
+
+    async def test_another_server_error_is_relayed(self, branch: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        error = ServerError("Internal", "boom")
+        qs = _raising_queryset(branch, monkeypatch, error)
+        with pytest.raises(ServerError) as info:
+            await qs._execute_query(_SELECT, {}, subquery_tables=_READS_SQ_PERSON)
+        assert info.value is error
+
+
+def _recording_execute(
+    monkeypatch: pytest.MonkeyPatch, qs: QuerySet, answer: Any = None
+) -> list[tuple[tuple[Any, ...], dict[str, Any]]]:
+    """Replace *qs*'s ``_execute_query`` with a fake recording ``(args, kwargs)``: it raises ``_MissingSubqueryTable``
+    for the greatest table of a non-empty ``subquery_tables``, else returns *answer* (``[]`` by default)."""
+    calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+    async def _execute(*args: Any, **kwargs: Any) -> Any:
+        calls.append((args, kwargs))
+        tables = kwargs.get("subquery_tables", frozenset())
+        if tables:
+            raise _MissingSubqueryTable(max(tables))
+        return [] if answer is None else answer
+
+    monkeypatch.setattr(qs, "_execute_query", _execute)
+    return calls
+
+
+class TestRunCompiled:
+    """The read loop (spec §6.3 ``_run_compiled``), without a server: one re-send per missing subquery table, and
+    today's two-argument call once no ``LET`` reads a table."""
+
+    async def test_one_resend_per_missing_subquery_table(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        writers = SqPost.objects().filter(score__gt=8).select("author")
+        qs = SqPost.objects().filter(author__in=Subquery(SqPerson.objects().filter(id__in=Subquery(writers))))
+        calls = _recording_execute(monkeypatch, qs)
+        assert await qs.exec() == []
+        assert len(calls) == 3
+        assert calls[0][1] == {"subquery_tables": frozenset({"sq_person", "sq_post"})}
+        assert calls[1] == (
+            (
+                "{ LET $_sq0 = []; LET $_sq1 = (SELECT VALUE id FROM sq_person WHERE id IN $_sq0); "
+                "(SELECT * FROM sq_post WHERE author IN $_sq1) };",
+                {},
+            ),
+            {"subquery_tables": frozenset({"sq_person"})},
+        )
+        assert calls[2] == (("{ LET $_sq0 = []; (SELECT * FROM sq_post WHERE author IN $_sq0) };", {}), {})
+
+    @pytest.mark.parametrize(
+        ("read", "statement"),
+        [
+            (lambda qs: qs.exec(), "SELECT * FROM sq_post WHERE score > $_f0;"),
+            (lambda qs: qs.exists(), "SELECT * FROM sq_post WHERE score > $_f0 LIMIT 1;"),
+            (lambda qs: qs.count(), "SELECT count() FROM sq_post WHERE score > $_f0 GROUP ALL;"),
+            (lambda qs: qs.sum("score"), "SELECT math::sum(score) AS sum FROM sq_post WHERE score > $_f0 GROUP ALL;"),
+            (lambda qs: qs.avg("score"), "SELECT math::mean(score) AS avg FROM sq_post WHERE score > $_f0 GROUP ALL;"),
+            (lambda qs: qs.min("score"), "SELECT math::min(score) AS min FROM sq_post WHERE score > $_f0 GROUP ALL;"),
+            (lambda qs: qs.max("score"), "SELECT math::max(score) AS max FROM sq_post WHERE score > $_f0 GROUP ALL;"),
+        ],
+        ids=["exec", "exists", "count", "sum", "avg", "min", "max"],
+    )
+    async def test_without_a_subquery_the_call_is_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch, read: Callable[[Any], Any], statement: str
+    ) -> None:
+        qs = SqPost.objects().filter(score__gt=5)
+        calls = _recording_execute(monkeypatch, qs)
+        await read(qs)
+        assert calls == [((statement, {"_f0": 5}), {})]
+
+    @pytest.mark.parametrize(
+        ("read", "statement"),
+        [
+            (lambda qs: qs.exec(), "SELECT * FROM sq_post WHERE author IN $_sq0"),
+            (lambda qs: qs.exists(), "SELECT * FROM sq_post WHERE author IN $_sq0 LIMIT 1"),
+            (lambda qs: qs.count(), "SELECT count() FROM sq_post WHERE author IN $_sq0 GROUP ALL"),
+            (lambda qs: qs.sum("score"), "SELECT math::sum(score) AS sum FROM sq_post WHERE author IN $_sq0 GROUP ALL"),
+            (lambda qs: qs.avg("score"), "SELECT math::mean(score) AS avg FROM sq_post WHERE author IN $_sq0 GROUP ALL"),
+            (lambda qs: qs.min("score"), "SELECT math::min(score) AS min FROM sq_post WHERE author IN $_sq0 GROUP ALL"),
+            (lambda qs: qs.max("score"), "SELECT math::max(score) AS max FROM sq_post WHERE author IN $_sq0 GROUP ALL"),
+            (
+                lambda qs: qs.values("author").annotate(n=Count()).exec(),
+                "SELECT author, count() AS n FROM sq_post WHERE author IN $_sq0 GROUP BY author",
+            ),
+            (
+                lambda qs: qs.annotate(d=GeoDistance("spot", _PARIS)).exec(),
+                "SELECT *, IF spot.is_point() THEN geo::distance(spot, $_gd0) END AS d FROM sq_post WHERE author IN $_sq0",
+            ),
+        ],
+        ids=["exec", "exists", "count", "sum", "avg", "min", "max", "values-annotate", "geo-distance"],
+    )
+    async def test_every_read_sends_again_with_the_subquery_empty(
+        self, monkeypatch: pytest.MonkeyPatch, read: Callable[[Any], Any], statement: str
+    ) -> None:
+        qs = _with_inner(_active())
+        calls = _recording_execute(monkeypatch, qs)
+        await read(qs)
+        assert [(args[0], kwargs) for args, kwargs in calls] == [
+            (f"{{ {_C1_LET} ({statement}) }};", {"subquery_tables": _READS_SQ_PERSON}),
+            (f"{{ LET $_sq0 = []; ({statement}) }};", {}),
+        ]
+
+    async def test_the_limit_of_exists_is_restored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        qs = _with_inner(_active()).limit(7)
+        _recording_execute(monkeypatch, qs)
+        assert await qs.exists() is False
+        assert qs._limit == 7

@@ -234,6 +234,19 @@ class SubqueryCompiler:
         return "{ " + " ".join(self.lets) + f" ({statement.removesuffix(';')}) }};"
 
 
+class _MissingSubqueryTable(Exception):
+    """SurrealDB 3.x said that *table*, which a ``LET`` of the statement reads, does not exist.
+
+    Raised by ``QuerySet._execute_query()`` from the server's error and caught by ``QuerySet._run_compiled()``,
+    which compiles the statement again with every subquery of that table bound to ``[]`` and sends it again: it
+    never reaches the caller.
+    """
+
+    def __init__(self, table: str) -> None:
+        super().__init__(table)
+        self.table = table
+
+
 def subquery_condition(
     field: str, lookup: str, op: str, sub: Subquery, counter: int, compiler: SubqueryCompiler | None
 ) -> tuple[str, dict[str, Any], int]:

@@ -192,7 +192,8 @@ class QuerySet:
         ``select()``; its ``filter()``, ``Q``, ``nearby()``, ``order_by()``, ``limit()``, ``offset()`` and
         ``variables()`` apply, its ``fetch()`` is ignored. It is read when this queryset runs, in the same
         statement: one request. A clause it cannot honour raises when this queryset compiles, before any request
-        (see ``Subquery``).
+        (see ``Subquery``). A subquery reading a table that does not exist reads as empty, as any missing table
+        (SurrealDB 3.x raises: the statement is then sent once more with that subquery empty).
         """
         for arg in args:
             if not isinstance(arg, Q):
@@ -843,34 +844,107 @@ class QuerySet:
 
     # ==================== Query execution ====================
 
-    async def _execute_query(self, query: str, variables: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    async def _execute_query(
+        self, query: str, variables: dict[str, Any] | None = None, *, subquery_tables: frozenset[str] = frozenset()
+    ) -> list[dict[str, Any]]:
         """
         Execute a read query. Routes through the transaction when one is attached
         (``objects(tx=)``), so reads participate in the transaction and see its
         uncommitted writes (interactive, 3.x). On a buffered tx, ``run_read`` raises.
+
+        A table that does not exist reads as no rows (``NotFoundError``, SurrealDB 3.x).
 
         On a queryset read ``as_of()`` (v0.26.0) — every read of which is a ``VERSION`` read, its writes
         and ``query()`` being refused — a server whose storage keeps no history ("does not support
         versioned queries": SurrealDB 3.x, 2.x on RocksDB) is reported as ``SurrealDbError`` (T7), chained
         to the SDK's error. Keyed on ``as_of()``, never on the variables: without it, every error is
         relayed unchanged.
+
+        Args:
+            query: the statement.
+            variables: its bound values (the queryset's ``variables()`` when ``None``).
+            subquery_tables: the tables a ``LET`` of the statement still reads (v0.27.0; empty: the behaviour
+                above, exactly). When the server says one of them does not exist (``NotFoundError``, or
+                ``ThrownError`` inside a block on 3.1), ``_MissingSubqueryTable`` asks
+                :meth:`_run_compiled` to send the statement again with it empty. While the set is not empty,
+                a ``NotFoundError`` that names no table is relayed: it cannot be told to be the outer table's.
+
+        Raises:
+            _MissingSubqueryTable: a table of *subquery_tables* does not exist (caught by :meth:`_run_compiled`).
         """
         vars_ = variables if variables is not None else self._variables
         compiled = remove_quotes_for_variables(query)
         if self._tx is not None:
             try:
                 return await self._tx.run_read(compiled, vars_)  # type: ignore[no-any-return]
-            except NotFoundError:
-                return []
+            except ServerError as exc:
+                self._raise_missing_subquery_table(exc, subquery_tables)
+                if self._reads_as_empty(exc, subquery_tables):
+                    return []
+                raise
         client = await SurrealDBConnectionManager.get_client()
         try:
             return await client.query(compiled, _encoding.encode(vars_))  # type: ignore
-        except NotFoundError:
-            return []
         except ServerError as exc:
+            self._raise_missing_subquery_table(exc, subquery_tables)
+            if self._reads_as_empty(exc, subquery_tables):
+                return []
             if self._as_of is not None and _time_travel.UNSUPPORTED_MARKER in str(exc):
                 raise SurrealDbError(_time_travel.server_refused(exc)) from exc
             raise
+
+    @staticmethod
+    def _raise_missing_subquery_table(exc: ServerError, subquery_tables: frozenset[str]) -> None:
+        """Raise ``_MissingSubqueryTable`` when *exc* says that a table of *subquery_tables* does not exist (v0.27.0).
+
+        The outer table is not set apart: when a subquery reads it too, the ``LET`` runs first and its error names
+        it (SurrealDB 3.1 as a ``ThrownError``), so the statement is sent again with that subquery empty. Once no
+        ``LET`` reads it, an error naming it is the outer table's own, which reads as no rows.
+        """
+        table = _subquery.missing_table(exc)
+        if table is not None and table in subquery_tables:
+            raise _subquery._MissingSubqueryTable(table) from exc
+
+    @staticmethod
+    def _reads_as_empty(exc: ServerError, subquery_tables: frozenset[str]) -> bool:
+        """Whether *exc* reads as no rows: a ``NotFoundError`` (a table that does not exist, SurrealDB 3.x).
+
+        Except, while a ``LET`` reads *subquery_tables* (v0.27.0), one that names no table: it cannot be told to be
+        the outer table's, so it is relayed.
+        """
+        if not isinstance(exc, NotFoundError):
+            return False
+        return not subquery_tables or _subquery.missing_table(exc) is not None
+
+    async def _run_compiled(
+        self, compile_statement: Callable[[SubqueryCompiler], tuple[str, dict[str, Any]]], *, write: bool = False
+    ) -> Any:
+        """Compile a statement of this queryset with a new subquery compiler and run it (v0.27.0).
+
+        A statement whose ``LET`` s read no table — no subquery, or every subquery table already bound to ``[]`` —
+        is today's call, ``_execute_query(query, variables)``. Otherwise, when SurrealDB 3.x says that a subquery
+        table does not exist, the statement is compiled again with every subquery of that table bound to ``[]``
+        and sent again: a missing subquery table reads as empty, as on 2.x, where the server reads it so. At most
+        one more request per subquery table, and only then.
+
+        Args:
+            compile_statement: compiles the statement with the compiler it is given; returns its text and variables.
+            write: a write by filter: inside a transaction it is added to it, never sent again (the server's
+                error is the transaction's).
+        """
+        empty: frozenset[str] = frozenset()
+        while True:
+            compiler = self._subquery_compiler(empty)
+            query, variables = compile_statement(compiler)
+            if write and self._tx is not None:
+                return await self._tx.add(query, variables)
+            read = frozenset(compiler.tables) - empty
+            if not read:
+                return await self._execute_query(query, variables)
+            try:
+                return await self._execute_query(query, variables, subquery_tables=read)
+            except _subquery._MissingSubqueryTable as missing:
+                empty |= {missing.table}
 
     async def exec(self) -> Any:
         """
@@ -890,14 +964,12 @@ class QuerySet:
             return await self._exec_with_distances(moment)
 
         if self._annotations:
-            query, variables = self._compile_group_by_query(moment)
-            results = await self._execute_query(query, variables)
+            results = await self._run_compiled(lambda c: self._compile_group_by_query(moment, subqueries=c))
             if not isinstance(results, list):
                 return []
             return [self._py_keyed(row) for row in results]
 
-        query, variables = self._compile_query(moment)
-        results = await self._execute_query(query, variables)
+        results = await self._run_compiled(lambda c: self._compile_query(moment, subqueries=c))
         try:
             if isinstance(results, list):
                 return self._mark_snapshots(self.model.from_db(results), moment)
@@ -917,8 +989,7 @@ class QuerySet:
         ``as_of()``, *moment* is the read's resolved moment and the instances are snapshots (v0.26.0).
         """
         self._reject_geo_distance_mixing(self._annotations, grouped=bool(self._group_by_fields))
-        query, variables = self._compile_query(moment)
-        results = await self._execute_query(query, variables)
+        results = await self._run_compiled(lambda c: self._compile_query(moment, subqueries=c))
         rows = results if isinstance(results, list) else []
         stripped: list[dict[str, Any]] = []
         distances: list[dict[str, Any]] = []
@@ -1194,8 +1265,7 @@ class QuerySet:
             The number of matching records.
         """
         moment = await self._time_travel_moment()
-        query, variables = self._compile_aggregation_query("count()", moment=moment)
-        results = await self._execute_query(query, variables)
+        results = await self._run_compiled(lambda c: self._compile_aggregation_query("count()", moment=moment, subqueries=c))
 
         if isinstance(results, list) and len(results) > 0:
             result = results[0]
@@ -1216,8 +1286,10 @@ class QuerySet:
         """
         validate_field_name(field, "sum() field")
         moment = await self._time_travel_moment()
-        query, variables = self._compile_aggregation_query(f"math::sum({self._column(field)})", alias="sum", moment=moment)
-        results = await self._execute_query(query, variables)
+        expression = f"math::sum({self._column(field)})"
+        results = await self._run_compiled(
+            lambda c: self._compile_aggregation_query(expression, alias="sum", moment=moment, subqueries=c)
+        )
 
         if isinstance(results, list) and len(results) > 0:
             result = results[0]
@@ -1239,8 +1311,10 @@ class QuerySet:
         """
         validate_field_name(field, "avg() field")
         moment = await self._time_travel_moment()
-        query, variables = self._compile_aggregation_query(f"math::mean({self._column(field)})", alias="avg", moment=moment)
-        results = await self._execute_query(query, variables)
+        expression = f"math::mean({self._column(field)})"
+        results = await self._run_compiled(
+            lambda c: self._compile_aggregation_query(expression, alias="avg", moment=moment, subqueries=c)
+        )
 
         if isinstance(results, list) and len(results) > 0:
             result = results[0]
@@ -1264,8 +1338,10 @@ class QuerySet:
         """
         validate_field_name(field, "min() field")
         moment = await self._time_travel_moment()
-        query, variables = self._compile_aggregation_query(f"math::min({self._column(field)})", alias="min", moment=moment)
-        results = await self._execute_query(query, variables)
+        expression = f"math::min({self._column(field)})"
+        results = await self._run_compiled(
+            lambda c: self._compile_aggregation_query(expression, alias="min", moment=moment, subqueries=c)
+        )
 
         if isinstance(results, list) and len(results) > 0:
             result = results[0]
@@ -1289,8 +1365,10 @@ class QuerySet:
         """
         validate_field_name(field, "max() field")
         moment = await self._time_travel_moment()
-        query, variables = self._compile_aggregation_query(f"math::max({self._column(field)})", alias="max", moment=moment)
-        results = await self._execute_query(query, variables)
+        expression = f"math::max({self._column(field)})"
+        results = await self._run_compiled(
+            lambda c: self._compile_aggregation_query(expression, alias="max", moment=moment, subqueries=c)
+        )
 
         if isinstance(results, list) and len(results) > 0:
             result = results[0]
@@ -1313,8 +1391,7 @@ class QuerySet:
         original_limit = self._limit
         try:
             self._limit = 1
-            query, variables = self._compile_query(moment)
-            results = await self._execute_query(query, variables)
+            results = await self._run_compiled(lambda c: self._compile_query(moment, subqueries=c))
 
             if isinstance(results, list):
                 return len(results) > 0
