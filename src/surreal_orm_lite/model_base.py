@@ -7,13 +7,13 @@ import os
 import typing
 import warnings
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from types import UnionType
 from typing import TYPE_CHECKING, Any, Self, TypeVar, overload
 
 import pydantic
-from pydantic import BaseModel, ConfigDict, ModelWrapValidatorHandler, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, ModelWrapValidatorHandler, PrivateAttr, TypeAdapter, model_validator
 from pydantic_core import ValidationError
 
 from . import encoding as _encoding
@@ -553,6 +553,17 @@ def _own_annotation_names(cls: type) -> set[str]:
     return set(annotationlib.get_annotations(cls, format=annotationlib.Format.STRING))
 
 
+def _snapshot_moment(instance: BaseModel) -> datetime | None:
+    """The moment a time-travel read (``QuerySet.as_of()``) returned *instance* at; ``None`` for a current record (v0.26.0).
+
+    The only reader of the private marker ``_surreal_as_of``: never read ``instance._surreal_as_of`` itself. An
+    instance pickled by v0.25.x, whose models had no private attribute, may carry ``__pydantic_private__ = None``
+    (``BaseSurrealModel.__setstate__`` repairs it when it is unpickled, but not one built otherwise), and
+    Pydantic's ``__getattr__`` then raises ``TypeError`` on the attribute instead of answering.
+    """
+    return (instance.__pydantic_private__ or {}).get("_surreal_as_of")
+
+
 class SurrealConfigDict(ConfigDict, total=False):
     """
     SurrealConfigDict is a configuration dictionary for SurrealDB models.
@@ -621,6 +632,30 @@ class BaseSurrealModel(BaseModel):
     The internal marker the write paths, ``relate()`` and live hydration test to tell an edge
     model from a node, so they need not import ``edge.py`` (which imports this module).
     """
+
+    _surreal_as_of: datetime | None = PrivateAttr(default=None)
+    """The moment a time-travel read (``QuerySet.as_of()``) returned this instance at; ``None`` for a current record (v0.26.0).
+
+    Set by the QuerySet's time-travel reads only. Read it through :func:`_snapshot_moment`, never as an
+    attribute: an instance pickled by v0.25.x has no private state. A private attribute, so it never reaches
+    ``model_dump()`` or a write; ``model_copy()`` and ``pickle`` keep it, and Pydantic's ``==`` compares it.
+    """
+
+    def __setstate__(self, state: dict[Any, Any]) -> None:
+        """Unpickle; an instance pickled before v0.26.0 has no snapshot marker: it is a current record (v0.26.0).
+
+        v0.25.x models had no private attribute, so their pickled state holds ``__pydantic_private__: None``
+        (or, on a model declaring its own, a dict without the marker). The marker is added as ``None``: such an
+        instance equals a fresh equal one and writes as before the upgrade. A snapshot pickled by v0.26.0 keeps
+        its moment, and a model's own private attributes are kept.
+        """
+        super().__setstate__(state)
+        private = self.__pydantic_private__
+        if private is None:
+            # Pydantic's own __setstate__ sets this slot the same way (its __setattr__ refuses dunder names).
+            object.__setattr__(self, "__pydantic_private__", {"_surreal_as_of": None})
+        else:
+            private.setdefault("_surreal_as_of", None)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Collect ``Computed(...)`` defaults before Pydantic builds the model.

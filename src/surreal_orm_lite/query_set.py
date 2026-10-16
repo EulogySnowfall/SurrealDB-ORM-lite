@@ -13,9 +13,10 @@ from . import BaseSurrealModel, SurrealDBConnectionManager
 from . import encoding as _encoding
 from . import geo as _geo
 from . import time_travel as _time_travel
-from ._sdk import NotFoundError, SdkGeometryPoint
+from ._sdk import NotFoundError, SdkGeometryPoint, ServerError
 from .changefeed import ChangeModelStream, Since
 from .edge import _check_edge_id, insert_edges
+from .embedded import history_unsupported, keeps_history
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import SurrealFunc, Var
@@ -417,6 +418,49 @@ class QuerySet:
         if self._as_of is not None:
             raise SurrealDbError(_time_travel.queryset_refused(method))
 
+    async def _time_travel_moment(self, *, fetches: bool = False) -> datetime | None:
+        """The resolved moment of a read under ``as_of()``; ``None`` without it, and no request (v0.26.0).
+
+        The first step of every read. In order:
+
+        1. On the embedded engine, a URL that keeps no history (``embedded.keeps_history()``) raises T6
+           before any client is acquired, so nothing is sent.
+        2. A duration or a ``SurrealFunc`` is resolved by the database (one ``RETURN`` request), and the
+           resolved moment checked against the moments a version can address (``time_travel.resolve()``:
+           T10 a/b/c, after which the read is never sent). An absolute moment, checked by ``as_of()``, needs
+           no request.
+
+        Args:
+            fetches: whether the read returns the records ``fetch()`` resolves (``exec()`` outside
+                ``values()``+``annotate()``, hence ``first()`` and ``get()`` without an id); the other reads
+                ignore ``fetch()``.
+
+        Raises:
+            SurrealDbError: T6; T10 (a, b, c).
+        """
+        if self._as_of is None:
+            return None
+        url = SurrealDBConnectionManager.get_connection_string()
+        if SurrealDBConnectionManager.is_embedded() and not keeps_history(url):
+            raise SurrealDbError(history_unsupported(url))
+        client = await SurrealDBConnectionManager.get_client()
+        # The line check of fetch() under as_of() (T8, reads with fetches=True) belongs here, before the resolution.
+        return await _time_travel.resolve(self._as_of, client, self._variables)
+
+    @staticmethod
+    def _mark_snapshots(result: Any, moment: datetime | None) -> Any:
+        """Mark the instances of *result* (a list, or one instance) as snapshots read at *moment*; return it (v0.26.0).
+
+        Nothing happens without a moment (a current read). Rows that did not validate stay dicts, untouched.
+        The marker is read with ``model_base._snapshot_moment()``.
+        """
+        if moment is None:
+            return result
+        for instance in result if isinstance(result, list) else [result]:
+            if isinstance(instance, BaseSurrealModel):
+                instance._surreal_as_of = moment
+        return result
+
     # ==================== Internal query building ====================
 
     def _build_where(self, *, as_of: bool = False) -> tuple[str, dict[str, Any]]:
@@ -614,6 +658,12 @@ class QuerySet:
         Execute a read query. Routes through the transaction when one is attached
         (``objects(tx=)``), so reads participate in the transaction and see its
         uncommitted writes (interactive, 3.x). On a buffered tx, ``run_read`` raises.
+
+        On a queryset read ``as_of()`` (v0.26.0) — every read of which is a ``VERSION`` read, its writes
+        and ``query()`` being refused — a server whose storage keeps no history ("does not support
+        versioned queries": SurrealDB 3.x, 2.x on RocksDB) is reported as ``SurrealDbError`` (T7), chained
+        to the SDK's error. Keyed on ``as_of()``, never on the variables: without it, every error is
+        relayed unchanged.
         """
         vars_ = variables if variables is not None else self._variables
         compiled = remove_quotes_for_variables(query)
@@ -627,6 +677,10 @@ class QuerySet:
             return await client.query(compiled, _encoding.encode(vars_))  # type: ignore
         except NotFoundError:
             return []
+        except ServerError as exc:
+            if self._as_of is not None and _time_travel.UNSUPPORTED_MARKER in str(exc):
+                raise SurrealDbError(_time_travel.server_refused(exc)) from exc
+            raise
 
     async def exec(self) -> Any:
         """
@@ -638,38 +692,42 @@ class QuerySet:
 
         Returns:
             list[BaseSurrealModel] | list[dict]: Model instances or dictionaries for GROUP BY queries.
+            Under ``as_of()`` the instances are snapshots (v0.26.0).
         """
+        # The values()+annotate() branch compiles no FETCH: only the other two return fetched records.
+        moment = await self._time_travel_moment(fetches=bool(self._geo_annotations) or not self._annotations)
         if self._geo_annotations:
-            return await self._exec_with_distances()
+            return await self._exec_with_distances(moment)
 
         if self._annotations:
-            query, variables = self._compile_group_by_query()
+            query, variables = self._compile_group_by_query(moment)
             results = await self._execute_query(query, variables)
             if not isinstance(results, list):
                 return []
             return [self._py_keyed(row) for row in results]
 
-        query, variables = self._compile_query()
+        query, variables = self._compile_query(moment)
         results = await self._execute_query(query, variables)
         try:
             if isinstance(results, list):
-                return self.model.from_db(results)
+                return self._mark_snapshots(self.model.from_db(results), moment)
             data = cast(dict, results[0])
-            return self.model.from_db(data.get("result", []))
+            return self._mark_snapshots(self.model.from_db(data.get("result", [])), moment)
         except ValidationError as e:
             logger.info(f"Pydantic invalid format for the class, returning dict value: {e}")
             return [self._py_keyed(row) for row in results] if isinstance(results, list) else []
 
-    async def _exec_with_distances(self) -> Any:
+    async def _exec_with_distances(self, moment: datetime | None = None) -> Any:
         """Run the per-record ``SELECT`` of the ``GeoDistance`` annotations (v0.24.0).
 
         The alias keys are taken out of each row before validation, so they never reach a field, an
         ``extra="allow"`` model's extras or a later write, then set on the instance with
         ``object.__setattr__``. Rows that do not validate (a ``select()`` that omits a required
-        field…) come back as dicts, alias keys included, as ``exec()`` returns them today.
+        field…) come back as dicts, alias keys included, as ``exec()`` returns them today. Under
+        ``as_of()``, *moment* is the read's resolved moment and the instances are snapshots (v0.26.0).
         """
         self._reject_geo_distance_mixing(self._annotations, grouped=bool(self._group_by_fields))
-        query, variables = self._compile_query()
+        query, variables = self._compile_query(moment)
         results = await self._execute_query(query, variables)
         rows = results if isinstance(results, list) else []
         stripped: list[dict[str, Any]] = []
@@ -686,7 +744,7 @@ class QuerySet:
         for instance, values in zip(instances, distances, strict=True):
             for alias, value in values.items():
                 object.__setattr__(instance, alias, value)
-        return instances
+        return self._mark_snapshots(instances, moment)
 
     async def first(self) -> Any:
         """
@@ -715,6 +773,10 @@ class QuerySet:
         """
         Retrieve a single record by its unique identifier or based on the current filters.
 
+        Under ``as_of()`` (v0.26.0) the record is read as it was at the moment, and returned as a
+        snapshot: by id, a record deleted since is still found, one created later is not
+        (``SurrealDbNotFoundError``).
+
         Args:
             id_item: The unique identifier of the item to retrieve.
 
@@ -726,6 +788,17 @@ class QuerySet:
             # one. Building RecordID(table, str(id_item)) made get(5) unreachable on a model
             # with `id: int` (issue #159).
             record_id = coerce_record_id(id_item, self._model_table)
+
+            if self._as_of is not None:
+                # A record-id read at a moment is right on every versioned store: no per-record check.
+                moment = await self._time_travel_moment()
+                rows = await self._execute_query(
+                    f"SELECT * FROM $rid{_time_travel.VERSION_CLAUSE};",
+                    {"rid": record_id, _time_travel.MOMENT_VARIABLE: moment},
+                )
+                if not isinstance(rows, list) or not rows or not rows[0]:
+                    raise SurrealDbNotFoundError("No result found.")
+                return self._mark_snapshots(self.model.from_db(rows[0]), moment)
 
             if self._tx is not None:
                 try:
@@ -761,7 +834,18 @@ class QuerySet:
     async def all(self) -> Any:
         """
         Fetch all records from the associated table.
+
+        ``filter()`` and the other clauses are ignored; ``as_of()`` is not (v0.26.0): every record of the
+        table as it was at the moment, returned as snapshots.
         """
+        if self._as_of is not None:
+            moment = await self._time_travel_moment()
+            rows = await self._execute_query(
+                f"SELECT * FROM {self._model_table} WHERE {_time_travel.GUARD}{_time_travel.VERSION_CLAUSE};",
+                {_time_travel.MOMENT_VARIABLE: moment},
+            )
+            return self._mark_snapshots(self.model.from_db(rows if isinstance(rows, list) else []), moment)
+
         if self._tx is not None:
             try:
                 rows = await self._tx.run_read(f"SELECT * FROM {self._model_table};", {})
@@ -919,7 +1003,8 @@ class QuerySet:
         Returns:
             The number of matching records.
         """
-        query, variables = self._compile_aggregation_query("count()")
+        moment = await self._time_travel_moment()
+        query, variables = self._compile_aggregation_query("count()", moment=moment)
         results = await self._execute_query(query, variables)
 
         if isinstance(results, list) and len(results) > 0:
@@ -940,7 +1025,8 @@ class QuerySet:
             The sum of the field values, or 0 if no records match.
         """
         validate_field_name(field, "sum() field")
-        query, variables = self._compile_aggregation_query(f"math::sum({self._column(field)})", alias="sum")
+        moment = await self._time_travel_moment()
+        query, variables = self._compile_aggregation_query(f"math::sum({self._column(field)})", alias="sum", moment=moment)
         results = await self._execute_query(query, variables)
 
         if isinstance(results, list) and len(results) > 0:
@@ -962,7 +1048,8 @@ class QuerySet:
             The average of the field values, or 0.0 if no records match.
         """
         validate_field_name(field, "avg() field")
-        query, variables = self._compile_aggregation_query(f"math::mean({self._column(field)})", alias="avg")
+        moment = await self._time_travel_moment()
+        query, variables = self._compile_aggregation_query(f"math::mean({self._column(field)})", alias="avg", moment=moment)
         results = await self._execute_query(query, variables)
 
         if isinstance(results, list) and len(results) > 0:
@@ -986,7 +1073,8 @@ class QuerySet:
             The minimum value, or None if no records match.
         """
         validate_field_name(field, "min() field")
-        query, variables = self._compile_aggregation_query(f"math::min({self._column(field)})", alias="min")
+        moment = await self._time_travel_moment()
+        query, variables = self._compile_aggregation_query(f"math::min({self._column(field)})", alias="min", moment=moment)
         results = await self._execute_query(query, variables)
 
         if isinstance(results, list) and len(results) > 0:
@@ -1010,7 +1098,8 @@ class QuerySet:
             The maximum value, or None if no records match.
         """
         validate_field_name(field, "max() field")
-        query, variables = self._compile_aggregation_query(f"math::max({self._column(field)})", alias="max")
+        moment = await self._time_travel_moment()
+        query, variables = self._compile_aggregation_query(f"math::max({self._column(field)})", alias="max", moment=moment)
         results = await self._execute_query(query, variables)
 
         if isinstance(results, list) and len(results) > 0:
@@ -1030,10 +1119,11 @@ class QuerySet:
         Returns:
             True if at least one record matches, False otherwise.
         """
+        moment = await self._time_travel_moment()
         original_limit = self._limit
         try:
             self._limit = 1
-            query, variables = self._compile_query()
+            query, variables = self._compile_query(moment)
             results = await self._execute_query(query, variables)
 
             if isinstance(results, list):

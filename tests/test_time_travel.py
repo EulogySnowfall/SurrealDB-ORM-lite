@@ -7,15 +7,20 @@ the classes that open an engine or a server are suffixed ``E2E``. Most E2E class
 the embedded ``surrealkv+versioned://`` engine runs in-process.
 """
 
+import contextlib
 import enum
 import inspect
-from collections.abc import Callable, Iterator
+import itertools
+import pickle
+from collections.abc import AsyncIterator, Callable, Iterator
 from datetime import UTC, date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import pytest
 import surrealdb
+from pydantic import PrivateAttr
 from surrealdb import RecordID
 
 from surreal_orm_lite import (
@@ -30,11 +35,15 @@ from surreal_orm_lite import (
     SurrealConfigDict,
     SurrealDBConnectionManager,
     SurrealDbError,
+    SurrealDbNotFoundError,
     SurrealFunc,
+    _sdk,
     time_travel,
 )
 from surreal_orm_lite import embedded as embedded_module
 from surreal_orm_lite.embedded import history_unsupported, keeps_history, url_kind
+from surreal_orm_lite.model_base import _snapshot_moment
+from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.time_travel import MAX_MOMENT, MIN_MOMENT, AsOf, in_range, line_major, normalise_as_of
 
 # --- shared models and moments (later tasks reuse them) --------------------------------------------
@@ -69,6 +78,16 @@ class SnapBought(BaseSurrealEdge):
     model_config = SurrealConfigDict(table_name="snap_bought")
 
     quantity: int = 1
+
+
+class SnapMine(BaseSurrealModel):
+    """A model with a private attribute of its own: the snapshot marker must not replace it (P1)."""
+
+    model_config = SurrealConfigDict(table_name="SnapMine")
+
+    id: str | None = None
+    n: int = 0
+    _mine: int = PrivateAttr(default=0)
 
 
 M2020 = datetime(2020, 6, 1, tzinfo=UTC)
@@ -644,3 +663,572 @@ class TestTimeTravelRefusals:
         qs = Snap.objects()
         assert qs.as_of(moment) is qs
         assert qs._as_of is not None and qs._as_of.moment == moment
+
+
+# --- E2E on the embedded versioned engine: no server ---------------------------------------------------
+
+#: AC-5's history, one statement per ``client.query()`` (the SDK keeps the first statement's result and drops
+#: the others' errors, M12): a and b written in 2020, a rewritten and c created in 2021, b deleted now.
+_HISTORY = (
+    "CREATE Snap:a SET name='Ada', n=1, g='x' VERSION d'2020-01-01T00:00:00Z';",
+    "CREATE Snap:b SET name='Bob', n=2, g='x' VERSION d'2020-01-01T00:00:00Z';",
+    "CREATE Snap:a SET name='Ada', n=10, g='x' VERSION d'2021-01-01T00:00:00Z';",
+    "CREATE Snap:c SET name='Cy', n=3, g='y' VERSION d'2021-01-01T00:00:00Z';",
+    "DELETE Snap:b;",
+)
+#: ``SnapPlace:p`` at the origin since 2020, for the geo reads (AC-9).
+_PLACE = "CREATE SnapPlace:p SET spot = (0.0, 0.0) VERSION d'2020-01-01T00:00:00Z';"
+
+#: ``(id, n)`` of AC-5's records at M2020, at M2021 and now, ordered by ``n``.
+_AT_2020 = [("a", 1), ("b", 2)]
+_AT_2021 = [("b", 2), ("c", 3), ("a", 10)]
+_CURRENT = [("c", 3), ("a", 10)]
+
+
+def _versioned_url(tmp_path: Path) -> str:
+    """An embedded database that keeps history, in the test's own directory."""
+    return f"surrealkv+versioned://{tmp_path / 'kv'}"
+
+
+@contextlib.asynccontextmanager
+async def history_db(tmp_path: Path) -> AsyncIterator[Any]:
+    """AC-5's history on a fresh embedded ``surrealkv+versioned://`` database; yields its client."""
+    async with embedded_database(_versioned_url(tmp_path)) as client:
+        for statement in _HISTORY:
+            await client.query(statement)
+        yield client
+
+
+async def _now(client: Any) -> datetime:
+    """The database's clock, never the host's (spec §9)."""
+    moment = await client.query("RETURN time::now();")
+    assert isinstance(moment, datetime)
+    return moment
+
+
+def _strictly_increasing(*moments: datetime) -> None:
+    """Skip, rather than fail, when the database clock did not move forward between two writes (spec §9)."""
+    if any(later <= earlier for earlier, later in itertools.pairwise(moments)):
+        pytest.skip("the database clock did not move forward between two writes")
+
+
+def _record_queries(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[tuple[str, dict[str, Any]]]:
+    """Record ``(statement, variables)`` of each ``query()`` *client* runs from now on, then run it as usual.
+
+    Patched on the client's class and keyed on ``id(client)``: an instance attribute wrapping a bound method
+    would make the client refer to itself, so dropping it would no longer end its engine (v0.25.0).
+    """
+    calls: list[tuple[str, dict[str, Any]]] = []
+    cls = type(client)
+    real = cls.query
+    signature = inspect.signature(real)
+    owner = id(client)
+
+    async def recording(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if id(self) == owner:
+            bound = signature.bind(self, *args, **kwargs).arguments
+            calls.append((bound["query"], dict(bound.get("vars") or {})))
+        return await real(self, *args, **kwargs)
+
+    monkeypatch.setattr(cls, "query", recording)
+    return calls
+
+
+async def _forbidden_client(*args: Any, **kwargs: Any) -> Any:
+    pytest.fail("a client was acquired")
+
+
+def _pairs(rows: Any) -> list[tuple[Any, Any]]:
+    """``(id, n)`` of each instance, in order."""
+    return [(row.id, row.n) for row in rows]
+
+
+class TestEmbeddedHistoryE2E:
+    """AC-5: history written at explicit past timestamps, read back at each moment on the embedded engine."""
+
+    async def test_table_reads(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path):
+            assert _pairs(await Snap.objects().as_of(M2020).order_by("n").exec()) == _AT_2020
+            assert _pairs(await Snap.objects().as_of(M2021).order_by("n").exec()) == _AT_2021
+            assert _pairs(await Snap.objects().order_by("n").exec()) == _CURRENT
+
+    async def test_get_by_id(self, tmp_path: Path) -> None:
+        """A record deleted since is still found at the moment; one created later is not."""
+        async with history_db(tmp_path):
+            bob = await Snap.objects().as_of(M2021).get("b")
+            assert (bob.id, bob.name, bob.n) == ("b", "Bob", 2)
+            with pytest.raises(SurrealDbNotFoundError):
+                await Snap.objects().get("b")
+            with pytest.raises(SurrealDbNotFoundError):
+                await Snap.objects().as_of(M2020).get("c")
+
+    async def test_counts_and_aggregates(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path):
+            assert await Snap.objects().as_of(M2020).count() == 2
+            assert await Snap.objects().as_of(M2021).count() == 3
+            assert await Snap.objects().count() == 2
+            assert await Snap.objects().as_of(M2021).filter(n__gt=2).count() == 2
+            at_2021 = Snap.objects().as_of(M2021)
+            assert await at_2021.sum("n") == 15
+            assert await at_2021.avg("n") == 5.0
+            assert await at_2021.min("n") == 2
+            assert await at_2021.max("n") == 10
+
+    async def test_exists_first_and_slices(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path):
+            assert await Snap.objects().as_of(M2020).filter(name="Cy").exists() is False
+            assert await Snap.objects().as_of(M2021).filter(name="Cy").exists() is True
+            top = await Snap.objects().as_of(M2021).order_by("-n").first()
+            assert (top.id, top.n) == ("a", 10)
+            sliced = await Snap.objects().as_of(M2021).order_by("n").limit(1).offset(1).exec()
+            assert _pairs(sliced) == [("c", 3)]
+
+    async def test_grouped_counts(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path):
+            rows = await Snap.objects().as_of(M2021).values("g").annotate(c=Count()).exec()
+            assert {row["g"]: row["c"] for row in rows} == {"x": 2, "y": 1}
+
+    async def test_all_and_get_by_filters(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path):
+            assert sorted(_pairs(await Snap.objects().as_of(M2020).all())) == _AT_2020
+            bob = await Snap.objects().as_of(M2021).filter(name="Bob").get()
+            assert (bob.id, bob.n) == ("b", 2)
+
+
+class TestEmbeddedOrmWritesE2E:
+    """AC-6: records written by the ORM, then read at moments taken from the database clock between the writes."""
+
+    async def test_node(self, tmp_path: Path) -> None:
+        async with embedded_database(_versioned_url(tmp_path)) as client:
+            record = Snap(id="p", n=1)
+            await record.save()
+            t1 = await _now(client)
+            await record.merge(n=5)
+            t2 = await _now(client)
+            await record.delete()
+            t3 = await _now(client)
+            _strictly_increasing(t1, t2, t3)
+            assert (await Snap.objects().as_of(t1).get("p")).n == 1
+            assert (await Snap.objects().as_of(t2).get("p")).n == 5
+            with pytest.raises(SurrealDbNotFoundError):
+                await Snap.objects().as_of(t3).get("p")
+            assert [await Snap.objects().as_of(t).count() for t in (t1, t2, t3)] == [1, 1, 0]
+
+    async def test_edge(self, tmp_path: Path) -> None:
+        async with embedded_database(_versioned_url(tmp_path)) as client:
+            alice = await SnapAuthor(id="alice").save()
+            widget = await SnapAuthor(id="widget").save()
+            edge = await SnapBought(in_=alice, out=widget, quantity=1).save()
+            t1 = await _now(client)
+            await edge.merge(quantity=3)
+            t2 = await _now(client)
+            _strictly_increasing(t1, t2)
+            then = await SnapBought.objects().as_of(t1).filter(in_=alice).exec()
+            later = await SnapBought.objects().as_of(t2).filter(in_=alice).exec()
+            assert [(bought.id, bought.quantity) for bought in then] == [(edge.id, 1)]
+            assert [(bought.id, bought.quantity) for bought in later] == [(edge.id, 3)]
+
+
+class TestAsOfValueFormsE2E:
+    """AC-7: every form ``as_of()`` takes, on AC-5's history; durations computed from the database clock."""
+
+    async def test_absolute_forms_read_the_same_moment(self, tmp_path: Path) -> None:
+        forms: list[Any] = [
+            "2021-06-01T00:00:00Z",
+            datetime(2021, 6, 1),
+            datetime(2021, 6, 1, 2, tzinfo=timezone(timedelta(hours=2))),
+            "2021-06-01",
+        ]
+        async with history_db(tmp_path):
+            for form in forms:
+                assert _pairs(await Snap.objects().as_of(form).order_by("n").exec()) == _AT_2021, form
+
+    async def test_how_long_ago(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path) as client:
+            assert await Snap.objects().as_of(timedelta(0)).count() == 2
+            ago19 = await _now(client) - datetime(2019, 6, 1, tzinfo=UTC)
+            assert await Snap.objects().as_of(ago19).count() == 0
+            assert await Snap.objects().as_of(Duration.from_timedelta(ago19)).count() == 0
+            sdk_ago19 = surrealdb.Duration(Duration.from_timedelta(ago19).elapsed)
+            assert await Snap.objects().as_of(sdk_ago19).count() == 0  # type: ignore[arg-type]
+            # M2021 plus the milliseconds between the two requests: months away from any write of the history.
+            ago21 = await _now(client) - M2021
+            assert await Snap.objects().as_of(ago21).count() == 3
+
+    async def test_expressions(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path):
+            assert await Snap.objects().as_of(SurrealFunc("d'2021-06-01T00:00:00Z'")).count() == 3
+            # b was deleted less than an hour ago; a and c were last written in 2021.
+            assert await Snap.objects().as_of(SurrealFunc("time::now() - 1h")).count() == 3
+            assert await Snap.objects().variables(cutoff=M2020).as_of(SurrealFunc("$cutoff")).count() == 2
+
+    async def test_an_expression_that_gives_no_datetime(self, tmp_path: Path) -> None:
+        func = SurrealFunc("'not a date'")
+        async with history_db(tmp_path):
+            with pytest.raises(SurrealDbError, match="must give a datetime") as info:
+                await Snap.objects().as_of(func).count()
+        assert str(info.value) == time_travel.not_a_datetime(repr(func), "not a date")
+
+    async def test_an_expression_the_database_cannot_evaluate(self, tmp_path: Path) -> None:
+        func = SurrealFunc("time::nope()")
+        async with history_db(tmp_path):
+            with pytest.raises(SurrealDbError, match="could not be evaluated by the database") as info:
+                await Snap.objects().as_of(func).count()
+        assert str(info.value).startswith(f"as_of({func!r}) could not be evaluated by the database: ")
+        assert info.value.__cause__ is not None
+
+    async def test_a_future_moment_reads_the_current_state(self, tmp_path: Path) -> None:
+        """A day after the database's clock — never a literal future date (spec §9)."""
+        async with history_db(tmp_path) as client:
+            tomorrow = await _now(client) + timedelta(days=1)
+            assert _pairs(await Snap.objects().as_of(tomorrow).order_by("n").exec()) == _CURRENT
+            assert await Snap.objects().as_of(tomorrow).count() == 2
+
+
+class TestMomentBoundsE2E:
+    """AC-22 (b): the bounds read as SurrealDB addresses them; a resolved moment outside them is never read."""
+
+    async def test_min_moment(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path):
+            assert await Snap.objects().as_of(MIN_MOMENT).exec() == []
+            assert await Snap.objects().as_of(MIN_MOMENT).count() == 0
+            with pytest.raises(SurrealDbNotFoundError):
+                await Snap.objects().as_of(MIN_MOMENT).get("a")
+
+    async def test_max_moment(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path):
+            assert _pairs(await Snap.objects().as_of(MAX_MOMENT).order_by("n").exec()) == _CURRENT
+            assert await Snap.objects().as_of(MAX_MOMENT).count() == 2
+
+    async def test_a_duration_reaching_before_1970(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        async with history_db(tmp_path) as client:
+            ago = await _now(client) - datetime(1969, 1, 1, tzinfo=UTC)
+            calls = _record_queries(monkeypatch, client)
+            with pytest.raises(SurrealDbError, match="outside the moments SurrealDB versions can address") as info:
+                await Snap.objects().as_of(ago).count()
+        assert f"as_of({ago!r}) gave 1969-" in str(info.value)
+        assert [statement for statement, _ in calls] == ["RETURN time::now() - $_as_of_ago;"]
+
+    @pytest.mark.parametrize(
+        ("expression", "resolved"),
+        [
+            ("d'1900-01-01T00:00:00Z'", datetime(1900, 1, 1, tzinfo=UTC)),
+            ("d'2300-01-01T00:00:00Z'", datetime(2300, 1, 1, tzinfo=UTC)),
+        ],
+        ids=["1900", "2300"],
+    )
+    async def test_an_expression_outside_the_bounds(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, expression: str, resolved: datetime
+    ) -> None:
+        func = SurrealFunc(expression)
+        async with history_db(tmp_path) as client:
+            calls = _record_queries(monkeypatch, client)
+            with pytest.raises(SurrealDbError, match="outside the moments SurrealDB versions can address") as info:
+                await Snap.objects().as_of(func).exec()
+        assert str(info.value) == time_travel.resolved_out_of_range(repr(func), resolved)
+        assert [statement for statement, _ in calls] == [f"RETURN {expression};"]
+
+    async def test_an_expression_that_overflows(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        func = SurrealFunc("time::now() - 1000000y")
+        async with history_db(tmp_path) as client:
+            calls = _record_queries(monkeypatch, client)
+            with pytest.raises(SurrealDbError, match="could not be evaluated by the database"):
+                await Snap.objects().as_of(func).count()
+        statements = [statement for statement, _ in calls]
+        assert statements[-1].startswith("RETURN")
+        assert not [statement for statement in statements if statement.startswith("SELECT")]
+
+
+def _refusing_client(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    """Serve a server client (not embedded) whose every ``query()`` raises *error*."""
+
+    class _Refusing:
+        async def query(self, *args: Any, **kwargs: Any) -> Any:
+            raise error
+
+    async def _client(*args: Any, **kwargs: Any) -> Any:
+        return _Refusing()
+
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", _client)
+    monkeypatch.setattr(SurrealDBConnectionManager, "is_embedded", lambda *args: False)
+
+
+def _no_history_error() -> Exception:
+    """The SDK error a SurrealDB 3.x server without versioned storage answers a ``VERSION`` read with (M3)."""
+    return _sdk.ServerError(
+        "Configuration",
+        "There was a problem with the key-value store: The underlying datastore does not support versioned queries",
+    )
+
+
+_T7_READS: list[tuple[str, Callable[[Any], Any]]] = [
+    ("exec", lambda qs: qs.exec()),
+    ("count", lambda qs: qs.count()),
+    ("get-id", lambda qs: qs.get("a")),
+    ("all", lambda qs: qs.all()),
+]
+
+
+class TestT7KeyedOnAsOf:
+    """T7 is keyed on ``as_of()``, never on the variables: without it the SDK's error is relayed unchanged."""
+
+    async def test_variables_named_as_of_change_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        error = _no_history_error()
+        _refusing_client(monkeypatch, error)
+        with pytest.raises(_sdk.ServerError) as info:
+            await Snap.objects().variables(_as_of=M2021).exec()
+        assert info.value is error
+
+    @pytest.mark.parametrize(("name", "read"), _T7_READS, ids=[name for name, _ in _T7_READS])
+    async def test_a_time_travel_read_raises_t7(
+        self, monkeypatch: pytest.MonkeyPatch, name: str, read: Callable[[Any], Any]
+    ) -> None:
+        error = _no_history_error()
+        _refusing_client(monkeypatch, error)
+        with pytest.raises(SurrealDbError, match="keeps history") as info:
+            await read(Snap.objects().as_of(M2021))
+        assert str(info.value) == time_travel.server_refused(error)
+        assert "versioned=true" in str(info.value)
+        assert info.value.__cause__ is error
+
+    async def test_another_server_error_is_relayed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        error = _sdk.ServerError("Internal", "boom")
+        _refusing_client(monkeypatch, error)
+        with pytest.raises(_sdk.ServerError) as info:
+            await Snap.objects().as_of(M2021).count()
+        assert info.value is error
+
+
+_NO_HISTORY_URLS: list[Callable[[Path], str]] = [
+    lambda _: "mem://",
+    lambda _: "memory://",
+    lambda tmp: f"surrealkv://{tmp / 'a'}",
+    lambda tmp: f"surrealkv://{tmp / 'b'}?versioned=true",
+    lambda tmp: f"file://{tmp / 'c'}",
+]
+_NO_HISTORY_IDS = ["mem", "memory", "surrealkv", "surrealkv-versioned-query", "file"]
+
+_FIVE_READS: list[tuple[str, Callable[[Any], Any]]] = [
+    ("exec", lambda qs: qs.exec()),
+    ("count", lambda qs: qs.count()),
+    ("get-id", lambda qs: qs.get("a")),
+    ("all", lambda qs: qs.all()),
+    ("exists", lambda qs: qs.exists()),
+]
+
+
+class TestNoHistoryEmbeddedE2E:
+    """AC-8: an embedded store that keeps no history is refused by its URL (T6), before any request."""
+
+    @pytest.mark.parametrize("make_url", _NO_HISTORY_URLS, ids=_NO_HISTORY_IDS)
+    async def test_refused_before_any_request(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, make_url: Callable[[Path], str]
+    ) -> None:
+        url = make_url(tmp_path)
+        async with embedded_database(url) as client:
+            await Snap(id="a").save()
+            calls = _record_queries(monkeypatch, client)
+            with monkeypatch.context() as patched:
+                patched.setattr(SurrealDBConnectionManager, "get_client", _forbidden_client)
+                for name, read in _FIVE_READS:
+                    with pytest.raises(SurrealDbError, match="keeps none") as info:
+                        await read(Snap.objects().as_of(M2021))
+                    assert str(info.value) == history_unsupported(url), name
+            assert calls == []
+            # The same reads without as_of() work.
+            assert [row.id for row in await Snap.objects().exec()] == ["a"]
+            assert await Snap.objects().count() == 1
+            assert (await Snap.objects().get("a")).id == "a"
+            assert [row.id for row in await Snap.objects().all()] == ["a"]
+            assert await Snap.objects().exists() is True
+
+
+_EVERY_READ: list[tuple[str, type[BaseSurrealModel], Callable[[Any], Any], Callable[[Any], bool]]] = [
+    ("exec", Snap, lambda qs: qs.order_by("n").exec(), lambda r: _pairs(r) == _AT_2021),
+    ("first", Snap, lambda qs: qs.order_by("-n").first(), lambda r: (r.id, r.n) == ("a", 10)),
+    ("get", Snap, lambda qs: qs.filter(name="Bob").get(), lambda r: (r.id, r.n) == ("b", 2)),
+    ("get-id", Snap, lambda qs: qs.get("a"), lambda r: (r.id, r.n) == ("a", 10)),
+    ("all", Snap, lambda qs: qs.all(), lambda r: sorted(_pairs(r)) == sorted(_AT_2021)),
+    ("exists", Snap, lambda qs: qs.filter(name="Bob").exists(), lambda r: r is True),
+    ("count", Snap, lambda qs: qs.count(), lambda r: r == 3),
+    ("sum", Snap, lambda qs: qs.sum("n"), lambda r: r == 15),
+    ("avg", Snap, lambda qs: qs.avg("n"), lambda r: r == 5.0),
+    ("min", Snap, lambda qs: qs.min("n"), lambda r: r == 2),
+    ("max", Snap, lambda qs: qs.max("n"), lambda r: r == 10),
+    (
+        "values-annotate",
+        Snap,
+        lambda qs: qs.values("g").annotate(c=Count()).exec(),
+        lambda r: {row["g"]: row["c"] for row in r} == {"x": 2, "y": 1},
+    ),
+    (
+        "geo-distance",
+        SnapPlace,
+        lambda qs: qs.annotate(d=GeoDistance("spot", (0, 0))).exec(),
+        lambda r: [(place.id, place.d) for place in r] == [("p", 0.0)],
+    ),
+    ("nearby", SnapPlace, lambda qs: qs.nearby("spot", (0, 0), 1000).exec(), lambda r: [place.id for place in r] == ["p"]),
+]
+
+
+class TestEveryReadPathE2E:
+    """AC-9: every read sends one ``… VERSION $_as_of;`` statement, bound to the moment, guarded on a table."""
+
+    @pytest.mark.parametrize(("name", "model", "read", "expected"), _EVERY_READ, ids=[row[0] for row in _EVERY_READ])
+    async def test_version_and_guard(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        name: str,
+        model: type[BaseSurrealModel],
+        read: Callable[[Any], Any],
+        expected: Callable[[Any], bool],
+    ) -> None:
+        async with history_db(tmp_path) as client:
+            await client.query(_PLACE)
+            calls = _record_queries(monkeypatch, client)
+            result = await read(model.objects().as_of(M2021))
+            assert expected(result), result
+        assert len(calls) == 1, calls  # an absolute moment needs no resolution request
+        statement, variables = calls[0]
+        assert statement.endswith(" VERSION $_as_of;"), statement
+        assert variables["_as_of"] == M2021
+        if name == "get-id":
+            assert statement == "SELECT * FROM $rid VERSION $_as_of;"
+        else:
+            assert _G in statement
+
+
+class TestSnapshotMarkerE2E:
+    """AC-11, first sentence: every instance a time-travel read returns carries its moment; current reads none."""
+
+    async def test_time_travel_reads_mark_their_instances(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path) as client:
+            await client.query(_PLACE)
+            at = Snap.objects().as_of
+            instances = [
+                *(await at(M2021).exec()),
+                await at(M2021).order_by("n").first(),
+                await at(M2021).filter(name="Ada").get(),
+                await at(M2021).get("a"),
+                *(await at(M2021).all()),
+                *(await SnapPlace.objects().as_of(M2021).annotate(d=GeoDistance("spot", (0, 0))).exec()),
+            ]
+        assert len(instances) == 10
+        assert [_snapshot_moment(instance) for instance in instances] == [M2021] * 10
+
+    async def test_a_resolved_moment_marks_too(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path) as client:
+            before = await _now(client)
+            instances = await Snap.objects().as_of(timedelta(0)).exec()
+            after = await _now(client)
+        moments = {_snapshot_moment(instance) for instance in instances}
+        assert len(instances) == 2 and len(moments) == 1
+        (moment,) = moments
+        assert isinstance(moment, datetime) and before <= moment <= after
+
+    async def test_current_reads_carry_none(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path):
+            instances = [
+                *(await Snap.objects().exec()),
+                await Snap.objects().order_by("n").first(),
+                await Snap.objects().filter(name="Ada").get(),
+                await Snap.objects().get("a"),
+                *(await Snap.objects().all()),
+            ]
+        assert [_snapshot_moment(instance) for instance in instances] == [None] * 7
+
+    async def test_rows_that_do_not_validate_stay_dicts(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path) as client:
+            await client.query("CREATE Snap:z SET name='Zed', n='not a number' VERSION d'2020-01-01T00:00:00Z';")
+            rows = await Snap.objects().as_of(M2021).order_by("name").exec()
+        assert [row["name"] for row in rows] == ["Ada", "Bob", "Cy", "Zed"]
+        assert all(isinstance(row, dict) and "_surreal_as_of" not in row for row in rows)
+
+
+def _fresh_snap() -> BaseSurrealModel:
+    return Snap(id="p1", n=1)
+
+
+def _fresh_mine() -> BaseSurrealModel:
+    mine = SnapMine(id="m1", n=1)
+    mine._mine = 1
+    return mine
+
+
+#: v0.25.x states: the model, a fresh equal instance, the private dict v0.25.x pickled, the one restored.
+_V025_STATES: list[tuple[type[BaseSurrealModel], Callable[[], BaseSurrealModel], dict[str, Any] | None, dict[str, Any]]] = [
+    (Snap, _fresh_snap, None, {"_surreal_as_of": None}),
+    (SnapMine, _fresh_mine, {"_mine": 1}, {"_mine": 1, "_surreal_as_of": None}),
+]
+
+
+def _by_setstate(model: type[BaseSurrealModel], fresh: BaseSurrealModel, private: dict[str, Any] | None) -> Any:
+    """Restore *fresh*'s state with its private dict as v0.25.x pickled it, through ``__setstate__``."""
+    state = fresh.__getstate__()
+    state["__pydantic_private__"] = None if private is None else dict(private)
+    restored = model.__new__(model)
+    restored.__setstate__(state)
+    return restored
+
+
+def _by_pickle(model: type[BaseSurrealModel], fresh: BaseSurrealModel, private: dict[str, Any] | None) -> Any:
+    """Pickle *fresh* with its private dict emptied as by v0.25.x, then unpickle it."""
+    object.__setattr__(fresh, "__pydantic_private__", None if private is None else dict(private))
+    return pickle.loads(pickle.dumps(fresh))
+
+
+_RESTORES = [_by_setstate, _by_pickle]
+_RESTORE_IDS = ["setstate", "pickle"]
+
+
+class TestPicklesFromV025E2E:
+    """AC-11 (b), P1: an instance pickled by v0.25.x (no private state) unpickles as a current record that writes."""
+
+    @pytest.mark.parametrize("restore", _RESTORES, ids=_RESTORE_IDS)
+    @pytest.mark.parametrize(("model", "fresh", "private", "restored_private"), _V025_STATES, ids=["Snap", "SnapMine"])
+    def test_a_current_record(
+        self,
+        restore: Callable[..., Any],
+        model: type[BaseSurrealModel],
+        fresh: Callable[[], BaseSurrealModel],
+        private: dict[str, Any] | None,
+        restored_private: dict[str, Any],
+    ) -> None:
+        restored = restore(model, fresh(), private)
+        assert _snapshot_moment(restored) is None
+        assert restored.__pydantic_private__ == restored_private
+        assert restored == fresh()
+
+    @pytest.mark.parametrize("restore", _RESTORES, ids=_RESTORE_IDS)
+    @pytest.mark.parametrize(("model", "fresh", "private", "restored_private"), _V025_STATES, ids=["Snap", "SnapMine"])
+    async def test_its_writes_work(
+        self,
+        restore: Callable[..., Any],
+        model: type[BaseSurrealModel],
+        fresh: Callable[[], BaseSurrealModel],
+        private: dict[str, Any] | None,
+        restored_private: dict[str, Any],
+    ) -> None:
+        async with embedded_database("mem://"):
+            created = restore(model, fresh(), private)
+            await created.save()
+            assert (await model.objects().get(created.id)).n == 1
+            updated = restore(model, fresh(), private)
+            updated.n = 3
+            await updated.update()
+            assert (await model.objects().get(updated.id)).n == 3
+            merged = restore(model, fresh(), private)
+            await merged.merge(n=2)
+            assert (await model.objects().get(merged.id)).n == 2
+            deleted = restore(model, fresh(), private)
+            await deleted.delete()
+            with pytest.raises(SurrealDbNotFoundError):
+                await model.objects().get(deleted.id)
+
+    async def test_a_v026_snapshot_keeps_its_moment(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path):
+            snapshot = await Snap.objects().as_of(M2021).get("a")
+        restored = pickle.loads(pickle.dumps(snapshot))
+        assert _snapshot_moment(restored) == M2021
+        assert restored.model_dump() == snapshot.model_dump()
