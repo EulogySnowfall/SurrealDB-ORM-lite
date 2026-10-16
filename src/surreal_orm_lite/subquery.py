@@ -25,7 +25,9 @@ value is read as ``Subquery(qs)`` — sends **one** statement, inside which the 
   every record. ``in``, ``not_in``, ``containsall`` and ``containsany`` (:data:`COLLECTION_LOOKUPS`) compare with
   all its values.
 - **Live queries** keep the sub-SELECT inline (a ``LIVE SELECT`` cannot sit in a block), which is right there: the
-  server evaluates it on every notification.
+  server evaluates it on every notification. SurrealDB 3.x accepts one whose subquery reads a table that does not
+  exist and then never notifies, so the live query first reads each such table (``RETURN [(SELECT VALUE id FROM
+  <t> LIMIT 1), …];``) and raises S11 (:func:`live_table_missing`) when the server says one is missing.
 - **A subquery table that does not exist** reads as empty on 2.x and on the embedded engine. SurrealDB 3.x raises
   "The table '<t>' does not exist"; :func:`missing_table` recognises only the server's own forms of that error
   (never the sentence inside another error, which may quote a value the statement read). The ORM then asks the
@@ -391,6 +393,15 @@ def value_written(field: str) -> str:
     return (
         f"bulk_update() writes its values as data; '{field}' got a subquery, which is a filter value: filter() with it "
         "and pass the value to write."
+    )
+
+
+def live_table_missing(table: str, exc: BaseException) -> str:
+    """S11: SurrealDB 3.x says that *table*, which a live query's subquery reads, does not exist (*exc*)."""
+    return (
+        f"Cannot start a live query whose subquery reads {table!r}: the table does not exist. SurrealDB 3.x evaluates "
+        "the subquery on every change and would silently never notify (2.x reads a missing table as empty). Create "
+        f"it first, e.g. DEFINE TABLE {table} SCHEMALESS. Server said: {exc}"
     )
 
 

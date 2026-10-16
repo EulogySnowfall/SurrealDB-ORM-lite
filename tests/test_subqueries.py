@@ -10,11 +10,13 @@ use the embedded ``surrealkv+versioned://`` engine and a server started with ver
 ``SURREALDB_VERSIONED_PORT`` (skipped without it).
 """
 
+import asyncio
 import contextlib
 import re
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 import pytest
 from pydantic import Field
@@ -27,12 +29,14 @@ from surreal_orm_lite import (
     Count,
     GeoDistance,
     GeometryPoint,
+    LiveAction,
     PointField,
     Q,
     Subquery,
     SurrealConfigDict,
     SurrealDBConnectionManager,
     SurrealDbError,
+    SurrealDbNotFoundError,
     Var,
 )
 from surreal_orm_lite._sdk import NotFoundError, ServerError
@@ -170,6 +174,14 @@ def _s10(field: str) -> str:
     return (
         f"bulk_update() writes its values as data; '{field}' got a subquery, which is a filter value: filter() with it "
         "and pass the value to write."
+    )
+
+
+def _s11(table: str, exc: BaseException) -> str:
+    return (
+        f"Cannot start a live query whose subquery reads {table!r}: the table does not exist. SurrealDB 3.x evaluates "
+        "the subquery on every change and would silently never notify (2.x reads a missing table as empty). Create "
+        f"it first, e.g. DEFINE TABLE {table} SCHEMALESS. Server said: {exc}"
     )
 
 
@@ -2178,3 +2190,252 @@ class TestMissingSubqueryTableWritesE2E:
             assert created is True
             assert not any(_EMPTY_LET in statement for statement, _ in calls), calls
             await _assert_every_post_scored_one_and_one_created()
+
+
+# --- AC-9: live queries and watch() -----------------------------------------------------------------------------
+
+#: C15: a live query keeps the sub-SELECT inline, its values inlined too.
+_C15 = "LIVE SELECT * FROM sq_post WHERE author IN (SELECT VALUE id FROM sq_person WHERE active = true);"
+#: C16's sub-SELECT: the top score, ordered and limited, inline in a live query.
+_TOP_SCORE = "(SELECT score AS _sqv, score FROM sq_post ORDER BY score DESC LIMIT 1)._sqv"
+_C16 = f"LIVE SELECT * FROM sq_post WHERE ({_TOP_SCORE} != [] AND score = array::first({_TOP_SCORE}));"
+
+
+def _start_check(*tables: str) -> tuple[str, dict[str, Any]]:
+    """The start check a live query sends before its ``LIVE SELECT`` (C21), over *tables* in that order."""
+    return "RETURN [" + ", ".join(f"(SELECT VALUE id FROM {table} LIMIT 1)" for table in tables) + "];", {}
+
+
+_LIVE_ID = UUID("00000000-0000-4000-8000-000000000027")
+
+
+class _LiveClient:
+    """A client that records every ``(statement, variables)``, answers the start check (``RETURN …``) with
+    *check* — raised when it is an exception — and a ``LIVE SELECT`` with :data:`_LIVE_ID`."""
+
+    def __init__(self, check: Any = None) -> None:
+        self.check = check
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
+        self.calls.append((query, dict(variables or {})))
+        if not query.startswith("RETURN "):
+            return _LIVE_ID
+        if isinstance(self.check, BaseException):
+            raise self.check
+        return self.check
+
+
+@pytest.fixture
+def _live_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A WebSocket URL configured, and no client to acquire: the starter is given its client."""
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_connection_string", staticmethod(lambda: "ws://localhost:1/rpc"))
+
+    async def _forbidden(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("a client was acquired")
+
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", _forbidden)
+
+
+@pytest.mark.usefixtures("_live_url")
+class TestLiveStartCheck:
+    """AC-9 without a server: what a live query's starter sends. With a subquery, one ``RETURN [...]`` over the
+    subquery tables (sorted, each once) comes before the ``LIVE SELECT``, and a table SurrealDB 3.x says does not
+    exist raises S11 instead of a live query that would never notify; any other error is relayed unchanged.
+    Without a subquery the starter sends what it sent."""
+
+    async def test_without_a_subquery_the_live_select_alone(self) -> None:
+        client = _LiveClient()
+        assert await SqPost.objects().filter(score__gt=5)._live_starter(False)(client) == _LIVE_ID
+        assert client.calls == [("LIVE SELECT * FROM sq_post WHERE score > 5;", {})]
+
+    async def test_the_check_comes_before_the_live_select(self) -> None:
+        client = _LiveClient([[]])
+        assert await _with_inner(_active())._live_starter(False)(client) == _LIVE_ID
+        assert client.calls == [_start_check("sq_person"), (_C15, {})]
+
+    async def test_the_check_reads_each_subquery_table_once_sorted(self) -> None:
+        nested = SqPerson.objects().filter(id__in=Subquery(SqPost.objects().filter(score__gt=8).select("author")))
+        qs = SqPost.objects().filter(
+            author__in=Subquery(nested),
+            title__in=Subquery(SqAliased.objects().select("display")),
+            score__gt=Subquery(SqPost.objects().select("score").order_by("-score").limit(1)),
+        )
+        client = _LiveClient([[], [], []])
+        await qs._live_starter(True)(client)
+        assert client.calls[0] == _start_check("sq_aliased", "sq_person", "sq_post")
+        assert client.calls[1][0].startswith("LIVE SELECT DIFF FROM sq_post WHERE author IN (SELECT VALUE id FROM ")
+        assert len(client.calls) == 2
+
+    @pytest.mark.parametrize(
+        "error", [_not_found(), ThrownError("Thrown", _THROWN + _SENTENCE)], ids=["not-found", "thrown-3.1-form"]
+    )
+    async def test_a_missing_subquery_table_raises_s11_and_starts_nothing(self, error: Exception) -> None:
+        client = _LiveClient(error)
+        with pytest.raises(SurrealDbNotFoundError) as info:
+            await _with_inner(_active())._live_starter(False)(client)
+        assert str(info.value) == _s11("sq_person", error)
+        assert info.value.__cause__ is error
+        assert client.calls == [_start_check("sq_person")]
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            _not_found("The table 'sq_other' does not exist", "sq_other"),
+            _not_found(table=None),
+            NotFoundError("NotFound", "boom"),
+            InternalError("Internal", f'Could not cast into `int` using input `"{_SENTENCE}"`'),
+            ServerError("Internal", "boom"),
+            ConnectionError("dropped"),
+        ],
+        ids=["another-table", "not-found-without-details", "not-found-naming-no-table", "quoting-it", "other", "network"],
+    )
+    async def test_any_other_error_of_the_check_is_relayed(self, error: Exception) -> None:
+        client = _LiveClient(error)
+        with pytest.raises(type(error)) as info:
+            await _with_inner(_active())._live_starter(False)(client)
+        assert info.value is error
+        assert client.calls == [_start_check("sq_person")]
+
+    async def test_every_start_checks_again(self) -> None:
+        """A resubscribe runs the starter again on the new connection, the check included."""
+        start = _with_inner(_active())._live_starter(False)
+        first, second = _LiveClient([[]]), _LiveClient([[]])
+        await start(first)
+        await start(second)
+        assert first.calls == second.calls == [_start_check("sq_person"), (_C15, {})]
+
+
+async def _take(stream: Any, count: int, timeout: float = 10.0) -> list[Any]:
+    """The next *count* items of *stream*, failing after *timeout* seconds (``tests/test_live_queryset.py``)."""
+
+    async def _read() -> list[Any]:
+        seen: list[Any] = []
+        async for item in stream:
+            seen.append(item)
+            if len(seen) >= count:
+                break
+        return seen
+
+    return await asyncio.wait_for(_read(), timeout=timeout)
+
+
+async def _assert_silent(stream: Any, wait: float = 0.5) -> None:
+    """Nothing more arrives (``tests/test_live_queryset.py``)."""
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(stream.__anext__(), timeout=wait)
+
+
+@pytest.fixture
+def _live_registry() -> Iterator[None]:
+    """The live module's per-loop registries emptied after the test, as ``tests/test_live_queryset.py`` does."""
+    from surreal_orm_lite import live
+
+    yield
+    live._SUBSCRIBERS.clear()
+    live._RECENTLY_KILLED.clear()
+
+
+async def _create_post(client: Any, key: str, author: str | None = None, score: int = 0) -> None:
+    link = f", author = sq_person:{author}" if author else ""
+    await client.query(f"CREATE sq_post:{key} SET title = '{key}', score = {score}{link};")
+
+
+def _keys(events: list[Any]) -> list[str]:
+    return [event.instance.id for event in events]
+
+
+@pytest.mark.usefixtures("_live_registry")
+class TestSubqueryLiveE2E:
+    """AC-9: a live query with a subquery, on the server of ``SURREALDB_PORT`` over WebSocket (both lines). The
+    sub-SELECT is inline, so the server evaluates it on every change: a change of the inner table changes what
+    notifies, and the ordered and first-value forms notify exactly the expected records (SurrealDB 3.2+'s #7470
+    does not reach a live query). Writes that must not notify come before one that must, so the first event read
+    proves they did not."""
+
+    async def test_a_change_of_the_inner_table_changes_what_notifies(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with subquery_db("ws") as client:
+            await _seed()
+            calls = _record_queries(monkeypatch, client)
+            async with SqPost.objects().filter(author__in=Subquery(_active())).live() as stream:
+                assert calls == [_start_check("sq_person"), (_C15, {})]
+                await _create_post(client, "p7", "cy")
+                await client.query("UPDATE sq_person:cy SET active = true;")
+                await _create_post(client, "p8", "cy")
+                [event] = await _take(stream, 1)
+                await _assert_silent(stream)
+        assert event.action is LiveAction.CREATE
+        assert isinstance(event.instance, SqPost)
+        assert (event.instance.id, event.instance.author) == ("p8", _person("cy"))
+
+    async def test_an_ordered_subquery_follows_the_oldest_active_person(self) -> None:
+        oldest = SqPerson.objects().filter(active=True).order_by("-age").limit(1)
+        async with subquery_db("ws") as client:
+            await _seed()
+            async with SqPost.objects().filter(author__in=Subquery(oldest)).live() as stream:
+                for key, author in (("q1", "ada"), ("q2", "bob"), ("q3", "cy"), ("q4", "bob")):
+                    await _create_post(client, key, author)
+                await client.query("UPDATE sq_person:bob SET active = false;")
+                for key, author in (("q5", "bob"), ("q6", "ada")):
+                    await _create_post(client, key, author)
+                events = await _take(stream, 3)
+                await _assert_silent(stream)
+        assert _keys(events) == ["q2", "q4", "q6"]
+
+    async def test_a_first_value_subquery_notifies_each_new_top_score(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        best = SqPost.objects().select("score").order_by("-score").limit(1)
+        async with subquery_db("ws") as client:
+            await client.query("DEFINE TABLE sq_post SCHEMALESS;")
+            calls = _record_queries(monkeypatch, client)
+            async with SqPost.objects().filter(score=Subquery(best)).live() as stream:
+                assert calls == [_start_check("sq_post"), (_C16, {})]
+                for index, score in enumerate((5, 8, 2, 9, 9)):
+                    await _create_post(client, f"s{index}", score=score)
+                events = await _take(stream, 4)
+                await _assert_silent(stream)
+        assert _keys(events) == ["s0", "s1", "s3", "s4"]
+
+    async def test_watch_gives_the_raw_notifications(self) -> None:
+        async with subquery_db("ws") as client:
+            await _seed()
+            async with SqPost.objects().filter(author__in=_active()).watch() as stream:
+                await _create_post(client, "p7", "cy")
+                await _create_post(client, "p8", "ada")
+                [envelope] = await _take(stream, 1)
+                await _assert_silent(stream)
+        assert envelope["action"] == LiveAction.CREATE
+        assert str(envelope["record"].id) == "p8"
+        assert envelope["result"]["author"] == _person("ada")
+
+    @pytest.mark.parametrize("method", ["live", "watch"])
+    async def test_3x_a_missing_subquery_table_raises_s11_on_start(self, method: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with subquery_db("ws") as client:
+            if await _line(client) < 3:
+                pytest.skip("SurrealDB 3.x only: 2.x reads a missing subquery table as empty and the live query starts")
+            await _seed()
+            calls = _record_queries(monkeypatch, client)
+            stream = getattr(SqPost.objects().filter(author__not_in=_ghost()), method)()
+            with pytest.raises(SurrealDbNotFoundError) as info:
+                async with stream:
+                    pytest.fail("the live query started")
+            assert calls == [_start_check("sq_ghost")]
+            assert not stream.is_active
+        cause = info.value.__cause__
+        assert isinstance(cause, ServerError), repr(cause)
+        assert missing_table(cause) == "sq_ghost"
+        assert str(info.value) == _s11("sq_ghost", cause)
+
+    async def test_2x_a_missing_subquery_table_reads_as_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with subquery_db("ws") as client:
+            if await _line(client) >= 3:
+                pytest.skip("SurrealDB 2.x only: 3.x raises S11 when the live query starts")
+            await _seed()
+            calls = _record_queries(monkeypatch, client)
+            async with SqPost.objects().filter(author__not_in=_ghost()).live() as stream:
+                assert calls == [
+                    _start_check("sq_ghost"),
+                    ("LIVE SELECT * FROM sq_post WHERE author NOT IN (SELECT VALUE id FROM sq_ghost);", {}),
+                ]
+                await _create_post(client, "p9", "cy")
+                [event] = await _take(stream, 1)
+        assert (event.action, event.instance.id) == (LiveAction.CREATE, "p9")

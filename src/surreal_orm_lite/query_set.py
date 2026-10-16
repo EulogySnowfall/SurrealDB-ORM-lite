@@ -1904,9 +1904,19 @@ class QuerySet:
         Compiling eagerly makes a bad clause or value fail at the ``live()``/``watch()`` call,
         before any network traffic, and snapshots the query: changing the queryset afterwards
         does not change a stream already built from it.
+
+        With subqueries (v0.27.0) the coroutine first reads every table they read, in one request
+        (``RETURN [(SELECT VALUE id FROM <table> LIMIT 1), …];``, the tables sorted), then sends the
+        ``LIVE SELECT``. SurrealDB 3.x accepts a live query whose subquery reads a table that does
+        not exist and then never notifies, but refuses that check: the ORM raises S11 instead. 2.x
+        answers it (the table reads as empty) and the live query starts. A resubscribe runs the
+        check again, on the new connection.
         """
-        query = self._compile_live(diff)
+        compiler = self._subquery_compiler(inline=True)
+        query = self._compile_live(diff, compiler)
         table = self._model_table
+        tables = tuple(sorted(compiler.tables))
+        check = "RETURN [" + ", ".join(f"(SELECT VALUE id FROM {name} LIMIT 1)" for name in tables) + "];"
 
         async def start(client: Any = None) -> UUID:
             # A resubscribe passes the client it is about to move the stream onto, so the live
@@ -1914,6 +1924,14 @@ class QuerySet:
             require_websocket(SurrealDBConnectionManager.get_connection_string())
             if client is None:
                 client = await SurrealDBConnectionManager.get_client()
+            if tables:
+                try:
+                    await client.query(check)
+                except ServerError as exc:
+                    missing = _subquery.missing_table(exc)
+                    if missing is None or missing not in tables:
+                        raise
+                    raise SurrealDbNotFoundError(_subquery.live_table_missing(missing, exc)) from exc
             try:
                 live_id = await client.query(query)
             except NotFoundError as exc:
@@ -1945,6 +1963,13 @@ class QuerySet:
         ``diff=True`` the server sends patches: ``changed_fields`` lists what changed, and only ``CREATE``
         carries a whole record. The live query is killed when the ``async with`` exits.
 
+        **Subqueries (v0.27.0).** A subquery in the filter (``author__in=Subquery(active)``) stays an
+        inline sub-SELECT, which the server evaluates on every change: a change of the inner table
+        changes what notifies from then on (an ordered and limited subquery included). Before the
+        ``LIVE SELECT`` the stream checks, in one request, that every table the subqueries read
+        exists — again on each resubscribe — because SurrealDB 3.x would accept the live query on a
+        missing one and never notify; 2.x reads a missing table as empty, as everywhere else.
+
         ``await qs.live()`` — the v0.19.0 form returning the uuid — still works and is
         deprecated, and never resubscribes: the caller owns that uuid.
 
@@ -1961,7 +1986,9 @@ class QuerySet:
             current changes, v0.26.0), here; for a non-WebSocket connection (the embedded engine
             included: read its change feed with :meth:`changes`), on start.
         :raises TypeError: for a filter value with no SurrealQL literal form, here.
-        :raises SurrealDbNotFoundError: on SurrealDB 3.x, on start, if the table does not exist.
+        :raises ValueError, SurrealDbError: for a subquery the ORM cannot compile, here.
+        :raises SurrealDbNotFoundError: on SurrealDB 3.x, on start, if the table does not exist, or a
+            table a subquery reads.
         """
         self._reject_time_travel("live()")
         return LiveModelStream(
@@ -1991,7 +2018,9 @@ class QuerySet:
         ``filter()``, ``nearby()``, ``variables()`` and ``fetch()`` are applied by the server. With
         ``diff=True`` each ``result`` is a list of patches instead of a record. For model
         instances, use :meth:`live`. ``auto_resubscribe`` and ``on_reconnect`` behave as for
-        :meth:`live`, and so do its refusals (``as_of()`` included, here).
+        :meth:`live`, and so do its refusals (``as_of()`` included, here) and its subqueries (inline,
+        the tables they read checked on start: ``SurrealDbNotFoundError`` on SurrealDB 3.x for a
+        missing one).
         """
         self._reject_time_travel("watch()")
         return LiveStream(
