@@ -13,6 +13,7 @@ from pydantic_core import ValidationError
 from . import BaseSurrealModel, SurrealDBConnectionManager
 from . import encoding as _encoding
 from . import geo as _geo
+from . import subquery as _subquery
 from . import time_travel as _time_travel
 from ._sdk import NotFoundError, SdkGeometryPoint, ServerError
 from .changefeed import ChangeModelStream, Since
@@ -25,6 +26,7 @@ from .geo import GeoDistance, GeometryPoint
 from .live import LiveModelStream, LiveStream, ReconnectCallback, missing_table_error, require_websocket
 from .model_base import _snapshot_moment
 from .q import Q
+from .subquery import SubqueryCompiler
 from .surql_literal import inline_variables
 from .types import Duration
 from .utils import (
@@ -176,6 +178,21 @@ class QuerySet:
 
             # Mixed
             queryset.filter(Q(role="admin") | Q(role="mod"), status="active")
+
+            # A subquery (v0.27.0): another queryset's values, read by the server in the same statement
+            active = Person.objects().filter(active=True)
+            Post.objects().filter(author__in=Subquery(active))         # or author__in=active
+            best = Post.objects().select("score").order_by("-score").limit(1)
+            Post.objects().filter(score=Subquery(best))                # compared with its first value
+
+        A ``Subquery`` — or a QuerySet, read as one — is accepted as the whole value of ``in``, ``not_in``,
+        ``containsall`` and ``containsany`` (compared with all its values) and of ``exact``, ``gt``, ``gte``,
+        ``lt``, ``lte``, ``contains`` and ``not_contains`` (compared with its first value; no record when it is
+        empty), here and in ``Q``. The inner queryset selects its record ids, or the one field given to its
+        ``select()``; its ``filter()``, ``Q``, ``nearby()``, ``order_by()``, ``limit()``, ``offset()`` and
+        ``variables()`` apply, its ``fetch()`` is ignored. It is read when this queryset runs, in the same
+        statement: one request. A clause it cannot honour raises when this queryset compiles, before any request
+        (see ``Subquery``).
         """
         for arg in args:
             if not isinstance(arg, Q):
@@ -500,34 +517,64 @@ class QuerySet:
 
     # ==================== Internal query building ====================
 
-    def _build_where(self, *, as_of: bool = False) -> tuple[str, dict[str, Any]]:
+    def _subquery_compiler(self, empty_tables: frozenset[str] = frozenset(), *, inline: bool = False) -> SubqueryCompiler:
+        """A compiler for the subqueries of one statement of this queryset (v0.27.0).
+
+        It starts with this queryset's transaction, a copy of its ``variables()`` (the subqueries' are merged into
+        it) and this queryset on the stack of the querysets being rendered, so a queryset given as its own subquery
+        raises S3 before any other check of the inner queryset.
+
+        Args:
+            empty_tables: the tables whose subqueries are bound to ``[]`` (SurrealDB 3.x said they do not exist).
+            inline: write the sub-SELECTs inline instead of in ``LET`` s (a live query).
         """
-        Build a parameterized WHERE clause from filters, Q objects and ``nearby()`` conditions.
+        return SubqueryCompiler(
+            inline=inline,
+            empty_tables=empty_tables,
+            outer_tx=self._tx,
+            variables=dict(self._variables),
+            _stack=[id(self)],
+        )
 
-        With ``as_of=True`` (a time-travel table read, v0.26.0) the per-record check
-        ``time_travel.GUARD`` is the last condition, after the ``nearby()`` ones: every other part is a
-        single comparison or a parenthesised group, so the check applies to every row they keep.
+    def _where_parts(
+        self, counter: int = 0, *, as_of: bool = False, subqueries: SubqueryCompiler | None = None
+    ) -> tuple[list[str], dict[str, Any], int]:
+        """The AND-ed conditions of the WHERE clause, their bound values and the next ``$_f<N>`` number.
 
-        Returns:
-            A tuple of (where_clause_string, variables_dict).
-            The where_clause_string includes the ``WHERE`` keyword, or is empty if no filters.
+        Filters, ``Q`` objects and ``nearby()`` conditions, in that order, numbered from *counter* on: the outer
+        statement starts at 0, a subquery (v0.27.0) continues the numbering of the statement it goes into. With
+        ``as_of=True`` (a time-travel table read, v0.26.0) the per-record check ``time_travel.GUARD`` is the last
+        condition, after the ``nearby()`` ones: every other part is a single comparison or a parenthesised group,
+        so the check applies to every row they keep.
+
+        Args:
+            counter: the first ``$_f<N>`` number.
+            as_of: append the time-travel guard.
+            subqueries: the statement's compiler, which binds a subquery value; ``None`` refuses one (S8).
         """
         parts: list[str] = []
         variables: dict[str, Any] = {}
-        counter = 0
         endpoint_columns = self.model._endpoint_columns()
 
         # Regular keyword filters (AND-joined)
         for field_name, lookup_name, value in self._filters:
             sql, vars_, counter = build_filter_condition(
-                field_name, lookup_name, value, counter, self._model_table, endpoint_columns=endpoint_columns
+                field_name,
+                lookup_name,
+                value,
+                counter,
+                self._model_table,
+                endpoint_columns=endpoint_columns,
+                subqueries=subqueries,
             )
             parts.append(sql)
             variables.update(vars_)
 
         # Q object filters
         for q in self._q_filters:
-            sql, vars_, counter = q.to_sql(counter, self._model_table, self.model.to_db_field, endpoint_columns)
+            sql, vars_, counter = q.to_sql(
+                counter, self._model_table, self.model.to_db_field, endpoint_columns, subqueries=subqueries
+            )
             if sql:
                 parts.append(sql)
                 variables.update(vars_)
@@ -545,10 +592,90 @@ class QuerySet:
         if as_of:
             parts.append(_time_travel.GUARD)
 
+        return parts, variables, counter
+
+    def _build_where(self, *, as_of: bool = False, subqueries: SubqueryCompiler | None = None) -> tuple[str, dict[str, Any]]:
+        """
+        Build a parameterized WHERE clause from filters, Q objects and ``nearby()`` conditions.
+
+        With ``as_of=True`` (a time-travel table read, v0.26.0) the per-record check
+        ``time_travel.GUARD`` is the last condition (:meth:`_where_parts`). A subquery value (v0.27.0) is bound
+        by *subqueries*, the statement's compiler; without one it raises ``ValueError`` (S8).
+
+        Returns:
+            A tuple of (where_clause_string, variables_dict).
+            The where_clause_string includes the ``WHERE`` keyword, or is empty if no filters.
+        """
+        parts, variables, _ = self._where_parts(0, as_of=as_of, subqueries=subqueries)
         if not parts:
             return "", {}
 
         return " WHERE " + " AND ".join(parts), variables
+
+    def _subquery_select(self, compiler: SubqueryCompiler, counter: int) -> tuple[str, dict[str, Any], int]:
+        """This queryset as the sub-SELECT of another queryset's filter (v0.27.0); its values and the next counter.
+
+        ``(SELECT VALUE <column> FROM <table> [WHERE …] [LIMIT n] [START m] [VERSION $_as_of])``, the column being
+        the one ``select()`` names, else ``id``. Ordered, ``(SELECT <column> AS _sqv, <order columns> FROM …
+        ORDER BY … …)._sqv``: SurrealDB 2.x refuses to order a ``SELECT VALUE`` by another field and orders wrongly
+        by a column it selects only under an alias, so every order column is selected by its name. Its filter
+        values are bound from *counter* on, its ``variables()`` merged into the statement's, its own subqueries
+        rendered first (their ``LET`` s precede its own). Under the outer ``as_of()`` (``compiler.moment``) it
+        carries the per-record guard and ``VERSION $_as_of``: the server never applies the outer ``VERSION`` to a
+        ``LET``. A table in ``compiler.empty_tables`` compiles to ``[]``. ``fetch()`` is ignored, as in the full
+        SurrealDB-ORM: a sub-SELECT gives values, never records to resolve.
+
+        Called by :meth:`SubqueryCompiler.reference`, which checks S3 first.
+
+        Raises:
+            ValueError: ``annotate()``, ``select()`` of several fields or ``values()`` (S4, every offender named);
+                ``limit()``/``offset()`` not an ``int >= 0`` (S12); an invalid selected column; ``_sqv`` ordered on
+                where the ordered form selects its alias (S13); its ``variables()`` binding a name of the statement
+                to another value (S7); and its filters' own refusals.
+            SurrealDbError: an ``as_of()`` of its own (S5); a transaction that is not the outer queryset's (S6).
+        """
+        offenders = {
+            "annotate()": bool(self._annotations),
+            "select() of several fields": len(self.select_item) > 1,
+            "values()": bool(self._group_by_fields),
+        }
+        refused = sorted(name for name, present in offenders.items() if present)
+        if refused:
+            raise ValueError(_subquery.clauses_refused(refused))
+        if self._as_of is not None:
+            raise SurrealDbError(_subquery.moment_refused())
+        if self._tx is not None and self._tx is not compiler.outer_tx:
+            raise SurrealDbError(_subquery.transaction_refused())
+        for clause, value in (("limit()", self._limit), ("offset()", self._offset)):
+            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
+                raise ValueError(_subquery.bad_slice(clause, value))
+        column = self.select_item[0] if self.select_item else "id"
+        validate_field_name(column, "subquery select field")
+        order_columns: list[str] = []
+        if self._order_by:
+            order_columns = list(dict.fromkeys(part.rsplit(" ", 1)[0] for part in self._order_by.split(", ")))
+        alias = _subquery.VALUE_ALIAS
+        for order_column in order_columns:
+            if order_column.split(".")[0] == alias and not order_column == column == alias:
+                raise ValueError(_subquery.reserved_alias())
+        table = self._model_table
+        compiler.tables.add(table)
+        compiler.merge_variables(self._variables)
+        if table in compiler.empty_tables:
+            return "[]", {}, counter
+        parts, values, counter = self._where_parts(counter, as_of=compiler.moment is not None, subqueries=compiler)
+        where = " WHERE " + " AND ".join(parts) if parts else ""
+        tail = ""
+        if self._limit is not None:
+            tail += f" LIMIT {self._limit}"
+        if self._offset is not None:
+            tail += f" START {self._offset}"
+        if compiler.moment is not None:
+            tail += _time_travel.VERSION_CLAUSE
+        if not order_columns:
+            return f"(SELECT VALUE {column} FROM {table}{where}{tail})", values, counter
+        selected = ", ".join([f"{column} AS {alias}", *order_columns])
+        return f"(SELECT {selected} FROM {table}{where} ORDER BY {self._order_by}{tail}).{alias}", values, counter
 
     def _version_moment(self, moment: datetime | None) -> datetime | None:
         """The moment a compile function writes ``VERSION $_as_of`` for; ``None`` without ``as_of()`` (v0.26.0).
@@ -570,22 +697,30 @@ class QuerySet:
             return query + ";", variables
         return f"{query}{_time_travel.VERSION_CLAUSE};", {**variables, _time_travel.MOMENT_VARIABLE: moment}
 
-    def _compile_query(self, moment: datetime | None = None) -> tuple[str, dict[str, Any]]:
+    def _compile_query(
+        self, moment: datetime | None = None, *, subqueries: SubqueryCompiler | None = None
+    ) -> tuple[str, dict[str, Any]]:
         """
         Compile the QuerySet parameters into a parameterized SQL query.
 
         Args:
             moment: Under ``as_of()``, the resolved moment of the read (v0.26.0): the guarded WHERE and
                 ``VERSION $_as_of`` are compiled, ``$_as_of`` bound to it. Ignored without ``as_of()``.
+            subqueries: The compiler of the statement's subqueries (v0.27.0); a new one by default. With
+                subqueries the statement is a block, ``{ LET $_sq0 = (…); (SELECT …) };``; without, the text
+                and variables of v0.26.0.
 
         Returns:
             A tuple of (query_string, variables_dict).
 
         Raises:
             RuntimeError: under ``as_of()`` without a moment (an internal error).
+            ValueError, SurrealDbError: a subquery the ORM cannot compile (S2–S7, S12, S13, S15).
         """
         moment = self._version_moment(moment)
-        where_clause, where_vars = self._build_where(as_of=moment is not None)
+        compiler = subqueries if subqueries is not None else self._subquery_compiler()
+        compiler.moment = moment
+        where_clause, where_vars = self._build_where(as_of=moment is not None, subqueries=compiler)
 
         projection = list(self.select_item) or ["*"]
         # GeoDistance annotations (v0.24.0): one projection each, the point bound. The is_point() guard
@@ -611,10 +746,16 @@ class QuerySet:
         if self._fetch_fields:
             query += f" FETCH {', '.join(self._fetch_fields)}"
 
-        return self._terminate(query, {**self._variables, **where_vars, **distance_vars}, moment)
+        query, variables = self._terminate(query, {**compiler.variables, **where_vars, **distance_vars}, moment)
+        return compiler.wrap(query), variables
 
     def _compile_aggregation_query(
-        self, aggregation_expr: str, alias: str | None = None, moment: datetime | None = None
+        self,
+        aggregation_expr: str,
+        alias: str | None = None,
+        moment: datetime | None = None,
+        *,
+        subqueries: SubqueryCompiler | None = None,
     ) -> tuple[str, dict[str, Any]]:
         """
         Compile an aggregation query with parameterized WHERE clause.
@@ -624,15 +765,19 @@ class QuerySet:
             alias: Optional alias for the aggregation result.
             moment: Under ``as_of()``, the resolved moment of the read (v0.26.0), as for
                 :meth:`_compile_query`; ``VERSION $_as_of`` follows ``GROUP ALL``.
+            subqueries: The compiler of the statement's subqueries (v0.27.0), as for :meth:`_compile_query`.
 
         Returns:
             A tuple of (query_string, variables_dict).
 
         Raises:
             RuntimeError: under ``as_of()`` without a moment (an internal error).
+            ValueError, SurrealDbError: a subquery the ORM cannot compile, as for :meth:`_compile_query`.
         """
         moment = self._version_moment(moment)
-        where_clause, where_vars = self._build_where(as_of=moment is not None)
+        compiler = subqueries if subqueries is not None else self._subquery_compiler()
+        compiler.moment = moment
+        where_clause, where_vars = self._build_where(as_of=moment is not None, subqueries=compiler)
 
         if alias:
             query = f"SELECT {aggregation_expr} AS {alias} FROM {self._model_table}"
@@ -642,15 +787,19 @@ class QuerySet:
         query += where_clause
         query += " GROUP ALL"
 
-        return self._terminate(query, {**self._variables, **where_vars}, moment)
+        query, variables = self._terminate(query, {**compiler.variables, **where_vars}, moment)
+        return compiler.wrap(query), variables
 
-    def _compile_group_by_query(self, moment: datetime | None = None) -> tuple[str, dict[str, Any]]:
+    def _compile_group_by_query(
+        self, moment: datetime | None = None, *, subqueries: SubqueryCompiler | None = None
+    ) -> tuple[str, dict[str, Any]]:
         """
         Compile a GROUP BY query with annotations and parameterized WHERE clause.
 
         Args:
             moment: Under ``as_of()``, the resolved moment of the read (v0.26.0), as for
                 :meth:`_compile_query`; ``VERSION $_as_of`` follows ``START``.
+            subqueries: The compiler of the statement's subqueries (v0.27.0), as for :meth:`_compile_query`.
 
         Returns:
             A tuple of (query_string, variables_dict).
@@ -658,12 +807,15 @@ class QuerySet:
         Raises:
             ValueError: a ``GeoDistance`` annotation is present: it is computed per record.
             RuntimeError: under ``as_of()`` without a moment (an internal error).
+            ValueError, SurrealDbError: a subquery the ORM cannot compile, as for :meth:`_compile_query`.
         """
         if self._geo_annotations:
             raise ValueError(_GEO_DISTANCE_PER_RECORD)
         self._reject_annotation_collisions()
         moment = self._version_moment(moment)
-        where_clause, where_vars = self._build_where(as_of=moment is not None)
+        compiler = subqueries if subqueries is not None else self._subquery_compiler()
+        compiler.moment = moment
+        where_clause, where_vars = self._build_where(as_of=moment is not None, subqueries=compiler)
 
         select_parts = list(self._group_by_fields)
         for alias, agg in self._annotations.items():
@@ -686,7 +838,8 @@ class QuerySet:
         if self._offset is not None:
             query += f" START {self._offset}"
 
-        return self._terminate(query, {**self._variables, **where_vars}, moment)
+        query, variables = self._terminate(query, {**compiler.variables, **where_vars}, moment)
+        return compiler.wrap(query), variables
 
     # ==================== Query execution ====================
 
@@ -1563,7 +1716,7 @@ class QuerySet:
                 f"transaction. Drop the clause — filter(), variables() and fetch() are supported."
             )
 
-    def _compile_live(self, diff: bool) -> str:
+    def _compile_live(self, diff: bool, subqueries: SubqueryCompiler | None = None) -> str:
         """Compile this queryset into a ``LIVE SELECT`` with every bound value inlined.
 
         The WHERE is the ordinary parameterised one from :meth:`_build_where` — identifiers,
@@ -1571,14 +1724,20 @@ class QuerySet:
         literals, because SurrealDB 2.x evaluates a live query's parameters as ``NONE`` at
         notification time and the filter would silently match nothing (see ``surql_literal``).
 
+        A subquery (v0.27.0) stays an inline sub-SELECT, its values and ``variables()`` inlined too: a
+        ``LIVE SELECT`` cannot sit in a block, and the server evaluates the sub-SELECT on every notification.
+        *subqueries* is the inline compiler to use (a new one by default), which records the tables they read.
+
         :raises SurrealDbError: for a clause a live query cannot honour.
         :raises TypeError: for a filter value with no SurrealQL literal form.
+        :raises ValueError, SurrealDbError: for a subquery the ORM cannot compile (S2–S7, S12, S13, S15).
         """
         self._reject_live_clauses()
-        where_clause, where_vars = self._build_where()
+        compiler = subqueries if subqueries is not None else self._subquery_compiler(inline=True)
+        where_clause, where_vars = self._build_where(subqueries=compiler)
         # Only the WHERE fragment is rewritten: it is the one place references live, and the
         # table name and FETCH list never pass through the inliner.
-        where_clause = inline_variables(where_clause, {**self._variables, **where_vars})
+        where_clause = inline_variables(where_clause, {**compiler.variables, **where_vars})
         projection = "DIFF" if diff else "*"
         query = f"LIVE SELECT {projection} FROM {self._model_table}{where_clause}"
         if self._fetch_fields:

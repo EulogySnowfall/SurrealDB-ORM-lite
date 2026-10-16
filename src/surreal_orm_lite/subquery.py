@@ -201,11 +201,68 @@ class SubqueryCompiler:
             elif not _same_value(self.variables[name], value):
                 raise ValueError(variable_clash(name))
 
+    def reference(self, sub: Subquery, counter: int) -> tuple[str, dict[str, Any], int]:
+        """Render *sub* for the statement; return what the condition names it by, its values and the next counter.
+
+        The inner queryset is rendered by ``QuerySet._subquery_select()``, its filter values bound from *counter*
+        on (one ``$_f<N>`` numbering for the whole statement). Inline (a live query), the sub-SELECT itself is
+        returned; otherwise it is bound by a new ``LET $_sq<N> = …;`` and ``$_sq<N>`` returned. The subqueries of
+        the inner queryset are rendered while it is, so their ``LET`` s come first: innermost first.
+
+        Raises:
+            ValueError: the inner queryset is being rendered already — the outer queryset itself, or a queryset
+                that reaches itself through another subquery (S3). Checked before anything else about it.
+        """
+        queryset = sub.queryset
+        if id(queryset) in self._stack:
+            raise ValueError(own_subquery())
+        self._stack.append(id(queryset))
+        try:
+            select, values, counter = queryset._subquery_select(self, counter)
+        finally:
+            self._stack.pop()
+        if self.inline:
+            return select, values, counter
+        name = f"{LET_PREFIX}{len(self.lets)}"
+        self.lets.append(f"LET ${name} = {select};")
+        return f"${name}", values, counter
+
     def wrap(self, statement: str) -> str:
         """The statement to send: unchanged without subqueries, else the block ``{ LET …; (<statement>) };``."""
         if not self.lets:
             return statement
         return "{ " + " ".join(self.lets) + f" ({statement.removesuffix(';')}) }};"
+
+
+def subquery_condition(
+    field: str, lookup: str, op: str, sub: Subquery, counter: int, compiler: SubqueryCompiler | None
+) -> tuple[str, dict[str, Any], int]:
+    """The condition of a filter whose whole value is a subquery: ``(sql, values, next_counter)``.
+
+    ``in``, ``not_in``, ``containsall`` and ``containsany`` (:data:`COLLECTION_LOOKUPS`) compare *field* with all
+    the subquery's values (``author IN $_sq0``); ``exact``, ``gt``, ``gte``, ``lt``, ``lte``, ``contains`` and
+    ``not_contains`` (:data:`FIRST_VALUE_LOOKUPS`) with its first value, guarded so an empty subquery matches no
+    record: ``($_sq0 != [] AND score > array::first($_sq0))``.
+
+    Args:
+        field: the column, already validated and translated.
+        lookup: the lookup name.
+        op: its SurrealQL operator (``LOOKUP_OPERATORS``).
+        sub: the subquery.
+        counter: the next ``$_f<N>`` number.
+        compiler: the statement's compiler; ``None`` for a ``Q`` compiled on its own.
+
+    Raises:
+        ValueError: any other lookup (S2); no compiler (S8); and what :meth:`SubqueryCompiler.reference` raises.
+    """
+    if lookup not in COLLECTION_LOOKUPS and lookup not in FIRST_VALUE_LOOKUPS:
+        raise ValueError(lookup_refused(lookup))
+    if compiler is None:
+        raise ValueError(outside_a_queryset())
+    ref, values, counter = compiler.reference(sub, counter)
+    if lookup in COLLECTION_LOOKUPS:
+        return f"{field} {op} {ref}", values, counter
+    return f"({ref} != [] AND {field} {op} array::first({ref}))", values, counter
 
 
 # --- the texts of the errors (spec §5.5) ----------------------------------------------------------
@@ -216,9 +273,72 @@ def not_a_queryset(value: object) -> str:
     return f"Subquery() takes a QuerySet (Model.objects()...), not {type(value).__name__}"
 
 
+def lookup_refused(lookup: str) -> str:
+    """S2: a lookup that can take no subquery (``isnull``, the text and the spatial lookups)."""
+    return (
+        f"'{lookup}' cannot take a subquery: in, not_in, containsall and containsany compare with all its values; "
+        "exact, gt, gte, lt, lte, contains and not_contains with its first value"
+    )
+
+
+def own_subquery() -> str:
+    """S3: a queryset is, directly or through another subquery, its own subquery."""
+    return "A queryset cannot be its own subquery: build the inner queryset with a new Model.objects() call."
+
+
+def clauses_refused(offenders: list[str]) -> str:
+    """S4: the inner queryset has clauses a subquery cannot honour (*offenders*, sorted)."""
+    return (
+        f"A subquery cannot honour {', '.join(offenders)}: it gives the outer filter one list of values, SELECT VALUE "
+        "<one field>. Drop the clause; filter(), Q, nearby(), select() of one field, order_by(), limit(), offset() "
+        "and variables() are supported."
+    )
+
+
+def moment_refused() -> str:
+    """S5: the inner queryset has an ``as_of()`` moment of its own."""
+    return (
+        "A subquery reads at the moment of the queryset that uses it: call as_of() on the outer queryset, not on the subquery."
+    )
+
+
+def transaction_refused() -> str:
+    """S6: the inner queryset has a transaction that is not the outer queryset's."""
+    return (
+        "A subquery runs inside the statement of the queryset that uses it, so it cannot have a transaction of its "
+        "own: build it with the same objects(tx=) as the outer queryset, or with none."
+    )
+
+
 def variable_clash(name: str) -> str:
     """S7: a subquery's ``variables()`` binds a name the statement already binds to another value."""
     return (
         f"The subquery binds ${name} to another value than the queryset that uses it; they share one statement: "
         "rename one of the variables()."
     )
+
+
+def outside_a_queryset() -> str:
+    """S8: a subquery in a ``Q`` (or ``build_filter_condition``) compiled with no statement to bind it in."""
+    return (
+        "A subquery compiles only inside a QuerySet (filter(), get_or_create(), live()...), which binds it in the "
+        "statement it sends; Q.to_sql() alone cannot."
+    )
+
+
+def bad_slice(clause: str, value: object) -> str:
+    """S12: the inner ``limit()`` or ``offset()`` (*clause*) is not an ``int >= 0``."""
+    return f"A subquery's {clause} takes an int >= 0, got {value!r}"
+
+
+def reserved_alias() -> str:
+    """S13: the inner ``order_by()`` names ``_sqv`` (or a path under it) where the ordered form selects its alias."""
+    return (
+        f"'{VALUE_ALIAS}' names the values of an ordered subquery: a subquery can order by the column {VALUE_ALIAS} "
+        f"only when it selects {VALUE_ALIAS} itself, and never by a path under it such as {VALUE_ALIAS}.x."
+    )
+
+
+def inside_a_list(field: str, lookup: str) -> str:
+    """S15: a subquery given as an item of a list instead of as the whole value of a lookup."""
+    return f"'{lookup}' takes a subquery as its whole value, not inside a list: {field}__{lookup}=Subquery(...)"
