@@ -7,8 +7,11 @@ the classes that open an engine or a server are suffixed ``E2E``. Most E2E class
 the embedded ``surrealkv+versioned://`` engine runs in-process. The server classes come last: the server of
 ``SURREALDB_PORT``, started in memory (no history), and one started with versioned storage, found through
 ``SURREALDB_VERSIONED_PORT`` (``SURREALDB_VERSIONED_HOST``, default ``SURREALDB_HOST``), skipped without it.
+Last, what README section 27, the behaviour tables and ``docs/ROADMAP.md`` say, and the README's examples
+run on the embedded engine.
 """
 
+import ast
 import asyncio
 import contextlib
 import enum
@@ -16,6 +19,8 @@ import inspect
 import itertools
 import os
 import pickle
+import re
+import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
@@ -54,6 +59,7 @@ from surreal_orm_lite.model_base import _snapshot_moment
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.time_travel import MAX_MOMENT, MIN_MOMENT, AsOf, in_range, line_major, normalise_as_of
 from tests.conftest import orm_client
+from tests.test_embedded import _cells, _normalised, _readme_part, _subsection, _table_rows, _tables
 
 # --- shared models and moments (later tasks reuse them) --------------------------------------------
 
@@ -1994,3 +2000,249 @@ class TestVersionedServerE2E:
         assert str(info.value) == time_travel.fetch_refused()
         assert len(versions) == 1 and line_major(versions[0]) == 2, versions
         assert sent == []
+
+
+# --- README section 27, the behaviour tables and the ROADMAP (spec §11; AC-18, AC-19; P2, P4, P5, D14) ----
+
+_REPO = Path(__file__).resolve().parents[1]
+_SECTION_27 = "### 27. Time travel (`as_of()`)"
+_SERVER_BEHAVIOUR = "### ORM behaviour: SurrealDB 2.x vs 3.x"
+_EMBEDDED_BEHAVIOUR = "### ORM behaviour: the embedded engine"
+_COMING_FROM = "#### Coming from the full SurrealDB-ORM"
+
+#: P5: the five rows v0.26.0 adds to the 2.x/3.x table, cell by cell, exactly as spec §11 writes them.
+_TIME_TRAVEL_ROWS = [
+    [
+        "Time travel (`as_of()`) on a server without versioned storage",
+        "no error, and the ORM cannot tell: in memory or on plain SurrealKV, only records last written at or "
+        "before the moment, in their current state. RocksDB: `SurrealDbError`",
+        "`SurrealDbError` (the server refuses `VERSION`)",
+        "v0.26.0",
+    ],
+    [
+        "Time travel on versioned storage: records deleted since, counts and aggregates",
+        "right (the ORM's per-record check also corrects the server's unfiltered `count()`)",
+        "right (the ORM's per-record check hides the records deleted before the moment that the server's table reads return)",
+        "v0.26.0",
+    ],
+    [
+        "`fetch()` and dotted paths through record links under `as_of()`",
+        "`fetch()` refused (`SurrealDbError`) by `exec()`, `first()`, `get()` without an id; dotted paths in "
+        "`filter()`, `select()`, `order_by()`, `values()` read the current value",
+        "as they were at the moment",
+        "v0.26.0",
+    ],
+    [
+        "Writing history with a raw `CREATE … VERSION`",
+        "stored at that moment, readable with `as_of()`",
+        "accepted, not readable at that moment (the table did not exist then)",
+        "v0.26.0",
+    ],
+    [
+        "`as_of()` moment before 1970-01-01 or after 2262-04-11T23:47:16.854775Z",
+        "refused by the ORM before any read (`ValueError`; `SurrealDbError` for a duration or expression resolving "
+        "there): the server reads an earlier moment as the current state",
+        "refused by the ORM before any read, same errors: the server would fail with an internal error",
+        "v0.26.0",
+    ],
+]
+#: The widths between the pipes of the 2.x/3.x table (535 characters a line): the new rows keep them (P5).
+_SERVER_TABLE_WIDTHS = [136, 175, 181, 38]
+
+
+def _section_27() -> str:
+    return _readme_part(_SECTION_27)
+
+
+def _section_27_examples() -> list[str]:
+    """Section 27's ``python`` blocks, in order."""
+    blocks: list[str] = re.findall(r"^```python\n(.*?)^```$", _section_27(), re.MULTILINE | re.DOTALL)
+    assert blocks, "README section 27 has no example"
+    return blocks
+
+
+def _roadmap_part(heading: str) -> str:
+    """``docs/ROADMAP.md`` from the ``heading`` line up to the next ``##``/``###`` heading."""
+    roadmap = (_REPO / "docs" / "ROADMAP.md").read_text(encoding="utf-8")
+    match = re.search(rf"^{re.escape(heading)}\n.*?(?=^#{{2,3}} )", roadmap, re.MULTILINE | re.DOTALL)
+    assert match, f"docs/ROADMAP.md has no {heading!r} part"
+    return match.group(0)
+
+
+class TestTimeTravelDocs:
+    """Unit: what README section 27, the behaviour tables, the comparison tables and ``docs/ROADMAP.md`` say
+    about time travel (spec §11, AC-18, AC-19)."""
+
+    def test_section_27_has_an_as_of_example(self) -> None:
+        assert any(".as_of(" in block for block in _section_27_examples())
+
+    def test_section_27_ends_with_coming_from_the_full_orm(self) -> None:
+        """P4: the heading, found with the regex of ``tests/test_geo_fields.py``, closes the section."""
+        section = _section_27()
+        assert re.search(r"^#### Coming from the full SurrealDB-ORM$", section, re.MULTILINE), "P4 heading missing"
+        assert re.findall(r"^#### .*$", section, re.MULTILINE)[-1] == _COMING_FROM
+        text = _normalised(_subsection(_COMING_FROM, section))
+        for needle in ("The full ORM has no time travel", "`as_of()`", "`version()`", "`==`", "`model_dump()`"):
+            assert needle in text, needle
+
+    def test_section_27_links_no_upstream_issue(self) -> None:
+        """D14: the server bugs are stated as facts; reporting them upstream is the user's call."""
+        assert "github.com/surrealdb/surrealdb/issues" not in _section_27()
+
+    def test_sdk_duration_is_accepted_at_runtime_only(self) -> None:
+        """P2: the annotation names the ORM's types; the SDK ``Duration`` works but a type checker flags it."""
+        section = _normalised(_section_27())
+        assert "`surrealdb.Duration`" in section and "accepted at runtime only" in section, section
+
+    def test_section_27_names(self) -> None:
+        section = _normalised(_section_27())
+        for name in (
+            "`VERSION`",
+            "surrealkv+versioned://",
+            "?versioned=true",
+            "1970-01-01T00:00:00Z",
+            "2262-04-11T23:47:16.854775Z",
+            "midnight UTC",
+            "a `date` object is refused",
+            "one extra point read per record scanned",
+            "await BaseSurrealModel.refresh(snapshot)",
+            "model_dump()",
+            "server_fields",
+            "upsert()",
+            "`get_related()`",
+            "the current graph",
+            "cannot tell",
+            "objects(tx=",
+        ):
+            assert name in section, name
+
+    def test_server_behaviour_rows(self) -> None:
+        """P5: the five rows hold spec §11's texts and sit right before the table's last row."""
+        rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
+        assert rows[-6:-1] == _TIME_TRAVEL_ROWS, rows[-6:-1]
+        assert rows[-1][0].startswith("Full suite and every divergence") and rows[-1][3] == "v0.19.1", rows[-1]
+        assert [cells for cells in rows if cells[3] == "v0.26.0"] == _TIME_TRAVEL_ROWS
+
+    def test_server_behaviour_table_keeps_its_widths(self) -> None:
+        """P5: no line of the table is re-padded; the new rows fit the existing columns."""
+        [lines] = _tables(_readme_part(_SERVER_BEHAVIOUR))
+        assert {len(line) for line in lines} == {535}
+        for line in lines:
+            assert [len(cell) for cell in line.split("|")[1:-1]] == _SERVER_TABLE_WIDTHS, line
+
+    def test_server_behaviour_header_names_v0_26_0(self) -> None:
+        header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
+        assert "rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5" in header, (
+            header
+        )
+
+    def test_embedded_behaviour_row(self) -> None:
+        rows = [cells for _, cells in _table_rows(_readme_part(_EMBEDDED_BEHAVIOUR))]
+        [row] = [cells for cells in rows if cells[0] == "Time travel (`as_of()`)"]
+        assert row == [
+            "Time travel (`as_of()`)",
+            "`surrealkv+versioned://` only (`?versioned=true` is ignored by SDK 2.0.0); any other URL → "
+            "`SurrealDbError` before any request; `fetch()` refused (2.x core)",
+            "versioned storage required (see the 2.x/3.x table)",
+            "v0.26.0",
+        ], row
+        assert rows[-1][0] == "Everything else", "the catch-all row stays last"
+
+    def test_section_26_url_row_points_to_section_27(self) -> None:
+        rows = _table_rows(_readme_part("### 26. Embedded engine and test fixtures"), "Embedded URL")
+        [versioned] = [cells for _, cells in rows if cells[0] == "`surrealkv+versioned://<path>`"]
+        assert versioned[1] == "✅ on disk, keeps history: time travel with `as_of()` (section 27)", versioned
+
+    def test_features_comparison_and_roadmap_rows(self) -> None:
+        features = [cells for _, cells in _table_rows(_readme_part("## Features"))]
+        assert ["Time travel (`as_of()`, versioned storage)", "✅"] in features, features
+        comparison = [cells for _, cells in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        assert ["Time travel (`VERSION`)", "✅ v0.26.0 (`as_of()`)", "❌"] in comparison, comparison
+        firsts = [cells[0] for cells in comparison]
+        assert firsts.index("Time travel (`VERSION`)") == firsts.index("Embedded engine") + 1
+        roadmap = [cells[:2] for _, cells in _table_rows(_readme_part("## Roadmap"))]
+        assert ["v0.26.0", "Time travel (versioned storage)"] in roadmap, roadmap
+        assert ["v0.27.0 – v0.29.0", "Tier 2 — Extended (subqueries, cache, multi-db)"] in roadmap, roadmap
+        assert not [cells for cells in roadmap if cells[0] == "v0.26.0 – v0.29.0"], roadmap
+
+    def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
+        """AC-19: every table v0.26.0 touches keeps one cell count per line and no escaped pipe."""
+        parts = [
+            _section_27(),
+            _readme_part("### 26. Embedded engine and test fixtures"),
+            _readme_part(_SERVER_BEHAVIOUR),
+            _readme_part(_EMBEDDED_BEHAVIOUR),
+            _readme_part("## Features"),
+            _readme_part("## Roadmap"),
+            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+            _roadmap_part("### Embedded URLs"),
+            _roadmap_part("## Planned — Tier 2: Extended (SDK-2.0-native)"),
+        ]
+        tables = [lines for part in parts for lines in _tables(part)]
+        assert len(tables) >= len(parts) + 1, "section 27 has tables of its own"
+        for lines in tables:
+            assert len({len(_cells(line)) for line in lines}) == 1 and "\\|" not in "".join(lines), lines
+
+    def test_roadmap_content(self) -> None:
+        """Footnote ² of the Tier 2 table is defined below it; the embedded-URL parity row names ``as_of()``."""
+        tier_2 = _roadmap_part("## Planned — Tier 2: Extended (SDK-2.0-native)")
+        [lines] = _tables(tier_2)
+        [row] = [line for line in lines if line.startswith("| v0.26.0")]
+        assert "²" in row, row
+        below = _normalised(tier_2.split(lines[-1], 1)[1])
+        assert "¹ The embedded engine ships in the SDK 2.0.0 base wheel" in below, below
+        assert (
+            "² The versioned engine is the SDK 2.0.0 embedded engine's `surrealkv+versioned://`; versioned servers "
+            "(3.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too." in below
+        ), below
+        rows = _table_rows(_roadmap_part("### Embedded URLs"), "Embedded URL")
+        [versioned] = [cells for _, cells in rows if cells[0] == "`surrealkv+versioned://<path>`"]
+        assert versioned[1].startswith("✅") and "`as_of()`" in versioned[1], versioned
+
+    def test_typing_example(self) -> None:
+        """AC-18: each annotated form, and no SDK ``Duration`` (P2: accepted at runtime only)."""
+        source = (_REPO / "tests" / "typing_examples.py").read_text(encoding="utf-8")
+        match = re.search(r"^def time_travel_forms\(\) -> None:\n(.*?)(?=^\S|\Z)", source, re.MULTILINE | re.DOTALL)
+        assert match, "tests/typing_examples.py has no time_travel_forms()"
+        body = match.group(1)
+        calls = re.findall(r"assert_type\(QuerySet\(TypedMember\)\.as_of\((.*)\), QuerySet\)$", body, re.MULTILINE)
+        assert [call.split("(", 1)[0] for call in calls] == [
+            "datetime",
+            '"2026-01-01T00:00:00Z"',
+            "timedelta",
+            "Duration.parse",
+            "SurrealFunc",
+            "None",
+        ], calls
+        assert "surrealdb.Duration" not in body and "SdkDuration" not in body
+
+
+class TestReadmeTimeTravelExamplesE2E:
+    """AC-19: every example of README section 27 runs as written on the embedded versioned engine (no server),
+    in the test's own directory."""
+
+    async def test_section_27_examples(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr(tempfile, "mkdtemp", lambda *args, **kwargs: str(tmp_path))
+        namespace: dict[str, Any] = {"__name__": "readme_section_27"}
+        try:
+            for code in _section_27_examples():
+                compiled = compile(code, "<README section 27>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                # A doctest of this repository's own README (trusted text), top-level awaits included.
+                outcome = eval(compiled, namespace)
+                if inspect.iscoroutine(outcome):
+                    await outcome
+        except AssertionError:
+            moments = [namespace.get(name) for name in ("opening", "sale")]
+            if all(isinstance(moment, datetime) for moment in moments):
+                _strictly_increasing(*moments)  # a clock step skips; a wrong result fails
+            raise
+        finally:
+            namespace.clear()  # no client of the examples outlives them (closed-client rule)
+            await SurrealDBConnectionManager.unset_connection()
+
+        printed = capsys.readouterr().out
+        assert time_travel.moment_out_of_range(datetime(1900, 1, 1, tzinfo=UTC)) in printed
+        assert "Product.save() cannot run on an instance read with as_of()" in printed
+        assert not SurrealDBConnectionManager.is_connected()

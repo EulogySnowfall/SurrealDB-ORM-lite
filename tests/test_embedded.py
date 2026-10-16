@@ -2527,13 +2527,17 @@ class TestReadmeEmbeddedWording:
             assert name in section, name
 
     def test_section_26_follows_section_25(self) -> None:
-        """Section 26 comes right after section 25 and runs up to "Configuration Options"."""
+        """Section 26 comes right after section 25, and section 27 (v0.26.0) right after it, up to
+        "Configuration Options"."""
         readme = _readme()
         start_25 = readme.index("\n### 25. Geospatial fields\n")
         start_26 = readme.index(f"\n{_SECTION_26}\n")
         configuration = readme.index("\n## Configuration Options\n")
         assert start_25 < start_26 < configuration
-        assert re.findall(r"^#{2,3} .*$", readme[start_26 + 1 : configuration], re.MULTILINE) == [_SECTION_26]
+        assert re.findall(r"^#{2,3} .*$", readme[start_26 + 1 : configuration], re.MULTILINE) == [
+            _SECTION_26,
+            "### 27. Time travel (`as_of()`)",
+        ]
 
     def test_subsections_in_order(self) -> None:
         headings = re.findall(r"^#### (.*)$", _section_26(), re.MULTILINE)
@@ -2612,7 +2616,7 @@ class TestReadmeEmbeddedWording:
         [lines] = _tables(part)
         assert _cells(lines[0]) == ["ORM capability", "Embedded engine (SDK 2.0.0)", "Servers (2.x and 3.x)", "Since"]
         rows = [cells for _, cells in _table_rows(part)]
-        assert all(len(cells) == 4 and cells[3] == "v0.25.0" for cells in rows), rows
+        assert all(len(cells) == 4 and cells[3] in {"v0.25.0", "v0.26.0"} for cells in rows), rows
         firsts = " ".join(cells[0] for cells in rows).lower()
         for row in (
             "live queries",
@@ -2626,6 +2630,7 @@ class TestReadmeEmbeddedWording:
             "`ephemeral_client()`",
             "anonymous session",
             "transaction()",
+            "time travel (`as_of()`)",
         ):
             assert row in firsts, row
 
@@ -2671,10 +2676,13 @@ class TestReadmeEmbeddedWording:
         assert _cells(lines[0]) == ["Feature", "ORM (full)", "ORM-lite"]
         [row] = [line for line in lines if line.startswith("| Embedded / versioned engine")]
         assert "| yes" not in row, row
-        assert _cells(row) == ["Embedded / versioned engine", "no", "v0.25 – v0.26"], row
+        # The status marker is release-manager's: the row reads the same with or without it (v0.26.0).
+        assert _cells(row) in (
+            ["Embedded / versioned engine", "no", "v0.25 – v0.26"],
+            ["Embedded / versioned engine", "no", "✅ v0.25 – v0.26"],
+        ), row
         [fixtures] = [line for line in lines if line.startswith("| Test fixtures & factories")]
         assert _cells(fixtures) == ["Test fixtures & factories", "yes", "v0.25.0 + v0.39.0"], fixtures
-        assert "✅ v0.25" not in comparison, "no status marker: release-manager's"
         for name in ("rocksdb://", "#233", "2.3.10", "surrealdb[embedded]"):
             assert name in roadmap, name
         assert "To confirm" not in roadmap, "footnotes ¹/² are resolved"

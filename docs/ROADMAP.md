@@ -176,7 +176,7 @@ official SDK's in-process engine from v0.25.0.
 | ------------------------------ | ---------------------------------------------------------------------------------------- | ------------------------ |
 | `mem://`, `memory://`          | ✅ in memory, gone when the connection closes                                            | ❌ (HTTP/WebSocket only) |
 | `surrealkv://<path>`           | ✅ on disk (SurrealKV)                                                                   | ❌                       |
-| `surrealkv+versioned://<path>` | ✅ on disk; behaves as `surrealkv://` until time travel (v0.26.0)                        | ❌                       |
+| `surrealkv+versioned://<path>` | ✅ on disk, keeps history: time travel with `as_of()` (README section 27)                | ❌                       |
 | `file://<path>`                | ✅ a **SurrealKV** store, not the RocksDB store `file://` means for the SurrealDB server | ❌                       |
 | `rocksdb://<path>`             | ❌ not yet supported by the official SDK (#233)                                          | ❌                       |
 
@@ -681,6 +681,9 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 
 ¹ The embedded engine ships in the SDK 2.0.0 base wheel (engine core 2.3.10); the SDK 3.0 line
 moves it to the `surrealdb[embedded]` extra.
+
+² The versioned engine is the SDK 2.0.0 embedded engine's `surrealkv+versioned://`; versioned
+servers (3.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too.
 
 ---
 

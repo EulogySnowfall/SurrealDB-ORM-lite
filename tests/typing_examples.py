@@ -8,7 +8,7 @@ Deliberately named ``typing_examples`` rather than ``test_*`` so pytest does not
 the assertions here are made by mypy, not at runtime.
 """
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, assert_type
 
 from surrealdb import RecordID
@@ -29,6 +29,7 @@ from surreal_orm_lite import (
     MultiPolygonField,
     PointField,
     PolygonField,
+    QuerySet,
     Range,
     SurrealConfigDict,
     SurrealDBConnectionManager,
@@ -272,6 +273,20 @@ class TypedMember(BaseSurrealModel):
 
     id: str | None = None
     name: str
+
+
+def time_travel_forms() -> None:
+    """v0.26.0: ``as_of()`` takes each annotated form and gives the queryset back (``Self``).
+
+    The SDK's own ``Duration`` is accepted at runtime only: the annotation names the ORM's types, so it is not
+    called here (a type checker flags it).
+    """
+    assert_type(QuerySet(TypedMember).as_of(datetime(2026, 1, 1, tzinfo=UTC)), QuerySet)
+    assert_type(QuerySet(TypedMember).as_of("2026-01-01T00:00:00Z"), QuerySet)
+    assert_type(QuerySet(TypedMember).as_of(timedelta(hours=1)), QuerySet)
+    assert_type(QuerySet(TypedMember).as_of(Duration.parse("1h")), QuerySet)
+    assert_type(QuerySet(TypedMember).as_of(SurrealFunc("time::now() - 1h")), QuerySet)
+    assert_type(QuerySet(TypedMember).as_of(None), QuerySet)
 
 
 @fixture
