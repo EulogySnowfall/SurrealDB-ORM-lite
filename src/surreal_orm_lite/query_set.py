@@ -3,6 +3,7 @@ import logging
 import math
 import numbers
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Self, cast
 from uuid import UUID
 
@@ -11,16 +12,18 @@ from pydantic_core import ValidationError
 from . import BaseSurrealModel, SurrealDBConnectionManager
 from . import encoding as _encoding
 from . import geo as _geo
+from . import time_travel as _time_travel
 from ._sdk import NotFoundError, SdkGeometryPoint
 from .changefeed import ChangeModelStream, Since
 from .edge import _check_edge_id, insert_edges
 from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
-from .functions import Var
+from .functions import SurrealFunc, Var
 from .geo import GeoDistance, GeometryPoint
 from .live import LiveModelStream, LiveStream, ReconnectCallback, missing_table_error, require_websocket
 from .q import Q
 from .surql_literal import inline_variables
+from .types import Duration
 from .utils import (
     as_record_value,
     build_filter_condition,
@@ -71,6 +74,8 @@ class QuerySet:
         # nearby() conditions (v0.24.0): column, reference point, distance in metres.
         self._nearby: list[tuple[str, GeometryPoint, float]] = []
         self._tx: Any = None
+        # as_of() (v0.26.0): the moment a time-travel read is made at, normalised; None reads the current state.
+        self._as_of: _time_travel.AsOf | None = None
 
     def _py_keyed(self, row: Any) -> Any:
         """Re-key a raw result row from columns back to Python field names (v0.18.0).
@@ -336,11 +341,91 @@ class QuerySet:
         if kinds is not None and "point" not in kinds:
             raise ValueError(f"{caller} measures distances between points; field {field!r} is declared as {_geo._info(kinds)}")
 
+    def as_of(self, at: datetime | str | timedelta | Duration | SurrealFunc | None) -> Self:
+        """Read the records as they were at a moment: SurrealQL's ``VERSION`` (v0.26.0).
+
+        ::
+
+            from datetime import UTC, datetime, timedelta
+
+            then = await Order.objects().as_of(datetime(2026, 1, 1, tzinfo=UTC)).filter(status="open").count()
+            yesterday = await User.objects().as_of(timedelta(days=1)).get("alice")   # deleted since? still found
+            history = await User.objects().as_of("2026-09-30T18:00:00Z").order_by("name").exec()
+
+        ``at`` is an aware ``datetime`` (any time zone), a naive one (UTC — the rule for every datetime the ORM
+        sends), an ISO-8601 string (parsed here by ``datetime.fromisoformat``; naive means UTC, and a date alone
+        such as ``"2026-01-01"`` is that day's midnight UTC — a ``date`` object is refused), a ``timedelta`` or
+        an ORM ``Duration`` >= 0 meaning *that long before the database's clock* (the surrealdb SDK's
+        ``Duration`` is accepted too, at runtime only: the annotation names the ORM's types, so a type checker
+        flags it — convert it with ``Duration(sdk_duration.elapsed)``), a ``SurrealFunc`` the database
+        evaluates to a datetime
+        (``SurrealFunc("time::floor(time::now(), 1d)")``; it may reference ``variables()``), or ``None`` to
+        read the current state again. A duration or an expression is resolved once per read, by the database,
+        just before it.
+
+        The moment must lie between 1970-01-01T00:00:00Z and 2262-04-11T23:47:16.854775Z, the instants
+        SurrealDB versions can address (nanoseconds since 1970 in a signed 64-bit integer). SurrealDB 2.x reads
+        an earlier moment as the *current* state and every line fails after the later one, so the ORM refuses
+        both: an absolute moment here (``ValueError``), a resolved one before the read (``SurrealDbError``).
+
+        Every read honours it: ``exec()``, ``first()``, ``get()`` (by id too: a record deleted since is still
+        found, one created later is not), ``all()``, ``exists()``, ``count()``, ``sum()``/``avg()``/``min()``/
+        ``max()``, ``values()``+``annotate()`` and ``GeoDistance`` annotations, with ``filter()``, ``Q``,
+        ``nearby()``, ``order_by()``, ``limit()``, ``offset()``, ``select()`` and ``variables()``. The returned
+        instances are **snapshots**: their writes raise ``SurrealDbError``; ``refresh()`` loads the current
+        record into one (on a model mixing ``AuthenticatedUserMixin``, whose classmethod ``refresh(token)``
+        takes the name, call ``BaseSurrealModel.refresh(snapshot)``).
+
+        The store must keep history: on the embedded engine a ``surrealkv+versioned://<path>`` database; on a
+        server, versioned storage (3.x: ``surrealkv://…?versioned=true`` or ``rocksdb://…?versioned=true``;
+        2.x: ``surrealkv+versioned://…``). Otherwise the embedded engine raises before any request and a 3.x
+        server's refusal is raised as ``SurrealDbError``; a 2.x server without versioned storage answers without
+        an error and only returns records last written at or before the moment, in their current state (it
+        cannot be detected: see the README).
+
+        ``fetch()`` resolves links as they were on SurrealDB 3.x; on 2.x (servers and the embedded engine of the
+        surrealdb SDK 2.x) the reads that return the fetched records (``exec()``, ``first()``, ``get()``
+        without an id) refuse it, the server resolving them to their current state. A dotted path through a
+        link in ``filter()``, ``select()``, ``order_by()`` or ``values()`` reads the linked record as it was on
+        3.x and as it is now on 2.x (see the README).
+
+        A time-travel queryset is read-only: ``bulk_create()``, ``bulk_update()``, ``bulk_delete()``,
+        ``patch()``, ``update_or_create()``, ``get_or_create()``, ``delete_table()``, ``query()``, ``live()``,
+        ``watch()`` and ``changes()`` raise ``SurrealDbError`` on it, before any request. ``_as_of`` is a
+        reserved ``variables()`` name: the moment is bound under it, replacing a variable of that name.
+
+        Returns:
+            Self: the queryset, for chaining. Called again, the last moment wins.
+
+        Raises:
+            TypeError: ``at`` is none of the forms above (a ``date`` included) — T1.
+            ValueError: a string that is not ISO-8601 (T2); a negative duration (T3); a moment outside
+                1970-01-01T00:00:00Z … 2262-04-11T23:47:16.854775Z (T11).
+            SurrealDbError: the queryset is bound to a transaction (``objects(tx=)``) — T4.
+        """
+        if self._tx is not None:
+            raise SurrealDbError(_time_travel.transaction_refused())
+        self._as_of = _time_travel.normalise_as_of(at)
+        return self
+
+    def _reject_time_travel(self, method: str) -> None:
+        """Refuse *method* (a write or a stream, named with its ``()``) on a queryset read ``as_of()`` (v0.26.0).
+
+        A time-travel read is read-only and cannot be streamed: the first statement of each such method, so
+        nothing is sent and no client is acquired.
+        """
+        if self._as_of is not None:
+            raise SurrealDbError(_time_travel.queryset_refused(method))
+
     # ==================== Internal query building ====================
 
-    def _build_where(self) -> tuple[str, dict[str, Any]]:
+    def _build_where(self, *, as_of: bool = False) -> tuple[str, dict[str, Any]]:
         """
         Build a parameterized WHERE clause from filters, Q objects and ``nearby()`` conditions.
+
+        With ``as_of=True`` (a time-travel table read, v0.26.0) the per-record check
+        ``time_travel.GUARD`` is the last condition, after the ``nearby()`` ones: every other part is a
+        single comparison or a parenthesised group, so the check applies to every row they keep.
 
         Returns:
             A tuple of (where_clause_string, variables_dict).
@@ -376,19 +461,50 @@ class QuerySet:
             variables[distance_var] = distance
             counter += 2
 
+        if as_of:
+            parts.append(_time_travel.GUARD)
+
         if not parts:
             return "", {}
 
         return " WHERE " + " AND ".join(parts), variables
 
-    def _compile_query(self) -> tuple[str, dict[str, Any]]:
+    def _version_moment(self, moment: datetime | None) -> datetime | None:
+        """The moment a compile function writes ``VERSION $_as_of`` for; ``None`` without ``as_of()`` (v0.26.0).
+
+        Keyed on ``as_of()``, never on the argument: without it, a compile function returns v0.25.0's text
+        byte for byte, whatever *moment* says. With it, the resolved moment is required — a read compiled
+        without one must never fall back to the current data.
+        """
+        if self._as_of is None:
+            return None
+        if moment is None:
+            raise RuntimeError("internal: a time-travel read was compiled without its moment")
+        return moment
+
+    @staticmethod
+    def _terminate(query: str, variables: dict[str, Any], moment: datetime | None) -> tuple[str, dict[str, Any]]:
+        """End *query* with ``;`` — after ``VERSION $_as_of``, its moment bound last, for a time-travel read."""
+        if moment is None:
+            return query + ";", variables
+        return f"{query}{_time_travel.VERSION_CLAUSE};", {**variables, _time_travel.MOMENT_VARIABLE: moment}
+
+    def _compile_query(self, moment: datetime | None = None) -> tuple[str, dict[str, Any]]:
         """
         Compile the QuerySet parameters into a parameterized SQL query.
 
+        Args:
+            moment: Under ``as_of()``, the resolved moment of the read (v0.26.0): the guarded WHERE and
+                ``VERSION $_as_of`` are compiled, ``$_as_of`` bound to it. Ignored without ``as_of()``.
+
         Returns:
             A tuple of (query_string, variables_dict).
+
+        Raises:
+            RuntimeError: under ``as_of()`` without a moment (an internal error).
         """
-        where_clause, where_vars = self._build_where()
+        moment = self._version_moment(moment)
+        where_clause, where_vars = self._build_where(as_of=moment is not None)
 
         projection = list(self.select_item) or ["*"]
         # GeoDistance annotations (v0.24.0): one projection each, the point bound. The is_point() guard
@@ -414,22 +530,28 @@ class QuerySet:
         if self._fetch_fields:
             query += f" FETCH {', '.join(self._fetch_fields)}"
 
-        query += ";"
-        all_variables = {**self._variables, **where_vars, **distance_vars}
-        return query, all_variables
+        return self._terminate(query, {**self._variables, **where_vars, **distance_vars}, moment)
 
-    def _compile_aggregation_query(self, aggregation_expr: str, alias: str | None = None) -> tuple[str, dict[str, Any]]:
+    def _compile_aggregation_query(
+        self, aggregation_expr: str, alias: str | None = None, moment: datetime | None = None
+    ) -> tuple[str, dict[str, Any]]:
         """
         Compile an aggregation query with parameterized WHERE clause.
 
         Args:
             aggregation_expr: The aggregation expression (e.g., ``"count()"``, ``"math::sum(field)"``).
             alias: Optional alias for the aggregation result.
+            moment: Under ``as_of()``, the resolved moment of the read (v0.26.0), as for
+                :meth:`_compile_query`; ``VERSION $_as_of`` follows ``GROUP ALL``.
 
         Returns:
             A tuple of (query_string, variables_dict).
+
+        Raises:
+            RuntimeError: under ``as_of()`` without a moment (an internal error).
         """
-        where_clause, where_vars = self._build_where()
+        moment = self._version_moment(moment)
+        where_clause, where_vars = self._build_where(as_of=moment is not None)
 
         if alias:
             query = f"SELECT {aggregation_expr} AS {alias} FROM {self._model_table}"
@@ -437,25 +559,30 @@ class QuerySet:
             query = f"SELECT {aggregation_expr} FROM {self._model_table}"
 
         query += where_clause
-        query += " GROUP ALL;"
+        query += " GROUP ALL"
 
-        all_variables = {**self._variables, **where_vars}
-        return query, all_variables
+        return self._terminate(query, {**self._variables, **where_vars}, moment)
 
-    def _compile_group_by_query(self) -> tuple[str, dict[str, Any]]:
+    def _compile_group_by_query(self, moment: datetime | None = None) -> tuple[str, dict[str, Any]]:
         """
         Compile a GROUP BY query with annotations and parameterized WHERE clause.
+
+        Args:
+            moment: Under ``as_of()``, the resolved moment of the read (v0.26.0), as for
+                :meth:`_compile_query`; ``VERSION $_as_of`` follows ``START``.
 
         Returns:
             A tuple of (query_string, variables_dict).
 
         Raises:
             ValueError: a ``GeoDistance`` annotation is present: it is computed per record.
+            RuntimeError: under ``as_of()`` without a moment (an internal error).
         """
         if self._geo_annotations:
             raise ValueError(_GEO_DISTANCE_PER_RECORD)
         self._reject_annotation_collisions()
-        where_clause, where_vars = self._build_where()
+        moment = self._version_moment(moment)
+        where_clause, where_vars = self._build_where(as_of=moment is not None)
 
         select_parts = list(self._group_by_fields)
         for alias, agg in self._annotations.items():
@@ -478,9 +605,7 @@ class QuerySet:
         if self._offset is not None:
             query += f" START {self._offset}"
 
-        query += ";"
-        all_variables = {**self._variables, **where_vars}
-        return query, all_variables
+        return self._terminate(query, {**self._variables, **where_vars}, moment)
 
     # ==================== Query execution ====================
 
@@ -659,6 +784,7 @@ class QuerySet:
         so this is safe for idempotent cleanup on SurrealDB 3.x (which raises
         NotFoundError) as well as 2.x (which is a no-op).
         """
+        self._reject_time_travel("delete_table()")
         client = await SurrealDBConnectionManager.get_client()
         with contextlib.suppress(NotFoundError):
             await client.delete(self._model_table)
@@ -963,6 +1089,7 @@ class QuerySet:
                 Purchased(in_=bob, out=widget, quantity=1),
             ])  # one insert_relation() round-trip
         """
+        self._reject_time_travel("bulk_create()")
         if not models:
             return []
 
@@ -1026,6 +1153,7 @@ class QuerySet:
 
             count = await User.objects().filter(status="pending").bulk_update(status="active")
         """
+        self._reject_time_travel("bulk_update()")
         if not kwargs:
             return 0
         self.model._reject_computed_writes(kwargs, "bulk_update()")
@@ -1063,6 +1191,7 @@ class QuerySet:
 
             count = await User.objects().filter(status="inactive").bulk_delete()
         """
+        self._reject_time_travel("bulk_delete()")
         where_clause, where_vars = self._build_where()
         query = f"DELETE {self._model_table}{where_clause} RETURN BEFORE;"
         all_vars = {**self._variables, **where_vars}
@@ -1088,6 +1217,7 @@ class QuerySet:
                 [{"op": "replace", "path": "/plan", "value": "free"}]
             )
         """
+        self._reject_time_travel("patch()")
         validate_patch_operations(operations)
         self.model._reject_computed_patch(operations, "patch()")
         where_clause, where_vars = self._build_where()
@@ -1214,6 +1344,7 @@ class QuerySet:
         the server on update. On update, the endpoints the criteria named (they matched) are left
         out of the ``merge()``.
         """
+        self._reject_time_travel("update_or_create()")
         if not criteria:
             raise SurrealDbError("update_or_create() requires at least one lookup criteria.")
         defaults = defaults or {}
@@ -1254,6 +1385,7 @@ class QuerySet:
         ``SurrealDbError`` (unless the model sets ``extra="allow"``), and a missing required
         field raises ``ValidationError`` at construction.
         """
+        self._reject_time_travel("get_or_create()")
         if not criteria:
             raise SurrealDbError("get_or_create() requires at least one lookup criteria.")
         defaults = defaults or {}
@@ -1380,11 +1512,13 @@ class QuerySet:
         ``close_connection()``…) ends the stream either way.
 
         :raises SurrealDbError: for ``select``/``values``/``annotate``/``order_by``/``limit``/
-            ``offset``/``objects(tx=)``, here; for a non-WebSocket connection (the embedded
-            engine included: read its change feed with :meth:`changes`), on start.
+            ``offset``/``objects(tx=)``, and on a queryset read ``as_of()`` (a live query streams the
+            current changes, v0.26.0), here; for a non-WebSocket connection (the embedded engine
+            included: read its change feed with :meth:`changes`), on start.
         :raises TypeError: for a filter value with no SurrealQL literal form, here.
         :raises SurrealDbNotFoundError: on SurrealDB 3.x, on start, if the table does not exist.
         """
+        self._reject_time_travel("live()")
         return LiveModelStream(
             self.model,
             self._model_table,
@@ -1412,8 +1546,9 @@ class QuerySet:
         ``filter()``, ``nearby()``, ``variables()`` and ``fetch()`` are applied by the server. With
         ``diff=True`` each ``result`` is a list of patches instead of a record. For model
         instances, use :meth:`live`. ``auto_resubscribe`` and ``on_reconnect`` behave as for
-        :meth:`live`.
+        :meth:`live`, and so do its refusals (``as_of()`` included, here).
         """
+        self._reject_time_travel("watch()")
         return LiveStream(
             self._model_table,
             self._live_starter(diff),
@@ -1473,11 +1608,12 @@ class QuerySet:
             keeps no timestamps for its feed); or ``None`` for changes made after the stream starts.
         :param poll_interval: seconds between two polls when the feed has nothing new.
         :param batch_size: entries read per poll.
-        :raises SurrealDbError: for any queryset clause, here; on start, for a table that does not
-            exist or has no change feed (on the table or on its database), or for a datetime
-            ``since`` on the embedded engine of the surrealdb SDK 2.x.
+        :raises SurrealDbError: for any queryset clause (``as_of()`` included), here; on start, for a
+            table that does not exist or has no change feed (on the table or on its database), or for a
+            datetime ``since`` on the embedded engine of the surrealdb SDK 2.x.
         :raises TypeError, ValueError: for an unusable ``since``/``poll_interval``/``batch_size``.
         """
+        self._reject_time_travel("changes()")
         self._reject_changes_clauses()
         return ChangeModelStream(
             self.model,
@@ -1497,7 +1633,13 @@ class QuerySet:
 
         Returns:
             The result of the query, typically model instances.
+
+        Raises:
+            SurrealDbError: the query does not read ``FROM`` the model's table; the queryset is read
+                ``as_of()`` (v0.26.0): the custom statement would ignore the moment, so it is refused rather
+                than run on the current data.
         """
+        self._reject_time_travel("query()")
         if f"FROM {self._model_table}" not in query:
             raise SurrealDbError(f"The query must include 'FROM {self._model_table}' to reference the correct table.")
         # Same silent truncation raw_query() warns about: only the first statement's results
