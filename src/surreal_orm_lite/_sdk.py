@@ -27,6 +27,9 @@ v0.25.0 adds the SDK's URL parser (``SdkUrl``, ``SdkUrlScheme``), so the ORM cla
 ``__all__`` (2.0.0 and the 3.0 betas), so type checkers see the static import from
 ``surrealdb.connections.url``, the module that defines them; at run time they are looked up root first,
 then that module.
+
+v0.27.0 adds ``ThrownError`` (a top-level export of SDK 2.0.0): SurrealDB 3.1 reports a table that does not
+exist, read by a ``LET`` inside a block, as a ``ThrownError`` instead of a ``NotFoundError``.
 """
 
 import importlib
@@ -41,6 +44,7 @@ from surrealdb import (  # noqa: F401
     RecordID,
     ServerError,
     SurrealError,
+    ThrownError,
 )
 from surrealdb import Duration as SdkDuration
 from surrealdb import Geometry as SdkGeometry
@@ -136,6 +140,8 @@ __all__ = [
     "ServerError",
     "AlreadyExistsError",
     "NotFoundError",
+    # Subqueries (v0.27.0): SurrealDB 3.1's form of the missing-table error inside a block
+    "ThrownError",
     # Rich field types (v0.23.0)
     "SdkDuration",
     "SdkRange",

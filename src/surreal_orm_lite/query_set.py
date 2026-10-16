@@ -193,7 +193,8 @@ class QuerySet:
         ``variables()`` apply, its ``fetch()`` is ignored. It is read when this queryset runs, in the same
         statement: one request. A clause it cannot honour raises when this queryset compiles, before any request
         (see ``Subquery``). A subquery reading a table that does not exist reads as empty, as any missing table
-        (SurrealDB 3.x raises: the statement is then sent once more with that subquery empty).
+        (SurrealDB 3.x raises: once the server confirms the table does not exist, the statement is sent once more
+        with that subquery empty). Any other error raised while the subquery runs is the server's, relayed.
         """
         for arg in args:
             if not isinstance(arg, Q):
@@ -526,7 +527,7 @@ class QuerySet:
         raises S3 before any other check of the inner queryset.
 
         Args:
-            empty_tables: the tables whose subqueries are bound to ``[]`` (SurrealDB 3.x said they do not exist).
+            empty_tables: the tables whose subqueries are bound to ``[]`` (SurrealDB 3.x confirmed they do not exist).
             inline: write the sub-SELECTs inline instead of in ``LET`` s (a live query).
         """
         return SubqueryCompiler(
@@ -864,13 +865,14 @@ class QuerySet:
             query: the statement.
             variables: its bound values (the queryset's ``variables()`` when ``None``).
             subquery_tables: the tables a ``LET`` of the statement still reads (v0.27.0; empty: the behaviour
-                above, exactly). When the server says one of them does not exist (``NotFoundError``, or
-                ``ThrownError`` inside a block on 3.1), ``_MissingSubqueryTable`` asks
-                :meth:`_run_compiled` to send the statement again with it empty. While the set is not empty,
-                a ``NotFoundError`` that names no table is relayed: it cannot be told to be the outer table's.
+                above, exactly). While the set is not empty, only the server's own missing-table error reads as
+                anything but itself (:meth:`_reads_as_empty`): naming one of these tables, and confirmed by the
+                server, it asks :meth:`_run_compiled` to send the statement again with that subquery empty;
+                naming another table, it is the outer table's and reads as no rows. Every other error is relayed.
 
         Raises:
-            _MissingSubqueryTable: a table of *subquery_tables* does not exist (caught by :meth:`_run_compiled`).
+            _MissingSubqueryTable: the server confirmed that a table of *subquery_tables* does not exist (caught by
+                :meth:`_run_compiled`).
         """
         vars_ = variables if variables is not None else self._variables
         compiled = remove_quotes_for_variables(query)
@@ -878,43 +880,70 @@ class QuerySet:
             try:
                 return await self._tx.run_read(compiled, vars_)  # type: ignore[no-any-return]
             except ServerError as exc:
-                self._raise_missing_subquery_table(exc, subquery_tables)
-                if self._reads_as_empty(exc, subquery_tables):
+                if await self._reads_as_empty(exc, subquery_tables):
                     return []
                 raise
         client = await SurrealDBConnectionManager.get_client()
         try:
             return await client.query(compiled, _encoding.encode(vars_))  # type: ignore
         except ServerError as exc:
-            self._raise_missing_subquery_table(exc, subquery_tables)
-            if self._reads_as_empty(exc, subquery_tables):
+            if await self._reads_as_empty(exc, subquery_tables):
                 return []
             if self._as_of is not None and _time_travel.UNSUPPORTED_MARKER in str(exc):
                 raise SurrealDbError(_time_travel.server_refused(exc)) from exc
             raise
 
-    @staticmethod
-    def _raise_missing_subquery_table(exc: ServerError, subquery_tables: frozenset[str]) -> None:
-        """Raise ``_MissingSubqueryTable`` when *exc* says that a table of *subquery_tables* does not exist (v0.27.0).
+    async def _reads_as_empty(self, exc: ServerError, subquery_tables: frozenset[str]) -> bool:
+        """Whether the server's error *exc* reads as no rows; ``False`` relays it.
 
-        The outer table is not set apart: when a subquery reads it too, the ``LET`` runs first and its error names
-        it (SurrealDB 3.1 as a ``ThrownError``), so the statement is sent again with that subquery empty. Once no
-        ``LET`` reads it, an error naming it is the outer table's own, which reads as no rows.
+        Without *subquery_tables*, every ``NotFoundError`` reads as no rows (a table that does not exist, SurrealDB
+        3.x), as before v0.27.0. While a ``LET`` reads *subquery_tables* (v0.27.0), only the server's own
+        missing-table error is read (:func:`subquery.missing_table`): the sentence inside another error, which may
+        quote a value the statement read, is relayed. That error:
+
+        - naming a table of *subquery_tables*: the server is asked whether that table exists
+          (:meth:`_table_is_missing`); only when it confirms it does not is ``_MissingSubqueryTable`` raised, so
+          :meth:`_run_compiled` sends the statement again with that subquery empty. Otherwise the error is relayed.
+          The outer table is not set apart: when a subquery reads it too, the ``LET`` runs first and its error
+          names it (SurrealDB 3.1 as a ``ThrownError``).
+        - naming another table, as a ``NotFoundError``: the outer table's own, which reads as no rows. Once no
+          ``LET`` reads the outer table, an error naming it is that.
+
+        Raises:
+            _MissingSubqueryTable: the server confirmed that a table of *subquery_tables* does not exist.
         """
+        if not subquery_tables:
+            return isinstance(exc, NotFoundError)
         table = _subquery.missing_table(exc)
-        if table is not None and table in subquery_tables:
-            raise _subquery._MissingSubqueryTable(table) from exc
-
-    @staticmethod
-    def _reads_as_empty(exc: ServerError, subquery_tables: frozenset[str]) -> bool:
-        """Whether *exc* reads as no rows: a ``NotFoundError`` (a table that does not exist, SurrealDB 3.x).
-
-        Except, while a ``LET`` reads *subquery_tables* (v0.27.0), one that names no table: it cannot be told to be
-        the outer table's, so it is relayed.
-        """
-        if not isinstance(exc, NotFoundError):
+        if table is None:
             return False
-        return not subquery_tables or _subquery.missing_table(exc) is not None
+        if table in subquery_tables:
+            if await self._table_is_missing(table):
+                raise _subquery._MissingSubqueryTable(table) from exc
+            return False
+        return isinstance(exc, NotFoundError)
+
+    async def _table_is_missing(self, table: str) -> bool:
+        """Whether the server confirms that *table* does not exist (v0.27.0): ``subquery.TABLE_PROBE``, the name
+        bound, answered with the server's own ``NotFoundError`` naming that very table.
+
+        Sent where the failed read ran: inside the queryset's transaction (the same view of the tables, which a
+        3.x interactive transaction keeps open after a failed read), else on the shared client. Rows, ``[]`` (the
+        table exists) or any other server error mean "not confirmed", and the read's own error is relayed; an
+        error that is not the server's (a lost connection) propagates.
+        """
+        variables = {"table": table}
+        try:
+            if self._tx is not None:
+                await self._tx.run_read(_subquery.TABLE_PROBE, variables)
+            else:
+                client = await SurrealDBConnectionManager.get_client()
+                await client.query(_subquery.TABLE_PROBE, _encoding.encode(variables))
+        except NotFoundError as exc:
+            return _subquery.missing_table(exc) == table
+        except ServerError:
+            return False
+        return False
 
     async def _run_compiled(
         self, compile_statement: Callable[[SubqueryCompiler], tuple[str, dict[str, Any]]], *, write: bool = False
@@ -923,9 +952,10 @@ class QuerySet:
 
         A statement whose ``LET`` s read no table — no subquery, or every subquery table already bound to ``[]`` —
         is today's call, ``_execute_query(query, variables)``. Otherwise, when SurrealDB 3.x says that a subquery
-        table does not exist, the statement is compiled again with every subquery of that table bound to ``[]``
-        and sent again: a missing subquery table reads as empty, as on 2.x, where the server reads it so. At most
-        one more request per subquery table, and only then.
+        table does not exist and confirms it when asked (:meth:`_reads_as_empty`), the statement is compiled again
+        with every subquery of that table bound to ``[]`` and sent again: a missing subquery table reads as empty,
+        as on 2.x, where the server reads it so. At most two more requests per subquery table (the server's
+        confirmation, the statement again), and only then; any other error is the server's, relayed.
 
         Args:
             compile_statement: compiles the statement with the compiler it is given; returns its text and variables.

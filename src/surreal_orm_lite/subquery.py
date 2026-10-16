@@ -27,9 +27,12 @@ value is read as ``Subquery(qs)`` — sends **one** statement, inside which the 
 - **Live queries** keep the sub-SELECT inline (a ``LIVE SELECT`` cannot sit in a block), which is right there: the
   server evaluates it on every notification.
 - **A subquery table that does not exist** reads as empty on 2.x and on the embedded engine. SurrealDB 3.x raises
-  "The table '<t>' does not exist" (:func:`missing_table` reads the name); the ORM then sends the statement once
-  more with every subquery of that table bound to ``[]`` (``LET $_sq0 = [];``), so a missing table reads as empty
-  on every line, as the ORM reads any missing table.
+  "The table '<t>' does not exist"; :func:`missing_table` recognises only the server's own forms of that error
+  (never the sentence inside another error, which may quote a value the statement read). The ORM then asks the
+  server whether ``<t>`` exists (:data:`TABLE_PROBE`, the name bound) and, only when the server confirms it does
+  not, sends the statement once more with every subquery of that table bound to ``[]`` (``LET $_sq0 = [];``), so
+  a missing table reads as empty on every line, as the ORM reads any missing table. Any other error is the
+  server's, relayed unchanged: a subquery is never read as empty because an error mentions its table.
 
 :class:`SubqueryCompiler` is what one statement's subqueries share: the ``LET`` s, the tables they read, the
 ``variables()`` merged into the statement and the querysets being rendered.
@@ -46,6 +49,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final
 
+from ._sdk import NotFoundError, ThrownError
+
 if TYPE_CHECKING:
     from .query_set import QuerySet
 
@@ -58,7 +63,14 @@ COLLECTION_LOOKUPS: Final = frozenset({"in", "not_in", "containsall", "containsa
 #: The lookups that compare a field with the first value of a subquery (no record when it is empty).
 FIRST_VALUE_LOOKUPS: Final = frozenset({"exact", "gt", "gte", "lt", "lte", "contains", "not_contains"})
 
+#: SurrealDB 3.x's message for a table that does not exist, matched whole (``fullmatch``), never searched for.
 _MISSING_TABLE: Final = re.compile(r"The table '([^']+)' does not exist")
+#: The prefix SurrealDB 3.1 gives that message when a ``LET`` inside a block reads the table (a ``ThrownError``).
+_THROWN_PREFIX: Final = "An error occurred: "
+#: Asks the server whether a table exists, the name bound as ``$table``: SurrealDB 3.x answers a ``NotFoundError``
+#: naming it when it does not (``LIMIT 1``: 3.1 answers ``[]`` to ``LIMIT 0`` without looking), rows or ``[]``
+#: when it does; 2.x and the embedded engine always answer rows or ``[]``.
+TABLE_PROBE: Final = "SELECT VALUE id FROM type::table($table) LIMIT 1;"
 
 
 class Subquery:
@@ -127,14 +139,35 @@ def subquery_of(value: object) -> Subquery | None:
 
 
 def missing_table(exc: BaseException) -> str | None:
-    """The table a server error says does not exist (``"The table '<t>' does not exist"``), else ``None``.
+    """The table SurrealDB 3.x's own missing-table error names, else ``None``.
 
-    SurrealDB 3.x raises it for a table a statement reads before anyone wrote to it: ``NotFoundError``, or
-    ``ThrownError`` ("An error occurred: …") for a ``LET`` inside a block on 3.1. The name only chooses which
-    subquery to bind to ``[]``; it is never written into a statement.
+    Only the server's exact forms, as SurrealDB 3.3 and 3.1 send them (over WebSocket and HTTP) for a table a
+    statement reads before anyone wrote to it:
+
+    - a ``NotFoundError`` whose whole message is ``The table '<t>' does not exist`` and whose details name the
+      same table (``{"kind": "Table", "details": {"name": "<t>"}}``);
+    - on 3.1, for a ``LET`` inside a block, a ``ThrownError`` without details whose whole message is
+      ``An error occurred: The table '<t>' does not exist``.
+
+    Anything else is ``None``: another error type (2.x reports a ``THROW`` as an ``InternalError``), the sentence
+    inside a longer message (a cast or a function error quoting a value the statement read), two prefixes (a
+    ``THROW`` inside a block on 3.1). From 3.2 on, a ``THROW`` inside a block gives the very text of 3.1's form,
+    which no text can tell apart: the ORM reads a subquery as empty only once the server confirms that the table
+    does not exist (:data:`TABLE_PROBE`). The name only chooses which subquery to bind to ``[]``; it is never
+    written into a statement.
     """
-    match = _MISSING_TABLE.search(str(exc))
-    return match.group(1) if match else None
+    if isinstance(exc, NotFoundError):
+        match = _MISSING_TABLE.fullmatch(str(exc))
+        if match is None or exc.table_name != match.group(1):
+            return None
+        return match.group(1)
+    if isinstance(exc, ThrownError) and exc.details is None:
+        message = str(exc)
+        if not message.startswith(_THROWN_PREFIX):
+            return None
+        match = _MISSING_TABLE.fullmatch(message.removeprefix(_THROWN_PREFIX))
+        return match.group(1) if match else None
+    return None
 
 
 def _same_value(a: object, b: object) -> bool:
@@ -169,7 +202,7 @@ class SubqueryCompiler:
 
     Attributes:
         inline: the sub-SELECTs are written inline instead of bound in ``LET`` s (a live query).
-        empty_tables: the tables whose subqueries are bound to ``[]`` (SurrealDB 3.x said they do not exist).
+        empty_tables: the tables whose subqueries are bound to ``[]`` (SurrealDB 3.x confirmed they do not exist).
         outer_tx: the outer queryset's transaction; an inner queryset may share it, never have another.
         moment: the moment of an ``as_of()`` read, at which every subquery reads too (``None``: the current state).
         variables: the statement's ``variables()``: the outer queryset's, then each subquery's, merged.
@@ -235,9 +268,10 @@ class SubqueryCompiler:
 
 
 class _MissingSubqueryTable(Exception):
-    """SurrealDB 3.x said that *table*, which a ``LET`` of the statement reads, does not exist.
+    """SurrealDB 3.x said that *table*, which a ``LET`` of the statement reads, does not exist, and confirmed it.
 
-    Raised by ``QuerySet._execute_query()`` from the server's error and caught by ``QuerySet._run_compiled()``,
+    Raised by ``QuerySet._execute_query()`` from the server's error (:func:`missing_table`), once the server answered
+    :data:`TABLE_PROBE` that the table does not exist, and caught by ``QuerySet._run_compiled()``,
     which compiles the statement again with every subquery of that table bound to ``[]`` and sends it again: it
     never reaches the caller.
     """

@@ -12,13 +12,13 @@ use the embedded ``surrealkv+versioned://`` engine and a server started with ver
 
 import contextlib
 import re
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from pydantic import Field
-from surrealdb import RecordID, ThrownError
+from surrealdb import InternalError, RecordID, ThrownError
 
 import surreal_orm_lite
 from surreal_orm_lite import (
@@ -37,7 +37,14 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite._sdk import NotFoundError, ServerError
 from surreal_orm_lite.query_set import QuerySet
-from surreal_orm_lite.subquery import SubqueryCompiler, _MissingSubqueryTable, _same_value, missing_table, subquery_of
+from surreal_orm_lite.subquery import (
+    TABLE_PROBE,
+    SubqueryCompiler,
+    _MissingSubqueryTable,
+    _same_value,
+    missing_table,
+    subquery_of,
+)
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import build_filter_condition
 from tests.conftest import _ws_url
@@ -375,17 +382,92 @@ class TestCompilerBookkeeping:
         assert str(info.value) == _s7("x")
         assert compiler.variables["x"] is outer
 
+
+# --- the server's missing-table error, and only it ------------------------------------------------------------
+
+#: The sentence SurrealDB 3.x says for a table that does not exist, naming ``sq_person``.
+_SENTENCE = "The table 'sq_person' does not exist"
+_THROWN = "An error occurred: "
+
+
+def _not_found(message: str = _SENTENCE, table: str | None = "sq_person") -> NotFoundError:
+    """A ``NotFoundError`` as SurrealDB 3.3.4 and 3.1.5 send it: its details name the table."""
+    details = None if table is None else {"kind": "Table", "details": {"name": table}}
+    return NotFoundError("NotFound", message, details=details)
+
+
+class TestMissingTableMatcher:
+    """``missing_table()`` reads only the server's exact forms, measured on 3.3.4 and 3.1.5 over WebSocket and HTTP:
+    ``NotFoundError`` "The table '<t>' does not exist" whose details name ``<t>``, and 3.1's ``ThrownError``
+    "An error occurred: The table '<t>' does not exist" for a ``LET`` inside a block. The sentence inside another
+    error — a value the statement read, quoted by the server — is not the server saying the table is missing."""
+
     @pytest.mark.parametrize(
-        ("message", "table"),
+        ("error", "table"),
         [
-            ("The table 'sq_ghost' does not exist", "sq_ghost"),
-            ("An error occurred: The table 'a_b' does not exist", "a_b"),
-            ("boom", None),
+            (_not_found(), "sq_person"),
+            (_not_found("The table 'a_b' does not exist", "a_b"), "a_b"),
+            (ThrownError("Thrown", _THROWN + _SENTENCE), "sq_person"),
         ],
-        ids=["not-found", "thrown", "other"],
+        ids=["not-found", "not-found-other-name", "thrown-3.1-block"],
     )
-    def test_missing_table(self, message: str, table: str | None) -> None:
-        assert missing_table(Exception(message)) == table
+    def test_the_server_forms(self, error: Exception, table: str) -> None:
+        assert missing_table(error) == table
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            # The sentence inside a longer message: a stored value quoted by the server.
+            InternalError("Internal", f'Could not cast into `int` using input `"{_SENTENCE}"`'),
+            InternalError(
+                "Internal",
+                "Incorrect arguments for function math::sum(). Argument 1 was the wrong type. "
+                f'Expected `array<number>` but found `"{_SENTENCE}"`',
+            ),
+            InternalError("Internal", f'Expected a int but cannot convert "{_SENTENCE}" into a int'),
+            ThrownError("Thrown", f'{_THROWN}Could not cast into `int` using input `"{_SENTENCE}"`'),
+            _not_found(f"{_SENTENCE}."),
+            _not_found(f"Error: {_SENTENCE}"),
+            _not_found(f"{_SENTENCE}\n"),
+            # A user THROW: an InternalError on 2.x, wrapped twice inside a block on 3.1.
+            InternalError("Internal", _THROWN + _SENTENCE),
+            ThrownError("Thrown", _THROWN + _THROWN + _SENTENCE),
+            # Not the type the server sends the sentence with.
+            InternalError("Internal", _SENTENCE),
+            ServerError("Internal", _SENTENCE),
+            ThrownError("Thrown", _SENTENCE),
+            Exception(_SENTENCE),
+            # A NotFoundError whose details do not name that table, or a thrown error carrying details.
+            _not_found(table=None),
+            _not_found(table="sq_post"),
+            ThrownError("Thrown", _THROWN + _SENTENCE, details={"kind": "Table", "details": {"name": "sq_person"}}),
+            # Another sentence.
+            _not_found("The record 'sq_person:ada' does not exist"),
+            NotFoundError("NotFound", "boom"),
+        ],
+        ids=[
+            "3.x-cast-quoting-it",
+            "3.x-function-quoting-it",
+            "2.x-cast-quoting-it",
+            "3.1-cast-quoting-it",
+            "trailing-text",
+            "leading-text",
+            "trailing-newline",
+            "2.x-user-throw",
+            "3.1-user-throw-in-a-block",
+            "internal",
+            "server-error",
+            "thrown-without-prefix",
+            "plain-exception",
+            "not-found-without-details",
+            "not-found-naming-another-table",
+            "thrown-with-details",
+            "record",
+            "other",
+        ],
+    )
+    def test_anything_else_is_none(self, error: Exception) -> None:
+        assert missing_table(error) is None
 
 
 # --- AC-2: the compiled text (spec §6.5) -----------------------------------------------------------
@@ -1294,9 +1376,21 @@ def _nested_ghost() -> Any:
 _EMPTY_LET = "LET $_sq0 = [];"
 
 
+_PROBE_SQ_GHOST = (TABLE_PROBE, {"table": "sq_ghost"})
+
+
+def _assert_probed_then_sent_again(calls: list[tuple[str, dict[str, Any]]]) -> None:
+    """3.x: the statement, the probe that confirms ``sq_ghost`` does not exist, the statement with it empty."""
+    assert len(calls) == 3, calls
+    assert _EMPTY_LET not in calls[0][0]
+    assert calls[1] == _PROBE_SQ_GHOST
+    assert _EMPTY_LET in calls[2][0]
+
+
 class TestMissingSubqueryTableReadsE2E:
     """AC-7 (reads): a subquery table that does not exist reads as empty on every line — in one request on 2.x
-    and the embedded engine, in two on 3.x, whose server raises and gets the statement again with it empty."""
+    and the embedded engine; on 3.x, whose server raises, the ORM asks the server whether the table exists (one
+    probe) and, as it does not, sends the statement again with it empty."""
 
     async def test_3x_sends_the_statement_again_with_the_subquery_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async with subquery_db("ws") as client:
@@ -1305,19 +1399,16 @@ class TestMissingSubqueryTableReadsE2E:
             await _seed()
             calls = _record_queries(monkeypatch, client)
             assert _ids(await SqPost.objects().filter(author__not_in=_ghost()).exec()) == _ALL_POSTS
-            assert len(calls) == 2
-            assert _EMPTY_LET not in calls[0][0]
-            assert _EMPTY_LET in calls[1][0]
+            _assert_probed_then_sent_again(calls)
             calls.clear()
             assert await SqPost.objects().filter(author__not_in=_ghost()).count() == 5
-            assert len(calls) == 2
+            _assert_probed_then_sent_again(calls)
             calls.clear()
             assert await SqPost.objects().filter(author__in=_ghost()).exec() == []
-            assert len(calls) == 2
+            _assert_probed_then_sent_again(calls)
             calls.clear()
             assert _ids(await _nested_ghost().exec()) == {"p1", "p2", "p3", "p4"}
-            assert len(calls) == 2
-            assert _EMPTY_LET in calls[1][0]
+            _assert_probed_then_sent_again(calls)
 
     @pytest.mark.parametrize("kind", ["mem", "ws"])
     async def test_2x_reads_it_as_empty_in_one_request(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1343,11 +1434,10 @@ class TestMissingSubqueryTableReadsE2E:
             for lookup in ("x__in", "x__not_in"):
                 calls.clear()
                 assert await SqGhost.objects().filter(**{lookup: _ghost()}).exec() == []
-                assert len(calls) == 2, lookup
-                assert _EMPTY_LET in calls[1][0]
+                _assert_probed_then_sent_again(calls)
                 calls.clear()
                 assert await SqGhost.objects().filter(**{lookup: _ghost()}).count() == 0
-                assert len(calls) == 2, lookup
+                _assert_probed_then_sent_again(calls)
 
     @pytest.mark.parametrize("kind", ["mem", "ws"])
     async def test_2x_the_outer_table_missing_as_the_subquery_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1373,7 +1463,7 @@ class TestMissingSubqueryTableReadsE2E:
             assert len(calls) == 2
 
     async def test_3x_in_an_interactive_transaction(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """M9: the read is sent again inside the transaction, which still writes and commits."""
+        """M9: the probe and the read sent again run inside the transaction, which still writes and commits."""
         async with subquery_db("ws") as client:
             if not await _interactive_transactions(client):
                 pytest.skip("SurrealDB 3.x only: 2.x has no interactive transaction (begin())")
@@ -1382,56 +1472,159 @@ class TestMissingSubqueryTableReadsE2E:
             async with SurrealDBConnectionManager.transaction() as tx:
                 rows = await SqPost.objects(tx=tx).filter(author__not_in=_ghost()).exec()
                 assert _ids(rows) == _ALL_POSTS
-                assert len(calls) == 2
-                assert _EMPTY_LET in calls[1][0]
+                _assert_probed_then_sent_again(calls)
                 await SqPerson(id="dan", name="Dan", age=40).save(tx=tx)
             assert (await SqPerson.objects().get("dan")).name == "Dan"
 
 
+# --- an error quoting a stored value that reads like the missing-table error ---------------------------------
+
+#: What makes reading ``sq_person.boom`` fail on a stored ``nick``: a ``THROW`` of it, or a cast that quotes it.
+_FAILING_READS = {"throw": "{ THROW nick }", "cast": "{ <int> nick }"}
+
+
+async def _boom_quotes_the_sentence(client: Any, how: str) -> None:
+    """Give every person the nick :data:`_SENTENCE` ("The table 'sq_person' does not exist", naming the subquery
+    table) and a field ``boom`` computed when it is read, which fails quoting that stored value (*how*).
+
+    3.x computes a ``COMPUTED`` field on every read; 2.x and the embedded engine evaluate a ``<future>`` on output,
+    once a write has stored it (so the field is defined before the update there, after it on 3.x).
+    """
+    expression = _FAILING_READS[how]
+    if await _line(client) >= 3:
+        await client.query("UPDATE sq_person SET nick = $nick RETURN NONE;", {"nick": _SENTENCE})
+        await client.query(f"DEFINE FIELD boom ON sq_person COMPUTED {expression};")
+    else:
+        await client.query(f"DEFINE FIELD boom ON sq_person VALUE <future> {expression};")
+        await client.query("UPDATE sq_person SET nick = $nick RETURN NONE;", {"nick": _SENTENCE})
+
+
+def _quoting_subquery() -> Any:
+    """The posts whose author is not one of the persons' ``boom`` values: reading them fails on every line."""
+    return SqPost.objects().filter(author__not_in=Subquery(SqPerson.objects().select("boom")))
+
+
+async def _assert_relayed(read: Awaitable[Any], calls: list[tuple[str, dict[str, Any]]]) -> None:
+    """*read* raises the server's error quoting the sentence — it never reads the subquery as empty, which would make
+    ``author__not_in`` match every post — and no statement binds the subquery to ``[]``."""
+    try:
+        rows = await read
+    except ServerError as exc:
+        assert _SENTENCE in str(exc)
+    else:
+        pytest.fail(f"the subquery was read as empty: {rows!r}")
+    assert not any(_EMPTY_LET in statement for statement, _ in calls), calls
+
+
+@pytest.mark.parametrize("how", sorted(_FAILING_READS))
+class TestAnErrorQuotingTheSentenceE2E:
+    """A server error raised while the subquery runs, quoting a stored value that reads "The table '<subquery
+    table>' does not exist", is relayed on every line: the ORM never reads that subquery as empty. On 3.2 and later
+    a ``THROW`` gives the very text of 3.1's missing-table error; the table exists, so it is still relayed."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_relayed_not_read_as_empty(self, kind: str, how: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with subquery_db(kind) as client:
+            await _seed()
+            await _boom_quotes_the_sentence(client, how)
+            calls = _record_queries(monkeypatch, client)
+            await _assert_relayed(_quoting_subquery().exec(), calls)
+            await _assert_relayed(_quoting_subquery().count(), calls)
+            await _assert_relayed(_quoting_subquery().exists(), calls)
+
+    async def test_3x_in_an_interactive_transaction(self, how: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with subquery_db("ws") as client:
+            if not await _interactive_transactions(client):
+                pytest.skip("SurrealDB 3.x only: 2.x has no interactive transaction (begin())")
+            await _seed()
+            await _boom_quotes_the_sentence(client, how)
+            calls = _record_queries(monkeypatch, client)
+            async with SurrealDBConnectionManager.transaction() as tx:
+                inner = SqPerson.objects().select("boom")
+                await _assert_relayed(SqPost.objects(tx=tx).filter(author__not_in=Subquery(inner)).exec(), calls)
+
+
+@pytest.mark.parametrize("kind", ["ws", "http"])
+async def test_3_2_and_later_a_throw_reading_like_3_1s_error_is_relayed_once_the_server_says_the_table_exists(
+    kind: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """From 3.2 on a ``THROW`` inside a block is a ``ThrownError`` "An error occurred: The table 'sq_person' does
+    not exist", the very text of 3.1's missing-table error: the ORM asks the server, which answers that
+    ``sq_person`` exists, and relays the error (3.1 and 2.x: other texts, relayed without asking)."""
+    async with subquery_db(kind) as client:
+        if await _line_version(client) < (3, 2):
+            pytest.skip("SurrealDB 3.2 and later only: 3.1 wraps a THROW inside a block twice, 2.x has no ThrownError")
+        await _seed()
+        await _boom_quotes_the_sentence(client, "throw")
+        calls = _record_queries(monkeypatch, client)
+        with pytest.raises(ThrownError) as info:
+            await _quoting_subquery().exec()
+        assert str(info.value) == _THROWN + _SENTENCE
+        assert len(calls) == 2, calls
+        assert calls[1] == (TABLE_PROBE, {"table": "sq_person"})
+
+
 # --- the 3.x re-send, without a server ---------------------------------------------------------------------
+
+#: What a fake answers the table probe when no probe is expected: the test fails if one is sent.
+_NO_PROBE = AssertionError("no table probe expected")
 
 
 class _RaisingClient:
-    """A client whose ``query`` raises *error*."""
+    """A client whose ``query`` raises *error*, except for :data:`TABLE_PROBE`, answered with *probe* (raised when
+    it is an exception, returned otherwise); it records every ``(statement, variables)``."""
 
-    def __init__(self, error: Exception) -> None:
+    def __init__(self, error: Exception, probe: Any = _NO_PROBE) -> None:
         self.error = error
+        self.probe = probe
+        self.calls: list[tuple[str, dict[str, Any]]] = []
 
     async def query(self, query: str, variables: dict[str, Any] | None = None) -> Any:
-        raise self.error
+        self.calls.append((query, dict(variables or {})))
+        if query != TABLE_PROBE:
+            raise self.error
+        if isinstance(self.probe, BaseException):
+            raise self.probe
+        return self.probe
 
 
-class _RaisingTx:
-    """A transaction whose ``run_read`` raises *error* (the pattern of ``tests/test_transactions.py::_FakeTx``)."""
-
-    def __init__(self, error: Exception) -> None:
-        self.error = error
+class _RaisingTx(_RaisingClient):
+    """A transaction whose ``run_read`` answers as :class:`_RaisingClient` does (the pattern of
+    ``tests/test_transactions.py::_FakeTx``)."""
 
     @property
     def is_interactive(self) -> bool:
         return True
 
     async def run_read(self, sql: str, variables: dict[str, Any] | None = None) -> Any:
-        raise self.error
+        return await self.query(sql, variables)
 
     async def add(self, sql: str, variables: dict[str, Any] | None = None) -> Any:
         raise AssertionError("no write expected")
 
 
-def _raising_queryset(branch: str, monkeypatch: pytest.MonkeyPatch, error: Exception) -> QuerySet:
-    """``SqPost.objects()`` whose reads raise *error*: through the client, or through a transaction."""
+def _raising_queryset(
+    branch: str, monkeypatch: pytest.MonkeyPatch, error: Exception, probe: Any = _NO_PROBE
+) -> tuple[QuerySet, list[tuple[str, dict[str, Any]]]]:
+    """``SqPost.objects()`` whose reads raise *error* — through the client, or through a transaction — and the
+    ``(statement, variables)`` it sends; the table probe is answered with *probe*."""
     if branch == "tx":
-        return SqPost.objects(tx=_RaisingTx(error))
+        tx = _RaisingTx(error, probe)
+        return SqPost.objects(tx=tx), tx.calls
+    client = _RaisingClient(error, probe)
 
     async def _client(*args: Any, **kwargs: Any) -> Any:
-        return _RaisingClient(error)
+        return client
 
     monkeypatch.setattr(SurrealDBConnectionManager, "get_client", _client)
-    return SqPost.objects()
+    return SqPost.objects(), client.calls
 
 
 _SELECT = "SELECT * FROM sq_post;"
 _READS_SQ_PERSON = frozenset({"sq_person"})
+_PROBE_SQ_PERSON = (TABLE_PROBE, {"table": "sq_person"})
+#: The forms the server says a subquery table is missing with: 3.x's ``NotFoundError``, 3.1's in a block.
+_MISSING_SQ_PERSON = [_not_found(), ThrownError("Thrown", _THROWN + _SENTENCE)]
 
 
 @pytest.mark.parametrize("branch", ["client", "tx"])
@@ -1443,55 +1636,123 @@ class TestExecuteQueryNotFound:
         self, branch: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         error = NotFoundError("NotFound", "nope")
-        qs = _raising_queryset(branch, monkeypatch, error)
+        qs, calls = _raising_queryset(branch, monkeypatch, error)
         with pytest.raises(NotFoundError) as info:
             await qs._execute_query(_SELECT, {}, subquery_tables=_READS_SQ_PERSON)
         assert info.value is error
+        assert calls == [(_SELECT, {})]
 
     async def test_without_subquery_tables_a_not_found_reads_as_empty(
         self, branch: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        qs = _raising_queryset(branch, monkeypatch, NotFoundError("NotFound", "nope"))
+        qs, calls = _raising_queryset(branch, monkeypatch, NotFoundError("NotFound", "nope"))
         assert await qs._execute_query(_SELECT, {}, subquery_tables=frozenset()) == []
         assert await qs._execute_query(_SELECT, {}) == []
+        assert calls == [(_SELECT, {}), (_SELECT, {})]
 
     async def test_the_outer_table_missing_reads_as_empty(self, branch: str, monkeypatch: pytest.MonkeyPatch) -> None:
-        qs = _raising_queryset(branch, monkeypatch, NotFoundError("NotFound", "The table 'sq_post' does not exist"))
+        """A ``NotFoundError`` naming a table no ``LET`` reads is the outer table's: no rows, without a probe."""
+        error = _not_found("The table 'sq_post' does not exist", "sq_post")
+        qs, calls = _raising_queryset(branch, monkeypatch, error)
         assert await qs._execute_query(_SELECT, {}, subquery_tables=_READS_SQ_PERSON) == []
+        assert calls == [(_SELECT, {})]
 
-    @pytest.mark.parametrize(
-        "error",
-        [
-            NotFoundError("NotFound", "The table 'sq_person' does not exist"),
-            ThrownError("Thrown", "An error occurred: The table 'sq_person' does not exist"),
-        ],
-        ids=["NotFoundError", "ThrownError"],
-    )
-    async def test_a_missing_subquery_table_asks_for_the_statement_again(
+    @pytest.mark.parametrize("error", _MISSING_SQ_PERSON, ids=["NotFoundError", "ThrownError"])
+    async def test_a_missing_subquery_table_the_server_confirms_asks_for_the_statement_again(
         self, branch: str, monkeypatch: pytest.MonkeyPatch, error: Exception
     ) -> None:
-        qs = _raising_queryset(branch, monkeypatch, error)
+        qs, calls = _raising_queryset(branch, monkeypatch, error, probe=_not_found())
         with pytest.raises(_MissingSubqueryTable) as info:
             await qs._execute_query(_SELECT, {}, subquery_tables=_READS_SQ_PERSON)
         assert info.value.table == "sq_person"
         assert info.value.__cause__ is error
+        assert calls == [(_SELECT, {}), _PROBE_SQ_PERSON]
+
+    @pytest.mark.parametrize("error", _MISSING_SQ_PERSON, ids=["NotFoundError", "ThrownError"])
+    @pytest.mark.parametrize(
+        "probe",
+        [
+            [],
+            [RecordID("sq_person", "ada")],
+            None,
+            InternalError("Internal", "boom"),
+            ThrownError("Thrown", _THROWN + _SENTENCE),
+            _not_found("The table 'sq_post' does not exist", "sq_post"),
+            _not_found(table=None),
+            _not_found(f"Error: {_SENTENCE}"),
+        ],
+        ids=[
+            "no-row",
+            "a-row",
+            "none",
+            "another-error",
+            "a-thrown-error",
+            "another-table",
+            "not-found-without-details",
+            "not-found-quoting-it",
+        ],
+    )
+    async def test_a_subquery_table_the_server_does_not_confirm_missing_is_relayed(
+        self, branch: str, monkeypatch: pytest.MonkeyPatch, error: Exception, probe: Any
+    ) -> None:
+        """The table exists (a row, or none), or the probe's answer is not the server's own missing-table error
+        for that table: the statement's error is relayed unchanged, never read as an empty subquery. On 3.2 and
+        later a user ``THROW`` gives the very text of 3.1's ``ThrownError``."""
+        qs, calls = _raising_queryset(branch, monkeypatch, error, probe=probe)
+        with pytest.raises(type(error)) as info:
+            await qs._execute_query(_SELECT, {}, subquery_tables=_READS_SQ_PERSON)
+        assert info.value is error
+        assert calls == [(_SELECT, {}), _PROBE_SQ_PERSON]
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            InternalError("Internal", f'Could not cast into `int` using input `"{_SENTENCE}"`'),
+            InternalError("Internal", _THROWN + _SENTENCE),
+            ThrownError("Thrown", _THROWN + _THROWN + _SENTENCE),
+            ThrownError("Thrown", f'{_THROWN}Could not cast into `int` using input `"{_SENTENCE}"`'),
+            ThrownError("Thrown", _THROWN + "The table 'sq_post' does not exist"),
+            _not_found(f"{_SENTENCE}."),
+        ],
+        ids=["3.x-cast", "2.x-throw", "3.1-throw-in-a-block", "3.1-cast", "3.1-thrown-outer-table", "trailing-text"],
+    )
+    async def test_an_error_quoting_the_sentence_is_relayed_without_a_probe(
+        self, branch: str, monkeypatch: pytest.MonkeyPatch, error: Exception
+    ) -> None:
+        qs, calls = _raising_queryset(branch, monkeypatch, error)
+        with pytest.raises(type(error)) as info:
+            await qs._execute_query(_SELECT, {}, subquery_tables=_READS_SQ_PERSON)
+        assert info.value is error
+        assert calls == [(_SELECT, {})]
+
+    async def test_a_probe_that_cannot_reach_the_server_raises_its_own_error(
+        self, branch: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Only a server answer is read: a probe that fails otherwise (here, a lost connection) raises its error."""
+        lost = ConnectionError("lost")
+        qs, _ = _raising_queryset(branch, monkeypatch, _not_found(), probe=lost)
+        with pytest.raises(ConnectionError) as info:
+            await qs._execute_query(_SELECT, {}, subquery_tables=_READS_SQ_PERSON)
+        assert info.value is lost
 
     async def test_without_subquery_tables_a_thrown_error_is_relayed(
         self, branch: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Without subquery tables the 3.1 ``ThrownError`` stays the server's error, as today."""
-        error = ThrownError("Thrown", "An error occurred: The table 'sq_person' does not exist")
-        qs = _raising_queryset(branch, monkeypatch, error)
+        error = ThrownError("Thrown", _THROWN + _SENTENCE)
+        qs, calls = _raising_queryset(branch, monkeypatch, error)
         with pytest.raises(ThrownError) as info:
             await qs._execute_query(_SELECT, {})
         assert info.value is error
+        assert calls == [(_SELECT, {})]
 
     async def test_another_server_error_is_relayed(self, branch: str, monkeypatch: pytest.MonkeyPatch) -> None:
         error = ServerError("Internal", "boom")
-        qs = _raising_queryset(branch, monkeypatch, error)
+        qs, calls = _raising_queryset(branch, monkeypatch, error)
         with pytest.raises(ServerError) as info:
             await qs._execute_query(_SELECT, {}, subquery_tables=_READS_SQ_PERSON)
         assert info.value is error
+        assert calls == [(_SELECT, {})]
 
 
 def _recording_execute(
