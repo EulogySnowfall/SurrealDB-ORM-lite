@@ -7,11 +7,14 @@ lookup, the sub-SELECT inline in a live query, read at the outer moment under ``
 classes that open an engine or a server are suffixed ``E2E``. Most of them run on the embedded ``mem://`` engine
 and on the server of ``SURREALDB_PORT`` (both lines in CI, over WebSocket and HTTP); the time-travel classes also
 use the embedded ``surrealkv+versioned://`` engine and a server started with versioned storage, found through
-``SURREALDB_VERSIONED_PORT`` (skipped without it).
+``SURREALDB_VERSIONED_PORT`` (skipped without it). Last, what README section 28 and the tables it touches say, and
+section 28's examples, run on ``mem://``.
 """
 
+import ast
 import asyncio
 import contextlib
+import inspect
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
@@ -53,7 +56,11 @@ from surreal_orm_lite.subquery import (
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import build_filter_condition
 from tests.conftest import _ws_url
+from tests.test_embedded import _cells, _normalised, _readme, _readme_part, _subsection, _table_rows, _tables
 from tests.test_time_travel import (
+    _SERVER_BEHAVIOUR,
+    _SERVER_TABLE_WIDTHS,
+    _TIME_TRAVEL_ROWS,
     _assert_refused_by_the_server,
     _http_url,
     _line,
@@ -2681,3 +2688,300 @@ class TestSubqueryAsOfE2E:
                 _assert_probed_then_sent_again(sent)
             else:
                 assert len(sent) == 1, sent
+
+
+# --- AC-12: README section 28, the tables it touches and its examples (spec §11; D13, D14, P1, P4) -------------
+
+_SECTION_28 = "### 28. Subqueries (`Subquery`)"
+_SECTION_28_ANCHOR = "(#28-subqueries-subquery)"
+_COMING_FROM_28 = "#### Coming from the full SurrealDB-ORM"
+#: Spec §11: section 28's subsections, in order, after an untitled intro.
+_SUBSECTIONS_28 = [
+    "What a subquery selects",
+    "Lookups",
+    "Ordered and limited subqueries",
+    "Where subqueries apply",
+    "What a subquery cannot do",
+    "Coming from the full SurrealDB-ORM",
+]
+#: The four rows v0.27.0 adds to the 2.x/3.x table, cell by cell. Rows 1, 2 and 4 are spec §11's texts; row 3's
+#: 3.x cell says what a missing subquery table costs since the server confirms it (statement, table probe,
+#: re-send) and that any other error is relayed (plan Task 7's note, after the strict missing-table detection).
+_SUBQUERY_ROWS = [
+    [
+        "Subqueries (`Subquery`, or a QuerySet as a filter value)",
+        "one statement for every read, count, aggregation, write by filter and live query; reads inside a transaction "
+        "raise (buffered)",
+        "the same, and reads inside an interactive transaction (`objects(tx=)`) see its uncommitted writes",
+        "v0.27.0",
+    ],
+    [
+        "A subquery with `order_by()` and `limit()`",
+        "right; the ORM also selects the order fields, without which 2.x refuses to order by a field other than the "
+        "one compared",
+        "right: the ORM binds each subquery once, in a `LET`; 3.2 and later can return wrong rows for such an inline "
+        "sub-SELECT (surrealdb#7470)",
+        "v0.27.0",
+    ],
+    [
+        "A subquery reading a table that does not exist",
+        "read as empty, like any missing table",
+        'read as empty in three requests (statement, table probe, re-send); other errors, even ones quoting "does not '
+        'exist", are relayed; transaction writes fail; `live()` raises on start',
+        "v0.27.0",
+    ],
+    [
+        "Subqueries under `as_of()`",
+        "each subquery reads at the same moment: the ORM adds `VERSION` to it (the server would read the current state)",
+        "the same (the server applies the outer `VERSION` to an inline sub-SELECT only); without versioned storage "
+        "`SurrealDbError`, but 3.1.5 raises the server's own `ThrownError`",
+        "v0.27.0",
+    ],
+]
+_LOOKUPS_BULLET = (
+    "- a subquery — `Subquery(qs)` or the queryset itself — as the value of `in`, `not_in`, `containsall`, "
+    "`containsany` (all its values) or `exact`, `gt`, `gte`, `lt`, `lte`, `contains`, `not_contains` (its first "
+    "value): see [section 28](#28-subqueries-subquery)"
+)
+_HEADER_CLAUSE = (
+    "rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in "
+    "v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs."
+)
+#: P4: each "Coming from" bullet the product owner added, as the names it must hold together.
+_P4_BULLETS = {
+    "a missing table reads as empty": ("does not exist", "empty", "`TableNotFoundError`"),
+    "Subquery() refuses anything else": ("`Subquery()`", "`TypeError`", "`to_surql()`"),
+    "inner variables() and nearby() apply": ("`variables()`", "merged", "`nearby()`"),
+    "inner fetch() ignored, values()/annotate() refused": ("`fetch()`", "ignored", "`values()`", "`annotate()`"),
+}
+
+
+def _section_28() -> str:
+    return _readme_part(_SECTION_28)
+
+
+def _section_28_blocks(language: str) -> list[str]:
+    """Section 28's fenced blocks of *language*, in order."""
+    return re.findall(rf"^```{language}\n(.*?)^```$", _section_28(), re.MULTILINE | re.DOTALL)
+
+
+def _bullets(text: str) -> list[str]:
+    """The ``- `` bullets of *text*, each with its continuation lines, whitespace normalised."""
+    return [_normalised(bullet) for bullet in re.findall(r"^- .*?(?=^- |^\s*$|\Z)", text, re.MULTILINE | re.DOTALL)]
+
+
+class TestSubqueryDocs:
+    """Unit: what README section 28, the lookups list, section 5, the behaviour table, the comparison and the
+    roadmap say about subqueries (spec §11, AC-12)."""
+
+    def test_section_28_follows_section_27(self) -> None:
+        """Right after section 27 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        readme = _readme()
+        start_27 = readme.index("\n### 27. Time travel (`as_of()`)\n")
+        start_28 = readme.index(f"\n{_SECTION_28}\n")
+        configuration = readme.index("\n## Configuration Options\n")
+        assert start_27 < start_28 < configuration
+        assert re.findall(r"^#{2,3} .*$", readme[start_27 + 1 : configuration], re.MULTILINE) == [
+            "### 27. Time travel (`as_of()`)",
+            _SECTION_28,
+        ]
+        assert readme[:configuration].rstrip().endswith("\n---"), "section 28 ends before the --- of the next part"
+
+    def test_subsections_in_order(self) -> None:
+        section = _section_28()
+        assert re.findall(r"^#### (.*)$", section, re.MULTILINE) == _SUBSECTIONS_28
+        intro = section.split("\n#### ", 1)[0]
+        assert "```python\n" in intro, "the untitled intro holds the first example"
+
+    def test_coming_from_the_full_orm_names(self) -> None:
+        """P4: the last subsection, found with the regex of ``tests/test_geo_fields.py``, names what differs."""
+        section = _section_28()
+        assert re.search(r"^#### Coming from the full SurrealDB-ORM$", section, re.MULTILINE), "heading missing"
+        text = _normalised(_subsection(_COMING_FROM_28, section))
+        for name in (
+            "`Subquery",
+            "`SELECT *`",
+            "`LET`",
+            "`array::first",
+            "`annotate()`",
+            "`TableNotFoundError`",
+            "`variables()`",
+        ):
+            assert name in text, name
+
+    @pytest.mark.parametrize("needles", list(_P4_BULLETS.values()), ids=list(_P4_BULLETS))
+    def test_coming_from_has_p4_bullets(self, needles: tuple[str, ...]) -> None:
+        bullets = _bullets(_subsection(_COMING_FROM_28, _section_28()))
+        assert [bullet for bullet in bullets if all(needle in bullet for needle in needles)], bullets
+
+    def test_what_a_subquery_selects_says_fetch_is_ignored(self) -> None:
+        """P1: the inner ``fetch()`` is ignored, as in the full ORM."""
+        text = _normalised(_subsection("#### What a subquery selects", _section_28()))
+        assert "`fetch()` on the inner queryset is ignored, as in the full ORM" in text, text
+
+    def test_section_28_names(self) -> None:
+        """D14: the upstream issue is linked; the reserved names, the one request and the missing-table cost."""
+        section = _section_28()
+        assert "https://github.com/surrealdb/surrealdb/issues/7470" in section
+        text = _normalised(section)
+        for name in ("one request", "`_sqv`", "`_sq", "`LET`", "`array::first", "`NONE`", "`~Q(", "`changes()`"):
+            assert name in text, name
+
+    def test_missing_table_prose(self) -> None:
+        """Plan Task 7's note: on 3.x three requests (statement, table probe, re-send); any other error relayed."""
+        text = _normalised(_subsection("#### Where subqueries apply", _section_28()))
+        for name in ("three requests", "table probe", "relayed", "never read as empty", "`SurrealDbNotFoundError`"):
+            assert name in text, name
+
+    def test_lookups_bullet(self) -> None:
+        bullets = [line for line in _readme_part("### Supported Filter Lookups").splitlines() if line.startswith("- ")]
+        assert _LOOKUPS_BULLET in bullets, bullets
+
+    def test_q_objects_sentence(self) -> None:
+        section = _readme_part("### 5. Q Objects (Complex Queries)")
+        assert "Q(author__in=Subquery(" in section and _SECTION_28_ANCHOR in section, section
+
+    def test_features_row(self) -> None:
+        features = [cells for _, cells in _table_rows(_readme_part("## Features"))]
+        firsts = [cells[0] for cells in features]
+        row = ["Subqueries (`Subquery`, a QuerySet as a filter value)", "✅"]
+        assert row in features, features
+        assert firsts.index(row[0]) == firsts.index("Time travel (`as_of()`, versioned storage)") + 1
+
+    def test_server_behaviour_rows(self) -> None:
+        """The four rows, Since v0.27.0, right after the five v0.26.0 rows and before the table's last row."""
+        rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
+        assert rows[-5:-1] == _SUBQUERY_ROWS, rows[-5:-1]
+        assert rows[-10:-5] == _TIME_TRAVEL_ROWS, rows[-10:-5]
+        assert rows[-1][3] == "v0.19.1", rows[-1]
+        assert [cells for cells in rows if cells[3] == "v0.27.0"] == _SUBQUERY_ROWS
+
+    def test_server_behaviour_table_keeps_its_widths(self) -> None:
+        """Every line 535 characters, the columns 136, 175, 181 and 38 wide: no line re-padded."""
+        [lines] = _tables(_readme_part(_SERVER_BEHAVIOUR))
+        assert {len(line) for line in lines} == {535}
+        for line in lines:
+            assert [len(cell) for cell in line.split("|")[1:-1]] == _SERVER_TABLE_WIDTHS, line
+
+    def test_row_4_backs_the_header_s_3_1_5_clause(self) -> None:
+        """The header says "with 3.1.5 where it differs": row 4's 3.x cell is where (D15)."""
+        cell = _SUBQUERY_ROWS[3][2]
+        assert len(cell) == 171 and "3.1.5" in cell and "`ThrownError`" in cell
+        header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
+        assert _HEADER_CLAUSE in header, header
+
+    def test_comparison_rows(self) -> None:
+        comparison = [cells for _, cells in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        firsts = [cells[0] for cells in comparison]
+        start = firsts.index("Time travel (`VERSION`)") + 1
+        assert comparison[start : start + 2] == [
+            ["Subqueries", "✅ v0.27.0 (`Subquery`, a QuerySet in `filter()`)", "✅"],
+            ["Query Cache", "v0.28.0", "✅"],
+        ], comparison
+        assert "Subqueries & Query Cache" not in firsts
+
+    def test_roadmap_split(self) -> None:
+        roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
+        firsts = [cells[0] for cells in roadmap]
+        start = firsts.index("v0.26.0") + 1
+        assert roadmap[start : start + 2] == [
+            ["v0.27.0", "Subqueries", "✅ Released"],
+            ["v0.28.0 – v0.29.0", "Tier 2 — Extended (cache, multi-db)", "📋 Planned"],
+        ], roadmap
+        assert "v0.27.0 – v0.29.0" not in firsts
+
+    def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
+        """Every table v0.27.0 touches keeps one cell count per line and no escaped pipe."""
+        parts = [
+            _section_28(),
+            _readme_part("## Features"),
+            _readme_part(_SERVER_BEHAVIOUR),
+            _readme_part("## Roadmap"),
+            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+        ]
+        assert all(_tables(part) for part in parts), "section 28 has a table of its own (the lookups)"
+        tables = [lines for part in parts for lines in _tables(part)]
+        for lines in tables:
+            assert len({len(_cells(line)) for line in lines}) == 1 and "\\|" not in "".join(lines), lines
+
+    def test_section_28_fences(self) -> None:
+        """Python blocks, which the E2E test runs, and the one SurrealQL block it compares with the compiled text."""
+        fences = re.findall(r"^```(\S*)$", _section_28(), re.MULTILINE)
+        assert fences[1::2] == [""] * (len(fences) // 2) and set(fences[0::2]) == {"python", "sql"}, fences
+        assert len(_section_28_blocks("sql")) == 1
+
+
+#: The results section 28's comments state, by the names its examples assign (P4/AC-12: each one asserted).
+_STATED_RESULTS = {
+    "posts",
+    "same",
+    "writers",
+    "others",
+    "how_many",
+    "top",
+    "above",
+    "not_above",
+    "theirs",
+    "by_writers",
+    "mixed",
+    "total",
+    "groups",
+    "updated",
+    "post, created",
+}
+
+
+def _rendered(value: Any) -> str:
+    """How a section 28 comment writes *value*: record keys sorted, ``[]``, ``key: n`` groups, else ``str()``."""
+    if isinstance(value, tuple):
+        return ", ".join(_rendered(item) for item in value)
+    if isinstance(value, BaseSurrealModel):
+        return str(value.get_raw_id())
+    if isinstance(value, list):
+        if not value:
+            return "[]"
+        if all(isinstance(item, dict) for item in value):
+            return ", ".join(sorted(f"{item['author'].id}: {item['n']}" for item in value))
+        return ", ".join(sorted(_rendered(item) for item in value))
+    return str(value)
+
+
+def _stated_results(blocks: list[str]) -> dict[str, str]:
+    """``{names: comment}`` for each line of *blocks* that assigns a result and states it in a trailing comment."""
+    stated: dict[str, str] = {}
+    for block in blocks:
+        for names, comment in re.findall(r"^(\w+(?:, \w+)*) = .*?  # (.+)$", block, re.MULTILINE):
+            assert names not in stated, f"{names} is stated twice"
+            stated[names] = comment
+    return stated
+
+
+class TestSubqueryReadmeExamplesE2E:
+    """AC-12: every ``python`` block of README section 28 runs as written, in order and in one namespace, on
+    ``embedded_database("mem://")``; every result a comment states is the one the examples got, and the SurrealQL
+    block is the statement the ORM sends."""
+
+    async def test_section_28_examples(self) -> None:
+        blocks = _section_28_blocks("python")
+        stated = _stated_results(blocks)
+        assert set(stated) == _STATED_RESULTS, sorted(stated)
+        namespace: dict[str, Any] = {"__name__": "readme_section_28"}
+        try:
+            async with embedded_database("mem://"):
+                for code in blocks:
+                    compiled = compile(code, "<README section 28>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                    # A doctest of this repository's own README (trusted text), top-level awaits included.
+                    outcome = eval(compiled, namespace)
+                    if inspect.iscoroutine(outcome):
+                        await outcome
+
+                for names, comment in stated.items():
+                    values = tuple(namespace[name] for name in names.split(", "))
+                    got = _rendered(values if len(values) > 1 else values[0])
+                    assert comment == got or comment.startswith(f"{got} ("), (names, comment, got)
+
+                [sql] = _section_28_blocks("sql")
+                statement = namespace["Post"].objects().filter(author__in=namespace["oldest"])._compile_query()
+                assert statement == (sql.strip(), {"_f0": True}), statement
+        finally:
+            namespace.clear()

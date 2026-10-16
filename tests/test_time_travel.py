@@ -2369,9 +2369,11 @@ class TestTimeTravelDocs:
             assert name in section, name
 
     def test_server_behaviour_rows(self) -> None:
-        """P5: the five rows hold spec §11's texts and sit right before the table's last row."""
+        """P5: the five rows hold spec §11's texts, one after the other, before the table's last row (later
+        versions add their rows after them: v0.27.0's subquery rows)."""
         rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
-        assert rows[-6:-1] == _TIME_TRAVEL_ROWS, rows[-6:-1]
+        starts = [index for index in range(len(rows)) if rows[index : index + 5] == _TIME_TRAVEL_ROWS]
+        assert len(starts) == 1 and starts[0] + 5 < len(rows), rows
         assert rows[-1][0].startswith("Full suite and every divergence") and rows[-1][3] == "v0.19.1", rows[-1]
         assert [cells for cells in rows if cells[3] == "v0.26.0"] == _TIME_TRAVEL_ROWS
 
@@ -2414,7 +2416,6 @@ class TestTimeTravelDocs:
         assert firsts.index("Time travel (`VERSION`)") == firsts.index("Embedded engine") + 1
         roadmap = [cells[:2] for _, cells in _table_rows(_readme_part("## Roadmap"))]
         assert ["v0.26.0", "Time travel (versioned storage)"] in roadmap, roadmap
-        assert ["v0.27.0 – v0.29.0", "Tier 2 — Extended (subqueries, cache, multi-db)"] in roadmap, roadmap
         assert not [cells for cells in roadmap if cells[0] == "v0.26.0 – v0.29.0"], roadmap
 
     def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:

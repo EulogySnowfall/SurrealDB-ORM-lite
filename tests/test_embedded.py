@@ -2529,7 +2529,7 @@ class TestReadmeEmbeddedWording:
             assert name in section, name
 
     def test_section_26_follows_section_25(self) -> None:
-        """Section 26 comes right after section 25, and section 27 (v0.26.0) right after it, up to
+        """Section 26 comes right after section 25, then section 27 (v0.26.0) and section 28 (v0.27.0), up to
         "Configuration Options"."""
         readme = _readme()
         start_25 = readme.index("\n### 25. Geospatial fields\n")
@@ -2539,6 +2539,7 @@ class TestReadmeEmbeddedWording:
         assert re.findall(r"^#{2,3} .*$", readme[start_26 + 1 : configuration], re.MULTILINE) == [
             _SECTION_26,
             "### 27. Time travel (`as_of()`)",
+            "### 28. Subqueries (`Subquery`)",
         ]
 
     def test_subsections_in_order(self) -> None:
