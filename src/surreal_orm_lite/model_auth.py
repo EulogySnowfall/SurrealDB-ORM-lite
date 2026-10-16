@@ -563,7 +563,7 @@ class AuthenticatedUserMixin:
         if adopted is None:
             assert token is not None  # the authenticate() path: the caller's token is the session's
             adopted = AuthTokens(access=token, refresh=None)
-        SurrealDBConnectionManager._adopt_tokens(adopted, store=True, operation=label, client=client)
+        SurrealDBConnectionManager._adopt_tokens(adopted, store=True, operation=label, client=client, embedded=True)
         if token is not None:
             return user, tokens
         # signup()/signin(): as on a server, a record that does not fit the model leaves the session

@@ -1049,6 +1049,59 @@ class TestServerClientsUntouchedE2E:
             lost.clear()
             await SurrealDBConnectionManager.unset_connection()
 
+    @pytest.mark.parametrize(
+        "call",
+        [
+            "invalidate",
+            "signin",
+            "signup",
+            "authenticate",
+            "model_signin_bind",
+            "model_signup_bind",
+            "model_authenticate_bind",
+        ],
+    )
+    async def test_an_identity_set_on_the_engine_keeps_a_lost_identity(self, call: str) -> None:
+        """Nor is it lifted by an identity set on the engine — connection-level ``signin()``/``signup()``/
+        ``authenticate()``/``invalidate()`` or model auth with ``bind=True``, as ``close_connection()``: the
+        engine's session says nothing about the server identity of the loop. (No server: the guard raises
+        first.)"""
+        lost: Any = SurrealDBConnectionManager._SurrealDBConnectionManager__lost_identity  # type: ignore[attr-defined]
+        try:
+            SurrealDBConnectionManager.set_connection(
+                url=_ws_url(), user="root", password="root", namespace="ns", database="db"
+            )
+            await SurrealDBConnectionManager.set_url("mem://")
+            engine = await SurrealDBConnectionManager.get_client()
+            await engine.query(_ACCOUNT_DDL)
+            await EmbUser.define_access()
+            account = await SurrealDBConnectionManager.signup(access="account", variables=_ACCOUNT)
+            user = await EmbUser.signup(email="u@x", password="p", bind=True)
+            await SurrealDBConnectionManager.invalidate()
+
+            lost.add(asyncio.get_running_loop())
+            if call == "invalidate":
+                await SurrealDBConnectionManager.invalidate()
+            elif call == "signin":
+                await SurrealDBConnectionManager.signin(access="account", variables=_ACCOUNT)
+            elif call == "signup":
+                await SurrealDBConnectionManager.signup(access="account", variables={"email": "b@x", "pass": "p"})
+            elif call == "authenticate":
+                await SurrealDBConnectionManager.authenticate(account.access)
+            elif call == "model_signin_bind":
+                await EmbUser.signin(email="u@x", password="p", bind=True)
+            elif call == "model_signup_bind":
+                await EmbUser.signup(email="v@x", password="p", bind=True)
+            else:
+                await EmbUser.authenticate(user.tokens.access, bind=True)
+
+            await SurrealDBConnectionManager.set_url(_ws_url())
+            with pytest.raises(SurrealDbAuthenticationError, match="dropped while it was authenticated"):
+                await SurrealDBConnectionManager.get_client()
+        finally:
+            lost.clear()
+            await SurrealDBConnectionManager.unset_connection()
+
 
 # --- Task 4: the ORM on the engine (spec §1.5, §7; AC-6, AC-7, AC-11; D5, D7) -----------------------------
 #

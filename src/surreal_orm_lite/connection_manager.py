@@ -461,7 +461,11 @@ class SurrealDBConnectionManager:
 
     @classmethod
     def _identity_restored(cls) -> None:
-        """The application set this loop's identity itself: a lost-identity state is over."""
+        """The application set this loop's server identity itself: a lost-identity state is over.
+
+        Not called for an identity set on the embedded engine's session: it says nothing about the server identity
+        the loop should come back as.
+        """
         with contextlib.suppress(RuntimeError):
             cls.__lost_identity.discard(asyncio.get_running_loop())
 
@@ -1136,12 +1140,12 @@ class SurrealDBConnectionManager:
                 default_database=cls.__database,
             )
         )
-        async with cls._identity_client() as (client, _):
+        async with cls._identity_client() as (client, embedded):
             try:
                 tokens = await client.signin(payload)
             except Exception as exc:
                 raise wrap_auth_error(exc, "signin") from exc
-            return cls._adopt_tokens(tokens, store=store, operation="signin", client=client)
+            return cls._adopt_tokens(tokens, store=store, operation="signin", client=client, embedded=embedded)
 
     @classmethod
     async def signup(
@@ -1183,20 +1187,24 @@ class SurrealDBConnectionManager:
                 default_database=cls.__database,
             )
         )
-        async with cls._identity_client() as (client, _):
+        async with cls._identity_client() as (client, embedded):
             try:
                 tokens = await client.signup(payload)
             except Exception as exc:
                 raise wrap_auth_error(exc, "signup") from exc
-            return cls._adopt_tokens(tokens, store=store, operation="signup", client=client)
+            return cls._adopt_tokens(tokens, store=store, operation="signup", client=client, embedded=embedded)
 
     @classmethod
-    def _adopt_tokens(cls, tokens: Any, *, store: bool, operation: str, client: Any) -> AuthTokens:
+    def _adopt_tokens(cls, tokens: Any, *, store: bool, operation: str, client: Any, embedded: bool) -> AuthTokens:
         """Convert the SDK's ``Tokens`` to :class:`AuthTokens`, optionally remembering it.
 
         The SDK types ``access`` as optional; the ORM does not hand back a token-shaped object
         with no token in it, so an empty one is an authentication failure rather than a
         surprise ``None`` three call frames later.
+
+        :param embedded: whether *client* is the embedded engine's shared session. An identity set
+            there leaves this loop's lost-identity state as it is (:meth:`_identity_restored` is a
+            server matter), as :meth:`close_connection` on an embedded URL does.
         """
         access = getattr(tokens, "access", None)
         if not access:
@@ -1207,7 +1215,8 @@ class SurrealDBConnectionManager:
             cls.__session_token = adopted.access
             cls.__refresh_token = adopted.refresh
         cls._stamp_identity(client, replayable=store)
-        cls._identity_restored()
+        if not embedded:
+            cls._identity_restored()
         return adopted
 
     @classmethod
@@ -1255,7 +1264,7 @@ class SurrealDBConnectionManager:
             A malformed one never reaches the server — the SDK rejects its shape with a plain
             ``ValueError``, which is normalised here like any other authentication failure.
         """
-        async with cls._identity_client() as (client, _):
+        async with cls._identity_client() as (client, embedded):
             # The SDK's HTTP connection assigns `self.token` BEFORE sending, unlike the WebSocket
             # one. So a rejected token stays stamped on the client and every later request comes
             # back 401 — and since the manager caches that client for the life of the event loop,
@@ -1275,7 +1284,8 @@ class SurrealDBConnectionManager:
                 # renew. A caller that *does* hold the matching pair passes refresh=.
                 cls.__refresh_token = refresh
             cls._stamp_identity(client, replayable=store)
-            cls._identity_restored()
+            if not embedded:
+                cls._identity_restored()
 
     @classmethod
     async def invalidate(cls) -> None:
@@ -1304,7 +1314,10 @@ class SurrealDBConnectionManager:
         thread — held from the ``invalidate()`` to the new selection, so the call runs one at a
         time with model-level ``bind=True`` calls and the other connection-level identity
         methods. If that selection fails, nothing is closed (no ``mem://`` data is lost): the
-        session is already the owner, and the next :meth:`get_client` selects again.
+        session is already the owner, and the next :meth:`get_client` selects again. Only the
+        engine's session changes: an event loop whose server connection dropped while signed in
+        with ``store=False`` still raises once a server URL is configured back — as after
+        :meth:`close_connection` on the engine, or any identity set on it.
 
         :raises SurrealDbAuthenticationError: if the server refuses either step.
         """
@@ -1362,9 +1375,9 @@ class SurrealDBConnectionManager:
             raise wrap_auth_error(exc, "invalidate (restoring the configured identity)") from exc
         if held:
             cls.__embedded_selection = (namespace, database)
-        # Back at the configured identity — exactly what a reopen restores.
+        # Back at the configured identity — exactly what a reopen restores. A server loop's
+        # lost-identity state is left as it is: the engine's owner says nothing about it.
         cls._stamp_identity(client, replayable=True)
-        cls._identity_restored()
 
     @classmethod
     def clear_session(cls) -> None:
