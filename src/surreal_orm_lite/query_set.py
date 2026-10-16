@@ -270,6 +270,13 @@ class QuerySet:
 
             posts = await Post.objects().fetch("author", "tags").exec()
             # Generates: SELECT * FROM Post FETCH author, tags;
+
+        Under ``as_of()`` (v0.26.0) SurrealDB 3.x resolves the links as they were at the moment. SurrealDB 2.x
+        (servers and the embedded engine of the surrealdb SDK 2.x) resolves them to their current state, so on
+        2.x the reads that return the fetched records (``exec()``, ``first()``, ``get()`` without an id) raise
+        ``SurrealDbError``; the other reads ignore ``fetch()``, as they do without ``as_of()``. A dotted path
+        through a link in ``filter()``, ``select()``, ``order_by()`` or ``values()`` reads the linked record as
+        it is now on 2.x.
         """
         for field in fields:
             validate_field_name(field, "FETCH field")
@@ -425,7 +432,10 @@ class QuerySet:
 
         1. On the embedded engine, a URL that keeps no history (``embedded.keeps_history()``) raises T6
            before any client is acquired, so nothing is sent.
-        2. A duration or a ``SurrealFunc`` is resolved by the database (one ``RETURN`` request), and the
+        2. A read that returns the records ``fetch()`` resolves (*fetches*), with ``fetch()`` set, asks the
+           server line (one ``version()`` request, as ``changes()`` does) and raises T8 below 3: SurrealDB 2.x
+           resolves fetched links to their current state. No other read asks the line.
+        3. A duration or a ``SurrealFunc`` is resolved by the database (one ``RETURN`` request), and the
            resolved moment checked against the moments a version can address (``time_travel.resolve()``:
            T10 a/b/c, after which the read is never sent). An absolute moment, checked by ``as_of()``, needs
            no request.
@@ -436,7 +446,7 @@ class QuerySet:
                 ignore ``fetch()``.
 
         Raises:
-            SurrealDbError: T6; T10 (a, b, c).
+            SurrealDbError: T6; T8; T10 (a, b, c).
         """
         if self._as_of is None:
             return None
@@ -444,7 +454,8 @@ class QuerySet:
         if SurrealDBConnectionManager.is_embedded() and not keeps_history(url):
             raise SurrealDbError(history_unsupported(url))
         client = await SurrealDBConnectionManager.get_client()
-        # The line check of fetch() under as_of() (T8, reads with fetches=True) belongs here, before the resolution.
+        if fetches and self._fetch_fields and _time_travel.line_major(await client.version()) < 3:
+            raise SurrealDbError(_time_travel.fetch_refused())
         return await _time_travel.resolve(self._as_of, client, self._variables)
 
     @staticmethod

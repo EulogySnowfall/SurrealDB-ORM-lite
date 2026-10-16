@@ -1232,3 +1232,196 @@ class TestPicklesFromV025E2E:
         restored = pickle.loads(pickle.dumps(snapshot))
         assert _snapshot_moment(restored) == M2021
         assert restored.model_dump() == snapshot.model_dump()
+
+
+# --- fetch() under as_of(), dispatched by line (AC-10, D6) ---------------------------------------------
+
+#: ``SnapAuthor:1`` written in 2020, linked from ``Snap:a`` now (one statement per ``client.query()``).
+_AUTHOR = (
+    "CREATE SnapAuthor:1 SET name='old' VERSION d'2020-01-01T00:00:00Z';",
+    "UPDATE Snap:a SET author = SnapAuthor:1;",
+)
+
+
+@contextlib.asynccontextmanager
+async def fetch_history_db(tmp_path: Path) -> AsyncIterator[Any]:
+    """AC-5's history, ``SnapPlace:p`` and AC-10's author link on a fresh embedded versioned database."""
+    async with history_db(tmp_path) as client:
+        for statement in (_PLACE, *_AUTHOR):
+            await client.query(statement)
+        yield client
+
+
+def _count_versions(monkeypatch: pytest.MonkeyPatch, client: Any, answer: str | None = None) -> list[str]:
+    """Record each ``version()`` request *client* makes from now on; answer *answer* instead of it when given.
+
+    Patched on the client's class and keyed on ``id(client)``, as ``_record_queries()`` does. Each entry is the
+    answer the caller received.
+    """
+    calls: list[str] = []
+    cls = type(client)
+    real = cls.version
+    owner = id(client)
+
+    async def counting(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if id(self) != owner:
+            return await real(self, *args, **kwargs)
+        version = answer if answer is not None else await real(self, *args, **kwargs)
+        calls.append(version)
+        return version
+
+    monkeypatch.setattr(cls, "version", counting)
+    return calls
+
+
+#: The reads that return the records ``fetch()`` resolves (spec §4): ``(id, model, fetched field, read, rows
+#: expected when the line is 3.x)``.
+_FETCHING_READS: list[tuple[str, type[BaseSurrealModel], str, Callable[[Any], Any], Callable[[Any], bool]]] = [
+    ("exec", Snap, "author", lambda qs: qs.order_by("n").exec(), lambda r: _pairs(r) == _AT_2021),
+    ("first", Snap, "author", lambda qs: qs.order_by("-n").first(), lambda r: (r.id, r.n) == ("a", 10)),
+    ("get", Snap, "author", lambda qs: qs.filter(name="Ada").get(), lambda r: (r.id, r.n) == ("a", 10)),
+    (
+        "geo-distance",
+        SnapPlace,
+        "spot",
+        lambda qs: qs.annotate(d=GeoDistance("spot", (0, 0))).exec(),
+        lambda r: [(place.id, place.d) for place in r] == [("p", 0.0)],
+    ),
+]
+_FETCHING_IDS = [row[0] for row in _FETCHING_READS]
+
+#: The reads that ignore ``fetch()`` (spec §4): no T8 and no ``version()`` request, on any line.
+_NON_FETCHING_READS: list[tuple[str, Callable[[Any], Any], Callable[[Any], bool]]] = [
+    ("count", lambda qs: qs.count(), lambda r: r == 3),
+    ("exists", lambda qs: qs.exists(), lambda r: r is True),
+    ("sum", lambda qs: qs.sum("n"), lambda r: r == 15),
+    ("avg", lambda qs: qs.avg("n"), lambda r: r == 5.0),
+    ("min", lambda qs: qs.min("n"), lambda r: r == 2),
+    ("max", lambda qs: qs.max("n"), lambda r: r == 10),
+    (
+        "values-annotate",
+        lambda qs: qs.values("g").annotate(c=Count()).exec(),
+        lambda r: {row["g"]: row["c"] for row in r} == {"x": 2, "y": 1},
+    ),
+    ("get-id", lambda qs: qs.get("a"), lambda r: (r.id, r.n) == ("a", 10) and _snapshot_moment(r) == M2021),
+    (
+        "all",
+        lambda qs: qs.all(),
+        lambda r: sorted(_pairs(r)) == sorted(_AT_2021) and {_snapshot_moment(x) for x in r} == {M2021},
+    ),
+]
+
+
+class TestFetchByLineE2E:
+    """AC-10: ``fetch()`` under ``as_of()`` is refused on SurrealDB 2.x (T8), only by the reads returning fetched records.
+
+    The embedded engine of the surrealdb SDK 2.x answers ``version()`` with a 2.x version (its core is 2.3):
+    T8. Patched to answer ``"surrealdb-3.3.4"``, the same reads run. The line is asked for only when a read
+    returns the fetched records and ``fetch()`` is set.
+    """
+
+    @pytest.mark.parametrize(("name", "model", "field", "read", "expected"), _FETCHING_READS, ids=_FETCHING_IDS)
+    async def test_refused_on_2x(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        name: str,
+        model: type[BaseSurrealModel],
+        field: str,
+        read: Callable[[Any], Any],
+        expected: Callable[[Any], bool],
+    ) -> None:
+        async with fetch_history_db(tmp_path) as client:
+            versions = _count_versions(monkeypatch, client)
+            calls = _record_queries(monkeypatch, client)
+            with pytest.raises(SurrealDbError, match=r"fetch\(\) under as_of\(\) needs SurrealDB 3\.x") as info:
+                await read(model.objects().as_of(M2021).fetch(field))
+        assert str(info.value) == time_travel.fetch_refused()
+        assert len(versions) == 1 and line_major(versions[0]) == 2, versions
+        assert calls == []  # refused after the one version() request: the read is never sent
+
+    @pytest.mark.parametrize(("name", "model", "field", "read", "expected"), _FETCHING_READS, ids=_FETCHING_IDS)
+    async def test_runs_on_3x(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        name: str,
+        model: type[BaseSurrealModel],
+        field: str,
+        read: Callable[[Any], Any],
+        expected: Callable[[Any], bool],
+    ) -> None:
+        async with fetch_history_db(tmp_path) as client:
+            versions = _count_versions(monkeypatch, client, answer="surrealdb-3.3.4")
+            calls = _record_queries(monkeypatch, client)
+            result = await read(model.objects().as_of(M2021).fetch(field))
+        assert expected(result), result
+        assert versions == ["surrealdb-3.3.4"]
+        assert len(calls) == 1, calls
+        statement, variables = calls[0]
+        assert statement.endswith(f" FETCH {field} VERSION $_as_of;"), statement
+        assert variables["_as_of"] == M2021
+
+    @pytest.mark.parametrize(("name", "read", "expected"), _NON_FETCHING_READS, ids=[row[0] for row in _NON_FETCHING_READS])
+    async def test_reads_ignoring_fetch_ask_no_line(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        name: str,
+        read: Callable[[Any], Any],
+        expected: Callable[[Any], bool],
+    ) -> None:
+        async with fetch_history_db(tmp_path) as client:
+            versions = _count_versions(monkeypatch, client)
+            result = await read(Snap.objects().as_of(M2021).fetch("author"))
+        assert expected(result), result
+        assert versions == []
+
+    @pytest.mark.parametrize(("name", "model", "field", "read", "expected"), _FETCHING_READS, ids=_FETCHING_IDS)
+    async def test_as_of_without_fetch_asks_no_line(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        name: str,
+        model: type[BaseSurrealModel],
+        field: str,
+        read: Callable[[Any], Any],
+        expected: Callable[[Any], bool],
+    ) -> None:
+        async with fetch_history_db(tmp_path) as client:
+            versions = _count_versions(monkeypatch, client)
+            result = await read(model.objects().as_of(M2021))
+        assert expected(result), result
+        assert versions == []
+
+    async def test_fetch_without_as_of_unchanged(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """A current read resolves the link as before, with no ``version()`` request."""
+        async with fetch_history_db(tmp_path) as client:
+            versions = _count_versions(monkeypatch, client)
+            calls = _record_queries(monkeypatch, client)
+            rows = await Snap.objects().order_by("n").fetch("author").exec()
+        assert versions == []
+        assert calls == [("SELECT * FROM Snap ORDER BY n ASC FETCH author;", {})]
+        # The fetched author is a record, not a RecordID: the rows do not validate and come back as dicts.
+        assert [(row["id"].id, row.get("author")) for row in rows] == [
+            ("c", None),
+            ("a", {"id": RecordID("SnapAuthor", 1), "name": "old"}),
+        ]
+
+    async def test_refused_before_the_resolution(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Spec §5.5 order: T8 comes before a duration is resolved, so no ``RETURN`` request is sent."""
+        async with fetch_history_db(tmp_path) as client:
+            versions = _count_versions(monkeypatch, client)
+            calls = _record_queries(monkeypatch, client)
+            with pytest.raises(SurrealDbError, match=r"fetch\(\) under as_of\(\)"):
+                await Snap.objects().as_of(timedelta(0)).fetch("author").exec()
+        assert len(versions) == 1
+        assert calls == []
+
+    async def test_no_history_comes_first(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Spec §5.5 order: T6 (no request) before T8: a store without history never asks the line."""
+        async with embedded_database("mem://") as client:
+            versions = _count_versions(monkeypatch, client)
+            with pytest.raises(SurrealDbError, match="keeps none"):
+                await Snap.objects().as_of(M2021).fetch("author").exec()
+        assert versions == []
