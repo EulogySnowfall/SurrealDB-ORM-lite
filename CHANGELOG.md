@@ -53,8 +53,10 @@ third minor of Tier 2.
   and the `async with` exit then close only the engine, so a server client keeps its live queries
   and its identity, even one signed in with `store=False`, and `is_connected()` stays true on its
   event loop; `close_all_connections()` and `unset_connection()` close it too. An event loop whose
-  server connection dropped while signed in with `store=False` still raises once a server URL is
-  configured back: neither closing the engine nor an identity set on it ends that state.
+  server connection dropped while signed in with `store=False` still raises once the server URL is
+  set back with `set_url()`, or after an `embedded_database()` block: neither closing the engine
+  nor an identity set on it ends that state. `set_connection()` does: a new configuration is a
+  choice of identity.
 - **Clear errors, before any request, for what the engine cannot do**: live queries (`live()`,
   `watch()`, `subscribe_live()`: read the table's change feed with `changes()` instead),
   `changes(since=<datetime>)` (pass a cursor or `since=None`), and `AuthenticatedUserMixin` calls
@@ -66,9 +68,10 @@ third minor of Tier 2.
   event loop and thread); `invalidate()` and a namespace or database change return it to the
   in-process owner and end the stored session. Model auth with `bind=True` signs that session in,
   one call at a time with the connection-level calls (the last one wins), and a failed call puts
-  the previous session back, with one exception, as on a server: when `signup()`, `signin()` or
-  `refresh()` succeeded but the record does not fit the model, the session stays signed in as
-  that record (the error says so).
+  the previous session back, with one exception, as on a server: when `signup()` or `signin()`
+  succeeded but the record does not fit the model, the session stays signed in as that record
+  (the error says so). `refresh()` cannot succeed on the engine: its SurrealQL does not parse
+  `WITH REFRESH`.
 - **`surreal_orm_lite.testing`**, a new module that does not import pytest:
   - `embedded_database(url="mem://", *, namespace="test", database="test")` runs a block against
     an isolated in-process database, yields the block's SDK client (valid inside the block only),
@@ -141,7 +144,7 @@ third minor of Tier 2.
   that does not exist yet: define the table first, or use `@retry_on_conflict()`.
 - The v0.24.3 read hook (#235) also applies to the embedded engine's client: zero durations and
   degenerate geometries read as on a server. A `<set>[…]` is stored as an array there, as on 2.x.
-- **Server lines unchanged**: tested against SurrealDB 3.3.4 and 2.7.0 (the CI pins), plus 3.1.5
+- **Server pins unchanged**: tested against SurrealDB 3.3.4 and 2.7.0 (the CI pins), plus 3.1.5
   for backward compatibility; the embedded tests run in every CI job. `ModelFactory` and
   `Faker` come in v0.39.0.
 

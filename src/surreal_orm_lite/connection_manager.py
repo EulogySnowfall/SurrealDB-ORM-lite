@@ -1318,8 +1318,10 @@ class SurrealDBConnectionManager:
         methods. If that selection fails, nothing is closed (no ``mem://`` data is lost): the
         session is already the owner, and the next :meth:`get_client` selects again. Only the
         engine's session changes: an event loop whose server connection dropped while signed in
-        with ``store=False`` still raises once a server URL is configured back — as after
-        :meth:`close_connection` on the engine, or any identity set on it.
+        with ``store=False`` still raises once the server URL is set back with :meth:`set_url`,
+        or after an ``embedded_database()`` block — as after :meth:`close_connection` on the
+        engine, or any identity set on it. :meth:`set_connection` ends that state: a new
+        configuration is a choice of identity.
 
         :raises SurrealDbAuthenticationError: if the server refuses either step.
         """

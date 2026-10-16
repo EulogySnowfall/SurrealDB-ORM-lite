@@ -14,8 +14,9 @@ database, so it has no short-lived connection to offer: there, ``bind=True`` is 
 exchange runs on the shared session — one call at a time (concurrent calls, and the connection-level
 ``signin``/``signup``/``authenticate``/``invalidate`` holding the same session, are serialised; the
 last one wins), the record checked before the token is adopted, the previous session put back when
-anything fails — except, as on a server, a ``signup``/``signin``/``refresh`` that succeeded but whose
-record does not fit the model: the session stays signed in as that record, and the error says so.
+anything fails — except, as on a server, a ``signup``/``signin`` that succeeded but whose record does
+not fit the model: the session stays signed in as that record, and the error says so. (A ``refresh``
+cannot succeed there: the engine's SurrealQL does not parse ``WITH REFRESH``.)
 
 This is a leaf module: it imports ``connection_manager`` and ``auth`` at runtime and
 ``model_base`` only for typing, which keeps the package acyclic (``connection_manager`` already
@@ -546,9 +547,10 @@ class AuthenticatedUserMixin:
         and on any failure (cancellation included) the previous session is put back before the
         error propagates: the stored identity, else the in-process owner. An identity set with
         ``store=False`` before the call is not restored: the manager does not know it. One
-        exception, as on a server: a ``signup()``/``signin()``/``refresh()`` exchange that succeeded
-        adopts its token first, so when the record then does not fit the model the session stays
-        signed in as that record (the error says so).
+        exception, as on a server: a ``signup()``/``signin()`` exchange that succeeded adopts its
+        token first, so when the record then does not fit the model the session stays signed in as
+        that record (the error says so). A ``refresh()`` would too, but cannot succeed on the
+        engine: its SurrealQL does not parse ``WITH REFRESH``.
         """
         payload = _encoding.encode(payload)
         tokens: AuthTokens | None = None
