@@ -1535,65 +1535,73 @@ class QuerySet:
         """
         Update all records matching the current filters.
 
+        A subquery in the filters (v0.27.0) is read by the server in the same statement, a block
+        ``{ LET $_sq0 = (…); (UPDATE …) };``: one request, and on SurrealDB 3.x a subquery table that does not exist
+        reads as empty, as on 2.x (outside a transaction; inside one, the server's error is the transaction's). A
+        value to write is data, never a subquery.
+
         Args:
             **kwargs: Fields and values to update.
 
         Returns:
-            The number of updated records.
+            The number of updated records (``0`` inside a buffered transaction, whose statements run at commit).
+
+        Raises:
+            ValueError: a value is a ``Subquery`` or a QuerySet (v0.27.0), before any request: filter with it, and
+                pass the value to write.
 
         Example::
 
             count = await User.objects().filter(status="pending").bulk_update(status="active")
+            count = await Post.objects().filter(author__in=Subquery(banned)).bulk_update(hidden=True)
         """
         self._reject_time_travel("bulk_update()")
         if not kwargs:
             return 0
+        for field, value in kwargs.items():
+            if _subquery.subquery_of(value) is not None:
+                raise ValueError(_subquery.value_written(field))
         self.model._reject_computed_writes(kwargs, "bulk_update()")
 
-        where_clause, where_vars = self._build_where()
+        def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
+            where_clause, where_vars = self._build_where(subqueries=compiler)
+            set_parts: list[str] = []
+            set_vars: dict[str, Any] = {}
+            for i, (field, value) in enumerate(kwargs.items()):
+                validate_field_name(field, "bulk_update field")
+                var_name = f"_v{i}"
+                set_parts.append(f"{self._column(field)} = ${var_name}")
+                set_vars[var_name] = value
+            query = f"UPDATE {self._model_table} SET {', '.join(set_parts)}{where_clause};"
+            return compiler.wrap(query), {**compiler.variables, **where_vars, **set_vars}
 
-        set_parts: list[str] = []
-        set_vars: dict[str, Any] = {}
-        for i, (field, value) in enumerate(kwargs.items()):
-            validate_field_name(field, "bulk_update field")
-            var_name = f"_v{i}"
-            set_parts.append(f"{self._column(field)} = ${var_name}")
-            set_vars[var_name] = value
-
-        set_clause = ", ".join(set_parts)
-        query = f"UPDATE {self._model_table} SET {set_clause}{where_clause};"
-
-        all_vars = {**self._variables, **where_vars, **set_vars}
-        if self._tx is not None:
-            rows = await self._tx.add(query, all_vars)
-            return len(rows) if isinstance(rows, list) else 0
-        results = await self._execute_query(query, all_vars)
-        if isinstance(results, list):
-            return len(results)
-        return 0
+        results = await self._run_compiled(compile_statement, write=True)
+        return len(results) if isinstance(results, list) else 0
 
     async def bulk_delete(self) -> int:
         """
         Delete all records matching the current filters.
 
+        A subquery in the filters (v0.27.0) is read by the server in the same statement, as for
+        :meth:`bulk_update`.
+
         Returns:
-            The number of deleted records.
+            The number of deleted records (``0`` inside a buffered transaction, whose statements run at commit).
 
         Example::
 
             count = await User.objects().filter(status="inactive").bulk_delete()
+            count = await Post.objects().filter(author__in=Subquery(banned)).bulk_delete()
         """
         self._reject_time_travel("bulk_delete()")
-        where_clause, where_vars = self._build_where()
-        query = f"DELETE {self._model_table}{where_clause} RETURN BEFORE;"
-        all_vars = {**self._variables, **where_vars}
-        if self._tx is not None:
-            rows = await self._tx.add(query, all_vars)
-            return len(rows) if isinstance(rows, list) else 0
-        results = await self._execute_query(query, all_vars)
-        if isinstance(results, list):
-            return len(results)
-        return 0
+
+        def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
+            where_clause, where_vars = self._build_where(subqueries=compiler)
+            query = f"DELETE {self._model_table}{where_clause} RETURN BEFORE;"
+            return compiler.wrap(query), {**compiler.variables, **where_vars}
+
+        results = await self._run_compiled(compile_statement, write=True)
+        return len(results) if isinstance(results, list) else 0
 
     async def patch(self, operations: list[dict[str, Any]]) -> int:
         """
@@ -1601,7 +1609,8 @@ class QuerySet:
 
         Whole table if unfiltered. Returns the number of affected rows. Participates in
         ``objects(tx=)`` like the other bulk operations. ``operations`` is validated then bound
-        as ``$_ops`` (never string-interpolated). Emits no signals.
+        as ``$_ops`` (never string-interpolated). Emits no signals. A subquery in the filters
+        (v0.27.0) is read by the server in the same statement, as for :meth:`bulk_update`.
 
         Example::
 
@@ -1612,16 +1621,15 @@ class QuerySet:
         self._reject_time_travel("patch()")
         validate_patch_operations(operations)
         self.model._reject_computed_patch(operations, "patch()")
-        where_clause, where_vars = self._build_where()
-        query = f"UPDATE {self._model_table} PATCH $_ops{where_clause};"
-        all_vars = {**self._variables, **where_vars, "_ops": self.model._columns_for_patch(operations)}
-        if self._tx is not None:
-            rows = await self._tx.add(query, all_vars)
-            return len(rows) if isinstance(rows, list) else 0
-        results = await self._execute_query(query, all_vars)
-        if isinstance(results, list):
-            return len(results)
-        return 0
+
+        def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
+            where_clause, where_vars = self._build_where(subqueries=compiler)
+            query = f"UPDATE {self._model_table} PATCH $_ops{where_clause};"
+            ops = self.model._columns_for_patch(operations)
+            return compiler.wrap(query), {**compiler.variables, **where_vars, "_ops": ops}
+
+        results = await self._run_compiled(compile_statement, write=True)
+        return len(results) if isinstance(results, list) else 0
 
     # ==================== Upsert / get_or_create ====================
 
@@ -1660,20 +1668,47 @@ class QuerySet:
             payload[field_name] = as_record_value(value)
         return payload
 
+    @staticmethod
+    def _reject_subquery_writes(criteria: Mapping[str, Any], defaults: Mapping[str, Any] | None, method: str) -> None:
+        """Refuse a subquery that ``get_or_create()``/``update_or_create()`` (*method*) would have to write (v0.27.0).
+
+        A subquery is a filter value whose values only the database knows: under an ``exact`` criterion, which
+        is written on create, or in ``defaults``, which is data. Another lookup (``author__in=Subquery(…)``)
+        drives the lookup only and is never written. Checked before any request.
+
+        Raises:
+            SurrealDbError: an ``exact`` criterion whose value is a ``Subquery`` or a QuerySet (S9a), then such a
+                ``defaults`` value (S9b).
+        """
+        for key, value in criteria.items():
+            field_name, lookup = parse_lookup(key)
+            if lookup == "exact" and _subquery.subquery_of(value) is not None:
+                raise SurrealDbError(_subquery.criterion_written(field_name))
+        for key, value in (defaults or {}).items():
+            if _subquery.subquery_of(value) is not None:
+                raise SurrealDbError(_subquery.default_written(method, key))
+
     async def _lookup_matches(self, criteria: dict[str, Any]) -> list[Any]:
         """Return rows matching ``criteria``, routed through the transaction when attached.
 
         Reuses the parameterized WHERE builder (anti-injection) via a throwaway QuerySet's
-        ``filter(**criteria)``, then runs through ``_execute_query`` so the read participates
-        in ``self._tx`` (``objects(tx=)``) — seeing the tx's uncommitted writes on an
-        interactive transaction, and raising on a buffered one (consistent with every other
-        read). ``LIMIT 2`` is enough to distinguish 0 / 1 / >1.
+        ``filter(**criteria)``, joined to ``self._tx`` (``objects(tx=)``) so the read participates in
+        it — seeing the tx's uncommitted writes on an interactive transaction, and raising on a
+        buffered one (consistent with every other read). ``LIMIT 2`` is enough to distinguish
+        0 / 1 / >1. A subquery criterion (v0.27.0) is read in the same statement, a block
+        ``{ LET $_sq0 = (…); (SELECT … LIMIT 2) };``, run as every read is (:meth:`_run_compiled`).
         """
         probe = QuerySet(self.model)
         probe.filter(**criteria)
-        where_clause, where_vars = probe._build_where()
-        query = f"SELECT * FROM {self._model_table}{where_clause} LIMIT 2;"
-        rows = await self._execute_query(query, where_vars)
+        probe._tx = self._tx
+        table = self._model_table
+
+        def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
+            where_clause, where_vars = probe._build_where(subqueries=compiler)
+            query = f"SELECT * FROM {table}{where_clause} LIMIT 2;"
+            return compiler.wrap(query), {**compiler.variables, **where_vars}
+
+        rows = await probe._run_compiled(compile_statement)
         return rows if isinstance(rows, list) else []
 
     def _writable_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1735,8 +1770,14 @@ class QuerySet:
         ``ValueError`` before the lookup — it would be written on create and silently ignored by
         the server on update. On update, the endpoints the criteria named (they matched) are left
         out of the ``merge()``.
+
+        A subquery criterion (v0.27.0) drives the lookup, read by the server in the same request:
+        ``update_or_create(author__in=Subquery(active), title="one", defaults={"score": 6})``. It is
+        never written; one the create would have to write — under an ``exact`` lookup, or in
+        ``defaults`` — raises ``SurrealDbError`` before any request.
         """
         self._reject_time_travel("update_or_create()")
+        self._reject_subquery_writes(criteria, defaults, "update_or_create")
         if not criteria:
             raise SurrealDbError("update_or_create() requires at least one lookup criteria.")
         defaults = defaults or {}
@@ -1776,8 +1817,14 @@ class QuerySet:
         Create builds ``self.model(**payload)``: a key the model does not declare raises
         ``SurrealDbError`` (unless the model sets ``extra="allow"``), and a missing required
         field raises ``ValidationError`` at construction.
+
+        A subquery criterion (v0.27.0) drives the lookup, read by the server in the same request:
+        ``get_or_create(author__in=Subquery(active), title="one")``. It is never written; one the
+        create would have to write — under an ``exact`` lookup, or in ``defaults`` — raises
+        ``SurrealDbError`` before any request.
         """
         self._reject_time_travel("get_or_create()")
+        self._reject_subquery_writes(criteria, defaults, "get_or_create")
         if not criteria:
             raise SurrealDbError("get_or_create() requires at least one lookup criteria.")
         defaults = defaults or {}

@@ -373,6 +373,27 @@ def outside_a_queryset() -> str:
     )
 
 
+def criterion_written(field: str) -> str:
+    """S9a: a ``get_or_create()``/``update_or_create()`` ``exact`` criterion whose value is a subquery."""
+    return (
+        f"Cannot create a record from the subquery given for '{field}': a subquery is a filter whose values only the "
+        f"database knows. Use a lookup such as {field}__in, and pass the value to write in defaults=."
+    )
+
+
+def default_written(method: str, key: str) -> str:
+    """S9b: a ``defaults=`` value of *method* (``get_or_create`` or ``update_or_create``) that is a subquery."""
+    return f"{method}(defaults=) cannot write the subquery given for '{key}': a subquery is a filter value, not data."
+
+
+def value_written(field: str) -> str:
+    """S10: a ``bulk_update()`` value that is a subquery."""
+    return (
+        f"bulk_update() writes its values as data; '{field}' got a subquery, which is a filter value: filter() with it "
+        "and pass the value to write."
+    )
+
+
 def bad_slice(clause: str, value: object) -> str:
     """S12: the inner ``limit()`` or ``offset()`` (*clause*) is not an ``int >= 0``."""
     return f"A subquery's {clause} takes an int >= 0, got {value!r}"

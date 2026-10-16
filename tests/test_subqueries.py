@@ -155,6 +155,24 @@ _S13 = (
 )
 
 
+def _s9a(field: str) -> str:
+    return (
+        f"Cannot create a record from the subquery given for '{field}': a subquery is a filter whose values only the "
+        f"database knows. Use a lookup such as {field}__in, and pass the value to write in defaults=."
+    )
+
+
+def _s9b(method: str, key: str) -> str:
+    return f"{method}(defaults=) cannot write the subquery given for '{key}': a subquery is a filter value, not data."
+
+
+def _s10(field: str) -> str:
+    return (
+        f"bulk_update() writes its values as data; '{field}' got a subquery, which is a filter value: filter() with it "
+        "and pass the value to write."
+    )
+
+
 def _s15(field: str, lookup: str) -> str:
     return f"'{lookup}' takes a subquery as its whole value, not inside a list: {field}__{lookup}=Subquery(...)"
 
@@ -1071,6 +1089,62 @@ class TestSubqueryRefusals:
             "filter the events."
         )
 
+    @pytest.mark.usefixtures("_no_request")
+    @pytest.mark.parametrize(
+        ("call", "error", "message"),
+        [
+            pytest.param(
+                lambda: SqPost.objects().get_or_create(author=Subquery(_active())),
+                SurrealDbError,
+                _s9a("author"),
+                id="S9a-get_or_create",
+            ),
+            pytest.param(
+                lambda: SqPost.objects().update_or_create(title="one", author=_active(), defaults={"score": 1}),
+                SurrealDbError,
+                _s9a("author"),
+                id="S9a-update_or_create-bare-queryset",
+            ),
+            pytest.param(
+                lambda: SqPost.objects().get_or_create(score__exact=Subquery(_no_score())),
+                SurrealDbError,
+                _s9a("score"),
+                id="S9a-exact-suffix",
+            ),
+            pytest.param(
+                lambda: SqPost.objects().get_or_create(author__in=_active(), defaults={"author": Subquery(_active())}),
+                SurrealDbError,
+                _s9b("get_or_create", "author"),
+                id="S9b-get_or_create",
+            ),
+            pytest.param(
+                lambda: SqPost.objects().update_or_create(title="one", defaults={"score": _no_score()}),
+                SurrealDbError,
+                _s9b("update_or_create", "score"),
+                id="S9b-update_or_create-bare-queryset",
+            ),
+            pytest.param(
+                lambda: _with_inner(_active()).bulk_update(score=Subquery(_no_score())),
+                ValueError,
+                _s10("score"),
+                id="S10",
+            ),
+            pytest.param(
+                lambda: SqPost.objects().bulk_update(title="x", score=_no_score()),
+                ValueError,
+                _s10("score"),
+                id="S10-bare-queryset",
+            ),
+        ],
+    )
+    async def test_a_subquery_as_a_written_value_raises_before_any_request(
+        self, call: Callable[[], Awaitable[Any]], error: type[Exception], message: str
+    ) -> None:
+        """S9 and S10 (spec N3): a subquery is a filter value, never data to write."""
+        with pytest.raises(error) as info:
+            await call()
+        assert str(info.value) == message
+
 
 # --- the engines and the data (spec §9) ---------------------------------------------------------------
 
@@ -1852,3 +1926,255 @@ class TestRunCompiled:
         _recording_execute(monkeypatch, qs)
         assert await qs.exists() is False
         assert qs._limit == 7
+
+
+# --- AC-8 and AC-7 (writes): writes by filter, the get_or_create lookups, transactions ---------------------------
+
+_C17 = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM sq_person WHERE active = $_f0); "
+    "(UPDATE sq_post SET score = $_v0 WHERE author IN $_sq0) };"
+)
+_C18 = "{ LET $_sq0 = (SELECT VALUE id FROM sq_person WHERE active = $_f0); (DELETE sq_post WHERE author IN $_sq0 RETURN BEFORE) };"
+_C19 = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM sq_person WHERE active = $_f0); (UPDATE sq_post PATCH $_ops WHERE author IN $_sq0) };"
+)
+_C20 = "{ LET $_sq0 = (SELECT VALUE id FROM sq_person WHERE active = $_f0); (SELECT * FROM sq_post WHERE author IN $_sq0 LIMIT 2) };"
+_RETITLE = [{"op": "replace", "path": "/title", "value": "x"}]
+_SEEDED_SCORES = {"p1": 5, "p2": 8, "p3": 2, "p4": 9, "p5": 1}
+
+
+async def _scores() -> dict[str, int]:
+    """Every post's score, by id."""
+    return {post.id: post.score for post in await SqPost.objects().exec()}
+
+
+class TestSubqueryWriteStatementsE2E:
+    """AC-2 (C17–C20): what the writes by filter and the ``get_or_create`` lookup send, recorded from the embedded
+    engine's client — one block per call, exactly, with its variables."""
+
+    async def test_c17_bulk_update(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with subquery_db("mem") as client:
+            await _seed()
+            calls = _record_queries(monkeypatch, client)
+            assert await _with_inner(_inactive()).bulk_update(score=0) == 1
+            assert calls == [(_C17, {"_f0": False, "_v0": 0})]
+
+    async def test_c18_bulk_delete(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with subquery_db("mem") as client:
+            await _seed()
+            calls = _record_queries(monkeypatch, client)
+            assert await _with_inner(_inactive()).bulk_delete() == 1
+            assert calls == [(_C18, {"_f0": False})]
+
+    async def test_c19_patch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with subquery_db("mem") as client:
+            await _seed()
+            calls = _record_queries(monkeypatch, client)
+            assert await _with_inner(_active()).patch(_RETITLE) == 3
+            assert calls == [(_C19, {"_f0": True, "_ops": _RETITLE})]
+
+    async def test_c20_get_or_create_lookup(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with subquery_db("mem") as client:
+            await _seed()
+            calls = _record_queries(monkeypatch, client)
+            post, created = await SqPost.objects().get_or_create(author__in=Subquery(_inactive()), defaults={"title": "x"})
+            assert (post.id, created) == ("p3", False)
+            assert calls == [(_C20, {"_f0": False})]
+
+    async def test_without_a_subquery_the_writes_send_what_they_sent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC-3 for the writes: no block, and the variables of v0.26.0 in their order."""
+        async with subquery_db("mem") as client:
+            await _seed()
+            calls = _record_queries(monkeypatch, client)
+            qs = SqPost.objects().variables(a=1).filter(score__gt=5)
+            assert await qs.bulk_update(title="t") == 2
+            assert await SqPost.objects().filter(score__gt=8).patch(_RETITLE) == 1
+            assert await SqPost.objects().filter(score__lt=2).bulk_delete() == 1
+            await SqPost.objects().get_or_create(title="two")
+            assert calls == [
+                ("UPDATE sq_post SET title = $_v0 WHERE score > $_f0;", {"a": 1, "_f0": 5, "_v0": "t"}),
+                ("UPDATE sq_post PATCH $_ops WHERE score > $_f0;", {"_f0": 8, "_ops": _RETITLE}),
+                ("DELETE sq_post WHERE score < $_f0 RETURN BEFORE;", {"_f0": 2}),
+                ("SELECT * FROM sq_post WHERE title = $_f0 LIMIT 2;", {"_f0": "two"}),
+            ]
+            assert [list(variables) for _, variables in calls[:1]] == [["a", "_f0", "_v0"]]
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+class TestSubqueryWritesE2E:
+    """AC-8 (writes and helpers): the writes by filter and the ``get_or_create``/``update_or_create`` lookups honour
+    a subquery, on the embedded engine and on the server (WebSocket and HTTP)."""
+
+    async def test_bulk_update(self, kind: str) -> None:
+        async with subquery_db(kind):
+            await _seed()
+            assert await _with_inner(_inactive()).bulk_update(score=0) == 1
+            assert await _scores() == {**_SEEDED_SCORES, "p3": 0}
+
+    async def test_bulk_delete(self, kind: str) -> None:
+        async with subquery_db(kind):
+            await _seed()
+            assert await _with_inner(_inactive()).bulk_delete() == 1
+            assert _ids(await SqPost.objects().exec()) == _ALL_POSTS - {"p3"}
+
+    async def test_patch(self, kind: str) -> None:
+        async with subquery_db(kind):
+            await _seed()
+            assert await _with_inner(_active()).patch(_RETITLE) == 3
+            assert _ids(await SqPost.objects().filter(title="x").exec()) == {"p1", "p2", "p4"}
+
+    async def test_get_or_create_finds_through_a_subquery(self, kind: str) -> None:
+        async with subquery_db(kind):
+            await _seed()
+            post, created = await SqPost.objects().get_or_create(author__in=_active(), title="one", defaults={"score": 7})
+            assert (post.id, created, post.score) == ("p1", False, 5)
+            assert await _scores() == _SEEDED_SCORES
+
+    async def test_get_or_create_creates_without_writing_the_subquery(self, kind: str) -> None:
+        async with subquery_db(kind) as client:
+            await _seed()
+            post, created = await SqPost.objects().get_or_create(author__in=Subquery(_nobody()), title="new")
+            assert created is True
+            assert (post.title, post.author) == ("new", None)
+            rows = await client.query("SELECT * FROM sq_post WHERE title = 'new';")
+            assert len(rows) == 1
+            assert "author" not in rows[0], rows
+
+    async def test_update_or_create_updates_through_a_subquery(self, kind: str) -> None:
+        async with subquery_db(kind):
+            await _seed()
+            post, created = await SqPost.objects().update_or_create(author__in=_active(), title="one", defaults={"score": 6})
+            assert (created, post.title, post.score) == (False, "one", 6)
+            assert await _scores() == {**_SEEDED_SCORES, "p1": 6}
+            stored = await SqPost.objects().get("p1")
+            assert stored.author == _person("ada")
+
+
+class TestSubqueryTransactionsE2E:
+    """AC-8 (transactions) and AC-7 (writes in a transaction): the block runs in the transaction — interactive on
+    SurrealDB 3.x over WebSocket, buffered over HTTP on both lines and on the embedded engine."""
+
+    async def test_3x_interactive_reads_and_writes_see_the_transaction(self) -> None:
+        async with subquery_db("ws") as client:
+            if not await _interactive_transactions(client):
+                pytest.skip("SurrealDB 3.x only: 2.x has no interactive transaction (begin())")
+            await _seed()
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert tx.is_interactive
+                await SqPerson(id="dan", name="Dan", active=True, age=40).save(tx=tx)
+                await SqPost(id="p6", title="six", author=_person("dan"), score=6).save(tx=tx)
+                rows = await SqPost.objects(tx=tx).filter(author__in=_active()).exec()
+                assert _ids(rows) == {"p1", "p2", "p4", "p6"}
+                assert await SqPost.objects(tx=tx).filter(author__in=_active()).bulk_update(score=3) == 4
+            assert await _scores() == {"p1": 3, "p2": 3, "p3": 2, "p4": 3, "p5": 1, "p6": 3}
+
+    @pytest.mark.parametrize("kind", ["mem", "http"])
+    async def test_buffered_bulk_delete_applies_at_commit(self, kind: str) -> None:
+        async with subquery_db(kind):
+            await _seed()
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert not tx.is_interactive
+                assert await SqPost.objects(tx=tx).filter(author__in=_inactive()).bulk_delete() == 0
+                assert "p3" in _ids(await SqPost.objects().exec())
+            assert _ids(await SqPost.objects().exec()) == _ALL_POSTS - {"p3"}
+
+    @pytest.mark.parametrize("kind", ["mem", "http"])
+    async def test_buffered_two_blocks_in_one_batch(self, kind: str) -> None:
+        """M8 (rev. 2): two blocks binding the same ``$_sq0`` in one ``BEGIN … COMMIT`` batch both apply."""
+        async with subquery_db(kind):
+            await _seed()
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert await SqPost.objects(tx=tx).filter(author__in=_active()).bulk_update(score=5) == 0
+                assert await SqPost.objects(tx=tx).filter(author__in=_inactive()).bulk_delete() == 0
+                assert [statement.startswith("{ LET $_sq0 = ") for statement in tx.statements] == [True, True]
+            assert await _scores() == {"p1": 5, "p2": 5, "p4": 5, "p5": 1}
+
+    async def test_3x_a_missing_subquery_table_fails_an_interactive_write(self) -> None:
+        async with subquery_db("ws") as client:
+            if not await _interactive_transactions(client):
+                pytest.skip("SurrealDB 3.x only: 2.x has no interactive transaction (begin())")
+            await _seed()
+            with pytest.raises(SurrealDbError, match="does not exist"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await SqPost.objects(tx=tx).filter(author__not_in=_ghost()).bulk_update(score=1)
+            assert await _scores() == _SEEDED_SCORES
+
+    async def test_3x_a_missing_subquery_table_fails_a_buffered_commit(self) -> None:
+        async with subquery_db("http") as client:
+            if await _line(client) < 3:
+                pytest.skip("SurrealDB 3.x only: 2.x commits, reading the missing table as empty")
+            await _seed()
+            with pytest.raises(SurrealDbError, match="does not exist"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    assert await SqPost.objects(tx=tx).filter(author__not_in=_ghost()).bulk_update(score=1) == 0
+            assert await _scores() == _SEEDED_SCORES
+
+    @pytest.mark.parametrize("kind", ["mem", "http"])
+    async def test_2x_a_missing_subquery_table_reads_as_empty_in_a_buffered_commit(self, kind: str) -> None:
+        async with subquery_db(kind) as client:
+            if await _line(client) >= 3:
+                pytest.skip("SurrealDB 2.x and the embedded engine only: on 3.x the commit fails")
+            await _seed()
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert await SqPost.objects(tx=tx).filter(author__not_in=_ghost()).bulk_update(score=1) == 0
+            assert await _scores() == dict.fromkeys(_ALL_POSTS, 1)
+
+
+async def _assert_every_post_scored_one_and_one_created() -> None:
+    """After the ghost writes: the five posts updated to 1, none deleted or retitled, and the post ``get_or_create``
+    created (score 0)."""
+    scores = await _scores()
+    assert {key: scores.pop(key) for key in sorted(_ALL_POSTS)} == dict.fromkeys(_ALL_POSTS, 1)
+    assert list(scores.values()) == [0]
+    assert await SqPost.objects().filter(title="x").count() == 0
+
+
+class TestMissingSubqueryTableWritesE2E:
+    """AC-7 (writes outside a transaction): a write by filter or a ``get_or_create`` lookup whose subquery reads a
+    table that does not exist reads it as empty — in one request on 2.x and the embedded engine; on 3.x after the
+    server confirms the table is missing, sent again with the subquery empty (nothing was written: the ``LET``
+    fails before the statement runs)."""
+
+    async def test_3x_sends_the_write_again_with_the_subquery_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with subquery_db("ws") as client:
+            if await _line(client) < 3:
+                pytest.skip("SurrealDB 3.x only: 2.x reads a missing subquery table as empty in one request")
+            await _seed()
+            calls = _record_queries(monkeypatch, client)
+            assert await SqPost.objects().filter(author__not_in=_ghost()).bulk_update(score=1) == 5
+            _assert_probed_then_sent_again(calls)
+            calls.clear()
+            assert await SqPost.objects().filter(author__in=_ghost()).bulk_delete() == 0
+            _assert_probed_then_sent_again(calls)
+            calls.clear()
+            assert await SqPost.objects().filter(author__in=_ghost()).patch(_RETITLE) == 0
+            _assert_probed_then_sent_again(calls)
+            calls.clear()
+            _, created = await SqPost.objects().get_or_create(author__in=_ghost(), title="g")
+            assert created is True
+            assert calls[:3] == [
+                (
+                    "{ LET $_sq0 = (SELECT VALUE id FROM sq_ghost); "
+                    "(SELECT * FROM sq_post WHERE author IN $_sq0 AND title = $_f0 LIMIT 2) };",
+                    {"_f0": "g"},
+                ),
+                _PROBE_SQ_GHOST,
+                ("{ LET $_sq0 = []; (SELECT * FROM sq_post WHERE author IN $_sq0 AND title = $_f0 LIMIT 2) };", {"_f0": "g"}),
+            ]
+            await _assert_every_post_scored_one_and_one_created()
+
+    @pytest.mark.parametrize("kind", ["mem", "ws"])
+    async def test_2x_reads_it_as_empty_in_one_request(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with subquery_db(kind) as client:
+            if await _line(client) >= 3:
+                pytest.skip("SurrealDB 2.x and the embedded engine only: 3.x raises, and the ORM sends again")
+            await _seed()
+            calls = _record_queries(monkeypatch, client)
+            assert await SqPost.objects().filter(author__not_in=_ghost()).bulk_update(score=1) == 5
+            assert await SqPost.objects().filter(author__in=_ghost()).bulk_delete() == 0
+            assert await SqPost.objects().filter(author__in=_ghost()).patch(_RETITLE) == 0
+            assert len(calls) == 3
+            _, created = await SqPost.objects().get_or_create(author__in=_ghost(), title="g")
+            assert created is True
+            assert not any(_EMPTY_LET in statement for statement, _ in calls), calls
+            await _assert_every_post_scored_one_and_one_created()
