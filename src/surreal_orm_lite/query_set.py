@@ -22,6 +22,7 @@ from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import SurrealFunc, Var
 from .geo import GeoDistance, GeometryPoint
 from .live import LiveModelStream, LiveStream, ReconnectCallback, missing_table_error, require_websocket
+from .model_base import _snapshot_moment
 from .q import Q
 from .surql_literal import inline_variables
 from .types import Duration
@@ -1176,7 +1177,8 @@ class QuerySet:
 
         Raises:
             SurrealDbError: an edge id that already exists, edges the ``PERMISSIONS`` refused, or
-                any other refusal of an edge batch by the server.
+                any other refusal of an edge batch by the server; a model read with ``as_of()``
+                (a read-only snapshot) in ``models``, before any call (v0.26.0).
             SurrealDbNotFoundError: an endpoint of an ``ENFORCED`` relation that does not exist.
             ValueError: an edge id that is a ``RecordID`` of another table, or a ``bool``.
 
@@ -1191,6 +1193,10 @@ class QuerySet:
             ])  # one insert_relation() round-trip
         """
         self._reject_time_travel("bulk_create()")
+        for model in models:
+            moment = _snapshot_moment(model) if isinstance(model, BaseSurrealModel) else None
+            if moment is not None:
+                raise SurrealDbError(_time_travel.snapshot_write_refused(type(model).__name__, "bulk_create()", moment))
         if not models:
             return []
 

@@ -12,7 +12,7 @@ import enum
 import inspect
 import itertools
 import pickle
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,7 @@ from pydantic import PrivateAttr
 from surrealdb import RecordID
 
 from surreal_orm_lite import (
+    AuthenticatedUserMixin,
     BaseSurrealEdge,
     BaseSurrealModel,
     Count,
@@ -38,6 +39,9 @@ from surreal_orm_lite import (
     SurrealDbNotFoundError,
     SurrealFunc,
     _sdk,
+    pre_delete,
+    pre_save,
+    pre_update,
     time_travel,
 )
 from surreal_orm_lite import embedded as embedded_module
@@ -88,6 +92,16 @@ class SnapMine(BaseSurrealModel):
     id: str | None = None
     n: int = 0
     _mine: int = PrivateAttr(default=0)
+
+
+class SnapUser(AuthenticatedUserMixin, BaseSurrealModel):
+    """An auth model: the mixin's classmethod ``refresh(refresh_token)`` shadows the instance ``refresh()``."""
+
+    model_config = SurrealConfigDict(table_name="SnapUser")
+
+    id: str | None = None
+    email: str = ""
+    password: str = ""
 
 
 M2020 = datetime(2020, 6, 1, tzinfo=UTC)
@@ -1232,6 +1246,269 @@ class TestPicklesFromV025E2E:
         restored = pickle.loads(pickle.dumps(snapshot))
         assert _snapshot_moment(restored) == M2021
         assert restored.model_dump() == snapshot.model_dump()
+
+
+# --- read-only snapshots (AC-11, D5) ------------------------------------------------------------------
+
+#: Every instance write (spec §5.4), named as T9 names it, called on a snapshot with a transaction or none.
+_SNAPSHOT_WRITES: list[tuple[str, str, Callable[[Any, Any], Awaitable[Any]]]] = [
+    ("save", "save()", lambda s, tx: s.save(tx=tx)),
+    ("update", "update()", lambda s, tx: s.update(tx=tx)),
+    ("merge", "merge()", lambda s, tx: s.merge(tx=tx, n=1)),
+    ("patch", "patch()", lambda s, tx: s.patch([{"op": "replace", "path": "/n", "value": 1}], tx=tx)),
+    ("upsert", "upsert()", lambda s, tx: s.upsert(tx=tx)),
+    ("delete", "delete()", lambda s, tx: s.delete(tx=tx)),
+    ("atomic_append", "atomic_append()", lambda s, tx: s.atomic_append("tags", "x", tx=tx)),
+    ("atomic_remove", "atomic_remove()", lambda s, tx: s.atomic_remove("tags", "x", tx=tx)),
+    ("atomic_set_add", "atomic_set_add()", lambda s, tx: s.atomic_set_add("tags", "x", tx=tx)),
+    ("atomic_increment", "atomic_increment()", lambda s, tx: s.atomic_increment("n", tx=tx)),
+    ("atomic_append_many", "atomic_append_many()", lambda s, tx: s.atomic_append_many("tags", ["x"], tx=tx)),
+    ("atomic_set_add_many", "atomic_set_add_many()", lambda s, tx: s.atomic_set_add_many("tags", ["x"], tx=tx)),
+    ("atomic_remove_many", "atomic_remove_many()", lambda s, tx: s.atomic_remove_many("tags", ["x"], tx=tx)),
+    ("relate", "relate()", lambda s, tx: s.relate("likes", SnapAuthor(id="z"), tx=tx)),
+    ("relate-typed", "relate()", lambda s, tx: s.relate(SnapBought, SnapAuthor(id="z"), tx=tx)),
+    ("remove_relation", "remove_relation()", lambda s, tx: s.remove_relation("likes", SnapAuthor(id="z"), tx=tx)),
+    ("remove_all_relations", "remove_all_relations()", lambda s, tx: s.remove_all_relations("likes", tx=tx)),
+]
+
+#: The SDK's write methods: a snapshot write must reach none of them.
+_CLIENT_WRITES = ("create", "insert", "insert_relation", "update", "merge", "patch", "upsert", "delete")
+
+
+def _record_writes(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[str]:
+    """Record the name of each SDK write method *client* calls from now on, then run it as usual.
+
+    Patched on the client's class and keyed on ``id(client)``, as ``_record_queries()`` does.
+    """
+    calls: list[str] = []
+    cls = type(client)
+    owner = id(client)
+
+    def recording(name: str, real: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
+        async def method(self: Any, *args: Any, **kwargs: Any) -> Any:
+            if id(self) == owner:
+                calls.append(name)
+            return await real(self, *args, **kwargs)
+
+        return method
+
+    for name in _CLIENT_WRITES:
+        monkeypatch.setattr(cls, name, recording(name, getattr(cls, name)))
+    return calls
+
+
+@contextlib.contextmanager
+def _pre_signals(model: type[BaseSurrealModel]) -> Iterator[list[str]]:
+    """Count the ``pre_save``/``pre_update``/``pre_delete`` calls for *model*; the handlers leave on exit."""
+    fired: list[str] = []
+
+    async def on_save(sender: type, **kwargs: Any) -> None:
+        fired.append("pre_save")
+
+    async def on_update(sender: type, **kwargs: Any) -> None:
+        fired.append("pre_update")
+
+    async def on_delete(sender: type, **kwargs: Any) -> None:
+        fired.append("pre_delete")
+
+    pre_save.connect(model)(on_save)
+    pre_update.connect(model)(on_update)
+    pre_delete.connect(model)(on_delete)
+    try:
+        yield fired
+    finally:
+        pre_save.disconnect(on_save, model)
+        pre_update.disconnect(on_update, model)
+        pre_delete.disconnect(on_delete, model)
+
+
+class _UntouchableTx:
+    """A transaction a snapshot write must never reach: any use of it fails the test."""
+
+    def __getattr__(self, name: str) -> Any:
+        pytest.fail(f"the transaction was used ({name})")
+
+
+class _ReadingTx:
+    """An interactive transaction whose reads answer *rows*: ``refresh(tx=)``'s branch, without a 3.x server."""
+
+    is_interactive = True
+
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self.rows = rows
+
+    async def run_read(self, statement: str, variables: dict[str, Any]) -> list[dict[str, Any]]:
+        return self.rows
+
+
+#: ``SnapUser:u`` created in 2020 with an old e-mail, changed now (one statement per ``client.query()``).
+_USER_HISTORY = (
+    "CREATE SnapUser:u SET email='old@x', password='p' VERSION d'2020-01-01T00:00:00Z';",
+    "UPDATE SnapUser:u SET email='new@x';",
+)
+
+
+class TestSnapshotWritesE2E:
+    """AC-11: an instance read with ``as_of()`` is a read-only snapshot until ``refresh()``; a past state is restored
+    through a new instance.
+
+    Every write raises T9 before any signal, transaction or request. Every marker assertion reads it with
+    ``_snapshot_moment()`` (P1).
+    """
+
+    @pytest.mark.parametrize("in_tx", [False, True], ids=["no-tx", "tx"])
+    @pytest.mark.parametrize(("name", "method", "write"), _SNAPSHOT_WRITES, ids=[row[0] for row in _SNAPSHOT_WRITES])
+    async def test_every_write_is_refused(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        in_tx: bool,
+        name: str,
+        method: str,
+        write: Callable[[Any, Any], Awaitable[Any]],
+    ) -> None:
+        async with history_db(tmp_path) as client:
+            snapshot = await Snap.objects().as_of(M2021).get("a")
+            calls = _record_queries(monkeypatch, client)
+            writes = _record_writes(monkeypatch, client)
+            refused = pytest.raises(SurrealDbError, match=r"cannot run on an instance read with as_of\(\)")
+            with _pre_signals(Snap) as fired, refused as info:
+                await write(snapshot, _UntouchableTx() if in_tx else None)
+            assert str(info.value) == time_travel.snapshot_write_refused("Snap", method, M2021)
+            assert fired == []
+            assert calls == []
+            assert writes == []
+            assert _snapshot_moment(snapshot) == M2021
+            current = await Snap.objects().get("a")
+        assert (current.n, current.tags) == (10, [])
+
+    async def test_bulk_create_refuses_a_snapshot(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        async with history_db(tmp_path) as client:
+            snapshot = await Snap.objects().as_of(M2021).get("a")
+            calls = _record_queries(monkeypatch, client)
+            writes = _record_writes(monkeypatch, client)
+            with pytest.raises(SurrealDbError, match=r"read with as_of\(\)") as info:
+                await Snap.objects().bulk_create([Snap(id="new", n=5), snapshot])
+            assert str(info.value) == time_travel.snapshot_write_refused("Snap", "bulk_create()", M2021)
+            assert calls == []
+            assert writes == []
+            with pytest.raises(SurrealDbNotFoundError):
+                await Snap.objects().get("new")
+
+    async def test_a_copy_is_a_snapshot(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path):
+            snapshot = await Snap.objects().as_of(M2021).get("a")
+            copy = snapshot.model_copy()
+            assert _snapshot_moment(copy) == M2021
+            with pytest.raises(SurrealDbError) as info:
+                await copy.save()
+            assert str(info.value) == time_travel.snapshot_write_refused("Snap", "save()", M2021)
+
+    async def test_a_pickled_snapshot_stays_a_snapshot(self, tmp_path: Path) -> None:
+        """AC-11 (b)'s last sentence: unlike a v0.25.x pickle, a v0.26.0 snapshot unpickles as a snapshot."""
+        async with history_db(tmp_path):
+            snapshot = await Snap.objects().as_of(M2021).get("a")
+            restored = pickle.loads(pickle.dumps(snapshot))
+            assert _snapshot_moment(restored) == M2021
+            with pytest.raises(SurrealDbError) as info:
+                await restored.save()
+            assert str(info.value) == time_travel.snapshot_write_refused("Snap", "save()", M2021)
+
+    async def test_refresh_turns_it_into_the_current_record(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path):
+            snapshot = await Snap.objects().as_of(M2020).get("a")
+            assert (snapshot.n, _snapshot_moment(snapshot)) == (1, M2020)
+            await snapshot.refresh()
+            assert (snapshot.n, _snapshot_moment(snapshot)) == (10, None)
+            await snapshot.merge(n=7)
+            assert (await Snap.objects().get("a")).n == 7
+
+    async def test_refresh_of_a_record_deleted_since(self, tmp_path: Path) -> None:
+        """The existing error, and the instance stays a snapshot."""
+        async with history_db(tmp_path):
+            snapshot = await Snap.objects().as_of(M2021).get("b")
+            with pytest.raises(SurrealDbError, match="Can't refresh data, no record found."):
+                await snapshot.refresh()
+        assert _snapshot_moment(snapshot) == M2021
+
+    async def test_refresh_in_a_transaction(self, tmp_path: Path) -> None:
+        """``refresh(tx=)`` clears the marker too, and keeps it when the transaction finds no record."""
+        async with history_db(tmp_path):
+            snapshot = await Snap.objects().as_of(M2020).get("a")
+            gone = await Snap.objects().as_of(M2021).get("b")
+        row = {"id": RecordID("Snap", "a"), "name": "Ada", "n": 10, "g": "x"}
+        await snapshot.refresh(tx=_ReadingTx([row]))
+        assert (snapshot.n, _snapshot_moment(snapshot)) == (10, None)
+        with pytest.raises(SurrealDbError, match="Can't refresh data, no record found."):
+            await gone.refresh(tx=_ReadingTx([]))
+        assert _snapshot_moment(gone) == M2021
+
+    async def test_restore_a_live_record_with_update(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path):
+            old = await Snap.objects().as_of(M2020).get("a")
+            await Snap(**old.model_dump()).update()
+            assert (await Snap.objects().get("a")).n == 1
+
+    async def test_undelete_with_save(self, tmp_path: Path) -> None:
+        async with history_db(tmp_path):
+            old_b = await Snap.objects().as_of(M2021).get("b")
+            await Snap(**old_b.model_dump()).save()
+            current = await Snap.objects().get("b")
+        assert (current.name, current.n, _snapshot_moment(current)) == ("Bob", 2, None)
+
+    async def test_upsert_restores_both(self, tmp_path: Path) -> None:
+        """``upsert()`` restores a past state whether the record still exists (a) or was deleted since (b)."""
+        async with history_db(tmp_path):
+            old_a = await Snap.objects().as_of(M2020).get("a")
+            old_b = await Snap.objects().as_of(M2021).get("b")
+            await Snap(**old_a.model_dump()).upsert()
+            await Snap(**old_b.model_dump()).upsert()
+            assert _pairs(await Snap.objects().order_by("n").exec()) == [("a", 1), ("b", 2), ("c", 3)]
+
+    async def test_a_snapshot_is_never_equal_to_the_current_instance(self, tmp_path: Path) -> None:
+        """a's last write is 2021-01-01: same fields at M2021 and now, yet ``==`` compares the marker too."""
+        async with history_db(tmp_path):
+            snapshot_a = await Snap.objects().as_of(M2021).get("a")
+            current_a = await Snap.objects().get("a")
+        assert snapshot_a != current_a
+        assert snapshot_a.model_dump() == current_a.model_dump()
+
+    async def test_an_auth_model_refreshes_through_the_base_class(self, tmp_path: Path) -> None:
+        """On an ``AuthenticatedUserMixin`` model ``refresh`` is the mixin's token exchange: the base class's one."""
+        async with history_db(tmp_path) as client:
+            for statement in _USER_HISTORY:
+                await client.query(statement)
+            snap = await SnapUser.objects().as_of(M2021).get("u")
+            assert (snap.email, _snapshot_moment(snap)) == ("old@x", M2021)
+            with pytest.raises(SurrealDbError) as info:
+                await snap.save()
+            assert str(info.value) == time_travel.snapshot_write_refused("SnapUser", "save()", M2021)
+            await BaseSurrealModel.refresh(snap)
+            assert (snap.email, _snapshot_moment(snap)) == ("new@x", None)
+
+    async def test_an_edge_snapshot(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        async with embedded_database(_versioned_url(tmp_path)) as client:
+            alice = await SnapAuthor(id="alice").save()
+            widget = await SnapAuthor(id="widget").save()
+            await SnapBought(in_=alice, out=widget, quantity=1).save()
+            (snapshot,) = await SnapBought.objects().as_of(MAX_MOMENT).filter(in_=alice).exec()
+            assert _snapshot_moment(snapshot) == MAX_MOMENT
+            calls = _record_queries(monkeypatch, client)
+            writes = _record_writes(monkeypatch, client)
+            for method, write in [
+                ("save()", snapshot.save),
+                ("merge()", lambda: snapshot.merge(quantity=3)),
+                ("delete()", snapshot.delete),
+            ]:
+                with pytest.raises(SurrealDbError) as info:
+                    await write()
+                assert str(info.value) == time_travel.snapshot_write_refused("SnapBought", method, MAX_MOMENT)
+            with pytest.raises(SurrealDbError) as info:
+                await SnapBought.objects().bulk_create([snapshot])
+            assert str(info.value) == time_travel.snapshot_write_refused("SnapBought", "bulk_create()", MAX_MOMENT)
+            assert calls == []
+            assert writes == []
+            assert [bought.quantity for bought in await SnapBought.objects().exec()] == [1]
 
 
 # --- fetch() under as_of(), dispatched by line (AC-10, D6) ---------------------------------------------
