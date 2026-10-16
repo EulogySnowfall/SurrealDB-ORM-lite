@@ -992,6 +992,7 @@ class TestServerClientsUntouchedE2E:
                         else:
                             async with SurrealDBConnectionManager():
                                 pass
+                        assert SurrealDBConnectionManager.is_connected()  # the loop keeps its server client
                         assert await Person.objects().count() == 0  # the engine was closed: a new, empty one
 
                     assert await SurrealDBConnectionManager.get_client() is server

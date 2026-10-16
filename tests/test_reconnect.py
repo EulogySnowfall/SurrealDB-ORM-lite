@@ -1206,6 +1206,33 @@ class TestLostIdentityE2E:
             assert await Reconnected.objects().all() == []
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("choice", ["authenticate", "signup", "invalidate"])
+    async def test_every_identity_call_on_the_server_is_an_explicit_choice(self, choice: str) -> None:
+        """Like ``signin()``, the other connection-level identity calls on the server end the state: each one is
+        the application choosing an identity."""
+        from surreal_orm_lite.exceptions import SurrealDbAuthenticationError
+
+        async with proxied() as proxy, record_user(store=False):
+            variables = {"email": f"{uuid4().hex}@example.test"}
+            token = (await SurrealDBConnectionManager.signup(access=OWNED_ACCESS, variables=variables, store=False)).access
+            client = await SurrealDBConnectionManager.get_client()
+            proxy.cut()
+            await _wait_dead(client)
+            with pytest.raises(SurrealDbAuthenticationError, match="does not store"):
+                await Reconnected.objects().all()
+
+            if choice == "authenticate":
+                await SurrealDBConnectionManager.authenticate(token)
+                me = await SurrealDBConnectionManager.info()
+                assert me is not None and me["email"] == variables["email"]
+            elif choice == "signup":
+                await SurrealDBConnectionManager.signup(access=OWNED_ACCESS, variables={"email": f"{uuid4().hex}@example.test"})
+            else:
+                await SurrealDBConnectionManager.invalidate()
+            assert await Reconnected.objects().all() == []
+            await SurrealDBConnectionManager.get_client()  # no longer refused
+
+    @pytest.mark.asyncio
     async def test_a_stored_identity_is_still_replaced_transparently(self) -> None:
         async with proxied() as proxy, record_user(store=True) as user_id:
             client = await SurrealDBConnectionManager.get_client()
