@@ -7,17 +7,18 @@ import os
 import typing
 import warnings
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
-from datetime import timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from types import UnionType
 from typing import TYPE_CHECKING, Any, Self, TypeVar, overload
 
 import pydantic
-from pydantic import BaseModel, ConfigDict, ModelWrapValidatorHandler, TypeAdapter, model_validator
+from pydantic import BaseModel, ConfigDict, ModelWrapValidatorHandler, PrivateAttr, TypeAdapter, model_validator
 from pydantic_core import ValidationError
 
 from . import encoding as _encoding
 from . import geo as _geo
+from . import time_travel as _time_travel
 from ._sdk import NotFoundError, RecordID, SdkDuration, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
@@ -553,6 +554,17 @@ def _own_annotation_names(cls: type) -> set[str]:
     return set(annotationlib.get_annotations(cls, format=annotationlib.Format.STRING))
 
 
+def _snapshot_moment(instance: BaseModel) -> datetime | None:
+    """The moment a time-travel read (``QuerySet.as_of()``) returned *instance* at; ``None`` for a current record (v0.26.0).
+
+    The only reader of the private marker ``_surreal_as_of``: never read ``instance._surreal_as_of`` itself. An
+    instance pickled by v0.25.x, whose models had no private attribute, may carry ``__pydantic_private__ = None``
+    (``BaseSurrealModel.__setstate__`` repairs it when it is unpickled, but not one built otherwise), and
+    Pydantic's ``__getattr__`` then raises ``TypeError`` on the attribute instead of answering.
+    """
+    return (instance.__pydantic_private__ or {}).get("_surreal_as_of")
+
+
 class SurrealConfigDict(ConfigDict, total=False):
     """
     SurrealConfigDict is a configuration dictionary for SurrealDB models.
@@ -621,6 +633,49 @@ class BaseSurrealModel(BaseModel):
     The internal marker the write paths, ``relate()`` and live hydration test to tell an edge
     model from a node, so they need not import ``edge.py`` (which imports this module).
     """
+
+    _surreal_as_of: datetime | None = PrivateAttr(default=None)
+    """The moment a time-travel read (``QuerySet.as_of()``) returned this instance at; ``None`` for a current record (v0.26.0).
+
+    Set by the QuerySet's time-travel reads only, on the instances they return and on the record models nested
+    in their fields, such as a link ``fetch()`` resolves into a model-typed field (``QuerySet._mark_snapshots()``).
+    Read it through :func:`_snapshot_moment`, never as an attribute: an instance pickled by v0.25.x has no
+    private state. While it is set, the instance is a read-only snapshot: every write (``save()``, ``update()``,
+    ``merge()``, ``patch()``, ``upsert()``, ``delete()``, the ``atomic_*()`` methods, ``relate()``,
+    ``remove_relation()``, ``remove_all_relations()``, and ``QuerySet.bulk_create()``) raises ``SurrealDbError``
+    before any signal or request; ``refresh()`` clears it. A private attribute, so it never reaches
+    ``model_dump()`` or a write; ``model_copy()`` and ``pickle`` keep it, and Pydantic's ``==`` compares it.
+    """
+
+    def __setstate__(self, state: dict[Any, Any]) -> None:
+        """Unpickle; an instance pickled before v0.26.0 has no snapshot marker: it is a current record (v0.26.0).
+
+        v0.25.x models had no private attribute, so their pickled state holds ``__pydantic_private__: None``
+        (or, on a model declaring its own, a dict without the marker). The marker is added as ``None``: such an
+        instance equals a fresh equal one and writes as before the upgrade. A snapshot pickled by v0.26.0 keeps
+        its moment, and a model's own private attributes are kept.
+        """
+        super().__setstate__(state)
+        private = self.__pydantic_private__
+        if private is None:
+            # Pydantic's own __setstate__ sets this slot the same way (its __setattr__ refuses dunder names).
+            object.__setattr__(self, "__pydantic_private__", {"_surreal_as_of": None})
+        else:
+            private.setdefault("_surreal_as_of", None)
+
+    def _reject_snapshot_write(self, method: str) -> None:
+        """Refuse *method* (named with its ``()``) on a snapshot, an instance read with ``as_of()`` (v0.26.0).
+
+        The first statement of every instance write, so nothing runs before it: no signal, no transaction, no
+        request. The marker is read through :func:`_snapshot_moment`, the only reader (an instance pickled by
+        v0.25.x may have no private state).
+
+        Raises:
+            SurrealDbError: the instance holds the record as it was at a moment, not the current record.
+        """
+        moment = _snapshot_moment(self)
+        if moment is not None:
+            raise SurrealDbError(_time_travel.snapshot_write_refused(type(self).__name__, method, moment))
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Collect ``Computed(...)`` defaults before Pydantic builds the model.
@@ -1300,6 +1355,12 @@ class BaseSurrealModel(BaseModel):
         When ``tx`` is provided, the read participates in the transaction. This requires an
         ``InteractiveTransaction`` (WebSocket + SurrealDB 3.x); on a ``BufferedTransaction``
         (HTTP or SurrealDB 2.6.x) reads are not supported and this raises ``SurrealDbError``.
+
+        Turns a snapshot (an instance read with ``QuerySet.as_of()``, whose writes are refused) back into
+        the current record (v0.26.0). When the record has been deleted since, the existing "no record found"
+        ``SurrealDbError`` is raised and the instance stays a snapshot. On a model mixing
+        ``AuthenticatedUserMixin``, whose classmethod ``refresh(refresh_token)`` takes this name, call
+        ``BaseSurrealModel.refresh(instance)``.
         """
         if tx is not None:
             if not tx.is_interactive:
@@ -1314,6 +1375,8 @@ class BaseSurrealModel(BaseModel):
             if not isinstance(record, dict):
                 raise SurrealDbError("Can't refresh data, no record found.")
             self._apply_record(record)
+            if _snapshot_moment(self) is not None:
+                self._surreal_as_of = None
             return
         if not self.get_id():
             raise SurrealDbError("Can't refresh data, not recorded yet.")  # pragma: no cover
@@ -1332,6 +1395,8 @@ class BaseSurrealModel(BaseModel):
 
         # Update current instance with refreshed data (keep native RecordID for id)
         self._apply_record(record)
+        if _snapshot_moment(self) is not None:
+            self._surreal_as_of = None
 
     def _write_payload(self, replace: bool = False, keep: Collection[str] = ()) -> dict[str, Any]:
         """Return this instance's data for a write: no ``id``, no client-owned server column.
@@ -1758,6 +1823,7 @@ class BaseSurrealModel(BaseModel):
             values are unknown until commit, so the instance keeps its pre-save values for
             those fields — ``refresh()`` after commit if you need them.
         """
+        self._reject_snapshot_write("save()")
         self._validate_server_values(server_values, extra_vars)
         if server_values:
             self._reject_computed_writes(server_values, "save(server_values=)")
@@ -2012,6 +2078,7 @@ class BaseSurrealModel(BaseModel):
         in a transaction ``around_save`` is skipped and ``post_save`` is deferred to a
         successful commit (consistent with ``save(tx=)``).
         """
+        self._reject_snapshot_write("upsert()")
         return await self._save_with_signals(self._do_upsert, tx)
 
     async def update(self, tx: Transaction | None = None) -> Any:
@@ -2027,6 +2094,7 @@ class BaseSurrealModel(BaseModel):
         ``around_update`` is skipped (the write is deferred to commit) and
         ``post_update`` only fires after a successful commit.
         """
+        self._reject_snapshot_write("update()")
         sender = self.__class__
         data = self._write_payload(replace=True)
         record_id = self._record_id()
@@ -2171,6 +2239,7 @@ class BaseSurrealModel(BaseModel):
             >>> await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
             >>> await user.merge(last_seen=now, refresh=False)  # fire-and-forget
         """
+        self._reject_snapshot_write("merge()")
         self._reject_computed_writes(data, "merge()")
         self._validate_server_values(server_values, extra_vars)
         if server_values:
@@ -2231,6 +2300,7 @@ class BaseSurrealModel(BaseModel):
         name a field either way — ``/password`` or its column ``/password_hash`` — and are
         rewritten to the column before they are sent.
         """
+        self._reject_snapshot_write("patch()")
         validate_patch_operations(operations)
         self._reject_computed_patch(operations, "patch()")
         operations = self._columns_for_patch(operations)
@@ -2246,14 +2316,16 @@ class BaseSurrealModel(BaseModel):
         self._apply_record(record)
         return self
 
-    async def _atomic_update(self, set_expr: str, variables: dict[str, Any], tx: Transaction | None) -> Self:
+    async def _atomic_update(self, set_expr: str, variables: dict[str, Any], tx: Transaction | None, *, label: str) -> Self:
         """Run ``UPDATE $rid SET <set_expr>`` atomically and sync ``self`` with the result.
 
         Shared by the atomic helpers. ``$rid`` and every value in ``variables`` are bound
         (robust for any id type; anti-injection); only the validated ``set_expr`` is inlined.
         Non-tx and interactive-tx apply the returned row to ``self``; a buffered tx leaves
         ``self`` stale (the new value is computed server-side, unknown until commit).
+        ``label`` is the calling method's name with its ``()``, for the snapshot refusal (v0.26.0).
         """
+        self._reject_snapshot_write(label)
         record_id = self._record_id()
         if record_id is None:
             raise SurrealDbError("atomic operations require an explicit id.")
@@ -2275,7 +2347,9 @@ class BaseSurrealModel(BaseModel):
         semantics (skip if already present) use :meth:`atomic_set_add`. Emits no signals.
         """
         column = self._validate_atomic_field(field)
-        return await self._atomic_update(f"{column} = array::append({column}, $value)", {"value": value}, tx)
+        return await self._atomic_update(
+            f"{column} = array::append({column}, $value)", {"value": value}, tx, label="atomic_append()"
+        )
 
     async def atomic_remove(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
         """Atomically remove ALL occurrences of ``value`` from an array ``field``.
@@ -2285,7 +2359,9 @@ class BaseSurrealModel(BaseModel):
         but only the first on 2.6.x.) Emits no signals.
         """
         column = self._validate_atomic_field(field)
-        return await self._atomic_update(f"{column} = array::complement({column}, [$value])", {"value": value}, tx)
+        return await self._atomic_update(
+            f"{column} = array::complement({column}, [$value])", {"value": value}, tx, label="atomic_remove()"
+        )
 
     async def atomic_set_add(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
         """Atomically add ``value`` to an array ``field`` only if not already present.
@@ -2294,7 +2370,9 @@ class BaseSurrealModel(BaseModel):
         ``+=`` operator, which appends duplicates on both server lines.) Emits no signals.
         """
         column = self._validate_atomic_field(field)
-        return await self._atomic_update(f"{column} = array::add({column}, $value)", {"value": value}, tx)
+        return await self._atomic_update(
+            f"{column} = array::add({column}, $value)", {"value": value}, tx, label="atomic_set_add()"
+        )
 
     async def atomic_increment(self, field: str, amount: Decimal | int | float = 1, tx: Transaction | None = None) -> Self:
         """Atomically add ``amount`` (default 1) to a numeric ``field``.
@@ -2314,7 +2392,7 @@ class BaseSurrealModel(BaseModel):
                 f"Set the new value with merge({field}=…) instead."
             )
         column = self._validate_atomic_field(field)
-        return await self._atomic_update(f"{column} += $amount", {"amount": amount}, tx)
+        return await self._atomic_update(f"{column} += $amount", {"amount": amount}, tx, label="atomic_increment()")
 
     @staticmethod
     def _as_value_list(values: Any) -> list[Any]:
@@ -2335,7 +2413,10 @@ class BaseSurrealModel(BaseModel):
         """
         column = self._validate_atomic_field(field)
         return await self._atomic_update(
-            f"{column} = array::concat({column}, $values)", {"values": self._as_value_list(values)}, tx
+            f"{column} = array::concat({column}, $values)",
+            {"values": self._as_value_list(values)},
+            tx,
+            label="atomic_append_many()",
         )
 
     async def atomic_set_add_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
@@ -2347,7 +2428,10 @@ class BaseSurrealModel(BaseModel):
         """
         column = self._validate_atomic_field(field)
         return await self._atomic_update(
-            f"{column} = array::add({column}, $values)", {"values": self._as_value_list(values)}, tx
+            f"{column} = array::add({column}, $values)",
+            {"values": self._as_value_list(values)},
+            tx,
+            label="atomic_set_add_many()",
         )
 
     async def atomic_remove_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
@@ -2358,7 +2442,10 @@ class BaseSurrealModel(BaseModel):
         """
         column = self._validate_atomic_field(field)
         return await self._atomic_update(
-            f"{column} = array::complement({column}, $values)", {"values": self._as_value_list(values)}, tx
+            f"{column} = array::complement({column}, $values)",
+            {"values": self._as_value_list(values)},
+            tx,
+            label="atomic_remove_many()",
         )
 
     async def delete(self, tx: Transaction | None = None) -> None:
@@ -2374,6 +2461,7 @@ class BaseSurrealModel(BaseModel):
         ``around_delete`` is skipped (the write is deferred to commit) and
         ``post_delete`` only fires after a successful commit.
         """
+        self._reject_snapshot_write("delete()")
         sender = self.__class__
         record_id = self._record_id()
         if record_id is None:
@@ -2666,7 +2754,8 @@ class BaseSurrealModel(BaseModel):
             ValueError: a malformed name or ``"table:id"`` string; the fields name an endpoint
                 or a computed field (typed form).
             SurrealDbError: an unsaved source or target; the fields name an undeclared field
-                (typed form); the write is refused.
+                (typed form); the write is refused; this record was read with ``as_of()`` (a
+                read-only snapshot, v0.26.0).
             pydantic.ValidationError: the fields are invalid for the edge model (nothing
                 written).
 
@@ -2680,6 +2769,7 @@ class BaseSurrealModel(BaseModel):
             async with SurrealDBConnectionManager.transaction() as tx:
                 await user.relate(Follows, other_user, tx=tx)
         """
+        self._reject_snapshot_write("relate()")
         if isinstance(edge, type) and issubclass(edge, BaseSurrealModel) and edge.__surreal_edge__:
             fields = self._merge_edge_fields(data, edge_data, edge.to_py_field)
             return await self._relate_typed(edge, target, fields, reverse, tx)
@@ -2822,7 +2912,8 @@ class BaseSurrealModel(BaseModel):
                 another type.
             ValueError: an invalid edge name, a malformed ``"table:id"`` string, or an empty or
                 blank target.
-            SurrealDbError: an unsaved source or target.
+            SurrealDbError: an unsaved source or target; this record was read with ``as_of()`` (a
+                read-only snapshot, v0.26.0).
 
         Example::
 
@@ -2834,6 +2925,7 @@ class BaseSurrealModel(BaseModel):
             async with SurrealDBConnectionManager.transaction() as tx:
                 await user.remove_relation(Follows, other_user, tx=tx)
         """
+        self._reject_snapshot_write("remove_relation()")
         edge_name = self._edge_name(edge)
         source = self._graph_source()
         arrow, column = ("<-", "in") if reverse else ("->", "out")
@@ -2882,7 +2974,8 @@ class BaseSurrealModel(BaseModel):
         Raises:
             ValueError: an invalid direction or edge name, or an empty list.
             TypeError: an edge that is neither an edge model class nor a string.
-            SurrealDbError: an unsaved record.
+            SurrealDbError: an unsaved record, or one read with ``as_of()`` (a read-only snapshot,
+                v0.26.0).
 
         Example::
 
@@ -2892,6 +2985,7 @@ class BaseSurrealModel(BaseModel):
             async with SurrealDBConnectionManager.transaction() as tx:
                 await user.remove_all_relations(["likes", "blocks"], direction="both", tx=tx)
         """
+        self._reject_snapshot_write("remove_all_relations()")
         self._check_direction(direction)
         names = ", ".join(self._edge_names(edge))
         source = self._graph_source()

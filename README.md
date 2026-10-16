@@ -172,6 +172,7 @@ results = await User.objects().query(
 | Rich field types (datetime, date, duration, decimal, uuid, bytes, set, range) | ✅     |
 | Geospatial fields (nearby, distance, spatial lookups)                         | ✅     |
 | Embedded engine (mem://, surrealkv://) & test fixtures                        | ✅     |
+| Time travel (`as_of()`, versioned storage)                                    | ✅     |
 
 ### Supported Filter Lookups
 
@@ -2672,7 +2673,7 @@ which one is configured.
 | ------------------------------ | ---------------------------------------------------------------------------------------- | ------------------------ |
 | `mem://`, `memory://`          | ✅ in memory, gone when the connection closes                                            | ❌ (HTTP/WebSocket only) |
 | `surrealkv://<path>`           | ✅ on disk (SurrealKV)                                                                   | ❌                       |
-| `surrealkv+versioned://<path>` | ✅ on disk; behaves as `surrealkv://` until time travel (v0.26.0)                        | ❌                       |
+| `surrealkv+versioned://<path>` | ✅ on disk, keeps history: time travel with `as_of()` (section 27)                       | ❌                       |
 | `file://<path>`                | ✅ a **SurrealKV** store, not the RocksDB store `file://` means for the SurrealDB server | ❌                       |
 | `rocksdb://<path>`             | ❌ not yet supported by the official SDK (#233): the ORM raises the SDK's refusal        | ❌                       |
 
@@ -2911,6 +2912,258 @@ async with embedded_database() as client:
 - **Lite additions**: `SurrealDBConnectionManager.is_embedded()` and `embedded_database()`.
 - **`ModelFactory` and `Faker`** come in v0.39.0.
 
+### 27. Time travel (`as_of()`)
+
+Since v0.26.0 a QuerySet can read a model's records **as they were at a moment**: `as_of()` adds
+SurrealQL's `VERSION` clause to every read of the queryset. The store must keep history (see
+[Stores that keep history](#stores-that-keep-history)): the embedded engine's
+`surrealkv+versioned://` keeps it on disk, with no server.
+
+```python
+import tempfile
+
+from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager, SurrealDbNotFoundError
+
+
+class Product(BaseSurrealModel):
+    id: str | None = None
+    name: str
+    price: float
+
+
+path = tempfile.mkdtemp()
+SurrealDBConnectionManager.set_connection(
+    url=f"surrealkv+versioned://{path}/shop", namespace="shop", database="shop"
+)
+client = await SurrealDBConnectionManager.get_client()
+
+lamp = Product(id="lamp", name="Lamp", price=40.0)
+desk = Product(id="desk", name="Desk", price=250.0)
+await lamp.save()
+await desk.save()
+opening = await client.query("RETURN time::now();")  # a moment, from the database's clock
+await lamp.merge(price=30.0)
+sale = await client.query("RETURN time::now();")
+await desk.delete()
+
+then = await Product.objects().as_of(opening).order_by("name").exec()
+assert [(product.name, product.price) for product in then] == [("Desk", 250.0), ("Lamp", 40.0)]
+assert await Product.objects().as_of(sale).count() == 2
+assert await Product.objects().count() == 1
+
+# A record deleted since is still found at that moment; one created later is not.
+assert (await Product.objects().as_of(sale).get("desk")).price == 250.0
+try:
+    await Product.objects().get("desk")
+except SurrealDbNotFoundError:
+    print("no desk now")
+```
+
+#### Stores that keep history
+
+| Where the read runs                                                                               | `as_of()`                                                                                |
+| ------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Embedded `surrealkv+versioned://<path>`                                                           | ✅ (SDK 2.0.0 ignores `?versioned=true` on `surrealkv://`)                               |
+| Embedded `mem://`, `memory://`, `surrealkv://`, `file://`                                         | `SurrealDbError` before any request                                                      |
+| SurrealDB 3.x started on `surrealkv://<path>?versioned=true` or `rocksdb://<path>?versioned=true` | ✅                                                                                       |
+| SurrealDB 3.x in memory, or on `surrealkv://` or `rocksdb://` without `versioned=true`            | `SurrealDbError`: the server refuses `VERSION` (the SDK's error is its `__cause__`)      |
+| SurrealDB 2.x started on `surrealkv+versioned://<path>`                                           | ✅                                                                                       |
+| SurrealDB 2.x on RocksDB                                                                          | `SurrealDbError`: the server refuses `VERSION`                                           |
+| SurrealDB 2.x in memory or on plain `surrealkv://`                                                | no error, and the ORM cannot tell (see [below](#surrealdb-2x-without-versioned-storage)) |
+
+```bash
+surreal start --user root --pass root "surrealkv:///var/lib/surrealdb?versioned=true"  # SurrealDB 3.x
+surreal start --user root --pass root "surrealkv+versioned:///var/lib/surrealdb"       # SurrealDB 2.x
+```
+
+#### The moment
+
+`as_of()` takes a moment, "how long ago", a server expression, or `None`:
+
+```python
+from datetime import UTC, datetime, timedelta
+
+from surreal_orm_lite import Duration, SurrealFunc
+
+Product.objects().as_of(datetime(2026, 1, 1, 9, 30, tzinfo=UTC))      # an aware datetime, any time zone
+Product.objects().as_of(datetime(2026, 1, 1, 9, 30))                  # a naive one is UTC
+Product.objects().as_of("2026-01-01T09:30:00+02:00")                  # ISO-8601, parsed by the ORM
+Product.objects().as_of("2026-01-01")                                 # a date alone: midnight UTC
+Product.objects().as_of(timedelta(hours=1))                           # an hour before the database's clock
+Product.objects().as_of(Duration.parse("1h"))                         # the ORM's Duration too
+Product.objects().as_of(SurrealFunc("time::floor(time::now(), 1d)"))  # evaluated by the database
+Product.objects().variables(cutoff=opening).as_of(SurrealFunc("$cutoff"))
+Product.objects().as_of(opening).as_of(None)                          # None: the current state again
+
+assert await Product.objects().as_of(timedelta(0)).count() == 1                     # now
+assert await Product.objects().as_of(SurrealFunc("time::now() - 1h")).count() == 0  # before the shop
+```
+
+- A naive `datetime` or ISO-8601 string is UTC, as for every datetime the ORM sends; a date alone
+  is that day's midnight UTC, while a `date` object is refused (`TypeError`), and so are numbers,
+  `bool` and `bytes`. A string that is not ISO-8601 raises `ValueError`.
+- A `timedelta` or an ORM `Duration` (>= 0) means that long before the **database's** clock, and a
+  `SurrealFunc` is an expression the database evaluates to a datetime: both are resolved by the
+  database just before each read (one `RETURN` request). A `SurrealFunc` is written into that
+  `RETURN` as is: build it in your code, never from user input, and pass user values through
+  `variables()` (bound), as `$cutoff` above. `_as_of` is a reserved `variables()` name: the
+  moment is bound under it.
+- The surrealdb SDK's own `Duration` (`surrealdb.Duration`) is accepted at runtime only: the
+  annotation names the ORM's types, so a type checker flags it. `Duration(sdk_duration.elapsed)`
+  converts it.
+- Called again, the last moment wins. A moment after the last write reads the current state; a
+  moment before the table existed reads no records.
+
+**The moment must lie between 1970-01-01T00:00:00Z and 2262-04-11T23:47:16.854775Z**, the
+instants SurrealDB versions can address (nanoseconds since 1970 in a signed 64-bit integer).
+SurrealDB 2.x reads an earlier moment as the **current** state, without an error, and every line
+fails after the later one, so the ORM refuses both, on every line: an absolute moment at the call
+(`ValueError`), a duration or an expression once the database has resolved it, before the read is
+sent (`SurrealDbError`).
+
+```python
+try:
+    Product.objects().as_of(datetime(1900, 1, 1))
+except ValueError as error:
+    print(error)
+# as_of() takes a moment from 1970-01-01T00:00:00+00:00 to 2262-04-11T23:47:16.854775+00:00, the
+# instants SurrealDB versions can address (SurrealDB 2.x reads an earlier moment as the current
+# state), got 1900-01-01T00:00:00+00:00
+```
+
+#### Reads
+
+Every read of the queryset honours the moment, with `filter()`, `Q`, `nearby()`, `order_by()`,
+`limit()`, `offset()`, `select()` and `variables()`, on edge models too:
+
+| Read                                                      | Under `as_of()`                                                                            |
+| --------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `exec()`, `first()`, `get()` with filters                 | the records as they were, as snapshots (a row that does not validate comes back as a dict) |
+| `get("id")`                                               | the record as it was: found if deleted since, `SurrealDbNotFoundError` if created later    |
+| `all()`                                                   | every record as it was, as snapshots (`all()` still ignores `filter()`)                    |
+| `exists()`, `count()`, `sum()`, `avg()`, `min()`, `max()` | the values at that moment                                                                  |
+| `values(…).annotate(…)`                                   | the groups at that moment, as dicts                                                        |
+| `annotate(d=GeoDistance(…))`                              | snapshots carrying their distances                                                         |
+
+A plain `SELECT … VERSION` is wrong on both server lines, so the ORM never sends one on its own.
+SurrealDB 3.x's table reads return the records deleted before the moment, in their last state
+(so filtered counts, sums and groups count them too); SurrealDB 2.x and the embedded engine
+miscount an unfiltered `count()`. Every time-travel table read therefore also reads each record
+by its id at the moment, which is right on every versioned store:
+
+```sql
+SELECT * FROM Product WHERE (SELECT VALUE id FROM ONLY $parent.id VERSION $_as_of) != NONE VERSION $_as_of;
+```
+
+It costs about one extra point read per record scanned; a read by id (`get("lamp")`) needs no
+check. The moment is always a bound parameter.
+
+#### Snapshots
+
+The instances a time-travel read returns are **snapshots**, read-only: `save()`, `update()`,
+`merge()`, `patch()`, `upsert()`, `delete()`, the `atomic_*()` methods, `relate()`,
+`remove_relation()` and `remove_all_relations()` raise `SurrealDbError` before any signal or
+request, and `bulk_create()` refuses a snapshot in its list. To restore a past state, build a new
+instance from the snapshot:
+
+```python
+from surreal_orm_lite import SurrealDbError
+
+old_lamp = await Product.objects().as_of(opening).get("lamp")
+try:
+    await old_lamp.save()
+except SurrealDbError as error:
+    print(str(error).split(":")[0])
+# Product.save() cannot run on an instance read with as_of()
+
+# The record exists: update() writes the past state back.
+await Product(**old_lamp.model_dump()).update()
+assert (await Product.objects().get("lamp")).price == 40.0
+
+# It was deleted since: save() creates it again (an "undelete").
+old_desk = await Product.objects().as_of(sale).get("desk")
+await Product(**old_desk.model_dump()).save()
+assert await Product.objects().count() == 2
+
+# refresh() turns a snapshot back into the current record: its writes work again.
+await old_lamp.refresh()
+await old_lamp.merge(price=35.0)
+
+# A snapshot is never == the current instance, even with the same fields.
+current_desk = await Product.objects().get("desk")
+assert old_desk != current_desk and old_desk.model_dump() == current_desk.model_dump()
+```
+
+- **Auth models**: on a model mixing `AuthenticatedUserMixin`, `refresh` is the mixin's
+  token-exchange classmethod; call `await BaseSurrealModel.refresh(snapshot)`.
+- **Equality**: Pydantic compares private attributes, and the snapshot's moment is one: compare
+  `model_dump()`s.
+- **`server_fields`**: `save()` leaves them out, so an undelete by `save()` lets the server's
+  `DEFAULT` fill them again; `update()` and `upsert()` write them back.
+  `await Product(**snapshot.model_dump()).upsert()` restores the past state exactly, whether the
+  record still exists or not (not on edge models, whose `upsert()` always raises). Computed fields
+  are recomputed by the server in every case.
+- **Copies**: `model_copy()` and `pickle` keep the snapshot; an instance pickled by v0.25.x
+  unpickles as a current record.
+- **Nested records**: a record model nested in a snapshot's fields is a snapshot too, such as a
+  link `fetch()` resolves into a model-typed field (`author: Author | RecordID | None`, see
+  [Record links](#record-links)): it holds the linked record as it was. Its own `refresh()` makes
+  it the current record; the snapshot's `refresh()` re-reads that record only.
+- **Graph reads** stay available: `get_related()` and `traverse()` read the current graph.
+- When the record was deleted since, `refresh()` raises its usual `SurrealDbError` and the
+  instance stays a snapshot.
+
+#### What a time-travel queryset refuses
+
+A time-travel read is read-only and cannot be streamed: `bulk_create()`, `bulk_update()`,
+`bulk_delete()`, `patch()`, `update_or_create()`, `get_or_create()`, `delete_table()`, `query()`,
+`live()`, `watch()` and `changes()` raise `SurrealDbError` on a queryset with `as_of()`, before
+any request. History cannot join a transaction: `Model.objects(tx=...).as_of(...)` raises at the
+call. On the embedded engine, a URL that keeps no history raises before any request, naming
+`surrealkv+versioned://`.
+
+#### SurrealDB 2.x without versioned storage
+
+A SurrealDB 2.x server in memory or on plain SurrealKV answers a time-travel read **without an
+error**: it returns only the records last written at or before the moment, in their **current**
+state, and nothing tells the ORM which storage the server runs, so it cannot tell. Start 2.x with
+`surrealkv+versioned://` for time travel. A 3.x server without versioned storage refuses the read
+(`SurrealDbError`), and so does 2.x on RocksDB.
+
+#### Record links
+
+`fetch()` resolves links as they were on SurrealDB 3.x. SurrealDB 2.x (servers, and the embedded
+engine of the surrealdb SDK 2.x) resolves them to their current state, so on 2.x the reads that
+return the fetched records (`exec()`, `first()`, `get()` without an id) raise `SurrealDbError`;
+the other reads ignore `fetch()`, as without `as_of()`. Read the linked records with their own
+`as_of()` query. On 3.x, a link fetched into a model-typed field is a snapshot too, read-only. A
+dotted path through a link (`author.name`) in `filter()`, `select()`, `order_by()` or `values()`
+reads the linked record as it was on 3.x and as it is now on 2.x.
+
+#### Writing history at a past moment
+
+The ORM writes now. A raw query can write a record at a past moment, one statement per
+`client.query()` call:
+
+```python
+await client.query("CREATE Product:stool SET name = 'Stool', price = 15.0 VERSION d'2020-01-01T00:00:00Z';")
+# SurrealDB 2.x and the embedded engine: stored at that moment, readable with as_of()
+assert await Product.objects().as_of(datetime(2021, 1, 1, tzinfo=UTC)).count() == 1
+```
+
+SurrealDB 3.x accepts the statement, but the record is not readable at that moment (the table did
+not exist then), and a `CREATE` of an id that exists raises.
+
+#### Coming from the full SurrealDB-ORM
+
+- **The full ORM has no time travel** (no `VERSION` support): `as_of()`, snapshots and their
+  errors are lite additions.
+- **`as_of()`, not `version()`**: the name is temporal SQL's `AS OF`. SurrealQL's keyword is
+  `VERSION` and the JavaScript SDK has `select().version()`, but on the Python SDK's connection
+  `version()` returns the server's version.
+- **A snapshot is never `==` the current instance**, even with identical fields: compare
+  `model_dump()`s.
+
 ---
 
 ## Configuration Options
@@ -3025,7 +3278,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -3121,6 +3374,11 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | Geometry fields, `nearby()`, `GeoDistance`, the `inside` / `outside` / `intersects` lookups                                            | same on both lines: stored as native geometries, read back as the declared class, distances in metres identical                                                               | same on both lines (verified on 3.3.4 and 3.1.5); an SDK geometry SurrealDB refuses raises `ValueError` before anything is sent                                                     | v0.24.0                              |
 | A `Decimal` coordinate written with an exponent in an SDK geometry                                                                     | raw SDK value: refused, or a wrong value for a long one. ORM: sent in fixed point, stored with its value                                                                      | raw SDK value: stored, a long one with a wrong value. ORM: sent in fixed point, stored with its value                                                                               | v0.24.0                              |
 | A GeoJSON dict written to an untyped field (`Any`, `dict`)                                                                             | stored as a plain object, not a geometry: `nearby()` skips it, `geo::*` functions and `geometry<…>` columns refuse it; declare a geometry field                               | same on both lines                                                                                                                                                                  | pre-existing (documented in v0.24.0) |
+| Time travel (`as_of()`) on a server without versioned storage                                                                          | no error, and the ORM cannot tell: in memory or on plain SurrealKV, only records last written at or before the moment, in their current state. RocksDB: `SurrealDbError`      | `SurrealDbError` (the server refuses `VERSION`)                                                                                                                                     | v0.26.0                              |
+| Time travel on versioned storage: records deleted since, counts and aggregates                                                         | right (the ORM's per-record check also corrects the server's unfiltered `count()`)                                                                                            | right (the ORM's per-record check hides the records deleted before the moment that the server's table reads return)                                                                 | v0.26.0                              |
+| `fetch()` and dotted paths through record links under `as_of()`                                                                        | `fetch()` refused (`SurrealDbError`) by `exec()`, `first()`, `get()` without an id; dotted paths in `filter()`, `select()`, `order_by()`, `values()` read the current value   | as they were at the moment                                                                                                                                                          | v0.26.0                              |
+| Writing history with a raw `CREATE … VERSION`                                                                                          | stored at that moment, readable with `as_of()`                                                                                                                                | accepted, not readable at that moment (the table did not exist then)                                                                                                                | v0.26.0                              |
+| `as_of()` moment before 1970-01-01 or after 2262-04-11T23:47:16.854775Z                                                                | refused by the ORM before any read (`ValueError`; `SurrealDbError` for a duration or expression resolving there): the server reads an earlier moment as the current state     | refused by the ORM before any read, same errors: the server would fail with an internal error                                                                                       | v0.26.0                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
@@ -3129,7 +3387,8 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 
 The official SDK's in-process engine ([section 26](#26-embedded-engine-and-test-fixtures)) is a
 line of its own: SurrealDB core 2.3.10, bundled with SDK 2.0.0. Rows measured with SDK 2.0.0 on
-`mem://`, and on the 2.7.0 and 3.3.4 servers. Capabilities not listed behave as on a 2.x server.
+`mem://` (the time-travel row on `surrealkv+versioned://`), and on the 2.7.0 and 3.3.4 servers.
+Capabilities not listed behave as on a 2.x server.
 
 | ORM capability                                                      | Embedded engine (SDK 2.0.0)                                                                                                                                                                                                                                                                                                                           | Servers (2.x and 3.x)                                                                                           | Since   |
 | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | ------- |
@@ -3149,6 +3408,7 @@ line of its own: SurrealDB core 2.3.10, bundled with SDK 2.0.0. Rows measured wi
 | `invalidate()`                                                      | back to the in-process owner                                                                                                                                                                                                                                                                                                                          | signs in again as the configured user                                                                           | v0.25.0 |
 | Reading a table that does not exist                                 | `[]`, raw queries included (as on 2.x)                                                                                                                                                                                                                                                                                                                | the ORM reads `[]`; a raw query on 3.x raises `NotFoundError`                                                   | v0.25.0 |
 | Parse errors                                                        | bare `RuntimeError` (the DDL helpers raise `SurrealDbError`)                                                                                                                                                                                                                                                                                          | the SDK's error classes                                                                                         | v0.25.0 |
+| Time travel (`as_of()`)                                             | `surrealkv+versioned://` only (`?versioned=true` is ignored by SDK 2.0.0); any other URL → `SurrealDbError` before any request; `fetch()` refused (2.x core)                                                                                                                                                                                          | versioned storage required (see the 2.x/3.x table)                                                              | v0.26.0 |
 | Everything else                                                     | CRUD, QuerySet, aggregations, relations, typed edges, rich and geo fields, upsert/patch, server values, computed fields, stored functions, signals: the same as on a 2.x server                                                                                                                                                                       | unchanged                                                                                                       | v0.25.0 |
 
 ---
@@ -3189,7 +3449,8 @@ Contributions are welcome! Please:
 | v0.23.0           | Rich field types                                     | ✅ Released |
 | v0.24.0           | Geospatial fields                                    | ✅ Released |
 | v0.25.0           | Embedded test engine                                 | ✅ Released |
-| v0.26.0 – v0.29.0 | Tier 2 — Extended (time travel, subqueries)          | 📋 Planned  |
+| v0.26.0           | Time travel (versioned storage)                      | ✅ Released |
+| v0.27.0 – v0.29.0 | Tier 2 — Extended (subqueries, cache, multi-db)      | 📋 Planned  |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)     | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | 📋 Planned  |
@@ -3239,6 +3500,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Rich field types              | ✅ v0.23.0                                                            | ✅                               |
 | Geospatial Fields             | ✅ v0.24.0                                                            | ✅                               |
 | Embedded engine               | ✅ v0.25.0 (mem://, surrealkv://; rocksdb:// #233)                    | ❌ (HTTP/WebSocket only)         |
+| Time travel (`VERSION`)       | ✅ v0.26.0 (`as_of()`)                                                | ❌                               |
 | Subqueries & Query Cache      | v0.27 – v0.28                                                         | ✅                               |
 | Multi-database                | v0.29.0                                                               | ✅                               |
 | Schema Introspection          | v0.30.0                                                               | ✅                               |

@@ -34,7 +34,8 @@
 | v0.23.0           | Tier 2 — Rich field types                            | Done    |
 | v0.24.0           | Tier 2 — Geospatial fields                           | Done    |
 | v0.25.0           | Tier 2 — Embedded test engine                        | Done    |
-| v0.26.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 4 minors         | Planned |
+| v0.26.0           | Tier 2 — Time travel (versioned storage)             | Done    |
+| v0.27.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 3 minors         | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | Planned |
@@ -86,7 +87,7 @@ pieces stay out.
 | Rich field types                       | native `Datetime`/`Duration`/`Decimal`/`Range`/`Uuid` | ✅ v0.23.0     |
 | Geospatial fields (`nearby()`)         | native `Geometry` + `geo::*`                          | ✅ v0.24.0     |
 | Embedded / in-memory test engine       | `mem://` / `surrealkv://` ²                           | ✅ v0.25.0     |
-| Versioned storage (time-travel)        | `surrealkv+versioned://` ²                            | v0.26.0        |
+| Versioned storage (time-travel)        | `surrealkv+versioned://` ²                            | ✅ v0.26.0     |
 | Subqueries                             | nested `SELECT` via `query()`                         | v0.27.0        |
 | Query cache (TTL)                      | client-side cache (SDK-independent)                   | v0.28.0        |
 | Multi-database                         | multiple `AsyncSurreal` instances                     | v0.29.0        |
@@ -150,7 +151,7 @@ moves it to the `surrealdb[embedded]` extra.
 | Native typed relations        | yes        | ✅ v0.22.0                  |
 | Rich field types              | yes        | ✅ v0.23.0                  |
 | Geospatial fields             | yes        | ✅ v0.24.0                  |
-| Embedded / versioned engine   | no         | v0.25 – v0.26               |
+| Embedded / versioned engine   | no         | ✅ v0.25 – v0.26            |
 | Subqueries                    | yes        | v0.27.0                     |
 | Query cache (TTL)             | yes        | v0.28.0                     |
 | Multi-database                | yes        | v0.29.0                     |
@@ -176,7 +177,7 @@ official SDK's in-process engine from v0.25.0.
 | ------------------------------ | ---------------------------------------------------------------------------------------- | ------------------------ |
 | `mem://`, `memory://`          | ✅ in memory, gone when the connection closes                                            | ❌ (HTTP/WebSocket only) |
 | `surrealkv://<path>`           | ✅ on disk (SurrealKV)                                                                   | ❌                       |
-| `surrealkv+versioned://<path>` | ✅ on disk; behaves as `surrealkv://` until time travel (v0.26.0)                        | ❌                       |
+| `surrealkv+versioned://<path>` | ✅ on disk, keeps history: time travel with `as_of()` (README section 27)                | ❌                       |
 | `file://<path>`                | ✅ a **SurrealKV** store, not the RocksDB store `file://` means for the SurrealDB server | ❌                       |
 | `rocksdb://<path>`             | ❌ not yet supported by the official SDK (#233)                                          | ❌                       |
 
@@ -495,6 +496,28 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   table of its own in the README. Server lines unchanged (2.7.0 and 3.3.4, 3.1.5 retro). Time travel
   on `surrealkv+versioned://` is v0.26.0; the SDK 3.0 engine (3.x core, `surrealdb[embedded]`) is #205
 
+### Version 0.26.0 — Time travel (versioned storage)
+
+- `QuerySet.as_of(at)` reads a model's records as they were at a moment: SurrealQL's `VERSION`
+  clause through `query()` (no SDK method takes a version), the moment always bound. It takes a
+  `datetime` (naive = UTC), an ISO-8601 string, a `timedelta` or `Duration` before the database's
+  clock, a `SurrealFunc` the database evaluates, or `None`; moments SurrealDB versions cannot
+  address (before 1970, after 2262-04-11) are refused on every line
+- Every read honours it (`exec()`, `first()`, `get()`, `all()`, `exists()`, `count()` and the
+  aggregates, `values().annotate()`, `GeoDistance`), and each table read checks every record by
+  its id at the moment: a plain `SELECT … VERSION` returns records deleted before the moment on
+  3.x and miscounts an unfiltered `count()` on 2.x and the embedded engine
+- The instances it returns are read-only snapshots (their writes raise before any signal or
+  request; `refresh()` makes them current again); writes, bulk operations, `query()`, live queries,
+  `changes()` and transactions are refused on a time-travel queryset
+- Stores: the embedded `surrealkv+versioned://` engine, 3.x servers on `?versioned=true` storage,
+  2.x servers on `surrealkv+versioned://`. The embedded engine refuses a URL without history before
+  any request and a 3.x server refuses `VERSION`; a 2.x server in memory answers without an error
+  and cannot be detected (documented). `fetch()` under `as_of()` is refused on 2.x, whose links
+  resolve to their current state
+- No equivalent in the full SurrealDB-ORM. CI adds a versioned server per job; server lines
+  unchanged (2.7.0 and 3.3.4, 3.1.5 retro, identical)
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -674,13 +697,16 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 | ✅ v0.23.0 | Rich field types: `Datetime`, `Duration`, `Decimal`, `Range`, `Uuid` | typed Pydantic ↔ native SDK types |
 | ✅ v0.24.0 | Geospatial fields: `Geometry` + `nearby()` / distance                | native `Geometry` + `geo::*`      |
 | ✅ v0.25.0 | Embedded test engine: `mem://` / `surrealkv://` + base fixtures ¹    | SDK embedded connection           |
-| v0.26.0    | Versioned storage / time-travel: `surrealkv+versioned://` ²          | embedded versioned engine         |
+| ✅ v0.26.0 | Versioned storage / time-travel: `surrealkv+versioned://` ²          | embedded versioned engine         |
 | v0.27.0    | Subqueries (nested QuerySets in `filter`/`in`)                       | nested `SELECT` via `query()`     |
 | v0.28.0    | Query cache (TTL + invalidation), client-side                        | client cache                      |
 | v0.29.0    | Multi-database: named connection registry                            | N × `AsyncSurreal` instances      |
 
 ¹ The embedded engine ships in the SDK 2.0.0 base wheel (engine core 2.3.10); the SDK 3.0 line
 moves it to the `surrealdb[embedded]` extra.
+
+² The versioned engine is the SDK 2.0.0 embedded engine's `surrealkv+versioned://`; versioned
+servers (3.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too.
 
 ---
 

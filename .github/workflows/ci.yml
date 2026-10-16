@@ -80,6 +80,36 @@ jobs:
           docker logs surreal >&2 || true
           exit 1
 
+      # tests/test_time_travel.py reads history (as_of(), SELECT ... VERSION) from a second server
+      # started with versioned storage, found through SURREALDB_VERSIONED_PORT; its versioned-server
+      # tests skip without it. The first server stays in memory: its tests pin the refusal (3.x) and
+      # the silent answer (2.x) of a store without history. 3.x enables history with
+      # ?versioned=true, 2.x with the surrealkv+versioned:// scheme. tmpfs: nothing outlives the job.
+      - name: Start versioned SurrealDB ${{ matrix.surrealdb-version }} (time travel)
+        run: |
+          case "${{ matrix.surrealdb-version }}" in
+            v2.*) store="surrealkv+versioned:///data/db" ;;
+            *) store="surrealkv:///data/db?versioned=true" ;;
+          esac
+          docker run -d \
+            --name surreal-versioned \
+            --tmpfs /data:mode=1777 \
+            -p 8001:8000 \
+            surrealdb/surrealdb:${{ matrix.surrealdb-version }} \
+            start --user root --pass root "$store"
+
+          echo "Waiting for the versioned SurrealDB to be healthy..."
+          for i in {1..30}; do
+            if curl -sf http://localhost:8001/health >/dev/null; then
+              echo "Versioned SurrealDB is up! (attempt ${i})"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Versioned SurrealDB did not become healthy" >&2
+          docker logs surreal-versioned >&2 || true
+          exit 1
+
       - name: Checkout code
         uses: actions/checkout@v7
 
@@ -98,6 +128,7 @@ jobs:
         env:
           SURREALDB_HOST: localhost
           SURREALDB_PORT: 8000
+          SURREALDB_VERSIONED_PORT: 8001
         run: uv run pytest tests/ -v --cov=src/surreal_orm_lite --cov-report=xml
 
       - name: Upload coverage to Codecov
