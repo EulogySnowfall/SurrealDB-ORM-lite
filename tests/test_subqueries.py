@@ -14,7 +14,8 @@ import asyncio
 import contextlib
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import UUID
 
@@ -52,7 +53,18 @@ from surreal_orm_lite.subquery import (
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import build_filter_condition
 from tests.conftest import _ws_url
-from tests.test_time_travel import _http_url, _line, _record_queries, connected
+from tests.test_time_travel import (
+    _assert_refused_by_the_server,
+    _http_url,
+    _line,
+    _now,
+    _record_queries,
+    _strictly_increasing,
+    _versioned_http_url,
+    _versioned_url,
+    _versioned_ws_url,
+    connected,
+)
 
 M2020 = datetime(2020, 6, 1, tzinfo=UTC)
 M2021 = datetime(2021, 6, 1, tzinfo=UTC)
@@ -2439,3 +2451,233 @@ class TestSubqueryLiveE2E:
                 await _create_post(client, "p9", "cy")
                 [event] = await _take(stream, 1)
         assert (event.action, event.instance.id) == (LiveAction.CREATE, "p9")
+
+
+# --- AC-10: time travel — every subquery reads at the outer as_of() moment ---------------------------------
+
+#: Spec AC-10's history on the embedded ``surrealkv+versioned://`` engine, one statement per ``client.query()``:
+#: in 2020 ``a`` is active and ``b`` is not, each with a post; in 2021 they swap. ``b`` is the older, so the
+#: oldest active person is ``a`` in 2020 and ``b`` since.
+_SQ_HISTORY = (
+    "CREATE sq_person:a SET name = 'Ada', active = true, age = 36 VERSION d'2020-01-01T00:00:00Z';",
+    "CREATE sq_person:b SET name = 'Bob', active = false, age = 50 VERSION d'2020-01-01T00:00:00Z';",
+    "CREATE sq_post:p1 SET title = 'one', author = sq_person:a, score = 5 VERSION d'2020-01-01T00:00:00Z';",
+    "CREATE sq_post:p2 SET title = 'two', author = sq_person:b, score = 8 VERSION d'2020-01-01T00:00:00Z';",
+    "CREATE sq_person:b SET name = 'Bob', active = true, age = 50 VERSION d'2021-01-01T00:00:00Z';",
+    "CREATE sq_person:a SET name = 'Ada', active = false, age = 36 VERSION d'2021-01-01T00:00:00Z';",
+)
+
+
+@contextlib.asynccontextmanager
+async def sq_history_db(tmp_path: Path) -> AsyncIterator[Any]:
+    """``_SQ_HISTORY`` on a fresh embedded ``surrealkv+versioned://`` database; yields its client."""
+    async with embedded_database(_versioned_url(tmp_path)) as client:
+        for statement in _SQ_HISTORY:
+            await client.query(statement)
+        yield client
+
+
+def _by_active_authors() -> Any:
+    """C1: the posts whose author is active — at the moment of the outer ``as_of()``, if any."""
+    return SqPost.objects().filter(author__in=Subquery(_active()))
+
+
+def _by_oldest_active() -> Any:
+    """C4's ordered and limited inner: the posts of the oldest active person."""
+    return SqPost.objects().filter(author__in=Subquery(_active().order_by("-age").limit(1)))
+
+
+def _keys_in_order(rows: Any) -> list[str]:
+    return sorted(row.id for row in rows)
+
+
+#: What the plain reads (no subquery, v0.26.0) of :func:`_plain_state` see: the active persons, then the posts.
+_State = tuple[list[str], list[str]]
+
+
+async def _plain_state(moment: datetime) -> _State:
+    """The active persons and the posts at *moment*, read without a subquery (v0.26.0's time-travel reads)."""
+    persons = await SqPerson.objects().as_of(moment).filter(active=True).exec()
+    posts = await SqPost.objects().as_of(moment).exec()
+    return _keys_in_order(persons), _keys_in_order(posts)
+
+
+async def _settled_moment(client: Any, expected: _State) -> datetime:
+    """The database's clock, read again until the plain reads at that moment show *expected*: every write so far.
+
+    SurrealDB 3.3's versioned storage can stamp a write a few milliseconds after the ``time::now()`` read just
+    after it (measured on 3.3.4: around one moment every 30 seconds of uptime), and a moment read that
+    early misses the write in every read, the plain ones included. Polling the database clock, never the host's
+    and never a sleep, finds the first moment at which the server shows its own writes; the subquery reads must
+    then agree with the plain ones. A server that never shows them within 5 seconds of its clock fails the test.
+    """
+    first = await _now(client)
+    while True:
+        moment = await _now(client)
+        seen = await _plain_state(moment)
+        if seen == expected:
+            return moment
+        if moment - first > timedelta(seconds=5):
+            pytest.fail(f"the versioned server's plain reads still show {seen}, not {expected}, 5 s after the writes")
+
+
+async def _still_shows(moment: datetime, expected: _State) -> None:
+    """Skip, rather than fail, when a later write was stamped at or before an earlier moment: the history between
+    two moments read from the database clock is what the test is about (``_strictly_increasing``'s rule)."""
+    if await _plain_state(moment) != expected:
+        pytest.skip("the versioned server stamped a later write at or before an earlier moment")
+
+
+class TestSubqueryAsOfE2E:
+    """AC-10: under the outer ``as_of()``, every subquery reads at the same moment, on every versioned store.
+
+    The embedded ``surrealkv+versioned://`` engine (no server) with history written at fixed past moments: like a
+    2.x server, it never applies the outer ``VERSION`` to a sub-SELECT (spec M13), so a subquery read without its
+    own ``VERSION`` would see the current state (``b`` active) and ``M2020`` would give ``p2`` instead of ``p1``.
+    Then the server of ``SURREALDB_PORT`` (in memory, no history: one branch per line) and a server started with
+    versioned storage (``SURREALDB_VERSIONED_PORT``, skipped without it), over WebSocket and HTTP.
+    """
+
+    async def test_reads_at_each_moment(self, tmp_path: Path) -> None:
+        async with sq_history_db(tmp_path):
+            assert _keys_in_order(await _by_active_authors().as_of(M2020).exec()) == ["p1"]
+            assert await _by_active_authors().as_of(M2020).count() == 1
+            assert await _by_active_authors().as_of(M2020).exists() is True
+            assert await _by_active_authors().as_of(M2020).sum("score") == 5
+            grouped = await _by_active_authors().as_of(M2020).values("author").annotate(n=Count()).exec()
+            assert grouped == [{"author": _person("a"), "n": 1}]
+
+            assert _keys_in_order(await _by_active_authors().as_of(M2021).exec()) == ["p2"]
+            assert await _by_active_authors().as_of(M2021).count() == 1
+            grouped = await _by_active_authors().as_of(M2021).values("author").annotate(n=Count()).exec()
+            assert grouped == [{"author": _person("b"), "n": 1}]
+
+            assert _keys_in_order(await _by_active_authors().exec()) == ["p2"]
+            assert await _by_active_authors().count() == 1
+
+    async def test_an_ordered_subquery_reads_at_the_moment(self, tmp_path: Path) -> None:
+        async with sq_history_db(tmp_path):
+            for _ in range(_RUNS):
+                assert _keys_in_order(await _by_oldest_active().as_of(M2020).exec()) == ["p1"]
+                assert _keys_in_order(await _by_oldest_active().as_of(M2021).exec()) == ["p2"]
+                assert _keys_in_order(await _by_oldest_active().exec()) == ["p2"]
+
+    async def test_a_first_value_subquery_reads_at_the_moment(self, tmp_path: Path) -> None:
+        """``exact`` with the first value: the score of the oldest active person's post, at each moment."""
+        best = SqPost.objects().filter(author__in=Subquery(_active().order_by("-age").limit(1))).select("score")
+        async with sq_history_db(tmp_path):
+            for _ in range(_RUNS):
+                assert _keys_in_order(await SqPost.objects().as_of(M2020).filter(score=Subquery(best)).exec()) == ["p1"]
+                assert _keys_in_order(await SqPost.objects().as_of(M2021).filter(score=Subquery(best)).exec()) == ["p2"]
+
+    async def test_a_subquery_of_its_own_moment_is_refused_s5(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with sq_history_db(tmp_path) as client:
+            calls = _record_queries(monkeypatch, client)
+            for outer in (SqPost.objects().as_of(M2020), SqPost.objects()):
+                with pytest.raises(SurrealDbError) as info:
+                    await outer.filter(author__in=Subquery(_active().as_of(M2021))).exec()
+                assert str(info.value) == _S5
+            assert calls == []
+
+    async def test_a_missing_subquery_table_reads_as_empty(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """As without ``as_of()``: the embedded engine reads a missing subquery table as empty, in one request."""
+        async with sq_history_db(tmp_path) as client:
+            calls = _record_queries(monkeypatch, client)
+            assert _keys_in_order(await SqPost.objects().as_of(M2020).filter(author__not_in=_ghost()).exec()) == ["p1", "p2"]
+            assert await SqPost.objects().as_of(M2020).filter(author__in=_ghost()).exec() == []
+            assert len(calls) == 2
+
+    @pytest.mark.parametrize("kind", ["ws", "http"])
+    async def test_a_server_without_history(self, kind: str) -> None:
+        """The in-memory server of ``SURREALDB_PORT``, one branch per line (spec D15, M18).
+
+        3.2 and later refuse the ``VERSION`` read inside the ``LET`` with the marker T7 maps ("does not support
+        versioned queries"). 3.1 fails first with an opaque ``ThrownError`` ("Failed to scan record") that names
+        neither the cause nor a table: the ORM relays it unchanged rather than guess (README 2.x/3.x row
+        'Subqueries under as_of()'). 2.x answers without an error, as v0.26.0 documents.
+        """
+        async with subquery_db(kind) as client:
+            version = await _line_version(client)
+            if version[0] < 3:
+                pytest.skip("2.x in memory keeps v0.26.0's silent reading, covered by tests/test_time_travel.py")
+            await _seed()
+            for read in (lambda qs: qs.exec(), lambda qs: qs.count()):
+                at_now = _by_active_authors().as_of(timedelta(0))
+                if version >= (3, 2):
+                    await _assert_refused_by_the_server(read(at_now))
+                    continue
+                with pytest.raises(ServerError) as info:
+                    await read(at_now)
+                assert isinstance(info.value, ThrownError), repr(info.value)
+                assert not isinstance(info.value, SurrealDbError)
+                assert "Failed to scan record" in str(info.value)
+
+    @pytest.mark.skipif(_versioned_ws_url() is None, reason="no versioned SurrealDB server (SURREALDB_VERSIONED_PORT)")
+    @pytest.mark.parametrize("transport", ["ws", "http"])
+    async def test_a_versioned_server(self, transport: str) -> None:
+        """ORM writes, moments read from the database clock between them (spec §9), each line; each moment one at
+        which the plain reads show the writes before it (:func:`_settled_moment`).
+
+        A person ``c`` (active, the oldest) is created and deleted before ``t1``: SurrealDB 3.x's versioned table
+        reads return a record deleted before the moment unless the per-record guard drops it (v0.26.0, M5), so the
+        subquery carries the guard as the outer read does.
+        """
+        url = _versioned_ws_url() if transport == "ws" else _versioned_http_url()
+        assert url is not None
+        async with connected(url, "tt", *_TABLES) as client:
+            ada = await SqPerson(id="a", name="Ada", active=True, age=36).save()
+            bob = await SqPerson(id="b", name="Bob", active=False, age=50).save()
+            cy = await SqPerson(id="c", name="Cy", active=True, age=99).save()
+            await SqPost(id="p1", title="one", author=_person("a"), score=5).save()
+            await SqPost(id="p2", title="two", author=_person("b"), score=8).save()
+            await SqPost(id="p3", title="three", author=_person("c"), score=2).save()
+            await cy.delete()
+            t1 = await _settled_moment(client, (["a"], ["p1", "p2", "p3"]))
+            await ada.merge(active=False)
+            await bob.merge(active=True)
+            t2 = await _settled_moment(client, (["b"], ["p1", "p2", "p3"]))
+            _strictly_increasing(t1, t2)
+            await _still_shows(t1, (["a"], ["p1", "p2", "p3"]))
+
+            assert _keys_in_order(await _by_active_authors().as_of(t1).exec()) == ["p1"]
+            assert await _by_active_authors().as_of(t1).count() == 1
+            grouped = await _by_active_authors().as_of(t1).values("author").annotate(n=Count()).exec()
+            assert grouped == [{"author": _person("a"), "n": 1}]
+            assert _keys_in_order(await _by_active_authors().as_of(t2).exec()) == ["p2"]
+            assert await _by_active_authors().as_of(t2).count() == 1
+            assert _keys_in_order(await _by_active_authors().exec()) == ["p2"]
+            for _ in range(_RUNS):
+                assert _keys_in_order(await _by_oldest_active().as_of(t1).exec()) == ["p1"]
+                assert _keys_in_order(await _by_oldest_active().as_of(t2).exec()) == ["p2"]
+
+    @pytest.mark.skipif(_versioned_ws_url() is None, reason="no versioned SurrealDB server (SURREALDB_VERSIONED_PORT)")
+    @pytest.mark.parametrize("transport", ["ws", "http"])
+    async def test_a_missing_subquery_table_on_a_versioned_server(
+        self, transport: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A subquery table that does not exist reads as empty at the moment too: in one request on 2.x; on 3.x the
+        ``LET`` (with its own ``VERSION``) raises the server's missing-table error — a ``NotFoundError`` on 3.3, a
+        ``ThrownError`` with its "An error occurred: " prefix on 3.1 — so the ORM probes the table and sends the
+        statement again with that subquery empty."""
+        url = _versioned_ws_url() if transport == "ws" else _versioned_http_url()
+        assert url is not None
+        async with connected(url, "tt", *_TABLES) as client:
+            await SqPerson(id="a", name="Ada", active=True, age=36).save()
+            await SqPost(id="p1", title="one", author=_person("a"), score=5).save()
+            t1 = await _settled_moment(client, (["a"], ["p1"]))
+            await SqPost(id="p2", title="two", author=_person("a"), score=8).save()
+            t2 = await _settled_moment(client, (["a"], ["p1", "p2"]))
+            _strictly_increasing(t1, t2)
+            await _still_shows(t1, (["a"], ["p1"]))
+            line = await _line(client)
+            calls = _record_queries(monkeypatch, client)
+            assert _keys_in_order(await SqPost.objects().as_of(t1).filter(author__not_in=_ghost()).exec()) == ["p1"]
+            sent_not_in = list(calls)
+            calls.clear()
+            assert await SqPost.objects().as_of(t1).filter(author__in=_ghost()).exec() == []
+            sent_in = list(calls)  # before the cleanup's own statements
+        for sent in (sent_not_in, sent_in):
+            if line >= 3:
+                _assert_probed_then_sent_again(sent)
+            else:
+                assert len(sent) == 1, sent

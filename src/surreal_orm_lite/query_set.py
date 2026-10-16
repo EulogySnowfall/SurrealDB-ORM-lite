@@ -403,17 +403,20 @@ class QuerySet:
         Every read honours it: ``exec()``, ``first()``, ``get()`` (by id too: a record deleted since is still
         found, one created later is not), ``all()``, ``exists()``, ``count()``, ``sum()``/``avg()``/``min()``/
         ``max()``, ``values()``+``annotate()`` and ``GeoDistance`` annotations, with ``filter()``, ``Q``,
-        ``nearby()``, ``order_by()``, ``limit()``, ``offset()``, ``select()`` and ``variables()``. The returned
-        instances are **snapshots**: their writes raise ``SurrealDbError``; ``refresh()`` loads the current
-        record into one (on a model mixing ``AuthenticatedUserMixin``, whose classmethod ``refresh(token)``
-        takes the name, call ``BaseSurrealModel.refresh(snapshot)``).
+        ``nearby()``, ``order_by()``, ``limit()``, ``offset()``, ``select()`` and ``variables()``. Every subquery
+        of the filter (``Subquery``, v0.27.0) reads at the same moment — the ORM gives each its own ``VERSION``,
+        which the server would not — and a subquery cannot carry its own ``as_of()`` (``SurrealDbError``). The
+        returned instances are **snapshots**: their writes raise ``SurrealDbError``; ``refresh()`` loads the
+        current record into one (on a model mixing ``AuthenticatedUserMixin``, whose classmethod
+        ``refresh(token)`` takes the name, call ``BaseSurrealModel.refresh(snapshot)``).
 
         The store must keep history: on the embedded engine a ``surrealkv+versioned://<path>`` database; on a
         server, versioned storage (3.x: ``surrealkv://…?versioned=true`` or ``rocksdb://…?versioned=true``;
         2.x: ``surrealkv+versioned://…``). Otherwise the embedded engine raises before any request and a 3.x
-        server's refusal is raised as ``SurrealDbError``; a 2.x server without versioned storage answers without
-        an error and only returns records last written at or before the moment, in their current state (it
-        cannot be detected: see the README).
+        server's refusal is raised as ``SurrealDbError`` (with a subquery, SurrealDB 3.1 fails first with an
+        error of its own that does not say why, relayed as is); a 2.x server without versioned storage answers
+        without an error and only returns records last written at or before the moment, in their current state
+        (it cannot be detected: see the README).
 
         ``fetch()`` resolves links as they were on SurrealDB 3.x; on 2.x (servers and the embedded engine of the
         surrealdb SDK 2.x) the reads that return the fetched records (``exec()``, ``first()``, ``get()``
