@@ -117,9 +117,10 @@ third minor of Tier 2.
 - The `SurrealDbError` of an `AuthenticatedUserMixin` call whose record does not fit the model
   (since v0.17.0) has a new text, on every path, the server lines included: it says whether the
   shared session kept its previous identity or is now signed in as that record (for `refresh()`,
-  also that the refresh token passed in is spent and whether the new pair is kept), and it lists
-  the fields that do not fit, with Pydantic's message for each, and no longer quotes the record's
-  values. The Pydantic `ValidationError` is its `__context__` instead of its `__cause__`.
+  also that the refresh token passed in is spent and whether the new pair is kept), and it names
+  the fields that do not fit and Pydantic's error codes (`nickname: missing; prefs: int_parsing`),
+  and quotes no value from the record. The Pydantic `ValidationError` is its `__context__` instead
+  of its `__cause__`.
 
 ### Notes
 

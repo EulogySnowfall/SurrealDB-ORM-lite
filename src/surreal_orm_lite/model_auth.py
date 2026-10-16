@@ -59,19 +59,30 @@ _DURATION_RE = re.compile(r"^\d+(ns|us|ms|s|m|h|d|w|y)$")
 
 
 def _misfit_details(exc: Exception) -> str:
-    """Why a record does not fit the model, without any of its values.
+    """Which fields of a record do not fit the model, without anything taken from the record.
 
-    Each failing field of a Pydantic ``ValidationError`` with its message (``nickname: Field
-    required; email: Input should be a valid string``), else the error's type alone: its text may
-    quote the record.
+    Each top-level field a Pydantic ``ValidationError`` reports, once and in order, with Pydantic's
+    error codes (``nickname: missing; prefs: int_parsing``); ``(record)`` for an error of the whole
+    record (a model validator) and ``(undeclared field)`` for a key the model forbids
+    (``extra="forbid"``), whose name comes from the record. Nothing else is read from the error: a
+    deeper ``loc`` part can be a key of the record, and a message can quote one of its values (an
+    unknown discriminator tag, a validator's own text). Any other exception is named by its type
+    alone, since its text may quote the record too.
     """
     if isinstance(exc, ValidationError):
-        failures = [
-            f"{'.'.join(str(part) for part in error['loc']) or '(record)'}: {error['msg']}"
-            for error in exc.errors(include_url=False, include_context=False, include_input=False)
-        ]
-        if failures:
-            return "; ".join(failures)
+        codes: dict[str, list[str]] = {}
+        for error in exc.errors(include_url=False, include_context=False, include_input=False):
+            if error["type"] == "extra_forbidden":
+                field = "(undeclared field)"
+            elif error["loc"]:
+                field = str(error["loc"][0])
+            else:
+                field = "(record)"
+            field_codes = codes.setdefault(field, [])
+            if error["type"] not in field_codes:
+                field_codes.append(error["type"])
+        if codes:
+            return "; ".join(f"{field}: {', '.join(types)}" for field, types in codes.items())
     return type(exc).__name__
 
 
@@ -614,11 +625,13 @@ class AuthenticatedUserMixin:
     def _hydrate_record(cls, record: Any, label: str, *, bound: bool) -> Any:
         """Build the model instance from the record the session reports.
 
-        A record that does not fit raises a :class:`SurrealDbError` that lists each field that does
-        not fit and why, and quotes **none of the record's values**: Pydantic's own text does
-        (``input_value=…``, the whole record for a missing field), and a user's record carries the
-        password hash. For the same reason the validation error is not chained as the cause, so a
-        logged traceback does not print it; it stays reachable as ``__context__``.
+        A record that does not fit raises a :class:`SurrealDbError` that names the fields that do
+        not fit and Pydantic's error codes (``nickname: missing; prefs: int_parsing``), and quotes
+        **no value from the record**: Pydantic's own text does (``input_value=…``, the whole record
+        for a missing field; a dict key in ``loc``; an unknown discriminator tag or a validator's
+        own text in the message), and a user's record carries the password hash. For the same
+        reason the validation error is not chained as the cause, so a logged traceback does not
+        print it; it stays reachable as ``__context__``.
 
         :param bound: whether the shared session holds the exchange's new identity when the record
             turns out not to fit: ``signup()``/``signin()``/``refresh()`` with ``bind=True``, whose

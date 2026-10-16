@@ -1,14 +1,16 @@
 """Model-level authentication — AuthenticatedUserMixin (v0.17.0)."""
 
 import contextlib
+import logging
 import os
 import traceback
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 from surreal_orm_lite import (
     AuthenticatedUserMixin,
@@ -599,6 +601,46 @@ class E2EMisfit(AuthenticatedUserMixin, BaseSurrealModel):
     nickname: str
 
 
+class _MisfitCat(BaseModel):
+    kind: Literal["cat"]
+    lives: int
+
+
+class _MisfitDog(BaseModel):
+    kind: Literal["dog"]
+    good: bool
+
+
+class ShapedMisfit(AuthenticatedUserMixin, BaseSurrealModel):
+    """Fields whose Pydantic errors carry record data outside ``input_value``: a dict key in ``loc``, a
+    discriminator tag in ``msg``, a validator's own text in ``msg``."""
+
+    model_config = SurrealConfigDict(table_name="E2EUser", access_name="e2e_acct")
+
+    id: str | None = None
+    email: str
+    password: str
+    nickname: str
+    prefs: dict[str, int] = {}
+    pet: _MisfitCat | _MisfitDog | None = Field(default=None, discriminator="kind")
+    code: str = "ok"
+    badge: str = "ok"
+
+    @field_validator("code")
+    @classmethod
+    def _check_code(cls, value: str) -> str:
+        if not value.startswith("ok"):
+            raise ValueError(f"bad code {value!r}")
+        return value
+
+    @field_validator("badge")
+    @classmethod
+    def _check_badge(cls, value: str) -> str:
+        if not value.startswith("ok"):
+            raise PydanticCustomError("badge_refused", "badge {badge} is not on the list", {"badge": value})
+        return value
+
+
 #: What the error says about the shared session when the record does not fit the model.
 _NOW_BOUND = "The shared session is now signed in as that record"
 _UNCHANGED = "The shared session keeps its previous identity"
@@ -638,13 +680,13 @@ class TestMisfitRecordMessage:
 
     def test_the_failing_fields_are_listed_without_the_record_values(self) -> None:
         """Pydantic's own text quotes the input (``input_value=…``): for a missing field, the whole record,
-        password hash included. The error names each field that does not fit and why, and no value."""
+        password hash included. The error names the fields that do not fit and Pydantic's error codes, and
+        quotes no value from the record."""
         record = {"id": "misfit-id-4821", "email": 987654321, "password": "$argon2id$v=19$m=19456,t=2,p=1$c2VjcmV0"}
         with pytest.raises(SurrealDbError) as raised:
             E2EMisfit._hydrate_record(record, "signin", bound=False)
         message = str(raised.value)
-        assert "email: Input should be a valid string" in message
-        assert "nickname: Field required" in message
+        assert "(email: string_type; nickname: missing)" in message
         for value in ("misfit-id-4821", "987654321", "$argon2id", "c2VjcmV0"):
             assert value not in message, value
         assert "input_value" not in message and "errors.pydantic.dev" not in message
@@ -653,6 +695,71 @@ class TestMisfitRecordMessage:
         assert "c2VjcmV0" not in rendered and "987654321" not in rendered
         assert raised.value.__cause__ is None
         assert isinstance(raised.value.__context__, ValidationError)
+
+    def test_record_data_in_pydantic_locations_and_messages_is_not_quoted(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Beyond ``input_value``, Pydantic's errors carry record data in ``loc`` (a dict key) and in ``msg`` (an
+        unknown discriminator tag, a validator's own text). The error lists each failing top-level field once,
+        with Pydantic's error codes only: none of these reach the message, a formatted traceback or a log."""
+        record = {
+            "id": "misfit-id-4821",
+            "email": "a@b.c",
+            "password": "$argon2id$v=19$m=19456,t=2,p=1$c2VjcmV0",
+            "prefs": {"SECRETKEYNAME": "not-a-number", "OTHERKEYNAME": "nan-either"},
+            "pet": {"kind": "SECRETTAG"},
+            "code": "xSECRETCODE",
+            "badge": "xSECRETBADGE",
+        }
+        with pytest.raises(SurrealDbError) as raised:
+            ShapedMisfit._hydrate_record(record, "signin", bound=False)
+        message = str(raised.value)
+        assert (
+            "(nickname: missing; prefs: int_parsing; pet: union_tag_invalid; code: value_error; badge: badge_refused)"
+            in message
+        )
+
+        with caplog.at_level(logging.ERROR, logger="tests.misfit"):
+            try:
+                raise raised.value
+            except SurrealDbError:
+                logging.getLogger("tests.misfit").exception("signin failed")
+        rendered = {
+            "str": message,
+            "traceback": "".join(traceback.format_exception(raised.value)),
+            "log": caplog.text,
+        }
+        assert "union_tag_invalid" in rendered["log"]
+        for where, text in rendered.items():
+            for secret in ("SECRETKEYNAME", "OTHERKEYNAME", "SECRETTAG", "SECRETCODE", "SECRETBADGE", "c2VjcmV0", "a@b.c"):
+                assert secret not in text, (where, secret)
+            for wording in ("Input tag", "Value error", "not on the list", "unable to parse"):
+                assert wording not in text, (where, wording)
+
+    def test_an_error_of_the_whole_record_is_listed_as_the_record(self) -> None:
+        """A model-level validator has no field: its error is listed as ``(record)``, with its code only."""
+
+        class WholeMisfit(E2EMisfit):
+            @model_validator(mode="after")
+            def _refuse(self) -> "WholeMisfit":
+                raise ValueError(f"refused {self.password}")
+
+        with pytest.raises(SurrealDbError) as raised:
+            WholeMisfit._hydrate_record({"email": "a@b.c", "password": "c2VjcmV0", "nickname": "n"}, "signin", bound=False)
+        message = str(raised.value)
+        assert "((record): value_error)" in message
+        assert "c2VjcmV0" not in message and "refused" not in message
+
+    def test_a_forbidden_key_is_listed_without_its_name(self) -> None:
+        """With ``extra="forbid"``, Pydantic's ``loc`` is the record's own key: it is not quoted either."""
+
+        class StrictMisfit(E2EMisfit):
+            model_config = SurrealConfigDict(table_name="E2EUser", access_name="e2e_acct", extra="forbid")
+
+        record = {"email": "a@b.c", "password": "x", "SECRETCOLUMN": 1, "OTHERCOLUMN": 2}
+        with pytest.raises(SurrealDbError) as raised:
+            StrictMisfit._hydrate_record(record, "signin", bound=False)
+        message = str(raised.value)
+        assert "(nickname: missing; (undeclared field): extra_forbidden)" in message
+        assert "SECRETCOLUMN" not in message and "OTHERCOLUMN" not in message
 
     def test_another_failure_is_named_by_its_type_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def refuse(record: Any) -> Any:
@@ -728,7 +835,7 @@ class TestMisfitRecordE2E:
             with pytest.raises(SurrealDbError) as raised:
                 await E2EMisfit.signin(email=email, password=AUTH_PASSWORD)
             message = str(raised.value)
-            assert "nickname: Field required" in message
+            assert "(nickname: missing)" in message
             assert email not in message and stored_hash not in message
             assert str(created.user.get_id()) not in message
 
