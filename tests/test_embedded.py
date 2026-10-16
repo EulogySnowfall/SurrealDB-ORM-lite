@@ -2180,6 +2180,18 @@ class TestFailedBindEmbeddedE2E:
             assert me is not None
             assert me["email"] == "b@x"
 
+    async def test_the_error_quotes_no_value_of_the_record(self) -> None:
+        """As on a server, the error names the fields that do not fit and none of the record's values."""
+        async with _embedded_auth():
+            created = await EmbUser.signup(email="b@x", password="p", bind=True)
+            await SurrealDBConnectionManager.invalidate()
+            with pytest.raises(SurrealDbError, match="does not fit the model") as raised:
+                await EmbMisfit.signin(email="b@x", password="p", bind=True)
+            message = str(raised.value)
+            assert "nickname: Field required" in message
+            assert "b@x" not in message and created.user.password not in message
+            assert str(created.user.get_id()) not in message
+
 
 def _slow_info(monkeypatch: pytest.MonkeyPatch, delays: list[float]) -> asyncio.Event:
     """Make the embedded client's ``info()`` wait ``delays[n]`` seconds on its n-th call (then none), so that two

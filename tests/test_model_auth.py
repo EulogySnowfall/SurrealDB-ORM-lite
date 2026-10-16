@@ -2,11 +2,13 @@
 
 import contextlib
 import os
+import traceback
 from collections.abc import AsyncIterator
 from typing import Any
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 
 from surreal_orm_lite import (
     AuthenticatedUserMixin,
@@ -634,6 +636,49 @@ class TestMisfitRecordMessage:
         assert "has been created" not in message
         assert "The session is authenticated" not in message
 
+    def test_the_failing_fields_are_listed_without_the_record_values(self) -> None:
+        """Pydantic's own text quotes the input (``input_value=…``): for a missing field, the whole record,
+        password hash included. The error names each field that does not fit and why, and no value."""
+        record = {"id": "misfit-id-4821", "email": 987654321, "password": "$argon2id$v=19$m=19456,t=2,p=1$c2VjcmV0"}
+        with pytest.raises(SurrealDbError) as raised:
+            E2EMisfit._hydrate_record(record, "signin", bound=False)
+        message = str(raised.value)
+        assert "email: Input should be a valid string" in message
+        assert "nickname: Field required" in message
+        for value in ("misfit-id-4821", "987654321", "$argon2id", "c2VjcmV0"):
+            assert value not in message, value
+        assert "input_value" not in message and "errors.pydantic.dev" not in message
+        # Nor in a logged traceback: the ValidationError is not chained as the cause.
+        rendered = "".join(traceback.format_exception(raised.value))
+        assert "c2VjcmV0" not in rendered and "987654321" not in rendered
+        assert raised.value.__cause__ is None
+        assert isinstance(raised.value.__context__, ValidationError)
+
+    def test_another_failure_is_named_by_its_type_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def refuse(record: Any) -> Any:
+            raise RuntimeError(f"cannot build from {record['password']}")
+
+        monkeypatch.setattr(E2EMisfit, "from_db", refuse)
+        with pytest.raises(SurrealDbError) as raised:
+            E2EMisfit._hydrate_record({"email": "a@b.c", "password": "hash-c2VjcmV0"}, "signin", bound=False)
+        message = str(raised.value)
+        assert "so no instance could be built (RuntimeError)" in message
+        assert "c2VjcmV0" not in message and "a@b.c" not in message
+
+    def test_an_unbound_refresh_says_the_tokens_are_not_kept(self) -> None:
+        """The server rotated the token before the record was read: the one passed in is spent, and the new
+        pair is neither returned nor stored."""
+        with pytest.raises(SurrealDbError) as raised:
+            E2EMisfit._hydrate_record({"email": "a@b.c", "password": "x"}, "refresh", bound=False)
+        expected = f"{_UNCHANGED}, but the refresh token passed in is spent and the new token pair is not kept"
+        assert expected in str(raised.value)
+
+    def test_a_bound_refresh_says_the_manager_stores_the_new_pair(self) -> None:
+        with pytest.raises(SurrealDbError) as raised:
+            E2EMisfit._hydrate_record({"email": "a@b.c", "password": "x"}, "refresh", bound=True)
+        expected = f"{_NOW_BOUND}, the refresh token passed in is spent, and the manager stores the new token pair"
+        assert expected in str(raised.value)
+
 
 class TestMisfitRecordE2E:
     """On a server: what the error says about the shared session is what the session holds."""
@@ -673,6 +718,84 @@ class TestMisfitRecordE2E:
             finally:
                 with contextlib.suppress(Exception):
                     await SurrealDBConnectionManager.invalidate()
+
+    @pytest.mark.asyncio
+    async def test_the_error_quotes_no_value_of_the_record(self) -> None:
+        async with auth_model() as model:
+            email = _unique_email()
+            created = await model.signup(email=email, password=AUTH_PASSWORD)
+            stored_hash = created.user.password
+            with pytest.raises(SurrealDbError) as raised:
+                await E2EMisfit.signin(email=email, password=AUTH_PASSWORD)
+            message = str(raised.value)
+            assert "nickname: Field required" in message
+            assert email not in message and stored_hash not in message
+            assert str(created.user.get_id()) not in message
+
+
+class RefreshAcct(AuthenticatedUserMixin, BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="RefreshAcct", access_name="e2e_refresh_misfit", with_refresh=True)
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+class RefreshMisfit(AuthenticatedUserMixin, BaseSurrealModel):
+    """``RefreshAcct``'s table and access, with a required field its records lack."""
+
+    model_config = SurrealConfigDict(table_name="RefreshAcct", access_name="e2e_refresh_misfit", with_refresh=True)
+
+    id: str | None = None
+    email: str
+    password: str
+    nickname: str
+
+
+class TestRefreshMisfitE2E:
+    """``refresh()`` of a record that does not fit the model — SurrealDB 3.x only: the token passed in is spent
+    either way, and only ``bind=True`` keeps the new pair (the manager stores it)."""
+
+    @contextlib.asynccontextmanager
+    async def _refresh_model(self) -> AsyncIterator[Any]:
+        _connect()
+        try:
+            try:
+                await RefreshAcct.define_access()
+            except SurrealDbError as exc:
+                pytest.skip(f"WITH REFRESH requires SurrealDB 3.x: {exc}")
+            yield RefreshAcct
+        finally:
+            with contextlib.suppress(Exception):
+                await SurrealDBConnectionManager.invalidate()
+            with contextlib.suppress(Exception):
+                client = await SurrealDBConnectionManager.get_client()
+                await client.query("REMOVE ACCESS e2e_refresh_misfit ON DATABASE;", {})
+                await client.query("REMOVE TABLE RefreshAcct;", {})
+            await SurrealDBConnectionManager.unset_connection()
+
+    @pytest.mark.asyncio
+    async def test_bind_false_spends_the_token_and_keeps_no_pair(self) -> None:
+        async with self._refresh_model() as model:
+            created = await model.signup(email=_unique_email(), password=AUTH_PASSWORD)
+            assert created.tokens.refresh is not None
+            with pytest.raises(SurrealDbError, match="the new token pair is not kept"):
+                await RefreshMisfit.refresh(created.tokens.refresh)
+            assert SurrealDBConnectionManager.get_refresh_token() is None
+            with pytest.raises(SurrealDbAuthenticationError):
+                await model.refresh(created.tokens.refresh)  # spent
+
+    @pytest.mark.asyncio
+    async def test_bind_true_stores_the_new_pair(self) -> None:
+        async with self._refresh_model() as model:
+            created = await model.signup(email=_unique_email(), password=AUTH_PASSWORD)
+            assert created.tokens.refresh is not None
+            with pytest.raises(SurrealDbError, match="the manager stores the new token pair"):
+                await RefreshMisfit.refresh(created.tokens.refresh, bind=True)
+            stored = SurrealDBConnectionManager.get_refresh_token()
+            assert stored not in (None, created.tokens.refresh)
+            renewed = await model.refresh(stored)  # the stored pair is live
+            assert renewed.tokens.access
 
 
 class TestBindKeepsTheRefreshTokenE2E:

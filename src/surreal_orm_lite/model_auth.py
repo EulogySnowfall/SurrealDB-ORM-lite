@@ -26,6 +26,8 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
+from pydantic import ValidationError
+
 from . import encoding as _encoding
 from .auth import AuthTokens, build_auth_payload, wrap_auth_error
 from .connection_manager import SurrealDBConnectionManager
@@ -53,6 +55,23 @@ _HASH_ALGORITHMS = frozenset({"argon2", "bcrypt", "pbkdf2", "scrypt"})
 #: client — so, like every other interpolated value here, they are validated rather than trusted.
 #: A model config assembled from settings or environment is not an exotic pattern.
 _DURATION_RE = re.compile(r"^\d+(ns|us|ms|s|m|h|d|w|y)$")
+
+
+def _misfit_details(exc: Exception) -> str:
+    """Why a record does not fit the model, without any of its values.
+
+    Each failing field of a Pydantic ``ValidationError`` with its message (``nickname: Field
+    required; email: Input should be a valid string``), else the error's type alone: its text may
+    quote the record.
+    """
+    if isinstance(exc, ValidationError):
+        failures = [
+            f"{'.'.join(str(part) for part in error['loc']) or '(record)'}: {error['msg']}"
+            for error in exc.errors(include_url=False, include_context=False, include_input=False)
+        ]
+        if failures:
+            return "; ".join(failures)
+    return type(exc).__name__
 
 
 @dataclass(frozen=True, slots=True)
@@ -591,6 +610,12 @@ class AuthenticatedUserMixin:
     def _hydrate_record(cls, record: Any, label: str, *, bound: bool) -> Any:
         """Build the model instance from the record the session reports.
 
+        A record that does not fit raises a :class:`SurrealDbError` that lists each field that does
+        not fit and why, and quotes **none of the record's values**: Pydantic's own text does
+        (``input_value=…``, the whole record for a missing field), and a user's record carries the
+        password hash. For the same reason the validation error is not chained as the cause, so a
+        logged traceback does not print it; it stays reachable as ``__context__``.
+
         :param bound: whether the shared session holds the exchange's new identity when the record
             turns out not to fit: ``signup()``/``signin()``/``refresh()`` with ``bind=True``, whose
             token is adopted first. ``authenticate()`` adopts its token only once the instance is
@@ -603,18 +628,25 @@ class AuthenticatedUserMixin:
             # The exchange already succeeded, so on signup the account now exists and a token
             # was issued — both of which a bare pydantic ValidationError would hide. Say so, or
             # the caller retries a signup that will then fail as a duplicate; and say what the
-            # shared session holds, since that differs from one path to the other.
+            # shared session holds, since that differs from one path to the other. A refresh
+            # spent the token passed in: the server rotated it before the record was read.
             if bound:
                 session = "The shared session is now signed in as that record"
-                created = ", and the record has been created" if label == "signup" else ""
+                aftermath = {
+                    "signup": ", and the record has been created",
+                    "refresh": ", the refresh token passed in is spent, and the manager stores the new token pair",
+                }.get(label, "")
             else:
                 session = "The shared session keeps its previous identity"
-                created = ", but the record has been created" if label == "signup" else ""
+                aftermath = {
+                    "signup": ", but the record has been created",
+                    "refresh": ", but the refresh token passed in is spent and the new token pair is not kept",
+                }.get(label, "")
             raise SurrealDbError(
                 f"{cls.__name__}.{label}() succeeded but the returned record does not fit the "
-                f"model, so no instance could be built: {exc}. {session}{created} — reconcile the "
-                f"model with the table rather than retrying."
-            ) from exc
+                f"model, so no instance could be built ({_misfit_details(exc)}). {session}{aftermath} "
+                f"— reconcile the model with the table rather than retrying."
+            ) from None
 
     @classmethod
     async def _exchange(
@@ -758,7 +790,11 @@ class AuthenticatedUserMixin:
             SurrealDbAuthenticationError: if the token is spent or expired, or the server does
                 not support refresh.
             SurrealDbError: on the embedded engine without ``bind=True`` (``bind=`` behaves as
-                in :meth:`signup`).
+                in :meth:`signup`); or when the exchange succeeded but the record does not fit
+                the model. The token passed in is then spent all the same: without ``bind`` the
+                new pair is not kept either (sign in again), with ``bind=True`` the manager stores
+                it (:meth:`SurrealDBConnectionManager.get_refresh_token`) and the shared session
+                is signed in as that record. The error says which.
         """
         SurrealDBConnectionManager.require_connection()
         if not cls._auth_setting("with_refresh", False):
