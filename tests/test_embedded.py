@@ -2676,7 +2676,7 @@ class TestReadmeEmbeddedWording:
         assert _cells(lines[0]) == ["Feature", "ORM (full)", "ORM-lite"]
         [row] = [line for line in lines if line.startswith("| Embedded / versioned engine")]
         assert "| yes" not in row, row
-        # The status marker is release-manager's: the row reads the same with or without it (v0.26.0).
+        # The release marks the row ✅: it reads the same with or without the marker (v0.26.0).
         assert _cells(row) in (
             ["Embedded / versioned engine", "no", "v0.25 – v0.26"],
             ["Embedded / versioned engine", "no", "✅ v0.25 – v0.26"],

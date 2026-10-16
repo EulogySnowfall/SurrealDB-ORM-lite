@@ -5,6 +5,112 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.26.0] - 2026-10-16
+
+Time travel: a QuerySet reads a model's records as they were at a past moment, with
+`as_of()` (SurrealQL's `VERSION` clause), on the official SDK's embedded
+`surrealkv+versioned://` engine and on SurrealDB servers started with versioned storage. The
+fourth minor of Tier 2.
+
+### Added
+
+- **`QuerySet.as_of(at)`** adds a moment to every read of the queryset. Records updated since
+  read as they were, a record deleted since is still found, and one created later is not. The
+  store must keep history: the embedded `surrealkv+versioned://<path>` (no server), SurrealDB 3.x
+  started on `surrealkv://<path>?versioned=true` or `rocksdb://<path>?versioned=true`, or
+  SurrealDB 2.x started on `surrealkv+versioned://<path>`.
+
+  ```python
+  from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
+
+  class Product(BaseSurrealModel):
+      id: str | None = None
+      name: str
+      price: float
+
+  SurrealDBConnectionManager.set_connection(
+      url=f"surrealkv+versioned://{path}/shop", namespace="shop", database="shop"
+  )
+  client = await SurrealDBConnectionManager.get_client()
+
+  lamp = Product(id="lamp", name="Lamp", price=40.0)
+  await lamp.save()
+  opening = await client.query("RETURN time::now();")  # a moment, from the database's clock
+  await lamp.merge(price=30.0)
+
+  assert (await Product.objects().as_of(opening).get("lamp")).price == 40.0
+  assert (await Product.objects().get("lamp")).price == 30.0
+  ```
+
+- **The moment** is an aware `datetime` (any time zone) or a naive one (UTC), an ISO-8601 string
+  (parsed by the ORM; a date alone is midnight UTC), a `timedelta` or the ORM's `Duration` (that
+  long before the database's clock), a `SurrealFunc` the database evaluates
+  (`SurrealFunc("time::now() - 1h")`), or `None` (the current state again); called again, the last
+  moment wins. The moment is always a bound parameter. A moment outside the instants SurrealDB
+  versions can address (1970-01-01T00:00:00Z to 2262-04-11T23:47:16.854775Z) is refused on every
+  line: `ValueError` at the call, or `SurrealDbError` before the read for a duration or an
+  expression the database resolved there.
+- **Every read honours it**, with `filter()`, `Q`, `nearby()`, `order_by()`, `limit()`, `offset()`,
+  `select()` and `variables()`, on edge models too: `exec()`, `first()`, `get()` (with filters or by
+  id), `all()`, `exists()`, `count()`, `sum()`, `avg()`, `min()`, `max()`, `values(…).annotate(…)`
+  and `annotate(d=GeoDistance(…))`.
+- **Snapshots.** The instances a time-travel read returns are read-only: `save()`, `update()`,
+  `merge()`, `patch()`, `upsert()`, `delete()`, the `atomic_*()` methods, `relate()`,
+  `remove_relation()` and `remove_all_relations()` raise `SurrealDbError` before any signal or
+  request, and `bulk_create()` refuses a snapshot in its list. `refresh()` turns a snapshot back
+  into the current record; `Product(**snapshot.model_dump()).update()` (or `.save()` for a record
+  deleted since, or `.upsert()`) writes a past state back. `model_copy()` and `pickle` keep the
+  snapshot, and a snapshot is never `==` the current instance (compare `model_dump()`s).
+- **Refusals before any request.** On a queryset with `as_of()`: `bulk_create()`, `bulk_update()`,
+  `bulk_delete()`, `patch()`, `update_or_create()`, `get_or_create()`, `delete_table()`, `query()`,
+  `live()`, `watch()` and `changes()` raise `SurrealDbError`; `Model.objects(tx=...).as_of(...)`
+  raises at the call (history cannot join a transaction); on the embedded engine, a URL that keeps
+  no history (`mem://`, `memory://`, `surrealkv://`, `file://`) raises, naming
+  `surrealkv+versioned://`. A 3.x server without versioned storage refuses the read, raised as
+  `SurrealDbError` with the SDK's error as its `__cause__`.
+- README section 27, "Time travel (`as_of()`)" (stores that keep history, the moment, reads,
+  snapshots, refusals, SurrealDB 2.x without versioned storage, record links, writing history with
+  a raw `CREATE … VERSION`, a note for users of the full SurrealDB-ORM, which has no time travel),
+  new rows in both behaviour tables, and the example notebook `examples/v0.26.0_time_travel.ipynb`.
+
+### Changed
+
+- `BaseSurrealModel` declares a private attribute, the snapshot marker, so every instance now has
+  a `__pydantic_private__` dict. Two current instances compare as before; an instance pickled by
+  v0.25.x unpickles as a current record, and a model's own private attributes are kept.
+- `refresh()` also clears the snapshot marker of an instance read with `as_of()`.
+- CI starts a second SurrealDB per job, on versioned storage, for the time-travel tests; they find
+  it through `SURREALDB_VERSIONED_PORT` and skip without it.
+
+### Notes
+
+- **Every time-travel table read also reads each record by its id at the moment**, because a plain
+  `SELECT … VERSION` is wrong on both server lines: SurrealDB 3.x's table reads return the records
+  deleted before the moment, in their last state, and SurrealDB 2.x and the embedded engine
+  miscount an unfiltered `count()`. It costs about one extra point read per record scanned; a read
+  by id needs no check.
+- **SurrealDB 2.x without versioned storage answers without an error**: in memory or on plain
+  SurrealKV, it returns only the records last written at or before the moment, in their current
+  state, and the ORM cannot tell which storage the server runs. Start 2.x with
+  `surrealkv+versioned://` for time travel. SurrealDB 2.x on RocksDB refuses `VERSION`
+  (`SurrealDbError`).
+- **Record links**: `fetch()` resolves links as they were on SurrealDB 3.x. On SurrealDB 2.x
+  (servers and the SDK 2.x embedded engine) they resolve to their current state, so `exec()`,
+  `first()` and `get()` without an id refuse `fetch()` under `as_of()`; a dotted path through a
+  link reads the current value there.
+- **Writing history at a past moment** is left to raw queries (`CREATE … VERSION d'…'`, one
+  statement per `client.query()` call): stored at that moment and readable with `as_of()` on
+  SurrealDB 2.x and the embedded engine; accepted but not readable at that moment on SurrealDB 3.x.
+- The surrealdb SDK 2.x embedded engine ignores `?versioned=true` on `surrealkv://`: use
+  `surrealkv+versioned://`. The SDK's own `surrealdb.Duration` is accepted at runtime only (the
+  annotation names the ORM's types). `_as_of` is a reserved `variables()` name on a time-travel
+  read: the moment is bound under it.
+- A `SurrealFunc` moment is sent as written: build it in your code, never from user input, and pass
+  user values through `variables()`, bound.
+- **Server pins unchanged**: tested against SurrealDB 3.3.4 and 2.7.0, in memory and on versioned
+  storage, plus 3.1.5 for backward compatibility (identical); the embedded tests run in every CI
+  job. Every existing call behaves as in v0.25.x.
+
 ## [0.25.0] - 2026-10-15
 
 Embedded test engine: the ORM also runs on the official SDK's in-process SurrealDB engine

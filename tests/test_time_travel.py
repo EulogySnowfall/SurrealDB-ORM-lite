@@ -2187,7 +2187,8 @@ class TestTimeTravelDocs:
         """Footnote ² of the Tier 2 table is defined below it; the embedded-URL parity row names ``as_of()``."""
         tier_2 = _roadmap_part("## Planned — Tier 2: Extended (SDK-2.0-native)")
         [lines] = _tables(tier_2)
-        [row] = [line for line in lines if line.startswith("| v0.26.0")]
+        # The release marks the row ✅: it reads the same with or without the marker.
+        [row] = [line for line in lines if line.startswith(("| v0.26.0", "| ✅ v0.26.0"))]
         assert "²" in row, row
         below = _normalised(tier_2.split(lines[-1], 1)[1])
         assert "¹ The embedded engine ships in the SDK 2.0.0 base wheel" in below, below
