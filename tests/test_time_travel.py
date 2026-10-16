@@ -29,7 +29,7 @@ from urllib.parse import urlparse
 
 import pytest
 import surrealdb
-from pydantic import PrivateAttr
+from pydantic import BaseModel, PrivateAttr
 from surrealdb import RecordID
 
 from surreal_orm_lite import (
@@ -56,6 +56,7 @@ from surreal_orm_lite import (
 from surreal_orm_lite import embedded as embedded_module
 from surreal_orm_lite.embedded import history_unsupported, keeps_history, url_kind
 from surreal_orm_lite.model_base import _snapshot_moment
+from surreal_orm_lite.query_set import QuerySet
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.time_travel import MAX_MOMENT, MIN_MOMENT, AsOf, in_range, line_major, normalise_as_of
 from tests.conftest import orm_client
@@ -113,6 +114,48 @@ class SnapUser(AuthenticatedUserMixin, BaseSurrealModel):
     id: str | None = None
     email: str = ""
     password: str = ""
+
+
+class SnapLinked(BaseSurrealModel):
+    """``Snap`` with its links typed as models: a link ``fetch()`` resolves validates into a ``SnapAuthor``."""
+
+    model_config = SurrealConfigDict(table_name="Snap")
+
+    id: str | None = None
+    name: str = ""
+    n: int = 0
+    author: SnapAuthor | RecordID | None = None
+    authors: list[SnapAuthor | RecordID] = []
+
+
+class SnapFrozen(BaseSurrealModel):
+    """A hashable record model, so a set can hold one."""
+
+    model_config = SurrealConfigDict(table_name="SnapFrozen", frozen=True)
+
+    id: str | None = None
+
+
+class SnapInner(BaseModel):
+    """A plain Pydantic sub-model holding a record model."""
+
+    author: SnapAuthor | None = None
+
+
+class SnapNest(BaseSurrealModel):
+    """Record models at every depth a field can hold one: the snapshot marker reaches them all."""
+
+    model_config = SurrealConfigDict(table_name="SnapNest")
+
+    id: str | None = None
+    one: SnapAuthor | None = None
+    many: list[SnapAuthor] = []
+    pair: tuple[SnapAuthor, ...] = ()
+    by_key: dict[str, SnapAuthor] = {}
+    hashed: set[SnapFrozen] = set()
+    inner: SnapInner | None = None
+    deep: list[dict[str, list[SnapAuthor]]] = []
+    nest: "SnapNest | None" = None
 
 
 M2020 = datetime(2020, 6, 1, tzinfo=UTC)
@@ -1171,6 +1214,60 @@ class TestSnapshotMarkerE2E:
         assert all(isinstance(row, dict) and "_surreal_as_of" not in row for row in rows)
 
 
+def _nested_tree() -> tuple[SnapNest, list[BaseSurrealModel]]:
+    """A ``SnapNest`` holding a record model at each depth, and every record model it holds (itself included)."""
+    authors = [SnapAuthor(id=str(i)) for i in range(8)]
+    frozen = SnapFrozen(id="f")
+    child = SnapNest(id="child", one=authors[7])
+    root = SnapNest(
+        id="root",
+        one=authors[0],
+        many=[authors[1]],
+        pair=(authors[2],),
+        by_key={"k": authors[3]},
+        hashed={frozen},
+        inner=SnapInner(author=authors[4]),
+        deep=[{"k": [authors[5], authors[6]]}],
+        nest=child,
+    )
+    return root, [root, *authors, frozen, child]
+
+
+class TestNestedSnapshotMarks:
+    """Unit: the record models nested in a snapshot's fields are snapshots too, at any depth (review of #241)."""
+
+    def test_every_nested_record_model_is_marked(self) -> None:
+        root, models = _nested_tree()
+        assert QuerySet._mark_snapshots([root], M2021) == [root]
+        assert [_snapshot_moment(model) for model in models] == [M2021] * len(models)
+
+    def test_one_instance(self) -> None:
+        root, models = _nested_tree()
+        assert QuerySet._mark_snapshots(root, M2021) is root
+        assert [_snapshot_moment(model) for model in models] == [M2021] * len(models)
+
+    def test_a_current_read_marks_nothing(self) -> None:
+        root, models = _nested_tree()
+        QuerySet._mark_snapshots([root], None)
+        assert [_snapshot_moment(model) for model in models] == [None] * len(models)
+
+    def test_cycles_end(self) -> None:
+        """An instance reachable from itself is marked once; the walk ends."""
+        a, b = SnapNest(id="a"), SnapNest(id="b")
+        a.nest, b.nest = b, a
+        lone = SnapNest(id="lone")
+        lone.nest = lone
+        QuerySet._mark_snapshots([a, lone], M2021)
+        assert [_snapshot_moment(model) for model in (a, b, lone)] == [M2021] * 3
+
+    def test_a_plain_sub_model_carries_no_marker(self) -> None:
+        """Only record models are marked: a plain Pydantic sub-model is walked, never given private state."""
+        root, _ = _nested_tree()
+        QuerySet._mark_snapshots(root, M2021)
+        assert root.inner is not None and root.inner.__pydantic_private__ is None
+        assert "_surreal_as_of" not in root.inner.model_dump()
+
+
 def _fresh_snap() -> BaseSurrealModel:
     return Snap(id="p1", n=1)
 
@@ -1715,6 +1812,128 @@ class TestFetchByLineE2E:
         assert versions == []
 
 
+#: ``SnapAuthor:w`` and ``SnapAuthor:v`` written in 2020 and linked then from ``Snap:p``, ``w`` renamed now (one
+#: statement per ``client.query()``).
+_LINKED = (
+    "CREATE SnapAuthor:w SET name='old' VERSION d'2020-01-01T00:00:00Z';",
+    "CREATE SnapAuthor:v SET name='vee' VERSION d'2020-01-01T00:00:00Z';",
+    "CREATE Snap:p SET name='Post', n=1, author=SnapAuthor:w, authors=[SnapAuthor:w, SnapAuthor:v] "
+    "VERSION d'2020-01-01T00:00:00Z';",
+    "UPDATE SnapAuthor:w SET name='new';",
+)
+
+
+async def _single(rows: Awaitable[Any]) -> Any:
+    """The one row of *rows*."""
+    [row] = await rows
+    return row
+
+
+#: The reads returning the records ``fetch()`` resolves, each giving ``Snap:p``.
+_LINKED_READS: list[tuple[str, Callable[[Any], Awaitable[Any]]]] = [
+    ("exec", lambda qs: _single(qs.exec())),
+    ("first", lambda qs: qs.first()),
+    ("get", lambda qs: qs.filter(name="Post").get()),
+]
+
+
+@contextlib.asynccontextmanager
+async def linked_db(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> AsyncIterator[Any]:
+    """``_LINKED`` on a fresh embedded versioned database whose ``version()`` answers 3.x, as in ``test_runs_on_3x``."""
+    async with embedded_database(_versioned_url(tmp_path)) as client:
+        for statement in _LINKED:
+            await client.query(statement)
+        _count_versions(monkeypatch, client, answer="surrealdb-3.3.4")
+        yield client
+
+
+async def _linked_author() -> SnapAuthor:
+    """``Snap:p``'s author, fetched at M2021 into a model-typed field."""
+    post = await SnapLinked.objects().as_of(M2021).fetch("author").filter(name="Post").get()
+    assert isinstance(post.author, SnapAuthor), post.author
+    return post.author
+
+
+class TestNestedSnapshotsE2E:
+    """AC-11 for the records nested in a snapshot (review of #241): a link ``fetch()`` resolves into a model-typed
+    field holds the linked record as it was, so it is a read-only snapshot too.
+
+    On the embedded engine with ``version()`` answering 3.x (its 2.x core resolves the link to its current state;
+    the 3.x versioned server class checks the past state).
+    """
+
+    @pytest.mark.parametrize(("name", "read"), _LINKED_READS, ids=[row[0] for row in _LINKED_READS])
+    async def test_fetched_links_are_snapshots(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, name: str, read: Callable[[Any], Awaitable[Any]]
+    ) -> None:
+        async with linked_db(monkeypatch, tmp_path):
+            post = await read(SnapLinked.objects().as_of(M2021).fetch("author", "authors"))
+        assert isinstance(post, SnapLinked), post
+        linked = [post.author, *post.authors]
+        assert [type(model) for model in linked] == [SnapAuthor] * 3, linked
+        assert [_snapshot_moment(model) for model in (post, *linked)] == [M2021] * 4
+
+    @pytest.mark.parametrize("in_tx", [False, True], ids=["no-tx", "tx"])
+    @pytest.mark.parametrize(("name", "method", "write"), _SNAPSHOT_WRITES, ids=[row[0] for row in _SNAPSHOT_WRITES])
+    async def test_every_write_of_a_fetched_link_is_refused(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        in_tx: bool,
+        name: str,
+        method: str,
+        write: Callable[[Any, Any], Awaitable[Any]],
+    ) -> None:
+        async with linked_db(monkeypatch, tmp_path) as client:
+            author = await _linked_author()
+            calls = _record_queries(monkeypatch, client)
+            writes = _record_writes(monkeypatch, client)
+            refused = pytest.raises(SurrealDbError, match=r"cannot run on an instance read with as_of\(\)")
+            with _pre_signals(SnapAuthor) as fired, refused as info:
+                await write(author, _UntouchableTx() if in_tx else None)
+            assert str(info.value) == time_travel.snapshot_write_refused("SnapAuthor", method, M2021)
+            assert fired == []
+            assert calls == []
+            assert writes == []
+            current = await SnapAuthor.objects().get("w")
+        assert current.name == "new"
+
+    async def test_bulk_create_refuses_a_fetched_link(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        async with linked_db(monkeypatch, tmp_path) as client:
+            author = await _linked_author()
+            calls = _record_queries(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as info:
+                await SnapAuthor.objects().bulk_create([author])
+            assert calls == []
+        assert str(info.value) == time_travel.snapshot_write_refused("SnapAuthor", "bulk_create()", M2021)
+
+    async def test_refresh_of_the_post_leaves_its_link_a_snapshot(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``refresh()`` re-reads the post only: the author it held stays a snapshot until its own ``refresh()``."""
+        async with linked_db(monkeypatch, tmp_path):
+            post = await SnapLinked.objects().as_of(M2021).fetch("author").filter(name="Post").get()
+            author = post.author
+            assert isinstance(author, SnapAuthor)
+            await post.refresh()
+            assert (post.author, _snapshot_moment(post)) == (RecordID("SnapAuthor", "w"), None)
+            assert _snapshot_moment(author) == M2021
+            await author.refresh()
+            assert (author.name, _snapshot_moment(author)) == ("new", None)
+            await author.merge(name="newer")
+            assert (await SnapAuthor.objects().get("w")).name == "newer"
+
+    async def test_a_current_fetch_marks_nothing(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        async with linked_db(monkeypatch, tmp_path):
+            post = await SnapLinked.objects().fetch("author", "authors").filter(name="Post").get()
+            linked = [post.author, *post.authors]
+            assert [type(model) for model in linked] == [SnapAuthor] * 3, linked
+            assert [_snapshot_moment(model) for model in (post, *linked)] == [None] * 4
+            assert isinstance(post.author, SnapAuthor)
+            await post.author.merge(name="newer")
+            assert (await SnapAuthor.objects().get("w")).name == "newer"
+
+
 # --- server lines: in memory (CI as today) and on versioned storage (AC-12 to AC-15, AC-22 (c) and (d)) ----
 
 
@@ -2000,6 +2219,39 @@ class TestVersionedServerE2E:
         assert str(info.value) == time_travel.fetch_refused()
         assert len(versions) == 1 and line_major(versions[0]) == 2, versions
         assert sent == []
+
+    async def test_fetched_link_is_a_snapshot_on_3x(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AC-11 and AC-15, 3.x (review of #241): a link ``fetch()`` resolves into a model-typed field holds the
+        linked record as it was, and its writes are refused: they would put that past state back."""
+        async with versioned_client() as client:
+            if await _line(client) < 3:
+                pytest.skip("SurrealDB 3.x only: 2.x refuses fetch() under as_of() (T8)")
+            author = await SnapAuthor(id="w", name="old").save()
+            await Snap(id="p", n=1, author=RecordID("SnapAuthor", "w")).save()
+            t1 = await _now(client)
+            await author.merge(name="new")
+            t2 = await _now(client)
+            _strictly_increasing(t1, t2)
+            [post] = await SnapLinked.objects().as_of(t1).fetch("author").exec()
+            past = post.author
+            assert isinstance(past, SnapAuthor), past
+            moment = _snapshot_moment(post)
+            assert moment is not None and (past.name, _snapshot_moment(past)) == ("old", moment)
+            calls = _record_queries(monkeypatch, client)
+            for method, write in (
+                ("update()", past.update),
+                ("save()", past.save),
+                ("merge()", lambda: past.merge(name="x")),
+            ):
+                with pytest.raises(SurrealDbError) as info:
+                    await write()
+                assert str(info.value) == time_travel.snapshot_write_refused("SnapAuthor", method, moment)
+            sent = list(calls)  # before the reads below
+            assert (await SnapAuthor.objects().get("w")).name == "new"
+            [current] = await SnapLinked.objects().fetch("author").exec()
+        assert sent == []
+        assert isinstance(current.author, SnapAuthor)
+        assert (current.author.name, _snapshot_moment(current.author)) == ("new", None)
 
 
 # --- README section 27, the behaviour tables and the ROADMAP (spec §11; AC-18, AC-19; P2, P4, P5, D14) ----

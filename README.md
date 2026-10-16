@@ -3105,6 +3105,10 @@ assert old_desk != current_desk and old_desk.model_dump() == current_desk.model_
   are recomputed by the server in every case.
 - **Copies**: `model_copy()` and `pickle` keep the snapshot; an instance pickled by v0.25.x
   unpickles as a current record.
+- **Nested records**: a record model nested in a snapshot's fields is a snapshot too, such as a
+  link `fetch()` resolves into a model-typed field (`author: Author | RecordID | None`, see
+  [Record links](#record-links)): it holds the linked record as it was. Its own `refresh()` makes
+  it the current record; the snapshot's `refresh()` re-reads that record only.
 - **Graph reads** stay available: `get_related()` and `traverse()` read the current graph.
 - When the record was deleted since, `refresh()` raises its usual `SurrealDbError` and the
   instance stays a snapshot.
@@ -3132,8 +3136,9 @@ state, and nothing tells the ORM which storage the server runs, so it cannot tel
 engine of the surrealdb SDK 2.x) resolves them to their current state, so on 2.x the reads that
 return the fetched records (`exec()`, `first()`, `get()` without an id) raise `SurrealDbError`;
 the other reads ignore `fetch()`, as without `as_of()`. Read the linked records with their own
-`as_of()` query. A dotted path through a link (`author.name`) in `filter()`, `select()`,
-`order_by()` or `values()` reads the linked record as it was on 3.x and as it is now on 2.x.
+`as_of()` query. On 3.x, a link fetched into a model-typed field is a snapshot too, read-only. A
+dotted path through a link (`author.name`) in `filter()`, `select()`, `order_by()` or `values()`
+reads the linked record as it was on 3.x and as it is now on 2.x.
 
 #### Writing history at a past moment
 

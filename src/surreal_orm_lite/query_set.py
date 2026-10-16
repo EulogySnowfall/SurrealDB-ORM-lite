@@ -2,11 +2,12 @@ import contextlib
 import logging
 import math
 import numbers
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Self, cast
 from uuid import UUID
 
+from pydantic import BaseModel
 from pydantic_core import ValidationError
 
 from . import BaseSurrealModel, SurrealDBConnectionManager
@@ -42,6 +43,9 @@ if TYPE_CHECKING:
     from .aggregations import Aggregation
 
 logger = logging.getLogger(__name__)
+
+#: The values a snapshot's fields can nest a record model in (``QuerySet._mark_snapshots()``, v0.26.0).
+_SNAPSHOT_HOLDERS = (BaseModel, list, tuple, set, frozenset, dict)
 
 
 class QuerySet:
@@ -463,14 +467,35 @@ class QuerySet:
     def _mark_snapshots(result: Any, moment: datetime | None) -> Any:
         """Mark the instances of *result* (a list, or one instance) as snapshots read at *moment*; return it (v0.26.0).
 
-        Nothing happens without a moment (a current read). Rows that did not validate stay dicts, untouched.
-        The marker is read with ``model_base._snapshot_moment()``.
+        The record models nested in their fields are marked too, at any depth: in a sub-model, a list, a tuple,
+        a set or a dict's values. A link ``fetch()`` resolves into a model-typed field (``author: Author |
+        RecordID | None``, SurrealDB 3.x) holds the linked record as it was, and its writes would put that past
+        state back over the current record. Each object is visited once, so a cycle ends the walk.
+
+        Nothing happens without a moment (a current read). Rows that did not validate stay dicts, untouched; a
+        plain Pydantic sub-model is walked but carries no marker. The marker is read with
+        ``model_base._snapshot_moment()``.
         """
         if moment is None:
             return result
-        for instance in result if isinstance(result, list) else [result]:
-            if isinstance(instance, BaseSurrealModel):
-                instance._surreal_as_of = moment
+        rows = result if isinstance(result, list) else [result]
+        pending: list[Any] = [row for row in rows if isinstance(row, BaseSurrealModel)]
+        seen: set[int] = set()
+        while pending:
+            value = pending.pop()
+            if id(value) in seen:
+                continue
+            seen.add(id(value))
+            children: Iterable[Any]
+            if isinstance(value, BaseModel):
+                if isinstance(value, BaseSurrealModel):
+                    value._surreal_as_of = moment
+                children = [*value.__dict__.values(), *(value.__pydantic_extra__ or {}).values()]
+            elif isinstance(value, dict):
+                children = value.values()
+            else:
+                children = value
+            pending.extend(child for child in children if isinstance(child, _SNAPSHOT_HOLDERS))
         return result
 
     # ==================== Internal query building ====================

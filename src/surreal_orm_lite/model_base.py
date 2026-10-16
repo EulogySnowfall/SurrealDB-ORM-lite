@@ -637,13 +637,14 @@ class BaseSurrealModel(BaseModel):
     _surreal_as_of: datetime | None = PrivateAttr(default=None)
     """The moment a time-travel read (``QuerySet.as_of()``) returned this instance at; ``None`` for a current record (v0.26.0).
 
-    Set by the QuerySet's time-travel reads only. Read it through :func:`_snapshot_moment`, never as an
-    attribute: an instance pickled by v0.25.x has no private state. While it is set, the instance is a
-    read-only snapshot: every write (``save()``, ``update()``, ``merge()``, ``patch()``, ``upsert()``,
-    ``delete()``, the ``atomic_*()`` methods, ``relate()``, ``remove_relation()``, ``remove_all_relations()``,
-    and ``QuerySet.bulk_create()``) raises ``SurrealDbError`` before any signal or request; ``refresh()``
-    clears it. A private attribute, so it never reaches ``model_dump()`` or a write; ``model_copy()`` and
-    ``pickle`` keep it, and Pydantic's ``==`` compares it.
+    Set by the QuerySet's time-travel reads only, on the instances they return and on the record models nested
+    in their fields, such as a link ``fetch()`` resolves into a model-typed field (``QuerySet._mark_snapshots()``).
+    Read it through :func:`_snapshot_moment`, never as an attribute: an instance pickled by v0.25.x has no
+    private state. While it is set, the instance is a read-only snapshot: every write (``save()``, ``update()``,
+    ``merge()``, ``patch()``, ``upsert()``, ``delete()``, the ``atomic_*()`` methods, ``relate()``,
+    ``remove_relation()``, ``remove_all_relations()``, and ``QuerySet.bulk_create()``) raises ``SurrealDbError``
+    before any signal or request; ``refresh()`` clears it. A private attribute, so it never reaches
+    ``model_dump()`` or a write; ``model_copy()`` and ``pickle`` keep it, and Pydantic's ``==`` compares it.
     """
 
     def __setstate__(self, state: dict[Any, Any]) -> None:
