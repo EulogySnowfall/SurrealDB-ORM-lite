@@ -8,9 +8,13 @@ opens a server transport for ``http``, ``https``, ``ws`` and ``wss``, and its in
 (#233) needs no change here. A URL the parser refuses gets one clear ORM error quoting the
 SDK's own message (:func:`require_supported_url`) before anything is opened.
 
+Time travel (v0.26.0): ``QuerySet.as_of()`` needs a store that keeps history. On the embedded engine
+that is decided from the URL alone, before any request (:func:`keeps_history`): the SDK's parser must
+recognise the scheme and its name must end with ``+versioned`` — a naming rule, again not a list.
+
 The texts of the errors the ORM raises for what the engine cannot do (live queries, a second session,
-model auth on a session of its own, ``changes(since=<datetime>)``) are built here too, so each lives in
-one place.
+model auth on a session of its own, ``changes(since=<datetime>)``, ``as_of()`` without history) are built
+here too, so each lives in one place.
 
 A leaf module: it imports ``_sdk``, ``exceptions`` and the standard library only.
 """
@@ -54,6 +58,20 @@ def is_embedded_url(url: str | None) -> bool:
     if not url:  # an explicit test: mypy does not narrow ``str | None`` through ``bool(url) and …``
         return False
     return url_kind(url) == "embedded"
+
+
+def keeps_history(url: str | None) -> bool:
+    """Whether the SDK's in-process engine at *url* keeps the history ``as_of()`` reads (v0.26.0).
+
+    True when the SDK's own parser recognises the scheme and its name ends with ``+versioned`` (SDK 2.0.0:
+    ``surrealkv+versioned``) — a naming rule, not a list. The engine of the surrealdb SDK 2.x (core 2.3.10)
+    ignores a ``?versioned=true`` query, so it does not count; the SDK 3.0 move (#205) revisits this rule,
+    the 3.x core naming versioning that way. False for ``None``/``""``, a server URL or a URL the SDK refuses.
+    """
+    if not url or url_kind(url) != "embedded":
+        return False
+    scheme = SdkUrl(url).scheme
+    return isinstance(scheme, SdkUrlScheme) and str(scheme.value).endswith("+versioned")
 
 
 def require_supported_url(url: str | None) -> None:
@@ -121,4 +139,13 @@ def changes_since_datetime_unsupported() -> str:
         "changes(since=<datetime>) is not available on the embedded engine of the surrealdb SDK 2.x: it keeps "
         "no timestamps for change-feed positions, so a datetime cannot be resolved. Pass a cursor "
         "(ChangeModelStream.cursor) or since=None."
+    )
+
+
+def history_unsupported(url: str | None) -> str:
+    """T6: a time-travel read (``as_of()``) on an embedded URL that :func:`keeps_history` refuses (v0.26.0)."""
+    return (
+        f"as_of() needs a store that keeps history, and the embedded engine at {url!r} keeps none. Open a "
+        "surrealkv+versioned://<path> database (the surrealdb SDK 2.x ignores ?versioned=true), or connect to a "
+        "server started with versioned storage."
     )

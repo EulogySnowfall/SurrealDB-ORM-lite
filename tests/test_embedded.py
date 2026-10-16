@@ -1175,7 +1175,7 @@ _PARIS = (2.35, 48.85)
 
 def test_the_boundary_guard_still_covers_every_pre_existing_module() -> None:
     """The encoding-boundary guard of ``conftest.py`` is lifted for this new module only (v0.25.0), beside the
-    modules of v0.23.0, v0.24.0 and v0.24.3 (#235)."""
+    modules of v0.23.0, v0.24.0 and v0.24.3 (#235), and for ``tests/test_time_travel.py`` (v0.26.0), new too."""
     assert (
         frozenset(
             {
@@ -1186,6 +1186,7 @@ def test_the_boundary_guard_still_covers_every_pre_existing_module() -> None:
                 "tests.test_geo_fields",
                 "tests.test_decoding",
                 "tests.test_embedded",
+                "tests.test_time_travel",
             }
         )
         == _REWRITE_MODULES
