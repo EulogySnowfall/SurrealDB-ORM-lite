@@ -5,6 +5,113 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.0] - 2026-10-17
+
+Query cache: a QuerySet serves its reads from a client-side cache with `cache(ttl)`, and every ORM
+write removes the cached reads it can change, with nothing to set up. The sixth minor of Tier 2.
+
+### Added
+
+- **`QuerySet.cache(ttl=None)`** and **`QueryCache`**, exported from `surreal_orm_lite` (the full
+  SurrealDB-ORM's names). The rows a cached read returned stay in this process's memory, and the
+  same read is answered from there, without a request, until its TTL runs out or an ORM write
+  changes what it reads.
+
+  ```python
+  from surreal_orm_lite import QueryCache
+
+  books = await Product.objects().filter(category="book").cache(ttl=30).exec()  # the database answers
+  again = await Product.objects().filter(category="book").cache(ttl=30).exec()  # the cache answers
+  await Product(id="p4", name="Atlas", category="book", price=40).save()  # removes Product's cached reads
+  fresh = await Product.objects().filter(category="book").cache(ttl=30).exec()  # the database answers
+  QueryCache.stats()["hits"]  # 1
+  ```
+
+- **Every read of a cached queryset**: `exec()`, `first()`, `get()` by filters or by id, `all()`,
+  `count()`, `sum()`, `avg()`, `min()`, `max()`, `exists()`, `values(…).annotate(…)` and
+  `annotate(GeoDistance)`. A read is a hit when an earlier read sent the same statement with the
+  same variables, on the same connection and with the same identity, within the TTL. Rows are
+  cached, not instances: each hit builds new instances from a copy. Empty results are cached
+  (`get(<id>)` of a missing record raises `SurrealDbNotFoundError` on the hit too); errors never
+  are. An internal failure of the cache never fails a read: the read goes to the database.
+- **Time to live**: seconds (`int` or `float`) or a `timedelta`, the oldest result the read
+  accepts; `cache()` without a TTL uses `QueryCache`'s default (60 s unless configured); `0` means
+  never cached.
+- **Built-in invalidation**: every ORM write removes the cached reads of the tables it writes,
+  before its `post_*` signals fire — `save()`, `update()`, `merge()`, `upsert()`, `patch()`,
+  `delete()`, the atomic operations, `relate()` and the `remove_*()` helpers, a typed edge's
+  `save()`, `bulk_create()`, `bulk_update()`, `bulk_delete()`, `QuerySet.patch()`,
+  `delete_table()`, `get_or_create()`/`update_or_create()` when they write, `signup()`,
+  `define_computed_fields()` and `define_access()`. Reads whose subqueries read those tables go
+  too; a read that follows links (`fetch()`, a dotted path, a `select()` item that is not a plain
+  field) is removed by any ORM write, and a read of an edge model by any delete. Inside
+  `transaction()` the written tables are invalidated at commit (a failed commit too, nothing on
+  rollback). While a write runs, reads of its tables go to the database and store nothing.
+- **One cache scope per connection and identity**: a sign-in, a sign-up, `authenticate()` or
+  `invalidate()` starts a new scope and drops the previous identity's results; another event loop's
+  connection, a reconnect and an `embedded_database()` block start empty; closing a connection
+  drops its results. Cached results never cross identities.
+- **`QueryCache`**: `configure(default_ttl=60, max_size=1000, enabled=True)` sets all three
+  settings at every call, as in the full ORM, and never clears; `enabled=False` hides the entries
+  (`cache()` reads go to the database and calling `cache()` logs a warning). Past `max_size` the
+  least recently used entry is evicted. `invalidate()` takes a model class or a table name and
+  returns how many entries it removed; `clear()` drops every entry and resets the counters;
+  `stats()` returns `entries`, `tables`, `max_size`, `default_ttl`, `enabled`, `hits` and
+  `misses`. `make_key()`, `get()` and `set()` cache your own results (of `raw_query()`, say),
+  tagged with a table so that an ORM write to it removes them; `get()` misses while such a write
+  runs.
+- **Refusals**: `query()` raises `SurrealDbError` on a queryset with `cache()`; `live()`, `watch()`
+  and `changes()` name `cache()` among the clauses their usual error refuses; combining `cache()`
+  with `as_of()` raises `SurrealDbError`, in either order. A negative or non-finite TTL raises
+  `ValueError`, anything but a number or a `timedelta` (`True` included) `TypeError`.
+- README section 29, "Query cache (`cache()`, `QueryCache`)" (what is cached, the time to live,
+  invalidation and what the cache cannot see, one cache per connection and identity,
+  configuration and statistics, a note for users of the full SurrealDB-ORM), a features row, a
+  row in the 2.x/3.x behaviour table, the comparison and roadmap rows, and the example notebook
+  `examples/v0.28.0_query_cache.ipynb`.
+
+### Changed
+
+- ORM writes now also remove the cached reads they can change, in memory, without a request.
+  Without `cache()`, every read and write sends the same requests as in v0.27.x; the texts of the
+  `live()`, `watch()` and `changes()` refusals are unchanged.
+
+### Notes
+
+- **Same on SurrealDB 2.x and 3.x**, and on the embedded engine. Reads inside a transaction
+  (`objects(tx=)`) are never cached: on 3.x an interactive transaction's reads see its uncommitted
+  writes, and on 2.x a buffered transaction cannot read.
+- **What the cache cannot see** (the TTL bounds it; `QueryCache.invalidate(Model)` removes a
+  table's entries after such a change): writes by another process or client; raw SurrealQL
+  (`raw_query()`, `QuerySet.query()`, `call_function()`, `Transaction.add()`); a write whose task
+  is cancelled, or that fails client-side, after its request was sent; writes made by an access
+  method's own `SIGNIN`/`SIGNUP` clauses beyond the record they create; what the server derives on
+  its own (`DEFINE EVENT`, `REFERENCE … ON DELETE` on 3.x, views, `PERMISSIONS` that read another
+  table); values computed when the read runs (a `DEFINE PARAM` read with `Var()`,
+  `<future>`/`COMPUTED` fields, time functions in a `select()` expression); a table of relations
+  read through a model that is not a `BaseSurrealEdge`. A session changed behind the ORM's back
+  (`raw_query("USE …")`, `signin()` or `use()` on the SDK client) is not seen either: call
+  `QueryCache.clear()` after it.
+- **Memory**: cached rows stay in this process's memory until they expire, are evicted,
+  invalidated or cleared, or their connection closes. `configure(enabled=False)` only hides them;
+  `QueryCache.clear()` drops them. Entries stored with `QueryCache.set()` are not scoped to a
+  connection or an identity: put whatever tells your callers apart in the key.
+- **Keys** are the SHA-256 of the CBOR bytes the official SDK sends, with the keys of mappings
+  sorted: `RecordID("user", 1)` and `"user:1"` never share an entry. An SDK that exposes no CBOR
+  encoder sends every `cache()` read to the database (one warning per process).
+- Concurrent misses of the same read each send their own request.
+- **Differences from the full SurrealDB-ORM**: every read is cached, not only `exec()`, `first()`
+  and `get()` by filters; invalidation is built in and covers bulk operations, `QuerySet.patch()`,
+  the atomic operations, relations and transactions, where the full ORM listens to `post_save`,
+  `post_update` and `post_delete`; rows are cached instead of instances; one scope per connection
+  and identity; `live()`, `watch()`, `changes()` and `query()` refuse `cache()`; the TTL may be a
+  `float` or a `timedelta` and negative values are refused; LRU eviction instead of FIFO;
+  `invalidate()` takes a table name too; `stats()` adds `hits` and `misses`.
+- Not available yet: invalidation from other processes or clients (through live queries),
+  caching `as_of()` reads, sharing cached results between event loops.
+- **Server pins unchanged**: tested against SurrealDB 3.3.4 and 2.7.0, and on the embedded engine,
+  plus 3.1.5 for backward compatibility (identical).
+
 ## [0.27.0] - 2026-10-16
 
 Subqueries: a QuerySet filters another, as `Subquery(qs)` or the queryset itself, compiled to a

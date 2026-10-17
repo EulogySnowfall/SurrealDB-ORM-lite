@@ -36,7 +36,8 @@
 | v0.25.0           | Tier 2 — Embedded test engine                        | Done    |
 | v0.26.0           | Tier 2 — Time travel (versioned storage)             | Done    |
 | v0.27.0           | Tier 2 — Subqueries                                  | Done    |
-| v0.28.0 – v0.29.0 | Tier 2 — Extended (SDK-2.0-native), 2 minors         | Planned |
+| v0.28.0           | Tier 2 — Query cache                                 | Done    |
+| v0.29.0           | Tier 2 — Multi-database                              | Planned |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | Planned |
@@ -90,7 +91,7 @@ pieces stay out.
 | Embedded / in-memory test engine       | `mem://` / `surrealkv://` ²                           | ✅ v0.25.0     |
 | Versioned storage (time-travel)        | `surrealkv+versioned://` ²                            | ✅ v0.26.0     |
 | Subqueries                             | nested `SELECT` via `query()`                         | ✅ v0.27.0     |
-| Query cache (TTL)                      | client-side cache (SDK-independent)                   | v0.28.0        |
+| Query cache (TTL)                      | client-side cache (SDK-independent)                   | ✅ v0.28.0     |
 | Multi-database                         | multiple `AsyncSurreal` instances                     | v0.29.0        |
 | Schema introspection                   | `INFO FOR DB` / `INFO FOR TABLE`                      | v0.30.0        |
 | `DEFINE EVENT` (triggers)              | DDL via `query()`                                     | v0.31.0        |
@@ -154,7 +155,7 @@ moves it to the `surrealdb[embedded]` extra.
 | Geospatial fields             | yes        | ✅ v0.24.0                  |
 | Embedded / versioned engine   | no         | ✅ v0.25 – v0.26            |
 | Subqueries                    | yes        | ✅ v0.27.0                  |
-| Query cache (TTL)             | yes        | v0.28.0                     |
+| Query cache (TTL)             | yes        | ✅ v0.28.0                  |
 | Multi-database                | yes        | v0.29.0                     |
 | Schema introspection          | yes        | v0.30.0                     |
 | DEFINE EVENT                  | yes        | v0.31.0                     |
@@ -543,6 +544,31 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   lines unchanged (2.7.0 and 3.3.4, 3.1.5 retro, which differs only in the error a time-travel
   subquery raises without versioned storage)
 
+### Version 0.28.0 — Query cache
+
+- `QuerySet.cache(ttl)` and `QueryCache` (`configure()`, `make_key()`, `get()`, `set()`,
+  `invalidate()`, `clear()`, `stats()`), the full SurrealDB-ORM's names. Every read of a cached
+  queryset is served from this process's memory: `exec()`, `first()`, `get()` by filters or by id,
+  `all()`, `count()`, the aggregates, `exists()`, `values().annotate()` and `GeoDistance`. Rows
+  are cached, and each hit builds new instances from a copy
+- Keys are the SHA-256 of the CBOR bytes the SDK sends (statement and variables, mapping keys
+  sorted), so `RecordID("user", 1)` and `"user:1"` never share an entry. The TTL is the oldest
+  result a read accepts (seconds or a `timedelta`, `0` never cached, default 60 s); at most
+  `max_size` entries (1000 by default), least recently used evicted first; `stats()` adds `hits`
+  and `misses`
+- Invalidation is built in: every ORM write removes the reads of the tables it writes before its
+  `post_*` signals, the reads whose subqueries read them included; a read that follows links
+  (`fetch()`, a dotted path, a `select()` item that is not a plain field) by any write; a read of
+  an edge model by any delete. Inside `transaction()` at commit; while a write runs, reads of its
+  tables go to the database and store nothing
+- One cache scope per connection and identity, retired with the connection or at its next
+  identity change (sign-in, sign-up, `authenticate()`, `invalidate()`): results never cross
+  identities. Reads inside a transaction are never cached; `query()`,
+  `live()`, `watch()`, `changes()` and `as_of()` refuse `cache()`
+- Same on both lines (2.7.0 and 3.3.4, 3.1.5 retro identical) and on the embedded engine. Deferred:
+  invalidation from other processes (LIVE SELECT), caching `as_of()` reads, sharing results
+  between event loops, coalescing concurrent misses
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -724,7 +750,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 | ✅ v0.25.0 | Embedded test engine: `mem://` / `surrealkv://` + base fixtures ¹    | SDK embedded connection           |
 | ✅ v0.26.0 | Versioned storage / time-travel: `surrealkv+versioned://` ²          | embedded versioned engine         |
 | ✅ v0.27.0 | Subqueries (nested QuerySets in `filter`/`in`)                       | nested `SELECT` via `query()`     |
-| v0.28.0    | Query cache (TTL + invalidation), client-side                        | client cache                      |
+| ✅ v0.28.0 | Query cache (TTL + invalidation), client-side                        | client cache                      |
 | v0.29.0    | Multi-database: named connection registry                            | N × `AsyncSurreal` instances      |
 
 ¹ The embedded engine ships in the SDK 2.0.0 base wheel (engine core 2.3.10); the SDK 3.0 line
