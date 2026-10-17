@@ -2,9 +2,9 @@ import contextlib
 import logging
 import math
 import numbers
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING, Any, Self, SupportsIndex, cast
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -19,6 +19,7 @@ from . import time_travel as _time_travel
 from ._sdk import NotFoundError, RecordID, SdkGeometryPoint, ServerError
 from .cache import EDGES, CacheRequest, QueryCache, follows_links, statement_key, ttl_seconds
 from .changefeed import ChangeModelStream, Since
+from .constants import SESSION_PARAMETERS
 from .edge import _check_edge_id, insert_edges
 from .embedded import history_unsupported, keeps_history
 from .enum import OrderBy
@@ -33,15 +34,20 @@ from .surql_literal import inline_variables
 from .types import Duration
 from .utils import (
     VALID_FIELD_PATTERN,
+    VARIABLE_NAME_VALUE,
     as_record_value,
     build_filter_condition,
     coerce_record_id,
+    is_select_item,
+    non_negative_int,
     parse_lookup,
-    remove_quotes_for_variables,
+    unescape_filter_value,
     validate_alias_name,
     validate_field_name,
     validate_patch_operations,
+    validate_select_item,
     warn_on_multiple_statements,
+    warn_on_variable_names,
 )
 
 if TYPE_CHECKING:
@@ -141,30 +147,79 @@ class QuerySet:
         """
         Specify the fields to retrieve in the query.
 
-        By default, all fields are selected (``SELECT *``). This method allows you to specify
-        a subset of fields to be retrieved.
+        By default, all fields are selected (``SELECT *``). Each item is one of:
+
+        - ``"*"``: every field;
+        - a field name, the Python one for an aliased field (its column is selected): ``"name"``, ``"id"``;
+        - a dotted path into a nested object or through a record link: ``"author.name"``;
+        - a path followed by ``.*``: every field of the nested object or of the linked record: ``"author.*"``.
+
+        Names are letters, digits and underscores, each part starting with a letter or an underscore, as in
+        ``order_by()`` and ``values()``. Anything else — an expression, a function call, ``AS``, ``{…}`` or
+        ``[…]`` — is refused when ``select()`` is called, before any request; write a computed projection
+        with :meth:`query`. Rows that do not validate as the model (a link read as a record, a required field
+        left out) come back as dicts keyed by Python names. On a nested object that is not a link,
+        ``"meta.*"`` gives the object on SurrealDB 3.x and its values as a list on 2.x and the embedded engine.
+
+        Example::
+
+            await User.objects().select("name", "email").exec()
+            await Book.objects().select("title", "author.name").exec()   # [{"title": …, "author": {"name": …}}]
+            await Book.objects().select("title", "author.*").exec()      # the author's whole record
 
         Args:
-            *fields: Field names to select.
+            *fields: The items to select; none selects every field.
 
         Returns:
             Self: The current instance for method chaining.
+
+        Raises:
+            TypeError: an item is not a ``str``.
+            ValueError: an item is none of the above, or an aliased field's column is not a field name; the
+                message names it. The selection in place is kept.
         """
-        self.select_item = [self._column(field) for field in fields]
+        self.select_item = [self._select_column(field) for field in fields]
         return self
+
+    def _select_column(self, field: str) -> str:
+        """The column ``select()`` writes for *field*, both checked: *field* as given, then its column."""
+        column = self._column(validate_select_item(field))
+        if column != field and not is_select_item(column):
+            raise ValueError(f"select() cannot select {field!r}: its column {column!r} is not a field name")
+        return column
 
     def variables(self, **kwargs: Any) -> Self:
         """
         Set variables for the query.
 
-        Variables can be used in parameterized queries to safely inject values.
+        A filter reads one with ``Var("name")``: ``filter(age__gte=Var("min_age")).variables(min_age=21)``.
+        A string filter value is data, whatever it starts with: ``filter(name="$min_age")`` compares ``name``
+        with the string ``"$min_age"``, with a ``UserWarning`` naming ``Var("min_age")`` when ``variables()``
+        gives ``min_age`` (until v0.28.1 that string read the variable).
+
+        SurrealDB's session parameters — ``access``, ``auth``, ``session`` and ``token`` — are not variables: the
+        server sets them for each session and refuses a query variable of that name, so ``variables()`` refuses them
+        (v0.28.1). To pass your own value, give it another name —
+        ``filter(token=Var("device_token")).variables(device_token=t)`` — or pass the value itself in the filter
+        (``filter(token=t)``). ``Var("token")`` without ``variables()`` reads SurrealDB's ``$token``.
 
         Args:
             **kwargs: Variable names and their values.
 
         Returns:
             Self: The current instance for method chaining.
+
+        Raises:
+            ValueError: a name is one of the session parameters; the variables in place are kept.
         """
+        for name in kwargs:
+            if name in SESSION_PARAMETERS:
+                raise ValueError(
+                    f"variables() cannot set '{name}': SurrealDB sets ${name} for each session and refuses a query "
+                    f"variable of that name. To pass your own value, give it another name (variables(my_{name}=...) "
+                    f"with Var('my_{name}')) or pass the value itself in the filter; Var('{name}') without "
+                    f"variables() reads SurrealDB's ${name} parameter."
+                )
         self._variables.update(kwargs)
         return self
 
@@ -198,6 +253,20 @@ class QuerySet:
             best = Post.objects().select("score").order_by("-score").limit(1)
             Post.objects().filter(score=Subquery(best))                # compared with its first value
 
+        A ``str`` value is data, whatever it starts with: ``filter(name="$admin")`` compares ``name`` with the
+        string ``"$admin"``. ``Var("name")`` is the only reference to a query variable (given with ``variables()``).
+        A ``str`` that is ``$`` and the name of a variable ``variables()`` gives — ``age__lte="$max_age"`` with
+        ``variables(max_age=25)``, which read ``$max_age`` until v0.28.1 — is still the string, with a
+        ``UserWarning`` naming ``Var("max_age")``, once per read, when the statement is compiled.
+
+        ``Var("auth")`` also reads SurrealDB's own session parameters, without ``variables()``:
+        ``filter(owner=Var("auth"))`` keeps the records of the signed-in record user (``$auth``; ``$access``,
+        ``$session`` and ``$token`` likewise), in a read and in a live query. The string ``"$auth"`` is data:
+        ``filter(owner="$auth")`` compares ``owner`` with the string ``"$auth"``, with a ``UserWarning`` naming
+        ``Var("auth")``. On an edge's ``in``/``out`` a ``str`` starting with ``$`` is not a record id: ``ValueError``,
+        whose message names the ``Var(...)`` to use only when the value is ``$`` and the name of a variable
+        ``variables()`` gives or of a session parameter (``"$auth"``).
+
         A ``Subquery`` — or a QuerySet, read as one — is accepted as the whole value of ``in``, ``not_in``,
         ``containsall`` and ``containsany`` (compared with all its values) and of ``exact``, ``gt``, ``gte``,
         ``lt``, ``lte``, ``contains`` and ``not_contains`` (compared with its first value; no record when it is
@@ -218,30 +287,48 @@ class QuerySet:
             self._filters.append((self._column(field_name), lookup, value))
         return self
 
-    def limit(self, value: int) -> Self:
+    def limit(self, value: SupportsIndex) -> Self:
         """
         Set a limit on the number of results to retrieve.
 
         Args:
-            value: The maximum number of records to retrieve.
+            value: The maximum number of records to retrieve: an integer from ``0`` (reads none) to ``2**63 - 1``,
+                SurrealQL's largest integer. Any integer type gives its value: an ``int`` subclass such as an
+                ``IntEnum`` member, or a type with ``__index__`` such as NumPy's ``int64``.
 
         Returns:
             Self: The current instance for method chaining.
+
+        Raises:
+            TypeError: *value* is a ``bool``, or not an integer (no ``__index__``: a ``str`` such as ``"10"``, a
+                ``float``, ``None``) — raised when ``limit()`` is called, before any request; the limit in place is
+                kept.
+            ValueError: *value* is negative or above ``2**63 - 1``, likewise. SurrealDB 2.x and the embedded engine
+                refuse a limit above ``2**32 - 1`` when the read runs (the server's error); SurrealDB 3.x reads it.
         """
-        self._limit = value
+        self._limit = non_negative_int("limit()", value)
         return self
 
-    def offset(self, value: int) -> Self:
+    def offset(self, value: SupportsIndex) -> Self:
         """
         Set an offset for the results.
 
         Args:
-            value: The number of records to skip.
+            value: The number of records to skip: an integer from ``0`` to ``2**63 - 1``, SurrealQL's largest
+                integer. Any integer type gives its value: an ``int`` subclass such as an ``IntEnum`` member, or a
+                type with ``__index__`` such as NumPy's ``int64``.
 
         Returns:
             Self: The current instance for method chaining.
+
+        Raises:
+            TypeError: *value* is a ``bool``, or not an integer (no ``__index__``: a ``str`` such as ``"10"``, a
+                ``float``, ``None``) — raised when ``offset()`` is called, before any request; the offset in place
+                is kept.
+            ValueError: *value* is negative or above ``2**63 - 1``, likewise. SurrealDB 2.x and the embedded engine
+                refuse an offset above ``2**32 - 1`` when the read runs (the server's error); SurrealDB 3.x reads it.
         """
-        self._offset = value
+        self._offset = non_negative_int("offset()", value)
         return self
 
     def order_by(self, *fields: str | OrderBy) -> Self:
@@ -474,7 +561,7 @@ class QuerySet:
         connection, with the same identity, less than ``ttl`` seconds ago, and no ORM write that can change its result
         has completed since: a write to a table it reads; any write, when it follows links (``fetch()``, a dotted path
         such as ``filter(**{"author.name": …})``, a ``select()`` item that is not a plain field, such as
-        ``"author.*"`` or an expression); any delete, when it reads an edge model (a deleted record's edges go with it).
+        ``"author.*"``); any delete, when it reads an edge model (a deleted record's edges go with it).
         Each hit builds new instances from a copy of the cached rows: changing one never changes the cache.
 
         ``ttl`` is the oldest result this read accepts, in seconds (an ``int`` or a ``float`` >= 0) or a ``timedelta``;
@@ -596,7 +683,9 @@ class QuerySet:
 
     # ==================== Internal query building ====================
 
-    def _subquery_compiler(self, empty_tables: frozenset[str] = frozenset(), *, inline: bool = False) -> SubqueryCompiler:
+    def _subquery_compiler(
+        self, empty_tables: frozenset[str] = frozenset(), *, inline: bool = False, warn: bool = True
+    ) -> SubqueryCompiler:
         """A compiler for the subqueries of one statement of this queryset (v0.27.0).
 
         It starts with this queryset's transaction, a copy of its ``variables()`` (the subqueries' are merged into
@@ -606,12 +695,14 @@ class QuerySet:
         Args:
             empty_tables: the tables whose subqueries are bound to ``[]`` (SurrealDB 3.x confirmed they do not exist).
             inline: write the sub-SELECTs inline instead of in ``LET`` s (a live query).
+            warn: emit the warnings of the filter values (v0.28.1); ``False`` for a statement this read compiled once.
         """
         return SubqueryCompiler(
             inline=inline,
             empty_tables=empty_tables,
             outer_tx=self._tx,
             variables=dict(self._variables),
+            warn=warn,
             _stack=[id(self)],
         )
 
@@ -673,7 +764,13 @@ class QuerySet:
 
         return parts, variables, counter
 
-    def _build_where(self, *, as_of: bool = False, subqueries: SubqueryCompiler | None = None) -> tuple[str, dict[str, Any]]:
+    def _build_where(
+        self,
+        *,
+        as_of: bool = False,
+        subqueries: SubqueryCompiler | None = None,
+        variable_names: Collection[str] = (),
+    ) -> tuple[str, dict[str, Any]]:
         """
         Build a parameterized WHERE clause from filters, Q objects and ``nearby()`` conditions.
 
@@ -681,11 +778,29 @@ class QuerySet:
         ``time_travel.GUARD`` is the last condition (:meth:`_where_parts`). A subquery value (v0.27.0) is bound
         by *subqueries*, the statement's compiler; without one it raises ``ValueError`` (S8).
 
+        Once every condition is compiled, a scalar ``str`` filter value that is ``$`` and the name of one of the
+        statement's ``variables()`` — this queryset's, its subqueries', or *variable_names* — or of SurrealDB's
+        session parameters (``$auth``…) gives a ``UserWarning`` naming ``Var(...)``
+        (:func:`utils.warn_on_variable_names`, v0.28.1), unless ``subqueries.warn`` is false. Without *subqueries*
+        nothing is checked: only a statement has variables.
+
+        Args:
+            variable_names: names the checks count as variables besides the statement's (the warning, and the hint
+                of an edge endpoint's ``ValueError``): the ``variables()`` of the queryset whose
+                ``get_or_create()``/``update_or_create()`` look up with this one. Kept on *subqueries*
+                (``outer_variable_names``).
+
         Returns:
             A tuple of (where_clause_string, variables_dict).
             The where_clause_string includes the ``WHERE`` keyword, or is empty if no filters.
         """
+        if subqueries is not None and variable_names:
+            subqueries.outer_variable_names = frozenset(variable_names)
         parts, variables, _ = self._where_parts(0, as_of=as_of, subqueries=subqueries)
+        if subqueries is not None:
+            if subqueries.warn:
+                warn_on_variable_names(subqueries.variable_like, {*subqueries.variables, *subqueries.outer_variable_names})
+            subqueries.variable_like.clear()
         if not parts:
             return "", {}
 
@@ -708,9 +823,9 @@ class QuerySet:
 
         Raises:
             ValueError: ``annotate()``, ``select()`` of several fields or ``values()`` (S4, every offender named);
-                ``limit()``/``offset()`` not an ``int >= 0`` (S12); an invalid selected column; ``_sqv`` ordered on
-                where the ordered form selects its alias (S13); its ``variables()`` binding a name of the statement
-                to another value (S7); and its filters' own refusals.
+                an invalid selected column; ``_sqv`` ordered on where the ordered form selects its alias (S13); its
+                ``variables()`` binding a name of the statement to another value (S7); and its filters' own refusals.
+                Its ``limit()`` and ``offset()`` were checked when they were called (a non-negative integer).
             SurrealDbError: an ``as_of()`` of its own (S5); a transaction that is not the outer queryset's (S6).
         """
         offenders = {
@@ -725,9 +840,6 @@ class QuerySet:
             raise SurrealDbError(_subquery.moment_refused())
         if self._tx is not None and self._tx is not compiler.outer_tx:
             raise SurrealDbError(_subquery.transaction_refused())
-        for clause, value in (("limit()", self._limit), ("offset()", self._offset)):
-            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
-                raise ValueError(_subquery.bad_slice(clause, value))
         column = self.select_item[0] if self.select_item else "id"
         validate_field_name(column, "subquery select field")
         order_columns: list[str] = []
@@ -796,7 +908,7 @@ class QuerySet:
 
         Raises:
             RuntimeError: under ``as_of()`` without a moment (an internal error).
-            ValueError, SurrealDbError: a subquery the ORM cannot compile (S2–S7, S12, S13, S15).
+            ValueError, SurrealDbError: a subquery the ORM cannot compile (S2–S7, S13, S15).
         """
         moment = self._version_moment(moment)
         compiler = subqueries if subqueries is not None else self._subquery_compiler()
@@ -954,17 +1066,16 @@ class QuerySet:
                 :meth:`_run_compiled`).
         """
         vars_ = variables if variables is not None else self._variables
-        compiled = remove_quotes_for_variables(query)
         if self._tx is not None:
             try:
-                return await self._tx.run_read(compiled, vars_)  # type: ignore[no-any-return]
+                return await self._tx.run_read(query, vars_)  # type: ignore[no-any-return]
             except ServerError as exc:
                 if await self._reads_as_empty(exc, subquery_tables):
                     return []
                 raise
         client = await SurrealDBConnectionManager.get_client()
         try:
-            return await client.query(compiled, _encoding.encode(vars_))  # type: ignore
+            return await client.query(query, _encoding.encode(vars_))  # type: ignore
         except ServerError as exc:
             if await self._reads_as_empty(exc, subquery_tables):
                 return []
@@ -1049,13 +1160,21 @@ class QuerySet:
         return await self._run_cached(compile_statement)
 
     async def _run_uncached(
-        self, compile_statement: Callable[[SubqueryCompiler], tuple[str, dict[str, Any]]], *, write: bool = False
+        self,
+        compile_statement: Callable[[SubqueryCompiler], tuple[str, dict[str, Any]]],
+        *,
+        write: bool = False,
+        warn: bool = True,
     ) -> Any:
         """The loop of :meth:`_run_compiled`, as in v0.27.0: compile, send, and on a confirmed missing subquery
-        table compile again with that subquery bound to ``[]`` and send again."""
+        table compile again with that subquery bound to ``[]`` and send again.
+
+        The filter values' warnings are given by the first compilation only, and only with *warn* (v0.28.1):
+        ``False`` when :meth:`_run_cached` compiled the statement for this read already."""
         empty: frozenset[str] = frozenset()
         while True:
-            compiler = self._subquery_compiler(empty)
+            compiler = self._subquery_compiler(empty, warn=warn)
+            warn = False
             query, variables = compile_statement(compiler)
             if write and self._tx is not None:
                 return await self._tx.add(query, variables)
@@ -1073,9 +1192,10 @@ class QuerySet:
         The statement is compiled once to key the read and decide what it depends on (spec §5.3): the model's
         table and every table a subquery reads; ``EDGES`` when one of them is an edge model's (every delete
         invalidates it); "any table" when the statement follows links (``FETCH``, a dotted path, a graph arrow) or
-        a ``select()`` item is neither ``*`` nor a plain field path (``author.*``, an expression: projection
-        semantics may read another table). On a miss :meth:`_run_uncached` sends it, compiling it again
-        (compilation is pure), so the missing-subquery-table re-send happens inside the read.
+        a ``select()`` item is neither ``*`` nor a plain field path (``author.*``: projection semantics read the
+        linked table). On a miss :meth:`_run_uncached` sends it, compiling it again
+        (compilation is pure), so the missing-subquery-table re-send happens inside the read; only the first
+        compilation gives the filter values' warnings, once per read.
         """
         compiler = self._subquery_compiler()
         query, variables = compile_statement(compiler)
@@ -1088,7 +1208,12 @@ class QuerySet:
             or any(item != "*" and not VALID_FIELD_PATTERN.match(item) for item in self.select_item)
         )
         return await self._cached_read(
-            "query", query, variables, frozenset(tables), any_table, lambda: self._run_uncached(compile_statement)
+            "query",
+            query,
+            variables,
+            frozenset(tables),
+            any_table,
+            lambda: self._run_uncached(compile_statement, warn=False),
         )
 
     async def _cached_read(
@@ -1111,7 +1236,7 @@ class QuerySet:
 
         Args:
             kind: ``"query"`` (a compiled statement) or ``"select"`` (the SDK's ``select()``, *statement* empty).
-            statement: the statement as compiled, before ``remove_quotes_for_variables``.
+            statement: the statement as compiled, as it is sent.
             variables: its bound values (``{"target": …}`` for a ``select``).
             tables: what the read depends on, ``EDGES`` included.
             any_table: the read follows links: any write invalidates it.
@@ -1853,27 +1978,27 @@ class QuerySet:
         create.
 
         Values go through the same interpretation the WHERE builder applies, so the row that
-        gets created is the row the next lookup finds: ``"$$literal"`` is un-escaped to
-        ``"$literal"`` (otherwise ``get_or_create(name="$$admin")`` filtered on ``"$admin"``
-        but stored ``"$$admin"``, never converging and creating a duplicate on every call),
-        and a query-variable reference is refused outright — its value lives on the server,
-        so it cannot be written back (issue #156 follow-up). A model instance is written as its
-        record id, the value its lookup binds (v0.22.0): ``get_or_create(customer=alice)``
-        stores ``customer = RecordID(...)``.
+        gets created is the row the next lookup finds: a ``str`` is data, ``"$admin"`` included;
+        the deprecated ``"$$admin"`` escape is un-escaped to ``"$admin"`` (otherwise it filtered on
+        ``"$admin"`` but stored ``"$$admin"``, never converging and creating a duplicate on every
+        call), without a second warning (the lookup warns); and a ``Var`` reference is refused
+        outright — its value lives on the server, so it cannot be written back (issue #156
+        follow-up). A model instance is written as its record id, the value its lookup binds
+        (v0.22.0): ``get_or_create(customer=alice)`` stores ``customer = RecordID(...)``. A string
+        ``"$auth"`` naming a session parameter or a variable of ``variables()`` never gets here: the
+        caller refused it before the lookup (:meth:`_reject_string_references`).
         """
         payload: dict[str, Any] = {}
         for key, value in criteria.items():
             field_name, lookup = parse_lookup(key)
             if lookup != "exact":
                 continue
-            if isinstance(value, Var) or (isinstance(value, str) and value.startswith("$") and value[1:2] != "$"):
+            if isinstance(value, Var):
                 raise SurrealDbError(
                     f"Cannot create a record from the query-variable reference given for '{field_name}': "
                     "its value is only known to the database. Pass the literal value in defaults=."
                 )
-            if isinstance(value, str) and value.startswith("$$"):
-                value = value[1:]
-            payload[field_name] = as_record_value(value)
+            payload[field_name] = as_record_value(unescape_filter_value(value, warn=False))
         return payload
 
     @staticmethod
@@ -1896,6 +2021,58 @@ class QuerySet:
             if _subquery.subquery_of(value) is not None:
                 raise SurrealDbError(_subquery.default_written(method, key))
 
+    def _reject_string_references(self, criteria: Mapping[str, Any]) -> None:
+        """Refuse a criterion ``"$<name>"`` naming a variable or a session parameter, whatever its lookup (v0.28.1).
+
+        A ``str`` is data: ``get_or_create()`` and ``update_or_create()`` look a criterion up as the string, and write
+        an ``exact`` one on create, so ``update_or_create(owner="$auth", …)`` would find and write the record whose
+        owner is the string ``"$auth"``, the same record for every record user, and ``members__contains="$auth"``
+        would look for the string. A criterion whose read would warn
+        (:func:`~surreal_orm_lite.utils.warn_on_variable_names`) — a scalar ``str`` that is ``$`` and the name of a
+        variable this queryset's ``variables()`` give, or of one of SurrealDB's session parameters — is refused
+        instead, before any request, saying to pass the actual value as the criterion; ``Var(...)`` reads the value
+        in a filter but cannot be written. Any other ``"$name"`` is data, looked up and written as it is, and so is
+        an item of a list lookup. A criterion the lookup refuses with a ``ValueError`` (:meth:`_compares_with_string`)
+        is left to it: on an edge endpoint, which holds a record id, the message names the same ``Var(...)``.
+
+        Raises:
+            SurrealDbError: the first such criterion.
+        """
+        for key, value in criteria.items():
+            match = VARIABLE_NAME_VALUE.fullmatch(value) if isinstance(value, str) else None
+            if match is None:
+                continue
+            name = match.group(1)
+            if name in self._variables:
+                source, kind = f"the variable {name} given to variables()", "variable"
+            elif name in SESSION_PARAMETERS:
+                source, kind = f"SurrealDB's ${name} parameter", "parameter"
+            else:
+                continue
+            if not self._compares_with_string(key, value):
+                continue
+            how = "looked up and written" if parse_lookup(key)[1] == "exact" else "looked up"
+            raise SurrealDbError(
+                f"Cannot look up or create a record from the string '${name}' given for '{key}': it names "
+                f"{source}, but a string criterion is data, {how} as the string '${name}'. Pass the actual value as "
+                f"the criterion (the record id, or the value itself); Var('{name}') reads the {kind} in a filter but "
+                "cannot be written."
+            )
+
+    def _compares_with_string(self, key: str, value: str) -> bool:
+        """Whether the lookup of the criterion ``key=value`` compares a column with the string *value*.
+
+        The criterion is compiled as the lookup compiles it (:meth:`_where_parts`), without a warning: ``True`` when
+        the read notes *value* among the strings that warn (``SubqueryCompiler.variable_like``); ``False`` when the
+        lookup refuses it with a ``ValueError``, which the lookup raises itself.
+        """
+        compiler = SubqueryCompiler(warn=False)
+        try:
+            QuerySet(self.model).filter(**{key: value})._where_parts(subqueries=compiler)
+        except ValueError:
+            return False
+        return bool(compiler.variable_like)
+
     async def _lookup_matches(self, criteria: dict[str, Any]) -> list[Any]:
         """Return rows matching ``criteria``, routed through the transaction when attached.
 
@@ -1905,6 +2082,9 @@ class QuerySet:
         buffered one (consistent with every other read). ``LIMIT 2`` is enough to distinguish
         0 / 1 / >1. A subquery criterion (v0.27.0) is read in the same statement, a block
         ``{ LET $_sq0 = (…); (SELECT … LIMIT 2) };``, run as every read is (:meth:`_run_compiled`).
+        The lookup binds no ``variables()``; their names give the hint of an edge endpoint's ``ValueError``
+        (``variable_names``). A criterion ``"$name"`` that would warn never gets here
+        (:meth:`_reject_string_references`).
         """
         probe = QuerySet(self.model)
         probe.filter(**criteria)
@@ -1912,7 +2092,7 @@ class QuerySet:
         table = self._model_table
 
         def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
-            where_clause, where_vars = probe._build_where(subqueries=compiler)
+            where_clause, where_vars = probe._build_where(subqueries=compiler, variable_names=self._variables)
             query = f"SELECT * FROM {table}{where_clause} LIMIT 2;"
             return compiler.wrap(query), {**compiler.variables, **where_vars}
 
@@ -1983,9 +2163,19 @@ class QuerySet:
         ``update_or_create(author__in=Subquery(active), title="one", defaults={"score": 6})``. It is
         never written; one the create would have to write — under an ``exact`` lookup, or in
         ``defaults`` — raises ``SurrealDbError`` before any request.
+
+        A ``str`` criterion is data, looked up and written as it is (``owner="$admin"``). A scalar criterion, whatever
+        its lookup, that is ``$`` and the name of a variable ``variables()`` gives or of one of SurrealDB's session
+        parameters — ``update_or_create(owner="$auth", …)`` — raises ``SurrealDbError`` before any request
+        (v0.28.1): it would find and write the record whose owner is the string ``"$auth"``, the same for every
+        record user. The message says to pass the actual value as the criterion (the record id, or the value
+        itself); ``Var("auth")`` reads the parameter in a filter but cannot be written (an ``exact`` ``Var``
+        criterion raises ``SurrealDbError`` here). On an edge endpoint such a string raises the lookup's
+        ``ValueError``.
         """
         self._reject_time_travel("update_or_create()")
         self._reject_subquery_writes(criteria, defaults, "update_or_create")
+        self._reject_string_references(criteria)
         if not criteria:
             raise SurrealDbError("update_or_create() requires at least one lookup criteria.")
         defaults = defaults or {}
@@ -2030,9 +2220,18 @@ class QuerySet:
         ``get_or_create(author__in=Subquery(active), title="one")``. It is never written; one the
         create would have to write — under an ``exact`` lookup, or in ``defaults`` — raises
         ``SurrealDbError`` before any request.
+
+        A ``str`` criterion is data, looked up and written as it is (``owner="$admin"``). A scalar criterion, whatever
+        its lookup, that is ``$`` and the name of a variable ``variables()`` gives or of one of SurrealDB's session
+        parameters — ``get_or_create(owner="$auth")``, ``get_or_create(members__contains="$auth", …)`` — raises
+        ``SurrealDbError`` before any request (v0.28.1), saying to pass the actual value as the criterion (the record
+        id, or the value itself). ``get_or_create(owner=Var("auth"))`` returns the signed-in record user's record;
+        when there is none it raises ``SurrealDbError``: a ``Var`` cannot be written. On an edge endpoint such a
+        string raises the lookup's ``ValueError``.
         """
         self._reject_time_travel("get_or_create()")
         self._reject_subquery_writes(criteria, defaults, "get_or_create")
+        self._reject_string_references(criteria)
         if not criteria:
             raise SurrealDbError("get_or_create() requires at least one lookup criteria.")
         defaults = defaults or {}
@@ -2094,7 +2293,7 @@ class QuerySet:
 
         :raises SurrealDbError: for a clause a live query cannot honour.
         :raises TypeError: for a filter value with no SurrealQL literal form.
-        :raises ValueError, SurrealDbError: for a subquery the ORM cannot compile (S2–S7, S12, S13, S15).
+        :raises ValueError, SurrealDbError: for a subquery the ORM cannot compile (S2–S7, S13, S15).
         """
         self._reject_live_clauses()
         compiler = subqueries if subqueries is not None else self._subquery_compiler(inline=True)

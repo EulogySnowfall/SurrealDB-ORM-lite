@@ -233,19 +233,28 @@ def computed(expression: "str | SurrealFunc") -> Any:
 
 
 class Var:
-    """An explicit reference to a **bound query variable** in a filter (v0.14.3).
+    """A reference to a **bound query variable** in a filter (v0.14.3): the only one.
 
-    ``filter()`` has always read a string starting with ``$`` as a variable reference, which
-    makes a literal value like ``"$admin"`` impossible to express and turns any user-supplied
-    string into an accidental reference. ``Var`` states the intent instead of inferring it::
+    A string filter value is data, whatever it starts with: ``filter(name="$admin")`` compares
+    ``name`` with the string ``"$admin"``. ``Var`` is how a filter reads a query variable
+    instead::
 
         from surreal_orm_lite import Var
 
         qs = User.objects().filter(age__gte=Var("min_age"))     # … WHERE age >= $min_age
+        await qs.variables(min_age=21).exec()
 
-    The variable itself is supplied at execution time, exactly as before. Plain strings
-    beginning with ``$`` still work but are deprecated; write ``"$$admin"`` to filter on a
-    literal that starts with a dollar sign.
+    The variable itself is supplied with ``variables()``. A leading ``$`` in the name is
+    accepted: ``Var("$min_age")`` is ``Var("min_age")``.
+
+    ``Var`` also reads the parameters SurrealDB sets for the session — ``$auth`` (the signed-in
+    record user), ``$access``, ``$session``, ``$token`` — with no ``variables()``, in a read and in
+    a live query::
+
+        mine = await Doc.objects().filter(owner=Var("auth")).exec()   # … WHERE owner = $auth
+
+    The string ``"$auth"`` is data: ``filter(owner="$auth")`` compares ``owner`` with the string
+    ``"$auth"``, with a ``UserWarning`` naming ``Var("auth")``.
     """
 
     __slots__ = ("name",)

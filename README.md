@@ -129,6 +129,43 @@ results = await User.objects().query(
 )
 ```
 
+#### What `select()` accepts
+
+```python
+await Book.objects().select("title", "price").exec()        # field names
+await Book.objects().select("title", "author.name").exec()  # [{"title": "Dune", "author": {"name": "Ada"}}, …]
+await Book.objects().select("title", "author.*").exec()     # every field of the linked author
+await Book.objects().select("*", "author.*").exec()         # every field, the author's record included
+```
+
+Each item is `*`, a field name (an aliased field by its Python name: its column is selected), a
+dotted path into a nested object or through a record link, or such a path followed by `.*`. Names
+are letters, digits and underscores, each part starting with a letter or an underscore, as in
+`order_by()` and `values()`. Anything else — an expression, a function call, `AS`, `{…}` or
+`[…]` — raises `ValueError` naming the item when `select()` is called, before any request; write a
+computed projection with `query()` and bound parameters. Rows that do not validate as the model (a
+link read as a record, a required field left out) come back as dicts keyed by Python names. On a
+nested object that is not a link, `"meta.*"` gives the object on SurrealDB 3.x and its values as a
+list on 2.x and the embedded engine.
+
+#### `limit()` and `offset()`
+
+```python
+users = await User.objects().order_by("name").limit(10).offset(20).exec()
+User.objects().limit(int(size))   # a size read as text: convert it first
+User.objects().limit("10")        # TypeError: limit() takes a non-negative integer, got '10'
+User.objects().offset(-1)         # ValueError: offset() takes a non-negative integer, got -1
+```
+
+Each takes a non-negative integer (`0` reads no record; an `IntEnum` member or an integer type
+such as NumPy's `int64` gives its value). A value that is not an integer — a `bool`, a `str` such
+as `"10"`, a `float`, `None` — raises `TypeError`, and a negative one or one above `2**63 - 1`
+(SurrealQL's largest integer) `ValueError`, naming the method and the value, when `limit()` or
+`offset()` is called, before any request; the value in place is kept. The same holds wherever the
+queryset is read: `exec()`, `first()`, `get()`, `values(…).annotate(…)`, `cache()`, `as_of()` and
+a subquery. The server may still refuse a large value when the read runs: SurrealDB 2.x and the
+embedded engine refuse one above `4294967295` (`2**32 - 1`), SurrealDB 3.x reads it.
+
 ---
 
 ## Features
@@ -222,23 +259,64 @@ await User.objects().filter(id__startswith="al").exec()
 A model that aliases its identity through `primary_key` keeps that alias as an ordinary
 column, so `filter(code="abc")` is a normal string comparison and is unaffected.
 
-#### Filter values that start with `$`
-
-A filter value beginning with `$` is read as a reference to a **query variable**, not as data.
-Use `Var(...)` to say so explicitly, and `$$` to escape a value that genuinely starts with a
-dollar sign:
+#### String filter values and `Var()`
 
 ```python
 from surreal_orm_lite import Var
 
-await User.objects().filter(age__gte=Var("min_age")).exec()   # … WHERE age >= $min_age
-await User.objects().filter(name="$$admin").exec()            # matches the literal "$admin"
-await User.objects().filter(name="$admin").exec()             # deprecated: reads as $admin
+await User.objects().filter(name="$admin").exec()                                  # the string "$admin"
+await User.objects().filter(age__gte=Var("min_age")).variables(min_age=21).exec()  # … WHERE age >= $min_age
 ```
 
-The bare `"$admin"` form still works for backward compatibility but emits a `DeprecationWarning`:
-it silently matches nothing when the value is really meant as data, which is a trap for
-user-supplied strings. Prefer `Var(...)` in new code.
+A string filter value is data, whatever it starts with: `filter(name="$admin")` compares `name`
+with the string `"$admin"`, bound like any other value, wherever a filter applies: `filter()`, `Q`,
+`get()`, `get_or_create()`, `update_or_create()`, `bulk_update()` by filter, subqueries and live
+queries. `Var(...)` is the only way to reference a query variable, whose value `variables()`
+gives.
+
+Until v0.28.1 a value starting with `$` was read as a variable reference (deprecated since
+v0.14.3), and `"$$admin"` was how to write the string `"$admin"`. That escape keeps its meaning,
+deprecated: a filter value starting with `$$` loses one `$` (`"$$admin"` finds `"$admin"`: write
+`"$admin"`), with a `DeprecationWarning`; an item of an `in` list never had the escape.
+
+A call written for the old reading, such as `filter(age__lte="$max_age").variables(max_age=25)`,
+now compares `age` with the string `"$max_age"`: a number sorts below a string, so `lt` and `lte`
+match every number, and `gt`, `gte` and `exact` none. When a string filter value is exactly `$`
+followed by the name of a variable that `variables()` gives, the ORM keeps it as data and emits a
+`UserWarning` that says to write `Var("max_age")`, once per read, pointing at your line.
+
+`Var()` also reads the parameters SurrealDB sets for each session, without `variables()`: `$auth`
+(the signed-in record user), `$access`, `$session` and `$token`, in reads and in live queries.
+
+```python
+mine = await Doc.objects().filter(owner=Var("auth")).exec()  # … WHERE owner = $auth
+```
+
+The string `"$auth"` is data: `filter(owner="$auth")` compares `owner` with the string `"$auth"`,
+so a read keeps only the records whose `owner` is that string, and a live query notifies only for
+those. A string filter value that is exactly `"$auth"`, `"$access"`, `"$session"` or `"$token"`
+emits a `UserWarning` naming the `Var(...)` that reads the parameter, once per read, pointing at
+your line. Any other string, such as `"$x"` with no variable `x`, is data the caller meant: no
+warning. On an edge's `in` and `out`, which hold record ids, such a string is not a record id and
+raises `ValueError`; when it names a variable of `variables()` or one of these parameters, the
+message names the `Var(...)` to write.
+
+`get_or_create()` and `update_or_create()` look up their criteria and write the `exact` ones on
+create, so there such a string is refused: `update_or_create(owner="$auth", defaults=…)` would find
+and write the record whose `owner` is the string `"$auth"`, the same record for every record user,
+and `members__contains="$auth"` would look for the string. A criterion that is exactly `$` followed
+by the name of a variable of `variables()` or of one of these parameters raises `SurrealDbError`
+before any request, whatever its lookup, saying to pass the actual value as the criterion: the
+record id, or the value itself. `Var("auth")` finds the signed-in user's record
+(`get_or_create(owner=Var("auth"))` returns it) but cannot be written: with no record to return, it
+raises `SurrealDbError`. Any other string, such as `"$admin"`, is looked up and written as it is. On
+an edge's `in` and `out`, such a criterion raises the `ValueError` above.
+
+`variables()` refuses these four names with a `ValueError`: SurrealDB sets them for each session
+and refuses a query variable of that name. To pass your own value, give it another name, or pass
+the value itself in the filter: `filter(token=Var("device_token")).variables(device_token=t)` or
+`filter(token=t)`, in a read or a live query. `Var("token")` without `variables()` reads SurrealDB's
+`$token`.
 
 #### Model instances as filter values
 
@@ -1291,8 +1369,12 @@ else, a string containing a NUL character, an integer beyond 64 bits, a `Decimal
 round or a zero, negative or oversized duration raises `TypeError` when you call `live()`, before
 anything is sent. A `Var` must be supplied through `variables()` — an unbound reference would read
 as `NONE` on every notification, so `age > $min_age` would match every record; it raises
-`SurrealDbError` instead (server parameters such as `$auth` and `$session` are allowed). Every
-other query keeps binding parameters.
+`SurrealDbError` instead. SurrealDB's own parameters need no `variables()`: `Var("auth")` (and
+`$access`, `$session`, `$token`) stays a reference the server reads on every notification, so
+`filter(owner=Var("auth"))` streams the signed-in record user's own records, on both lines; the
+string `"$auth"` is data, written as `'$auth'` (see
+[String filter values and `Var()`](#string-filter-values-and-var)). Every other query keeps binding
+parameters.
 
 #### Diff mode
 
@@ -3295,7 +3377,8 @@ A statement with subqueries is one block, whose `LET`s bind each subquery once, 
 - **Reserved names**: `$_sq0`, `$_sq1`, … (`_sq<N>`) are the block's `LET`s and hide a
   `variables()` value of the same name; a subquery can order by `_sqv` only when it selects `_sqv`
   itself (`ValueError` otherwise).
-- `limit()` and `offset()` of a subquery take an `int >= 0` (`ValueError` otherwise).
+- `limit()` and `offset()` of a subquery take a non-negative integer, as everywhere (`TypeError` or
+  `ValueError` when they are called).
 
 #### Where subqueries apply
 
@@ -3357,8 +3440,7 @@ at the call):
 - an inner `objects(tx=)` whose transaction is not the outer queryset's: `SurrealDbError`;
 - an inner `variables()` binding a name of the statement to another value: `ValueError` (the two
   values must have the same type and be equal: `1` and `True`, or `1` and `1.0`, differ);
-- an inner `limit()` or `offset()` that is not an `int >= 0`, or an inner `order_by()` on `_sqv`
-  (above): `ValueError`;
+- an inner `order_by()` on `_sqv` (above): `ValueError`;
 - a subquery inside a list (`author__in=[Subquery(qs)]`): `ValueError`, give it as the whole value;
 - `Q(...).to_sql()` called on its own with a subquery lookup: `ValueError` (only a QuerySet binds
   a subquery);
@@ -3479,8 +3561,8 @@ Every ORM write removes the cached reads it can change, **before** its `post_*` 
   included.
 - A read that **follows links** is removed by **any** ORM write: `fetch()`, a dotted path such as
   `filter(**{"author.name": …})` or `order_by("author.name")` (in a subquery too), and a
-  `select()` item that is not a plain field, such as `"author.*"` or an expression (a projection
-  may read another table).
+  `select()` item that is not a plain field, such as `"author.*"` (the projection reads the linked
+  record).
 - A read of an **edge model** (`BaseSurrealEdge`) is removed by any delete: deleting a record
   deletes the edges that point at it or from it.
 - Inside `transaction()` the tables written are invalidated **at commit** (a failed commit too,
@@ -3502,8 +3584,7 @@ table's entries after such a change:
 - what the server derives on its own: `DEFINE EVENT`, `REFERENCE … ON DELETE` (3.x), views
   (`DEFINE TABLE … AS SELECT`), `PERMISSIONS` that read another table;
 - values computed when the read runs: a `DEFINE PARAM` read with `Var()`, `<future>`/`COMPUTED`
-  fields (over another table, the graph such as `count(<-likes)`, or the time), time functions
-  inside a `select()` expression;
+  fields (over another table, the graph such as `count(<-likes)`, or the time);
 - a table of relations read through a model that is not a `BaseSurrealEdge`.
 
 ```python
@@ -3721,7 +3802,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -3827,6 +3908,9 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | A subquery reading a table that does not exist                                                                                         | read as empty, like any missing table                                                                                                                                         | read as empty in three requests (statement, table probe, re-send); other errors, even ones quoting "does not exist", are relayed; transaction writes fail; `live()` raises on start | v0.27.0                              |
 | Subqueries under `as_of()`                                                                                                             | each subquery reads at the same moment: the ORM adds `VERSION` to it (the server would read the current state)                                                                | the same (the server applies the outer `VERSION` to an inline sub-SELECT only); without versioned storage `SurrealDbError`, but 3.1.5 raises the server's own `ThrownError`         | v0.27.0                              |
 | Query cache (`cache()`, `QueryCache`)                                                                                                  | same on both lines: client-side, per connection and identity; writes in a transaction invalidate at commit; reads in one are never cached (on 2.x they raise: buffered)       | the same; reads inside an interactive transaction are never cached (they see its uncommitted writes)                                                                                | v0.28.0                              |
+| `select("meta.*")` on a nested object that is not a record link                                                                        | its values, as a list; through a link (`select("author.*")`), the linked record                                                                                               | the object; through a link, the linked record                                                                                                                                       | pre-existing (documented in v0.28.1) |
+| `filter(f="$x")`: a string filter value starting with `$`                                                                              | same on both lines: compared with the string `"$x"`, bound like any value, in a live query too; `Var("x")` reads the variable `$x`, `Var("auth")` SurrealDB's `$auth`         | the same; on an edge's `in`/`out` (record ids) such a string raises `ValueError`, on both lines; `$access`, `$session`, `$token` read like `$auth`                                  | v0.28.1                              |
+| `limit(n)` or `offset(n)` above `4294967295` (`2**32 - 1`)                                                                             | the server refuses the read: `Found <n> but the LIMIT clause must evaluate to a positive integer` (`START` likewise)                                                          | read; above `2**63 - 1` the ORM raises `ValueError` when `limit()` or `offset()` is called, on both lines                                                                           | pre-existing (documented in v0.28.1) |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.

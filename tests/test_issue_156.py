@@ -18,7 +18,7 @@ from surrealdb import RecordID
 import surreal_orm_lite
 from surreal_orm_lite import Var
 from surreal_orm_lite.exceptions import SurrealDbError
-from surreal_orm_lite.utils import build_filter_condition, remove_quotes_for_variables
+from surreal_orm_lite.utils import build_filter_condition
 
 SURREALDB_HOST = os.environ.get("SURREALDB_HOST", "localhost")
 SURREALDB_PORT = os.environ.get("SURREALDB_PORT", "8000")
@@ -49,18 +49,27 @@ def setup_surrealdb() -> None:
 
 
 class TestDollarStrings:
-    def test_bare_dollar_string_is_still_a_variable_reference(self) -> None:
-        """Documented behaviour, kept for compatibility — but it now warns."""
-        with pytest.deprecated_call():
-            sql, variables, _ = build_filter_condition("name", "exact", "$admin", 0)
-        assert sql == "name = $admin"
-        assert variables == {}
-
-    def test_double_dollar_escapes_to_a_literal(self) -> None:
-        sql, variables, counter = build_filter_condition("name", "exact", "$$admin", 0)
+    def test_bare_dollar_string_is_data(self) -> None:
+        """A string value is data, whatever it starts with (v0.28.1); ``Var`` is the reference."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            sql, variables, counter = build_filter_condition("name", "exact", "$admin", 0)
         assert sql == "name = $_f0"
         assert variables == {"_f0": "$admin"}
         assert counter == 1
+
+    def test_double_dollar_escapes_to_a_literal(self) -> None:
+        """The v0.14.3 escape keeps its meaning, deprecated (v0.28.1); the warning never quotes the value."""
+        with pytest.deprecated_call() as caught:
+            sql, variables, counter = build_filter_condition("name", "exact", "$$admin", 0)
+            build_filter_condition("name", "exact", "$$root", 0)
+        assert sql == "name = $_f0"
+        assert variables == {"_f0": "$admin"}
+        assert counter == 1
+        assert [str(warning.message) for warning in caught] == [
+            "A filter value starting with '$$' is read with one '$' less: the '$$' escape is deprecated. A string "
+            "filter value is always data, so write it with one '$' less; Var('name') references a query variable."
+        ] * 2
 
     def test_var_compiles_to_a_reference(self) -> None:
         sql, variables, counter = build_filter_condition("age", "gte", Var("min_age"), 0)
@@ -76,13 +85,10 @@ class TestDollarStrings:
         assert Var("$min_age").name == "min_age"
 
 
-# ==================== #3 — the unquoting helper must not touch user SQL ====================
+# ==================== #3 — raw SQL reaches the server verbatim ====================
 
 
 class TestRawSqlIsVerbatim:
-    def test_helper_still_unquotes_compiled_queries(self) -> None:
-        assert remove_quotes_for_variables("SELECT * FROM U WHERE a = '$x';") == "SELECT * FROM U WHERE a = $x;"
-
     async def test_raw_query_keeps_a_quoted_dollar_literal(self) -> None:
         """``raw_query`` is user-authored SQL: it goes to the server byte for byte."""
         sent: dict[str, str] = {}
@@ -169,7 +175,10 @@ class TestIssue156E2E:
         await self._reset()
         await Issue156Model(id="1", name="$admin", age=1).save()
 
-        found = await Issue156Model.objects().filter(name="$$admin").exec()
+        found = await Issue156Model.objects().filter(name="$admin").exec()
+        assert [row.name for row in found] == ["$admin"]
+        with pytest.deprecated_call():
+            found = await Issue156Model.objects().filter(name="$$admin").exec()
         assert [row.name for row in found] == ["$admin"]
 
     # ---- #3 raw SQL reaches the server verbatim ----
@@ -347,7 +356,7 @@ class TestWarningsReachUserCode:
     def test_deprecation_warning_points_at_the_caller(self) -> None:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            Issue156Model.objects().filter(name="$admin")._build_where()
+            Issue156Model.objects().filter(name="$$admin")._build_where()
         deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
         assert deprecations, [str(w.message) for w in caught]
         assert deprecations[0].filename == __file__
@@ -392,8 +401,9 @@ class TestCriteriaPayloadInterpretation:
         qs = surreal_orm_lite.QuerySet(Issue156Model)
         with pytest.raises(SurrealDbError, match="query-variable reference"):
             qs._criteria_payload({"name": Var("admin")})
-        with pytest.raises(SurrealDbError, match="query-variable reference"):
-            qs._criteria_payload({"name": "$admin"})
+
+    def test_a_dollar_string_is_written_as_data(self) -> None:
+        assert surreal_orm_lite.QuerySet(Issue156Model)._criteria_payload({"name": "$admin"}) == {"name": "$admin"}
 
 
 class TestDollarEscapeRoundTripE2E:
@@ -404,10 +414,14 @@ class TestDollarEscapeRoundTripE2E:
 
         # `id` stays out of the criteria: it is a RecordID on the row, so an equality
         # lookup on the plain string would never match — unrelated to the escape itself.
-        first, created_first = await Issue156Model.objects().get_or_create(defaults={"id": "dollar", "age": 1}, name="$$admin")
-        second, created_second = await Issue156Model.objects().get_or_create(
-            defaults={"id": "dollar", "age": 1}, name="$$admin"
-        )
+        with pytest.deprecated_call():
+            first, created_first = await Issue156Model.objects().get_or_create(
+                defaults={"id": "dollar", "age": 1}, name="$$admin"
+            )
+        with pytest.deprecated_call():
+            second, created_second = await Issue156Model.objects().get_or_create(
+                defaults={"id": "dollar", "age": 1}, name="$$admin"
+            )
         assert created_first is True
         assert created_second is False, "the escaped literal must round-trip, not duplicate"
         assert first.name == "$admin"

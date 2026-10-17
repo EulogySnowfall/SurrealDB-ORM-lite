@@ -1,15 +1,16 @@
 import inspect
+import operator
 import os
 import re
 import warnings
 from collections.abc import Collection, Iterable, Mapping
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, SupportsIndex, cast
 
 import pydantic
 
 from . import geo as _geo
 from ._sdk import RecordID, SdkRange, ServerError
-from .constants import GEOMETRY_LOOKUP_OPERATORS, LOOKUP_OPERATORS
+from .constants import GEOMETRY_LOOKUP_OPERATORS, LOOKUP_OPERATORS, SESSION_PARAMETERS
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, Var
 from .subquery import SubqueryCompiler, inside_a_list, lookup_refused, subquery_condition, subquery_of
@@ -21,6 +22,10 @@ if TYPE_CHECKING:
 # Pattern for valid field names: alphanumeric, underscores, dots (for nested fields)
 # Must start with a letter or underscore
 VALID_FIELD_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
+
+# Pattern for a field path followed by ``.*`` (``author.*``, ``meta.inner.*``): every field of the nested
+# object or of the record a link points to. ``select()`` accepts it besides ``*`` and VALID_FIELD_PATTERN.
+VALID_FIELD_STAR_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*\.\*$")
 
 # Pattern for valid alias names: alphanumeric and underscores only
 # Must start with a letter or underscore (like Python identifiers)
@@ -38,13 +43,19 @@ VALID_THING_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*:(`[a-zA-Z0-9_-]+`|[a-
 # hyphen, punctuation) must be backtick-quoted to keep its string form.
 BARE_RECORD_ID = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
-# Pattern for valid SurrealQL variable references: $variable_name
-VALID_VARIABLE_REF_PATTERN = re.compile(r"^\$[a-zA-Z_][a-zA-Z0-9_]*$")
+# A ``str`` filter value that is ``$`` and a variable name (``"$max_age"``): the form the ORM read as a reference
+# to that query variable until v0.28.1. It is data now; :func:`warn_on_variable_names` says so when the statement's
+# ``variables()`` give that name. Used with ``fullmatch``.
+VARIABLE_NAME_VALUE = re.compile(r"\$([a-zA-Z_][a-zA-Z0-9_]*)")
 
+#: The largest ``limit()``/``offset()`` value: SurrealQL's largest integer (a signed 64-bit one).
+MAX_PAGING_VALUE = 2**63 - 1
 
-def remove_quotes_for_variables(query: str) -> str:
-    # Regex to remove single quotes around variables ($)
-    return re.sub(r"'(\$[a-zA-Z_]\w*)'", r"\1", query)
+#: The ``DeprecationWarning`` of the ``"$$"`` escape (:func:`unescape_filter_value`): the same text whatever the value.
+ESCAPE_DEPRECATED = (
+    "A filter value starting with '$$' is read with one '$' less: the '$$' escape is deprecated. A string filter "
+    "value is always data, so write it with one '$' less; Var('name') references a query variable."
+)
 
 
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -154,6 +165,32 @@ def warn_on_multiple_statements(query: str) -> None:
         )
 
 
+def non_negative_int(method: str, value: object) -> int:
+    """*value* as the ``int`` that *method* (``"limit()"`` or ``"offset()"``) writes into its statement.
+
+    An integer from ``0`` to :data:`MAX_PAGING_VALUE` (``2**63 - 1``, SurrealQL's largest integer) is returned as a
+    plain ``int``: an ``int`` subclass, such as an ``IntEnum`` member, or an integer type with ``__index__``, such as
+    NumPy's, gives its value. Anything else is refused, naming *method* and *value*: ``limit("10")`` and
+    ``limit(-1)`` raise instead of reaching a statement. The server may still refuse a large value when the read runs
+    (SurrealDB 2.x one above ``2**32 - 1``).
+
+    Raises:
+        TypeError: *value* is a ``bool`` or not an integer (no ``__index__``: a ``str``, a ``float``, ``None``).
+        ValueError: *value* is negative, or above :data:`MAX_PAGING_VALUE`.
+    """
+    if isinstance(value, bool):
+        raise TypeError(f"{method} takes a non-negative integer, got {value!r}")
+    try:
+        number = operator.index(cast(SupportsIndex, value))
+    except TypeError:
+        raise TypeError(f"{method} takes a non-negative integer, got {value!r}") from None
+    if number < 0:
+        raise ValueError(f"{method} takes a non-negative integer, got {value!r}")
+    if number > MAX_PAGING_VALUE:
+        raise ValueError(f"{method} takes an integer up to {MAX_PAGING_VALUE} (2**63 - 1), got {value!r}")
+    return int(number)
+
+
 def validate_field_name(field: str, context: str = "field") -> None:
     """
     Validate a field name to prevent SQL injection.
@@ -172,6 +209,38 @@ def validate_field_name(field: str, context: str = "field") -> None:
             f"Invalid {context} name '{field}': must contain only alphanumeric characters, "
             "underscores, and dots (for nested fields), and start with a letter or underscore"
         )
+
+
+#: What ``select()`` accepts, as its refusals say it.
+SELECT_ITEMS = (
+    "select() takes '*', a field name or a dotted field path (letters, digits and underscores, each part "
+    "starting with a letter or an underscore), optionally followed by '.*' (every field of a nested object or "
+    "of a linked record); write a computed projection with query()"
+)
+
+
+def is_select_item(item: str) -> bool:
+    """Whether *item* is a ``select()`` item: ``*``, a field path, or a field path followed by ``.*``.
+
+    A field path is :data:`VALID_FIELD_PATTERN`'s (``name``, ``author.name``), as ``order_by()`` and ``values()``
+    accept it; ``author.*`` is :data:`VALID_FIELD_STAR_PATTERN`'s. The whole string must match: a trailing newline
+    is not part of a name.
+    """
+    return item == "*" or any(pattern.fullmatch(item) for pattern in (VALID_FIELD_PATTERN, VALID_FIELD_STAR_PATTERN))
+
+
+def validate_select_item(item: object) -> str:
+    """Check one ``select()`` item (:func:`is_select_item`) and return it.
+
+    Raises:
+        TypeError: *item* is not a ``str``.
+        ValueError: *item* is not ``*``, a field path or a field path followed by ``.*``; the message names it.
+    """
+    if not isinstance(item, str):
+        raise TypeError(f"select() takes field names as str, got {type(item).__name__} {item!r}")
+    if not is_select_item(item):
+        raise ValueError(f"select() cannot select {item!r}: {SELECT_ITEMS}")
+    return item
 
 
 def build_set_clause(merged: Mapping[str, Any], param_prefix: str = "_sv_") -> tuple[str, dict[str, Any]]:
@@ -522,6 +591,84 @@ def _list_item(item: Any, field: str, lookup: str) -> Any:
     return item
 
 
+def unescape_filter_value(value: Any, *, warn: bool = True) -> Any:
+    """The data a scalar filter value stands for: *value* itself, but for the deprecated ``"$$"`` escape.
+
+    A ``str`` is data, whatever it starts with: ``"$x"`` is compared with the string ``"$x"``, and only
+    ``Var("x")`` references the query variable ``$x``. The ``"$$"`` escape of v0.14.3, written when ``"$x"``
+    still read as a reference, keeps its meaning so that escaped values find the same records: a ``str``
+    starting with ``"$$"`` is the same string with one ``$`` less (``"$$x"`` is ``"$x"``, ``"$$$x"`` is
+    ``"$$x"``), with a ``DeprecationWarning`` saying to write the value with one ``$`` less
+    (:data:`ESCAPE_DEPRECATED`, the same text whatever the value). An item of a list lookup never had the escape,
+    and is not unescaped.
+
+    Args:
+        value: a scalar filter value, or a ``get_or_create()``/``update_or_create()`` ``exact`` criterion.
+        warn: emit the ``DeprecationWarning`` (the WHERE builder does once per read; the create payload of the same
+            call and a statement compiled again for the same read do not).
+    """
+    if not (isinstance(value, str) and value.startswith("$$")):
+        return value
+    if warn:
+        warnings.warn(ESCAPE_DEPRECATED, DeprecationWarning, stacklevel=user_stacklevel())
+    return value[1:]
+
+
+def warn_on_variable_names(names: Iterable[str], variables: Collection[str]) -> None:
+    """Warn for each of *names* that *variables* or SurrealDB's session parameters hold, once per name: a ``str``
+    filter value ``"$<name>"`` is data.
+
+    Until v0.28.1 ``filter(age__lte="$max_age").variables(max_age=25)`` compiled ``age <= $max_age``. The string
+    is data now, bound and compared as it is, so such a call changes its result without an error (a number sorts
+    below a string: ``lt``/``lte`` match every number, ``gt``/``gte``/``exact`` none). A ``UserWarning`` names
+    ``Var("max_age")``, the reference. ``filter(owner="$auth")`` likewise compares ``owner`` with the string: a
+    name of :data:`~surreal_orm_lite.constants.SESSION_PARAMETERS` that *variables* do not hold gets the
+    ``UserWarning`` of :func:`session_parameter_warning`, which names ``Var("auth")``; its text is the same apart
+    from that name, so the warnings registry of a call site holds one entry per session parameter at most. Any
+    other name is data the caller meant (``"$x"`` with no variable ``x``): nothing warns.
+
+    Args:
+        names: the names of the scalar ``str`` filter values of one statement that match :data:`VARIABLE_NAME_VALUE`
+            (``"$max_age"`` gives ``max_age``), in order.
+        variables: the names the statement's ``variables()`` give.
+    """
+    for name in dict.fromkeys(names):
+        if name in variables:
+            warnings.warn(
+                f"The filter value '${name}' is compared as the string '${name}', not with the variable {name} "
+                f"given to variables(); to reference the variable, use Var('{name}').",
+                UserWarning,
+                stacklevel=user_stacklevel(),
+            )
+        elif name in SESSION_PARAMETERS:
+            warnings.warn(session_parameter_warning(name), UserWarning, stacklevel=user_stacklevel())
+
+
+def session_parameter_warning(name: str) -> str:
+    """The ``UserWarning`` text of a ``str`` filter value ``"$<name>"`` naming SurrealDB's session parameter *name*.
+
+    *name* is one of :data:`~surreal_orm_lite.constants.SESSION_PARAMETERS`: the text is fixed apart from it.
+    """
+    return (
+        f"The filter value '${name}' is compared as the string '${name}', not with SurrealDB's ${name} parameter; "
+        f"to read the parameter, use Var('{name}')."
+    )
+
+
+def reference_hint(name: str, subqueries: SubqueryCompiler | None) -> str | None:
+    """The hint of the ``ValueError`` for a ``str`` filter value ``"$<name>"`` that cannot be data where it is.
+
+    An edge's ``in``/``out`` holds a record id, so ``filter(in_="$p")`` raises; when ``p`` is a variable of the
+    statement (:meth:`SubqueryCompiler.names_a_variable`) or one of SurrealDB's session parameters, the message ends
+    with the ``Var(...)`` that reads it (v0.28.1). ``None`` for any other name.
+    """
+    if subqueries is not None and subqueries.names_a_variable(name):
+        return f"to reference the variable, use Var('{name}')"
+    if name in SESSION_PARAMETERS:
+        return f"to read SurrealDB's ${name} parameter, use Var('{name}')"
+    return None
+
+
 def build_filter_condition(
     field: str,
     lookup: str,
@@ -534,6 +681,16 @@ def build_filter_condition(
 ) -> tuple[str, dict[str, Any], int]:
     """
     Build a single parameterized filter condition.
+
+    A ``str`` value is data, whatever it starts with: ``"$x"`` is bound and compared with the string ``"$x"``.
+    ``Var("x")`` is the only reference to a query variable, written ``$x``. A scalar ``str`` starting with
+    ``"$$"`` (the deprecated escape) loses one ``$``, with a ``DeprecationWarning`` (:func:`unescape_filter_value`)
+    unless ``subqueries.warn`` is false. The name of a scalar ``str`` that is ``$`` and a variable name (``"$x"``
+    gives ``x``) is noted in ``subqueries.variable_like``: ``QuerySet._build_where`` checks it against the
+    statement's ``variables()`` and SurrealDB's session parameters (``$auth``…) once every condition is compiled
+    (:func:`warn_on_variable_names`). On an edge endpoint column such a value is not a record id: when it names a
+    variable or a session parameter, the ``ValueError`` ends with the ``Var(...)`` that reads it
+    (:func:`reference_hint`).
 
     A model instance given as the value — or as an item of a sequence lookup — is bound as its
     record id (:func:`as_record_value`, v0.22.0).
@@ -583,7 +740,7 @@ def build_filter_condition(
             to an endpoint column (v0.24.0). ``InvalidGeometryError`` (a ``ValueError``) for a
             malformed GeoJSON object. With a subquery (v0.27.0): a lookup that takes none — ``isnull``, the
             text and the spatial lookups — (S2); a subquery as an item of a list (S15); no *subqueries* compiler
-            (S8); and the inner queryset's refusals (S3–S7, S12, S13).
+            (S8); and the inner queryset's refusals (S3–S7, S13).
     """
     validate_field_name(field, "filter field")
     sub = subquery_of(value)
@@ -649,35 +806,23 @@ def build_filter_condition(
 
     value = as_record_value(value)
     if isinstance(value, Var):
-        # The explicit, unambiguous form (v0.14.3).
+        # The one variable reference (v0.14.3): every other value is bound as data.
         return f"{field} {op} {value.reference}", {}, counter
-    elif isinstance(value, str) and value.startswith("$$"):
-        # "$$x" escapes to the literal "$x" — the only way to filter on a value that
-        # really does start with a dollar sign (issue #156).
-        return f"{field} {op} ${var_name}", {var_name: value[1:]}, counter + 1
-    elif isinstance(value, str) and value.startswith("$"):
-        # Backward compat: string values starting with $ are variable references. This is
-        # a trap for user-supplied data — a literal "$admin" silently matches nothing — so
-        # it is deprecated in favour of Var("admin"), with "$$admin" for the literal.
-        if not VALID_VARIABLE_REF_PATTERN.match(value):
-            raise ValueError(
-                f"Invalid variable reference '{value}': must match $variable_name pattern. "
-                f"To filter on the literal string, escape the dollar sign: '${value}'."
-            )
-        warnings.warn(
-            f"Passing '{value}' as a filter value is interpreted as a reference to the query "
-            f"variable {value} and is deprecated; use Var({value[1:]!r}) to reference a "
-            f"variable, or '${value}' to match the literal string.",
-            DeprecationWarning,
-            stacklevel=user_stacklevel(),
-        )
-        return f"{field} {op} {value}", {}, counter
-    else:
-        if is_record_id_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
-            value = coerce_record_id(value, cast(str, record_table))
-        elif is_endpoint_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
+    variable_like = VARIABLE_NAME_VALUE.fullmatch(value) if isinstance(value, str) else None
+    if subqueries is not None and variable_like is not None:
+        subqueries.variable_like.append(variable_like.group(1))
+    value = unescape_filter_value(value, warn=subqueries is None or subqueries.warn)
+    if is_record_id_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
+        value = coerce_record_id(value, cast(str, record_table))
+    elif is_endpoint_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
+        try:
             value = coerce_endpoint(value)
-        return f"{field} {op} ${var_name}", {var_name: value}, counter + 1
+        except ValueError as exc:
+            hint = None if variable_like is None else reference_hint(variable_like.group(1), subqueries)
+            if hint is None:
+                raise
+            raise ValueError(f"{exc}; {hint}") from exc
+    return f"{field} {op} ${var_name}", {var_name: value}, counter + 1
 
 
 # JSON Patch (RFC 6902) operation kinds. SurrealDB also accepts ``change`` (string diff).

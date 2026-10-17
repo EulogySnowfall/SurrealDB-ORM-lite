@@ -47,6 +47,7 @@ from uuid import UUID
 
 from . import encoding as _encoding
 from ._sdk import BoundExcluded, BoundIncluded, RecordID, SdkDuration, SdkRange
+from .constants import SESSION_PARAMETERS
 from .exceptions import SurrealDbError
 from .geo import _SDK_GEOMETRIES, Geometry, _geometry_text
 from .types import _MAX_RANGE_TEXT, Duration, Range, _is_open_side, _nanoseconds
@@ -65,9 +66,10 @@ _DECIMAL_SCALE_MAX = 28
 # A ``$name`` reference. Greedy, so ``$_f10`` is never read as ``$_f1`` followed by ``0``.
 _REFERENCE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
 
-# Parameters the server itself defines while it evaluates a live query. They are the only
-# references allowed to stay unbound: any other one would read as NONE on every notification.
-_SERVER_PARAMETERS = frozenset({"auth", "session", "token", "access", "scope", "this", "parent"})
+# Parameters the server itself defines while it evaluates a live query: the session's, plus ``$this`` and
+# ``$parent``. They are the only references allowed to stay unbound: any other one would read as NONE on every
+# notification, ``$scope`` included (a 1.x name: NONE on 2.7.0 and 3.3.4).
+_SERVER_PARAMETERS = SESSION_PARAMETERS | {"this", "parent"}
 
 _SUPPORTED = (
     "None, bool, int, float, str, Decimal, datetime, date, timedelta, Duration, UUID, RecordID, Range, "
@@ -387,9 +389,10 @@ def inline_variables(sql: str, variables: Mapping[str, Any]) -> str:
     an unused variable of an unsupported type is harmless.
 
     A reference with no entry in *variables* is refused, except the parameters the server
-    defines itself (``$auth``, ``$session``, ``$token``, ``$access``, ``$scope``, ``$this``,
-    ``$parent``): an unbound ``$min_age`` reads as ``NONE`` on every notification, so
-    ``age > $min_age`` would silently match every record and ``age = $min_age`` none.
+    defines itself (``$auth``, ``$session``, ``$token``, ``$access``, ``$this``, ``$parent``):
+    an unbound ``$min_age`` reads as ``NONE`` on every notification, so ``age > $min_age``
+    would silently match every record and ``age = $min_age`` none. ``$scope`` is refused like
+    any unbound name: SurrealDB 2.x and 3.x give it no value.
 
     :raises TypeError: naming the variable, if a referenced value cannot be inlined.
     :raises SurrealDbError: naming the variable, if a reference is neither bound nor a server

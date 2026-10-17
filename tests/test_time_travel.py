@@ -862,6 +862,14 @@ class TestEmbeddedHistoryE2E:
             bob = await Snap.objects().as_of(M2021).filter(name="Bob").get()
             assert (bob.id, bob.n) == ("b", 2)
 
+    async def test_selected_fields(self, tmp_path: Path) -> None:
+        """``select()``'s forms read at the moment too: field names, ``*`` and a path ending in ``.*``."""
+        async with history_db(tmp_path):
+            for items in (("id", "n"), ("*",), ("id", "n", "author.*")):
+                assert _pairs(await Snap.objects().as_of(M2021).select(*items).order_by("n").exec()) == _AT_2021, items
+            rows = await Snap.objects().as_of(M2021).select("id", "name").order_by("name").exec()
+            assert [(row.id, row.name, row.n) for row in rows] == [("a", "Ada", 0), ("b", "Bob", 0), ("c", "Cy", 0)]
+
 
 class TestEmbeddedOrmWritesE2E:
     """AC-6: records written by the ORM, then read at moments taken from the database clock between the writes."""

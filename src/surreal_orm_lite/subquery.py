@@ -211,6 +211,16 @@ class SubqueryCompiler:
         lets: the ``LET $_sq<N> = …;`` of the block, innermost first.
         tables: the tables the subqueries read.
         edge_tables: the tables of edge models the subqueries read: the query cache tags such a read (v0.28.0).
+        warn: emit the warnings of the statement's filter values (the ``"$$"`` escape, a string naming a variable):
+            ``False`` when the statement is compiled again for a read that compiled it once (a ``cache()`` miss, a
+            re-send for a missing subquery table), so each read warns once (v0.28.1).
+        variable_like: the names of the scalar ``str`` filter values that are ``$`` and a variable name
+            (``"$x"`` gives ``x``), every subquery's included, in order: ``QuerySet._build_where`` warns for those
+            :meth:`names_a_variable` or SurrealDB's session parameters hold once the statement's conditions are
+            compiled (v0.28.1).
+        outer_variable_names: the ``variables()`` names of the queryset whose ``get_or_create()`` or
+            ``update_or_create()`` looks up with this statement, which binds none of them: the checks of the filter
+            values count them as variables (v0.28.1).
         _stack: the ids of the querysets being rendered, the outer one first (a queryset cannot be its own subquery).
     """
 
@@ -222,7 +232,14 @@ class SubqueryCompiler:
     lets: list[str] = field(default_factory=list)
     tables: set[str] = field(default_factory=set)
     edge_tables: set[str] = field(default_factory=set)
+    warn: bool = True
+    variable_like: list[str] = field(default_factory=list)
+    outer_variable_names: frozenset[str] = frozenset()
     _stack: list[int] = field(default_factory=list)
+
+    def names_a_variable(self, name: str) -> bool:
+        """Whether *name* is one of the statement's ``variables()`` so far, or of :attr:`outer_variable_names`."""
+        return name in self.variables or name in self.outer_variable_names
 
     def merge_variables(self, variables: Mapping[str, Any]) -> None:
         """Add a subquery's ``variables()`` to the statement's, in order.
@@ -405,11 +422,6 @@ def live_table_missing(table: str, exc: BaseException) -> str:
         "the subquery on every change and would silently never notify (2.x reads a missing table as empty). Create "
         f"it first, e.g. DEFINE TABLE {table} SCHEMALESS. Server said: {exc}"
     )
-
-
-def bad_slice(clause: str, value: object) -> str:
-    """S12: the inner ``limit()`` or ``offset()`` (*clause*) is not an ``int >= 0``."""
-    return f"A subquery's {clause} takes an int >= 0, got {value!r}"
 
 
 def reserved_alias() -> str:
