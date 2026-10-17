@@ -42,7 +42,7 @@ from .live import (
     release_subscribers,
     require_websocket,
 )
-from .routing import check_name
+from .routing import check_call_transaction, check_name
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
 
 logger = logging.getLogger(__name__)
@@ -1506,7 +1506,9 @@ class SurrealDBConnectionManager:
         transaction is one connection's, one database's. When that connection is removed, or registered again
         with other settings, while the block is open, the transaction is cancelled when the block ends and nothing
         is committed: the exit raises ``SurrealDbConnectionError`` (open it again) — or, when the body raised, its
-        own exception propagates unchanged with that explanation added as a note (PEP 678).
+        own exception propagates unchanged with that explanation added as a note (PEP 678). A model routed to another
+        connection refuses to join the transaction: its write, ``objects(tx=)``, ``refresh(tx=)`` or
+        ``call_function(tx=)`` raises ``SurrealDbError`` before anything is sent.
 
         Example::
 
@@ -1533,6 +1535,7 @@ class SurrealDBConnectionManager:
             tx = InteractiveTransaction(client, txn_id) if txn_id is not None else BufferedTransaction(client)
         else:
             tx = BufferedTransaction(client)
+        tx._connection_name = cls._connection_name
         tx._connection_generation = generation
 
         try:
@@ -2083,8 +2086,10 @@ class SurrealDBConnectionManager:
             *params* are given, or if *params* does not match the declared parameters.
         :raises SurrealDbNotFoundError: if the server has no such function.
         :raises SurrealDbValidationError: if the result does not fit ``return_type``.
-        :raises SurrealDbError: for any other database failure.
+        :raises SurrealDbError: for any other database failure, and before anything when *tx* belongs to another
+            connection than the current one (v0.29.0).
         """
+        check_call_transaction(cls._connection_name or "default", tx)
         if args is not None and params is not None:
             raise ValueError(
                 "Pass either 'args' (positional) or 'params' (named), not both — they are two "

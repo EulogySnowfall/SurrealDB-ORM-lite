@@ -24,7 +24,7 @@ from ._sdk import NotFoundError, RecordID, SdkDuration, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, _ComputedDefault
-from .routing import check_config_connection
+from .routing import check_config_connection, check_transaction
 from .signals import (
     around_delete,
     around_save,
@@ -1407,8 +1407,11 @@ class BaseSurrealModel(BaseModel):
         ``SurrealDbError`` is raised and the instance stays a snapshot. On a model mixing
         ``AuthenticatedUserMixin``, whose classmethod ``refresh(refresh_token)`` takes this name, call
         ``BaseSurrealModel.refresh(instance)``.
+
+        A ``tx`` of another connection than the model's raises ``SurrealDbError`` before anything (v0.29.0).
         """
         if tx is not None:
+            check_transaction(type(self), tx, f"{type(self).__name__}.refresh()")
             if not tx.is_interactive:
                 raise SurrealDbError(
                     "refresh() is a read; it requires a WebSocket connection to SurrealDB 3.x "
@@ -3173,10 +3176,13 @@ class BaseSurrealModel(BaseModel):
         Return a QuerySet for the model class.
 
         When ``tx`` is provided, the QuerySet's reads and bulk operations participate in
-        that transaction (reads require an interactive transaction — WS + SurrealDB 3.x).
+        that transaction (reads require an interactive transaction — WS + SurrealDB 3.x). A transaction of
+        another connection than the model's (v0.29.0) raises ``SurrealDbError`` here, before anything is sent.
         """
         from .query_set import QuerySet
 
+        if tx is not None:
+            check_transaction(cls, tx, f"{cls.__name__}.objects(tx=)")
         qs = QuerySet(cls)
         if tx is not None:
             qs._tx = tx
@@ -3261,5 +3267,8 @@ class BaseSurrealModel(BaseModel):
         rather than another of the same connection changes nothing::
 
             acquired = await GameTable.call_function("fn::acquire_lock", [table_id, pod_id])
+
+        A ``tx`` of another connection than the model's raises ``SurrealDbError`` before anything.
         """
+        check_transaction(cls, tx, f"{cls.__name__}.call_function()")
         return await cls._connection_manager().call_function(function, args, params=params, return_type=return_type, tx=tx)

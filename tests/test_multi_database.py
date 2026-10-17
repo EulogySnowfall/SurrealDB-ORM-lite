@@ -13,6 +13,7 @@ import dataclasses
 import inspect
 import logging
 import os
+import sys
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
 from datetime import UTC, datetime
@@ -22,7 +23,7 @@ from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
-from surrealdb import AsyncSurreal
+from surrealdb import AsyncSurreal, RecordID
 
 import surreal_orm_lite
 from surreal_orm_lite import (
@@ -30,13 +31,24 @@ from surreal_orm_lite import (
     BaseSurrealEdge,
     BaseSurrealModel,
     ConnectionConfig,
+    QueryCache,
+    QuerySet,
     SurrealConfigDict,
     SurrealDbAuthenticationError,
     SurrealDbConnectionError,
     SurrealDBConnectionManager,
     SurrealDbError,
+    Transaction,
+    cache,
     connection_manager,
     live,
+    post_delete,
+    post_save,
+    post_update,
+    pre_delete,
+    pre_save,
+    pre_update,
+    routing,
 )
 from tests._proxy import CuttableProxy
 from tests.conftest import default_connection_class
@@ -2607,3 +2619,378 @@ class TestRoutedLiveE2E:
             async with SurrealDBConnectionManager.using("md_a"):
                 await SurrealDBConnectionManager.kill(live_id)
             assert await _lives("md_a", "md_event") == []
+
+
+# === One transaction, one connection (spec §6.1 tagging, §6.3, §6.6, §7.1, X1, X1m) =========================
+
+
+def _x1(operation: str, tx_name: str, model: str, model_name: str) -> str:
+    """X1's exact text (spec §5.7)."""
+    return (
+        f"{operation} cannot run in this transaction: the transaction belongs to connection {tx_name!r} and {model} "
+        f"runs on connection {model_name!r}. A transaction is one connection's (one database): open it on "
+        f"{model_name!r} — SurrealDBConnectionManager.transaction({model_name!r}) — or run the block inside "
+        f"using({tx_name!r})."
+    )
+
+
+def _x1m(tx_name: str, name: str) -> str:
+    """X1m's exact text (spec §5.7)."""
+    return (
+        f"call_function() cannot run in this transaction: the transaction belongs to connection {tx_name!r} and the "
+        f"call runs on connection {name!r}. A transaction is one connection's (one database): call it inside "
+        f"using({tx_name!r}), or open the transaction on {name!r}."
+    )
+
+
+def _takes_tx(value: Any) -> bool:
+    try:
+        return "tx" in inspect.signature(value).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _tx_methods() -> list[tuple[str, str]]:
+    """``(owner, name)`` of every public method with a ``tx`` parameter (spec §6.6, AC-15), found by introspection:
+    the models' — ``BaseSurrealModel``, ``BaseSurrealEdge``, ``AuthenticatedUserMixin`` — and the manager's
+    ``call_function()``. A queryset joins a transaction through ``objects(tx=)`` only."""
+    found = [
+        (owner.__name__, name)
+        for owner in (BaseSurrealModel, BaseSurrealEdge, AuthenticatedUserMixin)
+        for name in sorted(dir(owner))
+        if not name.startswith("_") and callable(getattr(owner, name, None)) and _takes_tx(getattr(owner, name))
+    ]
+    return [*found, ("SurrealDBConnectionManager", "call_function")]
+
+
+_TX_METHODS = _tx_methods()
+_TX_IDS = [f"{owner}.{name}" for owner, name in _TX_METHODS]
+
+#: How the tests call each model method of :data:`_TX_METHODS` with the transaction ``tx``, on *target* — an
+#: instance of the owner's test model (``MdEvent``, ``MdLikes``, ``MdMember``); classmethods on its class.
+_TX_CALLS: dict[str, Callable[[Any, Any], Any]] = {
+    "atomic_append": lambda m, tx: m.atomic_append("title", "x", tx=tx),
+    "atomic_append_many": lambda m, tx: m.atomic_append_many("title", ["x"], tx=tx),
+    "atomic_increment": lambda m, tx: m.atomic_increment("n", tx=tx),
+    "atomic_remove": lambda m, tx: m.atomic_remove("title", "x", tx=tx),
+    "atomic_remove_many": lambda m, tx: m.atomic_remove_many("title", ["x"], tx=tx),
+    "atomic_set_add": lambda m, tx: m.atomic_set_add("title", "x", tx=tx),
+    "atomic_set_add_many": lambda m, tx: m.atomic_set_add_many("title", ["x"], tx=tx),
+    "call_function": lambda m, tx: type(m).call_function("fn::md_ping", tx=tx),
+    "define_access": lambda m, tx: type(m).define_access(tx=tx),
+    "define_computed_fields": lambda m, tx: type(m).define_computed_fields(tx=tx),
+    "delete": lambda m, tx: m.delete(tx=tx),
+    "merge": lambda m, tx: m.merge(tx=tx, n=1),
+    "objects": lambda m, tx: type(m).objects(tx=tx),
+    "patch": lambda m, tx: m.patch([{"op": "replace", "path": "/n", "value": 1}], tx=tx),
+    "refresh": lambda m, tx: BaseSurrealModel.refresh(m, tx=tx),
+    "relate": lambda m, tx: m.relate("md_follows", MdEvent(id="b"), tx=tx),
+    "remove_all_relations": lambda m, tx: m.remove_all_relations("md_follows", tx=tx),
+    "remove_relation": lambda m, tx: m.remove_relation("md_follows", MdEvent(id="b"), tx=tx),
+    "save": lambda m, tx: m.save(tx=tx),
+    "update": lambda m, tx: m.update(tx=tx),
+    "upsert": lambda m, tx: m.upsert(tx=tx),
+}
+
+
+def _tx_target(owner: str) -> Any:
+    """An instance of the test model of *owner*: each is routed to ``md_a``."""
+    if owner == "BaseSurrealEdge":
+        return MdLikes(id="l1", in_=RecordID("md_event", "a"), out=RecordID("md_event", "b"))
+    if owner == "AuthenticatedUserMixin":
+        return MdMember(id="m1", email="m@example.com", password="p")
+    return MdEvent(id="e1", title="x")
+
+
+async def _call_with_tx(owner: str, name: str, target: Any, tx: Any) -> Any:
+    """Call the method *owner*.*name* with the transaction *tx* (on *target* for a model method)."""
+    if owner == "SurrealDBConnectionManager":
+        return await SurrealDBConnectionManager.call_function("fn::md_ping", tx=tx)
+    result = _TX_CALLS[name](target, tx)
+    return await result if inspect.isawaitable(result) else result
+
+
+def _expected_x1(owner: str, name: str, target: Any, tx_name: str, name_of_call: str = "md_a") -> str:
+    """The X1 (X1m for the manager) a call of :func:`_call_with_tx` raises with a transaction of *tx_name*."""
+    if owner == "SurrealDBConnectionManager":
+        return _x1m(tx_name, name_of_call)
+    model = type(target).__name__
+    operation = f"{model}.objects(tx=)" if name == "objects" else f"{model}.{name}()"
+    return _x1(operation, tx_name, model, "md_a")
+
+
+_SIGNALS = (pre_save, post_save, pre_update, post_update, pre_delete, post_delete)
+
+
+@contextlib.contextmanager
+def _signal_spy(*models: type) -> Iterator[list[str]]:
+    """Record the name of every ``pre_*``/``post_*`` signal sent for *models*; the handlers leave on exit."""
+    fired: list[str] = []
+    handlers: list[tuple[Any, Any]] = []
+
+    def recorder(name: str) -> Callable[..., Coroutine[Any, Any, None]]:
+        async def handler(sender: type, **kwargs: Any) -> None:
+            fired.append(name)
+
+        return handler
+
+    for signal in _SIGNALS:
+        handler = recorder(signal.name)
+        handlers.append((signal, handler))
+        for model in models:
+            signal.connect(model)(handler)
+    try:
+        yield fired
+    finally:
+        for signal, handler in handlers:
+            for model in models:
+                signal.disconnect(handler, model)
+
+
+def _record_cache_writes(patched: pytest.MonkeyPatch) -> list[Any]:
+    """Record the tables of every ``cache.writing()`` block an ORM write method enters from now on (spec §6.4: the
+    guard runs before it, so a refused write invalidates nothing and notes nothing on the transaction)."""
+    entered: list[Any] = []
+    real = cache.writing
+
+    @contextlib.asynccontextmanager
+    async def recording(tables: Any, tx: Any = None) -> AsyncIterator[None]:
+        entered.append(tables)
+        async with real(tables, tx):
+            yield
+
+    patched.setattr(cache, "writing", recording)
+    return entered
+
+
+@contextlib.asynccontextmanager
+async def _mem_default_and_md_a() -> AsyncIterator[None]:
+    """The default connection (database ``md_b``) and ``md_a`` (database ``md_a``) on ``mem://``, an engine each.
+    Used with the ``unset_default`` fixture."""
+    SurrealDBConnectionManager.set_connection(url="mem://", namespace="ns", database="md_b")
+    SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="ns", database="md_a")
+    try:
+        yield
+    finally:
+        await SurrealDBConnectionManager.remove_connection("md_a")
+        await SurrealDBConnectionManager.close_connection()
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestTransactionPerConnection:
+    """AC-15 (``mem://``): a transaction carries the name of the connection it was opened on, and the models of that
+    connection write in it."""
+
+    async def test_the_transaction_is_tagged_with_its_connection(self) -> None:
+        async with _mem_default_and_md_a():
+            async with SurrealDBConnectionManager.transaction("md_a") as tx:
+                assert tx._connection_name == "md_a"
+            async with SurrealDBConnectionManager.using("md_a"), SurrealDBConnectionManager.transaction() as tx:
+                assert tx._connection_name == "md_a"
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert tx._connection_name == "default"
+            assert Transaction._connection_name is None
+
+    async def test_a_model_of_the_connection_commits_in_it(self) -> None:
+        async with _mem_default_and_md_a():
+            async with SurrealDBConnectionManager.transaction("md_a") as tx:
+                await MdEvent(id="e1", title="in md_a").save(tx=tx)
+            async with SurrealDBConnectionManager.using("md_a"), SurrealDBConnectionManager.transaction() as tx:
+                await MdNote(id="n1", text="in md_a too").save(tx=tx)
+            md_a = await SurrealDBConnectionManager.get_client("md_a")
+            default = await SurrealDBConnectionManager.get_client()
+            assert _titles(await _rows_of(md_a, "md_event")) == ["in md_a"]
+            assert [row["text"] for row in await _rows_of(md_a, "md_note")] == ["in md_a too"]
+            assert await _rows_of(default, "md_event") == []
+            assert await _rows_of(default, "md_note") == []
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestTransactionPerConnectionE2E:
+    """AC-15 (both lines, ws and http): ``transaction("md_a")`` and ``using("md_a")`` + ``transaction()`` run on
+    ``md_a`` — interactive on 3.x over WebSocket, buffered otherwise."""
+
+    @pytest.mark.parametrize("kind", ["ws", "http"])
+    async def test_a_model_of_the_connection_commits_in_it(self, kind: str) -> None:
+        async with _routed_databases(kind):
+            async with SurrealDBConnectionManager.transaction("md_a") as tx:
+                assert tx._connection_name == "md_a"
+                await MdEvent(id="e1", title="in md_a").save(tx=tx)
+            async with SurrealDBConnectionManager.using("md_a"), SurrealDBConnectionManager.transaction() as tx:
+                assert tx._connection_name == "md_a"
+                await MdNote(id="n1", text="in md_a too").save(tx=tx)
+            assert _titles(await _root_rows("md_a", "md_event")) == ["in md_a"]
+            assert [row["text"] for row in await _root_rows("md_a", "md_note")] == ["in md_a too"]
+            assert await _root_rows("md_b", "md_event") == []
+            assert await _root_rows("md_b", "md_note") == []
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestTransactionGuard:
+    """AC-15, X1, X1m (``mem://``): every public method with a ``tx`` parameter refuses a transaction of another
+    connection before anything — no client acquired, nothing queued on the transaction, no signal, no cache write —
+    and a model of the transaction's own connection still commits in the same block."""
+
+    def test_the_list_is_complete(self) -> None:
+        names = {name for owner, name in _TX_METHODS if owner != "SurrealDBConnectionManager"}
+        assert names == set(_TX_CALLS)
+        owners = {owner for owner, _ in _TX_METHODS}
+        assert owners == {"BaseSurrealModel", "BaseSurrealEdge", "AuthenticatedUserMixin", "SurrealDBConnectionManager"}
+        public = [name for name in dir(QuerySet) if not name.startswith("_")]
+        assert [name for name in public if _takes_tx(getattr(QuerySet, name))] == []
+
+    @pytest.mark.parametrize(("owner", "name"), _TX_METHODS, ids=_TX_IDS)
+    async def test_another_connections_transaction_is_refused(
+        self, owner: str, name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = _tx_target(owner)
+        async with _mem_default_and_md_a():
+            async with SurrealDBConnectionManager.transaction() as tx:
+                with monkeypatch.context() as patched, _signal_spy(MdEvent, MdLikes, MdMember) as fired:
+                    patched.setattr(SurrealDBConnectionManager, "get_client", staticmethod(_forbidden_client))
+                    writes = _record_cache_writes(patched)
+                    stats = QueryCache.stats()
+                    with pytest.raises(SurrealDbError) as info:
+                        if owner == "SurrealDBConnectionManager":
+                            async with SurrealDBConnectionManager.using("md_a"):
+                                await _call_with_tx(owner, name, target, tx)
+                        else:
+                            await _call_with_tx(owner, name, target, tx)
+                    assert str(info.value) == _expected_x1(owner, name, target, "default")
+                    assert fired == []
+                    assert writes == []
+                    assert QueryCache.stats() == stats
+                    assert tx.is_empty
+                    assert tx._cache_written() == frozenset()
+                await MdCustomer(id="c1", name="kept").save(tx=tx)
+            assert [customer.name for customer in await MdCustomer.objects().exec()] == ["kept"]
+            md_a = await SurrealDBConnectionManager.get_client("md_a")
+            for table in ("md_event", "md_likes", "md_member", "md_follows"):
+                assert await _rows_of(md_a, table) == [], table
+
+
+class _TrapReached(Exception):
+    """A method body used the object as its transaction: past every guard, as an untagged object should go."""
+
+
+#: The modules of the guards (``routing.check_transaction()``, the ``invalidates()`` wrapper and ``writing()``).
+_GUARD_MODULES = frozenset({"surreal_orm_lite.routing", "surreal_orm_lite.cache"})
+
+
+class _Trap:
+    """A transaction object no guard may ask anything — ``tests/test_time_travel.py``'s ``_UntouchableTx`` (spec §6.3).
+
+    ``inspect.getattr_static`` reads the instance ``__dict__`` and the class without calling ``__getattr__``; any other
+    read of a missing attribute lands here and is recorded in ``asked``. The tag (``_connection_name``), or any question
+    from a guard module, fails the test. A method body that uses the object as its transaction once the guards let it
+    through gets :class:`_TrapReached` and stops there: what it does with a fake transaction is not under test.
+    """
+
+    def __init__(self) -> None:
+        self.asked: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        self.asked.append(name)
+        caller = sys._getframe(1).f_globals.get("__name__")
+        if name == "_connection_name" or caller in _GUARD_MODULES:
+            pytest.fail(f"the guard asked the transaction for {name!r} ({caller})")
+        raise _TrapReached(name)
+
+
+def _tagged_trap(name: str) -> _Trap:
+    """A trap tagged with connection *name* through its instance ``__dict__``, as ``transaction()`` tags one."""
+    trap = _Trap()
+    trap.__dict__["_connection_name"] = name
+    return trap
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestGuardNeverAsksTheTransaction:
+    """AC-15, spec §6.3: the tag is read statically and first; the transaction object itself is never asked."""
+
+    def test_check_transaction_reads_the_tag_statically(self) -> None:
+        untagged = _Trap()
+        assert routing.check_transaction(MdEvent, untagged, "op") is None
+        tagged = _tagged_trap("md_b")
+        with pytest.raises(SurrealDbError) as info:
+            routing.check_transaction(MdEvent, tagged, "op")
+        assert str(info.value) == _x1("op", "md_b", "MdEvent", "md_a")
+        assert untagged.asked == []
+        assert tagged.asked == []
+
+    def test_only_a_str_tag_is_a_connection(self) -> None:
+        """No transaction, a transaction the manager did not tag, and a tag that is not a ``str``: nothing checked."""
+        assert routing.check_transaction(MdEvent, None, "op") is None
+        assert routing.check_transaction(MdEvent, object(), "op") is None
+        for tag in (None, 1, b"md_b"):
+            trap = _Trap()
+            trap.__dict__["_connection_name"] = tag
+            assert routing.check_transaction(MdEvent, trap, "op") is None
+            assert trap.asked == []
+        assert routing.check_transaction(MdEvent, _tagged_trap("md_a"), "op") is None
+
+    @pytest.mark.parametrize(("owner", "name"), _TX_METHODS, ids=_TX_IDS)
+    async def test_a_tagged_trap_is_refused_unasked(self, owner: str, name: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(_forbidden_client))
+        target = _tx_target(owner)
+        trap = _tagged_trap("md_b")
+        with _signal_spy(MdEvent, MdLikes, MdMember) as fired, pytest.raises(SurrealDbError) as info:
+            await _call_with_tx(owner, name, target, trap)
+        assert str(info.value) == _expected_x1(owner, name, target, "md_b", name_of_call="default")
+        assert trap.asked == []
+        assert fired == []
+
+    @pytest.mark.parametrize(("owner", "name"), _TX_METHODS, ids=_TX_IDS)
+    async def test_an_untagged_trap_reaches_the_method_unasked(self, owner: str, name: str) -> None:
+        """On a model of the default connection (``using("default")``): no X1, and no guard asked the object."""
+        trap = _Trap()
+        async with _mem_default_and_md_a(), SurrealDBConnectionManager.using("default"):
+            try:
+                await _call_with_tx(owner, name, _tx_target(owner), trap)
+            except Exception as exc:  # the body's own behaviour with a fake transaction is not under test
+                assert "cannot run in this transaction" not in str(exc)
+        assert "_connection_name" not in trap.asked
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestTransactionGenerationModelsE2E:
+    """AC-28 item 4 with models (both lines; ws, http and ``mem://``): a block whose connection is registered again
+    with other settings, or removed, while it is open commits nothing, fires no deferred ``post_*`` signal and
+    invalidates no cached read (R12; spec §7.1). Completes ``TestTransactionGenerationE2E`` (raw writes)."""
+
+    @pytest.mark.parametrize("change", _CHANGES)
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_nothing_is_committed_signalled_or_invalidated(
+        self, kind: str, change: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        QueryCache.clear()
+        async with _routed_databases(kind):
+            old = await MdEvent(id="old", title="old").save()
+            client = await SurrealDBConnectionManager.get_client("md_a")
+            sent = _record_raw(monkeypatch, client)
+            # The same table, cached on another connection: a committed md_event write would invalidate it (D16).
+            async with SurrealDBConnectionManager.using("default"):
+                assert await MdEvent.objects().cache().exec() == []
+                assert await MdEvent.objects().cache().exec() == []
+            hits = QueryCache.stats()["hits"]
+            refused = pytest.raises(SurrealDbConnectionError, match="nothing was committed")
+            with _signal_spy(MdEvent) as fired, refused as info:
+                async with SurrealDBConnectionManager.transaction("md_a") as tx:
+                    await MdEvent(id="e1", title="x").save(tx=tx)
+                    await old.delete(tx=tx)
+                    await _change(change, lambda: _register(kind, "md_a", database="md_b"))
+            assert info.value.retryable is False  # type: ignore[attr-defined]
+            assert "'md_a'" in str(info.value)
+            assert "registered again with other settings" in str(info.value)
+            assert [name for name in fired if name.startswith("post_")] == []
+            async with SurrealDBConnectionManager.using("default"):
+                assert await MdEvent.objects().cache().exec() == []
+            assert QueryCache.stats()["hits"] == hits + 1
+            await _drain_background()
+            assert not any("BEGIN TRANSACTION" in statement for statement in sent), sent
+            if kind != "mem":
+                assert _titles(await _root_rows("md_a", "md_event")) == ["old"]
+                assert await _root_rows("md_b", "md_event") == []
+            elif change == "re-register":
+                assert _titles(await _engine_rows(client, "md_a", "md_event")) == ["old"]
+                assert await _engine_rows(client, "md_b", "md_event") == []

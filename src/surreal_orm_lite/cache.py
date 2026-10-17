@@ -25,8 +25,8 @@ What makes a cached result right:
 Internal failures never fail a read: keying, copying a hit and copying a result to store fall back to the database.
 Nothing is logged but W2's fixed text: no row, variable or key.
 
-A leaf module: it imports ``_sdk``, ``encoding``, ``exceptions`` and the standard library only (``BaseSurrealModel``
-under ``TYPE_CHECKING``, and lazily in :meth:`QueryCache.invalidate`).
+A leaf module: it imports ``_sdk``, ``encoding``, ``exceptions``, ``routing`` and the standard library only
+(``BaseSurrealModel`` under ``TYPE_CHECKING``, and lazily in :meth:`QueryCache.invalidate`).
 """
 
 from __future__ import annotations
@@ -53,6 +53,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, TypeVar, cast
 
 from . import encoding as _encoding
+from . import routing as _routing
 from ._sdk import cbor_encode
 from .exceptions import SurrealDbError
 
@@ -745,6 +746,8 @@ F = TypeVar("F", bound=Callable[..., Coroutine[Any, Any, Any]])
 
 _Of = Literal["self", "cls", "queryset", "table", "edge", "all"]
 _RESOLVERS: Final = frozenset({"self", "cls", "queryset", "table", "edge", "all"})
+#: The resolvers whose first argument is a model instance (``"self"``, ``"edge"``) or class (``"cls"``).
+_MODEL_RESOLVERS: Final = frozenset({"self", "cls", "edge"})
 
 
 def _resolve(
@@ -787,7 +790,12 @@ def invalidates(of: _Of, *, deletes: bool = False) -> Callable[[F], F]:
     tables named by the ``edge`` argument), ``"all"`` (every table). ``deletes`` adds ``EDGES``. The transaction is
     the call's ``tx`` argument when the method has one. A resolver that raises means every table. Under
     ``@classmethod``, this is the inner decorator. The wrapper keeps the signature, the docstring and
-    ``__wrapped__``, sends nothing and raises nothing of its own, and carries ``__surreal_cache_writes__``.
+    ``__wrapped__``, sends nothing, and carries ``__surreal_cache_writes__``.
+
+    The one error of its own (v0.29.0): with ``"self"``, ``"edge"`` or ``"cls"``, a ``tx`` of another connection than
+    the model's raises ``SurrealDbError`` (``routing.check_transaction()``) before the write is put in flight or noted
+    on the transaction, so a refused write invalidates nothing. The transaction is read statically, never asked. A
+    queryset's transaction is checked by ``objects(tx=)``.
     """
     if of not in _RESOLVERS:
         raise ValueError(f"invalidates() takes one of {sorted(_RESOLVERS)}, not {of!r}")
@@ -804,6 +812,10 @@ def invalidates(of: _Of, *, deletes: bool = False) -> Callable[[F], F]:
             except TypeError:
                 return await func(*args, **kwargs)  # Python raises the function's own error
             tables, tx = _resolve(of, first, bound, has_tx, deletes)
+            if tx is not None and of in _MODEL_RESOLVERS and first in bound.arguments:
+                arg0 = bound.arguments[first]
+                model = arg0 if isinstance(arg0, type) else type(arg0)
+                _routing.check_transaction(model, tx, f"{model.__name__}.{func.__name__}()")
             async with writing(tables, tx):
                 return await func(*args, **kwargs)
 

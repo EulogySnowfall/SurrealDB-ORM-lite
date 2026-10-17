@@ -61,6 +61,10 @@ class Transaction(ABC):
     refresh, refresh) adapt.
     """
 
+    #: The name of the connection the transaction was opened on (v0.29.0), set by
+    #: ``SurrealDBConnectionManager.transaction()``; ``None`` on a transaction built by hand. A model of another
+    #: connection refuses to join it (``routing.check_transaction()``, which reads it statically).
+    _connection_name: str | None = None
     #: The settings generation of the connection the transaction was opened on (v0.29.0), set by
     #: ``SurrealDBConnectionManager.transaction()``: a connection removed or registered again with other
     #: settings while the block is open is cancelled at its exit instead of committing.

@@ -21,6 +21,7 @@ from pydantic import AliasChoices, Field, field_validator
 
 from . import cache as _cache
 from . import encoding as _encoding
+from . import routing as _routing
 from ._sdk import NotFoundError, RecordID, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
@@ -279,8 +280,10 @@ class BaseSurrealEdge(BaseSurrealModel):
         ``update()``.
 
         Raises:
-            SurrealDbError: always.
+            SurrealDbError: always — first for a ``tx`` of another connection than the edge's
+                (v0.29.0), as every write does.
         """
+        _routing.check_transaction(type(self), tx, f"{type(self).__name__}.upsert()")
         raise SurrealDbError(
             "upsert() is not available on an edge: UPSERT stores a plain record that no graph traversal sees. "
             "Use save()/relate() to create an edge, merge()/update() to change its data."
