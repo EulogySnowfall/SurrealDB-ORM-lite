@@ -806,10 +806,10 @@ class TestSessionParameterLiveE2E:
 #: The row the 2.x/3.x behaviour table gives a filter string value, cell by cell.
 _FILTER_VALUE_ROW = [
     '`filter(f="$x")`: a string filter value starting with `$`',
-    'same on both lines: compared with the string `"$x"`, bound like any value, in a live query too (on an edge\'s '
-    '`in`/`out`, `ValueError`: not a record id); `Var("x")` reads the variable `$x`, `Var("auth")` SurrealDB\'s '
-    "`$auth` (also `$access`, `$session`, `$token`)",
-    "the same",
+    'same on both lines: compared with the string `"$x"`, bound like any value, in a live query too; `Var("x")` reads '
+    'the variable `$x`, `Var("auth")` SurrealDB\'s `$auth`',
+    "the same; on an edge's `in`/`out` (record ids) such a string raises `ValueError`, on both lines; `$access`, "
+    "`$session`, `$token` read like `$auth`",
     "v0.28.1",
 ]
 
