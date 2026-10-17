@@ -10,6 +10,7 @@ import ast
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import inspect
 import logging
 import os
@@ -54,6 +55,7 @@ from surreal_orm_lite import (
     pre_save,
     pre_update,
     routing,
+    time_travel,
 )
 from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
 from tests._proxy import CuttableProxy
@@ -593,10 +595,12 @@ async def _drain_background() -> None:
 
 
 @contextlib.asynccontextmanager
-async def _root(database: str) -> AsyncIterator[Any]:
-    """A raw SDK client signed in as root on database *database* of namespace ``ns`` (never the ORM's)."""
-    client = AsyncSurreal(_url("ws"))
-    await client.connect(_url("ws"))
+async def _root(database: str, url: str | None = None) -> AsyncIterator[Any]:
+    """A raw SDK client signed in as root on database *database* of namespace ``ns`` (never the ORM's), on the line
+    under test or on the WebSocket *url*."""
+    url = url or _url("ws")
+    client = AsyncSurreal(url)
+    await client.connect(url)
     try:
         await client.signin({"username": "root", "password": "root"})
         await client.use("ns", database)
@@ -613,9 +617,10 @@ async def _rows_of(client: Any, table: str) -> list[Any]:
     return list(await client.query(f"SELECT * FROM {table};", {}))
 
 
-async def _root_rows(database: str, table: str) -> list[Any]:
-    """What a root client reads from *table* of database *database*: proof of where a write landed."""
-    async with _root(database) as client:
+async def _root_rows(database: str, table: str, url: str | None = None) -> list[Any]:
+    """What a root client reads from *table* of database *database* (on the line under test, or on *url*): proof of
+    where a write landed."""
+    async with _root(database, url) as client:
         return await _rows_of(client, table)
 
 
@@ -1593,39 +1598,6 @@ class TestTransactionGenerationE2E:
             assert info.value is mine
             assert len(mine.__notes__) == 1
             assert "registered again with other settings" in mine.__notes__[0]
-
-
-class TestServerBesideEmbeddedE2E:
-    """AC-9: a ws and an http connection to the line under test and a ``mem://`` one, side by side in one process;
-    each decides its transaction strategy on its own server."""
-
-    async def test_side_by_side(self) -> None:
-        await _reset_databases(define=True)
-        _register("ws", "md_a", database="md_a")
-        _register("http", "md_b", database="md_b")
-        _register("mem", "md_mem", database="md_mem")
-        try:
-            ws = await SurrealDBConnectionManager.get_client("md_a")
-            http = await SurrealDBConnectionManager.get_client("md_b")
-            mem = await SurrealDBConnectionManager.get_client("md_mem")
-            assert len({id(ws), id(http), id(mem)}) == 3
-            await ws.query("UPSERT md_item:1 SET v = 'ws';", {})
-            await http.query("UPSERT md_item:1 SET v = 'http';", {})
-            await mem.query("UPSERT md_item:1 SET v = 'mem';", {})
-            assert _values(await _root_rows("md_a", "md_item")) == ["ws"]
-            assert _values(await _root_rows("md_b", "md_item")) == ["http"]
-            assert _values(await _rows_of(mem, "md_item")) == ["mem"]
-            line = int(str(await ws.version()).rsplit("-", 1)[-1].split(".")[0])
-            async with SurrealDBConnectionManager.transaction("md_a") as tx:
-                assert tx.is_interactive is (line >= 3)
-            async with SurrealDBConnectionManager.transaction("md_b") as tx:
-                assert tx.is_interactive is False
-            async with SurrealDBConnectionManager.transaction("md_mem") as tx:
-                assert tx.is_interactive is False
-        finally:
-            for name in ("md_a", "md_b", "md_mem"):
-                await SurrealDBConnectionManager.remove_connection(name)
-            await _reset_databases(define=False)
 
 
 #: A record access on database ``md_a`` only (AC-11): a record user signs up and in there, and reads itself.
@@ -3802,3 +3774,510 @@ class TestEmbeddedDatabaseConnection:
                 assert await _rows_of(default, "md_event") == []
             assert await _rows_of(md_a, "md_customer") == []
             assert await _rows_of(md_a, "md_event") == []
+
+
+# === Server lines, the query cache and threads across connections (spec §4, §7.11, §9.3; AC-9, AC-10, AC-21-23) =
+
+
+@dataclasses.dataclass(frozen=True)
+class _Side:
+    """One connection of a pair the per-connection decisions of spec §4 run on, side by side in one event loop."""
+
+    name: str
+    #: ``"ws"`` for a server connection over WebSocket, ``"mem"`` for the embedded engine.
+    kind: str
+    #: The major its server answers ``version()`` with; the embedded engine of the surrealdb SDK 2.x: 2 (spec M12).
+    line: int
+    #: Reads a table of its database from outside the ORM (a root client, or the engine's own client).
+    rows: Callable[[str], Awaitable[list[Any]]]
+
+    @property
+    def interactive(self) -> bool:
+        """Whether ``transaction()`` is interactive on it: WebSocket to SurrealDB 3.x (spec §4)."""
+        return self.kind == "ws" and self.line >= 3
+
+
+#: The tables of the decisions, defined beforehand in each connection's database: SurrealDB 3.x refuses to watch a
+#: missing table, and ``md_event`` is the database's only change-feed table (SurrealDB 2.x applies ``SHOW CHANGES``'
+#: ``LIMIT`` to the whole database's feed).
+_DECISION_TABLES = (
+    "DEFINE TABLE md_customer SCHEMALESS; DEFINE TABLE md_note SCHEMALESS; DEFINE TABLE md_post SCHEMALESS;"
+    " DEFINE TABLE md_event SCHEMALESS CHANGEFEED 1h;"
+)
+
+#: An absolute ``as_of()`` moment: resolved without a request.
+_MOMENT = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def _record_requests(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[str]:
+    """The statement of each ``query()`` and the target of each ``select()`` *client* sends from now on.
+
+    Patched on the client's class and keyed on ``id(client)``, as ``tests.test_time_travel._record_queries`` does; each
+    wrapper keeps the signature it wraps (``functools.wraps``), so the wrappers of two clients of one class stack.
+    """
+    sent: list[str] = []
+    cls = type(client)
+    owner = id(client)
+
+    def wrap(real: Any) -> Any:
+        @functools.wraps(real)
+        async def recording(self: Any, *args: Any, **kwargs: Any) -> Any:
+            if id(self) == owner:
+                sent.append(str(args[0] if args else next(iter(kwargs.values()), "")))
+            return await real(self, *args, **kwargs)
+
+        return recording
+
+    for method in ("query", "select"):
+        monkeypatch.setattr(cls, method, wrap(getattr(cls, method)))
+    return sent
+
+
+async def _line_of(name: str) -> int:
+    """The major of the server connection *name* talks to (``changes()``' rule; the embedded engine answers 2)."""
+    client = await SurrealDBConnectionManager.get_client(name)
+    return time_travel.line_major(await client.version())
+
+
+def _ws_url_at(port: str) -> str:
+    """The WebSocket URL of the server on *port* of ``SURREALDB_HOST``."""
+    return f"ws://{os.environ.get('SURREALDB_HOST', 'localhost')}:{port}/rpc"
+
+
+async def _server_side(name: str, url: str, database: str) -> _Side:
+    """Register *name* as root on *database* of namespace ``ns`` at the WebSocket *url*, the database removed and
+    defined again with :data:`_DECISION_TABLES` first."""
+    async with _root("db", url) as root:
+        await root.query(f"REMOVE DATABASE IF EXISTS {database}; DEFINE DATABASE {database};", {})
+    async with _root(database, url) as root:
+        await root.query(_DECISION_TABLES, {})
+    SurrealDBConnectionManager.add_connection(name, url=url, user="root", password="root", namespace="ns", database=database)
+
+    async def rows(table: str) -> list[Any]:
+        return await _root_rows(database, table, url)
+
+    return _Side(name, "ws", await _line_of(name), rows)
+
+
+async def _remove_server_database(url: str, database: str) -> None:
+    async with _root("db", url) as root:
+        await root.query(f"REMOVE DATABASE IF EXISTS {database};", {})
+
+
+@contextlib.asynccontextmanager
+async def _mixed_lines() -> AsyncIterator[list[_Side]]:
+    """``md_3x`` on ``SURREALDB_PORT_3X`` and ``md_2x`` on ``SURREALDB_PORT_2X`` (same ``SURREALDB_HOST``), each on
+    database ``md_mixed`` of namespace ``ns``, removed before and after; skips without both ports (spec §9.1, §9.3).
+    ``SURREALDB_PORT`` is not read: the pair is the same in each line's run."""
+    port_3x, port_2x = os.environ.get("SURREALDB_PORT_3X"), os.environ.get("SURREALDB_PORT_2X")
+    if not (port_3x and port_2x):
+        pytest.skip("needs SURREALDB_PORT_3X and SURREALDB_PORT_2X (both server lines)")
+    urls = {"md_3x": _ws_url_at(port_3x), "md_2x": _ws_url_at(port_2x)}
+    try:
+        sides = [await _server_side(name, url, "md_mixed") for name, url in urls.items()]
+        assert [side.line for side in sides] == [3, 2], "SURREALDB_PORT_3X and SURREALDB_PORT_2X name the two lines"
+        yield sides
+    finally:
+        for name, url in urls.items():
+            await SurrealDBConnectionManager.remove_connection(name)
+            await _remove_server_database(url, "md_mixed")
+
+
+@contextlib.asynccontextmanager
+async def _beside_embedded() -> AsyncIterator[list[_Side]]:
+    """``md_a`` over WebSocket to the line under test (database ``md_a``) and ``md_mem`` on ``mem://`` — a 2.x core —
+    in one process: the always-on twin of :func:`_mixed_lines` (spec §9.3)."""
+    url = _url("ws")
+    try:
+        server = await _server_side("md_a", url, "md_a")
+        _register("mem", "md_mem", database="md_mem")
+        engine = await SurrealDBConnectionManager.get_client("md_mem")
+        await engine.query(_DECISION_TABLES, {})
+
+        async def rows(table: str) -> list[Any]:
+            return await _rows_of(engine, table)
+
+        yield [server, _Side("md_mem", "mem", await _line_of("md_mem"), rows)]
+    finally:
+        for name in ("md_a", "md_mem"):
+            await SurrealDBConnectionManager.remove_connection(name)
+        await _remove_server_database(url, "md_a")
+
+
+async def _decide_transactions(side: _Side) -> None:
+    """Spec §4, transactions: ``transaction()`` inside ``using()`` takes the strategy of the block's server, and a read
+    inside it sees the uncommitted write (interactive) or is refused (buffered)."""
+    async with SurrealDBConnectionManager.using(side.name), SurrealDBConnectionManager.transaction() as tx:
+        assert type(tx).__name__ == ("InteractiveTransaction" if side.interactive else "BufferedTransaction")
+        await MdCustomer(id="t1", name=side.name).save(tx=tx)
+        if side.interactive:
+            assert [customer.name for customer in await MdCustomer.objects(tx=tx).exec()] == [side.name]
+        else:
+            with pytest.raises(SurrealDbError, match="Reads inside a transaction require"):
+                await MdCustomer.objects(tx=tx).exec()
+        assert await side.rows("md_customer") == []  # nothing committed yet
+    assert [row["name"] for row in await side.rows("md_customer")] == [side.name]
+
+
+async def _decide_time_travel(side: _Side, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spec §4, ``as_of()`` + ``fetch()``: refused below SurrealDB 3.x before the read is sent (T8; the embedded
+    ``mem://`` engine keeps no history at all: T6), sent on 3.x — whose in-memory server then refuses the store (T7)."""
+    async with SurrealDBConnectionManager.using(side.name):
+        await MdPost(id="p1", title=side.name).save()
+        sent = _record_requests(monkeypatch, await SurrealDBConnectionManager.get_client())
+
+        def read() -> Awaitable[Any]:
+            return MdPost.objects().as_of(_MOMENT).fetch("author").exec()  # type: ignore[no-any-return]
+
+        if side.kind == "mem":
+            with pytest.raises(SurrealDbError) as info:
+                await read()
+            assert str(info.value) == embedded.history_unsupported("mem://")
+            assert sent == []
+        elif side.line < 3:
+            with pytest.raises(SurrealDbError) as info:
+                await read()
+            assert str(info.value) == time_travel.fetch_refused()
+            assert sent == []
+        else:
+            try:
+                await read()
+            except SurrealDbError as exc:  # T7: a server started in memory keeps no history
+                assert "needs a store that keeps history" in str(exc), exc
+            assert [statement for statement in sent if statement.endswith(" FETCH author VERSION $_as_of;")], sent
+
+
+async def _decide_change_feeds(sides: list[_Side]) -> None:
+    """Spec §4, change feeds: a stream on each connection at once, in one event loop, reads its own feed with its own
+    line's cursor rule — ``changes(since=stream.cursor)`` resumes right after the last event, on each."""
+    streams: list[Any] = []
+    cursors: list[int | None] = []
+    try:
+        for side in sides:
+            async with SurrealDBConnectionManager.using(side.name):
+                stream = MdEvent.objects().changes(poll_interval=0.05)
+                await stream.start()
+            streams.append(stream)
+        for index, side in enumerate(sides):
+            async with SurrealDBConnectionManager.using(side.name):
+                await MdEvent(id=f"c{index}", title=side.name).save()
+        for index, (side, stream) in enumerate(zip(sides, streams, strict=True)):
+            [event] = await _next_events(stream, 1)
+            assert (event.record_id, event.instance.title) == (f"md_event:c{index}", side.name)
+            assert stream._major == side.line
+            cursors.append(stream.cursor)
+    finally:
+        for stream in streams:
+            stream.stop()
+    for index, (side, cursor) in enumerate(zip(sides, cursors, strict=True)):
+        async with SurrealDBConnectionManager.using(side.name):
+            await MdEvent(id=f"r{index}", title=side.name).save()
+            resumed = MdEvent.objects().changes(since=cursor, poll_interval=0.05)
+            try:
+                [event] = await _next_events(resumed, 1)
+            finally:
+                resumed.stop()
+        assert (event.record_id, event.instance.title) == (f"md_event:r{index}", side.name)
+
+
+async def _decide_live(sides: list[_Side]) -> None:
+    """Spec §4, live queries: a stream on each server connection at once receives its own connection's events only;
+    the embedded engine refuses one (E1) before anything is opened."""
+    async with contextlib.AsyncExitStack() as stack:
+        streams: list[tuple[int, _Side, Any]] = []
+        for index, side in enumerate(sides):
+            async with SurrealDBConnectionManager.using(side.name):
+                if side.kind == "mem":
+                    with pytest.raises(SurrealDbError) as info:
+                        await MdNote.objects().live().start()
+                    assert str(info.value) == embedded.live_unsupported("mem://")
+                    continue
+                stream = await MdNote.objects().live().start()
+            stack.push_async_callback(stream.stop)
+            streams.append((index, side, stream))
+        # Written last to first: a stream reading another connection would get that connection's write first.
+        for index, side in reversed(list(enumerate(sides))):
+            async with SurrealDBConnectionManager.using(side.name):
+                await MdNote(id=f"l{index}", text=side.name).save()
+        for index, side, stream in streams:
+            [event] = await _next_events(stream, 1)
+            assert (event.record_id, event.instance.text) == (f"md_note:l{index}", side.name)
+
+
+class _PerConnectionDecisions:
+    """Spec §4: each connection decides on its own server — two connections side by side, in one process and one event
+    loop. A subclass gives the pair (:meth:`_sides`)."""
+
+    @staticmethod
+    def _sides() -> contextlib.AbstractAsyncContextManager[list[_Side]]:
+        raise NotImplementedError
+
+    async def test_transactions(self) -> None:
+        async with self._sides() as sides:
+            for side in sides:
+                await _decide_transactions(side)
+
+    async def test_as_of_fetch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with self._sides() as sides:
+            for side in sides:
+                await _decide_time_travel(side, monkeypatch)
+
+    async def test_change_feeds(self) -> None:
+        async with self._sides() as sides:
+            await _decide_change_feeds(sides)
+
+    async def test_live_streams(self) -> None:
+        async with self._sides() as sides:
+            await _decide_live(sides)
+
+
+class TestMixedLinesE2E(_PerConnectionDecisions):
+    """AC-10 (spec §9.3): ``md_3x`` and ``md_2x``, a SurrealDB 3.x and a 2.x server in one process — interactive
+    against buffered transactions, ``as_of().fetch()`` refused on ``md_2x`` only, each line's change-feed cursor, live
+    streams that receive their own events only. Runs when ``SURREALDB_PORT_3X`` and ``SURREALDB_PORT_2X`` are set
+    (the ``mixed-lines`` CI job, the team's ``test-dbs.sh test``), skips otherwise."""
+
+    @staticmethod
+    def _sides() -> contextlib.AbstractAsyncContextManager[list[_Side]]:
+        return _mixed_lines()
+
+
+class TestServerBesideEmbeddedE2E(_PerConnectionDecisions):
+    """AC-9, and AC-10's always-on twin (spec §9.3): the line under test and the embedded engine side by side in one
+    process — the decisions of :class:`TestMixedLinesE2E` with ``md_a`` over WebSocket and ``md_mem`` on ``mem://``
+    (a 2.x core); a ws, an http and a ``mem://`` connection each decide their transaction strategy on their own
+    server."""
+
+    @staticmethod
+    def _sides() -> contextlib.AbstractAsyncContextManager[list[_Side]]:
+        return _beside_embedded()
+
+    async def test_side_by_side(self) -> None:
+        await _reset_databases(define=True)
+        _register("ws", "md_a", database="md_a")
+        _register("http", "md_b", database="md_b")
+        _register("mem", "md_mem", database="md_mem")
+        try:
+            ws = await SurrealDBConnectionManager.get_client("md_a")
+            http = await SurrealDBConnectionManager.get_client("md_b")
+            mem = await SurrealDBConnectionManager.get_client("md_mem")
+            assert len({id(ws), id(http), id(mem)}) == 3
+            await ws.query("UPSERT md_item:1 SET v = 'ws';", {})
+            await http.query("UPSERT md_item:1 SET v = 'http';", {})
+            await mem.query("UPSERT md_item:1 SET v = 'mem';", {})
+            assert _values(await _root_rows("md_a", "md_item")) == ["ws"]
+            assert _values(await _root_rows("md_b", "md_item")) == ["http"]
+            assert _values(await _rows_of(mem, "md_item")) == ["mem"]
+            line = int(str(await ws.version()).rsplit("-", 1)[-1].split(".")[0])
+            async with SurrealDBConnectionManager.transaction("md_a") as tx:
+                assert tx.is_interactive is (line >= 3)
+            async with SurrealDBConnectionManager.transaction("md_b") as tx:
+                assert tx.is_interactive is False
+            async with SurrealDBConnectionManager.transaction("md_mem") as tx:
+                assert tx.is_interactive is False
+        finally:
+            for name in ("md_a", "md_b", "md_mem"):
+                await SurrealDBConnectionManager.remove_connection(name)
+            await _reset_databases(define=False)
+
+
+class MdItem(BaseSurrealModel):
+    """Routed nowhere: the default connection, or the ``using()`` block's (the query-cache tests)."""
+
+    model_config = SurrealConfigDict(table_name="md_item")
+
+    id: str | None = None
+    v: str = ""
+
+
+@pytest.fixture
+def fresh_query_cache() -> Iterator[None]:
+    """The query cache's default settings and an empty store around the test: the cache is process-wide."""
+    QueryCache.configure()
+    QueryCache.clear()
+    yield
+    QueryCache.configure()
+    QueryCache.clear()
+
+
+async def _cached_values(name: str) -> list[str]:
+    """The values ``MdItem.objects().cache().exec()`` returns inside ``using(name)``."""
+    async with SurrealDBConnectionManager.using(name):
+        return sorted(item.v for item in await MdItem.objects().cache().exec())
+
+
+def _cache_counts() -> tuple[int, int]:
+    stats = QueryCache.stats()
+    return stats["hits"], stats["misses"]
+
+
+@pytest.mark.usefixtures("fresh_query_cache")
+class TestCachePerConnectionE2E:
+    """AC-21, spec §7.11 (both lines, ws and http, and ``mem://``): the ORM's cached reads are scoped per client, so
+    per connection — the same statement on ``md_a`` and ``md_b`` is two entries, each with its own rows; invalidation
+    stays per table name across connections (D16: over-invalidation, never a stale hit); the application's own keys
+    tell connections apart only when the connection's name is among their variables (README section 30's recipe)."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_cached_reads_stay_on_their_connection(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _databases(kind, "md_a", "md_b"):
+            clients = {name: await SurrealDBConnectionManager.get_client(name) for name in ("md_a", "md_b")}
+            for name, client in clients.items():
+                await client.query("UPSERT md_item:one SET v = $v;", {"v": name})
+            requests = {name: _record_requests(monkeypatch, client) for name, client in clients.items()}
+            # Two misses: one statement, two databases.
+            for name in clients:
+                assert await _cached_values(name) == [name]
+            assert {name: len(sent) for name, sent in requests.items()} == {"md_a": 1, "md_b": 1}
+            assert _cache_counts() == (0, 2)
+            # Out of band (not an ORM write): each database changes, and no cached read hears of it.
+            for client in clients.values():
+                await client.query("UPSERT md_item:oob SET v = 'oob';", {})
+            before = {name: len(sent) for name, sent in requests.items()}
+            # Two hits, each with its own rows, and no request.
+            for name in clients:
+                assert await _cached_values(name) == [name]
+            assert {name: len(sent) for name, sent in requests.items()} == before
+            assert _cache_counts() == (2, 2)
+            # D16: an ORM write to md_item on md_a also invalidates md_b's cached md_item read.
+            async with SurrealDBConnectionManager.using("md_a"):
+                await MdItem(id="orm", v="orm").save()
+            assert await _cached_values("md_b") == ["md_b", "oob"]
+            assert len(requests["md_b"]) == before["md_b"] + 1
+            assert _cache_counts() == (2, 3)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_application_keys_name_the_connection(self, kind: str) -> None:
+        async with _databases(kind, "md_a", "md_b"):
+            statement = "SELECT * FROM md_item WHERE v = $v;"
+            recipe: dict[str, str] = {}
+            bare: dict[str, str] = {}
+            for name in ("md_a", "md_b"):
+                async with SurrealDBConnectionManager.using(name):
+                    variables = {"v": "x"}
+                    connection = MdItem.get_connection_name()
+                    recipe[name] = QueryCache.make_key(statement, {**variables, "connection": connection}, "md_item")
+                    bare[name] = QueryCache.make_key(statement, variables, "md_item")
+            assert recipe["md_a"] != recipe["md_b"]
+            assert bare["md_a"] == bare["md_b"]  # the documented limit: such a key holds no connection
+            QueryCache.set(recipe["md_a"], ["md_a's rows"], "md_item")
+            assert QueryCache.get(recipe["md_a"]) == ["md_a's rows"]
+            # The table is left as is in the recipe, so an ORM write to md_item — on any connection — removes it.
+            async with SurrealDBConnectionManager.using("md_b"):
+                await MdItem(id="w", v="w").save()
+            assert QueryCache.get(recipe["md_a"]) is None
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestRemoveConnectionE2E:
+    """AC-22 (both lines, ws): ``remove_connection()`` closes the connection's clients of two event loops (the second
+    one in a thread), ends its live stream, forgets its session and bumps its generation; a model routed to it then
+    raises R2, and ``add_connection()`` of the same name right after registers a fresh connection that works."""
+
+    async def test_everything_it_held_ends(self) -> None:
+        router = SurrealDBConnectionManager
+        async with _live_connections():
+            connection = router._manager_for("md_a")
+            here = await router.get_client("md_a")
+            async with router.using("md_a"):
+                await router.signin(username="root", password="root")
+            assert connection.get_session_token() is not None
+            stream = await MdEvent.objects().live().start()
+            try:
+                parked = threading.Event()
+                outcome: dict[str, Any] = {}
+
+                async def on_another_loop() -> None:
+                    client = await router.get_client("md_a")
+                    assert await client.query("RETURN 1;", {}) == 1
+                    receiving = live.recv_task_of(client)
+                    assert receiving is not None
+                    outcome["client"] = client
+                    parked.set()
+                    # This loop runs until the removal has closed the client's transport here, on its own loop.
+                    await asyncio.wait({receiving}, timeout=15)
+                    outcome["dead"] = live.is_dead(client)
+                    others = {task for task in asyncio.all_tasks() if task is not asyncio.current_task()}
+                    if others:
+                        await asyncio.wait(others, timeout=10)
+
+                thread = _start_loop_thread(on_another_loop, outcome)
+                assert await asyncio.to_thread(parked.wait, 10)
+                assert outcome["client"] is not here
+                generation = connection._settings_generation()
+
+                await router.remove_connection("md_a")
+
+                with pytest.raises(StopAsyncIteration):
+                    await _read_one(stream)
+                assert stream.is_active is False
+                await _drain_background()
+                here_receiving = live.recv_task_of(here)
+                assert here_receiving is not None
+                await asyncio.wait({here_receiving}, timeout=10)
+                assert live.is_dead(here)
+                await asyncio.to_thread(thread.join, 30)
+                assert not thread.is_alive()
+                assert "error" not in outcome, outcome.get("error")
+                assert outcome["dead"] is True
+                assert vars(connection)[_P + "clients"] == {}
+                assert connection.get_session_token() is None
+                assert connection._settings_generation() == generation + 1
+                assert "md_a" not in router.list_connections()
+                with pytest.raises(ValueError) as info:
+                    await MdEvent.objects().exec()
+                assert str(info.value) == _r2("MdEvent", "md_a")
+            finally:
+                await stream.stop()
+
+            _register("ws", "md_a", database="md_a")
+            assert router._manager_for("md_a") is not connection
+            await MdEvent(id="again", title="again").save()
+            assert [event.title for event in await MdEvent.objects().exec()] == ["again"]
+            assert _titles(await _root_rows("md_a", "md_event")) == ["again"]
+
+
+class TestThreadsE2E:
+    """AC-23 (threads; both lines, ws and http, and ``mem://``): two threads, each running its own event loop with
+    ``asyncio.run()``, write through ``md_a`` and ``md_b`` while both ``using()`` blocks are open; each write lands in
+    its own database (asserted after ``join()``). A new thread starts outside any block (spec M9); the embedded engine
+    is the connection's one for the whole process."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_two_threads_two_connections(self, kind: str) -> None:
+        async with _databases(kind, "md_a", "md_b"):
+            both_open = threading.Barrier(2)
+            outcome: dict[str, Any] = {}
+
+            async def work(name: str) -> None:
+                outcome[f"{name} active"] = SurrealDBConnectionManager.get_active_connection_name()
+                async with SurrealDBConnectionManager.using(name):
+                    outcome[name] = await SurrealDBConnectionManager.get_client()
+                    await asyncio.to_thread(both_open.wait, 10)  # both blocks are open, on two loops
+                    await MdNote(id="t", text=name).save()
+                if kind != "mem":
+                    await SurrealDBConnectionManager.close_connection(name)  # this loop's client only
+
+            def run(name: str) -> None:
+                try:
+                    asyncio.run(work(name))
+                except BaseException as exc:  # noqa: BLE001 - reported through `outcome`
+                    outcome[f"{name} error"] = exc
+
+            threads = [threading.Thread(target=run, args=(name,)) for name in ("md_a", "md_b")]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                await asyncio.to_thread(thread.join, 30)
+            assert not any(thread.is_alive() for thread in threads)
+            assert {key: value for key, value in outcome.items() if key.endswith("error")} == {}
+            assert (outcome["md_a active"], outcome["md_b active"]) == (None, None)
+            assert outcome["md_a"] is not outcome["md_b"]
+            for name in ("md_a", "md_b"):
+                if kind == "mem":
+                    engine = await SurrealDBConnectionManager.get_client(name)
+                    assert outcome[name] is engine
+                    rows = await _rows_of(engine, "md_note")
+                else:
+                    rows = await _root_rows(name, "md_note")
+                assert [row["text"] for row in rows] == [name]
