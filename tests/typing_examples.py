@@ -316,6 +316,19 @@ def query_cache_examples() -> None:
     assert_type(QueryCache.invalidate("typed_member"), int)
 
 
+class _PageSize:
+    """An integer type that is not an ``int``: ``__index__`` only, as NumPy's ``int64``."""
+
+    def __index__(self) -> int:
+        return 10
+
+
+def paging_takes_any_integer_type() -> None:
+    """v0.28.1: ``limit()`` and ``offset()`` take any ``__index__`` integer type (``SupportsIndex``)."""
+    assert_type(QuerySet(TypedMember).limit(10).offset(20), QuerySet)
+    assert_type(QuerySet(TypedMember).limit(_PageSize()).offset(_PageSize()), QuerySet)
+
+
 async def invalidating_writes_keep_their_types(member: TypedMember, edge: Purchased, tx: Transaction) -> None:
     """v0.28.0: every write the query cache wraps (``cache.invalidates()``) keeps its own type, ``Self`` included."""
     assert_type(await member.save(), TypedMember)

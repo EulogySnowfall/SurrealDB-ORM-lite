@@ -4,7 +4,7 @@ import math
 import numbers
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Self, cast
+from typing import TYPE_CHECKING, Any, Self, SupportsIndex, cast
 from uuid import UUID
 
 from pydantic import BaseModel
@@ -267,40 +267,46 @@ class QuerySet:
             self._filters.append((self._column(field_name), lookup, value))
         return self
 
-    def limit(self, value: int) -> Self:
+    def limit(self, value: SupportsIndex) -> Self:
         """
         Set a limit on the number of results to retrieve.
 
         Args:
-            value: The maximum number of records to retrieve: a non-negative integer (``0`` reads none). An ``int``
-                subclass, such as an ``IntEnum`` member, gives its value.
+            value: The maximum number of records to retrieve: an integer from ``0`` (reads none) to ``2**63 - 1``,
+                SurrealQL's largest integer. Any integer type gives its value: an ``int`` subclass such as an
+                ``IntEnum`` member, or a type with ``__index__`` such as NumPy's ``int64``.
 
         Returns:
             Self: The current instance for method chaining.
 
         Raises:
-            TypeError: *value* is not an ``int`` — a ``bool``, a ``str`` such as ``"10"``, a ``float``, ``None`` —
-                raised when ``limit()`` is called, before any request; the limit in place is kept.
-            ValueError: *value* is negative, likewise.
+            TypeError: *value* is a ``bool``, or not an integer (no ``__index__``: a ``str`` such as ``"10"``, a
+                ``float``, ``None``) — raised when ``limit()`` is called, before any request; the limit in place is
+                kept.
+            ValueError: *value* is negative or above ``2**63 - 1``, likewise. SurrealDB 2.x and the embedded engine
+                refuse a limit above ``2**32 - 1`` when the read runs (the server's error); SurrealDB 3.x reads it.
         """
         self._limit = non_negative_int("limit()", value)
         return self
 
-    def offset(self, value: int) -> Self:
+    def offset(self, value: SupportsIndex) -> Self:
         """
         Set an offset for the results.
 
         Args:
-            value: The number of records to skip: a non-negative integer. An ``int`` subclass, such as an
-                ``IntEnum`` member, gives its value.
+            value: The number of records to skip: an integer from ``0`` to ``2**63 - 1``, SurrealQL's largest
+                integer. Any integer type gives its value: an ``int`` subclass such as an ``IntEnum`` member, or a
+                type with ``__index__`` such as NumPy's ``int64``.
 
         Returns:
             Self: The current instance for method chaining.
 
         Raises:
-            TypeError: *value* is not an ``int`` — a ``bool``, a ``str`` such as ``"10"``, a ``float``, ``None`` —
-                raised when ``offset()`` is called, before any request; the offset in place is kept.
-            ValueError: *value* is negative, likewise.
+            TypeError: *value* is a ``bool``, or not an integer (no ``__index__``: a ``str`` such as ``"10"``, a
+                ``float``, ``None``) — raised when ``offset()`` is called, before any request; the offset in place
+                is kept.
+            ValueError: *value* is negative or above ``2**63 - 1``, likewise. SurrealDB 2.x and the embedded engine
+                refuse an offset above ``2**32 - 1`` when the read runs (the server's error); SurrealDB 3.x reads it.
         """
         self._offset = non_negative_int("offset()", value)
         return self
