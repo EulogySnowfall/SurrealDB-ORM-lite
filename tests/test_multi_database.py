@@ -7,21 +7,36 @@ classes that open an engine or a server are suffixed ``E2E``. Models are prefixe
 """
 
 import asyncio
+import contextlib
+import dataclasses
 import inspect
+import os
 import threading
-from collections.abc import Callable, Coroutine, Iterator
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from typing import Any
 
 import pytest
+import pytest_asyncio
+from surrealdb import AsyncSurreal
 
-from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager, connection_manager, live
+import surreal_orm_lite
+from surreal_orm_lite import (
+    BaseSurrealModel,
+    ConnectionConfig,
+    SurrealConfigDict,
+    SurrealDbConnectionError,
+    SurrealDBConnectionManager,
+    connection_manager,
+    live,
+)
 from tests.conftest import default_connection_class
 
 #: The prefix of the manager's name-mangled private attributes.
 _P = "_SurrealDBConnectionManager__"
 
-#: The classmethods of the class body that are deliberately not routed (spec §6.1): the resolvers themselves.
-_NOT_ROUTED = {"_route", "_manager_for"}
+#: The classmethods of the class body that are deliberately not routed (spec §6.1): the resolvers themselves and
+#: the registry, which acts by the name it is given.
+_NOT_ROUTED = {"_route", "_manager_for", "add_connection", "remove_connection", "get_config", "list_connections"}
 
 #: The routing policy of every routed classmethod that does not act on the current connection (spec §6.1).
 _POLICIES = {
@@ -474,3 +489,759 @@ class TestRouterStateE2E:
         assert vars(default)[_P + "url"] is None
         for key, factory in connection_manager._STATE:
             assert _is_template(vars(SurrealDBConnectionManager)[_P + key], factory()), key
+
+
+# === The registry (spec §5.1, §5.2, §6.1) =====================================================================
+
+#: An address nothing listens on: the unit tests below never open a server client.
+_UNREACHABLE = "ws://127.0.0.1:9/rpc"
+
+#: The two ways a test changes a connection's settings under its holders (D7).
+_CHANGES = ("re-register", "remove")
+
+#: The transports of the line under test, and the embedded engine.
+_KINDS = ("ws", "http", "mem")
+
+
+def _url(kind: str) -> str:
+    """The URL of the server line under test (``SURREALDB_PORT``) for *kind* ``ws`` or ``http``."""
+    host = os.environ.get("SURREALDB_HOST", "localhost")
+    port = os.environ.get("SURREALDB_PORT", "8000")
+    return f"ws://{host}:{port}/rpc" if kind == "ws" else f"http://{host}:{port}"
+
+
+def _register(kind: str, name: str, *, database: str) -> None:
+    """Register *name* on database *database* of namespace ``ns``: on the line under test, or on ``mem://``."""
+    if kind == "mem":
+        SurrealDBConnectionManager.add_connection(name, url="mem://", namespace="ns", database=database)
+    else:
+        SurrealDBConnectionManager.add_connection(
+            name, url=_url(kind), user="root", password="root", namespace="ns", database=database
+        )
+
+
+async def _change(change: str, register: Callable[[], None]) -> None:
+    """Re-register ``md_a`` with other settings (*register*), or remove it."""
+    if change == "re-register":
+        register()
+    else:
+        await SurrealDBConnectionManager.remove_connection("md_a")
+
+
+async def _drain_background() -> None:
+    """Wait for the manager's fire-and-forget closes started on this event loop."""
+    loop = asyncio.get_running_loop()
+    tasks = [task for task in list(connection_manager._BACKGROUND) if task.get_loop() is loop]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@contextlib.asynccontextmanager
+async def _root(database: str) -> AsyncIterator[Any]:
+    """A raw SDK client signed in as root on database *database* of namespace ``ns`` (never the ORM's)."""
+    client = AsyncSurreal(_url("ws"))
+    await client.connect(_url("ws"))
+    try:
+        await client.signin({"username": "root", "password": "root"})
+        await client.use("ns", database)
+        yield client
+    finally:
+        await client.close()
+
+
+async def _rows_of(client: Any, table: str) -> list[Any]:
+    """The rows of *table* — none when it does not exist (SurrealDB 3.x refuses to select a missing table)."""
+    info = await client.query("INFO FOR DB;", {})
+    if table not in (info.get("tables") or {}):
+        return []
+    return list(await client.query(f"SELECT * FROM {table};", {}))
+
+
+async def _root_rows(database: str, table: str) -> list[Any]:
+    """What a root client reads from *table* of database *database*: proof of where a write landed."""
+    async with _root(database) as client:
+        return await _rows_of(client, table)
+
+
+async def _engine_rows(client: Any, database: str, table: str) -> list[Any]:
+    """The rows of *table* in *database* of an embedded engine, through a request-scoped ``USE DB`` (spec M5)."""
+    raw = await client.query_raw(f"USE DB {database}; SELECT * FROM {table};", {})
+    return list(raw["result"][-1]["result"])
+
+
+def _values(rows: list[Any]) -> list[Any]:
+    return sorted(row["v"] for row in rows)
+
+
+async def _reset_databases(*, define: bool) -> None:
+    """Remove the databases ``md_a`` and ``md_b`` of the line under test, and define them again when asked."""
+    async with _root("db") as client:
+        for database in ("md_a", "md_b"):
+            await client.query(f"REMOVE DATABASE IF EXISTS {database};", {})
+            if define:
+                await client.query(f"DEFINE DATABASE {database};", {})
+
+
+@contextlib.asynccontextmanager
+async def _databases(kind: str, *names: str) -> AsyncIterator[None]:
+    """Register each of *names* on the database of the same name (``ws``/``http``: on the line under test, the
+    databases ``md_a`` and ``md_b`` removed before and after; ``mem``: an engine of its own)."""
+    server = kind != "mem"
+    if server:
+        await _reset_databases(define=True)
+    for name in names:
+        _register(kind, name, database=name)
+    try:
+        yield
+    finally:
+        for name in names:
+            await SurrealDBConnectionManager.remove_connection(name)
+        if server:
+            await _reset_databases(define=False)
+
+
+def _record_raw(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[str]:
+    """Record the statement of each ``query_raw()`` *client* sends from now on (the batch of a buffered commit,
+    the writes of an interactive transaction). Patched on the client's class and keyed on ``id(client)``, as
+    ``tests.test_time_travel._record_queries`` does."""
+    sent: list[str] = []
+    cls = type(client)
+    real = cls.query_raw
+    owner = id(client)
+
+    async def recording(self: Any, query: str, *args: Any, **kwargs: Any) -> Any:
+        if id(self) == owner:
+            sent.append(query)
+        return await real(self, query, *args, **kwargs)
+
+    monkeypatch.setattr(cls, "query_raw", recording)
+    return sent
+
+
+class _FakeSocket:
+    """A transport whose ``close()`` records the event loop it ran on."""
+
+    def __init__(self) -> None:
+        self.closed_on: list[asyncio.AbstractEventLoop] = []
+        self.closed = threading.Event()
+
+    async def close(self) -> None:
+        self.closed_on.append(asyncio.get_running_loop())
+        self.closed.set()
+
+
+class _FakeServerClient:
+    """A WebSocket-like server client: a transport, a live-query table and a ``close()`` that counts its calls."""
+
+    def __init__(self) -> None:
+        self.socket = _FakeSocket()
+        self.live_queues: dict[str, list[asyncio.Queue[Any]]] = {}
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class _HttpLikeClient:
+    """The SDK 2.0 HTTP client's shape (spec M17): no transport, and a ``close()`` that raises."""
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        raise NotImplementedError
+
+
+class _RecordingSet(set):  # type: ignore[type-arg]
+    """``connection_manager._BACKGROUND`` for one test: it also keeps every task ever added."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.recorded: list[asyncio.Task[Any]] = []
+
+    def add(self, task: Any) -> None:
+        self.recorded.append(task)
+        super().add(task)
+
+
+@pytest_asyncio.fixture(loop_scope="function")
+async def unset_default() -> AsyncIterator[None]:
+    """The default connection unset for the test, its settings put back after it."""
+    saved = default_connection_class()._settings()
+    await SurrealDBConnectionManager.unset_connection()
+    yield
+    await SurrealDBConnectionManager.unset_connection()
+    if saved[0] is not None:
+        url, user, password, namespace, database = saved
+        SurrealDBConnectionManager.set_connection(url, user, password, namespace, database)
+
+
+class TestConnectionConfig:
+    """Spec §5.2, AC-3: the full ORM's frozen dataclass, without ``protocol``, password out of ``repr``."""
+
+    def test_frozen(self) -> None:
+        config = ConnectionConfig("mem://", None, None, "t", "t")
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            config.url = "x"  # type: ignore[misc]
+
+    def test_built_by_position_or_by_keyword(self) -> None:
+        assert ConnectionConfig("mem://", None, None, "t", "t") == ConnectionConfig(
+            url="mem://", user=None, password=None, namespace="t", database="t"
+        )
+
+    def test_user_and_password_are_never_left_out(self) -> None:
+        with pytest.raises(TypeError):
+            ConnectionConfig(url="mem://", password=None, namespace="t", database="t")  # type: ignore[call-arg]
+        with pytest.raises(TypeError):
+            ConnectionConfig(url="mem://", user=None, namespace="t", database="t")  # type: ignore[call-arg]
+
+    def test_the_full_orms_fields_in_order_without_defaults(self) -> None:
+        fields = dataclasses.fields(ConnectionConfig)
+        assert [field.name for field in fields] == ["url", "user", "password", "namespace", "database"]
+        for field in fields:
+            assert field.default is dataclasses.MISSING, field.name
+            assert field.default_factory is dataclasses.MISSING, field.name
+
+    def test_the_password_stays_out_of_repr_and_counts_for_equality(self) -> None:
+        config = ConnectionConfig("ws://db:8000/rpc", "root", "secret", "shop", "main")
+        assert "secret" not in repr(config)
+        assert "root" in repr(config)
+        assert config != ConnectionConfig("ws://db:8000/rpc", "root", "other", "shop", "main")
+        assert config == ConnectionConfig("ws://db:8000/rpc", "root", "secret", "shop", "main")
+
+    def test_exported(self) -> None:
+        assert surreal_orm_lite.ConnectionConfig is ConnectionConfig
+        names = surreal_orm_lite.__all__
+        assert names.index("ConnectionConfig") == names.index("SurrealDBConnectionManager") + 1
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestRegistry:
+    """AC-3: ``add_connection()``, ``remove_connection()``, ``get_config()``, ``list_connections()`` and the ``name``
+    parameters (``mem://``, no server)."""
+
+    def test_invalid_arguments_change_nothing(self) -> None:
+        add = SurrealDBConnectionManager.add_connection
+        with pytest.raises(TypeError, match=r"^Connection name must be a str, not int\.$"):
+            add(1, url="mem://", namespace="t", database="t")  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match=r"^Connection name must not be empty\.$"):
+            add("", url="mem://", namespace="t", database="t")
+        for url, namespace, database in (("", "t", "t"), ("mem://", "", "t"), ("mem://", "t", "")):
+            with pytest.raises(ValueError, match="needs a non-empty url, namespace and database"):
+                add("md_a", url=url, namespace=namespace, database=database)
+        for user, password in ((None, None), ("root", None), (None, "root"), ("", "root")):
+            with pytest.raises(ValueError, match="a server URL needs user and password"):
+                add("md_a", url=_UNREACHABLE, user=user, password=password, namespace="t", database="t")
+        with pytest.raises(SurrealDbConnectionError) as info:
+            add("md_a", url="rocksdb://x", namespace="t", database="t")
+        assert info.value.retryable is False  # type: ignore[attr-defined]
+        assert SurrealDBConnectionManager.list_connections() == []
+        assert set(connection_manager._REGISTRY) == {"default"}
+
+    def test_registration_listing_and_config(self) -> None:
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        assert SurrealDBConnectionManager.list_connections() == ["md_a"]
+        assert SurrealDBConnectionManager.get_config("md_a") == ConnectionConfig("mem://", None, None, "t", "a")
+        assert SurrealDBConnectionManager.get_config("nope") is None
+        assert SurrealDBConnectionManager.get_config() is None
+        # Listed once its URL is set, its config only once it is complete.
+        SurrealDBConnectionManager.set_connection(url="ws://x", namespace="n", database=None)
+        assert SurrealDBConnectionManager.list_connections() == ["default", "md_a"]
+        assert SurrealDBConnectionManager.get_config("default") is None
+        SurrealDBConnectionManager.set_connection(url="mem://", namespace="n", database="d")
+        assert SurrealDBConnectionManager.get_config() == ConnectionConfig("mem://", None, None, "n", "d")
+        SurrealDBConnectionManager.add_connection("md_b", url=_UNREACHABLE, user="u", password="p", namespace="t", database="b")
+        assert SurrealDBConnectionManager.list_connections() == ["default", "md_a", "md_b"]
+        assert SurrealDBConnectionManager.get_config("md_b") == ConnectionConfig(_UNREACHABLE, "u", "p", "t", "b")
+        with pytest.raises(TypeError, match="Connection name must be a str"):
+            SurrealDBConnectionManager.get_config(1)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="Connection name must not be empty"):
+            SurrealDBConnectionManager.get_config("")
+
+    def test_the_same_settings_again_change_nothing(self) -> None:
+        SurrealDBConnectionManager.add_connection("md_a", url=_UNREACHABLE, user="u", password="p", namespace="t", database="a")
+        conn = SurrealDBConnectionManager._manager_for("md_a")
+        generation = conn._settings_generation()
+        setattr(conn, _P + "session_token", "token")
+        SurrealDBConnectionManager.add_connection("md_a", url=_UNREACHABLE, user="u", password="p", namespace="t", database="a")
+        assert SurrealDBConnectionManager._manager_for("md_a") is conn
+        assert conn.get_session_token() == "token"
+        assert conn._settings_generation() == generation
+        # Any of the five differing is a change: the password too.
+        SurrealDBConnectionManager.add_connection("md_a", url=_UNREACHABLE, user="u", password="q", namespace="t", database="a")
+        assert conn.get_session_token() is None
+        assert conn._settings_generation() == generation + 1
+
+    @pytest.mark.usefixtures("clear_live_registry")
+    async def test_unknown_names(self) -> None:
+        loop = asyncio.get_running_loop()
+        SurrealDBConnectionManager.set_connection(url=_UNREACHABLE, user="u", password="p", namespace="t", database="d")
+        SurrealDBConnectionManager.add_connection("md_a", url=_UNREACHABLE, user="u", password="p", namespace="t", database="a")
+        for name in ("default", "md_a"):
+            client = _FakeServerClient()
+            vars(SurrealDBConnectionManager._manager_for(name))[_P + "clients"][loop] = client
+            live.register_subscriber(client, f"u-{name}", owner=name)
+
+        def snapshot() -> Any:
+            return (
+                {
+                    name: (dict(vars(conn)[_P + "clients"]), conn._settings())
+                    for name, conn in connection_manager._REGISTRY.items()
+                },
+                {uuid: list(queues) for uuid, queues in live._bucket().items()},
+            )
+
+        before = snapshot()
+        with pytest.raises(ValueError, match=r"^Unknown connection: 'nope'\. Register it with add_connection\(\) first\.$"):
+            await SurrealDBConnectionManager.get_client("nope")
+        with pytest.raises(ValueError, match="Unknown connection: 'nope'"):
+            SurrealDBConnectionManager.transaction("nope")
+        assert await SurrealDBConnectionManager.close_connection("nope") is None
+        assert await SurrealDBConnectionManager.close_connection(name="nope") is None
+        assert snapshot() == before
+        with pytest.raises(TypeError, match=r"^Connection name must be a str, not int\.$"):
+            await SurrealDBConnectionManager.close_connection(1)  # type: ignore[arg-type]
+        with pytest.raises(ValueError, match="Connection name must not be empty"):
+            await SurrealDBConnectionManager.close_connection("")
+        with pytest.raises(TypeError, match="Connection name must be a str"):
+            await SurrealDBConnectionManager.get_client(1)  # type: ignore[arg-type]
+        assert snapshot() == before
+
+    async def test_name_by_position_and_by_keyword(self) -> None:
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        conn = SurrealDBConnectionManager._manager_for("md_a")
+        client = await SurrealDBConnectionManager.get_client("md_a")
+        assert await SurrealDBConnectionManager.get_client(name="md_a") is client
+        assert vars(conn)[_P + "embedded_client"] is client
+        async with SurrealDBConnectionManager.transaction("md_a") as tx:
+            assert tx._client is client
+        async with SurrealDBConnectionManager.transaction(name="md_a") as tx:
+            assert tx._client is client
+        # The default is not configured: only the name reached md_a.
+        with pytest.raises(ValueError, match=r"^Connection not been set\.$"):
+            await SurrealDBConnectionManager.get_client()
+        await SurrealDBConnectionManager.close_connection("md_a")
+        assert conn.is_connected() is False
+
+    async def test_close_connection_is_silent_for_a_removed_active_name(self) -> None:
+        """P6: the active name comes from ``using()`` (here its private ``ContextVar``) and was removed meanwhile."""
+        loop = asyncio.get_running_loop()
+        SurrealDBConnectionManager.set_connection(url=_UNREACHABLE, user="u", password="p", namespace="t", database="d")
+        default_client = _FakeServerClient()
+        vars(default_connection_class())[_P + "clients"][loop] = default_client
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        token = connection_manager._ACTIVE.set("md_a")
+        try:
+            await SurrealDBConnectionManager.remove_connection("md_a")
+            assert await SurrealDBConnectionManager.close_connection() is None
+            assert vars(default_connection_class())[_P + "clients"][loop] is default_client
+            assert default_client.close_calls == 0
+            with pytest.raises(ValueError, match=r"^Unknown connection: 'md_a'\."):
+                await SurrealDBConnectionManager.get_client()
+        finally:
+            connection_manager._ACTIVE.reset(token)
+
+    async def test_remove_connection(self) -> None:
+        assert await SurrealDBConnectionManager.remove_connection("nope") is None
+        with pytest.raises(TypeError, match="Connection name must be a str"):
+            await SurrealDBConnectionManager.remove_connection(1)  # type: ignore[arg-type]
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        conn = SurrealDBConnectionManager._manager_for("md_a")
+        await SurrealDBConnectionManager.get_client("md_a")
+        assert conn.is_connected() is True
+        generation = conn._settings_generation()
+        await SurrealDBConnectionManager.remove_connection("md_a")
+        assert conn.is_connected() is False
+        assert conn.get_url() is None
+        assert conn._settings_generation() == generation + 1
+        assert "md_a" not in SurrealDBConnectionManager.list_connections()
+        assert "md_a" not in connection_manager._REGISTRY
+        with pytest.raises(ValueError, match="Unknown connection: 'md_a'"):
+            await SurrealDBConnectionManager.get_client("md_a")
+
+    async def test_removing_the_default_unsets_it(self) -> None:
+        SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="d")
+        default = default_connection_class()
+        await SurrealDBConnectionManager.get_client()
+        generation = default._settings_generation()
+        await SurrealDBConnectionManager.remove_connection("default")
+        assert connection_manager._REGISTRY["default"] is default
+        assert default.get_url() is None
+        assert default.is_connected() is False
+        assert default._settings_generation() == generation
+        assert "default" not in SurrealDBConnectionManager.list_connections()
+
+    async def test_two_mem_names_are_two_databases(self) -> None:
+        """M6: each ``mem://`` connection is an engine, so a database, of its own."""
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="t")
+        SurrealDBConnectionManager.add_connection("md_b", url="mem://", namespace="t", database="t")
+        a = await SurrealDBConnectionManager.get_client("md_a")
+        b = await SurrealDBConnectionManager.get_client("md_b")
+        assert a is not b
+        await a.query("UPSERT md_item:1 SET v = 'a';", {})
+        assert _values(await _rows_of(a, "md_item")) == ["a"]
+        assert await _rows_of(b, "md_item") == []
+
+
+@pytest.mark.usefixtures("clear_live_registry")
+class TestReRegistration:
+    """D7, AC-3, AC-28 item 3: other settings retire the connection's server clients on every event loop and refuse
+    a client still opening on the old ones (R11). No server: fake clients."""
+
+    async def test_other_settings_retire_every_loops_clients(self) -> None:
+        loop = asyncio.get_running_loop()
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        conn = SurrealDBConnectionManager._manager_for("md_a")
+        clients = vars(conn)[_P + "clients"]
+        here = _FakeServerClient()
+        clients[loop] = here
+        reader = live.register_subscriber(here, "u-a", owner="md_a")
+        closed_loop = asyncio.new_event_loop()
+        closed_loop.close()
+        gone = _FakeServerClient()
+        clients[closed_loop] = gone
+        setattr(conn, _P + "session_token", "token")
+        vars(conn)[_P + "function_signatures"][("u", "n", "d", "fn::x")] = ("a",)
+        generation = conn._settings_generation()
+
+        there = _FakeServerClient()
+        parked = threading.Event()
+        result: dict[str, Any] = {}
+
+        async def keep_a_client_on_another_loop() -> None:
+            result["loop"] = asyncio.get_running_loop()
+            clients[result["loop"]] = there
+            parked.set()
+            # The loop keeps running until the retirement has closed the socket here.
+            result["closed"] = await asyncio.to_thread(there.socket.closed.wait, 10)
+            current = asyncio.current_task()
+            await asyncio.gather(*(t for t in asyncio.all_tasks() if t is not current))
+
+        thread = _start_loop_thread(keep_a_client_on_another_loop, result)
+        assert await asyncio.to_thread(parked.wait, 10)
+
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="other")
+
+        assert len(clients) == 0
+        assert conn._settings_generation() == generation + 1
+        assert reader.get_nowait() is live._STREAM_END
+        assert conn.get_session_token() is None
+        assert conn.function_signature_cache_size() == 0
+        await _drain_background()
+        assert here.socket.closed_on == [loop]
+        await asyncio.to_thread(thread.join, 15)
+        assert not thread.is_alive()
+        assert "error" not in result, result.get("error")
+        assert result["closed"] is True
+        assert there.socket.closed_on == [result["loop"]]
+        assert gone.socket.closed_on == []
+        # The transport only: a client the application kept fails on its next request instead of reopening.
+        assert here.close_calls == there.close_calls == gone.close_calls == 0
+
+    async def test_from_a_thread_with_no_running_loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        conn = SurrealDBConnectionManager._manager_for("md_a")
+        here = _FakeServerClient()
+        vars(conn)[_P + "clients"][loop] = here
+        reader = live.register_subscriber(here, "u-a", owner="md_a")
+        generation = conn._settings_generation()
+        await asyncio.to_thread(
+            SurrealDBConnectionManager.add_connection, "md_a", url="mem://", namespace="t", database="other"
+        )
+        assert loop not in vars(conn)[_P + "clients"]
+        assert conn._settings_generation() == generation + 1
+        assert await asyncio.to_thread(here.socket.closed.wait, 10)
+        assert here.socket.closed_on == [loop]
+        assert await asyncio.wait_for(reader.get(), 10) is live._STREAM_END
+        await _drain_background()
+
+    @staticmethod
+    def _park_the_open(
+        monkeypatch: pytest.MonkeyPatch, conn: type[SurrealDBConnectionManager], make: Callable[[], Any]
+    ) -> tuple[asyncio.Event, asyncio.Event, list[Any]]:
+        """Replace *conn*'s ``_open_client`` by one that waits for a gate, then returns ``make()``."""
+        entered, gate = asyncio.Event(), asyncio.Event()
+        opened: list[Any] = []
+
+        async def fake_open(cls: Any, *, signin_as_configured: bool) -> Any:
+            entered.set()
+            await gate.wait()
+            client = make()
+            opened.append(client)
+            return client
+
+        monkeypatch.setattr(conn, "_open_client", classmethod(fake_open))
+        return entered, gate, opened
+
+    @pytest.mark.parametrize("change", _CHANGES)
+    async def test_a_client_opening_on_the_old_settings_raises_r11(self, monkeypatch: pytest.MonkeyPatch, change: str) -> None:
+        def register(database: str) -> None:
+            SurrealDBConnectionManager.add_connection(
+                "md_a", url=_UNREACHABLE, user="u", password="p", namespace="t", database=database
+            )
+
+        register("a")
+        conn = SurrealDBConnectionManager._manager_for("md_a")
+        entered, gate, opened = self._park_the_open(monkeypatch, conn, _FakeServerClient)
+        task = asyncio.create_task(SurrealDBConnectionManager.get_client("md_a"))
+        await entered.wait()
+        await _change(change, lambda: register("b"))
+        gate.set()
+        with pytest.raises(SurrealDbConnectionError, match="registered again with other settings") as info:
+            await task
+        assert info.value.retryable is True  # type: ignore[attr-defined]
+        assert str(info.value) == (
+            "Connection 'md_a' was removed or registered again with other settings while a client was opening on "
+            "the old ones; that client was closed unused. Retry the call."
+        )
+        assert asyncio.get_running_loop() not in vars(conn)[_P + "clients"]
+        await _drain_background()
+        assert opened[0].close_calls == 1
+
+    async def test_the_unused_client_is_closed_quietly(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """P7: the SDK 2.0 HTTP client's ``close()`` raises; the background close keeps that to itself."""
+        recording = _RecordingSet()
+        monkeypatch.setattr(connection_manager, "_BACKGROUND", recording)
+        SurrealDBConnectionManager.add_connection("md_a", url=_UNREACHABLE, user="u", password="p", namespace="t", database="a")
+        conn = SurrealDBConnectionManager._manager_for("md_a")
+        entered, gate, opened = self._park_the_open(monkeypatch, conn, _HttpLikeClient)
+        task = asyncio.create_task(SurrealDBConnectionManager.get_client("md_a"))
+        await entered.wait()
+        SurrealDBConnectionManager.add_connection("md_a", url=_UNREACHABLE, user="u", password="p", namespace="t", database="b")
+        gate.set()
+        with pytest.raises(SurrealDbConnectionError, match="registered again with other settings") as info:
+            await task
+        assert info.value.retryable is True  # type: ignore[attr-defined]
+        assert recording.recorded
+        await asyncio.gather(*recording.recorded, return_exceptions=True)
+        for background in recording.recorded:
+            assert background.done()
+            assert not background.cancelled()
+            assert background.exception() is None
+        assert opened[0].close_calls == 1
+
+    @pytest.mark.usefixtures("unset_default")
+    async def test_set_connection_on_the_default_keeps_its_clients(self) -> None:
+        """v0.28.0 tolerance, kept: ``set_connection()`` retires nothing and bumps no generation (spec §14.6)."""
+        loop = asyncio.get_running_loop()
+        SurrealDBConnectionManager.set_connection(url=_UNREACHABLE, user="u", password="p", namespace="t", database="a")
+        default = default_connection_class()
+        client = _FakeServerClient()
+        vars(default)[_P + "clients"][loop] = client
+        generation = default._settings_generation()
+        SurrealDBConnectionManager.set_connection(url=_UNREACHABLE, user="u", password="p", namespace="t", database="b")
+        assert vars(default)[_P + "clients"][loop] is client
+        assert default._settings_generation() == generation
+        assert client.socket.closed_on == []
+
+
+class TestRemoveOrder:
+    """Spec §6.1: ``remove_connection()`` unregisters the name, then retires its clients, then unsets it."""
+
+    async def test_unregistered_then_retired_then_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        conn = SurrealDBConnectionManager._manager_for("md_a")
+        generation = conn._settings_generation()
+        real_unset = conn.unset_connection
+        seen: dict[str, Any] = {}
+
+        async def recording_unset(cls: Any) -> None:
+            seen["registered"] = "md_a" in connection_manager._REGISTRY
+            seen["generation"] = conn._settings_generation()
+            # The name is free again at once: registering it now makes a new connection.
+            SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="new")
+            await real_unset()
+
+        monkeypatch.setattr(conn, "unset_connection", classmethod(recording_unset))
+        await SurrealDBConnectionManager.remove_connection("md_a")
+        assert seen == {"registered": False, "generation": generation + 1}
+        new = SurrealDBConnectionManager._manager_for("md_a")
+        assert new is not conn
+        assert SurrealDBConnectionManager.get_config("md_a") == ConnectionConfig("mem://", None, None, "t", "new")
+        assert conn.get_url() is None
+
+
+# === E2E: the line under test (ws, http) and the embedded engine =============================================
+
+
+@pytest.mark.parametrize("kind", ["ws", "http"])
+class TestTwoDatabasesE2E:
+    """M4: two connections on two databases of one server are isolated (both lines)."""
+
+    async def test_each_connection_writes_its_own_database(self, kind: str) -> None:
+        async with _databases(kind, "md_a", "md_b"):
+            a = await SurrealDBConnectionManager.get_client("md_a")
+            b = await SurrealDBConnectionManager.get_client(name="md_b")
+            assert a is not b
+            await a.query("UPSERT md_item:a SET v = 'a';", {})
+            await b.query("UPSERT md_item:b SET v = 'b';", {})
+            assert _values(await _root_rows("md_a", "md_item")) == ["a"]
+            assert _values(await _root_rows("md_b", "md_item")) == ["b"]
+            async with SurrealDBConnectionManager.transaction("md_a") as tx:
+                await tx.add("UPSERT md_item:t SET v = 't';")
+            assert _values(await _root_rows("md_a", "md_item")) == ["a", "t"]
+            assert _values(await _root_rows("md_b", "md_item")) == ["b"]
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+class TestReRegistrationE2E:
+    """AC-28 items 1-2 (raw clients): after a re-registration with another database, the next client serves it; the
+    client the application kept behaves as documented for its transport."""
+
+    async def test_the_next_client_serves_the_new_settings(self, kind: str) -> None:
+        async with _databases(kind, "md_a"):
+            c1 = await SurrealDBConnectionManager.get_client("md_a")
+            if kind == "mem":
+                await c1.query("UPSERT md_item:old SET v = 'old';", {})
+            _register(kind, "md_a", database="md_b")
+            c2 = await SurrealDBConnectionManager.get_client("md_a")
+            if kind == "mem":
+                # The connection's one in-process session, re-selected on md_b at the ORM's call.
+                assert c2 is c1
+                assert await _rows_of(c1, "md_item") == []
+                await c2.query("UPSERT md_item:new SET v = 'new';", {})
+                assert _values(await _rows_of(c1, "md_item")) == ["new"]
+                assert _values(await _engine_rows(c1, "md_a", "md_item")) == ["old"]
+                return
+            assert c2 is not c1
+            await c2.query("UPSERT md_item:new SET v = 'new';", {})
+            assert _values(await _root_rows("md_b", "md_item")) == ["new"]
+            assert await _root_rows("md_a", "md_item") == []
+            await _drain_background()
+            if kind == "ws":
+                # Its transport was closed: its receive task ends, its next request fails.
+                await asyncio.wait({c1.recv_task}, timeout=10)
+                assert live.is_dead(c1)
+                with pytest.raises(Exception):  # noqa: B017 - the SDK's own error for a closed socket
+                    await c1.query("RETURN 1;", {})
+            else:
+                # SDK 2.0 HTTP (M17): it keeps the namespace and database it was opened on.
+                await c1.query("UPSERT md_item:kept SET v = 'kept';", {})
+                assert _values(await _root_rows("md_a", "md_item")) == ["kept"]
+                assert _values(await _root_rows("md_b", "md_item")) == ["new"]
+
+
+class TestTransactionGenerationE2E:
+    """AC-28 item 4 (raw writes), P1, P10: a transaction whose connection is removed or registered again with other
+    settings while it is open is cancelled at its exit; nothing is committed (R12)."""
+
+    @staticmethod
+    async def _assert_nothing_committed(kind: str, change: str, client: Any, sent: list[str]) -> None:
+        assert not any("BEGIN TRANSACTION" in statement for statement in sent), sent
+        if kind != "mem":
+            assert await _root_rows("md_a", "md_item") == []
+            assert await _root_rows("md_b", "md_item") == []
+        elif change == "re-register":
+            assert await _engine_rows(client, "md_a", "md_item") == []
+            assert await _engine_rows(client, "md_b", "md_item") == []
+
+    @pytest.mark.parametrize("change", _CHANGES)
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_exit_raises_r12(self, kind: str, change: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _databases(kind, "md_a"):
+            client = await SurrealDBConnectionManager.get_client("md_a")
+            sent = _record_raw(monkeypatch, client)
+            with pytest.raises(SurrealDbConnectionError, match="nothing was committed") as info:
+                async with SurrealDBConnectionManager.transaction("md_a") as tx:
+                    await tx.add("UPSERT md_item:1 SET v = 1;")
+                    await _change(change, lambda: _register(kind, "md_a", database="md_b"))
+            assert info.value.retryable is False  # type: ignore[attr-defined]
+            assert str(info.value) == (
+                "Connection 'md_a' was removed or registered again with other settings while this transaction was "
+                "open on it; the transaction was cancelled and nothing was committed. Open it again."
+            )
+            await _drain_background()
+            await self._assert_nothing_committed(kind, change, client, sent)
+
+    @pytest.mark.parametrize("change", _CHANGES)
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_body_exception_keeps_its_identity_and_gets_a_note(
+        self, kind: str, change: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with _databases(kind, "md_a"):
+            client = await SurrealDBConnectionManager.get_client("md_a")
+            sent = _record_raw(monkeypatch, client)
+            mine = RuntimeError("mine")
+            with pytest.raises(RuntimeError) as info:
+                async with SurrealDBConnectionManager.transaction("md_a") as tx:
+                    await tx.add("UPSERT md_item:1 SET v = 1;")
+                    await _change(change, lambda: _register(kind, "md_a", database="md_b"))
+                    raise mine
+            assert info.value is mine
+            notes = [note for note in mine.__notes__ if "registered again with other settings" in note]
+            assert len(notes) == 1
+            assert "'md_a'" in notes[0]
+            assert "nothing was committed" in notes[0]
+            await _drain_background()
+            await self._assert_nothing_committed(kind, change, client, sent)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_body_exception_without_a_change_gets_no_note(self, kind: str) -> None:
+        async with _databases(kind, "md_a"):
+            client = await SurrealDBConnectionManager.get_client("md_a")
+            with pytest.raises(RuntimeError, match="plain") as info:
+                async with SurrealDBConnectionManager.transaction("md_a") as tx:
+                    await tx.add("UPSERT md_item:1 SET v = 1;")
+                    raise RuntimeError("plain")
+            assert not hasattr(info.value, "__notes__")
+            rows = await (_rows_of(client, "md_item") if kind == "mem" else _root_rows("md_a", "md_item"))
+            assert rows == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_same_settings_again_commit(self, kind: str) -> None:
+        async with _databases(kind, "md_a"):
+            client = await SurrealDBConnectionManager.get_client("md_a")
+            async with SurrealDBConnectionManager.transaction("md_a") as tx:
+                await tx.add("UPSERT md_item:1 SET v = 1;")
+                _register(kind, "md_a", database="md_a")
+            rows = await (_rows_of(client, "md_item") if kind == "mem" else _root_rows("md_a", "md_item"))
+            assert _values(rows) == [1]
+
+    async def test_nested_blocks_get_the_note_once(self) -> None:
+        """P10: both blocks were open across the change; the inner one notes it, the outer one does not again."""
+        async with _databases("mem", "md_a"):
+            mine = RuntimeError("mine")
+            with pytest.raises(RuntimeError) as info:
+                async with SurrealDBConnectionManager.transaction("md_a") as outer:
+                    await outer.add("UPSERT md_item:1 SET v = 1;")
+                    async with SurrealDBConnectionManager.transaction("md_a") as inner:
+                        await inner.add("UPSERT md_item:2 SET v = 2;")
+                        _register("mem", "md_a", database="md_b")
+                        raise mine
+            assert info.value is mine
+            assert len(mine.__notes__) == 1
+            assert "registered again with other settings" in mine.__notes__[0]
+
+
+class TestServerBesideEmbeddedE2E:
+    """AC-9: a ws and an http connection to the line under test and a ``mem://`` one, side by side in one process;
+    each decides its transaction strategy on its own server."""
+
+    async def test_side_by_side(self) -> None:
+        await _reset_databases(define=True)
+        _register("ws", "md_a", database="md_a")
+        _register("http", "md_b", database="md_b")
+        _register("mem", "md_mem", database="md_mem")
+        try:
+            ws = await SurrealDBConnectionManager.get_client("md_a")
+            http = await SurrealDBConnectionManager.get_client("md_b")
+            mem = await SurrealDBConnectionManager.get_client("md_mem")
+            assert len({id(ws), id(http), id(mem)}) == 3
+            await ws.query("UPSERT md_item:1 SET v = 'ws';", {})
+            await http.query("UPSERT md_item:1 SET v = 'http';", {})
+            await mem.query("UPSERT md_item:1 SET v = 'mem';", {})
+            assert _values(await _root_rows("md_a", "md_item")) == ["ws"]
+            assert _values(await _root_rows("md_b", "md_item")) == ["http"]
+            assert _values(await _rows_of(mem, "md_item")) == ["mem"]
+            line = int(str(await ws.version()).rsplit("-", 1)[-1].split(".")[0])
+            async with SurrealDBConnectionManager.transaction("md_a") as tx:
+                assert tx.is_interactive is (line >= 3)
+            async with SurrealDBConnectionManager.transaction("md_b") as tx:
+                assert tx.is_interactive is False
+            async with SurrealDBConnectionManager.transaction("md_mem") as tx:
+                assert tx.is_interactive is False
+        finally:
+            for name in ("md_a", "md_b", "md_mem"):
+                await SurrealDBConnectionManager.remove_connection(name)
+            await _reset_databases(define=False)

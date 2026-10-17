@@ -61,6 +61,11 @@ class Transaction(ABC):
     refresh, refresh) adapt.
     """
 
+    #: The settings generation of the connection the transaction was opened on (v0.29.0), set by
+    #: ``SurrealDBConnectionManager.transaction()``: a connection removed or registered again with other
+    #: settings while the block is open is cancelled at its exit instead of committing.
+    _connection_generation: int | None = None
+
     def __init__(self) -> None:
         self._post_commit: list[Callable[[], Awaitable[None]]] = []
         # Query cache: the tables written in this transaction, invalidated at commit.

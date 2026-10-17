@@ -24,6 +24,11 @@ Dropping the cached client after every test makes the coupling impossible rather
 unlikely. It costs a reconnect per test, which is negligible next to the round-trips the E2E
 tests already make.
 
+**Named connections (v0.29.0) never outlive their test.** A second autouse fixture removes every
+connection a test registered — every name of the registry but ``"default"``, the registry itself
+rather than ``list_connections()``, so a name registered but never configured goes too — closing its
+clients, engines and live readers.
+
 **The v0.23.0 encoding boundary is the identity on everything v0.22.2 could send.** Every payload
 the ORM hands the SDK goes through ``surreal_orm_lite.encoding.encode()``, which converts rich
 values (durations, dates, sets, ranges, exponent decimals) and must return the very object it was
@@ -48,7 +53,7 @@ from typing import Any
 import pytest
 import pytest_asyncio
 
-from surreal_orm_lite import SurrealDBConnectionManager, encoding
+from surreal_orm_lite import SurrealDBConnectionManager, connection_manager, encoding
 
 #: The test modules written for v0.23.0's rich field types, v0.24.0's geometries, v0.24.3's read
 #: hook, v0.25.0's embedded engine, v0.26.0's time travel, v0.27.0's subqueries and v0.28.0's query cache:
@@ -73,6 +78,15 @@ _REWRITE_MODULES = frozenset(
 async def _drop_cached_connection() -> None:
     yield
     await SurrealDBConnectionManager.close_connection()
+
+
+@pytest_asyncio.fixture(autouse=True, loop_scope="function")
+async def _remove_named_connections() -> AsyncIterator[None]:
+    """Remove every connection the test registered (v0.29.0); the default one is never unregistered."""
+    yield
+    for name in list(connection_manager._REGISTRY):
+        if name != "default":
+            await SurrealDBConnectionManager.remove_connection(name)
 
 
 @pytest.fixture(autouse=True)

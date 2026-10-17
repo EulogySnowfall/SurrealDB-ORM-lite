@@ -2281,6 +2281,7 @@ _CLASSIFIED: dict[type, dict[str, frozenset[str]]] = {
         "other": frozenset(
             {
                 "unset_connection",
+                "remove_connection",
                 "get_client",
                 "close_connection",
                 "close_all_connections",
