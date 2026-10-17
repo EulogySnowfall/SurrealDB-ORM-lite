@@ -12,6 +12,7 @@ server of ``SURREALDB_PORT`` over WebSocket and HTTP.
 """
 
 import asyncio
+import contextlib
 import gc
 import hashlib
 import inspect
@@ -20,7 +21,7 @@ import math
 import random
 import re
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
@@ -39,12 +40,17 @@ from surreal_orm_lite import (
     QueryCache,
     Subquery,
     SurrealConfigDict,
+    SurrealDbConnectionError,
+    SurrealDBConnectionManager,
     SurrealDbError,
     cache,
     encoding,
 )
 from surreal_orm_lite._sdk import cbor_encode
 from surreal_orm_lite.cache import EDGES
+from surreal_orm_lite.testing import embedded_database
+from tests.conftest import _ws_url
+from tests.test_time_travel import _http_url, connected
 
 # --- models (spec §9) ---------------------------------------------------------------------------------
 
@@ -1051,6 +1057,146 @@ class TestScopeCells:
         assert scope not in cache._retired
 
 
+# --- AC-4 (manager): a scope per identity stamp, retired where the manager drops the client -------------
+
+
+class _ClosableClient(_Client):
+    """A stand-in for an SDK client the manager may close."""
+
+    closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _manager_clients() -> Any:
+    """The manager's per-loop clients (its private ``WeakKeyDictionary``, reached through the mangled name)."""
+    return SurrealDBConnectionManager._SurrealDBConnectionManager__clients  # type: ignore[attr-defined]
+
+
+def _stamped(client: Any) -> int:
+    """Stamp ``client`` as the manager does when it publishes one; return its live scope."""
+    SurrealDBConnectionManager._stamp_identity(client, replayable=True)
+    scope = SurrealDBConnectionManager._cache_scope(client)
+    assert scope is not None
+    assert scope in QueryCache._live_scopes
+    return scope
+
+
+def _retired(scope: int, key: str) -> bool:
+    """Whether ``scope`` is no longer live and the entry stored under it (``key``) has left memory."""
+    return scope not in QueryCache._live_scopes and key not in QueryCache._entries
+
+
+@contextlib.asynccontextmanager
+async def _bare_manager() -> AsyncIterator[Any]:
+    """The manager with no settings and no client, before and after; yields its per-loop clients (for fakes)."""
+    await SurrealDBConnectionManager.unset_connection()
+    try:
+        yield _manager_clients()
+    finally:
+        await SurrealDBConnectionManager.unset_connection()
+
+
+class TestScopeUnit:
+    def test_every_stamp_mints_a_new_scope(self) -> None:
+        fake = _Client()
+        first = _stamped(fake)
+        _store("k", [1], {"t"}, scope=first)
+        second = _stamped(fake)
+        assert second != first
+        assert first not in QueryCache._live_scopes
+        assert "k" not in QueryCache._entries
+        SurrealDBConnectionManager._stamp_identity(fake, replayable=False, fingerprint="other")
+        third = SurrealDBConnectionManager._cache_scope(fake)
+        assert third is not None
+        assert third not in (first, second)
+        assert second not in QueryCache._live_scopes
+        cache.retire_client(fake)
+        assert third not in QueryCache._live_scopes
+
+    def test_a_client_that_cannot_be_weakly_referenced_gets_no_scope(self) -> None:
+        live = set(QueryCache._live_scopes)
+        SurrealDBConnectionManager._stamp_identity(1, replayable=True)
+        assert SurrealDBConnectionManager._cache_scope(1) is None
+        assert QueryCache._live_scopes == live
+
+    def test_an_unstamped_client_has_no_scope(self) -> None:
+        assert SurrealDBConnectionManager._cache_scope(_Client()) is None
+
+    async def test_close_connection_retires_the_running_loops_client(self) -> None:
+        async with _bare_manager() as clients:
+            fake = _ClosableClient()
+            scope = _stamped(fake)
+            clients[asyncio.get_running_loop()] = fake
+            _store("k", [1], {"t"}, scope=scope)
+            await SurrealDBConnectionManager.close_connection()
+            assert fake.closed
+            assert _retired(scope, "k")
+            assert SurrealDBConnectionManager._cache_scope(fake) is None
+
+    async def test_close_all_connections_retires_every_loops_client(self) -> None:
+        other_loop = asyncio.new_event_loop()
+        try:
+            async with _bare_manager() as clients:
+                mine, other = _ClosableClient(), _ClosableClient()
+                mine_scope, other_scope = _stamped(mine), _stamped(other)
+                clients[asyncio.get_running_loop()] = mine
+                clients[other_loop] = other
+                _store("mine", [1], {"t"}, scope=mine_scope)
+                _store("other", [2], {"t"}, scope=other_scope)
+                await SurrealDBConnectionManager.close_all_connections()
+                assert mine.closed
+                assert not other.closed  # another live loop's client is dropped, not awaited
+                assert _retired(mine_scope, "mine")
+                assert _retired(other_scope, "other")
+        finally:
+            other_loop.close()
+
+    async def test_a_closed_loops_client_is_retired_when_pruned(self) -> None:
+        async with _bare_manager() as clients:
+            dead_loop = asyncio.new_event_loop()
+            dead_loop.close()
+            fake = _ClosableClient()
+            scope = _stamped(fake)
+            clients[dead_loop] = fake
+            _store("k", [1], {"t"}, scope=scope)
+            assert not SurrealDBConnectionManager.is_connected()  # prunes the closed loop's client
+            assert dead_loop not in clients
+            assert _retired(scope, "k")
+
+    async def test_a_dead_client_is_retired_when_discarded(self) -> None:
+        async with _bare_manager() as clients:
+            loop = asyncio.get_running_loop()
+            fake = _ClosableClient()
+            scope = _stamped(fake)
+            clients[loop] = fake
+            _store("k", [1], {"t"}, scope=scope)
+            await SurrealDBConnectionManager._discard_dead_client(loop, fake)
+            assert loop not in clients
+            assert _retired(scope, "k")
+
+    async def test_a_stale_client_is_retired_when_its_replacement_cannot_connect(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def refused(*args: Any, **kwargs: Any) -> Any:
+            raise SurrealDbConnectionError("Can't connect to the database.")
+
+        async with _bare_manager() as clients:
+            loop = asyncio.get_running_loop()
+            fake = _ClosableClient()
+            scope = _stamped(fake)
+            clients[loop] = fake
+            _store("k", [1], {"t"}, scope=scope)
+            SurrealDBConnectionManager.set_connection(
+                url=_ws_url(), user="root", password="root", namespace="ns", database="db"
+            )
+            monkeypatch.setattr(SurrealDBConnectionManager, "_open_client", refused)
+            with pytest.raises(SurrealDbConnectionError):
+                await SurrealDBConnectionManager._connect_for_loop(loop)
+            assert fake.closed
+            assert loop not in clients
+            assert _retired(scope, "k")
+
+
 # --- AC-3: threads ------------------------------------------------------------------------------------
 
 
@@ -1396,3 +1542,183 @@ class TestInvalidatesDecorator:
         release.set()
         await write
         assert QueryCache.stats()["entries"] == 0
+
+
+# === E2E: an engine or a server ===========================================================================
+
+#: The tables of this module's models, removed before and after each E2E test on a server.
+_TABLES = ("qc_item", "qc_author", "qc_book", "qc_place")
+
+
+@contextlib.asynccontextmanager
+async def cache_db(kind: str) -> AsyncIterator[Any]:
+    """The ORM on *kind*: a fresh ``mem://`` engine, or the server of ``SURREALDB_PORT`` over ``ws`` or ``http``.
+
+    On a server the tables of this module are removed before and after, and the connection settings are unset at
+    the end (``connected()``); yields the SDK client.
+    """
+    if kind == "mem":
+        async with embedded_database("mem://") as client:
+            yield client
+        return
+    async with connected(_ws_url() if kind == "ws" else _http_url(), "db", *_TABLES) as client:
+        yield client
+
+
+#: Spec M1/M2's record-access fixture, in a database of its own.
+_AUTH_DB = "qc_auth"
+_AUTH_ACCESS = "qc_access"
+_AUTH_PASS = "qc-passphrase"
+_AUTH_DEFINE = (
+    "DEFINE TABLE OVERWRITE qc_acct SCHEMALESS PERMISSIONS FOR select WHERE id = $auth.id;",
+    "DEFINE TABLE OVERWRITE qc_note SCHEMALESS PERMISSIONS FOR select WHERE owner = $auth.id;",
+    f"DEFINE ACCESS OVERWRITE {_AUTH_ACCESS} ON DATABASE TYPE RECORD"
+    " SIGNUP ( CREATE qc_acct SET name = $name, pass = crypto::argon2::generate($pass) )"
+    " SIGNIN ( SELECT * FROM qc_acct WHERE name = $name AND crypto::argon2::compare(pass, $pass) );",
+    "CREATE qc_acct:a SET name = 'a', pass = crypto::argon2::generate($pass);",
+    "CREATE qc_acct:b SET name = 'b', pass = crypto::argon2::generate($pass);",
+    "CREATE qc_note:a1 SET owner = qc_acct:a;",
+    "CREATE qc_note:b1 SET owner = qc_acct:b;",
+    "CREATE qc_note:b2 SET owner = qc_acct:b;",
+)
+_AUTH_REMOVE = (f"REMOVE ACCESS {_AUTH_ACCESS} ON DATABASE;", "REMOVE TABLE qc_note;", "REMOVE TABLE qc_acct;")
+
+
+async def _remove_auth(client: Any) -> None:
+    for statement in _AUTH_REMOVE:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(client.query(statement), 10)
+
+
+@contextlib.asynccontextmanager
+async def auth_db(kind: str) -> AsyncIterator[Any]:
+    """Spec M1/M2's data on the server of ``SURREALDB_PORT`` over ``ws`` or ``http``, in database ``qc_auth``.
+
+    Accounts ``a`` and ``b`` (record access ``qc_access``, variables ``name`` and ``pass``), notes ``a1`` (``a``'s),
+    ``b1`` and ``b2`` (``b``'s), each readable by its owner only. Yields the ORM's client, signed in as root; at the
+    end it signs in as root again, removes everything and unsets the connection settings.
+    """
+    url = _ws_url() if kind == "ws" else _http_url()
+    SurrealDBConnectionManager.set_connection(url=url, user="root", password="root", namespace="ns", database=_AUTH_DB)
+    try:
+        client = await SurrealDBConnectionManager.get_client()
+        await _remove_auth(client)
+        for statement in _AUTH_DEFINE:
+            await client.query(statement, {"pass": _AUTH_PASS})
+        try:
+            yield client
+        finally:
+            with contextlib.suppress(Exception):
+                await client.signin({"username": "root", "password": "root"})
+                await client.use("ns", _AUTH_DB)
+            await _remove_auth(client)
+    finally:
+        await SurrealDBConnectionManager.unset_connection()
+
+
+def _sign_in_as(name: str, *, store: bool) -> Callable[[], Awaitable[Any]]:
+    """The manager's record sign-in as account *name* of :func:`auth_db`."""
+
+    async def sign_in() -> Any:
+        variables = {"name": name, "pass": _AUTH_PASS}
+        return await SurrealDBConnectionManager.signin(access=_AUTH_ACCESS, variables=variables, store=store)
+
+    return sign_in
+
+
+async def _note_keys(client: Any) -> list[str]:
+    """The keys of the ``qc_note`` rows the client's current identity may read."""
+    rows = await client.query("SELECT VALUE id FROM qc_note;")
+    return sorted(str(row.id) for row in rows)
+
+
+class TestScopeE2E:
+    @pytest.mark.parametrize("kind", ["ws", "http"])
+    async def test_every_identity_change_mints_a_new_scope(self, kind: str) -> None:
+        """M1: root, ``signin(store=False)`` as ``a``, as ``b``, ``signin`` as ``a``, ``invalidate()`` — the same
+        client reads other rows at each step, so each step has a scope of its own and retires the previous one."""
+
+        async def as_root() -> None:
+            return None
+
+        steps: list[tuple[Callable[[], Awaitable[Any]], list[str]]] = [
+            (as_root, ["a1", "b1", "b2"]),
+            (_sign_in_as("a", store=False), ["a1"]),
+            (_sign_in_as("b", store=False), ["b1", "b2"]),
+            (_sign_in_as("a", store=True), ["a1"]),
+            (SurrealDBConnectionManager.invalidate, ["a1", "b1", "b2"]),
+        ]
+        async with auth_db(kind) as client:
+            scopes: list[int] = []
+            for step, notes in steps:
+                await step()
+                assert await SurrealDBConnectionManager.get_client() is client
+                scope = SurrealDBConnectionManager._cache_scope(client)
+                assert scope is not None
+                assert scope in QueryCache._live_scopes
+                assert not set(scopes) & QueryCache._live_scopes  # every previous scope is retired…
+                assert QueryCache.stats()["entries"] == 0  # …with its entries
+                assert await _note_keys(client) == notes
+                _store(f"k{len(scopes)}", notes, {"qc_note"}, scope=scope)
+                scopes.append(scope)
+            assert len(set(scopes)) == 5
+
+    @pytest.mark.parametrize("kind", ["mem", "ws", "http"])
+    async def test_a_published_client_has_a_scope(self, kind: str) -> None:
+        async with cache_db(kind) as client:
+            scope = SurrealDBConnectionManager._cache_scope(client)
+            assert scope is not None
+            assert scope in QueryCache._live_scopes
+            assert await SurrealDBConnectionManager.get_client() is client
+            assert SurrealDBConnectionManager._cache_scope(client) == scope  # handing it out again mints nothing
+
+    @pytest.mark.parametrize("kind", ["ws", "http"])
+    @pytest.mark.parametrize("closing", ["close_connection", "close_all_connections", "unset_connection", "reconnect"])
+    async def test_dropping_the_client_retires_its_scope(self, kind: str, closing: str) -> None:
+        async with connected(_ws_url() if kind == "ws" else _http_url(), "db") as client:
+            scope = SurrealDBConnectionManager._cache_scope(client)
+            assert scope is not None
+            _store("k", [1], {"qc_item"}, scope=scope)
+            await getattr(SurrealDBConnectionManager, closing)()
+            assert _retired(scope, "k")
+            assert SurrealDBConnectionManager._cache_scope(client) is None
+            if closing == "reconnect":
+                fresh = await SurrealDBConnectionManager.get_client()
+                assert fresh is not client
+                fresh_scope = SurrealDBConnectionManager._cache_scope(fresh)
+                assert fresh_scope is not None
+                assert fresh_scope in QueryCache._live_scopes
+
+    async def test_leaving_embedded_database_retires_its_engines_scope(self) -> None:
+        async with embedded_database("mem://") as outer:
+            outer_scope = SurrealDBConnectionManager._cache_scope(outer)
+            assert outer_scope is not None
+            _store("outer", [1], {"qc_item"}, scope=outer_scope)
+            async with embedded_database("mem://") as inner:
+                inner_scope = SurrealDBConnectionManager._cache_scope(inner)
+                assert inner_scope is not None
+                assert inner_scope != outer_scope
+                _store("inner", [2], {"qc_item"}, scope=inner_scope)
+                assert outer_scope in QueryCache._live_scopes  # the outer engine is detached, not retired
+            del inner
+            assert _retired(inner_scope, "inner")
+            assert await SurrealDBConnectionManager.get_client() is outer
+            assert SurrealDBConnectionManager._cache_scope(outer) == outer_scope
+            assert "outer" in QueryCache._entries
+        assert _retired(outer_scope, "outer")
+
+    async def test_a_close_inside_embedded_database_retires_the_engines_scope(self) -> None:
+        async with embedded_database("mem://") as first:
+            scope = SurrealDBConnectionManager._cache_scope(first)
+            assert scope is not None
+            _store("k", [1], {"qc_item"}, scope=scope)
+            await SurrealDBConnectionManager.close_connection()
+            assert _retired(scope, "k")
+            second = await SurrealDBConnectionManager.get_client()
+            assert second is not first
+            second_scope = SurrealDBConnectionManager._cache_scope(second)
+            assert second_scope is not None
+            assert second_scope != scope
+            assert second_scope in QueryCache._live_scopes
+            del first, second
+        assert second_scope not in QueryCache._live_scopes
