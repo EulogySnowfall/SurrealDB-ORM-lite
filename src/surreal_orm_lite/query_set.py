@@ -199,7 +199,9 @@ class QuerySet:
 
         SurrealDB's session parameters — ``access``, ``auth``, ``session`` and ``token`` — are not variables: the
         server sets them for each session and refuses a query variable of that name, so ``variables()`` refuses them
-        (v0.28.1). A filter reads them with ``Var("auth")``, without ``variables()``.
+        (v0.28.1). To pass your own value, give it another name —
+        ``filter(token=Var("device_token")).variables(device_token=t)`` — or pass the value itself in the filter
+        (``filter(token=t)``). ``Var("token")`` without ``variables()`` reads SurrealDB's ``$token``.
 
         Args:
             **kwargs: Variable names and their values.
@@ -214,7 +216,9 @@ class QuerySet:
             if name in SESSION_PARAMETERS:
                 raise ValueError(
                     f"variables() cannot set '{name}': SurrealDB sets ${name} for each session and refuses a query "
-                    f"variable of that name. Read it with Var('{name}'), without variables()."
+                    f"variable of that name. To pass your own value, give it another name (variables(my_{name}=...) "
+                    f"with Var('my_{name}')) or pass the value itself in the filter; Var('{name}') without "
+                    f"variables() reads SurrealDB's ${name} parameter."
                 )
         self._variables.update(kwargs)
         return self
@@ -2018,25 +2022,24 @@ class QuerySet:
                 raise SurrealDbError(_subquery.default_written(method, key))
 
     def _reject_string_references(self, criteria: Mapping[str, Any]) -> None:
-        """Refuse an ``exact`` criterion ``"$<name>"`` naming a variable or a session parameter (v0.28.1).
+        """Refuse a criterion ``"$<name>"`` naming a variable or a session parameter, whatever its lookup (v0.28.1).
 
-        ``get_or_create()`` and ``update_or_create()`` look up an ``exact`` criterion and write it on create, and a
-        ``str`` is data: ``update_or_create(owner="$auth", …)`` would find and write the record whose owner is the
-        string ``"$auth"``, the same record for every record user. A criterion whose lookup would warn
-        (:func:`~surreal_orm_lite.utils.warn_on_variable_names`) — ``$`` and the name of a variable this queryset's
-        ``variables()`` give, or of one of SurrealDB's session parameters — is refused instead, before any request,
-        naming the ``Var(...)`` that reads the value in a filter and ``defaults=``. Any other ``"$name"`` is data,
-        looked up and written as it is. An edge endpoint is left to the lookup, which refuses a string that is not a
-        record id and names the same ``Var(...)``.
+        A ``str`` is data: ``get_or_create()`` and ``update_or_create()`` look a criterion up as the string, and write
+        an ``exact`` one on create, so ``update_or_create(owner="$auth", …)`` would find and write the record whose
+        owner is the string ``"$auth"``, the same record for every record user, and ``members__contains="$auth"``
+        would look for the string. A criterion whose read would warn
+        (:func:`~surreal_orm_lite.utils.warn_on_variable_names`) — a scalar ``str`` that is ``$`` and the name of a
+        variable this queryset's ``variables()`` give, or of one of SurrealDB's session parameters — is refused
+        instead, before any request, saying to pass the actual value as the criterion; ``Var(...)`` reads the value
+        in a filter but cannot be written. Any other ``"$name"`` is data, looked up and written as it is, and so is
+        an item of a list lookup. A criterion the lookup refuses with a ``ValueError`` (:meth:`_compares_with_string`)
+        is left to it: on an edge endpoint, which holds a record id, the message names the same ``Var(...)``.
 
         Raises:
             SurrealDbError: the first such criterion.
         """
         for key, value in criteria.items():
-            field_name, lookup = parse_lookup(key)
-            if lookup != "exact" or not isinstance(value, str) or self.model._is_write_protected(field_name):
-                continue
-            match = VARIABLE_NAME_VALUE.fullmatch(value)
+            match = VARIABLE_NAME_VALUE.fullmatch(value) if isinstance(value, str) else None
             if match is None:
                 continue
             name = match.group(1)
@@ -2046,11 +2049,29 @@ class QuerySet:
                 source, kind = f"SurrealDB's ${name} parameter", "parameter"
             else:
                 continue
+            if not self._compares_with_string(key, value):
+                continue
+            how = "looked up and written" if parse_lookup(key)[1] == "exact" else "looked up"
             raise SurrealDbError(
-                f"Cannot look up or create a record from the string '${name}' given for '{field_name}': it names "
-                f"{source}, but a string criterion is data, looked up and written as the string '${name}'. "
-                f"Var('{name}') reads the {kind} in a filter but cannot be written: pass the value to write in defaults=."
+                f"Cannot look up or create a record from the string '${name}' given for '{key}': it names "
+                f"{source}, but a string criterion is data, {how} as the string '${name}'. Pass the actual value as "
+                f"the criterion (the record id, or the value itself); Var('{name}') reads the {kind} in a filter but "
+                "cannot be written."
             )
+
+    def _compares_with_string(self, key: str, value: str) -> bool:
+        """Whether the lookup of the criterion ``key=value`` compares a column with the string *value*.
+
+        The criterion is compiled as the lookup compiles it (:meth:`_where_parts`), without a warning: ``True`` when
+        the read notes *value* among the strings that warn (``SubqueryCompiler.variable_like``); ``False`` when the
+        lookup refuses it with a ``ValueError``, which the lookup raises itself.
+        """
+        compiler = SubqueryCompiler(warn=False)
+        try:
+            QuerySet(self.model).filter(**{key: value})._where_parts(subqueries=compiler)
+        except ValueError:
+            return False
+        return bool(compiler.variable_like)
 
     async def _lookup_matches(self, criteria: dict[str, Any]) -> list[Any]:
         """Return rows matching ``criteria``, routed through the transaction when attached.
@@ -2061,9 +2082,9 @@ class QuerySet:
         buffered one (consistent with every other read). ``LIMIT 2`` is enough to distinguish
         0 / 1 / >1. A subquery criterion (v0.27.0) is read in the same statement, a block
         ``{ LET $_sq0 = (…); (SELECT … LIMIT 2) };``, run as every read is (:meth:`_run_compiled`).
-        The lookup binds no ``variables()``, as before; a criterion ``"$name"`` of another lookup than ``exact``
-        whose name this queryset's ``variables()`` give still warns (v0.28.1): until then it read as that variable.
-        An ``exact`` one never gets here (:meth:`_reject_string_references`).
+        The lookup binds no ``variables()``; their names give the hint of an edge endpoint's ``ValueError``
+        (``variable_names``). A criterion ``"$name"`` that would warn never gets here
+        (:meth:`_reject_string_references`).
         """
         probe = QuerySet(self.model)
         probe.filter(**criteria)
@@ -2143,12 +2164,14 @@ class QuerySet:
         never written; one the create would have to write — under an ``exact`` lookup, or in
         ``defaults`` — raises ``SurrealDbError`` before any request.
 
-        A ``str`` criterion is data, looked up and written as it is (``owner="$admin"``). An ``exact`` criterion
-        that is ``$`` and the name of a variable ``variables()`` gives or of one of SurrealDB's session parameters
-        — ``update_or_create(owner="$auth", …)`` — raises ``SurrealDbError`` before any request (v0.28.1): it
-        would find and write the record whose owner is the string ``"$auth"``, the same for every record user. The
-        message names ``Var("auth")``, which reads the parameter in a filter but cannot be written (a
-        ``Var`` criterion raises ``SurrealDbError`` here), and ``defaults=``.
+        A ``str`` criterion is data, looked up and written as it is (``owner="$admin"``). A scalar criterion, whatever
+        its lookup, that is ``$`` and the name of a variable ``variables()`` gives or of one of SurrealDB's session
+        parameters — ``update_or_create(owner="$auth", …)`` — raises ``SurrealDbError`` before any request
+        (v0.28.1): it would find and write the record whose owner is the string ``"$auth"``, the same for every
+        record user. The message says to pass the actual value as the criterion (the record id, or the value
+        itself); ``Var("auth")`` reads the parameter in a filter but cannot be written (an ``exact`` ``Var``
+        criterion raises ``SurrealDbError`` here). On an edge endpoint such a string raises the lookup's
+        ``ValueError``.
         """
         self._reject_time_travel("update_or_create()")
         self._reject_subquery_writes(criteria, defaults, "update_or_create")
@@ -2198,11 +2221,13 @@ class QuerySet:
         create would have to write — under an ``exact`` lookup, or in ``defaults`` — raises
         ``SurrealDbError`` before any request.
 
-        A ``str`` criterion is data, looked up and written as it is (``owner="$admin"``). An ``exact`` criterion
-        that is ``$`` and the name of a variable ``variables()`` gives or of one of SurrealDB's session parameters
-        — ``get_or_create(owner="$auth")`` — raises ``SurrealDbError`` before any request (v0.28.1), naming
-        ``Var("auth")`` and ``defaults=``. ``get_or_create(owner=Var("auth"))`` returns the signed-in record
-        user's record; when there is none it raises ``SurrealDbError``: a ``Var`` cannot be written.
+        A ``str`` criterion is data, looked up and written as it is (``owner="$admin"``). A scalar criterion, whatever
+        its lookup, that is ``$`` and the name of a variable ``variables()`` gives or of one of SurrealDB's session
+        parameters — ``get_or_create(owner="$auth")``, ``get_or_create(members__contains="$auth", …)`` — raises
+        ``SurrealDbError`` before any request (v0.28.1), saying to pass the actual value as the criterion (the record
+        id, or the value itself). ``get_or_create(owner=Var("auth"))`` returns the signed-in record user's record;
+        when there is none it raises ``SurrealDbError``: a ``Var`` cannot be written. On an edge endpoint such a
+        string raises the lookup's ``ValueError``.
         """
         self._reject_time_travel("get_or_create()")
         self._reject_subquery_writes(criteria, defaults, "get_or_create")

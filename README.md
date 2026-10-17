@@ -301,17 +301,22 @@ warning. On an edge's `in` and `out`, which hold record ids, such a string is no
 raises `ValueError`; when it names a variable of `variables()` or one of these parameters, the
 message names the `Var(...)` to write.
 
-`get_or_create()` and `update_or_create()` look up their `exact` criteria and write them on create,
-so there such a string is refused: `update_or_create(owner="$auth", defaults=…)` would find and
-write the record whose `owner` is the string `"$auth"`, the same record for every record user. An
-`exact` criterion that is exactly `$` followed by the name of a variable of `variables()` or of one
-of these parameters raises `SurrealDbError` before any request, naming the `Var(...)` and
-`defaults=`. `Var("auth")` finds the signed-in user's record (`get_or_create(owner=Var("auth"))`
-returns it) but cannot be written: with no record to return, it raises `SurrealDbError`. Any other
-string, such as `"$admin"`, is looked up and written as it is.
+`get_or_create()` and `update_or_create()` look up their criteria and write the `exact` ones on
+create, so there such a string is refused: `update_or_create(owner="$auth", defaults=…)` would find
+and write the record whose `owner` is the string `"$auth"`, the same record for every record user,
+and `members__contains="$auth"` would look for the string. A criterion that is exactly `$` followed
+by the name of a variable of `variables()` or of one of these parameters raises `SurrealDbError`
+before any request, whatever its lookup, saying to pass the actual value as the criterion: the
+record id, or the value itself. `Var("auth")` finds the signed-in user's record
+(`get_or_create(owner=Var("auth"))` returns it) but cannot be written: with no record to return, it
+raises `SurrealDbError`. Any other string, such as `"$admin"`, is looked up and written as it is. On
+an edge's `in` and `out`, such a criterion raises the `ValueError` above.
 
 `variables()` refuses these four names with a `ValueError`: SurrealDB sets them for each session
-and refuses a query variable of that name. Read them with `Var(...)`, without `variables()`.
+and refuses a query variable of that name. To pass your own value, give it another name, or pass
+the value itself in the filter: `filter(token=Var("device_token")).variables(device_token=t)` or
+`filter(token=t)`, in a read or a live query. `Var("token")` without `variables()` reads SurrealDB's
+`$token`.
 
 #### Model instances as filter values
 
