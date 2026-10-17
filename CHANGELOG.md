@@ -5,6 +5,96 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.28.1] - 2026-10-17
+
+Query building checks what it is given: `select()` accepts field names and paths, `limit()` and
+`offset()` take a non-negative integer, and a string filter value is always data, with `Var()` as
+the only variable reference. No new public API.
+
+### Changed
+
+- **A string filter value is data, whatever its first character** (#250), on every filter path:
+  `filter()`, `Q`, `get()`, `first()`, `count()`, `exists()`, `get_or_create()`,
+  `update_or_create()`, `bulk_update()` by filter, `cache()`, subqueries and live queries.
+  `filter(name="$admin")` compares `name` with the string `"$admin"`, bound like any other value.
+  `Var("name")` is the only reference to a query variable, whose value `variables()` gives.
+  Migration: where a filter uses the `"$name"` form (deprecated since v0.14.3), write
+  `Var("name")`. When a string filter value is exactly `$` followed by the name of a variable of
+  `variables()` or of a session parameter (`$access`, `$auth`, `$session`, `$token`), a
+  `UserWarning` names the `Var(...)` to write, once per read, pointing at the caller's line; the
+  value stays data. Any other string, such as `"$x"` with no variable `x`, is data and nothing
+  warns.
+
+  ```python
+  from surreal_orm_lite import Var
+
+  await User.objects().filter(name="$admin").exec()  # the string "$admin"
+  await User.objects().filter(age__gte=Var("min_age")).variables(min_age=21).exec()  # $min_age
+  await Doc.objects().filter(owner=Var("auth")).exec()  # SurrealDB's $auth
+  ```
+
+- **The `"$$"` escape keeps its meaning and is deprecated** (#250): a string filter value starting
+  with `$$` loses one `$` (`"$$admin"` finds `"$admin"`) and emits a `DeprecationWarning`; write
+  the value with one `$` less. An item of an `in` list never had the escape and is unchanged.
+- **`variables()` refuses `access`, `auth`, `session` and `token`** with a `ValueError` (#250):
+  SurrealDB sets these parameters for each session and refuses a query variable of that name. To
+  pass your own value, give it another name or put the value itself in the filter:
+  `filter(token=Var("device_token")).variables(device_token=t)` or `filter(token=t)`.
+  `Var("token")` without `variables()` reads SurrealDB's `$token`, and likewise for the three
+  others, in reads and in live queries.
+- **`get_or_create()` and `update_or_create()`** raise `SurrealDbError` before any request when a
+  scalar string criterion is exactly `$` followed by the name of a variable of `variables()` or of
+  a session parameter, whatever its lookup (#250): pass the actual value as the criterion (the
+  record id, or the value itself). Any other `"$name"` string is looked up and written as it is.
+  `Var("auth")` finds the signed-in user's record but cannot be written: with no record to return,
+  it raises `SurrealDbError`.
+- **`select()` checks its items** like `order_by()` and `values()` (#247): each item is `"*"`, a
+  field name (an aliased field by its Python name), a dotted path into a nested object or through a
+  record link, or such a path followed by `.*` (`"author.*"`). Anything else raises `ValueError`
+  naming the item when `select()` is called, before any request, and the selection in place is
+  kept; an item that is not a `str` raises `TypeError`. Write a computed projection with `query()`
+  and bound parameters.
+- **`limit()` and `offset()` take a non-negative integer** (#249) of any type with `__index__`
+  (an `IntEnum` member, NumPy's `int64`; the parameter is annotated `SupportsIndex`), up to
+  `2**63 - 1`. A `bool`, `str`, `float` or `None` raises `TypeError`, a negative value or one above
+  `2**63 - 1` `ValueError`, naming the method and the value, when the method is called (for a
+  subquery's `limit()` and `offset()` too), before any request; the value in place is kept.
+  SurrealDB 2.x and the embedded engine refuse a value above `2**32 - 1` when the read runs;
+  SurrealDB 3.x reads it.
+- **Live queries**: `Var("scope")` takes its value from `variables(scope=...)` like any other name
+  and raises `SurrealDbError` without it (#250). `$access`, `$auth`, `$session`, `$token`, `$this`
+  and `$parent` stay references the server reads on every notification.
+
+### Fixed
+
+- On an edge's `in` and `out`, which hold record ids, a string that is `$` followed by the name of
+  a variable of `variables()` or of a session parameter raises a `ValueError` whose message names
+  the `Var(...)` to write (#250).
+- Each warning of a filter value is emitted once per read: the second compilation of a `cache()`
+  miss and the re-send of a subquery over a missing table stay quiet, for the `"$$"`
+  `DeprecationWarning` too (#250).
+
+### Removed
+
+- `utils.remove_quotes_for_variables()` and `utils.VALID_VARIABLE_REF_PATTERN`, internal helpers
+  that were never in `__all__`.
+
+### Notes
+
+- **SurrealDB 2.x vs 3.x**: string filter values and `Var()` behave the same on both lines and on
+  the embedded engine. `select("meta.*")` on a nested object that is not a record link gives the
+  object on 3.x and its values as a list on 2.x and the embedded engine (through a link, the linked
+  record on both). A `limit()` or `offset()` above `2**32 - 1` is refused by SurrealDB 2.x and the
+  embedded engine when the read runs, and read by 3.x.
+- **Docs**: the README section "String filter values and `Var()`" replaces "Filter values that
+  start with `$`"; new parts "What `select()` accepts" and "`limit()` and `offset()`"; the
+  live-query, subquery and query-cache invalidation notes match; three rows in the 2.x/3.x behaviour
+  table (string filter values, a nested object's `.*`, `LIMIT`/`START` above `2**32 - 1`). The
+  `getting_started` notebook reads `SURREALDB_HOST` and `SURREALDB_PORT`; the v0.14.3 notebook says
+  the `"$$"` escape is deprecated since v0.28.1.
+- **Server pins unchanged**: tested against SurrealDB 3.3.4 and 2.7.0, and on the embedded engine,
+  plus 3.1.5 for backward compatibility (identical).
+
 ## [0.28.0] - 2026-10-17
 
 Query cache: a QuerySet serves its reads from a client-side cache with `cache(ttl)`, and every ORM
