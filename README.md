@@ -3564,7 +3564,10 @@ QueryCache.clear()  # drops every entry from memory and resets hits and misses
 
 To cache your own results, of `raw_query()` for instance, build a key with `make_key()` and use
 `get()` and `set()`. The key comes from the statement, its variables as the SDK sends them and the
-table; the entry is tagged with the table, so an ORM write to it removes the entry:
+table; the entry is tagged with the table, so an ORM write to it removes the entry. From the
+moment the write starts, its `pre_*`, `around_*` and `post_*` handlers included, `get()` returns
+`None` for the entry (a miss), and what `set()` stores for that table meanwhile leaves with the
+write:
 
 ```python
 async def total_price() -> int:
