@@ -24,6 +24,7 @@ from ._sdk import NotFoundError, RecordID, SdkDuration, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, _ComputedDefault
+from .routing import check_config_connection
 from .signals import (
     around_delete,
     around_save,
@@ -589,10 +590,18 @@ class SurrealConfigDict(ConfigDict, total=False):
         server_fields (list[str] | None): Columns the server owns (v0.18.0). They are dropped
             from implicit write payloads and hydrated back from the row the write returns,
             but stay writable when a caller names one explicitly.
+        connection (str | None): The named connection this model reads and writes (v0.29.0,
+            ``SurrealDBConnectionManager.add_connection()``); default: ``"default"``. Full
+            SurrealDB-ORM key. Checked when the class is defined (a non-empty ``str``), inherited
+            by subclasses unless they set their own; registered or not is checked at the model's
+            first database call.
     """
 
     table_name: str | None
     " Override the table name; default: the class name. Full SurrealDB-ORM key. "
+
+    connection: str | None
+    ' The named connection this model reads and writes (v0.29.0); default: ``"default"``. Full SurrealDB-ORM key. '
 
     primary_key: str | None
     " The primary key field name for the model. "
@@ -719,7 +728,8 @@ class BaseSurrealModel(BaseModel):
 
         ``__init_subclass__`` runs too early: the merged ``model_config`` does not exist yet.
         A bad name fails at the ``class`` statement rather than on the first query, because
-        ``get_table_name()`` is interpolated into SurrealQL.
+        ``get_table_name()`` is interpolated into SurrealQL. The ``connection`` key (v0.29.0) is
+        checked here too: a non-empty ``str``, or ``None`` for the default connection.
 
         The deprecated ``_table_name: ClassVar[str]`` is checked the same way and warns once,
         where it is defined — a subclass inheriting it does not warn again.
@@ -728,6 +738,9 @@ class BaseSurrealModel(BaseModel):
         configured = cls.model_config.get("table_name")
         if configured is not None:
             _check_table_name(cls, "table_name", configured)
+        connection = cls.model_config.get("connection")
+        if connection is not None:
+            check_config_connection(cls, connection)
         legacy = cls.__dict__.get("_table_name")
         if isinstance(legacy, str):
             _check_table_name(cls, "_table_name", legacy)
@@ -817,7 +830,7 @@ class BaseSurrealModel(BaseModel):
         if not statements:
             return []
         # Cheap even inside a transaction: get_client() returns the already-connected client.
-        client = await SurrealDBConnectionManager.get_client()
+        client = await cls._connection_manager().get_client()
         return await apply_ddl_statements(statements, client=client, tx=tx, what="computed field")
 
     # ==================== Field aliases & server-owned fields (v0.18.0) ====================
@@ -1206,6 +1219,37 @@ class BaseSurrealModel(BaseModel):
         return legacy if legacy is not None else cls.__name__
 
     @classmethod
+    def get_connection_name(cls) -> str:
+        """The connection this model's database calls use right now (v0.29.0) — the full SurrealDB-ORM's method.
+
+        The ``using()`` override when a block is active, else ``model_config = SurrealConfigDict(connection=…)``,
+        else ``"default"``. Resolved at every database call (a QuerySet built outside a ``using()`` block and run
+        inside it uses the block's connection); a live stream or a change feed resolves it once, when it starts.
+        Registration is checked at the first database call, not here.
+        """
+        active = SurrealDBConnectionManager.get_active_connection_name()
+        if active is not None:
+            return active
+        configured = cls.model_config.get("connection")
+        return configured if isinstance(configured, str) else "default"
+
+    @classmethod
+    def _connection_manager(cls) -> type[SurrealDBConnectionManager]:
+        """The connection class of :meth:`get_connection_name` (v0.29.0): the one way a model reaches its connection.
+
+        :raises ValueError: the connection is not registered (R2) — at the model's first database call, never at
+            class definition nor in a queryset builder.
+        """
+        name = cls.get_connection_name()
+        try:
+            return SurrealDBConnectionManager._manager_for(name)
+        except ValueError:
+            raise ValueError(
+                f"{cls.__name__}: connection {name!r} is not registered. Register it with "
+                f"SurrealDBConnectionManager.add_connection({name!r}, …) first."
+            ) from None
+
+    @classmethod
     def _endpoint_columns(cls) -> frozenset[str]:
         """Return the columns of this model that hold an edge endpoint (v0.22.0).
 
@@ -1383,7 +1427,7 @@ class BaseSurrealModel(BaseModel):
         if not self.get_id():
             raise SurrealDbError("Can't refresh data, not recorded yet.")  # pragma: no cover
 
-        client = await SurrealDBConnectionManager.get_client()
+        client = await type(self)._connection_manager().get_client()
         record = await client.select(self._record_id())
 
         if record is None:
@@ -1657,7 +1701,7 @@ class BaseSurrealModel(BaseModel):
             self._apply_record(rows)
             return self, True
 
-        client = await SurrealDBConnectionManager.get_client()
+        client = await type(self)._connection_manager().get_client()
 
         if record_id is not None:
             # SDK 2.0 raises a structured exception instead of returning a string.
@@ -1760,7 +1804,7 @@ class BaseSurrealModel(BaseModel):
             self._apply_record(rows)  # interactive: applies; buffered: None → stale until commit
             return self, True
 
-        client = await SurrealDBConnectionManager.get_client()
+        client = await type(self)._connection_manager().get_client()
         try:
             rows = await client.query(statement, _encoding.encode(variables))
         except ServerError as e:
@@ -1956,7 +2000,7 @@ class BaseSurrealModel(BaseModel):
         DB lines. That holds under ``refresh=False`` too: the server raises for a missing table
         whatever the statement asks back.
         """
-        client = await SurrealDBConnectionManager.get_client()
+        client = await type(self)._connection_manager().get_client()
         try:
             rows = await client.query(statement, _encoding.encode(variables))
         except NotFoundError as e:
@@ -1975,7 +2019,7 @@ class BaseSurrealModel(BaseModel):
             statement = "UPDATE $rid MERGE $data RETURN NONE;"
             await self._run_update(statement, {"rid": record_id, "data": wire_data}, False, data, {})
             return
-        client = await SurrealDBConnectionManager.get_client()
+        client = await type(self)._connection_manager().get_client()
         try:
             row = await client.merge(record_id, _encoding.encode(wire_data))
         except NotFoundError as e:
@@ -2049,7 +2093,7 @@ class BaseSurrealModel(BaseModel):
             self._apply_record(after if after is not None else rows)
             return self, before is None
 
-        client = await SurrealDBConnectionManager.get_client()
+        client = await type(self)._connection_manager().get_client()
         rows = await client.query(statement, _encoding.encode(variables))
         before, after = self._split_upsert_result(rows)
         self._apply_record(after if after is not None else rows)
@@ -2120,7 +2164,7 @@ class BaseSurrealModel(BaseModel):
             tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
             return None
 
-        client = await SurrealDBConnectionManager.get_client()
+        client = await type(self)._connection_manager().get_client()
 
         if not has_signals:
             return await client.update(record_id, _encoding.encode(data))
@@ -2319,7 +2363,7 @@ class BaseSurrealModel(BaseModel):
             rows = await tx.add("UPDATE $rid PATCH $data;", {"rid": record_id, "data": operations})
             self._apply_record(rows)  # interactive: applies; buffered: add() returns None → no-op (stale)
             return self
-        client = await SurrealDBConnectionManager.get_client()
+        client = await type(self)._connection_manager().get_client()
         record = await client.patch(record_id, _encoding.encode(operations))
         self._apply_record(record)
         return self
@@ -2343,7 +2387,7 @@ class BaseSurrealModel(BaseModel):
             rows = await tx.add(statement, vars_)
             self._apply_record(rows)
             return self
-        client = await SurrealDBConnectionManager.get_client()
+        client = await type(self)._connection_manager().get_client()
         rows = await client.query(statement, _encoding.encode(vars_))
         self._apply_record(rows)
         return self
@@ -2494,7 +2538,7 @@ class BaseSurrealModel(BaseModel):
             tx.enqueue_post_commit(lambda: post_delete.send(sender, instance=self))
             return None
 
-        client = await SurrealDBConnectionManager.get_client()
+        client = await type(self)._connection_manager().get_client()
 
         # Record delete() is STRICT: a missing record is an error on every server
         # version. SurrealDB 2.x returns falsy; 3.x raises NotFoundError. Both map
@@ -2811,7 +2855,7 @@ class BaseSurrealModel(BaseModel):
             rows = await tx.add(query, variables)
             return rows if isinstance(rows, list) else []
 
-        client = await SurrealDBConnectionManager.get_client()
+        client = await type(self)._connection_manager().get_client()
         result = await client.query(query, _encoding.encode(variables))
         return result if isinstance(result, list) else []
 
@@ -2868,9 +2912,9 @@ class BaseSurrealModel(BaseModel):
         if direction not in ("out", "in", "both"):
             raise ValueError(f"direction must be 'out', 'in', or 'both', got '{direction}'")
 
-    @staticmethod
-    async def _run_graph_delete(statement: str, variables: dict[str, Any], tx: Transaction | None) -> None:
-        """Run a graph-path ``DELETE`` now, or queue it on ``tx``.
+    @classmethod
+    async def _run_graph_delete(cls, statement: str, variables: dict[str, Any], tx: Transaction | None) -> None:
+        """Run a graph-path ``DELETE`` now, on this model's connection, or queue it on ``tx``.
 
         Outside a transaction a ``NotFoundError`` is a silent no-op (the v0.7.0 contract: on 3.x
         it is only raised for a source record whose own table does not exist). Inside one the
@@ -2879,7 +2923,7 @@ class BaseSurrealModel(BaseModel):
         if tx is not None:
             await tx.add(statement, variables)
             return
-        client = await SurrealDBConnectionManager.get_client()
+        client = await cls._connection_manager().get_client()
         with contextlib.suppress(NotFoundError):
             await client.query(statement, _encoding.encode(variables))
 
@@ -3062,7 +3106,7 @@ class BaseSurrealModel(BaseModel):
         selected = {"out": outgoing, "in": incoming, "both": f"array::concat({outgoing}, {incoming})"}[direction]
         query = f"SELECT VALUE {selected} FROM ONLY $src;"
 
-        client = await SurrealDBConnectionManager.get_client()
+        client = await type(self)._connection_manager().get_client()
         results = await client.query(query, _encoding.encode({"src": source}))
 
         if not isinstance(results, list) or len(results) == 0:
@@ -3116,7 +3160,7 @@ class BaseSurrealModel(BaseModel):
         source = self._graph_source()
 
         query = f"SELECT VALUE {path} FROM ONLY $src;"
-        client = await SurrealDBConnectionManager.get_client()
+        client = await type(self)._connection_manager().get_client()
         results = await client.query(query, _encoding.encode({"src": source}))
 
         if isinstance(results, list):
@@ -3183,7 +3227,7 @@ class BaseSurrealModel(BaseModel):
 
         # Sent verbatim: this is the caller's own SurrealQL, so the ORM does not rewrite it
         # (unquoting "$word" occurrences used to corrupt string literals — issue #156).
-        client = await SurrealDBConnectionManager.get_client()
+        client = await cls._connection_manager().get_client()
         results = await client.query(query, _encoding.encode(variables or {}))
 
         # SDK 2.0 returns the rows list directly from query()
@@ -3212,9 +3256,10 @@ class BaseSurrealModel(BaseModel):
 
         A convenience shortcut for code organised around models; it delegates verbatim to
         :meth:`SurrealDBConnectionManager.call_function`, which documents the arguments and
-        the transaction semantics. A stored function is **not** bound to a table, so calling
-        it through one model rather than another changes nothing::
+        the transaction semantics, on the model's connection (:meth:`get_connection_name`,
+        v0.29.0). A stored function is **not** bound to a table, so calling it through one model
+        rather than another of the same connection changes nothing::
 
             acquired = await GameTable.call_function("fn::acquire_lock", [table_id, pod_id])
         """
-        return await SurrealDBConnectionManager.call_function(function, args, params=params, return_type=return_type, tx=tx)
+        return await cls._connection_manager().call_function(function, args, params=params, return_type=return_type, tx=tx)

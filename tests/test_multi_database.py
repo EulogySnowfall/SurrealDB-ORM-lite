@@ -6,13 +6,17 @@ classmethod of the public class resolves the connection class and runs there. Un
 classes that open an engine or a server are suffixed ``E2E``. Models are prefixed ``Md``, tables ``md_*``.
 """
 
+import ast
 import asyncio
 import contextlib
 import dataclasses
 import inspect
+import logging
 import os
 import threading
-from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -22,6 +26,8 @@ from surrealdb import AsyncSurreal
 
 import surreal_orm_lite
 from surreal_orm_lite import (
+    AuthenticatedUserMixin,
+    BaseSurrealEdge,
     BaseSurrealModel,
     ConnectionConfig,
     SurrealConfigDict,
@@ -34,6 +40,7 @@ from surreal_orm_lite import (
 )
 from tests._proxy import CuttableProxy
 from tests.conftest import default_connection_class
+from tests.test_time_travel import _forbidden_client
 
 #: The prefix of the manager's name-mangled private attributes.
 _P = "_SurrealDBConnectionManager__"
@@ -174,6 +181,9 @@ class _SubstituteClient:
     async def insert(self, *args: Any, **kwargs: Any) -> Any:
         raise _Sentinel("insert")
 
+    async def version(self, *args: Any, **kwargs: Any) -> Any:
+        raise _Sentinel("version")
+
 
 class TestSubstitutedGetClient:
     """AC-1: the ORM acquires clients with ``get_client()`` without argument, so a substitute still intercepts."""
@@ -190,6 +200,21 @@ class TestSubstitutedGetClient:
             await MdCustomer(name="x").save()
         with pytest.raises(_Sentinel):
             await MdCustomer.objects().exec()
+        assert len(acquired) == 2
+
+    async def test_relate_and_a_change_feed_start_go_through_it_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Through the model's connection class, which inherits the substitute (spec AC-1)."""
+        acquired: list[bool] = []
+
+        async def fake() -> Any:
+            acquired.append(True)
+            return _SubstituteClient()
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(fake))
+        with pytest.raises(_Sentinel, match="query"):
+            await MdCustomer(id="a").relate("md_knows", MdCustomer(id="b"))
+        with pytest.raises(_Sentinel, match="version"):
+            await MdCustomer.objects().changes().start()
         assert len(acquired) == 2
 
 
@@ -1728,3 +1753,649 @@ class TestConcurrentBlocksE2E:
         assert a_client is not b_client
         assert _values(await _rows_of(a_client, "md_item")) == ["md_a"]
         assert _values(await _rows_of(b_client, "md_item")) == ["md_b"]
+
+
+# === Models routed to a connection (spec §5.5, §6.4) =========================================================
+
+
+class MdEvent(BaseSurrealModel):
+    """Routed to ``md_a``."""
+
+    model_config = SurrealConfigDict(table_name="md_event", connection="md_a")
+
+    id: str | None = None
+    title: str = ""
+    n: int = 0
+
+
+class MdNote(BaseSurrealModel):
+    """Routed nowhere: the default connection, or the ``using()`` block's."""
+
+    model_config = SurrealConfigDict(table_name="md_note")
+
+    id: str | None = None
+    text: str = ""
+
+
+class MdOrphan(BaseSurrealModel):
+    """Routed to a name nobody registers."""
+
+    model_config = SurrealConfigDict(table_name="md_orphan", connection="md_missing")
+
+    id: str | None = None
+
+
+class MdLikes(BaseSurrealEdge):
+    """An edge model routed to ``md_a``, like the records it links."""
+
+    model_config = SurrealConfigDict(table_name="md_likes", connection="md_a")
+
+    weight: int = 1
+
+
+class MdMember(AuthenticatedUserMixin, BaseSurrealModel):
+    """A record user of ``md_a``: its access method and table exist there only."""
+
+    model_config = SurrealConfigDict(table_name="md_member", access_name="md_member", connection="md_a")
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+def _r2(model: str, name: str) -> str:
+    return (
+        f"{model}: connection {name!r} is not registered. Register it with "
+        f"SurrealDBConnectionManager.add_connection({name!r}, …) first."
+    )
+
+
+class TestModelRouting:
+    """AC-6 (no server but ``mem://``): R7 at class definition, inheritance and override, ``get_connection_name()``
+    and its ``using()`` override, R2 at the first database call only."""
+
+    def test_r7_at_class_definition(self) -> None:
+        with pytest.raises(TypeError) as numbered:
+
+            class MdNumbered(BaseSurrealModel):
+                model_config = SurrealConfigDict(connection=1)  # type: ignore[typeddict-item]
+
+        assert str(numbered.value) == "MdNumbered: connection must be a str, got int."
+        with pytest.raises(ValueError) as blank:
+
+            class MdBlank(BaseSurrealModel):
+                model_config = SurrealConfigDict(connection="")
+
+        assert str(blank.value) == "MdBlank: connection must not be empty."
+
+    def test_inherited_and_overridden(self) -> None:
+        class MdBase(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="md_base", connection="md_a")
+
+        class MdChild(MdBase):
+            pass
+
+        class MdElsewhere(MdBase):
+            model_config = SurrealConfigDict(connection="md_b")
+
+        class MdBack(MdBase):
+            model_config = SurrealConfigDict(connection=None)
+
+        assert MdChild.get_connection_name() == "md_a"
+        assert MdChild.get_table_name() == "md_base"
+        assert MdElsewhere.get_connection_name() == "md_b"
+        assert MdBack.get_connection_name() == "default"
+
+    async def test_get_connection_name(self) -> None:
+        assert MdCustomer.get_connection_name() == "default"
+        assert MdEvent.get_connection_name() == "md_a"
+        assert MdOrphan.get_connection_name() == "md_missing"
+        _register("mem", "md_b", database="md_b")
+        async with SurrealDBConnectionManager.using("md_b"):
+            # The block wins over the model's own connection.
+            assert MdCustomer.get_connection_name() == "md_b"
+            assert MdEvent.get_connection_name() == "md_b"
+            assert MdOrphan.get_connection_name() == "md_b"
+            await MdOrphan(id="x").save()
+            assert [orphan.id for orphan in await MdOrphan.objects().exec()] == ["x"]
+        assert MdEvent.get_connection_name() == "md_a"
+
+    async def test_r2_at_the_first_database_call_only(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", _forbidden_client)
+        # Defining the class, objects() and the builders raise nothing.
+        queryset = MdOrphan.objects().filter(id="x").order_by("id").limit(1)
+        calls: list[Callable[[], Awaitable[Any]]] = [
+            queryset.exec,
+            MdOrphan.objects().count,
+            lambda: MdOrphan.objects().get("x"),
+            MdOrphan(id="x").save,
+            lambda: MdOrphan.call_function("fn::md_ping"),
+            lambda: MdOrphan.raw_query("SELECT * FROM md_orphan;"),
+        ]
+        for call in calls:
+            with pytest.raises(ValueError) as info:
+                await call()
+            assert str(info.value) == _r2("MdOrphan", "md_missing")
+
+    async def test_a_removed_connection_raises_r2(self) -> None:
+        _register("mem", "md_a", database="md_a")
+        await MdEvent(id="e1").save()
+        await SurrealDBConnectionManager.remove_connection("md_a")
+        with pytest.raises(ValueError) as info:
+            await MdEvent.objects().exec()
+        assert str(info.value) == _r2("MdEvent", "md_a")
+
+    @pytest.mark.usefixtures("unset_default")
+    async def test_a_queryset_resolves_its_connection_when_it_runs(self) -> None:
+        _register("mem", "md_a", database="md_a")
+        client = await SurrealDBConnectionManager.get_client("md_a")
+        await client.query("CREATE md_note:1 SET text = 'in md_a';")
+        queryset = MdNote.objects()  # built outside the block, while the default is not configured
+        async with SurrealDBConnectionManager.using("md_a"):
+            assert [note.text for note in await queryset.exec()] == ["in md_a"]
+        with pytest.raises(ValueError, match="Connection not been set"):
+            await queryset.exec()
+
+
+#: Attributes of ``SurrealDBConnectionManager`` the package may name outside ``connection_manager.py`` (spec §6.4):
+#: the resolvers and the registry. Everything else goes through a resolved connection class.
+_RESOLVERS = frozenset(
+    {
+        "_manager_for",
+        "_register_for_block",
+        "get_active_connection_name",
+        "add_connection",
+        "remove_connection",
+        "get_config",
+        "list_connections",
+        "using",
+    }
+)
+
+# Temporary: removed entry by entry, empty and deleted at Task 9 (spec AC-7).
+_NOT_YET_ROUTED: dict[tuple[str, str | None], str] = {
+    ("live.py", None): "Task 6 binds LiveStream to its connection",
+    ("query_set.py", "_live_starter"): "Task 6 passes the bound client",
+    ("testing/database.py", None): "Task 9 adds embedded_database(connection=)",
+}
+
+
+def _manager_attributes() -> list[tuple[str, tuple[str, ...], str, int]]:
+    """``(path, enclosing functions, attribute, line)`` of every ``SurrealDBConnectionManager.<attribute>`` node in the
+    package's code outside ``connection_manager.py`` (AST nodes: docstrings and comments do not count)."""
+    package = Path(surreal_orm_lite.__file__).parent
+    found: list[tuple[str, tuple[str, ...], str, int]] = []
+    for path in sorted(package.rglob("*.py")):
+        relative = path.relative_to(package).as_posix()
+        if relative == "connection_manager.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)):
+                continue
+            if node.value.id != "SurrealDBConnectionManager":
+                continue
+            functions: list[str] = []
+            parent = parents.get(node)
+            while parent is not None:
+                if isinstance(parent, ast.FunctionDef | ast.AsyncFunctionDef):
+                    functions.append(parent.name)
+                parent = parents.get(parent)
+            found.append((relative, tuple(functions), node.attr, node.lineno))
+    return found
+
+
+def _not_yet_routed(path: str, functions: tuple[str, ...]) -> tuple[str, str | None] | None:
+    """The entry of :data:`_NOT_YET_ROUTED` covering a node of *path* inside *functions*, if any."""
+    for key in ((path, None), *((path, name) for name in functions)):
+        if key in _NOT_YET_ROUTED:
+            return key
+    return None
+
+
+class TestSingleResolver:
+    """AC-7: outside ``connection_manager.py`` the package reaches a connection through its resolvers only."""
+
+    def test_every_call_goes_through_a_resolved_connection(self) -> None:
+        found = _manager_attributes()
+        # The scan sees the package: the models' resolver names _manager_for.
+        assert any(path == "model_base.py" and attribute == "_manager_for" for path, _, attribute, _ in found)
+        offenders = [
+            f"{path}:{line} {attribute}"
+            for path, functions, attribute, line in found
+            if attribute not in _RESOLVERS and _not_yet_routed(path, functions) is None
+        ]
+        assert offenders == []
+
+    def test_no_stale_allowlist_entry(self) -> None:
+        needed = {
+            _not_yet_routed(path, functions)
+            for path, functions, attribute, _ in _manager_attributes()
+            if attribute not in _RESOLVERS
+        }
+        assert set(_NOT_YET_ROUTED) <= needed
+
+
+@contextlib.asynccontextmanager
+async def _routed_databases(kind: str) -> AsyncIterator[None]:
+    """``md_a`` on database ``md_a`` and the default connection on database ``md_b``, both through *kind* (``ws`` or
+    ``http`` to the line under test, as root; ``mem``: an engine each). Used with the ``unset_default`` fixture."""
+    async with _databases(kind, "md_a"):
+        if kind == "mem":
+            SurrealDBConnectionManager.set_connection(url="mem://", namespace="ns", database="md_b")
+        else:
+            SurrealDBConnectionManager.set_connection(
+                url=_url(kind), user="root", password="root", namespace="ns", database="md_b"
+            )
+        try:
+            yield
+        finally:
+            await SurrealDBConnectionManager.close_connection()
+
+
+async def _rows_in(kind: str, connection: str, table: str) -> list[Any]:
+    """The rows of *table* where *connection* (``md_a`` or ``default``) keeps them: read back with a root client
+    on its database, or through its own engine (``mem``)."""
+    if kind == "mem":
+        return await _rows_of(await SurrealDBConnectionManager.get_client(connection), table)
+    return await _root_rows("md_a" if connection == "md_a" else "md_b", table)
+
+
+def _titles(rows: list[Any]) -> list[str]:
+    return sorted(row["title"] for row in rows)
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestRoutedModelsE2E:
+    """AC-8 (both lines, ws and http, and ``mem://``): every operation of a model routed to ``md_a`` reads and
+    writes ``md_a``, never the default connection's database; AC-28 item 1, the model part."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_every_operation_stays_in_its_database(self, kind: str) -> None:
+        async with _routed_databases(kind):
+            a = await SurrealDBConnectionManager.get_client("md_a")
+            await a.query("DEFINE FUNCTION OVERWRITE fn::md_ping() { RETURN 'md_a'; };", {})
+
+            first = await MdEvent(id="e1", title="one", n=1).save()
+            first.title = "uno"
+            await first.update()
+            await first.merge(n=2)
+            await first.patch([{"op": "replace", "path": "/title", "value": "eins"}])
+            second = await MdEvent(id="e2", title="two").upsert()
+            await second.atomic_increment("n", 5)
+            first.title = "stale"
+            await first.refresh()
+            assert first.title == "eins"
+            assert _titles(await _rows_in(kind, "md_a", "md_event")) == ["eins", "two"]
+
+            assert sorted(event.title for event in await MdEvent.objects().filter(n__gte=2).exec()) == ["eins", "two"]
+            assert (await MdEvent.objects().get("e2")).n == 5
+            assert sorted(event.title for event in await MdEvent.objects().all()) == ["eins", "two"]
+            assert await MdEvent.objects().count() == 2
+            await MdEvent.objects().bulk_create([MdEvent(id="e3", title="three"), MdEvent(id="e4", title="four")])
+            assert await MdEvent.objects().filter(title="three").bulk_update(n=9) == 1
+            assert (await MdEvent.objects().get("e3")).n == 9
+
+            await first.relate("md_follows", second)
+            await first.relate(MdLikes, second, weight=3)
+            assert [event.title for event in await first.get_related(MdLikes, model_class=MdEvent)] == ["two"]
+            assert [event.title for event in await first.get_related("md_follows", model_class=MdEvent)] == ["two"]
+            raw = await MdEvent.raw_query("SELECT * FROM md_event WHERE title = $title;", {"title": "four"})
+            assert [event.title for event in raw] == ["four"]  # type: ignore[union-attr]
+            assert await MdEvent.call_function("fn::md_ping") == "md_a"
+
+            assert _titles(await _rows_in(kind, "md_a", "md_event")) == ["eins", "four", "three", "two"]
+            assert len(await _rows_in(kind, "md_a", "md_likes")) == 1
+            assert len(await _rows_in(kind, "md_a", "md_follows")) == 1
+            for table in ("md_event", "md_likes", "md_follows"):
+                assert await _rows_in(kind, "default", table) == [], table
+
+            assert await MdEvent.objects().filter(title="four").bulk_delete() == 1
+            await second.delete()
+            assert _titles(await _rows_in(kind, "md_a", "md_event")) == ["eins", "three"]
+            assert await MdEvent.objects().delete_table() is True
+            assert await _rows_in(kind, "md_a", "md_event") == []
+            assert await _rows_in(kind, "default", "md_event") == []
+
+    async def test_as_of_reads_the_history_of_the_models_connection(self, tmp_path: Path) -> None:
+        """The default keeps no history (``mem://``: T6 if the read went there); ``md_a`` does."""
+        SurrealDBConnectionManager.set_connection(url="mem://", namespace="ns", database="md_b")
+        SurrealDBConnectionManager.add_connection(
+            "md_a", url=f"surrealkv+versioned://{tmp_path / 'kv'}", namespace="ns", database="md_a"
+        )
+        client = await SurrealDBConnectionManager.get_client("md_a")
+        await client.query("CREATE md_event:a SET title = 'old', n = 1 VERSION d'2020-01-01T00:00:00Z';")
+        await client.query("CREATE md_event:a SET title = 'new', n = 2 VERSION d'2021-01-01T00:00:00Z';")
+        [old] = await MdEvent.objects().as_of(datetime(2020, 6, 1, tzinfo=UTC)).exec()
+        assert (old.title, old.n) == ("old", 1)
+        [current] = await MdEvent.objects().exec()
+        assert (current.title, current.n) == ("new", 2)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_re_registration_moves_the_model(self, kind: str) -> None:
+        """AC-28 item 1: after ``add_connection("md_a", …, database="md_b")`` the model reads and writes ``md_b``."""
+        async with _databases(kind, "md_a"):
+            await MdEvent(id="old", title="old").save()
+            _register(kind, "md_a", database="md_b")
+            assert await MdEvent.objects().exec() == []
+            await MdEvent(id="new", title="new").save()
+            assert [event.title for event in await MdEvent.objects().exec()] == ["new"]
+            if kind == "mem":
+                client = await SurrealDBConnectionManager.get_client("md_a")
+                assert _titles(await _engine_rows(client, "md_a", "md_event")) == ["old"]
+                assert _titles(await _engine_rows(client, "md_b", "md_event")) == ["new"]
+            else:
+                assert _titles(await _root_rows("md_a", "md_event")) == ["old"]
+                assert _titles(await _root_rows("md_b", "md_event")) == ["new"]
+
+
+_PASSPHRASE = "s3cret-passphrase"
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestRoutedModelAuthE2E:
+    """AC-12: an ``AuthenticatedUserMixin`` model routed to ``md_a`` defines its access, signs up and in on ``md_a``
+    (both lines, ws); ``bind=True`` adopts the session on ``md_a`` only, also on an embedded named connection."""
+
+    async def test_model_auth_runs_on_its_connection(self) -> None:
+        async with _routed_databases("ws"):
+            await MdMember.define_access()
+            async with _root("md_a") as root:
+                assert "md_member" in str(await root.query("INFO FOR DB;", {}))
+            async with _root("md_b") as root:
+                assert "md_member" not in str(await root.query("INFO FOR DB;", {}))
+            email = f"{uuid4().hex}@example.test"
+            created = await MdMember.signup(email=email, password=_PASSPHRASE)
+            assert [row["email"] for row in await _root_rows("md_a", "md_member")] == [email]
+            assert await _root_rows("md_b", "md_member") == []
+            signed_in = await MdMember.signin(email=email, password=_PASSPHRASE)
+            assert signed_in.user.get_id() == created.user.get_id()
+            assert (await MdMember.authenticate(created.tokens.access)).email == email
+
+            connection = SurrealDBConnectionManager._manager_for("md_a")
+            assert connection.is_authenticated() is False
+            bound = await MdMember.signin(email=email, password=_PASSPHRASE, bind=True)
+            assert connection.get_session_token() == bound.tokens.access
+            assert SurrealDBConnectionManager.is_authenticated() is False
+            assert SurrealDBConnectionManager.get_session_token() is None
+
+    async def test_bind_true_on_an_embedded_named_connection(self) -> None:
+        SurrealDBConnectionManager.set_connection(url="mem://", namespace="ns", database="md_b")
+        _register("mem", "md_a", database="md_a")
+        await MdMember.define_access()
+        with pytest.raises(SurrealDbError, match="bind=True"):
+            await MdMember.signup(email="m@x", password="p")
+        result = await MdMember.signup(email="m@x", password="p", bind=True)
+        assert SurrealDBConnectionManager._manager_for("md_a").get_session_token() == result.tokens.access
+        async with SurrealDBConnectionManager.using("md_a"):
+            me = await SurrealDBConnectionManager.info()
+        assert me is not None and me["email"] == "m@x"
+        assert SurrealDBConnectionManager.is_authenticated() is False
+        assert await _rows_of(await SurrealDBConnectionManager.get_client(), "md_member") == []
+
+
+# === Change feeds (spec §6.4, AC-14) ==========================================================================
+
+#: The change-feed kinds: WebSocket to the line under test, and the embedded engine (from now, from a cursor).
+_FEED_KINDS = ("ws", "mem")
+
+
+@contextlib.asynccontextmanager
+async def _feed_databases(kind: str, table: str) -> AsyncIterator[None]:
+    """:func:`_routed_databases` with a change feed on *table* in ``md_a`` and in the default's ``md_b``. One
+    change-feed table per database: SurrealDB 2.x applies ``SHOW CHANGES``' ``LIMIT`` to the whole database's feed."""
+    async with _routed_databases(kind):
+        for connection in ("md_a", "default"):
+            client = await SurrealDBConnectionManager.get_client(connection)
+            await client.query(f"DEFINE TABLE {table} SCHEMALESS CHANGEFEED 1h;", {})
+        yield
+
+
+async def _read_one(stream: Any) -> Any:
+    """One ``__anext__()`` of *stream*, within ten seconds (a stream that should have ended fails, not hangs)."""
+    async with asyncio.timeout(10):
+        return await anext(stream)
+
+
+async def _next_events(stream: Any, count: int) -> list[Any]:
+    """The next *count* events of *stream*, within ten seconds."""
+    events: list[Any] = []
+    async with asyncio.timeout(10):
+        while len(events) < count:
+            events.append(await anext(stream))
+    return events
+
+
+def _fail_once(monkeypatch: pytest.MonkeyPatch, client: Any, method: str) -> None:
+    """Make *client*'s *method* raise ``RuntimeError("failed once")`` the next time only (patched on its class, keyed
+    on ``id(client)``)."""
+    cls = type(client)
+    real = getattr(cls, method)
+    owner = id(client)
+    left = [1]
+
+    async def failing(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if id(self) == owner and left[0]:
+            left[0] -= 1
+            raise RuntimeError("failed once")
+        return await real(self, *args, **kwargs)
+
+    monkeypatch.setattr(cls, method, failing)
+
+
+def _count_client_calls(monkeypatch: pytest.MonkeyPatch, connection: type[SurrealDBConnectionManager]) -> list[str]:
+    """Record every ``get_client()`` and ``_open_client()`` of *connection* from now on (spec AC-14's client spy)."""
+    calls: list[str] = []
+    for name in ("get_client", "_open_client"):
+        real = getattr(connection, name)
+
+        def spy(real: Any = real, name: str = name) -> Any:
+            async def recording(*args: Any, **kwargs: Any) -> Any:
+                calls.append(name)
+                return await real(*args, **kwargs)
+
+            return recording
+
+        monkeypatch.setattr(connection, name, spy())
+    return calls
+
+
+async def _write_in_md_b(kind: str) -> None:
+    """A change on ``md_event`` in database ``md_b``, where ``md_a`` gets registered again: a read of that feed with
+    ``md_a``'s position would return it (``mem``: the database ``md_b`` of ``md_a``'s engine, request-scoped, M5)."""
+    if kind == "mem":
+        client = await SurrealDBConnectionManager.get_client("md_a")
+        await client.query_raw(
+            "USE DB md_b; DEFINE TABLE IF NOT EXISTS md_event SCHEMALESS CHANGEFEED 1h; CREATE md_event:b SET title = 'b';",
+            {},
+        )
+    else:
+        async with _root("md_b") as root:
+            await root.query("CREATE md_event:b SET title = 'b';", {})
+
+
+#: R13, verbatim (spec §5.7).
+_R13 = (
+    "Connection 'md_a' was removed or registered again with other settings while this change feed was being read; "
+    "its position belongs to the previous database, so the stream ended. Start a new one."
+)
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestRoutedChangeFeedsE2E:
+    """AC-14 (both lines, ws; ``mem://`` with a cursor): a change feed reads its model's connection, bound once."""
+
+    @pytest.mark.parametrize("kind", _FEED_KINDS)
+    async def test_a_routed_model_reads_its_connections_feed(self, kind: str) -> None:
+        async with _feed_databases(kind, "md_event"):
+            stream = MdEvent.objects().changes(poll_interval=0.05)
+            await stream.start()
+            await MdEvent(id="a1", title="one").save()
+            default = await SurrealDBConnectionManager.get_client("default")
+            await default.query("CREATE md_event:d1 SET title = 'default';", {})
+            [event] = await _next_events(stream, 1)
+            assert (event.record_id, event.instance.title) == ("md_event:a1", "one")
+            cursor = stream.cursor
+            stream.stop()
+            await MdEvent(id="a2", title="two").save()
+            resumed = MdEvent.objects().changes(since=cursor, poll_interval=0.05)
+            [event] = await _next_events(resumed, 1)
+            assert event.record_id == "md_event:a2"
+            resumed.stop()
+
+    @pytest.mark.parametrize("kind", _FEED_KINDS)
+    async def test_a_stream_started_in_a_block_keeps_its_connection(self, kind: str) -> None:
+        async with _feed_databases(kind, "md_note"):
+            async with SurrealDBConnectionManager.using("md_a"):
+                stream = MdNote.objects().changes(poll_interval=0.05)
+                await stream.start()
+            default = await SurrealDBConnectionManager.get_client("default")
+            await default.query("CREATE md_note:d1 SET text = 'default';", {})
+            a = await SurrealDBConnectionManager.get_client("md_a")
+            await a.query("CREATE md_note:a1 SET text = 'md_a';", {})
+            [event] = await _next_events(stream, 1)
+            assert (event.record_id, event.instance.text) == ("md_note:a1", "md_a")
+            stream.stop()
+
+    @pytest.mark.parametrize("kind", _FEED_KINDS)
+    async def test_a_failed_start_keeps_its_first_binding(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _feed_databases(kind, "md_note"):
+            _fail_once(monkeypatch, await SurrealDBConnectionManager.get_client("md_a"), "version")
+            async with SurrealDBConnectionManager.using("md_a"):
+                stream = MdNote.objects().changes(poll_interval=0.05)
+                with pytest.raises(RuntimeError, match="failed once"):
+                    await stream.start()
+            # Started again outside the block: still md_a.
+            await stream.start()
+            default = await SurrealDBConnectionManager.get_client("default")
+            await default.query("CREATE md_note:d1 SET text = 'default';", {})
+            a = await SurrealDBConnectionManager.get_client("md_a")
+            await a.query("CREATE md_note:a1 SET text = 'md_a';", {})
+            [event] = await _next_events(stream, 1)
+            assert (event.record_id, event.instance.text) == ("md_note:a1", "md_a")
+            stream.stop()
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestChangeFeedGenerationE2E:
+    """AC-14 R13, P3 (both lines, ws; ``mem://``): a change feed whose connection is registered again with other
+    settings, or removed, ends at its next read — before any request and before any pending event — and at every
+    later read; the default connection keeps its v0.28.0 tolerance."""
+
+    @pytest.mark.parametrize("change", _CHANGES)
+    @pytest.mark.parametrize("kind", _FEED_KINDS)
+    async def test_the_next_read_raises_r13(self, kind: str, change: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _feed_databases(kind, "md_event"):
+            stream = MdEvent.objects().changes(poll_interval=0.05)
+            await stream.start()
+            await MdEvent(id="a1", title="one").save()
+            [event] = await _next_events(stream, 1)
+            assert event.record_id == "md_event:a1"
+            await _write_in_md_b(kind)
+            connection = SurrealDBConnectionManager._manager_for("md_a")
+            calls = _count_client_calls(monkeypatch, connection)
+            await _change(change, lambda: _register(kind, "md_a", database="md_b"))
+            for _ in range(2):
+                with pytest.raises(SurrealDbConnectionError) as info:
+                    await _read_one(stream)
+                assert str(info.value) == _R13
+                assert info.value.retryable is False  # type: ignore[attr-defined]
+            assert calls == []  # nothing reached md_b, nothing was even opened
+            stream.stop()
+            with pytest.raises(StopAsyncIteration):
+                await _read_one(stream)
+            if change == "re-register":
+                fresh = MdEvent.objects().changes(poll_interval=0.05)
+                await fresh.start()
+                await MdEvent(id="b2", title="in md_b").save()
+                [event] = await _next_events(fresh, 1)
+                assert (event.record_id, event.instance.title) == ("md_event:b2", "in md_b")
+                fresh.stop()
+
+    @pytest.mark.parametrize("kind", _FEED_KINDS)
+    async def test_a_pending_event_is_not_handed_out(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """P3: events a poll fetched but did not yield yet are dropped, and the cursor stays where it was."""
+        async with _feed_databases(kind, "md_event"):
+            stream = MdEvent.objects().changes(poll_interval=0.05)
+            await stream.start()
+            await MdEvent(id="p1", n=1).save()
+            await MdEvent(id="p2", n=2).save()
+            [first] = await _next_events(stream, 1)
+            assert first.record_id == "md_event:p1"
+            assert len(stream._pending) == 1  # the second event was fetched by the same poll
+            before = stream.cursor
+            calls = _count_client_calls(monkeypatch, SurrealDBConnectionManager._manager_for("md_a"))
+            _register(kind, "md_a", database="md_b")
+            with pytest.raises(SurrealDbConnectionError, match="so the stream ended"):
+                await _read_one(stream)
+            assert stream.cursor == before
+            assert calls == []
+            stream.stop()
+
+    async def test_the_second_check_closes_the_race(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A change landing while ``get_client()`` runs is caught before the operation, and not retried (P3)."""
+        _register("mem", "md_a", database="md_a")
+        connection = SurrealDBConnectionManager._manager_for("md_a")
+        client = await connection.get_client()
+        await client.query("DEFINE TABLE md_event SCHEMALESS CHANGEFEED 1h;")
+        stream = MdEvent.objects().changes()
+        await stream.start()
+        acquired: list[bool] = []
+
+        async def changing_get_client(*args: Any, **kwargs: Any) -> Any:
+            acquired.append(True)
+            connection._retire_server_clients()  # the generation moves while the client is being acquired
+            return client
+
+        ran: list[bool] = []
+
+        async def operation(client: Any) -> Any:
+            ran.append(True)
+            return None
+
+        monkeypatch.setattr(connection, "get_client", changing_get_client)
+        with (
+            caplog.at_level(logging.WARNING, logger="surreal_orm_lite.changefeed"),
+            pytest.raises(SurrealDbConnectionError) as info,
+        ):
+            await stream._with_retry(operation)
+        assert str(info.value) == _R13
+        assert info.value.retryable is False  # type: ignore[attr-defined]
+        assert ran == []
+        assert acquired == [True]
+        assert [record for record in caplog.records if record.name == "surreal_orm_lite.changefeed"] == []
+
+    async def test_the_default_keeps_its_v028_tolerance(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``set_connection()`` and ``set_database()`` on the default leave its stream reading on the cached client."""
+        async with _feed_databases("ws", "md_note"):
+            stream = MdNote.objects().changes(poll_interval=0.05)
+            await stream.start()
+            client = await SurrealDBConnectionManager.get_client()
+            await client.query("CREATE md_note:n1 SET text = 'one';", {})
+            [event] = await _next_events(stream, 1)
+            assert event.record_id == "md_note:n1"
+            served: list[Any] = []
+            default = default_connection_class()
+            real = default.get_client
+
+            async def recording(*args: Any, **kwargs: Any) -> Any:
+                result = await real(*args, **kwargs)
+                served.append(result)
+                return result
+
+            monkeypatch.setattr(default, "get_client", recording)
+            SurrealDBConnectionManager.set_connection(
+                url=_url("ws"), user="root", password="root", namespace="ns", database="md_a"
+            )
+            await client.query("CREATE md_note:n2 SET text = 'two';", {})
+            [event] = await _next_events(stream, 1)
+            assert event.record_id == "md_note:n2"
+            await SurrealDBConnectionManager.set_database("db")
+            await client.query("CREATE md_note:n3 SET text = 'three';", {})
+            [event] = await _next_events(stream, 1)
+            assert event.record_id == "md_note:n3"
+            assert served and all(result is client for result in served)
+            stream.stop()

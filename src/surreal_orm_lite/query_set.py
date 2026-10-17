@@ -104,6 +104,16 @@ class QuerySet:
         # cache() (v0.28.0): the oldest result this queryset's reads accept; None: no cache.
         self._cache: CacheRequest | None = None
 
+    def _manager(self) -> type[SurrealDBConnectionManager]:
+        """The connection class the model's database calls use right now (v0.29.0, ``get_connection_name()``).
+
+        Resolved when a read or a write runs, never when the queryset is built: a queryset built outside a
+        ``using()`` block and run inside it uses the block's connection.
+
+        :raises ValueError: the model's connection is not registered (R2).
+        """
+        return self.model._connection_manager()
+
     def _py_keyed(self, row: Any) -> Any:
         """Re-key a raw result row from columns back to Python field names (v0.18.0).
 
@@ -638,10 +648,11 @@ class QuerySet:
         """
         if self._as_of is None:
             return None
-        url = SurrealDBConnectionManager.get_connection_string()
-        if SurrealDBConnectionManager.is_embedded() and not keeps_history(url):
+        manager = self._manager()
+        url = manager.get_connection_string()
+        if manager.is_embedded() and not keeps_history(url):
             raise SurrealDbError(history_unsupported(url))
-        client = await SurrealDBConnectionManager.get_client()
+        client = await manager.get_client()
         if fetches and self._fetch_fields and _time_travel.line_major(await client.version()) < 3:
             raise SurrealDbError(_time_travel.fetch_refused())
         return await _time_travel.resolve(self._as_of, client, self._variables)
@@ -1073,7 +1084,7 @@ class QuerySet:
                 if await self._reads_as_empty(exc, subquery_tables):
                     return []
                 raise
-        client = await SurrealDBConnectionManager.get_client()
+        client = await self._manager().get_client()
         try:
             return await client.query(query, _encoding.encode(vars_))  # type: ignore
         except ServerError as exc:
@@ -1127,7 +1138,7 @@ class QuerySet:
             if self._tx is not None:
                 await self._tx.run_read(_subquery.TABLE_PROBE, variables)
             else:
-                client = await SurrealDBConnectionManager.get_client()
+                client = await self._manager().get_client()
                 await client.query(_subquery.TABLE_PROBE, _encoding.encode(variables))
         except NotFoundError as exc:
             return _subquery.missing_table(exc) == table
@@ -1247,8 +1258,9 @@ class QuerySet:
         if ttl == 0:
             QueryCache._count_miss()
             return await run()
-        client = await SurrealDBConnectionManager.get_client()
-        scope = SurrealDBConnectionManager._cache_scope(client)
+        manager = self._manager()
+        client = await manager.get_client()
+        scope = manager._cache_scope(client)
         key = None if scope is None else statement_key(scope, kind, statement, variables)
         if scope is None or key is None:
             QueryCache._count_miss()
@@ -1391,7 +1403,7 @@ class QuerySet:
             if self._cache is not None:
                 return await self._cached_get(record_id)
 
-            client = await SurrealDBConnectionManager.get_client()
+            client = await self._manager().get_client()
             try:
                 data = await client.select(record_id)
             except NotFoundError:
@@ -1438,7 +1450,7 @@ class QuerySet:
         if self._cache is not None:
             return self.model.from_db(await self._cached_select(self._model_table, frozenset({self._model_table}), []))
 
-        client = await SurrealDBConnectionManager.get_client()
+        client = await self._manager().get_client()
         try:
             results = await client.select(self._model_table)
         except NotFoundError:
@@ -1465,7 +1477,7 @@ class QuerySet:
             tables |= {EDGES}
 
         async def run() -> Any:
-            client = await SurrealDBConnectionManager.get_client()
+            client = await self._manager().get_client()
             try:
                 return await client.select(target)
             except NotFoundError:
@@ -1487,7 +1499,7 @@ class QuerySet:
         whose edges die with the records — are invalidated when it ends, never at a commit.
         """
         self._reject_time_travel("delete_table()")
-        client = await SurrealDBConnectionManager.get_client()
+        client = await self._manager().get_client()
         with contextlib.suppress(NotFoundError):
             await client.delete(self._model_table)
         return True
@@ -1832,7 +1844,7 @@ class QuerySet:
                 return self.model.from_db(rows)  # type: ignore
             return models  # buffered: not executed until commit; return inputs
 
-        client = await SurrealDBConnectionManager.get_client()
+        client = await self._manager().get_client()
         results = await client.insert(self._model_table, _encoding.encode(data_list))
 
         if isinstance(results, list):
@@ -1856,7 +1868,7 @@ class QuerySet:
                 row["id"] = record_id
             rows.append(row)
 
-        created = await insert_edges(self._model_table, rows, tx=self._tx)
+        created = await insert_edges(self._model_table, rows, tx=self._tx, manager=self._manager())
         if self._tx is not None and not self._tx.is_interactive:
             return models  # buffered: not executed until commit; return inputs
         return cast(list[BaseSurrealModel], self.model.from_db(created))
@@ -2534,7 +2546,7 @@ class QuerySet:
         # Same silent truncation raw_query() warns about: only the first statement's results
         # come back from the SDK (issue #156).
         warn_on_multiple_statements(query)
-        client = await SurrealDBConnectionManager.get_client()
+        client = await self._manager().get_client()
         try:
             # User-authored SurrealQL is sent verbatim: the caller owns that string and
             # binds their own variables, so rewriting quoted "$word" occurrences inside it

@@ -73,12 +73,19 @@ def _as_rows(result: Any) -> list[dict[str, Any]]:
     return []
 
 
-async def insert_edges(table: str, rows: list[dict[str, Any]], *, tx: Transaction | None) -> list[dict[str, Any]]:
+async def insert_edges(
+    table: str,
+    rows: list[dict[str, Any]],
+    *,
+    tx: Transaction | None,
+    manager: type[SurrealDBConnectionManager],
+) -> list[dict[str, Any]]:
     """Create edges in ``table`` with ``INSERT RELATION`` and return the rows the server sent back.
 
     The one write path of every edge creation, so the rules below hold whichever API creates the
     edge. ``rows`` are column-keyed (``in``/``out``, data, and ``id`` when the caller chose one).
-    The SDK's ``insert_relation()`` is called here and nowhere else.
+    The SDK's ``insert_relation()`` is called here and nowhere else. Outside a transaction it runs
+    on *manager*, the edge model's connection (v0.29.0), which the caller resolves.
 
     - **Statement**: outside a transaction, when no row carries an ``id``, the SDK's own
       ``insert_relation()`` — no duplicate is possible. Otherwise the guarded statement
@@ -103,7 +110,7 @@ async def insert_edges(table: str, rows: list[dict[str, Any]], *, tx: Transactio
         if not tx.is_interactive:
             return []
     else:
-        client = await SurrealDBConnectionManager.get_client()
+        client = await manager.get_client()
         try:
             if any("id" in row for row in rows):
                 result = await client.query(_GUARDED_INSERT.format(table=table), _encoding.encode({"data": data}))
@@ -292,7 +299,7 @@ class BaseSurrealEdge(BaseSurrealModel):
         record_id = self._record_id()
         if record_id is not None:
             row["id"] = record_id
-        rows = await insert_edges(self.get_table_name(), [row], tx=tx)
+        rows = await insert_edges(self.get_table_name(), [row], tx=tx, manager=type(self)._connection_manager())
         if rows:
             self._apply_record(rows, only={"id", *self.get_server_fields()})
         return self, True
