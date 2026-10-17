@@ -663,7 +663,7 @@ class TestLiveErrorPathsE2E:
                 raise RuntimeError("connection reset by peer")
 
         async with orm_client(TABLE):
-            original = SurrealDBConnectionManager._cached_client
+            original = vars(SurrealDBConnectionManager)["_cached_client"]
             SurrealDBConnectionManager._cached_client = classmethod(  # type: ignore[method-assign,assignment]
                 lambda cls: _AngryClient()
             )
@@ -687,7 +687,7 @@ class TestLiveErrorPathsE2E:
 
         async with orm_client(TABLE):
             queue = live.register_subscriber(_AngryClient(), "22222222-2222-2222-2222-222222222222")
-            original = SurrealDBConnectionManager._cached_client
+            original = vars(SurrealDBConnectionManager)["_cached_client"]
             SurrealDBConnectionManager._cached_client = classmethod(  # type: ignore[method-assign,assignment]
                 lambda cls: _AngryClient()
             )
@@ -760,7 +760,7 @@ class TestFailedKillE2E:
         async with orm_client(TABLE) as client:
             await _define_table(client)
             live_id = await Watched.objects().live()
-            original = SurrealDBConnectionManager._cached_client
+            original = vars(SurrealDBConnectionManager)["_cached_client"]
             SurrealDBConnectionManager._cached_client = classmethod(  # type: ignore[method-assign,assignment]
                 lambda cls: _AngryClient()
             )

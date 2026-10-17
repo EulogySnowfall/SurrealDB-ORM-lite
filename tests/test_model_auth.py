@@ -1175,6 +1175,7 @@ class TestReviewRegressions:
         _connect()
         opened: list[Any] = []
         real_open = SurrealDBConnectionManager._open_client
+        saved_open = vars(SurrealDBConnectionManager)["_open_client"]
 
         async def failing_use(*, signin_as_configured: bool) -> Any:
             client = await real_open(signin_as_configured=signin_as_configured)
@@ -1187,7 +1188,7 @@ class TestReviewRegressions:
                 async with SurrealDBConnectionManager.ephemeral_client():
                     pass  # pragma: no cover
         finally:
-            SurrealDBConnectionManager._open_client = real_open  # type: ignore[method-assign]
+            SurrealDBConnectionManager._open_client = saved_open  # type: ignore[method-assign]
             for client in opened:
                 with contextlib.suppress(Exception):
                     await client.close()
