@@ -256,9 +256,17 @@ class TestReviewFixesEncoder:
         with pytest.raises(SurrealDbError, match=r"\$min_age.*variables\(min_age="):
             inline_variables("age > $min_age", {})
 
-    @pytest.mark.parametrize("name", ["auth", "session", "token", "access", "scope", "this", "parent"])
+    @pytest.mark.parametrize("name", ["auth", "session", "token", "access", "this", "parent"])
     def test_server_parameters_are_left_alone(self, name: str) -> None:
         assert inline_variables(f"owner = ${name}", {}) == f"owner = ${name}"
+
+    def test_scope_is_an_unbound_name(self) -> None:
+        """``$scope`` is a 1.x name: SurrealDB 2.x and 3.x set no such parameter, so it reads as NONE unbound."""
+        from surreal_orm_lite.exceptions import SurrealDbError
+
+        with pytest.raises(SurrealDbError, match=r"\$scope is not bound: pass it with \.variables\(scope="):
+            inline_variables("owner = $scope", {})
+        assert inline_variables("owner = $scope", {"scope": "x"}) == "owner = 'x'"
 
     def test_where_builders_emit_dollar_only_as_references(self) -> None:
         """Review #9: inlining rewrites every ``$name`` in the WHERE, so the builders must never
