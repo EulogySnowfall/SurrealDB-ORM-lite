@@ -2530,8 +2530,8 @@ class TestReadmeEmbeddedWording:
             assert name in section, name
 
     def test_section_26_follows_section_25(self) -> None:
-        """Section 26 comes right after section 25, then section 27 (v0.26.0), section 28 (v0.27.0) and section 29
-        (v0.28.0), up to "Configuration Options"."""
+        """Section 26 comes right after section 25, then section 27 (v0.26.0), section 28 (v0.27.0), section 29
+        (v0.28.0) and section 30 (v0.29.0), up to "Configuration Options"."""
         readme = _readme()
         start_25 = readme.index("\n### 25. Geospatial fields\n")
         start_26 = readme.index(f"\n{_SECTION_26}\n")
@@ -2542,6 +2542,7 @@ class TestReadmeEmbeddedWording:
             "### 27. Time travel (`as_of()`)",
             "### 28. Subqueries (`Subquery`)",
             "### 29. Query cache (`cache()`, `QueryCache`)",
+            "### 30. Multiple databases (`add_connection()`, `using()`)",
         ]
 
     def test_subsections_in_order(self) -> None:
@@ -2621,7 +2622,7 @@ class TestReadmeEmbeddedWording:
         [lines] = _tables(part)
         assert _cells(lines[0]) == ["ORM capability", "Embedded engine (SDK 2.0.0)", "Servers (2.x and 3.x)", "Since"]
         rows = [cells for _, cells in _table_rows(part)]
-        assert all(len(cells) == 4 and cells[3] in {"v0.25.0", "v0.26.0"} for cells in rows), rows
+        assert all(len(cells) == 4 and cells[3] in {"v0.25.0", "v0.26.0", "v0.29.0"} for cells in rows), rows
         firsts = " ".join(cells[0] for cells in rows).lower()
         for row in (
             "live queries",

@@ -212,6 +212,7 @@ embedded engine refuse one above `4294967295` (`2**32 - 1`), SurrealDB 3.x reads
 | Time travel (`as_of()`, versioned storage)                                    | ✅     |
 | Subqueries (`Subquery`, a QuerySet as a filter value)                         | ✅     |
 | Query cache (`cache()`, TTL, invalidated by ORM writes)                       | ✅     |
+| Multiple databases (named connections, `using()`)                             | ✅     |
 
 ### Supported Filter Lookups
 
@@ -3688,6 +3689,236 @@ cached_total = await total_price()  # 96 (the cache answers)
 - **LRU eviction** instead of FIFO.
 - **`invalidate()` takes a table name too**, and **`stats()` adds `hits` and `misses`**.
 
+### 30. Multiple databases (`add_connection()`, `using()`)
+
+Since v0.29.0 one process can work with several databases at once. Beside the default connection
+(`set_connection()`), `add_connection()` registers **named connections** — another database on the
+same server, another server, or the embedded engine — and each model reads and writes through its
+own. Each connection keeps its own clients, session, live streams, transactions and cached reads,
+and decides on its own server line: a SurrealDB 2.x server and a 3.x server work side by side. The
+examples of this section run on the embedded engine (`mem://`), with nothing to start.
+
+```python
+from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager
+
+# Any URL works: ws://…/rpc or http://… (with user= and password=), mem://, surrealkv://<path>
+SurrealDBConnectionManager.set_connection(url="mem://", namespace="shop", database="main")   # "default"
+SurrealDBConnectionManager.add_connection("analytics", url="mem://", namespace="shop", database="analytics")
+
+class Customer(BaseSurrealModel):                       # no connection key: "default"
+    id: str | None = None
+    name: str
+
+class PageView(BaseSurrealModel):
+    model_config = SurrealConfigDict(connection="analytics")
+    id: str | None = None
+    path: str
+
+await Customer(id="ada", name="Ada").save()             # shop/main
+await PageView(id="v1", path="/pricing").save()         # shop/analytics
+names = SurrealDBConnectionManager.list_connections()   # ['default', 'analytics']
+```
+
+- `add_connection(name, *, url, user=None, password=None, namespace, database)` opens nothing:
+  each connection opens its own clients on first use, as the default one does. Its arguments are
+  checked before anything is registered — a non-empty name, URL, namespace and database, and a
+  user and password for a server URL (optional on the embedded engine) — and a URL the installed
+  SDK refuses raises `SurrealDbConnectionError`. `add_connection("default", …)` configures the
+  default connection, as `set_connection()` does, with these checks.
+- Registering a name again with the same settings changes nothing; with other settings, see
+  [What each connection keeps for itself](#what-each-connection-keeps-for-itself).
+- `get_config(name)` returns the settings as a frozen `ConnectionConfig` (`url`, `user`,
+  `password`, `namespace`, `database`; the password is kept out of its `repr`), and `None` for a
+  name that is not registered or for the default connection while it is not configured.
+  `list_connections()` returns the registered names, `'default'` first while it is configured.
+- `remove_connection(name)` unregisters a name and closes what it holds; a name that is not
+  registered is a no-op, and `remove_connection("default")` is `unset_connection()`.
+- `get_client(name)`, `close_connection(name)` and `transaction(name)` act on a named connection,
+  and without a name on the current one
+  ([Which connection a manager method uses](#which-connection-a-manager-method-uses)). For a name
+  that is not registered, `get_client(name)` and `transaction(name)` raise `ValueError`, while
+  `close_connection(name)` closes nothing.
+
+#### Routing a model
+
+A model's `connection` key — `model_config = SurrealConfigDict(connection="analytics")`, the full
+SurrealDB-ORM's key — sends every database call of the model to that connection: writes, reads
+and every QuerySet, relations, `raw_query()`, `call_function()`, model auth, live queries, change
+feeds and `as_of()`. A model without the key, or with `None`, uses the default connection.
+
+```python
+where = PageView.get_connection_name()                  # analytics
+```
+
+- `get_connection_name()` is the connection the model's calls use right now: the name of the
+  `using()` block around the call, else the `connection` key, else `"default"`. It is resolved at
+  every database call, so a QuerySet built outside a `using()` block and run inside it uses the
+  block's connection; a live stream or a change feed resolves it once, when it starts.
+- The key is checked when the class is defined (`TypeError` for a value that is not a string,
+  `ValueError` for an empty one). Whether the name is registered is checked at the model's first
+  database call (`ValueError`), so models can be declared before `add_connection()` runs.
+- Subclasses inherit the key and may set their own; edge models (`BaseSurrealEdge`) and
+  `AuthenticatedUserMixin` models take it too. `table_name` and `connection` are independent: two
+  connections can each hold a table of the same name.
+
+#### Redirecting a block: `using()`
+
+`using(name)`, the full SurrealDB-ORM's, runs a block of code against a named connection: inside
+it every model, whatever its `connection` key, and every manager method that talks to a database
+use that connection, with the exceptions of
+[Which connection a manager method uses](#which-connection-a-manager-method-uses).
+
+```python
+async with SurrealDBConnectionManager.using("analytics"):
+    elsewhere = await Customer.objects().count()        # 0
+here = await Customer.objects().count()                 # 1
+```
+
+- The name is checked when the block is entered: one that is not registered raises `ValueError`
+  before the block runs. `get_active_connection_name()` returns the block's name, `None` outside
+  any block.
+- Blocks nest, and the outer connection is back after the inner block, on an exception too.
+- It is async-safe: the name lives in a `contextvars.ContextVar`, so concurrent tasks each see
+  their own block. A task created inside the block keeps its connection for its whole life, even
+  after the block exits; `asyncio.to_thread()` carries it, a new `threading.Thread` does not.
+- Live streams and change feeds started inside the block keep its connection after it.
+- `signin()` inside `using(name)` signs in that connection only.
+- With the test helpers, `embedded_database()` inside `using(name)` isolates that connection, and
+  `embedded_database(connection=name)` does so outside any block; inside a `using()` block, naming
+  another connection raises `ValueError` (the block's models would reach their real database).
+
+#### Transactions and other operations across connections
+
+SurrealDB runs a statement, and a transaction, in one database. So the ORM refuses, before sending
+the statement, every operation that would mix two connections in one statement or one
+transaction:
+
+```python
+from surreal_orm_lite import SurrealDbError
+
+async with SurrealDBConnectionManager.transaction("analytics") as tx:
+    await PageView(id="v2", path="/").save(tx=tx)
+
+try:
+    async with SurrealDBConnectionManager.transaction() as tx:      # the default connection
+        await PageView(id="v3", path="/x").save(tx=tx)
+except SurrealDbError as exc:
+    refused = type(exc).__name__                        # SurrealDbError
+```
+
+- **A transaction is one connection's.** `transaction(name)`, or `transaction()` inside
+  `using(name)`, opens it on that connection, with that connection's strategy (interactive on a
+  3.x server over WebSocket, buffered otherwise). A model of another connection given that `tx=`
+  raises `SurrealDbError`, before any request and any signal: its writes, `objects(tx=)`,
+  `refresh(tx=)`, `call_function(tx=)`, and the manager's `call_function(tx=)`. Transactions of
+  two connections are independent: nothing commits across connections.
+- **Subqueries**: a `Subquery`, or a QuerySet used as a filter value, whose model runs on another
+  connection than the statement around it raises `SurrealDbError`: SurrealDB would read it in the
+  outer statement's database. Read it through its own connection first and filter on its values.
+- **Relations**: `relate()`, `remove_relation()`, `remove_all_relations()` and `get_related()`
+  raise `SurrealDbError` when the source, a target model instance, the edge model and
+  `model_class` are not all on one connection. A `RecordID` or `"table:id"` target is not checked.
+- **Links**: following a record link — `fetch()`, or a dotted path in `filter()`, `Q`, `select()`,
+  `order_by()`, `values()` or an aggregation — through a field typed with a model of another
+  connection raises `SurrealDbError`: SurrealDB resolves a link in the statement's database.
+- **An on-disk embedded store** (`surrealkv://`, `file://`) is open under one name at a time in a
+  process: a second name raises `SurrealDbConnectionError` until the first one closes it
+  (`close_connection()`, `remove_connection()`). Two `mem://` names are two separate databases.
+- Inside a `using()` block every model runs on the block's connection, so none of these refusals
+  apply there.
+
+What the ORM cannot see, and you keep on one connection yourself:
+
+- a link followed through a field whose annotation names no model (`RecordID`, `str`, `dict`);
+- graph arrows: `select("->likes->Post")`, `traverse()`;
+- an edge saved with endpoint ids of another database;
+- raw SurrealQL: `raw_query()`, `QuerySet.query()`, `call_function()`, `Transaction.add()`.
+
+#### What each connection keeps for itself
+
+- **Its clients**: one per event loop, as the default connection's
+  ([Connections and event loops](#connections-and-event-loops)); on the embedded engine, one for
+  the whole process. `close_connection(name)` closes one connection's client on the running loop,
+  `close_all_connections()` every connection's.
+- **Its session**: `signin()`, `signup()`, `authenticate()`, `invalidate()`, `info()` and
+  `clear_session()` act on the current connection, so sign in inside `using(name)`. A stored token
+  is replayed on its own connection only, and an identity lost on one connection does not block
+  another. An `AuthenticatedUserMixin` model signs in on its own connection.
+- **Its live streams and change feeds**, bound to the connection when they start:
+  `close_connection(name)` ends that connection's live streams only.
+- **Its transactions**, with the strategy of its server: one process holds interactive
+  transactions on a 3.x connection beside buffered ones on a 2.x connection.
+- **Its stored-function signatures** (`call_function()`).
+- **The ORM's cached reads** (`cache()`): a cached result is never served to another connection.
+  An ORM write removes the cached reads of its table on every connection: more than needed, never
+  a stale result.
+- Registering a name again with other settings, or removing it with `remove_connection()`, ends what the ORM holds
+  on the old settings: a client still opening is closed unused (a retryable `SurrealDbConnectionError`: retry the
+  call), live streams end, a change feed ends at its next read (`SurrealDbConnectionError`: its cursor belongs to
+  the old database, start a new one), and an open `transaction()` is cancelled when its block ends, with nothing
+  committed (`SurrealDbConnectionError`: open it again). A client you obtained yourself with `get_client()` before
+  the change is yours: on WebSocket its socket is closed and its next request fails; an HTTP client keeps the
+  namespace and database it was opened on, so call `get_client()` again; an embedded client is the connection's
+  one in-process session: it follows a new namespace or database at the ORM's next call, but after a new URL or
+  `remove_connection()` it is the previous engine (with SDK 2.x still running), so stop using it, as after
+  `close_connection()`. `set_connection()` and the `set_*()` setters do none of this: clients opened on the
+  previous settings keep serving, as in earlier versions.
+
+Entries you cache yourself with `QueryCache.make_key()` and `set()` are not scoped to a connection: the key is
+built from the table, the statement and the variables only. When the same statement runs on two connections, put
+the connection's name among the variables (keep the table name as it is, so the ORM's writes still invalidate the
+entry).
+
+```python
+from surreal_orm_lite import QueryCache
+
+statement = "SELECT count() AS n FROM page_view GROUP ALL;"
+key_main = QueryCache.make_key(statement, {"connection": "default"}, "page_view")
+key_analytics = QueryCache.make_key(statement, {"connection": "analytics"}, "page_view")
+distinct = key_main != key_analytics                   # True
+```
+
+#### Which connection a manager method uses
+
+A manager method acts on the **current connection** — the `name` it is given, else the innermost
+`using()` block's, else the default one — except where this table says otherwise:
+
+| Method                                                                                                                                                                                                                                                                                      | Acts on                                                                                         |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `add_connection()`, `remove_connection()`, `get_config()`, `list_connections()`, `using()`, `get_active_connection_name()`                                                                                                                                                                  | the registry, by the name given                                                                 |
+| `set_connection()`, `unset_connection()`                                                                                                                                                                                                                                                    | always the default connection                                                                   |
+| `close_all_connections()`                                                                                                                                                                                                                                                                   | every connection, on every event loop                                                           |
+| `get_client(name)`, `close_connection(name)`, `transaction(name)`                                                                                                                                                                                                                           | _name_, else the current connection                                                             |
+| `subscribe_live(uuid)`, `kill(uuid)`                                                                                                                                                                                                                                                        | the connection whose live stream started _uuid_ on this event loop, else the current connection |
+| every other method: the session methods (`signin()`, `info()` …), the getters and setters (`get_url()`, `set_database()` …), `reconnect()`, `validate_connection()`, `ephemeral_client()`, `call_function()`, `is_connected()`, `is_embedded()`, `async with SurrealDBConnectionManager():` | the current connection                                                                          |
+
+A coroutine method (`get_client()`, `signin()`, `close_connection()` …) resolves the connection
+when it is awaited, and a context manager (`transaction()`, `ephemeral_client()`) when it is opened
+by `async with` (strictly, when it is called), so both act on the connection of the `using()`
+block they are written in.
+
+#### Coming from the full SurrealDB-ORM
+
+- Same names: `add_connection()`, `remove_connection()`, `get_config()`, `list_connections()`,
+  `get_active_connection_name()`, `using()`, `ConnectionConfig`, `SurrealConfigDict(connection=)`,
+  `get_connection_name()`, `get_client(name)`, `close_connection(name)`.
+- `ConnectionConfig` has the same fields in the same order, built by position or by keyword, without `protocol`
+  (the official SDK speaks CBOR only); `user` and `password` may be `None` (the embedded engine needs neither).
+- `close_connection()` without a name: closing an embedded `mem://` client discards its database, so
+  `close_connection()` without a name stays on the current connection; `close_all_connections()` closes every one
+  (full ORM: `close_connection()` closes every connection).
+- `list_connections()` lists `'default'` first while it is configured (full ORM: registration order).
+- Registering a name again with other settings closes its open clients and ends what the ORM holds on the old
+  settings (full ORM: drops the clients without closing them). `set_connection()` keeps its open clients, as in
+  earlier lite versions.
+- The getters, the setters and `reconnect()` follow `using()` (full ORM: the default connection).
+- `transaction(name)`, `embedded_database(connection=)` and the errors for operations across connections are lite
+  additions.
+- `add_connection()` checks its arguments before registering anything (a non-empty name, URL, namespace and
+  database; a user and password for a server URL, optional on the embedded engine), and a model's `connection` key
+  must be a non-empty string, checked when the class is defined (full ORM: no checks). `ConnectionConfig` keeps the
+  password out of its `repr`.
+
 ---
 
 ## Configuration Options
@@ -3744,6 +3975,9 @@ async with SurrealDBConnectionManager():
 # Connection automatically closed
 ```
 
+`async with SurrealDBConnectionManager():` uses the current connection (the default, or the `using()` block's)
+and closes that connection's client on exit.
+
 ### Connections and event loops
 
 The manager caches **one client per event loop**. A SurrealDB WebSocket client is bound to
@@ -3764,10 +3998,15 @@ An entry whose loop has been closed is dropped the next time a client is request
 client is not closed — that would have to be awaited on a loop that is already gone — and its
 socket is released when the loop is finalised.
 
-- `close_connection()` closes **the running loop's** client only.
-- `close_all_connections()` tears down every cached client (used by `unset_connection()`).
+- `close_connection()` closes **the running loop's** client of the current connection only (the default, or the
+  one a `using()` block names).
+- `close_all_connections()` tears down every cached client of every connection; `unset_connection()` does that for
+  the default connection only, `remove_connection(name)` for a named one.
 - `is_connected()` answers for the loop asking; called outside a loop, it reports whether any
   loop still holds a client.
+
+Each named connection keeps its own per-loop clients in the same way
+([section 30](#30-multiple-databases-add_connection-using)).
 
 Long-lived single-loop applications are unaffected: one loop, one connection, as before.
 
@@ -3802,7 +4041,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -3911,6 +4150,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | `select("meta.*")` on a nested object that is not a record link                                                                        | its values, as a list; through a link (`select("author.*")`), the linked record                                                                                               | the object; through a link, the linked record                                                                                                                                       | pre-existing (documented in v0.28.1) |
 | `filter(f="$x")`: a string filter value starting with `$`                                                                              | same on both lines: compared with the string `"$x"`, bound like any value, in a live query too; `Var("x")` reads the variable `$x`, `Var("auth")` SurrealDB's `$auth`         | the same; on an edge's `in`/`out` (record ids) such a string raises `ValueError`, on both lines; `$access`, `$session`, `$token` read like `$auth`                                  | v0.28.1                              |
 | `limit(n)` or `offset(n)` above `4294967295` (`2**32 - 1`)                                                                             | the server refuses the read: `Found <n> but the LIMIT clause must evaluate to a positive integer` (`START` likewise)                                                          | read; above `2**63 - 1` the ORM raises `ValueError` when `limit()` or `offset()` is called, on both lines                                                                           | pre-existing (documented in v0.28.1) |
+| Several connections in one process (`add_connection()`, `using()`)                                                                     | each connection follows its own server: a 2.x connection's transactions are buffered, whatever the others are                                                                 | each 3.x WebSocket connection gets interactive transactions, beside 2.x connections in the same process                                                                             | v0.29.0                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
@@ -3926,7 +4166,7 @@ Capabilities not listed behave as on a 2.x server.
 | ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | ------- |
 | Connection and credentials (`set_connection()`)                     | URL, namespace and database; `user` and `password` optional, kept and never sent                                                                                                                                                                                                                                                                      | every setting required; the configured user signs in on each new connection                                     | v0.25.0 |
 | URLs the SDK refuses (`rocksdb://`, a typo)                         | `SurrealDbConnectionError` quoting the SDK (naming #233 for `rocksdb://`), before anything is opened                                                                                                                                                                                                                                                  | n/a                                                                                                             | v0.25.0 |
-| Clients                                                             | one for the whole process, shared by every event loop and thread                                                                                                                                                                                                                                                                                      | one per event loop                                                                                              | v0.25.0 |
+| Clients                                                             | one per connection for the whole process, shared by every event loop and thread                                                                                                                                                                                                                                                                       | one per connection and event loop                                                                               | v0.25.0 |
 | Namespace/database change                                           | the next call resets the session to the owner and selects the new pair on the same engine (no data lost); the stored session ends                                                                                                                                                                                                                     | taken by the next connection                                                                                    | v0.25.0 |
 | Closing (`close_connection()`, `unset_connection()`, `reconnect()`) | `mem://` discarded, `surrealkv://` reopened with its data; with SDK 2.x a client kept after the close is still a running engine; `close_connection()` and `reconnect()` leave the server clients open (`is_connected()` stays true on a loop with one)                                                                                                | the connection closes                                                                                           | v0.25.0 |
 | SurrealQL line                                                      | 2.x (SurrealDB 2.3.10 core); `client.version()` reports the SDK (`surrealdb-2.0.0`)                                                                                                                                                                                                                                                                   | the server's                                                                                                    | v0.25.0 |
@@ -3941,6 +4181,7 @@ Capabilities not listed behave as on a 2.x server.
 | Reading a table that does not exist                                 | `[]`, raw queries included (as on 2.x)                                                                                                                                                                                                                                                                                                                | the ORM reads `[]`; a raw query on 3.x raises `NotFoundError`                                                   | v0.25.0 |
 | Parse errors                                                        | bare `RuntimeError` (the DDL helpers raise `SurrealDbError`)                                                                                                                                                                                                                                                                                          | the SDK's error classes                                                                                         | v0.25.0 |
 | Time travel (`as_of()`)                                             | `surrealkv+versioned://` only (`?versioned=true` is ignored by SDK 2.0.0); any other URL → `SurrealDbError` before any request; `fetch()` refused (2.x core)                                                                                                                                                                                          | versioned storage required (see the 2.x/3.x table)                                                              | v0.26.0 |
+| Several connections (`add_connection()`)                            | `mem://`: each name is a database of its own; an on-disk store (`surrealkv://`, `file://`) is open under one name at a time — a second name raises `SurrealDbConnectionError`                                                                                                                                                                         | each name opens its own clients; two databases on one server are isolated                                       | v0.29.0 |
 | Everything else                                                     | CRUD, QuerySet, aggregations, relations, typed edges, rich and geo fields, upsert/patch, server values, computed fields, stored functions, signals: the same as on a 2.x server                                                                                                                                                                       | unchanged                                                                                                       | v0.25.0 |
 
 ---
@@ -3984,7 +4225,7 @@ Contributions are welcome! Please:
 | v0.26.0           | Time travel (versioned storage)                      | ✅ Released |
 | v0.27.0           | Subqueries                                           | ✅ Released |
 | v0.28.0           | Query cache                                          | ✅ Released |
-| v0.29.0           | Tier 2 — Multi-database                              | 📋 Planned  |
+| v0.29.0           | Tier 2 — Multi-database                              | ✅ Released |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)     | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | 📋 Planned  |
@@ -4037,7 +4278,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Time travel (`VERSION`)       | ✅ v0.26.0 (`as_of()`)                                                | ❌                               |
 | Subqueries                    | ✅ v0.27.0 (`Subquery`, a QuerySet in `filter()`)                     | ✅                               |
 | Query Cache                   | ✅ v0.28.0 (`cache()`, `QueryCache`)                                  | ✅                               |
-| Multi-database                | v0.29.0                                                               | ✅                               |
+| Multi-database                | ✅ v0.29.0 (`add_connection()`, `using()`)                            | ✅                               |
 | Schema Introspection          | v0.30.0                                                               | ✅                               |
 | DEFINE EVENT                  | v0.31.0                                                               | ✅                               |
 | Materialized views            | v0.32.0                                                               | ✅                               |

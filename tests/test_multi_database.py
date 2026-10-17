@@ -14,6 +14,7 @@ import functools
 import inspect
 import logging
 import os
+import re
 import sys
 import threading
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator, Sequence
@@ -60,7 +61,18 @@ from surreal_orm_lite import (
 from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
 from tests._proxy import CuttableProxy
 from tests.conftest import default_connection_class
-from tests.test_time_travel import _forbidden_client
+from tests.test_embedded import (
+    _EMBEDDED_BEHAVIOUR,
+    _cells,
+    _normalised,
+    _readme,
+    _readme_part,
+    _subsection,
+    _table_rows,
+    _tables,
+)
+from tests.test_query_cache import _QUERY_CACHE_ROW, _bullets
+from tests.test_time_travel import _SERVER_BEHAVIOUR, _SERVER_TABLE_WIDTHS, _forbidden_client
 
 #: The prefix of the manager's name-mangled private attributes.
 _P = "_SurrealDBConnectionManager__"
@@ -4281,3 +4293,473 @@ class TestThreadsE2E:
                 else:
                     rows = await _root_rows(name, "md_note")
                 assert [row["text"] for row in rows] == [name]
+
+
+# --- AC-24: README section 30, the tables and sentences it touches, and its examples (spec §11; C4, C7, P5, P8, P9) --
+
+_SECTION_29 = "### 29. Query cache (`cache()`, `QueryCache`)"
+_SECTION_30 = "### 30. Multiple databases (`add_connection()`, `using()`)"
+#: Spec §11 item 1: section 30's subsections, in order, after an untitled intro holding the first example.
+_SUBSECTIONS_30 = [
+    "Routing a model",
+    "Redirecting a block: `using()`",
+    "Transactions and other operations across connections",
+    "What each connection keeps for itself",
+    "Which connection a manager method uses",
+    "Coming from the full SurrealDB-ORM",
+]
+#: Spec §11 item 1: the four examples it writes out, exactly (the intro one first).
+_INTRO_EXAMPLE = """\
+from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager
+
+# Any URL works: ws://…/rpc or http://… (with user= and password=), mem://, surrealkv://<path>
+SurrealDBConnectionManager.set_connection(url="mem://", namespace="shop", database="main")   # "default"
+SurrealDBConnectionManager.add_connection("analytics", url="mem://", namespace="shop", database="analytics")
+
+class Customer(BaseSurrealModel):                       # no connection key: "default"
+    id: str | None = None
+    name: str
+
+class PageView(BaseSurrealModel):
+    model_config = SurrealConfigDict(connection="analytics")
+    id: str | None = None
+    path: str
+
+await Customer(id="ada", name="Ada").save()             # shop/main
+await PageView(id="v1", path="/pricing").save()         # shop/analytics
+names = SurrealDBConnectionManager.list_connections()   # ['default', 'analytics']
+"""
+_USING_EXAMPLE = """\
+async with SurrealDBConnectionManager.using("analytics"):
+    elsewhere = await Customer.objects().count()        # 0
+here = await Customer.objects().count()                 # 1
+"""
+_TRANSACTION_EXAMPLE = """\
+from surreal_orm_lite import SurrealDbError
+
+async with SurrealDBConnectionManager.transaction("analytics") as tx:
+    await PageView(id="v2", path="/").save(tx=tx)
+
+try:
+    async with SurrealDBConnectionManager.transaction() as tx:      # the default connection
+        await PageView(id="v3", path="/x").save(tx=tx)
+except SurrealDbError as exc:
+    refused = type(exc).__name__                        # SurrealDbError
+"""
+_KEY_EXAMPLE = """\
+from surreal_orm_lite import QueryCache
+
+statement = "SELECT count() AS n FROM page_view GROUP ALL;"
+key_main = QueryCache.make_key(statement, {"connection": "default"}, "page_view")
+key_analytics = QueryCache.make_key(statement, {"connection": "analytics"}, "page_view")
+distinct = key_main != key_analytics                   # True
+"""
+#: Spec §11 (C4, P5): the last bullet of "What each connection keeps for itself", exactly.
+_D7_BULLET = (
+    "- Registering a name again with other settings, or removing it with `remove_connection()`, ends what the ORM "
+    "holds on the old settings: a client still opening is closed unused (a retryable `SurrealDbConnectionError`: "
+    "retry the call), live streams end, a change feed ends at its next read (`SurrealDbConnectionError`: its cursor "
+    "belongs to the old database, start a new one), and an open `transaction()` is cancelled when its block ends, "
+    "with nothing committed (`SurrealDbConnectionError`: open it again). A client you obtained yourself with "
+    "`get_client()` before the change is yours: on WebSocket its socket is closed and its next request fails; an "
+    "HTTP client keeps the namespace and database it was opened on, so call `get_client()` again; an embedded client "
+    "is the connection's one in-process session: it follows a new namespace or database at the ORM's next call, but "
+    "after a new URL or `remove_connection()` it is the previous engine (with SDK 2.x still running), so stop using "
+    "it, as after `close_connection()`. `set_connection()` and the `set_*()` setters do none of this: clients opened "
+    "on the previous settings keep serving, as in earlier versions."
+)
+#: AC-24: the revision-3 wording P5 replaced, which must not come back.
+_REVISION_3_WORDING = "one in-process session and follows the new namespace and database"
+#: Spec §11 (§7.11): the paragraph before the application-key example, exactly.
+_KEY_PARAGRAPH = (
+    "Entries you cache yourself with `QueryCache.make_key()` and `set()` are not scoped to a connection: the key is "
+    "built from the table, the statement and the variables only. When the same statement runs on two connections, "
+    "put the connection's name among the variables (keep the table name as it is, so the ORM's writes still "
+    "invalidate the entry)."
+)
+#: Spec §11 (C7, P9): the eight "Coming from the full SurrealDB-ORM" bullets, exactly, and no ninth.
+_COMING_FROM_30 = [
+    "- Same names: `add_connection()`, `remove_connection()`, `get_config()`, `list_connections()`, "
+    "`get_active_connection_name()`, `using()`, `ConnectionConfig`, `SurrealConfigDict(connection=)`, "
+    "`get_connection_name()`, `get_client(name)`, `close_connection(name)`.",
+    "- `ConnectionConfig` has the same fields in the same order, built by position or by keyword, without `protocol` "
+    "(the official SDK speaks CBOR only); `user` and `password` may be `None` (the embedded engine needs neither).",
+    "- `close_connection()` without a name: closing an embedded `mem://` client discards its database, so "
+    "`close_connection()` without a name stays on the current connection; `close_all_connections()` closes every one "
+    "(full ORM: `close_connection()` closes every connection).",
+    "- `list_connections()` lists `'default'` first while it is configured (full ORM: registration order).",
+    "- Registering a name again with other settings closes its open clients and ends what the ORM holds on the old "
+    "settings (full ORM: drops the clients without closing them). `set_connection()` keeps its open clients, as in "
+    "earlier lite versions.",
+    "- The getters, the setters and `reconnect()` follow `using()` (full ORM: the default connection).",
+    "- `transaction(name)`, `embedded_database(connection=)` and the errors for operations across connections are lite "
+    "additions.",
+    "- `add_connection()` checks its arguments before registering anything (a non-empty name, URL, namespace and "
+    "database; a user and password for a server URL, optional on the embedded engine), and a model's `connection` key "
+    "must be a non-empty string, checked when the class is defined (full ORM: no checks). `ConnectionConfig` keeps the "
+    "password out of its `repr`.",
+]
+#: Spec §11 item 5: the row v0.29.0 adds to the 2.x/3.x table, cell by cell, and the clause it appends to the header.
+_MULTI_DATABASE_ROW = [
+    "Several connections in one process (`add_connection()`, `using()`)",
+    "each connection follows its own server: a 2.x connection's transactions are buffered, whatever the others are",
+    "each 3.x WebSocket connection gets interactive transactions, beside 2.x connections in the same process",
+    "v0.29.0",
+]
+_HEADER_CLAUSE_29 = (
+    "rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one "
+    "process, identical on 3.1.5."
+)
+#: Spec §11 item 6 (P8): all four cells of the embedded table's "Clients" row and of its new row.
+_EMBEDDED_CLIENTS_ROW = [
+    "Clients",
+    "one per connection for the whole process, shared by every event loop and thread",
+    "one per connection and event loop",
+    "v0.25.0",
+]
+_EMBEDDED_CONNECTIONS_ROW = [
+    "Several connections (`add_connection()`)",
+    "`mem://`: each name is a database of its own; an on-disk store (`surrealkv://`, `file://`) is open under one "
+    "name at a time — a second name raises `SurrealDbConnectionError`",
+    "each name opens its own clients; two databases on one server are isolated",
+    "v0.29.0",
+]
+#: Spec §11 item 7: the two rewritten "Connections and event loops" bullets, and the v0.28.0 one they replace.
+_EVENT_LOOP_BULLETS = [
+    "- `close_connection()` closes **the running loop's** client of the current connection only (the default, or the "
+    "one a `using()` block names).",
+    "- `close_all_connections()` tears down every cached client of every connection; `unset_connection()` does that "
+    "for the default connection only, `remove_connection(name)` for a named one.",
+]
+_EVENT_LOOP_V028 = "tears down every cached client (used by `unset_connection()`)"
+_SECTION_30_LINK = "[section 30](#30-multiple-databases-add_connection-using)"
+_CONTEXT_MANAGER_SENTENCE = (
+    "`async with SurrealDBConnectionManager():` uses the current connection (the default, or the `using()` block's) "
+    "and closes that connection's client on exit."
+)
+#: Spec §5.4 as section 30's table: the method column and the connection it acts on.
+_WHICH_CONNECTION_ROWS = [
+    [
+        "`add_connection()`, `remove_connection()`, `get_config()`, `list_connections()`, `using()`, "
+        "`get_active_connection_name()`",
+        "the registry, by the name given",
+    ],
+    ["`set_connection()`, `unset_connection()`", "always the default connection"],
+    ["`close_all_connections()`", "every connection, on every event loop"],
+    ["`get_client(name)`, `close_connection(name)`, `transaction(name)`", "_name_, else the current connection"],
+    [
+        "`subscribe_live(uuid)`, `kill(uuid)`",
+        "the connection whose live stream started _uuid_ on this event loop, else the current connection",
+    ],
+    [
+        "every other method: the session methods (`signin()`, `info()` …), the getters and setters (`get_url()`, "
+        "`set_database()` …), `reconnect()`, `validate_connection()`, `ephemeral_client()`, `call_function()`, "
+        "`is_connected()`, `is_embedded()`, `async with SurrealDBConnectionManager():`",
+        "the current connection",
+    ],
+]
+#: "Transactions and other operations across connections": each refusal (X1–X5) and each limit the ORM cannot see
+#: (N8) is one bullet holding these names together.
+_ACROSS_CONNECTIONS = {
+    "X1 transactions": ("`transaction(name)`", "`objects(tx=)`", "`refresh(tx=)`", "`call_function(tx=)`", "independent"),
+    "X2 subqueries": ("`Subquery`", "filter value", "`SurrealDbError`"),
+    "X3 relations": ("`relate()`", "`remove_relation()`", "`remove_all_relations()`", "`get_related()`", "`RecordID`"),
+    "X4 links": ("`fetch()`", "dotted path", "`order_by()`", "`values()`", "`SurrealDbError`"),
+    "X5 on-disk stores": ("`surrealkv://`", "`file://`", "`SurrealDbConnectionError`", "`mem://`"),
+    "inside using()": ("`using()`", "none of these"),
+    "N8 untyped links": ("`RecordID`", "`str`", "`dict`"),
+    "N8 graph arrows": ('`select("->likes->Post")`', "`traverse()`"),
+    "N8 edges": ("endpoint ids",),
+    "N8 raw SurrealQL": ("`raw_query()`", "`QuerySet.query()`", "`call_function()`", "`Transaction.add()`"),
+}
+#: "What each connection keeps for itself": each holder of spec §11 is one bullet holding these names together.
+_HOLDERS = {
+    "clients": ("one per event loop", "one for the whole process"),
+    "session and tokens": ("`signin()`", "token", "`using("),
+    "live streams and change feeds": ("live streams", "change feeds", "when they start"),
+    "transactions": ("transactions", "interactive", "buffered"),
+    "stored-function signatures": ("stored-function signatures", "`call_function()`"),
+    "cached reads": ("`cache()`", "never served to another connection"),
+}
+
+
+def _section_30() -> str:
+    return _readme_part(_SECTION_30)
+
+
+def _python_blocks(text: str) -> list[str]:
+    """The ``python`` blocks of *text*, in order."""
+    return re.findall(r"^```python\n(.*?)^```$", text, re.MULTILINE | re.DOTALL)
+
+
+def _part_30(heading: str) -> str:
+    """One ``####`` subsection of section 30, as written."""
+    return _subsection(f"#### {heading}", _section_30())
+
+
+class TestMultiDatabaseDocs:
+    """Unit, AC-24: what README section 30, the features, roadmap, comparison and both behaviour tables, the
+    "Connections and event loops" bullets and the "Context Manager" sentence say about several connections (spec §11;
+    C4, C7, P5, P8, P9)."""
+
+    def test_section_30_follows_section_29(self) -> None:
+        """Right after section 29 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        readme = _readme()
+        start_29 = readme.index(f"\n{_SECTION_29}\n")
+        start_30 = readme.index(f"\n{_SECTION_30}\n")
+        configuration = readme.index("\n## Configuration Options\n")
+        assert start_29 < start_30 < configuration
+        assert re.findall(r"^#{2,3} .*$", readme[start_29 + 1 : configuration], re.MULTILINE) == [
+            _SECTION_29,
+            _SECTION_30,
+        ]
+        assert readme[:configuration].rstrip().endswith("\n---"), "section 30 ends before the --- of the next part"
+
+    def test_subsections_in_order(self) -> None:
+        section = _section_30()
+        assert re.findall(r"^#### (.*)$", section, re.MULTILINE) == _SUBSECTIONS_30
+        intro = section.split("\n#### ", 1)[0]
+        assert _python_blocks(intro)[:1] == [_INTRO_EXAMPLE]
+
+    def test_examples_as_the_spec_writes_them(self) -> None:
+        """The intro example first, then each other spec example in its subsection; python blocks only."""
+        blocks = _python_blocks(_section_30())
+        assert blocks[0] == _INTRO_EXAMPLE
+        assert _USING_EXAMPLE in _python_blocks(_part_30(_SUBSECTIONS_30[1]))
+        assert _TRANSACTION_EXAMPLE in _python_blocks(_part_30(_SUBSECTIONS_30[2]))
+        assert _KEY_EXAMPLE in _python_blocks(_part_30(_SUBSECTIONS_30[3]))
+        fences = re.findall(r"^```(\S*)$", _section_30(), re.MULTILINE)
+        assert fences[1::2] == [""] * (len(fences) // 2) and set(fences[0::2]) == {"python"}, fences
+        assert "mem://" in blocks[0].splitlines()[2], "the first example says it runs on mem://"
+
+    def test_registry_names(self) -> None:
+        intro = _normalised(_section_30().split("\n#### ", 1)[0])
+        for name in (
+            "`add_connection(",
+            "`get_config(",
+            "`ConnectionConfig`",
+            "`list_connections()`",
+            "`remove_connection(",
+            "`unset_connection()`",
+            "`get_client(name)`",
+            "`close_connection(name)`",
+            "`transaction(name)`",
+            "`SurrealDbConnectionError`",
+        ):
+            assert name in intro, name
+
+    def test_routing_a_model(self) -> None:
+        text = _normalised(_part_30("Routing a model"))
+        for name in (
+            'SurrealConfigDict(connection="analytics")',
+            "`get_connection_name()`",
+            "`TypeError`",
+            "`ValueError`",
+            "first database call",
+            "`BaseSurrealEdge`",
+            "`AuthenticatedUserMixin`",
+            "`table_name`",
+            "when it starts",
+        ):
+            assert name in text, name
+
+    def test_redirecting_a_block(self) -> None:
+        text = _normalised(_part_30(_SUBSECTIONS_30[1]))
+        for name in (
+            "`get_active_connection_name()`",
+            "`ValueError`",
+            "nest",
+            "`contextvars.ContextVar`",
+            "`asyncio.to_thread()`",
+            "`threading.Thread`",
+            "`embedded_database()`",
+            "`embedded_database(connection=",
+        ):
+            assert name in text, name
+
+    @pytest.mark.parametrize("needles", list(_ACROSS_CONNECTIONS.values()), ids=list(_ACROSS_CONNECTIONS))
+    def test_operations_across_connections(self, needles: tuple[str, ...]) -> None:
+        """X1–X5 and the N8 limits, each one bullet."""
+        bullets = _bullets(_part_30(_SUBSECTIONS_30[2]))
+        assert [bullet for bullet in bullets if all(needle in bullet for needle in needles)], bullets
+
+    @pytest.mark.parametrize("needles", list(_HOLDERS.values()), ids=list(_HOLDERS))
+    def test_what_each_connection_keeps(self, needles: tuple[str, ...]) -> None:
+        bullets = _bullets(_part_30("What each connection keeps for itself"))
+        assert [bullet for bullet in bullets[:-1] if all(needle in bullet for needle in needles)], bullets
+
+    def test_d7_bullet_exactly(self) -> None:
+        """C4 and P5: the last holder bullet, exactly; the revision-3 wording is gone from the whole README."""
+        bullets = _bullets(_part_30("What each connection keeps for itself"))
+        assert bullets[-1] == _D7_BULLET, bullets[-1]
+        assert _REVISION_3_WORDING not in _normalised(_readme())
+
+    def test_application_key_paragraph_then_its_example(self) -> None:
+        """§7.11: the paragraph exactly, after the bullets, and the make_key() example right after it."""
+        part = _part_30("What each connection keeps for itself")
+        after_bullets = part.split(_D7_BULLET[-40:], 1)[1]
+        paragraph, example = after_bullets.split("```python\n", 1)
+        assert _normalised(paragraph) == _KEY_PARAGRAPH, paragraph
+        assert example.split("```", 1)[0] == _KEY_EXAMPLE
+
+    def test_which_connection_table_and_timing(self) -> None:
+        part = _part_30("Which connection a manager method uses")
+        [lines] = _tables(part)
+        assert _cells(lines[0]) == ["Method", "Acts on"]
+        assert [cells for _, cells in _table_rows(part)] == _WHICH_CONNECTION_ROWS
+        text = _normalised(part)
+        assert "when it is awaited" in text and "when it is opened" in text, text
+        assert "the innermost `using()` block's, else the default one" in text, text
+
+    def test_coming_from_the_full_orm(self) -> None:
+        """C7 and P9: eight bullets, exactly, and no ninth."""
+        assert _bullets(_part_30("Coming from the full SurrealDB-ORM")) == _COMING_FROM_30
+
+    def test_features_row(self) -> None:
+        features = [cells for _, cells in _table_rows(_readme_part("## Features"))]
+        firsts = [cells[0] for cells in features]
+        row = ["Multiple databases (named connections, `using()`)", "✅"]
+        assert row in features, features
+        assert firsts.index(row[0]) == firsts.index("Query cache (`cache()`, TTL, invalidated by ORM writes)") + 1
+
+    def test_roadmap_row(self) -> None:
+        roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
+        firsts = [cells[0] for cells in roadmap]
+        start = firsts.index("v0.28.0")
+        assert roadmap[start : start + 3] == [
+            ["v0.28.0", "Query cache", "✅ Released"],
+            ["v0.29.0", "Tier 2 — Multi-database", "✅ Released"],
+            ["v0.30.0 – v0.39.0", "Tier 3 — Advanced (search, DDL, migrations, CLI)", "📋 Planned"],
+        ], roadmap
+
+    def test_comparison_row(self) -> None:
+        comparison = [cells for _, cells in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        firsts = [cells[0] for cells in comparison]
+        start = firsts.index("Query Cache") + 1
+        assert comparison[start] == ["Multi-database", "✅ v0.29.0 (`add_connection()`, `using()`)", "✅"], comparison
+        assert comparison[start + 1][0] == "Schema Introspection", comparison
+
+    def test_server_behaviour_row(self) -> None:
+        """One row, Since v0.29.0, right after the query-cache row and before the table's last row."""
+        rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
+        assert rows[-2] == _MULTI_DATABASE_ROW, rows[-2]
+        assert rows[-3] == _QUERY_CACHE_ROW, rows[-3]
+        assert rows[-1][3] == "v0.19.1", rows[-1]
+        assert [cells for cells in rows if cells[3] == "v0.29.0"] == [_MULTI_DATABASE_ROW]
+
+    def test_server_behaviour_table_keeps_its_widths(self) -> None:
+        """Every line 535 characters, the columns 136, 175, 181 and 38 wide: no line re-padded."""
+        [lines] = _tables(_readme_part(_SERVER_BEHAVIOUR))
+        assert {len(line) for line in lines} == {535}
+        for line in lines:
+            assert [len(cell) for cell in line.split("|")[1:-1]] == _SERVER_TABLE_WIDTHS, line
+
+    def test_server_behaviour_header_clause(self) -> None:
+        header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
+        assert _HEADER_CLAUSE_29 in header, header
+
+    def test_embedded_table_rows(self) -> None:
+        """P8: all four cells of the "Clients" row and of the new row, which comes before the catch-all last row."""
+        rows = [cells for _, cells in _table_rows(_readme_part(_EMBEDDED_BEHAVIOUR))]
+        [clients] = [cells for cells in rows if cells[0] == "Clients"]
+        assert clients == _EMBEDDED_CLIENTS_ROW, clients
+        assert rows[-2] == _EMBEDDED_CONNECTIONS_ROW, rows[-2]
+        assert rows[-1][0] == "Everything else", rows[-1]
+
+    def test_connections_and_event_loops(self) -> None:
+        """Spec §11 item 7: the two bullets rewritten exactly, the third kept, a paragraph pointing to section 30."""
+        part = _readme_part("### Connections and event loops")
+        bullets = _bullets(part)
+        assert bullets[:2] == _EVENT_LOOP_BULLETS, bullets
+        assert bullets[2].startswith("- `is_connected()` answers for the loop asking"), bullets
+        assert len(bullets) == 3, bullets
+        assert _EVENT_LOOP_V028 not in _normalised(_readme())
+        paragraphs = [_normalised(paragraph) for paragraph in part.split("\n\n")]
+        [index] = [index for index, paragraph in enumerate(paragraphs) if paragraph.startswith(_EVENT_LOOP_BULLETS[0])]
+        after = paragraphs[index + 1]  # the paragraph right after the list
+        assert _SECTION_30_LINK in after and "per-loop clients" in after, after
+
+    def test_context_manager_sentence(self) -> None:
+        part = _readme_part("### Context Manager")
+        assert _normalised(part.split("```", 2)[2]) == _CONTEXT_MANAGER_SENTENCE, part
+
+    def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
+        """Every table v0.29.0 touches keeps one cell count per line and no escaped pipe."""
+        parts = [
+            _section_30(),
+            _readme_part("## Features"),
+            _readme_part(_SERVER_BEHAVIOUR),
+            _readme_part(_EMBEDDED_BEHAVIOUR),
+            _readme_part("## Roadmap"),
+            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+        ]
+        tables = [lines for part in parts for lines in _tables(part)]
+        assert len(tables) == len(parts), "section 30 has its table"
+        for lines in tables:
+            assert len({len(_cells(line)) for line in lines}) == 1 and "\\|" not in "".join(lines), lines
+
+    def test_typing_examples(self) -> None:
+        """AC-25: the typing guard exercises the registry, ``using()`` and model routing."""
+        source = (Path(__file__).parent / "typing_examples.py").read_text(encoding="utf-8")
+        for name in (
+            "SurrealConfigDict(connection=",
+            ".add_connection(",
+            "assert_type(SurrealDBConnectionManager.get_config(",
+            "ConnectionConfig | None",
+            "SurrealDBConnectionManager.using(",
+            ".get_connection_name(), str)",
+            ".get_client(",
+            ".transaction(",
+            "embedded_database(connection=None)",
+        ):
+            assert name in source, name
+
+
+#: The results section 30's comments state, by the names its examples assign (AC-24: each one asserted).
+_STATED_RESULTS_30 = {"names", "where", "elsewhere", "here", "refused", "distinct"}
+
+
+def _stated_results_30(blocks: list[str]) -> dict[str, str]:
+    """``{name: comment}`` for each line of *blocks*, indented or not, that assigns a result and states it in a
+    trailing comment."""
+    stated: dict[str, str] = {}
+    for block in blocks:
+        for name, comment in re.findall(r"^\s*(\w+) = .*?  # (.+)$", block, re.MULTILINE):
+            assert name not in stated, f"{name} is stated twice"
+            stated[name] = comment
+    return stated
+
+
+class TestMultiDatabaseReadmeExamplesE2E:
+    """AC-24: every ``python`` block of README section 30 runs as written, in order and in one namespace, inside
+    ``embedded_database()`` (the blocks point the default connection at ``mem://`` themselves); every result a
+    comment states is the one the examples got, and each write landed in the database its comment names."""
+
+    async def test_section_30_examples(self) -> None:
+        blocks = _python_blocks(_section_30())
+        stated = _stated_results_30(blocks)
+        assert set(stated) == _STATED_RESULTS_30, sorted(stated)
+        namespace: dict[str, Any] = {"__name__": "readme_section_30"}
+        router = SurrealDBConnectionManager
+        try:
+            async with embedded_database():
+                for code in blocks:
+                    compiled = compile(code, "<README section 30>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                    # A doctest of this repository's own README (trusted text), top-level awaits included.
+                    outcome = eval(compiled, namespace)
+                    if inspect.iscoroutine(outcome):
+                        await outcome
+
+                for name, comment in stated.items():
+                    assert comment == str(namespace[name]), (name, comment, namespace[name])
+
+                customer, page_view = namespace["Customer"], namespace["PageView"]
+                assert router.get_config() == ConnectionConfig("mem://", None, None, "shop", "main")
+                assert router.get_config("analytics") == ConnectionConfig("mem://", None, None, "shop", "analytics")
+                assert [row.get_raw_id() for row in await customer.objects().exec()] == ["ada"]
+                assert sorted(row.get_raw_id() for row in await page_view.objects().exec()) == ["v1", "v2"]
+                async with router.using("default"):
+                    assert await page_view.objects().count() == 0  # v3 was refused, v1 and v2 are elsewhere
+        finally:
+            namespace.clear()
+            await router.remove_connection("analytics")
