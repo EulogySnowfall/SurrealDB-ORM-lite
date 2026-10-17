@@ -17,8 +17,9 @@ What makes a cached result right:
 - **Tickets**: a miss takes a ticket (:meth:`QueryCache._begin_read`) holding the epoch, the generations of the
   tables it reads and the count of completed writes; its result is stored (:meth:`QueryCache._finish_read`) only if
   none of them moved and no write to its tables is in flight. A write (:func:`writing`, :func:`invalidates`) puts
-  its tables in flight for its whole call, then bumps their generations and removes their entries; a read that
-  follows links (``any_table``) is removed by every write. ``EDGES`` tags the reads of edge tables, which every
+  its tables in flight for its whole call (no entry of them is served, by ``QueryCache.get()`` neither, and no read
+  of them is stored), then bumps their generations and removes their entries; a read that follows links
+  (``any_table``) is removed by every write. ``EDGES`` tags the reads of edge tables, which every
   delete invalidates (a deleted record's edges go with it).
 
 Internal failures never fail a read: keying, copying a hit and copying a result to store fall back to the database.
@@ -301,7 +302,11 @@ class QueryCache:
 
     @classmethod
     def get(cls, key: str) -> Any | None:
-        """A copy of the value cached under ``key``; ``None`` when missing, expired or the cache is disabled (C7)."""
+        """A copy of the value cached under ``key``; ``None`` when missing, expired or the cache is disabled (C7).
+
+        Also ``None`` (a miss) while an ORM write to the entry's table runs, from its start to its end (its
+        ``pre_*``, ``around_*`` and ``post_*`` handlers included), as a ``cache()`` read of that table then goes to
+        the database: the write removes the entry when it ends, with any entry ``set()`` meanwhile."""
         _require_str("get", "key", key)
         with cls._guard():
             if not cls._enabled:
@@ -310,6 +315,9 @@ class QueryCache:
             if entry is None or _clock() >= entry.expires_at:
                 if entry is not None:
                     cls._remove(key)
+                cls._misses += 1
+                return None
+            if cls._busy(entry.tables, entry.any_table):
                 cls._misses += 1
                 return None
             cls._entries.move_to_end(key)

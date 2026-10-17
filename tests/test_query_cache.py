@@ -1377,6 +1377,30 @@ class TestWriting:
         assert QueryCache.get("k") is None
         assert QueryCache.get("other") == 2
 
+    async def test_get_hides_the_entries_of_a_table_in_flight(self) -> None:
+        """From the start of a write to its end (its ``post_*`` handlers included), ``get()`` answers ``None``, a
+        miss, for an entry tagged with a table it writes, an entry set meanwhile included; other tables are served."""
+        QueryCache.set("k", 1, "t")
+        QueryCache.set("other", 2, "u")
+        async with cache.writing({"t"}):
+            assert QueryCache.get("k") is None
+            QueryCache.set("during", 3, "t")
+            assert QueryCache.get("during") is None
+            assert QueryCache.get("other") == 2
+            assert _counts() == (1, 2)
+        assert QueryCache.get("k") is None
+        assert QueryCache.get("during") is None
+        assert QueryCache.get("other") == 2
+
+    async def test_get_hides_every_entry_while_every_table_is_in_flight(self) -> None:
+        QueryCache.set("k", 1, "t")
+        async with cache.writing(None):
+            assert QueryCache.get("k") is None
+            QueryCache.set("during", 2, "u")
+            assert QueryCache.get("during") is None
+            assert _counts() == (0, 2)
+        assert QueryCache.stats()["entries"] == 0
+
     async def test_invalidated_after_an_exception(self) -> None:
         QueryCache.set("k", 1, "t")
         with pytest.raises(RuntimeError, match="boom"):
@@ -3416,6 +3440,45 @@ class TestWriteInvalidationE2E:
             sent = requests()
             assert await QcItem.objects().cache().count() == 5
             assert requests() == sent + 1  # neither handler's read was stored
+
+    async def test_signal_handlers_get_no_user_entry_of_the_table_written(self, kind: str) -> None:
+        """README's ``total_price()``: an entry of ``QueryCache.set()`` tagged with the table a write changes is hidden
+        from ``QueryCache.get()`` before the write's handlers run (``around_save`` after its ``yield``, ``post_save``),
+        so they compute the value from the database, never from the entry stored before the write."""
+        statement = "SELECT math::sum(price) AS total FROM qc_item GROUP ALL"
+        key = QueryCache.make_key(statement, {}, "qc_item")
+        seen: list[tuple[str, Any, int]] = []
+        clients: list[Any] = []
+
+        async def total_price() -> int:
+            rows = QueryCache.get(key)
+            if rows is None:
+                rows = await clients[0].query(statement)
+                QueryCache.set(key, rows, "qc_item", ttl=60)
+            return int(rows[0]["total"])
+
+        async def on_saved(sender: Any, instance: Any, created: bool, **kwargs: Any) -> None:
+            seen.append(("post_save", QueryCache.get(key), await total_price()))
+
+        async def around(sender: Any, instance: Any, **kwargs: Any) -> AsyncIterator[None]:
+            yield
+            seen.append(("around_save", QueryCache.get(key), await total_price()))
+
+        async with cache_db(kind) as client:
+            clients.append(client)
+            await _seed()
+            assert await total_price() == 100
+            assert QueryCache.get(key) is not None  # stored before the write
+            post_save.connect(QcItem)(on_saved)
+            around_save.connect(QcItem)(around)
+            try:
+                await QcItem(id="i5", name="e", category="toy", price=50).save()
+            finally:
+                post_save.disconnect(on_saved, QcItem)
+                around_save.disconnect(around, QcItem)
+            assert seen == [("around_save", None, 150), ("post_save", None, 150)]
+            assert QueryCache.get(key) is None  # what the handlers stored left with the write
+            assert await total_price() == 150
 
 
 @pytest.mark.parametrize("kind", ["mem", "ws"])
