@@ -37,6 +37,7 @@ from .utils import (
     build_filter_condition,
     coerce_record_id,
     is_select_item,
+    non_negative_int,
     parse_lookup,
     remove_quotes_for_variables,
     validate_alias_name,
@@ -254,12 +255,18 @@ class QuerySet:
         Set a limit on the number of results to retrieve.
 
         Args:
-            value: The maximum number of records to retrieve.
+            value: The maximum number of records to retrieve: a non-negative integer (``0`` reads none). An ``int``
+                subclass, such as an ``IntEnum`` member, gives its value.
 
         Returns:
             Self: The current instance for method chaining.
+
+        Raises:
+            TypeError: *value* is not an ``int`` — a ``bool``, a ``str`` such as ``"10"``, a ``float``, ``None`` —
+                raised when ``limit()`` is called, before any request; the limit in place is kept.
+            ValueError: *value* is negative, likewise.
         """
-        self._limit = value
+        self._limit = non_negative_int("limit()", value)
         return self
 
     def offset(self, value: int) -> Self:
@@ -267,12 +274,18 @@ class QuerySet:
         Set an offset for the results.
 
         Args:
-            value: The number of records to skip.
+            value: The number of records to skip: a non-negative integer. An ``int`` subclass, such as an
+                ``IntEnum`` member, gives its value.
 
         Returns:
             Self: The current instance for method chaining.
+
+        Raises:
+            TypeError: *value* is not an ``int`` — a ``bool``, a ``str`` such as ``"10"``, a ``float``, ``None`` —
+                raised when ``offset()`` is called, before any request; the offset in place is kept.
+            ValueError: *value* is negative, likewise.
         """
-        self._offset = value
+        self._offset = non_negative_int("offset()", value)
         return self
 
     def order_by(self, *fields: str | OrderBy) -> Self:
@@ -739,9 +752,9 @@ class QuerySet:
 
         Raises:
             ValueError: ``annotate()``, ``select()`` of several fields or ``values()`` (S4, every offender named);
-                ``limit()``/``offset()`` not an ``int >= 0`` (S12); an invalid selected column; ``_sqv`` ordered on
-                where the ordered form selects its alias (S13); its ``variables()`` binding a name of the statement
-                to another value (S7); and its filters' own refusals.
+                an invalid selected column; ``_sqv`` ordered on where the ordered form selects its alias (S13); its
+                ``variables()`` binding a name of the statement to another value (S7); and its filters' own refusals.
+                Its ``limit()`` and ``offset()`` were checked when they were called (a non-negative integer).
             SurrealDbError: an ``as_of()`` of its own (S5); a transaction that is not the outer queryset's (S6).
         """
         offenders = {
@@ -756,9 +769,6 @@ class QuerySet:
             raise SurrealDbError(_subquery.moment_refused())
         if self._tx is not None and self._tx is not compiler.outer_tx:
             raise SurrealDbError(_subquery.transaction_refused())
-        for clause, value in (("limit()", self._limit), ("offset()", self._offset)):
-            if value is not None and (not isinstance(value, int) or isinstance(value, bool) or value < 0):
-                raise ValueError(_subquery.bad_slice(clause, value))
         column = self.select_item[0] if self.select_item else "id"
         validate_field_name(column, "subquery select field")
         order_columns: list[str] = []
@@ -827,7 +837,7 @@ class QuerySet:
 
         Raises:
             RuntimeError: under ``as_of()`` without a moment (an internal error).
-            ValueError, SurrealDbError: a subquery the ORM cannot compile (S2–S7, S12, S13, S15).
+            ValueError, SurrealDbError: a subquery the ORM cannot compile (S2–S7, S13, S15).
         """
         moment = self._version_moment(moment)
         compiler = subqueries if subqueries is not None else self._subquery_compiler()
@@ -2125,7 +2135,7 @@ class QuerySet:
 
         :raises SurrealDbError: for a clause a live query cannot honour.
         :raises TypeError: for a filter value with no SurrealQL literal form.
-        :raises ValueError, SurrealDbError: for a subquery the ORM cannot compile (S2–S7, S12, S13, S15).
+        :raises ValueError, SurrealDbError: for a subquery the ORM cannot compile (S2–S7, S13, S15).
         """
         self._reject_live_clauses()
         compiler = subqueries if subqueries is not None else self._subquery_compiler(inline=True)

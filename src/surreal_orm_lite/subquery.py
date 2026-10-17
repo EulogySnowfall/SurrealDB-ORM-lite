@@ -407,11 +407,6 @@ def live_table_missing(table: str, exc: BaseException) -> str:
     )
 
 
-def bad_slice(clause: str, value: object) -> str:
-    """S12: the inner ``limit()`` or ``offset()`` (*clause*) is not an ``int >= 0``."""
-    return f"A subquery's {clause} takes an int >= 0, got {value!r}"
-
-
 def reserved_alias() -> str:
     """S13: the inner ``order_by()`` names ``_sqv`` (or a path under it) where the ordered form selects its alias."""
     return (

@@ -148,6 +148,22 @@ link read as a record, a required field left out) come back as dicts keyed by Py
 nested object that is not a link, `"meta.*"` gives the object on SurrealDB 3.x and its values as a
 list on 2.x and the embedded engine.
 
+#### `limit()` and `offset()`
+
+```python
+users = await User.objects().order_by("name").limit(10).offset(20).exec()
+User.objects().limit(int(size))   # a size read as text: convert it first
+User.objects().limit("10")        # TypeError: limit() takes a non-negative integer, got '10'
+User.objects().offset(-1)         # ValueError: offset() takes a non-negative integer, got -1
+```
+
+Each takes a non-negative integer (`0` reads no record; an `IntEnum` member gives its value). A
+value that is not an `int` — a `bool`, a `str` such as `"10"`, a `float`, `None` — raises
+`TypeError`, and a negative one `ValueError`, naming the method and the value, when `limit()` or
+`offset()` is called, before any request; the value in place is kept. The same holds wherever the
+queryset is read: `exec()`, `first()`, `get()`, `values(…).annotate(…)`, `cache()`, `as_of()` and
+a subquery.
+
 ---
 
 ## Features
@@ -3314,7 +3330,8 @@ A statement with subqueries is one block, whose `LET`s bind each subquery once, 
 - **Reserved names**: `$_sq0`, `$_sq1`, … (`_sq<N>`) are the block's `LET`s and hide a
   `variables()` value of the same name; a subquery can order by `_sqv` only when it selects `_sqv`
   itself (`ValueError` otherwise).
-- `limit()` and `offset()` of a subquery take an `int >= 0` (`ValueError` otherwise).
+- `limit()` and `offset()` of a subquery take a non-negative integer, as everywhere (`TypeError` or
+  `ValueError` when they are called).
 
 #### Where subqueries apply
 
@@ -3376,8 +3393,7 @@ at the call):
 - an inner `objects(tx=)` whose transaction is not the outer queryset's: `SurrealDbError`;
 - an inner `variables()` binding a name of the statement to another value: `ValueError` (the two
   values must have the same type and be equal: `1` and `True`, or `1` and `1.0`, differ);
-- an inner `limit()` or `offset()` that is not an `int >= 0`, or an inner `order_by()` on `_sqv`
-  (above): `ValueError`;
+- an inner `order_by()` on `_sqv` (above): `ValueError`;
 - a subquery inside a list (`author__in=[Subquery(qs)]`): `ValueError`, give it as the whole value;
 - `Q(...).to_sql()` called on its own with a subquery lookup: `ValueError` (only a QuerySet binds
   a subquery);

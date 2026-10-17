@@ -158,6 +158,24 @@ def warn_on_multiple_statements(query: str) -> None:
         )
 
 
+def non_negative_int(method: str, value: object) -> int:
+    """*value* as the ``int`` that *method* (``"limit()"`` or ``"offset()"``) writes into its statement.
+
+    A non-negative ``int`` is returned as a plain ``int`` (an ``int`` subclass, such as an ``IntEnum`` member,
+    gives its value). Anything else is refused, naming *method* and *value*: ``limit("10")`` and ``limit(-1)``
+    raise instead of reaching a statement.
+
+    Raises:
+        TypeError: *value* is not an ``int``, or is a ``bool``.
+        ValueError: *value* is negative.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{method} takes a non-negative integer, got {value!r}")
+    if value < 0:
+        raise ValueError(f"{method} takes a non-negative integer, got {value!r}")
+    return int(value)
+
+
 def validate_field_name(field: str, context: str = "field") -> None:
     """
     Validate a field name to prevent SQL injection.
@@ -619,7 +637,7 @@ def build_filter_condition(
             to an endpoint column (v0.24.0). ``InvalidGeometryError`` (a ``ValueError``) for a
             malformed GeoJSON object. With a subquery (v0.27.0): a lookup that takes none — ``isnull``, the
             text and the spatial lookups — (S2); a subquery as an item of a list (S15); no *subqueries* compiler
-            (S8); and the inner queryset's refusals (S3–S7, S12, S13).
+            (S8); and the inner queryset's refusals (S3–S7, S13).
     """
     validate_field_name(field, "filter field")
     sub = subquery_of(value)

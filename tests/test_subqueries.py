@@ -168,8 +168,9 @@ _S8 = (
 )
 
 
-def _s12(clause: str, value: object) -> str:
-    return f"A subquery's {clause} takes an int >= 0, got {value!r}"
+def _paging(method: str, value: object) -> str:
+    """Raised by ``limit()``/``offset()`` when called, for a subquery as for any queryset (v0.28.1)."""
+    return f"{method} takes a non-negative integer, got {value!r}"
 
 
 _S13 = (
@@ -986,24 +987,24 @@ _REFUSALS: list[tuple[str, Callable[[], Any], type[Exception], str, bool]] = [
         True,
     ),
     (
-        "S12-limit-negative",
+        "limit-negative",
         _filtered("author__in", lambda: SqPerson.objects().limit(-1)),
         ValueError,
-        _s12("limit()", -1),
+        _paging("limit()", -1),
         True,
     ),
     (
-        "S12-limit-bool",
+        "limit-bool",
         _filtered("author__in", lambda: SqPerson.objects().limit(True)),
-        ValueError,
-        _s12("limit()", True),
+        TypeError,
+        _paging("limit()", True),
         True,
     ),
     (
-        "S12-offset-str",
+        "offset-str",
         _filtered("author__in", lambda: SqPerson.objects().offset("1")),
-        ValueError,
-        _s12("offset()", "1"),
+        TypeError,
+        _paging("offset()", "1"),
         True,
     ),
     ("S13-order-sqv", _filtered("author__in", lambda: SqPerson.objects().order_by("_sqv")), ValueError, _S13, True),
