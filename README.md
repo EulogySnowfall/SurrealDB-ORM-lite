@@ -129,6 +129,25 @@ results = await User.objects().query(
 )
 ```
 
+#### What `select()` accepts
+
+```python
+await Book.objects().select("title", "price").exec()        # field names
+await Book.objects().select("title", "author.name").exec()  # [{"title": "Dune", "author": {"name": "Ada"}}, …]
+await Book.objects().select("title", "author.*").exec()     # every field of the linked author
+await Book.objects().select("*", "author.*").exec()         # every field, the author's record included
+```
+
+Each item is `*`, a field name (an aliased field by its Python name: its column is selected), a
+dotted path into a nested object or through a record link, or such a path followed by `.*`. Names
+are letters, digits and underscores, each part starting with a letter or an underscore, as in
+`order_by()` and `values()`. Anything else — an expression, a function call, `AS`, `{…}` or
+`[…]` — raises `ValueError` naming the item when `select()` is called, before any request; write a
+computed projection with `query()` and bound parameters. Rows that do not validate as the model (a
+link read as a record, a required field left out) come back as dicts keyed by Python names. On a
+nested object that is not a link, `"meta.*"` gives the object on SurrealDB 3.x and its values as a
+list on 2.x and the embedded engine.
+
 ---
 
 ## Features
@@ -3479,8 +3498,8 @@ Every ORM write removes the cached reads it can change, **before** its `post_*` 
   included.
 - A read that **follows links** is removed by **any** ORM write: `fetch()`, a dotted path such as
   `filter(**{"author.name": …})` or `order_by("author.name")` (in a subquery too), and a
-  `select()` item that is not a plain field, such as `"author.*"` or an expression (a projection
-  may read another table).
+  `select()` item that is not a plain field, such as `"author.*"` (the projection reads the linked
+  record).
 - A read of an **edge model** (`BaseSurrealEdge`) is removed by any delete: deleting a record
   deletes the edges that point at it or from it.
 - Inside `transaction()` the tables written are invalidated **at commit** (a failed commit too,
@@ -3502,8 +3521,7 @@ table's entries after such a change:
 - what the server derives on its own: `DEFINE EVENT`, `REFERENCE … ON DELETE` (3.x), views
   (`DEFINE TABLE … AS SELECT`), `PERMISSIONS` that read another table;
 - values computed when the read runs: a `DEFINE PARAM` read with `Var()`, `<future>`/`COMPUTED`
-  fields (over another table, the graph such as `count(<-likes)`, or the time), time functions
-  inside a `select()` expression;
+  fields (over another table, the graph such as `count(<-likes)`, or the time);
 - a table of relations read through a model that is not a `BaseSurrealEdge`.
 
 ```python
@@ -3721,7 +3739,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the row added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -3827,6 +3845,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | A subquery reading a table that does not exist                                                                                         | read as empty, like any missing table                                                                                                                                         | read as empty in three requests (statement, table probe, re-send); other errors, even ones quoting "does not exist", are relayed; transaction writes fail; `live()` raises on start | v0.27.0                              |
 | Subqueries under `as_of()`                                                                                                             | each subquery reads at the same moment: the ORM adds `VERSION` to it (the server would read the current state)                                                                | the same (the server applies the outer `VERSION` to an inline sub-SELECT only); without versioned storage `SurrealDbError`, but 3.1.5 raises the server's own `ThrownError`         | v0.27.0                              |
 | Query cache (`cache()`, `QueryCache`)                                                                                                  | same on both lines: client-side, per connection and identity; writes in a transaction invalidate at commit; reads in one are never cached (on 2.x they raise: buffered)       | the same; reads inside an interactive transaction are never cached (they see its uncommitted writes)                                                                                | v0.28.0                              |
+| `select("meta.*")` on a nested object that is not a record link                                                                        | its values, as a list; through a link (`select("author.*")`), the linked record                                                                                               | the object; through a link, the linked record                                                                                                                                       | pre-existing (documented in v0.28.1) |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.

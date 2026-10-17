@@ -2128,15 +2128,23 @@ class TestTags:
             _Read("select", "", {"target": "qc_likes"}, frozenset({"qc_likes", EDGES}), False),
         ]
 
-    @pytest.mark.parametrize("item", ["author.*", "author.{name}", "author[*]", "x AS y"])
-    async def test_a_select_item_that_is_not_a_field_is_any(self, reads: list[_Read], item: str) -> None:
-        """P3: ``select()`` items are not validated, and projection semantics read the linked table."""
+    @pytest.mark.parametrize(
+        ("item", "dotted"), [("author.*", False), ("author.name.*", True)], ids=["author.*", "author.name.*"]
+    )
+    async def test_a_select_item_that_is_not_a_field_is_any(self, reads: list[_Read], item: str, dotted: bool) -> None:
+        """P3: a ``select()`` item ending in ``.*`` reads every field of the linked record."""
         await QcBook.objects().select("title", item).cache().exec()
         (read,) = reads
         assert read.any_table is True
-        if item == "author.*":
-            assert read.statement == "SELECT title, author.* FROM qc_book;"
-            assert follows_links(read.statement) is False  # the projection rule is what tags it
+        assert read.statement == f"SELECT title, {item} FROM qc_book;"
+        assert follows_links(read.statement) is dotted  # for author.*, the projection rule is what tags it
+
+    @pytest.mark.parametrize("item", ["author.{name}", "author[*]", "x AS y", "count()"])
+    async def test_a_select_item_that_is_not_a_field_path_is_refused(self, reads: list[_Read], item: str) -> None:
+        """``select()`` refuses it when called: nothing is read, nothing is cached."""
+        with pytest.raises(ValueError, match=r"select\(\)"):
+            await QcBook.objects().select("title", item).cache().exec()
+        assert reads == []
 
     async def test_plain_select_fields_are_not_any(self, reads: list[_Read]) -> None:
         await QcBook.objects().select("title", "price").cache().exec()
@@ -3808,7 +3816,7 @@ _QUERY_CACHE_ROW = [
 ]
 _HEADER_CLAUSE_28 = (
     "rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and "
-    "3.3.4, identical on 3.1.5."
+    "3.3.4, identical on 3.1.5"
 )
 #: Spec §11 (revision 3, P5): what the cache cannot see, one bullet of "Invalidation" holding each group of names.
 _CANNOT_SEE = {
@@ -3817,7 +3825,7 @@ _CANNOT_SEE = {
     "a write cancelled or failed client-side": ("cancelled", "after its request was sent"),
     "an access method's own clauses": ("`SIGNIN`", "`SIGNUP`"),
     "what the server derives": ("`DEFINE EVENT`", "`REFERENCE … ON DELETE`", "AS SELECT", "`PERMISSIONS`"),
-    "values computed when the read runs": ("`Var()`", "`DEFINE PARAM`", "`<future>`", "`COMPUTED`", "`select()`"),
+    "values computed when the read runs": ("`Var()`", "`DEFINE PARAM`", "`<future>`", "`COMPUTED`"),
     "relations through a model that is not an edge": ("`BaseSurrealEdge`",),
 }
 
@@ -3988,12 +3996,13 @@ class TestQueryCacheDocs:
         assert firsts.index(row[0]) == firsts.index("Subqueries (`Subquery`, a QuerySet as a filter value)") + 1
 
     def test_server_behaviour_row(self) -> None:
-        """One row, Since v0.28.0, right after the four v0.27.0 rows and before the table's last row."""
+        """One row, Since v0.28.0, right after the four v0.27.0 rows and before the table's last row (later versions
+        add their rows after it)."""
         rows = _behaviour_rows()
         assert [len(cell) for cell in _QUERY_CACHE_ROW] == [37, 167, 100, 7]
-        assert rows[-2] == _QUERY_CACHE_ROW, rows[-2]
-        assert rows[-6:-2] == _SUBQUERY_ROWS, rows[-6:-2]
-        assert rows[-1][3] == "v0.19.1", rows[-1]
+        index = rows.index(_QUERY_CACHE_ROW)
+        assert rows[index - 4 : index] == _SUBQUERY_ROWS, rows[index - 4 : index]
+        assert index < len(rows) - 1 and rows[-1][3] == "v0.19.1", rows[-1]
         assert [cells for cells in rows if cells[3] == "v0.28.0"] == [_QUERY_CACHE_ROW]
 
     def test_server_behaviour_table_keeps_its_widths(self) -> None:
@@ -4004,7 +4013,7 @@ class TestQueryCacheDocs:
             assert [len(cell) for cell in line.split("|")[1:-1]] == _SERVER_TABLE_WIDTHS, line
 
     def test_server_behaviour_header_clause(self) -> None:
-        """The header's last clause names v0.28.0's lines, before its final period."""
+        """The header names v0.28.0's lines."""
         header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
         assert _HEADER_CLAUSE_28 in header, header
 

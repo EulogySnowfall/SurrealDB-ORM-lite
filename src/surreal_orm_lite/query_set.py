@@ -36,11 +36,13 @@ from .utils import (
     as_record_value,
     build_filter_condition,
     coerce_record_id,
+    is_select_item,
     parse_lookup,
     remove_quotes_for_variables,
     validate_alias_name,
     validate_field_name,
     validate_patch_operations,
+    validate_select_item,
     warn_on_multiple_statements,
 )
 
@@ -141,17 +143,46 @@ class QuerySet:
         """
         Specify the fields to retrieve in the query.
 
-        By default, all fields are selected (``SELECT *``). This method allows you to specify
-        a subset of fields to be retrieved.
+        By default, all fields are selected (``SELECT *``). Each item is one of:
+
+        - ``"*"``: every field;
+        - a field name, the Python one for an aliased field (its column is selected): ``"name"``, ``"id"``;
+        - a dotted path into a nested object or through a record link: ``"author.name"``;
+        - a path followed by ``.*``: every field of the nested object or of the linked record: ``"author.*"``.
+
+        Names are letters, digits and underscores, each part starting with a letter or an underscore, as in
+        ``order_by()`` and ``values()``. Anything else — an expression, a function call, ``AS``, ``{…}`` or
+        ``[…]`` — is refused when ``select()`` is called, before any request; write a computed projection
+        with :meth:`query`. Rows that do not validate as the model (a link read as a record, a required field
+        left out) come back as dicts keyed by Python names. On a nested object that is not a link,
+        ``"meta.*"`` gives the object on SurrealDB 3.x and its values as a list on 2.x and the embedded engine.
+
+        Example::
+
+            await User.objects().select("name", "email").exec()
+            await Book.objects().select("title", "author.name").exec()   # [{"title": …, "author": {"name": …}}]
+            await Book.objects().select("title", "author.*").exec()      # the author's whole record
 
         Args:
-            *fields: Field names to select.
+            *fields: The items to select; none selects every field.
 
         Returns:
             Self: The current instance for method chaining.
+
+        Raises:
+            TypeError: an item is not a ``str``.
+            ValueError: an item is none of the above, or an aliased field's column is not a field name; the
+                message names it. The selection in place is kept.
         """
-        self.select_item = [self._column(field) for field in fields]
+        self.select_item = [self._select_column(field) for field in fields]
         return self
+
+    def _select_column(self, field: str) -> str:
+        """The column ``select()`` writes for *field*, both checked: *field* as given, then its column."""
+        column = self._column(validate_select_item(field))
+        if column != field and not is_select_item(column):
+            raise ValueError(f"select() cannot select {field!r}: its column {column!r} is not a field name")
+        return column
 
     def variables(self, **kwargs: Any) -> Self:
         """
@@ -474,7 +505,7 @@ class QuerySet:
         connection, with the same identity, less than ``ttl`` seconds ago, and no ORM write that can change its result
         has completed since: a write to a table it reads; any write, when it follows links (``fetch()``, a dotted path
         such as ``filter(**{"author.name": …})``, a ``select()`` item that is not a plain field, such as
-        ``"author.*"`` or an expression); any delete, when it reads an edge model (a deleted record's edges go with it).
+        ``"author.*"``); any delete, when it reads an edge model (a deleted record's edges go with it).
         Each hit builds new instances from a copy of the cached rows: changing one never changes the cache.
 
         ``ttl`` is the oldest result this read accepts, in seconds (an ``int`` or a ``float`` >= 0) or a ``timedelta``;
@@ -1073,8 +1104,8 @@ class QuerySet:
         The statement is compiled once to key the read and decide what it depends on (spec §5.3): the model's
         table and every table a subquery reads; ``EDGES`` when one of them is an edge model's (every delete
         invalidates it); "any table" when the statement follows links (``FETCH``, a dotted path, a graph arrow) or
-        a ``select()`` item is neither ``*`` nor a plain field path (``author.*``, an expression: projection
-        semantics may read another table). On a miss :meth:`_run_uncached` sends it, compiling it again
+        a ``select()`` item is neither ``*`` nor a plain field path (``author.*``: projection semantics read the
+        linked table). On a miss :meth:`_run_uncached` sends it, compiling it again
         (compilation is pure), so the missing-subquery-table re-send happens inside the read.
         """
         compiler = self._subquery_compiler()

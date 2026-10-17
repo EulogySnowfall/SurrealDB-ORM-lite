@@ -22,6 +22,10 @@ if TYPE_CHECKING:
 # Must start with a letter or underscore
 VALID_FIELD_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$")
 
+# Pattern for a field path followed by ``.*`` (``author.*``, ``meta.inner.*``): every field of the nested
+# object or of the record a link points to. ``select()`` accepts it besides ``*`` and VALID_FIELD_PATTERN.
+VALID_FIELD_STAR_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*\.\*$")
+
 # Pattern for valid alias names: alphanumeric and underscores only
 # Must start with a letter or underscore (like Python identifiers)
 VALID_ALIAS_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
@@ -172,6 +176,38 @@ def validate_field_name(field: str, context: str = "field") -> None:
             f"Invalid {context} name '{field}': must contain only alphanumeric characters, "
             "underscores, and dots (for nested fields), and start with a letter or underscore"
         )
+
+
+#: What ``select()`` accepts, as its refusals say it.
+SELECT_ITEMS = (
+    "select() takes '*', a field name or a dotted field path (letters, digits and underscores, each part "
+    "starting with a letter or an underscore), optionally followed by '.*' (every field of a nested object or "
+    "of a linked record); write a computed projection with query()"
+)
+
+
+def is_select_item(item: str) -> bool:
+    """Whether *item* is a ``select()`` item: ``*``, a field path, or a field path followed by ``.*``.
+
+    A field path is :data:`VALID_FIELD_PATTERN`'s (``name``, ``author.name``), as ``order_by()`` and ``values()``
+    accept it; ``author.*`` is :data:`VALID_FIELD_STAR_PATTERN`'s. The whole string must match: a trailing newline
+    is not part of a name.
+    """
+    return item == "*" or any(pattern.fullmatch(item) for pattern in (VALID_FIELD_PATTERN, VALID_FIELD_STAR_PATTERN))
+
+
+def validate_select_item(item: object) -> str:
+    """Check one ``select()`` item (:func:`is_select_item`) and return it.
+
+    Raises:
+        TypeError: *item* is not a ``str``.
+        ValueError: *item* is not ``*``, a field path or a field path followed by ``.*``; the message names it.
+    """
+    if not isinstance(item, str):
+        raise TypeError(f"select() takes field names as str, got {type(item).__name__} {item!r}")
+    if not is_select_item(item):
+        raise ValueError(f"select() cannot select {item!r}: {SELECT_ITEMS}")
+    return item
 
 
 def build_set_clause(merged: Mapping[str, Any], param_prefix: str = "_sv_") -> tuple[str, dict[str, Any]]:
