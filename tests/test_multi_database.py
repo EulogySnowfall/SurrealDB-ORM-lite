@@ -14,6 +14,7 @@ import os
 import threading
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from typing import Any
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
@@ -24,11 +25,14 @@ from surreal_orm_lite import (
     BaseSurrealModel,
     ConnectionConfig,
     SurrealConfigDict,
+    SurrealDbAuthenticationError,
     SurrealDbConnectionError,
     SurrealDBConnectionManager,
+    SurrealDbError,
     connection_manager,
     live,
 )
+from tests._proxy import CuttableProxy
 from tests.conftest import default_connection_class
 
 #: The prefix of the manager's name-mangled private attributes.
@@ -36,7 +40,16 @@ _P = "_SurrealDBConnectionManager__"
 
 #: The classmethods of the class body that are deliberately not routed (spec §6.1): the resolvers themselves and
 #: the registry, which acts by the name it is given.
-_NOT_ROUTED = {"_route", "_manager_for", "add_connection", "remove_connection", "get_config", "list_connections"}
+_NOT_ROUTED = {
+    "_route",
+    "_manager_for",
+    "add_connection",
+    "remove_connection",
+    "get_config",
+    "list_connections",
+    "using",
+    "get_active_connection_name",
+}
 
 #: The routing policy of every routed classmethod that does not act on the current connection (spec §6.1).
 _POLICIES = {
@@ -1062,6 +1075,330 @@ class TestRemoveOrder:
         assert conn.get_url() is None
 
 
+# === using() and the current connection (spec §5.3, §5.4, §5.7 R9 R10) ========================================
+
+#: The lost-identity text of v0.28.0, byte for byte: the default connection keeps it (spec R10, D24).
+_V028_LOST_IDENTITY = (
+    "The SurrealDB connection on this event loop dropped while it was authenticated as an "
+    "identity the connection manager does not store (signin/signup/authenticate with "
+    "store=False), so a new connection cannot restore it — and answering as the configured "
+    "user instead would silently change privileges. Sign in or authenticate again, call "
+    "invalidate(), or reconnect()/close_connection() to continue as the configured user."
+)
+
+
+def _active() -> str | None:
+    return SurrealDBConnectionManager.get_active_connection_name()
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestUsing:
+    """AC-4, spec §5.3, §5.4, D25, M9, P6: ``using()`` redirects a block of code to a named connection (``mem://``)."""
+
+    async def test_validated_at_entry_before_the_block_runs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        # Registered but never configured (an embedded_database() block's name): not listed, so unknown here.
+        monkeypatch.setitem(connection_manager._REGISTRY, "md_bare", connection_manager._new_connection_class("md_bare"))
+        ran: list[Any] = []
+        cases: list[tuple[Any, type[Exception], str]] = [
+            (1, TypeError, r"^Connection name must be a str, not int\.$"),
+            ("", ValueError, r"^Connection name must not be empty\.$"),
+            ("nope", ValueError, r"^Unknown connection: 'nope'\. Register it with add_connection\(\) first\.$"),
+            ("md_bare", ValueError, r"^Unknown connection: 'md_bare'\."),
+            # The default is never unknown, except while it is not configured.
+            ("default", ValueError, r"^Unknown connection: 'default'\."),
+        ]
+        for name, error, text in cases:
+            block = SurrealDBConnectionManager.using(name)  # nothing is checked before the block is entered
+            with pytest.raises(error, match=text):
+                async with block:
+                    ran.append(name)  # pragma: no cover - the block never runs
+            assert _active() is None
+        assert ran == []
+        SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="d")
+        async with SurrealDBConnectionManager.using("default"):
+            assert _active() == "default"
+        assert _active() is None
+
+    async def test_nesting_and_exceptions_restore_the_outer_name(self) -> None:
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        SurrealDBConnectionManager.add_connection("md_b", url="mem://", namespace="t", database="b")
+        assert _active() is None
+        async with SurrealDBConnectionManager.using("md_a"):
+            assert _active() == "md_a"
+            async with SurrealDBConnectionManager.using("md_b"):
+                assert _active() == "md_b"
+                async with SurrealDBConnectionManager.using("md_a"):
+                    assert _active() == "md_a"
+                assert _active() == "md_b"
+            assert _active() == "md_a"
+            with pytest.raises(RuntimeError, match="boom"):
+                async with SurrealDBConnectionManager.using("md_b"):
+                    assert _active() == "md_b"
+                    raise RuntimeError("boom")
+            assert _active() == "md_a"
+            # A failed entry leaves the outer name as it was.
+            with pytest.raises(ValueError, match="Unknown connection: 'nope'"):
+                async with SurrealDBConnectionManager.using("nope"):
+                    pass  # pragma: no cover
+            assert _active() == "md_a"
+        assert _active() is None
+        with pytest.raises(KeyError):
+            async with SurrealDBConnectionManager.using("md_a"):
+                raise KeyError("x")
+        assert _active() is None
+
+    async def test_context_semantics(self) -> None:
+        """M9: a task created inside keeps the name after the block; ``to_thread`` and ``gather`` children carry it;
+        a new thread starts without it."""
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        released = asyncio.Event()
+        seen: dict[str, Any] = {}
+
+        async def outlives_the_block() -> None:
+            seen["task, in the block"] = _active()
+            await released.wait()
+            seen["task, after the block"] = _active()
+
+        async def child() -> str | None:
+            return _active()
+
+        in_thread: dict[str, Any] = {}
+        async with SurrealDBConnectionManager.using("md_a"):
+            task = asyncio.create_task(outlives_the_block())
+            seen["to_thread"] = await asyncio.to_thread(_active)
+            seen["gather"] = await asyncio.gather(child(), child())
+            thread = threading.Thread(target=lambda: in_thread.setdefault("name", _active()))
+            thread.start()
+            await asyncio.to_thread(thread.join, 10)
+            assert not thread.is_alive()
+        assert _active() is None
+        released.set()
+        await task
+        assert seen == {
+            "task, in the block": "md_a",
+            "task, after the block": "md_a",
+            "to_thread": "md_a",
+            "gather": ["md_a", "md_a"],
+        }
+        assert in_thread == {"name": None}
+
+    async def test_when_the_connection_is_resolved(self) -> None:
+        """D25: a coroutine method resolves its connection when it starts running; a context-manager factory (and
+        any plain method) at the call."""
+        SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="d")
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        default_client = await SurrealDBConnectionManager.get_client()
+        a_client = await SurrealDBConnectionManager.get_client("md_a")
+        assert default_client is not a_client
+        created_outside = SurrealDBConnectionManager.get_client()
+        async with SurrealDBConnectionManager.using("md_a"):
+            created_inside = SurrealDBConnectionManager.get_client()
+            factory_inside = SurrealDBConnectionManager.transaction()
+            assert await SurrealDBConnectionManager.get_client() is a_client
+            # Created outside, awaited inside: the block's connection.
+            assert await created_outside is a_client
+        # Created inside, awaited outside: the default.
+        assert await created_inside is default_client
+        # The factory resolved at the call: entered outside the block, it still runs on md_a.
+        async with factory_inside as tx:
+            assert tx._client is a_client
+        async with SurrealDBConnectionManager.transaction() as tx:
+            assert tx._client is default_client
+
+    async def test_a_connection_removed_inside_its_block(self) -> None:
+        """P6 with ``using()``: ``close_connection()`` returns ``None`` and closes nothing, ``get_client()`` raises R1,
+        and the block still exits cleanly."""
+        loop = asyncio.get_running_loop()
+        SurrealDBConnectionManager.set_connection(url=_UNREACHABLE, user="u", password="p", namespace="t", database="d")
+        default_client = _FakeServerClient()
+        vars(default_connection_class())[_P + "clients"][loop] = default_client
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        async with SurrealDBConnectionManager.using("md_a"):
+            await SurrealDBConnectionManager.get_client()
+            await SurrealDBConnectionManager.remove_connection("md_a")
+            assert _active() == "md_a"
+            assert await SurrealDBConnectionManager.close_connection() is None
+            assert vars(default_connection_class())[_P + "clients"][loop] is default_client
+            assert default_client.close_calls == 0
+            with pytest.raises(ValueError, match=r"^Unknown connection: 'md_a'\. Register it with add_connection"):
+                await SurrealDBConnectionManager.get_client()
+            with pytest.raises(ValueError, match=r"^Unknown connection: 'md_a'\."):
+                SurrealDBConnectionManager.get_url()
+        assert _active() is None
+        assert SurrealDBConnectionManager.get_url() == _UNREACHABLE
+
+
+@pytest.mark.usefixtures("unset_default", "clear_live_registry")
+class TestRoutingTable:
+    """AC-5, spec §5.4: on the router, a method acts on the name given, else the ``using()`` block's connection, else
+    the default — except ``set_connection()``/``unset_connection()`` (the default) and ``close_all_connections()``
+    (every connection). ``mem://`` connections; the default on an address nothing listens on, never contacted."""
+
+    @staticmethod
+    def _connections() -> tuple[
+        type[SurrealDBConnectionManager], type[SurrealDBConnectionManager], type[SurrealDBConnectionManager]
+    ]:
+        SurrealDBConnectionManager.set_connection(url=_UNREACHABLE, user="u", password="p", namespace="t", database="d")
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        SurrealDBConnectionManager.add_connection("md_b", url="mem://", namespace="t", database="b")
+        return (
+            default_connection_class(),
+            SurrealDBConnectionManager._manager_for("md_a"),
+            SurrealDBConnectionManager._manager_for("md_b"),
+        )
+
+    async def test_the_current_methods_act_on_the_block_connection(self) -> None:
+        default, md_a, md_b = self._connections()
+        router = SurrealDBConnectionManager
+        async with router.using("md_a"):
+            # Settings, read.
+            assert router.get_url() == router.get_connection_string() == "mem://"
+            assert (router.get_namespace(), router.get_database(), router.get_user()) == ("t", "a", None)
+            assert router.get_connection_kwargs() == {"url": "mem://", "user": None, "namespace": "t", "database": "a"}
+            assert router.is_password_set() is False
+            assert router.is_embedded() is True
+            assert router.is_connection_set() is True
+            router.require_connection()
+            # The client, the connection state, a transaction.
+            assert router.is_connected() is False
+            client = await router.get_client()
+            assert client is vars(md_a)[_P + "embedded_client"]
+            assert router.is_connected() is True
+            assert await router.validate_connection() is True
+            async with router.transaction() as tx:
+                assert tx._client is client
+            with pytest.raises(SurrealDbError, match=r"ephemeral_client\(\) opens a second session"):
+                async with router.ephemeral_client():
+                    pass  # pragma: no cover
+            # The session: the embedded owner answers, the default (never contacted) is not asked.
+            assert await router.info() is None
+            await router.invalidate()
+            with pytest.raises(SurrealDbAuthenticationError):
+                await router.authenticate("not-a-jwt")
+            # A stored function, read and called on md_a.
+            await client.query("DEFINE FUNCTION fn::md_ping() { RETURN 'md_a'; };", {})
+            assert await router.call_function("md_ping") == "md_a"
+            # reconnect() reopens md_a's engine and hands back its new client.
+            again = await router.reconnect()
+            assert again is not client
+            assert again is vars(md_a)[_P + "embedded_client"]
+            # Settings, written.
+            await router.set_namespace("n2")
+            await router.set_database("a2")
+            await router.set_user("ua")
+            await router.set_password("pa")
+            await router.set_url("mem://")
+            assert router.get_config("md_a") == ConnectionConfig("mem://", "ua", "pa", "n2", "a2")
+            # The stored session and the function signatures.
+            setattr(md_a, _P + "session_token", "a-token")
+            setattr(md_a, _P + "refresh_token", "a-refresh")
+            setattr(default, _P + "session_token", "d-token")
+            vars(md_a)[_P + "function_signatures"][("mem://", "n2", "a2", "fn::x")] = ("x",)
+            vars(default)[_P + "function_signatures"][(_UNREACHABLE, "t", "d", "fn::x")] = ("x",)
+            assert router.is_authenticated() is True
+            assert (router.get_session_token(), router.get_refresh_token()) == ("a-token", "a-refresh")
+            assert router.function_signature_cache_size() == 1
+            router.clear_function_signature_cache()
+            router.clear_session()
+            assert router.function_signature_cache_size() == 0
+            assert router.is_authenticated() is False
+            # close_connection() closes md_a's engine only.
+            assert md_b.is_connected() is False
+            await router.get_client("md_b")
+            await router.close_connection()
+            assert md_a.is_connected() is False
+            assert md_b.is_connected() is True
+        # Outside the block: the default, untouched.
+        assert router.get_config("default") == ConnectionConfig(_UNREACHABLE, "u", "p", "t", "d")
+        assert router.is_embedded() is False
+        assert router.get_session_token() == "d-token"
+        assert router.function_signature_cache_size() == 1
+        assert router.is_connected() is False
+        router.clear_session()
+
+    async def test_an_explicit_name_wins_over_the_block(self) -> None:
+        _, md_a, md_b = self._connections()
+        router = SurrealDBConnectionManager
+        async with router.using("md_a"):
+            b_client = await router.get_client("md_b")
+            assert b_client is vars(md_b)[_P + "embedded_client"]
+            async with router.transaction("md_b") as tx:
+                assert tx._client is b_client
+            a_client = await router.get_client()
+            assert a_client is not b_client
+            await router.close_connection(name="md_b")
+            assert md_b.is_connected() is False
+            assert md_a.is_connected() is True
+
+    async def test_set_and_unset_connection_act_on_the_default(self) -> None:
+        self._connections()
+        router = SurrealDBConnectionManager
+        async with router.using("md_a"):
+            router.set_connection(url="mem://", namespace="t", database="d2")
+            assert router.get_database() == "a"
+            assert router.get_config("default") == ConnectionConfig("mem://", None, None, "t", "d2")
+            await router.unset_connection()
+            assert router.get_config("default") is None
+            assert router.get_config("md_a") == ConnectionConfig("mem://", None, None, "t", "a")
+            assert router.get_url() == "mem://"
+        assert router.get_url() is None
+        assert router.list_connections() == ["md_a", "md_b"]
+
+    async def test_close_all_connections_closes_every_connection(self) -> None:
+        loop = asyncio.get_running_loop()
+        default, md_a, md_b = self._connections()
+        default_client = _FakeServerClient()
+        vars(default)[_P + "clients"][loop] = default_client
+        await SurrealDBConnectionManager.get_client("md_a")
+        await SurrealDBConnectionManager.get_client("md_b")
+        async with SurrealDBConnectionManager.using("md_a"):
+            await SurrealDBConnectionManager.close_all_connections()
+        assert md_a.is_connected() is False
+        assert md_b.is_connected() is False
+        assert len(vars(default)[_P + "clients"]) == 0
+        assert default_client.close_calls == 1
+
+    async def test_the_instance_context_manager_uses_the_block_connection(self) -> None:
+        _, md_a, md_b = self._connections()
+        await SurrealDBConnectionManager.get_client("md_b")
+        async with SurrealDBConnectionManager.using("md_a"):
+            async with SurrealDBConnectionManager() as client:
+                assert client is vars(md_a)[_P + "embedded_client"]
+            assert vars(md_a)[_P + "embedded_client"] is None
+            assert md_a.is_connected() is False
+        assert md_b.is_connected() is True
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestNamedTexts:
+    """AC-29, spec R9, R10, D24: the texts of a named connection name it; the default's stay byte-identical."""
+
+    async def test_r9_names_the_connection(self) -> None:
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        async with SurrealDBConnectionManager.using("md_a"):
+            await SurrealDBConnectionManager.set_database("")
+            with pytest.raises(ValueError) as info:
+                await SurrealDBConnectionManager.get_client()
+            assert str(info.value) == "Connection not been set ('md_a')."
+            with pytest.raises(ValueError, match=r"^Connection not been set \('md_a'\)\.$"):
+                SurrealDBConnectionManager.require_connection()
+        with pytest.raises(ValueError) as info:
+            await SurrealDBConnectionManager.get_client()
+        assert str(info.value) == "Connection not been set."
+        with pytest.raises(ValueError) as info:
+            await SurrealDBConnectionManager.get_client("default")
+        assert str(info.value) == "Connection not been set."
+
+    def test_r10_names_the_connection(self) -> None:
+        named = SurrealDBConnectionManager._lost_identity_error("md_a")
+        assert isinstance(named, SurrealDbAuthenticationError)
+        assert str(named).startswith("The SurrealDB connection 'md_a' on this event loop dropped")
+        assert str(named) == _V028_LOST_IDENTITY.replace("The SurrealDB connection on", "The SurrealDB connection 'md_a' on", 1)
+        assert str(SurrealDBConnectionManager._lost_identity_error("default")) == _V028_LOST_IDENTITY
+        assert str(SurrealDBConnectionManager._lost_identity_error(None)) == _V028_LOST_IDENTITY
+
+
 # === E2E: the line under test (ws, http) and the embedded engine =============================================
 
 
@@ -1245,3 +1582,149 @@ class TestServerBesideEmbeddedE2E:
             for name in ("md_a", "md_b", "md_mem"):
                 await SurrealDBConnectionManager.remove_connection(name)
             await _reset_databases(define=False)
+
+
+#: A record access on database ``md_a`` only (AC-11): a record user signs up and in there, and reads itself.
+_RECORD_ACCESS = (
+    "DEFINE TABLE OVERWRITE md_account SCHEMALESS PERMISSIONS FOR select, update WHERE id = $auth.id;"
+    "DEFINE ACCESS OVERWRITE md_account ON DATABASE TYPE RECORD"
+    " SIGNUP (CREATE md_account SET email = $email, pass = crypto::argon2::generate($pass))"
+    " SIGNIN (SELECT * FROM md_account WHERE email = $email AND crypto::argon2::compare(pass, $pass))"
+    " DURATION FOR TOKEN 15m, FOR SESSION 12h;"
+)
+
+
+@contextlib.asynccontextmanager
+async def _record_access(url: str | None = None) -> AsyncIterator[dict[str, str]]:
+    """``md_a`` registered on database ``md_a`` (through *url*, else straight to the line under test), with the
+    record access ``md_account`` defined there only; the default connection on ``ns``/``db`` as root. Yields the
+    variables of a record user to sign up."""
+    await _reset_databases(define=True)
+    async with _root("md_a") as root:
+        await root.query(_RECORD_ACCESS, {})
+    SurrealDBConnectionManager.set_connection(url=_url("ws"), user="root", password="root", namespace="ns", database="db")
+    SurrealDBConnectionManager.add_connection(
+        "md_a", url=url or _url("ws"), user="root", password="root", namespace="ns", database="md_a"
+    )
+    try:
+        yield {"email": f"{uuid4().hex}@example.test", "pass": "s3cret-passphrase"}
+    finally:
+        await SurrealDBConnectionManager.remove_connection("md_a")
+        SurrealDBConnectionManager.clear_session()
+        await SurrealDBConnectionManager.close_connection()
+        await _reset_databases(define=False)
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestSessionsPerConnectionE2E:
+    """AC-11 (both lines, ws): a session is stored, replayed, lost and ended per connection — ``using()`` picks it."""
+
+    async def test_a_record_session_stays_on_its_connection(self) -> None:
+        router = SurrealDBConnectionManager
+        async with _record_access() as variables:
+            default_client = await router.get_client()
+            async with router.using("md_a"):
+                assert router.is_authenticated() is False
+                tokens = await router.signup(access="md_account", variables=variables)
+                assert router.is_authenticated() is True
+                assert router.get_session_token() == tokens.access
+                me = await router.info()
+                assert me is not None and me["email"] == variables["email"]
+            # The default: no session, still root.
+            assert router.is_authenticated() is False
+            assert router.get_session_token() is None
+            assert await router.info() is None
+            assert await router.get_client() is default_client
+            # reconnect() inside the block replays md_a's token, and only on md_a.
+            async with router.using("md_a"):
+                before = await router.get_client()
+                again = await router.reconnect()
+                assert again is not before
+                me = await router.info()
+                assert me is not None and me["email"] == variables["email"]
+                assert router.get_session_token() == tokens.access
+            assert await router.get_client() is default_client
+            assert await router.info() is None
+            assert SurrealDBConnectionManager._manager_for("md_a").get_session_token() == tokens.access
+
+    async def test_invalidate_and_clear_session_act_on_the_block_connection(self) -> None:
+        router = SurrealDBConnectionManager
+        async with _record_access() as variables:
+            await router.signin(username="root", password="root")
+            default_token = router.get_session_token()
+            assert default_token is not None
+            async with router.using("md_a"):
+                await router.signup(access="md_account", variables=variables)
+                await router.invalidate()
+                assert router.is_authenticated() is False
+                assert await router.info() is None
+                await router.signin(access="md_account", variables=variables)
+                assert router.is_authenticated() is True
+                router.clear_session()
+                assert router.is_authenticated() is False
+                # clear_session() forgets the replay only: the live session is still the record user.
+                me = await router.info()
+                assert me is not None and me["email"] == variables["email"]
+            assert router.get_session_token() == default_token
+            assert await router.info() is None
+
+    async def test_a_dropped_unstored_session_blocks_only_its_connection(self) -> None:
+        """R10: the lost-identity state is per connection and event loop, and its error names the connection."""
+        router = SurrealDBConnectionManager
+        async with CuttableProxy() as proxy, _record_access(proxy.url()) as variables:
+            async with router.using("md_a"):
+                await router.signup(access="md_account", variables=variables, store=False)
+                assert router.is_authenticated() is False
+                client = await router.get_client()
+                receiving = live.recv_task_of(client)
+                assert receiving is not None
+                proxy.cut()
+                await asyncio.wait({receiving}, timeout=10)
+                assert live.is_dead(client)
+                with pytest.raises(SurrealDbAuthenticationError) as info:
+                    await router.get_client()
+                assert str(info.value).startswith("The SurrealDB connection 'md_a' on this event loop dropped")
+            # The default is served, as its configured user.
+            default_client = await router.get_client()
+            assert await default_client.query("RETURN 1;", {}) == 1
+            assert await router.info() is None
+            async with router.using("md_a"):
+                with pytest.raises(SurrealDbAuthenticationError, match="'md_a'"):
+                    await router.get_client()
+                # An explicit choice ends the state: back to the configured user.
+                await router.reconnect()
+                assert await router.info() is None
+
+
+class TestConcurrentBlocksE2E:
+    """AC-23 (tasks): two tasks, each inside its own ``using()`` block and interleaved, write their own database
+    (``mem://``)."""
+
+    async def test_two_tasks_in_two_blocks(self) -> None:
+        _register("mem", "md_a", database="md_a")
+        _register("mem", "md_b", database="md_b")
+        a_open, b_open, a_wrote = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def write(name: str, mine: asyncio.Event, theirs: asyncio.Event) -> tuple[str | None, Any]:
+            async with SurrealDBConnectionManager.using(name):
+                mine.set()
+                await theirs.wait()  # both blocks are open from here on
+                if name == "md_b":
+                    await a_wrote.wait()  # md_a writes first, then md_b while md_a's block is still open
+                client = await SurrealDBConnectionManager.get_client()
+                await client.query("UPSERT md_item:1 SET v = $v;", {"v": name})
+                if name == "md_a":
+                    a_wrote.set()
+                    await b_open.wait()
+                return SurrealDBConnectionManager.get_active_connection_name(), client
+
+        (a_name, a_client), (b_name, b_client) = await asyncio.gather(
+            write("md_a", a_open, b_open), write("md_b", b_open, a_open)
+        )
+        assert (a_name, b_name) == ("md_a", "md_b")
+        assert _active() is None
+        assert a_client is await SurrealDBConnectionManager.get_client("md_a")
+        assert b_client is await SurrealDBConnectionManager.get_client("md_b")
+        assert a_client is not b_client
+        assert _values(await _rows_of(a_client, "md_item")) == ["md_a"]
+        assert _values(await _rows_of(b_client, "md_item")) == ["md_b"]

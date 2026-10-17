@@ -212,7 +212,8 @@ class SurrealDBConnectionManager:
     Every classmethod acts on a **connection**. Each connection — the default one included — is a private subclass
     of this class whose name-mangled class attributes are that connection's state (:data:`_STATE`), so every method
     body runs unchanged on its connection's class. This class itself holds no connection state: a classmethod called
-    on it resolves the connection class (the default one, unless said otherwise) and runs there.
+    on it resolves the connection class — the ``name`` it is given, else the innermost :meth:`using` block's, else
+    the default one — and runs there.
     """
 
     #: The connection's name on a connection class; ``None`` on this class, the router.
@@ -494,6 +495,49 @@ class SurrealDBConnectionManager:
         return [name for name, connection in list(_REGISTRY.items()) if connection.get_url() is not None]
 
     @classmethod
+    @contextlib.asynccontextmanager
+    async def using(cls, name: str) -> AsyncIterator[None]:
+        """Run a block of code against a named connection (v0.29.0) — the full SurrealDB-ORM's ``using()``.
+
+        ::
+
+            async with SurrealDBConnectionManager.using("archive"):
+                old = await Order.objects().filter(year=2020).exec()     # read in "archive"
+                await SurrealDBConnectionManager.signin(username="ops", password="…")   # "archive"'s session
+
+        Inside the block every model — whatever its ``model_config`` connection — and every manager method that talks
+        to a database use *name*: the method's explicit ``name`` argument wins (:meth:`get_client`,
+        :meth:`close_connection`, :meth:`transaction`), :meth:`set_connection` and :meth:`unset_connection` keep acting
+        on the default connection, and :meth:`close_all_connections` on every one. Async-safe: the override is a
+        ``contextvars.ContextVar``, so concurrent tasks each see their own block. A task created inside the block
+        keeps the override for its whole life, even after the block exits; ``asyncio.to_thread`` carries it, a new
+        thread does not. Blocks nest; the outer override is back after the inner block, also on an exception. Live
+        streams and change feeds started inside the block keep its connection for their whole life.
+
+        A coroutine method resolves its connection when it starts running, a plain method or a context-manager
+        factory (:meth:`transaction`, :meth:`ephemeral_client`) when it is called: ``await get_client()`` and ``async
+        with transaction():`` written inside the block both act on its connection.
+
+        :raises TypeError: *name* is not a ``str``.
+        :raises ValueError: *name* is empty, or not a registered connection — at entry, before the block runs.
+        """
+        name = check_name(name)
+        connection = _REGISTRY.get(name)
+        # Listed by list_connections(): registered and configured (the default is registered from the start).
+        if connection is None or connection.get_url() is None:
+            raise ValueError(f"Unknown connection: {name!r}. Register it with add_connection() first.")
+        token = _ACTIVE.set(name)
+        try:
+            yield
+        finally:
+            _ACTIVE.reset(token)
+
+    @classmethod
+    def get_active_connection_name(cls) -> str | None:
+        """The name ``using()`` set for the running code, or ``None`` outside any block (v0.29.0)."""
+        return _ACTIVE.get()
+
+    @classmethod
     @_routed("current")
     def _settings(cls) -> tuple[str | None, str | None, str | None, str | None, str | None]:
         """The connection's ``(url, user, password, namespace, database)``: what "the same settings" compares."""
@@ -650,12 +694,17 @@ class SurrealDBConnectionManager:
         A URL the installed SDK refuses is reported first, whatever else is missing: the
         ``SurrealDbConnectionError`` quoting the SDK says what to fix, "not been set" would not.
 
+        On a named connection (v0.29.0) the text names it — ``"Connection not been set ('archive')."`` — and the
+        default connection keeps ``"Connection not been set."`` exactly.
+
         :raises SurrealDbConnectionError: the configured URL is one the SDK refuses (never retryable).
         :raises ValueError: a setting is missing.
         """
         require_supported_url(cls.__url)
         if not cls.is_connection_set():
-            raise ValueError("Connection not been set.")
+            if cls._connection_name in (None, "default"):
+                raise ValueError("Connection not been set.")
+            raise ValueError(f"Connection not been set ({cls._connection_name!r}).")
 
     @classmethod
     @_routed("current")
@@ -810,7 +859,7 @@ class SurrealDBConnectionManager:
             # serve the configuration as it is now.
             return await cls._acquire_client(restoring_identity=restoring_identity, still_wanted=still_wanted)
         if not restoring_identity and loop in cls.__lost_identity:
-            raise cls._lost_identity_error()
+            raise cls._lost_identity_error(cls._connection_name)
 
         existing = cls.__clients.get(loop)
         if existing is not None and not is_dead(existing):
@@ -830,13 +879,16 @@ class SurrealDBConnectionManager:
                 if stamp is not None and not stamp[1]:
                     cls.__lost_identity.add(loop)
             if not restoring_identity and loop in cls.__lost_identity:
-                raise cls._lost_identity_error()
+                raise cls._lost_identity_error(cls._connection_name)
             return await cls._connect_for_loop(loop, still_wanted)
 
     @staticmethod
-    def _lost_identity_error() -> SurrealDbAuthenticationError:
+    def _lost_identity_error(connection: str | None) -> SurrealDbAuthenticationError:
+        """The lost-identity error of *connection*: named for a named connection (v0.29.0), the v0.28.0 text for the
+        default one (``"default"`` or ``None``)."""
+        named = "" if connection in (None, "default") else f" {connection!r}"
         return SurrealDbAuthenticationError(
-            "The SurrealDB connection on this event loop dropped while it was authenticated as an "
+            f"The SurrealDB connection{named} on this event loop dropped while it was authenticated as an "
             "identity the connection manager does not store (signin/signup/authenticate with "
             "store=False), so a new connection cannot restore it — and answering as the configured "
             "user instead would silently change privileges. Sign in or authenticate again, call "
