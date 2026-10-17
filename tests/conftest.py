@@ -95,6 +95,15 @@ def _boundary_identity_guard(request: pytest.FixtureRequest, monkeypatch: pytest
     assert not seen, f"encode() rewrote values in a v0.22.2 test: {seen}"
 
 
+def default_connection_class() -> type[SurrealDBConnectionManager]:
+    """The default connection's class (v0.29.0): where its private, name-mangled state lives (white box).
+
+    The public ``SurrealDBConnectionManager`` routes every call to a connection class and holds no state of its own,
+    so a test that reads or writes the default connection's private attributes does it here.
+    """
+    return SurrealDBConnectionManager._manager_for("default")
+
+
 def _ws_url() -> str:
     host = os.environ.get("SURREALDB_HOST", "localhost")
     port = os.environ.get("SURREALDB_PORT", "8000")

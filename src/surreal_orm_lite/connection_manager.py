@@ -1,13 +1,16 @@
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import hashlib
+import inspect
 import logging
 import threading
 import weakref
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from functools import lru_cache
-from typing import Any
+from typing import Any, ClassVar, Concatenate, Final, Literal, ParamSpec, TypeVar, cast
 from uuid import UUID
 
 from pydantic import TypeAdapter, ValidationError
@@ -86,7 +89,107 @@ class _ManagerState:
     embedded_selection: tuple[str | None, str | None] | None
 
 
+#: A connection's state (v0.29.0): each name-mangled state attribute of :class:`SurrealDBConnectionManager`, with
+#: the factory of its fresh value. A connection class gets one fresh value of each (:func:`_new_connection_class`);
+#: a state attribute declared without an entry here would be shared by every connection, which a test forbids.
+_STATE: Final[tuple[tuple[str, Callable[[], Any]], ...]] = (
+    ("url", lambda: None),
+    ("user", lambda: None),
+    ("password", lambda: None),
+    ("namespace", lambda: None),
+    ("database", lambda: None),
+    ("clients", weakref.WeakKeyDictionary),
+    ("open_locks", weakref.WeakKeyDictionary),
+    ("function_signatures", dict),
+    ("session_token", lambda: None),
+    ("refresh_token", lambda: None),
+    ("client_identities", weakref.WeakKeyDictionary),
+    ("lost_identity", weakref.WeakSet),
+    ("embedded_client", lambda: None),
+    ("embedded_url", lambda: None),
+    ("embedded_selection", lambda: None),
+    ("embedded_lock", threading.Lock),
+)
+
+#: Which connection a routed classmethod acts on when called on the router (spec §5.4): the current one (the
+#: explicit name, else the ``using()`` override, else ``"default"``), always the default one, every registered one,
+#: or the one whose live stream started the uuid.
+_Policy = Literal["current", "default", "every", "live"]
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+_M = TypeVar("_M", bound="SurrealDBConnectionManager")
+
+
+def _routed(
+    policy: _Policy,
+) -> Callable[[Callable[Concatenate[type[_M], _P], _R]], Callable[Concatenate[type[_M], _P], _R]]:
+    """Run a classmethod of :class:`SurrealDBConnectionManager` on the connection class it resolves to.
+
+    Called on the router, the method runs on the connection class :meth:`SurrealDBConnectionManager._route`
+    returns; called on a connection class, on that class itself, so a method body never re-routes its internal
+    calls. Two wrappers, chosen once here: an ``async def`` one for a coroutine function, so
+    ``inspect.iscoroutinefunction()`` keeps its answer (Python 3.11 has no ``inspect.markcoroutinefunction()``),
+    and a plain one for the rest — the ``asynccontextmanager`` factories included, which resolve at the call. The
+    explicit connection name is read only from a ``name`` parameter declared first after ``cls``. The wrapper
+    carries ``functools.wraps`` and the marker ``__surreal_routed__`` (the policy). Under ``@classmethod``, and
+    above ``@contextlib.asynccontextmanager``; under ``@_cache.invalidates(...)`` too (``signup``), whose wrapper
+    stays outermost.
+    """
+
+    def decorate(func: Callable[Concatenate[type[_M], _P], _R]) -> Callable[Concatenate[type[_M], _P], _R]:
+        parameters = list(inspect.signature(func).parameters)
+        takes_name = len(parameters) > 1 and parameters[1] == "name"
+
+        def explicit_name(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+            if not takes_name:
+                return None
+            return args[0] if args else kwargs.get("name")
+
+        body: Any = func
+        wrapper: Any
+        if inspect.iscoroutinefunction(func):
+
+            @functools.wraps(func)
+            async def routed_coroutine(cls: Any, *args: Any, **kwargs: Any) -> Any:
+                if policy == "every" and cls._connection_name is None:
+                    # On the router: every registered connection, then whatever live reader none of them owns.
+                    for connection in list(_REGISTRY.values()):
+                        await body(connection, *args, **kwargs)
+                    close_all_subscribers(every_loop=True)
+                    return None
+                target = cls._route(explicit_name(args, kwargs), policy=policy)
+                return await body(target, *args, **kwargs)
+
+            wrapper = routed_coroutine
+        else:
+
+            @functools.wraps(func)
+            def routed(cls: Any, *args: Any, **kwargs: Any) -> Any:
+                target = cls._route(explicit_name(args, kwargs), policy=policy)
+                return body(target, *args, **kwargs)
+
+            wrapper = routed
+        wrapper.__surreal_routed__ = policy
+        return cast(Callable[Concatenate[type[_M], _P], _R], wrapper)
+
+    return decorate
+
+
 class SurrealDBConnectionManager:
+    """The connection manager: settings, per-event-loop clients, the session, transactions and live queries.
+
+    Every classmethod acts on a **connection**. Each connection — the default one included — is a private subclass
+    of this class whose name-mangled class attributes are that connection's state (:data:`_STATE`), so every method
+    body runs unchanged on its connection's class. This class itself holds no connection state: a classmethod called
+    on it resolves the connection class (the default one, unless said otherwise) and runs there.
+    """
+
+    #: The connection's name on a connection class; ``None`` on this class, the router.
+    _connection_name: ClassVar[str | None] = None
+
+    # The template of a connection's state: every name-mangled attribute below has an entry in _STATE, and a
+    # connection class gets fresh values of its own. Never written on the router itself.
     __url: str | None = None
     __user: str | None = None
     __password: str | None = None
@@ -162,13 +265,52 @@ class SurrealDBConnectionManager:
     __embedded_selection: tuple[str | None, str | None] | None = None
     __embedded_lock: threading.Lock = threading.Lock()
 
+    #: The connection ``async with SurrealDBConnectionManager():`` resolved on entry, closed on exit.
+    _target: "type[SurrealDBConnectionManager]"
+
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        await SurrealDBConnectionManager.close_connection()
+        await self._target.close_connection()
 
     async def __aenter__(self) -> Any:
-        return await SurrealDBConnectionManager.get_client()
+        self._target = SurrealDBConnectionManager._manager_for()
+        return await self._target.get_client()
+
+    # ------------------------------------------------------------------
+    # Routing (v0.29.0)
+    # ------------------------------------------------------------------
 
     @classmethod
+    def _route(cls, name: str | None = None, *, policy: _Policy) -> "type[SurrealDBConnectionManager]":
+        """The connection class a routed classmethod called on *cls* runs on.
+
+        An explicit *name* wins; a connection class resolves to itself, so internal calls never re-route; on the
+        router, ``"default"`` is the default connection and every other policy the current one: the ``using()``
+        override, else ``"default"``. Never takes ``_REGISTRY_LOCK``: one ``dict`` lookup.
+
+        :raises ValueError: *name*, or the active override, is not a registered connection.
+        """
+        if name is None:
+            if cls._connection_name is not None:
+                return cls
+            active = None if policy == "default" else _ACTIVE.get()
+            if active is None:
+                return _REGISTRY["default"]
+            name = active
+        connection = _REGISTRY.get(name)
+        if connection is None:
+            raise ValueError(f"Unknown connection: {name!r}. Register it with add_connection() first.")
+        return connection
+
+    @classmethod
+    def _manager_for(cls, name: str | None = None) -> "type[SurrealDBConnectionManager]":
+        """The connection class of *name*, else of the current connection: the one resolver other modules use.
+
+        :raises ValueError: *name* is not a registered connection.
+        """
+        return cls._route(name, policy="current")
+
+    @classmethod
+    @_routed("default")
     def set_connection(
         cls,
         url: str,
@@ -214,6 +356,7 @@ class SurrealDBConnectionManager:
         cls.clear_function_signature_cache()
 
     @classmethod
+    @_routed("default")
     async def unset_connection(cls) -> None:
         """
         Clear all connection settings and close the connection (every loop's, and the embedded
@@ -230,6 +373,7 @@ class SurrealDBConnectionManager:
         await cls.close_all_connections()
 
     @classmethod
+    @_routed("current")
     def is_connection_set(cls) -> bool:
         """
         Check if the connection kwargs are set: URL, namespace and database, and — for a server URL — user
@@ -244,6 +388,7 @@ class SurrealDBConnectionManager:
         )
 
     @classmethod
+    @_routed("current")
     def is_embedded(cls) -> bool:
         """Whether the configured URL addresses the SDK's in-process engine (``mem://``, ``surrealkv://<path>`` …).
 
@@ -253,6 +398,7 @@ class SurrealDBConnectionManager:
         return is_embedded_url(cls.__url)
 
     @classmethod
+    @_routed("current")
     def __prune_dead_loops(cls) -> None:
         """Drop cached clients whose loop is closed.
 
@@ -268,6 +414,7 @@ class SurrealDBConnectionManager:
             logger.debug("Dropped the cached SurrealDB client of a closed event loop.")
 
     @classmethod
+    @_routed("current")
     def require_connection(cls) -> None:
         """Raise the canonical error if no connection has been configured.
 
@@ -286,6 +433,7 @@ class SurrealDBConnectionManager:
             raise ValueError("Connection not been set.")
 
     @classmethod
+    @_routed("current")
     async def _open_client(cls, *, signin_as_configured: bool) -> Any:
         """Open one SDK client on the configured URL/namespace/database.
 
@@ -365,6 +513,7 @@ class SurrealDBConnectionManager:
         return client
 
     @classmethod
+    @_routed("current")
     async def get_client(cls) -> Any:
         """
         Connect to the SurrealDB instance, reusing this event loop's client.
@@ -401,6 +550,7 @@ class SurrealDBConnectionManager:
         return await cls._acquire_client()
 
     @classmethod
+    @_routed("current")
     async def _acquire_client(
         cls,
         *,
@@ -463,6 +613,7 @@ class SurrealDBConnectionManager:
         )
 
     @classmethod
+    @_routed("current")
     def _identity_restored(cls) -> None:
         """The application set this loop's server identity itself: a lost-identity state is over.
 
@@ -473,6 +624,7 @@ class SurrealDBConnectionManager:
             cls.__lost_identity.discard(asyncio.get_running_loop())
 
     @classmethod
+    @_routed("current")
     async def _discard_dead_client(cls, loop: asyncio.AbstractEventLoop, client: Any) -> None:
         """Forget a client whose WebSocket dropped, so the next caller gets a working one.
 
@@ -521,11 +673,13 @@ class SurrealDBConnectionManager:
         return hashlib.sha256(material.encode()).hexdigest()
 
     @classmethod
+    @_routed("current")
     def _replay_identity(cls) -> str:
         """The fingerprint of the identity a new connection would come back as, right now."""
         return cls._fingerprint(cls.__url, cls.__namespace, cls.__database, cls.__user, cls.__session_token)
 
     @classmethod
+    @_routed("current")
     async def _connect_for_loop(cls, loop: asyncio.AbstractEventLoop, still_wanted: Callable[[], bool] | None = None) -> Any:
         """Open, sign in, replay the session and cache a client for *loop*. Caller holds the lock."""
         cls.require_connection()
@@ -563,6 +717,7 @@ class SurrealDBConnectionManager:
         )
 
     @classmethod
+    @_routed("current")
     async def _replay_then_publish(
         cls, client: Any, *, replayed: str, configured: str, publish: Callable[[Any, str], None]
     ) -> Any:
@@ -604,6 +759,7 @@ class SurrealDBConnectionManager:
         return client
 
     @classmethod
+    @_routed("current")
     def _publish(
         cls, loop: asyncio.AbstractEventLoop, client: Any, fingerprint: str, still_wanted: Callable[[], bool] | None
     ) -> None:
@@ -620,6 +776,7 @@ class SurrealDBConnectionManager:
         cls.__clients[loop] = client
 
     @classmethod
+    @_routed("current")
     async def _replay_session(cls, client: Any) -> None:
         """Re-establish the stored identity on a freshly built connection.
 
@@ -656,6 +813,7 @@ class SurrealDBConnectionManager:
     # ------------------------------------------------------------------
 
     @classmethod
+    @_routed("current")
     async def _acquire_embedded_client(cls) -> Any:
         """The process-wide client of the embedded engine: opened, re-selected or replaced as needed.
 
@@ -677,6 +835,7 @@ class SurrealDBConnectionManager:
             return await cls._held_embedded_client()
 
     @classmethod
+    @_routed("current")
     async def _held_embedded_client(cls) -> Any:
         """:meth:`_acquire_embedded_client` for a caller that holds the guard: the slot's client, opened,
         re-selected or replaced as needed, or ``None`` when the configured URL is no longer embedded."""
@@ -698,6 +857,7 @@ class SurrealDBConnectionManager:
         return await cls._open_embedded()
 
     @classmethod
+    @_routed("current")
     @contextlib.asynccontextmanager
     async def _exclusive_embedded_client(cls) -> AsyncIterator[Any]:
         """Hold the embedded engine's shared session for one identity exchange: model-level ``bind=True``, or a
@@ -717,6 +877,7 @@ class SurrealDBConnectionManager:
             yield await cls._held_embedded_client()
 
     @classmethod
+    @_routed("current")
     async def _open_embedded(cls) -> Any:
         """Open the configured embedded URL, replay the stored session and publish the client in the
         slot. Caller holds the guard, and the slot is empty."""
@@ -736,6 +897,7 @@ class SurrealDBConnectionManager:
         return await cls._replay_then_publish(client, replayed=replayed, configured=configured, publish=publish)
 
     @classmethod
+    @_routed("current")
     async def _reset_embedded_session(cls, client: Any) -> None:
         """Re-identify the shared embedded session on the configured selection. Caller holds the guard.
 
@@ -780,6 +942,7 @@ class SurrealDBConnectionManager:
         cls.__embedded_selection = (namespace, database)
 
     @classmethod
+    @_routed("current")
     @contextlib.asynccontextmanager
     async def _embedded_guard(cls) -> AsyncIterator[None]:
         """Hold the embedded slot's lock.
@@ -798,6 +961,7 @@ class SurrealDBConnectionManager:
             lock.release()
 
     @classmethod
+    @_routed("current")
     async def _forget_embedded(cls) -> None:
         """Close the embedded slot's client and empty the slot. Caller holds the guard.
 
@@ -818,6 +982,7 @@ class SurrealDBConnectionManager:
         cls.clear_function_signature_cache()
 
     @classmethod
+    @_routed("current")
     async def _close_embedded(cls) -> None:
         """Close the embedded engine's client, if the slot holds one (from any loop or thread)."""
         if cls.__embedded_client is None:
@@ -826,6 +991,7 @@ class SurrealDBConnectionManager:
             await cls._forget_embedded()
 
     @classmethod
+    @_routed("current")
     async def _enter_embedded_block(cls, url: str, namespace: str, database: str) -> _ManagerState:
         """Point the manager at an isolated embedded database for ``embedded_database()``; return what to put back.
 
@@ -861,6 +1027,7 @@ class SurrealDBConnectionManager:
         return state
 
     @classmethod
+    @_routed("current")
     async def _exit_embedded_block(cls, state: _ManagerState) -> None:
         """Close the block's engine and put back everything :meth:`_enter_embedded_block` snapshotted.
 
@@ -893,6 +1060,7 @@ class SurrealDBConnectionManager:
                     await block_client.close()
 
     @classmethod
+    @_routed("current")
     async def close_connection(cls) -> None:
         """
         Close this event loop's connection to the SurrealDB instance.
@@ -937,6 +1105,7 @@ class SurrealDBConnectionManager:
             await client.close()
 
     @classmethod
+    @_routed("every")
     async def close_all_connections(cls) -> None:
         """
         Close every cached connection, whatever loop created it.
@@ -964,6 +1133,7 @@ class SurrealDBConnectionManager:
         cls.__clients.clear()
 
     @classmethod
+    @_routed("current")
     @contextlib.asynccontextmanager
     async def ephemeral_client(cls) -> AsyncIterator[Any]:
         """A short-lived, **anonymous** client on the configured URL/namespace/database.
@@ -996,6 +1166,7 @@ class SurrealDBConnectionManager:
                 await client.close()
 
     @classmethod
+    @_routed("current")
     @contextlib.asynccontextmanager
     async def transaction(cls) -> Any:
         """Atomic transaction. Strategy depends on server capability:
@@ -1055,6 +1226,7 @@ class SurrealDBConnectionManager:
     # ------------------------------------------------------------------
 
     @classmethod
+    @_routed("current")
     @contextlib.asynccontextmanager
     async def _identity_client(cls) -> AsyncIterator[tuple[Any, bool]]:
         """The client whose identity :meth:`signin`, :meth:`signup`, :meth:`authenticate` or :meth:`invalidate`
@@ -1080,6 +1252,7 @@ class SurrealDBConnectionManager:
         yield await cls._acquire_client(restoring_identity=True), False
 
     @classmethod
+    @_routed("current")
     async def signin(
         cls,
         *,
@@ -1162,6 +1335,7 @@ class SurrealDBConnectionManager:
 
     @classmethod
     @_cache.invalidates("all")
+    @_routed("current")
     async def signup(
         cls,
         *,
@@ -1209,6 +1383,7 @@ class SurrealDBConnectionManager:
             return cls._adopt_tokens(tokens, store=store, operation="signup", client=client, embedded=embedded)
 
     @classmethod
+    @_routed("current")
     def _adopt_tokens(cls, tokens: Any, *, store: bool, operation: str, client: Any, embedded: bool) -> AuthTokens:
         """Convert the SDK's ``Tokens`` to :class:`AuthTokens`, optionally remembering it.
 
@@ -1234,6 +1409,7 @@ class SurrealDBConnectionManager:
         return adopted
 
     @classmethod
+    @_routed("current")
     def _stamp_identity(cls, client: Any, *, replayable: bool, fingerprint: str | None = None) -> None:
         """Record that the manager just set *client*'s identity, and whether a reconnect restores it,
         and mint the client's query-cache scope: a new one at every stamp, so cached results never
@@ -1248,6 +1424,7 @@ class SurrealDBConnectionManager:
         _cache.bind_scope(client)
 
     @classmethod
+    @_routed("current")
     def _cache_scope(cls, client: Any) -> int | None:
         """*client*'s live query-cache scope, or ``None`` for a client the manager did not stamp (or
         one that cannot be weakly referenced, whose reads are never cached): the one place a
@@ -1255,6 +1432,7 @@ class SurrealDBConnectionManager:
         return _cache.client_scope(client)
 
     @classmethod
+    @_routed("current")
     def _identity_of(cls, client: Any) -> tuple[str, bool] | None:
         """*client*'s identity stamp, or ``None`` for a client the manager did not identify."""
         try:
@@ -1263,6 +1441,7 @@ class SurrealDBConnectionManager:
             return None
 
     @classmethod
+    @_routed("current")
     async def authenticate(cls, token: str, *, store: bool = True, refresh: str | None = None) -> None:
         """Authenticate the connection with a JWT obtained earlier.
 
@@ -1312,6 +1491,7 @@ class SurrealDBConnectionManager:
                 cls._identity_restored()
 
     @classmethod
+    @_routed("current")
     async def invalidate(cls) -> None:
         """End the current session and return the connection to its configured identity.
 
@@ -1378,6 +1558,7 @@ class SurrealDBConnectionManager:
             raise wrap_auth_error(exc, "invalidate (restoring the configured identity)") from exc
 
     @classmethod
+    @_routed("current")
     async def _reselect_after_invalidate(cls, client: Any) -> None:
         """The embedded half of :meth:`invalidate`, once the SDK's ``invalidate()`` succeeded: the
         session is the in-process owner, and only the selection is left to restore. Caller holds
@@ -1406,6 +1587,7 @@ class SurrealDBConnectionManager:
         cls._stamp_identity(client, replayable=True)
 
     @classmethod
+    @_routed("current")
     def clear_session(cls) -> None:
         """Forget the stored tokens without touching the server or the connection settings.
 
@@ -1421,6 +1603,7 @@ class SurrealDBConnectionManager:
         cls.__refresh_token = None
 
     @classmethod
+    @_routed("current")
     def is_authenticated(cls) -> bool:
         """Whether the manager holds a session token it will replay on reconnect.
 
@@ -1433,6 +1616,7 @@ class SurrealDBConnectionManager:
         return cls.__session_token is not None
 
     @classmethod
+    @_routed("current")
     def get_session_token(cls) -> str | None:
         """The stored access token (JWT), or ``None``.
 
@@ -1444,6 +1628,7 @@ class SurrealDBConnectionManager:
         return cls.__session_token
 
     @classmethod
+    @_routed("current")
     def get_refresh_token(cls) -> str | None:
         """The stored refresh token, or ``None``.
 
@@ -1455,6 +1640,7 @@ class SurrealDBConnectionManager:
         return cls.__refresh_token
 
     @classmethod
+    @_routed("current")
     async def info(cls, *, return_type: Any = None) -> Any:
         """Return the record the connection is authenticated as, or ``None``.
 
@@ -1501,6 +1687,7 @@ class SurrealDBConnectionManager:
         return cls._coerce_result(value, return_type, "info()")
 
     @classmethod
+    @_routed("current")
     async def call_function(
         cls,
         function: str,
@@ -1622,6 +1809,7 @@ class SurrealDBConnectionManager:
             raise SurrealDbValidationError(f"The value returned by {subject} does not fit {return_type!r}: {exc}") from exc
 
     @classmethod
+    @_routed("current")
     async def _resolve_named_args(cls, client: Any, function: str, params: Mapping[str, Any]) -> list[Any]:
         """Order *params* by the function's declared signature.
 
@@ -1650,6 +1838,7 @@ class SurrealDBConnectionManager:
         return [params[name] for name in expected]
 
     @classmethod
+    @_routed("current")
     async def _function_signature(cls, client: Any, function: str, refresh: bool = False) -> tuple[str, ...]:
         """Return the declared parameter names of *function*, in order, caching the result.
 
@@ -1680,6 +1869,7 @@ class SurrealDBConnectionManager:
         return signature
 
     @classmethod
+    @_routed("current")
     def clear_function_signature_cache(cls) -> None:
         """Forget every cached stored-function signature.
 
@@ -1690,6 +1880,7 @@ class SurrealDBConnectionManager:
         cls.__function_signatures.clear()
 
     @classmethod
+    @_routed("current")
     def function_signature_cache_size(cls) -> int:
         """Number of cached stored-function signatures (introspection aid)."""
         return len(cls.__function_signatures)
@@ -1714,6 +1905,7 @@ class SurrealDBConnectionManager:
     # ------------------------------------------------------------------
 
     @classmethod
+    @_routed("live")
     def subscribe_live(cls, query_uuid: str | UUID) -> LiveIterator:
         """Iterate the raw notification envelopes of a running live query.
 
@@ -1746,6 +1938,7 @@ class SurrealDBConnectionManager:
         return open_stream(cls._live_client(), query_uuid)
 
     @classmethod
+    @_routed("current")
     def _cached_client(cls) -> Any:
         """This event loop's cached client, or ``None`` — never opens a connection."""
         try:
@@ -1755,6 +1948,7 @@ class SurrealDBConnectionManager:
         return cls.__clients.get(loop)
 
     @classmethod
+    @_routed("current")
     def _live_client(cls) -> Any:
         """The client already cached for this event loop.
 
@@ -1773,6 +1967,7 @@ class SurrealDBConnectionManager:
         return client
 
     @classmethod
+    @_routed("live")
     async def kill(cls, query_uuid: str | UUID) -> None:
         """Stop a live query and end every stream reading it.
 
@@ -1830,6 +2025,7 @@ class SurrealDBConnectionManager:
         return "KILL statement using id" in str(exc)
 
     @classmethod
+    @_routed("current")
     async def reconnect(cls) -> Any:
         """
         Reconnect to the SurrealDB instance.
@@ -1842,6 +2038,7 @@ class SurrealDBConnectionManager:
         return await cls.get_client()
 
     @classmethod
+    @_routed("current")
     async def validate_connection(cls) -> bool:
         """
         Validate the connection to the SurrealDB instance.
@@ -1866,6 +2063,7 @@ class SurrealDBConnectionManager:
             return False
 
     @classmethod
+    @_routed("current")
     def get_connection_string(cls) -> str | None:
         """
         Get the connection string for the SurrealDB instance.
@@ -1875,6 +2073,7 @@ class SurrealDBConnectionManager:
         return cls.__url
 
     @classmethod
+    @_routed("current")
     def get_connection_kwargs(cls) -> dict[str, str | None]:
         """
         Get the connection kwargs for the SurrealDB instance.
@@ -1889,6 +2088,7 @@ class SurrealDBConnectionManager:
         }
 
     @classmethod
+    @_routed("current")
     async def set_url(cls, url: str, reconnect: bool = False) -> bool:
         """
         Set the URL for the SurrealDB instance.
@@ -1908,6 +2108,7 @@ class SurrealDBConnectionManager:
         return True
 
     @classmethod
+    @_routed("current")
     async def set_user(cls, user: str, reconnect: bool = False) -> bool:
         """
         Set the username for authentication.
@@ -1927,6 +2128,7 @@ class SurrealDBConnectionManager:
         return True
 
     @classmethod
+    @_routed("current")
     async def set_password(cls, password: str, reconnect: bool = False) -> bool:
         """
         Set the password for authentication.
@@ -1946,6 +2148,7 @@ class SurrealDBConnectionManager:
         return True
 
     @classmethod
+    @_routed("current")
     async def set_namespace(cls, namespace: str, reconnect: bool = False) -> bool:
         """
         Set the namespace to use.
@@ -1972,6 +2175,7 @@ class SurrealDBConnectionManager:
         return True
 
     @classmethod
+    @_routed("current")
     async def set_database(cls, database: str, reconnect: bool = False) -> bool:
         """
         Set the database to use.
@@ -1995,6 +2199,7 @@ class SurrealDBConnectionManager:
         return True
 
     @classmethod
+    @_routed("current")
     def get_url(cls) -> str | None:
         """
         Get the URL of the SurrealDB instance.
@@ -2004,6 +2209,7 @@ class SurrealDBConnectionManager:
         return cls.__url
 
     @classmethod
+    @_routed("current")
     def get_user(cls) -> str | None:
         """
         Get the username for authentication.
@@ -2013,6 +2219,7 @@ class SurrealDBConnectionManager:
         return cls.__user
 
     @classmethod
+    @_routed("current")
     def get_namespace(cls) -> str | None:
         """
         Get the namespace to use.
@@ -2022,6 +2229,7 @@ class SurrealDBConnectionManager:
         return cls.__namespace
 
     @classmethod
+    @_routed("current")
     def get_database(cls) -> str | None:
         """
         Get the database to use.
@@ -2031,6 +2239,7 @@ class SurrealDBConnectionManager:
         return cls.__database
 
     @classmethod
+    @_routed("current")
     def is_password_set(cls) -> bool:
         """
         Check if the password is set.
@@ -2040,6 +2249,7 @@ class SurrealDBConnectionManager:
         return cls.__password is not None
 
     @classmethod
+    @_routed("current")
     def is_connected(cls) -> bool:
         """
         Check whether a connection to the SurrealDB instance is established.
@@ -2062,3 +2272,28 @@ class SurrealDBConnectionManager:
             return len(cls.__clients) > 0 or cls.__embedded_client is not None
 
         return cls.__clients.get(loop) is not None or cls.__embedded_client is not None
+
+
+def _new_connection_class(name: str) -> type[SurrealDBConnectionManager]:
+    """A new connection class for *name*: a subclass of the router with a fresh value of every state attribute."""
+    namespace: dict[str, Any] = {f"_SurrealDBConnectionManager__{key}": factory() for key, factory in _STATE}
+    namespace["_connection_name"] = name
+    namespace["__module__"] = __name__
+    return cast(
+        type[SurrealDBConnectionManager],
+        type(f"SurrealDBConnectionManager[{name!r}]", (SurrealDBConnectionManager,), namespace),
+    )
+
+
+#: The registered connections, by name, in registration order. The default connection is created at import and is
+#: never unregistered.
+_REGISTRY: dict[str, type[SurrealDBConnectionManager]] = {"default": _new_connection_class("default")}
+
+# Lock discipline. _REGISTRY_LOCK is a non-reentrant threading.Lock, held only around one read-modify-write of
+# _REGISTRY (a get-or-create, a pop), never while a method of a connection class runs (routed or not), never across
+# an await. The routing paths (_route(), _manager_for() and the "every"/"live" policies) never take it: they read
+# _REGISTRY with one dict lookup, or iterate a snapshot of it.
+_REGISTRY_LOCK = threading.Lock()
+
+#: The connection name a ``using()`` block sets for the code running inside it; ``None`` outside any block.
+_ACTIVE: ContextVar[str | None] = ContextVar("surreal_orm_lite_connection", default=None)

@@ -24,6 +24,7 @@ from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
 from surreal_orm_lite.exceptions import SurrealDbConnectionError
 from surreal_orm_lite.live import is_dead, recv_task_of
 from tests._proxy import CuttableProxy
+from tests.conftest import default_connection_class
 
 TABLE = "Reconnected"
 
@@ -1156,7 +1157,7 @@ class TestReplayTransportFailureUnit:
             url="ws://unused.invalid/rpc", user="root", password="root", namespace="ns", database="db"
         )
         monkeypatch.setattr(SurrealDBConnectionManager, "_open_client", classmethod(_open))
-        SurrealDBConnectionManager._SurrealDBConnectionManager__session_token = "stored-token"  # type: ignore[attr-defined]
+        default_connection_class()._SurrealDBConnectionManager__session_token = "stored-token"  # type: ignore[attr-defined]
         try:
             with pytest.raises(SurrealDbConnectionError) as excinfo:
                 await SurrealDBConnectionManager.get_client()

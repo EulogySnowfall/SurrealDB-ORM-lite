@@ -63,7 +63,7 @@ from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbC
 from surreal_orm_lite.live import require_websocket
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.transaction import BufferedTransaction
-from tests.conftest import _REWRITE_MODULES, _ws_url, orm_client
+from tests.conftest import _REWRITE_MODULES, _ws_url, default_connection_class, orm_client
 
 _T = TypeVar("_T")
 
@@ -192,18 +192,18 @@ async def _in_new_loop(fn: Callable[[], Coroutine[Any, Any, _T]]) -> _T:
 def _signatures() -> dict[tuple[str | None, str | None, str | None, str], tuple[str, ...]]:
     """The manager's stored-function signature cache (white box)."""
     cache: dict[tuple[str | None, str | None, str | None, str], tuple[str, ...]]
-    cache = SurrealDBConnectionManager._SurrealDBConnectionManager__function_signatures  # type: ignore[attr-defined]
+    cache = default_connection_class()._SurrealDBConnectionManager__function_signatures  # type: ignore[attr-defined]
     return cache
 
 
 def _slot_client() -> Any:
     """The manager's embedded slot (white box): its client, or ``None``."""
-    return getattr(SurrealDBConnectionManager, "_SurrealDBConnectionManager__embedded_client", None)
+    return getattr(default_connection_class(), "_SurrealDBConnectionManager__embedded_client", None)
 
 
 def _mark_selection_stale() -> None:
     """White box: what a failed selection reset leaves behind."""
-    SurrealDBConnectionManager._SurrealDBConnectionManager__embedded_selection = None  # type: ignore[attr-defined]
+    default_connection_class()._SurrealDBConnectionManager__embedded_selection = None  # type: ignore[attr-defined]
 
 
 #: A record access and its table, on the database ``t`` of the engine (spec AC-4).
@@ -859,7 +859,7 @@ class TestSelectionResetE2E:
         """§14.5: unchanged for server URLs in v0.25.0."""
         SurrealDBConnectionManager.set_connection("ws://127.0.0.1:1/rpc", "root", "root", "ns", "db")
         try:
-            SurrealDBConnectionManager._SurrealDBConnectionManager__session_token = "s"  # type: ignore[attr-defined]
+            default_connection_class()._SurrealDBConnectionManager__session_token = "s"  # type: ignore[attr-defined]
             assert await SurrealDBConnectionManager.set_database("other") is True
             assert await SurrealDBConnectionManager.set_namespace("other") is True
             assert SurrealDBConnectionManager.get_session_token() == "s"
@@ -905,7 +905,7 @@ class TestSelectionResetE2E:
 
     async def test_a_stale_selection_with_a_refused_token_forgets_it(self) -> None:
         async with embedded() as client:
-            SurrealDBConnectionManager._SurrealDBConnectionManager__session_token = "not-a-token"  # type: ignore[attr-defined]
+            default_connection_class()._SurrealDBConnectionManager__session_token = "not-a-token"  # type: ignore[attr-defined]
             _mark_selection_stale()
             with pytest.raises(SurrealDbAuthenticationError):
                 await SurrealDBConnectionManager.get_client()
@@ -1035,7 +1035,7 @@ class TestServerClientsUntouchedE2E:
     async def test_an_embedded_close_keeps_a_lost_identity(self) -> None:
         """Nor is a server loop's lost-identity guard lifted: ``close_connection()`` on the engine says nothing
         about which identity the next server connection should have. (No server: the guard raises first.)"""
-        lost: Any = SurrealDBConnectionManager._SurrealDBConnectionManager__lost_identity  # type: ignore[attr-defined]
+        lost: Any = default_connection_class()._SurrealDBConnectionManager__lost_identity  # type: ignore[attr-defined]
         try:
             SurrealDBConnectionManager.set_connection(
                 url=_ws_url(), user="root", password="root", namespace="ns", database="db"
@@ -1067,7 +1067,7 @@ class TestServerClientsUntouchedE2E:
         ``authenticate()``/``invalidate()`` or model auth with ``bind=True``, as ``close_connection()``: the
         engine's session says nothing about the server identity of the loop. (No server: the guard raises
         first.)"""
-        lost: Any = SurrealDBConnectionManager._SurrealDBConnectionManager__lost_identity  # type: ignore[attr-defined]
+        lost: Any = default_connection_class()._SurrealDBConnectionManager__lost_identity  # type: ignore[attr-defined]
         try:
             SurrealDBConnectionManager.set_connection(
                 url=_ws_url(), user="root", password="root", namespace="ns", database="db"

@@ -62,7 +62,7 @@ from surreal_orm_lite._sdk import AsyncSurreal, cbor_encode
 from surreal_orm_lite.cache import EDGES, CacheRequest, follows_links
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.transaction import BufferedTransaction, InteractiveTransaction
-from tests.conftest import _ws_url
+from tests.conftest import _ws_url, default_connection_class
 from tests.test_embedded import _cells, _normalised, _readme, _readme_part, _subsection, _table_rows, _tables
 from tests.test_subqueries import _SUBQUERY_ROWS
 from tests.test_time_travel import (
@@ -1152,7 +1152,7 @@ class _ClosableClient(_Client):
 
 def _manager_clients() -> Any:
     """The manager's per-loop clients (its private ``WeakKeyDictionary``, reached through the mangled name)."""
-    return SurrealDBConnectionManager._SurrealDBConnectionManager__clients  # type: ignore[attr-defined]
+    return default_connection_class()._SurrealDBConnectionManager__clients  # type: ignore[attr-defined]
 
 
 def _stamped(client: Any) -> int:

@@ -25,7 +25,7 @@ import surreal_orm_lite
 from surreal_orm_lite import BaseSurrealEdge, BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager, testing
 from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbConnectionError, SurrealDbError
 from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
-from tests.conftest import orm_client
+from tests.conftest import default_connection_class, orm_client
 from tests.test_embedded import (
     _calls_of,
     _count_constructions,
@@ -51,11 +51,11 @@ class Note(BaseSurrealModel):
 
 def _white(name: str) -> Any:
     """A private attribute of the connection manager (white box)."""
-    return getattr(SurrealDBConnectionManager, f"_SurrealDBConnectionManager__{name}")
+    return getattr(default_connection_class(), f"_SurrealDBConnectionManager__{name}")
 
 
 def _set_white(name: str, value: Any) -> None:
-    setattr(SurrealDBConnectionManager, f"_SurrealDBConnectionManager__{name}", value)
+    setattr(default_connection_class(), f"_SurrealDBConnectionManager__{name}", value)
 
 
 def _lost_identity() -> "weakref.WeakSet[asyncio.AbstractEventLoop]":
