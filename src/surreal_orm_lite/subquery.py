@@ -211,6 +211,12 @@ class SubqueryCompiler:
         lets: the ``LET $_sq<N> = …;`` of the block, innermost first.
         tables: the tables the subqueries read.
         edge_tables: the tables of edge models the subqueries read: the query cache tags such a read (v0.28.0).
+        warn: emit the warnings of the statement's filter values (the ``"$$"`` escape, a string naming a variable):
+            ``False`` when the statement is compiled again for a read that compiled it once (a ``cache()`` miss, a
+            re-send for a missing subquery table), so each read warns once (v0.28.1).
+        variable_like: the names of the scalar ``str`` filter values that are ``$`` and a variable name
+            (``"$x"`` gives ``x``), every subquery's included, in order: ``QuerySet._build_where`` warns for those
+            ``variables`` holds once the statement's conditions are compiled (v0.28.1).
         _stack: the ids of the querysets being rendered, the outer one first (a queryset cannot be its own subquery).
     """
 
@@ -222,6 +228,8 @@ class SubqueryCompiler:
     lets: list[str] = field(default_factory=list)
     tables: set[str] = field(default_factory=set)
     edge_tables: set[str] = field(default_factory=set)
+    warn: bool = True
+    variable_like: list[str] = field(default_factory=list)
     _stack: list[int] = field(default_factory=list)
 
     def merge_variables(self, variables: Mapping[str, Any]) -> None:

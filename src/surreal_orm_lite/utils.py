@@ -42,10 +42,16 @@ VALID_THING_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*:(`[a-zA-Z0-9_-]+`|[a-
 # hyphen, punctuation) must be backtick-quoted to keep its string form.
 BARE_RECORD_ID = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
+# A ``str`` filter value that is ``$`` and a variable name (``"$max_age"``): the form the ORM read as a reference
+# to that query variable until v0.28.1. It is data now; :func:`warn_on_variable_names` says so when the statement's
+# ``variables()`` give that name. Used with ``fullmatch``.
+VARIABLE_NAME_VALUE = re.compile(r"\$([a-zA-Z_][a-zA-Z0-9_]*)")
 
-def remove_quotes_for_variables(query: str) -> str:
-    # Regex to remove single quotes around variables ($)
-    return re.sub(r"'(\$[a-zA-Z_]\w*)'", r"\1", query)
+#: The ``DeprecationWarning`` of the ``"$$"`` escape (:func:`unescape_filter_value`): the same text whatever the value.
+ESCAPE_DEPRECATED = (
+    "A filter value starting with '$$' is read with one '$' less: the '$$' escape is deprecated. A string filter "
+    "value is always data, so write it with one '$' less; Var('name') references a query variable."
+)
 
 
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -580,24 +586,44 @@ def unescape_filter_value(value: Any, *, warn: bool = True) -> Any:
     ``Var("x")`` references the query variable ``$x``. The ``"$$"`` escape of v0.14.3, written when ``"$x"``
     still read as a reference, keeps its meaning so that escaped values find the same records: a ``str``
     starting with ``"$$"`` is the same string with one ``$`` less (``"$$x"`` is ``"$x"``, ``"$$$x"`` is
-    ``"$$x"``), with a ``DeprecationWarning`` saying to write the value itself. An item of a list lookup never
-    had the escape, and is not unescaped.
+    ``"$$x"``), with a ``DeprecationWarning`` saying to write the value with one ``$`` less
+    (:data:`ESCAPE_DEPRECATED`, the same text whatever the value). An item of a list lookup never had the escape,
+    and is not unescaped.
 
     Args:
         value: a scalar filter value, or a ``get_or_create()``/``update_or_create()`` ``exact`` criterion.
-        warn: emit the ``DeprecationWarning`` (the WHERE builder does; the create payload of the same call does not).
+        warn: emit the ``DeprecationWarning`` (the WHERE builder does once per read; the create payload of the same
+            call and a statement compiled again for the same read do not).
     """
     if not (isinstance(value, str) and value.startswith("$$")):
         return value
-    data = value[1:]
     if warn:
-        warnings.warn(
-            f"The filter value {value!r} is read as {data!r}: the '$$' escape is deprecated. A string filter value "
-            f"is always data, so write {data!r}; Var('name') references a query variable.",
-            DeprecationWarning,
-            stacklevel=user_stacklevel(),
-        )
-    return data
+        warnings.warn(ESCAPE_DEPRECATED, DeprecationWarning, stacklevel=user_stacklevel())
+    return value[1:]
+
+
+def warn_on_variable_names(names: Iterable[str], variables: Collection[str]) -> None:
+    """Warn for each of *names* that *variables* hold, once per name: a ``str`` filter value ``"$<name>"`` is data.
+
+    Until v0.28.1 ``filter(age__lte="$max_age").variables(max_age=25)`` compiled ``age <= $max_age``. The string
+    is data now, bound and compared as it is, so such a call changes its result without an error (a number sorts
+    below a string: ``lt``/``lte`` match every number, ``gt``/``gte``/``exact`` none). A ``UserWarning`` names
+    ``Var("max_age")``, the reference. A name *variables* does not hold is data the caller meant (``"$x"`` with no
+    variable ``x``): nothing warns.
+
+    Args:
+        names: the names of the scalar ``str`` filter values of one statement that match :data:`VARIABLE_NAME_VALUE`
+            (``"$max_age"`` gives ``max_age``), in order.
+        variables: the names the statement's ``variables()`` give.
+    """
+    for name in dict.fromkeys(names):
+        if name in variables:
+            warnings.warn(
+                f"The filter value '${name}' is compared as the string '${name}', not with the variable {name} "
+                f"given to variables(); to reference the variable, use Var('{name}').",
+                UserWarning,
+                stacklevel=user_stacklevel(),
+            )
 
 
 def build_filter_condition(
@@ -615,7 +641,10 @@ def build_filter_condition(
 
     A ``str`` value is data, whatever it starts with: ``"$x"`` is bound and compared with the string ``"$x"``.
     ``Var("x")`` is the only reference to a query variable, written ``$x``. A scalar ``str`` starting with
-    ``"$$"`` (the deprecated escape) loses one ``$``, with a ``DeprecationWarning`` (:func:`unescape_filter_value`).
+    ``"$$"`` (the deprecated escape) loses one ``$``, with a ``DeprecationWarning`` (:func:`unescape_filter_value`)
+    unless ``subqueries.warn`` is false. The name of a scalar ``str`` that is ``$`` and a variable name (``"$x"``
+    gives ``x``) is noted in ``subqueries.variable_like``: ``QuerySet._build_where`` checks it against the
+    statement's ``variables()`` once every condition is compiled (:func:`warn_on_variable_names`).
 
     A model instance given as the value — or as an item of a sequence lookup — is bound as its
     record id (:func:`as_record_value`, v0.22.0).
@@ -733,7 +762,10 @@ def build_filter_condition(
     if isinstance(value, Var):
         # The one variable reference (v0.14.3): every other value is bound as data.
         return f"{field} {op} {value.reference}", {}, counter
-    value = unescape_filter_value(value)
+    variable_like = VARIABLE_NAME_VALUE.fullmatch(value) if isinstance(value, str) else None
+    if subqueries is not None and variable_like is not None:
+        subqueries.variable_like.append(variable_like.group(1))
+    value = unescape_filter_value(value, warn=subqueries is None or subqueries.warn)
     if is_record_id_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
         value = coerce_record_id(value, cast(str, record_table))
     elif is_endpoint_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:

@@ -274,8 +274,15 @@ gives.
 
 Until v0.28.1 a value starting with `$` was read as a variable reference (deprecated since
 v0.14.3), and `"$$admin"` was how to write the string `"$admin"`. That escape keeps its meaning,
-deprecated: a filter value starting with `$$` loses one `$` (`"$$admin"` finds `"$admin"`), with a
-`DeprecationWarning` that says to write `"$admin"`; an item of an `in` list never had the escape.
+deprecated: a filter value starting with `$$` loses one `$` (`"$$admin"` finds `"$admin"`: write
+`"$admin"`), with a `DeprecationWarning`; an item of an `in` list never had the escape.
+
+A call written for the old reading, such as `filter(age__lte="$max_age").variables(max_age=25)`,
+now compares `age` with the string `"$max_age"`: a number sorts below a string, so `lt` and `lte`
+match every number, and `gt`, `gte` and `exact` none. When a string filter value is exactly `$`
+followed by the name of a variable that `variables()` gives, the ORM keeps it as data and raises a
+`UserWarning` that says to write `Var("max_age")`, once per read, pointing at your line. A string
+such as `"$x"` with no variable `x` is data the caller meant: no warning.
 
 #### Model instances as filter values
 

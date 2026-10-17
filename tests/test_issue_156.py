@@ -18,7 +18,7 @@ from surrealdb import RecordID
 import surreal_orm_lite
 from surreal_orm_lite import Var
 from surreal_orm_lite.exceptions import SurrealDbError
-from surreal_orm_lite.utils import build_filter_condition, remove_quotes_for_variables
+from surreal_orm_lite.utils import build_filter_condition
 
 SURREALDB_HOST = os.environ.get("SURREALDB_HOST", "localhost")
 SURREALDB_PORT = os.environ.get("SURREALDB_PORT", "8000")
@@ -59,12 +59,17 @@ class TestDollarStrings:
         assert counter == 1
 
     def test_double_dollar_escapes_to_a_literal(self) -> None:
-        """The v0.14.3 escape keeps its meaning, deprecated (v0.28.1)."""
-        with pytest.deprecated_call():
+        """The v0.14.3 escape keeps its meaning, deprecated (v0.28.1); the warning never quotes the value."""
+        with pytest.deprecated_call() as caught:
             sql, variables, counter = build_filter_condition("name", "exact", "$$admin", 0)
+            build_filter_condition("name", "exact", "$$root", 0)
         assert sql == "name = $_f0"
         assert variables == {"_f0": "$admin"}
         assert counter == 1
+        assert [str(warning.message) for warning in caught] == [
+            "A filter value starting with '$$' is read with one '$' less: the '$$' escape is deprecated. A string "
+            "filter value is always data, so write it with one '$' less; Var('name') references a query variable."
+        ] * 2
 
     def test_var_compiles_to_a_reference(self) -> None:
         sql, variables, counter = build_filter_condition("age", "gte", Var("min_age"), 0)
@@ -80,13 +85,10 @@ class TestDollarStrings:
         assert Var("$min_age").name == "min_age"
 
 
-# ==================== #3 — the unquoting helper must not touch user SQL ====================
+# ==================== #3 — raw SQL reaches the server verbatim ====================
 
 
 class TestRawSqlIsVerbatim:
-    def test_helper_still_unquotes_compiled_queries(self) -> None:
-        assert remove_quotes_for_variables("SELECT * FROM U WHERE a = '$x';") == "SELECT * FROM U WHERE a = $x;"
-
     async def test_raw_query_keeps_a_quoted_dollar_literal(self) -> None:
         """``raw_query`` is user-authored SQL: it goes to the server byte for byte."""
         sent: dict[str, str] = {}

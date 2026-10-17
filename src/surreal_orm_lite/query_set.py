@@ -2,7 +2,7 @@ import contextlib
 import logging
 import math
 import numbers
-from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Self, cast
 from uuid import UUID
@@ -39,13 +39,13 @@ from .utils import (
     is_select_item,
     non_negative_int,
     parse_lookup,
-    remove_quotes_for_variables,
     unescape_filter_value,
     validate_alias_name,
     validate_field_name,
     validate_patch_operations,
     validate_select_item,
     warn_on_multiple_statements,
+    warn_on_variable_names,
 )
 
 if TYPE_CHECKING:
@@ -192,7 +192,8 @@ class QuerySet:
 
         A filter reads one with ``Var("name")``: ``filter(age__gte=Var("min_age")).variables(min_age=21)``.
         A string filter value is data, whatever it starts with: ``filter(name="$min_age")`` compares ``name``
-        with the string ``"$min_age"``.
+        with the string ``"$min_age"``, with a ``UserWarning`` naming ``Var("min_age")`` when ``variables()``
+        gives ``min_age`` (until v0.28.1 that string read the variable).
 
         Args:
             **kwargs: Variable names and their values.
@@ -235,6 +236,9 @@ class QuerySet:
 
         A ``str`` value is data, whatever it starts with: ``filter(name="$admin")`` compares ``name`` with the
         string ``"$admin"``. ``Var("name")`` is the only reference to a query variable (given with ``variables()``).
+        A ``str`` that is ``$`` and the name of a variable ``variables()`` gives — ``age__lte="$max_age"`` with
+        ``variables(max_age=25)``, which read ``$max_age`` until v0.28.1 — is still the string, with a
+        ``UserWarning`` naming ``Var("max_age")``, once per read, when the statement is compiled.
 
         A ``Subquery`` — or a QuerySet, read as one — is accepted as the whole value of ``in``, ``not_in``,
         ``containsall`` and ``containsany`` (compared with all its values) and of ``exact``, ``gt``, ``gte``,
@@ -646,7 +650,9 @@ class QuerySet:
 
     # ==================== Internal query building ====================
 
-    def _subquery_compiler(self, empty_tables: frozenset[str] = frozenset(), *, inline: bool = False) -> SubqueryCompiler:
+    def _subquery_compiler(
+        self, empty_tables: frozenset[str] = frozenset(), *, inline: bool = False, warn: bool = True
+    ) -> SubqueryCompiler:
         """A compiler for the subqueries of one statement of this queryset (v0.27.0).
 
         It starts with this queryset's transaction, a copy of its ``variables()`` (the subqueries' are merged into
@@ -656,12 +662,14 @@ class QuerySet:
         Args:
             empty_tables: the tables whose subqueries are bound to ``[]`` (SurrealDB 3.x confirmed they do not exist).
             inline: write the sub-SELECTs inline instead of in ``LET`` s (a live query).
+            warn: emit the warnings of the filter values (v0.28.1); ``False`` for a statement this read compiled once.
         """
         return SubqueryCompiler(
             inline=inline,
             empty_tables=empty_tables,
             outer_tx=self._tx,
             variables=dict(self._variables),
+            warn=warn,
             _stack=[id(self)],
         )
 
@@ -723,7 +731,13 @@ class QuerySet:
 
         return parts, variables, counter
 
-    def _build_where(self, *, as_of: bool = False, subqueries: SubqueryCompiler | None = None) -> tuple[str, dict[str, Any]]:
+    def _build_where(
+        self,
+        *,
+        as_of: bool = False,
+        subqueries: SubqueryCompiler | None = None,
+        variable_names: Collection[str] = (),
+    ) -> tuple[str, dict[str, Any]]:
         """
         Build a parameterized WHERE clause from filters, Q objects and ``nearby()`` conditions.
 
@@ -731,11 +745,24 @@ class QuerySet:
         ``time_travel.GUARD`` is the last condition (:meth:`_where_parts`). A subquery value (v0.27.0) is bound
         by *subqueries*, the statement's compiler; without one it raises ``ValueError`` (S8).
 
+        Once every condition is compiled, a scalar ``str`` filter value that is ``$`` and the name of one of the
+        statement's ``variables()`` — this queryset's, its subqueries', or *variable_names* — gives a
+        ``UserWarning`` naming ``Var(...)`` (:func:`utils.warn_on_variable_names`, v0.28.1), unless
+        ``subqueries.warn`` is false. Without *subqueries* nothing is checked: only a statement has variables.
+
+        Args:
+            variable_names: names the check counts as variables besides the statement's: the ``variables()`` of the
+                queryset whose ``get_or_create()``/``update_or_create()`` look up with this one.
+
         Returns:
             A tuple of (where_clause_string, variables_dict).
             The where_clause_string includes the ``WHERE`` keyword, or is empty if no filters.
         """
         parts, variables, _ = self._where_parts(0, as_of=as_of, subqueries=subqueries)
+        if subqueries is not None:
+            if subqueries.warn:
+                warn_on_variable_names(subqueries.variable_like, {*subqueries.variables, *variable_names})
+            subqueries.variable_like.clear()
         if not parts:
             return "", {}
 
@@ -1001,17 +1028,16 @@ class QuerySet:
                 :meth:`_run_compiled`).
         """
         vars_ = variables if variables is not None else self._variables
-        compiled = remove_quotes_for_variables(query)
         if self._tx is not None:
             try:
-                return await self._tx.run_read(compiled, vars_)  # type: ignore[no-any-return]
+                return await self._tx.run_read(query, vars_)  # type: ignore[no-any-return]
             except ServerError as exc:
                 if await self._reads_as_empty(exc, subquery_tables):
                     return []
                 raise
         client = await SurrealDBConnectionManager.get_client()
         try:
-            return await client.query(compiled, _encoding.encode(vars_))  # type: ignore
+            return await client.query(query, _encoding.encode(vars_))  # type: ignore
         except ServerError as exc:
             if await self._reads_as_empty(exc, subquery_tables):
                 return []
@@ -1096,13 +1122,21 @@ class QuerySet:
         return await self._run_cached(compile_statement)
 
     async def _run_uncached(
-        self, compile_statement: Callable[[SubqueryCompiler], tuple[str, dict[str, Any]]], *, write: bool = False
+        self,
+        compile_statement: Callable[[SubqueryCompiler], tuple[str, dict[str, Any]]],
+        *,
+        write: bool = False,
+        warn: bool = True,
     ) -> Any:
         """The loop of :meth:`_run_compiled`, as in v0.27.0: compile, send, and on a confirmed missing subquery
-        table compile again with that subquery bound to ``[]`` and send again."""
+        table compile again with that subquery bound to ``[]`` and send again.
+
+        The filter values' warnings are given by the first compilation only, and only with *warn* (v0.28.1):
+        ``False`` when :meth:`_run_cached` compiled the statement for this read already."""
         empty: frozenset[str] = frozenset()
         while True:
-            compiler = self._subquery_compiler(empty)
+            compiler = self._subquery_compiler(empty, warn=warn)
+            warn = False
             query, variables = compile_statement(compiler)
             if write and self._tx is not None:
                 return await self._tx.add(query, variables)
@@ -1122,7 +1156,8 @@ class QuerySet:
         invalidates it); "any table" when the statement follows links (``FETCH``, a dotted path, a graph arrow) or
         a ``select()`` item is neither ``*`` nor a plain field path (``author.*``: projection semantics read the
         linked table). On a miss :meth:`_run_uncached` sends it, compiling it again
-        (compilation is pure), so the missing-subquery-table re-send happens inside the read.
+        (compilation is pure), so the missing-subquery-table re-send happens inside the read; only the first
+        compilation gives the filter values' warnings, once per read.
         """
         compiler = self._subquery_compiler()
         query, variables = compile_statement(compiler)
@@ -1135,7 +1170,12 @@ class QuerySet:
             or any(item != "*" and not VALID_FIELD_PATTERN.match(item) for item in self.select_item)
         )
         return await self._cached_read(
-            "query", query, variables, frozenset(tables), any_table, lambda: self._run_uncached(compile_statement)
+            "query",
+            query,
+            variables,
+            frozenset(tables),
+            any_table,
+            lambda: self._run_uncached(compile_statement, warn=False),
         )
 
     async def _cached_read(
@@ -1158,7 +1198,7 @@ class QuerySet:
 
         Args:
             kind: ``"query"`` (a compiled statement) or ``"select"`` (the SDK's ``select()``, *statement* empty).
-            statement: the statement as compiled, before ``remove_quotes_for_variables``.
+            statement: the statement as compiled, as it is sent.
             variables: its bound values (``{"target": …}`` for a ``select``).
             tables: what the read depends on, ``EDGES`` included.
             any_table: the read follows links: any write invalidates it.
@@ -1950,6 +1990,8 @@ class QuerySet:
         buffered one (consistent with every other read). ``LIMIT 2`` is enough to distinguish
         0 / 1 / >1. A subquery criterion (v0.27.0) is read in the same statement, a block
         ``{ LET $_sq0 = (…); (SELECT … LIMIT 2) };``, run as every read is (:meth:`_run_compiled`).
+        The lookup binds no ``variables()``, as before; a criterion ``"$name"`` whose name this queryset's
+        ``variables()`` give still warns (v0.28.1): until then it read as that variable.
         """
         probe = QuerySet(self.model)
         probe.filter(**criteria)
@@ -1957,7 +1999,7 @@ class QuerySet:
         table = self._model_table
 
         def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
-            where_clause, where_vars = probe._build_where(subqueries=compiler)
+            where_clause, where_vars = probe._build_where(subqueries=compiler, variable_names=self._variables)
             query = f"SELECT * FROM {table}{where_clause} LIMIT 2;"
             return compiler.wrap(query), {**compiler.variables, **where_vars}
 
