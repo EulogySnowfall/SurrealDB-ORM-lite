@@ -14,6 +14,9 @@ from typing import Any, assert_type
 from surrealdb import RecordID
 
 from surreal_orm_lite import (
+    AuthenticatedUserMixin,
+    AuthResult,
+    AuthTokens,
     BaseSurrealEdge,
     BaseSurrealModel,
     BoundExcluded,
@@ -309,6 +312,32 @@ def query_cache_examples() -> None:
     assert_type(QuerySet(TypedMember).filter(name="x").cache(30).order_by("name"), QuerySet)
     assert_type(QueryCache.stats(), dict[str, Any])
     assert_type(QueryCache.make_key("SELECT 1;", {}, "t"), str)
+    assert_type(QueryCache.invalidate(TypedMember), int)
+    assert_type(QueryCache.invalidate("typed_member"), int)
+
+
+async def invalidating_writes_keep_their_types(member: TypedMember, edge: Purchased, tx: Transaction) -> None:
+    """v0.28.0: every write the query cache wraps (``cache.invalidates()``) keeps its own type, ``Self`` included."""
+    assert_type(await member.save(), TypedMember)
+    assert_type(await member.save(tx=tx), TypedMember)
+    assert_type(await member.upsert(), TypedMember)
+    assert_type(await member.update(), Any)
+    assert_type(await member.merge(name="x"), Any)
+    assert_type(await member.patch([{"op": "replace", "path": "/name", "value": "x"}]), TypedMember)
+    assert_type(await member.atomic_append("tags", 1), TypedMember)
+    assert_type(await member.atomic_increment("n", 2, tx), TypedMember)
+    assert_type(await member.atomic_remove_many("tags", [1]), TypedMember)
+    await member.delete(tx=tx)
+    assert_type(await edge.save(), Purchased)
+    assert_type(await Player.define_computed_fields(tx=tx), list[str])
+    assert_type(await QuerySet(TypedMember).bulk_create([member]), list[BaseSurrealModel])
+    assert_type(await QuerySet(TypedMember).bulk_update(name="x"), int)
+    assert_type(await QuerySet(TypedMember).bulk_delete(), int)
+    assert_type(await QuerySet(TypedMember).patch([]), int)
+    assert_type(await QuerySet(TypedMember).delete_table(), bool)
+    assert_type(await AuthenticatedUserMixin.define_access(tx=tx), list[str])
+    assert_type(await AuthenticatedUserMixin.signup(email="a@b.c", password="p"), AuthResult[AuthenticatedUserMixin])
+    assert_type(await SurrealDBConnectionManager.signup(access="a", variables={}), AuthTokens)
 
 
 @fixture

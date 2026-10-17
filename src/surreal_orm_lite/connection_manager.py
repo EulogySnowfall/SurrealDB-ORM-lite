@@ -1161,6 +1161,7 @@ class SurrealDBConnectionManager:
             return cls._adopt_tokens(tokens, store=store, operation="signin", client=client, embedded=embedded)
 
     @classmethod
+    @_cache.invalidates("all")
     async def signup(
         cls,
         *,

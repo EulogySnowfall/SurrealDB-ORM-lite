@@ -33,8 +33,10 @@ from surrealdb import RecordID
 
 import surreal_orm_lite
 from surreal_orm_lite import (
+    AuthenticatedUserMixin,
     BaseSurrealEdge,
     BaseSurrealModel,
+    Computed,
     Count,
     GeoDistance,
     GeometryPoint,
@@ -44,14 +46,18 @@ from surreal_orm_lite import (
     QuerySet,
     Subquery,
     SurrealConfigDict,
+    SurrealDbConflictError,
     SurrealDbConnectionError,
     SurrealDBConnectionManager,
     SurrealDbError,
     SurrealDbNotFoundError,
+    around_save,
     cache,
+    computed,
     encoding,
+    post_save,
 )
-from surreal_orm_lite._sdk import cbor_encode
+from surreal_orm_lite._sdk import AsyncSurreal, cbor_encode
 from surreal_orm_lite.cache import EDGES, CacheRequest, follows_links
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.transaction import BufferedTransaction, InteractiveTransaction
@@ -134,6 +140,26 @@ class QcNote(BaseSurrealModel):
 
     id: str | None = None
     owner: RecordID | None = None
+
+
+class QcPlayer(BaseSurrealModel):
+    """A ``computed()`` field: ``define_computed_fields()`` writes DDL on its table."""
+
+    model_config = SurrealConfigDict(table_name="qc_player")
+
+    id: str | None = None
+    name: str = ""
+    shout: Computed[str] = computed("string::uppercase(name)")
+
+
+class QcAccount(AuthenticatedUserMixin, BaseSurrealModel):
+    """A record-access model: ``define_access()`` and ``signup()`` write its table."""
+
+    model_config = SurrealConfigDict(table_name="qc_account", access_name="qc_account_access")
+
+    id: str | None = None
+    email: str
+    password: str
 
 
 # --- helpers ------------------------------------------------------------------------------------------
@@ -1382,6 +1408,19 @@ class TestWriting:
             assert _in_flight() == ({"t": 1}, 0)
         assert QueryCache.get("k") is None
 
+    async def test_the_transaction_is_recognised_by_its_class(self) -> None:
+        """Never by asking the object: a write refused before it reaches its transaction (a time-travel snapshot,
+        v0.26.0) leaves an object that answers through ``__getattr__`` untouched, as no transaction."""
+
+        class _Untouchable:
+            def __getattr__(self, name: str) -> Any:
+                raise AssertionError(f"the transaction was used ({name})")
+
+        QueryCache.set("k", 1, "t")
+        async with cache.writing({"t"}, tx=_Untouchable()):
+            assert _in_flight() == ({"t": 1}, 0)
+        assert QueryCache.get("k") is None
+
 
 class _Writer:
     """A model as ``invalidates()`` sees one."""
@@ -2140,10 +2179,162 @@ class TestUncachedUnchanged:
         assert selected == [RecordID("qc_item", "i1"), "qc_item"]
 
 
+# --- AC-11, AC-12: every public coroutine is classified; every write is wrapped ------------------------------
+
+#: The 26 writes of spec §5.4, by the class that defines them (``vars(cls)``).
+_INVALIDATING_WRITES: dict[type, frozenset[str]] = {
+    BaseSurrealModel: frozenset(
+        {
+            "save",
+            "upsert",
+            "update",
+            "merge",
+            "patch",
+            "atomic_append",
+            "atomic_remove",
+            "atomic_set_add",
+            "atomic_increment",
+            "atomic_append_many",
+            "atomic_set_add_many",
+            "atomic_remove_many",
+            "delete",
+            "relate",
+            "remove_relation",
+            "remove_all_relations",
+            "define_computed_fields",
+        }
+    ),
+    BaseSurrealEdge: frozenset({"save"}),
+    AuthenticatedUserMixin: frozenset({"define_access", "signup"}),
+    QuerySet: frozenset({"bulk_create", "bulk_update", "patch", "bulk_delete", "delete_table"}),
+    SurrealDBConnectionManager: frozenset({"signup"}),
+}
+
+#: Every public coroutine of the classes a user calls, by what it does to the cache (spec §5.3, §5.4, AC-11). A
+#: new public coroutine fails :class:`TestExhaustiveness` until it is classified here.
+_CLASSIFIED: dict[type, dict[str, frozenset[str]]] = {
+    BaseSurrealModel: {
+        "invalidating writes": _INVALIDATING_WRITES[BaseSurrealModel],
+        "raw, refused or not cached": frozenset({"raw_query", "call_function", "refresh", "get_related", "traverse"}),
+    },
+    BaseSurrealEdge: {
+        "invalidating writes": _INVALIDATING_WRITES[BaseSurrealEdge],
+        "refused": frozenset({"upsert"}),
+    },
+    AuthenticatedUserMixin: {
+        "invalidating writes": _INVALIDATING_WRITES[AuthenticatedUserMixin],
+        "identity": frozenset({"signin", "authenticate", "refresh"}),
+    },
+    QuerySet: {
+        "cached reads": frozenset({"exec", "first", "get", "all", "count", "sum", "avg", "min", "max", "exists"}),
+        "invalidating writes": _INVALIDATING_WRITES[QuerySet],
+        "writes through wrapped helpers": frozenset({"get_or_create", "update_or_create"}),
+        "raw, refused or not cached": frozenset({"query"}),
+    },
+    SurrealDBConnectionManager: {
+        "invalidating writes": _INVALIDATING_WRITES[SurrealDBConnectionManager],
+        "identity": frozenset({"signin", "authenticate", "invalidate"}),
+        "raw, refused or not cached": frozenset({"call_function"}),
+        "other": frozenset(
+            {
+                "unset_connection",
+                "get_client",
+                "close_connection",
+                "close_all_connections",
+                "info",
+                "kill",
+                "reconnect",
+                "validate_connection",
+                "set_url",
+                "set_user",
+                "set_password",
+                "set_namespace",
+                "set_database",
+            }
+        ),
+    },
+}
+
+#: The writes defined as class methods: ``invalidates()`` is the inner decorator there.
+_CLASS_METHOD_WRITES = {
+    (BaseSurrealModel, "define_computed_fields"),
+    (AuthenticatedUserMixin, "define_access"),
+    (AuthenticatedUserMixin, "signup"),
+    (SurrealDBConnectionManager, "signup"),
+}
+
+
+def _defined(cls: type, name: str) -> Any:
+    """The function *cls* defines as *name*, class and static methods unwrapped."""
+    value = vars(cls)[name]
+    return value.__func__ if isinstance(value, classmethod | staticmethod) else value
+
+
+def _public_coroutines(cls: type) -> set[str]:
+    return {name for name in vars(cls) if not name.startswith("_") and inspect.iscoroutinefunction(_defined(cls, name))}
+
+
+def _ids(classes: Any) -> list[str]:
+    return [cls.__name__ for cls in classes]
+
+
+class TestExhaustiveness:
+    """AC-11: each public coroutine is a cached read, an invalidating write, or classified as neither on purpose."""
+
+    @pytest.mark.parametrize("cls", list(_CLASSIFIED), ids=_ids(_CLASSIFIED))
+    def test_every_public_coroutine_is_classified(self, cls: type) -> None:
+        groups = _CLASSIFIED[cls]
+        classified = [name for names in groups.values() for name in names]
+        assert len(classified) == len(set(classified)), "a coroutine is in two classes"
+        assert _public_coroutines(cls) == set(classified)
+
+    def test_the_26_writes_of_the_spec(self) -> None:
+        assert sum(len(names) for names in _INVALIDATING_WRITES.values()) == 26
+
+    @pytest.mark.parametrize("cls", list(_CLASSIFIED), ids=_ids(_CLASSIFIED))
+    def test_every_invalidating_write_is_wrapped_and_nothing_else(self, cls: type) -> None:
+        for group, names in _CLASSIFIED[cls].items():
+            for name in names:
+                wrapped = getattr(_defined(cls, name), "__surreal_cache_writes__", False) is True
+                assert wrapped is (group == "invalidating writes"), f"{cls.__name__}.{name}"
+
+    def test_save_naming_is_wrapped(self) -> None:
+        """The create of ``get_or_create()``/``update_or_create()`` and of ``relate(EdgeModel, …)``."""
+        assert BaseSurrealModel._save_naming.__surreal_cache_writes__ is True  # type: ignore[attr-defined]
+
+    @pytest.mark.parametrize("cls", list(_INVALIDATING_WRITES), ids=_ids(_INVALIDATING_WRITES))
+    def test_a_wrapped_write_keeps_its_signature_and_docs(self, cls: type) -> None:
+        """AC-12: ``inspect.signature``, ``__doc__``, ``__name__`` and ``__wrapped__``; still a coroutine function,
+        and still a class method where it was one."""
+        for name in _INVALIDATING_WRITES[cls]:
+            function = _defined(cls, name)
+            original = function.__wrapped__
+            assert inspect.iscoroutinefunction(original), name
+            assert not hasattr(original, "__surreal_cache_writes__"), name
+            assert inspect.signature(function) == inspect.signature(original), name
+            assert function.__doc__ == original.__doc__, name
+            assert function.__doc__, name
+            assert function.__name__ == original.__name__ == name
+            assert inspect.iscoroutinefunction(function), name
+            is_class_method = isinstance(inspect.getattr_static(cls, name), classmethod)
+            assert is_class_method is ((cls, name) in _CLASS_METHOD_WRITES), name
+
+
 # === E2E: an engine or a server ===========================================================================
 
 #: The tables of this module's models, removed before and after each E2E test on a server.
-_TABLES = ("qc_item", "qc_author", "qc_book", "qc_place", "qc_user", "qc_post", "qc_likes", "qc_ghost")
+_TABLES = (
+    "qc_item",
+    "qc_author",
+    "qc_book",
+    "qc_place",
+    "qc_user",
+    "qc_post",
+    "qc_likes",
+    "qc_ghost",
+    "qc_player",
+    "qc_account",
+)
 
 #: The engines every cached read runs on (spec §9).
 _KINDS = ["mem", "ws", "http"]
@@ -2849,4 +3040,671 @@ class TestIdentityE2E:
             assert QueryCache.stats()["entries"] == 0
             requests = _requests(monkeypatch, client)
             assert await _note_ids() == ["b1", "b2"]
+            assert requests() == 1
+
+
+# --- AC-7, AC-8, AC-10: every ORM write invalidates ------------------------------------------------------
+
+
+@contextlib.asynccontextmanager
+async def _account_access(client: Any, wanted: bool = True) -> AsyncIterator[None]:
+    """``QcAccount``'s access method is removed at the end (its table goes with ``_TABLES``); nothing when not
+    *wanted*."""
+    try:
+        yield
+    finally:
+        if wanted:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(client.query(f"REMOVE ACCESS {QcAccount.get_access_name()} ON DATABASE;"), 10)
+
+
+async def _item(key: str = "i1") -> Any:
+    """The stored item *key*, read without the cache."""
+    return await QcItem.objects().get(key)
+
+
+def _items(cached: bool) -> Awaitable[Any]:
+    return _qs(QcItem, cached).order_by("id").exec()
+
+
+def _item_rows(rows: Any) -> list[tuple[Any, ...]]:
+    return [(row.id, row.name, row.category, row.price, row.tags) for row in rows]
+
+
+def _likes(cached: bool) -> Awaitable[Any]:
+    return _qs(QcLikes, cached).exec()
+
+
+def _like_pairs(rows: Any) -> list[tuple[str, str]]:
+    return sorted((str(row.in_), str(row.out)) for row in rows)
+
+
+def _players(cached: bool) -> Awaitable[Any]:
+    return _qs(QcPlayer, cached).order_by("id").exec()
+
+
+def _player_rows(rows: Any) -> list[tuple[Any, Any]]:
+    return [(row.id, row.name) for row in rows]
+
+
+def _accounts(cached: bool) -> Awaitable[Any]:
+    return _qs(QcAccount, cached).order_by("email").exec()
+
+
+def _emails(rows: Any) -> list[str]:
+    return [row.email for row in rows]
+
+
+async def _seed_player(client: Any) -> None:
+    await QcPlayer(id="p1", name="ann").save()
+
+
+async def _seed_account(client: Any) -> None:
+    await client.query("CREATE qc_account:x SET email = 'x@qc', password = 'h';")
+
+
+async def _define_accounts(client: Any) -> None:
+    await QcAccount.define_access()
+
+
+async def _ada() -> Any:
+    return await QcUser.objects().get("ada")
+
+
+async def _relate_by_name(client: Any) -> Any:
+    return await (await _ada()).relate("qc_likes", RecordID("qc_post", "p2"))
+
+
+async def _remove_relation(client: Any) -> None:
+    await (await _ada()).remove_relation("qc_likes", RecordID("qc_post", "p1"))
+
+
+async def _remove_all_relations(client: Any) -> None:
+    await (await _ada()).remove_all_relations(QcLikes)
+
+
+async def _signup_through_the_manager(client: Any) -> None:
+    """A record sign-up on the shared connection, then back to root (``store=False``: nothing remembered)."""
+    variables = {"email": "manager@qc", "password": _AUTH_PASS}
+    await SurrealDBConnectionManager.signup(access=QcAccount.get_access_name(), variables=variables, store=False)
+    await SurrealDBConnectionManager.invalidate()
+
+
+class _WriteCase(NamedTuple):
+    """One write of spec §5.4 (AC-7): a cached read of the table it writes, and the write.
+
+    ``table`` tags a ``QueryCache.set()`` entry that must be gone after the write. ``setup`` runs before the read is
+    primed; ``change`` is an out-of-band statement run after it, before the write: for a write whose own effect a
+    read cannot see (DDL), the change is what the refreshed read shows. ``server``: runs on a server only.
+    """
+
+    read: Callable[[bool], Awaitable[Any]]
+    render: Callable[[Any], Any]
+    write: Callable[[Any], Awaitable[Any]]
+    table: str
+    setup: Callable[[Any], Awaitable[None]] | None = None
+    change: str | None = None
+    server: bool = False
+
+
+def _item_write(write: Callable[[Any], Awaitable[Any]]) -> _WriteCase:
+    """A write of ``qc_item:i1`` through the instance read without the cache."""
+
+    async def run(client: Any) -> Any:
+        return await write(await _item())
+
+    return _WriteCase(_items, _item_rows, run, "qc_item")
+
+
+def _qs_write(write: Callable[[], Awaitable[Any]]) -> _WriteCase:
+    async def run(client: Any) -> Any:
+        return await write()
+
+    return _WriteCase(_items, _item_rows, run, "qc_item")
+
+
+async def _update_i1(item: Any) -> Any:
+    item.price = 11
+    return await item.update()
+
+
+_WRITE_CASES: dict[str, _WriteCase] = {
+    "save": _qs_write(lambda: QcItem(id="i5", name="e", category="toy", price=50).save()),
+    "upsert": _qs_write(lambda: QcItem(id="i1", name="a2", category="book", price=10).upsert()),
+    "update": _item_write(_update_i1),
+    "merge": _item_write(lambda item: item.merge(price=12)),
+    "patch": _item_write(lambda item: item.patch([{"op": "replace", "path": "/price", "value": 13}])),
+    "atomic_append": _item_write(lambda item: item.atomic_append("tags", "y")),
+    "atomic_remove": _item_write(lambda item: item.atomic_remove("tags", "x")),
+    "atomic_set_add": _item_write(lambda item: item.atomic_set_add("tags", "y")),
+    "atomic_increment": _item_write(lambda item: item.atomic_increment("price", 5)),
+    "atomic_append_many": _item_write(lambda item: item.atomic_append_many("tags", ["y", "z"])),
+    "atomic_set_add_many": _item_write(lambda item: item.atomic_set_add_many("tags", ["x", "y"])),
+    "atomic_remove_many": _item_write(lambda item: item.atomic_remove_many("tags", ["x"])),
+    "delete": _item_write(lambda item: item.delete()),
+    "relate": _WriteCase(_likes, _like_pairs, _relate_by_name, "qc_likes"),
+    "remove_relation": _WriteCase(_likes, _like_pairs, _remove_relation, "qc_likes"),
+    "remove_all_relations": _WriteCase(_likes, _like_pairs, _remove_all_relations, "qc_likes"),
+    "define_computed_fields": _WriteCase(
+        _players,
+        _player_rows,
+        lambda client: QcPlayer.define_computed_fields(),
+        "qc_player",
+        setup=_seed_player,
+        change="UPDATE qc_player:p1 SET name = 'bo';",
+    ),
+    "edge_save": _WriteCase(
+        _likes,
+        _like_pairs,
+        lambda client: QcLikes(in_=RecordID("qc_user", "bob"), out=RecordID("qc_post", "p2")).save(),
+        "qc_likes",
+    ),
+    "bulk_create": _qs_write(lambda: QcItem.objects().bulk_create([QcItem(id="i5", name="e", category="toy", price=50)])),
+    "bulk_update": _qs_write(lambda: QcItem.objects().filter(category="home").bulk_update(price=1)),
+    "queryset_patch": _qs_write(
+        lambda: QcItem.objects().filter(category="home").patch([{"op": "replace", "path": "/price", "value": 2}])
+    ),
+    "bulk_delete": _qs_write(lambda: QcItem.objects().filter(category="home").bulk_delete()),
+    "delete_table": _qs_write(lambda: QcItem.objects().delete_table()),
+    "define_access": _WriteCase(
+        _accounts,
+        _emails,
+        lambda client: QcAccount.define_access(),
+        "qc_account",
+        setup=_seed_account,
+        change="UPDATE qc_account:x SET email = 'y@qc';",
+        server=True,
+    ),
+    "signup": _WriteCase(
+        _accounts,
+        _emails,
+        lambda client: QcAccount.signup(email="new@qc", password=_AUTH_PASS),
+        "qc_account",
+        setup=_define_accounts,
+        server=True,
+    ),
+    "manager_signup": _WriteCase(
+        _items,
+        _item_rows,
+        _signup_through_the_manager,
+        "qc_item",  # D24: every table, not only the access method's
+        setup=_define_accounts,
+        change="UPDATE qc_item:i1 SET price = 77;",
+        server=True,
+    ),
+    "get_or_create_creating": _qs_write(
+        lambda: QcItem.objects().get_or_create(name="e", defaults={"category": "toy", "price": 50})
+    ),
+    "update_or_create_creating": _qs_write(
+        lambda: QcItem.objects().update_or_create(name="e", defaults={"category": "toy", "price": 50})
+    ),
+    "update_or_create_updating": _qs_write(lambda: QcItem.objects().update_or_create(name="a", defaults={"price": 99})),
+}
+
+
+def _book_titles(rows: Any) -> list[str]:
+    return [row.title if isinstance(row, BaseSurrealModel) else row["title"] for row in rows]
+
+
+@pytest.mark.parametrize("kind", ["mem", "ws"])
+class TestWriteInvalidationE2E:
+    """AC-7: a cached read of the table a write changes is served fresh right after it."""
+
+    @pytest.mark.parametrize("case", list(_WRITE_CASES.values()), ids=list(_WRITE_CASES))
+    async def test_a_write_refreshes_the_cached_reads_of_its_table(
+        self, kind: str, case: _WriteCase, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        if case.server and kind == "mem":
+            pytest.skip("sign-up runs on a server here")
+        async with cache_db(kind) as client, _account_access(client, case.server):
+            await _seed()
+            if case.setup is not None:
+                await case.setup(client)
+            requests = _requests(monkeypatch, client)
+            first = case.render(await case.read(True))
+            sent = requests()
+            assert case.render(await case.read(True)) == first
+            assert requests() == sent  # primed: a hit
+            QueryCache.set("user", 1, case.table)
+            if case.change is not None:
+                await client.query(case.change)
+            await case.write(client)
+            assert QueryCache.get("user") is None
+            sent = requests()
+            fresh = case.render(await case.read(True))
+            assert requests() == sent + 1, "the read after the write was answered from the cache"
+            assert fresh == case.render(await case.read(False))
+            assert fresh != first
+
+    async def test_get_or_create_that_finds_invalidates_nothing(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            first = _item_rows(await _items(True))
+            found, created = await QcItem.objects().get_or_create(name="a", defaults={"price": 99})
+            assert (found.id, created) == ("i1", False)
+            sent = requests()
+            assert _item_rows(await _items(True)) == first
+            assert requests() == sent
+
+    @pytest.mark.parametrize("relation", ["relate_name", "relate_model", "remove_relation", "remove_all_relations"])
+    async def test_relations_refresh_the_edge_table_not_the_source(
+        self, kind: str, relation: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def users() -> Awaitable[Any]:
+            return QcUser.objects().order_by("name").cache().exec()
+
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            likes = _like_pairs(await _likes(True))
+            names = _names(await users())
+            ada = await _ada()
+            if relation == "relate_name":
+                await ada.relate("qc_likes", RecordID("qc_post", "p2"))
+            elif relation == "relate_model":
+                await ada.relate(QcLikes, RecordID("qc_post", "p2"))
+            elif relation == "remove_relation":
+                await ada.remove_relation(QcLikes, RecordID("qc_post", "p1"))
+            else:
+                await ada.remove_all_relations(["qc_likes"])
+            sent = requests()
+            fresh = _like_pairs(await _likes(True))
+            assert requests() == sent + 1
+            assert fresh == _like_pairs(await _likes(False))
+            assert fresh != likes
+            sent = requests()
+            assert _names(await users()) == names
+            assert requests() == sent  # the source table's entry is still a hit
+
+    async def test_a_fetch_read_is_refreshed_by_a_write_to_the_fetched_table(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def dune() -> Awaitable[Any]:
+            return QcBook.objects().filter(title="Dune").fetch("author").cache().exec()
+
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            assert _fetched_author(await dune()) == ["Ada"]
+            await (await QcAuthor.objects().get("ada")).merge(name="Ann")
+            sent = requests()
+            assert _fetched_author(await dune()) == ["Ann"]
+            assert requests() == sent + 1
+
+    async def test_a_subquery_read_is_refreshed_by_a_write_to_the_inner_table(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def by_bea() -> Awaitable[Any]:
+            authors = QcAuthor.objects().filter(name="Bea").select("id")
+            return QcBook.objects().filter(author__in=Subquery(authors)).order_by("title").cache().exec()
+
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            assert _book_titles(await by_bea()) == ["Emma"]
+            await (await QcAuthor.objects().get("ada")).merge(name="Bea")
+            sent = requests()
+            assert _book_titles(await by_bea()) == ["Dune", "Emma"]
+            assert requests() == sent + 1
+
+    async def test_a_raw_write_is_seen_once_invalidated(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """D13: ``client.query()`` invalidates nothing; ``QueryCache.invalidate()`` by model, then by table name."""
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            for price, target in ((77, QcItem), (78, "qc_item")):
+                first = _item_rows(await _items(True))
+                await client.query(f"UPDATE qc_item:i1 SET price = {price};")
+                sent = requests()
+                assert _item_rows(await _items(True)) == first
+                assert requests() == sent
+                assert QueryCache.invalidate(target) == 1
+                fresh = _item_rows(await _items(True))
+                assert requests() == sent + 1
+                assert fresh[0][3] == price
+
+    async def test_a_write_that_raises_still_invalidates(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            first = _item_rows(await _items(True))
+            await client.query("UPDATE qc_item:i2 SET price = 77;")  # unseen by the entry
+            with pytest.raises(SurrealDbError, match="already exists"):
+                await QcItem(id="i1", name="dup").save()
+            sent = requests()
+            fresh = _item_rows(await _items(True))
+            assert requests() == sent + 1
+            assert fresh == _item_rows(await _items(False))
+            assert fresh != first
+
+    async def test_signal_handlers_see_the_write(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """While a write runs (pre → around → write → post), its tables are in flight: a handler's cached read goes
+        to the database, sees the write and stores nothing."""
+        seen: list[tuple[str, int]] = []
+
+        async def on_saved(sender: Any, instance: Any, created: bool, **kwargs: Any) -> None:
+            seen.append(("post_save", await QcItem.objects().cache().count()))
+
+        async def around(sender: Any, instance: Any, **kwargs: Any) -> AsyncIterator[None]:
+            yield
+            seen.append(("around_save", await QcItem.objects().cache().count()))
+
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            post_save.connect(QcItem)(on_saved)
+            around_save.connect(QcItem)(around)
+            try:
+                assert await QcItem.objects().cache().count() == 4
+                await QcItem(id="i5", name="e", category="toy", price=50).save()
+            finally:
+                post_save.disconnect(on_saved, QcItem)
+                around_save.disconnect(around, QcItem)
+            assert seen == [("around_save", 5), ("post_save", 5)]
+            sent = requests()
+            assert await QcItem.objects().cache().count() == 5
+            assert requests() == sent + 1  # neither handler's read was stored
+
+
+@pytest.mark.parametrize("kind", ["mem", "ws"])
+class TestDeleteCascadeE2E:
+    """AC-7, D21 (M10): deleting a record deletes the edges that point at it, so every delete refreshes the reads of
+    edge tables — and only them."""
+
+    @pytest.mark.parametrize("deletion", ["delete", "bulk_delete", "delete_table"])
+    async def test_deleting_a_node_refreshes_the_edge_reads(
+        self, kind: str, deletion: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def like_count() -> Awaitable[int]:
+            return QcLikes.objects().cache().count()
+
+        def likers() -> Awaitable[Any]:
+            return QcUser.objects().filter(id__in=Subquery(QcLikes.objects().select("in"))).cache().exec()
+
+        def user_count() -> Awaitable[int]:
+            return QcUser.objects().cache().count()
+
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            assert await like_count() == 1
+            assert _names(await likers()) == ["Ada"]
+            assert await user_count() == 2
+            if deletion == "delete":
+                await (await QcPost.objects().get("p1")).delete()
+            elif deletion == "bulk_delete":
+                await QcPost.objects().bulk_delete()
+            else:
+                await QcPost.objects().delete_table()
+            sent = requests()
+            assert await like_count() == 0
+            assert await likers() == []
+            assert requests() == sent + 2
+            assert await user_count() == 2
+            assert requests() == sent + 2  # a read without edges is still a hit
+
+
+@pytest.mark.parametrize("kind", ["mem", "ws"])
+class TestDeleteTableInTransactionE2E:
+    """AC-7 (M11): ``delete_table()`` runs at once, outside ``objects(tx=)``: it invalidates when it ends, never at a
+    commit, and a rollback does not leave a deleted row in the cache."""
+
+    async def test_delete_table_in_a_transaction_invalidates_at_once(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        def posts() -> Awaitable[Any]:
+            return QcPost.objects().order_by("id").cache().exec()
+
+        def post_count() -> Awaitable[int]:
+            return QcPost.objects().cache().count()
+
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            assert [post.id for post in await posts()] == ["p1", "p2"]
+            assert await post_count() == 2
+            with pytest.raises(RuntimeError, match="roll back"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    assert await QcPost.objects(tx=tx).delete_table() is True
+                    sent = requests()
+                    assert await post_count() == 0  # not deferred to the commit
+                    assert requests() == sent + 1
+                    raise RuntimeError("roll back")
+            sent = requests()
+            assert await posts() == []  # not lost with the rollback
+            assert requests() == sent + 1
+            assert await post_count() == 0  # stored inside the block, after the delete: still right
+            assert requests() == sent + 1
+
+
+class TestDdlInTransactionE2E:
+    """AC-7: ``define_computed_fields(tx=)`` and ``define_access(tx=)`` join the transaction (``"cls"`` reads the
+    bound ``tx``): a cached read outside it keeps hitting until the commit, and is fresh after it."""
+
+    @pytest.mark.parametrize("kind", ["mem", "ws"])
+    async def test_define_computed_fields(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with cache_db(kind) as client:
+            await _seed_player(client)
+            requests = _requests(monkeypatch, client)
+            assert _player_rows(await _players(True)) == [("p1", "ann")]
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert await QcPlayer.define_computed_fields(tx=tx) == QcPlayer.computed_field_ddl()
+                sent = requests()
+                assert _player_rows(await _players(True)) == [("p1", "ann")]
+                assert requests() == sent  # the committed state has not changed: a hit
+            sent = requests()
+            assert _player_rows(await _players(True)) == [("p1", "ann")]
+            assert requests() == sent + 1  # invalidated at the commit
+
+    @pytest.mark.parametrize("kind", ["ws"])
+    async def test_define_access(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with cache_db(kind) as client, _account_access(client):
+            await _seed_account(client)
+            requests = _requests(monkeypatch, client)
+            assert _emails(await _accounts(True)) == ["x@qc"]
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert await QcAccount.define_access(tx=tx) == QcAccount.access_ddl()
+                sent = requests()
+                assert _emails(await _accounts(True)) == ["x@qc"]
+                assert requests() == sent
+            sent = requests()
+            assert _emails(await _accounts(True)) == ["x@qc"]
+            assert requests() == sent + 1
+
+
+def _author_names(rows: Any) -> list[tuple[str, str]]:
+    """``(title, author's name)`` of each book read with a projection of the linked author."""
+    return [(row["title"], row["author"]["name"]) for row in rows]
+
+
+def _dotted(qs: Any, cached: bool) -> Awaitable[Any]:
+    return (qs.cache() if cached else qs).exec()
+
+
+#: D22 and P3: reads that follow the ``author`` link — ``(read, render, the author's new name, before, after)``.
+#: ``order_by`` alone keeps its order: SurrealDB orders ``SELECT *`` by the output document, where the link is not
+#: followed. The read still follows a link on its face, so the write refreshes it (a request, the database's rows).
+_DOTTED_READS: dict[str, tuple[Callable[[bool], Awaitable[Any]], Callable[[Any], Any], str, Any, Any]] = {
+    "filter": (
+        lambda c: _dotted(QcBook.objects().filter(**{"author.name": "Ada"}), c),
+        _book_titles,
+        "Bea",
+        ["Dune"],
+        [],
+    ),
+    "order_by": (
+        lambda c: _dotted(QcBook.objects().order_by("author.name"), c),
+        _book_titles,
+        "Zoe",
+        ["Dune", "Emma"],
+        ["Dune", "Emma"],
+    ),
+    "select": (
+        lambda c: _dotted(QcBook.objects().select("title", "author.name").order_by("title"), c),
+        _author_names,
+        "Zoe",
+        [("Dune", "Ada"), ("Emma", "Bea")],
+        [("Dune", "Zoe"), ("Emma", "Bea")],
+    ),
+    "select_star": (
+        lambda c: _dotted(QcBook.objects().select("title", "author.*").order_by("title"), c),
+        _author_names,
+        "Bea",
+        [("Dune", "Ada"), ("Emma", "Bea")],
+        [("Dune", "Bea"), ("Emma", "Bea")],
+    ),
+}
+
+
+@pytest.mark.parametrize("kind", ["mem", "ws"])
+class TestDottedPathsE2E:
+    """AC-7, D22, P3: a read that follows a link is refreshed by a write to the linked table."""
+
+    @pytest.mark.parametrize("read", list(_DOTTED_READS))
+    async def test_a_write_to_the_linked_table_refreshes_the_read(
+        self, kind: str, read: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run, render, name, before, after = _DOTTED_READS[read]
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            assert render(await run(True)) == before
+            sent = requests()
+            assert render(await run(True)) == before
+            assert requests() == sent  # primed: a hit
+            await (await QcAuthor.objects().get("ada")).merge(name=name)
+            sent = requests()
+            assert render(await run(True)) == after
+            assert requests() == sent + 1
+            assert render(await run(False)) == after
+
+
+async def _raw_ws_client() -> Any:
+    """A connection of its own to the server of ``SURREALDB_PORT`` (not the ORM's), as root on ``ns``/``db``."""
+    other = AsyncSurreal(_ws_url())
+    await other.connect(_ws_url())
+    await other.signin({"username": "root", "password": "root"})
+    await other.use("ns", "db")
+    return other
+
+
+class TestTransactionsE2E:
+    """AC-8: a write in a transaction is noted and invalidated at the commit — a failed one too —, never on a
+    rollback; deferred ``post_save`` handlers run after the invalidation."""
+
+    @pytest.mark.parametrize("kind", ["ws", "http"])
+    async def test_a_write_is_invalidated_at_the_commit(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: list[int] = []
+
+        async def on_saved(sender: Any, instance: Any, created: bool, **kwargs: Any) -> None:
+            seen.append(await QcItem.objects().cache().count())
+
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            first = _item_rows(await _items(True))
+            assert await QcItem.objects().cache().count() == 4
+            post_save.connect(QcItem)(on_saved)
+            try:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await QcItem(id="i5", name="e", category="toy", price=50).save(tx=tx)
+                    sent = requests()
+                    assert _item_rows(await _items(True)) == first  # the committed state, from the cache
+                    assert requests() == sent
+                    assert seen == []
+            finally:
+                post_save.disconnect(on_saved, QcItem)
+            assert seen == [5]  # the deferred handler's cached count() ran after the invalidation
+            sent = requests()
+            fresh = _item_rows(await _items(True))
+            assert requests() == sent + 1
+            assert ("i5", "e", "toy", 50, []) in fresh
+
+    @pytest.mark.parametrize("kind", ["ws", "http"])
+    async def test_a_rollback_leaves_the_entries(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            first = _item_rows(await _items(True))
+            with pytest.raises(RuntimeError, match="roll back"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await QcItem(id="i5", name="e", category="toy", price=50).save(tx=tx)
+                    raise RuntimeError("roll back")
+            sent = requests()
+            assert _item_rows(await _items(True)) == first
+            assert requests() == sent
+
+    @pytest.mark.parametrize("kind", ["ws", "http"])
+    async def test_a_failed_buffered_commit_still_invalidates(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A duplicate id in the batch: the commit raises, its state is unknown, the tables are invalidated."""
+        async with cache_db(kind) as client:
+            await _seed()
+            interactive = kind == "ws" and await _line(client) >= 3
+            requests = _requests(monkeypatch, client)
+            first = _item_rows(await _items(True))
+            await client.query("UPDATE qc_item:i2 SET price = 77;")  # unseen by the entry
+            duplicate = QcItem(id="i1", name="dup")
+            with pytest.raises(SurrealDbError, match="already exists"):
+                if interactive:  # the manager would open an interactive transaction here: buffer by hand
+                    tx = BufferedTransaction(client)
+                    await duplicate.save(tx=tx)
+                    await tx.commit()
+                else:
+                    async with SurrealDBConnectionManager.transaction() as tx:
+                        await duplicate.save(tx=tx)
+            sent = requests()
+            fresh = _item_rows(await _items(True))
+            assert requests() == sent + 1
+            assert fresh == _item_rows(await _items(False))
+            assert fresh != first
+
+    async def test_a_failed_interactive_commit_still_invalidates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Two transactions write ``qc_item:i1``; the other one commits first, so the ORM's commit is a conflict."""
+        async with cache_db("ws") as client:
+            if await _line(client) < 3:
+                pytest.skip("interactive transactions need SurrealDB 3.x")
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            first = _item_rows(await _items(True))
+            other = await _raw_ws_client()
+            try:
+                with pytest.raises(SurrealDbConflictError):
+                    async with SurrealDBConnectionManager.transaction() as tx:
+                        assert tx.is_interactive
+                        item = await QcItem.objects(tx=tx).get("i1")
+                        await item.merge(tx=tx, price=11)
+                        rival = InteractiveTransaction(other, await other.begin())
+                        await rival.run_read("SELECT * FROM qc_item:i1;", {})
+                        await rival.add("UPDATE qc_item:i1 SET price = 22;", {})
+                        await rival.commit()
+            finally:
+                with contextlib.suppress(Exception):
+                    await other.close()
+            sent = requests()
+            fresh = _item_rows(await _items(True))
+            assert requests() == sent + 1
+            assert fresh == _item_rows(await _items(False))
+            assert fresh[0][3] == 22
+            assert fresh != first
+
+
+class TestRaceE2E:
+    """AC-10: a read answered before a write completes is returned to its caller, never stored."""
+
+    async def test_a_read_answered_before_a_write_is_not_stored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def books() -> Awaitable[Any]:
+            return QcItem.objects().filter(category="book").order_by("name").cache().exec()
+
+        async with cache_db("mem") as client:
+            await _seed()
+            reached, release = _hold_next_reply(monkeypatch, client)
+            held = asyncio.create_task(books())
+            try:
+                await _until_held(reached, held)  # the old rows are computed
+                await QcItem(id="i5", name="e", category="book", price=50).save()
+            finally:
+                release.set()
+            assert _names(await asyncio.wait_for(held, 10)) == ["a", "b"]
+            assert QueryCache.stats()["entries"] == 0
+            requests = _requests(monkeypatch, client)
+            assert _names(await books()) == ["a", "b", "e"]
             assert requests() == 1

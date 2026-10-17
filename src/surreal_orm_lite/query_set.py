@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from pydantic_core import ValidationError
 
 from . import BaseSurrealModel, SurrealDBConnectionManager
+from . import cache as _cache
 from . import encoding as _encoding
 from . import geo as _geo
 from . import subquery as _subquery
@@ -1347,6 +1348,7 @@ class QuerySet:
 
         return await self._cached_read("select", "", {"target": target}, tables, False, run)
 
+    @_cache.invalidates("table", deletes=True)
     async def delete_table(self) -> bool:
         """
         Delete the associated table from the SurrealDB database.
@@ -1354,6 +1356,10 @@ class QuerySet:
         Returns True. A missing table is treated as already-absent (no-op),
         so this is safe for idempotent cleanup on SurrealDB 3.x (which raises
         NotFoundError) as well as 2.x (which is a no-op).
+
+        It runs at once, outside the queryset's ``objects(tx=)`` transaction (a rollback does
+        not bring the rows back), so the cached reads of the table — and of every edge table,
+        whose edges die with the records — are invalidated when it ends, never at a commit.
         """
         self._reject_time_travel("delete_table()")
         client = await SurrealDBConnectionManager.get_client()
@@ -1629,6 +1635,7 @@ class QuerySet:
 
     # ==================== Bulk Operations ====================
 
+    @_cache.invalidates("queryset")
     async def bulk_create(self, models: list[BaseSurrealModel]) -> list[BaseSurrealModel]:
         """
         Create multiple records in a single operation.
@@ -1729,6 +1736,7 @@ class QuerySet:
             return models  # buffered: not executed until commit; return inputs
         return cast(list[BaseSurrealModel], self.model.from_db(created))
 
+    @_cache.invalidates("queryset")
     async def bulk_update(self, **kwargs: Any) -> int:
         """
         Update all records matching the current filters.
@@ -1776,6 +1784,7 @@ class QuerySet:
         results = await self._run_compiled(compile_statement, write=True)
         return len(results) if isinstance(results, list) else 0
 
+    @_cache.invalidates("queryset", deletes=True)
     async def bulk_delete(self) -> int:
         """
         Delete all records matching the current filters.
@@ -1801,6 +1810,7 @@ class QuerySet:
         results = await self._run_compiled(compile_statement, write=True)
         return len(results) if isinstance(results, list) else 0
 
+    @_cache.invalidates("queryset")
     async def patch(self, operations: list[dict[str, Any]]) -> int:
         """
         Apply a JSON Patch (RFC 6902) to every row matching the current filters.

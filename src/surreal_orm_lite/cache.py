@@ -712,16 +712,18 @@ async def writing(tables: Iterable[str] | None, tx: Any = None) -> AsyncIterator
     """Around one ORM write of ``tables`` (``None``: every table).
 
     Outside a transaction, the tables are in flight for the whole block (a cached read of them goes to the database
-    and stores nothing), then invalidated when it ends, also on an exception. With a transaction (``tx`` having
-    ``_note_cache_write``), the tables are noted on it and invalidated at its commit. No table: nothing.
+    and stores nothing), then invalidated when it ends, also on an exception. With a transaction (``tx`` whose class
+    has ``_note_cache_write``), the tables are noted on it and invalidated at its commit. No table: nothing.
+
+    The transaction is recognised by its class, never by asking the object (no instance ``__getattr__`` runs), so a
+    write refused before it reaches its transaction leaves the object untouched.
     """
     resolved = None if tables is None else frozenset(tables)
     if resolved is not None and not resolved:
         yield
         return
-    note = getattr(tx, "_note_cache_write", None) if tx is not None else None
-    if callable(note):
-        note(resolved)
+    if tx is not None and callable(getattr(type(tx), "_note_cache_write", None)):
+        tx._note_cache_write(resolved)
         yield
         return
     token = QueryCache._write_started(resolved)

@@ -19,6 +19,7 @@ from typing import Any, ClassVar, Self
 
 from pydantic import AliasChoices, Field, field_validator
 
+from . import cache as _cache
 from . import encoding as _encoding
 from ._sdk import NotFoundError, RecordID, ServerError
 from .connection_manager import SurrealDBConnectionManager
@@ -216,6 +217,7 @@ class BaseSurrealEdge(BaseSurrealModel):
         """``in_``/``out``: SurrealDB ignores a change to an existing edge's endpoints."""
         return _ENDPOINT_FIELDS
 
+    @_cache.invalidates("self")
     async def save(
         self,
         tx: Transaction | None = None,
