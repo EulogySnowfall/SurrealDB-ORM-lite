@@ -71,6 +71,7 @@ from tests.test_embedded import (
     _table_rows,
     _tables,
 )
+from tests.test_paging import _PAGING_ROW
 from tests.test_query_cache import _QUERY_CACHE_ROW, _bullets
 from tests.test_time_travel import _SERVER_BEHAVIOUR, _SERVER_TABLE_WIDTHS, _forbidden_client
 
@@ -4473,8 +4474,8 @@ _MULTI_DATABASE_ROW = [
     "v0.29.0",
 ]
 _HEADER_CLAUSE_29 = (
-    "rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one "
-    "process, identical on 3.1.5."
+    "rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, "
+    "identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5"
 )
 #: Spec §11 item 6 (P8): all four cells of the embedded table's "Clients" row and of its new row.
 _EMBEDDED_CLIENTS_ROW = [
@@ -4706,11 +4707,14 @@ class TestMultiDatabaseDocs:
         assert comparison[start + 1][0] == "Schema Introspection", comparison
 
     def test_server_behaviour_row(self) -> None:
-        """One row, Since v0.29.0, right after the query-cache row and before the table's last row."""
+        """One row, Since v0.29.0, after the query-cache row and v0.28.1's rows, before the table's last row (later
+        versions add their rows after it)."""
         rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
-        assert rows[-2] == _MULTI_DATABASE_ROW, rows[-2]
-        assert rows[-3] == _QUERY_CACHE_ROW, rows[-3]
-        assert rows[-1][3] == "v0.19.1", rows[-1]
+        index = rows.index(_MULTI_DATABASE_ROW)
+        assert rows[index - 1] == _PAGING_ROW, rows[index - 1]
+        between = rows[rows.index(_QUERY_CACHE_ROW) + 1 : index]
+        assert between and all("v0.28.1" in cells[3] for cells in between), between
+        assert index < len(rows) - 1 and rows[-1][3] == "v0.19.1", rows[-1]
         assert [cells for cells in rows if cells[3] == "v0.29.0"] == [_MULTI_DATABASE_ROW]
 
     def test_server_behaviour_table_keeps_its_widths(self) -> None:
@@ -4721,6 +4725,7 @@ class TestMultiDatabaseDocs:
             assert [len(cell) for cell in line.split("|")[1:-1]] == _SERVER_TABLE_WIDTHS, line
 
     def test_server_behaviour_header_clause(self) -> None:
+        """v0.29.0's clause follows v0.28.0's and v0.28.1's (later versions append theirs after it)."""
         header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
         assert _HEADER_CLAUSE_29 in header, header
 

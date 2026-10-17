@@ -305,8 +305,9 @@ class TestPagingDocs:
             assert needle in text, needle
 
     def test_server_behaviour_row(self) -> None:
-        """Right after the filter value row of v0.28.1, before the table's last row."""
+        """Right after the filter value row of v0.28.1, before the table's last row (later versions add their rows
+        after it)."""
         rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
         index = rows.index(_PAGING_ROW)
         assert rows[index - 1] == _FILTER_VALUE_ROW, rows[index - 1]
-        assert index == len(rows) - 2, rows[index + 1]
+        assert index < len(rows) - 1 and rows[-1][3] == "v0.19.1", rows[-1]
