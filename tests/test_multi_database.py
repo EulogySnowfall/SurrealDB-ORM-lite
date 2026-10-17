@@ -45,6 +45,7 @@ from surreal_orm_lite import (
     Transaction,
     cache,
     connection_manager,
+    embedded,
     live,
     post_delete,
     post_save,
@@ -54,6 +55,7 @@ from surreal_orm_lite import (
     pre_update,
     routing,
 )
+from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
 from tests._proxy import CuttableProxy
 from tests.conftest import default_connection_class
 from tests.test_time_travel import _forbidden_client
@@ -66,6 +68,7 @@ _P = "_SurrealDBConnectionManager__"
 _NOT_ROUTED = {
     "_route",
     "_manager_for",
+    "_register_for_block",
     "add_connection",
     "remove_connection",
     "get_config",
@@ -1928,67 +1931,35 @@ _RESOLVERS = frozenset(
     }
 )
 
-# Temporary: removed entry by entry, empty and deleted at Task 9 (spec AC-7).
-_NOT_YET_ROUTED: dict[tuple[str, str | None], str] = {
-    ("testing/database.py", None): "Task 9 adds embedded_database(connection=)",
-}
 
-
-def _manager_attributes() -> list[tuple[str, tuple[str, ...], str, int]]:
-    """``(path, enclosing functions, attribute, line)`` of every ``SurrealDBConnectionManager.<attribute>`` node in the
-    package's code outside ``connection_manager.py`` (AST nodes: docstrings and comments do not count)."""
+def _manager_attributes() -> list[tuple[str, str, int]]:
+    """``(path, attribute, line)`` of every ``SurrealDBConnectionManager.<attribute>`` node in the package's code
+    outside ``connection_manager.py`` (AST nodes: docstrings and comments do not count)."""
     package = Path(surreal_orm_lite.__file__).parent
-    found: list[tuple[str, tuple[str, ...], str, int]] = []
+    found: list[tuple[str, str, int]] = []
     for path in sorted(package.rglob("*.py")):
         relative = path.relative_to(package).as_posix()
         if relative == "connection_manager.py":
             continue
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
-        for node in ast.walk(tree):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
             if not (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)):
                 continue
-            if node.value.id != "SurrealDBConnectionManager":
-                continue
-            functions: list[str] = []
-            parent = parents.get(node)
-            while parent is not None:
-                if isinstance(parent, ast.FunctionDef | ast.AsyncFunctionDef):
-                    functions.append(parent.name)
-                parent = parents.get(parent)
-            found.append((relative, tuple(functions), node.attr, node.lineno))
+            if node.value.id == "SurrealDBConnectionManager":
+                found.append((relative, node.attr, node.lineno))
     return found
 
 
-def _not_yet_routed(path: str, functions: tuple[str, ...]) -> tuple[str, str | None] | None:
-    """The entry of :data:`_NOT_YET_ROUTED` covering a node of *path* inside *functions*, if any."""
-    for key in ((path, None), *((path, name) for name in functions)):
-        if key in _NOT_YET_ROUTED:
-            return key
-    return None
-
-
 class TestSingleResolver:
-    """AC-7: outside ``connection_manager.py`` the package reaches a connection through its resolvers only."""
+    """AC-7: outside ``connection_manager.py`` the package reaches a connection through its resolvers only — with no
+    allowlist."""
 
     def test_every_call_goes_through_a_resolved_connection(self) -> None:
         found = _manager_attributes()
-        # The scan sees the package: the models' resolver names _manager_for.
-        assert any(path == "model_base.py" and attribute == "_manager_for" for path, _, attribute, _ in found)
-        offenders = [
-            f"{path}:{line} {attribute}"
-            for path, functions, attribute, line in found
-            if attribute not in _RESOLVERS and _not_yet_routed(path, functions) is None
-        ]
+        # The scan sees the package: the models' resolver names _manager_for, the testing helpers _register_for_block.
+        assert ("model_base.py", "_manager_for") in {(path, attribute) for path, attribute, _ in found}
+        assert ("testing/database.py", "_register_for_block") in {(path, attribute) for path, attribute, _ in found}
+        offenders = [f"{path}:{line} {attribute}" for path, attribute, line in found if attribute not in _RESOLVERS]
         assert offenders == []
-
-    def test_no_stale_allowlist_entry(self) -> None:
-        needed = {
-            _not_yet_routed(path, functions)
-            for path, functions, attribute, _ in _manager_attributes()
-            if attribute not in _RESOLVERS
-        }
-        assert set(_NOT_YET_ROUTED) <= needed
 
 
 @contextlib.asynccontextmanager
@@ -3514,3 +3485,320 @@ class TestLinkGuardE2E:
                 assert (here.title, here.author.name) == ("here", "Ann")
             assert [row["title"] for row in await _root_rows("md_a", "md_post")] == ["here"]
             assert [row["title"] for row in await _root_rows("md_b", "md_post")] == ["elsewhere"]
+
+
+# === Embedded engines per connection (spec §5.6, §6.7, §6.8) =================================================
+
+
+def _x5(name: str, url: str, holder: str) -> str:
+    return (
+        f"Connection {name!r} cannot open {url!r}: connection {holder!r} already has that store open in this process, "
+        f"and two in-process engines on one store miss each other's writes. Use one connection for the store, or close "
+        f"{holder!r} first."
+    )
+
+
+def _r8(name: str, active: str) -> str:
+    return (
+        f"embedded_database(connection={name!r}) cannot isolate {name!r} inside using({active!r}): every model of the "
+        f"block would use {active!r} and reach its real database. Leave connection=None (it isolates {active!r}), or "
+        "open the block outside using()."
+    )
+
+
+def _slot(name: str) -> Any:
+    """The client in the embedded slot of connection *name* (white box)."""
+    return vars(connection_manager._REGISTRY[name])[_P + "embedded_client"]
+
+
+def _claim(url: str) -> str | None:
+    """The name of the connection holding the on-disk store of *url*, if any."""
+    key = embedded.store_key(url)
+    assert key is not None
+    return connection_manager._STORE_CLAIMS.get(key)
+
+
+class TestStoreKey:
+    """Spec §6.7: the canonical path of the on-disk store an embedded URL opens — one key for every spelling."""
+
+    def test_in_memory_and_server_urls_hold_no_store(self) -> None:
+        for url in (None, "", "mem://", "memory://", _UNREACHABLE, "http://localhost:8000", "rocksdb://x"):
+            assert embedded.store_key(url) is None, url
+
+    def test_every_spelling_of_one_path_is_one_store(self, tmp_path: Path) -> None:
+        path = tmp_path / "kv"
+        expected = os.path.realpath(path)
+        spellings = (
+            f"surrealkv://{path}",
+            f"surrealkv://{path}/",
+            f"surrealkv+versioned://{path}",
+            f"file://{path}",
+            f"surrealkv://{path}?versioned=true",
+            f"file://{path}/#fragment",
+        )
+        for url in spellings:
+            assert embedded.store_key(url) == expected, url
+        assert embedded.store_key(f"surrealkv://{tmp_path / 'other'}") == os.path.realpath(tmp_path / "other")
+
+    def test_relative_paths_and_symbolic_links_resolve(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        (tmp_path / "kv").mkdir()
+        (tmp_path / "link").symlink_to(tmp_path / "kv")
+        monkeypatch.chdir(tmp_path)
+        expected = os.path.realpath(tmp_path / "kv")
+        assert embedded.store_key("surrealkv://kv") == expected
+        assert embedded.store_key(f"surrealkv://{tmp_path / 'link'}") == expected
+
+
+class TestStoreClaims:
+    """AC-19, X5 (no server): an on-disk store is open under one connection name at a time in the process; two names
+    on ``mem://`` are two databases."""
+
+    async def test_a_second_name_on_one_store_raises_x5_until_the_first_closes(self, tmp_path: Path) -> None:
+        path = tmp_path / "kv"
+        url = f"surrealkv://{path}"
+        SurrealDBConnectionManager.add_connection("md_a", url=url, namespace="t", database="t")
+        client = await SurrealDBConnectionManager.get_client("md_a")
+        await client.query("CREATE md_item:1 SET v = 1;", {})
+        del client  # the closed-client rule of v0.25.0: the path is reopened below
+        assert _claim(url) == "md_a"
+        for spelling in (url, f"{url}/", f"file://{path}", f"surrealkv+versioned://{path}"):
+            SurrealDBConnectionManager.add_connection("md_b", url=spelling, namespace="t", database="t")
+            with pytest.raises(SurrealDbConnectionError) as info:
+                await SurrealDBConnectionManager.get_client("md_b")
+            assert str(info.value) == _x5("md_b", spelling, "md_a")
+            assert info.value.retryable is False  # type: ignore[attr-defined]
+            assert _slot("md_b") is None
+            assert _claim(url) == "md_a"
+        await SurrealDBConnectionManager.close_connection("md_a")
+        assert _claim(url) is None
+        md_b = await SurrealDBConnectionManager.get_client("md_b")
+        assert _claim(url) == "md_b"
+        assert _values(await _rows_of(md_b, "md_item")) == [1]  # md_a's committed row, on the one store
+        del md_b
+        with pytest.raises(SurrealDbConnectionError, match="already has that store open in this process"):
+            await SurrealDBConnectionManager.get_client("md_a")
+
+    async def test_remove_connection_releases_the_store(self, tmp_path: Path) -> None:
+        url = f"surrealkv://{tmp_path / 'kv'}"
+        SurrealDBConnectionManager.add_connection("md_a", url=url, namespace="t", database="t")
+        SurrealDBConnectionManager.add_connection("md_b", url=url, namespace="t", database="t")
+        await SurrealDBConnectionManager.get_client("md_a")
+        with pytest.raises(SurrealDbConnectionError, match="already has that store open in this process"):
+            await SurrealDBConnectionManager.get_client("md_b")
+        await SurrealDBConnectionManager.remove_connection("md_a")
+        assert _claim(url) is None
+        assert await SurrealDBConnectionManager.get_client("md_b") is _slot("md_b")
+        assert _claim(url) == "md_b"
+
+    async def test_a_store_that_cannot_open_is_not_claimed(self) -> None:
+        url = "surrealkv:///proc/forbidden/kv"
+        for name in ("md_a", "md_b"):
+            SurrealDBConnectionManager.add_connection(name, url=url, namespace="t", database="t")
+            with pytest.raises(SurrealDbConnectionError, match="Can't open the embedded database"):
+                await SurrealDBConnectionManager.get_client(name)
+            assert _claim(url) is None
+
+    async def test_the_same_name_reopens_its_store_in_an_embedded_database_block(self, tmp_path: Path) -> None:
+        """v0.25.0 behaviour on the connection's own store; the claim stays the connection's after the block."""
+        url = f"surrealkv://{tmp_path / 'kv'}"
+        SurrealDBConnectionManager.add_connection("md_a", url=url, namespace="t", database="t")
+        outer = await SurrealDBConnectionManager.get_client("md_a")
+        async with embedded_database(url, connection="md_a") as block:
+            assert block is not outer
+            assert await SurrealDBConnectionManager.get_client("md_a") is block
+            assert _claim(url) == "md_a"
+            del block
+        assert await SurrealDBConnectionManager.get_client("md_a") is outer
+        assert _claim(url) == "md_a"
+        SurrealDBConnectionManager.add_connection("md_b", url=url, namespace="t", database="t")
+        with pytest.raises(SurrealDbConnectionError, match="already has that store open in this process"):
+            await SurrealDBConnectionManager.get_client("md_b")
+
+    async def test_a_close_inside_such_a_block_keeps_the_outer_engines_claim(self, tmp_path: Path) -> None:
+        """The block's close releases the store while the outer engine, detached, still has it open: the claim is
+        the outer engine's again when it comes back."""
+        url = f"surrealkv://{tmp_path / 'kv'}"
+        SurrealDBConnectionManager.add_connection("md_a", url=url, namespace="t", database="t")
+        outer = await SurrealDBConnectionManager.get_client("md_a")
+        async with embedded_database(url, connection="md_a") as block:
+            del block
+            await SurrealDBConnectionManager.close_connection("md_a")
+        assert await SurrealDBConnectionManager.get_client("md_a") is outer
+        assert _claim(url) == "md_a"
+        SurrealDBConnectionManager.add_connection("md_b", url=url, namespace="t", database="t")
+        with pytest.raises(SurrealDbConnectionError, match="already has that store open in this process"):
+            await SurrealDBConnectionManager.get_client("md_b")
+
+    async def test_another_store_in_a_block_is_released_after_it(self, tmp_path: Path) -> None:
+        url = f"surrealkv://{tmp_path / 'kv'}"
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="t")
+        async with embedded_database(url, connection="md_a"):
+            assert _claim(url) == "md_a"
+        assert _claim(url) is None
+
+    async def test_two_names_on_mem_are_two_databases(self) -> None:
+        claims = dict(connection_manager._STORE_CLAIMS)
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="t")
+        SurrealDBConnectionManager.add_connection("md_b", url="mem://", namespace="t", database="t")
+        a_client = await SurrealDBConnectionManager.get_client("md_a")
+        b_client = await SurrealDBConnectionManager.get_client("md_b")
+        assert a_client is not b_client
+        await a_client.query("CREATE md_item:1 SET v = 1;", {})
+        assert await _rows_of(b_client, "md_item") == []
+        assert dict(connection_manager._STORE_CLAIMS) == claims  # in memory: nothing to claim
+
+
+@fixture
+class MdFixtures(SurrealFixture):
+    """A record of the default connection and one of ``md_a``."""
+
+    customer = MdCustomer(id="c1", name="Ada")
+    event = MdEvent(id="e1", title="Launch")
+
+
+def _untouched(*names: str) -> list[Any]:
+    """What a refused ``embedded_database()`` must leave as it was: the registry, and each connection's settings,
+    stored session, embedded slot and per-loop clients."""
+    state: list[Any] = [list(connection_manager._REGISTRY)]
+    for name in names:
+        connection = connection_manager._REGISTRY[name]
+        state.append(
+            (
+                name,
+                connection._settings(),
+                connection.get_session_token(),
+                vars(connection)[_P + "embedded_client"],
+                dict(vars(connection)[_P + "clients"]),
+            )
+        )
+    return state
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestEmbeddedDatabaseConnection:
+    """AC-20, spec §5.6, §6.8 (no server): ``embedded_database(connection=)`` isolates one connection, the current
+    one by default; R8 and R3 before anything changes; ``SurrealFixture`` across two connections."""
+
+    async def test_an_explicit_connection_is_isolated_alone(self) -> None:
+        async with _mem_default_and_md_a():
+            default = await SurrealDBConnectionManager.get_client()
+            await MdCustomer(id="c1", name="default").save()
+            md_a = await SurrealDBConnectionManager.get_client("md_a")
+            await md_a.query("CREATE md_customer:a SET name = 'md_a';", {})
+            default_connection_class()._SurrealDBConnectionManager__session_token = "kept"  # type: ignore[attr-defined]
+            config = SurrealDBConnectionManager.get_config("md_a")
+            try:
+                async with embedded_database(connection="md_a") as client:
+                    assert client is not md_a
+                    assert await SurrealDBConnectionManager.get_client("md_a") is client
+                    assert SurrealDBConnectionManager.get_config("md_a") == ConnectionConfig(
+                        "mem://", None, None, "test", "test"
+                    )
+                    async with SurrealDBConnectionManager.using("md_a"):
+                        assert await MdCustomer.objects().count() == 0
+                        await MdCustomer(id="block", name="block").save()
+                    # The default connection is not touched.
+                    assert await SurrealDBConnectionManager.get_client() is default
+                    assert SurrealDBConnectionManager.get_session_token() == "kept"
+                    assert [customer.id for customer in await MdCustomer.objects().exec()] == ["c1"]
+                assert await SurrealDBConnectionManager.get_client("md_a") is md_a
+                assert SurrealDBConnectionManager.get_config("md_a") == config
+                assert [row["name"] for row in await _rows_of(md_a, "md_customer")] == ["md_a"]
+                assert await SurrealDBConnectionManager.get_client() is default
+                assert SurrealDBConnectionManager.get_session_token() == "kept"
+            finally:
+                SurrealDBConnectionManager.clear_session()
+
+    async def test_inside_using_the_block_isolates_the_current_connection(self) -> None:
+        async with _mem_default_and_md_a():
+            default = await SurrealDBConnectionManager.get_client()
+            md_a = await SurrealDBConnectionManager.get_client("md_a")
+            async with SurrealDBConnectionManager.using("md_a"):
+                async with embedded_database() as client:
+                    assert client is not md_a
+                    assert await SurrealDBConnectionManager.get_client() is client
+                    await MdCustomer(id="in-block", name="isolated").save()  # default-routed: the block's connection
+                    assert await MdCustomer.objects().count() == 1
+                assert await SurrealDBConnectionManager.get_client() is md_a
+            assert await _rows_of(md_a, "md_customer") == []
+            assert await _rows_of(default, "md_customer") == []
+            assert await SurrealDBConnectionManager.get_client() is default
+
+    async def test_outside_any_block_it_isolates_the_default(self) -> None:
+        async with _mem_default_and_md_a():
+            default = await SurrealDBConnectionManager.get_client()
+            md_a = await SurrealDBConnectionManager.get_client("md_a")
+            async with embedded_database() as client:
+                assert client is not default
+                assert await SurrealDBConnectionManager.get_client() is client
+                assert await SurrealDBConnectionManager.get_client("md_a") is md_a
+                await MdCustomer(id="in-block").save()
+            assert await SurrealDBConnectionManager.get_client() is default
+            assert await _rows_of(default, "md_customer") == []
+
+    async def test_r8_before_anything_changes(self) -> None:
+        async with _mem_default_and_md_a():
+            await SurrealDBConnectionManager.get_client()
+            await SurrealDBConnectionManager.get_client("md_a")
+            SurrealDBConnectionManager.add_connection("md_b", url="mem://", namespace="ns", database="md_b")
+            before = _untouched("default", "md_a", "md_b")
+            async with SurrealDBConnectionManager.using("md_a"):
+                for name in ("default", "md_b", "md_new"):
+                    with pytest.raises(ValueError) as info:
+                        async with embedded_database(connection=name):
+                            pytest.fail("the block must not run")  # pragma: no cover
+                    assert str(info.value) == _r8(name, "md_a")
+                    assert _untouched("default", "md_a", "md_b") == before
+                async with embedded_database(connection="md_a") as client:
+                    assert await SurrealDBConnectionManager.get_client() is client
+            assert _untouched("default", "md_a", "md_b") == before
+
+    async def test_r3_before_anything_changes(self) -> None:
+        async with _mem_default_and_md_a():
+            await SurrealDBConnectionManager.get_client()
+            before = _untouched("default", "md_a")
+            cases: list[tuple[Any, type[Exception], str]] = [
+                (1, TypeError, "Connection name must be a str, not int."),
+                ("", ValueError, "Connection name must not be empty."),
+            ]
+            for connection, error, text in cases:
+                with pytest.raises(error) as info:
+                    async with embedded_database(connection=connection):
+                        pytest.fail("the block must not run")  # pragma: no cover
+                assert str(info.value) == text
+                assert _untouched("default", "md_a") == before
+
+    async def test_an_unregistered_name_is_registered_for_the_block_only(self) -> None:
+        assert "md_a" not in connection_manager._REGISTRY
+        async with embedded_database(connection="md_a") as client:
+            assert "md_a" in SurrealDBConnectionManager.list_connections()
+            assert await SurrealDBConnectionManager.get_client("md_a") is client
+            await MdEvent(id="e1", title="routed").save()  # routed to md_a: the block's engine
+            assert [event.title for event in await MdEvent.objects().exec()] == ["routed"]
+            async with SurrealDBConnectionManager.using("md_a"):
+                assert await MdEvent.objects().count() == 1
+        assert "md_a" not in connection_manager._REGISTRY
+        assert "md_a" not in SurrealDBConnectionManager.list_connections()
+        with pytest.raises(ValueError) as info:
+            await MdEvent.objects().exec()
+        assert str(info.value) == _r2("MdEvent", "md_a")
+
+    async def test_surreal_fixture_saves_each_record_through_its_connection(self) -> None:
+        async with _mem_default_and_md_a():
+            default = await SurrealDBConnectionManager.get_client()
+            md_a = await SurrealDBConnectionManager.get_client("md_a")
+            async with MdFixtures.load() as loaded:
+                assert (loaded.customer.id, loaded.event.id) == ("c1", "e1")
+                assert [row["name"] for row in await _rows_of(default, "md_customer")] == ["Ada"]
+                assert _titles(await _rows_of(md_a, "md_event")) == ["Launch"]
+                assert await _rows_of(default, "md_event") == []
+                assert await _rows_of(md_a, "md_customer") == []
+            assert await _rows_of(default, "md_customer") == []
+            assert await _rows_of(md_a, "md_event") == []
+            async with SurrealDBConnectionManager.using("md_a"), MdFixtures.load():
+                assert [row["name"] for row in await _rows_of(md_a, "md_customer")] == ["Ada"]
+                assert _titles(await _rows_of(md_a, "md_event")) == ["Launch"]
+                assert await _rows_of(default, "md_customer") == []
+                assert await _rows_of(default, "md_event") == []
+            assert await _rows_of(md_a, "md_customer") == []
+            assert await _rows_of(md_a, "md_event") == []
