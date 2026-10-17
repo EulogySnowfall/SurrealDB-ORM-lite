@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from pydantic import AliasChoices, AliasPath, ValidationError
 
+from . import cache as _cache
 from . import encoding as _encoding
 from .auth import AuthTokens, build_auth_payload, wrap_auth_error
 from .connection_manager import SurrealDBConnectionManager
@@ -367,6 +368,7 @@ class AuthenticatedUserMixin:
         return statements
 
     @classmethod
+    @_cache.invalidates("cls")
     async def define_access(
         cls,
         *,
@@ -727,6 +729,7 @@ class AuthenticatedUserMixin:
         return AuthResult(user=user, tokens=tokens)
 
     @classmethod
+    @_cache.invalidates("cls")
     async def signup(cls, *, bind: bool = False, **fields: Any) -> "AuthResult[Self]":
         """Register a new record user, and return the created instance with its tokens.
 

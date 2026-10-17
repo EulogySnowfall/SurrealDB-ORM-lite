@@ -12,6 +12,7 @@ from uuid import UUID
 
 from pydantic import TypeAdapter, ValidationError
 
+from . import cache as _cache
 from . import decoding as _decoding
 from . import encoding as _encoding
 from ._sdk import AsyncSurreal, NotFoundError
@@ -261,7 +262,9 @@ class SurrealDBConnectionManager:
         """
         dead = [loop for loop in list(cls.__clients) if loop.is_closed()]
         for loop in dead:
-            cls.__clients.pop(loop, None)
+            client = cls.__clients.pop(loop, None)
+            if client is not None:
+                _cache.retire_client(client)
             logger.debug("Dropped the cached SurrealDB client of a closed event loop.")
 
     @classmethod
@@ -485,6 +488,7 @@ class SurrealDBConnectionManager:
         """
         if cls.__clients.get(loop) is client:
             cls.__clients.pop(loop, None)
+        _cache.retire_client(client)
         logger.info("The SurrealDB WebSocket connection dropped; opening a new one.")
         await cls._close_dead_socket(client)
         for candidate in (client, getattr(client, "_connection", None)):
@@ -545,7 +549,8 @@ class SurrealDBConnectionManager:
             _client = await cls._open_client(signin_as_configured=True)
         except SurrealDbConnectionError:
             stale = cls.__clients.pop(loop, None)
-            if stale is not None:  # pragma: no cover
+            if stale is not None:
+                _cache.retire_client(stale)
                 with contextlib.suppress(NotImplementedError):
                     await stale.close()
             raise
@@ -807,6 +812,7 @@ class SurrealDBConnectionManager:
         cls.__embedded_client = None
         cls.__embedded_url = None
         cls.__embedded_selection = None
+        _cache.retire_client(client)
         with contextlib.suppress(Exception):
             await client.close()
         cls.clear_function_signature_cache()
@@ -882,6 +888,7 @@ class SurrealDBConnectionManager:
             cls.__embedded_client = state.embedded_client  # last: see the fast path of _acquire_embedded_client()
             cls.clear_function_signature_cache()
             if block_client is not None and block_client is not state.embedded_client:
+                _cache.retire_client(block_client)
                 with contextlib.suppress(Exception):
                     await block_client.close()
 
@@ -924,6 +931,7 @@ class SurrealDBConnectionManager:
         client = cls.__clients.pop(asyncio.get_running_loop(), None)
         if client is None:
             return
+        _cache.retire_client(client)
 
         with contextlib.suppress(NotImplementedError):
             await client.close()
@@ -948,8 +956,11 @@ class SurrealDBConnectionManager:
         await cls._close_embedded()
         client = cls.__clients.pop(loop, None)
         if client is not None:
+            _cache.retire_client(client)
             with contextlib.suppress(NotImplementedError):
                 await client.close()
+        for other in list(cls.__clients.values()):
+            _cache.retire_client(other)
         cls.__clients.clear()
 
     @classmethod
@@ -1150,6 +1161,7 @@ class SurrealDBConnectionManager:
             return cls._adopt_tokens(tokens, store=store, operation="signin", client=client, embedded=embedded)
 
     @classmethod
+    @_cache.invalidates("all")
     async def signup(
         cls,
         *,
@@ -1223,7 +1235,9 @@ class SurrealDBConnectionManager:
 
     @classmethod
     def _stamp_identity(cls, client: Any, *, replayable: bool, fingerprint: str | None = None) -> None:
-        """Record that the manager just set *client*'s identity, and whether a reconnect restores it.
+        """Record that the manager just set *client*'s identity, and whether a reconnect restores it,
+        and mint the client's query-cache scope: a new one at every stamp, so cached results never
+        cross identities; the scope is retired when the manager drops the client.
 
         *fingerprint* is what the client was built from when that was read before an await; by
         default, the current replay identity.
@@ -1231,6 +1245,14 @@ class SurrealDBConnectionManager:
         stamp = (cls._replay_identity() if fingerprint is None else fingerprint, replayable)
         with contextlib.suppress(TypeError):  # an object that cannot be weakly referenced
             cls.__client_identities[client] = stamp
+        _cache.bind_scope(client)
+
+    @classmethod
+    def _cache_scope(cls, client: Any) -> int | None:
+        """*client*'s live query-cache scope, or ``None`` for a client the manager did not stamp (or
+        one that cannot be weakly referenced, whose reads are never cached): the one place a
+        QuerySet asks."""
+        return _cache.client_scope(client)
 
     @classmethod
     def _identity_of(cls, client: Any) -> tuple[str, bool] | None:

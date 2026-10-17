@@ -1175,8 +1175,8 @@ _PARIS = (2.35, 48.85)
 
 def test_the_boundary_guard_still_covers_every_pre_existing_module() -> None:
     """The encoding-boundary guard of ``conftest.py`` is lifted for this new module only (v0.25.0), beside the
-    modules of v0.23.0, v0.24.0 and v0.24.3 (#235), and for ``tests/test_time_travel.py`` (v0.26.0) and
-    ``tests/test_subqueries.py`` (v0.27.0), new too."""
+    modules of v0.23.0, v0.24.0 and v0.24.3 (#235), and for ``tests/test_time_travel.py`` (v0.26.0),
+    ``tests/test_subqueries.py`` (v0.27.0) and ``tests/test_query_cache.py`` (v0.28.0), new too."""
     assert (
         frozenset(
             {
@@ -1189,6 +1189,7 @@ def test_the_boundary_guard_still_covers_every_pre_existing_module() -> None:
                 "tests.test_embedded",
                 "tests.test_time_travel",
                 "tests.test_subqueries",
+                "tests.test_query_cache",
             }
         )
         == _REWRITE_MODULES
@@ -2529,8 +2530,8 @@ class TestReadmeEmbeddedWording:
             assert name in section, name
 
     def test_section_26_follows_section_25(self) -> None:
-        """Section 26 comes right after section 25, then section 27 (v0.26.0) and section 28 (v0.27.0), up to
-        "Configuration Options"."""
+        """Section 26 comes right after section 25, then section 27 (v0.26.0), section 28 (v0.27.0) and section 29
+        (v0.28.0), up to "Configuration Options"."""
         readme = _readme()
         start_25 = readme.index("\n### 25. Geospatial fields\n")
         start_26 = readme.index(f"\n{_SECTION_26}\n")
@@ -2540,6 +2541,7 @@ class TestReadmeEmbeddedWording:
             _SECTION_26,
             "### 27. Time travel (`as_of()`)",
             "### 28. Subqueries (`Subquery`)",
+            "### 29. Query cache (`cache()`, `QueryCache`)",
         ]
 
     def test_subsections_in_order(self) -> None:

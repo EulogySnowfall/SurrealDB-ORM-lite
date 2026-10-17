@@ -16,6 +16,7 @@ import pydantic
 from pydantic import BaseModel, ConfigDict, ModelWrapValidatorHandler, PrivateAttr, TypeAdapter, model_validator
 from pydantic_core import ValidationError
 
+from . import cache as _cache
 from . import encoding as _encoding
 from . import geo as _geo
 from . import time_travel as _time_travel
@@ -784,6 +785,7 @@ class BaseSurrealModel(BaseModel):
         return statements
 
     @classmethod
+    @_cache.invalidates("cls")
     async def define_computed_fields(
         cls,
         overwrite: bool = True,
@@ -1771,6 +1773,7 @@ class BaseSurrealModel(BaseModel):
         self._apply_record(rows)
         return self, True
 
+    @_cache.invalidates("self")
     async def _save_naming(self, fields: Iterable[str], tx: Transaction | None = None) -> Self:
         """``save()`` that also writes the ``server_fields`` among ``fields``.
 
@@ -1783,6 +1786,7 @@ class BaseSurrealModel(BaseModel):
             return await self.save(tx=tx)
         return await self._save_with_signals(functools.partial(self._do_save, keep=keep), tx)
 
+    @_cache.invalidates("self")
     async def save(
         self,
         tx: Transaction | None = None,
@@ -2064,6 +2068,7 @@ class BaseSurrealModel(BaseModel):
             return rows[0].get("before"), rows[0].get("after")
         return None, None
 
+    @_cache.invalidates("self")
     async def upsert(self, tx: Transaction | None = None) -> Self:
         """
         Insert the model instance, or fully replace it if a record with the same id exists.
@@ -2081,6 +2086,7 @@ class BaseSurrealModel(BaseModel):
         self._reject_snapshot_write("upsert()")
         return await self._save_with_signals(self._do_upsert, tx)
 
+    @_cache.invalidates("self")
     async def update(self, tx: Transaction | None = None) -> Any:
         """
         Update the model instance to the database.
@@ -2186,6 +2192,7 @@ class BaseSurrealModel(BaseModel):
         await post_update.send(sender, instance=self, update_fields=update_fields)
         return None
 
+    @_cache.invalidates("self")
     async def merge(
         self,
         tx: Transaction | None = None,
@@ -2283,6 +2290,7 @@ class BaseSurrealModel(BaseModel):
 
     # ==================== Patch & atomic operations ====================
 
+    @_cache.invalidates("self")
     async def patch(self, operations: list[dict[str, Any]], tx: Transaction | None = None) -> Self:
         """Apply a JSON Patch (RFC 6902) to this record.
 
@@ -2340,6 +2348,7 @@ class BaseSurrealModel(BaseModel):
         self._apply_record(rows)
         return self
 
+    @_cache.invalidates("self")
     async def atomic_append(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
         """Atomically append ``value`` to an array ``field`` (duplicates allowed).
 
@@ -2351,6 +2360,7 @@ class BaseSurrealModel(BaseModel):
             f"{column} = array::append({column}, $value)", {"value": value}, tx, label="atomic_append()"
         )
 
+    @_cache.invalidates("self")
     async def atomic_remove(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
         """Atomically remove ALL occurrences of ``value`` from an array ``field``.
 
@@ -2363,6 +2373,7 @@ class BaseSurrealModel(BaseModel):
             f"{column} = array::complement({column}, [$value])", {"value": value}, tx, label="atomic_remove()"
         )
 
+    @_cache.invalidates("self")
     async def atomic_set_add(self, field: str, value: Any, tx: Transaction | None = None) -> Self:
         """Atomically add ``value`` to an array ``field`` only if not already present.
 
@@ -2374,6 +2385,7 @@ class BaseSurrealModel(BaseModel):
             f"{column} = array::add({column}, $value)", {"value": value}, tx, label="atomic_set_add()"
         )
 
+    @_cache.invalidates("self")
     async def atomic_increment(self, field: str, amount: Decimal | int | float = 1, tx: Transaction | None = None) -> Self:
         """Atomically add ``amount`` (default 1) to a numeric ``field``.
 
@@ -2403,6 +2415,7 @@ class BaseSurrealModel(BaseModel):
             return list(values)
         raise ValueError(f"values must be a list of items, got {type(values).__name__}")
 
+    @_cache.invalidates("self")
     async def atomic_append_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
         """Atomically append every element of ``values`` to an array ``field`` (duplicates allowed).
 
@@ -2419,6 +2432,7 @@ class BaseSurrealModel(BaseModel):
             label="atomic_append_many()",
         )
 
+    @_cache.invalidates("self")
     async def atomic_set_add_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
         """Atomically add every element of ``values`` to an array ``field``, skipping any already present.
 
@@ -2434,6 +2448,7 @@ class BaseSurrealModel(BaseModel):
             label="atomic_set_add_many()",
         )
 
+    @_cache.invalidates("self")
     async def atomic_remove_many(self, field: str, values: list[Any], tx: Transaction | None = None) -> Self:
         """Atomically remove ALL occurrences of every element of ``values`` from an array ``field``.
 
@@ -2448,6 +2463,7 @@ class BaseSurrealModel(BaseModel):
             label="atomic_remove_many()",
         )
 
+    @_cache.invalidates("self", deletes=True)
     async def delete(self, tx: Transaction | None = None) -> None:
         """
         Delete the model instance from the database.
@@ -2695,6 +2711,7 @@ class BaseSurrealModel(BaseModel):
         **edge_data: Any,
     ) -> list[dict[str, Any]]: ...
 
+    @_cache.invalidates("edge")
     async def relate(
         self,
         edge: "str | type[BaseSurrealEdge]",
@@ -2866,6 +2883,7 @@ class BaseSurrealModel(BaseModel):
         with contextlib.suppress(NotFoundError):
             await client.query(statement, _encoding.encode(variables))
 
+    @_cache.invalidates("edge")
     async def remove_relation(
         self,
         edge: "str | type[BaseSurrealEdge]",
@@ -2942,6 +2960,7 @@ class BaseSurrealModel(BaseModel):
             variables = {"src": source, "dst": self._graph_target(target)}
         await self._run_graph_delete(statement, variables, tx)
 
+    @_cache.invalidates("edge")
     async def remove_all_relations(
         self,
         edge: "str | type[BaseSurrealEdge] | Sequence[str | type[BaseSurrealEdge]]",
