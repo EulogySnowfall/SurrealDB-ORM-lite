@@ -2743,9 +2743,10 @@ _LOOKUPS_BULLET = (
     "`containsany` (all its values) or `exact`, `gt`, `gte`, `lt`, `lte`, `contains`, `not_contains` (its first "
     "value): see [section 28](#28-subqueries-subquery)"
 )
+#: No final period: v0.28.0 appends its own clause after this one (spec §11 of v0.28.0, D16).
 _HEADER_CLAUSE = (
     "rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in "
-    "v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs."
+    "v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs"
 )
 #: P4: each "Coming from" bullet the product owner added, as the names it must hold together.
 _P4_BULLETS = {
@@ -2775,7 +2776,8 @@ class TestSubqueryDocs:
     roadmap say about subqueries (spec §11, AC-12)."""
 
     def test_section_28_follows_section_27(self) -> None:
-        """Right after section 27 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        """Right after section 27 (after its "Coming from" bullets), then section 29 (v0.28.0), and before the
+        ``---`` of "Configuration Options"."""
         readme = _readme()
         start_27 = readme.index("\n### 27. Time travel (`as_of()`)\n")
         start_28 = readme.index(f"\n{_SECTION_28}\n")
@@ -2784,8 +2786,9 @@ class TestSubqueryDocs:
         assert re.findall(r"^#{2,3} .*$", readme[start_27 + 1 : configuration], re.MULTILINE) == [
             "### 27. Time travel (`as_of()`)",
             _SECTION_28,
+            "### 29. Query cache (`cache()`, `QueryCache`)",
         ]
-        assert readme[:configuration].rstrip().endswith("\n---"), "section 28 ends before the --- of the next part"
+        assert readme[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
     def test_subsections_in_order(self) -> None:
         section = _section_28()
@@ -2849,10 +2852,12 @@ class TestSubqueryDocs:
         assert firsts.index(row[0]) == firsts.index("Time travel (`as_of()`, versioned storage)") + 1
 
     def test_server_behaviour_rows(self) -> None:
-        """The four rows, Since v0.27.0, right after the five v0.26.0 rows and before the table's last row."""
+        """The four rows, Since v0.27.0, right after the five v0.26.0 rows and before the table's last row (later
+        versions add their rows after them: v0.28.0's query cache row)."""
         rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
-        assert rows[-5:-1] == _SUBQUERY_ROWS, rows[-5:-1]
-        assert rows[-10:-5] == _TIME_TRAVEL_ROWS, rows[-10:-5]
+        starts = [index for index in range(len(rows)) if rows[index : index + 4] == _SUBQUERY_ROWS]
+        assert len(starts) == 1 and starts[0] + 4 < len(rows), rows
+        assert rows[starts[0] - 5 : starts[0]] == _TIME_TRAVEL_ROWS, rows[starts[0] - 5 : starts[0]]
         assert rows[-1][3] == "v0.19.1", rows[-1]
         assert [cells for cells in rows if cells[3] == "v0.27.0"] == _SUBQUERY_ROWS
 
@@ -2876,7 +2881,7 @@ class TestSubqueryDocs:
         start = firsts.index("Time travel (`VERSION`)") + 1
         assert comparison[start : start + 2] == [
             ["Subqueries", "✅ v0.27.0 (`Subquery`, a QuerySet in `filter()`)", "✅"],
-            ["Query Cache", "v0.28.0", "✅"],
+            ["Query Cache", "✅ v0.28.0 (`cache()`, `QueryCache`)", "✅"],
         ], comparison
         assert "Subqueries & Query Cache" not in firsts
 
@@ -2884,11 +2889,12 @@ class TestSubqueryDocs:
         roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
         firsts = [cells[0] for cells in roadmap]
         start = firsts.index("v0.26.0") + 1
-        assert roadmap[start : start + 2] == [
+        assert roadmap[start : start + 3] == [
             ["v0.27.0", "Subqueries", "✅ Released"],
-            ["v0.28.0 – v0.29.0", "Tier 2 — Extended (cache, multi-db)", "📋 Planned"],
+            ["v0.28.0", "Query cache", "✅ Released"],
+            ["v0.29.0", "Tier 2 — Multi-database", "📋 Planned"],
         ], roadmap
-        assert "v0.27.0 – v0.29.0" not in firsts
+        assert "v0.27.0 – v0.29.0" not in firsts and "v0.28.0 – v0.29.0" not in firsts
 
     def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
         """Every table v0.27.0 touches keeps one cell count per line and no escaped pipe."""

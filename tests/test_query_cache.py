@@ -11,6 +11,7 @@ classes that open an engine or a server are suffixed ``E2E`` and run on the embe
 server of ``SURREALDB_PORT`` over WebSocket and HTTP.
 """
 
+import ast
 import asyncio
 import contextlib
 import functools
@@ -62,7 +63,17 @@ from surreal_orm_lite.cache import EDGES, CacheRequest, follows_links
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.transaction import BufferedTransaction, InteractiveTransaction
 from tests.conftest import _ws_url
-from tests.test_time_travel import _forbidden_client, _http_url, _line, _record_queries, connected
+from tests.test_embedded import _cells, _normalised, _readme, _readme_part, _subsection, _table_rows, _tables
+from tests.test_subqueries import _SUBQUERY_ROWS
+from tests.test_time_travel import (
+    _SERVER_BEHAVIOUR,
+    _SERVER_TABLE_WIDTHS,
+    _forbidden_client,
+    _http_url,
+    _line,
+    _record_queries,
+    connected,
+)
 
 # --- models (spec §9) ---------------------------------------------------------------------------------
 
@@ -3708,3 +3719,315 @@ class TestRaceE2E:
             requests = _requests(monkeypatch, client)
             assert _names(await books()) == ["a", "b", "e"]
             assert requests() == 1
+
+
+# --- AC-14: README section 29, the tables it touches and its examples (spec §11; D13, D16, P1, P2, P3, P5) -----
+
+_SECTION_28 = "### 28. Subqueries (`Subquery`)"
+_SECTION_29 = "### 29. Query cache (`cache()`, `QueryCache`)"
+_COMING_FROM_29 = "#### Coming from the full SurrealDB-ORM"
+#: Spec §11: section 29's subsections, in order, after an untitled intro.
+_SUBSECTIONS_29 = [
+    "What is cached",
+    "Time to live",
+    "Invalidation",
+    "One cache per connection and identity",
+    "Configuration and statistics",
+    "Coming from the full SurrealDB-ORM",
+]
+#: The row v0.28.0 adds to the 2.x/3.x table, cell by cell (spec §11: 37, 167, 100 and 7 characters).
+_QUERY_CACHE_ROW = [
+    "Query cache (`cache()`, `QueryCache`)",
+    "same on both lines: client-side, per connection and identity; writes in a transaction invalidate at commit; "
+    "reads in one are never cached (on 2.x they raise: buffered)",
+    "the same; reads inside an interactive transaction are never cached (they see its uncommitted writes)",
+    "v0.28.0",
+]
+_HEADER_CLAUSE_28 = (
+    "rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and "
+    "3.3.4, identical on 3.1.5."
+)
+#: Spec §11 (revision 3, P5): what the cache cannot see, one bullet of "Invalidation" holding each group of names.
+_CANNOT_SEE = {
+    "another process or client": ("another process",),
+    "raw SurrealQL": ("`raw_query()`", "`QuerySet.query()`", "`call_function()`", "`Transaction.add()`"),
+    "a write cancelled or failed client-side": ("cancelled", "after its request was sent"),
+    "an access method's own clauses": ("`SIGNIN`", "`SIGNUP`"),
+    "what the server derives": ("`DEFINE EVENT`", "`REFERENCE … ON DELETE`", "AS SELECT", "`PERMISSIONS`"),
+    "values computed when the read runs": ("`Var()`", "`DEFINE PARAM`", "`<future>`", "`COMPUTED`", "`select()`"),
+    "relations through a model that is not an edge": ("`BaseSurrealEdge`",),
+}
+
+
+def _section_29() -> str:
+    return _readme_part(_SECTION_29)
+
+
+def _section_29_blocks(language: str) -> list[str]:
+    """Section 29's fenced blocks of *language*, in order."""
+    return re.findall(rf"^```{language}\n(.*?)^```$", _section_29(), re.MULTILINE | re.DOTALL)
+
+
+def _part_29(heading: str) -> str:
+    """One ``####`` subsection of section 29, whitespace normalised."""
+    return _normalised(_subsection(f"#### {heading}", _section_29()))
+
+
+def _bullets(text: str) -> list[str]:
+    """The ``- `` bullets of *text*, each with its continuation lines, whitespace normalised."""
+    return [_normalised(bullet) for bullet in re.findall(r"^- .*?(?=^- |^\s*$|\Z)", text, re.MULTILINE | re.DOTALL)]
+
+
+def _behaviour_rows() -> list[list[str]]:
+    return [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
+
+
+class TestQueryCacheDocs:
+    """Unit: what README section 29, the features table, the 2.x/3.x behaviour table, the comparison and the
+    roadmap say about the query cache (spec §11, AC-14; P1, P2, P3, P5)."""
+
+    def test_section_29_follows_section_28(self) -> None:
+        """Right after section 28 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        readme = _readme()
+        start_28 = readme.index(f"\n{_SECTION_28}\n")
+        start_29 = readme.index(f"\n{_SECTION_29}\n")
+        configuration = readme.index("\n## Configuration Options\n")
+        assert start_28 < start_29 < configuration
+        assert re.findall(r"^#{2,3} .*$", readme[start_28 + 1 : configuration], re.MULTILINE) == [
+            _SECTION_28,
+            _SECTION_29,
+        ]
+        assert readme[:configuration].rstrip().endswith("\n---"), "section 29 ends before the --- of the next part"
+
+    def test_subsections_in_order(self) -> None:
+        section = _section_29()
+        assert re.findall(r"^#### (.*)$", section, re.MULTILINE) == _SUBSECTIONS_29
+        intro = section.split("\n#### ", 1)[0]
+        assert "```python\n" in intro, "the untitled intro holds the first example"
+
+    def test_coming_from_the_full_orm(self) -> None:
+        """What differs from the full ORM; no bullet about ``configure()``'s semantics, which are the same (P1)."""
+        section = _section_29()
+        assert re.search(r"^#### Coming from the full SurrealDB-ORM$", section, re.MULTILINE), "heading missing"
+        text = _normalised(_subsection(_COMING_FROM_29, section))
+        for name in (
+            "`cache(",
+            "`QueryCache`",
+            "`exec()`",
+            "post_save",
+            "`configure()`",
+            "default=str",
+            "sort_keys",
+            "FIFO",
+            "`timedelta`",
+            "`hits`",
+            "`live()`",
+            "never cached",
+        ):
+            assert name in text, name
+        assert "keeps what you do not pass" not in text
+        assert _bullets(_subsection(_COMING_FROM_29, section)), "the differences are bullets"
+
+    def test_what_is_cached(self) -> None:
+        text = _part_29("What is cached")
+        for name in (
+            "`exec()`",
+            "`get(<id>)`",
+            "`all()`",
+            "`count()`",
+            "`exists()`",
+            "`query()`",
+            "`live()`",
+            "`watch()`",
+            "`changes()`",
+            "`as_of()`",
+            "`refresh()`",
+            "`raw_query()`",
+            "`Subquery`",
+            "mem://",
+        ):
+            assert name in text, name
+
+    def test_time_to_live(self) -> None:
+        """P2: ``0`` means never cached; negative or non-finite values are refused."""
+        text = _part_29("Time to live")
+        for name in ("`0`", "never cached", "`timedelta`", "60", "non-finite", "oldest result"):
+            assert name in text, name
+
+    def test_invalidation(self) -> None:
+        """P3 (an expression in ``select()``) and P5 (the completed and corrected list of what the cache cannot see)."""
+        text = _part_29("Invalidation")
+        for name in (
+            "DEFINE EVENT",
+            "REFERENCE",
+            "COMPUTED",
+            "<future>",
+            "`Var()`",
+            "AS SELECT",
+            "`raw_query()`",
+            "`Transaction.add()`",
+            "`QueryCache.invalidate(",
+            "`fetch()`",
+            "author.name",
+            "`select()`",
+            "SIGNIN",
+            "cancelled",
+            "BaseSurrealEdge",
+            "`delete_table()`",
+            "another process",
+            '"author.*"',
+            "`SurrealDBConnectionManager.signup()`",
+            "commit",
+        ):
+            assert name in text, name
+        assert "`SurrealFunc` filter" not in text and "SurrealFunc" not in text, "P5: a SurrealFunc is bound, not seen"
+
+    @pytest.mark.parametrize("needles", list(_CANNOT_SEE.values()), ids=list(_CANNOT_SEE))
+    def test_what_the_cache_cannot_see_is_a_bullet_list(self, needles: tuple[str, ...]) -> None:
+        bullets = _bullets(_subsection("#### Invalidation", _section_29()))
+        assert [bullet for bullet in bullets if all(needle in bullet for needle in needles)], bullets
+
+    def test_one_cache_per_connection_and_identity(self) -> None:
+        text = _part_29("One cache per connection and identity")
+        for name in (
+            "`invalidate()`",
+            "memory",
+            "`QueryCache.set()`",
+            "USE",
+            "`QueryCache.clear()`",
+            "`embedded_database()`",
+            "never cross",
+        ):
+            assert name in text, name
+
+    def test_configuration_and_statistics(self) -> None:
+        """P1: every call sets all three settings, never clears; ``enabled=False`` hides; ``clear()`` drops."""
+        text = _part_29("Configuration and statistics")
+        for name in (
+            "enabled=False",
+            "hides",
+            "never clears",
+            "`clear()`",
+            "`stats()`",
+            "`make_key()`",
+            "`raw_query()`",
+            "takes its default",
+        ):
+            assert name in text, name
+        for key in ("entries", "tables", "max_size", "default_ttl", "enabled", "hits", "misses"):
+            assert f"`{key}`" in text, key
+
+    def test_features_row(self) -> None:
+        features = [cells for _, cells in _table_rows(_readme_part("## Features"))]
+        firsts = [cells[0] for cells in features]
+        row = ["Query cache (`cache()`, TTL, invalidated by ORM writes)", "✅"]
+        assert row in features, features
+        assert firsts.index(row[0]) == firsts.index("Subqueries (`Subquery`, a QuerySet as a filter value)") + 1
+
+    def test_server_behaviour_row(self) -> None:
+        """One row, Since v0.28.0, right after the four v0.27.0 rows and before the table's last row."""
+        rows = _behaviour_rows()
+        assert [len(cell) for cell in _QUERY_CACHE_ROW] == [37, 167, 100, 7]
+        assert rows[-2] == _QUERY_CACHE_ROW, rows[-2]
+        assert rows[-6:-2] == _SUBQUERY_ROWS, rows[-6:-2]
+        assert rows[-1][3] == "v0.19.1", rows[-1]
+        assert [cells for cells in rows if cells[3] == "v0.28.0"] == [_QUERY_CACHE_ROW]
+
+    def test_server_behaviour_table_keeps_its_widths(self) -> None:
+        """Every line 535 characters, the columns 136, 175, 181 and 38 wide: no line re-padded."""
+        [lines] = _tables(_readme_part(_SERVER_BEHAVIOUR))
+        assert {len(line) for line in lines} == {535}
+        for line in lines:
+            assert [len(cell) for cell in line.split("|")[1:-1]] == _SERVER_TABLE_WIDTHS, line
+
+    def test_server_behaviour_header_clause(self) -> None:
+        """The header's last clause names v0.28.0's lines, before its final period."""
+        header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
+        assert _HEADER_CLAUSE_28 in header, header
+
+    def test_comparison_row(self) -> None:
+        comparison = [cells for _, cells in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        firsts = [cells[0] for cells in comparison]
+        start = firsts.index("Subqueries") + 1
+        assert comparison[start] == ["Query Cache", "✅ v0.28.0 (`cache()`, `QueryCache`)", "✅"], comparison
+        assert comparison[start + 1][0] == "Multi-database", comparison
+
+    def test_roadmap_split(self) -> None:
+        roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
+        firsts = [cells[0] for cells in roadmap]
+        start = firsts.index("v0.27.0") + 1
+        assert roadmap[start : start + 2] == [
+            ["v0.28.0", "Query cache", "✅ Released"],
+            ["v0.29.0", "Tier 2 — Multi-database", "📋 Planned"],
+        ], roadmap
+        assert "v0.28.0 – v0.29.0" not in firsts
+
+    def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
+        """Every table v0.28.0 touches keeps one cell count per line and no escaped pipe."""
+        parts = [
+            _section_29(),
+            _readme_part("## Features"),
+            _readme_part(_SERVER_BEHAVIOUR),
+            _readme_part("## Roadmap"),
+            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+        ]
+        tables = [lines for part in parts for lines in _tables(part)]
+        assert len(tables) >= 4, "the four tables v0.28.0 touches"
+        for lines in tables:
+            assert len({len(_cells(line)) for line in lines}) == 1 and "\\|" not in "".join(lines), lines
+
+    def test_section_29_fences(self) -> None:
+        """Python blocks only, which the E2E test runs."""
+        fences = re.findall(r"^```(\S*)$", _section_29(), re.MULTILINE)
+        assert fences and fences[1::2] == [""] * (len(fences) // 2) and set(fences[0::2]) == {"python"}, fences
+
+
+#: The results section 29's comments state, by the names its examples assign (AC-14: each one asserted).
+_STATED_RESULTS_29 = {"books", "again", "hits", "fresh", "n", "lamp", "stale", "price", "ttl", "total", "cached_total"}
+
+
+def _rendered(value: Any) -> str:
+    """How a section 29 comment writes *value*: a record by its name, records by their sorted names, else ``str()``."""
+    if isinstance(value, BaseSurrealModel):
+        return str(value.name)  # type: ignore[attr-defined]
+    if isinstance(value, list):
+        return ", ".join(sorted(_rendered(item) for item in value)) if value else "[]"
+    return str(value)
+
+
+def _stated_results(blocks: list[str]) -> dict[str, str]:
+    """``{name: comment}`` for each line of *blocks* that assigns a result and states it in a trailing comment."""
+    stated: dict[str, str] = {}
+    for block in blocks:
+        for name, comment in re.findall(r"^(\w+) = .*?  # (.+)$", block, re.MULTILINE):
+            assert name not in stated, f"{name} is stated twice"
+            stated[name] = comment
+    return stated
+
+
+class TestQueryCacheReadmeExamplesE2E:
+    """AC-14: every ``python`` block of README section 29 runs as written, in order and in one namespace, on
+    ``embedded_database("mem://")`` with the cache reset first; every result a comment states is the one the
+    examples got."""
+
+    async def test_section_29_examples(self) -> None:
+        blocks = _section_29_blocks("python")
+        stated = _stated_results(blocks)
+        assert set(stated) == _STATED_RESULTS_29, sorted(stated)
+        namespace: dict[str, Any] = {"__name__": "readme_section_29"}
+        QueryCache.configure()
+        QueryCache.clear()
+        try:
+            async with embedded_database("mem://"):
+                for code in blocks:
+                    compiled = compile(code, "<README section 29>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                    # A doctest of this repository's own README (trusted text), top-level awaits included.
+                    outcome = eval(compiled, namespace)
+                    if inspect.iscoroutine(outcome):
+                        await outcome
+
+                for name, comment in stated.items():
+                    got = _rendered(namespace[name])
+                    assert comment == got or comment.startswith(f"{got} ("), (name, comment, got)
+        finally:
+            namespace.clear()

@@ -174,6 +174,7 @@ results = await User.objects().query(
 | Embedded engine (mem://, surrealkv://) & test fixtures                        | ✅     |
 | Time travel (`as_of()`, versioned storage)                                    | ✅     |
 | Subqueries (`Subquery`, a QuerySet as a filter value)                         | ✅     |
+| Query cache (`cache()`, TTL, invalidated by ORM writes)                       | ✅     |
 
 ### Supported Filter Lookups
 
@@ -3391,6 +3392,218 @@ are not available yet.
 - **The inner `fetch()` is ignored**, as in the full ORM, while `values()` and `annotate()` are
   refused.
 
+### 29. Query cache (`cache()`, `QueryCache`)
+
+Since v0.28.0 a QuerySet can serve its reads from a **client-side cache**: with `cache(ttl)`, the
+rows a read returned stay in this process's memory, and the same read is answered from there,
+without a request, until its TTL runs out or an ORM write changes what it reads. Invalidation is
+built in: every ORM write removes the cached reads it can change, with nothing to set up. The
+cache behaves the same on SurrealDB 2.x, 3.x and the embedded engine.
+
+```python
+from surreal_orm_lite import BaseSurrealModel, QueryCache
+
+
+class Product(BaseSurrealModel):
+    id: str | None = None
+    name: str
+    category: str
+    price: int
+
+
+for key, name, category, price in [("p1", "Dune", "book", 12), ("p2", "Lamp", "home", 30), ("p3", "Emma", "book", 9)]:
+    await Product(id=key, name=name, category=category, price=price).save()
+
+books = await Product.objects().filter(category="book").order_by("name").cache(ttl=30).exec()  # Dune, Emma
+again = await Product.objects().filter(category="book").order_by("name").cache(ttl=30).exec()  # Dune, Emma
+hits = QueryCache.stats()["hits"]  # 1 (the second read was answered from memory, without a request)
+
+await Product(id="p4", name="Atlas", category="book", price=40).save()  # an ORM write to Product
+fresh = await Product.objects().filter(category="book").order_by("name").cache(ttl=30).exec()  # Atlas, Dune, Emma
+```
+
+#### What is cached
+
+Every read of a queryset with `cache()`: `exec()`, `first()`, `get()` by filters or by id
+(`get(<id>)`), `all()`, `count()`, `sum()`, `avg()`, `min()`, `max()`, `exists()`,
+`values(…).annotate(…)` and `annotate(GeoDistance)`. A read is answered from the cache when an
+earlier read sent **the same statement with the same variables**, on the same connection and with
+the same identity, within the TTL, and no ORM write that can change its result has completed
+since.
+
+- **Rows are cached, not instances**: each hit builds new instances from a copy of the cached
+  rows, so changing a result never changes the cache.
+- **Empty results are cached too**: `[]`, a count of `0`, a missing record (`get(<id>)` raises
+  `SurrealDbNotFoundError` on the hit as on the first read). Errors never are.
+- **Not cached**: reads inside a transaction (`objects(tx=)`, which on SurrealDB 3.x may see its
+  uncommitted writes), `refresh()`, `get_related()`, `traverse()`, `raw_query()` and
+  `call_function()`.
+- **Refused with `cache()`**: `query()` runs your own SurrealQL and raises `SurrealDbError` (cache
+  its result yourself, see [Configuration and statistics](#configuration-and-statistics));
+  `live()`, `watch()` and `changes()` name `cache()` among the clauses their usual error refuses;
+  `as_of()` raises `SurrealDbError` in either order (a time-travel read is never cached).
+- **Writes on a cached queryset** (`bulk_update()`, `bulk_delete()`, `QuerySet.patch()`,
+  `delete_table()`, `get_or_create()`…) run as without `cache()`: they never read the cache, and
+  they invalidate it.
+- **A `Subquery`** is read inside the outer statement: the outer queryset's `cache()` applies, the
+  inner one's is ignored, as its `fetch()` is.
+- **An internal failure of the cache** (a value it cannot copy, say) never fails a read: the read
+  goes to the database.
+- It works the same on the embedded engine (`mem://`, `surrealkv://`).
+
+#### Time to live
+
+`cache(ttl)` takes the TTL in seconds (an `int` or a `float`) or a `timedelta`. It is the **oldest
+result this read accepts**: an entry stored by a read with a longer TTL is not served to it once
+older than its own, and a result it stores lives for its TTL. `cache()` without a TTL uses
+`QueryCache`'s default when the read runs: 60 seconds unless configured. A TTL of `0` means
+**never cached**: every read goes to the database. Negative or non-finite values raise
+`ValueError`, anything but a number or a `timedelta` (`True` included) `TypeError`.
+
+```python
+from datetime import timedelta
+
+n = await Product.objects().filter(category="book").cache(timedelta(minutes=5)).count()  # 3
+```
+
+#### Invalidation
+
+Every ORM write removes the cached reads it can change, **before** its `post_*` signals fire:
+`save()`, `update()`, `merge()`, `upsert()`, `patch()`, `delete()`, the atomic operations,
+`relate()`, `remove_relation()`, `remove_all_relations()`, a typed edge's `save()`,
+`bulk_create()`, `bulk_update()`, `bulk_delete()`, `QuerySet.patch()`, `delete_table()`,
+`get_or_create()` and `update_or_create()` when they write, `signup()`, and the DDL helpers
+`define_computed_fields()` and `define_access()`.
+
+- A write removes the reads of the tables it writes, the reads whose **subqueries** read them
+  included.
+- A read that **follows links** is removed by **any** ORM write: `fetch()`, a dotted path such as
+  `filter(**{"author.name": …})` or `order_by("author.name")` (in a subquery too), and a
+  `select()` item that is not a plain field, such as `"author.*"` or an expression (a projection
+  may read another table).
+- A read of an **edge model** (`BaseSurrealEdge`) is removed by any delete: deleting a record
+  deletes the edges that point at it or from it.
+- Inside `transaction()` the tables written are invalidated **at commit** (a failed commit too,
+  nothing on rollback); until then, reads outside the transaction see the committed state.
+  `delete_table()` runs at once, outside `objects(tx=)`, and invalidates at once.
+- `SurrealDBConnectionManager.signup()` writes into a table the ORM does not map: it empties the
+  cache.
+- While a write runs, cached reads of its tables go to the database and store nothing: a read
+  answered before the write completed is returned to its caller, never stored.
+
+What the cache **cannot see** — the TTL bounds it, and `QueryCache.invalidate(Model)` removes a
+table's entries after such a change:
+
+- writes by another process or client;
+- raw SurrealQL: `raw_query()`, `QuerySet.query()`, `call_function()`, `Transaction.add()`;
+- a write whose task is cancelled, or that fails client-side, after its request was sent: the
+  server may apply it after the invalidation;
+- writes made by an access method's own `SIGNIN`/`SIGNUP` clauses beyond the record they create;
+- what the server derives on its own: `DEFINE EVENT`, `REFERENCE … ON DELETE` (3.x), views
+  (`DEFINE TABLE … AS SELECT`), `PERMISSIONS` that read another table;
+- values computed when the read runs: a `DEFINE PARAM` read with `Var()`, `<future>`/`COMPUTED`
+  fields (over another table, the graph such as `count(<-likes)`, or the time), time functions
+  inside a `select()` expression;
+- a table of relations read through a model that is not a `BaseSurrealEdge`.
+
+```python
+lamp = await Product.objects().cache().get("p2")  # Lamp (price 30, now cached)
+await Product.raw_query("UPDATE Product:p2 SET price = 35")  # raw SurrealQL: the cache is not told
+stale = (await Product.objects().cache().get("p2")).price  # 30
+QueryCache.invalidate(Product)  # removes Product's entries (and every read that follows links)
+price = (await Product.objects().cache().get("p2")).price  # 35
+```
+
+#### One cache per connection and identity
+
+Cached results never cross identities. Each connection the manager opens has its own cache scope,
+and every identity change on it starts a new one: after a sign-in, a sign-up, `authenticate()` or
+`invalidate()`, the previous identity's results leave memory. The connection of another event
+loop, a reconnect and an `embedded_database()` block start empty for the same reason, and closing
+a connection (`close_connection()`, `close_all_connections()`, or the manager dropping a dead one)
+drops its results.
+
+- A session changed **behind the ORM's back** — `raw_query("USE …")`, or `signin()`/`use()`
+  called on the SDK client itself — is not seen: call `QueryCache.clear()` after it.
+- Cached rows stay in this process's memory until they expire, are evicted, invalidated or
+  cleared, or their connection closes. `configure(enabled=False)` only hides them;
+  `QueryCache.clear()` drops them.
+- Entries you store with `QueryCache.set()` are not scoped to a connection or an identity: put
+  whatever tells your callers apart in the key.
+
+#### Configuration and statistics
+
+`QueryCache` is one store for the whole process, shared by its event loops and threads, with the
+full SurrealDB-ORM's three settings: `QueryCache.configure(default_ttl=60, max_size=1000,
+enabled=True)`.
+
+- **Every call sets all three settings**: an argument you leave out takes its default, as in the
+  full ORM. `configure()` never clears the cache.
+- `default_ttl` is the TTL of a `cache()` read without one (seconds or a `timedelta`; `0`: never
+  cached). `max_size` is the most entries kept: past it, the least recently used entry is evicted,
+  and lowering it evicts at once.
+- `enabled=False` **hides** the entries without removing them: `cache()` reads go to the database
+  (calling `cache()` logs a warning), `QueryCache.get()` returns `None`, `QueryCache.set()` stores
+  nothing and nothing is counted, while ORM writes, expiry and closed connections keep removing
+  entries. `enabled=True` serves again the entries still valid. `clear()` is the way to drop the
+  rows from memory; it also resets `hits` and `misses`.
+- `stats()` returns `entries` (unexpired entries, hidden ones included), `tables` (the distinct
+  tables they are tagged with), `max_size`, `default_ttl` (seconds), `enabled`, and `hits` and
+  `misses` (the `cache()` reads and `get()` calls answered from the cache, and those that were not,
+  since start-up or `clear()`).
+- `invalidate()` takes a model class or a table name and returns how many entries it removed.
+
+```python
+QueryCache.configure(default_ttl=timedelta(seconds=30), max_size=500)  # enabled=True: its default
+ttl = QueryCache.stats()["default_ttl"]  # 30.0
+
+QueryCache.configure(enabled=False)  # hides the entries; default_ttl and max_size take their defaults
+QueryCache.configure()  # enabled again: the entries still valid are served
+QueryCache.clear()  # drops every entry from memory and resets hits and misses
+```
+
+To cache your own results, of `raw_query()` for instance, build a key with `make_key()` and use
+`get()` and `set()`. The key comes from the statement, its variables as the SDK sends them and the
+table; the entry is tagged with the table, so an ORM write to it removes the entry:
+
+```python
+async def total_price() -> int:
+    statement = "SELECT math::sum(price) AS total FROM Product GROUP ALL"
+    key = QueryCache.make_key(statement, {}, "Product")
+    rows = QueryCache.get(key)  # a copy, or None: missing, expired, or the cache is disabled
+    if rows is None:
+        rows = await Product.raw_query(statement)
+        QueryCache.set(key, rows, "Product", ttl=60)
+    return rows[0]["total"]
+
+
+total = await total_price()  # 96 (the database answers)
+cached_total = await total_price()  # 96 (the cache answers)
+```
+
+#### Coming from the full SurrealDB-ORM
+
+- **The same names**: `cache(ttl=…)` on a QuerySet, and `QueryCache` with `configure()`,
+  `make_key()`, `get()`, `set()`, `invalidate()`, `clear()` and `stats()`, imported from
+  `surreal_orm_lite`.
+- **Every read is cached**, not only `exec()` (with `first()` and `get()` by filters):
+  `get(<id>)`, `all()`, `count()`, the aggregations, `exists()` and `values()`+`annotate()` too.
+- **Invalidation is built in** and needs no `configure()` call. It covers `bulk_*()`,
+  `QuerySet.patch()`, the atomic operations, relations and transactions (at commit), where the
+  full ORM listens to `post_save`, `post_update` and `post_delete`. Reads through links
+  (`fetch()`, dotted paths) and edge reads after a delete are invalidated too.
+- **Rows are cached**, and each hit builds new instances: the full ORM caches the instances.
+- **Keys come from the CBOR bytes the SDK sends**, with the keys of mappings sorted as the full
+  ORM's `sort_keys=True` does: `RecordID("user", 1)` and `"user:1"` never share an entry, where the
+  full ORM's JSON with `default=str` writes them alike.
+- **One scope per connection and identity**: a sign-in never reads another identity's results.
+- **`live()`, `watch()`, `changes()` and `query()` refuse `cache()`**, which the full ORM ignores
+  there; `as_of()` reads are not cached (the full ORM has no time travel).
+- **`ttl`** may be a `float` or a `timedelta`; `0` is never cached, as in the full ORM; negative or
+  non-finite values are refused; it is the oldest result a read accepts.
+- **LRU eviction** instead of FIFO.
+- **`invalidate()` takes a table name too**, and **`stats()` adds `hits` and `misses`**.
+
 ---
 
 ## Configuration Options
@@ -3505,7 +3718,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -3610,6 +3823,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | A subquery with `order_by()` and `limit()`                                                                                             | right; the ORM also selects the order fields, without which 2.x refuses to order by a field other than the one compared                                                       | right: the ORM binds each subquery once, in a `LET`; 3.2 and later can return wrong rows for such an inline sub-SELECT (surrealdb#7470)                                             | v0.27.0                              |
 | A subquery reading a table that does not exist                                                                                         | read as empty, like any missing table                                                                                                                                         | read as empty in three requests (statement, table probe, re-send); other errors, even ones quoting "does not exist", are relayed; transaction writes fail; `live()` raises on start | v0.27.0                              |
 | Subqueries under `as_of()`                                                                                                             | each subquery reads at the same moment: the ORM adds `VERSION` to it (the server would read the current state)                                                                | the same (the server applies the outer `VERSION` to an inline sub-SELECT only); without versioned storage `SurrealDbError`, but 3.1.5 raises the server's own `ThrownError`         | v0.27.0                              |
+| Query cache (`cache()`, `QueryCache`)                                                                                                  | same on both lines: client-side, per connection and identity; writes in a transaction invalidate at commit; reads in one are never cached (on 2.x they raise: buffered)       | the same; reads inside an interactive transaction are never cached (they see its uncommitted writes)                                                                                | v0.28.0                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
@@ -3682,7 +3896,8 @@ Contributions are welcome! Please:
 | v0.25.0           | Embedded test engine                                 | ✅ Released |
 | v0.26.0           | Time travel (versioned storage)                      | ✅ Released |
 | v0.27.0           | Subqueries                                           | ✅ Released |
-| v0.28.0 – v0.29.0 | Tier 2 — Extended (cache, multi-db)                  | 📋 Planned  |
+| v0.28.0           | Query cache                                          | ✅ Released |
+| v0.29.0           | Tier 2 — Multi-database                              | 📋 Planned  |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)     | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | 📋 Planned  |
@@ -3734,7 +3949,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Embedded engine               | ✅ v0.25.0 (mem://, surrealkv://; rocksdb:// #233)                    | ❌ (HTTP/WebSocket only)         |
 | Time travel (`VERSION`)       | ✅ v0.26.0 (`as_of()`)                                                | ❌                               |
 | Subqueries                    | ✅ v0.27.0 (`Subquery`, a QuerySet in `filter()`)                     | ✅                               |
-| Query Cache                   | v0.28.0                                                               | ✅                               |
+| Query Cache                   | ✅ v0.28.0 (`cache()`, `QueryCache`)                                  | ✅                               |
 | Multi-database                | v0.29.0                                                               | ✅                               |
 | Schema Introspection          | v0.30.0                                                               | ✅                               |
 | DEFINE EVENT                  | v0.31.0                                                               | ✅                               |
