@@ -54,6 +54,7 @@ from surreal_orm_lite import (
 from surreal_orm_lite._sdk import cbor_encode
 from surreal_orm_lite.cache import EDGES, CacheRequest, follows_links
 from surreal_orm_lite.testing import embedded_database
+from surreal_orm_lite.transaction import BufferedTransaction, InteractiveTransaction
 from tests.conftest import _ws_url
 from tests.test_time_travel import _forbidden_client, _http_url, _line, _record_queries, connected
 
@@ -1585,6 +1586,180 @@ class TestInvalidatesDecorator:
         release.set()
         await write
         assert QueryCache.stats()["entries"] == 0
+
+
+# --- spec §6.5: transactions note the tables written and invalidate them at commit ----------------------
+
+
+class _TxClient:
+    """A client as a transaction's commit and cancel see one: it records what is in flight while it commits."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.in_flight_during_commit: list[tuple[dict[str, int], int]] = []
+        self.cancelled = 0
+
+    async def query_raw(self, query: str, variables: Any = None) -> Any:
+        """The buffered commit: one ``BEGIN … COMMIT`` request; ``fail`` answers an ``ERR`` statement."""
+        self.in_flight_during_commit.append(_in_flight())
+        if self.fail:
+            return {"result": [{"status": "ERR", "result": "Database record `t:1` already exists"}]}
+        return {"result": [{"status": "OK", "result": []}]}
+
+    async def commit(self, txn_id: Any) -> None:
+        """The interactive commit; ``fail`` raises as a refused commit does."""
+        self.in_flight_during_commit.append(_in_flight())
+        if self.fail:
+            raise RuntimeError("commit refused")
+
+    async def cancel(self, txn_id: Any) -> None:
+        self.cancelled += 1
+
+
+_STRATEGIES = ("buffered", "interactive")
+
+
+async def _transaction(strategy: str, client: _TxClient, *, statement: bool = True) -> Any:
+    """A transaction of ``strategy`` on the fake ``client``; a buffered one holds one statement unless told not to."""
+    if strategy == "interactive":
+        return InteractiveTransaction(client, "txn")
+    tx = BufferedTransaction(client)
+    if statement:
+        await tx.add("CREATE t:1;")
+    return tx
+
+
+def _commit_error(strategy: str) -> tuple[type[Exception], str]:
+    if strategy == "interactive":
+        return RuntimeError, "commit refused"
+    return SurrealDbError, "Transaction failed and rolled back: Database record `t:1` already exists"
+
+
+class TestTransactionBookkeeping:
+    """Spec §6.5: a write in a transaction is noted, not in flight; the commit puts the tables noted in flight and
+    invalidates them when it returns or raises; ``cancel()`` forgets them; ``None`` is every table."""
+
+    @pytest.mark.parametrize("strategy", _STRATEGIES)
+    async def test_a_write_is_noted_not_invalidated(self, strategy: str) -> None:
+        QueryCache.set("k", 1, "t")
+        tx = await _transaction(strategy, _TxClient())
+        async with cache.writing({"t"}, tx=tx):
+            assert _in_flight() == ({}, 0)
+        assert _in_flight() == ({}, 0)
+        assert tx._cache_written() == frozenset({"t"})
+        assert QueryCache.get("k") == 1
+
+    @pytest.mark.parametrize("strategy", _STRATEGIES)
+    async def test_the_commit_invalidates_the_tables_noted(self, strategy: str) -> None:
+        QueryCache.set("k", 1, "t")
+        QueryCache.set("other", 2, "u")
+        client = _TxClient()
+        tx = await _transaction(strategy, client)
+        async with cache.writing({"t"}, tx=tx):
+            pass
+        async with cache.writing(["t"], tx=tx):
+            pass
+        await tx.commit()
+        assert client.in_flight_during_commit == [({"t": 1}, 0)]
+        assert _in_flight() == ({}, 0)
+        assert QueryCache.get("k") is None
+        assert QueryCache.get("other") == 2
+        assert tx._cache_written() == frozenset()
+
+    @pytest.mark.parametrize("strategy", _STRATEGIES)
+    async def test_a_failed_commit_still_invalidates(self, strategy: str) -> None:
+        QueryCache.set("k", 1, "t")
+        QueryCache.set("other", 2, "u")
+        client = _TxClient(fail=True)
+        tx = await _transaction(strategy, client)
+        async with cache.writing({"t"}, tx=tx):
+            pass
+        error, text = _commit_error(strategy)
+        with pytest.raises(error) as info:
+            await tx.commit()
+        assert str(info.value) == text
+        assert client.in_flight_during_commit == [({"t": 1}, 0)]
+        assert _in_flight() == ({}, 0)
+        assert QueryCache.get("k") is None
+        assert QueryCache.get("other") == 2
+        assert tx._cache_written() == frozenset()
+
+    @pytest.mark.parametrize("strategy", _STRATEGIES)
+    @pytest.mark.parametrize("tables", [{"t"}, None])
+    async def test_cancel_forgets_without_invalidating(self, strategy: str, tables: set[str] | None) -> None:
+        QueryCache.set("k", 1, "t")
+        client = _TxClient()
+        tx = await _transaction(strategy, client)
+        async with cache.writing(tables, tx=tx):
+            pass
+        await tx.cancel()
+        assert client.cancelled == (1 if strategy == "interactive" else 0)
+        assert _in_flight() == ({}, 0)
+        assert QueryCache.get("k") == 1
+        assert tx._cache_written() == frozenset()
+        assert client.in_flight_during_commit == []
+
+    @pytest.mark.parametrize("strategy", _STRATEGIES)
+    async def test_none_is_every_table(self, strategy: str) -> None:
+        QueryCache.set("k", 1, "t")
+        QueryCache.set("other", 2, "u")
+        client = _TxClient()
+        tx = await _transaction(strategy, client)
+        tx._note_cache_write(None)
+        assert tx._cache_written() is None
+        tx._note_cache_write({"t"})
+        assert tx._cache_written() is None
+        await tx.commit()
+        assert client.in_flight_during_commit == [({}, 1)]
+        assert _in_flight() == ({}, 0)
+        assert QueryCache.stats()["entries"] == 0
+        assert tx._cache_written() == frozenset()
+
+    @pytest.mark.parametrize("strategy", _STRATEGIES)
+    async def test_none_through_writing(self, strategy: str) -> None:
+        QueryCache.set("k", 1, "t")
+        tx = await _transaction(strategy, _TxClient())
+        async with cache.writing(None, tx=tx):
+            assert _in_flight() == ({}, 0)
+        assert tx._cache_written() is None
+        assert QueryCache.get("k") == 1
+        await tx.commit()
+        assert QueryCache.stats()["entries"] == 0
+
+    @pytest.mark.parametrize("strategy", _STRATEGIES)
+    async def test_edges_is_noted_like_a_table(self, strategy: str, scope: int) -> None:
+        _store("edge", [1], {"qc_likes", EDGES}, scope=scope)
+        _store("user", [2], {"qc_user"}, scope=scope)
+        client = _TxClient()
+        tx = await _transaction(strategy, client)
+        async with cache.writing({"t", EDGES}, tx=tx):
+            pass
+        assert tx._cache_written() == frozenset({"t", EDGES})
+        assert QueryCache.get("edge") == [1]
+        await tx.commit()
+        assert client.in_flight_during_commit == [({"t": 1, EDGES: 1}, 0)]
+        assert QueryCache.get("edge") is None
+        assert QueryCache.get("user") == [2]
+
+    async def test_an_empty_buffered_commit_invalidates_nothing(self) -> None:
+        QueryCache.set("k", 1, "t")
+        client = _TxClient()
+        tx = await _transaction("buffered", client, statement=False)
+        await tx.commit()
+        assert client.in_flight_during_commit == []
+        assert QueryCache.get("k") == 1
+        assert tx._cache_written() == frozenset()
+
+    async def test_a_second_commit_invalidates_nothing_more(self) -> None:
+        client = _TxClient()
+        tx = await _transaction("interactive", client)
+        async with cache.writing({"t"}, tx=tx):
+            pass
+        await tx.commit()
+        QueryCache.set("k", 1, "t")
+        await tx.commit()
+        assert client.in_flight_during_commit == [({"t": 1}, 0), ({}, 0)]
+        assert QueryCache.get("k") == 1
 
 
 # --- spec §5.1, §5.3, §6.3: QuerySet.cache(), its tags and its refusals ---------------------------------

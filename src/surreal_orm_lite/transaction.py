@@ -13,14 +13,20 @@ Two strategies share one public interface:
   writes; the ``txn_id`` isolates the transaction on the shared connection.
 
 ``connection_manager.transaction()`` probes ``client.begin()`` to pick the strategy.
+
+Query cache (v0.28.0): an ORM write that joins a transaction notes the tables it writes on it
+(``_note_cache_write``); the commit puts them in flight and invalidates their cached reads when
+it returns or raises (a failed commit's state is unknown). ``cancel()`` forgets them: nothing
+became visible.
 """
 
 import contextlib
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
+from . import cache as _cache
 from . import encoding as _encoding
 from .exceptions import SurrealDbConflictError, SurrealDbError
 
@@ -57,6 +63,30 @@ class Transaction(ABC):
 
     def __init__(self) -> None:
         self._post_commit: list[Callable[[], Awaitable[None]]] = []
+        # Query cache: the tables written in this transaction, invalidated at commit.
+        self._cache_tables: set[str] = set()
+        self._cache_all = False
+
+    def _note_cache_write(self, tables: Iterable[str] | None) -> None:
+        """Note the tables an ORM write in this transaction changes (``None``: every table).
+
+        ``cache.writing()`` calls it instead of invalidating at once: the rows only become
+        visible at commit. ``cache.EDGES`` is noted like a table (a delete in the transaction
+        invalidates the edge reads at commit).
+        """
+        if tables is None:
+            self._cache_all = True
+        else:
+            self._cache_tables.update(tables)
+
+    def _cache_written(self) -> frozenset[str] | None:
+        """The tables noted so far: ``None`` when a write noted every table."""
+        return None if self._cache_all else frozenset(self._cache_tables)
+
+    def _forget_cache_writes(self) -> None:
+        """Clear the tables noted (after a commit, or on cancel without invalidating)."""
+        self._cache_tables.clear()
+        self._cache_all = False
 
     @property
     @abstractmethod
@@ -188,15 +218,23 @@ class BufferedTransaction(Transaction):
         return f"BEGIN TRANSACTION;\n{body}\nCOMMIT TRANSACTION;"
 
     async def commit(self) -> None:
-        if self.is_empty:
-            return
-        # query_raw (NOT query): query() returns None on a failed tx; query_raw gives
-        # per-statement status for raise_for_status.
-        raw = await self._client.query_raw(self.build_query(), _encoding.encode(self.variables))
-        self.raise_for_status(raw)
+        # The tables noted are in flight during the commit and invalidated when it returns
+        # or raises (a failed commit's state is unknown).
+        try:
+            async with _cache.writing(self._cache_written()):
+                if self.is_empty:
+                    return
+                # query_raw (NOT query): query() returns None on a failed tx; query_raw gives
+                # per-statement status for raise_for_status.
+                raw = await self._client.query_raw(self.build_query(), _encoding.encode(self.variables))
+                self.raise_for_status(raw)
+        finally:
+            self._forget_cache_writes()
 
     async def cancel(self) -> None:
-        # Nothing was sent (statements buffered) → rollback is free.
+        # Nothing was sent (statements buffered) → rollback is free; nothing became visible,
+        # so the tables noted are forgotten, not invalidated.
+        self._forget_cache_writes()
         self.statements = []
         self.variables = {}
 
@@ -239,11 +277,19 @@ class InteractiveTransaction(Transaction):
             raise _as_conflict(exc) from exc
 
     async def commit(self) -> None:
+        # The tables noted are in flight during the commit and invalidated when it returns
+        # or raises (a failed commit's state is unknown).
         try:
-            await self._client.commit(self._txn_id)
-        except Exception as exc:
-            raise _as_conflict(exc) from exc
+            async with _cache.writing(self._cache_written()):
+                try:
+                    await self._client.commit(self._txn_id)
+                except Exception as exc:
+                    raise _as_conflict(exc) from exc
+        finally:
+            self._forget_cache_writes()
 
     async def cancel(self) -> None:
+        # Nothing became visible: the tables noted are forgotten, not invalidated.
+        self._forget_cache_writes()
         with contextlib.suppress(Exception):
             await self._client.cancel(self._txn_id)
