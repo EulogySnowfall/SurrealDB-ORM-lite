@@ -148,13 +148,20 @@ def _routed(
     ``__surreal_routed__`` (the policy). Under ``@classmethod``, and above ``@contextlib.asynccontextmanager``;
     under ``@_cache.invalidates(...)`` too (``signup``), whose wrapper stays outermost.
 
+    A method that takes ``name`` (``get_client``, ``close_connection``, ``transaction``) keeps it in code and for
+    type checkers, but its wrapper's ``__signature__`` leaves it out (spec D26): ``inspect.signature()`` shows what
+    it showed in v0.28.0, so a framework that fills parameters from a request (FastAPI's
+    ``Depends(SurrealDBConnectionManager.get_client)``) never lets request data choose the connection.
+    ``inspect.unwrap()`` still reaches the declared ``name``.
+
     With ``unknown_name="ignore"`` (``close_connection`` alone), a connection name that is not registered — given
     explicitly, or the active ``using()`` name removed meanwhile — makes the coroutine return ``None`` without
     running the method.
     """
 
     def decorate(func: Callable[Concatenate[type[_M], _P], _R]) -> Callable[Concatenate[type[_M], _P], _R]:
-        parameters = list(inspect.signature(func).parameters)
+        signature = inspect.signature(func)
+        parameters = list(signature.parameters)
         takes_name = len(parameters) > 1 and parameters[1] == "name"
         takes_uuid = policy == "live" and len(parameters) > 1 and parameters[1] == "query_uuid"
 
@@ -201,6 +208,12 @@ def _routed(
 
             wrapper = routed
         wrapper.__surreal_routed__ = policy
+        if takes_name:
+            # Hidden from introspection only (spec D26): ``cls`` stays, without it ``inspect.signature()`` of the
+            # bound method raises; later parameters and the return annotation stay too.
+            wrapper.__signature__ = signature.replace(
+                parameters=[parameter for index, parameter in enumerate(signature.parameters.values()) if index != 1]
+            )
         return cast(Callable[Concatenate[type[_M], _P], _R], wrapper)
 
     return decorate
@@ -808,6 +821,9 @@ class SurrealDBConnectionManager:
 
         With *name* (v0.29.0), the client of that registered connection (:meth:`add_connection`); without it, the
         current connection's: the innermost ``using()`` block's, else the default one.
+        *name* is accepted in code and by type checkers but hidden from ``inspect.signature()``, so a framework that
+        fills parameters from a request (FastAPI ``Depends(SurrealDBConnectionManager.get_client)``) never lets request
+        data choose the connection, as in v0.28.
 
         Each event loop gets its own connection: a client belongs to the loop it was created
         on, so a cached one is only ever handed back to that same loop (issue #163).
@@ -1417,6 +1433,9 @@ class SurrealDBConnectionManager:
         ``using()`` block's, else the default one) — never every connection: :meth:`close_all_connections` does
         that. A name that is not registered closes nothing and raises nothing (after its type check), and neither
         does a call inside a ``using()`` block whose connection was removed meanwhile.
+        *name* is accepted in code and by type checkers but hidden from ``inspect.signature()``, so a framework that
+        fills parameters from a request (FastAPI ``Depends(SurrealDBConnectionManager.get_client)``) never lets request
+        data choose the connection, as in v0.28.
 
         Only the running loop's client is closed: another loop may still be using its own,
         and closing that one from here is both impossible and wrong. Use
@@ -1552,6 +1571,9 @@ class SurrealDBConnectionManager:
         own exception propagates unchanged with that explanation added as a note (PEP 678). A model routed to another
         connection refuses to join the transaction: its write, ``objects(tx=)``, ``refresh(tx=)`` or
         ``call_function(tx=)`` raises ``SurrealDbError`` before anything is sent.
+        *name* is accepted in code and by type checkers but hidden from ``inspect.signature()``, so a framework that
+        fills parameters from a request (FastAPI ``Depends(SurrealDBConnectionManager.get_client)``) never lets request
+        data choose the connection, as in v0.28.
 
         Example::
 

@@ -117,6 +117,26 @@ def _routed_names() -> list[str]:
     return sorted(name for name in _class_methods() if name not in _NOT_ROUTED)
 
 
+#: The routed classmethods whose first parameter after ``cls`` is the connection ``name`` (spec D26), with what
+#: ``inspect.signature()`` showed for each on the router in v0.28.0 — and still shows: ``name`` is hidden from it.
+_TAKES_NAME = {
+    "get_client": "() -> Any",
+    "close_connection": "() -> None",
+    "transaction": "() -> Any",
+}
+
+
+def _takes_name(function: Callable[..., Any]) -> bool:
+    """Whether *function* declares ``name`` first after ``cls``."""
+    parameters = list(inspect.signature(function).parameters)
+    return len(parameters) > 1 and parameters[1] == "name"
+
+
+def _without_name(signature: inspect.Signature) -> inspect.Signature:
+    """*signature* without its ``name`` parameter: what a routed method taking a name shows (spec D26)."""
+    return signature.replace(parameters=[p for p in signature.parameters.values() if p.name != "name"])
+
+
 def _is_template(value: Any, template: Any) -> bool:
     """Whether *value* is still what a fresh connection starts with (spec AC-2)."""
     if hasattr(template, "locked"):
@@ -173,7 +193,11 @@ class TestConnectionClasses:
             assert inspect.iscoroutinefunction(function) is expected, name
             assert inspect.iscoroutinefunction(getattr(SurrealDBConnectionManager, name)) is expected, name
             assert inspect.iscoroutinefunction(getattr(default, name)) is expected, name
-            assert inspect.signature(function) == inspect.signature(original), name
+            if _takes_name(original):
+                # D26: name is hidden from introspection; every other parameter and the return annotation stay.
+                assert inspect.signature(function) == _without_name(inspect.signature(original)), name
+            else:
+                assert inspect.signature(function) == inspect.signature(original), name
             assert function.__name__ == original.__name__, name
             assert name.endswith(function.__name__), name
             assert function.__doc__ == original.__doc__, name
@@ -181,6 +205,38 @@ class TestConnectionClasses:
             assert inspect.iscoroutinefunction(getattr(SurrealDBConnectionManager, name)), name
         for name in ("transaction", "ephemeral_client", "is_connected", "subscribe_live"):
             assert not inspect.iscoroutinefunction(getattr(SurrealDBConnectionManager, name)), name
+
+    def test_exactly_three_routed_methods_take_a_name_and_none_shows_it(self) -> None:
+        """D26: the rule lives in ``_routed``, so a new method taking a name cannot forget it; changing the set of
+        methods that take one is deliberate."""
+        default = SurrealDBConnectionManager._manager_for("default")
+        taking: set[str] = set()
+        for name in _routed_names():
+            function = vars(SurrealDBConnectionManager)[name].__func__
+            if _takes_name(inspect.unwrap(function)):
+                taking.add(name)
+            for introspected in (function, getattr(SurrealDBConnectionManager, name), getattr(default, name)):
+                assert "name" not in inspect.signature(introspected).parameters, name
+        assert taking == set(_TAKES_NAME)
+
+    @pytest.mark.parametrize("method", sorted(_TAKES_NAME))
+    def test_name_is_hidden_from_introspection(self, method: str) -> None:
+        """D26: v0.28.0's ``()`` on the router and on every connection class, so FastAPI's
+        ``Depends(SurrealDBConnectionManager.get_client)`` adds no ``?name=``; ``inspect.unwrap`` keeps ``name``."""
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        owners = (
+            SurrealDBConnectionManager,
+            SurrealDBConnectionManager._manager_for("default"),
+            SurrealDBConnectionManager._manager_for("md_a"),
+        )
+        for owner in owners:
+            signature = inspect.signature(getattr(owner, method))
+            assert list(signature.parameters) == [], owner
+            assert str(signature) == _TAKES_NAME[method], owner
+        function = vars(SurrealDBConnectionManager)[method].__func__
+        assert "name" in inspect.signature(inspect.unwrap(function)).parameters
+        assert list(inspect.signature(function).parameters) == ["cls"]
+        assert function.__surreal_routed__ == "current"
 
     def test_signup_keeps_the_invalidation_wrapper_outermost(self) -> None:
         function = vars(SurrealDBConnectionManager)["signup"].__func__
@@ -882,6 +938,7 @@ class TestRegistry:
         assert snapshot() == before
 
     async def test_name_by_position_and_by_keyword(self) -> None:
+        """Hidden from ``inspect.signature()`` (D26), ``name`` still routes, by position and by keyword."""
         SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
         conn = SurrealDBConnectionManager._manager_for("md_a")
         client = await SurrealDBConnectionManager.get_client("md_a")
@@ -895,6 +952,11 @@ class TestRegistry:
         with pytest.raises(ValueError, match=r"^Connection not been set\.$"):
             await SurrealDBConnectionManager.get_client()
         await SurrealDBConnectionManager.close_connection("md_a")
+        assert conn.is_connected() is False
+        reopened = await SurrealDBConnectionManager.get_client("md_a")
+        assert reopened is not client
+        assert conn.is_connected() is True
+        await SurrealDBConnectionManager.close_connection(name="md_a")
         assert conn.is_connected() is False
 
     async def test_close_connection_is_silent_for_a_removed_active_name(self) -> None:
@@ -4377,7 +4439,7 @@ _KEY_PARAGRAPH = (
     "put the connection's name among the variables (keep the table name as it is, so the ORM's writes still "
     "invalidate the entry)."
 )
-#: Spec §11 (C7, P9): the eight "Coming from the full SurrealDB-ORM" bullets, exactly, and no ninth.
+#: Spec §11 (C7, P9, D26): the nine "Coming from the full SurrealDB-ORM" bullets, exactly, and no tenth.
 _COMING_FROM_30 = [
     "- Same names: `add_connection()`, `remove_connection()`, `get_config()`, `list_connections()`, "
     "`get_active_connection_name()`, `using()`, `ConnectionConfig`, `SurrealConfigDict(connection=)`, "
@@ -4398,6 +4460,10 @@ _COMING_FROM_30 = [
     "database; a user and password for a server URL, optional on the embedded engine), and a model's `connection` key "
     "must be a non-empty string, checked when the class is defined (full ORM: no checks). `ConnectionConfig` keeps the "
     "password out of its `repr`.",
+    "- `get_client(name)`, `close_connection(name)` and `transaction(name)` accept `name` in code, but "
+    "`inspect.signature()` does not show it, so FastAPI's `Depends(SurrealDBConnectionManager.get_client)` adds no "
+    "`?name=` query parameter: a request never chooses the connection (full ORM: `name` is visible and becomes a query "
+    "parameter).",
 ]
 #: Spec §11 item 5: the row v0.29.0 adds to the 2.x/3.x table, cell by cell, and the clause it appends to the header.
 _MULTI_DATABASE_ROW = [
@@ -4612,7 +4678,7 @@ class TestMultiDatabaseDocs:
         assert "the innermost `using()` block's, else the default one" in text, text
 
     def test_coming_from_the_full_orm(self) -> None:
-        """C7 and P9: eight bullets, exactly, and no ninth."""
+        """C7, P9 and D26: nine bullets, exactly, and no tenth."""
         assert _bullets(_part_30("Coming from the full SurrealDB-ORM")) == _COMING_FROM_30
 
     def test_features_row(self) -> None:

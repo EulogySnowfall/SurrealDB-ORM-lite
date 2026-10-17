@@ -3918,6 +3918,10 @@ block they are written in.
   database; a user and password for a server URL, optional on the embedded engine), and a model's `connection` key
   must be a non-empty string, checked when the class is defined (full ORM: no checks). `ConnectionConfig` keeps the
   password out of its `repr`.
+- `get_client(name)`, `close_connection(name)` and `transaction(name)` accept `name` in code, but
+  `inspect.signature()` does not show it, so FastAPI's `Depends(SurrealDBConnectionManager.get_client)` adds no
+  `?name=` query parameter: a request never chooses the connection (full ORM: `name` is visible and becomes a query
+  parameter).
 
 ---
 
