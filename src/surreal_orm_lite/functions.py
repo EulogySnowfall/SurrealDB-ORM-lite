@@ -246,6 +246,15 @@ class Var:
 
     The variable itself is supplied with ``variables()``. A leading ``$`` in the name is
     accepted: ``Var("$min_age")`` is ``Var("min_age")``.
+
+    ``Var`` also reads the parameters SurrealDB sets for the session — ``$auth`` (the signed-in
+    record user), ``$access``, ``$session``, ``$token`` — with no ``variables()``, in a read and in
+    a live query::
+
+        mine = await Doc.objects().filter(owner=Var("auth")).exec()   # … WHERE owner = $auth
+
+    The string ``"$auth"`` is data: ``filter(owner="$auth")`` compares ``owner`` with the string
+    ``"$auth"``, with a ``UserWarning`` naming ``Var("auth")``.
     """
 
     __slots__ = ("name",)

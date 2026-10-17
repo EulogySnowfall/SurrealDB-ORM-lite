@@ -10,7 +10,7 @@ import pydantic
 
 from . import geo as _geo
 from ._sdk import RecordID, SdkRange, ServerError
-from .constants import GEOMETRY_LOOKUP_OPERATORS, LOOKUP_OPERATORS
+from .constants import GEOMETRY_LOOKUP_OPERATORS, LOOKUP_OPERATORS, SESSION_PARAMETERS
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, Var
 from .subquery import SubqueryCompiler, inside_a_list, lookup_refused, subquery_condition, subquery_of
@@ -615,13 +615,17 @@ def unescape_filter_value(value: Any, *, warn: bool = True) -> Any:
 
 
 def warn_on_variable_names(names: Iterable[str], variables: Collection[str]) -> None:
-    """Warn for each of *names* that *variables* hold, once per name: a ``str`` filter value ``"$<name>"`` is data.
+    """Warn for each of *names* that *variables* or SurrealDB's session parameters hold, once per name: a ``str``
+    filter value ``"$<name>"`` is data.
 
     Until v0.28.1 ``filter(age__lte="$max_age").variables(max_age=25)`` compiled ``age <= $max_age``. The string
     is data now, bound and compared as it is, so such a call changes its result without an error (a number sorts
     below a string: ``lt``/``lte`` match every number, ``gt``/``gte``/``exact`` none). A ``UserWarning`` names
-    ``Var("max_age")``, the reference. A name *variables* does not hold is data the caller meant (``"$x"`` with no
-    variable ``x``): nothing warns.
+    ``Var("max_age")``, the reference. ``filter(owner="$auth")`` likewise compares ``owner`` with the string: a
+    name of :data:`~surreal_orm_lite.constants.SESSION_PARAMETERS` that *variables* do not hold gets the
+    ``UserWarning`` of :func:`session_parameter_warning`, which names ``Var("auth")``; its text is the same apart
+    from that name, so the warnings registry of a call site holds one entry per session parameter at most. Any
+    other name is data the caller meant (``"$x"`` with no variable ``x``): nothing warns.
 
     Args:
         names: the names of the scalar ``str`` filter values of one statement that match :data:`VARIABLE_NAME_VALUE`
@@ -636,6 +640,33 @@ def warn_on_variable_names(names: Iterable[str], variables: Collection[str]) -> 
                 UserWarning,
                 stacklevel=user_stacklevel(),
             )
+        elif name in SESSION_PARAMETERS:
+            warnings.warn(session_parameter_warning(name), UserWarning, stacklevel=user_stacklevel())
+
+
+def session_parameter_warning(name: str) -> str:
+    """The ``UserWarning`` text of a ``str`` filter value ``"$<name>"`` naming SurrealDB's session parameter *name*.
+
+    *name* is one of :data:`~surreal_orm_lite.constants.SESSION_PARAMETERS`: the text is fixed apart from it.
+    """
+    return (
+        f"The filter value '${name}' is compared as the string '${name}', not with SurrealDB's ${name} parameter; "
+        f"to read the parameter, use Var('{name}')."
+    )
+
+
+def reference_hint(name: str, subqueries: SubqueryCompiler | None) -> str | None:
+    """The hint of the ``ValueError`` for a ``str`` filter value ``"$<name>"`` that cannot be data where it is.
+
+    An edge's ``in``/``out`` holds a record id, so ``filter(in_="$p")`` raises; when ``p`` is a variable of the
+    statement (:meth:`SubqueryCompiler.names_a_variable`) or one of SurrealDB's session parameters, the message ends
+    with the ``Var(...)`` that reads it (v0.28.1). ``None`` for any other name.
+    """
+    if subqueries is not None and subqueries.names_a_variable(name):
+        return f"to reference the variable, use Var('{name}')"
+    if name in SESSION_PARAMETERS:
+        return f"to read SurrealDB's ${name} parameter, use Var('{name}')"
+    return None
 
 
 def build_filter_condition(
@@ -656,7 +687,10 @@ def build_filter_condition(
     ``"$$"`` (the deprecated escape) loses one ``$``, with a ``DeprecationWarning`` (:func:`unescape_filter_value`)
     unless ``subqueries.warn`` is false. The name of a scalar ``str`` that is ``$`` and a variable name (``"$x"``
     gives ``x``) is noted in ``subqueries.variable_like``: ``QuerySet._build_where`` checks it against the
-    statement's ``variables()`` once every condition is compiled (:func:`warn_on_variable_names`).
+    statement's ``variables()`` and SurrealDB's session parameters (``$auth``…) once every condition is compiled
+    (:func:`warn_on_variable_names`). On an edge endpoint column such a value is not a record id: when it names a
+    variable or a session parameter, the ``ValueError`` ends with the ``Var(...)`` that reads it
+    (:func:`reference_hint`).
 
     A model instance given as the value — or as an item of a sequence lookup — is bound as its
     record id (:func:`as_record_value`, v0.22.0).
@@ -781,7 +815,13 @@ def build_filter_condition(
     if is_record_id_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
         value = coerce_record_id(value, cast(str, record_table))
     elif is_endpoint_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
-        value = coerce_endpoint(value)
+        try:
+            value = coerce_endpoint(value)
+        except ValueError as exc:
+            hint = None if variable_like is None else reference_hint(variable_like.group(1), subqueries)
+            if hint is None:
+                raise
+            raise ValueError(f"{exc}; {hint}") from exc
     return f"{field} {op} ${var_name}", {var_name: value}, counter + 1
 
 

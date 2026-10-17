@@ -240,6 +240,13 @@ class QuerySet:
         ``variables(max_age=25)``, which read ``$max_age`` until v0.28.1 — is still the string, with a
         ``UserWarning`` naming ``Var("max_age")``, once per read, when the statement is compiled.
 
+        ``Var("auth")`` also reads SurrealDB's own session parameters, without ``variables()``:
+        ``filter(owner=Var("auth"))`` keeps the records of the signed-in record user (``$auth``; ``$access``,
+        ``$session`` and ``$token`` likewise), in a read and in a live query. The string ``"$auth"`` is data:
+        ``filter(owner="$auth")`` compares ``owner`` with the string ``"$auth"``, with a ``UserWarning`` naming
+        ``Var("auth")``. On an edge's ``in``/``out`` such a value is not a record id: ``ValueError``, naming the
+        ``Var(...)`` to use.
+
         A ``Subquery`` — or a QuerySet, read as one — is accepted as the whole value of ``in``, ``not_in``,
         ``containsall`` and ``containsany`` (compared with all its values) and of ``exact``, ``gt``, ``gte``,
         ``lt``, ``lte``, ``contains`` and ``not_contains`` (compared with its first value; no record when it is
@@ -746,22 +753,27 @@ class QuerySet:
         by *subqueries*, the statement's compiler; without one it raises ``ValueError`` (S8).
 
         Once every condition is compiled, a scalar ``str`` filter value that is ``$`` and the name of one of the
-        statement's ``variables()`` — this queryset's, its subqueries', or *variable_names* — gives a
-        ``UserWarning`` naming ``Var(...)`` (:func:`utils.warn_on_variable_names`, v0.28.1), unless
-        ``subqueries.warn`` is false. Without *subqueries* nothing is checked: only a statement has variables.
+        statement's ``variables()`` — this queryset's, its subqueries', or *variable_names* — or of SurrealDB's
+        session parameters (``$auth``…) gives a ``UserWarning`` naming ``Var(...)``
+        (:func:`utils.warn_on_variable_names`, v0.28.1), unless ``subqueries.warn`` is false. Without *subqueries*
+        nothing is checked: only a statement has variables.
 
         Args:
-            variable_names: names the check counts as variables besides the statement's: the ``variables()`` of the
-                queryset whose ``get_or_create()``/``update_or_create()`` look up with this one.
+            variable_names: names the checks count as variables besides the statement's (the warning, and the hint
+                of an edge endpoint's ``ValueError``): the ``variables()`` of the queryset whose
+                ``get_or_create()``/``update_or_create()`` look up with this one. Kept on *subqueries*
+                (``outer_variable_names``).
 
         Returns:
             A tuple of (where_clause_string, variables_dict).
             The where_clause_string includes the ``WHERE`` keyword, or is empty if no filters.
         """
+        if subqueries is not None and variable_names:
+            subqueries.outer_variable_names = frozenset(variable_names)
         parts, variables, _ = self._where_parts(0, as_of=as_of, subqueries=subqueries)
         if subqueries is not None:
             if subqueries.warn:
-                warn_on_variable_names(subqueries.variable_like, {*subqueries.variables, *variable_names})
+                warn_on_variable_names(subqueries.variable_like, {*subqueries.variables, *subqueries.outer_variable_names})
             subqueries.variable_like.clear()
         if not parts:
             return "", {}

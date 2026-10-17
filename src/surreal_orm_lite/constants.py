@@ -27,3 +27,10 @@ GEOMETRY_LOOKUP_OPERATORS = {
     "outside": "OUTSIDE",
     "intersects": "INTERSECTS",
 }
+
+#: SurrealDB's session parameters (v0.28.1): ``$access``, ``$auth``, ``$session`` and ``$token``. The server sets them
+#: for every session and refuses ``LET`` on them (its protected parameters; measured on 2.7.0 and 3.3.4), so a filter
+#: reads them with ``Var("auth")`` and no ``variables()``. A ``str`` filter value ``"$auth"`` is data, with a
+#: ``UserWarning`` (``utils.warn_on_variable_names``). The statement parameters (``$this``, ``$parent``, ``$value``,
+#: ``$before``, ``$after``, ``$input``, ``$event``) and the 1.x ``$scope`` are not session values: not listed.
+SESSION_PARAMETERS = frozenset({"access", "auth", "session", "token"})

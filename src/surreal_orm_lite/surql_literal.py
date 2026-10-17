@@ -47,6 +47,7 @@ from uuid import UUID
 
 from . import encoding as _encoding
 from ._sdk import BoundExcluded, BoundIncluded, RecordID, SdkDuration, SdkRange
+from .constants import SESSION_PARAMETERS
 from .exceptions import SurrealDbError
 from .geo import _SDK_GEOMETRIES, Geometry, _geometry_text
 from .types import _MAX_RANGE_TEXT, Duration, Range, _is_open_side, _nanoseconds
@@ -65,9 +66,10 @@ _DECIMAL_SCALE_MAX = 28
 # A ``$name`` reference. Greedy, so ``$_f10`` is never read as ``$_f1`` followed by ``0``.
 _REFERENCE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
 
-# Parameters the server itself defines while it evaluates a live query. They are the only
-# references allowed to stay unbound: any other one would read as NONE on every notification.
-_SERVER_PARAMETERS = frozenset({"auth", "session", "token", "access", "scope", "this", "parent"})
+# Parameters the server itself defines while it evaluates a live query: the session's, plus ``$scope``,
+# ``$this`` and ``$parent``. They are the only references allowed to stay unbound: any other one would read
+# as NONE on every notification.
+_SERVER_PARAMETERS = SESSION_PARAMETERS | {"scope", "this", "parent"}
 
 _SUPPORTED = (
     "None, bool, int, float, str, Decimal, datetime, date, timedelta, Duration, UUID, RecordID, Range, "
