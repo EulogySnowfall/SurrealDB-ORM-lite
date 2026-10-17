@@ -157,12 +157,14 @@ User.objects().limit("10")        # TypeError: limit() takes a non-negative inte
 User.objects().offset(-1)         # ValueError: offset() takes a non-negative integer, got -1
 ```
 
-Each takes a non-negative integer (`0` reads no record; an `IntEnum` member gives its value). A
-value that is not an `int` — a `bool`, a `str` such as `"10"`, a `float`, `None` — raises
-`TypeError`, and a negative one `ValueError`, naming the method and the value, when `limit()` or
+Each takes a non-negative integer (`0` reads no record; an `IntEnum` member or an integer type
+such as NumPy's `int64` gives its value). A value that is not an integer — a `bool`, a `str` such
+as `"10"`, a `float`, `None` — raises `TypeError`, and a negative one or one above `2**63 - 1`
+(SurrealQL's largest integer) `ValueError`, naming the method and the value, when `limit()` or
 `offset()` is called, before any request; the value in place is kept. The same holds wherever the
 queryset is read: `exec()`, `first()`, `get()`, `values(…).annotate(…)`, `cache()`, `as_of()` and
-a subquery.
+a subquery. The server may still refuse a large value when the read runs: SurrealDB 2.x and the
+embedded engine refuse one above `4294967295` (`2**32 - 1`), SurrealDB 3.x reads it.
 
 ---
 
@@ -3872,6 +3874,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | Query cache (`cache()`, `QueryCache`)                                                                                                  | same on both lines: client-side, per connection and identity; writes in a transaction invalidate at commit; reads in one are never cached (on 2.x they raise: buffered)       | the same; reads inside an interactive transaction are never cached (they see its uncommitted writes)                                                                                | v0.28.0                              |
 | `select("meta.*")` on a nested object that is not a record link                                                                        | its values, as a list; through a link (`select("author.*")`), the linked record                                                                                               | the object; through a link, the linked record                                                                                                                                       | pre-existing (documented in v0.28.1) |
 | `filter(f="$x")`: a string filter value starting with `$`                                                                              | same on both lines: compared with the string `"$x"`, bound like any value, in a live query too; `Var("x")` reads the variable `$x`                                            | the same                                                                                                                                                                            | v0.28.1                              |
+| `limit(n)` or `offset(n)` above `4294967295` (`2**32 - 1`)                                                                             | the server refuses the read: `Found <n> but the LIMIT clause must evaluate to a positive integer` (`START` likewise)                                                          | read; above `2**63 - 1` the ORM raises `ValueError` when `limit()` or `offset()` is called, on both lines                                                                           | pre-existing (documented in v0.28.1) |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.

@@ -1,9 +1,10 @@
 import inspect
+import operator
 import os
 import re
 import warnings
 from collections.abc import Collection, Iterable, Mapping
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, SupportsIndex, cast
 
 import pydantic
 
@@ -46,6 +47,9 @@ BARE_RECORD_ID = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 # to that query variable until v0.28.1. It is data now; :func:`warn_on_variable_names` says so when the statement's
 # ``variables()`` give that name. Used with ``fullmatch``.
 VARIABLE_NAME_VALUE = re.compile(r"\$([a-zA-Z_][a-zA-Z0-9_]*)")
+
+#: The largest ``limit()``/``offset()`` value: SurrealQL's largest integer (a signed 64-bit one).
+MAX_PAGING_VALUE = 2**63 - 1
 
 #: The ``DeprecationWarning`` of the ``"$$"`` escape (:func:`unescape_filter_value`): the same text whatever the value.
 ESCAPE_DEPRECATED = (
@@ -164,19 +168,27 @@ def warn_on_multiple_statements(query: str) -> None:
 def non_negative_int(method: str, value: object) -> int:
     """*value* as the ``int`` that *method* (``"limit()"`` or ``"offset()"``) writes into its statement.
 
-    A non-negative ``int`` is returned as a plain ``int`` (an ``int`` subclass, such as an ``IntEnum`` member,
-    gives its value). Anything else is refused, naming *method* and *value*: ``limit("10")`` and ``limit(-1)``
-    raise instead of reaching a statement.
+    An integer from ``0`` to :data:`MAX_PAGING_VALUE` (``2**63 - 1``, SurrealQL's largest integer) is returned as a
+    plain ``int``: an ``int`` subclass, such as an ``IntEnum`` member, or an integer type with ``__index__``, such as
+    NumPy's, gives its value. Anything else is refused, naming *method* and *value*: ``limit("10")`` and
+    ``limit(-1)`` raise instead of reaching a statement. The server may still refuse a large value when the read runs
+    (SurrealDB 2.x one above ``2**32 - 1``).
 
     Raises:
-        TypeError: *value* is not an ``int``, or is a ``bool``.
-        ValueError: *value* is negative.
+        TypeError: *value* is a ``bool`` or not an integer (no ``__index__``: a ``str``, a ``float``, ``None``).
+        ValueError: *value* is negative, or above :data:`MAX_PAGING_VALUE`.
     """
-    if isinstance(value, bool) or not isinstance(value, int):
+    if isinstance(value, bool):
         raise TypeError(f"{method} takes a non-negative integer, got {value!r}")
-    if value < 0:
+    try:
+        number = operator.index(cast(SupportsIndex, value))
+    except TypeError:
+        raise TypeError(f"{method} takes a non-negative integer, got {value!r}") from None
+    if number < 0:
         raise ValueError(f"{method} takes a non-negative integer, got {value!r}")
-    return int(value)
+    if number > MAX_PAGING_VALUE:
+        raise ValueError(f"{method} takes an integer up to {MAX_PAGING_VALUE} (2**63 - 1), got {value!r}")
+    return int(number)
 
 
 def validate_field_name(field: str, context: str = "field") -> None:
