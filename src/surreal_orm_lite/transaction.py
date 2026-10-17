@@ -77,7 +77,7 @@ class Transaction(ABC):
         if tables is None:
             self._cache_all = True
         else:
-            self._cache_tables.update(tables)
+            self._cache_tables |= set(tables)
 
     def _cache_written(self) -> frozenset[str] | None:
         """The tables noted so far: ``None`` when a write noted every table."""
