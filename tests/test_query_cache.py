@@ -13,6 +13,7 @@ server of ``SURREALDB_PORT`` over WebSocket and HTTP.
 
 import asyncio
 import contextlib
+import functools
 import gc
 import hashlib
 import inspect
@@ -25,32 +26,36 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 from surrealdb import RecordID
 
 import surreal_orm_lite
 from surreal_orm_lite import (
+    BaseSurrealEdge,
     BaseSurrealModel,
     Count,
     GeoDistance,
+    GeometryPoint,
     PointField,
     Q,
     QueryCache,
+    QuerySet,
     Subquery,
     SurrealConfigDict,
     SurrealDbConnectionError,
     SurrealDBConnectionManager,
     SurrealDbError,
+    SurrealDbNotFoundError,
     cache,
     encoding,
 )
 from surreal_orm_lite._sdk import cbor_encode
-from surreal_orm_lite.cache import EDGES
+from surreal_orm_lite.cache import EDGES, CacheRequest, follows_links
 from surreal_orm_lite.testing import embedded_database
 from tests.conftest import _ws_url
-from tests.test_time_travel import _http_url, connected
+from tests.test_time_travel import _forbidden_client, _http_url, _line, _record_queries, connected
 
 # --- models (spec §9) ---------------------------------------------------------------------------------
 
@@ -89,6 +94,44 @@ class QcPlace(BaseSurrealModel):
     id: str | None = None
     name: str = ""
     loc: PointField = None
+    owner: RecordID | None = None
+
+
+class QcUser(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="qc_user")
+
+    id: str | None = None
+    name: str = ""
+
+
+class QcPost(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="qc_post")
+
+    id: str | None = None
+    title: str = ""
+
+
+class QcLikes(BaseSurrealEdge):
+    """An edge ``QcUser`` → ``QcPost``: its reads carry ``EDGES``."""
+
+    model_config = SurrealConfigDict(table_name="qc_likes")
+
+
+class QcGhost(BaseSurrealModel):
+    """A table never created: SurrealDB 3.x answers ``NotFoundError``, 2.x and the embedded engine ``[]``."""
+
+    model_config = SurrealConfigDict(table_name="qc_ghost")
+
+    id: str | None = None
+    x: int = 0
+
+
+class QcNote(BaseSurrealModel):
+    """A note of :func:`auth_db`'s record-access fixture, readable by its owner only."""
+
+    model_config = SurrealConfigDict(table_name="qc_note")
+
+    id: str | None = None
     owner: RecordID | None = None
 
 
@@ -1544,10 +1587,391 @@ class TestInvalidatesDecorator:
         assert QueryCache.stats()["entries"] == 0
 
 
+# --- spec §5.1, §5.3, §6.3: QuerySet.cache(), its tags and its refusals ---------------------------------
+
+_C3 = "cache() cannot be combined with as_of(): a time-travel read is never cached"
+_C10 = (
+    "query() runs your own SurrealQL and is never cached: drop cache(), or cache its result yourself with "
+    "QueryCache.make_key(), get() and set()"
+)
+_W1 = "QueryCache is disabled — .cache() has no effect"
+
+
+def _live_refused(offenders: str) -> str:
+    """The pre-existing refusal of ``live()``/``watch()``, naming *offenders* (unchanged text, spec §5.1)."""
+    return (
+        f"A live query cannot honour {offenders}: SurrealDB's LIVE SELECT has no ORDER BY, LIMIT or START, streams "
+        "whole records, and runs outside any transaction. Drop the clause — filter(), variables() and fetch() are "
+        "supported."
+    )
+
+
+def _changes_refused(offenders: str) -> str:
+    """The pre-existing refusal of ``changes()``, naming *offenders* (unchanged text, spec §5.1)."""
+    return (
+        f"A change feed cannot honour {offenders}: SurrealDB's SHOW CHANGES reads the whole table's log, with no "
+        "WHERE, projection, ordering or paging, outside any transaction. Call changes() on Model.objects() and "
+        "filter the events."
+    )
+
+
+def _warnings(caplog: pytest.LogCaptureFixture, logger: str) -> list[tuple[int, str]]:
+    return [(record.levelno, record.getMessage()) for record in caplog.records if record.name == logger]
+
+
+class TestCacheMethod:
+    """Spec §5.1: ``cache()`` records the oldest result its reads accept; C1/C2 on ``ttl``, then C3; W1."""
+
+    @pytest.mark.parametrize(
+        ("ttl", "expected"),
+        [
+            (30, 30.0),
+            (0.5, 0.5),
+            (Fraction(1, 2), 0.5),
+            (timedelta(minutes=2), 120.0),
+            (0, 0.0),
+            (0.0, 0.0),
+            (timedelta(0), 0.0),
+            (None, None),
+        ],
+        ids=["int", "float", "fraction", "timedelta", "zero", "zero-float", "zero-timedelta", "none"],
+    )
+    def test_records_the_request(self, ttl: Any, expected: float | None) -> None:
+        qs = QcItem.objects()
+        assert qs.cache(ttl) is qs
+        assert qs._cache == CacheRequest(expected)
+        assert QcItem.objects().cache(ttl=ttl)._cache == CacheRequest(expected)
+
+    def test_without_an_argument_the_default_is_read_when_the_read_runs(self) -> None:
+        assert QcItem.objects()._cache is None
+        assert QcItem.objects().cache()._cache == CacheRequest(None)
+
+    def test_called_again_replaces_the_ttl(self) -> None:
+        qs = QcItem.objects().cache(30).cache(5)
+        assert qs._cache == CacheRequest(5.0)
+        assert qs.cache()._cache == CacheRequest(None)
+
+    @pytest.mark.parametrize("ttl", [True, "30", Decimal("1"), [1]], ids=repr)
+    def test_c1(self, ttl: Any) -> None:
+        qs = QcItem.objects()
+        expected = f"cache() ttl must be a number of seconds or a timedelta, not {type(ttl).__name__}"
+        _raises(TypeError, expected, qs.cache, ttl)
+        assert qs._cache is None
+
+    @pytest.mark.parametrize("ttl", [-1, -0.5, timedelta(seconds=-1), math.nan, math.inf, -math.inf], ids=repr)
+    def test_c2(self, ttl: Any) -> None:
+        qs = QcItem.objects()
+        _raises(ValueError, f"cache() ttl must be a finite number of seconds >= 0, got {ttl!r}", qs.cache, ttl)
+        assert qs._cache is None
+
+    def test_c3_after_as_of(self) -> None:
+        qs = QcItem.objects().as_of(datetime(2026, 1, 1, tzinfo=UTC))
+        _raises(SurrealDbError, _C3, qs.cache)
+        _raises(SurrealDbError, _C3, qs.cache, 30)
+        assert qs._cache is None
+
+    def test_c1_and_c2_come_before_c3(self) -> None:
+        qs = QcItem.objects().as_of(datetime(2026, 1, 1, tzinfo=UTC))
+        _raises(ValueError, "cache() ttl must be a finite number of seconds >= 0, got -1", qs.cache, -1)
+        _raises(TypeError, "cache() ttl must be a number of seconds or a timedelta, not bool", qs.cache, True)
+
+    @pytest.mark.parametrize(
+        "at",
+        [datetime(2026, 1, 1, tzinfo=UTC), "2026-01-01T00:00:00Z", timedelta(hours=1), "not a moment"],
+        ids=["datetime", "iso", "timedelta", "invalid-string"],
+    )
+    def test_c3_on_as_of_after_cache(self, at: Any) -> None:
+        """C3 comes before ``as_of()`` normalises its moment: even an invalid one is refused with C3."""
+        qs = QcItem.objects().cache()
+        _raises(SurrealDbError, _C3, qs.as_of, at)
+        assert qs._as_of is None
+
+    def test_as_of_none_after_cache_is_accepted(self) -> None:
+        qs = QcItem.objects().cache(30)
+        assert qs.as_of(None) is qs
+        assert qs._as_of is None
+        assert qs._cache == CacheRequest(30.0)
+
+    def test_the_transaction_check_of_as_of_comes_first(self) -> None:
+        qs = QcItem.objects(tx=_Tx()).cache()
+        with pytest.raises(SurrealDbError) as info:
+            qs.as_of(datetime(2026, 1, 1, tzinfo=UTC))
+        assert str(info.value) != _C3
+
+    def test_w1_while_disabled(self, caplog: pytest.LogCaptureFixture) -> None:
+        QueryCache.configure(enabled=False)
+        qs = QcItem.objects()
+        with caplog.at_level(logging.WARNING, logger="surreal_orm_lite.query_set"):
+            assert qs.cache(30) is qs
+        assert _warnings(caplog, "surreal_orm_lite.query_set") == [(logging.WARNING, _W1)]
+        assert qs._cache == CacheRequest(30.0)  # still set: it applies if the cache is enabled before the read
+
+    def test_no_warning_while_enabled(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING, logger="surreal_orm_lite.query_set"):
+            QcItem.objects().cache()
+        assert _warnings(caplog, "surreal_orm_lite.query_set") == []
+
+
+@pytest.fixture
+def _no_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test if anything asks for a client: these refusals come before any request."""
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", _forbidden_client)
+
+
+@pytest.mark.usefixtures("_no_client")
+class TestRefusals:
+    """AC-6, D18: ``query()``, ``live()``, ``watch()`` and ``changes()`` refuse a queryset with ``cache()``."""
+
+    async def test_query_raises_c10(self) -> None:
+        with pytest.raises(SurrealDbError) as info:
+            await QcItem.objects().cache().query("SELECT * FROM qc_item;")
+        assert str(info.value) == _C10
+
+    async def test_c10_comes_before_the_from_check(self) -> None:
+        with pytest.raises(SurrealDbError) as info:
+            await QcItem.objects().cache().query("SELECT 1;")
+        assert str(info.value) == _C10
+
+    @pytest.mark.parametrize("method", ["live", "watch"])
+    def test_live_and_watch_name_cache(self, method: str) -> None:
+        _raises(SurrealDbError, _live_refused("cache()"), getattr(QcItem.objects().cache(), method))
+        _raises(SurrealDbError, _live_refused("cache(), limit()"), getattr(QcItem.objects().cache().limit(1), method))
+
+    def test_changes_names_cache(self) -> None:
+        _raises(SurrealDbError, _changes_refused("cache()"), QcItem.objects().cache().changes)
+        _raises(SurrealDbError, _changes_refused("cache(), limit()"), QcItem.objects().cache().limit(1).changes)
+
+    async def test_without_cache_the_texts_are_unchanged(self) -> None:
+        _raises(SurrealDbError, _live_refused("limit()"), QcItem.objects().limit(1).live)
+        _raises(SurrealDbError, _live_refused("limit()"), QcItem.objects().limit(1).watch)
+        _raises(SurrealDbError, _changes_refused("limit()"), QcItem.objects().limit(1).changes)
+        with pytest.raises(SurrealDbError) as info:
+            await QcItem.objects().query("SELECT 1;")
+        assert str(info.value) == "The query must include 'FROM qc_item' to reference the correct table."
+
+
+class _Read(NamedTuple):
+    """What ``QuerySet._cached_read`` was asked."""
+
+    kind: str
+    statement: str
+    variables: dict[str, Any]
+    tables: frozenset[str]
+    any_table: bool
+
+
+@pytest.fixture
+def reads(monkeypatch: pytest.MonkeyPatch) -> list[_Read]:
+    """Replace ``QuerySet._cached_read`` with a recorder answering ``[]``; no client may be acquired."""
+    calls: list[_Read] = []
+
+    async def recording(
+        self: QuerySet,
+        kind: str,
+        statement: str,
+        variables: dict[str, Any],
+        tables: frozenset[str],
+        any_table: bool,
+        run: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        calls.append(_Read(kind, statement, dict(variables), tables, any_table))
+        return []
+
+    monkeypatch.setattr(QuerySet, "_cached_read", recording)
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", _forbidden_client)
+    return calls
+
+
+def _active_likers() -> Any:
+    return QcUser.objects().filter(id__in=Subquery(QcLikes.objects().select("in")))
+
+
+# Reads whose statement follows a link (spec §5.3 "any"): a dotted path wherever it sits, or FETCH.
+_FOLLOWING: list[tuple[str, Callable[[], Any]]] = [
+    ("filter", lambda: QcBook.objects().filter(**{"author.name": "x"}).cache().exec()),
+    ("q", lambda: QcBook.objects().filter(Q(**{"author.name": "x"}) | Q(price=1)).cache().exec()),
+    ("order_by", lambda: QcBook.objects().order_by("author.name").cache().exec()),
+    ("select", lambda: QcBook.objects().select("title", "author.name").cache().exec()),
+    ("values", lambda: QcBook.objects().values("author.name").annotate(n=Count()).cache().exec()),
+    ("count", lambda: QcBook.objects().filter(**{"author.name": "x"}).cache().count()),
+    (
+        "in-a-subquery",
+        lambda: (
+            QcAuthor.objects()
+            .filter(id__in=Subquery(QcBook.objects().filter(**{"author.name": "x"}).select("author")))
+            .cache()
+            .exec()
+        ),
+    ),
+    ("fetch", lambda: QcBook.objects().fetch("author").cache().exec()),
+]
+
+
+class TestTags:
+    """Spec §5.3, §6.3: what a cached read depends on, decided once from its compiled statement and its models."""
+
+    async def test_a_plain_read(self, reads: list[_Read]) -> None:
+        assert await QcItem.objects().filter(category="book").cache().exec() == []
+        expected = QcItem.objects().filter(category="book")._compile_query()
+        assert reads == [_Read("query", *expected, frozenset({"qc_item"}), False)]
+
+    async def test_every_compiled_read_goes_through_the_cache(self, reads: list[_Read]) -> None:
+        qs = QcItem.objects().filter(price__gt=1).cache()
+        assert await qs.exec() == []
+        with pytest.raises(SurrealDbNotFoundError):
+            await qs.first()
+        with pytest.raises(SurrealDbNotFoundError):
+            await qs.get()
+        assert await qs.count() == 0
+        assert await qs.sum("price") == 0
+        assert await qs.avg("price") == 0.0
+        assert await qs.min("price") is None
+        assert await qs.max("price") is None
+        assert await qs.exists() is False
+        assert await QcItem.objects().values("category").annotate(n=Count()).cache().exec() == []
+        assert [read.kind for read in reads] == ["query"] * 10
+        assert {read.tables for read in reads} == {frozenset({"qc_item"})}
+        assert not any(read.any_table for read in reads)
+        # exec() and get() send the same statement, as first() and exists() do (LIMIT 1).
+        assert len({read.statement for read in reads}) == 8
+        assert qs._limit is None  # first() and exists() leave the queryset untouched
+
+    async def test_an_edge_read(self, reads: list[_Read]) -> None:
+        await QcLikes.objects().cache().exec()
+        await QcLikes.objects().cache().count()
+        assert [(read.tables, read.any_table) for read in reads] == [(frozenset({"qc_likes", EDGES}), False)] * 2
+
+    async def test_a_subquery_of_an_edge(self, reads: list[_Read]) -> None:
+        await _active_likers().cache().exec()
+        (read,) = reads
+        assert read.tables == frozenset({"qc_user", "qc_likes", EDGES})
+        assert read.any_table is False
+
+    async def test_a_subquery_of_a_node(self, reads: list[_Read]) -> None:
+        await QcBook.objects().filter(author__in=Subquery(QcAuthor.objects().filter(name="Ada"))).cache().exec()
+        (read,) = reads
+        assert read.tables == frozenset({"qc_book", "qc_author"})
+        assert read.any_table is False
+
+    @pytest.mark.parametrize("read", [read for _, read in _FOLLOWING], ids=[name for name, _ in _FOLLOWING])
+    async def test_a_read_that_follows_links_is_any(self, reads: list[_Read], read: Callable[[], Any]) -> None:
+        await read()
+        (recorded,) = reads
+        assert recorded.any_table is True
+
+    async def test_geo_distance_on_a_plain_point_field(self, reads: list[_Read]) -> None:
+        await QcPlace.objects().annotate(d=GeoDistance("loc", (0.0, 0.0))).order_by("d").cache().exec()
+        await QcPlace.objects().nearby("loc", (0.0, 0.0), max_distance=10).cache().count()
+        assert [(read.tables, read.any_table) for read in reads] == [(frozenset({"qc_place"}), False)] * 2
+        assert "loc.is_point()" in reads[0].statement
+
+    async def test_get_by_id_and_all(self, reads: list[_Read]) -> None:
+        with pytest.raises(SurrealDbNotFoundError, match="No result found."):
+            await QcItem.objects().cache().get("i1")
+        assert await QcItem.objects().cache().all() == []
+        with pytest.raises(SurrealDbNotFoundError, match="No result found."):
+            await QcLikes.objects().cache().get("e1")
+        assert await QcLikes.objects().cache().all() == []
+        assert reads == [
+            _Read("select", "", {"target": RecordID("qc_item", "i1")}, frozenset({"qc_item"}), False),
+            _Read("select", "", {"target": "qc_item"}, frozenset({"qc_item"}), False),
+            _Read("select", "", {"target": RecordID("qc_likes", "e1")}, frozenset({"qc_likes", EDGES}), False),
+            _Read("select", "", {"target": "qc_likes"}, frozenset({"qc_likes", EDGES}), False),
+        ]
+
+    @pytest.mark.parametrize("item", ["author.*", "author.{name}", "author[*]", "x AS y"])
+    async def test_a_select_item_that_is_not_a_field_is_any(self, reads: list[_Read], item: str) -> None:
+        """P3: ``select()`` items are not validated, and projection semantics read the linked table."""
+        await QcBook.objects().select("title", item).cache().exec()
+        (read,) = reads
+        assert read.any_table is True
+        if item == "author.*":
+            assert read.statement == "SELECT title, author.* FROM qc_book;"
+            assert follows_links(read.statement) is False  # the projection rule is what tags it
+
+    async def test_plain_select_fields_are_not_any(self, reads: list[_Read]) -> None:
+        await QcBook.objects().select("title", "price").cache().exec()
+        await QcBook.objects().select("*").cache().exec()
+        assert [read.any_table for read in reads] == [False, False]
+
+    def test_an_inner_querysets_cache_changes_nothing(self) -> None:
+        plain = QcUser.objects().filter(id__in=Subquery(QcLikes.objects().select("in")))
+        cached = QcUser.objects().filter(id__in=Subquery(QcLikes.objects().select("in").cache(5)))
+        assert cached._compile_query() == plain._compile_query()
+
+
+class TestUncachedUnchanged:
+    """AC-12: without ``cache()`` (or inside a transaction, or for a write), every read runs today's code."""
+
+    @pytest.fixture
+    def executed(self, monkeypatch: pytest.MonkeyPatch) -> list[tuple[tuple[Any, ...], dict[str, Any]]]:
+        calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        async def recording(self: QuerySet, *args: Any, **kwargs: Any) -> Any:
+            calls.append((args, kwargs))
+            return []
+
+        async def never(*args: Any, **kwargs: Any) -> Any:
+            pytest.fail("the cache was consulted")
+
+        monkeypatch.setattr(QuerySet, "_execute_query", recording)
+        monkeypatch.setattr(QuerySet, "_cached_read", never)
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", _forbidden_client)
+        return calls
+
+    async def test_exec_and_count(self, executed: list[tuple[tuple[Any, ...], dict[str, Any]]]) -> None:
+        qs = QcItem.objects().filter(category="book")
+        await qs.exec()
+        await qs.count()
+        assert executed == [(qs._compile_query(), {}), (qs._compile_aggregation_query("count()"), {})]
+
+    async def test_a_subquery_read(self, executed: list[tuple[tuple[Any, ...], dict[str, Any]]]) -> None:
+        qs = QcUser.objects().filter(id__in=Subquery(QcLikes.objects().select("in").cache()))
+        await qs.exec()
+        assert executed == [(qs._compile_query(), {"subquery_tables": frozenset({"qc_likes"})})]
+
+    async def test_a_cached_read_in_a_transaction(self, executed: list[tuple[tuple[Any, ...], dict[str, Any]]]) -> None:
+        qs = QcItem.objects(tx=_Tx()).cache()
+        await qs.count()
+        assert executed == [(qs._compile_aggregation_query("count()"), {})]
+
+    async def test_a_write_on_a_cached_queryset(self, executed: list[tuple[tuple[Any, ...], dict[str, Any]]]) -> None:
+        await QcItem.objects().filter(category="book").cache().bulk_update(price=1)
+        assert executed == [
+            (("UPDATE qc_item SET price = $_v0 WHERE category = $_f0;", {"_f0": "book", "_v0": 1}), {}),
+        ]
+
+    async def test_get_by_id_and_all(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        selected: list[Any] = []
+
+        class _Selecting:
+            async def select(self, target: Any) -> Any:
+                selected.append(target)
+                row = {"id": RecordID("qc_item", "i1"), "name": "a"}
+                return row if isinstance(target, RecordID) else [row]
+
+        client = _Selecting()
+
+        async def get_client(*args: Any, **kwargs: Any) -> Any:
+            return client
+
+        async def never(*args: Any, **kwargs: Any) -> Any:
+            pytest.fail("the cache was consulted")
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+        monkeypatch.setattr(QuerySet, "_cached_read", never)
+        assert (await QcItem.objects().get("i1")).name == "a"
+        assert [item.name for item in await QcItem.objects().all()] == ["a"]
+        assert selected == [RecordID("qc_item", "i1"), "qc_item"]
+
+
 # === E2E: an engine or a server ===========================================================================
 
 #: The tables of this module's models, removed before and after each E2E test on a server.
-_TABLES = ("qc_item", "qc_author", "qc_book", "qc_place")
+_TABLES = ("qc_item", "qc_author", "qc_book", "qc_place", "qc_user", "qc_post", "qc_likes", "qc_ghost")
+
+#: The engines every cached read runs on (spec §9).
+_KINDS = ["mem", "ws", "http"]
 
 
 @contextlib.asynccontextmanager
@@ -1722,3 +2146,532 @@ class TestScopeE2E:
             assert second_scope in QueryCache._live_scopes
             del first, second
         assert second_scope not in QueryCache._live_scopes
+
+
+# --- AC-5, AC-6, AC-9: cached reads on every engine ------------------------------------------------------
+
+
+def _record_selects(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[Any]:
+    """Record the target of each ``select()`` *client* runs from now on (``_record_queries``' twin)."""
+    calls: list[Any] = []
+    cls = type(client)
+    real = cls.select
+    owner = id(client)
+
+    @functools.wraps(real)
+    async def recording(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if id(self) == owner:
+            calls.append(args[0] if args else next(iter(kwargs.values()), None))
+        return await real(self, *args, **kwargs)
+
+    monkeypatch.setattr(cls, "select", recording)
+    return calls
+
+
+def _requests(monkeypatch: pytest.MonkeyPatch, client: Any) -> Callable[[], int]:
+    """The number of ``query()`` and ``select()`` requests *client* sends from now on."""
+    queries = _record_queries(monkeypatch, client)
+    selects = _record_selects(monkeypatch, client)
+    return lambda: len(queries) + len(selects)
+
+
+def _hold_next_reply(
+    monkeypatch: pytest.MonkeyPatch, client: Any, method: str = "query"
+) -> tuple[asyncio.Event, asyncio.Event]:
+    """Hold the next *method* call of *client* **after** its reply: ``(reached, release)`` (spec §9).
+
+    The call runs for real first, so the rows it returns are computed before whatever the test does while it is
+    held; then ``reached`` is set and the call waits for ``release``. One-shot: disarmed before waiting, so the
+    test's own calls meanwhile pass through. Patched on the client's class and keyed on ``id(client)``.
+    """
+    reached, release = asyncio.Event(), asyncio.Event()
+    cls = type(client)
+    real = getattr(cls, method)
+    owner = id(client)
+    armed = [True]
+
+    @functools.wraps(real)  # keeps the signature: _record_queries() binds it
+    async def holding(self: Any, *args: Any, **kwargs: Any) -> Any:
+        hold = id(self) == owner and armed[0]
+        if hold:
+            armed[0] = False
+        result = await real(self, *args, **kwargs)
+        if hold:
+            reached.set()
+            await release.wait()
+        return result
+
+    monkeypatch.setattr(cls, method, holding)
+    return reached, release
+
+
+async def _until_held(reached: asyncio.Event, task: asyncio.Task[Any]) -> None:
+    """Wait until *task*'s held call has its reply; raise *task*'s error if it ended first."""
+    waiter = asyncio.ensure_future(reached.wait())
+    done, _ = await asyncio.wait({waiter, task}, timeout=10, return_when=asyncio.FIRST_COMPLETED)
+    if waiter in done:
+        return
+    waiter.cancel()
+    if task in done:
+        task.result()
+    raise AssertionError("the held call was never answered")
+
+
+async def _seed() -> None:
+    """Four items, two authors and their books, two places, two users, two posts and one like."""
+    for key, name, category, price, tags in (
+        ("i1", "a", "book", 10, ["x"]),
+        ("i2", "b", "book", 20, []),
+        ("i3", "c", "home", 30, []),
+        ("i4", "d", "home", 40, []),
+    ):
+        await QcItem(id=key, name=name, category=category, price=price, tags=tags).save()
+    await QcAuthor(id="ada", name="Ada").save()
+    await QcAuthor(id="bea", name="Bea").save()
+    await QcBook(id="b1", title="Dune", author=RecordID("qc_author", "ada"), price=12).save()
+    await QcBook(id="b2", title="Emma", author=RecordID("qc_author", "bea"), price=9).save()
+    await QcPlace(id="pl1", name="here", loc=GeometryPoint(0.0, 0.0)).save()
+    await QcPlace(id="pl2", name="there", loc=GeometryPoint(1.0, 1.0)).save()
+    await QcUser(id="ada", name="Ada").save()
+    await QcUser(id="bob", name="Bob").save()
+    await QcPost(id="p1", title="one").save()
+    await QcPost(id="p2", title="two").save()
+    await QcLikes(in_=RecordID("qc_user", "ada"), out=RecordID("qc_post", "p1")).save()
+
+
+def _qs(model: type[BaseSurrealModel], cached: bool) -> Any:
+    qs = model.objects()
+    return qs.cache() if cached else qs
+
+
+def _names(rows: Any) -> list[str]:
+    return [row.name for row in rows]
+
+
+def _id_price(row: Any) -> tuple[str, int]:
+    return row.id, row.price
+
+
+def _fetched_author(rows: Any) -> list[str]:
+    """The author's name of each book read with ``fetch("author")`` (a dict row: the link is now a record)."""
+    return [row["author"]["name"] if isinstance(row, dict) else row.author["name"] for row in rows]
+
+
+class _ReadCase(NamedTuple):
+    """One read of AC-5: ``read(cached)``, an out-of-band statement that changes its result, and that result
+    rendered before and after it."""
+
+    read: Callable[[bool], Awaitable[Any]]
+    change: str
+    render: Callable[[Any], Any]
+    before: Any
+    after: Any
+
+
+_READ_CASES: dict[str, _ReadCase] = {
+    "exec": _ReadCase(
+        lambda c: _qs(QcItem, c).filter(category="book").order_by("name").exec(),
+        "UPDATE qc_item:i1 SET name = 'z';",
+        _names,
+        ["a", "b"],
+        ["b", "z"],
+    ),
+    "first": _ReadCase(
+        lambda c: _qs(QcItem, c).order_by("price").first(),
+        "UPDATE qc_item:i1 SET price = 99;",
+        _id_price,
+        ("i1", 10),
+        ("i2", 20),
+    ),
+    "get_filtered": _ReadCase(
+        lambda c: _qs(QcItem, c).filter(name="c").get(),
+        "UPDATE qc_item:i3 SET price = 31;",
+        _id_price,
+        ("i3", 30),
+        ("i3", 31),
+    ),
+    "get_id": _ReadCase(
+        lambda c: _qs(QcItem, c).get("i1"),
+        "UPDATE qc_item:i1 SET price = 11;",
+        _id_price,
+        ("i1", 10),
+        ("i1", 11),
+    ),
+    "all": _ReadCase(
+        lambda c: _qs(QcItem, c).all(),
+        "DELETE qc_item:i4;",
+        lambda rows: sorted(row.id for row in rows),
+        ["i1", "i2", "i3", "i4"],
+        ["i1", "i2", "i3"],
+    ),
+    "count": _ReadCase(
+        lambda c: _qs(QcItem, c).filter(category="book").count(),
+        "UPDATE qc_item:i3 SET category = 'book';",
+        lambda value: value,
+        2,
+        3,
+    ),
+    "sum": _ReadCase(lambda c: _qs(QcItem, c).sum("price"), "UPDATE qc_item:i1 SET price = 11;", lambda value: value, 100, 101),
+    "avg": _ReadCase(
+        lambda c: _qs(QcItem, c).avg("price"), "UPDATE qc_item:i1 SET price = 14;", lambda value: value, 25.0, 26.0
+    ),
+    "min": _ReadCase(lambda c: _qs(QcItem, c).min("price"), "UPDATE qc_item:i1 SET price = 5;", lambda value: value, 10, 5),
+    "max": _ReadCase(lambda c: _qs(QcItem, c).max("price"), "UPDATE qc_item:i4 SET price = 50;", lambda value: value, 40, 50),
+    "exists": _ReadCase(
+        lambda c: _qs(QcItem, c).filter(category="toy").exists(),
+        "UPDATE qc_item:i1 SET category = 'toy';",
+        lambda value: value,
+        False,
+        True,
+    ),
+    "values_annotate": _ReadCase(
+        lambda c: _qs(QcItem, c).values("category").annotate(n=Count()).order_by("category").exec(),
+        "UPDATE qc_item:i3 SET category = 'book';",
+        lambda rows: [(row["category"], row["n"]) for row in rows],
+        [("book", 2), ("home", 2)],
+        [("book", 3), ("home", 1)],
+    ),
+    "geo_distance": _ReadCase(
+        lambda c: _qs(QcPlace, c).annotate(d=GeoDistance("loc", (0.0, 0.0))).order_by("d").exec(),
+        "UPDATE qc_place:pl1 SET loc = (2.0, 2.0);",
+        lambda rows: [(row.id, row.d == 0) for row in rows],
+        [("pl1", True), ("pl2", False)],
+        [("pl2", False), ("pl1", False)],
+    ),
+    "subquery": _ReadCase(
+        lambda c: _qs(QcUser, c).filter(id__in=Subquery(QcLikes.objects().select("in"))).order_by("name").exec(),
+        "UPDATE qc_user:ada SET name = 'Zed';",
+        lambda rows: [(row.id, row.name) for row in rows],
+        [("ada", "Ada")],
+        [("ada", "Zed")],
+    ),
+    "fetch": _ReadCase(
+        lambda c: _qs(QcBook, c).filter(title="Dune").fetch("author").exec(),
+        "UPDATE qc_author:ada SET name = 'Zed';",
+        _fetched_author,
+        ["Ada"],
+        ["Zed"],
+    ),
+}
+
+
+def _mutate(result: Any) -> None:
+    """Change the first row of *result* in place, nested values included (a scalar result has none)."""
+    first = result[0] if isinstance(result, list) and result else result
+    if isinstance(first, dict):
+        for value in first.values():
+            if isinstance(value, dict | list):
+                value.clear()
+        first.clear()
+    elif isinstance(first, BaseSurrealModel):
+        for value in first.__dict__.values():
+            if isinstance(value, dict | list):
+                value.clear()
+        first.__dict__.update(dict.fromkeys(type(first).model_fields))
+
+
+def _assert_new_objects(first: Any, second: Any) -> None:
+    """A hit is built from a copy: no instance, row or list of it is one the first read returned."""
+    if isinstance(first, list | dict | BaseSurrealModel):
+        assert second is not first
+    if isinstance(first, list) and isinstance(second, list):
+        for a, b in zip(first, second, strict=False):
+            assert b is not a
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+class TestCachedReadsE2E:
+    """AC-5: every read of a cached queryset is answered from the cache, as new objects, on every engine."""
+
+    @pytest.mark.parametrize("case", list(_READ_CASES.values()), ids=list(_READ_CASES))
+    async def test_the_second_read_is_answered_from_the_cache(
+        self, kind: str, case: _ReadCase, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            first = await case.read(True)
+            assert requests() >= 1
+            assert case.render(first) == case.before
+            _mutate(first)
+            await client.query(case.change)
+            sent = requests()
+            second = await case.read(True)
+            assert requests() == sent, "the second read sent a request"
+            assert case.render(second) == case.before
+            _assert_new_objects(first, second)
+            assert _counts() == (1, 1)
+            assert QueryCache.stats()["entries"] == 1
+            assert case.render(await case.read(False)) == case.after  # the database did change
+
+    async def test_without_cache_every_read_is_sent(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            for name, case in _READ_CASES.items():
+                sent = requests()
+                assert case.render(await case.read(False)) == case.before, name
+                once = requests() - sent
+                assert once >= 1, name
+                assert case.render(await case.read(False)) == case.before, name
+                assert requests() - sent == 2 * once, name
+            assert QueryCache.stats() == {
+                "entries": 0,
+                "tables": 0,
+                "max_size": 1000,
+                "default_ttl": 60.0,
+                "enabled": True,
+                "hits": 0,
+                "misses": 0,
+            }
+
+    async def test_negative_results_are_cached(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            empty = QcItem.objects().filter(category="none").cache()
+
+            async def read_all() -> None:
+                assert await empty.exec() == []
+                assert await empty.count() == 0
+                with pytest.raises(SurrealDbNotFoundError, match="No result found."):
+                    await QcItem.objects().cache().get("nope")
+                assert await QcGhost.objects().cache().exec() == []  # a table never created
+
+            await read_all()
+            await client.query("UPDATE qc_item:i1 SET category = 'none';")
+            await client.query("CREATE qc_item:nope SET name = 'n';")
+            await client.query("CREATE qc_ghost:g SET x = 1;")
+            sent = requests()
+            await read_all()
+            assert requests() == sent
+            assert _counts() == (4, 4)
+            assert _names(await QcItem.objects().filter(category="none").exec()) == ["a"]
+            assert (await QcItem.objects().get("nope")).name == "n"
+            assert [ghost.x for ghost in await QcGhost.objects().exec()] == [1]
+
+    async def test_different_requests_are_separate_entries(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+
+            async def read_all() -> list[Any]:
+                return [
+                    await QcItem.objects().filter(category="book").cache().count(),
+                    await QcItem.objects().filter(category="home").cache().count(),
+                    sorted(
+                        book.id for book in await QcBook.objects().filter(author=RecordID("qc_author", "ada")).cache().exec()
+                    ),
+                    sorted(book.id for book in await QcBook.objects().filter(author="qc_author:ada").cache().exec()),
+                    _names(await QcItem.objects().filter(category="home").order_by("name").cache().exec()),
+                ]
+
+            assert await read_all() == [2, 2, ["b1"], [], ["c", "d"]]
+            assert requests() == 5
+            assert _counts() == (0, 5)
+            assert await read_all() == [2, 2, ["b1"], [], ["c", "d"]]
+            assert requests() == 5
+            assert _counts() == (5, 5)
+            assert QueryCache.stats()["entries"] == 5
+
+    async def test_expiry_and_the_readers_ttl(self, kind: str, monkeypatch: pytest.MonkeyPatch, now: list[float]) -> None:
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+
+            def books() -> Awaitable[int]:
+                return QcItem.objects().filter(category="book").cache().count()
+
+            assert await books() == 2
+            now[0] += 59
+            assert await books() == 2
+            assert requests() == 1
+            now[0] += 2  # 61 s: past the default TTL
+            assert await books() == 2
+            assert requests() == 2
+
+            def home(ttl: float) -> Awaitable[int]:
+                return QcItem.objects().filter(category="home").cache(ttl).count()
+
+            assert await home(300) == 2
+            now[0] += 6
+            assert await home(300) == 2
+            assert requests() == 3
+            assert await home(5) == 2  # D10: older than this reader accepts
+            assert requests() == 4
+            assert await home(5) == 2  # the entry was replaced
+            assert await home(300) == 2
+            assert requests() == 4
+
+    async def test_a_failing_copy_never_fails_a_read(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """G7: the cache's own failures send the read to the database, never raise."""
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+
+            def books() -> Awaitable[Any]:
+                return QcItem.objects().filter(category="book").order_by("name").cache().exec()
+
+            assert _names(await books()) == ["a", "b"]  # stored
+            assert requests() == 1
+
+            def broken(value: Any) -> Any:
+                raise RuntimeError("no copy")
+
+            monkeypatch.setattr(cache, "_deepcopy", broken)
+            assert _names(await books()) == ["a", "b"]  # the hit cannot be copied: the database answers
+            assert requests() == 2
+            assert QueryCache.stats()["entries"] == 0
+            assert _names(await books()) == ["a", "b"]  # nothing can be stored: the database again
+            assert _names(await books()) == ["a", "b"]
+            assert requests() == 4
+            assert QueryCache.stats()["entries"] == 0
+
+    @pytest.mark.parametrize("zero", [0, timedelta(0)], ids=["int", "timedelta"])
+    async def test_ttl_zero_is_never_cached(self, kind: str, zero: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        """P2: a ``cache(0)`` read, or ``cache()`` under ``default_ttl=0``, goes to the database every time."""
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            for _ in range(2):
+                assert await QcItem.objects().filter(category="book").cache(zero).count() == 2
+            assert requests() == 2
+            assert QueryCache.stats()["entries"] == 0
+            assert _counts() == (0, 2)
+            QueryCache.configure(default_ttl=zero)
+            QueryCache.clear()
+            for _ in range(2):
+                assert await QcItem.objects().filter(category="book").cache().count() == 2
+            assert requests() == 4
+            assert QueryCache.stats()["entries"] == 0
+            assert _counts() == (0, 2)
+
+
+@pytest.mark.parametrize("kind", _KINDS)
+class TestNotCachedE2E:
+    """AC-6: what goes to the database although the queryset has ``cache()``."""
+
+    async def test_reads_in_a_transaction(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Interactive (WebSocket on 3.x): the read sees the transaction's uncommitted write and nothing is cached.
+        Buffered (2.x, HTTP, the embedded engine): it raises exactly as without ``cache()``."""
+        async with cache_db(kind) as client:
+            await _seed()
+            interactive = kind == "ws" and await _line(client) >= 3
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert tx.is_interactive is interactive
+                if interactive:
+                    await QcItem(id="i5", name="e", category="book", price=50).save(tx=tx)
+                    requests = _requests(monkeypatch, client)
+                    for _ in range(2):
+                        assert await QcItem.objects(tx=tx).filter(category="book").cache().count() == 3
+                    assert requests() == 2
+                else:
+                    with pytest.raises(SurrealDbError) as plain:
+                        await QcItem.objects(tx=tx).filter(category="book").count()
+                    with pytest.raises(SurrealDbError) as cached:
+                        await QcItem.objects(tx=tx).filter(category="book").cache().count()
+                    assert str(cached.value) == str(plain.value)
+            assert QueryCache.stats()["entries"] == 0
+            assert _counts() == (0, 0)
+
+    async def test_a_disabled_cache(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with cache_db(kind) as client:
+            await _seed()
+            QueryCache.configure(enabled=False)
+            requests = _requests(monkeypatch, client)
+            for _ in range(2):
+                assert await QcItem.objects().filter(category="book").cache().count() == 2
+                assert (await QcItem.objects().cache().get("i1")).name == "a"
+            assert requests() == 4
+            assert QueryCache.stats()["entries"] == 0
+            assert _counts() == (0, 0)
+
+    async def test_without_a_cbor_encoder(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        async with cache_db(kind) as client:
+            await _seed()
+            monkeypatch.setattr(cache, "cbor_encode", None)
+            requests = _requests(monkeypatch, client)
+            with caplog.at_level(logging.WARNING, logger="surreal_orm_lite.cache"):
+                for _ in range(2):
+                    assert await QcItem.objects().filter(category="book").cache().count() == 2
+            assert requests() == 2
+            assert _warnings(caplog, "surreal_orm_lite.cache") == [(logging.WARNING, _W2)]
+            assert QueryCache.stats()["entries"] == 0
+            assert _counts() == (0, 2)
+
+    async def test_a_client_without_a_scope(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with cache_db(kind) as client:
+            await _seed()
+            monkeypatch.setattr(SurrealDBConnectionManager, "_cache_scope", classmethod(lambda cls, client: None))
+            requests = _requests(monkeypatch, client)
+            for _ in range(2):
+                assert await QcItem.objects().filter(category="book").cache().count() == 2
+            assert requests() == 2
+            assert QueryCache.stats()["entries"] == 0
+            assert _counts() == (0, 2)
+
+    async def test_a_write_on_a_cached_queryset_runs_as_without_cache(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with cache_db(kind) as client:
+            await _seed()
+            requests = _requests(monkeypatch, client)
+            books = QcItem.objects().filter(category="book").cache()
+            assert await books.bulk_update(price=1) == 2
+            assert await books.bulk_update(price=2) == 2
+            assert requests() == 2
+            assert _counts() == (0, 0)  # a write never reads the cache
+            assert [item.price for item in await books.exec()] == [2, 2]
+            assert requests() == 3
+
+
+async def _note_ids() -> list[str]:
+    """A cached read of the ``qc_note`` rows the current identity may read."""
+    return [note.id for note in await QcNote.objects().order_by("id").cache().exec()]
+
+
+@pytest.mark.parametrize("kind", ["ws", "http"])
+class TestIdentityE2E:
+    """AC-9: a cached result never crosses identities (spec M1/M2's record-access fixture)."""
+
+    async def test_each_identity_reads_its_own_rows(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with auth_db(kind) as client:
+            requests = _requests(monkeypatch, client)
+
+            async def read(expected: list[str], sends: int) -> None:
+                sent = requests()
+                assert await _note_ids() == expected
+                assert requests() - sent == sends
+
+            await _sign_in_as("a", store=True)()
+            await read(["a1"], 1)
+            await read(["a1"], 0)
+            assert QueryCache.stats()["entries"] == 1
+            await _sign_in_as("b", store=True)()
+            assert QueryCache.stats()["entries"] == 0
+            await read(["b1", "b2"], 1)
+            await read(["b1", "b2"], 0)
+            await _sign_in_as("a", store=False)()
+            assert QueryCache.stats()["entries"] == 0
+            await read(["a1"], 1)
+            await read(["a1"], 0)
+            await SurrealDBConnectionManager.invalidate()
+            assert QueryCache.stats()["entries"] == 0
+            await read(["a1", "b1", "b2"], 1)
+            await read(["a1", "b1", "b2"], 0)
+
+    async def test_a_read_answered_before_a_sign_in_is_not_stored(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with auth_db(kind) as client:
+            await _sign_in_as("a", store=True)()
+            reached, release = _hold_next_reply(monkeypatch, client)
+            held = asyncio.create_task(_note_ids())
+            try:
+                await _until_held(reached, held)  # a's rows are computed
+                await _sign_in_as("b", store=True)()
+            finally:
+                release.set()
+            assert await asyncio.wait_for(held, 10) == ["a1"]
+            assert QueryCache.stats()["entries"] == 0
+            requests = _requests(monkeypatch, client)
+            assert await _note_ids() == ["b1", "b2"]
+            assert requests() == 1

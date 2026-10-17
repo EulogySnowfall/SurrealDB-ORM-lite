@@ -30,6 +30,7 @@ from surreal_orm_lite import (
     PointField,
     PolygonField,
     Q,
+    QueryCache,
     QuerySet,
     Range,
     Subquery,
@@ -297,6 +298,17 @@ def subquery_forms() -> None:
     assert_type(QuerySet(TypedMember).filter(id__in=Subquery(QuerySet(TypedMember))), QuerySet)
     assert_type(Q(id__in=QuerySet(TypedMember)), Q)
     assert_type(Subquery(QuerySet(TypedMember)).queryset, QuerySet)
+
+
+def query_cache_examples() -> None:
+    """v0.28.0: ``cache()`` keeps the queryset's type; ``QueryCache``'s class methods are typed."""
+    assert_type(QuerySet(TypedMember).cache(), QuerySet)
+    assert_type(QuerySet(TypedMember).cache(30), QuerySet)
+    assert_type(QuerySet(TypedMember).cache(0.5), QuerySet)
+    assert_type(QuerySet(TypedMember).cache(ttl=timedelta(seconds=5)), QuerySet)
+    assert_type(QuerySet(TypedMember).filter(name="x").cache(30).order_by("name"), QuerySet)
+    assert_type(QueryCache.stats(), dict[str, Any])
+    assert_type(QueryCache.make_key("SELECT 1;", {}, "t"), str)
 
 
 @fixture

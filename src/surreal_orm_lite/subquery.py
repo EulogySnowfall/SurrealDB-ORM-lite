@@ -210,6 +210,7 @@ class SubqueryCompiler:
         variables: the statement's ``variables()``: the outer queryset's, then each subquery's, merged.
         lets: the ``LET $_sq<N> = …;`` of the block, innermost first.
         tables: the tables the subqueries read.
+        edge_tables: the tables of edge models the subqueries read: the query cache tags such a read (v0.28.0).
         _stack: the ids of the querysets being rendered, the outer one first (a queryset cannot be its own subquery).
     """
 
@@ -220,6 +221,7 @@ class SubqueryCompiler:
     variables: dict[str, Any] = field(default_factory=dict)
     lets: list[str] = field(default_factory=list)
     tables: set[str] = field(default_factory=set)
+    edge_tables: set[str] = field(default_factory=set)
     _stack: list[int] = field(default_factory=list)
 
     def merge_variables(self, variables: Mapping[str, Any]) -> None:

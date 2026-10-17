@@ -15,7 +15,8 @@ from . import encoding as _encoding
 from . import geo as _geo
 from . import subquery as _subquery
 from . import time_travel as _time_travel
-from ._sdk import NotFoundError, SdkGeometryPoint, ServerError
+from ._sdk import NotFoundError, RecordID, SdkGeometryPoint, ServerError
+from .cache import EDGES, CacheRequest, QueryCache, follows_links, statement_key, ttl_seconds
 from .changefeed import ChangeModelStream, Since
 from .edge import _check_edge_id, insert_edges
 from .embedded import history_unsupported, keeps_history
@@ -30,6 +31,7 @@ from .subquery import SubqueryCompiler
 from .surql_literal import inline_variables
 from .types import Duration
 from .utils import (
+    VALID_FIELD_PATTERN,
     as_record_value,
     build_filter_condition,
     coerce_record_id,
@@ -48,6 +50,14 @@ logger = logging.getLogger(__name__)
 
 #: The values a snapshot's fields can nest a record model in (``QuerySet._mark_snapshots()``, v0.26.0).
 _SNAPSHOT_HOLDERS = (BaseModel, list, tuple, set, frozenset, dict)
+
+# The query cache's refusals and warning (v0.28.0, spec §5.5: C3, C10, W1).
+_CACHE_AS_OF = "cache() cannot be combined with as_of(): a time-travel read is never cached"
+_CACHE_QUERY = (
+    "query() runs your own SurrealQL and is never cached: drop cache(), or cache its result yourself with "
+    "QueryCache.make_key(), get() and set()"
+)
+_CACHE_DISABLED = "QueryCache is disabled — .cache() has no effect"
 
 
 class QuerySet:
@@ -84,6 +94,8 @@ class QuerySet:
         self._tx: Any = None
         # as_of() (v0.26.0): the moment a time-travel read is made at, normalised; None reads the current state.
         self._as_of: _time_travel.AsOf | None = None
+        # cache() (v0.28.0): the oldest result this queryset's reads accept; None: no cache.
+        self._cache: CacheRequest | None = None
 
     def _py_keyed(self, row: Any) -> Any:
         """Re-key a raw result row from columns back to Python field names (v0.18.0).
@@ -436,11 +448,72 @@ class QuerySet:
             TypeError: ``at`` is none of the forms above (a ``date`` included) — T1.
             ValueError: a string that is not ISO-8601 (T2); a negative duration (T3); a moment outside
                 1970-01-01T00:00:00Z … 2262-04-11T23:47:16.854775Z (T11).
-            SurrealDbError: the queryset is bound to a transaction (``objects(tx=)``) — T4.
+            SurrealDbError: the queryset is bound to a transaction (``objects(tx=)``) — T4; a moment on a queryset
+                with ``cache()`` (v0.28.0: a time-travel read is never cached) — C3. ``as_of(None)`` is accepted.
         """
         if self._tx is not None:
             raise SurrealDbError(_time_travel.transaction_refused())
+        if at is not None and self._cache is not None:
+            raise SurrealDbError(_CACHE_AS_OF)
         self._as_of = _time_travel.normalise_as_of(at)
+        return self
+
+    def cache(self, ttl: float | timedelta | None = None) -> Self:
+        """Serve this queryset's reads from the query cache (v0.28.0) — same name and argument as the full SurrealDB-ORM.
+
+        ::
+
+            books = await Product.objects().filter(category="book").cache(ttl=30).exec()   # the database answers
+            again = await Product.objects().filter(category="book").cache(ttl=30).exec()   # the cache answers
+            n = await Product.objects().filter(category="book").cache().count()            # default TTL
+
+        Every read of the queryset is cached: ``exec()``, ``first()``, ``get()`` (with or without an id), ``all()``,
+        ``count()``, ``sum()``, ``avg()``, ``min()``, ``max()``, ``exists()``, ``values()``+``annotate()``. A read is
+        answered from the cache when an earlier read sent the same statement with the same variables on the same
+        connection, with the same identity, less than ``ttl`` seconds ago, and no ORM write that can change its result
+        has completed since: a write to a table it reads; any write, when it follows links (``fetch()``, a dotted path
+        such as ``filter(**{"author.name": …})``, a ``select()`` item that is not a plain field, such as
+        ``"author.*"`` or an expression); any delete, when it reads an edge model (a deleted record's edges go with it).
+        Each hit builds new instances from a copy of the cached rows: changing one never changes the cache.
+
+        ``ttl`` is the oldest result this read accepts, in seconds (an ``int`` or a ``float`` >= 0) or a ``timedelta``;
+        ``0`` means never cached (every read goes to the database); ``None`` uses ``QueryCache``'s default when the read
+        runs (60 s unless configured). A result stored by this read lives for its ``ttl``. Called again, the last
+        ``ttl`` wins. While the cache is disabled (``QueryCache.configure(enabled=False)``) a warning is logged and the
+        request is kept: it applies if the cache is enabled again before the read.
+
+        Not cached: reads inside a transaction (``objects(tx=…)``, which may see its uncommitted writes). ``live()``,
+        ``watch()``, ``changes()`` and ``query()`` raise on a queryset with ``cache()``, as ``as_of()`` does. A write
+        (``bulk_*()``, ``patch()``, ``delete_table()``, ``get_or_create()``…) never reads the cache: it runs as without
+        ``cache()``, and invalidates. A ``Subquery`` is read in the outer statement: the outer queryset's ``cache()``
+        applies, the inner one's is ignored (as its ``fetch()`` is).
+
+        Invalidation: every write through the ORM (``save()``, ``update()``, ``merge()``, ``upsert()``, ``patch()``,
+        ``delete()``, the atomic operations, relations, ``bulk_*()``, ``QuerySet.patch()``, ``delete_table()``,
+        ``get_or_create()``/``update_or_create()`` when they write, ``signup()``, the DDL helpers) removes the cached
+        reads it can change before its ``post_*`` signals fire; inside a transaction, at the commit. Not seen: writes by
+        another process or client, raw SurrealQL (``raw_query()``, ``QuerySet.query()``, ``call_function()``,
+        ``Transaction.add()``), a write cancelled or failed client-side after its request was sent, writes made by an
+        access method's own ``SIGNIN``/``SIGNUP`` clauses, what the server derives on its own (``DEFINE EVENT``,
+        ``REFERENCE … ON DELETE``, views over other tables), values computed when the read runs (``Var()`` of a
+        ``DEFINE PARAM``, ``<future>``/``COMPUTED`` fields, time functions in a ``select()`` expression): the TTL bounds
+        them; call ``QueryCache.invalidate(Model)`` after such a write, ``QueryCache.clear()`` after changing the session
+        behind the ORM's back.
+
+        Returns:
+            Self: the queryset, for chaining.
+
+        Raises:
+            TypeError: ``ttl`` is not a number of seconds or a ``timedelta`` (C1; ``bool`` refused).
+            ValueError: ``ttl`` is negative or not finite (C2).
+            SurrealDbError: the queryset reads ``as_of()`` (C3).
+        """
+        request = CacheRequest(None if ttl is None else ttl_seconds(ttl, "cache() ttl"))
+        if self._as_of is not None:
+            raise SurrealDbError(_CACHE_AS_OF)
+        if not QueryCache._enabled:
+            logger.warning(_CACHE_DISABLED)
+        self._cache = request
         return self
 
     def _reject_time_travel(self, method: str) -> None:
@@ -665,6 +738,8 @@ class QuerySet:
                 raise ValueError(_subquery.reserved_alias())
         table = self._model_table
         compiler.tables.add(table)
+        if self.model.__surreal_edge__:
+            compiler.edge_tables.add(table)
         compiler.merge_variables(self._variables)
         if table in compiler.empty_tables:
             return "[]", {}, counter
@@ -960,11 +1035,23 @@ class QuerySet:
         as on 2.x, where the server reads it so. At most two more requests per subquery table (the server's
         confirmation, the statement again), and only then; any other error is the server's, relayed.
 
+        With ``cache()`` (v0.28.0), a read outside a transaction is answered from the query cache when it can be
+        (:meth:`_run_cached`); a write, a read inside a transaction or a read without ``cache()`` runs as above.
+
         Args:
             compile_statement: compiles the statement with the compiler it is given; returns its text and variables.
             write: a write by filter: inside a transaction it is added to it, never sent again (the server's
                 error is the transaction's).
         """
+        if write or self._cache is None or self._tx is not None:
+            return await self._run_uncached(compile_statement, write=write)
+        return await self._run_cached(compile_statement)
+
+    async def _run_uncached(
+        self, compile_statement: Callable[[SubqueryCompiler], tuple[str, dict[str, Any]]], *, write: bool = False
+    ) -> Any:
+        """The loop of :meth:`_run_compiled`, as in v0.27.0: compile, send, and on a confirmed missing subquery
+        table compile again with that subquery bound to ``[]`` and send again."""
         empty: frozenset[str] = frozenset()
         while True:
             compiler = self._subquery_compiler(empty)
@@ -979,6 +1066,75 @@ class QuerySet:
             except _subquery._MissingSubqueryTable as missing:
                 empty |= {missing.table}
 
+    async def _run_cached(self, compile_statement: Callable[[SubqueryCompiler], tuple[str, dict[str, Any]]]) -> Any:
+        """A read of a queryset with ``cache()``, outside a transaction (v0.28.0, spec §6.3).
+
+        The statement is compiled once to key the read and decide what it depends on (spec §5.3): the model's
+        table and every table a subquery reads; ``EDGES`` when one of them is an edge model's (every delete
+        invalidates it); "any table" when the statement follows links (``FETCH``, a dotted path, a graph arrow) or
+        a ``select()`` item is neither ``*`` nor a plain field path (``author.*``, an expression: projection
+        semantics may read another table). On a miss :meth:`_run_uncached` sends it, compiling it again
+        (compilation is pure), so the missing-subquery-table re-send happens inside the read.
+        """
+        compiler = self._subquery_compiler()
+        query, variables = compile_statement(compiler)
+        tables = {self._model_table, *compiler.tables}
+        if self.model.__surreal_edge__ or compiler.edge_tables:
+            tables.add(EDGES)
+        any_table = (
+            " FETCH " in query
+            or follows_links(query)
+            or any(item != "*" and not VALID_FIELD_PATTERN.match(item) for item in self.select_item)
+        )
+        return await self._cached_read(
+            "query", query, variables, frozenset(tables), any_table, lambda: self._run_uncached(compile_statement)
+        )
+
+    async def _cached_read(
+        self,
+        kind: str,
+        statement: str,
+        variables: Mapping[str, Any],
+        tables: frozenset[str],
+        any_table: bool,
+        run: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        """Answer a read of a queryset with ``cache()`` from the query cache, or *run* it and store its rows (v0.28.0).
+
+        The one read frontier of the cache (spec §6.3): every compiled read (:meth:`_run_cached`), ``get(<id>)``
+        and ``all()``. The rows returned — a copy of the cached ones on a hit — go through the caller's usual
+        post-processing, as on a miss. A TTL of ``0`` never looks up nor stores; a read the cache cannot key (a
+        client without a scope, no CBOR encoder, a value the SDK cannot send) goes to the database, as does one a
+        write in flight concerns. The cache's own failures never fail the read; *run*'s errors propagate, and an
+        error is never cached.
+
+        Args:
+            kind: ``"query"`` (a compiled statement) or ``"select"`` (the SDK's ``select()``, *statement* empty).
+            statement: the statement as compiled, before ``remove_quotes_for_variables``.
+            variables: its bound values (``{"target": …}`` for a ``select``).
+            tables: what the read depends on, ``EDGES`` included.
+            any_table: the read follows links: any write invalidates it.
+            run: sends the read and returns its rows.
+        """
+        request = cast(CacheRequest, self._cache)
+        ttl = request.ttl if request.ttl is not None else QueryCache._default()
+        if ttl == 0:
+            QueryCache._count_miss()
+            return await run()
+        client = await SurrealDBConnectionManager.get_client()
+        scope = SurrealDBConnectionManager._cache_scope(client)
+        key = None if scope is None else statement_key(scope, kind, statement, variables)
+        if scope is None or key is None:
+            QueryCache._count_miss()
+            return await run()
+        hit, data, ticket = QueryCache._begin_read(key, tables, any_table, scope, ttl)
+        if hit:
+            return data
+        rows = await run()
+        if ticket is not None:
+            QueryCache._finish_read(ticket, rows)
+        return rows
+
     async def exec(self) -> Any:
         """
         Execute the compiled query and return the results.
@@ -986,6 +1142,7 @@ class QuerySet:
         When ``values()`` and ``annotate()`` are used, returns a list of dictionaries with
         the grouped fields and aggregation results. With ``GeoDistance`` annotations, returns the
         model instances, each carrying its distances as attributes (see :meth:`annotate`).
+        Served from the query cache with ``cache()`` (v0.28.0), as new instances.
 
         Returns:
             list[BaseSurrealModel] | list[dict]: Model instances or dictionaries for GROUP BY queries.
@@ -1069,7 +1226,8 @@ class QuerySet:
 
         Under ``as_of()`` (v0.26.0) the record is read as it was at the moment, and returned as a
         snapshot: by id, a record deleted since is still found, one created later is not
-        (``SurrealDbNotFoundError``).
+        (``SurrealDbNotFoundError``). Served from the query cache with ``cache()`` (v0.28.0), by id
+        or not; a record found missing is cached too.
 
         Args:
             id_item: The unique identifier of the item to retrieve.
@@ -1104,6 +1262,9 @@ class QuerySet:
                     raise SurrealDbNotFoundError("No result found.")
                 return self.model.from_db(data)
 
+            if self._cache is not None:
+                return await self._cached_get(record_id)
+
             client = await SurrealDBConnectionManager.get_client()
             try:
                 data = await client.select(record_id)
@@ -1130,7 +1291,8 @@ class QuerySet:
         Fetch all records from the associated table.
 
         ``filter()`` and the other clauses are ignored; ``as_of()`` is not (v0.26.0): every record of the
-        table as it was at the moment, returned as snapshots.
+        table as it was at the moment, returned as snapshots. Served from the query cache with ``cache()``
+        (v0.28.0).
         """
         if self._as_of is not None:
             moment = await self._time_travel_moment()
@@ -1147,12 +1309,43 @@ class QuerySet:
                 return self.model.from_db([])
             return self.model.from_db(rows if isinstance(rows, list) else [])
 
+        if self._cache is not None:
+            return self.model.from_db(await self._cached_select(self._model_table, frozenset({self._model_table}), []))
+
         client = await SurrealDBConnectionManager.get_client()
         try:
             results = await client.select(self._model_table)
         except NotFoundError:
             return self.model.from_db([])
         return self.model.from_db(results)
+
+    async def _cached_get(self, record_id: RecordID) -> Any:
+        """``get(<id>)`` with ``cache()``, outside a transaction (v0.28.0): the SDK's ``select()`` of the record,
+        answered from the query cache when it can be, then today's post-processing. "No record" is cached too: the
+        hit raises ``SurrealDbNotFoundError`` as the miss does."""
+        data = await self._cached_select(record_id, frozenset({record_id.table_name}), None)
+        if isinstance(data, list):
+            if len(data) == 0:
+                raise SurrealDbNotFoundError("No result found.")
+            data = data[0]
+        if data is None:
+            raise SurrealDbNotFoundError("No result found.")
+        return self.model.from_db(data)
+
+    async def _cached_select(self, target: RecordID | str, tables: frozenset[str], missing: Any) -> Any:
+        """The SDK's ``select(target)`` through :meth:`_cached_read` (v0.28.0, spec §5.3): keyed on the target,
+        tagged with its table (and ``EDGES`` on an edge model); *missing* when the server says it does not exist."""
+        if self.model.__surreal_edge__:
+            tables |= {EDGES}
+
+        async def run() -> Any:
+            client = await SurrealDBConnectionManager.get_client()
+            try:
+                return await client.select(target)
+            except NotFoundError:
+                return missing
+
+        return await self._cached_read("select", "", {"target": target}, tables, False, run)
 
     async def delete_table(self) -> bool:
         """
@@ -1293,6 +1486,8 @@ class QuerySet:
     async def count(self) -> int:
         """
         Count the number of records matching the query.
+
+        Served from the query cache with ``cache()`` (v0.28.0), as every aggregation is.
 
         Returns:
             The number of matching records.
@@ -1864,6 +2059,8 @@ class QuerySet:
             # values() is the only public setter of _group_by_fields.
             "values()": bool(self._group_by_fields),
             "objects(tx=)": self._tx is not None,
+            # A live query streams changes: nothing to cache (v0.28.0).
+            "cache()": self._cache is not None,
         }
         offenders = sorted(name for name, present in unsupported.items() if present)
         if offenders:
@@ -1985,9 +2182,10 @@ class QuerySet:
         ``close_connection()``…) ends the stream either way.
 
         :raises SurrealDbError: for ``select``/``values``/``annotate``/``order_by``/``limit``/
-            ``offset``/``objects(tx=)``, and on a queryset read ``as_of()`` (a live query streams the
-            current changes, v0.26.0), here; for a non-WebSocket connection (the embedded engine
-            included: read its change feed with :meth:`changes`), on start.
+            ``offset``/``objects(tx=)``/``cache()`` (v0.28.0: a stream is never cached), and on a
+            queryset read ``as_of()`` (a live query streams the current changes, v0.26.0), here; for a
+            non-WebSocket connection (the embedded engine included: read its change feed with
+            :meth:`changes`), on start.
         :raises TypeError: for a filter value with no SurrealQL literal form, here.
         :raises ValueError, SurrealDbError: for a subquery the ORM cannot compile, here.
         :raises SurrealDbNotFoundError: on SurrealDB 3.x, on start, if the table does not exist, or a
@@ -2021,7 +2219,7 @@ class QuerySet:
         ``filter()``, ``nearby()``, ``variables()`` and ``fetch()`` are applied by the server. With
         ``diff=True`` each ``result`` is a list of patches instead of a record. For model
         instances, use :meth:`live`. ``auto_resubscribe`` and ``on_reconnect`` behave as for
-        :meth:`live`, and so do its refusals (``as_of()`` included, here) and its subqueries (inline,
+        :meth:`live`, and so do its refusals (``as_of()`` and ``cache()`` included, here) and its subqueries (inline,
         the tables they read checked on start: ``SurrealDbNotFoundError`` on SurrealDB 3.x for a
         missing one).
         """
@@ -2051,6 +2249,8 @@ class QuerySet:
             "values()": bool(self._group_by_fields),
             "fetch()": bool(self._fetch_fields),
             "objects(tx=)": self._tx is not None,
+            # A change feed streams changes: nothing to cache (v0.28.0).
+            "cache()": self._cache is not None,
         }
         offenders = sorted(name for name, present in unsupported.items() if present)
         if offenders:
@@ -2085,7 +2285,7 @@ class QuerySet:
             keeps no timestamps for its feed); or ``None`` for changes made after the stream starts.
         :param poll_interval: seconds between two polls when the feed has nothing new.
         :param batch_size: entries read per poll.
-        :raises SurrealDbError: for any queryset clause (``as_of()`` included), here; on start, for a
+        :raises SurrealDbError: for any queryset clause (``as_of()`` and ``cache()`` included), here; on start, for a
             table that does not exist or has no change feed (on the table or on its database), or for a
             datetime ``since`` on the embedded engine of the surrealdb SDK 2.x.
         :raises TypeError, ValueError: for an unusable ``since``/``poll_interval``/``batch_size``.
@@ -2114,9 +2314,12 @@ class QuerySet:
         Raises:
             SurrealDbError: the query does not read ``FROM`` the model's table; the queryset is read
                 ``as_of()`` (v0.26.0): the custom statement would ignore the moment, so it is refused rather
-                than run on the current data.
+                than run on the current data; the queryset has ``cache()`` (v0.28.0, C10): your own SurrealQL is
+                never cached — cache its result yourself with ``QueryCache.make_key()``, ``get()`` and ``set()``.
         """
         self._reject_time_travel("query()")
+        if self._cache is not None:
+            raise SurrealDbError(_CACHE_QUERY)
         if f"FROM {self._model_table}" not in query:
             raise SurrealDbError(f"The query must include 'FROM {self._model_table}' to reference the correct table.")
         # Same silent truncation raw_query() warns about: only the first statement's results
