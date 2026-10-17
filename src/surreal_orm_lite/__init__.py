@@ -3,6 +3,7 @@ __version__ = "0.27.0"
 from ._sdk import BoundExcluded, BoundIncluded
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
 from .auth import AuthTokens
+from .cache import QueryCache
 from .changefeed import ChangeModelStream
 from .concurrency import is_conflict_error, retry_on_conflict
 from .connection_manager import SurrealDBConnectionManager
@@ -105,6 +106,8 @@ __all__ = [
     "Avg",
     "Min",
     "Max",
+    # Query cache (v0.28.0)
+    "QueryCache",
     # Signals
     "Signal",
     "AroundSignal",

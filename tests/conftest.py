@@ -33,9 +33,10 @@ existed at v0.22.2 it wraps ``encode`` and fails the test if any call returned a
 Only the three modules written for the rich field types, the two v0.24.0 geometry modules and the
 v0.24.3 read-hook module are exempt (``_REWRITE_MODULES``), and ``tests/test_embedded.py`` (v0.25.0),
 which writes rich and geo values on the embedded engine, ``tests/test_time_travel.py`` (v0.26.0),
-which sends ``as_of()`` durations, and ``tests/test_subqueries.py`` (v0.27.0), which sends a point for
-a subquery's ``nearby()``. A new test that needs rich values goes into one of them — never add a
-pre-existing module to that set.
+which sends ``as_of()`` durations, ``tests/test_subqueries.py`` (v0.27.0), which sends a point for
+a subquery's ``nearby()``, and ``tests/test_query_cache.py`` (v0.28.0), whose cache keys are computed
+over sets. A new test that needs rich values goes into one of them — never add a pre-existing module
+to that set.
 """
 
 import asyncio
@@ -50,8 +51,8 @@ import pytest_asyncio
 from surreal_orm_lite import SurrealDBConnectionManager, encoding
 
 #: The test modules written for v0.23.0's rich field types, v0.24.0's geometries, v0.24.3's read
-#: hook, v0.25.0's embedded engine, v0.26.0's time travel and v0.27.0's subqueries: the only ones whose
-#: values ``encode()`` may rewrite. Never list a module that existed at v0.22.2 here.
+#: hook, v0.25.0's embedded engine, v0.26.0's time travel, v0.27.0's subqueries and v0.28.0's query cache:
+#: the only ones whose values ``encode()`` may rewrite. Never list a module that existed at v0.22.2 here.
 _REWRITE_MODULES = frozenset(
     {
         "tests.test_encoding",
@@ -63,6 +64,7 @@ _REWRITE_MODULES = frozenset(
         "tests.test_embedded",
         "tests.test_time_travel",
         "tests.test_subqueries",
+        "tests.test_query_cache",
     }
 )
 
