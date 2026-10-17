@@ -26,7 +26,7 @@ from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import SurrealFunc, Var
 from .geo import GeoDistance, GeometryPoint
-from .live import LiveModelStream, LiveStream, ReconnectCallback, missing_table_error, require_websocket
+from .live import LiveModelStream, LiveStream, ReconnectCallback, missing_table_error
 from .model_base import _snapshot_moment
 from .q import Q
 from .subquery import SubqueryCompiler
@@ -2332,6 +2332,10 @@ class QuerySet:
         not exist and then never notifies, but refuses that check: the ORM raises S11 instead. 2.x
         answers it (the table reads as empty) and the live query starts. A resubscribe runs the
         check again, on the new connection.
+
+        The coroutine runs on the client it is given (v0.29.0): the stream passes its connection's — at start, the
+        client it opened; at a resubscribe, the one it is about to move onto — so the live query runs on that very
+        connection, and the stream has already checked the transport.
         """
         compiler = self._subquery_compiler(inline=True)
         query = self._compile_live(diff, compiler)
@@ -2339,12 +2343,7 @@ class QuerySet:
         tables = tuple(sorted(compiler.tables))
         check = "RETURN [" + ", ".join(f"(SELECT VALUE id FROM {name} LIMIT 1)" for name in tables) + "];"
 
-        async def start(client: Any = None) -> UUID:
-            # A resubscribe passes the client it is about to move the stream onto, so the live
-            # query is guaranteed to run on that very connection.
-            require_websocket(SurrealDBConnectionManager.get_connection_string())
-            if client is None:
-                client = await SurrealDBConnectionManager.get_client()
+        async def start(client: Any) -> UUID:
             if tables:
                 try:
                     await client.query(check)
@@ -2420,6 +2419,7 @@ class QuerySet:
             diff=diff,
             auto_resubscribe=auto_resubscribe,
             on_reconnect=on_reconnect,
+            connection=self.model._connection_manager,
         )
 
     def watch(
@@ -2450,6 +2450,7 @@ class QuerySet:
             self._live_starter(diff),
             auto_resubscribe=auto_resubscribe,
             on_reconnect=on_reconnect,
+            connection=self.model._connection_manager,
         )
 
     def _reject_changes_clauses(self) -> None:

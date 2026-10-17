@@ -18,7 +18,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Itera
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
@@ -1914,8 +1914,6 @@ _RESOLVERS = frozenset(
 
 # Temporary: removed entry by entry, empty and deleted at Task 9 (spec AC-7).
 _NOT_YET_ROUTED: dict[tuple[str, str | None], str] = {
-    ("live.py", None): "Task 6 binds LiveStream to its connection",
-    ("query_set.py", "_live_starter"): "Task 6 passes the bound client",
     ("testing/database.py", None): "Task 9 adds embedded_database(connection=)",
 }
 
@@ -2399,3 +2397,213 @@ class TestChangeFeedGenerationE2E:
             assert event.record_id == "md_note:n3"
             assert served and all(result is client for result in served)
             stream.stop()
+
+
+# === Live streams keep their connection (spec §6.5, §7.6) =====================================================
+
+
+@pytest.mark.usefixtures("clear_live_registry")
+class TestLiveStreamBinding:
+    """Spec §6.5 (no server, fake clients): a stream resolves its connection once when it starts — the one it is
+    given, else the current one — and stops on it wherever it is stopped from."""
+
+    @staticmethod
+    def _starter(received: list[Any]) -> Callable[[Any], Awaitable[UUID]]:
+        async def start(client: Any) -> UUID:
+            received.append(client)
+            return uuid4()
+
+        return start
+
+    async def test_a_stream_without_a_connection_starts_on_the_current_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        md_a, a_client = _named_connection(monkeypatch, "md_a")
+        received: list[Any] = []
+        stream = live.LiveStream("md_item", self._starter(received))
+        async with SurrealDBConnectionManager.using("md_a"):
+            await stream.start()
+        assert received == [a_client]
+        assert stream.live_id is not None
+        assert live.owner_of(stream.live_id) == "md_a"
+        live_id = stream.live_id
+        await stream.stop()  # outside the block: still md_a's
+        assert a_client.killed == [str(live_id)]
+
+    async def test_the_given_connection_wins_over_the_block(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _, a_client = _named_connection(monkeypatch, "md_a")
+        md_b, b_client = _named_connection(monkeypatch, "md_b")
+        received: list[Any] = []
+        stream = live.LiveStream("md_item", self._starter(received), connection=lambda: md_b)
+        async with SurrealDBConnectionManager.using("md_a"):
+            await stream.start()
+            assert stream.live_id is not None
+            live_id = stream.live_id
+            assert live.owner_of(live_id) == "md_b"
+            await stream.stop()
+        assert received == [b_client]
+        assert b_client.killed == [str(live_id)]
+        assert a_client.killed == []
+
+    async def test_an_orphaned_start_is_killed_on_its_connection(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A ``LIVE SELECT`` that answers after its stream stopped is killed on the stream's connection."""
+        md_a, a_client = _named_connection(monkeypatch, "md_a")
+        _, b_client = _named_connection(monkeypatch, "md_b")
+        started: asyncio.Future[UUID] = asyncio.get_running_loop().create_future()
+        orphan = uuid4()
+        started.set_result(orphan)
+        async with SurrealDBConnectionManager.using("md_b"):
+            live._kill_when_started(started, md_a)
+            await asyncio.gather(*list(live._ORPHAN_KILLS))
+        assert a_client.killed == [str(orphan)]
+        assert b_client.killed == []
+
+
+@contextlib.asynccontextmanager
+async def _live_connections(md_a_url: str | None = None) -> AsyncIterator[None]:
+    """``md_a`` on database ``md_a`` (through *md_a_url*, else straight to the line under test), ``md_b`` and the
+    default connection on database ``md_b``, all as root over WebSocket, with ``md_event`` and ``md_note`` defined in
+    both databases (SurrealDB 3.x refuses to watch a missing table). Used with the ``unset_default`` fixture."""
+    await _reset_databases(define=True)
+    for database in ("md_a", "md_b"):
+        async with _root(database) as root:
+            await root.query("DEFINE TABLE md_event SCHEMALESS; DEFINE TABLE md_note SCHEMALESS;", {})
+    SurrealDBConnectionManager.set_connection(url=_url("ws"), user="root", password="root", namespace="ns", database="md_b")
+    SurrealDBConnectionManager.add_connection(
+        "md_a", url=md_a_url or _url("ws"), user="root", password="root", namespace="ns", database="md_a"
+    )
+    _register("ws", "md_b", database="md_b")
+    try:
+        yield
+    finally:
+        for name in ("md_a", "md_b"):
+            await SurrealDBConnectionManager.remove_connection(name)
+        await SurrealDBConnectionManager.close_connection()
+        await _reset_databases(define=False)
+
+
+async def _create(connection: str, table: str, key: str) -> None:
+    """A new record ``<table>:<key>`` written through *connection*'s client — always a new record, never an ``UPSERT``
+    that changes nothing, which SurrealDB 2.7.0 does not notify (M10)."""
+    client = await SurrealDBConnectionManager.get_client(connection)
+    await client.query(f"CREATE {table}:{key} SET title = '{key}', text = '{key}';", {})
+
+
+async def _lives(database: str, table: str) -> list[str]:
+    """The uuids of the live queries the server runs on *table* of *database*, read by a root client of its own."""
+    async with _root(database) as root:
+        info = await root.query(f"INFO FOR TABLE {table};", {})
+    return sorted(str(key) for key in (info.get("lives") or {}))
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestRoutedLiveE2E:
+    """AC-13 (both lines, ws): a live stream runs on its model's connection — or its ``using()`` block's — and keeps
+    it to stop, resubscribe and check its identity; ``subscribe_live()``/``kill()`` find it through the uuid's owner;
+    only that connection's teardown, its removal or its registration with other settings ends it."""
+
+    async def test_a_stream_receives_its_connections_events_only(self) -> None:
+        async with _live_connections(), MdEvent.objects().live() as stream:
+            assert await _lives("md_a", "md_event") == [str(stream.live_id)]
+            assert await _lives("md_b", "md_event") == []
+            # The same table in the other database first: had the stream run there, this would be its first event.
+            await _create("md_b", "md_event", "b1")
+            await _create("default", "md_event", "d1")
+            await MdEvent(id="a1", title="one").save()
+            [event] = await _next_events(stream, 1)
+            assert (event.record_id, event.instance.title) == ("md_event:a1", "one")
+
+    async def test_only_its_own_connections_close_ends_it(self) -> None:
+        async with _live_connections(), MdEvent.objects().live() as stream:
+            await SurrealDBConnectionManager.get_client("md_b")
+            await SurrealDBConnectionManager.close_connection("md_b")
+            await SurrealDBConnectionManager.close_connection()  # the default's: not the stream's either
+            await MdEvent(id="a1", title="one").save()
+            [event] = await _next_events(stream, 1)
+            assert event.record_id == "md_event:a1"
+            await SurrealDBConnectionManager.close_connection("md_a")
+            with pytest.raises(StopAsyncIteration):
+                await _read_one(stream)
+            assert stream.is_active is False
+
+    async def test_a_stream_started_in_a_block_keeps_its_connection(self) -> None:
+        async with _live_connections():
+            async with SurrealDBConnectionManager.using("md_a"):
+                stream = await MdNote.objects().live().start()
+            try:
+                assert stream.live_id is not None
+                assert await _lives("md_a", "md_note") == [str(stream.live_id)]
+                await _create("default", "md_note", "d1")
+                await _create("md_a", "md_note", "a1")
+                [event] = await _next_events(stream, 1)
+                assert (event.record_id, event.instance.text) == ("md_note:a1", "a1")
+            finally:
+                await stream.stop()  # outside the block: the KILL goes to md_a
+            assert await _lives("md_a", "md_note") == []
+
+    async def test_subscribe_live_and_kill_find_the_streams_connection(self) -> None:
+        async with _live_connections():
+            stream = await MdEvent.objects().watch().start()
+            try:
+                assert stream.live_id is not None
+                # Outside any using() block, where the current connection is the default.
+                reader = SurrealDBConnectionManager.subscribe_live(stream.live_id)
+                await MdEvent(id="a1", title="one").save()
+                assert str((await _read_one(reader))["record"]) == "md_event:a1"
+                assert str((await _read_one(stream))["record"]) == "md_event:a1"
+                await SurrealDBConnectionManager.kill(stream.live_id)
+                assert await _lives("md_a", "md_event") == []
+                for ended in (reader, stream):
+                    with pytest.raises(StopAsyncIteration):
+                        await _read_one(ended)
+            finally:
+                await stream.stop()
+
+    async def test_a_drop_resubscribes_on_its_connection(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(live.LiveModelStream, "reconnect_delay", 0.05)
+        reconnected = asyncio.Event()
+        moves: list[tuple[UUID, UUID]] = []
+
+        def on_reconnect(old: UUID, new: UUID) -> None:
+            moves.append((old, new))
+            reconnected.set()
+
+        async with CuttableProxy() as proxy, _live_connections(proxy.url()):
+            default_client = await SurrealDBConnectionManager.get_client()
+            async with MdEvent.objects().live(on_reconnect=on_reconnect) as stream:
+                first = await SurrealDBConnectionManager.get_client("md_a")
+                old = stream.live_id
+                proxy.cut()
+                async with asyncio.timeout(10):
+                    await reconnected.wait()
+                assert old is not None and moves == [(old, stream.live_id)]
+                assert proxy.connections == 2
+                second = await SurrealDBConnectionManager.get_client("md_a")
+                assert second is not first
+                assert stream._stream._client is second
+                await MdEvent(id="a1", title="after").save()
+                [event] = await _next_events(stream, 1)
+                assert (event.record_id, event.instance.title) == ("md_event:a1", "after")
+                assert str(stream.live_id) in await _lives("md_a", "md_event")
+            assert await SurrealDBConnectionManager.get_client() is default_client
+
+    @pytest.mark.parametrize("change", _CHANGES)
+    async def test_the_same_settings_keep_it_other_settings_end_it(self, change: str) -> None:
+        async with _live_connections(), MdEvent.objects().live() as stream:
+            _register("ws", "md_a", database="md_a")  # the same settings: nothing changes
+            await MdEvent(id="a1", title="one").save()
+            [event] = await _next_events(stream, 1)
+            assert event.record_id == "md_event:a1"
+            await _change(change, lambda: _register("ws", "md_a", database="md_b"))
+            with pytest.raises(StopAsyncIteration):
+                await _read_one(stream)
+            assert stream.is_active is False
+
+    async def test_the_deprecated_uuid_form_starts_on_the_models_connection(self) -> None:
+        async with _live_connections():
+            with pytest.warns(DeprecationWarning, match="async with"):
+                live_id = await MdEvent.objects().live()
+            assert await _lives("md_a", "md_event") == [str(live_id)]
+            assert await _lives("md_b", "md_event") == []
+            # The uuid is the caller's: no stream registered it, so kill() acts on the current connection.
+            async with SurrealDBConnectionManager.using("md_a"):
+                await SurrealDBConnectionManager.kill(live_id)
+            assert await _lives("md_a", "md_event") == []

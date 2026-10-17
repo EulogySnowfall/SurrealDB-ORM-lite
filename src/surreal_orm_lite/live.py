@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import inspect
 import logging
 import warnings
@@ -64,6 +65,7 @@ from .exceptions import (
 from .utils import user_stacklevel
 
 if TYPE_CHECKING:
+    from .connection_manager import SurrealDBConnectionManager
     from .model_base import BaseSurrealModel
 
 __all__ = ["LiveIterator", "LiveModelStream", "LiveStream", "ModelChangeEvent", "ReconnectCallback"]
@@ -609,6 +611,16 @@ class LiveStream:
     :attr:`reconnect_max_attempts` tries); any other failure, or the last attempt failing, is
     raised from the iteration. **What changed during the outage is not replayed** — a live query
     only reports what happens while it runs — so ``on_reconnect`` is where to catch up.
+
+    **Its connection (v0.29.0).** :meth:`start` resolves the connection once — *connection* when
+    given (``QuerySet.live()``/``watch()`` pass the model's), else the current one (the innermost
+    ``using()`` block's, else the default) — and the stream keeps it until it stops: the live
+    query, its kill, every resubscribe and its identity checks run on that connection, whatever
+    ``using()`` block is active later. Another connection's teardown never ends it; its own does
+    (``close_connection()`` of it, ``close_all_connections()``, ``remove_connection()`` of its
+    name, or ``add_connection()`` of its name with other settings): a stream never follows its
+    name to another database. A stream started again after :meth:`stop` resolves its connection
+    again.
     """
 
     #: Seconds before the first reconnect attempt after a drop. Doubles after each failure.
@@ -625,11 +637,16 @@ class LiveStream:
         *,
         auto_resubscribe: bool = True,
         on_reconnect: ReconnectCallback | None = None,
+        connection: Callable[[], type[SurrealDBConnectionManager]] | None = None,
     ) -> None:
         self._table = table
         self._starter = starter
         self._auto_resubscribe = auto_resubscribe
         self._on_reconnect = on_reconnect
+        # How start() resolves the connection; None: the current one (v0.29.0).
+        self._connection = connection
+        # The connection class the running stream lives on, set by start().
+        self._manager: type[SurrealDBConnectionManager] | None = None
         self._live_id: UUID | None = None
         self._client: Any = None
         self._iterator: LiveIterator | None = None
@@ -658,27 +675,46 @@ class LiveStream:
         """Whether the subscription is currently running."""
         return self._live_id is not None
 
+    def _resolve_connection(self) -> type[SurrealDBConnectionManager]:
+        """The connection a start runs on: the one given at construction, else the current one.
+
+        :raises ValueError: the connection is not registered (R1, or R2 for a model's).
+        """
+        if self._connection is not None:
+            return self._connection()
+        from .connection_manager import SurrealDBConnectionManager
+
+        return SurrealDBConnectionManager._manager_for()
+
     async def start(self) -> LiveStream:
         """Open the subscription. Calling it on a running stream is a no-op."""
         if self._live_id is not None:
             return self
-        from .connection_manager import SurrealDBConnectionManager
-
+        # Resolved once, before anything is opened; the stream keeps it until it stops (v0.29.0).
+        manager = self._resolve_connection()
         # Transport first: on an http:// URL no client should be opened just to be refused.
-        require_websocket(SurrealDBConnectionManager.get_connection_string())
+        require_websocket(manager.get_connection_string())
         # A resubscribe left over from a previous run must not land on this one.
         await self._cancel_tasks()
         self._resubscribing = None
         # Client next, so no await sits between opening the subscription and buffering it.
         self._stopping = False
-        # The connection get_client() serves below, which owns the reader its teardown must release.
-        owner = SurrealDBConnectionManager._manager_for()._connection_name or "default"
-        self._client = await SurrealDBConnectionManager.get_client()
-        self._identity = SurrealDBConnectionManager._identity_of(self._client)
+        self._manager = manager
+        self._client = await manager.get_client()
+        self._identity = manager._identity_of(self._client)
         self._live_id = await self._starter(self._client)
         on_lost = self._schedule_resubscribe if self._auto_resubscribe else None
+        # The connection owns the reader: its teardown, and only its teardown, releases it.
+        owner = manager._connection_name or "default"
         self._iterator = open_stream(self._client, self._live_id, owner=owner, on_lost=on_lost)
         return self
+
+    async def _start_detached(self) -> UUID:
+        """Start the live query for the deprecated ``await qs.live()`` form, on the connection :meth:`start` would
+        use. The uuid is the caller's: no reader is registered and the stream does not keep the connection."""
+        manager = self._resolve_connection()
+        require_websocket(manager.get_connection_string())
+        return await self._starter(await manager.get_client())
 
     async def stop(self) -> None:
         """Kill the subscription and end the iteration. Safe before start and to repeat.
@@ -691,12 +727,11 @@ class LiveStream:
         if self._live_id is None:
             await self._drop_iterator()
             return
-        from .connection_manager import SurrealDBConnectionManager
-
+        assert self._manager is not None  # a live uuid means start() bound the connection
         # `live_id` is cleared only once the kill has actually gone through. A transient
         # failure would otherwise leave the caller reporting `is_active is False` with a
         # subscription still running on the server and no uuid left to retry with.
-        await SurrealDBConnectionManager.kill(self._live_id)
+        await self._manager.kill(self._live_id)
         self._live_id = None
         await self._drop_iterator()
 
@@ -750,8 +785,10 @@ class LiveStream:
         return _is_registered(iterator._loop, old_id, queue)
 
     async def _resubscribe_once(self, old_id: UUID) -> None:
-        from .connection_manager import SurrealDBConnectionManager
-
+        # The connection the dropped live query ran on, read once: the new one opens there too, whatever
+        # using() block the task was created in, and a later start() cannot move it (v0.29.0).
+        manager = self._manager
+        assert manager is not None  # a drop follows a start, which bound the connection
         # The old uuid is gone with the socket; a late subscribe_live() on it must end at once.
         mark_killed(old_id)
         iterator = self._iterator
@@ -765,15 +802,13 @@ class LiveStream:
             attempt += 1
             client: Any = None
             try:
-                self._check_identity()
-                client = await SurrealDBConnectionManager._acquire_client(
-                    still_wanted=lambda: self._still_wanted(iterator, queue, old_id)
-                )
+                self._check_identity(manager)
+                client = await manager._acquire_client(still_wanted=lambda: self._still_wanted(iterator, queue, old_id))
                 if not self._still_wanted(iterator, queue, old_id):
                     return
                 # Again once connected: the replay itself, or a concurrent signin, may have moved it.
-                self._check_identity(client)
-                new_id = await self._start_on(client)
+                self._check_identity(manager, client)
+                new_id = await self._start_on(manager, client)
                 break
             except asyncio.CancelledError:
                 if cancelled_from_outside():
@@ -810,7 +845,7 @@ class LiveStream:
         if not self._still_wanted(iterator, queue, old_id):
             # Torn down while the LIVE SELECT was in flight: the new subscription is nobody's.
             with contextlib.suppress(Exception):
-                await SurrealDBConnectionManager.kill(new_id)
+                await manager.kill(new_id)
             return
         assert iterator is not None
         self._client, self._live_id = client, new_id
@@ -820,7 +855,7 @@ class LiveStream:
         logger.info("Live query on %s resubscribed after a dropped connection (%s → %s)", self._table, old_id, new_id)
         await self._notify_reconnect(old_id, new_id)
 
-    def _check_identity(self, client: Any = None) -> None:
+    def _check_identity(self, manager: type[SurrealDBConnectionManager], client: Any = None) -> None:
         """Refuse to reopen the live query under an identity other than the one that opened it.
 
         A live query is evaluated with the permissions of whoever opened it. A new connection
@@ -833,15 +868,14 @@ class LiveStream:
         sets the client's identity, the fingerprint covering what a connection is built from (url,
         namespace, database, user, stored token). So: the client the stream started on must have
         been replayable, its fingerprint must still be the replay identity, and the new *client*
-        must carry that same stamp. Settings changed and then restored count as no change.
+        must carry that same stamp. Settings changed and then restored count as no change. All of
+        it is read on *manager*, the stream's connection (v0.29.0): its settings and session.
 
         :raises SurrealDbAuthenticationError: the stream started under an identity a reconnect
             cannot restore (``store=False``), or that identity is no longer the one a reconnect
             restores (signin, signup, authenticate, invalidate, clear_session, set_connection or a
             setter, or a session the server refused to replay).
         """
-        from .connection_manager import SurrealDBConnectionManager
-
         started = self._identity
         if started is None or not started[1]:
             raise SurrealDbAuthenticationError(
@@ -850,8 +884,8 @@ class LiveStream:
                 "store=False). It is not resubscribed: a new connection would run it with "
                 "different permissions."
             )
-        moved = started[0] != SurrealDBConnectionManager._replay_identity()
-        if moved or (client is not None and SurrealDBConnectionManager._identity_of(client) != started):
+        moved = started[0] != manager._replay_identity()
+        if moved or (client is not None and manager._identity_of(client) != started):
             raise SurrealDbAuthenticationError(
                 f"The identity a new connection comes back as changed since the live query on "
                 f"{self._table!r} was opened (signin, signup, authenticate, invalidate, "
@@ -859,15 +893,15 @@ class LiveStream:
                 "resubscribed: the new subscription would run with different permissions."
             )
 
-    async def _start_on(self, client: Any) -> UUID:
+    async def _start_on(self, manager: type[SurrealDBConnectionManager], client: Any) -> UUID:
         """Run the starter, shielded: a stop() landing mid-request must not orphan its result."""
         start = asyncio.ensure_future(self._starter(client))
         try:
             return await asyncio.shield(start)
         except asyncio.CancelledError:
             if cancelled_from_outside():
-                # The LIVE SELECT may already be running on the server: kill it once it answers.
-                start.add_done_callback(_kill_when_started)
+                # The LIVE SELECT may already be running on the server: kill it, on its connection, once it answers.
+                start.add_done_callback(functools.partial(_kill_when_started, manager=manager))
             raise
 
     def _give_up(self, error: Exception) -> None:
@@ -909,13 +943,12 @@ class LiveStream:
         await self.stop()
 
 
-def _kill_when_started(start: asyncio.Future[UUID]) -> None:
-    """Kill a live query whose start outlived the stream that requested it."""
+def _kill_when_started(start: asyncio.Future[UUID], manager: type[SurrealDBConnectionManager]) -> None:
+    """Kill a live query whose start outlived the stream that requested it, on *manager*: the connection it started
+    on (v0.29.0)."""
     if start.cancelled() or start.exception() is not None:
         return
-    from .connection_manager import SurrealDBConnectionManager
-
-    task = asyncio.get_running_loop().create_task(SurrealDBConnectionManager.kill(start.result()))
+    task = asyncio.get_running_loop().create_task(manager.kill(start.result()))
     _ORPHAN_KILLS.add(task)
     task.add_done_callback(_ORPHAN_KILLS.discard)
 
@@ -1078,7 +1111,10 @@ class LiveModelStream(Generic[T]):
 
     **Deprecated v0.19.0 form:** ``await qs.live()`` still starts a live query and returns its
     uuid, for :meth:`SurrealDBConnectionManager.subscribe_live`. That subscription belongs to the
-    caller, not to this object. The object also behaves as a coroutine for that path, so
+    caller, not to this object. It starts on the connection :meth:`start` would use (v0.29.0: the
+    model's); no stream registered its uuid, so ``subscribe_live()``/``kill()`` of it act on the
+    current connection — inside ``using()`` of that name for a model routed elsewhere. The object
+    also behaves as a coroutine for that path, so
     ``asyncio.create_task(qs.live())`` and ``asyncio.run(qs.live())`` keep working. Like a
     coroutine it can be awaited once, and an awaited stream cannot also be started (nor the
     reverse): the two would be separate subscriptions, and only one would be killed.
@@ -1100,11 +1136,13 @@ class LiveModelStream(Generic[T]):
         diff: bool = False,
         auto_resubscribe: bool = True,
         on_reconnect: ReconnectCallback | None = None,
+        connection: Callable[[], type[SurrealDBConnectionManager]] | None = None,
     ) -> None:
         self._model = model
         self._diff = diff
-        self._starter = starter
-        self._stream = LiveStream(table, starter, auto_resubscribe=auto_resubscribe, on_reconnect=on_reconnect)
+        self._stream = LiveStream(
+            table, starter, auto_resubscribe=auto_resubscribe, on_reconnect=on_reconnect, connection=connection
+        )
         self._stream._policy = self
         self._started = False
         self._uuid_start: Coroutine[Any, Any, UUID] | None = None
@@ -1207,7 +1245,7 @@ class LiveModelStream(Generic[T]):
                 DeprecationWarning,
                 stacklevel=user_stacklevel(),
             )
-            self._uuid_start = cast(Coroutine[Any, Any, UUID], self._starter())
+            self._uuid_start = self._stream._start_detached()
         return self._uuid_start
 
     def __await__(self) -> Generator[Any, None, UUID]:
