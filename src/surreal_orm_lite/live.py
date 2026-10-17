@@ -111,6 +111,13 @@ _SUBSCRIBERS: dict[asyncio.AbstractEventLoop, dict[str, list[asyncio.Queue[Any]]
 _RECENTLY_KILLED: dict[asyncio.AbstractEventLoop, deque[str]] = {}
 _RECENTLY_KILLED_MAX = 64
 
+# Which connection opened each registered reader (v0.29.0), per loop and then by uuid: a connection
+# name, beside ``_SUBSCRIBERS`` rather than inside it, so the registry above keeps its shape. A
+# connection's teardown releases only the readers it owns — the others ride other connections'
+# clients — and ``subscribe_live()``/``kill()`` find the connection that started a uuid. Owners are
+# names, not connection classes: a reader registered without one belongs to ``"default"``.
+_OWNERS: dict[asyncio.AbstractEventLoop, dict[str, str]] = {}
+
 
 def _key(query_uuid: str | UUID) -> str:
     return str(query_uuid)
@@ -123,10 +130,11 @@ def _prune_dead_loops() -> None:
     add its loop to the same dict while ``is_closed()`` runs, and iterating the live dict would
     then raise ``dictionary changed size during iteration``.
     """
-    for registry in (_SUBSCRIBERS, _RECENTLY_KILLED):
+    registries: tuple[dict[asyncio.AbstractEventLoop, Any], ...] = (_SUBSCRIBERS, _RECENTLY_KILLED, _OWNERS)
+    for registry in registries:
         for loop in list(registry):
             if loop.is_closed():
-                registry.pop(loop, None)  # type: ignore[arg-type]
+                registry.pop(loop, None)
 
 
 def _bucket() -> dict[str, list[asyncio.Queue[Any]]]:
@@ -142,6 +150,27 @@ def _killed_on(loop: asyncio.AbstractEventLoop) -> deque[str]:
 def _killed() -> deque[str]:
     """This event loop's recently-killed uuids."""
     return _killed_on(asyncio.get_running_loop())
+
+
+def _owners() -> dict[str, str]:
+    """This event loop's reader owners (uuid → connection name), created on first use."""
+    return _OWNERS.setdefault(asyncio.get_running_loop(), {})
+
+
+def owner_of(query_uuid: str | UUID) -> str | None:
+    """The connection that registered a reader of ``query_uuid`` on the running loop, else ``None``.
+
+    Only while a reader of it is still registered: an owner left behind by a registry cleared
+    directly never routes anything. ``None`` outside a running loop.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    key = _key(query_uuid)
+    if not _SUBSCRIBERS.get(loop, {}).get(key):
+        return None
+    return _OWNERS.get(loop, {}).get(key, "default")
 
 
 def _sdk_queues(client: Any) -> dict[str, list[asyncio.Queue[Any]]] | None:
@@ -177,11 +206,20 @@ def is_dead(client: Any) -> bool:
     return task is not None and task.done()
 
 
-def register_subscriber(client: Any, query_uuid: str | UUID, queue: asyncio.Queue[Any] | None = None) -> asyncio.Queue[Any]:
+def register_subscriber(
+    client: Any,
+    query_uuid: str | UUID,
+    queue: asyncio.Queue[Any] | None = None,
+    *,
+    owner: str = "default",
+) -> asyncio.Queue[Any]:
     """Register a queue fed by ``query_uuid``'s notifications everywhere — a new one by default.
 
     Passing an existing *queue* is how a resubscribe keeps a reader's buffer: what it has not
     read yet stays queued, and a read parked on it simply completes with the new uuid's events.
+
+    *owner* names the connection whose client carries the live query: its teardown releases the
+    reader (:func:`close_all_subscribers`). Left out, the reader belongs to the default connection.
     """
     key = _key(query_uuid)
     if queue is None:
@@ -190,6 +228,7 @@ def register_subscriber(client: Any, query_uuid: str | UUID, queue: asyncio.Queu
     if queues is not None:
         queues.setdefault(key, []).append(queue)
     _bucket().setdefault(key, []).append(queue)
+    _owners()[key] = owner
     return queue
 
 
@@ -202,7 +241,8 @@ def unregister_subscriber(client: Any, query_uuid: str | UUID, queue: asyncio.Qu
     """Drop one subscriber, leaving any other reader of the same live query untouched."""
     key = _key(query_uuid)
     sdk = _sdk_queues(client)
-    registries = [_bucket()] if sdk is None else [sdk, _bucket()]
+    bucket = _bucket()
+    registries = [bucket] if sdk is None else [sdk, bucket]
     for registry in registries:
         holders = registry.get(key)
         if holders is None:
@@ -211,6 +251,8 @@ def unregister_subscriber(client: Any, query_uuid: str | UUID, queue: asyncio.Qu
             holders.remove(queue)
         if not holders:
             registry.pop(key, None)
+    if key not in bucket:  # the uuid's last reader on this loop is gone, and its owner with it
+        _owners().pop(key, None)
 
 
 def release_subscribers(query_uuid: str | UUID) -> None:
@@ -220,8 +262,10 @@ def release_subscribers(query_uuid: str | UUID) -> None:
     its readers — nothing else would wake them — but must not record the uuid as dead, because
     the subscription is still running on the server and a retry has to be able to re-attach.
     """
-    for queue in _bucket().pop(_key(query_uuid), []):
+    key = _key(query_uuid)
+    for queue in _bucket().pop(key, []):
         queue.put_nowait(_STREAM_END)
+    _owners().pop(key, None)
 
 
 def mark_killed(query_uuid: str | UUID) -> None:
@@ -238,17 +282,26 @@ def close_subscribers(query_uuid: str | UUID) -> None:
     mark_killed(query_uuid)
 
 
-def _release_loop(loop: asyncio.AbstractEventLoop) -> None:
-    """End every stream registered on *loop*. Must run **on** that loop."""
+def _release_loop(loop: asyncio.AbstractEventLoop, owner: str | None = None) -> None:
+    """End the streams registered on *loop* — every one, or only *owner*'s. Must run **on** that loop."""
     killed = _killed_on(loop)
-    for key, queues in _SUBSCRIBERS.pop(loop, {}).items():
+    if owner is None:
+        released = _SUBSCRIBERS.pop(loop, {})
+        _OWNERS.pop(loop, None)
+    else:
+        bucket = _SUBSCRIBERS.get(loop, {})
+        owners = _OWNERS.get(loop, {})
+        released = {key: bucket.pop(key) for key in list(bucket) if owners.get(key, "default") == owner}
+        for key in released:
+            owners.pop(key, None)
+    for key, queues in released.items():
         for queue in queues:
             queue.put_nowait(_STREAM_END)
         if key not in killed:
             killed.append(key)
 
 
-def close_all_subscribers(*, every_loop: bool = False) -> None:
+def close_all_subscribers(*, owner: str | None = None, every_loop: bool = False) -> None:
     """End every stream open on this event loop — and, with ``every_loop``, on all of them.
 
     Called by the connection-teardown paths. A live query rides the WebSocket, so once the
@@ -257,22 +310,35 @@ def close_all_subscribers(*, every_loop: bool = False) -> None:
     every reader parked on ``queue.get()`` forever, and the ``async with`` around a
     :class:`LiveStream` never reaches its ``__aexit__``.
 
+    *owner* (v0.29.0) narrows the release to the readers that connection registered
+    (:func:`register_subscriber`): one connection's teardown must not end the streams riding
+    another's client. ``None`` releases every reader, whoever owns it.
+
     ``every_loop`` serves ``close_all_connections()``, which drops every loop's client. Another
     loop's queues can only be woken from that loop's own thread, so the release is handed to it
-    with ``call_soon_threadsafe`` rather than performed here.
+    with ``call_soon_threadsafe`` rather than performed here. With ``every_loop`` the caller
+    needs no running loop (a connection re-registered at import time): every loop's release is
+    then handed over. Without it, the running loop is the one released, and there must be one.
     """
-    current = asyncio.get_running_loop()
+    try:
+        current: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+    except RuntimeError:
+        if not every_loop:
+            raise
+        current = None
     _prune_dead_loops()
-    _release_loop(current)
+    if current is not None:
+        _release_loop(current, owner)
     if not every_loop:
         return
     for loop in list(_SUBSCRIBERS):
         if loop is current or loop.is_closed():
             continue
         try:
-            loop.call_soon_threadsafe(_release_loop, loop)
+            loop.call_soon_threadsafe(_release_loop, loop, owner)
         except RuntimeError:  # pragma: no cover - closed between the check and the call
             _SUBSCRIBERS.pop(loop, None)
+            _OWNERS.pop(loop, None)
 
 
 class LiveIterator:
@@ -308,11 +374,14 @@ class LiveIterator:
         queue: asyncio.Queue[Any] | None,
         *,
         on_lost: Callable[[], None] | None = None,
+        owner: str = "default",
     ) -> None:
         self._client = client
         self._query_uuid = query_uuid
         self._queue = queue
         self._on_lost = on_lost
+        # The connection the reader belongs to, kept across a resubscribe (rebind()).
+        self._owner = owner
         self._loop: asyncio.AbstractEventLoop | None = None
         self._watched: asyncio.Task[Any] | None = None
         if queue is not None:
@@ -377,7 +446,7 @@ class LiveIterator:
         self._unwatch()
         unregister_subscriber(self._client, self._query_uuid, queue)
         self._client, self._query_uuid = client, query_uuid
-        register_subscriber(client, query_uuid, queue)
+        register_subscriber(client, query_uuid, queue, owner=self._owner)
         self._watch(client)
 
     def fail(self, error: Exception) -> None:
@@ -393,11 +462,18 @@ class LiveIterator:
         unregister_subscriber(self._client, self._query_uuid, queue)
 
 
-def open_stream(client: Any, query_uuid: str | UUID, *, on_lost: Callable[[], None] | None = None) -> LiveIterator:
+def open_stream(
+    client: Any,
+    query_uuid: str | UUID,
+    *,
+    owner: str = "default",
+    on_lost: Callable[[], None] | None = None,
+) -> LiveIterator:
     """Start buffering ``query_uuid``'s notifications now, and return an iterator over them.
 
     Everything the server pushes from this moment on is buffered until the caller gets round to
     reading it — see :class:`LiveIterator` for why registration cannot wait for the first read.
+    *owner* is the connection whose client carries the live query (:func:`register_subscriber`).
     """
     queues = _sdk_queues(client)
     if queues is None:
@@ -409,7 +485,7 @@ def open_stream(client: Any, query_uuid: str | UUID, *, on_lost: Callable[[], No
         )
     if _key(query_uuid) in _killed():
         return LiveIterator(client, query_uuid, None)
-    return LiveIterator(client, query_uuid, register_subscriber(client, query_uuid), on_lost=on_lost)
+    return LiveIterator(client, query_uuid, register_subscriber(client, query_uuid, owner=owner), on_lost=on_lost, owner=owner)
 
 
 def _is_transport_error(exc: BaseException) -> bool:
@@ -595,11 +671,13 @@ class LiveStream:
         self._resubscribing = None
         # Client next, so no await sits between opening the subscription and buffering it.
         self._stopping = False
+        # The connection get_client() serves below, which owns the reader its teardown must release.
+        owner = SurrealDBConnectionManager._manager_for()._connection_name or "default"
         self._client = await SurrealDBConnectionManager.get_client()
         self._identity = SurrealDBConnectionManager._identity_of(self._client)
         self._live_id = await self._starter(self._client)
         on_lost = self._schedule_resubscribe if self._auto_resubscribe else None
-        self._iterator = open_stream(self._client, self._live_id, on_lost=on_lost)
+        self._iterator = open_stream(self._client, self._live_id, owner=owner, on_lost=on_lost)
         return self
 
     async def stop(self) -> None:

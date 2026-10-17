@@ -37,6 +37,7 @@ from .live import (
     is_dead,
     mark_killed,
     open_stream,
+    owner_of,
     release_subscribers,
     require_websocket,
 )
@@ -131,20 +132,34 @@ def _routed(
     calls. Two wrappers, chosen once here: an ``async def`` one for a coroutine function, so
     ``inspect.iscoroutinefunction()`` keeps its answer (Python 3.11 has no ``inspect.markcoroutinefunction()``),
     and a plain one for the rest — the ``asynccontextmanager`` factories included, which resolve at the call. The
-    explicit connection name is read only from a ``name`` parameter declared first after ``cls``. The wrapper
-    carries ``functools.wraps`` and the marker ``__surreal_routed__`` (the policy). Under ``@classmethod``, and
-    above ``@contextlib.asynccontextmanager``; under ``@_cache.invalidates(...)`` too (``signup``), whose wrapper
-    stays outermost.
+    explicit connection name is read only from a ``name`` parameter declared first after ``cls``. With the
+    ``"live"`` policy, the router first asks :func:`~surreal_orm_lite.live.owner_of` which connection's stream
+    registered the ``query_uuid`` (the first parameter after ``cls``) on this loop, and runs there while that name
+    is registered; otherwise, the current connection. The wrapper carries ``functools.wraps`` and the marker
+    ``__surreal_routed__`` (the policy). Under ``@classmethod``, and above ``@contextlib.asynccontextmanager``;
+    under ``@_cache.invalidates(...)`` too (``signup``), whose wrapper stays outermost.
     """
 
     def decorate(func: Callable[Concatenate[type[_M], _P], _R]) -> Callable[Concatenate[type[_M], _P], _R]:
         parameters = list(inspect.signature(func).parameters)
         takes_name = len(parameters) > 1 and parameters[1] == "name"
+        takes_uuid = policy == "live" and len(parameters) > 1 and parameters[1] == "query_uuid"
 
         def explicit_name(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
             if not takes_name:
                 return None
             return args[0] if args else kwargs.get("name")
+
+        def target_of(cls: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+            if takes_uuid and cls._connection_name is None:
+                # On the router: the connection whose live stream registered the uuid on this loop, while that
+                # name is registered — a uuid belongs to the client that started it, not to the current one.
+                query_uuid = args[0] if args else kwargs.get("query_uuid")
+                owner = None if query_uuid is None else owner_of(query_uuid)
+                connection = None if owner is None else _REGISTRY.get(owner)
+                if connection is not None:
+                    return connection
+            return cls._route(explicit_name(args, kwargs), policy=policy)
 
         body: Any = func
         wrapper: Any
@@ -158,7 +173,7 @@ def _routed(
                         await body(connection, *args, **kwargs)
                     close_all_subscribers(every_loop=True)
                     return None
-                target = cls._route(explicit_name(args, kwargs), policy=policy)
+                target = target_of(cls, args, kwargs)
                 return await body(target, *args, **kwargs)
 
             wrapper = routed_coroutine
@@ -166,7 +181,7 @@ def _routed(
 
             @functools.wraps(func)
             def routed(cls: Any, *args: Any, **kwargs: Any) -> Any:
-                target = cls._route(explicit_name(args, kwargs), policy=policy)
+                target = target_of(cls, args, kwargs)
                 return body(target, *args, **kwargs)
 
             wrapper = routed
@@ -1091,8 +1106,9 @@ class SurrealDBConnectionManager:
             return
         cls.__prune_dead_loops()
         # Before the socket goes: a live-query reader is parked on a queue nothing will ever
-        # feed once the connection is gone, so releasing them has to happen here.
-        close_all_subscribers()
+        # feed once the connection is gone, so releasing them has to happen here — this
+        # connection's readers only: another connection's ride a client this close leaves open.
+        close_all_subscribers(owner=cls._connection_name)
         # Closing is an explicit choice: the next connection is the configured identity.
         cls._identity_restored()
         await cls._close_embedded()
@@ -1118,9 +1134,9 @@ class SurrealDBConnectionManager:
         database is discarded with it).
         """
         loop = asyncio.get_running_loop()
-        # Every loop's client is dropped below, so every loop's readers are released too —
-        # another loop's through its own thread, since only that loop may wake its queues.
-        close_all_subscribers(every_loop=True)
+        # Every loop's client is dropped below, so every loop's readers of this connection are
+        # released too — another loop's through its own thread, since only that loop may wake its queues.
+        close_all_subscribers(owner=cls._connection_name, every_loop=True)
         cls.__lost_identity.clear()
         await cls._close_embedded()
         client = cls.__clients.pop(loop, None)
@@ -1935,7 +1951,7 @@ class SurrealDBConnectionManager:
             if no client is connected on this event loop.
         """
         require_websocket(cls.__url)
-        return open_stream(cls._live_client(), query_uuid)
+        return open_stream(cls._live_client(), query_uuid, owner=cls._connection_name or "default")
 
     @classmethod
     @_routed("current")
