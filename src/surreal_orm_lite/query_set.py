@@ -14,6 +14,7 @@ from . import BaseSurrealModel, SurrealDBConnectionManager
 from . import cache as _cache
 from . import encoding as _encoding
 from . import geo as _geo
+from . import routing as _routing
 from . import subquery as _subquery
 from . import time_travel as _time_travel
 from ._sdk import NotFoundError, RecordID, SdkGeometryPoint, ServerError
@@ -92,6 +93,9 @@ class QuerySet:
         self._model_table: str = model.get_table_name()
         self._variables: dict = {}
         self._fetch_fields: list[str] = []
+        # The first segment of every dotted column a clause names (v0.29.0, _column()): the links it may follow,
+        # checked against the model's connection before a statement is sent (X4).
+        self._link_heads: set[str] = set()
         self._group_by_fields: list[str] = []
         self._annotations: dict[str, Aggregation | GeoDistance] = {}
         # GeoDistance annotations (v0.24.0), as annotate() checked them: alias -> column, reference point.
@@ -150,8 +154,27 @@ class QuerySet:
         Python fields. This is the one boundary between the two, so an aliased model is
         addressable by its Python names throughout the query API. A model with no aliases gets
         the name back unchanged.
+
+        The first segment of a dotted path (``author.name``) is recorded (v0.29.0): a path may follow a link, which
+        :meth:`_check_links` checks before the statement is sent.
         """
-        return self.model.to_db_field(field)
+        column = self.model.to_db_field(field)
+        head, dot, _ = column.partition(".")
+        if dot:
+            self._link_heads.add(head)
+        return column
+
+    def _check_links(self) -> None:
+        """X4 (v0.29.0): refuse a statement that follows a link to a model of another connection than this one's.
+
+        The links are the ``fetch()`` paths and the dotted paths of every other clause (:meth:`_column`, which also
+        translates the ``Q`` objects and the aggregations as they compile). Called once the statement is compiled,
+        before anything is sent.
+
+        :raises SurrealDbError: a link to a model of another connection (``routing.check_links()``).
+        """
+        if self._fetch_fields or self._link_heads:
+            _routing.check_links(self.model, [*self._fetch_fields, *sorted(self._link_heads)])
 
     def select(self, *fields: str) -> Self:
         """
@@ -287,6 +310,10 @@ class QuerySet:
         (see ``Subquery``). A subquery reading a table that does not exist reads as empty, as any missing table
         (SurrealDB 3.x raises: once the server confirms the table does not exist, the statement is sent once more
         with that subquery empty). Any other error raised while the subquery runs is the server's, relayed.
+
+        The server runs a subquery in the database of the statement around it (v0.29.0): a subquery whose model runs
+        on another connection than this model's raises ``SurrealDbError`` when this queryset compiles, before any
+        request — read it through its own connection first, or run both inside one ``using()`` block.
         """
         for arg in args:
             if not isinstance(arg, Q):
@@ -411,10 +438,16 @@ class QuerySet:
         ``SurrealDbError``; the other reads ignore ``fetch()``, as they do without ``as_of()``. A dotted path
         through a link in ``filter()``, ``select()``, ``order_by()`` or ``values()`` reads the linked record as
         it is now on 2.x.
+
+        A link is resolved in the database of the statement (v0.29.0): a field typed with a model of another
+        connection than this model's raises ``SurrealDbError`` when the queryset runs, before anything is sent — so
+        does a dotted path through it in ``filter()``, ``Q``, ``select()``, ``order_by()`` or ``values()``. A field
+        typed ``RecordID`` names no model and is not checked.
         """
         for field in fields:
             validate_field_name(field, "FETCH field")
-        self._fetch_fields.extend(self._column(field) for field in fields)
+        # Recorded whole, not through _column(): a subquery ignores its fetch(), so it must follow no link there.
+        self._fetch_fields.extend(self.model.to_db_field(field) for field in fields)
         return self
 
     def nearby(
@@ -703,6 +736,8 @@ class QuerySet:
         it) and this queryset on the stack of the querysets being rendered, so a queryset given as its own subquery
         raises S3 before any other check of the inner queryset.
 
+        It also carries this queryset's model (v0.29.0): every subquery of the statement must run on its connection.
+
         Args:
             empty_tables: the tables whose subqueries are bound to ``[]`` (SurrealDB 3.x confirmed they do not exist).
             inline: write the sub-SELECTs inline instead of in ``LET`` s (a live query).
@@ -712,6 +747,7 @@ class QuerySet:
             inline=inline,
             empty_tables=empty_tables,
             outer_tx=self._tx,
+            outer_model=self.model,
             variables=dict(self._variables),
             warn=warn,
             _stack=[id(self)],
@@ -753,9 +789,7 @@ class QuerySet:
 
         # Q object filters
         for q in self._q_filters:
-            sql, vars_, counter = q.to_sql(
-                counter, self._model_table, self.model.to_db_field, endpoint_columns, subqueries=subqueries
-            )
+            sql, vars_, counter = q.to_sql(counter, self._model_table, self._column, endpoint_columns, subqueries=subqueries)
             if sql:
                 parts.append(sql)
                 variables.update(vars_)
@@ -1023,7 +1057,7 @@ class QuerySet:
 
         select_parts = list(self._group_by_fields)
         for alias, agg in self._annotations.items():
-            select_parts.append(f"{cast('Aggregation', agg).to_sql(self.model.to_db_field)} AS {alias}")
+            select_parts.append(f"{cast('Aggregation', agg).to_sql(self._column)} AS {alias}")
 
         query = f"SELECT {', '.join(select_parts)} FROM {self._model_table}"
         query += where_clause
@@ -1161,6 +1195,9 @@ class QuerySet:
         With ``cache()`` (v0.28.0), a read outside a transaction is answered from the query cache when it can be
         (:meth:`_run_cached`); a write, a read inside a transaction or a read without ``cache()`` runs as above.
 
+        In both, the statement's links are checked once it is compiled (v0.29.0, :meth:`_check_links`), before it is
+        sent, added to a transaction or looked up in the cache; its subqueries were checked while it compiled.
+
         Args:
             compile_statement: compiles the statement with the compiler it is given; returns its text and variables.
             write: a write by filter: inside a transaction it is added to it, never sent again (the server's
@@ -1187,6 +1224,7 @@ class QuerySet:
             compiler = self._subquery_compiler(empty, warn=warn)
             warn = False
             query, variables = compile_statement(compiler)
+            self._check_links()
             if write and self._tx is not None:
                 return await self._tx.add(query, variables)
             read = frozenset(compiler.tables) - empty
@@ -1210,6 +1248,7 @@ class QuerySet:
         """
         compiler = self._subquery_compiler()
         query, variables = compile_statement(compiler)
+        self._check_links()
         tables = {self._model_table, *compiler.tables}
         if self.model.__surreal_edge__ or compiler.edge_tables:
             tables.add(EDGES)
@@ -2303,13 +2342,15 @@ class QuerySet:
         ``LIVE SELECT`` cannot sit in a block, and the server evaluates the sub-SELECT on every notification.
         *subqueries* is the inline compiler to use (a new one by default), which records the tables they read.
 
-        :raises SurrealDbError: for a clause a live query cannot honour.
+        :raises SurrealDbError: for a clause a live query cannot honour; for a subquery or a link of another
+            connection (X2, X4; v0.29.0).
         :raises TypeError: for a filter value with no SurrealQL literal form.
         :raises ValueError, SurrealDbError: for a subquery the ORM cannot compile (S2–S7, S13, S15).
         """
         self._reject_live_clauses()
         compiler = subqueries if subqueries is not None else self._subquery_compiler(inline=True)
         where_clause, where_vars = self._build_where(subqueries=compiler)
+        self._check_links()
         # Only the WHERE fragment is rewritten: it is the one place references live, and the
         # table name and FETCH list never pass through the inliner.
         where_clause = inline_variables(where_clause, {**compiler.variables, **where_vars})

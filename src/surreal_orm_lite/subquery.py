@@ -39,6 +39,11 @@ value is read as ``Subquery(qs)`` — sends **one** statement, inside which the 
 :class:`SubqueryCompiler` is what one statement's subqueries share: the ``LET`` s, the tables they read, the
 ``variables()`` merged into the statement and the querysets being rendered.
 
+**One connection (v0.29.0).** A subquery runs in the database of the statement around it, so its model must run on
+the connection of the statement's model: :meth:`SubqueryCompiler.reference` raises X2 (``routing.check_subquery()``)
+otherwise, and X4 (``routing.check_links()``) for a link the inner queryset follows to a model of another connection,
+when the statement compiles — before any request, a live query included.
+
 ``query_set`` and ``utils`` import this module, never the other way round at import time: ``QuerySet`` is
 imported lazily, for ``isinstance``.
 """
@@ -51,6 +56,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final
 
+from . import routing as _routing
 from ._sdk import NotFoundError, ThrownError
 
 if TYPE_CHECKING:
@@ -200,13 +206,15 @@ class SubqueryCompiler:
     """What the subqueries of one statement share, for one attempt at compiling it.
 
     Every field has a default, so ``SubqueryCompiler()`` stands on its own; ``QuerySet`` builds one per statement
-    with the outer queryset's transaction, ``variables()`` and identity.
+    with the outer queryset's model, transaction, ``variables()`` and identity.
 
     Attributes:
         inline: the sub-SELECTs are written inline instead of bound in ``LET`` s (a live query).
         empty_tables: the tables whose subqueries are bound to ``[]`` (SurrealDB 3.x confirmed they do not exist).
         outer_tx: the outer queryset's transaction; an inner queryset may share it, never have another.
         moment: the moment of an ``as_of()`` read, at which every subquery reads too (``None``: the current state).
+        outer_model: the model of the statement (v0.29.0), whose connection every subquery must run on (X2);
+            ``None`` checks nothing.
         variables: the statement's ``variables()``: the outer queryset's, then each subquery's, merged.
         lets: the ``LET $_sq<N> = …;`` of the block, innermost first.
         tables: the tables the subqueries read.
@@ -228,6 +236,7 @@ class SubqueryCompiler:
     empty_tables: frozenset[str] = frozenset()
     outer_tx: Any = None
     moment: datetime | None = None
+    outer_model: type | None = None
     variables: dict[str, Any] = field(default_factory=dict)
     lets: list[str] = field(default_factory=list)
     tables: set[str] = field(default_factory=set)
@@ -266,15 +275,22 @@ class SubqueryCompiler:
         Raises:
             ValueError: the inner queryset is being rendered already — the outer queryset itself, or a queryset
                 that reaches itself through another subquery (S3). Checked before anything else about it.
+            SurrealDbError: the inner queryset's model runs on another connection than :attr:`outer_model` (X2),
+                checked next; a link the inner queryset follows leads to a model of another connection (X4), checked
+                once it is rendered (its ``Q`` objects name their fields then). Its ``fetch()`` is ignored, so it
+                follows no link.
         """
         queryset = sub.queryset
         if id(queryset) in self._stack:
             raise ValueError(own_subquery())
+        if self.outer_model is not None:
+            _routing.check_subquery(self.outer_model, queryset.model)
         self._stack.append(id(queryset))
         try:
             select, values, counter = queryset._subquery_select(self, counter)
         finally:
             self._stack.pop()
+        _routing.check_links(queryset.model, sorted(queryset._link_heads))
         if self.inline:
             return select, values, counter
         name = f"{LET_PREFIX}{len(self.lets)}"

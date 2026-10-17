@@ -15,14 +15,15 @@ import logging
 import os
 import sys
 import threading
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any, Optional
 from uuid import UUID, uuid4
 
 import pytest
 import pytest_asyncio
+from pydantic import BaseModel, Field
 from surrealdb import AsyncSurreal, RecordID
 
 import surreal_orm_lite
@@ -31,8 +32,11 @@ from surreal_orm_lite import (
     BaseSurrealEdge,
     BaseSurrealModel,
     ConnectionConfig,
+    Count,
+    Q,
     QueryCache,
     QuerySet,
+    Subquery,
     SurrealConfigDict,
     SurrealDbAuthenticationError,
     SurrealDbConnectionError,
@@ -2994,3 +2998,519 @@ class TestTransactionGenerationModelsE2E:
             elif change == "re-register":
                 assert _titles(await _engine_rows(client, "md_a", "md_event")) == ["old"]
                 assert await _engine_rows(client, "md_b", "md_event") == []
+
+
+# === Cross-connection guards: subqueries, relations, links (spec §6.3, §6.4, X2–X4) ==========================
+
+
+class MdRates(BaseSurrealEdge):
+    """An edge model of the default connection."""
+
+    model_config = SurrealConfigDict(table_name="md_rates")
+
+    stars: int = 1
+
+
+class MdAuthor(BaseSurrealModel):
+    """Routed to ``md_a``: the model the ``author`` link of :class:`MdPost` names."""
+
+    model_config = SurrealConfigDict(table_name="md_author", connection="md_a")
+
+    id: str | None = None
+    name: str = ""
+
+
+class MdTag(BaseSurrealModel):
+    """Routed to ``md_a``: the model the ``tags`` links of :class:`MdPost` name."""
+
+    model_config = SurrealConfigDict(table_name="md_tag", connection="md_a")
+
+    id: str | None = None
+    label: str = ""
+
+
+class MdAddress(BaseModel):
+    """A nested Pydantic object: a dotted path into it follows no link."""
+
+    city: str = ""
+
+
+class MdPost(BaseSurrealModel):
+    """On the default connection, with links typed with models of ``md_a`` and of the default connection, an
+    untyped link (``RecordID``) and a nested object."""
+
+    model_config = SurrealConfigDict(table_name="md_post")
+
+    id: str | None = None
+    title: str = ""
+    author: MdAuthor | RecordID | None = None
+    tags: list[MdTag | RecordID] | None = None
+    reviewer: MdCustomer | RecordID | None = None
+    editor: RecordID | None = None
+    address: MdAddress | None = None
+
+
+class MdShapes(BaseSurrealModel):
+    """Every annotation shape ``routing.linked_models()`` walks (spec §6.3)."""
+
+    model_config = SurrealConfigDict(table_name="md_shapes")
+
+    id: str | None = None
+    optional: Optional[MdAuthor] = None  # noqa: UP045 (typing.Optional on purpose)
+    union: MdAuthor | MdTag | RecordID | None = None
+    annotated: Annotated[MdAuthor | None, "meta"] = None
+    listed: list[MdTag] = []
+    nested: Optional[Annotated[list[MdTag], "meta"]] = None  # noqa: UP045 (typing.Optional on purpose)
+    mapped: dict[str, MdAuthor] = {}
+    sequence: Sequence[MdTag] = ()
+    tupled: tuple[MdTag, ...] = ()
+    twice: MdAuthor | list[MdAuthor] | None = None
+    plain: RecordID | None = None
+    text: str = ""
+    aliased: MdAuthor | None = Field(default=None, alias="by")
+
+
+def _x2(inner: str, inner_name: str, outer: str, outer_name: str) -> str:
+    """X2's exact text (spec §5.7)."""
+    return (
+        f"{inner} (connection {inner_name!r}) cannot be read in a subquery of {outer} (connection {outer_name!r}): "
+        f"SurrealDB runs a subquery in the database of the statement around it. Read {inner} first through its own "
+        "connection and filter on its values, or route both models to one connection."
+    )
+
+
+def _x3(operation: str, a: str, a_name: str, b: str, b_name: str) -> str:
+    """X3's exact text (spec §5.7)."""
+    return (
+        f"{operation} cannot relate records of two connections: {a} runs on connection {a_name!r} and {b} on "
+        f"connection {b_name!r}. A relation is stored in one database: route the models (and the edge model) to one "
+        "connection."
+    )
+
+
+def _x4(model: str, field: str, linked: str, linked_name: str, model_name: str) -> str:
+    """X4's exact text (spec §5.7)."""
+    return (
+        f"{model}.{field} links to {linked}, which runs on connection {linked_name!r}, while {model} runs on "
+        f"connection {model_name!r}: SurrealDB resolves a record link in the database of the statement, so following "
+        f"it would read the wrong database. Read {linked} through its own connection, or route both models to one "
+        "connection."
+    )
+
+
+class _RelationSubstitute(_SubstituteClient):
+    """The substitute client of AC-1, with the SDK call a typed edge is created through."""
+
+    async def insert_relation(self, *args: Any, **kwargs: Any) -> Any:
+        raise _Sentinel("insert_relation")
+
+
+@contextlib.contextmanager
+def _substitute(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Every client the ORM acquires is :class:`_RelationSubstitute`: a call that passed the guards raises
+    :class:`_Sentinel` at its first request."""
+
+    async def fake() -> Any:
+        return _RelationSubstitute()
+
+    with monkeypatch.context() as patched:
+        patched.setattr(SurrealDBConnectionManager, "get_client", staticmethod(fake))
+        yield
+
+
+async def _run(call: Callable[[], Any]) -> Any:
+    """Run *call*: await the coroutine it returns (a queryset read or write), else return what it returns (the stream
+    of ``live()`` or ``watch()``, which is never awaited: ``await qs.live()`` is the deprecated uuid form)."""
+    result = call()
+    return await result if inspect.iscoroutine(result) else result
+
+
+#: Reads, writes and streams of a queryset whose filter value is a subquery of ``md_a`` while the statement runs on
+#: the default connection: each raises X2 when it compiles, before any request.
+_X2_CALLS: dict[str, Callable[[QuerySet], Any]] = {
+    "exec": lambda qs: qs.exec(),
+    "count": lambda qs: qs.count(),
+    "exists": lambda qs: qs.exists(),
+    "cache().exec": lambda qs: qs.cache().exec(),
+    "bulk_delete": lambda qs: qs.bulk_delete(),
+    "bulk_update": lambda qs: qs.bulk_update(name="x"),
+    "live": lambda qs: qs.live(),
+    "watch": lambda qs: qs.watch(),
+}
+
+
+class TestSubqueryGuard:
+    """AC-16, X2 (no server): a subquery whose model runs on another connection than the statement around it is
+    refused when the statement compiles — before any request, whatever the depth, in a live query too; the
+    names are compared, never looked up (``md_a`` is not even registered here). Same-connection subqueries compile
+    as in v0.28.0."""
+
+    @pytest.mark.parametrize("call", list(_X2_CALLS), ids=list(_X2_CALLS))
+    async def test_a_queryset_filter_value_of_another_connection_is_refused(
+        self, call: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(_forbidden_client))
+        qs = MdCustomer.objects().filter(id__in=MdEvent.objects().select("id"))
+        with pytest.raises(SurrealDbError) as info:
+            await _run(lambda: _X2_CALLS[call](qs))
+        assert str(info.value) == _x2("MdEvent", "md_a", "MdCustomer", "default")
+
+    async def test_a_subquery_object_and_a_q_are_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(_forbidden_client))
+        inner = MdEvent.objects().filter(title="x").select("title")
+        expected = _x2("MdEvent", "md_a", "MdCustomer", "default")
+        for qs in (
+            MdCustomer.objects().filter(name__in=Subquery(inner)),
+            MdCustomer.objects().filter(Q(name="a") | Q(name__in=Subquery(inner))),
+            MdCustomer.objects().filter(name=Subquery(inner.order_by("-title").limit(1))),
+        ):
+            with pytest.raises(SurrealDbError) as info:
+                await qs.exec()
+            assert str(info.value) == expected
+
+    async def test_two_levels_deep_the_statement_decides(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The innermost subquery runs in the database of the outermost statement, the one the block is sent to."""
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(_forbidden_client))
+        deep = MdCustomer.objects().filter(id__in=MdNote.objects().filter(id__in=MdEvent.objects()))
+        with pytest.raises(SurrealDbError) as info:
+            await deep.exec()
+        assert str(info.value) == _x2("MdEvent", "md_a", "MdCustomer", "default")
+        with pytest.raises(SurrealDbError) as info:
+            deep.live()
+        assert str(info.value) == _x2("MdEvent", "md_a", "MdCustomer", "default")
+        reverse = MdEvent.objects().filter(id__in=MdEvent.objects().filter(id__in=MdNote.objects()))
+        with pytest.raises(SurrealDbError) as info:
+            await reverse.exec()
+        assert str(info.value) == _x2("MdNote", "default", "MdEvent", "md_a")
+
+    async def test_the_links_of_a_subquery_are_checked_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """X4 for a link the inner queryset follows: its Q is translated while the statement compiles."""
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(_forbidden_client))
+        expected = _x4("MdPost", "author", "MdAuthor", "md_a", "default")
+        for inner in (
+            MdPost.objects().filter(**{"author.name": "x"}),
+            MdPost.objects().filter(Q(**{"author.name": "x"})),
+            MdPost.objects().select("author.name"),
+        ):
+            with pytest.raises(SurrealDbError) as info:
+                await MdNote.objects().filter(id__in=inner).exec()
+            assert str(info.value) == expected
+
+    def test_same_connection_subqueries_compile_as_before(self) -> None:
+        """The v0.28.0 text, byte for byte (statement, variables and live query)."""
+        qs = MdNote.objects().filter(id__in=MdCustomer.objects().filter(name="x").select("id"), text="t")
+        qs = qs.filter(Q(text__in=Subquery(MdCustomer.objects().select("name").order_by("-name").limit(1))))
+        assert qs._compile_query(subqueries=qs._subquery_compiler()) == (
+            "{ LET $_sq0 = (SELECT VALUE id FROM md_customer WHERE name = $_f0); LET $_sq1 = (SELECT name AS _sqv, "
+            "name FROM md_customer ORDER BY name DESC LIMIT 1)._sqv; (SELECT * FROM md_note WHERE id IN $_sq0 AND "
+            "text = $_f1 AND text IN $_sq1) };",
+            {"_f0": "x", "_f1": "t"},
+        )
+        assert qs._compile_live(False) == (
+            "LIVE SELECT * FROM md_note WHERE id IN (SELECT VALUE id FROM md_customer WHERE name = 'x') AND text = 't' "
+            "AND text IN (SELECT name AS _sqv, name FROM md_customer ORDER BY name DESC LIMIT 1)._sqv;"
+        )
+
+    @pytest.mark.usefixtures("unset_default")
+    async def test_inside_using_the_same_subquery_runs(self) -> None:
+        async with _mem_default_and_md_a():
+            async with SurrealDBConnectionManager.using("md_a"):
+                await MdEvent(id="e1", title="alice").save()
+                await MdCustomer(id="c1", name="alice").save()
+                await MdCustomer(id="c2", name="bob").save()
+                qs = MdCustomer.objects().filter(name__in=MdEvent.objects().select("title"))
+                assert [customer.id for customer in await qs.exec()] == ["c1"]
+                assert await qs.count() == 1
+            with pytest.raises(SurrealDbError, match="cannot be read in a subquery of"):
+                await MdCustomer.objects().filter(name__in=MdEvent.objects().select("title")).exec()
+            assert await _rows_of(await SurrealDBConnectionManager.get_client(), "md_customer") == []
+
+
+#: ``(id, call, operation, b, b_name)``: a relation helper on ``MdCustomer(id="c1")`` (the default connection) and the
+#: model X3 names against it — the target's class first, then the edge class, then ``model_class``.
+_X3_CASES: list[tuple[str, Callable[[MdCustomer], Any], str, str, str]] = [
+    ("relate-str-edge", lambda c: c.relate("md_likes", MdEvent(id="e1")), "relate", "MdEvent", "md_a"),
+    ("relate-edge-here-target-there", lambda c: c.relate(MdRates, MdEvent(id="e1")), "relate", "MdEvent", "md_a"),
+    ("relate-edge-there-target-there", lambda c: c.relate(MdLikes, MdEvent(id="e1")), "relate", "MdEvent", "md_a"),
+    ("relate-edge-there", lambda c: c.relate(MdLikes, MdCustomer(id="c2")), "relate", "MdLikes", "md_a"),
+    ("relate-reverse", lambda c: c.relate("md_likes", MdEvent(id="e1"), True), "relate", "MdEvent", "md_a"),
+    ("remove_relation-str-edge", lambda c: c.remove_relation("md_likes", MdEvent(id="e1")), "remove_relation", "MdEvent", "md_a"),
+    ("remove_relation-edge-there", lambda c: c.remove_relation(MdLikes, MdCustomer(id="c2")), "remove_relation", "MdLikes", "md_a"),
+    ("remove_all_relations", lambda c: c.remove_all_relations(MdLikes), "remove_all_relations", "MdLikes", "md_a"),
+    ("remove_all_relations-list", lambda c: c.remove_all_relations(["md_follows", MdRates, MdLikes], "both"), "remove_all_relations", "MdLikes", "md_a"),
+    ("get_related-edge-there", lambda c: c.get_related(MdLikes), "get_related", "MdLikes", "md_a"),
+    ("get_related-model_class", lambda c: c.get_related("md_likes", model_class=MdEvent), "get_related", "MdEvent", "md_a"),
+    ("get_related-edge-first", lambda c: c.get_related(MdLikes, "in", MdEvent), "get_related", "MdLikes", "md_a"),
+    ("get_related-edge-here", lambda c: c.get_related(MdRates, model_class=MdEvent), "get_related", "MdEvent", "md_a"),
+]  # fmt: skip
+
+
+class TestRelationGuard:
+    """AC-17, X3 (no server): ``relate()``, ``remove_relation()``, ``remove_all_relations()`` and ``get_related()``
+    refuse records, edge models and ``model_class`` of two connections before any request and any signal; a
+    ``RecordID`` or ``"table:id"`` target names no model and is not checked."""
+
+    @pytest.mark.parametrize(
+        ("call", "operation", "b", "b_name"), [case[1:] for case in _X3_CASES], ids=[case[0] for case in _X3_CASES]
+    )
+    async def test_two_connections_are_refused(
+        self, call: Callable[[MdCustomer], Any], operation: str, b: str, b_name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(_forbidden_client))
+        with _signal_spy(MdCustomer, MdEvent, MdLikes, MdRates) as fired, pytest.raises(SurrealDbError) as info:
+            await call(MdCustomer(id="c1", name="c"))
+        assert str(info.value) == _x3(f"MdCustomer.{operation}()", "MdCustomer", "default", b, b_name)
+        assert fired == []
+
+    async def test_a_source_of_md_a_is_named_first(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(_forbidden_client))
+        with pytest.raises(SurrealDbError) as info:
+            await MdEvent(id="e1").relate(MdLikes, MdCustomer(id="c1"))
+        assert str(info.value) == _x3("MdEvent.relate()", "MdEvent", "md_a", "MdCustomer", "default")
+        with pytest.raises(SurrealDbError) as info:
+            await MdEvent(id="e1").relate(MdRates, MdEvent(id="e2"))
+        assert str(info.value) == _x3("MdEvent.relate()", "MdEvent", "md_a", "MdRates", "default")
+
+    async def test_a_record_id_or_a_string_target_is_not_checked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The call goes on to its request (the substitute's sentinel), even when the id is of a table of ``md_a``."""
+        customer = MdCustomer(id="c1", name="c")
+        calls: list[Callable[[], Any]] = [
+            lambda: customer.relate("md_likes", RecordID("md_event", "e1")),
+            lambda: customer.relate("md_likes", "md_event:e1"),
+            lambda: customer.relate(MdRates, RecordID("md_event", "e1")),
+            lambda: customer.remove_relation("md_likes", "md_event:e1"),
+            lambda: customer.remove_relation(MdRates, RecordID("md_event", "e1")),
+            lambda: customer.remove_relation("md_likes", "e1"),
+            lambda: customer.remove_all_relations(["md_likes", MdRates], "both"),
+            lambda: customer.get_related("md_likes", model_class=MdCustomer),
+            lambda: customer.get_related(MdRates, "both"),
+        ]
+        with _substitute(monkeypatch):
+            for call in calls:
+                with pytest.raises(_Sentinel):
+                    await call()
+
+    @pytest.mark.usefixtures("unset_default")
+    async def test_inside_using_one_connection_relates(self) -> None:
+        async with _mem_default_and_md_a(), SurrealDBConnectionManager.using("md_a"):
+            customer = await MdCustomer(id="c1", name="c").save()
+            await MdEvent(id="e1", title="e").save()
+            edge = await customer.relate(MdLikes, MdEvent(id="e1"), weight=3)
+            assert edge.weight == 3
+            await customer.relate(MdRates, MdEvent(id="e1"))
+            related = await customer.get_related(MdLikes, model_class=MdEvent)
+            assert [event.id for event in related] == ["e1"]
+            await customer.remove_relation(MdLikes, MdEvent(id="e1"))
+            await customer.remove_all_relations([MdRates, "md_likes"])
+            assert await customer.get_related(MdLikes) == []
+            md_a = await SurrealDBConnectionManager.get_client("md_a")
+            assert await _rows_of(md_a, "md_likes") == []
+            assert await _rows_of(md_a, "md_rates") == []
+
+
+#: Reads, writes and streams of ``MdPost`` (the default connection) that follow its ``author`` link to ``MdAuthor``
+#: (``md_a``): each raises X4 before any request.
+_X4_CALLS: dict[str, Callable[[], Any]] = {
+    "fetch": lambda: MdPost.objects().fetch("author").exec(),
+    "fetch-path": lambda: MdPost.objects().fetch("author.name").exec(),
+    "filter": lambda: MdPost.objects().filter(**{"author.name": "x"}).exec(),
+    "filter-lookup": lambda: MdPost.objects().filter(**{"author.name__contains": "x"}).count(),
+    "Q": lambda: MdPost.objects().filter(Q(title="t") | Q(**{"author.name": "x"})).exec(),
+    "select": lambda: MdPost.objects().select("author.*").exec(),
+    "order_by": lambda: MdPost.objects().order_by("-author.name").exec(),
+    "values": lambda: MdPost.objects().values("author.name").annotate(n=Count()).exec(),
+    "annotate": lambda: MdPost.objects().values("title").annotate(n=Count("author.name")).exec(),
+    "sum": lambda: MdPost.objects().sum("author.age"),
+    "first": lambda: MdPost.objects().fetch("author").first(),
+    "get": lambda: MdPost.objects().filter(**{"author.name": "x"}).get(),
+    "cache": lambda: MdPost.objects().fetch("author").cache().exec(),
+    "bulk_delete": lambda: MdPost.objects().filter(**{"author.name": "x"}).bulk_delete(),
+    "get_or_create": lambda: MdPost.objects().get_or_create(**{"author.name__contains": "x"}),
+    "live-fetch": lambda: MdPost.objects().fetch("author").live(),
+    "live-filter": lambda: MdPost.objects().filter(**{"author.name": "x"}).live(),
+}
+
+
+class TestLinkGuard:
+    """AC-18, X4 (no server but the ``using()`` case): a queryset that follows a link through a field typed with a
+    model of another connection is refused before any request; a field typed ``RecordID`` (N8), a nested object
+    and a link to a model of the same connection are not; inside ``using()`` every model is on one connection.
+    ``routing.linked_models()`` walks the annotation, and caches it only once the model is complete."""
+
+    @pytest.mark.parametrize("call", list(_X4_CALLS), ids=list(_X4_CALLS))
+    async def test_a_link_to_another_connection_is_refused(self, call: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(_forbidden_client))
+        with _signal_spy(MdPost) as fired, pytest.raises(SurrealDbError) as info:
+            await _run(_X4_CALLS[call])
+        assert str(info.value) == _x4("MdPost", "author", "MdAuthor", "md_a", "default")
+        assert fired == []
+
+    async def test_a_list_of_links_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(_forbidden_client))
+        for call in (lambda: MdPost.objects().fetch("tags").exec(), lambda: MdPost.objects().fetch("title", "tags").live()):
+            with pytest.raises(SurrealDbError) as info:
+                await _run(call)
+            assert str(info.value) == _x4("MdPost", "tags", "MdTag", "md_a", "default")
+
+    async def test_untyped_links_nested_objects_and_same_connection_links_pass(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """They reach their request (the substitute's sentinel)."""
+        calls: list[Callable[[], Any]] = [
+            lambda: MdPost.objects().fetch("editor").exec(),
+            lambda: MdPost.objects().filter(**{"editor.name": "x"}).exec(),
+            lambda: MdPost.objects().filter(**{"address.city": "x"}).order_by("address.city").exec(),
+            lambda: MdPost.objects().select("address.city").exec(),
+            lambda: MdPost.objects().fetch("reviewer").filter(**{"reviewer.name": "x"}).exec(),
+            lambda: MdPost.objects().filter(**{"author": RecordID("md_author", "a1")}).exec(),
+            lambda: MdPost.objects().select("author").exec(),
+            lambda: MdNote.objects().filter(**{"text.x": "x"}).exec(),
+        ]
+        with _substitute(monkeypatch):
+            for call in calls:
+                with pytest.raises(_Sentinel):
+                    await call()
+
+    @pytest.mark.usefixtures("unset_default")
+    async def test_inside_using_the_link_is_followed(self) -> None:
+        async with _mem_default_and_md_a(), SurrealDBConnectionManager.using("md_a"):
+            await MdAuthor(id="a1", name="Ann").save()
+            await MdTag(id="t1", label="news").save()
+            await MdPost(id="p1", title="hello", author=RecordID("md_author", "a1"), tags=[RecordID("md_tag", "t1")]).save()
+            [post] = await MdPost.objects().fetch("author", "tags").filter(**{"author.name": "Ann"}).exec()
+            assert isinstance(post.author, MdAuthor)
+            assert post.author.name == "Ann"
+            assert [tag.label for tag in post.tags or []] == ["news"]
+            assert await MdPost.objects().filter(**{"author.name": "Bob"}).count() == 0
+
+    def test_linked_models_walks_the_annotation(self) -> None:
+        cases = {
+            "optional": (MdAuthor,),
+            "union": (MdAuthor, MdTag),
+            "annotated": (MdAuthor,),
+            "listed": (MdTag,),
+            "nested": (MdTag,),
+            "mapped": (MdAuthor,),
+            "sequence": (MdTag,),
+            "tupled": (MdTag,),
+            "twice": (MdAuthor,),
+            "by": (MdAuthor,),  # a column: the field stored under it
+            "plain": (),
+            "text": (),
+            "address": (),
+            "missing": (),
+        }
+        for column, expected in cases.items():
+            model = MdPost if column == "address" else MdShapes
+            assert routing.linked_models(model, column) == expected, column
+        assert routing.linked_models(MdPost, "author") == (MdAuthor,)
+        assert routing.linked_models(MdPost, "reviewer") == (MdCustomer,)
+
+    async def test_a_model_rebuilt_later_turns_the_guard_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """While a forward reference is unresolved nothing is cached, so ``model_rebuild()`` turns X4 on."""
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(_forbidden_client))
+
+        class MdLate(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="md_late")
+
+            id: str | None = None
+            later: "MdLater | RecordID | None" = None
+
+        assert MdLate.__pydantic_complete__ is False
+        assert routing.linked_models(MdLate, "later") == ()
+        assert routing.linked_models(MdLate, "later") == ()
+
+        class MdLater(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="md_later", connection="md_a")
+
+            id: str | None = None
+
+        MdLate.model_rebuild()
+        assert routing.linked_models(MdLate, "later") == (MdLater,)
+        with pytest.raises(SurrealDbError) as info:
+            await MdLate.objects().fetch("later").exec()
+        assert str(info.value) == _x4("MdLate", "later", "MdLater", "md_a", "default")
+
+    async def test_the_linked_models_connection_is_read_at_each_check(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Cached: the linked classes; never their connection (a ``using()`` block, or a model routed elsewhere)."""
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(_forbidden_client))
+        with pytest.raises(SurrealDbError, match="links to"):
+            await MdPost.objects().fetch("author").exec()
+        monkeypatch.setitem(MdAuthor.model_config, "connection", None)
+        with _substitute(monkeypatch), pytest.raises(_Sentinel):
+            await MdPost.objects().fetch("author").exec()
+        monkeypatch.undo()
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", staticmethod(_forbidden_client))
+        with pytest.raises(SurrealDbError, match="would read the wrong database"):
+            await MdPost.objects().fetch("author").exec()
+
+
+# --- the guards on the line under test (both lines) -----------------------------------------------------------
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestSubqueryGuardE2E:
+    """AC-16 (both lines, ws): X2 sends nothing; the same subquery inside ``using("md_a")`` and a subquery between
+    two models of ``md_a`` read ``md_a``."""
+
+    async def test_x2_sends_nothing_and_one_connection_reads(self) -> None:
+        async with _routed_databases("ws"):
+            await MdEvent(id="e1", title="alice").save()
+            await MdAuthor(id="a1", name="alice").save()
+            await MdAuthor(id="a2", name="bob").save()
+            with pytest.raises(SurrealDbError, match="cannot be read in a subquery of"):
+                await MdCustomer.objects().filter(name__in=MdEvent.objects().select("title")).exec()
+            same = MdAuthor.objects().filter(name__in=MdEvent.objects().select("title"))
+            assert [author.id for author in await same.exec()] == ["a1"]
+            async with SurrealDBConnectionManager.using("md_a"):
+                await MdCustomer(id="c1", name="alice").save()
+                qs = MdCustomer.objects().filter(name__in=MdEvent.objects().select("title"))
+                assert [customer.id for customer in await qs.exec()] == ["c1"]
+            assert [row["name"] for row in await _root_rows("md_a", "md_customer")] == ["alice"]
+            assert await _root_rows("md_b", "md_customer") == []
+            assert await _root_rows("md_b", "md_event") == []
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestRelationGuardE2E:
+    """AC-17 (both lines, ws): X3 writes no edge in either database; records and edge models of ``md_a`` relate in
+    ``md_a``."""
+
+    async def test_x3_writes_nothing_and_one_connection_relates(self) -> None:
+        async with _routed_databases("ws"):
+            customer = await MdCustomer(id="c1", name="c").save()
+            await MdEvent(id="e1", title="one").save()
+            await MdEvent(id="e2", title="two").save()
+            with pytest.raises(SurrealDbError, match="cannot relate records of two connections"):
+                await customer.relate("md_likes", MdEvent(id="e1"))
+            with pytest.raises(SurrealDbError, match="cannot relate records of two connections"):
+                await customer.relate(MdLikes, MdCustomer(id="c1"))
+            assert await _root_rows("md_a", "md_likes") == []
+            assert await _root_rows("md_b", "md_likes") == []
+            await MdEvent(id="e1").relate(MdLikes, MdEvent(id="e2"), weight=2)
+            related = await MdEvent(id="e1").get_related(MdLikes, model_class=MdEvent)
+            assert [event.title for event in related] == ["two"]
+            assert [row["weight"] for row in await _root_rows("md_a", "md_likes")] == [2]
+            assert await _root_rows("md_b", "md_likes") == []
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestLinkGuardE2E:
+    """AC-18 (both lines, ws): X4 sends nothing; inside ``using("md_a")`` the post and its author are in one
+    database and the link is followed."""
+
+    async def test_x4_sends_nothing_and_one_connection_follows(self) -> None:
+        async with _routed_databases("ws"):
+            await MdAuthor(id="a1", name="Ann").save()
+            await MdPost(id="p1", title="elsewhere", author=RecordID("md_author", "a1")).save()
+            with pytest.raises(SurrealDbError, match="would read the wrong database"):
+                await MdPost.objects().fetch("author").exec()
+            with pytest.raises(SurrealDbError, match="links to"):
+                await MdPost.objects().filter(**{"author.name": "Ann"}).exec()
+            [post] = await MdPost.objects().exec()
+            assert post.author == RecordID("md_author", "a1")
+            async with SurrealDBConnectionManager.using("md_a"):
+                await MdPost(id="p2", title="here", author=RecordID("md_author", "a1")).save()
+                [here] = await MdPost.objects().fetch("author").filter(**{"author.name": "Ann"}).exec()
+                assert isinstance(here.author, MdAuthor)
+                assert (here.title, here.author.name) == ("here", "Ann")
+            assert [row["title"] for row in await _root_rows("md_a", "md_post")] == ["here"]
+            assert [row["title"] for row in await _root_rows("md_b", "md_post")] == ["elsewhere"]

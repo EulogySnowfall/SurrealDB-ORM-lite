@@ -24,7 +24,7 @@ from ._sdk import NotFoundError, RecordID, SdkDuration, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, _ComputedDefault
-from .routing import check_config_connection, check_transaction
+from .routing import check_config_connection, check_same_connection, check_transaction
 from .signals import (
     around_delete,
     around_save,
@@ -2819,7 +2819,9 @@ class BaseSurrealModel(BaseModel):
                 or a computed field (typed form).
             SurrealDbError: an unsaved source or target; the fields name an undeclared field
                 (typed form); the write is refused; this record was read with ``as_of()`` (a
-                read-only snapshot, v0.26.0).
+                read-only snapshot, v0.26.0); this record, a model target or the edge model run on
+                two connections (v0.29.0: a relation is stored in one database), before any request
+                or signal.
             pydantic.ValidationError: the fields are invalid for the edge model (nothing
                 written).
 
@@ -2834,6 +2836,7 @@ class BaseSurrealModel(BaseModel):
                 await user.relate(Follows, other_user, tx=tx)
         """
         self._reject_snapshot_write("relate()")
+        self._check_relation("relate", self._model_of(target), self._edge_model(edge))
         if isinstance(edge, type) and issubclass(edge, BaseSurrealModel) and edge.__surreal_edge__:
             fields = self._merge_edge_fields(data, edge_data, edge.to_py_field)
             return await self._relate_typed(edge, target, fields, reverse, tx)
@@ -2890,6 +2893,31 @@ class BaseSurrealModel(BaseModel):
         start, end = (destination, source) if reverse else (source, destination)
         instance = edge.model_validate({**fields, "in": start, "out": end})
         return await instance._save_naming(names, tx=tx)
+
+    def _check_relation(self, method: str, *models: type | None) -> None:
+        """X3 (v0.29.0): refuse the relation helper *method* when *models* run on another connection than this record.
+
+        *models* are the target's model, the edge model and ``model_class``, in the order the error names them;
+        ``None`` (a ``RecordID`` or ``"table:id"`` target, an edge table name) is skipped. Connection names are
+        compared, before any signal or request.
+
+        :raises SurrealDbError: two connections (``routing.check_same_connection()``).
+        """
+        others = [model for model in models if model is not None]
+        if others:
+            check_same_connection(f"{type(self).__name__}.{method}()", type(self), *others)
+
+    @staticmethod
+    def _model_of(target: object) -> type | None:
+        """The model of a relation target that is a model instance, else ``None`` (a ``RecordID``, a string)."""
+        return type(target) if isinstance(target, BaseSurrealModel) else None
+
+    @staticmethod
+    def _edge_model(edge: object) -> type | None:
+        """*edge* when it is an edge model class, else ``None`` (an edge table name, or a value refused later)."""
+        if isinstance(edge, type) and issubclass(edge, BaseSurrealModel) and edge.__surreal_edge__:
+            return edge
+        return None
 
     @staticmethod
     def _edge_names(edge: object) -> list[str]:
@@ -2978,7 +3006,8 @@ class BaseSurrealModel(BaseModel):
             ValueError: an invalid edge name, a malformed ``"table:id"`` string, or an empty or
                 blank target.
             SurrealDbError: an unsaved source or target; this record was read with ``as_of()`` (a
-                read-only snapshot, v0.26.0).
+                read-only snapshot, v0.26.0); this record, a model target or the edge model run on two
+                connections (v0.29.0), before any request.
 
         Example::
 
@@ -2991,6 +3020,7 @@ class BaseSurrealModel(BaseModel):
                 await user.remove_relation(Follows, other_user, tx=tx)
         """
         self._reject_snapshot_write("remove_relation()")
+        self._check_relation("remove_relation", self._model_of(target), self._edge_model(edge))
         edge_name = self._edge_name(edge)
         source = self._graph_source()
         arrow, column = ("<-", "in") if reverse else ("->", "out")
@@ -3041,7 +3071,8 @@ class BaseSurrealModel(BaseModel):
             ValueError: an invalid direction or edge name, or an empty list.
             TypeError: an edge that is neither an edge model class nor a string.
             SurrealDbError: an unsaved record, or one read with ``as_of()`` (a read-only snapshot,
-                v0.26.0).
+                v0.26.0); an edge model of another connection than this record's (v0.29.0), before any
+                request.
 
         Example::
 
@@ -3053,6 +3084,8 @@ class BaseSurrealModel(BaseModel):
         """
         self._reject_snapshot_write("remove_all_relations()")
         self._check_direction(direction)
+        edges = edge if isinstance(edge, (list, tuple)) else (edge,)
+        self._check_relation("remove_all_relations", *(self._edge_model(item) for item in edges))
         names = ", ".join(self._edge_names(edge))
         source = self._graph_source()
         paths = {"out": f"$src->({names})", "in": f"$src<-({names})", "both": f"$src->({names}), $src<-({names})"}
@@ -3086,7 +3119,8 @@ class BaseSurrealModel(BaseModel):
         Raises:
             ValueError: an invalid direction or edge name.
             TypeError: ``edge`` is not an edge model class or a string.
-            SurrealDbError: an unsaved record.
+            SurrealDbError: an unsaved record; the edge model or ``model_class`` run on another connection
+                than this record (v0.29.0: the traversal reads one database), before any request.
 
         Example::
 
@@ -3095,6 +3129,7 @@ class BaseSurrealModel(BaseModel):
             everyone = await user.get_related(Follows, direction="both", model_class=User)
         """
         self._check_direction(direction)
+        self._check_relation("get_related", self._edge_model(edge), model_class)
         edge_name = self._edge_name(edge)
         source = self._graph_source()
 
