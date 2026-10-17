@@ -281,6 +281,6 @@ class TestReviewFixesEncoder:
             sql, variables, _ = build_filter_condition("field", lookup, value, 0, "T")
             assert "$" not in reference.sub("", sql), (lookup, sql)
             assert not bound.search(inline_variables(sql, variables)), (lookup, sql)
-        with pytest.warns(DeprecationWarning):  # "$x" is the deprecated variable-reference form
-            sql, variables, _ = (Q(a="$x") | ~Q(b__in=["$y"])).to_sql(0, "T")
+        sql, variables, _ = (Q(a="$x") | ~Q(b__in=["$y"])).to_sql(0, "T")  # strings are data (v0.28.1)
         assert "$" not in reference.sub("", sql)
+        assert variables == {"_f0": "$x", "_f1": ["$y"]}

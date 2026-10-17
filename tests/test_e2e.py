@@ -5,6 +5,7 @@ from pydantic import Field
 from surrealdb import RecordID
 
 import surreal_orm_lite
+from surreal_orm_lite import Var
 from surreal_orm_lite.exceptions import SurrealDbError, SurrealDbNotFoundError
 
 SURREALDB_HOST = os.environ.get("SURREALDB_HOST", "localhost")
@@ -236,7 +237,7 @@ async def test_multi_select() -> None:
     assert len(result6) == 5
     assert isinstance(result6[0], dict)
 
-    result7 = await ModelTest.objects().filter(age__lte="$max_age").variables(max_age=25).exec()
+    result7 = await ModelTest.objects().filter(age__lte=Var("max_age")).variables(max_age=25).exec()
     assert len(result7) == 3
     for res in result7:
         assert res.age <= 25

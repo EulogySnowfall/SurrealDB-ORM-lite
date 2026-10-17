@@ -42,9 +42,6 @@ VALID_THING_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*:(`[a-zA-Z0-9_-]+`|[a-
 # hyphen, punctuation) must be backtick-quoted to keep its string form.
 BARE_RECORD_ID = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
-# Pattern for valid SurrealQL variable references: $variable_name
-VALID_VARIABLE_REF_PATTERN = re.compile(r"^\$[a-zA-Z_][a-zA-Z0-9_]*$")
-
 
 def remove_quotes_for_variables(query: str) -> str:
     # Regex to remove single quotes around variables ($)
@@ -576,6 +573,33 @@ def _list_item(item: Any, field: str, lookup: str) -> Any:
     return item
 
 
+def unescape_filter_value(value: Any, *, warn: bool = True) -> Any:
+    """The data a scalar filter value stands for: *value* itself, but for the deprecated ``"$$"`` escape.
+
+    A ``str`` is data, whatever it starts with: ``"$x"`` is compared with the string ``"$x"``, and only
+    ``Var("x")`` references the query variable ``$x``. The ``"$$"`` escape of v0.14.3, written when ``"$x"``
+    still read as a reference, keeps its meaning so that escaped values find the same records: a ``str``
+    starting with ``"$$"`` is the same string with one ``$`` less (``"$$x"`` is ``"$x"``, ``"$$$x"`` is
+    ``"$$x"``), with a ``DeprecationWarning`` saying to write the value itself. An item of a list lookup never
+    had the escape, and is not unescaped.
+
+    Args:
+        value: a scalar filter value, or a ``get_or_create()``/``update_or_create()`` ``exact`` criterion.
+        warn: emit the ``DeprecationWarning`` (the WHERE builder does; the create payload of the same call does not).
+    """
+    if not (isinstance(value, str) and value.startswith("$$")):
+        return value
+    data = value[1:]
+    if warn:
+        warnings.warn(
+            f"The filter value {value!r} is read as {data!r}: the '$$' escape is deprecated. A string filter value "
+            f"is always data, so write {data!r}; Var('name') references a query variable.",
+            DeprecationWarning,
+            stacklevel=user_stacklevel(),
+        )
+    return data
+
+
 def build_filter_condition(
     field: str,
     lookup: str,
@@ -588,6 +612,10 @@ def build_filter_condition(
 ) -> tuple[str, dict[str, Any], int]:
     """
     Build a single parameterized filter condition.
+
+    A ``str`` value is data, whatever it starts with: ``"$x"`` is bound and compared with the string ``"$x"``.
+    ``Var("x")`` is the only reference to a query variable, written ``$x``. A scalar ``str`` starting with
+    ``"$$"`` (the deprecated escape) loses one ``$``, with a ``DeprecationWarning`` (:func:`unescape_filter_value`).
 
     A model instance given as the value — or as an item of a sequence lookup — is bound as its
     record id (:func:`as_record_value`, v0.22.0).
@@ -703,35 +731,14 @@ def build_filter_condition(
 
     value = as_record_value(value)
     if isinstance(value, Var):
-        # The explicit, unambiguous form (v0.14.3).
+        # The one variable reference (v0.14.3): every other value is bound as data.
         return f"{field} {op} {value.reference}", {}, counter
-    elif isinstance(value, str) and value.startswith("$$"):
-        # "$$x" escapes to the literal "$x" — the only way to filter on a value that
-        # really does start with a dollar sign (issue #156).
-        return f"{field} {op} ${var_name}", {var_name: value[1:]}, counter + 1
-    elif isinstance(value, str) and value.startswith("$"):
-        # Backward compat: string values starting with $ are variable references. This is
-        # a trap for user-supplied data — a literal "$admin" silently matches nothing — so
-        # it is deprecated in favour of Var("admin"), with "$$admin" for the literal.
-        if not VALID_VARIABLE_REF_PATTERN.match(value):
-            raise ValueError(
-                f"Invalid variable reference '{value}': must match $variable_name pattern. "
-                f"To filter on the literal string, escape the dollar sign: '${value}'."
-            )
-        warnings.warn(
-            f"Passing '{value}' as a filter value is interpreted as a reference to the query "
-            f"variable {value} and is deprecated; use Var({value[1:]!r}) to reference a "
-            f"variable, or '${value}' to match the literal string.",
-            DeprecationWarning,
-            stacklevel=user_stacklevel(),
-        )
-        return f"{field} {op} {value}", {}, counter
-    else:
-        if is_record_id_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
-            value = coerce_record_id(value, cast(str, record_table))
-        elif is_endpoint_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
-            value = coerce_endpoint(value)
-        return f"{field} {op} ${var_name}", {var_name: value}, counter + 1
+    value = unescape_filter_value(value)
+    if is_record_id_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
+        value = coerce_record_id(value, cast(str, record_table))
+    elif is_endpoint_column and lookup in _RECORD_ID_SCALAR_LOOKUPS:
+        value = coerce_endpoint(value)
+    return f"{field} {op} ${var_name}", {var_name: value}, counter + 1
 
 
 # JSON Patch (RFC 6902) operation kinds. SurrealDB also accepts ``change`` (string diff).

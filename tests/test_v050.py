@@ -11,6 +11,7 @@ from pydantic import Field
 from surrealdb import RecordID
 
 import surreal_orm_lite
+from surreal_orm_lite import Var
 from surreal_orm_lite.q import Q
 from surreal_orm_lite.utils import build_filter_condition, parse_lookup
 
@@ -274,7 +275,7 @@ class TestQuerySetParameterized:
 
     def test_user_variables_merged(self) -> None:
         """User-set variables merged with filter variables."""
-        qs = User.objects().filter(age__lte="$max_age").variables(max_age=50)
+        qs = User.objects().filter(age__lte=Var("max_age")).variables(max_age=50)
         query, variables = qs._compile_query()
         assert "max_age" in variables
         assert variables["max_age"] == 50

@@ -316,13 +316,14 @@ class TestSelectDocs:
             assert needle in text, needle
 
     def test_server_behaviour_row(self) -> None:
-        """Right after v0.28.0's query cache row, before the table's last row; the header names its lines."""
+        """Right after v0.28.0's query cache row, before v0.28.1's filter value row and the table's last row; the
+        header names its lines."""
         rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
         index = rows.index(_SELECT_ROW)
         assert rows[index - 1] == _QUERY_CACHE_ROW, rows[index - 1]
-        assert index == len(rows) - 2 and rows[-1][3] == "v0.19.1", rows[-1]
+        assert index == len(rows) - 3 and rows[-1][3] == "v0.19.1", rows[-1]
         header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
-        assert "; the row added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5. " in header, header
+        assert "; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5. " in header, header
 
     def test_the_cache_section_names_select_paths_only(self) -> None:
         text = _normalised(_readme_part(_SECTION_29))

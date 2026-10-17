@@ -257,23 +257,25 @@ await User.objects().filter(id__startswith="al").exec()
 A model that aliases its identity through `primary_key` keeps that alias as an ordinary
 column, so `filter(code="abc")` is a normal string comparison and is unaffected.
 
-#### Filter values that start with `$`
-
-A filter value beginning with `$` is read as a reference to a **query variable**, not as data.
-Use `Var(...)` to say so explicitly, and `$$` to escape a value that genuinely starts with a
-dollar sign:
+#### String filter values and `Var()`
 
 ```python
 from surreal_orm_lite import Var
 
-await User.objects().filter(age__gte=Var("min_age")).exec()   # … WHERE age >= $min_age
-await User.objects().filter(name="$$admin").exec()            # matches the literal "$admin"
-await User.objects().filter(name="$admin").exec()             # deprecated: reads as $admin
+await User.objects().filter(name="$admin").exec()                                  # the string "$admin"
+await User.objects().filter(age__gte=Var("min_age")).variables(min_age=21).exec()  # … WHERE age >= $min_age
 ```
 
-The bare `"$admin"` form still works for backward compatibility but emits a `DeprecationWarning`:
-it silently matches nothing when the value is really meant as data, which is a trap for
-user-supplied strings. Prefer `Var(...)` in new code.
+A string filter value is data, whatever it starts with: `filter(name="$admin")` compares `name`
+with the string `"$admin"`, bound like any other value, wherever a filter applies: `filter()`, `Q`,
+`get()`, `get_or_create()`, `update_or_create()`, `bulk_update()` by filter, subqueries and live
+queries. `Var(...)` is the only way to reference a query variable, whose value `variables()`
+gives.
+
+Until v0.28.1 a value starting with `$` was read as a variable reference (deprecated since
+v0.14.3), and `"$$admin"` was how to write the string `"$admin"`. That escape keeps its meaning,
+deprecated: a filter value starting with `$$` loses one `$` (`"$$admin"` finds `"$admin"`), with a
+`DeprecationWarning` that says to write `"$admin"`; an item of an `in` list never had the escape.
 
 #### Model instances as filter values
 
@@ -3755,7 +3757,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the row added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -3862,6 +3864,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | Subqueries under `as_of()`                                                                                                             | each subquery reads at the same moment: the ORM adds `VERSION` to it (the server would read the current state)                                                                | the same (the server applies the outer `VERSION` to an inline sub-SELECT only); without versioned storage `SurrealDbError`, but 3.1.5 raises the server's own `ThrownError`         | v0.27.0                              |
 | Query cache (`cache()`, `QueryCache`)                                                                                                  | same on both lines: client-side, per connection and identity; writes in a transaction invalidate at commit; reads in one are never cached (on 2.x they raise: buffered)       | the same; reads inside an interactive transaction are never cached (they see its uncommitted writes)                                                                                | v0.28.0                              |
 | `select("meta.*")` on a nested object that is not a record link                                                                        | its values, as a list; through a link (`select("author.*")`), the linked record                                                                                               | the object; through a link, the linked record                                                                                                                                       | pre-existing (documented in v0.28.1) |
+| `filter(f="$x")`: a string filter value starting with `$`                                                                              | same on both lines: compared with the string `"$x"`, bound like any value, in a live query too; `Var("x")` reads the variable `$x`                                            | the same                                                                                                                                                                            | v0.28.1                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.

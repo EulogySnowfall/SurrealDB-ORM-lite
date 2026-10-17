@@ -221,10 +221,10 @@ class TestFilteredWatchE2E:
 
     @pytest.mark.asyncio
     async def test_dollar_value_matches_literally(self) -> None:
-        """Review focus #2, end to end: '$$admin' is the literal string '$admin'."""
+        """Review focus #2, end to end: '$admin' is the string '$admin' (a string value is data, v0.28.1)."""
         async with orm_client(TABLE) as client:
             await _define(client)
-            async with Ticket.objects().filter(status="$$admin").watch() as stream:
+            async with Ticket.objects().filter(status="$admin").watch() as stream:
                 await client.query(f"CREATE {TABLE}:d SET status = $s;", {"s": "$admin"})
                 [envelope] = await _take(stream, 1)
                 assert envelope["result"]["status"] == "$admin"

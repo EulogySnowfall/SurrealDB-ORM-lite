@@ -319,9 +319,11 @@ class TestEndpointColumns:
 
     def test_variable_references_keep_their_meaning(self) -> None:
         assert build_filter_condition("in", "exact", Var("x"), 0, "e", endpoint_columns=ENDPOINTS) == ("in = $x", {}, 0)
-        with pytest.warns(DeprecationWarning, match=r"\$x"):
-            sql, variables, _ = build_filter_condition("in", "exact", "$x", 0, "e", endpoint_columns=ENDPOINTS)
-        assert (sql, variables) == ("in = $x", {})
+
+    def test_a_dollar_string_is_data_and_must_be_a_record_id(self) -> None:
+        """A string value is data (v0.28.1): on an endpoint column, a 'table:id' record id."""
+        with pytest.raises(ValueError):
+            build_filter_condition("in", "exact", "$x", 0, "e", endpoint_columns=ENDPOINTS)
 
     @pytest.mark.parametrize("value", ["nocolon", "a;b:c", "tr_person:joe@x.com", 42, None, {"id": "tr_person:a"}])
     def test_invalid_endpoint_values_raise(self, value: object) -> None:

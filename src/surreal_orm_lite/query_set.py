@@ -40,6 +40,7 @@ from .utils import (
     non_negative_int,
     parse_lookup,
     remove_quotes_for_variables,
+    unescape_filter_value,
     validate_alias_name,
     validate_field_name,
     validate_patch_operations,
@@ -189,7 +190,9 @@ class QuerySet:
         """
         Set variables for the query.
 
-        Variables can be used in parameterized queries to safely inject values.
+        A filter reads one with ``Var("name")``: ``filter(age__gte=Var("min_age")).variables(min_age=21)``.
+        A string filter value is data, whatever it starts with: ``filter(name="$min_age")`` compares ``name``
+        with the string ``"$min_age"``.
 
         Args:
             **kwargs: Variable names and their values.
@@ -229,6 +232,9 @@ class QuerySet:
             Post.objects().filter(author__in=Subquery(active))         # or author__in=active
             best = Post.objects().select("score").order_by("-score").limit(1)
             Post.objects().filter(score=Subquery(best))                # compared with its first value
+
+        A ``str`` value is data, whatever it starts with: ``filter(name="$admin")`` compares ``name`` with the
+        string ``"$admin"``. ``Var("name")`` is the only reference to a query variable (given with ``variables()``).
 
         A ``Subquery`` — or a QuerySet, read as one — is accepted as the whole value of ``in``, ``not_in``,
         ``containsall`` and ``containsany`` (compared with all its values) and of ``exact``, ``gt``, ``gte``,
@@ -1894,27 +1900,25 @@ class QuerySet:
         create.
 
         Values go through the same interpretation the WHERE builder applies, so the row that
-        gets created is the row the next lookup finds: ``"$$literal"`` is un-escaped to
-        ``"$literal"`` (otherwise ``get_or_create(name="$$admin")`` filtered on ``"$admin"``
-        but stored ``"$$admin"``, never converging and creating a duplicate on every call),
-        and a query-variable reference is refused outright — its value lives on the server,
-        so it cannot be written back (issue #156 follow-up). A model instance is written as its
-        record id, the value its lookup binds (v0.22.0): ``get_or_create(customer=alice)``
-        stores ``customer = RecordID(...)``.
+        gets created is the row the next lookup finds: a ``str`` is data, ``"$admin"`` included;
+        the deprecated ``"$$admin"`` escape is un-escaped to ``"$admin"`` (otherwise it filtered on
+        ``"$admin"`` but stored ``"$$admin"``, never converging and creating a duplicate on every
+        call), without a second warning (the lookup warns); and a ``Var`` reference is refused
+        outright — its value lives on the server, so it cannot be written back (issue #156
+        follow-up). A model instance is written as its record id, the value its lookup binds
+        (v0.22.0): ``get_or_create(customer=alice)`` stores ``customer = RecordID(...)``.
         """
         payload: dict[str, Any] = {}
         for key, value in criteria.items():
             field_name, lookup = parse_lookup(key)
             if lookup != "exact":
                 continue
-            if isinstance(value, Var) or (isinstance(value, str) and value.startswith("$") and value[1:2] != "$"):
+            if isinstance(value, Var):
                 raise SurrealDbError(
                     f"Cannot create a record from the query-variable reference given for '{field_name}': "
                     "its value is only known to the database. Pass the literal value in defaults=."
                 )
-            if isinstance(value, str) and value.startswith("$$"):
-                value = value[1:]
-            payload[field_name] = as_record_value(value)
+            payload[field_name] = as_record_value(unescape_filter_value(value, warn=False))
         return payload
 
     @staticmethod
