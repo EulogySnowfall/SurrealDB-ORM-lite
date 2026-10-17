@@ -13,9 +13,11 @@ same whatever the value. A scalar value that is exactly ``$`` and the name of a 
 and the name of one of SurrealDB's session parameters (``$access``, ``$auth``, ``$session``, ``$token``): ``"$auth"``
 is the string, with a ``UserWarning`` naming ``Var("auth")``, which reads the parameter. Each warning is given once
 per read, at the caller's line, ``cache()`` and a re-sent statement included. On an edge's ``in``/``out`` such a
-value raises ``ValueError`` (it is not a record id) naming ``Var(...)``. Unit tests first (no engine, no server); the
-``E2E`` classes run on the embedded ``mem://`` engine and on the server of ``SURREALDB_PORT`` (both lines in CI), the
-live query on the server only.
+value raises ``ValueError`` (it is not a record id) naming ``Var(...)``. As an ``exact`` criterion of
+``get_or_create()``/``update_or_create()``, which would look it up and write it, such a value raises ``SurrealDbError``
+before any request, naming ``Var(...)`` and ``defaults=``; ``variables()`` refuses the session parameters' names. Unit
+tests first (no engine, no server); the ``E2E`` classes run on the embedded ``mem://`` engine and on the server of
+``SURREALDB_PORT`` (both lines in CI), the live query on the server only.
 """
 
 import asyncio
@@ -40,6 +42,7 @@ from surreal_orm_lite import (
     Var,
 )
 from surreal_orm_lite.constants import LOOKUP_OPERATORS
+from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import build_filter_condition
 from tests.conftest import orm_client
@@ -74,6 +77,7 @@ class FvDoc(BaseSurrealModel):
 
     id: str | None = None
     owner: Any = None
+    title: str = ""
 
 
 class FvGhost(BaseSurrealModel):
@@ -370,11 +374,6 @@ class TestVariableNameWarning:
         FvItem.objects().filter(token__in=["$x"], name__not_in=["$x"]).variables(x=1)._compile_query()
         FvItem.objects().filter(token=Var("x")).variables(x=1)._compile_query()
 
-    @pytest.mark.usefixtures("_no_warning")
-    def test_the_get_or_create_payload(self) -> None:
-        """The lookup warns (its statement); the create payload of the same call does not warn again."""
-        assert FvItem.objects().variables(x=1)._criteria_payload({"token": "$x"}) == {"token": "$x"}
-
 
 #: Each statement a queryset compiles, for ``filter(token="$auth")`` (its subquery, for the last one).
 _PARAMETER_STATEMENTS: dict[str, Callable[[], Any]] = {
@@ -425,11 +424,6 @@ class TestSessionParameterWarning:
             qs._compile_query()
         assert _messages(caught) == [_parameter_warning("auth"), _parameter_warning("session")]
 
-    def test_a_variable_of_that_name_warns_once(self) -> None:
-        with _recorded() as caught:
-            FvItem.objects().filter(token="$auth").variables(auth=1)._compile_query()
-        assert _messages(caught) == [_variable_warning("auth")]
-
     def test_the_escape_warns_of_the_escape_only(self) -> None:
         """``"$$auth"`` was the string ``"$auth"`` before v0.28.1 too: the escape's warning is the only one."""
         with _recorded() as caught:
@@ -444,9 +438,8 @@ class TestSessionParameterWarning:
         FvItem.objects().filter(token=value)._compile_live(False)
 
     @pytest.mark.usefixtures("_no_warning")
-    def test_an_item_of_a_list_and_the_get_or_create_payload(self) -> None:
+    def test_an_item_of_a_list(self) -> None:
         FvItem.objects().filter(token__in=["$auth"], name__not_in=["$session"])._compile_query()
-        assert FvItem.objects()._criteria_payload({"token": "$auth"}) == {"token": "$auth"}
 
     def test_the_registry_is_bounded(self) -> None:
         """One call site holds one registry entry per session parameter at most, whatever the other values."""
@@ -481,6 +474,13 @@ class TestVarReadsSessionParameters:
             FvItem.objects().filter(token=Var(name))._compile_live(False)
             == f"LIVE SELECT * FROM fv_item WHERE token = ${name};"
         )
+
+    def test_scope_is_no_session_parameter(self) -> None:
+        """``$scope`` (a 1.x name) is set by neither line: an unbound ``Var("scope")`` is refused in a live query."""
+        with pytest.raises(SurrealDbError, match=r"\$scope is not bound"):
+            FvItem.objects().filter(token=Var("scope"))._compile_live(False)
+        live = FvItem.objects().filter(token=Var("scope")).variables(scope="s")._compile_live(False)
+        assert live == "LIVE SELECT * FROM fv_item WHERE token = 's';"
 
 
 @pytest.mark.usefixtures("_no_client", "_no_warning")
@@ -520,6 +520,80 @@ class TestEndpointHint:
         with pytest.raises(ValueError, match="Invalid record identifier") as raised:
             FvLink.objects().filter(in___in=["$auth"])._compile_query()
         assert "Var(" not in str(raised.value)
+
+
+@pytest.mark.usefixtures("_no_client", "_no_warning")
+class TestProtectedVariableNames:
+    """``variables()`` refuses SurrealDB's session parameters: the server refuses a query variable of that name."""
+
+    @pytest.mark.parametrize("name", _SESSION_PARAMETERS)
+    def test_refused(self, name: str) -> None:
+        qs = FvItem.objects().variables(x=1)
+        with pytest.raises(ValueError) as raised:
+            qs.variables(y=2, **{name: 1})
+        assert str(raised.value) == _protected_variable(name)
+        assert qs._variables == {"x": 1}
+
+    def test_any_other_name(self) -> None:
+        """``$scope`` (a 1.x name), ``$this`` and ``$AUTH`` are no session parameter: ordinary variables."""
+        qs = FvItem.objects().variables(scope=1, this=2, AUTH=3)
+        assert qs._variables == {"scope": 1, "this": 2, "AUTH": 3}
+
+
+def _protected_variable(name: str) -> str:
+    """The ``ValueError`` of ``variables()`` given *name*, one of SurrealDB's session parameters."""
+    return (
+        f"variables() cannot set '{name}': SurrealDB sets ${name} for each session and refuses a query variable of "
+        f"that name. Read it with Var('{name}'), without variables()."
+    )
+
+
+def _criterion_refusal(field: str, name: str, *, variable: bool) -> str:
+    """The ``SurrealDbError`` of a ``get_or_create()``/``update_or_create()`` ``exact`` criterion ``"$<name>"``."""
+    source = f"the variable {name} given to variables()" if variable else f"SurrealDB's ${name} parameter"
+    what = "variable" if variable else "parameter"
+    return (
+        f"Cannot look up or create a record from the string '${name}' given for '{field}': it names {source}, but a "
+        f"string criterion is data, looked up and written as the string '${name}'. Var('{name}') reads the {what} in "
+        "a filter but cannot be written: pass the value to write in defaults=."
+    )
+
+
+_OR_CREATE = ["get_or_create", "update_or_create"]
+
+
+@pytest.mark.usefixtures("_no_client", "_no_warning")
+@pytest.mark.parametrize("method", _OR_CREATE)
+class TestStringReferenceCriteria:
+    """An ``exact`` criterion ``"$<name>"`` naming a variable of ``variables()`` or a session parameter is refused.
+
+    It is data, so ``update_or_create(owner="$auth", …)`` would look up and write the string ``"$auth"``: every record
+    user would share, and overwrite, the one record whose owner is that string. ``get_or_create()`` and
+    ``update_or_create()`` refuse it before any request, naming ``Var(...)`` and ``defaults=``.
+    """
+
+    @pytest.mark.parametrize("name", _SESSION_PARAMETERS)
+    def test_a_session_parameter(self, method: str, name: str) -> None:
+        with pytest.raises(SurrealDbError) as raised:
+            asyncio.run(getattr(FvDoc.objects(), method)(owner=f"${name}", defaults={"title": "t"}))
+        assert str(raised.value) == _criterion_refusal("owner", name, variable=False)
+
+    def test_a_variable(self, method: str) -> None:
+        qs = FvItem.objects().variables(x=1)
+        with pytest.raises(SurrealDbError) as raised:
+            asyncio.run(getattr(qs, method)(name="A", token__exact="$x"))
+        assert str(raised.value) == _criterion_refusal("token", "x", variable=True)
+
+    def test_the_record_id_column(self, method: str) -> None:
+        with pytest.raises(SurrealDbError) as raised:
+            asyncio.run(getattr(FvDoc.objects(), method)(id="$token"))
+        assert str(raised.value) == _criterion_refusal("id", "token", variable=False)
+
+    def test_an_edge_endpoint_keeps_its_value_error(self, method: str) -> None:
+        """An endpoint holds a record id: the lookup refuses the string, naming ``Var(...)``, as for ``filter()``."""
+        with pytest.raises(ValueError, match="Invalid record identifier") as raised:
+            asyncio.run(getattr(FvLink.objects(), method)(in_="$auth", out=RecordID("person", "b")))
+        assert str(raised.value).endswith("; to read SurrealDB's $auth parameter, use Var('auth')")
 
 
 @contextlib.asynccontextmanager
@@ -656,18 +730,22 @@ class TestVariableNameWarningE2E:
             assert _messages(caught, DeprecationWarning) == [_ESCAPE_WARNING]
 
     async def test_get_or_create_and_update_or_create(self, kind: str) -> None:
-        """Their lookup warns for the queryset's ``variables()``; the record found or created holds the string."""
+        """An ``exact`` criterion is refused, nothing written; another lookup warns for the queryset's ``variables()``."""
         async with values_db(kind):
+            names = {row.id: row.name for row in await FvItem.objects().all()}
+            for method in _OR_CREATE:
+                with _recorded() as caught, pytest.raises(SurrealDbError) as raised:
+                    await getattr(FvItem.objects().variables(x="x"), method)(token="$x", defaults={"name": "new"})
+                assert str(raised.value) == _criterion_refusal("token", "x", variable=True)
+                assert _messages(caught) == []
+            assert {row.id: row.name for row in await FvItem.objects().all()} == names
             with _recorded() as caught:
-                found, created = await FvItem.objects().variables(x="x").get_or_create(token="$x")
+                found, created = await FvItem.objects().variables(x="x").get_or_create(token__gte="$x", name="A")
             assert (found.id, created) == ("a", False)
             assert _messages(caught) == [_variable_warning("x")]
             with _recorded() as caught:
-                made, created = await FvItem.objects().variables(z=1).get_or_create(token="$z", defaults={"id": "z"})
-            assert (made.token, created) == ("$z", True)
-            assert _messages(caught) == [_variable_warning("z")]
-            with _recorded() as caught:
-                updated, created = await FvItem.objects().variables(y="x").update_or_create(token="$y", defaults={"name": "D2"})
+                qs = FvItem.objects().variables(y="x")
+                updated, created = await qs.update_or_create(token__gte="$y", name="D", defaults={"name": "D2"})
             assert (updated.name, created) == ("D2", False)
             assert (await FvItem.objects().get("d")).name == "D2"
             assert _messages(caught) == [_variable_warning("y")]
@@ -740,6 +818,60 @@ class TestSessionParameterE2E:
             assert _messages(caught) == [_parameter_warning("auth")]
             [warning] = [warning for warning in caught if warning.category is UserWarning]
             assert warning.filename == __file__
+
+
+async def _docs() -> dict[str, tuple[str, str]]:
+    """Every ``fv_doc`` record: its owner (as text) and title, by id."""
+    return {row.id: (str(row.owner), row.title) for row in await FvDoc.objects().all()}
+
+
+@pytest.mark.parametrize("kind", ["mem", "ws"])
+class TestStringReferenceCriteriaE2E:
+    """Two record users: ``"$auth"`` as a criterion is refused, ``Var("auth")`` finds a user's own record."""
+
+    async def test_no_shared_record(self, kind: str) -> None:
+        """Neither user looks up nor writes the record whose owner is the string ``"$auth"`` (``fv_doc:text``).
+
+        Refused before the lookup: nothing warns.
+        """
+        async with session_db(kind):
+            before = await _docs()
+            assert before["text"] == ("$auth", "")
+            with _recorded() as caught:
+                for user in ("first", "second"):
+                    if user == "second":
+                        await SurrealDBConnectionManager.signup(access=_SESSION_ACCESS, variables={"name": uuid4().hex})
+                    for method in _OR_CREATE:
+                        with pytest.raises(SurrealDbError) as raised:
+                            await getattr(FvDoc.objects(), method)(owner="$auth", defaults={"title": user})
+                        assert str(raised.value) == _criterion_refusal("owner", "auth", variable=False)
+            assert await _docs() == before
+            assert _messages(caught) == []
+
+    @pytest.mark.usefixtures("_no_warning")
+    async def test_var_finds_the_users_own_record(self, kind: str) -> None:
+        """``Var("auth")`` is a lookup: found, the record; not found, no record can be created from it."""
+        async with session_db(kind):
+            before = await _docs()
+            found, created = await FvDoc.objects().get_or_create(owner=Var("auth"))
+            assert (found.id, created) == ("mine", False)
+            await SurrealDBConnectionManager.signup(access=_SESSION_ACCESS, variables={"name": uuid4().hex})
+            for method in _OR_CREATE:
+                with pytest.raises(SurrealDbError, match="query-variable reference given for 'owner'"):
+                    await getattr(FvDoc.objects(), method)(owner=Var("auth"), defaults={"title": "second"})
+            assert await _docs() == before
+
+    @pytest.mark.usefixtures("_no_warning")
+    async def test_any_other_name_is_data(self, kind: str) -> None:
+        """``"$admin"`` names no variable and no session parameter: looked up and written as the string."""
+        async with session_db(kind):
+            made, created = await FvDoc.objects().update_or_create(owner="$admin", defaults={"title": "one"})
+            assert (made.owner, made.title, created) == ("$admin", "one", True)
+            again, created = await FvDoc.objects().update_or_create(owner="$admin", defaults={"title": "two"})
+            assert (again.title, created) == ("two", False)
+            found, created = await FvDoc.objects().variables(other=1).get_or_create(owner="$admin")
+            assert (found.title, created) == ("two", False)
+            assert [title for owner, title in (await _docs()).values() if owner == "$admin"] == ["two"]
 
 
 async def _take(stream: Any, count: int, timeout: float = 10.0) -> list[Any]:
@@ -834,6 +966,9 @@ class TestFilterValueDocs:
             'compares `owner` with the string `"$auth"`',
             '`"$auth"`, `"$access"`, `"$session"` or `"$token"`',
             "On an edge's `in` and `out`",
+            'update_or_create(owner="$auth", defaults=…)',
+            "raises `SurrealDbError` before any request, naming the `Var(...)` and `defaults=`",
+            "`variables()` refuses these four names with a `ValueError`",
         ):
             assert needle in text, needle
         assert "silently matches nothing" not in text

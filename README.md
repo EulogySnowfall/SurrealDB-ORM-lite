@@ -301,6 +301,18 @@ warning. On an edge's `in` and `out`, which hold record ids, such a string is no
 raises `ValueError`; when it names a variable of `variables()` or one of these parameters, the
 message names the `Var(...)` to write.
 
+`get_or_create()` and `update_or_create()` look up their `exact` criteria and write them on create,
+so there such a string is refused: `update_or_create(owner="$auth", defaults=…)` would find and
+write the record whose `owner` is the string `"$auth"`, the same record for every record user. An
+`exact` criterion that is exactly `$` followed by the name of a variable of `variables()` or of one
+of these parameters raises `SurrealDbError` before any request, naming the `Var(...)` and
+`defaults=`. `Var("auth")` finds the signed-in user's record (`get_or_create(owner=Var("auth"))`
+returns it) but cannot be written: with no record to return, it raises `SurrealDbError`. Any other
+string, such as `"$admin"`, is looked up and written as it is.
+
+`variables()` refuses these four names with a `ValueError`: SurrealDB sets them for each session
+and refuses a query variable of that name. Read them with `Var(...)`, without `variables()`.
+
 #### Model instances as filter values
 
 ```python
