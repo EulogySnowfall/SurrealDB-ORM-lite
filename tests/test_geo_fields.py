@@ -1359,8 +1359,9 @@ CROSSING = [(-73.993, 40.70), (-73.993, 40.76)]
 #: The sets the spatial operators give on the mixed seed, measured on 2.7.0, 3.1.5 and 3.3.4 (spec §3.4).
 INSIDE_KEYS = {"near1", "near2", "poly"}
 OUTSIDE_KEYS = {"far", "none", "nullish", "obj", "text"}
-#: ``LOOKUP_OPERATORS`` as v0.23.0 shipped it: the spatial lookups live in a mapping of their own.
-LOOKUP_OPERATORS_V0_23 = {
+#: ``LOOKUP_OPERATORS``: the infix operators only. The spatial lookups live in a mapping of their own (v0.24.0), and
+#: so do the text lookups, which compile to string functions (#251, ``TEXT_LOOKUP_FUNCTIONS``).
+INFIX_LOOKUP_OPERATORS = {
     "exact": "=",
     "gt": ">",
     "gte": ">=",
@@ -1368,16 +1369,10 @@ LOOKUP_OPERATORS_V0_23 = {
     "lte": "<=",
     "in": "IN",
     "not_in": "NOT IN",
-    "like": "LIKE",
-    "ilike": "ILIKE",
     "contains": "CONTAINS",
     "not_contains": "CONTAINSNOT",
     "containsall": "CONTAINSALL",
     "containsany": "CONTAINSANY",
-    "startswith": "STARTSWITH",
-    "endswith": "ENDSWITH",
-    "match": "MATCH",
-    "regex": "REGEX",
     "isnull": "IS",
 }
 SPATIAL = [("inside", "INSIDE"), ("outside", "OUTSIDE"), ("intersects", "INTERSECTS")]
@@ -1393,7 +1388,7 @@ class TestSpatialLookupCompile:
 
     def test_the_operator_mappings(self) -> None:
         assert constants.GEOMETRY_LOOKUP_OPERATORS == {"inside": "INSIDE", "outside": "OUTSIDE", "intersects": "INTERSECTS"}
-        assert constants.LOOKUP_OPERATORS == LOOKUP_OPERATORS_V0_23
+        assert constants.LOOKUP_OPERATORS == INFIX_LOOKUP_OPERATORS
 
     @pytest.mark.parametrize(("lookup", "op"), SPATIAL)
     def test_one_bound_geometry(self, lookup: str, op: str) -> None:

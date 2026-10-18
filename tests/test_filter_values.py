@@ -117,6 +117,10 @@ def _no_warning() -> Iterator[None]:
     """Any warning raised by the test body is an error: a ``str`` value that is data warns of nothing."""
     with warnings.catch_warnings():
         warnings.simplefilter("error")
+        # A socket another test left open can be finalised by the garbage collector during this one: its
+        # ResourceWarning is not this test's, and pytest reports such finaliser errors while this filter holds.
+        warnings.simplefilter("ignore", ResourceWarning)
+        warnings.simplefilter("default", pytest.PytestUnraisableExceptionWarning)
         yield
 
 
@@ -192,7 +196,10 @@ class TestStringsAreData:
 
     def test_q(self) -> None:
         query, variables = FvItem.objects().filter(Q(token="$x") | ~Q(name="$y"), name__startswith="$")._compile_query()
-        assert query == "SELECT * FROM fv_item WHERE name STARTSWITH $_f0 AND (token = $_f1 OR NOT (name = $_f2));"
+        assert query == (
+            "SELECT * FROM fv_item WHERE ((name).is_string() AND string::starts_with(name, $_f0)) "
+            "AND (token = $_f1 OR NOT (name = $_f2));"
+        )
         assert variables == {"_f0": "$", "_f1": "$x", "_f2": "$y"}
 
     def test_a_list_lookup(self) -> None:

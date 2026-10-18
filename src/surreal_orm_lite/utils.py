@@ -10,7 +10,7 @@ import pydantic
 
 from . import geo as _geo
 from ._sdk import RecordID, SdkRange, ServerError
-from .constants import GEOMETRY_LOOKUP_OPERATORS, LOOKUP_OPERATORS, SESSION_PARAMETERS
+from .constants import GEOMETRY_LOOKUP_OPERATORS, LOOKUP_OPERATORS, SESSION_PARAMETERS, TEXT_LOOKUP_FUNCTIONS
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, Var
 from .subquery import SubqueryCompiler, inside_a_list, lookup_refused, subquery_condition, subquery_of
@@ -584,6 +584,81 @@ def _spatial_condition(
     return f"{field} {op} ${var_name}", {var_name: _geo._as_geometry(value, lookup)}, counter + 1
 
 
+#: The characters SurrealDB's ``string::matches`` (the Rust ``regex`` crate) reads as syntax outside a class. A
+#: ``like`` pattern escapes these and no other: a Rust regex refuses some escapes Python's ``re.escape`` writes.
+_REGEX_METACHARACTERS = frozenset("\\.+*?()|[]{}^$")
+
+
+def _like_regex(pattern: str, *, ignore_case: bool) -> str:
+    """The regular expression of an SQL ``LIKE`` *pattern* (#251), for ``string::matches``.
+
+    ``%`` matches any run of characters, newlines included (``.*`` under ``(?s)``), ``_`` exactly one (``.``), and
+    every other character is literal. Anchored at both ends: ``^`` and ``$`` are the text's start and end in a Rust
+    regex, never a line's. *ignore_case* (``ilike``) adds ``(?i)``.
+    """
+    parts = []
+    for char in pattern:
+        if char == "%":
+            parts.append(".*")
+        elif char == "_":
+            parts.append(".")
+        elif char in _REGEX_METACHARACTERS:
+            parts.append("\\" + char)
+        else:
+            parts.append(char)
+    flags = "(?is)" if ignore_case else "(?s)"
+    return f"{flags}^{''.join(parts)}$"
+
+
+def _text_condition(
+    field: str, lookup: str, function: str, value: Any, counter: int, subqueries: SubqueryCompiler | None
+) -> tuple[str, dict[str, Any], int]:
+    """The condition of a text lookup (``startswith``, ``endswith``, ``like``, ``ilike``, ``match``, ``regex``; #251).
+
+    ``((<field>).is_string() AND <function>(<field>, $_f<n>))``: the string function alone fails the whole query on
+    a record whose field is ``NONE``, ``NULL`` or not a string, and the guard makes such a record never match (and
+    match the negation). The method form parses on both lines and on the embedded engine (``type::is::string`` is
+    2.x-only, ``type::is_string`` 3.x-only). The parentheses make it test the path's value as a whole: SurrealDB 3.x
+    applies ``authors.name.is_string()`` to each element of the array a dotted path through an array of record links
+    or objects gives (``[true, true]``, truthy), which then reached the function and failed the query; such a path is
+    an array, never matches, and matches the negation on both lines.
+
+    The value is a ``str`` — data, whatever it starts with, the ``"$$"`` escape unescaped and a variable-like value
+    noted as in :func:`build_filter_condition` — or a ``Var`` reference, except for ``like``/``ilike``, whose
+    pattern is translated to a regular expression before it is bound (:func:`_like_regex`).
+
+    Raises:
+        ValueError: a ``Var`` given to ``like``/``ilike``, or a value that is neither a ``str`` nor a ``Var``.
+    """
+    if isinstance(value, Var):
+        if lookup in ("like", "ilike"):
+            raise ValueError(
+                f"'{lookup}' cannot take a Var: its pattern is translated to a regular expression before it is sent, "
+                "and a Var's value is only known to the database. Pass the pattern as a string, or use 'regex' "
+                "with a Var holding a regular expression."
+            )
+        return _guarded(field, function, value.reference), {}, counter
+    if not isinstance(value, str):
+        raise ValueError(f"'{lookup}' lookup requires a string, got {type(value).__name__}")
+    variable_like = VARIABLE_NAME_VALUE.fullmatch(value)
+    if subqueries is not None and variable_like is not None:
+        subqueries.variable_like.append(variable_like.group(1))
+    value = unescape_filter_value(value, warn=subqueries is None or subqueries.warn)
+    if lookup in ("like", "ilike"):
+        value = _like_regex(value, ignore_case=lookup == "ilike")
+    var_name = f"_f{counter}"
+    return _guarded(field, function, f"${var_name}"), {var_name: value}, counter + 1
+
+
+def _guarded(field: str, function: str, argument: str) -> str:
+    """``((<field>).is_string() AND <function>(<field>, <argument>))``, the condition of a text lookup (#251).
+
+    The path is parenthesised before ``.is_string()``, so a dotted path through an array is tested as the array it
+    gives, not element by element (:func:`_text_condition`).
+    """
+    return f"(({field}).is_string() AND {function}({field}, {argument}))"
+
+
 def _list_item(item: Any, field: str, lookup: str) -> Any:
     """An item of a sequence lookup's list, returned unchanged; a subquery there raises S15 (v0.27.0)."""
     if subquery_of(item) is not None:
@@ -704,6 +779,13 @@ def build_filter_condition(
     geometry object as the ORM value, or a ``Var`` reference. ``outside`` keeps SurrealQL's
     semantics: it also holds for a record whose field is missing or holds no geometry.
 
+    The text lookups ``startswith``, ``endswith``, ``like``, ``ilike``, ``match`` and ``regex`` (#251,
+    ``TEXT_LOOKUP_FUNCTIONS``) compile to SurrealQL's string functions, guarded by the field's type
+    (:func:`_text_condition`): ``((name).is_string() AND string::starts_with(name, $_f0))``. A record whose field
+    is missing, ``NULL`` or not a string (a dotted path through an array included) never matches. ``like``/``ilike``
+    bind their pattern translated to an anchored regular expression (:func:`_like_regex`); ``match``/``regex`` bind
+    theirs as it is.
+
     A subquery (v0.27.0) — a ``Subquery``, or a ``QuerySet`` read as one — given as the whole value is compiled
     by *subqueries*, the statement's compiler (``subquery.subquery_condition``): ``in``, ``not_in``,
     ``containsall`` and ``containsany`` compare with all its values, ``exact``, ``gt``, ``gte``, ``lt``, ``lte``,
@@ -738,9 +820,10 @@ def build_filter_condition(
             ``Range`` on the ``id`` column or on an endpoint column (v0.23.0) — or a spatial
             lookup gets a value that is not a geometry, or is applied to the ``id`` column or
             to an endpoint column (v0.24.0). ``InvalidGeometryError`` (a ``ValueError``) for a
-            malformed GeoJSON object. With a subquery (v0.27.0): a lookup that takes none — ``isnull``, the
-            text and the spatial lookups — (S2); a subquery as an item of a list (S15); no *subqueries* compiler
-            (S8); and the inner queryset's refusals (S3–S7, S13).
+            malformed GeoJSON object. A text lookup given a value that is neither a ``str`` nor a ``Var``, or
+            ``like``/``ilike`` given a ``Var`` (#251). With a subquery (v0.27.0): a lookup that takes none —
+            ``isnull``, the text and the spatial lookups — (S2); a subquery as an item of a list (S15); no
+            *subqueries* compiler (S8); and the inner queryset's refusals (S3–S7, S13).
     """
     validate_field_name(field, "filter field")
     sub = subquery_of(value)
@@ -749,11 +832,9 @@ def build_filter_condition(
         if sub is not None:
             raise ValueError(lookup_refused(lookup))
         return _spatial_condition(field, lookup, spatial_op, value, counter, endpoint_columns)
-    op = LOOKUP_OPERATORS.get(lookup)
-    if op is None:
+    text_function = TEXT_LOOKUP_FUNCTIONS.get(lookup)
+    if text_function is None and lookup not in LOOKUP_OPERATORS:
         raise ValueError(f"Unsupported lookup type: '{lookup}'")
-
-    var_name = f"_f{counter}"
 
     is_record_id_column = record_table is not None and field == RECORD_ID_COLUMN
     if is_record_id_column and lookup in _RECORD_ID_INVALID_LOOKUPS:
@@ -766,6 +847,13 @@ def build_filter_condition(
     if is_endpoint_column and lookup in _RECORD_ID_INVALID_LOOKUPS:
         raise ValueError(f"'{lookup}' cannot be applied to the edge endpoint column '{field}': it holds a record id, not text.")
 
+    if text_function is not None:
+        if sub is not None:
+            raise ValueError(lookup_refused(lookup))
+        return _text_condition(field, lookup, text_function, value, counter, subqueries)
+
+    op = LOOKUP_OPERATORS[lookup]
+    var_name = f"_f{counter}"
     if sub is not None:
         return subquery_condition(field, lookup, op, sub, counter, subqueries)
 
