@@ -581,18 +581,32 @@ def _protected_variable(name: str) -> str:
     )
 
 
-def _criterion_refusal(key: str, name: str, *, variable: bool, written: bool = True, record_id: str | None = None) -> str:
+def _criterion_refusal(
+    key: str,
+    name: str,
+    *,
+    variable: bool,
+    written: bool = True,
+    record_id: str | None = None,
+    lookup: str | None = None,
+) -> str:
     """The ``SurrealDbError`` of a ``get_or_create()``/``update_or_create()`` criterion *key* ``"$<name>"``.
 
     *written*: the criterion's lookup is ``exact``, which the create writes. *record_id*: the criterion is on the
     ``id`` column, where the string is read as that record id (``fv_doc:⟨$token⟩``). A variable's message points to
     ``Var(...)`` as the criterion that works (issue #252); a session parameter's says ``Var(...)`` works as a lookup,
-    and only an ``exact`` one cannot be written.
+    and only an ``exact`` one cannot be written. *lookup* ``like``/``ilike``, which take no ``Var``: the message says to
+    pass the pattern itself or to use ``regex``, for a variable and a session parameter alike.
     """
     source = f"the variable {name} given to variables()" if variable else f"SurrealDB's ${name} parameter"
     how = "looked up and written" if written else "looked up"
     what = f"the record id {record_id}" if record_id else f"the string '${name}'"
-    if variable:
+    if lookup in ("like", "ilike"):
+        advice = (
+            f"'{lookup}' cannot take Var('{name}'): its pattern is translated to a regular expression before it is "
+            "sent. Pass the actual pattern as the criterion, or use 'regex' with a Var holding a regular expression."
+        )
+    elif variable:
         advice = f"To read the variable, pass Var('{name}') as the criterion" + (
             ": the create writes the variable's value." if written else "."
         )
@@ -663,6 +677,17 @@ class TestStringReferenceCriteria:
         with pytest.raises(SurrealDbError) as raised:
             asyncio.run(getattr(qs, method)(name="A", token__gte="$x"))
         assert str(raised.value) == _criterion_refusal("token__gte", "x", variable=True, written=False)
+
+    def test_like_and_ilike_take_no_var(self, method: str) -> None:
+        """``like``/``ilike`` refuse a ``Var``: the message says to pass the pattern itself, or to use ``regex``."""
+        with pytest.raises(SurrealDbError) as raised:
+            asyncio.run(getattr(FvRoom.objects(), method)(title__like="$auth"))
+        expected = _criterion_refusal("title__like", "auth", variable=False, written=False, lookup="like")
+        assert str(raised.value) == expected
+        with pytest.raises(SurrealDbError) as raised:
+            asyncio.run(getattr(FvRoom.objects().variables(x="a"), method)(title__ilike="$x"))
+        expected = _criterion_refusal("title__ilike", "x", variable=True, written=False, lookup="ilike")
+        assert str(raised.value) == expected
 
     def test_a_list_item_is_left_to_the_lookup(self, method: str) -> None:
         """An item of a list lookup is data and never warns: nothing to refuse."""

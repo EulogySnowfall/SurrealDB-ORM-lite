@@ -2097,11 +2097,14 @@ class QuerySet:
         parameters — is refused instead, before any request. For a variable, the message names ``Var(...)`` as the
         criterion to pass: the lookup reads the variable, and the create writes its value. For a session parameter
         it says to pass the actual value under ``exact`` (``Var("auth")`` is looked up but cannot be written), and
-        that ``Var("auth")`` works under any other lookup, which is only looked up. On the ``id`` column the string
-        is the record id ``table:⟨$name⟩``, which the message names. Any other ``"$name"`` is data, looked up and
-        written as it is, and so is an item of a list lookup. A criterion the lookup refuses with a ``ValueError``
-        (an edge endpoint, which holds a record id; a text lookup on ``id``) raises that error here, as the lookup
-        would: on an edge endpoint its message names the same ``Var(...)``.
+        that ``Var("auth")`` works under any other lookup, which is only looked up. ``like``/``ilike`` take no
+        ``Var`` (their pattern is translated to a regular expression before it is sent): under them, for a variable
+        and a session parameter alike, the message says neither, but to pass the actual pattern as the criterion,
+        or to use ``regex`` with a ``Var`` holding a regular expression. On the ``id`` column the string is the
+        record id ``table:⟨$name⟩``, which the message names. Any other ``"$name"`` is data, looked up and written as
+        it is, and so is an item of a list lookup. A criterion the lookup refuses with a ``ValueError`` (an edge
+        endpoint, which holds a record id; a text lookup on ``id``) raises that error here, as the lookup would: on
+        an edge endpoint its message names the same ``Var(...)``.
 
         Raises:
             SurrealDbError: the first such criterion.
@@ -2129,7 +2132,13 @@ class QuerySet:
                 what = f"the record id {coerce_record_id(value, self._model_table)}"
             else:
                 what = f"the string '${name}'"
-            if variable:
+            if lookup in ("like", "ilike"):
+                advice = (
+                    f"'{lookup}' cannot take Var('{name}'): its pattern is translated to a regular expression before "
+                    "it is sent. Pass the actual pattern as the criterion, or use 'regex' with a Var holding a regular "
+                    "expression."
+                )
+            elif variable:
                 advice = f"To read the variable, pass Var('{name}') as the criterion" + (
                     ": the create writes the variable's value." if written else "."
                 )
@@ -2333,10 +2342,12 @@ class QuerySet:
         its lookup, that is ``$`` and the name of a variable the lookup binds or of one of SurrealDB's session
         parameters — ``update_or_create(owner="$auth", …)`` — raises ``SurrealDbError`` before any request
         (v0.28.1): it would find and write the record whose owner is the string ``"$auth"``, the same for every
-        record user. For a variable, the message names ``Var(...)`` as the criterion to pass; for a session
+        record user. For a variable, the message names ``Var(...)`` as the criterion to pass, under any lookup but
+        ``like``/``ilike``, which take no ``Var`` (pass the pattern itself, or use ``regex``); for a session
         parameter, it says to pass the actual value (the record id, or the value itself) under ``exact`` and that
-        ``Var("auth")`` works under any other lookup (``members__contains=Var("auth")``). On an edge endpoint such a
-        string raises the lookup's ``ValueError``.
+        ``Var("auth")`` works under any other lookup but ``like``/``ilike``, which take no ``Var`` (pass the pattern
+        itself, or use ``regex``): ``members__contains=Var("auth")``. On an edge endpoint such a string raises the
+        lookup's ``ValueError``.
         """
         self._reject_time_travel("update_or_create()")
         self._reject_subquery_writes(criteria, defaults, "update_or_create")
@@ -2402,8 +2413,10 @@ class QuerySet:
         its lookup, that is ``$`` and the name of a variable the lookup binds or of one of SurrealDB's session
         parameters — ``get_or_create(owner="$auth")``, ``get_or_create(members__contains="$auth", …)`` — raises
         ``SurrealDbError`` before any request (v0.28.1). For a variable, the message names ``Var(...)`` as the
-        criterion to pass; for a session parameter, it says to pass the actual value (the record id, or the value
-        itself) under ``exact`` and that ``Var("auth")`` works under any other lookup.
+        criterion to pass, under any lookup but ``like``/``ilike``, which take no ``Var`` (pass the pattern itself,
+        or use ``regex``); for a session parameter, it says to pass the actual value (the record id, or the value
+        itself) under ``exact`` and that ``Var("auth")`` works under any other lookup but ``like``/``ilike``, which
+        take no ``Var`` (pass the pattern itself, or use ``regex``).
         ``get_or_create(owner=Var("auth"))`` returns the signed-in record user's record; when there is none it raises
         ``SurrealDbError``: a session parameter's value is only known to the database and cannot be written, nor can
         a name no ``variables()`` gives. On an edge endpoint such a string raises the lookup's ``ValueError``.
