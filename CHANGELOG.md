@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.2] - 2026-10-18
+
+The text lookups `startswith`, `endswith`, `like`, `ilike`, `match` and `regex` work: each compiles
+to a SurrealQL string function. No new public API.
+
+### Fixed
+
+- **Text lookups compile to SurrealQL string functions** (#251). They compiled to infix operators
+  SurrealQL does not have (`STARTSWITH`, `LIKE`, `REGEX`…), so every such filter was a parse error
+  on SurrealDB 2.x, 3.x and the embedded engine, in reads and in live queries. Each now compiles to
+  a string function guarded by the field's type, with its value bound:
+  `filter(name__startswith="A")` is `(name.is_string() AND string::starts_with(name, $_f0))`.
+  - `startswith` and `endswith`: `string::starts_with` and `string::ends_with`.
+  - `match` and `regex`: `string::matches`, the regular expression (SurrealDB's syntax, the Rust
+    `regex` crate) as given. `match` is a regex lookup, not the full-text `@@` operator: full-text
+    search is planned for v0.34.0.
+  - `like` and `ilike`: `string::matches` on the pattern translated to an anchored regular
+    expression. `%` matches any run of characters (newlines included), `_` exactly one, every other
+    character is literal; `ilike` ignores case. The whole value must match: `like="Al"` finds
+    `"Al"`, not `"Alice"`.
+  - A record whose field is missing (`NONE`), `NULL` or not a string never matches, and the query
+    does not fail on it; the negation (`~Q(name__startswith="A")`) matches it.
+
+```python
+await User.objects().filter(name__startswith="A").exec()
+await User.objects().filter(email__ilike="%@EXAMPLE.com").exec()  # case-insensitive
+await User.objects().filter(name__regex=r"^\d{3}").exec()
+```
+
+### Changed
+
+- **The value of a text lookup must be a `str`** (#251), otherwise `ValueError`. A string starting
+  with `$` is data, as for every lookup. `startswith`, `endswith`, `match` and `regex` also take a
+  `Var`; `like` and `ilike` raise `ValueError` for one, since their pattern is translated before it
+  is sent. These calls were parse errors before, so no call that worked changes.
+
+### Notes
+
+- Same behaviour on SurrealDB 2.x, 3.x and the embedded engine: the guard is written in the method
+  form `field.is_string()`, which parses on both lines (`type::is::string` parses on 2.x only,
+  `type::is_string` on 3.x only). The README's behaviour table has a row for the text lookups.
+- `surreal_orm_lite.constants.LOOKUP_OPERATORS` (internal) no longer lists the text lookups; they
+  are in `TEXT_LOOKUP_FUNCTIONS`.
+
 ## [0.29.0] - 2026-10-18
 
 Multiple databases: one process works with several databases at once. Named connections stand

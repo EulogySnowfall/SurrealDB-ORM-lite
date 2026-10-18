@@ -294,9 +294,9 @@ _TEXT_LOOKUP_ROW = [
     "Text lookups (`startswith`, `endswith`, `like`, `ilike`, `match`, `regex`)",
     "same on both lines: string functions guarded by `field.is_string()` (`type::is::string` parses on 2.x only); "
     "a `NONE`, `NULL` or non-string field never matches",
-    "the same (`type::is_string` parses on 3.x only); until v0.28.1 they compiled to operators SurrealQL lacks "
+    "the same (`type::is_string` parses on 3.x only); until v0.29.1 they compiled to operators SurrealQL lacks "
     "(`LIKE`…): a parse error on both lines",
-    "v0.28.2",
+    "v0.29.2",
 ]
 
 
