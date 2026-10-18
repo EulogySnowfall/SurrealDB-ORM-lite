@@ -1,3 +1,5 @@
+#: The lookups that compile to a SurrealQL infix operator (``field <op> $_f<n>``). With
+#: ``GEOMETRY_LOOKUP_OPERATORS`` and ``TEXT_LOOKUP_FUNCTIONS`` it is the list of valid lookups.
 LOOKUP_OPERATORS = {
     "exact": "=",
     "gt": ">",
@@ -6,17 +8,24 @@ LOOKUP_OPERATORS = {
     "lte": "<=",
     "in": "IN",
     "not_in": "NOT IN",
-    "like": "LIKE",
-    "ilike": "ILIKE",
     "contains": "CONTAINS",
     "not_contains": "CONTAINSNOT",
     "containsall": "CONTAINSALL",
     "containsany": "CONTAINSANY",
-    "startswith": "STARTSWITH",
-    "endswith": "ENDSWITH",
-    "match": "MATCH",
-    "regex": "REGEX",
     "isnull": "IS",
+}
+
+#: The text lookups (#251): SurrealQL has no infix operator for them (``LIKE``, ``STARTSWITH``, ``REGEX``… are parse
+#: errors on 2.x and 3.x), so each compiles to the string function named here, guarded by the field's type:
+#: ``(name.is_string() AND string::starts_with(name, $_f0))`` (``utils._text_condition``). ``like``/``ilike`` bind
+#: their pattern translated to a regular expression, ``match``/``regex`` theirs as it is.
+TEXT_LOOKUP_FUNCTIONS = {
+    "startswith": "string::starts_with",
+    "endswith": "string::ends_with",
+    "like": "string::matches",
+    "ilike": "string::matches",
+    "match": "string::matches",
+    "regex": "string::matches",
 }
 
 #: The spatial lookups (v0.24.0): SurrealQL's geometry operators, each taking one geometry. They live

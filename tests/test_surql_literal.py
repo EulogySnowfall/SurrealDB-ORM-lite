@@ -274,12 +274,12 @@ class TestReviewFixesEncoder:
         import re
 
         from surreal_orm_lite import Q
-        from surreal_orm_lite.constants import LOOKUP_OPERATORS
+        from surreal_orm_lite.constants import LOOKUP_OPERATORS, TEXT_LOOKUP_FUNCTIONS
         from surreal_orm_lite.utils import build_filter_condition
 
         reference = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
         bound = re.compile(r"\$_f\d+")
-        for lookup in LOOKUP_OPERATORS:
+        for lookup in [*LOOKUP_OPERATORS, *TEXT_LOOKUP_FUNCTIONS]:
             if lookup == "isnull":
                 value: Any = True
             elif lookup in ("in", "not_in", "containsall", "containsany"):

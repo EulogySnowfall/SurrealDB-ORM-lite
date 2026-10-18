@@ -199,17 +199,17 @@ class TestBuildFilterCondition:
 
     def test_like(self) -> None:
         sql, vars_, counter = build_filter_condition("name", "like", "%alice%", 0)
-        assert sql == "name LIKE $_f0"
-        assert vars_ == {"_f0": "%alice%"}
+        assert sql == "(name.is_string() AND string::matches(name, $_f0))"
+        assert vars_ == {"_f0": "(?s)^.*alice.*$"}
 
     def test_startswith(self) -> None:
         sql, vars_, counter = build_filter_condition("name", "startswith", "al", 0)
-        assert sql == "name STARTSWITH $_f0"
+        assert sql == "(name.is_string() AND string::starts_with(name, $_f0))"
         assert vars_ == {"_f0": "al"}
 
     def test_endswith(self) -> None:
         sql, vars_, counter = build_filter_condition("name", "endswith", "ce", 0)
-        assert sql == "name ENDSWITH $_f0"
+        assert sql == "(name.is_string() AND string::ends_with(name, $_f0))"
         assert vars_ == {"_f0": "ce"}
 
     def test_counter_increments(self) -> None:
