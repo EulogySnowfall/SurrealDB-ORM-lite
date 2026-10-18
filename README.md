@@ -3853,16 +3853,17 @@ What the ORM cannot see, and you keep on one connection yourself:
   An ORM write removes the cached reads of its table on every connection: more than needed, never
   a stale result.
 - Registering a name again with other settings, or removing it with `remove_connection()`, ends what the ORM holds
-  on the old settings: a client still opening is closed unused (a retryable `SurrealDbConnectionError`: retry the
-  call), live streams end, a change feed ends at its next read (`SurrealDbConnectionError`: its cursor belongs to
-  the old database, start a new one), and an open `transaction()` is cancelled when its block ends, with nothing
-  committed (`SurrealDbConnectionError`: open it again). A client you obtained yourself with `get_client()` before
-  the change is yours: on WebSocket its socket is closed and its next request fails; an HTTP client keeps the
-  namespace and database it was opened on, so call `get_client()` again; an embedded client is the connection's
-  one in-process session: it follows a new namespace or database at the ORM's next call, but after a new URL or
-  `remove_connection()` it is the previous engine (with SDK 2.x still running), so stop using it, as after
-  `close_connection()`. `set_connection()` and the `set_*()` setters do none of this: clients opened on the
-  previous settings keep serving, as in earlier versions.
+  on the old settings: a client still opening is closed unused (the embedded engine is closed only when its URL
+  changed or the name was removed; otherwise it is kept and its session is selected again at the next call) and its
+  caller gets a retryable `SurrealDbConnectionError` (retry the call), live streams end, a change feed ends at its
+  next read (`SurrealDbConnectionError`: its cursor belongs to the old database, start a new one), and an open
+  `transaction()` is cancelled when its block ends, with nothing committed (`SurrealDbConnectionError`: open it
+  again). A client you obtained yourself with `get_client()` before the change is yours: on WebSocket its socket is
+  closed and its next request fails; an HTTP client keeps the namespace and database it was opened on, so call
+  `get_client()` again; an embedded client is the connection's one in-process session: it follows a new namespace or
+  database at the ORM's next call, but after a new URL or `remove_connection()` it is the previous engine (with SDK
+  2.x still running), so stop using it, as after `close_connection()`. `set_connection()` and the `set_*()` setters
+  do none of this: clients opened on the previous settings keep serving, as in earlier versions.
 
 Entries you cache yourself with `QueryCache.make_key()` and `set()` are not scoped to a connection: the key is
 built from the table, the statement and the variables only. When the same statement runs on two connections, put

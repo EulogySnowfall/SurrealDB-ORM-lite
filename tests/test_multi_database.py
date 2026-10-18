@@ -3839,6 +3839,301 @@ class TestStoreClaims:
         assert key not in connection_manager._STORE_CLAIMS
 
 
+def _gate_after_open(
+    monkeypatch: pytest.MonkeyPatch, conn: type[SurrealDBConnectionManager]
+) -> tuple[asyncio.Event, asyncio.Event]:
+    """Let *conn*'s real ``_open_client`` open its engine, then park until a gate opens: a barrier between the open
+    and the publication in the slot (the embedded variant of ``TestReRegistration._park_the_open``)."""
+    opened, gate = asyncio.Event(), asyncio.Event()
+    real = vars(SurrealDBConnectionManager)["_open_client"].__func__
+
+    async def gated(cls: Any, *, signin_as_configured: bool) -> Any:
+        client = await real(cls, signin_as_configured=signin_as_configured)
+        opened.set()
+        await gate.wait()
+        return client
+
+    monkeypatch.setattr(conn, "_open_client", classmethod(gated))
+    return opened, gate
+
+
+def _r11(name: str) -> str:
+    """R11 (spec §5.7): a client opening on settings the connection no longer serves was closed unused."""
+    return (
+        f"Connection {name!r} was removed or registered again with other settings while a client was opening on the "
+        "old ones; that client was closed unused. Retry the call."
+    )
+
+
+def _r11_kept(name: str) -> str:
+    """R11 on the embedded engine when only the namespace or database changed: the engine is kept."""
+    return (
+        f"Connection {name!r} was removed or registered again with other settings while its embedded session was "
+        "being selected on the old ones; the engine was kept, and the call did not run. Retry the call."
+    )
+
+
+async def _session_database(client: Any) -> Any:
+    """The database the embedded session is on."""
+    return await client.query("RETURN session::db();", {})
+
+
+class TestEmbeddedReRegistration:
+    """R11 on the embedded engine (no server, real ``mem://`` and ``surrealkv://`` engines): a change of settings
+    while the engine opens or its session is selected again raises a retryable error instead of serving the old
+    settings; a new URL or a removal closes the engine and releases its store, a new database keeps it."""
+
+    async def test_a_new_database_while_mem_opens_keeps_the_engine(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="db1")
+        conn = SurrealDBConnectionManager._manager_for("md_a")
+        opened, gate = _gate_after_open(monkeypatch, conn)
+        task = asyncio.create_task(SurrealDBConnectionManager.get_client("md_a"))
+        await opened.wait()
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="db2")
+        gate.set()
+        with pytest.raises(SurrealDbConnectionError) as info:
+            await task
+        assert str(info.value) == _r11_kept("md_a")
+        assert info.value.retryable is True  # type: ignore[attr-defined]
+        kept = _slot("md_a")
+        assert kept is not None
+        assert vars(conn)[_P + "embedded_selection"] is None  # stale: the next call selects again
+        client = await SurrealDBConnectionManager.get_client("md_a")
+        assert client is kept
+        assert await _session_database(client) == "db2"
+        assert vars(conn)[_P + "embedded_selection"] == ("t", "db2")
+
+    async def test_a_refused_replay_published_on_the_old_settings_is_replaced_by_r11(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Published, then raised: the stored session is refused while the database changes. R11 replaces the
+        refusal, chained to it; the engine is kept and selected again at the next call."""
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="db1")
+        conn = SurrealDBConnectionManager._manager_for("md_a")
+        setattr(conn, _P + "session_token", "a-token-the-engine-refuses")
+        replaying, gate = asyncio.Event(), asyncio.Event()
+        real = vars(SurrealDBConnectionManager)["_open_client"].__func__
+
+        async def open_then_refuse(cls: Any, *, signin_as_configured: bool) -> Any:
+            client = await real(cls, signin_as_configured=signin_as_configured)
+
+            async def refused(token: str) -> None:
+                replaying.set()
+                await gate.wait()
+                raise RuntimeError("token refused")
+
+            client.authenticate = refused
+            return client
+
+        monkeypatch.setattr(conn, "_open_client", classmethod(open_then_refuse))
+        task = asyncio.create_task(SurrealDBConnectionManager.get_client("md_a"))
+        await replaying.wait()
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="db2")
+        gate.set()
+        with pytest.raises(SurrealDbConnectionError) as info:
+            await task
+        assert str(info.value) == _r11_kept("md_a")
+        assert info.value.retryable is True  # type: ignore[attr-defined]
+        assert isinstance(info.value.__cause__, SurrealDbAuthenticationError)
+        kept = _slot("md_a")
+        assert kept is not None
+        assert vars(conn)[_P + "embedded_selection"] is None
+        assert await SurrealDBConnectionManager.get_client("md_a") is kept
+        assert await _session_database(kept) == "db2"
+
+    async def test_an_open_that_fails_before_publication_keeps_its_own_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """As on a server: nothing was published, so the open's own error is the answer, and nothing is claimed."""
+        url = "surrealkv:///proc/forbidden/kv"
+        SurrealDBConnectionManager.add_connection("md_a", url=url, namespace="t", database="db1")
+        conn = SurrealDBConnectionManager._manager_for("md_a")
+        entered, gate = asyncio.Event(), asyncio.Event()
+        real = vars(SurrealDBConnectionManager)["_open_client"].__func__
+
+        async def park_then_open(cls: Any, *, signin_as_configured: bool) -> Any:
+            entered.set()
+            await gate.wait()
+            return await real(cls, signin_as_configured=signin_as_configured)
+
+        monkeypatch.setattr(conn, "_open_client", classmethod(park_then_open))
+        task = asyncio.create_task(SurrealDBConnectionManager.get_client("md_a"))
+        await entered.wait()
+        assert _claim(url) == "md_a"
+        SurrealDBConnectionManager.add_connection("md_a", url=url, namespace="t", database="db2")
+        gate.set()
+        with pytest.raises(SurrealDbConnectionError, match="Can't open the embedded database") as info:
+            await task
+        assert info.value.retryable is False  # type: ignore[attr-defined]
+        assert _slot("md_a") is None
+        assert _claim(url) is None
+
+    async def test_a_new_store_while_one_opens_closes_it_and_releases_it(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        first, second = f"surrealkv://{tmp_path / 'a'}", f"surrealkv://{tmp_path / 'b'}"
+        SurrealDBConnectionManager.add_connection("md_a", url=first, namespace="t", database="t")
+        conn = SurrealDBConnectionManager._manager_for("md_a")
+        opened, gate = _gate_after_open(monkeypatch, conn)
+        task = asyncio.create_task(SurrealDBConnectionManager.get_client("md_a"))
+        await opened.wait()
+        assert _claim(first) == "md_a"
+        SurrealDBConnectionManager.add_connection("md_a", url=second, namespace="t", database="t")
+        gate.set()
+        with pytest.raises(SurrealDbConnectionError) as info:
+            await task
+        assert str(info.value) == _r11("md_a")
+        assert info.value.retryable is True  # type: ignore[attr-defined]
+        del info  # its traceback holds the closed client
+        assert _slot("md_a") is None
+        assert _claim(first) is None
+        SurrealDBConnectionManager.add_connection("md_b", url=first, namespace="t", database="t")
+        assert await SurrealDBConnectionManager.get_client("md_b") is _slot("md_b")
+        assert _claim(first) == "md_b"
+        assert await SurrealDBConnectionManager.get_client("md_a") is _slot("md_a")
+        assert _claim(second) == "md_a"
+
+    async def test_a_removal_while_a_store_opens_closes_it_and_releases_it(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        url = f"surrealkv://{tmp_path / 'kv'}"
+        SurrealDBConnectionManager.add_connection("md_a", url=url, namespace="t", database="t")
+        removed = SurrealDBConnectionManager._manager_for("md_a")
+        opened, gate = _gate_after_open(monkeypatch, removed)
+        task = asyncio.create_task(SurrealDBConnectionManager.get_client("md_a"))
+        await opened.wait()
+        await SurrealDBConnectionManager.remove_connection("md_a")
+        gate.set()
+        with pytest.raises(SurrealDbConnectionError) as info:
+            await task
+        assert str(info.value) == _r11("md_a")
+        assert info.value.retryable is True  # type: ignore[attr-defined]
+        del info
+        assert vars(removed)[_P + "embedded_client"] is None
+        assert _claim(url) is None
+        SurrealDBConnectionManager.add_connection("md_b", url=url, namespace="t", database="t")
+        assert await SurrealDBConnectionManager.get_client("md_b") is _slot("md_b")
+        assert _claim(url) == "md_b"
+        await SurrealDBConnectionManager.remove_connection("md_b")
+        SurrealDBConnectionManager.add_connection("md_a", url=url, namespace="t", database="t")
+        again = SurrealDBConnectionManager._manager_for("md_a")
+        assert again is not removed
+        assert await SurrealDBConnectionManager.get_client("md_a") is _slot("md_a")
+        assert _holder(url) is again
+
+    async def test_the_name_registered_again_waits_for_the_removed_connection(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Until the removed class has closed the store it is opening, the new class of the same name is refused
+        (X5); once the removed one's R11 has passed, it opens the store."""
+        url = f"surrealkv://{tmp_path / 'kv'}"
+        SurrealDBConnectionManager.add_connection("md_a", url=url, namespace="t", database="t")
+        removed = SurrealDBConnectionManager._manager_for("md_a")
+        opened, gate = _gate_after_open(monkeypatch, removed)
+        task = asyncio.create_task(SurrealDBConnectionManager.get_client("md_a"))
+        await opened.wait()
+        await SurrealDBConnectionManager.remove_connection("md_a")
+        SurrealDBConnectionManager.add_connection("md_a", url=url, namespace="t", database="t")
+        again = SurrealDBConnectionManager._manager_for("md_a")
+        assert again is not removed
+        with pytest.raises(SurrealDbConnectionError) as refused:
+            await SurrealDBConnectionManager.get_client("md_a")
+        assert str(refused.value) == _x5("md_a", url, "md_a")
+        assert _slot("md_a") is None
+        assert _holder(url) is removed
+        gate.set()
+        with pytest.raises(SurrealDbConnectionError) as info:
+            await task
+        assert str(info.value) == _r11("md_a")
+        del info
+        assert _claim(url) is None
+        assert await SurrealDBConnectionManager.get_client("md_a") is _slot("md_a")
+        assert _holder(url) is again
+        assert vars(removed)[_P + "embedded_client"] is None
+
+    async def test_a_transaction_entered_across_a_new_database_commits_nowhere(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="db1")
+        conn = SurrealDBConnectionManager._manager_for("md_a")
+        opened, gate = _gate_after_open(monkeypatch, conn)
+        ran: list[bool] = []
+
+        async def write() -> None:
+            async with SurrealDBConnectionManager.transaction("md_a") as tx:
+                ran.append(True)
+                await tx.add("UPSERT md_item:1 SET v = 1;")
+
+        task = asyncio.create_task(write())
+        await opened.wait()
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="db2")
+        gate.set()
+        with pytest.raises(SurrealDbConnectionError) as info:
+            await task
+        assert str(info.value) == _r11_kept("md_a")
+        assert info.value.retryable is True  # type: ignore[attr-defined]
+        assert ran == []
+        client = await SurrealDBConnectionManager.get_client("md_a")
+        assert await _engine_rows(client, "db1", "md_item") == []
+        assert await _engine_rows(client, "db2", "md_item") == []
+
+    async def test_a_change_while_the_session_is_selected_again_raises_r11(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="db1")
+        conn = SurrealDBConnectionManager._manager_for("md_a")
+        client = await SurrealDBConnectionManager.get_client("md_a")
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="db2")
+        selected, gate = asyncio.Event(), asyncio.Event()
+        real_use = client.use
+
+        async def gated_use(namespace: str, database: str) -> None:
+            await real_use(namespace, database)
+            selected.set()
+            await gate.wait()
+
+        monkeypatch.setattr(client, "use", gated_use)
+        task = asyncio.create_task(SurrealDBConnectionManager.get_client("md_a"))
+        await selected.wait()
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="db3")
+        gate.set()
+        with pytest.raises(SurrealDbConnectionError) as info:
+            await task
+        assert str(info.value) == _r11_kept("md_a")
+        assert info.value.retryable is True  # type: ignore[attr-defined]
+        assert _slot("md_a") is client
+        assert vars(conn)[_P + "embedded_selection"] is None
+        assert await SurrealDBConnectionManager.get_client("md_a") is client
+        assert await _session_database(client) == "db3"
+
+    async def test_a_new_store_while_the_session_is_selected_again_closes_the_engine(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The selection failed or not, a new URL that lands meanwhile closes the engine and releases its store; the
+        selection's own error is chained to R11."""
+        first, second = f"surrealkv://{tmp_path / 'a'}", f"surrealkv://{tmp_path / 'b'}"
+        SurrealDBConnectionManager.add_connection("md_a", url=first, namespace="t", database="db1")
+        client = await SurrealDBConnectionManager.get_client("md_a")
+        SurrealDBConnectionManager.add_connection("md_a", url=first, namespace="t", database="db2")
+        selecting, gate = asyncio.Event(), asyncio.Event()
+
+        async def failing_use(namespace: str, database: str) -> None:
+            selecting.set()
+            await gate.wait()
+            raise RuntimeError("use() failed")
+
+        monkeypatch.setattr(client, "use", failing_use)
+        task = asyncio.create_task(SurrealDBConnectionManager.get_client("md_a"))
+        await selecting.wait()
+        SurrealDBConnectionManager.add_connection("md_a", url=second, namespace="t", database="db2")
+        gate.set()
+        with pytest.raises(SurrealDbConnectionError) as info:
+            await task
+        assert str(info.value) == _r11("md_a")
+        assert info.value.retryable is True  # type: ignore[attr-defined]
+        assert isinstance(info.value.__cause__, SurrealDbConnectionError)
+        assert "Can't select namespace" in str(info.value.__cause__)
+        del info, client
+        assert _slot("md_a") is None
+        assert _claim(first) is None
+        assert await SurrealDBConnectionManager.get_client("md_a") is _slot("md_a")
+        assert _claim(second) == "md_a"
+
+
 @fixture
 class MdFixtures(SurrealFixture):
     """A record of the default connection and one of ``md_a``."""
@@ -4564,8 +4859,9 @@ distinct = key_main != key_analytics                   # True
 #: Spec §11 (C4, P5): the last bullet of "What each connection keeps for itself", exactly.
 _D7_BULLET = (
     "- Registering a name again with other settings, or removing it with `remove_connection()`, ends what the ORM "
-    "holds on the old settings: a client still opening is closed unused (a retryable `SurrealDbConnectionError`: "
-    "retry the call), live streams end, a change feed ends at its next read (`SurrealDbConnectionError`: its cursor "
+    "holds on the old settings: a client still opening is closed unused (the embedded engine is closed only when "
+    "its URL changed or the name was removed; otherwise it is kept and its session is selected again at the next "
+    "call) and its caller gets a retryable `SurrealDbConnectionError` (retry the call), live streams end, a change feed ends at its next read (`SurrealDbConnectionError`: its cursor "
     "belongs to the old database, start a new one), and an open `transaction()` is cancelled when its block ends, "
     "with nothing committed (`SurrealDbConnectionError`: open it again). A client you obtained yourself with "
     "`get_client()` before the change is yours: on WebSocket its socket is closed and its next request fails; an "

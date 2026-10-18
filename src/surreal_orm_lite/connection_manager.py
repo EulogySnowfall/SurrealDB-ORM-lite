@@ -427,8 +427,9 @@ class SurrealDBConnectionManager:
 
         What the ORM itself holds on the old settings ends instead of reaching the old database:
 
-        - a client still opening on them is closed unused, and its caller gets a retryable
-          ``SurrealDbConnectionError`` (retry the call);
+        - a client still opening on them is closed unused (the embedded engine is closed only when its URL changed or
+          the name was removed; otherwise it is kept and its session is selected again at the next call), and its
+          caller gets a retryable ``SurrealDbConnectionError`` (retry the call);
         - live streams end on every event loop, as on :meth:`close_connection`;
         - a change feed (``changes()``) ends at its next read with a ``SurrealDbConnectionError``: its position belongs
           to the previous database (start a new one);
@@ -471,16 +472,17 @@ class SurrealDBConnectionManager:
     async def remove_connection(cls, name: str) -> None:
         """Unregister a named connection, then close its clients (every event loop, and its embedded engine), end its
         live streams and forget its session, signatures and settings. What the ORM holds on it ends as on a
-        re-registration with other settings (:meth:`add_connection`): a client still opening is closed unused (retryable
-        ``SurrealDbConnectionError``), a change feed ends at its next read, an open :meth:`transaction` is cancelled when
-        its block ends and nothing is committed. A client the application obtained itself is its own, as after a
-        re-registration: on WebSocket its next request fails, an HTTP client keeps its namespace and database, and an
-        embedded client is the previous engine (with SDK 2.x still running), so stop using it, as after
-        :meth:`close_connection`. A no-op for a name that is not registered (after the name's type
-        check). ``remove_connection("default")`` is :meth:`unset_connection`, unchanged (the default is never
-        unregistered). A model routed to a removed name raises R2 at its next database call. The name is free again as
-        soon as this is called: an ``add_connection()`` of it, even while the old one is closing, registers a new
-        connection.
+        re-registration with other settings (:meth:`add_connection`): a client still opening is closed unused (the
+        embedded engine is closed only when its URL changed or the name was removed; otherwise it is kept and its
+        session is selected again at the next call) and its caller gets a retryable ``SurrealDbConnectionError``, a
+        change feed ends at its next read, an open :meth:`transaction` is cancelled when its block ends and nothing is
+        committed. A client the application obtained itself is its own, as after a re-registration: on WebSocket its
+        next request fails, an HTTP client keeps its namespace and database, and an embedded client is the previous
+        engine (with SDK 2.x still running), so stop using it, as after :meth:`close_connection`. A no-op for a name
+        that is not registered (after the name's type check). ``remove_connection("default")`` is
+        :meth:`unset_connection`, unchanged (the default is never unregistered). A model routed to a removed name raises
+        R2 at its next database call. The name is free again as soon as this is called: an ``add_connection()`` of it,
+        even while the old one is closing, registers a new connection.
 
         :raises TypeError: *name* is not a ``str``.
         :raises ValueError: *name* is empty.
@@ -1101,10 +1103,7 @@ class SurrealDBConnectionManager:
             closing = asyncio.get_running_loop().create_task(_close_quietly(client))
             _BACKGROUND.add(closing)
             closing.add_done_callback(_BACKGROUND.discard)
-            error = SurrealDbConnectionError(
-                f"Connection {cls._connection_name!r} was removed or registered again with other settings while a "
-                "client was opening on the old ones; that client was closed unused. Retry the call."
-            )
+            error = SurrealDbConnectionError(_opening_retired_text(cls._connection_name))
             error.retryable = True  # type: ignore[attr-defined]
             raise error
         cls._stamp_identity(client, fingerprint=fingerprint, replayable=True)
@@ -1173,10 +1172,17 @@ class SurrealDBConnectionManager:
     @_routed("current")
     async def _held_embedded_client(cls) -> Any:
         """:meth:`_acquire_embedded_client` for a caller that holds the guard: the slot's client, opened,
-        re-selected or replaced as needed, or ``None`` when the configured URL is no longer embedded."""
+        re-selected or replaced as needed, or ``None`` when the configured URL is no longer embedded.
+
+        The settings generation (v0.29.0) is read first, before any await: when ``add_connection()`` registers the
+        name again with other settings, or ``remove_connection()`` removes it, while the engine opens or its session
+        is selected again, the call raises R11 (retryable) instead of serving the old settings
+        (:meth:`_refuse_retired_embedded`).
+        """
         if not is_embedded_url(cls.__url):
             return None
         cls.require_connection()
+        generation = cls.__generation
         client = cls.__embedded_client
         if client is not None and cls.__embedded_url == cls.__url:
             selection = cls.__embedded_selection
@@ -1186,10 +1192,54 @@ class SurrealDBConnectionManager:
                 # A real change of namespace/database, not a stale marker: the stored session
                 # belongs to the previous selection, and replaying it would move the session back.
                 cls.clear_session()
-            await cls._reset_embedded_session(client)
+            try:
+                await cls._reset_embedded_session(client)
+            except Exception as exc:
+                await cls._refuse_retired_embedded(generation, exc)
+                raise
+            await cls._refuse_retired_embedded(generation)
             return client
         await cls._forget_embedded()
-        return await cls._open_embedded()
+        try:
+            client = await cls._open_embedded()
+        except Exception as exc:
+            # Published, then raised (a refused replay): the slot holds a client on the settings read at the start.
+            # A failure before publication keeps its own error, as on a server: the slot is empty, the store released.
+            if cls.__embedded_client is not None:
+                await cls._refuse_retired_embedded(generation, exc)
+            raise
+        await cls._refuse_retired_embedded(generation)
+        return client
+
+    @classmethod
+    @_routed("current")
+    async def _refuse_retired_embedded(cls, generation: int, cause: BaseException | None = None) -> None:
+        """R11 on the embedded engine: raise when the settings generation is no longer *generation*, the one the caller
+        of :meth:`_held_embedded_client` started under. Caller holds the guard, and the slot holds the client it
+        opened or selected again.
+
+        A new URL, or a removal (no URL any more): the engine is closed and its store released
+        (:meth:`_forget_embedded`). The same URL with another namespace or database: the engine is kept (a ``mem://``
+        database keeps its data) and its selection marked stale, so the next call selects the current settings
+        again. Either way the error is retryable, and chained to *cause* — what the open or the selection raised
+        itself — when there is one.
+        """
+        if cls.__generation == generation:
+            return
+        if cls.__embedded_url != cls.__url:
+            await cls._forget_embedded()
+            error = SurrealDbConnectionError(_opening_retired_text(cls._connection_name))
+        else:
+            cls.__embedded_selection = None
+            error = SurrealDbConnectionError(
+                f"Connection {cls._connection_name!r} was removed or registered again with other settings while its "
+                "embedded session was being selected on the old ones; the engine was kept, and the call did not run. "
+                "Retry the call."
+            )
+        error.retryable = True  # type: ignore[attr-defined]
+        if cause is None:
+            raise error
+        raise error from cause
 
     @classmethod
     @_routed("current")
@@ -1582,12 +1632,10 @@ class SurrealDBConnectionManager:
         :raises TypeError: *name* is not a ``str``.
         :raises ValueError: *name* is empty or not a registered connection.
         """
-        client = await cls.get_client()
-        # Read right after get_client() returns, with no await in between, so it is the generation this client was
-        # served under, and before begin(), so a change during begin() is seen at the exit. A re-registration from
-        # another thread that lands in the few instructions between get_client() returning and this read is the same
-        # residual accepted for a change-feed request already in flight when the change lands.
+        # Read before get_client(): any change from this point on — while the client opens, is selected again or
+        # begins — ends the block: get_client() raises the retryable error, or the exit cancels and raises.
         generation = cls.__generation
+        client = await cls.get_client()
         url = cls.__url or ""
         tx: Transaction
         if url.startswith(("ws://", "wss://")):
@@ -2709,6 +2757,15 @@ async def _close_quietly(client: Any) -> None:
     ``NotImplementedError``): a background task must not end with an exception nobody retrieves."""
     with contextlib.suppress(Exception):
         await client.close()
+
+
+def _opening_retired_text(name: str | None) -> str:
+    """R11: a client finished opening on settings connection *name* no longer serves (it was removed or registered
+    again with other settings meanwhile), and was closed unused."""
+    return (
+        f"Connection {name!r} was removed or registered again with other settings while a client was opening on the "
+        "old ones; that client was closed unused. Retry the call."
+    )
 
 
 def _transaction_retired_text(name: str | None) -> str:
