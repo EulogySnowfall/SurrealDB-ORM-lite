@@ -1221,9 +1221,7 @@ class SurrealDBConnectionManager:
         it open makes this raise X5 before anything opens. The claim is released when no client ends up in the slot.
         """
         url, namespace, database = cls.__url, cls.__namespace, cls.__database
-        name = cls._connection_name
-        assert name is not None  # routed: always a connection class
-        claimed = _claim_store(url, name)
+        claimed = _claim_store(url, cls)
         try:
             # Fingerprinted from the settings _open_client() reads before its first await, as in
             # _connect_for_loop().
@@ -1241,7 +1239,7 @@ class SurrealDBConnectionManager:
         except BaseException:
             # A refused replay publishes the client, which keeps the store; any other failure leaves the slot empty.
             if cls.__embedded_client is None:
-                _release_store(claimed, name)
+                _release_store(claimed, cls)
             raise
 
     @classmethod
@@ -1331,7 +1329,7 @@ class SurrealDBConnectionManager:
             with contextlib.suppress(Exception):
                 await client.close()
         finally:
-            _release_store(key, cls._connection_name)
+            _release_store(key, cls)
         cls.clear_function_signature_cache()
 
     @classmethod
@@ -1413,7 +1411,7 @@ class SurrealDBConnectionManager:
             cls.__embedded_client = state.embedded_client  # last: see the fast path of _acquire_embedded_client()
             cls.clear_function_signature_cache()
             restored_key = None if state.embedded_client is None else store_key(state.embedded_url)
-            _reclaim_store(restored_key, cls._connection_name)
+            _reclaim_store(restored_key, cls)
             if block_client is not None and block_client is not state.embedded_client:
                 _cache.retire_client(block_client)
                 try:
@@ -1421,7 +1419,7 @@ class SurrealDBConnectionManager:
                         await block_client.close()
                 finally:
                     if block_key != restored_key:
-                        _release_store(block_key, cls._connection_name)
+                        _release_store(block_key, cls)
 
     @classmethod
     @_routed("current", unknown_name="ignore")
@@ -2722,11 +2720,16 @@ def _transaction_retired_text(name: str | None) -> str:
     )
 
 
-def _claim_store(url: str | None, name: str) -> str | None:
-    """Claim the on-disk store of the embedded *url* for connection *name*, before its engine opens (v0.29.0).
+def _claim_store(url: str | None, connection: type[SurrealDBConnectionManager]) -> str | None:
+    """Claim the on-disk store of the embedded *url* for the connection class *connection*, before its engine opens
+    (v0.29.0).
 
-    :return: the store's key when this call claimed it; ``None`` for an in-memory or server URL, or a store *name*
-        already holds (a connection may open its own store again: an ``embedded_database()`` block on its path).
+    Claims belong to connection **classes**, not names: a name removed and registered again is a new class, refused
+    while the old one still has the store open — the old class's close must not release the new one's claim either.
+
+    :return: the store's key when this call claimed it; ``None`` for an in-memory or server URL, or a store
+        *connection* already holds (a connection may open its own store again: an ``embedded_database()`` block on
+        its path).
     :raises SurrealDbConnectionError: X5 — another connection of the process has that store open; never retryable.
     """
     key = store_key(url)
@@ -2735,35 +2738,37 @@ def _claim_store(url: str | None, name: str) -> str | None:
     with _STORE_LOCK:
         holder = _STORE_CLAIMS.get(key)
         if holder is None:
-            _STORE_CLAIMS[key] = name
+            _STORE_CLAIMS[key] = connection
             return key
-    if holder == name:
+    if holder is connection:
         return None
+    name, holding = connection._connection_name, holder._connection_name
     error = SurrealDbConnectionError(
-        f"Connection {name!r} cannot open {url!r}: connection {holder!r} already has that store open in this process, "
-        f"and two in-process engines on one store miss each other's writes. Use one connection for the store, or close "
-        f"{holder!r} first."
+        f"Connection {name!r} cannot open {url!r}: connection {holding!r} already has that store open in this "
+        f"process, and two in-process engines on one store miss each other's writes. Use one connection for the "
+        f"store, or close {holding!r} first."
     )
     error.retryable = False  # type: ignore[attr-defined]
     raise error
 
 
-def _release_store(key: str | None, name: str | None) -> None:
-    """Release the store *key* when connection *name* holds it: a claim is released only by its holder."""
+def _release_store(key: str | None, connection: type[SurrealDBConnectionManager]) -> None:
+    """Release the store *key* when the connection class *connection* holds it: a claim is released only by its
+    holder."""
     if key is None:
         return
     with _STORE_LOCK:
-        if _STORE_CLAIMS.get(key) == name:
+        if _STORE_CLAIMS.get(key) is connection:
             del _STORE_CLAIMS[key]
 
 
-def _reclaim_store(key: str | None, name: str | None) -> None:
-    """Claim the store *key* for connection *name* again when nobody holds it: an engine that kept it open while
-    detached (``embedded_database()``) comes back into its connection's slot."""
-    if key is None or name is None:
+def _reclaim_store(key: str | None, connection: type[SurrealDBConnectionManager]) -> None:
+    """Claim the store *key* for the connection class *connection* again when nobody holds it: an engine that kept
+    it open while detached (``embedded_database()``) comes back into its connection's slot."""
+    if key is None:
         return
     with _STORE_LOCK:
-        _STORE_CLAIMS.setdefault(key, name)
+        _STORE_CLAIMS.setdefault(key, connection)
 
 
 def _unregister_block(name: str, connection: type[SurrealDBConnectionManager]) -> None:
@@ -2786,9 +2791,10 @@ _REGISTRY: dict[str, type[SurrealDBConnectionManager]] = {"default": _new_connec
 _REGISTRY_LOCK = threading.Lock()
 
 #: The on-disk embedded stores open in this process (v0.29.0): store key (:func:`~surreal_orm_lite.embedded.store_key`)
-#: → the name of the connection whose engine has it open. Two in-process engines on one store miss each other's writes,
-#: so a second connection is refused (X5) until the first one closes its engine.
-_STORE_CLAIMS: dict[str, str] = {}
+#: → the connection class whose engine has it open — the class, not its name: a name registered again is another
+#: connection. Two in-process engines on one store miss each other's writes, so a second connection is refused (X5)
+#: until the first one closes its engine.
+_STORE_CLAIMS: dict[str, type[SurrealDBConnectionManager]] = {}
 _STORE_LOCK = threading.Lock()
 
 #: The connection name a ``using()`` block sets for the code running inside it; ``None`` outside any block.

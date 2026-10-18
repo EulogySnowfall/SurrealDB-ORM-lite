@@ -3645,6 +3645,12 @@ def _slot(name: str) -> Any:
 
 def _claim(url: str) -> str | None:
     """The name of the connection holding the on-disk store of *url*, if any."""
+    holder = _holder(url)
+    return None if holder is None else holder._connection_name
+
+
+def _holder(url: str) -> type[SurrealDBConnectionManager] | None:
+    """The connection class holding the on-disk store of *url*, if any: claims belong to classes, not names."""
     key = embedded.store_key(url)
     assert key is not None
     return connection_manager._STORE_CLAIMS.get(key)
@@ -3809,6 +3815,28 @@ class TestStoreClaims:
         assert _claim(store) == "md_b"
         await a_client.query("CREATE md_item:1 SET v = 1;", {})
         assert await _rows_of(b_client, "md_item") == []
+
+    def test_claims_belong_to_connection_classes_not_names(self, tmp_path: Path) -> None:
+        """Two classes of one name — a name removed and registered again — are two connections: the second is
+        refused (X5), and the second's release or reclaim leaves the first's claim in place."""
+        url = f"surrealkv://{tmp_path / 'kv'}"
+        first = connection_manager._new_connection_class("md_a")
+        second = connection_manager._new_connection_class("md_a")
+        key = connection_manager._claim_store(url, first)
+        assert key == embedded.store_key(url)
+        try:
+            assert connection_manager._claim_store(url, first) is None  # its own store, again: nothing new to claim
+            with pytest.raises(SurrealDbConnectionError) as info:
+                connection_manager._claim_store(url, second)
+            assert str(info.value) == _x5("md_a", url, "md_a")
+            assert info.value.retryable is False  # type: ignore[attr-defined]
+            connection_manager._release_store(key, second)
+            assert connection_manager._STORE_CLAIMS[key] is first
+            connection_manager._reclaim_store(key, second)
+            assert connection_manager._STORE_CLAIMS[key] is first
+        finally:
+            connection_manager._release_store(key, first)
+        assert key not in connection_manager._STORE_CLAIMS
 
 
 @fixture
