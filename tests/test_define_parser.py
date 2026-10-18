@@ -1,7 +1,8 @@
 """Schema introspection (v0.30.0): the private parser of the ``DEFINE`` statements ``INFO`` returns (spec §6.3).
 
 The scanner (spec §6.3.1; M11, M34, M35): string literals and their decoding, identifiers and field paths, the
-top-level keyword candidates with ``IF`` units, top-level splitting; and the fixed reasons ``DefineParseError`` is
+top-level keyword candidates with ``IF`` units, top-level splitting; the kinds (spec §6.3.5; M7, M15, M21): their
+grammar, one canonical rendering for SurrealDB 2.x and 3.x, nullability; and the fixed reasons ``DefineParseError`` is
 raised with (spec §6.3.6). Unit tests only (no server).
 """
 
@@ -17,12 +18,22 @@ from surreal_orm_lite.define_parser import (
     _R_HEADER,
     _R_IDENT,
     _R_IF,
+    _R_KIND,
     _R_PATH,
     _R_STRING,
     DefineParseError,
+    KLiteral,
+    KName,
+    KObject,
+    KTuple,
+    KUnion,
     canonical_name,
+    normalise_kind,
+    parse_kind,
+    parse_kind_prefix,
     read_identifier,
     read_idiom,
+    render_kind,
     split_top_level,
     top_level_keywords,
     unquote,
@@ -457,6 +468,335 @@ class TestScanner:
         with pytest.raises(DefineParseError) as error:
             read_idiom(text, 0)
         assert _reason(error) == reason
+
+
+_INT = KName("int")
+_STRING = KName("string")
+_NONE = KLiteral("none")
+
+#: Every kind the goldens hold (M7, M15, M21, probe13 ``p`` and ``l``; spec §6.3.5) → its canonical rendering. A 2.x
+#: rendering and its 3.x rendering sit side by side where they differ.
+_GOLDEN_KINDS = [
+    # M21: the names, rendered alike by both lines.
+    *[
+        (name, name)
+        for name in (
+            "any",
+            "bool",
+            "bytes",
+            "datetime",
+            "decimal",
+            "duration",
+            "float",
+            "int",
+            "number",
+            "object",
+            "string",
+            "uuid",
+            "regex",
+            "range",
+            "function",
+            "file",
+            "record",
+            "geometry",
+            "array",
+            "set",
+        )
+    ],
+    # M21: generic arguments, literals, object and tuple literals, rendered alike by both lines.
+    ("array<string, 10>", "array<string, 10>"),
+    ("set<int, 3>", "set<int, 3>"),
+    ("set<string>", "set<string>"),
+    ("set<record<a>>", "set<record<a>>"),
+    ("array<object>", "array<object>"),
+    ("record<a | b>", "record<a | b>"),
+    ("record<k | other>", "record<k | other>"),
+    ("geometry<point>", "geometry<point>"),
+    ("geometry<point | polygon>", "geometry<point | polygon>"),
+    ("'a' | 'b'", "'a' | 'b'"),
+    ("'dq'", "'dq'"),  # "dq" is rendered 'dq'
+    ("1 | 2 | 3", "1 | 2 | 3"),
+    ("true | false", "true | false"),
+    ("{ a: int, b: string }", "{ a: int, b: string }"),
+    ("[int, string]", "[int, string]"),
+    ("null | int", "null | int"),
+    # probe13 p (its TYPE is followed by two spaces) and l.
+    ("  1.5f | 2", "1.5f | 2"),
+    ("'dq' | \"it's\"", "'dq' | \"it's\""),
+    # M7: optional kinds — 2.x renders option<T>, 3.x none | T (order kept: int | none stays as written).
+    ("option<int>", "option<int>"),
+    ("none | int", "option<int>"),
+    ("int | none", "option<int>"),
+    ("option<int | string>", "option<int | string>"),
+    ("none | int | string", "option<int | string>"),
+    ("array<option<int>, 5>", "array<option<int>, 5>"),
+    ("array<none | int, 5>", "array<option<int>, 5>"),
+    ("option<array<option<string>>>", "option<array<option<string>>>"),
+    ("none | array<none | string>", "option<array<option<string>>>"),
+    ("option<{ x: int, y: option<string> }>", "option<{ x: int, y: option<string> }>"),
+    ("none | { x: int, y: none | string }", "option<{ x: int, y: option<string> }>"),
+    ("option<record<k | other>>", "option<record<k | other>>"),
+    ("none | record<k | other>", "option<record<k | other>>"),
+    # M15: a function's return kinds.
+    ("option<string>", "option<string>"),
+    ("none | string", "option<string>"),
+    ("{ a: int }", "{ a: int }"),
+]
+
+
+class TestKinds:
+    """Spec §6.3.5 (D5; AC-6): one grammar for every rendered kind, one canonical rendering both lines accept
+    (``option<T>`` at every depth, the 3.x spacing), and the top-level optional read as ``nullable``."""
+
+    # --- parse_kind: the tree ----------------------------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("text", "tree"),
+        [
+            ("int", _INT),
+            ("frob", KName("frob")),  # an unknown name is kept
+            ("array", KName("array")),
+            ("array<string, 10>", KName("array", (_STRING, "10"))),
+            ("set<int, 3>", KName("set", (_INT, "3"))),
+            ("set<record<a>>", KName("set", (KName("record", ("a",)),))),
+            ("record", KName("record")),
+            ("record<a | b>", KName("record", ("a", "b"))),
+            ("record<`weird-name` | b>", KName("record", ("`weird-name`", "b"))),  # names kept as rendered
+            ("geometry<point | polygon>", KName("geometry", ("point", "polygon"))),
+            ("file<bucket>", KName("file", ("bucket",))),  # other arguments: their text, as rendered
+            ("frob<a<b>, 'c>'>", KName("frob", ("a<b>, 'c>'",))),
+            ("'a' | 'b'", KUnion((KLiteral("'a'"), KLiteral("'b'")))),
+            ("'dq' | \"it's\"", KUnion((KLiteral("'dq'"), KLiteral('"it\'s"')))),
+            ("1.5f | 2", KUnion((KLiteral("1.5f"), KLiteral("2")))),
+            ("-0f | 1.5dec | -2 | 1000f", KUnion((KLiteral("-0f"), KLiteral("1.5dec"), KLiteral("-2"), KLiteral("1000f")))),
+            ("true | false", KUnion((KLiteral("true"), KLiteral("false")))),
+            ("null | int", KUnion((KLiteral("null"), _INT))),
+            ("none", _NONE),
+            ("{ a: int, b: string }", KObject((("a", _INT), ("b", _STRING)))),
+            ("{ `a-b`: int, 'c d': string }", KObject((("`a-b`", _INT), ("'c d'", _STRING)))),
+            ("{}", KObject(())),
+            ("[int, string]", KTuple((_INT, _STRING))),
+            # option<T> is the union of none and T's members: both renderings give one tree.
+            ("option<int>", KUnion((_NONE, _INT))),
+            ("none | int", KUnion((_NONE, _INT))),
+            ("option<int | string>", KUnion((_NONE, _INT, _STRING))),
+            ("none | int | string", KUnion((_NONE, _INT, _STRING))),
+            ("array<option<int>, 5>", KName("array", (KUnion((_NONE, _INT)), "5"))),
+            ("array<none | int, 5>", KName("array", (KUnion((_NONE, _INT)), "5"))),
+            (
+                "option<{ x: int, y: option<string> }>",
+                KUnion((_NONE, KObject((("x", _INT), ("y", KUnion((_NONE, _STRING))))))),
+            ),
+            (
+                "none | { x: int, y: none | string }",
+                KUnion((_NONE, KObject((("x", _INT), ("y", KUnion((_NONE, _STRING))))))),
+            ),
+        ],
+    )
+    def test_parse_kind(self, text: str, tree: object) -> None:
+        assert parse_kind(text) == tree
+
+    @pytest.mark.parametrize(
+        ("text", "canonical"),
+        [
+            ("array<string,10>", "array<string, 10>"),
+            ("set< int ,3 >", "set<int, 3>"),
+            ("record<a|b>", "record<a | b>"),
+            ("geometry<point|polygon>", "geometry<point | polygon>"),
+            ("{a:int,b:string}", "{ a: int, b: string }"),
+            ("[ int , string ]", "[int, string]"),
+            ("'a'|'b'", "'a' | 'b'"),
+            ("option< int >", "option<int>"),
+            ("\tint\n", "int"),
+            ("{}", "{  }"),
+            ("{  }", "{  }"),
+        ],
+    )
+    def test_render_kind_spacing(self, text: str, canonical: str) -> None:
+        assert render_kind(parse_kind(text)) == canonical
+
+    def test_render_kind_moves_none_into_option_at_any_depth(self) -> None:
+        assert render_kind(KUnion((_INT, _NONE))) == "option<int>"
+        assert render_kind(KUnion((_INT, _NONE, _STRING))) == "option<int | string>"
+        assert render_kind(KTuple((KUnion((_NONE, _INT)), _STRING))) == "[option<int>, string]"
+        assert render_kind(KObject((("a", KName("array", (KUnion((_STRING, _NONE)),))),))) == "{ a: array<option<string>> }"
+        assert render_kind(KUnion((_NONE, _NONE))) == "none"
+        assert render_kind(KUnion((KLiteral("null"), _INT))) == "null | int"  # null is a value, not none
+
+    # --- parse_kind_prefix -------------------------------------------------------------------------------------------
+
+    def test_prefix_stops_before_a_function_body(self) -> None:
+        # M15 fn::kw: an object kind before the body's brace.
+        text = "{ a: int } { RETURN $a; }"
+        assert parse_kind_prefix(text, 0) == (KObject((("a", _INT),)), text.index("{ RETURN"))
+        assert parse_kind_prefix("string { RETURN $s; }", 0) == (_STRING, 7)
+        assert parse_kind_prefix("int", 0) == (_INT, 3)
+        # The text after the kind is not read: a comparison in the body is not an angle bracket.
+        assert parse_kind_prefix("bool { RETURN $a < $b; }", 0) == (KName("bool"), 5)
+        text = "int | { a: int } {\nRETURN 1;\n}"
+        assert parse_kind_prefix(text, 0) == (KUnion((_INT, KObject((("a", _INT),)))), text.index("{\n"))
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            "DEFINE FUNCTION fn::f($s: string) -> option<string> {\nRETURN $s;\n} PERMISSIONS FULL",  # 2.x
+            "DEFINE FUNCTION fn::f($s: string) -> none | string { RETURN $s } PERMISSIONS FULL",  # 3.x
+        ],
+    )
+    def test_prefix_reads_a_return_kind_in_a_header(self, header: str) -> None:
+        kind, end = parse_kind_prefix(header, header.index("->") + 2)
+        assert kind == KUnion((_NONE, _STRING))
+        assert render_kind(kind) == "option<string>"
+        assert end == header.index("{")
+
+    @pytest.mark.parametrize("text", ["", "   ", "{ RETURN 1; }", "int | { RETURN 1 }", "<int> { }", "int |"])
+    def test_prefix_refuses(self, text: str) -> None:
+        with pytest.raises(DefineParseError) as error:
+            parse_kind_prefix(text, 0)
+        assert _reason(error) == _R_KIND
+
+    # --- normalise_kind ----------------------------------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("renderings", "expected"),
+        [
+            # Spec §6.3.5's pairs: each 2.x rendering and its 3.x rendering give one result (AC-6).
+            (["option<int>", "none | int", "int | none"], ("int", True)),
+            (["option<int | string>", "none | int | string"], ("int | string", True)),
+            (["array<option<int>, 5>", "array<none | int, 5>"], ("array<option<int>, 5>", False)),
+            (["option<array<option<string>>>", "none | array<none | string>"], ("array<option<string>>", True)),
+            (
+                ["option<{ x: int, y: option<string> }>", "none | { x: int, y: none | string }"],
+                ("{ x: int, y: option<string> }", True),
+            ),
+            (["option<record<k | other>>", "none | record<k | other>"], ("record<k | other>", True)),
+            (["option<string>", "none | string"], ("string", True)),  # M15
+            (["'a' | 'b'"], ("'a' | 'b'", False)),
+            (["null | int"], ("null | int", False)),
+            (["int"], ("int", False)),
+            (["  1.5f | 2"], ("1.5f | 2", False)),
+            (["none"], ("none", False)),  # not a union holding none: nothing to strip
+        ],
+    )
+    def test_normalise_kind(self, renderings: list[str], expected: tuple[str, bool]) -> None:
+        for text in renderings:
+            assert normalise_kind(text) == expected, text
+
+    @pytest.mark.parametrize(("text", "canonical"), _GOLDEN_KINDS)
+    def test_golden_kinds_render_canonically_and_stably(self, text: str, canonical: str) -> None:
+        kind = parse_kind(text)
+        assert render_kind(kind) == canonical
+        # The canonical text is a fixed point: it parses back to the same tree, which renders the same text.
+        assert render_kind(parse_kind(canonical)) == canonical
+        assert parse_kind(render_kind(parse_kind(canonical))) == parse_kind(canonical)
+        # Spec §6.3.5 item 3 and AC-6: normalising the rendering changes nothing; normalise is stable on its output.
+        assert normalise_kind(render_kind(kind)) == normalise_kind(text)
+        field_type, _ = normalise_kind(text)
+        assert normalise_kind(field_type) == (field_type, False)
+
+    # --- refused kinds -----------------------------------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # The plan's cases.
+            "option<",
+            "array<string,>",
+            "{ a int }",
+            "<>",
+            "int |",
+            "+ 1",
+            # And more of the same.
+            "",
+            "   ",
+            "| int",
+            "int || string",
+            "option",
+            "option<>",
+            "option <int>",
+            "option<int",
+            "array<int, x>",
+            "array<int, 3",
+            "array<int, -1>",
+            "array<int, 3, 4>",
+            "array <int>",
+            "record<>",
+            "record<a |>",
+            "record<a b>",
+            "record<`a>",
+            "record<a, b>",
+            "geometry<>",
+            "frob<>",
+            "frob<a",
+            "frob<a)>",
+            "frob<'a>",
+            "[]",
+            "[int,]",
+            "[int",
+            "{ a: int, }",
+            "{ a: }",
+            "{ a: int",
+            "{ `a: int }",
+            "{ (a): int }",
+            "int string",
+            "int,",
+            "int>",
+            "array<int>>",
+            "'unterminated",
+            "1abc",
+            "9lives",
+            "1.",
+            "1.5e3",
+            "- 1",
+            "(int)",
+            "$value",
+            "int::x",
+        ],
+    )
+    def test_refused_kinds(self, text: str) -> None:
+        with pytest.raises(DefineParseError) as error:
+            parse_kind(text)
+        assert _reason(error) == _R_KIND
+        with pytest.raises(DefineParseError) as error:
+            normalise_kind(text)
+        assert _reason(error) == _R_KIND
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "array<" * 5000 + "int" + ">" * 5000,
+            "option<" * 5000 + "int" + ">" * 5000,
+            "[" * 5000 + "int" + "]" * 5000,
+            "{ a: " * 5000 + "int" + " }" * 5000,
+        ],
+        ids=["array", "option", "tuple", "object"],
+    )
+    def test_too_deep_a_kind_is_refused(self, text: str) -> None:
+        # Server text is not trusted to be small: a kind nested past any real one is refused, not a RecursionError.
+        with pytest.raises(DefineParseError) as error:
+            parse_kind(text)
+        assert _reason(error) == _R_KIND
+
+    def test_nested_kinds_parse(self) -> None:
+        text = "array<" * 32 + "option<{ a: [int, set<string, 2>] }>" + ">" * 32
+        canonical = render_kind(parse_kind(text))
+        assert canonical == text
+        assert normalise_kind(text) == (text, False)
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            " | ".join(["int"] * 20_000),
+            " | ".join(f"'v{n}'" for n in range(20_000)),
+            "frob<" + "(" * 5000 + ")" * 5000 + ">",
+            "{ " + ", ".join(f"k{n}: int" for n in range(20_000)) + " }",
+        ],
+        ids=["union", "literals", "raw-argument", "object"],
+    )
+    def test_parse_kind_stays_linear(self, text: str) -> None:
+        started = time.perf_counter()
+        assert render_kind(parse_kind(text)) == text
+        assert time.perf_counter() - started < 1.0
 
 
 class TestParseErrorReasons:

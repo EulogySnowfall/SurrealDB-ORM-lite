@@ -26,17 +26,36 @@ simple anchored tokens:
 - ``top_level_keywords()`` lists **every** position at depth 0 where a clause keyword stands as a whole word: these
   are candidates only, since a bare identifier may spell a keyword; the clause reader resolves them.
   ``split_top_level()`` splits at a separator at depth 0.
+
+**Kinds** — ``parse_kind()`` reads a ``TYPE`` (or a function's ``->``) kind into a small tree (``KName``,
+``KLiteral``, ``KUnion``, ``KObject``, ``KTuple``); ``render_kind()`` writes a tree back in one canonical form that
+both lines accept, preferring the 3.x spacing: SurrealDB 2.x renders an optional kind ``option<int>``, 3.x
+``none | int`` (also ``int | none``, at any depth: ``array<none | int, 5>``), and both become ``option<…>``.
+``normalise_kind()`` gives ``(field_type, nullable)``: the top-level optional is stripped and read as ``nullable``
+(``"none | int"`` and ``"option<int>"`` both give ``("int", True)``). ``null`` is a value, not ``none``:
+``null | int`` stays as it is.
 """
 
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from typing import NamedTuple
+from dataclasses import dataclass
+from typing import NamedTuple, TypeAlias
 
 __all__ = [
     "DefineParseError",
+    "KLiteral",
+    "KName",
+    "KObject",
+    "KTuple",
+    "KUnion",
+    "Kind",
     "canonical_name",
+    "normalise_kind",
+    "parse_kind",
+    "parse_kind_prefix",
     "read_identifier",
     "read_idiom",
+    "render_kind",
     "split_top_level",
     "top_level_keywords",
     "unquote",
@@ -408,3 +427,331 @@ def split_top_level(text: str, separator: str, *, angle: bool = False) -> list[s
             begin = token.end
     parts.append(text[begin:])
     return parts
+
+
+# --- kinds ---------------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class KName:
+    """A named kind and its generic arguments: ``int``, ``array<string, 10>``, ``record<a | b>``.
+
+    ``args``: for ``array`` and ``set``, the item kind then the size if one is given (``(KName("string"), "10")``);
+    for ``record`` and ``geometry``, the names as rendered (``("a", "b")``); for any other name, the text between the
+    angle brackets, stripped (``file<bucket>`` → ``("bucket",)``). An unknown name is kept (``KName("frob")``).
+    """
+
+    name: str
+    args: tuple["Kind | str", ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class KLiteral:
+    """A literal kind, as rendered: ``'a'``, ``"it's"``, ``1.5f``, ``-2``, ``1.5dec``, ``true``, ``null`` or ``none``."""
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class KUnion:
+    """A union of two or more kinds, flattened: ``option<T>`` is the union of ``none`` and the members of ``T``."""
+
+    members: tuple["Kind", ...]
+
+
+@dataclass(frozen=True, slots=True)
+class KObject:
+    """An object literal kind ``{ a: int, b: string }``: its ``(key, kind)`` items in order, keys as rendered."""
+
+    items: tuple[tuple[str, "Kind"], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class KTuple:
+    """A tuple literal kind ``[int, string]``: its item kinds in order."""
+
+    items: tuple["Kind", ...]
+
+
+#: A parsed kind (spec §6.3.5).
+Kind: TypeAlias = KName | KLiteral | KUnion | KObject | KTuple
+
+_KIND_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+#: ``-? digits [. digits] [f | dec]`` — 3.x and 2.x render a float literal ``1.5f``.
+_KIND_NUMBER = re.compile(r"-?[0-9]+(?:\.[0-9]+)?(?:f|dec)?(?![A-Za-z0-9_])")
+_KIND_SIZE = re.compile(r"[0-9]+(?![A-Za-z0-9_])")
+_KIND_LITERAL_WORDS = frozenset({"true", "false", "none", "null"})
+#: Kinds whose arguments are an item kind and an optional size.
+_ITEM_KINDS = frozenset({"array", "set"})
+#: Kinds whose arguments are names separated by ``|``.
+_NAMED_KINDS = frozenset({"record", "geometry"})
+_KIND_CLOSERS = frozenset(_KIND_BRACKETS.values())
+_NONE_KIND = KLiteral("none")
+#: Nesting levels past any kind a server renders: deeper server text is refused, never a ``RecursionError``.
+_MAX_KIND_DEPTH = 100
+
+
+def _quote_close(char: str, *, strings: bool) -> str | None:
+    """The closing character of a quoted identifier (or, with *strings*, of a string literal) opening with *char*."""
+    close = _IDENTIFIER_QUOTES.get(char)
+    if close is None and strings and char in _QUOTES:
+        return char
+    return close
+
+
+class _KindReader:
+    """A recursive-descent reader of the kind grammar of spec §6.3.5, from a position of a text.
+
+    ::
+
+        kind    := member ("|" member)*
+        member  := "option" "<" kind ">" | NAME ["<" args ">"] | STRING | NUMBER | true | false | none | null
+                 | "{" [key ":" kind ("," key ":" kind)*] "}" | "[" kind ("," kind)* "]"
+        args    := array/set: kind ["," INT]; record/geometry: NAME ("|" NAME)*; any other name: its text
+
+    Every failure raises ``DefineParseError(_R_KIND)``.
+    """
+
+    __slots__ = ("pos", "text")
+
+    def __init__(self, text: str, pos: int) -> None:
+        self.text = text
+        self.pos = pos
+
+    def skip_space(self) -> str:
+        """Skip whitespace; return the character now at the position (``""`` at the end of the text)."""
+        space = _SPACE.match(self.text, self.pos)
+        if space is not None:
+            self.pos = space.end()
+        return self.text[self.pos : self.pos + 1]
+
+    def expect(self, char: str) -> None:
+        """Read *char*, after whitespace."""
+        if self.skip_space() != char:
+            raise DefineParseError(_R_KIND)
+        self.pos += 1
+
+    def kind(self, depth: int) -> Kind:
+        """``member ("|" member)*``: one member, or a flattened ``KUnion``."""
+        if depth > _MAX_KIND_DEPTH:
+            raise DefineParseError(_R_KIND)
+        members = self.member(depth)
+        while self.skip_space() == "|":
+            self.pos += 1
+            members.extend(self.member(depth))
+        return members[0] if len(members) == 1 else KUnion(tuple(members))
+
+    def member(self, depth: int) -> list[Kind]:
+        """One member — ``option<T>`` gives ``none`` and the members of ``T``."""
+        char = self.skip_space()
+        text, start = self.text, self.pos
+        if char in _QUOTES:
+            end = _delimited_end(text, start, char)
+            if end is None:
+                raise DefineParseError(_R_KIND)
+            self.pos = end
+            return [KLiteral(text[start:end])]
+        if char == "{":
+            return [self.object_literal(depth)]
+        if char == "[":
+            return [self.tuple_literal(depth)]
+        number = _KIND_NUMBER.match(text, start)
+        if number is not None:
+            self.pos = number.end()
+            return [KLiteral(number.group())]
+        name = _KIND_NAME.match(text, start)
+        if name is None:
+            raise DefineParseError(_R_KIND)
+        word = name.group()
+        self.pos = name.end()
+        if word in _KIND_LITERAL_WORDS:
+            return [KLiteral(word)]
+        opens = text.startswith("<", self.pos)
+        if word == "option":
+            if not opens:
+                raise DefineParseError(_R_KIND)
+            self.pos += 1
+            inner = self.kind(depth + 1)
+            self.expect(">")
+            return [_NONE_KIND, *(inner.members if isinstance(inner, KUnion) else (inner,))]
+        if not opens:
+            return [KName(word)]
+        self.pos += 1
+        return [KName(word, self.arguments(word, depth))]
+
+    def arguments(self, name: str, depth: int) -> tuple[Kind | str, ...]:
+        """The arguments of ``name<…>`` (the position is just after ``<``), up to and including the closing ``>``."""
+        if name in _ITEM_KINDS:
+            item = self.kind(depth + 1)
+            if self.skip_space() != ",":
+                self.expect(">")
+                return (item,)
+            self.pos += 1
+            self.skip_space()
+            size = _KIND_SIZE.match(self.text, self.pos)
+            if size is None:
+                raise DefineParseError(_R_KIND)
+            self.pos = size.end()
+            self.expect(">")
+            return (item, size.group())
+        if name in _NAMED_KINDS:
+            names = [self.identifier(strings=False)]
+            while self.skip_space() == "|":
+                self.pos += 1
+                names.append(self.identifier(strings=False))
+            self.expect(">")
+            return tuple(names)
+        return (self.raw_argument(),)
+
+    def identifier(self, *, strings: bool) -> str:
+        """An identifier as rendered — bare, or quoted between backquotes or ``⟨⟩`` — or, with *strings*, a string
+        literal too (an object key)."""
+        char = self.skip_space()
+        start = self.pos
+        close = _quote_close(char, strings=strings)
+        if close is not None:
+            end = _delimited_end(self.text, start, close)
+        else:
+            word = _WORD.match(self.text, start)
+            end = None if word is None else word.end()
+        if end is None:
+            raise DefineParseError(_R_KIND)
+        self.pos = end
+        return self.text[start:end]
+
+    def raw_argument(self) -> str:
+        """The text up to the ``>`` that closes ``name<``, stripped and non-empty: brackets (``<>`` included) must
+        match, string literals and quoted identifiers are skipped."""
+        text = self.text
+        start = index = self.pos
+        expected: list[str] = []
+        length = len(text)
+        while index < length:
+            char = text[index]
+            close = _quote_close(char, strings=True)
+            if close is not None:
+                end = _delimited_end(text, index, close)
+                if end is None:
+                    raise DefineParseError(_R_KIND)
+                index = end
+                continue
+            if char in _KIND_BRACKETS:
+                expected.append(_KIND_BRACKETS[char])
+            elif char in _KIND_CLOSERS:
+                if expected:
+                    if expected.pop() != char:
+                        raise DefineParseError(_R_KIND)
+                elif char == ">" and text[start:index].strip():
+                    self.pos = index + 1
+                    return text[start:index].strip()
+                else:
+                    raise DefineParseError(_R_KIND)
+            index += 1
+        raise DefineParseError(_R_KIND)
+
+    def object_literal(self, depth: int) -> KObject:
+        """``{ key: kind, … }`` (the position is at ``{``); ``{}`` is the empty object."""
+        self.pos += 1
+        items: list[tuple[str, Kind]] = []
+        if self.skip_space() != "}":
+            while True:
+                key = self.identifier(strings=True)
+                self.expect(":")
+                items.append((key, self.kind(depth + 1)))
+                if self.skip_space() != ",":
+                    break
+                self.pos += 1
+        self.expect("}")
+        return KObject(tuple(items))
+
+    def tuple_literal(self, depth: int) -> KTuple:
+        """``[kind, …]`` (the position is at ``[``), one item at least."""
+        self.pos += 1
+        items = [self.kind(depth + 1)]
+        while self.skip_space() == ",":
+            self.pos += 1
+            items.append(self.kind(depth + 1))
+        self.expect("]")
+        return KTuple(tuple(items))
+
+
+def parse_kind(text: str) -> Kind:
+    """Parse the whole of *text* — a ``TYPE`` kind as the server rendered it, whitespace around it allowed.
+
+    ``option<T>`` and a union holding ``none`` give the same tree (``"option<int>"`` and ``"none | int"``:
+    ``KUnion((KLiteral("none"), KName("int")))``). Raises ``DefineParseError`` (``_R_KIND``) for anything the
+    grammar does not cover, or a kind nested deeper than any a server renders.
+    """
+    reader = _KindReader(text, 0)
+    kind = reader.kind(0)
+    if reader.skip_space():
+        raise DefineParseError(_R_KIND)
+    return kind
+
+
+def parse_kind_prefix(text: str, pos: int) -> tuple[Kind, int]:
+    """Parse the kind starting at *pos* (after whitespace) and stop where it ends: ``(kind, end)``.
+
+    ``end`` is the position of the first character after the kind and the whitespace following it — the ``{`` of a
+    function's body after ``-> { a: int }`` or ``-> string``. Nothing after the kind is read. Raises
+    ``DefineParseError`` (``_R_KIND``) when no kind starts there.
+    """
+    reader = _KindReader(text, pos)
+    kind = reader.kind(0)
+    reader.skip_space()
+    return kind, reader.pos
+
+
+def _flat_members(members: Iterable[Kind]) -> list[Kind]:
+    flat: list[Kind] = []
+    for member in members:
+        flat.extend(_flat_members(member.members) if isinstance(member, KUnion) else (member,))
+    return flat
+
+
+def _render_argument(argument: Kind | str) -> str:
+    return argument if isinstance(argument, str) else render_kind(argument)
+
+
+def render_kind(kind: Kind) -> str:
+    """The canonical text of *kind*, which both lines accept as input and which parses back to the same tree.
+
+    Members joined by ``" | "``, a union holding ``none`` written ``option<…>`` at any depth (``none`` moved out,
+    the other members in order), generic arguments joined by ``", "`` (``record`` and ``geometry`` names by
+    ``" | "``), ``{ a: int, b: string }``, ``[int, string]``; literals, names and keys as rendered.
+    """
+    if isinstance(kind, KLiteral):
+        return kind.text
+    if isinstance(kind, KUnion):
+        members = _flat_members(kind.members)
+        rest = [member for member in members if member != _NONE_KIND]
+        if not rest:
+            return _NONE_KIND.text
+        joined = " | ".join(render_kind(member) for member in rest)
+        return joined if len(rest) == len(members) else f"option<{joined}>"
+    if isinstance(kind, KObject):
+        return "{ " + ", ".join(f"{key}: {render_kind(value)}" for key, value in kind.items) + " }"
+    if isinstance(kind, KTuple):
+        return "[" + ", ".join(render_kind(item) for item in kind.items) + "]"
+    if not kind.args:
+        return kind.name
+    separator = " | " if kind.name in _NAMED_KINDS else ", "
+    return f"{kind.name}<{separator.join(_render_argument(argument) for argument in kind.args)}>"
+
+
+def normalise_kind(text: str) -> tuple[str, bool]:
+    """``(field_type, nullable)`` for a rendered kind: the canonical text with the top-level optional stripped.
+
+    ``option<X>`` → ``X``, nullable; a top-level union holding ``none`` → that union without ``none`` (its only other
+    member alone), nullable; anything else → its canonical text, not nullable. So each SurrealDB 2.x rendering and its
+    3.x rendering give one result: ``"option<int>"``, ``"none | int"`` and ``"int | none"`` → ``("int", True)``;
+    ``"array<none | int, 5>"`` → ``("array<option<int>, 5>", False)``; ``"null | int"`` → ``("null | int", False)``.
+    Raises ``DefineParseError`` (``_R_KIND``) as ``parse_kind()``.
+    """
+    kind = parse_kind(text)
+    if isinstance(kind, KUnion):
+        members = _flat_members(kind.members)
+        rest = tuple(member for member in members if member != _NONE_KIND)
+        if rest and len(rest) < len(members):
+            return render_kind(rest[0] if len(rest) == 1 else KUnion(rest)), True
+    return render_kind(kind), False
