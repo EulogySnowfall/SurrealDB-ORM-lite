@@ -37,7 +37,7 @@
 | v0.26.0           | Tier 2 — Time travel (versioned storage)             | Done    |
 | v0.27.0           | Tier 2 — Subqueries                                  | Done    |
 | v0.28.0           | Tier 2 — Query cache                                 | Done    |
-| v0.29.0           | Tier 2 — Multi-database                              | Planned |
+| v0.29.0           | Tier 2 — Multi-database                              | Done    |
 | v0.30.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 10 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | Planned |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | Planned |
@@ -92,7 +92,7 @@ pieces stay out.
 | Versioned storage (time-travel)        | `surrealkv+versioned://` ²                            | ✅ v0.26.0     |
 | Subqueries                             | nested `SELECT` via `query()`                         | ✅ v0.27.0     |
 | Query cache (TTL)                      | client-side cache (SDK-independent)                   | ✅ v0.28.0     |
-| Multi-database                         | multiple `AsyncSurreal` instances                     | v0.29.0        |
+| Multi-database                         | multiple `AsyncSurreal` instances                     | ✅ v0.29.0     |
 | Schema introspection                   | `INFO FOR DB` / `INFO FOR TABLE`                      | v0.30.0        |
 | `DEFINE EVENT` (triggers)              | DDL via `query()`                                     | v0.31.0        |
 | `define_function()` DDL helper         | `DEFINE FUNCTION` via `query()` (`schema.py`)         | v0.31.0        |
@@ -156,7 +156,7 @@ moves it to the `surrealdb[embedded]` extra.
 | Embedded / versioned engine   | no         | ✅ v0.25 – v0.26            |
 | Subqueries                    | yes        | ✅ v0.27.0                  |
 | Query cache (TTL)             | yes        | ✅ v0.28.0                  |
-| Multi-database                | yes        | v0.29.0                     |
+| Multi-database                | yes        | ✅ v0.29.0                  |
 | Schema introspection          | yes        | v0.30.0                     |
 | DEFINE EVENT                  | yes        | v0.31.0                     |
 | Materialized views            | yes        | v0.32.0                     |
@@ -569,6 +569,27 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   invalidation from other processes (LIVE SELECT), caching `as_of()` reads, sharing results
   between event loops, coalescing concurrent misses
 
+### Version 0.29.0 — Multiple databases
+
+- `add_connection()`, `remove_connection()`, `get_config()` (`ConnectionConfig`),
+  `list_connections()`, `using()`, `get_active_connection_name()`,
+  `SurrealConfigDict(connection=)` and `get_connection_name()`, the full SurrealDB-ORM's names;
+  `name=` on `get_client()`, `close_connection()` and `transaction()`, hidden from
+  `inspect.signature()` so that FastAPI's `Depends()` behaves as before
+- Each named connection is a connection class of its own behind a routing manager, with its own
+  per-loop clients, session, live streams, change feeds, transactions, stored-function signatures
+  and query-cache scope. A call runs on the `using()` block's connection, else the model's
+  `connection` key, else `"default"`, resolved at every database call through a `ContextVar`
+- Each connection decides on its own server line: a 2.x and a 3.x server side by side in one
+  process (interactive transactions on 3.x over WebSocket, buffered on 2.x); CI adds a job with
+  both pinned servers
+- Errors before any request for what SurrealDB runs in one database: a transaction given another
+  connection's model, a subquery, a relation or a typed link across connections, and one on-disk
+  embedded store under two connections; `embedded_database(connection=)` for tests. Not detected,
+  and documented: untyped links, graph arrows, raw SurrealQL
+- Deferred: `QuerySet.using()`, a client-side connection pool, several connections over one
+  WebSocket (3.x sessions). Server lines unchanged (2.7.0 and 3.3.4, 3.1.5 retro identical)
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -751,7 +772,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 | ✅ v0.26.0 | Versioned storage / time-travel: `surrealkv+versioned://` ²          | embedded versioned engine         |
 | ✅ v0.27.0 | Subqueries (nested QuerySets in `filter`/`in`)                       | nested `SELECT` via `query()`     |
 | ✅ v0.28.0 | Query cache (TTL + invalidation), client-side                        | client cache                      |
-| v0.29.0    | Multi-database: named connection registry                            | N × `AsyncSurreal` instances      |
+| ✅ v0.29.0 | Multi-database: named connection registry                            | N × `AsyncSurreal` instances      |
 
 ¹ The embedded engine ships in the SDK 2.0.0 base wheel (engine core 2.3.10); the SDK 3.0 line
 moves it to the `surrealdb[embedded]` extra.
