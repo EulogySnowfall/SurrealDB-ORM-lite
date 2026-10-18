@@ -3657,6 +3657,12 @@ class TestStoreKey:
         for url in (None, "", "mem://", "memory://", _UNREACHABLE, "http://localhost:8000", "rocksdb://x"):
             assert embedded.store_key(url) is None, url
 
+    def test_whatever_follows_an_in_memory_scheme_holds_no_store(self, tmp_path: Path) -> None:
+        """Read from the SDK's parser: two clients on ``mem://abc`` are two databases, and nothing is written there."""
+        for url in ("mem://abc", "memory://abc", "mem:///abs/path", "mem://kv", f"mem://{tmp_path}/x"):
+            assert embedded.store_key(url) is None, url
+        assert embedded.store_key("surrealkv://kv") is not None
+
     def test_every_spelling_of_one_path_is_one_store(self, tmp_path: Path) -> None:
         path = tmp_path / "kv"
         expected = os.path.realpath(path)
@@ -3778,6 +3784,31 @@ class TestStoreClaims:
         await a_client.query("CREATE md_item:1 SET v = 1;", {})
         assert await _rows_of(b_client, "md_item") == []
         assert dict(connection_manager._STORE_CLAIMS) == claims  # in memory: nothing to claim
+
+    async def test_two_names_on_one_in_memory_path_are_two_databases(self) -> None:
+        """Whatever follows ``mem://`` names no store: no X5, and each name is a database of its own."""
+        claims = dict(connection_manager._STORE_CLAIMS)
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://abc", namespace="t", database="t")
+        SurrealDBConnectionManager.add_connection("md_b", url="mem://abc", namespace="t", database="t")
+        a_client = await SurrealDBConnectionManager.get_client("md_a")
+        b_client = await SurrealDBConnectionManager.get_client("md_b")
+        assert a_client is not b_client
+        await a_client.query("CREATE md_item:1 SET v = 1;", {})
+        await b_client.query("CREATE md_item:2 SET v = 2;", {})
+        assert _values(await _rows_of(a_client, "md_item")) == [1]
+        assert _values(await _rows_of(b_client, "md_item")) == [2]
+        assert dict(connection_manager._STORE_CLAIMS) == claims
+
+    async def test_an_in_memory_url_and_a_store_on_the_same_text_open_side_by_side(self, tmp_path: Path) -> None:
+        store = f"surrealkv://{tmp_path}/x"
+        SurrealDBConnectionManager.add_connection("md_a", url=f"mem://{tmp_path}/x", namespace="t", database="t")
+        SurrealDBConnectionManager.add_connection("md_b", url=store, namespace="t", database="t")
+        a_client = await SurrealDBConnectionManager.get_client("md_a")
+        b_client = await SurrealDBConnectionManager.get_client("md_b")
+        assert a_client is not b_client
+        assert _claim(store) == "md_b"
+        await a_client.query("CREATE md_item:1 SET v = 1;", {})
+        assert await _rows_of(b_client, "md_item") == []
 
 
 @fixture

@@ -9,8 +9,9 @@ opens a server transport for ``http``, ``https``, ``ws`` and ``wss``, and its in
 SDK's own message (:func:`require_supported_url`) before anything is opened.
 
 Multi-database (v0.29.0): two in-process engines on one on-disk store miss each other's writes, so a store is
-open under one connection name at a time. :func:`store_key` names the store an embedded URL opens — one key for
-every spelling of one path — and ``mem://`` none (every in-memory client is a database of its own).
+open by one connection at a time. :func:`store_key` names the store an embedded URL opens — one key for every
+spelling of one path — and an in-memory URL (``mem://...``, ``memory://...``) none: every in-memory client is a
+database of its own.
 
 Time travel (v0.26.0): ``QuerySet.as_of()`` needs a store that keeps history. On the embedded engine
 that is decided from the URL alone, before any request (:func:`keeps_history`): the SDK's parser must
@@ -37,6 +38,11 @@ UrlKind = Literal["server", "embedded", "refused"]
 
 #: The SDK's server transports. Every other scheme its parser recognises addresses the in-process engine.
 _NETWORK_SCHEMES: Final = frozenset({"http", "https", "ws", "wss"})
+
+#: The SDK's in-memory schemes: whatever follows ``://``, every client on one of them is a database of its own. A
+#: scheme a later SDK adds counts as an on-disk store (:func:`store_key`): at worst one refusal too many, never two
+#: engines on one store.
+_IN_MEMORY_SCHEMES: Final = frozenset({SdkUrlScheme.MEM, SdkUrlScheme.MEMORY})
 
 
 @functools.lru_cache(maxsize=64)
@@ -71,10 +77,11 @@ def store_key(url: str | None) -> str | None:
     The text after ``://``, cut at the first ``?`` or ``#``, without its trailing ``/``, resolved with
     ``os.path.realpath`` (a relative path against the working directory, symbolic links followed). So
     ``surrealkv://<d>/kv``, ``surrealkv://<d>/kv/``, ``surrealkv+versioned://<d>/kv`` and ``file://<d>/kv`` are one
-    store. ``None`` when that text is empty (``mem://``, ``memory://``: in memory, every client is a database of its
-    own), and for ``None``/``""``, a server URL or a URL the SDK refuses.
+    store. ``None`` for an in-memory URL (``mem://...``, ``memory://...``, whatever follows ``://``: every client is a
+    database of its own — the scheme as the SDK's parser reads it), when that text is empty, and for ``None``/``""``,
+    a server URL or a URL the SDK refuses.
     """
-    if not url or url_kind(url) != "embedded":
+    if not url or url_kind(url) != "embedded" or SdkUrl(url).scheme in _IN_MEMORY_SCHEMES:
         return None
     path = url.partition("://")[2]
     for mark in ("?", "#"):
