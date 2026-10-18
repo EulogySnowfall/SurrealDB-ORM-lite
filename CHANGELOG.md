@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.3] - 2026-10-18
+
+`get_or_create()` and `update_or_create()` bind the queryset's `variables()` in their lookup, as
+`filter()` does. No new public API.
+
+### Fixed
+
+- **`get_or_create()` and `update_or_create()` bind `variables()` in their lookup** (#252). The
+  lookup ran without the queryset's `variables()`, so a `Var` criterion read `NONE` there:
+  `variables(n=10).get_or_create(size__gte=Var("n"), …)` compared `size` with `NONE` and could
+  match a record the caller did not mean, which `update_or_create()` then updated, and
+  `variables(t="mine").get_or_create(title=Var("t"))` did not find the existing record. The lookup
+  now binds the queryset's `variables()`, merged with those of its subquery criteria as `filter()`
+  merges them (a subquery that binds one of these names to another value raises `ValueError`), on
+  SurrealDB 2.x, 3.x and the embedded engine.
+- **An `exact` `Var` criterion naming a variable of `variables()` is written as that variable's
+  value on create** (#252), so the next identical call finds the record:
+  `variables(t="mine").get_or_create(title=Var("t"))` behaves as `get_or_create(title="mine")`. On
+  the record id and on an edge's `in` and `out`, it is compared as the record id its value names,
+  as the same criterion given that value is (`variables(a="person:alice")` with
+  `get_or_create(in_=Var("a"), out=bob)` finds or relates `person:alice`); a value that names no
+  record id there raises `ValueError` before any request. A model instance given to `variables()`
+  is bound and written as its record id, as the instance given as the criterion is; an unsaved one
+  raises `ValueError` before any request. An `exact` `Var` that names a session parameter
+  (`Var("auth")`) or no variable of `variables()` still raises `SurrealDbError` on create.
+
+```python
+from surreal_orm_lite import Var
+
+qs = Room.objects().variables(t="mine", n=10)
+room, created = await qs.get_or_create(title=Var("t"))  # as get_or_create(title="mine")
+room, created = await qs.update_or_create(size__gte=Var("n"), title=Var("t"), defaults={"floor": 2})
+```
+
+### Changed
+
+- **Refusals of a `"$name"` criterion in `get_or_create()` and `update_or_create()`** (#252): a
+  string criterion that is exactly `$` followed by the name of a variable of a subquery criterion's
+  `variables()` now raises `SurrealDbError` too, like one naming a variable of the queryset's
+  `variables()`. For a variable, the message names `Var('x')` as the criterion to write. For a
+  session parameter, it says to pass the actual value under `exact`, and that `Var('auth')` works
+  under any other lookup (`members__contains=Var("auth")` is looked up, never written). On the `id`
+  column it names the record id `table:⟨$name⟩` the string would be.
+
 ## [0.29.2] - 2026-10-18
 
 The text lookups `startswith`, `endswith`, `like`, `ilike`, `match` and `regex` work: each compiles
