@@ -356,7 +356,9 @@ room, created = await qs.update_or_create(size__gte=Var("n"), title=Var("t"), de
 On the record id and on an edge's `in` and `out`, such a criterion is compared as the record id
 its value names, as the same criterion given that value is: with `variables(a="person:alice")`,
 `get_or_create(in_=Var("a"), out=bob)` finds or relates `person:alice`. A value that names no record
-id there raises `ValueError` before any request. The `variables()` of a subquery criterion share
+id there raises `ValueError` before any request. A model instance given to `variables()` is bound
+and written as its record id, as the instance given as the criterion is (`variables(a=alice)`); an
+unsaved one raises `ValueError` before any request. The `variables()` of a subquery criterion share
 the lookup, as in `filter()`: one that binds a name of the queryset's `variables()` to another
 value raises `ValueError`. `Var("auth")` finds the signed-in user's record
 (`get_or_create(owner=Var("auth"))` returns it) but cannot be written: with no record to return, it

@@ -2231,6 +2231,13 @@ class QuerySet:
         ``size`` with 10. An ``exact`` ``Var`` criterion on the record id or an edge endpoint is compared with the
         record id its value names (:meth:`_lookup_criteria`). A criterion ``"$name"`` that would warn never gets
         here (:meth:`_reject_string_references`).
+
+        Each variable is bound as the value the create writes (:func:`~surreal_orm_lite.utils.as_record_value`): a
+        model instance as its record id, whether a criterion reads it or not — bound as it is, the SDK has no
+        encoder for it. S7 compares the values given to ``variables()``, before that conversion.
+
+        Raises:
+            ValueError: an unsaved model instance in the variables (it has no record id), before any request.
         """
         probe = self._lookup_probe(self._lookup_criteria(criteria))
         table = self._model_table
@@ -2238,7 +2245,8 @@ class QuerySet:
         def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
             where_clause, where_vars = probe._build_where(subqueries=compiler)
             query = f"SELECT * FROM {table}{where_clause} LIMIT 2;"
-            return compiler.wrap(query), {**compiler.variables, **where_vars}
+            bound = {name: as_record_value(value) for name, value in compiler.variables.items()}
+            return compiler.wrap(query), {**bound, **where_vars}
 
         rows = await probe._run_compiled(compile_statement)
         return rows if isinstance(rows, list) else []
@@ -2316,8 +2324,10 @@ class QuerySet:
         criterion naming a variable the lookup binds is written as that variable's value on create
         (``title=Var("t")`` with ``variables(t="mine")`` writes ``title = "mine"``), so the next identical call
         finds the record; on the record id and an edge's ``in``/``out`` it is compared as the record id its value
-        names, as the same criterion given that value is. A ``Var`` naming a session parameter (``Var("auth")``) or
-        a name no ``variables()`` gives is looked up but cannot be written: ``SurrealDbError`` before any write.
+        names, as the same criterion given that value is. A model instance in ``variables()`` is bound and written as
+        its record id (an unsaved one raises ``ValueError`` before any request). A ``Var`` naming a session
+        parameter (``Var("auth")``) or a name no ``variables()`` gives is looked up but cannot be written:
+        ``SurrealDbError`` before any write.
 
         A ``str`` criterion is data, looked up and written as it is (``owner="$admin"``). A scalar criterion, whatever
         its lookup, that is ``$`` and the name of a variable the lookup binds or of one of SurrealDB's session
@@ -2384,7 +2394,9 @@ class QuerySet:
         ``objects().variables(t="mine").get_or_create(title=Var("t"))`` behaves as ``get_or_create(title="mine")``,
         and the next identical call returns ``created=False``. On the record id and an edge's ``in``/``out`` it is
         compared as the record id its value names, as the same criterion given that value is:
-        ``variables(a="person:alice").get_or_create(in_=Var("a"), out=bob)`` finds or relates ``person:alice``.
+        ``variables(a="person:alice").get_or_create(in_=Var("a"), out=bob)`` finds or relates ``person:alice``. A
+        model instance in ``variables()`` is bound and written as its record id (``variables(a=alice)``); an unsaved
+        one raises ``ValueError`` before any request.
 
         A ``str`` criterion is data, looked up and written as it is (``owner="$admin"``). A scalar criterion, whatever
         its lookup, that is ``$`` and the name of a variable the lookup binds or of one of SurrealDB's session

@@ -750,6 +750,33 @@ class TestVariableCriteria:
         assert payload == {"item": RecordID("fv_item", "a")}
         assert isinstance(payload["item"], RecordID)
 
+    def test_a_model_instance_is_bound_as_its_record_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The lookup binds the value the create writes: a model instance as its record id, whether a criterion reads
+        it or not (the SDK has no encoder for a model). A subquery binding the same instance shares it (S7 compares
+        the values given to ``variables()``)."""
+        calls = _recording_lookup(monkeypatch)
+        a, item = RecordID("fv_item", "a"), FvItem(id="a")
+        asyncio.run(FvNote.objects().variables(i=item)._lookup_matches({"item": Var("i")}))
+        asyncio.run(FvItem.objects().variables(unused=item)._lookup_matches({"name": "A"}))
+        inner = FvNote.objects().filter(item=Var("i")).variables(i=item).select("id")
+        asyncio.run(FvNote.objects().variables(i=item)._lookup_matches({"id__in": inner, "item": Var("i")}))
+        assert calls == [
+            ("SELECT * FROM fv_note WHERE item = $i LIMIT 2;", {"i": a}),
+            ("SELECT * FROM fv_item WHERE name = $_f0 LIMIT 2;", {"unused": a, "_f0": "A"}),
+            (
+                "{ LET $_sq0 = (SELECT VALUE id FROM fv_note WHERE item = $i); "
+                "(SELECT * FROM fv_note WHERE id IN $_sq0 AND item = $i LIMIT 2) };",
+                {"i": a},
+            ),
+        ]
+        assert all(type(value) is RecordID for _, bound in calls for key, value in bound.items() if key != "_f0")
+
+    @pytest.mark.parametrize("method", _OR_CREATE)
+    def test_an_unsaved_model_instance_is_refused(self, method: str) -> None:
+        """An unsaved instance has no record id to bind: ``ValueError`` before any request, used or not."""
+        with pytest.raises(ValueError, match=r"^An unsaved FvItem has no record id; save it first or pass a RecordID\.$"):
+            asyncio.run(getattr(FvItem.objects().variables(unused=FvItem(name="x")), method)(name="A"))
+
     def test_a_variable_of_a_subquery_criterion_is_written(self) -> None:
         inner = FvItem.objects().filter(name=Var("t")).variables(t="A").select("token")
         assert FvItem.objects()._criteria_payload({"name": Var("t"), "token__in": inner}) == {"name": "A"}
@@ -1189,6 +1216,24 @@ class TestVariableCriteriaE2E:
             assert (made_too.in_, made_too.out, created) == (c, c, True)
             edges = sorted((str(edge.in_), str(edge.out)) for edge in await FvLink.objects().all())
             assert edges == [("fv_item:a", "fv_item:c"), ("fv_item:c", "fv_item:c")]
+
+    async def test_a_model_instance(self, kind: str) -> None:
+        """A model instance in ``variables()`` is bound as its record id, the value the create writes: on an edge
+        endpoint, on a link column, and when no criterion reads it (until then, the SDK's ``BufferError``)."""
+        async with values_db(kind):
+            item, a, c = FvItem(id="a"), RecordID("fv_item", "a"), RecordID("fv_item", "c")
+            made, created = await FvLink.objects().variables(a=item).get_or_create(in_=Var("a"), out=c)
+            assert (made.in_, made.out, created) == (a, c, True)
+            for method in _OR_CREATE:
+                found, created = await getattr(FvLink.objects().variables(a=item), method)(in_=Var("a"), out=c)
+                assert (found.id, created) == (made.id, False), method
+                note, created = await getattr(FvNote.objects().variables(i=item), method)(item=Var("i"))
+                assert (str(note.id).removeprefix("fv_note:"), note.item, created) == ("n", a, False), method
+                found, created = await getattr(FvItem.objects().variables(unused=item), method)(name="A")
+                assert (str(found.id).removeprefix("fv_item:"), created) == ("a", False), method
+            assert [(str(edge.in_), str(edge.out)) for edge in await FvLink.objects().all()] == [("fv_item:a", "fv_item:c")]
+            assert [(str(note.id), note.item) for note in await FvNote.objects().all()] == [("n", a)]
+            assert _ids(await FvItem.objects().all()) == ["a", "b", "c", "d"]
 
 
 async def _take(stream: Any, count: int, timeout: float = 10.0) -> list[Any]:
