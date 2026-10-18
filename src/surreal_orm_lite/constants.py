@@ -17,7 +17,7 @@ LOOKUP_OPERATORS = {
 
 #: The text lookups (#251): SurrealQL has no infix operator for them (``LIKE``, ``STARTSWITH``, ``REGEX``… are parse
 #: errors on 2.x and 3.x), so each compiles to the string function named here, guarded by the field's type:
-#: ``(name.is_string() AND string::starts_with(name, $_f0))`` (``utils._text_condition``). ``like``/``ilike`` bind
+#: ``((name).is_string() AND string::starts_with(name, $_f0))`` (``utils._text_condition``). ``like``/``ilike`` bind
 #: their pattern translated to a regular expression, ``match``/``regex`` theirs as it is.
 TEXT_LOOKUP_FUNCTIONS = {
     "startswith": "string::starts_with",

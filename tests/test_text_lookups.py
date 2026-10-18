@@ -2,11 +2,12 @@
 
 SurrealQL has no infix operator for them (``name STARTSWITH $v`` is a parse error on 2.7.0, 3.3.4 and the
 embedded engine), so each compiles to a string function, guarded by the field's type:
-``(name.is_string() AND string::starts_with(name, $_f0))``. The bare function fails the whole query as soon as
+``((name).is_string() AND string::starts_with(name, $_f0))``. The bare function fails the whole query as soon as
 one record holds ``NONE``, ``NULL`` or a non-string in that field; the guard makes such a record never match,
 and match the negation (``~Q(...)``). ``type::is::string`` is 2.x-only and ``type::is_string`` 3.x-only: the
 method form ``.is_string()`` parses on both lines and on the embedded engine (measured on 2.7.0, 3.1.5, 3.3.4 and
-SDK 2.0.0's engine).
+SDK 2.0.0's engine). The path is parenthesised: 3.x applies ``authors.name.is_string()`` to each element of the
+array a dotted path through an array of links or objects gives, while ``(authors.name).is_string()`` is false.
 
 ``like``/``ilike`` take an SQL ``LIKE`` pattern, translated before it is bound: ``%`` matches any run of
 characters (newlines included), ``_`` exactly one, the pattern is anchored at both ends, and every other
@@ -152,7 +153,7 @@ class TestCompile:
     )
     def test_the_value_is_bound_as_it_is(self, lookup: str, function: str) -> None:
         assert build_filter_condition("name", lookup, "A.b%", 3) == (
-            f"(name.is_string() AND {function}(name, $_f3))",
+            f"((name).is_string() AND {function}(name, $_f3))",
             {"_f3": "A.b%"},
             4,
         )
@@ -172,27 +173,38 @@ class TestCompile:
     )
     def test_like_translates_its_pattern(self, pattern: str, regex: str) -> None:
         assert build_filter_condition("name", "like", pattern, 0) == (
-            "(name.is_string() AND string::matches(name, $_f0))",
+            "((name).is_string() AND string::matches(name, $_f0))",
             {"_f0": regex},
             1,
         )
 
     def test_ilike_is_case_insensitive(self) -> None:
         assert build_filter_condition("name", "ilike", "Al_c%.", 0) == (
-            "(name.is_string() AND string::matches(name, $_f0))",
+            "((name).is_string() AND string::matches(name, $_f0))",
             {"_f0": "(?is)^Al.c.*\\.$"},
             1,
         )
 
     def test_a_nested_field(self) -> None:
         sql, _, _ = build_filter_condition("profile.name", "startswith", "A", 0)
-        assert sql == "(profile.name.is_string() AND string::starts_with(profile.name, $_f0))"
+        assert sql == "((profile.name).is_string() AND string::starts_with(profile.name, $_f0))"
+
+    def test_a_nested_field_with_a_var(self) -> None:
+        sql, _, _ = build_filter_condition("authors.name", "regex", Var("p"), 0)
+        assert sql == "((authors.name).is_string() AND string::matches(authors.name, $p))"
+
+    def test_live_with_a_nested_field(self) -> None:
+        sql = TlItem.objects().filter(~Q(**{"authors.name__like": "B%"}))._compile_live(False)
+        assert sql == (
+            "LIVE SELECT * FROM tl_item WHERE NOT (((authors.name).is_string() "
+            "AND string::matches(authors.name, '(?s)^B.*$')));"
+        )
 
     def test_the_queryset_and_q(self) -> None:
         query, variables = TlItem.objects().filter(Q(name__like="A%") | ~Q(name__endswith="z"), age__gte=18)._compile_query()
         assert query == (
-            "SELECT * FROM tl_item WHERE age >= $_f0 AND ((name.is_string() AND string::matches(name, $_f1)) "
-            "OR NOT ((name.is_string() AND string::ends_with(name, $_f2))));"
+            "SELECT * FROM tl_item WHERE age >= $_f0 AND (((name).is_string() AND string::matches(name, $_f1)) "
+            "OR NOT (((name).is_string() AND string::ends_with(name, $_f2))));"
         )
         assert variables == {"_f0": 18, "_f1": "(?s)^A.*$", "_f2": "z"}
 
@@ -200,7 +212,7 @@ class TestCompile:
     def test_a_var(self, lookup: str) -> None:
         function = TEXT_LOOKUP_FUNCTIONS[lookup]
         assert build_filter_condition("name", lookup, Var("p"), 2) == (
-            f"(name.is_string() AND {function}(name, $p))",
+            f"((name).is_string() AND {function}(name, $p))",
             {},
             2,
         )
@@ -256,14 +268,14 @@ class TestCompile:
     def test_live_inlines_the_pattern_and_keeps_its_backslashes(self) -> None:
         sql = TlItem.objects().filter(name__like="a\\b'%", age__gte=1)._compile_live(False)
         assert sql == (
-            "LIVE SELECT * FROM tl_item WHERE (name.is_string() AND string::matches(name, '(?s)^a\\\\\\\\b\\'.*$')) "
+            "LIVE SELECT * FROM tl_item WHERE ((name).is_string() AND string::matches(name, '(?s)^a\\\\\\\\b\\'.*$')) "
             "AND age >= 1;"
         )
         assert "$" not in sql.replace("$'", "")
 
     def test_live_with_a_var(self) -> None:
         sql = TlItem.objects().filter(name__startswith=Var("p")).variables(p="A")._compile_live(False)
-        assert sql == "LIVE SELECT * FROM tl_item WHERE (name.is_string() AND string::starts_with(name, 'A'));"
+        assert sql == "LIVE SELECT * FROM tl_item WHERE ((name).is_string() AND string::starts_with(name, 'A'));"
 
 
 class TestRefusalsUnchanged:
@@ -292,10 +304,10 @@ class TestRefusalsUnchanged:
 #: The row the 2.x/3.x behaviour table gives the text lookups, cell by cell.
 _TEXT_LOOKUP_ROW = [
     "Text lookups (`startswith`, `endswith`, `like`, `ilike`, `match`, `regex`)",
-    "same on both lines: string functions guarded by `field.is_string()` (`type::is::string` parses on 2.x only); "
-    "a `NONE`, `NULL` or non-string field never matches",
-    "the same (`type::is_string` parses on 3.x only); until v0.29.1 they compiled to operators SurrealQL lacks "
-    "(`LIKE`…): a parse error on both lines",
+    "same on both lines: string functions guarded by `(field).is_string()` (`type::is::string` is 2.x-only); "
+    "a `NONE`, `NULL`, non-string or array path value never matches",
+    "the same (`type::is_string` is 3.x-only; `a.b.is_string()` tests each element of an array path); "
+    "until v0.29.1: operators SurrealQL lacks (`LIKE`…), a parse error on both lines",
     "v0.29.2",
 ]
 
@@ -385,6 +397,76 @@ class TestTextLookupsE2E:
         async with text_db(kind):
             with pytest.warns(DeprecationWarning):
                 assert _keys(await TlItem.objects().filter(name__like="$$adm%").exec()) == {"dollar"}
+
+
+# ==================== a dotted path through an array: mem:// and the server ====================
+
+POST_TABLE = "tl_post"
+USER_TABLE = "tl_user"
+
+
+class TlPost(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name=POST_TABLE)
+
+    id: str | None = None
+    authors: Any = None
+
+
+#: The posts, by what their ``authors`` hold. ``authors.name`` is an array on ``links`` and ``objects``, never a
+#: string: those posts never match a text lookup on it. It is the string ``'Alice'`` on ``object`` and ``link``.
+ALL_POSTS = frozenset({"links", "objects", "object", "link", "empty", "none"})
+ALICE_POSTS = frozenset({"object", "link"})
+
+#: (lookup, value): each finds ``'Alice'``.
+ALICE_CASES = [
+    ("startswith", "A"),
+    ("endswith", "ice"),
+    ("like", "A%"),
+    ("ilike", "a%"),
+    ("match", "^A"),
+    ("regex", "ice$"),
+]
+
+
+@contextlib.asynccontextmanager
+async def posts_db(kind: str) -> AsyncIterator[Any]:
+    """The ORM on *kind*, seeded with two users and the posts of :data:`ALL_POSTS`."""
+    context = embedded_database("mem://") if kind == "mem" else orm_client(POST_TABLE, USER_TABLE)
+    async with context as client:
+        await client.query(
+            f"CREATE {USER_TABLE}:al SET name = 'Alice'; CREATE {USER_TABLE}:bo SET name = 'Bob'; "
+            f"CREATE {POST_TABLE}:links SET authors = [{USER_TABLE}:al, {USER_TABLE}:bo]; "
+            f"CREATE {POST_TABLE}:objects SET authors = [{{ name: 'Alice' }}, {{ name: 'Bob' }}]; "
+            f"CREATE {POST_TABLE}:object SET authors = {{ name: 'Alice' }}; "
+            f"CREATE {POST_TABLE}:link SET authors = {USER_TABLE}:al; "
+            f"CREATE {POST_TABLE}:empty SET authors = []; CREATE {POST_TABLE}:none;",
+            {},
+        )
+        yield client
+
+
+@pytest.mark.usefixtures("_no_warning")
+@pytest.mark.parametrize("kind", ["mem", "ws"])
+class TestDottedPathE2E:
+    """A dotted path through an array of record links or of objects is an array, never a string: it never matches,
+    matches the negation, and does not fail the query (SurrealDB 3.x applies ``authors.name.is_string()`` to each
+    element; ``(authors.name).is_string()`` tests the array)."""
+
+    @pytest.mark.parametrize(("lookup", "value"), ALICE_CASES, ids=[lookup for lookup, _ in ALICE_CASES])
+    async def test_the_lookup_and_its_negation(self, kind: str, lookup: str, value: str) -> None:
+        criterion = {f"authors.name__{lookup}": value}
+        async with posts_db(kind):
+            assert _keys(await TlPost.objects().filter(**criterion).exec()) == ALICE_POSTS
+            assert _keys(await TlPost.objects().filter(~Q(**criterion)).exec()) == ALL_POSTS - ALICE_POSTS
+            assert await TlPost.objects().filter(**criterion).count() == len(ALICE_POSTS)
+
+    @pytest.mark.parametrize("lookup", ["startswith", "regex"])
+    async def test_a_var(self, kind: str, lookup: str) -> None:
+        async with posts_db(kind):
+            qs = TlPost.objects().filter(**{f"authors.name__{lookup}": Var("p")}).variables(p="A")
+            assert _keys(await qs.exec()) == ALICE_POSTS
+            negated = TlPost.objects().filter(~Q(**{f"authors.name__{lookup}": Var("p")})).variables(p="A")
+            assert _keys(await negated.exec()) == ALL_POSTS - ALICE_POSTS
 
 
 # ==================== live queries: the server only ====================

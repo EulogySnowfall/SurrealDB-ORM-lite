@@ -615,13 +615,17 @@ def _text_condition(
 ) -> tuple[str, dict[str, Any], int]:
     """The condition of a text lookup (``startswith``, ``endswith``, ``like``, ``ilike``, ``match``, ``regex``; #251).
 
-    ``(<field>.is_string() AND <function>(<field>, $_f<n>))``: the string function alone fails the whole query on a
-    record whose field is ``NONE``, ``NULL`` or not a string, and the guard makes such a record never match (and
+    ``((<field>).is_string() AND <function>(<field>, $_f<n>))``: the string function alone fails the whole query on
+    a record whose field is ``NONE``, ``NULL`` or not a string, and the guard makes such a record never match (and
     match the negation). The method form parses on both lines and on the embedded engine (``type::is::string`` is
-    2.x-only, ``type::is_string`` 3.x-only). The value is a ``str`` — data, whatever it starts with, the ``"$$"``
-    escape unescaped and a variable-like value noted as in :func:`build_filter_condition` — or a ``Var``
-    reference, except for ``like``/``ilike``, whose pattern is translated to a regular expression before it is
-    bound (:func:`_like_regex`).
+    2.x-only, ``type::is_string`` 3.x-only). The parentheses make it test the path's value as a whole: SurrealDB 3.x
+    applies ``authors.name.is_string()`` to each element of the array a dotted path through an array of record links
+    or objects gives (``[true, true]``, truthy), which then reached the function and failed the query; such a path is
+    an array, never matches, and matches the negation on both lines.
+
+    The value is a ``str`` — data, whatever it starts with, the ``"$$"`` escape unescaped and a variable-like value
+    noted as in :func:`build_filter_condition` — or a ``Var`` reference, except for ``like``/``ilike``, whose
+    pattern is translated to a regular expression before it is bound (:func:`_like_regex`).
 
     Raises:
         ValueError: a ``Var`` given to ``like``/``ilike``, or a value that is neither a ``str`` nor a ``Var``.
@@ -633,7 +637,7 @@ def _text_condition(
                 "and a Var's value is only known to the database. Pass the pattern as a string, or use 'regex' "
                 "with a Var holding a regular expression."
             )
-        return f"({field}.is_string() AND {function}({field}, {value.reference}))", {}, counter
+        return _guarded(field, function, value.reference), {}, counter
     if not isinstance(value, str):
         raise ValueError(f"'{lookup}' lookup requires a string, got {type(value).__name__}")
     variable_like = VARIABLE_NAME_VALUE.fullmatch(value)
@@ -643,7 +647,16 @@ def _text_condition(
     if lookup in ("like", "ilike"):
         value = _like_regex(value, ignore_case=lookup == "ilike")
     var_name = f"_f{counter}"
-    return f"({field}.is_string() AND {function}({field}, ${var_name}))", {var_name: value}, counter + 1
+    return _guarded(field, function, f"${var_name}"), {var_name: value}, counter + 1
+
+
+def _guarded(field: str, function: str, argument: str) -> str:
+    """``((<field>).is_string() AND <function>(<field>, <argument>))``, the condition of a text lookup (#251).
+
+    The path is parenthesised before ``.is_string()``, so a dotted path through an array is tested as the array it
+    gives, not element by element (:func:`_text_condition`).
+    """
+    return f"(({field}).is_string() AND {function}({field}, {argument}))"
 
 
 def _list_item(item: Any, field: str, lookup: str) -> Any:
@@ -768,9 +781,10 @@ def build_filter_condition(
 
     The text lookups ``startswith``, ``endswith``, ``like``, ``ilike``, ``match`` and ``regex`` (#251,
     ``TEXT_LOOKUP_FUNCTIONS``) compile to SurrealQL's string functions, guarded by the field's type
-    (:func:`_text_condition`): ``(name.is_string() AND string::starts_with(name, $_f0))``. A record whose field is
-    missing, ``NULL`` or not a string never matches. ``like``/``ilike`` bind their pattern translated to an
-    anchored regular expression (:func:`_like_regex`); ``match``/``regex`` bind theirs as it is.
+    (:func:`_text_condition`): ``((name).is_string() AND string::starts_with(name, $_f0))``. A record whose field
+    is missing, ``NULL`` or not a string (a dotted path through an array included) never matches. ``like``/``ilike``
+    bind their pattern translated to an anchored regular expression (:func:`_like_regex`); ``match``/``regex`` bind
+    theirs as it is.
 
     A subquery (v0.27.0) — a ``Subquery``, or a ``QuerySet`` read as one — given as the whole value is compiled
     by *subqueries*, the statement's compiler (``subquery.subquery_condition``): ``in``, ``not_in``,
