@@ -2,7 +2,7 @@ import contextlib
 import logging
 import math
 import numbers
-from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Self, SupportsIndex, cast
 from uuid import UUID
@@ -34,10 +34,12 @@ from .subquery import SubqueryCompiler
 from .surql_literal import inline_variables
 from .types import Duration
 from .utils import (
+    RECORD_ID_COLUMN,
     VALID_FIELD_PATTERN,
     VARIABLE_NAME_VALUE,
     as_record_value,
     build_filter_condition,
+    coerce_endpoint,
     coerce_record_id,
     is_select_item,
     non_negative_int,
@@ -66,6 +68,18 @@ _CACHE_QUERY = (
     "QueryCache.make_key(), get() and set()"
 )
 _CACHE_DISABLED = "QueryCache is disabled — .cache() has no effect"
+
+
+def _unwritable_variable(field: str, name: str) -> str:
+    """The refusal of an ``exact`` ``Var(name)`` criterion the create of ``get_or_create()``/``update_or_create()``
+    cannot write (issue #252): a session parameter, or a name no ``variables()`` of the lookup gives."""
+    if name in SESSION_PARAMETERS:
+        why = f"it reads SurrealDB's ${name} parameter, whose value only the database knows"
+        advice = "Pass the value itself as the criterion or in defaults=."
+    else:
+        why = f"variables() gives no {name}, so only the database knows its value"
+        advice = f"Give {name} to variables(), or pass the value itself as the criterion or in defaults=."
+    return f"Cannot create a record from Var('{name}') given for '{field}': {why}. {advice}"
 
 
 class QuerySet:
@@ -809,13 +823,7 @@ class QuerySet:
 
         return parts, variables, counter
 
-    def _build_where(
-        self,
-        *,
-        as_of: bool = False,
-        subqueries: SubqueryCompiler | None = None,
-        variable_names: Collection[str] = (),
-    ) -> tuple[str, dict[str, Any]]:
+    def _build_where(self, *, as_of: bool = False, subqueries: SubqueryCompiler | None = None) -> tuple[str, dict[str, Any]]:
         """
         Build a parameterized WHERE clause from filters, Q objects and ``nearby()`` conditions.
 
@@ -824,27 +832,18 @@ class QuerySet:
         by *subqueries*, the statement's compiler; without one it raises ``ValueError`` (S8).
 
         Once every condition is compiled, a scalar ``str`` filter value that is ``$`` and the name of one of the
-        statement's ``variables()`` — this queryset's, its subqueries', or *variable_names* — or of SurrealDB's
-        session parameters (``$auth``…) gives a ``UserWarning`` naming ``Var(...)``
-        (:func:`utils.warn_on_variable_names`, v0.28.1), unless ``subqueries.warn`` is false. Without *subqueries*
-        nothing is checked: only a statement has variables.
-
-        Args:
-            variable_names: names the checks count as variables besides the statement's (the warning, and the hint
-                of an edge endpoint's ``ValueError``): the ``variables()`` of the queryset whose
-                ``get_or_create()``/``update_or_create()`` look up with this one. Kept on *subqueries*
-                (``outer_variable_names``).
+        statement's ``variables()`` — this queryset's or its subqueries' — or of SurrealDB's session parameters
+        (``$auth``…) gives a ``UserWarning`` naming ``Var(...)`` (:func:`utils.warn_on_variable_names`, v0.28.1),
+        unless ``subqueries.warn`` is false. Without *subqueries* nothing is checked: only a statement has variables.
 
         Returns:
             A tuple of (where_clause_string, variables_dict).
             The where_clause_string includes the ``WHERE`` keyword, or is empty if no filters.
         """
-        if subqueries is not None and variable_names:
-            subqueries.outer_variable_names = frozenset(variable_names)
         parts, variables, _ = self._where_parts(0, as_of=as_of, subqueries=subqueries)
         if subqueries is not None:
             if subqueries.warn:
-                warn_on_variable_names(subqueries.variable_like, {*subqueries.variables, *subqueries.outer_variable_names})
+                warn_on_variable_names(subqueries.variable_like, subqueries.variables)
             subqueries.variable_like.clear()
         if not parts:
             return "", {}
@@ -2017,8 +2016,7 @@ class QuerySet:
 
     # ==================== Upsert / get_or_create ====================
 
-    @staticmethod
-    def _criteria_payload(criteria: dict[str, Any]) -> dict[str, Any]:
+    def _criteria_payload(self, criteria: Mapping[str, Any]) -> dict[str, Any]:
         """Field=value pairs usable as a WRITE payload, taken from EQUALITY criteria only.
 
         ``criteria`` keys are filter lookups (``field`` or ``field__lookup``). A literal raw
@@ -2032,23 +2030,37 @@ class QuerySet:
         gets created is the row the next lookup finds: a ``str`` is data, ``"$admin"`` included;
         the deprecated ``"$$admin"`` escape is un-escaped to ``"$admin"`` (otherwise it filtered on
         ``"$admin"`` but stored ``"$$admin"``, never converging and creating a duplicate on every
-        call), without a second warning (the lookup warns); and a ``Var`` reference is refused
-        outright — its value lives on the server, so it cannot be written back (issue #156
-        follow-up). A model instance is written as its record id, the value its lookup binds
-        (v0.22.0): ``get_or_create(customer=alice)`` stores ``customer = RecordID(...)``. A string
-        ``"$auth"`` naming a session parameter or a variable of ``variables()`` never gets here: the
-        caller refused it before the lookup (:meth:`_reject_string_references`).
+        call), without a second warning (the lookup warns). A model instance is written as its
+        record id, the value its lookup binds (v0.22.0): ``get_or_create(customer=alice)`` stores
+        ``customer = RecordID(...)``. A string ``"$auth"`` naming a session parameter or a variable
+        the lookup binds never gets here: the caller refused it before the lookup
+        (:meth:`_reject_string_references`).
+
+        A ``Var("t")`` criterion naming a variable the lookup binds (:meth:`_lookup_variables`: this
+        queryset's ``variables()`` and those of its subquery criteria) is written as that variable's value,
+        through :func:`~surreal_orm_lite.utils.as_record_value` — data, never un-escaped (issue #252): the lookup
+        compared the column with that value, so the next identical call finds the record.
+        ``get_or_create(title=Var("t"))`` with ``variables(t="mine")`` writes ``title = "mine"``. Any other
+        ``Var`` — a session parameter (``Var("auth")``), a name no ``variables()`` gives — is refused: its value
+        is only known to the database, so it cannot be written back (issue #156 follow-up).
+
+        Raises:
+            SurrealDbError: an ``exact`` ``Var`` criterion naming no variable the lookup binds.
+            ValueError: an unsaved model instance; and what compiling the criteria raises (:meth:`_lookup_variables`).
         """
         payload: dict[str, Any] = {}
+        variables: dict[str, Any] | None = None
         for key, value in criteria.items():
             field_name, lookup = parse_lookup(key)
             if lookup != "exact":
                 continue
             if isinstance(value, Var):
-                raise SurrealDbError(
-                    f"Cannot create a record from the query-variable reference given for '{field_name}': "
-                    "its value is only known to the database. Pass the literal value in defaults=."
-                )
+                if variables is None:
+                    variables = self._lookup_variables(criteria)
+                if value.name not in variables:
+                    raise SurrealDbError(_unwritable_variable(field_name, value.name))
+                payload[field_name] = as_record_value(variables[value.name])
+                continue
             payload[field_name] = as_record_value(unescape_filter_value(value, warn=False))
         return payload
 
@@ -2080,72 +2092,170 @@ class QuerySet:
         owner is the string ``"$auth"``, the same record for every record user, and ``members__contains="$auth"``
         would look for the string. A criterion whose read would warn
         (:func:`~surreal_orm_lite.utils.warn_on_variable_names`) — a scalar ``str`` that is ``$`` and the name of a
-        variable this queryset's ``variables()`` give, or of one of SurrealDB's session parameters — is refused
-        instead, before any request, saying to pass the actual value as the criterion; ``Var(...)`` reads the value
-        in a filter but cannot be written. Any other ``"$name"`` is data, looked up and written as it is, and so is
-        an item of a list lookup. A criterion the lookup refuses with a ``ValueError`` (:meth:`_compares_with_string`)
-        is left to it: on an edge endpoint, which holds a record id, the message names the same ``Var(...)``.
+        variable the lookup binds (:meth:`_lookup_variables`: this queryset's ``variables()`` and, since issue #252,
+        those of its subquery criteria, which its read counted already), or of one of SurrealDB's session
+        parameters — is refused instead, before any request. For a variable, the message names ``Var(...)`` as the
+        criterion to pass: the lookup reads the variable, and the create writes its value. For a session parameter
+        it says to pass the actual value under ``exact`` (``Var("auth")`` is looked up but cannot be written), and
+        that ``Var("auth")`` works under any other lookup, which is only looked up. ``like``/``ilike`` take no
+        ``Var`` (their pattern is translated to a regular expression before it is sent): under them, for a variable
+        and a session parameter alike, the message says neither, but to pass the actual pattern as the criterion,
+        or to use ``regex`` with a ``Var`` holding a regular expression. On the ``id`` column the string is the
+        record id ``table:⟨$name⟩``, which the message names. Any other ``"$name"`` is data, looked up and written as
+        it is, and so is an item of a list lookup. A criterion the lookup refuses with a ``ValueError`` (an edge
+        endpoint, which holds a record id; a text lookup on ``id``) raises that error here, as the lookup would: on
+        an edge endpoint its message names the same ``Var(...)``.
 
         Raises:
             SurrealDbError: the first such criterion.
+            ValueError: what compiling the criteria raises (:meth:`_lookup_variables`).
         """
-        for key, value in criteria.items():
-            match = VARIABLE_NAME_VALUE.fullmatch(value) if isinstance(value, str) else None
-            if match is None:
-                continue
-            name = match.group(1)
-            if name in self._variables:
-                source, kind = f"the variable {name} given to variables()", "variable"
+        candidates = [
+            (key, value, match.group(1))
+            for key, value in criteria.items()
+            if isinstance(value, str) and (match := VARIABLE_NAME_VALUE.fullmatch(value)) is not None
+        ]
+        if not candidates:
+            return
+        variables = self._lookup_variables(criteria)
+        for key, value, name in candidates:
+            if name in variables:
+                source, variable = f"the variable {name} given to variables()", True
             elif name in SESSION_PARAMETERS:
-                source, kind = f"SurrealDB's ${name} parameter", "parameter"
+                source, variable = f"SurrealDB's ${name} parameter", False
             else:
                 continue
-            if not self._compares_with_string(key, value):
-                continue
-            how = "looked up and written" if parse_lookup(key)[1] == "exact" else "looked up"
+            field_name, lookup = parse_lookup(key)
+            written = lookup == "exact"
+            how = "looked up and written" if written else "looked up"
+            if self._column(field_name) == RECORD_ID_COLUMN:
+                what = f"the record id {coerce_record_id(value, self._model_table)}"
+            else:
+                what = f"the string '${name}'"
+            if lookup in ("like", "ilike"):
+                advice = (
+                    f"'{lookup}' cannot take Var('{name}'): its pattern is translated to a regular expression before "
+                    "it is sent. Pass the actual pattern as the criterion, or use 'regex' with a Var holding a regular "
+                    "expression."
+                )
+            elif variable:
+                advice = f"To read the variable, pass Var('{name}') as the criterion" + (
+                    ": the create writes the variable's value." if written else "."
+                )
+            elif written:
+                advice = (
+                    f"Pass the actual value as the criterion (the record id, or the value itself); Var('{name}') reads "
+                    "the parameter in the lookup but cannot be written."
+                )
+            else:
+                advice = (
+                    f"To read the parameter, pass Var('{name}') as the criterion: {key}=Var('{name}') is looked up, "
+                    "never written."
+                )
             raise SurrealDbError(
-                f"Cannot look up or create a record from the string '${name}' given for '{key}': it names "
-                f"{source}, but a string criterion is data, {how} as the string '${name}'. Pass the actual value as "
-                f"the criterion (the record id, or the value itself); Var('{name}') reads the {kind} in a filter but "
-                "cannot be written."
+                f"Cannot look up or create a record from the string '${name}' given for '{key}': it names {source}, "
+                f"but a string criterion is data, {how} as {what}. {advice}"
             )
 
-    def _compares_with_string(self, key: str, value: str) -> bool:
-        """Whether the lookup of the criterion ``key=value`` compares a column with the string *value*.
+    def _lookup_probe(self, criteria: Mapping[str, Any]) -> "QuerySet":
+        """The queryset the lookup of ``get_or_create()``/``update_or_create()`` reads with: *criteria* as its
+        filters, a copy of this queryset's ``variables()`` (issue #252) and its transaction (``objects(tx=)``); no
+        ``cache()``, no ``as_of()``."""
+        probe = QuerySet(self.model)
+        probe.filter(**criteria)
+        probe._variables = dict(self._variables)
+        probe._tx = self._tx
+        return probe
 
-        The criterion is compiled as the lookup compiles it (:meth:`_where_parts`), without a warning: ``True`` when
-        the read notes *value* among the strings that warn (``SubqueryCompiler.variable_like``); ``False`` when the
-        lookup refuses it with a ``ValueError``, which the lookup raises itself.
+    def _lookup_variables(self, criteria: Mapping[str, Any]) -> dict[str, Any]:
+        """The variables the lookup of *criteria* binds (issue #252), by name.
+
+        This queryset's ``variables()``, then those of each subquery criterion (nested ones included), merged as
+        in ``filter()``: the statement :meth:`_lookup_matches` sends binds them all. Compiled, never sent, without
+        a warning.
+
+        Raises:
+            ValueError, SurrealDbError: what the lookup raises compiling *criteria*, before any request — S7 for a
+                subquery binding one of these names to another value, an edge endpoint that is no record id…
         """
-        compiler = SubqueryCompiler(warn=False)
-        try:
-            QuerySet(self.model).filter(**{key: value})._where_parts(subqueries=compiler)
-        except ValueError:
-            return False
-        return bool(compiler.variable_like)
+        probe = self._lookup_probe(criteria)
+        compiler = probe._subquery_compiler(warn=False)
+        probe._where_parts(subqueries=compiler)
+        return compiler.variables
+
+    def _lookup_criteria(self, criteria: Mapping[str, Any]) -> dict[str, Any]:
+        """*criteria* as the lookup compares them (issue #252).
+
+        An ``exact`` ``Var("k")`` criterion on the record id column or on an edge endpoint (``in``/``out``), naming
+        a variable the lookup binds, is compared with the record id that variable's value names — read as the same
+        criterion given that value is (:func:`~surreal_orm_lite.utils.coerce_record_id`,
+        :func:`~surreal_orm_lite.utils.coerce_endpoint`): ``id=Var("k")`` with ``variables(k="r1")`` compares
+        ``id`` with ``<table>:r1``, the record the create writes. Compared with the variable as it is, a string never
+        equals a record id: the lookup would never find the record it created. Every other criterion is unchanged,
+        a ``Var`` reading its variable as ``filter()`` does.
+
+        Raises:
+            ValueError: the variable's value names no record id there (``in_=Var("a")`` with ``variables(a="x")``,
+                a ``bool`` for ``id``), before any request; and what :meth:`_lookup_variables` raises.
+        """
+        endpoint_columns = self.model._endpoint_columns()
+        looked_up = dict(criteria)
+        variables: dict[str, Any] | None = None
+        for key, value in criteria.items():
+            field_name, lookup = parse_lookup(key)
+            if lookup != "exact" or not isinstance(value, Var):
+                continue
+            column = self._column(field_name)
+            if column != RECORD_ID_COLUMN and column not in endpoint_columns:
+                continue
+            if variables is None:
+                variables = self._lookup_variables(criteria)
+            if value.name not in variables:
+                continue
+            try:
+                record = as_record_value(variables[value.name])
+                if column == RECORD_ID_COLUMN:
+                    looked_up[key] = coerce_record_id(record, self._model_table)
+                else:
+                    looked_up[key] = coerce_endpoint(record)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Var('{value.name}') given for '{key}' is compared as the record id its value names: {exc}"
+                ) from exc
+        return looked_up
 
     async def _lookup_matches(self, criteria: dict[str, Any]) -> list[Any]:
         """Return rows matching ``criteria``, routed through the transaction when attached.
 
         Reuses the parameterized WHERE builder (anti-injection) via a throwaway QuerySet's
-        ``filter(**criteria)``, joined to ``self._tx`` (``objects(tx=)``) so the read participates in
-        it — seeing the tx's uncommitted writes on an interactive transaction, and raising on a
+        ``filter(**criteria)`` (:meth:`_lookup_probe`), joined to ``self._tx`` (``objects(tx=)``) so the read
+        participates in it — seeing the tx's uncommitted writes on an interactive transaction, and raising on a
         buffered one (consistent with every other read). ``LIMIT 2`` is enough to distinguish
         0 / 1 / >1. A subquery criterion (v0.27.0) is read in the same statement, a block
-        ``{ LET $_sq0 = (…); (SELECT … LIMIT 2) };``, run as every read is (:meth:`_run_compiled`).
-        The lookup binds no ``variables()``; their names give the hint of an edge endpoint's ``ValueError``
-        (``variable_names``). A criterion ``"$name"`` that would warn never gets here
-        (:meth:`_reject_string_references`).
+        ``{ LET $_sq0 = (…); (SELECT … LIMIT 2) };``, run as every read is (:meth:`_run_compiled`), never cached.
+
+        The lookup binds this queryset's ``variables()`` (issue #252; until then it bound none, and a ``Var``
+        criterion read ``NONE``), merged with its subquery criteria's as ``filter()`` merges them (S7 when a
+        subquery binds a name to another value), so ``variables(n=10).get_or_create(size__gte=Var("n"))`` compares
+        ``size`` with 10. An ``exact`` ``Var`` criterion on the record id or an edge endpoint is compared with the
+        record id its value names (:meth:`_lookup_criteria`). A criterion ``"$name"`` that would warn never gets
+        here (:meth:`_reject_string_references`).
+
+        Each variable is bound as the value the create writes (:func:`~surreal_orm_lite.utils.as_record_value`): a
+        model instance as its record id, whether a criterion reads it or not — bound as it is, the SDK has no
+        encoder for it. S7 compares the values given to ``variables()``, before that conversion.
+
+        Raises:
+            ValueError: an unsaved model instance in the variables (it has no record id), before any request.
         """
-        probe = QuerySet(self.model)
-        probe.filter(**criteria)
-        probe._tx = self._tx
+        probe = self._lookup_probe(self._lookup_criteria(criteria))
         table = self._model_table
 
         def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
-            where_clause, where_vars = probe._build_where(subqueries=compiler, variable_names=self._variables)
+            where_clause, where_vars = probe._build_where(subqueries=compiler)
             query = f"SELECT * FROM {table}{where_clause} LIMIT 2;"
-            return compiler.wrap(query), {**compiler.variables, **where_vars}
+            bound = {name: as_record_value(value) for name, value in compiler.variables.items()}
+            return compiler.wrap(query), {**bound, **where_vars}
 
         rows = await probe._run_compiled(compile_statement)
         return rows if isinstance(rows, list) else []
@@ -2215,14 +2325,29 @@ class QuerySet:
         never written; one the create would have to write — under an ``exact`` lookup, or in
         ``defaults`` — raises ``SurrealDbError`` before any request.
 
+        The lookup binds this queryset's ``variables()``, as ``filter()`` does (issue #252; until then a ``Var``
+        criterion read ``NONE`` there, and a comparison could match, then update, a record the caller did not
+        mean): ``objects().variables(n=10).update_or_create(size__gte=Var("n"), title="mine", defaults=…)``
+        compares ``size`` with 10. A subquery criterion's ``variables()`` share the statement: one binding a name of
+        this queryset's to another value raises S7 (``ValueError``) before any request. An ``exact`` ``Var``
+        criterion naming a variable the lookup binds is written as that variable's value on create
+        (``title=Var("t")`` with ``variables(t="mine")`` writes ``title = "mine"``), so the next identical call
+        finds the record; on the record id and an edge's ``in``/``out`` it is compared as the record id its value
+        names, as the same criterion given that value is. A model instance in ``variables()`` is bound and written as
+        its record id (an unsaved one raises ``ValueError`` before any request). A ``Var`` naming a session
+        parameter (``Var("auth")``) or a name no ``variables()`` gives is looked up but cannot be written:
+        ``SurrealDbError`` before any write.
+
         A ``str`` criterion is data, looked up and written as it is (``owner="$admin"``). A scalar criterion, whatever
-        its lookup, that is ``$`` and the name of a variable ``variables()`` gives or of one of SurrealDB's session
+        its lookup, that is ``$`` and the name of a variable the lookup binds or of one of SurrealDB's session
         parameters — ``update_or_create(owner="$auth", …)`` — raises ``SurrealDbError`` before any request
         (v0.28.1): it would find and write the record whose owner is the string ``"$auth"``, the same for every
-        record user. The message says to pass the actual value as the criterion (the record id, or the value
-        itself); ``Var("auth")`` reads the parameter in a filter but cannot be written (an ``exact`` ``Var``
-        criterion raises ``SurrealDbError`` here). On an edge endpoint such a string raises the lookup's
-        ``ValueError``.
+        record user. For a variable, the message names ``Var(...)`` as the criterion to pass, under any lookup but
+        ``like``/``ilike``, which take no ``Var`` (pass the pattern itself, or use ``regex``); for a session
+        parameter, it says to pass the actual value (the record id, or the value itself) under ``exact`` and that
+        ``Var("auth")`` works under any other lookup but ``like``/``ilike``, which take no ``Var`` (pass the pattern
+        itself, or use ``regex``): ``members__contains=Var("auth")``. On an edge endpoint such a string raises the
+        lookup's ``ValueError``.
         """
         self._reject_time_travel("update_or_create()")
         self._reject_subquery_writes(criteria, defaults, "update_or_create")
@@ -2272,13 +2397,29 @@ class QuerySet:
         create would have to write — under an ``exact`` lookup, or in ``defaults`` — raises
         ``SurrealDbError`` before any request.
 
+        The lookup binds this queryset's ``variables()``, as ``filter()`` does (issue #252; until then a ``Var``
+        criterion read ``NONE`` there): ``objects().variables(n=10).get_or_create(size__gte=Var("n"), …)`` compares
+        ``size`` with 10. A subquery criterion's ``variables()`` share the statement: one binding a name of this
+        queryset's to another value raises S7 (``ValueError``) before any request. An ``exact`` ``Var`` criterion
+        naming a variable the lookup binds is written as that variable's value on create:
+        ``objects().variables(t="mine").get_or_create(title=Var("t"))`` behaves as ``get_or_create(title="mine")``,
+        and the next identical call returns ``created=False``. On the record id and an edge's ``in``/``out`` it is
+        compared as the record id its value names, as the same criterion given that value is:
+        ``variables(a="person:alice").get_or_create(in_=Var("a"), out=bob)`` finds or relates ``person:alice``. A
+        model instance in ``variables()`` is bound and written as its record id (``variables(a=alice)``); an unsaved
+        one raises ``ValueError`` before any request.
+
         A ``str`` criterion is data, looked up and written as it is (``owner="$admin"``). A scalar criterion, whatever
-        its lookup, that is ``$`` and the name of a variable ``variables()`` gives or of one of SurrealDB's session
+        its lookup, that is ``$`` and the name of a variable the lookup binds or of one of SurrealDB's session
         parameters — ``get_or_create(owner="$auth")``, ``get_or_create(members__contains="$auth", …)`` — raises
-        ``SurrealDbError`` before any request (v0.28.1), saying to pass the actual value as the criterion (the record
-        id, or the value itself). ``get_or_create(owner=Var("auth"))`` returns the signed-in record user's record;
-        when there is none it raises ``SurrealDbError``: a ``Var`` cannot be written. On an edge endpoint such a
-        string raises the lookup's ``ValueError``.
+        ``SurrealDbError`` before any request (v0.28.1). For a variable, the message names ``Var(...)`` as the
+        criterion to pass, under any lookup but ``like``/``ilike``, which take no ``Var`` (pass the pattern itself,
+        or use ``regex``); for a session parameter, it says to pass the actual value (the record id, or the value
+        itself) under ``exact`` and that ``Var("auth")`` works under any other lookup but ``like``/``ilike``, which
+        take no ``Var`` (pass the pattern itself, or use ``regex``).
+        ``get_or_create(owner=Var("auth"))`` returns the signed-in record user's record; when there is none it raises
+        ``SurrealDbError``: a session parameter's value is only known to the database and cannot be written, nor can
+        a name no ``variables()`` gives. On an edge endpoint such a string raises the lookup's ``ValueError``.
         """
         self._reject_time_travel("get_or_create()")
         self._reject_subquery_writes(criteria, defaults, "get_or_create")

@@ -709,6 +709,8 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - New: `Var("name")` for an explicit query-variable reference in a filter, plus the `"$$literal"`
   escape. The bare `"$x"` string form is deprecated — **flipping the default so strings are
   always literals is planned for a later minor**, and the deprecation warning is the runway
+- Done in v0.28.1 (#250): a string filter value is always data, `Var()` is the only variable
+  reference, and the `"$$"` escape is deprecated
 - Every finding reproduced on live SurrealDB 3.2.4 **and** 2.6.5 before the fix, and verified on
   both afterwards; no line-specific behaviour
 

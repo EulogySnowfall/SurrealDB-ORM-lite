@@ -14,8 +14,10 @@ and the name of one of SurrealDB's session parameters (``$access``, ``$auth``, `
 is the string, with a ``UserWarning`` naming ``Var("auth")``, which reads the parameter. Each warning is given once
 per read, at the caller's line, ``cache()`` and a re-sent statement included. On an edge's ``in``/``out`` such a
 value raises ``ValueError`` (it is not a record id) naming ``Var(...)``. As a criterion of ``get_or_create()``/
-``update_or_create()``, whatever its lookup, such a value raises ``SurrealDbError`` before any request, saying to pass
-the actual value. ``variables()`` refuses the session parameters' names, saying how to pass one's own value under
+``update_or_create()``, whatever its lookup, such a value raises ``SurrealDbError`` before any request: for a variable
+the message names ``Var(...)``, for a session parameter it says to pass the actual value. The lookup of those two methods
+binds ``variables()`` as ``filter()`` does, and an ``exact`` ``Var`` criterion naming a variable is written as its value
+(issue #252). ``variables()`` refuses the session parameters' names, saying how to pass one's own value under
 another name and that ``Var("token")`` alone reads SurrealDB's ``$token``. Unit tests first (no engine, no server); the ``E2E`` classes run on the embedded ``mem://`` engine and on the server of
 ``SURREALDB_PORT`` (both lines in CI), the live query on the server only.
 """
@@ -43,6 +45,7 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite.constants import LOOKUP_OPERATORS
 from surreal_orm_lite.exceptions import SurrealDbError
+from surreal_orm_lite.query_set import QuerySet
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import build_filter_condition
 from tests.conftest import orm_client
@@ -89,7 +92,17 @@ class FvGhost(BaseSurrealModel):
     name: str = ""
 
 
-_TABLES = ("fv_item", "fv_note", "fv_ghost")
+class FvRoom(BaseSurrealModel):
+    """A room with a size, which a comparison criterion reads from ``variables()`` (issue #252)."""
+
+    model_config = SurrealConfigDict(table_name="fv_room")
+
+    id: str | None = None
+    title: str = ""
+    size: int | None = None
+
+
+_TABLES = ("fv_item", "fv_note", "fv_ghost", "fv_link", "fv_room")
 
 #: The scalar lookups, each with its operator: a ``str`` value is bound as ``$_f0``.
 _SCALAR_LOOKUPS = [
@@ -250,11 +263,10 @@ class TestVarIsTheReference:
         live = FvItem.objects().filter(token=Var("x")).variables(x="$y")._compile_live(False)
         assert live == "LIVE SELECT * FROM fv_item WHERE token = '$y';"
 
-    def test_cannot_be_written_by_get_or_create(self) -> None:
-        from surreal_orm_lite.exceptions import SurrealDbError
-
-        with pytest.raises(SurrealDbError, match="query-variable reference"):
+    def test_cannot_be_written_by_get_or_create_without_variables(self) -> None:
+        with pytest.raises(SurrealDbError) as raised:
             FvItem.objects()._criteria_payload({"token": Var("x")})
+        assert str(raised.value) == _var_refusal("token", "x")
 
 
 @pytest.mark.usefixtures("_no_client")
@@ -569,19 +581,61 @@ def _protected_variable(name: str) -> str:
     )
 
 
-def _criterion_refusal(key: str, name: str, *, variable: bool, written: bool = True) -> str:
+def _criterion_refusal(
+    key: str,
+    name: str,
+    *,
+    variable: bool,
+    written: bool = True,
+    record_id: str | None = None,
+    lookup: str | None = None,
+) -> str:
     """The ``SurrealDbError`` of a ``get_or_create()``/``update_or_create()`` criterion *key* ``"$<name>"``.
 
-    *written*: the criterion's lookup is ``exact``, which the create writes.
+    *written*: the criterion's lookup is ``exact``, which the create writes. *record_id*: the criterion is on the
+    ``id`` column, where the string is read as that record id (``fv_doc:⟨$token⟩``). A variable's message points to
+    ``Var(...)`` as the criterion that works (issue #252); a session parameter's says ``Var(...)`` works as a lookup,
+    and only an ``exact`` one cannot be written. *lookup* ``like``/``ilike``, which take no ``Var``: the message says to
+    pass the pattern itself or to use ``regex``, for a variable and a session parameter alike.
     """
     source = f"the variable {name} given to variables()" if variable else f"SurrealDB's ${name} parameter"
-    what = "variable" if variable else "parameter"
     how = "looked up and written" if written else "looked up"
+    what = f"the record id {record_id}" if record_id else f"the string '${name}'"
+    if lookup in ("like", "ilike"):
+        advice = (
+            f"'{lookup}' cannot take Var('{name}'): its pattern is translated to a regular expression before it is "
+            "sent. Pass the actual pattern as the criterion, or use 'regex' with a Var holding a regular expression."
+        )
+    elif variable:
+        advice = f"To read the variable, pass Var('{name}') as the criterion" + (
+            ": the create writes the variable's value." if written else "."
+        )
+    elif written:
+        advice = (
+            f"Pass the actual value as the criterion (the record id, or the value itself); Var('{name}') reads the "
+            "parameter in the lookup but cannot be written."
+        )
+    else:
+        advice = f"To read the parameter, pass Var('{name}') as the criterion: {key}=Var('{name}') is looked up, never written."
     return (
         f"Cannot look up or create a record from the string '${name}' given for '{key}': it names {source}, but a "
-        f"string criterion is data, {how} as the string '${name}'. Pass the actual value as the criterion (the "
-        f"record id, or the value itself); Var('{name}') reads the {what} in a filter but cannot be written."
+        f"string criterion is data, {how} as {what}. {advice}"
     )
+
+
+def _var_refusal(field: str, name: str) -> str:
+    """The ``SurrealDbError`` of an ``exact`` ``Var(name)`` criterion the create cannot write (issue #252).
+
+    A variable the lookup binds is written as its value; a session parameter or a name no ``variables()`` gives is
+    known to the database only.
+    """
+    if name in _SESSION_PARAMETERS:
+        why = f"it reads SurrealDB's ${name} parameter, whose value only the database knows"
+        advice = "Pass the value itself as the criterion or in defaults=."
+    else:
+        why = f"variables() gives no {name}, so only the database knows its value"
+        advice = f"Give {name} to variables(), or pass the value itself as the criterion or in defaults=."
+    return f"Cannot create a record from Var('{name}') given for '{field}': {why}. {advice}"
 
 
 _OR_CREATE = ["get_or_create", "update_or_create"]
@@ -624,14 +678,41 @@ class TestStringReferenceCriteria:
             asyncio.run(getattr(qs, method)(name="A", token__gte="$x"))
         assert str(raised.value) == _criterion_refusal("token__gte", "x", variable=True, written=False)
 
+    def test_like_and_ilike_take_no_var(self, method: str) -> None:
+        """``like``/``ilike`` refuse a ``Var``: the message says to pass the pattern itself, or to use ``regex``."""
+        with pytest.raises(SurrealDbError) as raised:
+            asyncio.run(getattr(FvRoom.objects(), method)(title__like="$auth"))
+        expected = _criterion_refusal("title__like", "auth", variable=False, written=False, lookup="like")
+        assert str(raised.value) == expected
+        with pytest.raises(SurrealDbError) as raised:
+            asyncio.run(getattr(FvRoom.objects().variables(x="a"), method)(title__ilike="$x"))
+        expected = _criterion_refusal("title__ilike", "x", variable=True, written=False, lookup="ilike")
+        assert str(raised.value) == expected
+
     def test_a_list_item_is_left_to_the_lookup(self, method: str) -> None:
         """An item of a list lookup is data and never warns: nothing to refuse."""
         FvDoc.objects().variables(x=1)._reject_string_references({"owner__in": ["$auth", "$x"], "title": "$admin"})
 
     def test_the_record_id_column(self, method: str) -> None:
+        """On ``id`` the string is read as the record id ``fv_doc:⟨$token⟩``: the message names it."""
         with pytest.raises(SurrealDbError) as raised:
             asyncio.run(getattr(FvDoc.objects(), method)(id="$token"))
-        assert str(raised.value) == _criterion_refusal("id", "token", variable=False)
+        assert str(raised.value) == _criterion_refusal("id", "token", variable=False, record_id="fv_doc:⟨$token⟩")
+        with pytest.raises(SurrealDbError) as raised:
+            asyncio.run(getattr(FvDoc.objects().variables(k="mine"), method)(id__gte="$k"))
+        expected = _criterion_refusal("id__gte", "k", variable=True, written=False, record_id="fv_doc:⟨$k⟩")
+        assert str(raised.value) == expected
+
+    def test_a_variable_of_a_subquery_criterion(self, method: str) -> None:
+        """The lookup binds the ``variables()`` of a subquery criterion too (its read warned): refused as well."""
+        inner = FvItem.objects().filter(token=Var("x")).variables(x="x").select("name")
+        with pytest.raises(SurrealDbError) as raised:
+            asyncio.run(getattr(FvItem.objects(), method)(token="$x", name__in=inner))
+        assert str(raised.value) == _criterion_refusal("token", "x", variable=True)
+        nested = FvItem.objects().filter(id__in=FvItem.objects().variables(y=1)).select("name")
+        with pytest.raises(SurrealDbError) as raised:
+            asyncio.run(getattr(FvItem.objects(), method)(name__in=nested, token__lt="$y"))
+        assert str(raised.value) == _criterion_refusal("token__lt", "y", variable=True, written=False)
 
     def test_a_text_lookup_on_the_record_id_keeps_its_value_error(self, method: str) -> None:
         with pytest.raises(ValueError, match="cannot be applied to the record id column 'id'"):
@@ -643,6 +724,135 @@ class TestStringReferenceCriteria:
         with pytest.raises(ValueError, match="Invalid record identifier") as raised:
             asyncio.run(getattr(FvLink.objects(), method)(out=RecordID("person", "b"), **{key: "$auth"}))
         assert str(raised.value).endswith("; to read SurrealDB's $auth parameter, use Var('auth')")
+
+
+def _recording_lookup(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict[str, Any]]]:
+    """Record each statement the ``get_or_create()``/``update_or_create()`` lookup sends, answering no rows."""
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def record(self: QuerySet, query: str, variables: dict[str, Any] | None = None, **kwargs: Any) -> list[Any]:
+        calls.append((query, dict(variables or {})))
+        return []
+
+    monkeypatch.setattr(QuerySet, "_execute_query", record)
+    return calls
+
+
+@pytest.mark.usefixtures("_no_client", "_no_warning")
+class TestVariableCriteria:
+    """Issue #252: the lookup of ``get_or_create()``/``update_or_create()`` binds the queryset's ``variables()``, as
+    ``filter()`` does, and an ``exact`` ``Var`` criterion naming a variable the lookup binds is written as its value.
+
+    On the record id and on an edge's ``in``/``out`` such a criterion is compared as the record id its value names,
+    as the same criterion given that value is: the create writes that value, and the next lookup finds it.
+    """
+
+    def test_the_lookup_binds_the_variables(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = _recording_lookup(monkeypatch)
+        qs = FvRoom.objects().variables(n=10, t="mine")
+        assert asyncio.run(qs._lookup_matches({"title": Var("t"), "size__gte": Var("n")})) == []
+        assert calls == [("SELECT * FROM fv_room WHERE title = $t AND size >= $n LIMIT 2;", {"n": 10, "t": "mine"})]
+
+    def test_with_the_variables_of_a_subquery(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = _recording_lookup(monkeypatch)
+        inner = FvItem.objects().filter(token=Var("x")).variables(x="x", y=2).select("name")
+        asyncio.run(FvItem.objects().variables(x="x")._lookup_matches({"name__in": inner, "token": Var("y")}))
+        assert calls == [
+            (
+                "{ LET $_sq0 = (SELECT VALUE name FROM fv_item WHERE token = $x); "
+                "(SELECT * FROM fv_item WHERE name IN $_sq0 AND token = $y LIMIT 2) };",
+                {"x": "x", "y": 2},
+            )
+        ]
+
+    def test_an_exact_variable_is_written_as_its_value(self) -> None:
+        """The value is data: ``"$$t"`` is written as it is, with no warning; a non-``exact`` criterion is not written."""
+        qs = FvItem.objects().variables(t="$$t", n=1)
+        assert qs._criteria_payload({"token": Var("t"), "name__gte": Var("n")}) == {"token": "$$t"}
+
+    def test_a_model_instance_is_written_as_its_record_id(self) -> None:
+        payload = FvNote.objects().variables(i=FvItem(id="a"))._criteria_payload({"item": Var("i")})
+        assert payload == {"item": RecordID("fv_item", "a")}
+        assert isinstance(payload["item"], RecordID)
+
+    def test_a_model_instance_is_bound_as_its_record_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The lookup binds the value the create writes: a model instance as its record id, whether a criterion reads
+        it or not (the SDK has no encoder for a model). A subquery binding the same instance shares it (S7 compares
+        the values given to ``variables()``)."""
+        calls = _recording_lookup(monkeypatch)
+        a, item = RecordID("fv_item", "a"), FvItem(id="a")
+        asyncio.run(FvNote.objects().variables(i=item)._lookup_matches({"item": Var("i")}))
+        asyncio.run(FvItem.objects().variables(unused=item)._lookup_matches({"name": "A"}))
+        inner = FvNote.objects().filter(item=Var("i")).variables(i=item).select("id")
+        asyncio.run(FvNote.objects().variables(i=item)._lookup_matches({"id__in": inner, "item": Var("i")}))
+        assert calls == [
+            ("SELECT * FROM fv_note WHERE item = $i LIMIT 2;", {"i": a}),
+            ("SELECT * FROM fv_item WHERE name = $_f0 LIMIT 2;", {"unused": a, "_f0": "A"}),
+            (
+                "{ LET $_sq0 = (SELECT VALUE id FROM fv_note WHERE item = $i); "
+                "(SELECT * FROM fv_note WHERE id IN $_sq0 AND item = $i LIMIT 2) };",
+                {"i": a},
+            ),
+        ]
+        assert all(type(value) is RecordID for _, bound in calls for key, value in bound.items() if key != "_f0")
+
+    @pytest.mark.parametrize("method", _OR_CREATE)
+    def test_an_unsaved_model_instance_is_refused(self, method: str) -> None:
+        """An unsaved instance has no record id to bind: ``ValueError`` before any request, used or not."""
+        with pytest.raises(ValueError, match=r"^An unsaved FvItem has no record id; save it first or pass a RecordID\.$"):
+            asyncio.run(getattr(FvItem.objects().variables(unused=FvItem(name="x")), method)(name="A"))
+
+    def test_a_variable_of_a_subquery_criterion_is_written(self) -> None:
+        inner = FvItem.objects().filter(name=Var("t")).variables(t="A").select("token")
+        assert FvItem.objects()._criteria_payload({"name": Var("t"), "token__in": inner}) == {"name": "A"}
+
+    @pytest.mark.parametrize("name", ["t", *_SESSION_PARAMETERS])
+    def test_any_other_name_is_not_written(self, name: str) -> None:
+        with pytest.raises(SurrealDbError) as raised:
+            FvItem.objects().variables(n=1)._criteria_payload({"name": "x", "token": Var(name)})
+        assert str(raised.value) == _var_refusal("token", name)
+
+    def test_the_record_id_column(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``id=Var("k")`` is compared as ``fv_item:a``, as ``id="a"`` is; a comparison reads the variable as it is."""
+        calls = _recording_lookup(monkeypatch)
+        for value in ("a", "fv_item:a", RecordID("fv_item", "a")):
+            asyncio.run(FvItem.objects().variables(k=value)._lookup_matches({"id": Var("k")}))
+        asyncio.run(FvItem.objects().variables(k="a")._lookup_matches({"id__gte": Var("k")}))
+        asyncio.run(FvItem.objects().variables(k="a")._lookup_matches({"id": Var("auth")}))
+        assert calls == [
+            *[
+                ("SELECT * FROM fv_item WHERE id = $_f0 LIMIT 2;", {"k": value, "_f0": RecordID("fv_item", "a")})
+                for value in ("a", "fv_item:a", RecordID("fv_item", "a"))
+            ],
+            ("SELECT * FROM fv_item WHERE id >= $k LIMIT 2;", {"k": "a"}),
+            ("SELECT * FROM fv_item WHERE id = $auth LIMIT 2;", {"k": "a"}),
+        ]
+
+    def test_an_edge_endpoint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls = _recording_lookup(monkeypatch)
+        a, c = RecordID("fv_item", "a"), RecordID("fv_item", "c")
+        values = (a, "fv_item:a", "fv_item:`a`")
+        for value in values:
+            asyncio.run(FvLink.objects().variables(a=value)._lookup_matches({"in_": Var("a"), "out": c}))
+        assert calls == [
+            ("SELECT * FROM fv_link WHERE in = $_f0 AND out = $_f1 LIMIT 2;", {"a": value, "_f0": a, "_f1": c})
+            for value in values
+        ]
+
+    @pytest.mark.parametrize("method", _OR_CREATE)
+    @pytest.mark.parametrize("value", ["nope", 7, True])
+    def test_an_endpoint_value_that_names_no_record_is_refused(self, method: str, value: Any) -> None:
+        with pytest.raises(ValueError) as raised:
+            asyncio.run(getattr(FvLink.objects().variables(a=value), method)(in_=Var("a"), out=RecordID("fv_item", "c")))
+        assert str(raised.value).startswith("Var('a') given for 'in_' is compared as the record id its value names: ")
+
+    @pytest.mark.parametrize("method", _OR_CREATE)
+    def test_a_record_id_value_that_is_a_boolean_is_refused(self, method: str) -> None:
+        with pytest.raises(ValueError) as raised:
+            asyncio.run(getattr(FvItem.objects().variables(k=True), method)(id=Var("k")))
+        assert str(raised.value) == (
+            "Var('k') given for 'id' is compared as the record id its value names: a record id cannot be a boolean"
+        )
 
 
 @contextlib.asynccontextmanager
@@ -913,8 +1123,9 @@ class TestStringReferenceCriteriaE2E:
             assert (found.id, created) == ("mine", False)
             await SurrealDBConnectionManager.signup(access=_SESSION_ACCESS, variables={"name": uuid4().hex})
             for method in _OR_CREATE:
-                with pytest.raises(SurrealDbError, match="query-variable reference given for 'owner'"):
+                with pytest.raises(SurrealDbError) as raised:
                     await getattr(FvDoc.objects(), method)(owner=Var("auth"), defaults={"title": "second"})
+                assert str(raised.value) == _var_refusal("owner", "auth")
             assert await _docs() == before
 
     @pytest.mark.usefixtures("_no_warning")
@@ -928,6 +1139,126 @@ class TestStringReferenceCriteriaE2E:
             found, created = await FvDoc.objects().variables(other=1).get_or_create(owner="$admin")
             assert (found.title, created) == ("two", False)
             assert [title for owner, title in (await _docs()).values() if owner == "$admin"] == ["two"]
+
+
+#: The rooms ``rooms_db`` seeds: ``(title, size)`` by id; ``r3`` has no size (``NONE``).
+_ROOMS: dict[str, tuple[str, int | None]] = {"r1": ("mine", 12), "r2": ("theirs", 5), "r3": ("empty", None)}
+
+
+@contextlib.asynccontextmanager
+async def rooms_db(kind: str) -> AsyncIterator[Any]:
+    """``values_db`` with the rooms of :data:`_ROOMS`."""
+    async with values_db(kind) as client:
+        await client.query("CREATE fv_room:r1 SET title = 'mine', size = 12;")
+        await client.query("CREATE fv_room:r2 SET title = 'theirs', size = 5;")
+        await client.query("CREATE fv_room:r3 SET title = 'empty';")
+        yield client
+
+
+async def _rooms() -> dict[str, tuple[str, int | None]]:
+    """Every ``fv_room`` record: its title and size, by id."""
+    return {row.id: (row.title, row.size) for row in await FvRoom.objects().all()}
+
+
+def _key(row: Any) -> str:
+    """The key of *row*'s record id, whether ``merge()`` left it a ``RecordID`` or a ``str``."""
+    return str(row.id).removeprefix("fv_room:")
+
+
+@pytest.mark.usefixtures("_no_warning")
+@pytest.mark.parametrize("kind", ["mem", "ws"])
+class TestVariableCriteriaE2E:
+    """Issue #252: a ``Var`` criterion reads ``variables()`` in the lookup of ``get_or_create()`` and
+    ``update_or_create()``, as in ``filter()``; until then it read ``NONE`` there."""
+
+    async def test_get_or_create_finds_the_record(self, kind: str) -> None:
+        async with rooms_db(kind):
+            qs = FvRoom.objects().variables(n=10)
+            found, created = await qs.get_or_create(size__gte=Var("n"), defaults={"title": "big"})
+            assert (found.id, created) == ("r1", False)
+            found, created = await FvRoom.objects().variables(t="mine").get_or_create(title=Var("t"))
+            assert (found.id, created) == ("r1", False)
+            assert await _rooms() == _ROOMS
+
+    async def test_update_or_create_updates_the_intended_record_only(self, kind: str) -> None:
+        """No room is titled "theirs" with a size of 10 or more: one is created. Read as ``NONE``, ``size >= $n`` held
+        for r2, which was updated."""
+        async with rooms_db(kind):
+            qs = FvRoom.objects().variables(n=10)
+            made, created = await qs.update_or_create(title="theirs", size__gte=Var("n"), defaults={"size": 20})
+            assert (made.title, made.size, created) == ("theirs", 20, True)
+            qs = FvRoom.objects().variables(n=10, t="mine")
+            updated, created = await qs.update_or_create(title=Var("t"), size__gte=Var("n"), defaults={"size": 13})
+            assert (_key(updated), updated.size, created) == ("r1", 13, False)
+            rooms = await _rooms()
+            assert {key: rooms.pop(key) for key in _ROOMS} == {**_ROOMS, "r1": ("mine", 13)}
+            assert list(rooms.values()) == [("theirs", 20)]
+
+    async def test_an_exact_variable_is_written_and_found_again(self, kind: str) -> None:
+        """The variable's value is written as it is (``"$$new"`` is data), and the next identical call finds it."""
+        async with rooms_db(kind):
+
+            def rooms() -> Any:
+                return FvRoom.objects().variables(t="$$new", n=3)
+
+            made, created = await rooms().get_or_create(title=Var("t"), size__lt=Var("n"), defaults={"size": 1})
+            assert (made.title, made.size, created) == ("$$new", 1, True)
+            again, created = await rooms().get_or_create(title=Var("t"), size__lt=Var("n"), defaults={"size": 2})
+            assert (_key(again), again.size, created) == (_key(made), 1, False)
+            same, created = await rooms().update_or_create(title=Var("t"), defaults={"size": 2})
+            assert (_key(same), same.size, created) == (_key(made), 2, False)
+            assert [room for room in (await _rooms()).values() if room[0] == "$$new"] == [("$$new", 2)]
+
+    async def test_a_name_variables_does_not_give_is_never_written(self, kind: str) -> None:
+        async with rooms_db(kind):
+            for method in _OR_CREATE:
+                with pytest.raises(SurrealDbError) as raised:
+                    await getattr(FvRoom.objects().variables(n=1), method)(title=Var("t"), defaults={"size": 1})
+                assert str(raised.value) == _var_refusal("title", "t")
+            assert await _rooms() == _ROOMS
+
+    async def test_the_record_id_column(self, kind: str) -> None:
+        async with rooms_db(kind):
+            found, created = await FvRoom.objects().variables(k="r1").get_or_create(id=Var("k"))
+            assert (found.title, created) == ("mine", False)
+            made, created = await FvRoom.objects().variables(k="r4").get_or_create(id=Var("k"), defaults={"title": "new"})
+            assert (made.id, made.title, created) == ("r4", "new", True)
+            again, created = await FvRoom.objects().variables(k="fv_room:r4").get_or_create(id=Var("k"))
+            assert (again.id, created) == ("r4", False)
+            assert await _rooms() == {**_ROOMS, "r4": ("new", None)}
+
+    async def test_an_edge_endpoint(self, kind: str) -> None:
+        """``in_=Var("a")`` finds or relates the endpoints the variable names: one edge, whatever form names it."""
+        async with values_db(kind):
+            a, c = RecordID("fv_item", "a"), RecordID("fv_item", "c")
+            made, created = await FvLink.objects().variables(a=a, c=c).get_or_create(in_=Var("a"), out=Var("c"))
+            assert (made.in_, made.out, created) == (a, c, True)
+            for value in (a, "fv_item:a"):
+                for method in _OR_CREATE:
+                    found, created = await getattr(FvLink.objects().variables(a=value), method)(in_=Var("a"), out=c)
+                    assert (found.id, created) == (made.id, False), (value, method)
+            made_too, created = await FvLink.objects().variables(c="fv_item:c").get_or_create(in_=c, out=Var("c"))
+            assert (made_too.in_, made_too.out, created) == (c, c, True)
+            edges = sorted((str(edge.in_), str(edge.out)) for edge in await FvLink.objects().all())
+            assert edges == [("fv_item:a", "fv_item:c"), ("fv_item:c", "fv_item:c")]
+
+    async def test_a_model_instance(self, kind: str) -> None:
+        """A model instance in ``variables()`` is bound as its record id, the value the create writes: on an edge
+        endpoint, on a link column, and when no criterion reads it (until then, the SDK's ``BufferError``)."""
+        async with values_db(kind):
+            item, a, c = FvItem(id="a"), RecordID("fv_item", "a"), RecordID("fv_item", "c")
+            made, created = await FvLink.objects().variables(a=item).get_or_create(in_=Var("a"), out=c)
+            assert (made.in_, made.out, created) == (a, c, True)
+            for method in _OR_CREATE:
+                found, created = await getattr(FvLink.objects().variables(a=item), method)(in_=Var("a"), out=c)
+                assert (found.id, created) == (made.id, False), method
+                note, created = await getattr(FvNote.objects().variables(i=item), method)(item=Var("i"))
+                assert (str(note.id).removeprefix("fv_note:"), note.item, created) == ("n", a, False), method
+                found, created = await getattr(FvItem.objects().variables(unused=item), method)(name="A")
+                assert (str(found.id).removeprefix("fv_item:"), created) == ("a", False), method
+            assert [(str(edge.in_), str(edge.out)) for edge in await FvLink.objects().all()] == [("fv_item:a", "fv_item:c")]
+            assert [(str(note.id), note.item) for note in await FvNote.objects().all()] == [("n", a)]
+            assert _ids(await FvItem.objects().all()) == ["a", "b", "c", "d"]
 
 
 async def _take(stream: Any, count: int, timeout: float = 10.0) -> list[Any]:
@@ -1058,18 +1389,36 @@ class TestFilterValueDocs:
             "On an edge's `in` and `out`",
             'update_or_create(owner="$auth", defaults=…)',
             '`members__contains="$auth"`',
-            "raises `SurrealDbError` before any request, whatever its lookup, saying to pass the actual value as the "
-            "criterion: the record id, or the value itself",
+            "raises `SurrealDbError` before any request, whatever its lookup",
+            "Their lookup binds `variables()`, as `filter()` does",
+            "an `exact` one is written as the variable's value on create",
+            'qs.get_or_create(title=Var("t")) # as get_or_create(title="mine")',
+            "compared as the record id its value names",
+            '`get_or_create(in_=Var("a"), out=bob)` finds or relates `person:alice`',
+            "binds a name of the queryset's `variables()` to another value raises `ValueError`",
+            'the message names `Var("x")` as the criterion to write',
+            '`members__contains=Var("auth")` is looked up, never written',
             "`variables()` refuses these four names with a `ValueError`",
             "To pass your own value, give it another name, or pass the value itself in the filter",
             '`filter(token=Var("device_token")).variables(device_token=t)`',
             '`Var("token")` without `variables()` reads SurrealDB\'s `$token`',
         ):
             assert needle in text, needle
+        assert "saying to pass the actual value as the criterion: the record id, or the value itself" not in text
         assert "naming the `Var(...)` and `defaults=`" not in text
         assert "Read them with `Var(...)`, without `variables()`" not in text
         assert "silently matches nothing" not in text
         assert "raises a `UserWarning`" not in text
+
+    def test_upsert_section(self) -> None:
+        """Section 12 says the lookup binds ``variables()`` (issue #252)."""
+        text = _normalised(_readme_part("### 12. Upsert & get_or_create / update_or_create"))
+        for needle in (
+            "The lookup binds the queryset's `variables()`, as `filter()` does",
+            '`User.objects().variables(e="bob@example.com").get_or_create(email=Var("e"))`',
+            "writes that value on create",
+        ):
+            assert needle in text, needle
 
     def test_live_query_note(self) -> None:
         text = _normalised(_readme_part("### 21. Live queries (real-time notifications)"))

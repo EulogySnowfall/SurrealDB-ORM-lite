@@ -226,9 +226,6 @@ class SubqueryCompiler:
             (``"$x"`` gives ``x``), every subquery's included, in order: ``QuerySet._build_where`` warns for those
             :meth:`names_a_variable` or SurrealDB's session parameters hold once the statement's conditions are
             compiled (v0.28.1).
-        outer_variable_names: the ``variables()`` names of the queryset whose ``get_or_create()`` or
-            ``update_or_create()`` looks up with this statement, which binds none of them: the checks of the filter
-            values count them as variables (v0.28.1).
         _stack: the ids of the querysets being rendered, the outer one first (a queryset cannot be its own subquery).
     """
 
@@ -243,12 +240,11 @@ class SubqueryCompiler:
     edge_tables: set[str] = field(default_factory=set)
     warn: bool = True
     variable_like: list[str] = field(default_factory=list)
-    outer_variable_names: frozenset[str] = frozenset()
     _stack: list[int] = field(default_factory=list)
 
     def names_a_variable(self, name: str) -> bool:
-        """Whether *name* is one of the statement's ``variables()`` so far, or of :attr:`outer_variable_names`."""
-        return name in self.variables or name in self.outer_variable_names
+        """Whether *name* is one of the statement's ``variables()`` so far."""
+        return name in self.variables
 
     def merge_variables(self, variables: Mapping[str, Any]) -> None:
         """Add a subquery's ``variables()`` to the statement's, in order.

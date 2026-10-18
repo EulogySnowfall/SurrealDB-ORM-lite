@@ -343,15 +343,39 @@ raises `ValueError`; when it names a variable of `variables()` or one of these p
 message names the `Var(...)` to write.
 
 `get_or_create()` and `update_or_create()` look up their criteria and write the `exact` ones on
-create, so there such a string is refused: `update_or_create(owner="$auth", defaults=…)` would find
-and write the record whose `owner` is the string `"$auth"`, the same record for every record user,
-and `members__contains="$auth"` would look for the string. A criterion that is exactly `$` followed
-by the name of a variable of `variables()` or of one of these parameters raises `SurrealDbError`
-before any request, whatever its lookup, saying to pass the actual value as the criterion: the
-record id, or the value itself. `Var("auth")` finds the signed-in user's record
+create. Their lookup binds `variables()`, as `filter()` does, so a `Var` criterion reads the
+variable there too, and an `exact` one is written as the variable's value on create: the next
+identical call finds the record.
+
+```python
+qs = Room.objects().variables(t="mine", n=10)
+room, created = await qs.get_or_create(title=Var("t"))  # as get_or_create(title="mine")
+room, created = await qs.update_or_create(size__gte=Var("n"), title=Var("t"), defaults={"floor": 2})
+```
+
+On the record id and on an edge's `in` and `out`, such a criterion is compared as the record id
+its value names, as the same criterion given that value is: with `variables(a="person:alice")`,
+`get_or_create(in_=Var("a"), out=bob)` finds or relates `person:alice`. A value that names no record
+id there raises `ValueError` before any request. A model instance given to `variables()` is bound
+and written as its record id, as the instance given as the criterion is (`variables(a=alice)`); an
+unsaved one raises `ValueError` before any request. The `variables()` of a subquery criterion share
+the lookup, as in `filter()`: one that binds a name of the queryset's `variables()` to another
+value raises `ValueError`. `Var("auth")` finds the signed-in user's record
 (`get_or_create(owner=Var("auth"))` returns it) but cannot be written: with no record to return, it
-raises `SurrealDbError`. Any other string, such as `"$admin"`, is looked up and written as it is. On
-an edge's `in` and `out`, such a criterion raises the `ValueError` above.
+raises `SurrealDbError`, and so does an `exact` `Var` that names no variable of `variables()`.
+
+A string criterion is refused where it would be a trap: `update_or_create(owner="$auth", defaults=…)`
+would find and write the record whose `owner` is the string `"$auth"`, the same record for every
+record user, and `members__contains="$auth"` would look for the string. A criterion that is exactly
+`$` followed by the name of one of these parameters or of a variable the lookup binds (of
+`variables()`, the queryset's or a subquery criterion's) raises `SurrealDbError` before any request,
+whatever its lookup. For a variable, the message names `Var("x")` as the criterion to write, under
+any lookup but `like`/`ilike`, which take no `Var` (pass the pattern itself, or use `regex`). For a
+parameter, it says to pass the actual value as an `exact` criterion (the record id, or the value
+itself), and that `Var("auth")` works under any other lookup but `like`/`ilike`, which take no `Var`
+(pass the pattern itself, or use `regex`): `members__contains=Var("auth")` is looked up, never
+written. Any other string, such as `"$admin"`, is looked up and written as it is. On an edge's `in`
+and `out`, such a criterion raises the `ValueError` above.
 
 `variables()` refuses these four names with a `ValueError`: SurrealDB sets them for each session
 and refuses a query variable of that name. To pass your own value, give it another name, or pass
@@ -686,7 +710,10 @@ async with SurrealDBConnectionManager.transaction() as tx:
 
 If the lookup criteria match more than one record, both methods raise `SurrealDbError`
 (the criteria are not unique). Non-`exact` lookups (e.g. `name__contains`) drive the lookup
-but are not written to the record. Without a transaction the behaviour is identical on
+but are not written to the record. The lookup binds the queryset's `variables()`, as `filter()`
+does: `User.objects().variables(e="bob@example.com").get_or_create(email=Var("e"))` finds the user
+whose email is the variable's value, and writes that value on create (see
+[String filter values and `Var()`](#string-filter-values-and-var)). Without a transaction the behaviour is identical on
 SurrealDB 2.6.x and 3.x; under `objects(tx=)` they participate in the transaction on 3.x,
 while a buffered 2.6.x transaction raises on the lookup (see the behaviour table).
 
