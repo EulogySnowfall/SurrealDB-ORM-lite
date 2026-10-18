@@ -21,6 +21,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Itera
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Optional
+from unittest import mock
 from uuid import UUID, uuid4
 
 import pytest
@@ -2120,6 +2121,90 @@ class TestRoutedModelsE2E:
             else:
                 assert _titles(await _root_rows("md_a", "md_event")) == ["old"]
                 assert _titles(await _root_rows("md_b", "md_event")) == ["new"]
+
+
+async def _offline() -> Any:
+    """A substitute of a manager method, put on ``SurrealDBConnectionManager`` by hand: no database here."""
+    raise ConnectionError("no database in this test")
+
+
+#: The routed methods the hand-patching tests replace: a public coroutine, a private one, a context-manager factory.
+_HAND_PATCHED = ("get_client", "_open_client", "transaction")
+
+
+class TestHandPatchedMethods:
+    """README section 30, "Which connection a manager method uses": a manager method replaced by hand on
+    ``SurrealDBConnectionManager`` is inherited by every connection. Put back from ``vars()``, it is the classmethod
+    again; ``SurrealDBConnectionManager.<name>`` is a method bound to the router, which every connection would inherit
+    (no server, nothing opened)."""
+
+    @pytest.mark.parametrize("name", _HAND_PATCHED)
+    def test_put_back_from_vars_each_connection_runs_on_itself(self, name: str) -> None:
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        connections = [SurrealDBConnectionManager._manager_for(each) for each in ("default", "md_a")]
+        saved = vars(SurrealDBConnectionManager)[name]
+        assert isinstance(saved, classmethod)
+        setattr(SurrealDBConnectionManager, name, _offline)
+        try:
+            for connection in connections:
+                assert getattr(connection, name) is _offline, connection
+        finally:
+            setattr(SurrealDBConnectionManager, name, saved)
+        assert vars(SurrealDBConnectionManager)[name] is saved
+        for connection in connections:
+            assert getattr(connection, name).__self__ is connection, connection
+
+    @pytest.mark.parametrize("name", _HAND_PATCHED)
+    def test_monkeypatch_and_patch_object_put_the_classmethod_back(self, name: str) -> None:
+        """What the README says pytest's ``monkeypatch.setattr()`` and ``unittest.mock.patch.object()`` do."""
+        saved = vars(SurrealDBConnectionManager)[name]
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(SurrealDBConnectionManager, name, _offline)
+            assert vars(SurrealDBConnectionManager)[name] is _offline
+        assert vars(SurrealDBConnectionManager)[name] is saved
+        with mock.patch.object(SurrealDBConnectionManager, name, _offline):
+            assert vars(SurrealDBConnectionManager)[name] is _offline
+        assert vars(SurrealDBConnectionManager)[name] is saved
+
+    @pytest.mark.parametrize("name", _HAND_PATCHED)
+    def test_the_bound_method_put_back_is_bound_to_the_router(self, name: str) -> None:
+        """What the README warns against: put back, ``SurrealDBConnectionManager.<name>`` is what every connection
+        inherits, and its ``cls`` is the router, which resolves the current connection."""
+        SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
+        connection = SurrealDBConnectionManager._manager_for("md_a")
+        saved = vars(SurrealDBConnectionManager)[name]
+        bound = getattr(SurrealDBConnectionManager, name)
+        assert bound.__self__ is SurrealDBConnectionManager
+        setattr(SurrealDBConnectionManager, name, bound)
+        try:
+            assert getattr(connection, name).__self__ is SurrealDBConnectionManager
+        finally:
+            setattr(SurrealDBConnectionManager, name, saved)
+        assert getattr(connection, name).__self__ is connection
+
+
+@pytest.mark.usefixtures("unset_default")
+class TestHandPatchedMethodsE2E:
+    """The same on ``mem://``, as the README states it: after a hand-made substitute of ``get_client``, a model routed
+    to ``md_a`` writes ``md_a`` when the classmethod is put back from ``vars()``, and the default connection's database,
+    with no error, when ``SurrealDBConnectionManager.get_client`` saved before the patch is put back."""
+
+    @pytest.mark.parametrize(("put_back", "lands_in"), [("vars", "md_a"), ("bound", "default")])
+    async def test_where_a_routed_model_writes(self, put_back: str, lands_in: str) -> None:
+        async with _routed_databases("mem"):
+            saved = vars(SurrealDBConnectionManager)["get_client"]
+            restored = saved if put_back == "vars" else SurrealDBConnectionManager.get_client
+            SurrealDBConnectionManager.get_client = _offline  # type: ignore[method-assign]
+            try:
+                with pytest.raises(ConnectionError, match="no database in this test"):
+                    await MdEvent(id="e0", title="zero").save()
+                SurrealDBConnectionManager.get_client = restored  # type: ignore[method-assign]
+                await MdEvent(id="e1", title="one").save()
+            finally:
+                SurrealDBConnectionManager.get_client = saved  # type: ignore[method-assign]
+            elsewhere = "default" if lands_in == "md_a" else "md_a"
+            assert _titles(await _rows_in("mem", lands_in, "md_event")) == ["one"]
+            assert await _rows_in("mem", elsewhere, "md_event") == []
 
 
 _PASSPHRASE = "s3cret-passphrase"
@@ -4525,6 +4610,31 @@ _WHICH_CONNECTION_ROWS = [
         "the current connection",
     ],
 ]
+#: "Which connection a manager method uses": putting back a manager method replaced by hand (review of PR #254).
+_HAND_PATCH_NEEDLES = (
+    "replace by hand",
+    "inherited by every connection",
+    "`vars(SurrealDBConnectionManager)[name]`",
+    "pytest's `monkeypatch.setattr()` and `unittest.mock.patch.object()`",
+    "`SurrealDBConnectionManager.<name>`",
+    "a method bound to `SurrealDBConnectionManager`",
+    "acts on the current connection",
+    "with no error",
+)
+_HAND_PATCH_EXAMPLE = """\
+async def offline():
+    raise ConnectionError("no database in this test")
+
+saved = vars(SurrealDBConnectionManager)["get_client"]
+SurrealDBConnectionManager.get_client = offline         # every connection calls offline()
+try:
+    await PageView.objects().count()                    # raises ConnectionError
+except ConnectionError:
+    pass
+finally:
+    SurrealDBConnectionManager.get_client = saved       # the classmethod again
+views = await PageView.objects().count()                # 2
+"""
 #: "Transactions and other operations across connections": each refusal (X1–X5) and each limit the ORM cannot see
 #: (N8) is one bullet holding these names together.
 _ACROSS_CONNECTIONS = {
@@ -4678,6 +4788,15 @@ class TestMultiDatabaseDocs:
         assert "when it is awaited" in text and "when it is opened" in text, text
         assert "the innermost `using()` block's, else the default one" in text, text
 
+    def test_which_connection_hand_patched_methods(self) -> None:
+        """Review of PR #254: how to put back a manager method replaced by hand, after the table, with its example."""
+        part = _part_30("Which connection a manager method uses")
+        after_table = part.split(_tables(part)[0][-1], 1)[1]
+        text = _normalised(after_table)
+        for needle in _HAND_PATCH_NEEDLES:
+            assert needle in text, needle
+        assert _python_blocks(part) == [_HAND_PATCH_EXAMPLE]
+
     def test_coming_from_the_full_orm(self) -> None:
         """C7, P9 and D26: nine bullets, exactly, and no tenth."""
         assert _bullets(_part_30("Coming from the full SurrealDB-ORM")) == _COMING_FROM_30
@@ -4787,7 +4906,7 @@ class TestMultiDatabaseDocs:
 
 
 #: The results section 30's comments state, by the names its examples assign (AC-24: each one asserted).
-_STATED_RESULTS_30 = {"names", "where", "elsewhere", "here", "refused", "distinct"}
+_STATED_RESULTS_30 = {"names", "where", "elsewhere", "here", "refused", "distinct", "views"}
 
 
 def _stated_results_30(blocks: list[str]) -> dict[str, str]:

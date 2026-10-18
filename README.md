@@ -3897,6 +3897,29 @@ when it is awaited, and a context manager (`transaction()`, `ephemeral_client()`
 by `async with` (strictly, when it is called), so both act on the connection of the `using()`
 block they are written in.
 
+A manager method you replace by hand, in a test for instance, is inherited by every connection, so
+it intercepts the calls of every connection. Save what the class body holds,
+`vars(SurrealDBConnectionManager)[name]`, and put that back: pytest's `monkeypatch.setattr()` and
+`unittest.mock.patch.object()` already do. Saving `SurrealDBConnectionManager.<name>` instead, which
+worked while there was one connection, saves a method bound to `SurrealDBConnectionManager`: put
+back, it is what every connection inherits, and it acts on the current connection, so a model with
+a `connection` key reads and writes the current connection's database, with no error.
+
+```python
+async def offline():
+    raise ConnectionError("no database in this test")
+
+saved = vars(SurrealDBConnectionManager)["get_client"]
+SurrealDBConnectionManager.get_client = offline         # every connection calls offline()
+try:
+    await PageView.objects().count()                    # raises ConnectionError
+except ConnectionError:
+    pass
+finally:
+    SurrealDBConnectionManager.get_client = saved       # the classmethod again
+views = await PageView.objects().count()                # 2
+```
+
 #### Coming from the full SurrealDB-ORM
 
 - Same names: `add_connection()`, `remove_connection()`, `get_config()`, `list_connections()`,

@@ -102,7 +102,14 @@ block of code. The seventh and last minor of Tier 2.
   removed, while it is open is cancelled when its block ends, with nothing committed
   (`SurrealDbConnectionError`: open it again).
 - The manager's state now lives in one class per connection, the default one included: code that
-  read or patched the private attributes of `SurrealDBConnectionManager` must follow it.
+  read or patched the private attributes of `SurrealDBConnectionManager` must follow it. A manager
+  method replaced by hand, public or private, is inherited by every connection: put it back from
+  `vars(SurrealDBConnectionManager)[name]`, as pytest's `monkeypatch.setattr()` and
+  `unittest.mock.patch.object()` already do. Putting back `SurrealDBConnectionManager.<name>`, saved
+  before the patch, worked with one connection; it is a method bound to `SurrealDBConnectionManager`
+  that every connection then inherits and that acts on the current connection, so once a named
+  connection exists, a model with a `connection` key reads and writes the current connection's
+  database, with no error (README section 30, "Which connection a manager method uses").
 - CI adds a "Mixed server lines" job, required by `CI Success`: the mixed-lines tests put a
   SurrealDB 3.x and a 2.x connection side by side in one process; they find the servers through
   `SURREALDB_PORT_3X` and `SURREALDB_PORT_2X` and skip without them.
