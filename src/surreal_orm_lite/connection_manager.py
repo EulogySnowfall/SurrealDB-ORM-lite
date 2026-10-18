@@ -470,19 +470,21 @@ class SurrealDBConnectionManager:
 
     @classmethod
     async def remove_connection(cls, name: str) -> None:
-        """Unregister a named connection, then close its clients (every event loop, and its embedded engine), end its
-        live streams and forget its session, signatures and settings. What the ORM holds on it ends as on a
+        """Unregister a named connection, forget its settings, session and signatures, then close its clients (every
+        event loop, and its embedded engine) and end its live streams. What the ORM holds on it ends as on a
         re-registration with other settings (:meth:`add_connection`): a client still opening is closed unused (the
         embedded engine is closed only when its URL changed or the name was removed; otherwise it is kept and its
         session is selected again at the next call) and its caller gets a retryable ``SurrealDbConnectionError``, a
         change feed ends at its next read, an open :meth:`transaction` is cancelled when its block ends and nothing is
-        committed. A client the application obtained itself is its own, as after a re-registration: on WebSocket its
-        next request fails, an HTTP client keeps its namespace and database, and an embedded client is the previous
-        engine (with SDK 2.x still running), so stop using it, as after :meth:`close_connection`. A no-op for a name
-        that is not registered (after the name's type check). ``remove_connection("default")`` is
-        :meth:`unset_connection`, unchanged (the default is never unregistered). A model routed to a removed name raises
-        R2 at its next database call. The name is free again as soon as this is called: an ``add_connection()`` of it,
-        even while the old one is closing, registers a new connection.
+        committed. A call already under way on the name opens no new client on the old settings: one still waiting for
+        the embedded engine while another thread held it raises ``ValueError("Connection not been set ('<name>').")``.
+        A client the application obtained itself is its own, as after a re-registration: on WebSocket its next request
+        fails, an HTTP client keeps its namespace and database, and an embedded client is the previous engine (with
+        SDK 2.x still running), so stop using it, as after :meth:`close_connection`. A no-op for a name that is not
+        registered (after the name's type check). ``remove_connection("default")`` is :meth:`unset_connection`,
+        unchanged (the default is never unregistered). A model routed to a removed name raises R2 at its next database
+        call. The name is free again as soon as this is called: an ``add_connection()`` of it, even while the old one
+        is closing, registers a new connection.
 
         :raises TypeError: *name* is not a ``str``.
         :raises ValueError: *name* is empty.
@@ -499,6 +501,11 @@ class SurrealDBConnectionManager:
             connection = _REGISTRY.pop(name, None)
         if connection is None:
             return
+        # Settings cleared before the generation bump, as add_connection() writes the new ones before it: a call that
+        # reads the new generation (another thread let through the embedded guard during the removal, say) reads no
+        # settings and opens nothing; one that read the old generation is refused when it publishes its client (R11),
+        # or published it before the bump, and the retirement below or unset_connection() closes it.
+        connection._clear_settings()
         connection._retire_server_clients()
         await connection.unset_connection()
 
@@ -660,6 +667,19 @@ class SurrealDBConnectionManager:
         Clear all connection settings and close the connection (every loop's, and the embedded
         engine's: a ``mem://`` database is discarded).
         """
+        cls._clear_settings()
+        await cls.close_all_connections()
+
+    @classmethod
+    @_routed("current")
+    def _clear_settings(cls) -> None:
+        """Forget the connection's settings and what belongs to them: the stored session, the stored-function
+        signatures and the lost-identity state. Closes nothing: :meth:`unset_connection` closes afterwards.
+
+        :meth:`remove_connection` runs it before the generation bump (:meth:`_retire_server_clients`), as
+        :meth:`add_connection` writes the new settings before it: whoever reads the new generation never reads the
+        old settings.
+        """
         cls.__url = None
         cls.__user = None
         cls.__password = None
@@ -668,7 +688,6 @@ class SurrealDBConnectionManager:
         cls.clear_session()
         cls.clear_function_signature_cache()
         cls.__lost_identity.clear()
-        await cls.close_all_connections()
 
     @classmethod
     @_routed("current")

@@ -1175,14 +1175,28 @@ class TestReRegistration:
 
 
 class TestRemoveOrder:
-    """Spec §6.1: ``remove_connection()`` unregisters the name, then retires its clients, then unsets it."""
+    """Spec §6.1: ``remove_connection()`` unregisters the name, clears its settings, then retires its clients (the
+    generation bump), then unsets it — new settings before the bump, as ``add_connection()`` does, so whoever reads the
+    new generation reads no settings."""
 
-    async def test_unregistered_then_retired_then_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_unregistered_then_cleared_then_retired_then_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
         SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="a")
         conn = SurrealDBConnectionManager._manager_for("md_a")
+        setattr(conn, _P + "session_token", "a-token")
+        vars(conn)[_P + "function_signatures"][("mem://", "t", "a", "fn::x")] = ("x",)
         generation = conn._settings_generation()
+        real_retire = conn._retire_server_clients
         real_unset = conn.unset_connection
         seen: dict[str, Any] = {}
+
+        def recording_retire(cls: Any) -> None:
+            seen["at the bump"] = (
+                conn._settings(),
+                conn.get_session_token(),
+                conn.function_signature_cache_size(),
+                conn._settings_generation(),
+            )
+            real_retire()
 
         async def recording_unset(cls: Any) -> None:
             seen["registered"] = "md_a" in connection_manager._REGISTRY
@@ -1191,9 +1205,14 @@ class TestRemoveOrder:
             SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="new")
             await real_unset()
 
+        monkeypatch.setattr(conn, "_retire_server_clients", classmethod(recording_retire))
         monkeypatch.setattr(conn, "unset_connection", classmethod(recording_unset))
         await SurrealDBConnectionManager.remove_connection("md_a")
-        assert seen == {"registered": False, "generation": generation + 1}
+        assert seen == {
+            "at the bump": ((None, None, None, None, None), None, 0, generation),
+            "registered": False,
+            "generation": generation + 1,
+        }
         new = SurrealDBConnectionManager._manager_for("md_a")
         assert new is not conn
         assert SurrealDBConnectionManager.get_config("md_a") == ConnectionConfig("mem://", None, None, "t", "new")
@@ -3878,6 +3897,24 @@ async def _session_database(client: Any) -> Any:
     return await client.query("RETURN session::db();", {})
 
 
+class _GuardSpy:
+    """A stand-in for a connection's embedded guard lock that says when somebody first found it taken:
+    ``_embedded_guard()`` spins on ``acquire(blocking=False)``, so a thread routed to the connection is then waiting."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.waited = threading.Event()
+
+    def acquire(self, blocking: bool = True) -> bool:
+        acquired = self._lock.acquire(blocking)
+        if not acquired:
+            self.waited.set()
+        return acquired
+
+    def release(self) -> None:
+        self._lock.release()
+
+
 class TestEmbeddedReRegistration:
     """R11 on the embedded engine (no server, real ``mem://`` and ``surrealkv://`` engines): a change of settings
     while the engine opens or its session is selected again raises a retryable error instead of serving the old
@@ -4048,6 +4085,79 @@ class TestEmbeddedReRegistration:
         assert await SurrealDBConnectionManager.get_client("md_a") is _slot("md_a")
         assert _holder(url) is again
         assert vars(removed)[_P + "embedded_client"] is None
+
+    async def test_a_thread_waiting_for_the_engine_across_a_removal_opens_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Another thread's ``get_client()``, already routed to the connection and waiting for its embedded guard,
+        gets it back inside the removal, right after the generation bump: it finds no settings any more, raises
+        ``ValueError`` and opens nothing. Neither the removed class nor the store claim keeps an engine, and the name
+        registered again opens the store."""
+        url = f"surrealkv://{tmp_path / 'kv'}"
+        SurrealDBConnectionManager.add_connection("md_a", url=url, namespace="t", database="t")
+        removed = SurrealDBConnectionManager._manager_for("md_a")
+        guard = _GuardSpy()
+        monkeypatch.setattr(removed, _P + "embedded_lock", guard)
+        settled, removal_done = threading.Event(), threading.Event()
+        real_open = vars(SurrealDBConnectionManager)["_open_client"].__func__
+
+        async def open_then_wait_for_the_removal(cls: Any, *, signin_as_configured: bool) -> Any:
+            client = await real_open(cls, signin_as_configured=signin_as_configured)
+            settled.set()
+            await asyncio.to_thread(removal_done.wait, 10)  # published only once the removal is over
+            return client
+
+        monkeypatch.setattr(removed, "_open_client", classmethod(open_then_wait_for_the_removal))
+        real_close_all_subscribers = connection_manager.close_all_subscribers
+        test_thread = threading.get_ident()
+        hooked: list[bool] = []
+
+        def release_the_guard_after_the_bump(*args: Any, **kwargs: Any) -> None:
+            # The removal's first call, inside _retire_server_clients(), right after the bump: the other thread takes
+            # the guard and goes as far as it can (an error, or an engine it opened) before the removal goes on.
+            if threading.get_ident() == test_thread and not hooked:
+                guard.release()
+                hooked.append(settled.wait(10))
+            real_close_all_subscribers(*args, **kwargs)
+
+        monkeypatch.setattr(connection_manager, "close_all_subscribers", release_the_guard_after_the_bump)
+        outcome: dict[str, Any] = {}
+
+        async def get_client() -> None:
+            try:
+                outcome["client"] = await SurrealDBConnectionManager.get_client("md_a")
+            except BaseException as exc:  # noqa: BLE001 - reported through `outcome`
+                outcome["error"] = exc
+            finally:
+                settled.set()
+
+        thread = threading.Thread(target=lambda: asyncio.run(get_client()))
+        guard.acquire()
+        try:
+            thread.start()
+            assert await asyncio.to_thread(guard.waited.wait, 10)  # routed to md_a, waiting for its guard
+            await SurrealDBConnectionManager.remove_connection("md_a")
+            removal_done.set()
+            await asyncio.to_thread(thread.join, 10)
+            assert not thread.is_alive()
+            assert hooked == [True]
+            error = outcome.get("error")
+            assert isinstance(error, ValueError), outcome
+            assert str(error) == "Connection not been set ('md_a')."
+            del error
+            assert vars(removed)[_P + "embedded_client"] is None
+            assert _holder(url) is None
+            SurrealDBConnectionManager.add_connection("md_a", url=url, namespace="t", database="t")
+            again = SurrealDBConnectionManager._manager_for("md_a")
+            assert await SurrealDBConnectionManager.get_client("md_a") is _slot("md_a")
+            assert _holder(url) is again
+        finally:
+            removal_done.set()
+            if not hooked:
+                guard.release()
+            await asyncio.to_thread(thread.join, 10)
+            outcome.clear()
+            await removed._close_embedded()  # whatever an engine the removed class kept, closed for the next tests
 
     async def test_a_transaction_entered_across_a_new_database_commits_nowhere(self, monkeypatch: pytest.MonkeyPatch) -> None:
         SurrealDBConnectionManager.add_connection("md_a", url="mem://", namespace="t", database="db1")
@@ -4863,7 +4973,9 @@ _D7_BULLET = (
     "its URL changed or the name was removed; otherwise it is kept and its session is selected again at the next "
     "call) and its caller gets a retryable `SurrealDbConnectionError` (retry the call), live streams end, a change feed ends at its next read (`SurrealDbConnectionError`: its cursor "
     "belongs to the old database, start a new one), and an open `transaction()` is cancelled when its block ends, "
-    "with nothing committed (`SurrealDbConnectionError`: open it again). A client you obtained yourself with "
+    "with nothing committed (`SurrealDbConnectionError`: open it again). After `remove_connection()`, a call already "
+    "under way on the name opens no new client on the old settings: one still waiting for the embedded engine while "
+    "another thread held it raises `ValueError` (`Connection not been set ('<name>').`). A client you obtained yourself with "
     "`get_client()` before the change is yours: on WebSocket its socket is closed and its next request fails; an "
     "HTTP client keeps the namespace and database it was opened on, so call `get_client()` again; an embedded client "
     "is the connection's one in-process session: it follows a new namespace or database at the ORM's next call, but "
