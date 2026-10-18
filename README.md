@@ -221,15 +221,52 @@ embedded engine refuse one above `4294967295` (`2**32 - 1`), SurrealDB 3.x reads
 - `in`, `not_in` (a list, or a `Range` bound as one value: see [section 24](#24-rich-field-types))
 - `contains`, `not_contains` (`contains` on a range column tests membership)
 - `containsall`, `containsany`
-- `startswith`, `endswith`
-- `like`, `ilike`
-- `match`, `regex`
+- `startswith`, `endswith`, `like`, `ilike`, `match`, `regex` (text: see [Text lookups](#text-lookups))
 - `isnull`
 - `inside`, `outside`, `intersects` (geometry values: see [section 25](#25-geospatial-fields))
 - a subquery — `Subquery(qs)` or the queryset itself — as the value of `in`, `not_in`, `containsall`, `containsany` (all its values) or `exact`, `gt`, `gte`, `lt`, `lte`, `contains`, `not_contains` (its first value): see [section 28](#28-subqueries-subquery)
 
 Filter values on rich fields must be typed: `filter(trial__gte=timedelta(days=7))`, not
 `"7d"`. Strings are not converted (see [section 24](#24-rich-field-types)).
+
+#### Text lookups
+
+SurrealQL has no `LIKE` or `STARTSWITH` operator, so each text lookup compiles to a string
+function, with its value bound:
+
+| Lookup       | Value                      | Compiles to                                                                      |
+| ------------ | -------------------------- | -------------------------------------------------------------------------------- |
+| `startswith` | a prefix                   | `string::starts_with(field, $v)`                                                 |
+| `endswith`   | a suffix                   | `string::ends_with(field, $v)`                                                   |
+| `like`       | an SQL `LIKE` pattern      | `string::matches(field, $v)`, the pattern translated to an anchored `(?s)` regex |
+| `ilike`      | the same, case-insensitive | the same, with `(?i)` added                                                      |
+| `regex`      | a regular expression       | `string::matches(field, $v)`                                                     |
+| `match`      | a regular expression       | `string::matches(field, $v)`: the same as `regex`                                |
+
+```python
+await User.objects().filter(name__startswith="A").exec()
+await User.objects().filter(email__ilike="%@EXAMPLE.com").exec()   # case-insensitive
+await User.objects().filter(code__like="AB_-%").exec()            # "AB", any one character, "-", anything
+await User.objects().filter(name__regex=r"^\d{3}").exec()          # SurrealDB's regex syntax (Rust regex)
+```
+
+- **Non-string fields.** Each condition is guarded by the field's type:
+  `filter(name__startswith="A")` is `(name.is_string() AND string::starts_with(name, $_f0))`.
+  A record whose field is missing (`NONE`), `NULL` or not a string never matches, and the
+  query does not fail on it. The negation (`~Q(name__startswith="A")`) matches it.
+- **`like` / `ilike` patterns.** `%` matches any run of characters (newlines included) and `_`
+  exactly one character. Every other character is literal, regex metacharacters included
+  (`.`, `*`, `(`, `\`, …). There is no escape character, so a pattern cannot match a literal
+  `%` or `_` alone: use `regex` for that. The whole value must match, so `like="Al"` finds
+  `"Al"` but not `"Alice"`.
+- **`match` and `regex`.** Both take a regular expression in SurrealDB's syntax (the Rust
+  `regex` crate) and match anywhere in the value unless it is anchored (`^…$`). Prefix it
+  with `(?i)` to ignore case. Here `match` is a regex lookup, not the full SurrealDB-ORM's
+  full-text `@@` operator: full-text search is planned for v0.34.0, as a separate API.
+- **Values.** The value must be a `str`, otherwise `ValueError`. A string starting with `$`
+  is data, as for every lookup ([String filter values and `Var()`](#string-filter-values-and-var)).
+  `startswith`, `endswith`, `match` and `regex` also take a `Var`. `like` and `ilike` do not:
+  their pattern is translated before it is sent, so `Var` raises `ValueError`.
 
 #### Filtering on the record id
 
@@ -4072,7 +4109,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.28.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -4182,6 +4219,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | `filter(f="$x")`: a string filter value starting with `$`                                                                              | same on both lines: compared with the string `"$x"`, bound like any value, in a live query too; `Var("x")` reads the variable `$x`, `Var("auth")` SurrealDB's `$auth`         | the same; on an edge's `in`/`out` (record ids) such a string raises `ValueError`, on both lines; `$access`, `$session`, `$token` read like `$auth`                                  | v0.28.1                              |
 | `limit(n)` or `offset(n)` above `4294967295` (`2**32 - 1`)                                                                             | the server refuses the read: `Found <n> but the LIMIT clause must evaluate to a positive integer` (`START` likewise)                                                          | read; above `2**63 - 1` the ORM raises `ValueError` when `limit()` or `offset()` is called, on both lines                                                                           | pre-existing (documented in v0.28.1) |
 | Several connections in one process (`add_connection()`, `using()`)                                                                     | each connection follows its own server: a 2.x connection's transactions are buffered, whatever the others are                                                                 | each 3.x WebSocket connection gets interactive transactions, beside 2.x connections in the same process                                                                             | v0.29.0                              |
+| Text lookups (`startswith`, `endswith`, `like`, `ilike`, `match`, `regex`)                                                             | same on both lines: string functions guarded by `field.is_string()` (`type::is::string` parses on 2.x only); a `NONE`, `NULL` or non-string field never matches               | the same (`type::is_string` parses on 3.x only); until v0.28.1 they compiled to operators SurrealQL lacks (`LIKE`…): a parse error on both lines                                    | v0.28.2                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
