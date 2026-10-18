@@ -398,9 +398,14 @@ class TestCriteriaPayloadInterpretation:
         assert payload == {"name": "$admin"}
 
     def test_variable_reference_cannot_be_written(self) -> None:
+        """Without ``variables(admin=...)`` the value of ``$admin`` is only known to the database (issue #252)."""
         qs = surreal_orm_lite.QuerySet(Issue156Model)
-        with pytest.raises(SurrealDbError, match="query-variable reference"):
+        with pytest.raises(SurrealDbError, match=r"Cannot create a record from Var\('admin'\) given for 'name'"):
             qs._criteria_payload({"name": Var("admin")})
+
+    def test_a_variable_of_variables_is_written_as_its_value(self) -> None:
+        qs = surreal_orm_lite.QuerySet(Issue156Model).variables(admin="$$admin")
+        assert qs._criteria_payload({"name": Var("admin")}) == {"name": "$$admin"}
 
     def test_a_dollar_string_is_written_as_data(self) -> None:
         assert surreal_orm_lite.QuerySet(Issue156Model)._criteria_payload({"name": "$admin"}) == {"name": "$admin"}

@@ -1177,6 +1177,16 @@ class TestSubqueryRefusals:
             await call()
         assert str(info.value) == message
 
+    @pytest.mark.usefixtures("_no_request")
+    @pytest.mark.parametrize("method", ["get_or_create", "update_or_create"])
+    async def test_s7_in_the_get_or_create_lookup(self, method: str) -> None:
+        """Issue #252: the lookup binds the queryset's ``variables()``, so a subquery criterion binding one of their
+        names to another value raises S7 before any request, as ``filter()`` does."""
+        older = SqPerson.objects().filter(age__gte=Var("n")).variables(n=40)
+        with pytest.raises(ValueError) as info:
+            await getattr(SqPost.objects().variables(n=30), method)(author__in=older, title="two")
+        assert str(info.value) == _s7("n")
+
 
 # --- the engines and the data (spec §9) ---------------------------------------------------------------
 
@@ -2080,6 +2090,28 @@ class TestSubqueryWritesE2E:
             assert await _scores() == {**_SEEDED_SCORES, "p1": 6}
             stored = await SqPost.objects().get("p1")
             assert stored.author == _person("ada")
+
+    async def test_the_lookup_binds_the_variables_with_the_subqueries(self, kind: str) -> None:
+        """Issue #252: the queryset's ``variables()`` and a subquery criterion's share the lookup, as in ``filter()``:
+        the same value for a name is accepted, and an outer ``Var`` criterion reads either."""
+        async with subquery_db(kind):
+            await _seed()
+
+            def older() -> Any:
+                return SqPerson.objects().filter(age__gte=Var("n")).variables(n=40)  # bob
+
+            post, created = await SqPost.objects().variables(n=40).get_or_create(author__in=older(), score__lte=Var("n"))
+            assert (post.id, created) == ("p2", False)
+            post, created = await SqPost.objects().get_or_create(author__in=older(), score__lte=Var("n"))
+            assert (post.id, created) == ("p2", False)
+            qs = SqPost.objects().variables(n=40, s=8)
+            post, created = await qs.update_or_create(author__in=older(), score=Var("s"), defaults={"title": "deux"})
+            assert (post.title, post.score, created) == ("deux", 8, False)
+            assert (await SqPost.objects().get("p2")).title == "deux"
+            assert await _scores() == _SEEDED_SCORES
+            with pytest.raises(ValueError) as info:
+                await SqPost.objects().variables(n=30).get_or_create(author__in=older(), title="two")
+            assert str(info.value) == _s7("n")
 
 
 class TestSubqueryTransactionsE2E:

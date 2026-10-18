@@ -250,13 +250,13 @@ class TestFilterByInstance:
 
     def test_criteria_payload_coerces_instances(self) -> None:
         alice = TrCustomer(id="alice")
-        payload = QuerySet._criteria_payload({"customer": alice, "note__contains": "x"})
+        payload = QuerySet(TrOrder)._criteria_payload({"customer": alice, "note__contains": "x"})
         assert payload == {"customer": ALICE}
         assert isinstance(payload["customer"], RecordID)
 
     def test_criteria_payload_refuses_unsaved_instance(self) -> None:
         with pytest.raises(ValueError, match="unsaved"):
-            QuerySet._criteria_payload({"customer": TrCustomer(name="x")})
+            QuerySet(TrOrder)._criteria_payload({"customer": TrCustomer(name="x")})
 
 
 # ==================== Task 2 — edge endpoint columns (unit) ====================
@@ -422,7 +422,7 @@ class TestParseLookupTrailingUnderscore:
         assert variables == {"_f0": [1, 2]}
 
     def test_criteria_payload_on_trailing_underscore_field(self) -> None:
-        assert QuerySet._criteria_payload({"type_": 3, "type___gt": 1}) == {"type_": 3}
+        assert QuerySet(TrTyped)._criteria_payload({"type_": 3, "type___gt": 1}) == {"type_": 3}
 
 
 # ==================== Task 2 — filtering by instance (E2E, both lines) ====================
