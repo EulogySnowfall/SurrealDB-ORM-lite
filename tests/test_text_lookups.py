@@ -108,6 +108,10 @@ def _no_warning() -> Iterator[None]:
     """Any warning raised by the test body is an error."""
     with warnings.catch_warnings():
         warnings.simplefilter("error")
+        # A socket another test left open can be finalised by the garbage collector during this one: its
+        # ResourceWarning is not this test's, and pytest reports such finaliser errors while this filter holds.
+        warnings.simplefilter("ignore", ResourceWarning)
+        warnings.simplefilter("default", pytest.PytestUnraisableExceptionWarning)
         yield
 
 
