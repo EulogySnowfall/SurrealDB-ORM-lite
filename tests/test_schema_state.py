@@ -323,6 +323,29 @@ class TestFrozenMap:
         assert repr(frozen_map({"b": 1, "a": 2})) == repr({"a": 2, "b": 1})
         assert repr(frozen_map({})) == "{}"
 
+    def test_a_map_of_texts_shows_its_keys_only(self) -> None:
+        """A map built with ``hide_values=True`` (rules, expressions, unmodelled sections) keeps its values out of
+        ``repr``/``str``, and keeps that through ``pickle``, ``copy`` and ``deepcopy``; equality ignores it."""
+        texts = _FrozenMap({"b": "s3cr3t-0042", "a": "x"}, hide_values=True)
+        assert repr(texts) == "{'a': ..., 'b': ...}"
+        assert str(texts) == repr(texts)
+        assert repr(_FrozenMap({}, hide_values=True)) == "{}"
+        assert type(texts) is _FrozenMap
+        assert list(texts) == ["a", "b"]
+        assert texts["b"] == "s3cr3t-0042"
+        assert texts == {"a": "x", "b": "s3cr3t-0042"}
+        assert texts == frozen_map({"a": "x", "b": "s3cr3t-0042"})
+        assert frozen_map({"a": "x", "b": "s3cr3t-0042"}) == texts
+        with pytest.raises(TypeError):
+            hash(texts)
+        clones = [copy.copy(texts), copy.deepcopy(texts)]
+        clones += [pickle.loads(pickle.dumps(texts, protocol=p)) for p in range(pickle.HIGHEST_PROTOCOL + 1)]
+        for clone in clones:
+            assert type(clone) is _FrozenMap
+            assert clone == texts
+            assert repr(clone) == "{'a': ..., 'b': ...}"
+        assert repr(copy.deepcopy(frozen_map({"a": 1}))) == "{'a': 1}"
+
     def test_pickle_copy_and_deepcopy(self) -> None:
         mapping = frozen_map({"b": [1, 2], "a": frozen_map({"x": 1})})
         clones = [pickle.loads(pickle.dumps(mapping)), copy.copy(mapping), copy.deepcopy(mapping)]
@@ -382,12 +405,24 @@ class TestParity:
             instance.not_an_attribute = 1
 
     def test_secrets_are_out_of_repr(self) -> None:
+        """Spec §8: every attribute holding SurrealQL text (a statement, an expression, a rule, a body) is out of
+        ``repr``; names, kinds, flags, durations and comments stay in it."""
         repr_flags = {
             cls.__name__: [item.name for item in dataclasses.fields(cls) if not item.repr]
             for cls in _PARITY
             if any(not item.repr for item in dataclasses.fields(cls))
         }
-        assert repr_flags == {"ParamState": ["value", "raw"], "SchemaIssue": ["statement"]}
+        assert repr_flags == {
+            "TableState": ["view_query", "raw"],
+            "FieldState": ["default", "assertion", "value", "on_delete", "computed", "raw"],
+            "IndexState": ["raw"],
+            "EventState": ["when", "then", "raw"],
+            "AccessState": ["signin_where", "signup", "signin", "raw"],
+            "AnalyzerState": ["raw"],
+            "FunctionState": ["permissions", "raw"],
+            "ParamState": ["value", "permissions", "raw"],
+            "SchemaIssue": ["statement"],
+        }
 
     def test_names_attributes_are_read_only_sequences(self) -> None:
         """D29: every names attribute is annotated ``Sequence[str]``, ``issues`` ``Sequence[SchemaIssue]``."""
@@ -698,8 +733,165 @@ class TestRoundTrip:
         assert hash(IndexState(name="i", fields=["a"])) == hash(IndexState(name="i", fields=["a"]))
 
 
+_SECRET = "s3cr3t-0042"
+
+
+def _secret_schema() -> SchemaState:
+    """A schema whose every SurrealQL text holds a credential: a JWT key, a user's ``PASSHASH`` in ``other``, literal
+    passwords and tokens in expressions, rules and bodies. Every one of them contains ``_SECRET``."""
+    field_state = FieldState(
+        name="api.token",
+        field_type="string",
+        nullable=False,
+        default=f"'{_SECRET}-default'",
+        assertion=f"$value != '{_SECRET}-assert'",
+        readonly=True,
+        value=f"crypto::argon2::generate('{_SECRET}-value')",
+        reference=True,
+        on_delete=f"THEN http::post('https://hook.example', {{ key: '{_SECRET}-on-delete' }})",
+        comment="the API token",
+        table="vault",
+        computed=f"string::concat('{_SECRET}-computed', id)",
+        permissions={"select": f"WHERE $token.key = '{_SECRET}-field-rule'", "update": "NONE"},
+        raw=f"DEFINE FIELD api.token ON vault TYPE string DEFAULT '{_SECRET}-default'",
+    )
+    index = IndexState(name="by_token", fields=["api.token"], unique=True, table="vault", raw="DEFINE INDEX by_token")
+    event = EventState(
+        "on_token",
+        "vault",
+        f"$after.api.token != '{_SECRET}-when'",
+        f"{{ http::post('https://hook.example', {{ token: '{_SECRET}-then' }}) }}",
+        comment="notify",
+        raw=f"DEFINE EVENT on_token ON vault THEN {{ http::post('https://hook.example', '{_SECRET}-then') }}",
+    )
+    table = TableState(
+        name="vault",
+        fields={"api.token": field_state},
+        indexes={"by_token": index},
+        events={"on_token": event},
+        changefeed="1d",
+        permissions={"select": f"WHERE $auth.key = '{_SECRET}-table-rule'", "delete": "NONE"},
+        view_query=f"SELECT * FROM secrets WHERE key = '{_SECRET}-view'",
+        comment="secrets",
+        other={"future": {"thing": f"DEFINE THING thing KEY '{_SECRET}-table-other'"}},
+        raw=f"DEFINE TABLE vault SCHEMAFULL PERMISSIONS FOR select WHERE $auth.key = '{_SECRET}-table-rule'",
+    )
+    access = AccessState(
+        name="acc",
+        table="user",
+        signup_fields={"password": f"crypto::argon2::generate('{_SECRET}-signup-field')"},
+        signin_where=f"pass = '{_SECRET}-signin-where'",
+        duration_token="1h",
+        signup=f"(CREATE user SET password = crypto::argon2::generate('{_SECRET}-signup-field'))",
+        signin=f"(SELECT * FROM user WHERE pass = '{_SECRET}-signin-where')",
+        with_refresh=True,
+        comment="login",
+        raw=f"DEFINE ACCESS acc ON DATABASE TYPE RECORD WITH JWT ALGORITHM HS512 KEY '{_SECRET}-jwt-key'",
+    )
+    analyzer = AnalyzerState(name="an", tokenizers=["blank"], filters=["lowercase"], raw=f"-- {_SECRET}-analyzer")
+    function = FunctionState(
+        "fn::login",
+        ["user"],
+        "string",
+        f"WHERE $token.key = '{_SECRET}-function-rule'",
+        "logs in",
+        f"DEFINE FUNCTION fn::login($user: string) {{ RETURN http::post('https://x', {{ password: '{_SECRET}-body' }}) }}",
+    )
+    param = ParamState(
+        "api_key",
+        f"'{_SECRET}-param'",
+        f"WHERE $token.key = '{_SECRET}-param-rule'",
+        "the key",
+        f"DEFINE PARAM $api_key VALUE '{_SECRET}-param'",
+    )
+    issue = SchemaIssue("param", "broken", None, "could not parse its definition", statement=f"DEFINE PARAM {_SECRET}")
+    return SchemaState(
+        tables={"vault": table},
+        connection="isp",
+        analyzers={"an": analyzer},
+        accesses={"acc": access},
+        functions={"fn::login": function},
+        params={"api_key": param},
+        other={
+            "users": {"admin": f"DEFINE USER admin ON DATABASE PASSHASH '$argon2id$v=19$m=19456${_SECRET}' ROLES OWNER"},
+            "apis": {"/b": f"DEFINE API '/b' FOR get THEN {{ RETURN '{_SECRET}-api' }}", "/a": "DEFINE API '/a'"},
+        },
+        issues=[issue],
+    )
+
+
+def _every_state(schema: SchemaState) -> list[object]:
+    """*schema* and every state it holds."""
+    states: list[object] = [schema, *schema.analyzers.values(), *schema.accesses.values(), *schema.issues]
+    states += [*schema.functions.values(), *schema.params.values()]
+    for table in schema.tables.values():
+        states += [table, *table.fields.values(), *table.indexes.values(), *table.events.values()]
+    return states
+
+
 class TestRepr:
-    """Spec §8, AC-10: a param's value and an issue's statement never reach ``repr``."""
+    """Spec §8, AC-10: no SurrealQL text the server returned reaches ``repr``/``str`` — names and structure do."""
+
+    def test_no_definition_text_reaches_repr(self) -> None:
+        schema = _secret_schema()
+        states = _every_state(schema)
+        assert len(states) == 10
+        for state in states:
+            for text in (repr(state), str(state)):
+                assert _SECRET not in text, text
+                for marker in ("DEFINE", "PASSHASH", "argon2", "KEY '", "http::", "WHERE", "SELECT", "$value"):
+                    assert marker not in text, (marker, text)
+
+    def test_names_and_structure_stay_in_repr(self) -> None:
+        schema = _secret_schema()
+        text = repr(schema)
+        for name in ("'vault'", "'api.token'", "'by_token'", "'on_token'", "'acc'", "'an'", "'fn::login'"):
+            assert name in text, name
+        for name in ("'api_key'", "'broken'", "'isp'", "'users'", "'admin'", "'apis'", "'/a'", "'/b'", "'future'"):
+            assert name in text, name
+        assert "other={'apis': {'/a': ..., '/b': ...}, 'users': {'admin': ...}}" in text
+        table = repr(schema.tables["vault"])
+        assert "permissions={'delete': ..., 'select': ...}" in table
+        assert "other={'future': {'thing': ...}}" in table
+        assert "changefeed='1d'" in table
+        assert "comment='secrets'" in table
+        field_state = repr(schema.tables["vault"].fields["api.token"])
+        for shown in ("field_type='string'", "nullable=False", "readonly=True", "reference=True", "table='vault'"):
+            assert shown in field_state, shown
+        assert "permissions={'select': ..., 'update': ...}" in field_state
+        assert "comment='the API token'" in field_state
+        access = repr(schema.accesses["acc"])
+        for shown in ("table='user'", "signup_fields={'password': ...}", "duration_token='1h'", "with_refresh=True"):
+            assert shown in access, shown
+        assert "returns='string'" in repr(schema.functions["fn::login"])
+        assert "parameters=('user',)" in repr(schema.functions["fn::login"])
+        assert "fields=('api.token',)" in repr(schema.tables["vault"].indexes["by_token"])
+        assert "message='could not parse its definition'" in repr(schema.issues[0])
+
+    def test_the_texts_are_still_there(self) -> None:
+        schema = _secret_schema()
+        assert schema.other["users"]["admin"].endswith("ROLES OWNER")
+        assert _SECRET in schema.accesses["acc"].raw
+        assert _SECRET in schema.functions["fn::login"].raw
+        assert _SECRET in schema.tables["vault"].permissions["select"]
+        assert _SECRET in schema.tables["vault"].events["on_token"].then
+        assert schema == _secret_schema()
+
+    def test_a_round_tripped_schema_keeps_its_texts_out_of_repr(self) -> None:
+        schema = _secret_schema()
+        clones = [copy.copy(schema), copy.deepcopy(schema), pickle.loads(pickle.dumps(schema))]
+        for clone in clones:
+            assert clone == schema
+            assert repr(clone) == repr(schema)
+            assert _SECRET not in repr(clone)
+
+    def test_text_maps_given_as_plain_maps_are_hidden(self) -> None:
+        """A plain ``_FrozenMap`` (or ``dict``) given for a map of texts is rebuilt with its values hidden."""
+        rules = frozen_map({"select": f"WHERE key = '{_SECRET}'"})
+        assert _SECRET not in repr(FieldState(name="x", field_type="int", permissions=rules))
+        assert _SECRET not in repr(TableState(name="t", permissions=rules, other={"s": rules}))
+        assert _SECRET not in repr(AccessState(name="a", signup_fields=rules))
+        assert _SECRET not in repr(SchemaState(other={"s": rules}))
 
     def test_param_value_and_raw_are_out_of_repr(self) -> None:
         param = ParamState(
@@ -712,7 +904,7 @@ class TestRepr:
         text = repr(param)
         assert "s3cr3t" not in text
         assert "'k'" in text
-        assert "FULL" in text
+        assert "FULL" not in text
         assert param.value == "s3cr3t"
         assert param == ParamState("k", "s3cr3t", "FULL", None, "DEFINE PARAM $k VALUE 's3cr3t' PERMISSIONS FULL")
         assert param != ParamState("k", "other", "FULL", None, "DEFINE PARAM $k VALUE 's3cr3t' PERMISSIONS FULL")
@@ -729,6 +921,8 @@ class TestRepr:
         state = SchemaState(params={"k": ParamState("k", "'s3cr3t'", "FULL", None, "DEFINE PARAM $k VALUE 's3cr3t'")})
         assert "s3cr3t" not in repr(state)
 
-    def test_maps_show_as_dicts(self) -> None:
+    def test_maps_of_states_show_as_dicts_maps_of_texts_show_their_keys(self) -> None:
         field_state = FieldState(name="x", field_type="int", permissions={"update": "NONE", "select": "FULL"})
-        assert "permissions={'select': 'FULL', 'update': 'NONE'}" in repr(field_state)
+        assert "permissions={'select': ..., 'update': ...}" in repr(field_state)
+        table = TableState(name="t", fields={"x": FieldState(name="x", field_type="int")})
+        assert "fields={'x': FieldState(name='x', field_type='int', nullable=True, flexible=False" in repr(table)
