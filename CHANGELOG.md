@@ -16,7 +16,7 @@ to a SurrealQL string function. No new public API.
   SurrealQL does not have (`STARTSWITH`, `LIKE`, `REGEX`…), so every such filter was a parse error
   on SurrealDB 2.x, 3.x and the embedded engine, in reads and in live queries. Each now compiles to
   a string function guarded by the field's type, with its value bound:
-  `filter(name__startswith="A")` is `(name.is_string() AND string::starts_with(name, $_f0))`.
+  `filter(name__startswith="A")` is `((name).is_string() AND string::starts_with(name, $_f0))`.
   - `startswith` and `endswith`: `string::starts_with` and `string::ends_with`.
   - `match` and `regex`: `string::matches`, the regular expression (SurrealDB's syntax, the Rust
     `regex` crate) as given. `match` is a regex lookup, not the full-text `@@` operator: full-text
@@ -26,7 +26,9 @@ to a SurrealQL string function. No new public API.
     character is literal; `ilike` ignores case. The whole value must match: `like="Al"` finds
     `"Al"`, not `"Alice"`.
   - A record whose field is missing (`NONE`), `NULL` or not a string never matches, and the query
-    does not fail on it; the negation (`~Q(name__startswith="A")`) matches it.
+    does not fail on it; the negation (`~Q(name__startswith="A")`) matches it. A dotted path
+    through an array of record links or objects (`authors.name`) holds an array: it never matches
+    either.
 
 ```python
 await User.objects().filter(name__startswith="A").exec()
@@ -44,8 +46,11 @@ await User.objects().filter(name__regex=r"^\d{3}").exec()
 ### Notes
 
 - Same behaviour on SurrealDB 2.x, 3.x and the embedded engine: the guard is written in the method
-  form `field.is_string()`, which parses on both lines (`type::is::string` parses on 2.x only,
-  `type::is_string` on 3.x only). The README's behaviour table has a row for the text lookups.
+  form `(field).is_string()`, which parses on both lines (`type::is::string` parses on 2.x only,
+  `type::is_string` on 3.x only). The path is in parentheses because SurrealDB 3.x applies
+  `authors.name.is_string()` to each element of the array such a path gives, and the array of
+  booleans let the array reach the string function, which failed the query. The README's behaviour
+  table has a row for the text lookups.
 - `surreal_orm_lite.constants.LOOKUP_OPERATORS` (internal) no longer lists the text lookups; they
   are in `TEXT_LOOKUP_FUNCTIONS`.
 
