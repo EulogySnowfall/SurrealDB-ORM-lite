@@ -369,11 +369,13 @@ would find and write the record whose `owner` is the string `"$auth"`, the same 
 record user, and `members__contains="$auth"` would look for the string. A criterion that is exactly
 `$` followed by the name of one of these parameters or of a variable the lookup binds (of
 `variables()`, the queryset's or a subquery criterion's) raises `SurrealDbError` before any request,
-whatever its lookup. For a variable, the message names `Var("x")` as the criterion to write. For a
+whatever its lookup. For a variable, the message names `Var("x")` as the criterion to write, under
+any lookup but `like`/`ilike`, which take no `Var` (pass the pattern itself, or use `regex`). For a
 parameter, it says to pass the actual value as an `exact` criterion (the record id, or the value
-itself), and that `Var("auth")` works under any other lookup: `members__contains=Var("auth")` is
-looked up, never written. Any other string, such as `"$admin"`, is looked up and written as it is.
-On an edge's `in` and `out`, such a criterion raises the `ValueError` above.
+itself), and that `Var("auth")` works under any other lookup but `like`/`ilike`, which take no `Var`
+(pass the pattern itself, or use `regex`): `members__contains=Var("auth")` is looked up, never
+written. Any other string, such as `"$admin"`, is looked up and written as it is. On an edge's `in`
+and `out`, such a criterion raises the `ValueError` above.
 
 `variables()` refuses these four names with a `ValueError`: SurrealDB sets them for each session
 and refuses a query variable of that name. To pass your own value, give it another name, or pass

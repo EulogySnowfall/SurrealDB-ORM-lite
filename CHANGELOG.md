@@ -44,10 +44,12 @@ room, created = await qs.update_or_create(size__gte=Var("n"), title=Var("t"), de
 - **Refusals of a `"$name"` criterion in `get_or_create()` and `update_or_create()`** (#252): a
   string criterion that is exactly `$` followed by the name of a variable of a subquery criterion's
   `variables()` now raises `SurrealDbError` too, like one naming a variable of the queryset's
-  `variables()`. For a variable, the message names `Var('x')` as the criterion to write. For a
+  `variables()`. For a variable, the message names `Var('x')` as the criterion to write, under any
+  lookup but `like`/`ilike`, which take no `Var` (pass the pattern itself, or use `regex`). For a
   session parameter, it says to pass the actual value under `exact`, and that `Var('auth')` works
-  under any other lookup (`members__contains=Var("auth")` is looked up, never written). On the `id`
-  column it names the record id `table:⟨$name⟩` the string would be.
+  under any other lookup but `like`/`ilike`, which take no `Var` (pass the pattern itself, or use
+  `regex`): `members__contains=Var("auth")` is looked up, never written. On the `id` column it names
+  the record id `table:⟨$name⟩` the string would be.
 
 ### Deprecated
 
