@@ -49,6 +49,13 @@ room, created = await qs.update_or_create(size__gte=Var("n"), title=Var("t"), de
   under any other lookup (`members__contains=Var("auth")` is looked up, never written). On the `id`
   column it names the record id `table:⟨$name⟩` the string would be.
 
+### Deprecated
+
+- The `"$$"` escape of a string filter value, deprecated since v0.28.1 (#250) and listed there
+  under Changed: a string filter value starting with `$$` loses one `$` (`"$$admin"` finds
+  `"$admin"`) and emits a `DeprecationWarning`. A string filter value is always data, so write the
+  value with one `$` less. An item of an `in` list never had the escape and is unchanged.
+
 ## [0.29.2] - 2026-10-18
 
 The text lookups `startswith`, `endswith`, `like`, `ilike`, `match` and `regex` work: each compiles
