@@ -101,7 +101,7 @@ class TestRawSqlIsVerbatim:
         async def fake_get_client() -> FakeClient:
             return FakeClient()
 
-        original = surreal_orm_lite.SurrealDBConnectionManager.get_client
+        original = vars(surreal_orm_lite.SurrealDBConnectionManager)["get_client"]
         surreal_orm_lite.SurrealDBConnectionManager.get_client = fake_get_client  # type: ignore[assignment]
         try:
             await Issue156Model.raw_query("SELECT * FROM Issue156Model WHERE name = '$admin';")
@@ -123,7 +123,7 @@ class TestMultiStatementWarning:
         async def fake_get_client() -> FakeClient:
             return FakeClient()
 
-        original = surreal_orm_lite.SurrealDBConnectionManager.get_client
+        original = vars(surreal_orm_lite.SurrealDBConnectionManager)["get_client"]
         surreal_orm_lite.SurrealDBConnectionManager.get_client = fake_get_client  # type: ignore[assignment]
         try:
             with warnings.catch_warnings(record=True) as caught:
@@ -369,7 +369,7 @@ class TestWarningsReachUserCode:
         async def fake_get_client() -> FakeClient:
             return FakeClient()
 
-        original = surreal_orm_lite.SurrealDBConnectionManager.get_client
+        original = vars(surreal_orm_lite.SurrealDBConnectionManager)["get_client"]
         surreal_orm_lite.SurrealDBConnectionManager.get_client = fake_get_client  # type: ignore[assignment]
         try:
             with warnings.catch_warnings(record=True) as caught:

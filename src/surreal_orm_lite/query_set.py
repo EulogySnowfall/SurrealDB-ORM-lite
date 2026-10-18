@@ -14,6 +14,7 @@ from . import BaseSurrealModel, SurrealDBConnectionManager
 from . import cache as _cache
 from . import encoding as _encoding
 from . import geo as _geo
+from . import routing as _routing
 from . import subquery as _subquery
 from . import time_travel as _time_travel
 from ._sdk import NotFoundError, RecordID, SdkGeometryPoint, ServerError
@@ -26,7 +27,7 @@ from .enum import OrderBy
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import SurrealFunc, Var
 from .geo import GeoDistance, GeometryPoint
-from .live import LiveModelStream, LiveStream, ReconnectCallback, missing_table_error, require_websocket
+from .live import LiveModelStream, LiveStream, ReconnectCallback, missing_table_error
 from .model_base import _snapshot_moment
 from .q import Q
 from .subquery import SubqueryCompiler
@@ -92,6 +93,9 @@ class QuerySet:
         self._model_table: str = model.get_table_name()
         self._variables: dict = {}
         self._fetch_fields: list[str] = []
+        # The first segment of every dotted column a clause names (v0.29.0, _column()): the links it may follow,
+        # checked against the model's connection before a statement is sent (X4).
+        self._link_heads: set[str] = set()
         self._group_by_fields: list[str] = []
         self._annotations: dict[str, Aggregation | GeoDistance] = {}
         # GeoDistance annotations (v0.24.0), as annotate() checked them: alias -> column, reference point.
@@ -103,6 +107,16 @@ class QuerySet:
         self._as_of: _time_travel.AsOf | None = None
         # cache() (v0.28.0): the oldest result this queryset's reads accept; None: no cache.
         self._cache: CacheRequest | None = None
+
+    def _manager(self) -> type[SurrealDBConnectionManager]:
+        """The connection class the model's database calls use right now (v0.29.0, ``get_connection_name()``).
+
+        Resolved when a read or a write runs, never when the queryset is built: a queryset built outside a
+        ``using()`` block and run inside it uses the block's connection.
+
+        :raises ValueError: the model's connection is not registered (R2).
+        """
+        return self.model._connection_manager()
 
     def _py_keyed(self, row: Any) -> Any:
         """Re-key a raw result row from columns back to Python field names (v0.18.0).
@@ -140,8 +154,27 @@ class QuerySet:
         Python fields. This is the one boundary between the two, so an aliased model is
         addressable by its Python names throughout the query API. A model with no aliases gets
         the name back unchanged.
+
+        The first segment of a dotted path (``author.name``) is recorded (v0.29.0): a path may follow a link, which
+        :meth:`_check_links` checks before the statement is sent.
         """
-        return self.model.to_db_field(field)
+        column = self.model.to_db_field(field)
+        head, dot, _ = column.partition(".")
+        if dot:
+            self._link_heads.add(head)
+        return column
+
+    def _check_links(self) -> None:
+        """X4 (v0.29.0): refuse a statement that follows a link to a model of another connection than this one's.
+
+        The links are the ``fetch()`` paths and the dotted paths of every other clause (:meth:`_column`, which also
+        translates the ``Q`` objects and the aggregations as they compile). Called once the statement is compiled,
+        before anything is sent.
+
+        :raises SurrealDbError: a link to a model of another connection (``routing.check_links()``).
+        """
+        if self._fetch_fields or self._link_heads:
+            _routing.check_links(self.model, [*self._fetch_fields, *sorted(self._link_heads)])
 
     def select(self, *fields: str) -> Self:
         """
@@ -277,6 +310,10 @@ class QuerySet:
         (see ``Subquery``). A subquery reading a table that does not exist reads as empty, as any missing table
         (SurrealDB 3.x raises: once the server confirms the table does not exist, the statement is sent once more
         with that subquery empty). Any other error raised while the subquery runs is the server's, relayed.
+
+        The server runs a subquery in the database of the statement around it (v0.29.0): a subquery whose model runs
+        on another connection than this model's raises ``SurrealDbError`` when this queryset compiles, before any
+        request — read it through its own connection first, or run both inside one ``using()`` block.
         """
         for arg in args:
             if not isinstance(arg, Q):
@@ -401,10 +438,16 @@ class QuerySet:
         ``SurrealDbError``; the other reads ignore ``fetch()``, as they do without ``as_of()``. A dotted path
         through a link in ``filter()``, ``select()``, ``order_by()`` or ``values()`` reads the linked record as
         it is now on 2.x.
+
+        A link is resolved in the database of the statement (v0.29.0): a field typed with a model of another
+        connection than this model's raises ``SurrealDbError`` when the queryset runs, before anything is sent — so
+        does a dotted path through it in ``filter()``, ``Q``, ``select()``, ``order_by()`` or ``values()``. A field
+        typed ``RecordID`` names no model and is not checked.
         """
         for field in fields:
             validate_field_name(field, "FETCH field")
-        self._fetch_fields.extend(self._column(field) for field in fields)
+        # Recorded whole, not through _column(): a subquery ignores its fetch(), so it must follow no link there.
+        self._fetch_fields.extend(self.model.to_db_field(field) for field in fields)
         return self
 
     def nearby(
@@ -638,10 +681,11 @@ class QuerySet:
         """
         if self._as_of is None:
             return None
-        url = SurrealDBConnectionManager.get_connection_string()
-        if SurrealDBConnectionManager.is_embedded() and not keeps_history(url):
+        manager = self._manager()
+        url = manager.get_connection_string()
+        if manager.is_embedded() and not keeps_history(url):
             raise SurrealDbError(history_unsupported(url))
-        client = await SurrealDBConnectionManager.get_client()
+        client = await manager.get_client()
         if fetches and self._fetch_fields and _time_travel.line_major(await client.version()) < 3:
             raise SurrealDbError(_time_travel.fetch_refused())
         return await _time_travel.resolve(self._as_of, client, self._variables)
@@ -692,6 +736,8 @@ class QuerySet:
         it) and this queryset on the stack of the querysets being rendered, so a queryset given as its own subquery
         raises S3 before any other check of the inner queryset.
 
+        It also carries this queryset's model (v0.29.0): every subquery of the statement must run on its connection.
+
         Args:
             empty_tables: the tables whose subqueries are bound to ``[]`` (SurrealDB 3.x confirmed they do not exist).
             inline: write the sub-SELECTs inline instead of in ``LET`` s (a live query).
@@ -701,6 +747,7 @@ class QuerySet:
             inline=inline,
             empty_tables=empty_tables,
             outer_tx=self._tx,
+            outer_model=self.model,
             variables=dict(self._variables),
             warn=warn,
             _stack=[id(self)],
@@ -742,9 +789,7 @@ class QuerySet:
 
         # Q object filters
         for q in self._q_filters:
-            sql, vars_, counter = q.to_sql(
-                counter, self._model_table, self.model.to_db_field, endpoint_columns, subqueries=subqueries
-            )
+            sql, vars_, counter = q.to_sql(counter, self._model_table, self._column, endpoint_columns, subqueries=subqueries)
             if sql:
                 parts.append(sql)
                 variables.update(vars_)
@@ -1012,7 +1057,7 @@ class QuerySet:
 
         select_parts = list(self._group_by_fields)
         for alias, agg in self._annotations.items():
-            select_parts.append(f"{cast('Aggregation', agg).to_sql(self.model.to_db_field)} AS {alias}")
+            select_parts.append(f"{cast('Aggregation', agg).to_sql(self._column)} AS {alias}")
 
         query = f"SELECT {', '.join(select_parts)} FROM {self._model_table}"
         query += where_clause
@@ -1073,7 +1118,7 @@ class QuerySet:
                 if await self._reads_as_empty(exc, subquery_tables):
                     return []
                 raise
-        client = await SurrealDBConnectionManager.get_client()
+        client = await self._manager().get_client()
         try:
             return await client.query(query, _encoding.encode(vars_))  # type: ignore
         except ServerError as exc:
@@ -1127,7 +1172,7 @@ class QuerySet:
             if self._tx is not None:
                 await self._tx.run_read(_subquery.TABLE_PROBE, variables)
             else:
-                client = await SurrealDBConnectionManager.get_client()
+                client = await self._manager().get_client()
                 await client.query(_subquery.TABLE_PROBE, _encoding.encode(variables))
         except NotFoundError as exc:
             return _subquery.missing_table(exc) == table
@@ -1149,6 +1194,9 @@ class QuerySet:
 
         With ``cache()`` (v0.28.0), a read outside a transaction is answered from the query cache when it can be
         (:meth:`_run_cached`); a write, a read inside a transaction or a read without ``cache()`` runs as above.
+
+        In both, the statement's links are checked once it is compiled (v0.29.0, :meth:`_check_links`), before it is
+        sent, added to a transaction or looked up in the cache; its subqueries were checked while it compiled.
 
         Args:
             compile_statement: compiles the statement with the compiler it is given; returns its text and variables.
@@ -1176,6 +1224,7 @@ class QuerySet:
             compiler = self._subquery_compiler(empty, warn=warn)
             warn = False
             query, variables = compile_statement(compiler)
+            self._check_links()
             if write and self._tx is not None:
                 return await self._tx.add(query, variables)
             read = frozenset(compiler.tables) - empty
@@ -1199,6 +1248,7 @@ class QuerySet:
         """
         compiler = self._subquery_compiler()
         query, variables = compile_statement(compiler)
+        self._check_links()
         tables = {self._model_table, *compiler.tables}
         if self.model.__surreal_edge__ or compiler.edge_tables:
             tables.add(EDGES)
@@ -1247,8 +1297,9 @@ class QuerySet:
         if ttl == 0:
             QueryCache._count_miss()
             return await run()
-        client = await SurrealDBConnectionManager.get_client()
-        scope = SurrealDBConnectionManager._cache_scope(client)
+        manager = self._manager()
+        client = await manager.get_client()
+        scope = manager._cache_scope(client)
         key = None if scope is None else statement_key(scope, kind, statement, variables)
         if scope is None or key is None:
             QueryCache._count_miss()
@@ -1391,7 +1442,7 @@ class QuerySet:
             if self._cache is not None:
                 return await self._cached_get(record_id)
 
-            client = await SurrealDBConnectionManager.get_client()
+            client = await self._manager().get_client()
             try:
                 data = await client.select(record_id)
             except NotFoundError:
@@ -1438,7 +1489,7 @@ class QuerySet:
         if self._cache is not None:
             return self.model.from_db(await self._cached_select(self._model_table, frozenset({self._model_table}), []))
 
-        client = await SurrealDBConnectionManager.get_client()
+        client = await self._manager().get_client()
         try:
             results = await client.select(self._model_table)
         except NotFoundError:
@@ -1465,7 +1516,7 @@ class QuerySet:
             tables |= {EDGES}
 
         async def run() -> Any:
-            client = await SurrealDBConnectionManager.get_client()
+            client = await self._manager().get_client()
             try:
                 return await client.select(target)
             except NotFoundError:
@@ -1487,7 +1538,7 @@ class QuerySet:
         whose edges die with the records — are invalidated when it ends, never at a commit.
         """
         self._reject_time_travel("delete_table()")
-        client = await SurrealDBConnectionManager.get_client()
+        client = await self._manager().get_client()
         with contextlib.suppress(NotFoundError):
             await client.delete(self._model_table)
         return True
@@ -1832,7 +1883,7 @@ class QuerySet:
                 return self.model.from_db(rows)  # type: ignore
             return models  # buffered: not executed until commit; return inputs
 
-        client = await SurrealDBConnectionManager.get_client()
+        client = await self._manager().get_client()
         results = await client.insert(self._model_table, _encoding.encode(data_list))
 
         if isinstance(results, list):
@@ -1856,7 +1907,7 @@ class QuerySet:
                 row["id"] = record_id
             rows.append(row)
 
-        created = await insert_edges(self._model_table, rows, tx=self._tx)
+        created = await insert_edges(self._model_table, rows, tx=self._tx, manager=self._manager())
         if self._tx is not None and not self._tx.is_interactive:
             return models  # buffered: not executed until commit; return inputs
         return cast(list[BaseSurrealModel], self.model.from_db(created))
@@ -2291,13 +2342,15 @@ class QuerySet:
         ``LIVE SELECT`` cannot sit in a block, and the server evaluates the sub-SELECT on every notification.
         *subqueries* is the inline compiler to use (a new one by default), which records the tables they read.
 
-        :raises SurrealDbError: for a clause a live query cannot honour.
+        :raises SurrealDbError: for a clause a live query cannot honour; for a subquery or a link of another
+            connection (X2, X4; v0.29.0).
         :raises TypeError: for a filter value with no SurrealQL literal form.
         :raises ValueError, SurrealDbError: for a subquery the ORM cannot compile (S2–S7, S13, S15).
         """
         self._reject_live_clauses()
         compiler = subqueries if subqueries is not None else self._subquery_compiler(inline=True)
         where_clause, where_vars = self._build_where(subqueries=compiler)
+        self._check_links()
         # Only the WHERE fragment is rewritten: it is the one place references live, and the
         # table name and FETCH list never pass through the inliner.
         where_clause = inline_variables(where_clause, {**compiler.variables, **where_vars})
@@ -2320,6 +2373,10 @@ class QuerySet:
         not exist and then never notifies, but refuses that check: the ORM raises S11 instead. 2.x
         answers it (the table reads as empty) and the live query starts. A resubscribe runs the
         check again, on the new connection.
+
+        The coroutine runs on the client it is given (v0.29.0): the stream passes its connection's — at start, the
+        client it opened; at a resubscribe, the one it is about to move onto — so the live query runs on that very
+        connection, and the stream has already checked the transport.
         """
         compiler = self._subquery_compiler(inline=True)
         query = self._compile_live(diff, compiler)
@@ -2327,12 +2384,7 @@ class QuerySet:
         tables = tuple(sorted(compiler.tables))
         check = "RETURN [" + ", ".join(f"(SELECT VALUE id FROM {name} LIMIT 1)" for name in tables) + "];"
 
-        async def start(client: Any = None) -> UUID:
-            # A resubscribe passes the client it is about to move the stream onto, so the live
-            # query is guaranteed to run on that very connection.
-            require_websocket(SurrealDBConnectionManager.get_connection_string())
-            if client is None:
-                client = await SurrealDBConnectionManager.get_client()
+        async def start(client: Any) -> UUID:
             if tables:
                 try:
                     await client.query(check)
@@ -2408,6 +2460,7 @@ class QuerySet:
             diff=diff,
             auto_resubscribe=auto_resubscribe,
             on_reconnect=on_reconnect,
+            connection=self.model._connection_manager,
         )
 
     def watch(
@@ -2438,6 +2491,7 @@ class QuerySet:
             self._live_starter(diff),
             auto_resubscribe=auto_resubscribe,
             on_reconnect=on_reconnect,
+            connection=self.model._connection_manager,
         )
 
     def _reject_changes_clauses(self) -> None:
@@ -2534,7 +2588,7 @@ class QuerySet:
         # Same silent truncation raw_query() warns about: only the first statement's results
         # come back from the SDK (issue #156).
         warn_on_multiple_statements(query)
-        client = await SurrealDBConnectionManager.get_client()
+        client = await self._manager().get_client()
         try:
             # User-authored SurrealQL is sent verbatim: the caller owns that string and
             # binds their own variables, so rewriting quoted "$word" occurrences inside it

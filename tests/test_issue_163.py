@@ -18,6 +18,7 @@ import pytest
 
 import surreal_orm_lite
 from surreal_orm_lite import BaseSurrealModel, SurrealDBConnectionManager
+from tests.conftest import default_connection_class
 
 SURREALDB_HOST = os.environ.get("SURREALDB_HOST", "localhost")
 SURREALDB_PORT = os.environ.get("SURREALDB_PORT", "8000")
@@ -55,7 +56,7 @@ def _cache() -> dict:
     Reached through the mangled name on purpose: the alternative is a test-only hook in
     production code, and the cache's shape is exactly what these tests are about.
     """
-    return SurrealDBConnectionManager._SurrealDBConnectionManager__clients  # type: ignore[attr-defined]
+    return default_connection_class()._SurrealDBConnectionManager__clients  # type: ignore[attr-defined]
 
 
 @pytest.fixture(autouse=True)

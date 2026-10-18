@@ -139,9 +139,66 @@ jobs:
           files: ./coverage.xml
           fail_ci_if_error: false
 
+  # Both supported server lines in one process (v0.29.0 named connections): TestMixedLinesE2E puts a
+  # SurrealDB 3.x and a 2.x connection side by side, and skips without SURREALDB_PORT_3X/_2X — which
+  # the matrix above, one server per job, never sets. The images are read from the pin files after
+  # the checkout, so a version monitor's bump reaches this job with no edit here.
+  mixed-lines:
+    name: Mixed server lines
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Start SurrealDB, both pinned lines
+        run: |
+          docker run -d --name surreal-3x -p 8000:8000 \
+            "surrealdb/surrealdb:v$(cat .surrealdb-version)" start --user root --pass root
+          docker run -d --name surreal-2x -p 8002:8000 \
+            "surrealdb/surrealdb:v$(cat .surrealdb-version2x)" start --user root --pass root
+
+          for server in surreal-3x:8000 surreal-2x:8002; do
+            name="${server%%:*}"
+            port="${server##*:}"
+            echo "Waiting for ${name} to be healthy..."
+            healthy=0
+            for i in {1..30}; do
+              if curl -sf "http://localhost:${port}/health" >/dev/null; then
+                echo "${name} is up! (attempt ${i})"
+                healthy=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "${healthy}" != 1 ]; then
+              echo "${name} did not become healthy" >&2
+              docker logs "${name}" >&2 || true
+              exit 1
+            fi
+          done
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install dependencies
+        run: uv sync --group dev
+
+      - name: Run the mixed-lines tests
+        env:
+          SURREALDB_HOST: localhost
+          SURREALDB_PORT: 8000
+          SURREALDB_PORT_3X: 8000
+          SURREALDB_PORT_2X: 8002
+        run: uv run pytest tests/test_multi_database.py -k MixedLines -v --no-cov
+
   ci-success:
     name: CI Success
-    needs: [lint, tests]
+    needs: [lint, tests, mixed-lines]
     runs-on: ubuntu-latest
     if: always()
     steps:
@@ -153,6 +210,10 @@ jobs:
           fi
           if [ "${{ needs.tests.result }}" != "success" ]; then
             echo "Tests failed"
+            exit 1
+          fi
+          if [ "${{ needs.mixed-lines.result }}" != "success" ]; then
+            echo "Mixed server lines failed"
             exit 1
           fi
           echo "All checks passed!"

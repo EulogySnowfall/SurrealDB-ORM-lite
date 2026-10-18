@@ -8,6 +8,11 @@ opens a server transport for ``http``, ``https``, ``ws`` and ``wss``, and its in
 (#233) needs no change here. A URL the parser refuses gets one clear ORM error quoting the
 SDK's own message (:func:`require_supported_url`) before anything is opened.
 
+Multi-database (v0.29.0): two in-process engines on one on-disk store miss each other's writes, so a store is
+open by one connection at a time. :func:`store_key` names the store an embedded URL opens — one key for every
+spelling of one path — and an in-memory URL (``mem://...``, ``memory://...``) none: every in-memory client is a
+database of its own.
+
 Time travel (v0.26.0): ``QuerySet.as_of()`` needs a store that keeps history. On the embedded engine
 that is decided from the URL alone, before any request (:func:`keeps_history`): the SDK's parser must
 recognise the scheme and its name must end with ``+versioned`` — a naming rule, again not a list.
@@ -21,6 +26,7 @@ A leaf module: it imports ``_sdk``, ``exceptions`` and the standard library only
 
 import contextlib
 import functools
+import os
 import urllib.parse
 from typing import Final, Literal
 
@@ -32,6 +38,11 @@ UrlKind = Literal["server", "embedded", "refused"]
 
 #: The SDK's server transports. Every other scheme its parser recognises addresses the in-process engine.
 _NETWORK_SCHEMES: Final = frozenset({"http", "https", "ws", "wss"})
+
+#: The SDK's in-memory schemes: whatever follows ``://``, every client on one of them is a database of its own. A
+#: scheme a later SDK adds counts as an on-disk store (:func:`store_key`): at worst one refusal too many, never two
+#: engines on one store.
+_IN_MEMORY_SCHEMES: Final = frozenset({SdkUrlScheme.MEM, SdkUrlScheme.MEMORY})
 
 
 @functools.lru_cache(maxsize=64)
@@ -58,6 +69,25 @@ def is_embedded_url(url: str | None) -> bool:
     if not url:  # an explicit test: mypy does not narrow ``str | None`` through ``bool(url) and …``
         return False
     return url_kind(url) == "embedded"
+
+
+def store_key(url: str | None) -> str | None:
+    """The on-disk store the SDK's in-process engine opens at *url*, as one canonical path (v0.29.0).
+
+    The text after ``://``, cut at the first ``?`` or ``#``, without its trailing ``/``, resolved with
+    ``os.path.realpath`` (a relative path against the working directory, symbolic links followed). So
+    ``surrealkv://<d>/kv``, ``surrealkv://<d>/kv/``, ``surrealkv+versioned://<d>/kv`` and ``file://<d>/kv`` are one
+    store. ``None`` for an in-memory URL (``mem://...``, ``memory://...``, whatever follows ``://``: every client is a
+    database of its own — the scheme as the SDK's parser reads it), when that text is empty, and for ``None``/``""``,
+    a server URL or a URL the SDK refuses.
+    """
+    if not url or url_kind(url) != "embedded" or SdkUrl(url).scheme in _IN_MEMORY_SCHEMES:
+        return None
+    path = url.partition("://")[2]
+    for mark in ("?", "#"):
+        path = path.partition(mark)[0]
+    path = path.rstrip("/")
+    return os.path.realpath(path) if path else None
 
 
 def keeps_history(url: str | None) -> bool:

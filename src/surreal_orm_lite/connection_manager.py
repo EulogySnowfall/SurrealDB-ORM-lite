@@ -1,13 +1,16 @@
 import asyncio
 import contextlib
 import dataclasses
+import functools
 import hashlib
+import inspect
 import logging
 import threading
 import weakref
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from contextvars import ContextVar
 from functools import lru_cache
-from typing import Any
+from typing import Any, ClassVar, Concatenate, Final, Literal, ParamSpec, TypeVar, cast
 from uuid import UUID
 
 from pydantic import TypeAdapter, ValidationError
@@ -17,7 +20,8 @@ from . import decoding as _decoding
 from . import encoding as _encoding
 from ._sdk import AsyncSurreal, NotFoundError
 from .auth import AuthTokens, build_auth_payload, wrap_auth_error
-from .embedded import ephemeral_unsupported, is_embedded_url, require_supported_url
+from .connection_config import ConnectionConfig
+from .embedded import ephemeral_unsupported, is_embedded_url, require_supported_url, store_key
 from .exceptions import (
     SurrealDbAuthenticationError,
     SurrealDbConflictError,
@@ -34,9 +38,11 @@ from .live import (
     is_dead,
     mark_killed,
     open_stream,
+    owner_of,
     release_subscribers,
     require_websocket,
 )
+from .routing import check_call_transaction, check_name
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
 
 logger = logging.getLogger(__name__)
@@ -86,7 +92,148 @@ class _ManagerState:
     embedded_selection: tuple[str | None, str | None] | None
 
 
+#: A connection's state (v0.29.0): each name-mangled state attribute of :class:`SurrealDBConnectionManager`, with
+#: the factory of its fresh value. A connection class gets one fresh value of each (:func:`_new_connection_class`);
+#: a state attribute declared without an entry here would be shared by every connection, which a test forbids.
+_STATE: Final[tuple[tuple[str, Callable[[], Any]], ...]] = (
+    ("url", lambda: None),
+    ("user", lambda: None),
+    ("password", lambda: None),
+    ("namespace", lambda: None),
+    ("database", lambda: None),
+    ("clients", weakref.WeakKeyDictionary),
+    ("open_locks", weakref.WeakKeyDictionary),
+    ("function_signatures", dict),
+    ("session_token", lambda: None),
+    ("refresh_token", lambda: None),
+    ("client_identities", weakref.WeakKeyDictionary),
+    ("lost_identity", weakref.WeakSet),
+    ("embedded_client", lambda: None),
+    ("embedded_url", lambda: None),
+    ("embedded_selection", lambda: None),
+    ("embedded_lock", threading.Lock),
+    ("generation", lambda: 0),
+)
+
+#: Which connection a routed classmethod acts on when called on the router (spec §5.4): the current one (the
+#: explicit name, else the ``using()`` override, else ``"default"``), always the default one, every registered one,
+#: or the one whose live stream started the uuid.
+_Policy = Literal["current", "default", "every", "live"]
+
+#: What :meth:`SurrealDBConnectionManager._route` does with a connection name that is not registered: raise R1, or
+#: answer ``None`` so the routed method returns ``None`` without running (``close_connection`` only, spec D10, P6).
+_UnknownName = Literal["raise", "ignore"]
+
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
+_M = TypeVar("_M", bound="SurrealDBConnectionManager")
+
+
+def _routed(
+    policy: _Policy,
+    *,
+    unknown_name: _UnknownName = "raise",
+) -> Callable[[Callable[Concatenate[type[_M], _P], _R]], Callable[Concatenate[type[_M], _P], _R]]:
+    """Run a classmethod of :class:`SurrealDBConnectionManager` on the connection class it resolves to.
+
+    Called on the router, the method runs on the connection class :meth:`SurrealDBConnectionManager._route`
+    returns; called on a connection class, on that class itself, so a method body never re-routes its internal
+    calls. Two wrappers, chosen once here: an ``async def`` one for a coroutine function, so
+    ``inspect.iscoroutinefunction()`` keeps its answer (Python 3.11 has no ``inspect.markcoroutinefunction()``),
+    and a plain one for the rest — the ``asynccontextmanager`` factories included, which resolve at the call. The
+    explicit connection name is read only from a ``name`` parameter declared first after ``cls``. With the
+    ``"live"`` policy, the router first asks :func:`~surreal_orm_lite.live.owner_of` which connection's stream
+    registered the ``query_uuid`` (the first parameter after ``cls``) on this loop, and runs there while that name
+    is registered; otherwise, the current connection. The wrapper carries ``functools.wraps`` and the marker
+    ``__surreal_routed__`` (the policy). Under ``@classmethod``, and above ``@contextlib.asynccontextmanager``;
+    under ``@_cache.invalidates(...)`` too (``signup``), whose wrapper stays outermost.
+
+    A method that takes ``name`` (``get_client``, ``close_connection``, ``transaction``) keeps it in code and for
+    type checkers, but its wrapper's ``__signature__`` leaves it out (spec D26): ``inspect.signature()`` shows what
+    it showed in v0.28.0, so a framework that fills parameters from a request (FastAPI's
+    ``Depends(SurrealDBConnectionManager.get_client)``) never lets request data choose the connection.
+    ``inspect.unwrap()`` still reaches the declared ``name``.
+
+    With ``unknown_name="ignore"`` (``close_connection`` alone), a connection name that is not registered — given
+    explicitly, or the active ``using()`` name removed meanwhile — makes the coroutine return ``None`` without
+    running the method.
+    """
+
+    def decorate(func: Callable[Concatenate[type[_M], _P], _R]) -> Callable[Concatenate[type[_M], _P], _R]:
+        signature = inspect.signature(func)
+        parameters = list(signature.parameters)
+        takes_name = len(parameters) > 1 and parameters[1] == "name"
+        takes_uuid = policy == "live" and len(parameters) > 1 and parameters[1] == "query_uuid"
+
+        def explicit_name(args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+            if not takes_name:
+                return None
+            return args[0] if args else kwargs.get("name")
+
+        def target_of(cls: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+            if takes_uuid and cls._connection_name is None:
+                # On the router: the connection whose live stream registered the uuid on this loop, while that
+                # name is registered — a uuid belongs to the client that started it, not to the current one.
+                query_uuid = args[0] if args else kwargs.get("query_uuid")
+                owner = None if query_uuid is None else owner_of(query_uuid)
+                connection = None if owner is None else _REGISTRY.get(owner)
+                if connection is not None:
+                    return connection
+            return cls._route(explicit_name(args, kwargs), policy=policy, unknown_name=unknown_name)
+
+        body: Any = func
+        wrapper: Any
+        if inspect.iscoroutinefunction(func):
+
+            @functools.wraps(func)
+            async def routed_coroutine(cls: Any, *args: Any, **kwargs: Any) -> Any:
+                if policy == "every" and cls._connection_name is None:
+                    # On the router: every registered connection, then whatever live reader none of them owns.
+                    for connection in list(_REGISTRY.values()):
+                        await body(connection, *args, **kwargs)
+                    close_all_subscribers(every_loop=True)
+                    return None
+                target = target_of(cls, args, kwargs)
+                if target is None:
+                    return None  # unknown_name="ignore": a name that is not registered (spec D10, P6)
+                return await body(target, *args, **kwargs)
+
+            wrapper = routed_coroutine
+        else:
+
+            @functools.wraps(func)
+            def routed(cls: Any, *args: Any, **kwargs: Any) -> Any:
+                target = target_of(cls, args, kwargs)
+                return body(target, *args, **kwargs)
+
+            wrapper = routed
+        wrapper.__surreal_routed__ = policy
+        if takes_name:
+            # Hidden from introspection only (spec D26): ``cls`` stays, without it ``inspect.signature()`` of the
+            # bound method raises; later parameters and the return annotation stay too.
+            wrapper.__signature__ = signature.replace(
+                parameters=[parameter for index, parameter in enumerate(signature.parameters.values()) if index != 1]
+            )
+        return cast(Callable[Concatenate[type[_M], _P], _R], wrapper)
+
+    return decorate
+
+
 class SurrealDBConnectionManager:
+    """The connection manager: settings, per-event-loop clients, the session, transactions and live queries.
+
+    Every classmethod acts on a **connection**. Each connection — the default one included — is a private subclass
+    of this class whose name-mangled class attributes are that connection's state (:data:`_STATE`), so every method
+    body runs unchanged on its connection's class. This class itself holds no connection state: a classmethod called
+    on it resolves the connection class — the ``name`` it is given, else the innermost :meth:`using` block's, else
+    the default one — and runs there.
+    """
+
+    #: The connection's name on a connection class; ``None`` on this class, the router.
+    _connection_name: ClassVar[str | None] = None
+
+    # The template of a connection's state: every name-mangled attribute below has an entry in _STATE, and a
+    # connection class gets fresh values of its own. Never written on the router itself.
     __url: str | None = None
     __user: str | None = None
     __password: str | None = None
@@ -162,13 +309,313 @@ class SurrealDBConnectionManager:
     __embedded_selection: tuple[str | None, str | None] | None = None
     __embedded_lock: threading.Lock = threading.Lock()
 
+    # The settings generation (v0.29.0): "these settings are still the ones this connection serves". Bumped only by
+    # _retire_server_clients() — add_connection() with other settings, remove_connection() of a named connection —
+    # never by set_connection(), unset_connection() or the setters, which keep their v0.28.0 tolerance. A client
+    # opening (R11), an open transaction (R12) and a change feed (R13) compare it with the one they started under.
+    __generation: int = 0
+
+    #: The connection ``async with SurrealDBConnectionManager():`` resolved on entry, closed on exit.
+    _target: "type[SurrealDBConnectionManager]"
+
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        await SurrealDBConnectionManager.close_connection()
+        await self._target.close_connection()
 
     async def __aenter__(self) -> Any:
-        return await SurrealDBConnectionManager.get_client()
+        self._target = SurrealDBConnectionManager._manager_for()
+        return await self._target.get_client()
+
+    # ------------------------------------------------------------------
+    # Routing (v0.29.0)
+    # ------------------------------------------------------------------
 
     @classmethod
+    def _route(
+        cls, name: str | None = None, *, policy: _Policy, unknown_name: _UnknownName = "raise"
+    ) -> "type[SurrealDBConnectionManager] | None":
+        """The connection class a routed classmethod called on *cls* runs on.
+
+        An explicit *name* wins; a connection class resolves to itself, so internal calls never re-route; on the
+        router, ``"default"`` is the default connection and every other policy the current one: the ``using()``
+        override, else ``"default"``. Never takes ``_REGISTRY_LOCK``: one ``dict`` lookup.
+
+        :param unknown_name: ``"ignore"`` answers ``None`` instead of raising R1 for a name that is not registered,
+            explicit or the active override removed meanwhile (``close_connection`` alone, spec D10, P6).
+        :raises TypeError: *name* is not a ``str`` (R3).
+        :raises ValueError: *name* is empty (R3); *name*, or the active override, is not a registered connection (R1).
+        """
+        if name is None:
+            if cls._connection_name is not None:
+                return cls
+            active = None if policy == "default" else _ACTIVE.get()
+            if active is None:
+                return _REGISTRY["default"]
+            name = active
+        else:
+            name = check_name(name)
+        connection = _REGISTRY.get(name)
+        if connection is None:
+            if unknown_name == "ignore":
+                return None
+            raise ValueError(f"Unknown connection: {name!r}. Register it with add_connection() first.")
+        return connection
+
+    @classmethod
+    def _manager_for(cls, name: str | None = None) -> "type[SurrealDBConnectionManager]":
+        """The connection class of *name*, else of the current connection: the one resolver other modules use.
+
+        :raises TypeError: *name* is not a ``str`` (R3).
+        :raises ValueError: *name* is empty (R3) or not a registered connection (R1).
+        """
+        connection = cls._route(name, policy="current")
+        assert connection is not None  # unknown_name="raise" never answers None
+        return connection
+
+    @classmethod
+    def _register_for_block(cls, name: str) -> "tuple[type[SurrealDBConnectionManager], bool]":
+        """The connection class an ``embedded_database(connection=name)`` block runs on (private, for
+        :mod:`surreal_orm_lite.testing`): the registered class and ``False``, or — a name that is not registered — a
+        new unconfigured class registered under *name* and ``True``, which the caller unregisters after the block
+        (:func:`_unregister_block`). Unconfigured, it is not listed by :meth:`list_connections` until the block sets
+        its URL. The caller checked *name*."""
+        with _REGISTRY_LOCK:
+            connection = _REGISTRY.get(name)
+            if connection is not None:
+                return connection, False
+            connection = _REGISTRY[name] = _new_connection_class(name)
+        return connection, True
+
+    # ------------------------------------------------------------------
+    # The registry (v0.29.0) — not routed: each method acts on the name it is given
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def add_connection(
+        cls,
+        name: str,
+        *,
+        url: str,
+        user: str | None = None,
+        password: str | None = None,
+        namespace: str,
+        database: str,
+    ) -> None:
+        """Register a named connection (v0.29.0) — the full SurrealDB-ORM's ``add_connection()``.
+
+        ::
+
+            SurrealDBConnectionManager.add_connection(
+                "analytics", url="ws://db.example.com/rpc", user="root", password="root",
+                namespace="shop", database="analytics",
+            )
+            SurrealDBConnectionManager.add_connection("scratch", url="mem://", namespace="t", database="t")
+
+        Nothing is opened here: each connection opens its own clients on first use, one per event loop (one for the
+        whole process on the embedded engine), exactly as the default connection does. ``add_connection("default", …)``
+        configures the default connection, as :meth:`set_connection` does, but validated.
+
+        Validated before anything changes: *name* a non-empty ``str``; *url*, *namespace* and *database* non-empty;
+        *user* and *password* required for a server URL (ws, wss, http, https) and optional on the embedded engine
+        (kept and never sent, as with :meth:`set_connection`); a URL the installed SDK refuses raises at once.
+
+        Registering a name again with the **same** settings changes nothing. With **different** settings (any of the
+        five), the ORM stops serving the old ones: the connection's stored session, stored-function signatures and
+        lost-identity state are forgotten (as :meth:`set_connection` does), and its server clients are retired on every
+        event loop — taken out of the cache, their cached query results dropped, their socket closed on their own loop —
+        so the next call opens a client on the new settings. An embedded engine follows at the next call, as today (a
+        new URL closes it and opens the new one; a new namespace or database resets its session).
+
+        What the ORM itself holds on the old settings ends instead of reaching the old database:
+
+        - a client still opening on them is closed unused (the embedded engine is closed only when its URL changed or
+          the name was removed; otherwise it is kept and its session is selected again at the next call), and its
+          caller gets a retryable ``SurrealDbConnectionError`` (retry the call);
+        - live streams end on every event loop, as on :meth:`close_connection`;
+        - a change feed (``changes()``) ends at its next read with a ``SurrealDbConnectionError``: its position belongs
+          to the previous database (start a new one);
+        - an open :meth:`transaction` is cancelled when its block ends and nothing is committed: it raises a
+          ``SurrealDbConnectionError`` (open it again).
+
+        A client the application obtained itself (:meth:`get_client`) before the call belongs to the application: on
+        WebSocket its transport is closed and its next request fails; an HTTP client (no socket with the SDK 2.0) keeps
+        the namespace and database it was opened on — call :meth:`get_client` again; an embedded client is the
+        connection's one in-process session: it follows a new namespace or database at the ORM's next call, but after a
+        new URL or :meth:`remove_connection` it is the previous engine (with SDK 2.x still running), so stop using it, as
+        after :meth:`close_connection`. :meth:`remove_connection` does all of this too.
+        :meth:`set_connection` keeps its v0.28 tolerance (its open clients keep serving until :meth:`close_connection`
+        or :meth:`reconnect`).
+
+        :raises TypeError: *name* is not a ``str``.
+        :raises ValueError: *name* empty; *url*, *namespace* or *database* empty; a server URL without user/password.
+        :raises SurrealDbConnectionError: the installed SDK refuses *url* (``rocksdb://`` …), never retryable.
+        """
+        name = check_name(name)
+        if not url or not namespace or not database:
+            raise ValueError(f"add_connection({name!r}) needs a non-empty url, namespace and database.")
+        require_supported_url(url)
+        if not is_embedded_url(url) and not (user and password):
+            raise ValueError(
+                f"add_connection({name!r}): a server URL needs user and password; only the embedded engine "
+                "(mem://, surrealkv://<path> …) runs without them."
+            )
+        with _REGISTRY_LOCK:
+            connection = _REGISTRY.get(name)
+            if connection is None:
+                connection = _REGISTRY[name] = _new_connection_class(name)
+        # After the lock (spec §6.1): never held while a method of a connection class runs.
+        if connection._settings() == (url, user, password, namespace, database):
+            return
+        connection.set_connection(url=url, user=user, password=password, namespace=namespace, database=database)
+        connection._retire_server_clients()
+
+    @classmethod
+    async def remove_connection(cls, name: str) -> None:
+        """Unregister a named connection, forget its settings, session and signatures, then close its clients (every
+        event loop, and its embedded engine) and end its live streams. What the ORM holds on it ends as on a
+        re-registration with other settings (:meth:`add_connection`): a client still opening is closed unused (the
+        embedded engine is closed only when its URL changed or the name was removed; otherwise it is kept and its
+        session is selected again at the next call) and its caller gets a retryable ``SurrealDbConnectionError``, a
+        change feed ends at its next read, an open :meth:`transaction` is cancelled when its block ends and nothing is
+        committed. A call already under way on the name opens no new client on the old settings: one still waiting for
+        the embedded engine while another thread held it raises ``ValueError("Connection not been set ('<name>').")``.
+        A client the application obtained itself is its own, as after a re-registration: on WebSocket its next request
+        fails, an HTTP client keeps its namespace and database, and an embedded client is the previous engine (with
+        SDK 2.x still running), so stop using it, as after :meth:`close_connection`. A no-op for a name that is not
+        registered (after the name's type check). ``remove_connection("default")`` is :meth:`unset_connection`,
+        unchanged (the default is never unregistered). A model routed to a removed name raises R2 at its next database
+        call. The name is free again as soon as this is called: an ``add_connection()`` of it, even while the old one
+        is closing, registers a new connection.
+
+        :raises TypeError: *name* is not a ``str``.
+        :raises ValueError: *name* is empty.
+        """
+        name = check_name(name)
+        if name == "default":
+            await _REGISTRY["default"].unset_connection()
+            return
+        # Unregistered first, so a concurrent add_connection(name) registers a new class instead of configuring the
+        # one about to be closed. Accepted until the old class has closed: a store it holds still refuses the new
+        # one, and a live stream the new class starts on another thread's loop in that window may be ended by the old
+        # class's release scheduled on that loop (owners are names).
+        with _REGISTRY_LOCK:
+            connection = _REGISTRY.pop(name, None)
+        if connection is None:
+            return
+        # Settings cleared before the generation bump, as add_connection() writes the new ones before it: a call that
+        # reads the new generation (another thread let through the embedded guard during the removal, say) reads no
+        # settings and opens nothing; one that read the old generation is refused when it publishes its client (R11),
+        # or published it before the bump, and the retirement below or unset_connection() closes it.
+        connection._clear_settings()
+        connection._retire_server_clients()
+        await connection.unset_connection()
+
+    @classmethod
+    def get_config(cls, name: str = "default") -> ConnectionConfig | None:
+        """The settings of a registered connection, as an immutable :class:`ConnectionConfig` (the password is kept out
+        of its ``repr``); ``None`` for a name that is not registered, or for ``"default"`` while it is not completely
+        configured (:meth:`is_connection_set` false).
+
+        :raises TypeError: *name* is not a ``str``.
+        :raises ValueError: *name* is empty.
+        """
+        name = check_name(name)
+        connection = _REGISTRY.get(name)
+        if connection is None or (name == "default" and not connection.is_connection_set()):
+            return None
+        url, user, password, namespace, database = connection._settings()
+        return ConnectionConfig(cast(str, url), user, password, cast(str, namespace), cast(str, database))
+
+    @classmethod
+    def list_connections(cls) -> list[str]:
+        """The registered names, in registration order: ``"default"`` first while it is configured (its URL set)."""
+        return [name for name, connection in list(_REGISTRY.items()) if connection.get_url() is not None]
+
+    @classmethod
+    @contextlib.asynccontextmanager
+    async def using(cls, name: str) -> AsyncIterator[None]:
+        """Run a block of code against a named connection (v0.29.0) — the full SurrealDB-ORM's ``using()``.
+
+        ::
+
+            async with SurrealDBConnectionManager.using("archive"):
+                old = await Order.objects().filter(year=2020).exec()     # read in "archive"
+                await SurrealDBConnectionManager.signin(username="ops", password="…")   # "archive"'s session
+
+        Inside the block every model — whatever its ``model_config`` connection — and every manager method that talks
+        to a database use *name*: the method's explicit ``name`` argument wins (:meth:`get_client`,
+        :meth:`close_connection`, :meth:`transaction`), :meth:`set_connection` and :meth:`unset_connection` keep acting
+        on the default connection, and :meth:`close_all_connections` on every one. Async-safe: the override is a
+        ``contextvars.ContextVar``, so concurrent tasks each see their own block. A task created inside the block
+        keeps the override for its whole life, even after the block exits; ``asyncio.to_thread`` carries it, a new
+        thread does not. Blocks nest; the outer override is back after the inner block, also on an exception. Live
+        streams and change feeds started inside the block keep its connection for their whole life.
+
+        A coroutine method resolves its connection when it starts running, a plain method or a context-manager
+        factory (:meth:`transaction`, :meth:`ephemeral_client`) when it is called: ``await get_client()`` and ``async
+        with transaction():`` written inside the block both act on its connection.
+
+        :raises TypeError: *name* is not a ``str``.
+        :raises ValueError: *name* is empty, or not a registered connection — at entry, before the block runs.
+        """
+        name = check_name(name)
+        connection = _REGISTRY.get(name)
+        # Listed by list_connections(): registered and configured (the default is registered from the start).
+        if connection is None or connection.get_url() is None:
+            raise ValueError(f"Unknown connection: {name!r}. Register it with add_connection() first.")
+        token = _ACTIVE.set(name)
+        try:
+            yield
+        finally:
+            _ACTIVE.reset(token)
+
+    @classmethod
+    def get_active_connection_name(cls) -> str | None:
+        """The name ``using()`` set for the running code, or ``None`` outside any block (v0.29.0)."""
+        return _ACTIVE.get()
+
+    @classmethod
+    @_routed("current")
+    def _settings(cls) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+        """The connection's ``(url, user, password, namespace, database)``: what "the same settings" compares."""
+        return (cls.__url, cls.__user, cls.__password, cls.__namespace, cls.__database)
+
+    @classmethod
+    @_routed("current")
+    def _settings_generation(cls) -> int:
+        """The connection's settings generation: the one way other modules read it (change feeds, R13)."""
+        return cls.__generation
+
+    @classmethod
+    @_routed("current")
+    def _retire_server_clients(cls) -> None:
+        """Stop serving the connection's previous settings (D7): bump its generation, end its live readers on every
+        event loop and retire its server clients on every loop.
+
+        Synchronous, with or without a running event loop (``add_connection()`` may run at import time). Each loop's
+        client is taken out of the cache, its query-cache scope retired, and its **transport** closed on its own loop —
+        the transport only, as :meth:`_discard_dead_client` does, so a WebSocket client the application kept fails on
+        its next request instead of reopening an anonymous socket (an HTTP client has no transport: it is only dropped,
+        and the ORM's own holders are stopped by the generation). A closed loop's client is just dropped. The embedded
+        slot is not touched: it follows the new settings at the next call.
+        """
+        cls.__generation += 1
+        close_all_subscribers(owner=cls._connection_name, every_loop=True)
+        try:
+            running: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        for loop, client in list(cls.__clients.items()):
+            cls.__clients.pop(loop, None)
+            _cache.retire_client(client)
+            if loop is running:
+                _spawn_socket_close(client)
+            elif not loop.is_closed():
+                # Closed meanwhile: the socket goes with that loop.
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(_spawn_socket_close, client)
+
+    @classmethod
+    @_routed("default")
     def set_connection(
         cls,
         url: str,
@@ -214,10 +661,24 @@ class SurrealDBConnectionManager:
         cls.clear_function_signature_cache()
 
     @classmethod
+    @_routed("default")
     async def unset_connection(cls) -> None:
         """
         Clear all connection settings and close the connection (every loop's, and the embedded
         engine's: a ``mem://`` database is discarded).
+        """
+        cls._clear_settings()
+        await cls.close_all_connections()
+
+    @classmethod
+    @_routed("current")
+    def _clear_settings(cls) -> None:
+        """Forget the connection's settings and what belongs to them: the stored session, the stored-function
+        signatures and the lost-identity state. Closes nothing: :meth:`unset_connection` closes afterwards.
+
+        :meth:`remove_connection` runs it before the generation bump (:meth:`_retire_server_clients`), as
+        :meth:`add_connection` writes the new settings before it: whoever reads the new generation never reads the
+        old settings.
         """
         cls.__url = None
         cls.__user = None
@@ -227,9 +688,9 @@ class SurrealDBConnectionManager:
         cls.clear_session()
         cls.clear_function_signature_cache()
         cls.__lost_identity.clear()
-        await cls.close_all_connections()
 
     @classmethod
+    @_routed("current")
     def is_connection_set(cls) -> bool:
         """
         Check if the connection kwargs are set: URL, namespace and database, and — for a server URL — user
@@ -244,6 +705,7 @@ class SurrealDBConnectionManager:
         )
 
     @classmethod
+    @_routed("current")
     def is_embedded(cls) -> bool:
         """Whether the configured URL addresses the SDK's in-process engine (``mem://``, ``surrealkv://<path>`` …).
 
@@ -253,6 +715,7 @@ class SurrealDBConnectionManager:
         return is_embedded_url(cls.__url)
 
     @classmethod
+    @_routed("current")
     def __prune_dead_loops(cls) -> None:
         """Drop cached clients whose loop is closed.
 
@@ -268,6 +731,7 @@ class SurrealDBConnectionManager:
             logger.debug("Dropped the cached SurrealDB client of a closed event loop.")
 
     @classmethod
+    @_routed("current")
     def require_connection(cls) -> None:
         """Raise the canonical error if no connection has been configured.
 
@@ -278,14 +742,20 @@ class SurrealDBConnectionManager:
         A URL the installed SDK refuses is reported first, whatever else is missing: the
         ``SurrealDbConnectionError`` quoting the SDK says what to fix, "not been set" would not.
 
+        On a named connection (v0.29.0) the text names it — ``"Connection not been set ('archive')."`` — and the
+        default connection keeps ``"Connection not been set."`` exactly.
+
         :raises SurrealDbConnectionError: the configured URL is one the SDK refuses (never retryable).
         :raises ValueError: a setting is missing.
         """
         require_supported_url(cls.__url)
         if not cls.is_connection_set():
-            raise ValueError("Connection not been set.")
+            if cls._connection_name in (None, "default"):
+                raise ValueError("Connection not been set.")
+            raise ValueError(f"Connection not been set ({cls._connection_name!r}).")
 
     @classmethod
+    @_routed("current")
     async def _open_client(cls, *, signin_as_configured: bool) -> Any:
         """Open one SDK client on the configured URL/namespace/database.
 
@@ -365,9 +835,16 @@ class SurrealDBConnectionManager:
         return client
 
     @classmethod
-    async def get_client(cls) -> Any:
+    @_routed("current")
+    async def get_client(cls, name: str | None = None) -> Any:
         """
         Connect to the SurrealDB instance, reusing this event loop's client.
+
+        With *name* (v0.29.0), the client of that registered connection (:meth:`add_connection`); without it, the
+        current connection's: the innermost ``using()`` block's, else the default one.
+        *name* is accepted in code and by type checkers but hidden from ``inspect.signature()``, so a framework that
+        fills parameters from a request (FastAPI ``Depends(SurrealDBConnectionManager.get_client)``) never lets request
+        data choose the connection, as in v0.28.
 
         Each event loop gets its own connection: a client belongs to the loop it was created
         on, so a cached one is only ever handed back to that same loop (issue #163).
@@ -396,11 +873,15 @@ class SurrealDBConnectionManager:
             …": the engine is kept, and the next call tries again).
         :raises SurrealDbAuthenticationError: in that lost-identity state (server URLs), or when the
             stored session is refused on a new connection (it is then forgotten).
-        :raises ValueError: if no connection has been configured.
+        :raises SurrealDbConnectionError: the connection was registered again with other settings, or removed, while
+            its client was opening (retryable: retry the call).
+        :raises TypeError: *name* is not a ``str``.
+        :raises ValueError: if no connection has been configured; *name* is empty or not a registered connection.
         """
         return await cls._acquire_client()
 
     @classmethod
+    @_routed("current")
     async def _acquire_client(
         cls,
         *,
@@ -429,7 +910,7 @@ class SurrealDBConnectionManager:
             # serve the configuration as it is now.
             return await cls._acquire_client(restoring_identity=restoring_identity, still_wanted=still_wanted)
         if not restoring_identity and loop in cls.__lost_identity:
-            raise cls._lost_identity_error()
+            raise cls._lost_identity_error(cls._connection_name)
 
         existing = cls.__clients.get(loop)
         if existing is not None and not is_dead(existing):
@@ -449,13 +930,16 @@ class SurrealDBConnectionManager:
                 if stamp is not None and not stamp[1]:
                     cls.__lost_identity.add(loop)
             if not restoring_identity and loop in cls.__lost_identity:
-                raise cls._lost_identity_error()
+                raise cls._lost_identity_error(cls._connection_name)
             return await cls._connect_for_loop(loop, still_wanted)
 
     @staticmethod
-    def _lost_identity_error() -> SurrealDbAuthenticationError:
+    def _lost_identity_error(connection: str | None) -> SurrealDbAuthenticationError:
+        """The lost-identity error of *connection*: named for a named connection (v0.29.0), the v0.28.0 text for the
+        default one (``"default"`` or ``None``)."""
+        named = "" if connection in (None, "default") else f" {connection!r}"
         return SurrealDbAuthenticationError(
-            "The SurrealDB connection on this event loop dropped while it was authenticated as an "
+            f"The SurrealDB connection{named} on this event loop dropped while it was authenticated as an "
             "identity the connection manager does not store (signin/signup/authenticate with "
             "store=False), so a new connection cannot restore it — and answering as the configured "
             "user instead would silently change privileges. Sign in or authenticate again, call "
@@ -463,6 +947,7 @@ class SurrealDBConnectionManager:
         )
 
     @classmethod
+    @_routed("current")
     def _identity_restored(cls) -> None:
         """The application set this loop's server identity itself: a lost-identity state is over.
 
@@ -473,6 +958,7 @@ class SurrealDBConnectionManager:
             cls.__lost_identity.discard(asyncio.get_running_loop())
 
     @classmethod
+    @_routed("current")
     async def _discard_dead_client(cls, loop: asyncio.AbstractEventLoop, client: Any) -> None:
         """Forget a client whose WebSocket dropped, so the next caller gets a working one.
 
@@ -521,11 +1007,13 @@ class SurrealDBConnectionManager:
         return hashlib.sha256(material.encode()).hexdigest()
 
     @classmethod
+    @_routed("current")
     def _replay_identity(cls) -> str:
         """The fingerprint of the identity a new connection would come back as, right now."""
         return cls._fingerprint(cls.__url, cls.__namespace, cls.__database, cls.__user, cls.__session_token)
 
     @classmethod
+    @_routed("current")
     async def _connect_for_loop(cls, loop: asyncio.AbstractEventLoop, still_wanted: Callable[[], bool] | None = None) -> Any:
         """Open, sign in, replay the session and cache a client for *loop*. Caller holds the lock."""
         cls.require_connection()
@@ -543,6 +1031,9 @@ class SurrealDBConnectionManager:
         # longer matches the replay identity.
         replayed = cls._fingerprint(cls.__url, cls.__namespace, cls.__database, cls.__user, cls.__session_token)
         configured = cls._fingerprint(cls.__url, cls.__namespace, cls.__database, cls.__user, None)
+        # The settings generation this client is built under (v0.29.0), read with the settings themselves: a
+        # re-registration with other settings, or a removal, while it opens makes _publish() refuse it (R11).
+        generation = cls.__generation
 
         # Establish the connection
         try:
@@ -559,10 +1050,11 @@ class SurrealDBConnectionManager:
             _client,
             replayed=replayed,
             configured=configured,
-            publish=lambda client, fingerprint: cls._publish(loop, client, fingerprint, still_wanted),
+            publish=lambda client, fingerprint: cls._publish(loop, client, fingerprint, still_wanted, generation),
         )
 
     @classmethod
+    @_routed("current")
     async def _replay_then_publish(
         cls, client: Any, *, replayed: str, configured: str, publish: Callable[[Any, str], None]
     ) -> Any:
@@ -604,11 +1096,19 @@ class SurrealDBConnectionManager:
         return client
 
     @classmethod
+    @_routed("current")
     def _publish(
-        cls, loop: asyncio.AbstractEventLoop, client: Any, fingerprint: str, still_wanted: Callable[[], bool] | None
+        cls,
+        loop: asyncio.AbstractEventLoop,
+        client: Any,
+        fingerprint: str,
+        still_wanted: Callable[[], bool] | None,
+        generation: int | None = None,
     ) -> None:
         """Stamp and cache a freshly built client — unless the reconnect that asked for it was
-        abandoned meanwhile (the application closed the connection, stopped the stream)."""
+        abandoned meanwhile (the application closed the connection, stopped the stream), or the
+        connection's settings changed while it opened (v0.29.0: *generation*, the settings
+        generation it was built under; the client is then closed unused and R11 raised)."""
         if still_wanted is not None and not still_wanted():
             closing = asyncio.get_running_loop().create_task(client.close())
             _BACKGROUND.add(closing)
@@ -616,10 +1116,20 @@ class SurrealDBConnectionManager:
             error = SurrealDbConnectionError("The reconnect was abandoned: its stream was torn down.")
             error.retryable = False  # type: ignore[attr-defined]
             raise error
+        if generation is not None and generation != cls.__generation:
+            # Built on settings the connection no longer serves: never cached, closed in the background, quietly
+            # (the SDK 2.0 HTTP client's close() raises NotImplementedError).
+            closing = asyncio.get_running_loop().create_task(_close_quietly(client))
+            _BACKGROUND.add(closing)
+            closing.add_done_callback(_BACKGROUND.discard)
+            error = SurrealDbConnectionError(_opening_retired_text(cls._connection_name))
+            error.retryable = True  # type: ignore[attr-defined]
+            raise error
         cls._stamp_identity(client, fingerprint=fingerprint, replayable=True)
         cls.__clients[loop] = client
 
     @classmethod
+    @_routed("current")
     async def _replay_session(cls, client: Any) -> None:
         """Re-establish the stored identity on a freshly built connection.
 
@@ -656,6 +1166,7 @@ class SurrealDBConnectionManager:
     # ------------------------------------------------------------------
 
     @classmethod
+    @_routed("current")
     async def _acquire_embedded_client(cls) -> Any:
         """The process-wide client of the embedded engine: opened, re-selected or replaced as needed.
 
@@ -677,12 +1188,20 @@ class SurrealDBConnectionManager:
             return await cls._held_embedded_client()
 
     @classmethod
+    @_routed("current")
     async def _held_embedded_client(cls) -> Any:
         """:meth:`_acquire_embedded_client` for a caller that holds the guard: the slot's client, opened,
-        re-selected or replaced as needed, or ``None`` when the configured URL is no longer embedded."""
+        re-selected or replaced as needed, or ``None`` when the configured URL is no longer embedded.
+
+        The settings generation (v0.29.0) is read first, before any await: when ``add_connection()`` registers the
+        name again with other settings, or ``remove_connection()`` removes it, while the engine opens or its session
+        is selected again, the call raises R11 (retryable) instead of serving the old settings
+        (:meth:`_refuse_retired_embedded`).
+        """
         if not is_embedded_url(cls.__url):
             return None
         cls.require_connection()
+        generation = cls.__generation
         client = cls.__embedded_client
         if client is not None and cls.__embedded_url == cls.__url:
             selection = cls.__embedded_selection
@@ -692,12 +1211,57 @@ class SurrealDBConnectionManager:
                 # A real change of namespace/database, not a stale marker: the stored session
                 # belongs to the previous selection, and replaying it would move the session back.
                 cls.clear_session()
-            await cls._reset_embedded_session(client)
+            try:
+                await cls._reset_embedded_session(client)
+            except Exception as exc:
+                await cls._refuse_retired_embedded(generation, exc)
+                raise
+            await cls._refuse_retired_embedded(generation)
             return client
         await cls._forget_embedded()
-        return await cls._open_embedded()
+        try:
+            client = await cls._open_embedded()
+        except Exception as exc:
+            # Published, then raised (a refused replay): the slot holds a client on the settings read at the start.
+            # A failure before publication keeps its own error, as on a server: the slot is empty, the store released.
+            if cls.__embedded_client is not None:
+                await cls._refuse_retired_embedded(generation, exc)
+            raise
+        await cls._refuse_retired_embedded(generation)
+        return client
 
     @classmethod
+    @_routed("current")
+    async def _refuse_retired_embedded(cls, generation: int, cause: BaseException | None = None) -> None:
+        """R11 on the embedded engine: raise when the settings generation is no longer *generation*, the one the caller
+        of :meth:`_held_embedded_client` started under. Caller holds the guard, and the slot holds the client it
+        opened or selected again.
+
+        A new URL, or a removal (no URL any more): the engine is closed and its store released
+        (:meth:`_forget_embedded`). The same URL with another namespace or database: the engine is kept (a ``mem://``
+        database keeps its data) and its selection marked stale, so the next call selects the current settings
+        again. Either way the error is retryable, and chained to *cause* — what the open or the selection raised
+        itself — when there is one.
+        """
+        if cls.__generation == generation:
+            return
+        if cls.__embedded_url != cls.__url:
+            await cls._forget_embedded()
+            error = SurrealDbConnectionError(_opening_retired_text(cls._connection_name))
+        else:
+            cls.__embedded_selection = None
+            error = SurrealDbConnectionError(
+                f"Connection {cls._connection_name!r} was removed or registered again with other settings while its "
+                "embedded session was being selected on the old ones; the engine was kept, and the call did not run. "
+                "Retry the call."
+            )
+        error.retryable = True  # type: ignore[attr-defined]
+        if cause is None:
+            raise error
+        raise error from cause
+
+    @classmethod
+    @_routed("current")
     @contextlib.asynccontextmanager
     async def _exclusive_embedded_client(cls) -> AsyncIterator[Any]:
         """Hold the embedded engine's shared session for one identity exchange: model-level ``bind=True``, or a
@@ -717,25 +1281,38 @@ class SurrealDBConnectionManager:
             yield await cls._held_embedded_client()
 
     @classmethod
+    @_routed("current")
     async def _open_embedded(cls) -> Any:
         """Open the configured embedded URL, replay the stored session and publish the client in the
-        slot. Caller holds the guard, and the slot is empty."""
+        slot. Caller holds the guard, and the slot is empty.
+
+        An on-disk store is claimed for this connection first (v0.29.0): another connection of the process that has
+        it open makes this raise X5 before anything opens. The claim is released when no client ends up in the slot.
+        """
         url, namespace, database = cls.__url, cls.__namespace, cls.__database
-        # Fingerprinted from the settings _open_client() reads before its first await, as in
-        # _connect_for_loop().
-        replayed = cls._fingerprint(url, namespace, database, cls.__user, cls.__session_token)
-        configured = cls._fingerprint(url, namespace, database, cls.__user, None)
-        client = await cls._open_client(signin_as_configured=False)
+        claimed = _claim_store(url, cls)
+        try:
+            # Fingerprinted from the settings _open_client() reads before its first await, as in
+            # _connect_for_loop().
+            replayed = cls._fingerprint(url, namespace, database, cls.__user, cls.__session_token)
+            configured = cls._fingerprint(url, namespace, database, cls.__user, None)
+            client = await cls._open_client(signin_as_configured=False)
 
-        def publish(opened: Any, fingerprint: str) -> None:
-            cls._stamp_identity(opened, fingerprint=fingerprint, replayable=True)
-            cls.__embedded_url = url
-            cls.__embedded_selection = (namespace, database)
-            cls.__embedded_client = opened  # last: see the fast path of _acquire_embedded_client()
+            def publish(opened: Any, fingerprint: str) -> None:
+                cls._stamp_identity(opened, fingerprint=fingerprint, replayable=True)
+                cls.__embedded_url = url
+                cls.__embedded_selection = (namespace, database)
+                cls.__embedded_client = opened  # last: see the fast path of _acquire_embedded_client()
 
-        return await cls._replay_then_publish(client, replayed=replayed, configured=configured, publish=publish)
+            return await cls._replay_then_publish(client, replayed=replayed, configured=configured, publish=publish)
+        except BaseException:
+            # A refused replay publishes the client, which keeps the store; any other failure leaves the slot empty.
+            if cls.__embedded_client is None:
+                _release_store(claimed, cls)
+            raise
 
     @classmethod
+    @_routed("current")
     async def _reset_embedded_session(cls, client: Any) -> None:
         """Re-identify the shared embedded session on the configured selection. Caller holds the guard.
 
@@ -780,6 +1357,7 @@ class SurrealDBConnectionManager:
         cls.__embedded_selection = (namespace, database)
 
     @classmethod
+    @_routed("current")
     @contextlib.asynccontextmanager
     async def _embedded_guard(cls) -> AsyncIterator[None]:
         """Hold the embedded slot's lock.
@@ -798,26 +1376,33 @@ class SurrealDBConnectionManager:
             lock.release()
 
     @classmethod
+    @_routed("current")
     async def _forget_embedded(cls) -> None:
         """Close the embedded slot's client and empty the slot. Caller holds the guard.
 
         A no-op when the slot is empty, so a close with no engine open changes nothing it did not
         change before (the stored-function signature cache in particular). Otherwise the slot is
         emptied first — nobody is handed the client while it closes — and the signature cache is
-        cleared: a new ``mem://`` database may define the same function name differently.
+        cleared: a new ``mem://`` database may define the same function name differently. The client's on-disk store,
+        if any, is released for another connection (v0.29.0).
         """
         client = cls.__embedded_client
         if client is None:
             return
+        key = store_key(cls.__embedded_url)
         cls.__embedded_client = None
         cls.__embedded_url = None
         cls.__embedded_selection = None
         _cache.retire_client(client)
-        with contextlib.suppress(Exception):
-            await client.close()
+        try:
+            with contextlib.suppress(Exception):
+                await client.close()
+        finally:
+            _release_store(key, cls)
         cls.clear_function_signature_cache()
 
     @classmethod
+    @_routed("current")
     async def _close_embedded(cls) -> None:
         """Close the embedded engine's client, if the slot holds one (from any loop or thread)."""
         if cls.__embedded_client is None:
@@ -826,6 +1411,7 @@ class SurrealDBConnectionManager:
             await cls._forget_embedded()
 
     @classmethod
+    @_routed("current")
     async def _enter_embedded_block(cls, url: str, namespace: str, database: str) -> _ManagerState:
         """Point the manager at an isolated embedded database for ``embedded_database()``; return what to put back.
 
@@ -861,6 +1447,7 @@ class SurrealDBConnectionManager:
         return state
 
     @classmethod
+    @_routed("current")
     async def _exit_embedded_block(cls, state: _ManagerState) -> None:
         """Close the block's engine and put back everything :meth:`_enter_embedded_block` snapshotted.
 
@@ -869,9 +1456,14 @@ class SurrealDBConnectionManager:
         stored-function signatures are forgotten (the block's belong to its discarded database). Everything is
         restored before the block's client is closed, so even an interrupted close leaves the previous state in
         place; with the surrealdb SDK 2.x the engine itself stops once nothing refers to that client.
+
+        Store claims (v0.29.0): the block's on-disk store is released, unless it is the restored engine's — that
+        engine, detached for the block, still has it open, and holds it again even if a close inside the block
+        released it.
         """
         async with cls._embedded_guard():
             block_client = cls.__embedded_client  # whatever the block left in the slot
+            block_key = store_key(cls.__embedded_url)
             cls.__url = state.url
             cls.__user = state.user
             cls.__password = state.password
@@ -887,15 +1479,30 @@ class SurrealDBConnectionManager:
             cls.__embedded_selection = state.embedded_selection
             cls.__embedded_client = state.embedded_client  # last: see the fast path of _acquire_embedded_client()
             cls.clear_function_signature_cache()
+            restored_key = None if state.embedded_client is None else store_key(state.embedded_url)
+            _reclaim_store(restored_key, cls)
             if block_client is not None and block_client is not state.embedded_client:
                 _cache.retire_client(block_client)
-                with contextlib.suppress(Exception):
-                    await block_client.close()
+                try:
+                    with contextlib.suppress(Exception):
+                        await block_client.close()
+                finally:
+                    if block_key != restored_key:
+                        _release_store(block_key, cls)
 
     @classmethod
-    async def close_connection(cls) -> None:
+    @_routed("current", unknown_name="ignore")
+    async def close_connection(cls, name: str | None = None) -> None:
         """
         Close this event loop's connection to the SurrealDB instance.
+
+        With *name* (v0.29.0), that registered connection's; without it, the current connection's (the innermost
+        ``using()`` block's, else the default one) — never every connection: :meth:`close_all_connections` does
+        that. A name that is not registered closes nothing and raises nothing (after its type check), and neither
+        does a call inside a ``using()`` block whose connection was removed meanwhile.
+        *name* is accepted in code and by type checkers but hidden from ``inspect.signature()``, so a framework that
+        fills parameters from a request (FastAPI ``Depends(SurrealDBConnectionManager.get_client)``) never lets request
+        data choose the connection, as in v0.28.
 
         Only the running loop's client is closed: another loop may still be using its own,
         and closing that one from here is both impossible and wrong. Use
@@ -915,6 +1522,9 @@ class SurrealDBConnectionManager:
         true on a loop that keeps one), and so is a lost-identity state of the loop's server
         connection. :meth:`close_all_connections` and :meth:`unset_connection` close the server
         clients too, and end that state.
+
+        :raises TypeError: *name* is not a ``str``.
+        :raises ValueError: *name* is empty.
         """
         if cls.is_embedded():
             # Server clients are untouched while an embedded URL is configured: closing the engine says
@@ -923,8 +1533,9 @@ class SurrealDBConnectionManager:
             return
         cls.__prune_dead_loops()
         # Before the socket goes: a live-query reader is parked on a queue nothing will ever
-        # feed once the connection is gone, so releasing them has to happen here.
-        close_all_subscribers()
+        # feed once the connection is gone, so releasing them has to happen here — this
+        # connection's readers only: another connection's ride a client this close leaves open.
+        close_all_subscribers(owner=cls._connection_name)
         # Closing is an explicit choice: the next connection is the configured identity.
         cls._identity_restored()
         await cls._close_embedded()
@@ -937,6 +1548,7 @@ class SurrealDBConnectionManager:
             await client.close()
 
     @classmethod
+    @_routed("every")
     async def close_all_connections(cls) -> None:
         """
         Close every cached connection, whatever loop created it.
@@ -949,9 +1561,9 @@ class SurrealDBConnectionManager:
         database is discarded with it).
         """
         loop = asyncio.get_running_loop()
-        # Every loop's client is dropped below, so every loop's readers are released too —
-        # another loop's through its own thread, since only that loop may wake its queues.
-        close_all_subscribers(every_loop=True)
+        # Every loop's client is dropped below, so every loop's readers of this connection are
+        # released too — another loop's through its own thread, since only that loop may wake its queues.
+        close_all_subscribers(owner=cls._connection_name, every_loop=True)
         cls.__lost_identity.clear()
         await cls._close_embedded()
         client = cls.__clients.pop(loop, None)
@@ -964,6 +1576,7 @@ class SurrealDBConnectionManager:
         cls.__clients.clear()
 
     @classmethod
+    @_routed("current")
     @contextlib.asynccontextmanager
     async def ephemeral_client(cls) -> AsyncIterator[Any]:
         """A short-lived, **anonymous** client on the configured URL/namespace/database.
@@ -996,8 +1609,9 @@ class SurrealDBConnectionManager:
                 await client.close()
 
     @classmethod
+    @_routed("current")
     @contextlib.asynccontextmanager
-    async def transaction(cls) -> Any:
+    async def transaction(cls, name: str | None = None) -> Any:
         """Atomic transaction. Strategy depends on server capability:
 
         - WebSocket + SurrealDB 3.x (native ``begin()`` available) →
@@ -1016,12 +1630,30 @@ class SurrealDBConnectionManager:
         SurrealDB has no savepoints/nested transactions; nested ``transaction()`` calls
         open INDEPENDENT transactions, not savepoints.
 
+        With *name* (v0.29.0), the transaction runs on that registered connection; without it, on the current
+        connection (the innermost ``using()`` block's, else the default one), resolved when this is called. A
+        transaction is one connection's, one database's. When that connection is removed, or registered again
+        with other settings, while the block is open, the transaction is cancelled when the block ends and nothing
+        is committed: the exit raises ``SurrealDbConnectionError`` (open it again) — or, when the body raised, its
+        own exception propagates unchanged with that explanation added as a note (PEP 678). A model routed to another
+        connection refuses to join the transaction: its write, ``objects(tx=)``, ``refresh(tx=)`` or
+        ``call_function(tx=)`` raises ``SurrealDbError`` before anything is sent.
+        *name* is accepted in code and by type checkers but hidden from ``inspect.signature()``, so a framework that
+        fills parameters from a request (FastAPI ``Depends(SurrealDBConnectionManager.get_client)``) never lets request
+        data choose the connection, as in v0.28.
+
         Example::
 
             async with SurrealDBConnectionManager.transaction() as tx:
                 users = await User.objects(tx=tx).filter(status="active").exec()
                 await User.objects(tx=tx).filter(role="guest").bulk_update(role="member")
+
+        :raises TypeError: *name* is not a ``str``.
+        :raises ValueError: *name* is empty or not a registered connection.
         """
+        # Read before get_client(): any change from this point on — while the client opens, is selected again or
+        # begins — ends the block: get_client() raises the retryable error, or the exit cancels and raises.
+        generation = cls.__generation
         client = await cls.get_client()
         url = cls.__url or ""
         tx: Transaction
@@ -1033,13 +1665,28 @@ class SurrealDBConnectionManager:
             tx = InteractiveTransaction(client, txn_id) if txn_id is not None else BufferedTransaction(client)
         else:
             tx = BufferedTransaction(client)
+        tx._connection_name = cls._connection_name
+        tx._connection_generation = generation
 
         try:
             yield tx
-        except Exception:
+        except Exception as exc:
             await tx.cancel()
+            if cls.__generation != tx._connection_generation:
+                # The body's own exception propagates, the same object: the note says why nothing was committed,
+                # once even when a nested block of this connection was open across the change too.
+                note = _transaction_retired_text(cls._connection_name)
+                if note not in getattr(exc, "__notes__", []):
+                    exc.add_note(note)
             raise
         else:
+            if cls.__generation != tx._connection_generation:
+                # The connection was removed or registered again with other settings while the block was open: never
+                # commit into the old database. No deferred post_* signal, no cache invalidation (cancel() forgets).
+                await tx.cancel()
+                error = SurrealDbConnectionError(_transaction_retired_text(cls._connection_name))
+                error.retryable = False  # type: ignore[attr-defined]
+                raise error
             # A commit failure (e.g. a server-side conflict surfacing at COMMIT) must also
             # cancel: on the interactive strategy the txn rides the shared connection, so we
             # never leave it half-open. cancel() is best-effort/idempotent on both strategies.
@@ -1055,6 +1702,7 @@ class SurrealDBConnectionManager:
     # ------------------------------------------------------------------
 
     @classmethod
+    @_routed("current")
     @contextlib.asynccontextmanager
     async def _identity_client(cls) -> AsyncIterator[tuple[Any, bool]]:
         """The client whose identity :meth:`signin`, :meth:`signup`, :meth:`authenticate` or :meth:`invalidate`
@@ -1080,6 +1728,7 @@ class SurrealDBConnectionManager:
         yield await cls._acquire_client(restoring_identity=True), False
 
     @classmethod
+    @_routed("current")
     async def signin(
         cls,
         *,
@@ -1162,6 +1811,7 @@ class SurrealDBConnectionManager:
 
     @classmethod
     @_cache.invalidates("all")
+    @_routed("current")
     async def signup(
         cls,
         *,
@@ -1209,6 +1859,7 @@ class SurrealDBConnectionManager:
             return cls._adopt_tokens(tokens, store=store, operation="signup", client=client, embedded=embedded)
 
     @classmethod
+    @_routed("current")
     def _adopt_tokens(cls, tokens: Any, *, store: bool, operation: str, client: Any, embedded: bool) -> AuthTokens:
         """Convert the SDK's ``Tokens`` to :class:`AuthTokens`, optionally remembering it.
 
@@ -1234,6 +1885,7 @@ class SurrealDBConnectionManager:
         return adopted
 
     @classmethod
+    @_routed("current")
     def _stamp_identity(cls, client: Any, *, replayable: bool, fingerprint: str | None = None) -> None:
         """Record that the manager just set *client*'s identity, and whether a reconnect restores it,
         and mint the client's query-cache scope: a new one at every stamp, so cached results never
@@ -1248,6 +1900,7 @@ class SurrealDBConnectionManager:
         _cache.bind_scope(client)
 
     @classmethod
+    @_routed("current")
     def _cache_scope(cls, client: Any) -> int | None:
         """*client*'s live query-cache scope, or ``None`` for a client the manager did not stamp (or
         one that cannot be weakly referenced, whose reads are never cached): the one place a
@@ -1255,6 +1908,7 @@ class SurrealDBConnectionManager:
         return _cache.client_scope(client)
 
     @classmethod
+    @_routed("current")
     def _identity_of(cls, client: Any) -> tuple[str, bool] | None:
         """*client*'s identity stamp, or ``None`` for a client the manager did not identify."""
         try:
@@ -1263,6 +1917,7 @@ class SurrealDBConnectionManager:
             return None
 
     @classmethod
+    @_routed("current")
     async def authenticate(cls, token: str, *, store: bool = True, refresh: str | None = None) -> None:
         """Authenticate the connection with a JWT obtained earlier.
 
@@ -1312,6 +1967,7 @@ class SurrealDBConnectionManager:
                 cls._identity_restored()
 
     @classmethod
+    @_routed("current")
     async def invalidate(cls) -> None:
         """End the current session and return the connection to its configured identity.
 
@@ -1378,6 +2034,7 @@ class SurrealDBConnectionManager:
             raise wrap_auth_error(exc, "invalidate (restoring the configured identity)") from exc
 
     @classmethod
+    @_routed("current")
     async def _reselect_after_invalidate(cls, client: Any) -> None:
         """The embedded half of :meth:`invalidate`, once the SDK's ``invalidate()`` succeeded: the
         session is the in-process owner, and only the selection is left to restore. Caller holds
@@ -1406,6 +2063,7 @@ class SurrealDBConnectionManager:
         cls._stamp_identity(client, replayable=True)
 
     @classmethod
+    @_routed("current")
     def clear_session(cls) -> None:
         """Forget the stored tokens without touching the server or the connection settings.
 
@@ -1421,6 +2079,7 @@ class SurrealDBConnectionManager:
         cls.__refresh_token = None
 
     @classmethod
+    @_routed("current")
     def is_authenticated(cls) -> bool:
         """Whether the manager holds a session token it will replay on reconnect.
 
@@ -1433,6 +2092,7 @@ class SurrealDBConnectionManager:
         return cls.__session_token is not None
 
     @classmethod
+    @_routed("current")
     def get_session_token(cls) -> str | None:
         """The stored access token (JWT), or ``None``.
 
@@ -1444,6 +2104,7 @@ class SurrealDBConnectionManager:
         return cls.__session_token
 
     @classmethod
+    @_routed("current")
     def get_refresh_token(cls) -> str | None:
         """The stored refresh token, or ``None``.
 
@@ -1455,6 +2116,7 @@ class SurrealDBConnectionManager:
         return cls.__refresh_token
 
     @classmethod
+    @_routed("current")
     async def info(cls, *, return_type: Any = None) -> Any:
         """Return the record the connection is authenticated as, or ``None``.
 
@@ -1501,6 +2163,7 @@ class SurrealDBConnectionManager:
         return cls._coerce_result(value, return_type, "info()")
 
     @classmethod
+    @_routed("current")
     async def call_function(
         cls,
         function: str,
@@ -1553,8 +2216,10 @@ class SurrealDBConnectionManager:
             *params* are given, or if *params* does not match the declared parameters.
         :raises SurrealDbNotFoundError: if the server has no such function.
         :raises SurrealDbValidationError: if the result does not fit ``return_type``.
-        :raises SurrealDbError: for any other database failure.
+        :raises SurrealDbError: for any other database failure, and before anything when *tx* belongs to another
+            connection than the current one (v0.29.0).
         """
+        check_call_transaction(cls._connection_name or "default", tx)
         if args is not None and params is not None:
             raise ValueError(
                 "Pass either 'args' (positional) or 'params' (named), not both — they are two "
@@ -1622,6 +2287,7 @@ class SurrealDBConnectionManager:
             raise SurrealDbValidationError(f"The value returned by {subject} does not fit {return_type!r}: {exc}") from exc
 
     @classmethod
+    @_routed("current")
     async def _resolve_named_args(cls, client: Any, function: str, params: Mapping[str, Any]) -> list[Any]:
         """Order *params* by the function's declared signature.
 
@@ -1650,6 +2316,7 @@ class SurrealDBConnectionManager:
         return [params[name] for name in expected]
 
     @classmethod
+    @_routed("current")
     async def _function_signature(cls, client: Any, function: str, refresh: bool = False) -> tuple[str, ...]:
         """Return the declared parameter names of *function*, in order, caching the result.
 
@@ -1680,6 +2347,7 @@ class SurrealDBConnectionManager:
         return signature
 
     @classmethod
+    @_routed("current")
     def clear_function_signature_cache(cls) -> None:
         """Forget every cached stored-function signature.
 
@@ -1690,6 +2358,7 @@ class SurrealDBConnectionManager:
         cls.__function_signatures.clear()
 
     @classmethod
+    @_routed("current")
     def function_signature_cache_size(cls) -> int:
         """Number of cached stored-function signatures (introspection aid)."""
         return len(cls.__function_signatures)
@@ -1714,6 +2383,7 @@ class SurrealDBConnectionManager:
     # ------------------------------------------------------------------
 
     @classmethod
+    @_routed("live")
     def subscribe_live(cls, query_uuid: str | UUID) -> LiveIterator:
         """Iterate the raw notification envelopes of a running live query.
 
@@ -1743,9 +2413,10 @@ class SurrealDBConnectionManager:
             if no client is connected on this event loop.
         """
         require_websocket(cls.__url)
-        return open_stream(cls._live_client(), query_uuid)
+        return open_stream(cls._live_client(), query_uuid, owner=cls._connection_name or "default")
 
     @classmethod
+    @_routed("current")
     def _cached_client(cls) -> Any:
         """This event loop's cached client, or ``None`` — never opens a connection."""
         try:
@@ -1755,6 +2426,7 @@ class SurrealDBConnectionManager:
         return cls.__clients.get(loop)
 
     @classmethod
+    @_routed("current")
     def _live_client(cls) -> Any:
         """The client already cached for this event loop.
 
@@ -1773,6 +2445,7 @@ class SurrealDBConnectionManager:
         return client
 
     @classmethod
+    @_routed("live")
     async def kill(cls, query_uuid: str | UUID) -> None:
         """Stop a live query and end every stream reading it.
 
@@ -1830,6 +2503,7 @@ class SurrealDBConnectionManager:
         return "KILL statement using id" in str(exc)
 
     @classmethod
+    @_routed("current")
     async def reconnect(cls) -> Any:
         """
         Reconnect to the SurrealDB instance.
@@ -1842,6 +2516,7 @@ class SurrealDBConnectionManager:
         return await cls.get_client()
 
     @classmethod
+    @_routed("current")
     async def validate_connection(cls) -> bool:
         """
         Validate the connection to the SurrealDB instance.
@@ -1866,6 +2541,7 @@ class SurrealDBConnectionManager:
             return False
 
     @classmethod
+    @_routed("current")
     def get_connection_string(cls) -> str | None:
         """
         Get the connection string for the SurrealDB instance.
@@ -1875,6 +2551,7 @@ class SurrealDBConnectionManager:
         return cls.__url
 
     @classmethod
+    @_routed("current")
     def get_connection_kwargs(cls) -> dict[str, str | None]:
         """
         Get the connection kwargs for the SurrealDB instance.
@@ -1889,6 +2566,7 @@ class SurrealDBConnectionManager:
         }
 
     @classmethod
+    @_routed("current")
     async def set_url(cls, url: str, reconnect: bool = False) -> bool:
         """
         Set the URL for the SurrealDB instance.
@@ -1908,6 +2586,7 @@ class SurrealDBConnectionManager:
         return True
 
     @classmethod
+    @_routed("current")
     async def set_user(cls, user: str, reconnect: bool = False) -> bool:
         """
         Set the username for authentication.
@@ -1927,6 +2606,7 @@ class SurrealDBConnectionManager:
         return True
 
     @classmethod
+    @_routed("current")
     async def set_password(cls, password: str, reconnect: bool = False) -> bool:
         """
         Set the password for authentication.
@@ -1946,6 +2626,7 @@ class SurrealDBConnectionManager:
         return True
 
     @classmethod
+    @_routed("current")
     async def set_namespace(cls, namespace: str, reconnect: bool = False) -> bool:
         """
         Set the namespace to use.
@@ -1972,6 +2653,7 @@ class SurrealDBConnectionManager:
         return True
 
     @classmethod
+    @_routed("current")
     async def set_database(cls, database: str, reconnect: bool = False) -> bool:
         """
         Set the database to use.
@@ -1995,6 +2677,7 @@ class SurrealDBConnectionManager:
         return True
 
     @classmethod
+    @_routed("current")
     def get_url(cls) -> str | None:
         """
         Get the URL of the SurrealDB instance.
@@ -2004,6 +2687,7 @@ class SurrealDBConnectionManager:
         return cls.__url
 
     @classmethod
+    @_routed("current")
     def get_user(cls) -> str | None:
         """
         Get the username for authentication.
@@ -2013,6 +2697,7 @@ class SurrealDBConnectionManager:
         return cls.__user
 
     @classmethod
+    @_routed("current")
     def get_namespace(cls) -> str | None:
         """
         Get the namespace to use.
@@ -2022,6 +2707,7 @@ class SurrealDBConnectionManager:
         return cls.__namespace
 
     @classmethod
+    @_routed("current")
     def get_database(cls) -> str | None:
         """
         Get the database to use.
@@ -2031,6 +2717,7 @@ class SurrealDBConnectionManager:
         return cls.__database
 
     @classmethod
+    @_routed("current")
     def is_password_set(cls) -> bool:
         """
         Check if the password is set.
@@ -2040,6 +2727,7 @@ class SurrealDBConnectionManager:
         return cls.__password is not None
 
     @classmethod
+    @_routed("current")
     def is_connected(cls) -> bool:
         """
         Check whether a connection to the SurrealDB instance is established.
@@ -2062,3 +2750,128 @@ class SurrealDBConnectionManager:
             return len(cls.__clients) > 0 or cls.__embedded_client is not None
 
         return cls.__clients.get(loop) is not None or cls.__embedded_client is not None
+
+
+def _new_connection_class(name: str) -> type[SurrealDBConnectionManager]:
+    """A new connection class for *name*: a subclass of the router with a fresh value of every state attribute."""
+    namespace: dict[str, Any] = {f"_SurrealDBConnectionManager__{key}": factory() for key, factory in _STATE}
+    namespace["_connection_name"] = name
+    namespace["__module__"] = __name__
+    return cast(
+        type[SurrealDBConnectionManager],
+        type(f"SurrealDBConnectionManager[{name!r}]", (SurrealDBConnectionManager,), namespace),
+    )
+
+
+def _spawn_socket_close(client: Any) -> None:
+    """Close *client*'s transport in the background on the running loop — the loop the client belongs to — kept in
+    ``_BACKGROUND`` until done (:meth:`SurrealDBConnectionManager._retire_server_clients`)."""
+    closing = asyncio.get_running_loop().create_task(SurrealDBConnectionManager._close_dead_socket(client))
+    _BACKGROUND.add(closing)
+    closing.add_done_callback(_BACKGROUND.discard)
+
+
+async def _close_quietly(client: Any) -> None:
+    """Close a client nobody will use, whatever its ``close()`` raises (the SDK 2.0 HTTP client's raises
+    ``NotImplementedError``): a background task must not end with an exception nobody retrieves."""
+    with contextlib.suppress(Exception):
+        await client.close()
+
+
+def _opening_retired_text(name: str | None) -> str:
+    """R11: a client finished opening on settings connection *name* no longer serves (it was removed or registered
+    again with other settings meanwhile), and was closed unused."""
+    return (
+        f"Connection {name!r} was removed or registered again with other settings while a client was opening on the "
+        "old ones; that client was closed unused. Retry the call."
+    )
+
+
+def _transaction_retired_text(name: str | None) -> str:
+    """R12: why a transaction whose connection was removed or registered again with other settings committed
+    nothing — the error of a committing exit, and the note added to a body's own exception."""
+    return (
+        f"Connection {name!r} was removed or registered again with other settings while this transaction was open "
+        "on it; the transaction was cancelled and nothing was committed. Open it again."
+    )
+
+
+def _claim_store(url: str | None, connection: type[SurrealDBConnectionManager]) -> str | None:
+    """Claim the on-disk store of the embedded *url* for the connection class *connection*, before its engine opens
+    (v0.29.0).
+
+    Claims belong to connection **classes**, not names: a name removed and registered again is a new class, refused
+    while the old one still has the store open — the old class's close must not release the new one's claim either.
+
+    :return: the store's key when this call claimed it; ``None`` for an in-memory or server URL, or a store
+        *connection* already holds (a connection may open its own store again: an ``embedded_database()`` block on
+        its path).
+    :raises SurrealDbConnectionError: X5 — another connection of the process has that store open; never retryable.
+    """
+    key = store_key(url)
+    if key is None:
+        return None
+    with _STORE_LOCK:
+        holder = _STORE_CLAIMS.get(key)
+        if holder is None:
+            _STORE_CLAIMS[key] = connection
+            return key
+    if holder is connection:
+        return None
+    name, holding = connection._connection_name, holder._connection_name
+    error = SurrealDbConnectionError(
+        f"Connection {name!r} cannot open {url!r}: connection {holding!r} already has that store open in this "
+        f"process, and two in-process engines on one store miss each other's writes. Use one connection for the "
+        f"store, or close {holding!r} first."
+    )
+    error.retryable = False  # type: ignore[attr-defined]
+    raise error
+
+
+def _release_store(key: str | None, connection: type[SurrealDBConnectionManager]) -> None:
+    """Release the store *key* when the connection class *connection* holds it: a claim is released only by its
+    holder."""
+    if key is None:
+        return
+    with _STORE_LOCK:
+        if _STORE_CLAIMS.get(key) is connection:
+            del _STORE_CLAIMS[key]
+
+
+def _reclaim_store(key: str | None, connection: type[SurrealDBConnectionManager]) -> None:
+    """Claim the store *key* for the connection class *connection* again when nobody holds it: an engine that kept
+    it open while detached (``embedded_database()``) comes back into its connection's slot."""
+    if key is None:
+        return
+    with _STORE_LOCK:
+        _STORE_CLAIMS.setdefault(key, connection)
+
+
+def _unregister_block(name: str, connection: type[SurrealDBConnectionManager]) -> None:
+    """Unregister the connection an ``embedded_database()`` block registered for itself
+    (:meth:`SurrealDBConnectionManager._register_for_block`) — unless *name* was removed or registered again
+    meanwhile."""
+    with _REGISTRY_LOCK:
+        if _REGISTRY.get(name) is connection:
+            del _REGISTRY[name]
+
+
+#: The registered connections, by name, in registration order. The default connection is created at import and is
+#: never unregistered.
+_REGISTRY: dict[str, type[SurrealDBConnectionManager]] = {"default": _new_connection_class("default")}
+
+# Lock discipline. _REGISTRY_LOCK and _STORE_LOCK are non-reentrant threading.Locks, each held only around one
+# read-modify-write of its dict (a get-or-create, a pop; a claim, a release), never while a method of a connection
+# class runs (routed or not), never across an await. The routing paths (_route(), _manager_for() and the
+# "every"/"live" policies) never take them: they read _REGISTRY with one dict lookup, or iterate a snapshot of it.
+_REGISTRY_LOCK = threading.Lock()
+
+#: The on-disk embedded stores open in this process (v0.29.0): store key (:func:`~surreal_orm_lite.embedded.store_key`)
+#: → the connection class whose engine has it open — the class, not its name: a name registered again is another
+#: connection. Two in-process engines on one store miss each other's writes, so a second connection is refused (X5)
+#: until the first one closes its engine.
+_STORE_CLAIMS: dict[str, type[SurrealDBConnectionManager]] = {}
+_STORE_LOCK = threading.Lock()
+
+#: The connection name a ``using()`` block sets for the code running inside it; ``None`` outside any block.
+_ACTIVE: ContextVar[str | None] = ContextVar("surreal_orm_lite_connection", default=None)

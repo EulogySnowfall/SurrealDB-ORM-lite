@@ -22,6 +22,7 @@ from surreal_orm_lite import (
     BoundExcluded,
     BoundIncluded,
     Computed,
+    ConnectionConfig,
     Duration,
     GeometryCollectionField,
     GeometryField,
@@ -351,6 +352,45 @@ async def invalidating_writes_keep_their_types(member: TypedMember, edge: Purcha
     assert_type(await AuthenticatedUserMixin.define_access(tx=tx), list[str])
     assert_type(await AuthenticatedUserMixin.signup(email="a@b.c", password="p"), AuthResult[AuthenticatedUserMixin])
     assert_type(await SurrealDBConnectionManager.signup(access="a", variables={}), AuthTokens)
+
+
+class RoutedMember(BaseSurrealModel):
+    """v0.29.0: a model routed to a named connection (``SurrealConfigDict`` keys are all optional)."""
+
+    model_config = SurrealConfigDict(connection="x")
+
+    id: str | None = None
+
+
+def multi_database_forms() -> None:
+    """v0.29.0: the registry and model routing are typed; ``add_connection()`` takes keywords and returns ``None``."""
+    SurrealDBConnectionManager.add_connection("x", url="mem://", namespace="t", database="t")
+    SurrealDBConnectionManager.add_connection(
+        "y", url="ws://localhost:8000/rpc", user="root", password="root", namespace="n", database="d"
+    )
+    assert_type(SurrealDBConnectionManager.get_config("x"), ConnectionConfig | None)
+    assert_type(SurrealDBConnectionManager.get_config(), ConnectionConfig | None)
+    assert_type(SurrealDBConnectionManager.list_connections(), list[str])
+    assert_type(SurrealDBConnectionManager.get_active_connection_name(), str | None)
+    assert_type(RoutedMember.get_connection_name(), str)
+    assert_type(ConnectionConfig("mem://", None, None, "t", "t"), ConnectionConfig)
+    assert_type(ConnectionConfig(url="ws://h/rpc", user="u", password="p", namespace="n", database="d").url, str)
+
+
+async def multi_database_blocks() -> None:
+    """v0.29.0: ``using()``, ``name=`` and ``embedded_database(connection=)`` are async context managers / coroutines."""
+    async with SurrealDBConnectionManager.using("x"):
+        assert_type(await SurrealDBConnectionManager.get_client(), Any)
+    assert_type(await SurrealDBConnectionManager.get_client("x"), Any)
+    assert_type(await SurrealDBConnectionManager.get_client(name="x"), Any)
+    async with SurrealDBConnectionManager.transaction("x") as tx:
+        await tx.add("RETURN 1;")
+    await SurrealDBConnectionManager.close_connection("x")
+    await SurrealDBConnectionManager.remove_connection("x")
+    async with embedded_database(connection="x"):
+        pass
+    async with embedded_database(connection=None):
+        pass
 
 
 @fixture

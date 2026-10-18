@@ -1,4 +1,4 @@
-__version__ = "0.28.1"
+__version__ = "0.29.0"
 
 from ._sdk import BoundExcluded, BoundIncluded
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
@@ -6,6 +6,7 @@ from .auth import AuthTokens
 from .cache import QueryCache
 from .changefeed import ChangeModelStream
 from .concurrency import is_conflict_error, retry_on_conflict
+from .connection_config import ConnectionConfig
 from .connection_manager import SurrealDBConnectionManager
 from .edge import BaseSurrealEdge
 from .enum import LiveAction, OrderBy
@@ -80,6 +81,7 @@ __all__ = [
     "__version__",
     # Connection
     "SurrealDBConnectionManager",
+    "ConnectionConfig",
     "Transaction",
     "BufferedTransaction",
     "InteractiveTransaction",

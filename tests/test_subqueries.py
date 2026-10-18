@@ -2777,8 +2777,8 @@ class TestSubqueryDocs:
     roadmap say about subqueries (spec §11, AC-12)."""
 
     def test_section_28_follows_section_27(self) -> None:
-        """Right after section 27 (after its "Coming from" bullets), then section 29 (v0.28.0), and before the
-        ``---`` of "Configuration Options"."""
+        """Right after section 27 (after its "Coming from" bullets), then section 29 (v0.28.0) and section 30
+        (v0.29.0), and before the ``---`` of "Configuration Options"."""
         readme = _readme()
         start_27 = readme.index("\n### 27. Time travel (`as_of()`)\n")
         start_28 = readme.index(f"\n{_SECTION_28}\n")
@@ -2788,6 +2788,7 @@ class TestSubqueryDocs:
             "### 27. Time travel (`as_of()`)",
             _SECTION_28,
             "### 29. Query cache (`cache()`, `QueryCache`)",
+            "### 30. Multiple databases (`add_connection()`, `using()`)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
@@ -2893,7 +2894,7 @@ class TestSubqueryDocs:
         assert roadmap[start : start + 3] == [
             ["v0.27.0", "Subqueries", "✅ Released"],
             ["v0.28.0", "Query cache", "✅ Released"],
-            ["v0.29.0", "Tier 2 — Multi-database", "📋 Planned"],
+            ["v0.29.0", "Tier 2 — Multi-database", "✅ Released"],
         ], roadmap
         assert "v0.27.0 – v0.29.0" not in firsts and "v0.28.0 – v0.29.0" not in firsts
 

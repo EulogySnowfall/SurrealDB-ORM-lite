@@ -323,7 +323,7 @@ class TestSelectDocs:
         assert rows[index - 1] == _QUERY_CACHE_ROW, rows[index - 1]
         assert index < len(rows) - 1 and rows[-1][3] == "v0.19.1", rows[-1]
         header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
-        assert "; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5. " in header, header
+        assert "; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5" in header, header
 
     def test_the_cache_section_names_select_paths_only(self) -> None:
         text = _normalised(_readme_part(_SECTION_29))

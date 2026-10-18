@@ -53,6 +53,7 @@ from .live import (
 )
 
 if TYPE_CHECKING:
+    from .connection_manager import SurrealDBConnectionManager
     from .model_base import BaseSurrealModel
 
 __all__ = ["ChangeModelStream"]
@@ -206,6 +207,16 @@ class ChangeModelStream(Generic[T]):
 
     A change feed records writes, not their kind: a creation arrives as ``UPDATE``. With
     ``INCLUDE ORIGINAL`` on the table, updates also carry ``changed_fields``.
+
+    **One connection for the stream's whole life (v0.29.0).** The stream reads the connection its
+    model resolves (:meth:`~surreal_orm_lite.model_base.BaseSurrealModel.get_connection_name`) when
+    it first starts — inside a ``using()`` block, that block's — and keeps it after the block. When
+    that connection is removed or registered again with other settings
+    (``SurrealDBConnectionManager.remove_connection()``/``add_connection()``), its position belongs
+    to the previous database: the next read and every later one raise
+    :class:`~surreal_orm_lite.exceptions.SurrealDbConnectionError` before any request, events
+    fetched but not yielded yet are dropped and :attr:`cursor` stays where it was, as after
+    :meth:`stop`. Start a new stream.
     """
 
     #: Seconds before the first retry after a connection failure. Doubles after each failure.
@@ -243,6 +254,10 @@ class ChangeModelStream(Generic[T]):
         # Set by stop() so a pending poll pause or retry backoff wakes at once; created lazily,
         # because an asyncio.Event belongs to the loop that awaits it.
         self._stop_event: asyncio.Event | None = None
+        # The connection the stream reads (v0.29.0), and its settings generation, bound together by the first
+        # _start(): a change of that generation ends the stream (_check_generation()).
+        self._manager: type[SurrealDBConnectionManager] | None = None
+        self._generation: int | None = None
 
     @property
     def table(self) -> str:
@@ -299,12 +314,15 @@ class ChangeModelStream(Generic[T]):
         return self
 
     async def _start(self) -> None:
-        from .connection_manager import SurrealDBConnectionManager
-
+        if self._manager is None:
+            # Bound once, in one synchronous step: a start that failed part-way and runs again — outside the
+            # using() block it began in, say — keeps the connection and the generation it resolved first.
+            self._manager = self._model._connection_manager()
+            self._generation = self._manager._settings_generation()
         version = await self._with_retry(lambda client: client.version())
         match = _VERSION.search(str(version))
         major = int(match.group(1)) if match else 3
-        if isinstance(self._since, datetime) and major < 3 and SurrealDBConnectionManager.is_embedded():
+        if isinstance(self._since, datetime) and major < 3 and self._bound().is_embedded():
             # The SDK 2.x engine (a 2.3 core) keeps no timestamps for its feed positions: refused
             # before any INFO or SHOW CHANGES, rather than an engine error at the first poll.
             raise SurrealDbError(changes_since_datetime_unsupported())
@@ -330,6 +348,10 @@ class ChangeModelStream(Generic[T]):
         while True:
             if self._stopped:
                 raise StopAsyncIteration
+            if self._manager is not None:
+                # Before a pending event is handed out: once the connection serves other settings, no event of the
+                # previous database is yielded and the cursor stays where it was (R13).
+                self._check_generation()
             if self._pending:
                 event, after = self._pending.popleft()
                 if after is not None:
@@ -346,6 +368,29 @@ class ChangeModelStream(Generic[T]):
                 await self._pause(self._poll_interval)
 
     # -- internals ---------------------------------------------------------------------------
+
+    def _bound(self) -> type[SurrealDBConnectionManager]:
+        """The connection the first :meth:`_start` bound."""
+        assert self._manager is not None, "a change feed reads only once _start() has bound its connection"
+        return self._manager
+
+    def _check_generation(self) -> None:
+        """R13: the bound connection was removed or registered again with other settings since the stream bound it.
+
+        Never retried: the error is not ``retryable``, and the generation never goes back, so every later read
+        raises it again.
+
+        :raises SurrealDbConnectionError: the generation changed (``retryable`` is ``False``).
+        """
+        manager = self._bound()
+        if manager._settings_generation() != self._generation:
+            error = SurrealDbConnectionError(
+                f"Connection {manager._connection_name!r} was removed or registered again with other settings while "
+                "this change feed was being read; its position belongs to the previous database, so the stream "
+                "ended. Start a new one."
+            )
+            error.retryable = False  # type: ignore[attr-defined]
+            raise error
 
     async def _poll(self) -> bool:
         """Read one page into the pending events. Whether the page was full (read on at once)."""
@@ -448,8 +493,6 @@ class ChangeModelStream(Generic[T]):
         read. The check is a courtesy, not a gate: when ``INFO`` is not permitted (a record user),
         it is skipped.
         """
-        from .connection_manager import SurrealDBConnectionManager
-
         tables = await self._info("INFO FOR DB;", "tables")
         if tables is None:
             return
@@ -465,7 +508,7 @@ class ChangeModelStream(Generic[T]):
         databases = await self._info("INFO FOR NS;", "databases")
         if databases is None:
             return
-        database = databases.get(SurrealDBConnectionManager.get_database() or "")
+        database = databases.get(self._bound().get_database() or "")
         if _CHANGEFEED_CLAUSE.search(str(database or "")):
             return
         raise SurrealDbError(
@@ -487,23 +530,30 @@ class ChangeModelStream(Generic[T]):
         return section if isinstance(section, dict) else None
 
     async def _with_retry(self, operation: Callable[[Any], Awaitable[Any]]) -> Any:
-        """Run *operation* on the manager's client, retrying connection failures with backoff.
+        """Run *operation* on the bound connection's client, retrying connection failures with backoff.
 
         A cancellation of the reading task (``asyncio.timeout``, ``wait_for``, ``Task.cancel()``) is
         never retried, even when the SDK reports it as a failed request: see
-        :func:`~surreal_orm_lite.live.cancellation_lost`.
+        :func:`~surreal_orm_lite.live.cancellation_lost`. Nor is R13 (:meth:`_check_generation`),
+        checked before every attempt and again once the client is in hand.
         """
-        from .connection_manager import SurrealDBConnectionManager
-
+        manager = self._bound()
         delay = float(self.reconnect_delay)
         attempt = 0
         while True:
             if self._stopped:
                 raise _StreamStopped
+            # Outside the try: R13 is never taken for a connection failure, and nothing is sent (nor opened) once
+            # the connection serves other settings.
+            self._check_generation()
             attempt += 1
             client: Any = None
             try:
-                client = await SurrealDBConnectionManager.get_client()
+                client = await manager.get_client()
+                # Again with the client in hand, no await before the operation: get_client() may have waited (the
+                # embedded guard) while the settings changed. Raised here, R13 is re-raised below, not retried:
+                # is_connection_failure() is false for a SurrealDbConnectionError that is not retryable.
+                self._check_generation()
                 return await operation(client)
             except asyncio.CancelledError:
                 if cancelled_from_outside():

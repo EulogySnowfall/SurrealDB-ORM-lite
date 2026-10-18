@@ -62,7 +62,7 @@ from surreal_orm_lite._sdk import AsyncSurreal, cbor_encode
 from surreal_orm_lite.cache import EDGES, CacheRequest, follows_links
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.transaction import BufferedTransaction, InteractiveTransaction
-from tests.conftest import _ws_url
+from tests.conftest import _ws_url, default_connection_class
 from tests.test_embedded import _cells, _normalised, _readme, _readme_part, _subsection, _table_rows, _tables
 from tests.test_subqueries import _SUBQUERY_ROWS
 from tests.test_time_travel import (
@@ -1152,7 +1152,7 @@ class _ClosableClient(_Client):
 
 def _manager_clients() -> Any:
     """The manager's per-loop clients (its private ``WeakKeyDictionary``, reached through the mangled name)."""
-    return SurrealDBConnectionManager._SurrealDBConnectionManager__clients  # type: ignore[attr-defined]
+    return default_connection_class()._SurrealDBConnectionManager__clients  # type: ignore[attr-defined]
 
 
 def _stamped(client: Any) -> int:
@@ -2281,6 +2281,7 @@ _CLASSIFIED: dict[type, dict[str, frozenset[str]]] = {
         "other": frozenset(
             {
                 "unset_connection",
+                "remove_connection",
                 "get_client",
                 "close_connection",
                 "close_all_connections",
@@ -3814,6 +3815,7 @@ _QUERY_CACHE_ROW = [
     "the same; reads inside an interactive transaction are never cached (they see its uncommitted writes)",
     "v0.28.0",
 ]
+#: No final period: v0.29.0 appends its own clause after this one.
 _HEADER_CLAUSE_28 = (
     "rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and "
     "3.3.4, identical on 3.1.5"
@@ -3858,7 +3860,8 @@ class TestQueryCacheDocs:
     roadmap say about the query cache (spec §11, AC-14; P1, P2, P3, P5)."""
 
     def test_section_29_follows_section_28(self) -> None:
-        """Right after section 28 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        """Right after section 28 (after its "Coming from" bullets), then section 30 (v0.29.0), and before the
+        ``---`` of "Configuration Options"."""
         readme = _readme()
         start_28 = readme.index(f"\n{_SECTION_28}\n")
         start_29 = readme.index(f"\n{_SECTION_29}\n")
@@ -3867,6 +3870,7 @@ class TestQueryCacheDocs:
         assert re.findall(r"^#{2,3} .*$", readme[start_28 + 1 : configuration], re.MULTILINE) == [
             _SECTION_28,
             _SECTION_29,
+            "### 30. Multiple databases (`add_connection()`, `using()`)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "section 29 ends before the --- of the next part"
 
@@ -3996,13 +4000,14 @@ class TestQueryCacheDocs:
         assert firsts.index(row[0]) == firsts.index("Subqueries (`Subquery`, a QuerySet as a filter value)") + 1
 
     def test_server_behaviour_row(self) -> None:
-        """One row, Since v0.28.0, right after the four v0.27.0 rows and before the table's last row (later versions
-        add their rows after it)."""
+        """One row, Since v0.28.0, right after the four v0.27.0 rows and before the table's last row (later
+        versions add their rows after it: v0.28.1's, v0.29.0's)."""
         rows = _behaviour_rows()
         assert [len(cell) for cell in _QUERY_CACHE_ROW] == [37, 167, 100, 7]
         index = rows.index(_QUERY_CACHE_ROW)
+        assert index < len(rows) - 1, rows
         assert rows[index - 4 : index] == _SUBQUERY_ROWS, rows[index - 4 : index]
-        assert index < len(rows) - 1 and rows[-1][3] == "v0.19.1", rows[-1]
+        assert rows[-1][3] == "v0.19.1", rows[-1]
         assert [cells for cells in rows if cells[3] == "v0.28.0"] == [_QUERY_CACHE_ROW]
 
     def test_server_behaviour_table_keeps_its_widths(self) -> None:
@@ -4013,7 +4018,7 @@ class TestQueryCacheDocs:
             assert [len(cell) for cell in line.split("|")[1:-1]] == _SERVER_TABLE_WIDTHS, line
 
     def test_server_behaviour_header_clause(self) -> None:
-        """The header names v0.28.0's lines."""
+        """The header's clause names v0.28.0's lines (v0.28.1 and v0.29.0 append theirs after it)."""
         header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
         assert _HEADER_CLAUSE_28 in header, header
 
@@ -4030,7 +4035,7 @@ class TestQueryCacheDocs:
         start = firsts.index("v0.27.0") + 1
         assert roadmap[start : start + 2] == [
             ["v0.28.0", "Query cache", "✅ Released"],
-            ["v0.29.0", "Tier 2 — Multi-database", "📋 Planned"],
+            ["v0.29.0", "Tier 2 — Multi-database", "✅ Released"],
         ], roadmap
         assert "v0.28.0 – v0.29.0" not in firsts
 
