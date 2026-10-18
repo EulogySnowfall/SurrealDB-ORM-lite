@@ -31,7 +31,9 @@ from surreal_orm_lite.constants import LOOKUP_OPERATORS, TEXT_LOOKUP_FUNCTIONS
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import build_filter_condition
 from tests.conftest import orm_client
-from tests.test_embedded import _normalised, _readme_part
+from tests.test_embedded import _normalised, _readme_part, _table_rows
+from tests.test_paging import _PAGING_ROW
+from tests.test_time_travel import _SERVER_BEHAVIOUR
 
 TABLE = "tl_item"
 
@@ -283,11 +285,30 @@ class TestRefusalsUnchanged:
             build_filter_condition("name", "istartswith", "a", 0)
 
 
+#: The row the 2.x/3.x behaviour table gives the text lookups, cell by cell.
+_TEXT_LOOKUP_ROW = [
+    "Text lookups (`startswith`, `endswith`, `like`, `ilike`, `match`, `regex`)",
+    "same on both lines: string functions guarded by `field.is_string()` (`type::is::string` parses on 2.x only); "
+    "a `NONE`, `NULL` or non-string field never matches",
+    "the same (`type::is_string` parses on 3.x only); until v0.28.1 they compiled to operators SurrealQL lacks "
+    "(`LIKE`…): a parse error on both lines",
+    "v0.28.2",
+]
+
+
 class TestReadme:
     def test_the_lookup_list_says_what_each_text_lookup_compiles_to(self) -> None:
         section = _normalised(_readme_part("### Supported Filter Lookups"))
         for text in ("string::starts_with", "string::ends_with", "string::matches", "is_string()", "(?i)", "v0.34.0"):
             assert text in section, text
+
+    def test_server_behaviour_row(self) -> None:
+        """Right after v0.29.0's row, itself after the paging row documented in v0.28.1, before the table's last row
+        (later versions add their rows after it)."""
+        rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
+        index = rows.index(_TEXT_LOOKUP_ROW)
+        assert rows[index - 1][3] == "v0.29.0" and rows[index - 2] == _PAGING_ROW, rows[index - 1]
+        assert index < len(rows) - 1 and rows[-1][3] == "v0.19.1", rows[-1]
 
 
 # ==================== end to end: mem:// and the server ====================
