@@ -437,7 +437,8 @@ class TestLiveE2E:
                 await _create_others(client)
                 events = await _take(stream, 4)
                 await _assert_silent(stream)
-            assert [event.instance.id for event in events] == ["none", "null", "number", "array"]
+            # One multi-statement request: 3.1.5 does not keep its notifications in statement order.
+            assert sorted(event.instance.id for event in events) == ["array", "none", "null", "number"]
 
     async def test_regex_and_ilike(self) -> None:
         async with orm_client(TABLE) as client:
