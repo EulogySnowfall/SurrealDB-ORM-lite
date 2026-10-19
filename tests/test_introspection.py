@@ -2274,9 +2274,11 @@ _COMING_FROM_31 = [
     '(`using()`, then `"default"`). A client object is refused with a `TypeError`, because a client does not carry '
     "the ORM's connection name, which routing, reconnects and the generated models' `connection=` key need (full ORM: "
     "an `HTTPConnection`).",
-    "- **Generated models use comments** where the full ORM writes `SurrealConfigDict(table_type=…, permissions=…, "
-    "changefeed=…, view_query=…, relation_in=…, relation_out=…, enforced=…)`: those keys arrive in the lite's "
-    "`SurrealConfigDict` with v0.31.0–v0.33.0. `READONLY` is a comment too (full ORM: `Field(readonly=True)`).",
+    "- **Generated models use comments** where the full ORM writes `SurrealConfigDict(permissions=…, changefeed=…, "
+    "view_query=…, relation_in=…, relation_out=…, enforced=…)` (`# Permissions: …`, `# Changefeed: …`, "
+    "`# View: AS …`, `# IN … OUT … ENFORCED`), and the base class where it writes `table_type=` (`BaseSurrealEdge` "
+    "for a relation table): those keys arrive in the lite's `SurrealConfigDict` with v0.31.0–v0.33.0. `READONLY` is "
+    "a comment too (full ORM: `Field(readonly=True)`).",
     "- **`RecordID` instead of `ForeignKey`/`ReferencesField`**; no `VectorField` or `Encrypted`; `computed()` "
     "instead of `Computed()`; `Duration`, `UUID`, `Decimal` and the geometry classes instead of `str`, `dict` and "
     "`float`; nested fields become sub-models (full ORM: dotted attribute lines).",

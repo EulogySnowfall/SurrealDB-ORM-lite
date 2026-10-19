@@ -4136,11 +4136,14 @@ schema.issues                         # (): everything was read and parsed
   logging a state shows names and structure only: definition texts stay in their attributes, out of `repr()` and
   `str()`.
 - Nothing is guessed. A definition that cannot be parsed exactly, a section of an unexpected shape or an
-  `INFO FOR TABLE` that fails becomes a `SchemaIssue` in `schema.issues` (its `kind`, `name`, `table`, `message` and
-  `statement`) and one WARNING on the `surreal_orm_lite.introspection` logger; `introspect()` does not raise for them.
-  An issue's message never quotes the definition, which may hold a secret.
-- Errors: `SurrealDbAuthenticationError` when the session may not run `INFO FOR DB`, `SurrealDbError` when
-  `INFO FOR DB` fails otherwise, and `SurrealDbNotFoundError` for a `tables=` name the database does not define.
+  `INFO FOR TABLE` the server answers with an error becomes a `SchemaIssue` in `schema.issues` (its `kind`, `name`,
+  `table`, `message` and `statement`) and one WARNING on the `surreal_orm_lite.introspection` logger; `introspect()`
+  does not raise for them. An issue's message never quotes the definition, which may hold a secret.
+- Errors: `SurrealDbAuthenticationError` when the session may not run `INFO FOR DB`, or is refused an
+  `INFO FOR TABLE` after `INFO FOR DB` succeeded (it lost its rights meanwhile); `SurrealDbError` when `INFO FOR DB`
+  fails otherwise; and `SurrealDbNotFoundError` for a `tables=` name the database does not define. A connection lost
+  during the read is not an issue: the transport's error (or the ORM's) propagates unchanged, so
+  `generate_models_from_db()` never replaces a file with models of tables it could not read.
 
 ```python
 SurrealDBConnectionManager.add_connection("archive", url="mem://", namespace="shop", database="archive")
@@ -4215,8 +4218,10 @@ class Person(BaseSurrealModel):
   model declares `id: str | None = None` first, then one line per field, in codepoint order of the columns.
 - A class is named after its table in PascalCase, without singularisation (`game_tables` → `GameTables`); a name
   that is taken — a Python keyword, a name the module imports, another table's class — gets `Model` appended (`range`
-  → `RangeModel`). The table's comment, relation ends, view query, indexes and events are comments of its class, and
-  the module's header lists every table or field left out, with the reason.
+  → `RangeModel`). The table's comment, relation ends, view query, change feed (`# Changefeed: 1d`), permissions
+  (`# Permissions: FOR select WHERE …, FOR create, update FULL`, left out when they are `NONE`, a table's default),
+  indexes and events are comments of its class, and the module's header lists every table or field left out, with
+  the reason.
 - The source is safe to import: names, comments and expressions read from the database reach it only as escaped
   string literals, single-line ASCII comments and identifiers the generator builds, so a schema cannot inject code
   into it. It holds no timestamp, server address, namespace or database name, and no
@@ -4293,8 +4298,9 @@ class Person(BaseSurrealModel):
 
 - It reads no record: a `SCHEMALESS` table's model holds the fields the table declares (with `extra="allow"`), and an
   object-literal kind (`{ a: int }`) stays a `dict[str, Any]`.
-- `ASSERT`, `PERMISSIONS`, `REFERENCE` (the field is a `RecordID`) and field comments are not generated: the database
-  still applies them. `READONLY` is a trailing `# READONLY` comment: no field option exists for it.
+- A field's `ASSERT`, `PERMISSIONS`, `REFERENCE` (the field is a `RecordID`) and comment are not generated, and a
+  table's permissions and change feed are only comments of its class: the database still applies them. `READONLY` is
+  a trailing `# READONLY` comment: no field option exists for it.
 - `update()` may fail on an instance holding a `READONLY` datetime below the top level, in a sub-model (`address.at`),
   a `tuple`, an array (`array<datetime>`, `items.*.at`) or a set, after `get()` as after `save()`: Python keeps
   microseconds, SurrealDB nanoseconds, and the server refuses the changed value. `update()` keeps the top-level
@@ -4391,9 +4397,10 @@ reads, stores, logs or writes them.
   ORM's connection name, which routing, reconnects and the generated models' `connection=` key need (full ORM: an
   `HTTPConnection`).
 - **Generated models use comments** where the full ORM writes
-  `SurrealConfigDict(table_type=…, permissions=…, changefeed=…, view_query=…, relation_in=…, relation_out=…, enforced=…)`:
-  those keys arrive in the lite's `SurrealConfigDict` with v0.31.0–v0.33.0. `READONLY` is a comment too (full ORM:
-  `Field(readonly=True)`).
+  `SurrealConfigDict(permissions=…, changefeed=…, view_query=…, relation_in=…, relation_out=…, enforced=…)`
+  (`# Permissions: …`, `# Changefeed: …`, `# View: AS …`, `# IN … OUT … ENFORCED`), and the base class where it writes
+  `table_type=` (`BaseSurrealEdge` for a relation table): those keys arrive in the lite's `SurrealConfigDict` with
+  v0.31.0–v0.33.0. `READONLY` is a comment too (full ORM: `Field(readonly=True)`).
 - **`RecordID` instead of `ForeignKey`/`ReferencesField`**; no `VectorField` or `Encrypted`; `computed()` instead
   of `Computed()`; `Duration`, `UUID`, `Decimal` and the geometry classes instead of `str`, `dict` and `float`;
   nested fields become sub-models (full ORM: dotted attribute lines).
