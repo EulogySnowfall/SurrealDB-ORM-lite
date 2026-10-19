@@ -436,6 +436,8 @@ _DEFINE_FUNCTION_HEAD = re.compile(r"\bDEFINE\s+FUNCTION\b", re.IGNORECASE)
 _PARAMETER_REFERENCE = re.compile(
     r"\$(?:([a-zA-Z_][a-zA-Z0-9_]*)|`([^`]+)`|⟨([^⟩]+)⟩)",
 )
+#: The opening quote of a quoted parameter name → its closing one.
+_PARAMETER_QUOTES = {"`": "`", "⟨": "⟩"}
 
 
 def normalize_function_name(function: str) -> str:
@@ -504,6 +506,9 @@ def parse_function_parameters(define_statement: str) -> tuple[str, ...]:
     names: list[str] = []
     depth = 0
     index = start
+    # Where each closing quote last appears: a `$` and an opening quote with no closing one after it name no
+    # parameter, and the pattern is not tried there — it would search the rest of the text from every such `$`.
+    last_close = {opening: define_statement.rfind(closing) for opening, closing in _PARAMETER_QUOTES.items()}
     while index < len(define_statement):
         char = define_statement[index]
         if char in "'\"":
@@ -528,11 +533,14 @@ def parse_function_parameters(define_statement: str) -> tuple[str, ...]:
             if depth == 0:
                 break
         elif char == "$" and depth == 1:
-            match = _PARAMETER_REFERENCE.match(define_statement[index:])
+            # Matched in place: a slice of the rest of the text at every `$` would copy it each time.
+            quote = define_statement[index + 1 : index + 2]
+            closable = last_close.get(quote, len(define_statement)) > index + 1
+            match = _PARAMETER_REFERENCE.match(define_statement, index) if closable else None
             if match:
                 # Exactly one of the three alternatives matched: bare, `backtick`, or ⟨bracket⟩.
                 names.append(next(group for group in match.groups() if group is not None))
-                index += match.end() - 1
+                index = match.end() - 1
         index += 1
     else:  # pragma: no cover - defensive: a truncated statement from the server
         raise ValueError(f"Unterminated parameter list in: {define_statement!r}")

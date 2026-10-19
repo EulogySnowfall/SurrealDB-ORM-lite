@@ -6,6 +6,7 @@ everything that talks to a server lives in a ``…E2E`` class and runs on both D
 
 import contextlib
 import os
+import time
 from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
@@ -122,6 +123,27 @@ class TestSignatureParsing:
     def test_rejects_text_that_is_not_a_define_function(self) -> None:
         with pytest.raises(ValueError):
             parse_function_parameters("DEFINE TABLE user SCHEMALESS")
+
+    def test_a_quoted_name_never_closed_names_no_parameter(self) -> None:
+        define = "DEFINE FUNCTION fn::f($`a`: int, $⟨b⟩: int, $`: int, $⟨: int, $) { RETURN 1 }"
+        assert parse_function_parameters(define) == ("a", "b")
+        assert parse_function_parameters("DEFINE FUNCTION fn::f($`a`, $⟨) { RETURN `x` }") == ("a",)
+
+    @pytest.mark.parametrize(
+        ("parameters", "expected"),
+        [
+            (", ".join(f"$a{n}: int" for n in range(100_000)), 100_000),  # no copy of the rest of the text per `$`
+            ("/" + "$⟨" * 30_000 + "/", 0),  # no ⟩ after them: no search of the rest of the text per `$⟨`
+            ("/" + "$`" + "a" * 100_000 + "/", 0),
+        ],
+        ids=["many-parameters", "unclosed-brackets", "unclosed-backquote"],
+    )
+    def test_reading_stays_linear(self, parameters: str, expected: int) -> None:
+        # Server text is not trusted to be small or kind (v0.30.0 reads every DEFINE FUNCTION through this).
+        started = time.perf_counter()
+        names = parse_function_parameters(f"DEFINE FUNCTION fn::f({parameters}) {{ RETURN 1; }}")
+        assert time.perf_counter() - started < 1.0
+        assert len(names) == expected
 
 
 class TestReturnTypeAdapterCache:
