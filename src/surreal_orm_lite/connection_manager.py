@@ -45,7 +45,13 @@ from .live import (
     require_websocket,
 )
 from .routing import check_call_transaction, check_name
-from .schema import Event, ensure_async_events_supported, remove_event_statement
+from .schema import (
+    Event,
+    ensure_async_events_supported,
+    function_ddl,
+    remove_event_statement,
+    remove_function_statement,
+)
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
 from .utils import apply_ddl_statements
 
@@ -2314,10 +2320,13 @@ class SurrealDBConnectionManager:
         the signature re-read **once**, and only a second mismatch raises. That way a function
         redefined at runtime resolves instead of failing on a cache the caller cannot see.
 
-        The one redefinition this cannot catch is a **reorder** of the same parameter names:
-        *params* is a mapping and carries no order of its own, so there is nothing to compare
-        the cached order against, and re-reading on every call would defeat the cache. Callers
-        that reorder a function's parameters must call
+        A redefinition through :meth:`define_function` or :meth:`remove_function` (v0.31.0) is
+        picked up at once, whatever the order of its parameters: both drop the function's cached
+        signature themselves (and again when their transaction commits). The one redefinition
+        this cannot catch is a **reorder** of the same parameter names by raw DDL
+        (``client.query("DEFINE FUNCTION …")``): *params* is a mapping and carries no order of
+        its own, so there is nothing to compare the cached order against, and re-reading on
+        every call would defeat the cache. After such a redefinition, call
         :meth:`clear_function_signature_cache`.
         """
         key = (cls.__url, cls.__namespace, cls.__database, function)
@@ -2371,8 +2380,9 @@ class SurrealDBConnectionManager:
         """Forget every cached stored-function signature.
 
         Called by :meth:`unset_connection`; also useful in tests, and **required** after
-        redefining a function with the same parameter names in a different order — the only
-        staleness :meth:`_resolve_named_args` cannot self-heal.
+        redefining a function by raw DDL with the same parameter names in a different order —
+        the only staleness :meth:`_resolve_named_args` cannot self-heal (:meth:`define_function`
+        and :meth:`remove_function` drop the signature themselves).
         """
         cls.__function_signatures.clear()
 
@@ -2468,6 +2478,139 @@ class SurrealDBConnectionManager:
         client = await cls.get_client()
         await apply_ddl_statements([statement], client=client, tx=tx, what="event", kind="removal", classify=True)
         return statement
+
+    # ------------------------------------------------------------------
+    # Stored functions (v0.31.0)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    @_routed("current")
+    async def define_function(
+        cls,
+        function: str,
+        body: str,
+        *,
+        parameters: Mapping[str, str] | None = None,
+        returns: str | None = None,
+        permissions: str | None = None,
+        comment: str | None = None,
+        overwrite: bool = True,
+        tx: Transaction | None = None,
+    ) -> str:
+        """Define the stored function *function* — SurrealDB's ``DEFINE FUNCTION`` — and return the statement applied.
+
+        Runs on the current connection (the innermost ``using()`` block's, else the default one), like
+        :meth:`call_function`, which calls what this defines::
+
+            await SurrealDBConnectionManager.define_function(
+                "fn::greet",
+                "RETURN string::concat('Hello, ', $name, '!');",
+                parameters={"name": "string"},
+                returns="string",
+                comment="Says hello",
+            )
+            await SurrealDBConnectionManager.call_function("fn::greet", ["Ada"])  # 'Hello, Ada!'
+
+        The statement is ``function_ddl(function, body, ...)`` with the same arguments: *parameters* maps each
+        parameter's name (without the ``$``) to its SurrealQL kind, in declaration order — the order of
+        ``call_function()``'s positional ``args`` —, and kinds are written in canonical form (``option<int>``). The
+        body and a ``WHERE`` permissions condition are written into the DDL as given: they are trusted application
+        code, never user input (``function_ddl()`` checks them for mistakes only). Applying needs a session allowed
+        to define (a system user such as root, or a namespace or database ``OWNER``/``EDITOR``).
+
+        The function's signature cached by ``call_function(params=)`` on this connection is dropped, so the next
+        ``params=`` call reads the new one — a redefinition with the same parameters in another order included. With
+        *tx*, the statement is applied with the transaction and the signature is dropped again once it commits.
+        ``params=`` reads the signature of the committed schema: inside the transaction that defines a function,
+        call it with positional ``args``.
+
+        :param function: ``"fn::name"``, ``"name"`` or a nested ``"fn::namespace::name"``, as ``call_function()``
+            takes it.
+        :param body: the SurrealQL the function runs, one statement or several separated by ``;``; written in a
+            ``{ … }`` block.
+        :param parameters: parameter name → SurrealQL kind (``{"name": "string", "times": "option<int>"}``).
+        :param returns: the SurrealQL kind of the result, or ``None``.
+        :param permissions: ``None`` (SurrealDB's default, ``FULL``), ``"FULL"``, ``"NONE"`` or
+            ``"WHERE <condition>"``.
+        :param comment: SurrealDB's ``COMMENT``.
+        :param overwrite: ``True`` (default) redefines an existing function (``OVERWRITE``), ``False`` keeps it
+            (``IF NOT EXISTS``).
+        :param tx: optional transaction the statement is applied with.
+        :return: the statement applied.
+        :raises TypeError: an argument has the wrong type (``function_ddl()``'s checks).
+        :raises ValueError: *function* is not a stored-function name, a parameter name is not an identifier or is
+            one SurrealDB defines itself, a kind cannot be read, *body* or the permissions condition is not
+            well-formed SurrealQL — all before any request.
+        :raises SurrealDbAuthenticationError: the session may not define functions.
+        :raises SurrealDbError: *tx* belongs to another connection — before any request; the server refused the
+            statement (``Can't apply function definition: …``).
+        """
+        check_call_transaction(cls._connection_name or "default", tx, operation="define_function()")
+        statement = function_ddl(
+            function,
+            body,
+            parameters=parameters,
+            returns=returns,
+            permissions=permissions,
+            comment=comment,
+            overwrite=overwrite,
+        )
+        client = await cls.get_client()
+        await apply_ddl_statements([statement], client=client, tx=tx, what="function", classify=True)
+        name = normalize_function_name(function)
+        cls._forget_function_signature(name)
+        # With tx, again after the commit: a params= call before it reads the committed schema, the old signature.
+        if tx is not None:
+
+            async def forget() -> None:
+                cls._forget_function_signature(name)
+
+            tx.enqueue_post_commit(forget)
+        return statement
+
+    @classmethod
+    @_routed("current")
+    async def remove_function(cls, function: str, *, missing_ok: bool = True, tx: Transaction | None = None) -> str:
+        """Remove the stored function *function* and return the statement applied.
+
+        Runs on the current connection (the innermost ``using()`` block's, else the default one)::
+
+            await SurrealDBConnectionManager.remove_function("fn::greet")
+            # 'REMOVE FUNCTION IF EXISTS fn::greet;'
+
+        The function's signature cached by ``call_function(params=)`` on this connection is dropped, and with *tx*
+        dropped again once the transaction commits.
+
+        :param function: ``"fn::name"``, ``"name"`` or a nested ``"fn::namespace::name"``.
+        :param missing_ok: ``True`` (default) emits ``REMOVE FUNCTION IF EXISTS …``, so a missing function is not an
+            error; ``False`` raises ``SurrealDbNotFoundError`` for it.
+        :param tx: optional transaction the statement is applied with.
+        :return: the statement applied.
+        :raises TypeError: *function* is not a ``str``, *missing_ok* not a ``bool``.
+        :raises ValueError: *function* is not a stored-function name.
+        :raises SurrealDbNotFoundError: ``missing_ok=False`` and the database has no such function.
+        :raises SurrealDbAuthenticationError: the session may not remove functions.
+        :raises SurrealDbError: *tx* belongs to another connection — before any request; any other refusal.
+        """
+        check_call_transaction(cls._connection_name or "default", tx, operation="remove_function()")
+        statement = remove_function_statement(function, missing_ok)
+        client = await cls.get_client()
+        await apply_ddl_statements([statement], client=client, tx=tx, what="function", kind="removal", classify=True)
+        name = normalize_function_name(function)
+        cls._forget_function_signature(name)
+        if tx is not None:
+
+            async def forget() -> None:
+                cls._forget_function_signature(name)
+
+            tx.enqueue_post_commit(forget)
+        return statement
+
+    @classmethod
+    @_routed("current")
+    def _forget_function_signature(cls, function: str) -> None:
+        """Drop the cached signature of *function* (``"fn::…"``) on this connection; never raises."""
+        cls.__function_signatures.pop((cls.__url, cls.__namespace, cls.__database, function), None)
 
     # ------------------------------------------------------------------
     # Live queries (v0.19.0)

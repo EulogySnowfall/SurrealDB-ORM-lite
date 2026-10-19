@@ -2279,7 +2279,7 @@ _CLASSIFIED: dict[type, dict[str, frozenset[str]]] = {
         "invalidating writes": _INVALIDATING_WRITES[SurrealDBConnectionManager],
         "identity": frozenset({"signin", "authenticate", "invalidate"}),
         "raw, refused or not cached": frozenset({"call_function"}),
-        "DDL that changes no row": frozenset({"define_event", "remove_event"}),
+        "DDL that changes no row": frozenset({"define_event", "remove_event", "define_function", "remove_function"}),
         "other": frozenset(
             {
                 "unset_connection",

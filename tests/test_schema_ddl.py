@@ -18,7 +18,10 @@ refused before any request and comments read back (spec §5.3, §5.4; AC-5, AC-6
 with ``tx=`` on both transaction strategies and a write a guard event refuses inside ``transaction()``, the model's and
 the manager's connection with a transaction of another one refused before any request, a record user refused (S1),
 and the rows events write seen by ``watch()`` and by the query cache once invalidated (spec §7; AC-8 a–b, AC-9, AC-12,
-AC-16).
+AC-16); stored functions defined, called, redefined and removed through the manager, their cached signature dropped
+at once and again after a transaction commits, with ``tx=``, another connection's transaction and a record user
+refused, and every definition read back by the schema introspection on each line (spec §5.4; AC-8d, AC-9, AC-10,
+AC-11, AC-12, AC-15).
 """
 
 import asyncio
@@ -1572,6 +1575,16 @@ _EV_ASYNC_INFO_3X = (
     "THEN { CREATE ev_log SET kind = 'async', rid = $value.id }"
 )
 
+#: ``fn::ev_greet`` of spec §5.2 — ``define_function(*_GREET_ARGS, **_GREET_KWARGS)`` —, parameters ``(name, times)``.
+_GREET_ARGS = (_GREET, "RETURN string::concat('Hello ', $name);")
+_GREET_KWARGS: dict[str, Any] = {
+    "parameters": {"name": "string", "times": "option<int>"},
+    "returns": "string",
+    "comment": "Greets",
+}
+#: The same function, its parameters declared in the other order: ``(times, name)``.
+_GREET_REORDERED: dict[str, Any] = {**_GREET_KWARGS, "parameters": {"times": "option<int>", "name": "string"}}
+
 
 class EvPerson(BaseSurrealModel):
     """The four synchronous events of spec §5.2 on ``ev_person``, in the database of the connection ``"evt"``."""
@@ -2157,8 +2170,8 @@ _EVT_ACCESS = (
 
 
 class TestDdlPermissionsE2E:
-    """AC-12 (events): a session that may not define — a record user — gets S1 (``SurrealDbAuthenticationError``) on
-    both server lines; the embedded engine's session is its owner, which may always define."""
+    """AC-12: a session that may not define — a record user — gets S1 (``SurrealDbAuthenticationError``) for events
+    and stored functions on both server lines; the embedded engine's session is its owner, which may always define."""
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_s1_a_record_user(self, kind: str) -> None:
@@ -2185,6 +2198,30 @@ class TestDdlPermissionsE2E:
             (remove_event, f"Can't apply event removal: {removal} -> "),
             (define_event, f"Can't apply event definition: {_EV_AUDIT.ddl('ev_person')} -> "),
             (manager_remove_event, f"Can't apply event removal: {removal} -> "),
+        ]
+        for raised, prefix in refusals:
+            assert type(raised.value) is SurrealDbAuthenticationError
+            assert str(raised.value).startswith(prefix)
+            assert "not enough permissions" in str(raised.value).lower()
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_s1_a_record_user_on_functions(self, kind: str) -> None:
+        if kind == "mem":
+            pytest.skip("the embedded engine's session is its owner: it may always define")
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            await _apply_ddl(client, _EVT_ACCESS)
+            await SurrealDBConnectionManager.signup(access="evt_acc", variables={"name": "evt-user"})
+            try:
+                with pytest.raises(SurrealDbError) as define_function:
+                    await SurrealDBConnectionManager.define_function(*_GREET_ARGS, **_GREET_KWARGS)
+                with pytest.raises(SurrealDbError) as remove_function:
+                    await SurrealDBConnectionManager.remove_function(_GREET)
+            finally:
+                await SurrealDBConnectionManager.invalidate()
+            assert "ev_greet" not in (await client.query("INFO FOR DB;", {}))["functions"]
+        refusals = [
+            (define_function, f"Can't apply function definition: {function_ddl(*_GREET_ARGS, **_GREET_KWARGS)} -> "),
+            (remove_function, "Can't apply function removal: REMOVE FUNCTION IF EXISTS fn::ev_greet; -> "),
         ]
         for raised, prefix in refusals:
             assert type(raised.value) is SurrealDbAuthenticationError
@@ -2237,3 +2274,323 @@ class TestEventLiveAndCacheE2E:
             assert QueryCache.invalidate(EvLog) == 1
             rows = await EvLog.objects().cache().exec()
         assert sorted(row.kind for row in rows) == ["CREATE", "upper"]
+
+
+#: What ``remove_function()`` applies for ``fn::ev_greet`` by default (``missing_ok=True``).
+_GREET_REMOVAL = "REMOVE FUNCTION IF EXISTS fn::ev_greet;"
+
+
+class TestFunctionsE2E:
+    """AC-10, AC-8d, AC-9 (functions) and AC-15 (i, functions): stored functions defined, called, redefined and
+    removed through the manager on every engine — the cached signature dropped by ``define_function()`` and
+    ``remove_function()``, and again after a transaction commits."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_define_then_call(self, kind: str) -> None:
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            statement = await SurrealDBConnectionManager.define_function(*_GREET_ARGS, **_GREET_KWARGS)
+            assert statement == function_ddl(*_GREET_ARGS, **_GREET_KWARGS)
+            assert sorted((await client.query("INFO FOR DB;", {}))["functions"]) == ["ev_greet"]
+            # A trailing option<…> parameter may be left out (M20).
+            assert await SurrealDBConnectionManager.call_function(_GREET, ["Ada"]) == "Hello Ada"
+            assert await SurrealDBConnectionManager.call_function("ev_greet", ["Bea", 2]) == "Hello Bea"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_reorder_is_picked_up_at_once(self, kind: str) -> None:
+        # Both keys in every params= call: the key sets match, so a stale cached order would not be noticed and the
+        # call would bind Ada to $times. Only the signature define_function() drops makes the new order read.
+        both = {"name": "Ada", "times": 1}
+        async with _evt(kind), SurrealDBConnectionManager.using("evt"):
+            await SurrealDBConnectionManager.define_function(*_GREET_ARGS, **_GREET_KWARGS)
+            assert await SurrealDBConnectionManager.call_function(_GREET, params=both) == "Hello Ada"
+            assert SurrealDBConnectionManager.function_signature_cache_size() == 1
+
+            await SurrealDBConnectionManager.define_function(*_GREET_ARGS, **_GREET_REORDERED)
+            assert SurrealDBConnectionManager.function_signature_cache_size() == 0
+            assert await SurrealDBConnectionManager.call_function(_GREET, params=both) == "Hello Ada"
+            assert await SurrealDBConnectionManager.call_function(_GREET, [1, "Bea"]) == "Hello Bea"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_remove_function(self, kind: str) -> None:
+        both = {"name": "Ada", "times": 1}
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            await SurrealDBConnectionManager.define_function(*_GREET_ARGS, **_GREET_KWARGS)
+            assert await SurrealDBConnectionManager.call_function(_GREET, params=both) == "Hello Ada"
+            assert SurrealDBConnectionManager.function_signature_cache_size() == 1
+
+            assert await SurrealDBConnectionManager.remove_function(_GREET) == _GREET_REMOVAL
+            assert SurrealDBConnectionManager.function_signature_cache_size() == 0
+            assert (await client.query("INFO FOR DB;", {}))["functions"] == {}
+            with pytest.raises(SurrealDbNotFoundError):
+                await SurrealDBConnectionManager.call_function(_GREET, ["Ada"])
+            with pytest.raises(SurrealDbNotFoundError):
+                await SurrealDBConnectionManager.call_function(_GREET, params=both)
+
+            # IF EXISTS: a second removal passes; without it, a missing function is S2.
+            assert await SurrealDBConnectionManager.remove_function("ev_greet") == _GREET_REMOVAL
+            with pytest.raises(SurrealDbNotFoundError) as raised:
+                await SurrealDBConnectionManager.remove_function(_GREET, missing_ok=False)
+        assert str(raised.value).startswith("Can't apply function removal: REMOVE FUNCTION fn::ev_greet; -> ")
+        assert "does not exist" in str(raised.value)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_overwrite_false_keeps_the_old_body(self, kind: str) -> None:
+        async with _evt(kind), SurrealDBConnectionManager.using("evt"):
+            await SurrealDBConnectionManager.define_function(_GREET, "RETURN 'old';")
+            statement = await SurrealDBConnectionManager.define_function(*_GREET_ARGS, **_GREET_KWARGS, overwrite=False)
+            assert statement == function_ddl(*_GREET_ARGS, **_GREET_KWARGS, overwrite=False)
+            assert statement.startswith("DEFINE FUNCTION IF NOT EXISTS fn::ev_greet(")
+            assert await SurrealDBConnectionManager.call_function(_GREET) == "old"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_server_refusal_is_s3(self, kind: str) -> None:
+        # Well formed for the ORM, refused by the server's parser.
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            with pytest.raises(SurrealDbError) as raised:
+                await SurrealDBConnectionManager.define_function("fn::ev_broken", "RETURN")
+            assert (await client.query("INFO FOR DB;", {}))["functions"] == {}
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value).startswith(
+            "Can't apply function definition: DEFINE FUNCTION OVERWRITE fn::ev_broken() { RETURN }; -> "
+        )
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_redefinition_in_a_transaction_is_read_after_the_commit(self, kind: str) -> None:
+        # D11: params= resolves against the committed schema, so a call inside the block reads and caches the old
+        # order again; the commit drops it once more, and the next call reads the new order.
+        async with _evt(kind), SurrealDBConnectionManager.using("evt"):
+            await SurrealDBConnectionManager.define_function(*_GREET_ARGS, **_GREET_KWARGS)
+            assert await SurrealDBConnectionManager.call_function(_GREET, params={"name": "Ada", "times": 1}) == "Hello Ada"
+            async with SurrealDBConnectionManager.transaction() as tx:
+                statement = await SurrealDBConnectionManager.define_function(*_GREET_ARGS, **_GREET_REORDERED, tx=tx)
+                assert statement == function_ddl(*_GREET_ARGS, **_GREET_REORDERED)
+                assert SurrealDBConnectionManager.function_signature_cache_size() == 0
+                both = {"name": "Bea", "times": 1}
+                assert await SurrealDBConnectionManager.call_function(_GREET, params=both) == "Hello Bea"
+                assert SurrealDBConnectionManager.function_signature_cache_size() == 1
+            assert SurrealDBConnectionManager.function_signature_cache_size() == 0
+            assert await SurrealDBConnectionManager.call_function(_GREET, params={"name": "Cy", "times": 1}) == "Hello Cy"
+            assert await SurrealDBConnectionManager.call_function(_GREET, [1, "Dee"]) == "Hello Dee"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_removal_in_a_transaction_drops_the_signature_after_the_commit(self, kind: str) -> None:
+        both = {"name": "Ada", "times": 1}
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            await SurrealDBConnectionManager.define_function(*_GREET_ARGS, **_GREET_KWARGS)
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert await SurrealDBConnectionManager.remove_function(_GREET, tx=tx) == _GREET_REMOVAL
+                # Still defined outside the block until it commits: params= reads and caches its signature.
+                assert await SurrealDBConnectionManager.call_function(_GREET, params=both) == "Hello Ada"
+                assert SurrealDBConnectionManager.function_signature_cache_size() == 1
+            assert SurrealDBConnectionManager.function_signature_cache_size() == 0
+            assert (await client.query("INFO FOR DB;", {}))["functions"] == {}
+            with pytest.raises(SurrealDbNotFoundError):
+                await SurrealDBConnectionManager.call_function(_GREET, params=both)
+
+    async def test_a_function_defined_in_an_interactive_transaction(self) -> None:
+        # AC-8d. Interactive transactions: WebSocket on 3.x. The function is callable inside the block with
+        # positional args; after the commit, params= reads its new signature.
+        async with _evt("ws") as client, SurrealDBConnectionManager.using("evt"):
+            await _require_line(client, 3, "interactive transactions")
+            await SurrealDBConnectionManager.define_function(*_GREET_ARGS, **_GREET_KWARGS)
+            assert await SurrealDBConnectionManager.call_function(_GREET, params={"name": "Ada", "times": 1}) == "Hello Ada"
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert tx.is_interactive
+                await SurrealDBConnectionManager.define_function(*_GREET_ARGS, **_GREET_REORDERED, tx=tx)
+                assert await SurrealDBConnectionManager.call_function(_GREET, [1, "Bea"], tx=tx) == "Hello Bea"
+                await SurrealDBConnectionManager.define_function("fn::ev_new", "RETURN 7;", tx=tx)
+                assert await SurrealDBConnectionManager.call_function("fn::ev_new", tx=tx) == 7
+                # Invisible outside the transaction until it commits (M14).
+                with pytest.raises(SurrealDbNotFoundError):
+                    await SurrealDBConnectionManager.call_function("fn::ev_new")
+            assert await SurrealDBConnectionManager.call_function(_GREET, params={"name": "Cy", "times": 1}) == "Hello Cy"
+            assert await SurrealDBConnectionManager.call_function("fn::ev_new", params={}) == 7
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_cancelled_block_defines_nothing(self, kind: str) -> None:
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            with pytest.raises(_Abort):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await SurrealDBConnectionManager.define_function(*_GREET_ARGS, **_GREET_KWARGS, tx=tx)
+                    raise _Abort
+            assert (await client.query("INFO FOR DB;", {}))["functions"] == {}
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_x1m_a_transaction_of_another_connection(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _default(kind) as default, _evt(kind) as client:
+            async with SurrealDBConnectionManager.transaction() as tx:
+                evt_calls = _spy(monkeypatch, client)
+                default_calls = _spy(monkeypatch, default)
+                async with SurrealDBConnectionManager.using("evt"):
+                    with pytest.raises(SurrealDbError) as define_function:
+                        await SurrealDBConnectionManager.define_function(*_GREET_ARGS, **_GREET_KWARGS, tx=tx)
+                    with pytest.raises(SurrealDbError) as remove_function:
+                        await SurrealDBConnectionManager.remove_function(_GREET, tx=tx)
+                assert evt_calls == []
+                assert default_calls == []
+                assert getattr(tx, "statements", []) == []
+            assert (await client.query("INFO FOR DB;", {}))["functions"] == {}
+        assert str(define_function.value) == _x1m("define_function()")
+        assert str(remove_function.value) == _x1m("remove_function()")
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_arguments_are_refused_before_any_request(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        # AC-15 (i): parameter names (F5), a function name (F1) and E13, each before anything reaches the server.
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            calls = _spy(monkeypatch, client)
+            for bad in ["a;b", "$a", "a b"]:
+                with pytest.raises(ValueError) as raised:
+                    await SurrealDBConnectionManager.define_function("fn::x", "RETURN 1;", parameters={bad: "int"})
+                assert str(raised.value) == _F5.format(bad)
+            with pytest.raises(ValueError) as raised:
+                await SurrealDBConnectionManager.define_function("fn::x;y", "RETURN 1;")
+            assert str(raised.value) == _INVALID_FUNCTION.format("fn::x;y")
+            with pytest.raises(ValueError) as raised:
+                await SurrealDBConnectionManager.remove_function("fn::x;y")
+            assert str(raised.value) == _INVALID_FUNCTION.format("fn::x;y")
+            with pytest.raises(TypeError) as raised:
+                await SurrealDBConnectionManager.define_function(*_GREET_ARGS, overwrite=1)  # type: ignore[arg-type]
+            assert str(raised.value) == "overwrite= must be a bool, got int."
+            with pytest.raises(TypeError) as raised:
+                await SurrealDBConnectionManager.remove_function(_GREET, missing_ok="yes")  # type: ignore[arg-type]
+            assert str(raised.value) == "missing_ok= must be a bool, got str."
+            assert calls == []
+
+
+#: The stored functions of spec §5.2, as ``(args, kwargs)`` of ``define_function()``.
+_FUNCTIONS = [
+    (_GREET_ARGS, _GREET_KWARGS),
+    (("ev_guarded", "RETURN 1;"), {"permissions": "where $auth.admin = true"}),
+    (
+        ("fn::ev_obj", "RETURN $a;"),
+        {"parameters": {"a": "{ x: int }"}, "returns": "{ x: int }", "permissions": "none", "overwrite": False},
+    ),
+]
+
+#: ``INFO FOR DB``'s ``functions`` once ``_FUNCTIONS`` are applied (spec §3): SurrealDB 3.x drops the ``;`` of a
+#: single-statement body and renders ``option<int>`` as ``none | int``.
+_FUNCTIONS_INFO_3X = {
+    "ev_greet": "DEFINE FUNCTION fn::ev_greet($name: string, $times: none | int) -> string "
+    "{ RETURN string::concat('Hello ', $name) } COMMENT 'Greets' PERMISSIONS FULL",
+    "ev_guarded": "DEFINE FUNCTION fn::ev_guarded() { RETURN 1 } PERMISSIONS WHERE $auth.admin = true",
+    "ev_obj": "DEFINE FUNCTION fn::ev_obj($a: { x: int }) -> { x: int } { RETURN $a } PERMISSIONS NONE",
+}
+#: The same on SurrealDB 2.x and the embedded engine.
+_FUNCTIONS_INFO_2X = {
+    "ev_greet": "DEFINE FUNCTION fn::ev_greet($name: string, $times: option<int>) -> string "
+    "{ RETURN string::concat('Hello ', $name); } COMMENT 'Greets' PERMISSIONS FULL",
+    "ev_guarded": "DEFINE FUNCTION fn::ev_guarded() { RETURN 1; } PERMISSIONS WHERE $auth.admin = true",
+    "ev_obj": "DEFINE FUNCTION fn::ev_obj($a: { x: int }) -> { x: int } { RETURN $a; } PERMISSIONS NONE",
+}
+
+#: ``then`` of each ``EvPerson`` event as SurrealDB 3.x reads it back (spec §3): one line, a single statement
+#: without its ``;``, several each followed by one.
+_THEN_3X = {
+    "ev_audit": "{ CREATE ev_log SET kind = $event, rid = $value.id }",
+    "ev_rename": "{ CREATE ev_log SET kind = 'rename', old = $before.name, new = $after.name }",
+    "ev_guard": "{ THROW 'name refused: ' + $after.name }",
+    "ev_upper": "{ LET $n = string::uppercase($after.name); CREATE ev_log SET kind = 'upper', name = $n; }",
+}
+#: The same on SurrealDB 2.x and the embedded engine: every ``;`` kept, several statements on separate lines.
+_THEN_2X = {
+    "ev_audit": "{ CREATE ev_log SET kind = $event, rid = $value.id; }",
+    "ev_rename": "{ CREATE ev_log SET kind = 'rename', old = $before.name, new = $after.name; }",
+    "ev_guard": "{ THROW 'name refused: ' + $after.name; }",
+    "ev_upper": "{\nLET $n = string::uppercase($after.name);\nCREATE ev_log SET kind = 'upper', name = $n;\n}",
+}
+
+
+def _event_fields(event: Any) -> tuple[Any, ...]:
+    """What AC-11 compares of an ``EventState``."""
+    return (
+        event.name,
+        event.table,
+        event.when,
+        event.then,
+        event.comment,
+        event.async_mode,
+        event.retry,
+        event.max_depth,
+    )
+
+
+class TestRoundTripE2E:
+    """AC-11 and AC-14: the events and stored functions of spec §5.2, applied through the ORM, read back by the
+    schema introspection (v0.30.0) as they were defined — each line with its own rendering of a body (spec §3)."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_events_and_functions_read_back(self, kind: str) -> None:
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            major = await _major(client)
+            await EvPerson.define_events()
+            if major >= 3:
+                await EvAsyncPerson.define_events()
+            for args, kwargs in _FUNCTIONS:
+                await SurrealDBConnectionManager.define_function(*args, **kwargs)
+            info = await client.query("INFO FOR DB;", {})
+            schema = await DatabaseIntrospector("evt", tables=["ev_person"]).introspect()
+        assert schema.issues == ()
+        then = _THEN_3X if major >= 3 else _THEN_2X
+        expected = {
+            "ev_audit": ("ev_audit", "ev_person", "true", then["ev_audit"], None, False, None, None),
+            "ev_rename": (
+                "ev_rename",
+                "ev_person",
+                "$event = 'UPDATE' AND $before.name != $after.name",
+                then["ev_rename"],
+                "it's renamed",
+                False,
+                None,
+                None,
+            ),
+            "ev_guard": ("ev_guard", "ev_person", "$after.name = 'forbidden'", then["ev_guard"], None, False, None, None),
+            "ev_upper": ("ev_upper", "ev_person", "$event = 'CREATE'", then["ev_upper"], None, False, None, None),
+        }
+        if major >= 3:
+            expected["ev_async"] = (
+                "ev_async",
+                "ev_person",
+                "$event = 'CREATE'",
+                "{ CREATE ev_log SET kind = 'async', rid = $value.id }",
+                None,
+                True,
+                2,
+                3,
+            )
+        events = schema.tables["ev_person"].events
+        assert {name: _event_fields(event) for name, event in events.items()} == expected
+
+        assert dict(info["functions"]) == (_FUNCTIONS_INFO_3X if major >= 3 else _FUNCTIONS_INFO_2X)
+        functions = {
+            name: (function.parameters, function.returns, function.permissions, function.comment)
+            for name, function in schema.functions.items()
+        }
+        assert functions == {
+            "fn::ev_greet": (("name", "times"), "string", "FULL", "Greets"),
+            "fn::ev_guarded": ((), None, "WHERE $auth.admin = true", None),
+            "fn::ev_obj": (("a",), "{ x: int }", "NONE", None),
+        }
+
+    async def test_async_event_is_read(self) -> None:
+        # M13: v0.30.0 reported an ASYNC event as an issue; it is now read, RETRY and MAXDEPTH included.
+        async with _evt("ws") as client:
+            await _require_line(client, 3, "ASYNC events")
+            await _apply_ddl(
+                client,
+                "DEFINE EVENT ev_async ON ev_person ASYNC RETRY 2 WHEN $event = 'CREATE' "
+                "THEN { CREATE ev_log SET kind = 'async', rid = $value.id };",
+            )
+            schema = await DatabaseIntrospector("evt", tables=["ev_person"]).introspect()
+        assert schema.issues == ()
+        event = schema.tables["ev_person"].events["ev_async"]
+        assert _event_fields(event) == (
+            "ev_async",
+            "ev_person",
+            "$event = 'CREATE'",
+            "{ CREATE ev_log SET kind = 'async', rid = $value.id }",
+            None,
+            True,
+            2,
+            3,
+        )
+        assert event.raw == _EV_ASYNC_INFO_3X
