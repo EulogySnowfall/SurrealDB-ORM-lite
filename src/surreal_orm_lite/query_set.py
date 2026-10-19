@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 #: The values a snapshot's fields can nest a record model in (``QuerySet._mark_snapshots()``, v0.26.0).
 _SNAPSHOT_HOLDERS = (BaseModel, list, tuple, set, frozenset, dict)
 
-# The query cache's refusals and warning (v0.28.0, spec §5.5: C3, C10, W1).
+# The query cache's refusals and warning (v0.28.0).
 _CACHE_AS_OF = "cache() cannot be combined with as_of(): a time-travel read is never cached"
 _CACHE_QUERY = (
     "query() runs your own SurrealQL and is never cached: drop cache(), or cache its result yourself with "
@@ -108,7 +108,7 @@ class QuerySet:
         self._variables: dict = {}
         self._fetch_fields: list[str] = []
         # The first segment of every dotted column a clause names (v0.29.0, _column()): the links it may follow,
-        # checked against the model's connection before a statement is sent (X4).
+        # checked against the model's connection before a statement is sent.
         self._link_heads: set[str] = set()
         self._group_by_fields: list[str] = []
         self._annotations: dict[str, Aggregation | GeoDistance] = {}
@@ -128,7 +128,7 @@ class QuerySet:
         Resolved when a read or a write runs, never when the queryset is built: a queryset built outside a
         ``using()`` block and run inside it uses the block's connection.
 
-        :raises ValueError: the model's connection is not registered (R2).
+        :raises ValueError: the model's connection is not registered.
         """
         return self.model._connection_manager()
 
@@ -179,7 +179,7 @@ class QuerySet:
         return column
 
     def _check_links(self) -> None:
-        """X4 (v0.29.0): refuse a statement that follows a link to a model of another connection than this one's.
+        """Refuse a statement that follows a link to a model of another connection than this one's (v0.29.0).
 
         The links are the ``fetch()`` paths and the dotted paths of every other clause (:meth:`_column`, which also
         translates the ``Q`` objects and the aggregations as they compile). Called once the statement is compiled,
@@ -590,11 +590,11 @@ class QuerySet:
             Self: the queryset, for chaining. Called again, the last moment wins.
 
         Raises:
-            TypeError: ``at`` is none of the forms above (a ``date`` included) — T1.
-            ValueError: a string that is not ISO-8601 (T2); a negative duration (T3); a moment outside
-                1970-01-01T00:00:00Z … 2262-04-11T23:47:16.854775Z (T11).
-            SurrealDbError: the queryset is bound to a transaction (``objects(tx=)``) — T4; a moment on a queryset
-                with ``cache()`` (v0.28.0: a time-travel read is never cached) — C3. ``as_of(None)`` is accepted.
+            TypeError: ``at`` is none of the forms above (a ``date`` included).
+            ValueError: a string that is not ISO-8601; a negative duration; a moment outside
+                1970-01-01T00:00:00Z … 2262-04-11T23:47:16.854775Z.
+            SurrealDbError: the queryset is bound to a transaction (``objects(tx=)``); a moment on a queryset
+                with ``cache()`` (v0.28.0: a time-travel read is never cached). ``as_of(None)`` is accepted.
         """
         if self._tx is not None:
             raise SurrealDbError(_time_travel.transaction_refused())
@@ -649,9 +649,9 @@ class QuerySet:
             Self: the queryset, for chaining.
 
         Raises:
-            TypeError: ``ttl`` is not a number of seconds or a ``timedelta`` (C1; ``bool`` refused).
-            ValueError: ``ttl`` is negative or not finite (C2).
-            SurrealDbError: the queryset reads ``as_of()`` (C3).
+            TypeError: ``ttl`` is not a number of seconds or a ``timedelta`` (``bool`` refused).
+            ValueError: ``ttl`` is negative or not finite.
+            SurrealDbError: the queryset reads ``as_of()``.
         """
         request = CacheRequest(None if ttl is None else ttl_seconds(ttl, "cache() ttl"))
         if self._as_of is not None:
@@ -675,14 +675,14 @@ class QuerySet:
 
         The first step of every read. In order:
 
-        1. On the embedded engine, a URL that keeps no history (``embedded.keeps_history()``) raises T6
+        1. On the embedded engine, a URL that keeps no history (``embedded.keeps_history()``) raises
            before any client is acquired, so nothing is sent.
         2. A read that returns the records ``fetch()`` resolves (*fetches*), with ``fetch()`` set, asks the
-           server line (one ``version()`` request, as ``changes()`` does) and raises T8 below 3: SurrealDB 2.x
+           server line (one ``version()`` request, as ``changes()`` does) and raises below 3: SurrealDB 2.x
            resolves fetched links to their current state. No other read asks the line.
         3. A duration or a ``SurrealFunc`` is resolved by the database (one ``RETURN`` request), and the
-           resolved moment checked against the moments a version can address (``time_travel.resolve()``:
-           T10 a/b/c, after which the read is never sent). An absolute moment, checked by ``as_of()``, needs
+           resolved moment checked against the moments a version can address (``time_travel.resolve()``,
+           which raises, after which the read is never sent). An absolute moment, checked by ``as_of()``, needs
            no request.
 
         Args:
@@ -691,7 +691,8 @@ class QuerySet:
                 ignore ``fetch()``.
 
         Raises:
-            SurrealDbError: T6; T8; T10 (a, b, c).
+            SurrealDbError: a store that keeps no history; ``fetch()`` on SurrealDB 2.x; a duration or an
+                expression the database cannot resolve to a moment a version can address.
         """
         if self._as_of is None:
             return None
@@ -748,7 +749,7 @@ class QuerySet:
 
         It starts with this queryset's transaction, a copy of its ``variables()`` (the subqueries' are merged into
         it) and this queryset on the stack of the querysets being rendered, so a queryset given as its own subquery
-        raises S3 before any other check of the inner queryset.
+        raises before any other check of the inner queryset.
 
         It also carries this queryset's model (v0.29.0): every subquery of the statement must run on its connection.
 
@@ -781,7 +782,7 @@ class QuerySet:
         Args:
             counter: the first ``$_f<N>`` number.
             as_of: append the time-travel guard.
-            subqueries: the statement's compiler, which binds a subquery value; ``None`` refuses one (S8).
+            subqueries: the statement's compiler, which binds a subquery value; ``None`` refuses one.
         """
         parts: list[str] = []
         variables: dict[str, Any] = {}
@@ -829,7 +830,7 @@ class QuerySet:
 
         With ``as_of=True`` (a time-travel table read, v0.26.0) the per-record check
         ``time_travel.GUARD`` is the last condition (:meth:`_where_parts`). A subquery value (v0.27.0) is bound
-        by *subqueries*, the statement's compiler; without one it raises ``ValueError`` (S8).
+        by *subqueries*, the statement's compiler; without one it raises ``ValueError``.
 
         Once every condition is compiled, a scalar ``str`` filter value that is ``$`` and the name of one of the
         statement's ``variables()`` — this queryset's or its subqueries' — or of SurrealDB's session parameters
@@ -863,14 +864,14 @@ class QuerySet:
         ``LET``. A table in ``compiler.empty_tables`` compiles to ``[]``. ``fetch()`` is ignored, as in the full
         SurrealDB-ORM: a sub-SELECT gives values, never records to resolve.
 
-        Called by :meth:`SubqueryCompiler.reference`, which checks S3 first.
+        Called by :meth:`SubqueryCompiler.reference`, which first refuses a queryset that is its own subquery.
 
         Raises:
-            ValueError: ``annotate()``, ``select()`` of several fields or ``values()`` (S4, every offender named);
-                an invalid selected column; ``_sqv`` ordered on where the ordered form selects its alias (S13); its
-                ``variables()`` binding a name of the statement to another value (S7); and its filters' own refusals.
+            ValueError: ``annotate()``, ``select()`` of several fields or ``values()`` (every offender named); an
+                invalid selected column; ``_sqv`` ordered on where the ordered form selects its alias; its
+                ``variables()`` binding a name of the statement to another value; and its filters' own refusals.
                 Its ``limit()`` and ``offset()`` were checked when they were called (a non-negative integer).
-            SurrealDbError: an ``as_of()`` of its own (S5); a transaction that is not the outer queryset's (S6).
+            SurrealDbError: an ``as_of()`` of its own; a transaction that is not the outer queryset's.
         """
         offenders = {
             "annotate()": bool(self._annotations),
@@ -952,7 +953,7 @@ class QuerySet:
 
         Raises:
             RuntimeError: under ``as_of()`` without a moment (an internal error).
-            ValueError, SurrealDbError: a subquery the ORM cannot compile (S2–S7, S13, S15).
+            ValueError, SurrealDbError: a subquery the ORM cannot compile (README section 28).
         """
         moment = self._version_moment(moment)
         compiler = subqueries if subqueries is not None else self._subquery_compiler()
@@ -1092,7 +1093,7 @@ class QuerySet:
 
         On a queryset read ``as_of()`` (v0.26.0) — every read of which is a ``VERSION`` read, its writes
         and ``query()`` being refused — a server whose storage keeps no history ("does not support
-        versioned queries": SurrealDB 3.x, 2.x on RocksDB) is reported as ``SurrealDbError`` (T7), chained
+        versioned queries": SurrealDB 3.x, 2.x on RocksDB) is reported as ``SurrealDbError``, chained
         to the SDK's error. Keyed on ``as_of()``, never on the variables: without it, every error is
         relayed unchanged.
 
@@ -1248,9 +1249,9 @@ class QuerySet:
                 empty |= {missing.table}
 
     async def _run_cached(self, compile_statement: Callable[[SubqueryCompiler], tuple[str, dict[str, Any]]]) -> Any:
-        """A read of a queryset with ``cache()``, outside a transaction (v0.28.0, spec §6.3).
+        """A read of a queryset with ``cache()``, outside a transaction (v0.28.0).
 
-        The statement is compiled once to key the read and decide what it depends on (spec §5.3): the model's
+        The statement is compiled once to key the read and decide what it depends on: the model's
         table and every table a subquery reads; ``EDGES`` when one of them is an edge model's (every delete
         invalidates it); "any table" when the statement follows links (``FETCH``, a dotted path, a graph arrow) or
         a ``select()`` item is neither ``*`` nor a plain field path (``author.*``: projection semantics read the
@@ -1289,7 +1290,7 @@ class QuerySet:
     ) -> Any:
         """Answer a read of a queryset with ``cache()`` from the query cache, or *run* it and store its rows (v0.28.0).
 
-        The one read frontier of the cache (spec §6.3): every compiled read (:meth:`_run_cached`), ``get(<id>)``
+        The one read frontier of the cache: every compiled read (:meth:`_run_cached`), ``get(<id>)``
         and ``all()``. The rows returned — a copy of the cached ones on a hit — go through the caller's usual
         post-processing, as on a miss. A TTL of ``0`` never looks up nor stores; a read the cache cannot key (a
         client without a scope, no CBOR encoder, a value the SDK cannot send) goes to the database, as does one a
@@ -1526,7 +1527,7 @@ class QuerySet:
         return self.model.from_db(data)
 
     async def _cached_select(self, target: RecordID | str, tables: frozenset[str], missing: Any) -> Any:
-        """The SDK's ``select(target)`` through :meth:`_cached_read` (v0.28.0, spec §5.3): keyed on the target,
+        """The SDK's ``select(target)`` through :meth:`_cached_read` (v0.28.0): keyed on the target,
         tagged with its table (and ``EDGES`` on an edge model); *missing* when the server says it does not exist."""
         if self.model.__surreal_edge__:
             tables |= {EDGES}
@@ -2090,8 +2091,8 @@ class QuerySet:
         drives the lookup only and is never written. Checked before any request.
 
         Raises:
-            SurrealDbError: an ``exact`` criterion whose value is a ``Subquery`` or a QuerySet (S9a), then such a
-                ``defaults`` value (S9b).
+            SurrealDbError: an ``exact`` criterion whose value is a ``Subquery`` or a QuerySet, then such a
+                ``defaults`` value.
         """
         for key, value in criteria.items():
             field_name, lookup = parse_lookup(key)
@@ -2192,7 +2193,7 @@ class QuerySet:
         a warning.
 
         Raises:
-            ValueError, SurrealDbError: what the lookup raises compiling *criteria*, before any request — S7 for a
+            ValueError, SurrealDbError: what the lookup raises compiling *criteria*, before any request — a
                 subquery binding one of these names to another value, an edge endpoint that is no record id…
         """
         probe = self._lookup_probe(criteria)
@@ -2252,15 +2253,15 @@ class QuerySet:
         ``{ LET $_sq0 = (…); (SELECT … LIMIT 2) };``, run as every read is (:meth:`_run_compiled`), never cached.
 
         The lookup binds this queryset's ``variables()`` (issue #252; until then it bound none, and a ``Var``
-        criterion read ``NONE``), merged with its subquery criteria's as ``filter()`` merges them (S7 when a
-        subquery binds a name to another value), so ``variables(n=10).get_or_create(size__gte=Var("n"))`` compares
+        criterion read ``NONE``), merged with its subquery criteria's as ``filter()`` merges them (``ValueError`` when
+        a subquery binds a name to another value), so ``variables(n=10).get_or_create(size__gte=Var("n"))`` compares
         ``size`` with 10. An ``exact`` ``Var`` criterion on the record id or an edge endpoint is compared with the
         record id its value names (:meth:`_lookup_criteria`). A criterion ``"$name"`` that would warn never gets
         here (:meth:`_reject_string_references`).
 
         Each variable is bound as the value the create writes (:func:`~surreal_orm_lite.utils.as_record_value`): a
         model instance as its record id, whether a criterion reads it or not — bound as it is, the SDK has no
-        encoder for it. S7 compares the values given to ``variables()``, before that conversion.
+        encoder for it. The name clash check compares the values given to ``variables()``, before that conversion.
 
         Raises:
             ValueError: an unsaved model instance in the variables (it has no record id), before any request.
@@ -2346,7 +2347,7 @@ class QuerySet:
         criterion read ``NONE`` there, and a comparison could match, then update, a record the caller did not
         mean): ``objects().variables(n=10).update_or_create(size__gte=Var("n"), title="mine", defaults=…)``
         compares ``size`` with 10. A subquery criterion's ``variables()`` share the statement: one binding a name of
-        this queryset's to another value raises S7 (``ValueError``) before any request. An ``exact`` ``Var``
+        this queryset's to another value raises ``ValueError`` before any request. An ``exact`` ``Var``
         criterion naming a variable the lookup binds is written as that variable's value on create
         (``title=Var("t")`` with ``variables(t="mine")`` writes ``title = "mine"``), so the next identical call
         finds the record; on the record id and an edge's ``in``/``out`` it is compared as the record id its value
@@ -2417,7 +2418,7 @@ class QuerySet:
         The lookup binds this queryset's ``variables()``, as ``filter()`` does (issue #252; until then a ``Var``
         criterion read ``NONE`` there): ``objects().variables(n=10).get_or_create(size__gte=Var("n"), …)`` compares
         ``size`` with 10. A subquery criterion's ``variables()`` share the statement: one binding a name of this
-        queryset's to another value raises S7 (``ValueError``) before any request. An ``exact`` ``Var`` criterion
+        queryset's to another value raises ``ValueError`` before any request. An ``exact`` ``Var`` criterion
         naming a variable the lookup binds is written as that variable's value on create:
         ``objects().variables(t="mine").get_or_create(title=Var("t"))`` behaves as ``get_or_create(title="mine")``,
         and the next identical call returns ``created=False``. On the record id and an edge's ``in``/``out`` it is
@@ -2501,9 +2502,9 @@ class QuerySet:
         *subqueries* is the inline compiler to use (a new one by default), which records the tables they read.
 
         :raises SurrealDbError: for a clause a live query cannot honour; for a subquery or a link of another
-            connection (X2, X4; v0.29.0).
+            connection (v0.29.0).
         :raises TypeError: for a filter value with no SurrealQL literal form.
-        :raises ValueError, SurrealDbError: for a subquery the ORM cannot compile (S2–S7, S13, S15).
+        :raises ValueError, SurrealDbError: for a subquery the ORM cannot compile (README section 28).
         """
         self._reject_live_clauses()
         compiler = subqueries if subqueries is not None else self._subquery_compiler(inline=True)
@@ -2528,7 +2529,7 @@ class QuerySet:
         With subqueries (v0.27.0) the coroutine first reads every table they read, in one request
         (``RETURN [(SELECT VALUE id FROM <table> LIMIT 1), …];``, the tables sorted), then sends the
         ``LIVE SELECT``. SurrealDB 3.x accepts a live query whose subquery reads a table that does
-        not exist and then never notifies, but refuses that check: the ORM raises S11 instead. 2.x
+        not exist and then never notifies, but refuses that check: the ORM raises instead. 2.x
         answers it (the table reads as empty) and the live query starts. A resubscribe runs the
         check again, on the new connection.
 
@@ -2735,7 +2736,7 @@ class QuerySet:
         Raises:
             SurrealDbError: the query does not read ``FROM`` the model's table; the queryset is read
                 ``as_of()`` (v0.26.0): the custom statement would ignore the moment, so it is refused rather
-                than run on the current data; the queryset has ``cache()`` (v0.28.0, C10): your own SurrealQL is
+                than run on the current data; the queryset has ``cache()`` (v0.28.0): your own SurrealQL is
                 never cached — cache its result yourself with ``QueryCache.make_key()``, ``get()`` and ``set()``.
         """
         self._reject_time_travel("query()")

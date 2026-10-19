@@ -18,7 +18,7 @@ codepoint order of the names, each name escaped as an identifier) on the connect
 record is read, nothing is defined or written. It never goes through a transaction — inside an open
 ``transaction()`` block it reads the committed schema, without the block's own ``DEFINE`` statements.
 
-**What is read** (spec §5.5). ``INFO FOR DB``: ``tables`` (each then read with ``INFO FOR TABLE``: its fields,
+**What is read.** ``INFO FOR DB``: ``tables`` (each then read with ``INFO FOR TABLE``: its fields,
 indexes and events), ``analyzers``, ``accesses``, ``functions`` and ``params`` become the typed states of
 :mod:`surreal_orm_lite.schema_state`; ``users`` is **never read** — not parsed, stored or logged (before SurrealDB
 3.2.2 ``INFO`` shows user password hashes); every other section (``apis``, ``configs``, ``models``, 3.x ``buckets``,
@@ -28,15 +28,19 @@ goes to ``TableState.other``. Kinds, nullability, field paths, flags and names a
 SurrealDB 2.x, 3.x and the embedded engine; expression texts are kept as each line rendered them.
 
 **Nothing is guessed.** A definition the parser cannot read exactly, a section of the wrong shape, an ``INFO FOR
-TABLE`` that fails: each becomes a :class:`SchemaIssue` in ``SchemaState.issues`` (in the order found) and one
-WARNING on this module's logger — the reader never raises for them. An issue's message is a fixed text with names
-only, never a definition's text, which may hold a credential (``DEFINE PARAM $api_key VALUE '…'``); the statement is
-kept in ``SchemaIssue.statement``, out of its ``repr``.
+TABLE`` the server answers with an error: each becomes a :class:`SchemaIssue` in ``SchemaState.issues`` (in the order
+found) and one WARNING on this module's logger — the reader never raises for them. An issue's message is a fixed text
+with names only, never a definition's text, which may hold a credential (``DEFINE PARAM $api_key VALUE '…'``); the
+statement is kept in ``SchemaIssue.statement``, out of its ``repr``.
 
 **Errors.** ``INFO FOR DB`` refused (a record user, an anonymous session) raises ``SurrealDbAuthenticationError``;
 failing otherwise, or answering something other than an object, ``SurrealDbError`` — ORM errors (a connection that
 cannot be opened …) propagate unchanged. A ``tables=`` name the database does not define raises
-``SurrealDbNotFoundError`` before any ``INFO FOR TABLE``. Arguments are checked when the introspector is built.
+``SurrealDbNotFoundError`` before any ``INFO FOR TABLE``. An ``INFO FOR TABLE`` refused after ``INFO FOR DB``
+succeeded (the session lost its rights meanwhile) raises ``SurrealDbAuthenticationError``, and one the server never
+answered — the connection dropped, an ORM error — raises that error unchanged: neither is an issue, so
+``generate_models_from_db()`` never replaces a file with models of tables it could not read. Arguments are checked
+when the introspector is built.
 
 **Files** (``generate_models_from_db()``). The generated module is written UTF-8 with ``"\\n"`` newlines. An existing
 file is replaced atomically by default — a temporary file in the same directory, then ``os.replace()``: a failure
@@ -53,6 +57,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any, Protocol, TypeVar
 
+from ._sdk import ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .define_parser import (
     DefineParseError,
@@ -100,7 +105,7 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-#: E9 (spec §5.6): a client object where the name of a registered connection is expected.
+#: The refusal of a client object where the name of a registered connection is expected.
 _CLIENT_OBJECT = (
     "connection= takes the name of a registered connection, not a client object: pass the name it was added with "
     "(add_connection()), or call DatabaseIntrospector() inside SurrealDBConnectionManager.using(name)."
@@ -111,7 +116,7 @@ _NOT_OTHER = frozenset({"users", "tables"})
 #: The ``INFO FOR TABLE`` sections that are ignored: running live queries, views fed by the table.
 _IGNORED_TABLE_SECTIONS = frozenset({"lives", "tables"})
 
-#: I3 and I5 (spec §5.7).
+#: The issue texts of a ``TYPE`` kept as written and of a second definition with the same name.
 _TYPE_AS_WRITTEN = "its TYPE clause was not understood and is kept as written"
 _SAME_NAME = "two definitions have the same name"
 
@@ -125,7 +130,8 @@ _S = TypeVar("_S", bound=_Named)
 
 
 def _connection_name(connection: object) -> str | None:
-    """*connection* when it is ``None`` or a usable name: a client object → E9 (first), another type or ``""`` → R3."""
+    """*connection* when it is ``None`` or a usable name: a client object is refused first (``TypeError``), then another
+    type or ``""`` (``check_name()``)."""
     if connection is None:
         return None
     if not isinstance(connection, str) and hasattr(connection, "query"):
@@ -134,7 +140,7 @@ def _connection_name(connection: object) -> str | None:
 
 
 def _table_names(tables: Iterable[str] | None) -> tuple[str, ...] | None:
-    """*tables* materialised to a ``tuple``: a ``str`` → E5, an item that is not a ``str`` → E6."""
+    """*tables* materialised to a ``tuple``: a ``str``, or an item that is not a ``str``, raises ``TypeError``."""
     if tables is None:
         return None
     if isinstance(tables, str):
@@ -155,15 +161,20 @@ def _definitions(value: object) -> dict[str, str] | None:
     return dict(value)
 
 
+def _refused(exc: BaseException) -> bool:
+    """Whether the server refused the statement to this session (the same text on SurrealDB 2.x and 3.x)."""
+    return "not enough permissions" in str(exc).lower()
+
+
 async def _info_for_db(client: Any, name: str) -> dict[str, Any]:
-    """``INFO FOR DB`` on *client*: E1 when the session may not run it, E2 when it fails otherwise, E3 for an answer
-    that is not an object; an ORM error propagates unchanged."""
+    """``INFO FOR DB`` on *client*: ``SurrealDbAuthenticationError`` when the session may not run it, ``SurrealDbError``
+    when it fails otherwise or answers something other than an object; an ORM error propagates unchanged."""
     try:
         info = await client.query("INFO FOR DB;", {})
     except SurrealORMError:
         raise
     except Exception as exc:
-        if "not enough permissions" in str(exc).lower():
+        if _refused(exc):
             raise SurrealDbAuthenticationError(
                 f"Cannot read the schema of connection {name!r}: this session may not run INFO FOR DB. Schema "
                 "introspection needs a system user (root, namespace or database user, any role); a record user or "
@@ -186,20 +197,20 @@ class _Reader:
         self.issues: list[SchemaIssue] = []
 
     def issue(self, kind: str, name: str, table: str | None, message: str, statement: str | None = None) -> None:
-        """Record an issue and log it once (spec §5.7): the message is a fixed text, names are formatted with ``%r``."""
+        """Record an issue and log it once: the message is a fixed text, names are formatted with ``%r``."""
         self.issues.append(SchemaIssue(kind=kind, name=name, table=table, message=message, statement=statement))
         logger.warning("Schema introspection: %s (%s %r)", message, kind, name)
 
     def section(self, section: str, value: object, table: str | None) -> dict[str, str] | None:
-        """*value* as a mapping of names to definitions, or ``None`` after issue I4."""
+        """*value* as a mapping of names to definitions, or ``None`` after an issue (a section of the wrong shape)."""
         definitions = _definitions(value)
         if definitions is None:
             self.issue("section", section, table, f"section {section!r} is not a mapping of names to definitions")
         return definitions
 
     def parse(self, kind: str, definitions: Mapping[str, str], parse: Callable[[str], _S], table: str | None) -> dict[str, _S]:
-        """Each definition parsed, keyed by its state's name; one that cannot be parsed is left out (issue I1), and so
-        is a second one with the same name (I5's text: the first is kept, nothing is dropped unreported)."""
+        """Each definition parsed, keyed by its state's name; one that cannot be parsed is left out (an issue), and so
+        is a second one with the same name (an issue too: the first is kept, nothing is dropped unreported)."""
         states: dict[str, _S] = {}
         for key in sorted(definitions):
             statement = definitions[key]
@@ -215,8 +226,8 @@ class _Reader:
         return states
 
     def fields(self, definitions: Mapping[str, str], table: str) -> dict[str, FieldState]:
-        """The fields, keyed by their canonical name: I1 (left out), I3 (kept, its TYPE as written), I5 (a second
-        field with the same name: the first one is kept)."""
+        """The fields, keyed by their canonical name. An issue each: a definition that cannot be parsed (left out), a
+        ``TYPE`` not understood (kept as written), a second field with the same name (the first one is kept)."""
         fields: dict[str, FieldState] = {}
         for key in sorted(definitions):
             statement = definitions[key]
@@ -234,16 +245,27 @@ class _Reader:
         return fields
 
     async def table(self, name: str, statement: str) -> TableState | None:
-        """The table *name* with its fields, indexes and events; ``None`` when its definition cannot be parsed (I1).
-        When ``INFO FOR TABLE`` fails, the table is kept with empty sections (I2)."""
+        """The table *name* with its fields, indexes and events; ``None`` when its definition cannot be parsed (an
+        issue). When the server answers ``INFO FOR TABLE`` with an error, the table is kept with empty sections (an
+        issue); an error that is not the server's answer (a dropped connection, an ORM error) propagates."""
         try:
             state = parse_define_table(statement)
         except DefineParseError as error:
             self.issue("table", name, name, f"could not parse its definition: {error}", statement)
             return None
         try:
-            info = await self.client.query(f"INFO FOR TABLE {_identifier(name)};", {})
-        except Exception as exc:
+            info_for_table = f"INFO FOR TABLE {_identifier(name)};"
+        except TypeError as exc:  # a name SurrealQL cannot hold (a NUL): never sent
+            self.issue("table", name, name, f"INFO FOR TABLE failed: {exc}")
+            return state
+        try:
+            info = await self.client.query(info_for_table, {})
+        except (ServerError, RuntimeError) as exc:  # the server's answer (the embedded engine's: a RuntimeError)
+            if _refused(exc):  # INFO FOR DB passed: the session lost its rights meanwhile, the table is not at fault
+                raise SurrealDbAuthenticationError(
+                    f"Cannot read the schema of connection {self.name!r}: INFO FOR TABLE {name!r} was refused after "
+                    f"INFO FOR DB succeeded; the session lost its rights while it was read. Server said: {exc}"
+                ) from exc
             self.issue("table", name, name, f"INFO FOR TABLE failed: {exc}")
             return state
         if not isinstance(info, dict):
@@ -270,7 +292,7 @@ class _Reader:
         return dataclasses.replace(state, fields=fields, indexes=indexes, events=events, other=other)
 
     async def read(self, info: Mapping[str, Any], wanted_names: tuple[str, ...] | None) -> SchemaState:
-        """The schema from the ``INFO FOR DB`` answer *info*, reading each wanted table (spec §6.2)."""
+        """The schema from the ``INFO FOR DB`` answer *info*, reading each wanted table."""
         if "tables" in info:
             tables_section = self.section("tables", info["tables"], None) or {}
         else:
@@ -353,15 +375,21 @@ class DatabaseIntrospector:
     async def introspect(self) -> SchemaState:
         """Read the schema: ``INFO FOR DB;``, then ``INFO FOR TABLE`` for each wanted table, outside any transaction.
 
-        Reusable: it holds no state between calls. What cannot be read or parsed is reported in
-        ``SchemaState.issues`` (and logged), never raised.
+        Reusable: it holds no state between calls. What cannot be read or parsed — a definition, a section, an
+        ``INFO FOR TABLE`` the server answers with an error — is reported in ``SchemaState.issues`` (and logged), never
+        raised.
 
         :raises ValueError: the connection is not registered, or not configured.
         :raises SurrealDbAuthenticationError: the session may not run ``INFO FOR DB`` (a record user, an anonymous
-            session).
+            session), or was refused an ``INFO FOR TABLE`` after ``INFO FOR DB`` succeeded (it lost its rights
+            meanwhile).
         :raises SurrealDbNotFoundError: a ``tables=`` name is not a table of the database.
         :raises SurrealDbError: ``INFO FOR DB`` failed otherwise, or did not answer an object.
         :raises SurrealDbConnectionError: what ``get_client()`` raises, unchanged.
+        :raises Exception: an ``INFO FOR TABLE`` the server never answered propagates its error unchanged, and the
+            tables after it are not read: the transport's (``OSError``, ``websockets``' ``ConnectionClosed``,
+            ``aiohttp``'s ``ClientConnectionError`` …) when the connection drops after ``INFO FOR DB``, or an ORM error
+            (``SurrealORMError``).
         """
         manager = SurrealDBConnectionManager._manager_for(self._connection)
         name = manager._connection_name or "default"
@@ -435,6 +463,9 @@ async def generate_models_from_db(
     :raises FileExistsError: *output_path* exists and ``overwrite=False`` — checked before any database read.
     :raises SurrealDbAuthenticationError, SurrealDbNotFoundError, SurrealDbError: as
         :meth:`DatabaseIntrospector.introspect`.
+    :raises Exception: as :meth:`DatabaseIntrospector.introspect`, an ``INFO FOR TABLE`` the server never answered
+        (the connection dropped after ``INFO FOR DB``) — before anything is written: an existing file is left as it
+        was.
     :raises OSError: the file cannot be written (the previous one, if any, is left as it was).
     """
     introspector = DatabaseIntrospector(connection, tables=tables)

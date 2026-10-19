@@ -12,6 +12,7 @@ fixed reasons ``DefineParseError`` is raised with (spec §6.3.6). Unit tests onl
 import ast
 import dataclasses
 import gc
+import math
 import pathlib
 import time
 from collections.abc import Callable
@@ -109,6 +110,32 @@ def _positions(text: str, *words: str) -> list[tuple[int, str]]:
         found.append((position, word))
         position += len(word)
     return found
+
+
+#: How many times a linear-time test may time a call: a pause of the machine (a busy runner, a coverage tracer) lands in
+#: one run, not in every one, so the fastest run measures the work itself.
+_TIMING_RUNS = 3
+
+
+def _fastest(call: Callable[[], object], *, under: float = 0.0) -> float:
+    """The shortest of up to ``_TIMING_RUNS`` timings of ``call()``, in seconds, with no garbage collection in any run.
+
+    The runs stop at the first one shorter than *under*: the shortest is then shorter than *under* too, so a bound
+    checked against the result holds exactly when it would after every run.
+    """
+    gc.collect()
+    gc.disable()
+    try:
+        best = math.inf
+        for _ in range(_TIMING_RUNS):
+            started = time.perf_counter()
+            call()
+            best = min(best, time.perf_counter() - started)
+            if best < under:
+                break
+    finally:
+        gc.enable()
+    return best
 
 
 def _reason(error: pytest.ExceptionInfo[DefineParseError]) -> str:
@@ -1319,20 +1346,12 @@ class TestClauseReader:
     ) -> None:
         # Server text is not trusted to be small or kind: thousands of keyword-named words, one reading or none. One
         # scan of the statement is the yardstick, whatever the machine or a coverage tracer: reading it costs about ten,
-        # a quadratic reading a hundred or more at these sizes. No garbage collection lands in either measure.
-        gc.collect()
-        gc.disable()
-        try:
-            started = time.perf_counter()
-            top_level_keywords(statement, [])
-            scan = time.perf_counter() - started
-            started = time.perf_counter()
-            parsed = parse(statement)
-            elapsed = time.perf_counter() - started
-        finally:
-            gc.enable()
+        # a quadratic reading a hundred or more at these sizes. Each is the fastest of a few runs (_fastest).
+        parsed: list[object] = []
+        scan = _fastest(lambda: top_level_keywords(statement, []))
+        elapsed = _fastest(lambda: parsed.append(parse(statement)), under=30 * scan)
         assert elapsed < 30 * scan
-        assert check(parsed)
+        assert check(parsed[-1])
 
     @pytest.mark.parametrize(
         ("parse", "statement"),
@@ -1384,21 +1403,22 @@ class TestClauseReader:
     )
     def test_keyword_soups_take_bounded_work(self, parse: Callable[[str], object], statement: str) -> None:
         # Server text is not trusted to be small or kind: the clause reader's work is bounded by the length of the
-        # statement. Past it, the statement is refused with its own fixed reason, never read for minutes.
-        gc.collect()
-        gc.disable()
-        try:
-            started = time.perf_counter()
-            top_level_keywords(statement, [])
-            scan = time.perf_counter() - started
-            started = time.perf_counter()
-            with pytest.raises(DefineParseError) as error:
+        # statement. Past it, the statement is refused with its own fixed reason, never read for minutes. Each timing
+        # is the fastest of a few runs (_fastest).
+        reasons: list[str | None] = []
+
+        def refused() -> None:
+            try:
                 parse(statement)
-            elapsed = time.perf_counter() - started
-        finally:
-            gc.enable()
+            except DefineParseError as error:
+                reasons.append(str(error))
+            else:
+                reasons.append(None)
+
+        scan = _fastest(lambda: top_level_keywords(statement, []))
+        elapsed = _fastest(refused, under=30 * scan)
         assert elapsed < 30 * scan
-        assert _reason(error) == _R_TOO_COMPLEX
+        assert reasons == [_R_TOO_COMPLEX] * len(reasons)
 
 
 def _table(statement: str, name: str, **attributes: object) -> tuple[str, TableState]:

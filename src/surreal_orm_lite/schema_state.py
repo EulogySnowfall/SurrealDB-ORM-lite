@@ -137,7 +137,8 @@ def _freeze_sections(value: Mapping[str, Mapping[str, str]]) -> _FrozenMap[Mappi
 
 
 def _names(state: object, attribute: str, value: Iterable[str]) -> tuple[str, ...]:
-    """*value* as a ``tuple`` of names; a ``str`` is refused (E10): it would split into characters."""
+    """*value* as a ``tuple`` of names; a ``str`` is refused (``TypeError``): it would split into
+    characters."""
     if isinstance(value, str):
         hint = repr(value.split(".") if attribute == "path" else [value])
         raise TypeError(f"{type(state).__name__}.{attribute} takes a sequence of str, not a str: write {attribute}={hint}.")

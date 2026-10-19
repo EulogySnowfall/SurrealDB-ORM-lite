@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.8] - 2026-10-19
+
+Follow-ups to the v0.30.0 schema introspection (#260): a connection lost while the schema is read
+raises instead of becoming schema issues, a relation table is an edge whatever the case of its
+`table_type`, and generated classes carry the change feed and permissions comments the v0.30.0
+notes described. No new public API.
+
+### Fixed
+
+- **A connection lost during `introspect()` raises** (#260). Every error of an `INFO FOR TABLE`
+  became a `SchemaIssue`, so a connection that dropped after `INFO FOR DB` turned every remaining
+  table into "could not be read": `introspect()` returned normally, and
+  `generate_models_from_db(path)` replaced a working module with one that listed those tables as
+  skipped. Only the server's answer to `INFO FOR TABLE` is an issue now; the transport's error, or
+  the ORM's, propagates unchanged before anything is written, so an existing file is left as it
+  was.
+- **A relation table is an edge whatever the case of its `table_type`** (#260). The generator
+  compared `table_type` with exact case in two places and ignored case in a third: a hand-built
+  `TableState(table_type="RELATION")` gave a `BaseSurrealEdge` class that declared `in_` and `out`
+  again, and the module failed to import with a `TypeError`. States read by `DatabaseIntrospector`
+  hold `"relation"` and were not affected.
+- **Generated classes comment their change feed and permissions** (#260), as the v0.30.0 notes
+  said: `# Changefeed: 1d INCLUDE ORIGINAL` and
+  `# Permissions: FOR select WHERE $auth.id = owner, FOR create, update FULL, FOR delete NONE`,
+  grouped the way SurrealDB renders them (`# Permissions: FULL` when `FULL` covers the four
+  operations). A table left at the default `PERMISSIONS NONE`, all four operations `NONE`, gets no
+  permissions comment. The database still applies both; the `SurrealConfigDict` keys for them
+  arrive with v0.31.0–v0.33.0. Unlike what those notes listed, `table_type` is not a comment: it
+  shows through the base class, `BaseSurrealEdge` for a relation table.
+
+### Changed
+
+- **An `INFO FOR TABLE` refused after `INFO FOR DB` succeeded raises
+  `SurrealDbAuthenticationError`** (#260) instead of becoming a `SchemaIssue`: the session lost its
+  rights while the schema was read (for example a client closed and reopened anonymously), and the
+  table is not at fault. A refused `INFO FOR DB` raises the same error, as in v0.30.0.
+
+### Notes
+
+- Docstrings and comments no longer cite internal design-note ids: they name the exception raised,
+  the case refused or the README section that documents it. README section 31 describes the new
+  class comments and which `INFO FOR TABLE` failures are schema issues.
+- The linear-time tests of the definition parser keep the fastest of up to three timings, so a
+  pause of a shared CI runner cannot fail them.
+- Same behaviour on SurrealDB 2.x, 3.x and the embedded engine. Server pins unchanged: tested
+  against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine, plus 3.1.5 for backward
+  compatibility.
+
 ## [0.30.7] - 2026-10-19
 
 An instance stays in step with its stored row (#261): `save()` applies the whole row the server

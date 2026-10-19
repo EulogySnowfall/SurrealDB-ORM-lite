@@ -53,7 +53,7 @@ async def embedded_database(
         changes.
     :raises TypeError: *connection* is not a ``str`` — before anything changes.
     """
-    # Validated before anything changes, in this order: a URL the SDK refuses (E11) says what to fix
+    # Validated before anything changes, in this order: a URL the SDK refuses says what to fix
     # even when the namespace is empty too, and a server URL is named before an empty namespace.
     require_supported_url(url)
     if not url or url_kind(url) == "server":

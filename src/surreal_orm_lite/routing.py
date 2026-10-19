@@ -9,12 +9,12 @@ that connection's name. The guards read the tag with ``inspect.getattr_static`` 
 then the class — and before anything else: no ``__getattr__``, no property and no descriptor of the object runs, so a
 transaction is recognised without asking it, as the query cache's ``writing()`` recognises one by its class.
 
-One statement runs in one database, so it cannot involve two connections: a subquery of a model of another connection
-(X2), a relation between records or edge models of two connections (X3), a link followed through a field typed with
-a model of another connection (X4). The guards compare connection **names** (``get_connection_name()``), never
-connection classes: they never look the registry up, so a guard never raises an unknown-connection error in place of
-its own. What a field links to is read from its annotation (:func:`linked_models`), duck-typed so this module does
-not import the models.
+One statement runs in one database, so it cannot involve two connections: a subquery of a model of another
+connection, a relation between records or edge models of two connections, a link followed through a field typed with
+a model of another connection (README section 30, "Multiple databases"). The guards compare connection **names**
+(``get_connection_name()``), never connection classes: they never look the registry up, so a guard never raises an
+unknown-connection error in place of its own. What a field links to is read from its annotation
+(:func:`linked_models`), duck-typed so this module does not import the models.
 """
 
 import collections.abc
@@ -60,10 +60,10 @@ def check_name(name: object) -> str:
 
 
 def check_config_connection(cls: type, value: object) -> None:
-    """R7: the ``connection`` key of a model's ``SurrealConfigDict``, checked when the class is defined.
+    """Check the ``connection`` key of a model's ``SurrealConfigDict`` when the class is defined.
 
     ``None`` (the default connection) is not passed here. Whether the name is registered is checked at the model's
-    first database call (R2), never here: a model may be defined before its connection is added.
+    first database call, never here: a model may be defined before its connection is added.
 
     :raises TypeError: *value* is not a ``str``.
     :raises ValueError: *value* is empty.
@@ -94,7 +94,7 @@ def _connection_of(model: type) -> str | None:
 
 
 def check_transaction(model: type, tx: object, operation: str) -> None:
-    """X1: refuse *operation* of *model* inside a transaction of another connection, before any request or signal.
+    """Refuse *operation* of *model* inside a transaction of another connection, before any request or signal.
 
     The transaction's tag is read first, and statically (:func:`transaction_connection`); a transaction without one
     returns at once. Only then is *model*'s connection resolved — by name, never through the registry, so this never
@@ -118,7 +118,7 @@ def check_transaction(model: type, tx: object, operation: str) -> None:
 
 
 def check_call_transaction(name: str, tx: object) -> None:
-    """X1m: refuse ``SurrealDBConnectionManager.call_function(tx=)`` on connection *name* with a transaction of another.
+    """Refuse ``SurrealDBConnectionManager.call_function(tx=)`` on connection *name* with a transaction of another.
 
     The tag is read statically, as in :func:`check_transaction`.
 
@@ -135,7 +135,7 @@ def check_call_transaction(name: str, tx: object) -> None:
 
 
 def check_subquery(outer: type, inner: type) -> None:
-    """X2: refuse a subquery of *inner* inside a statement of *outer* when they run on two connections.
+    """Refuse a subquery of *inner* inside a statement of *outer* when they run on two connections.
 
     *outer* is the model of the statement the subquery is sent in — the outermost one, whatever the depth: SurrealDB
     runs every subquery of a statement in that statement's database.
@@ -155,7 +155,7 @@ def check_subquery(outer: type, inner: type) -> None:
 
 
 def check_same_connection(operation: str, first: type, *others: type) -> None:
-    """X3: refuse *operation* (``"Event.relate()"``…) when one of *others* runs on another connection than *first*.
+    """Refuse *operation* (``"Event.relate()"``…) when one of *others* runs on another connection than *first*.
 
     *first* is the source record's model; *others* the target's model, the edge model and ``model_class``, in that
     order (a ``RecordID`` or a ``"table:id"`` target names no model and is not passed). The first model of another
@@ -229,7 +229,7 @@ def linked_models(model: type, column: str) -> tuple[type, ...]:
 
 
 def check_links(model: type, columns: Iterable[str]) -> None:
-    """X4: refuse a statement of *model* that follows a link to a model of another connection.
+    """Refuse a statement of *model* that follows a link to a model of another connection.
 
     *columns* are the columns the statement follows links through: its ``fetch()`` paths and the heads of the dotted
     paths of its other clauses. A dotted column is checked through its first segment (``author.name``: ``author``).

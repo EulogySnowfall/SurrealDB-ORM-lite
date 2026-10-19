@@ -181,6 +181,10 @@ def _bare(names: list[str]) -> list[TableState]:
     return [TableState(name=name) for name in names]
 
 
+#: A table's permissions when it defines none (``PERMISSIONS NONE``), as the reader gives them.
+_TABLE_PERMISSIONS_NONE = dict.fromkeys(("select", "create", "update", "delete"), "NONE")
+
+
 class TestBoundaries:
     """Spec §6.4.1 and §8: ``_py_str`` and ``_comment``."""
 
@@ -1674,6 +1678,98 @@ class TestClasses:
             '    model_config = SurrealConfigDict(table_name="r", extra="allow")\n'
         )
 
+    @pytest.mark.parametrize("table_type", ["relation", "RELATION", "Relation"])
+    def test_edge_whatever_the_case_of_its_type(self, tmp_path: Path, table_type: str) -> None:
+        """A hand-built ``TableState`` may spell its type in any case: the class is an edge either way, and ``in``/``out``
+        stay the base class's (declared again, the module failed to import with a ``TypeError``)."""
+        likes = _table(
+            "likes",
+            _f("in", "record<person>"),
+            _f("out", "record<post>"),
+            _f("since", "datetime", nullable=True),
+            table_type=table_type,
+        )
+        source = ModelCodeGenerator().generate(SchemaState(tables={"likes": likes}))
+        module = _import(tmp_path, source)
+        assert issubclass(module.Likes, surreal_orm_lite.BaseSurrealEdge)
+        assert set(module.Likes.__annotations__) == {"since"}
+        assert {"in_", "out", "since"} <= set(module.Likes.model_fields)
+        assert _class_block(source, "Likes") == (
+            "class Likes(BaseSurrealEdge):\n"
+            "    # IN any OUT any\n"
+            '    model_config = SurrealConfigDict(table_name="likes")\n'
+            "\n"
+            "    since: datetime | None = None\n"
+        )
+        assert dict(_Names([likes]).fields("likes")) == {"since": ("since", None)}
+
+    def test_changefeed_and_permissions(self) -> None:
+        """The table's change feed and permissions are class comments, the permissions grouped as SurrealDB renders
+        them (the same text on 2.x, 3.x and the embedded engine)."""
+        table = _parsed_table(
+            "DEFINE TABLE feed TYPE NORMAL SCHEMAFULL CHANGEFEED 1d INCLUDE ORIGINAL PERMISSIONS FOR select WHERE "
+            "$auth.id = owner, FOR create, update FULL, FOR delete NONE",
+            ["DEFINE FIELD owner ON feed TYPE option<record> PERMISSIONS FULL"],
+        )
+        source = ModelCodeGenerator().generate(SchemaState(tables={"feed": table}))
+        assert _class_block(source, "Feed") == (
+            "class Feed(BaseSurrealModel):\n"
+            "    # Changefeed: 1d INCLUDE ORIGINAL\n"
+            "    # Permissions: FOR select WHERE $auth.id = owner, FOR create, update FULL, FOR delete NONE\n"
+            '    model_config = SurrealConfigDict(table_name="feed")\n'
+            "\n"
+            "    id: str | None = None\n"
+            "    owner: RecordID | None = None\n"
+        )
+
+    @pytest.mark.parametrize(
+        ("changefeed", "include_original", "permissions", "expected"),
+        [
+            ("3h", False, _TABLE_PERMISSIONS_NONE, ["# Changefeed: 3h"]),
+            (None, False, _TABLE_PERMISSIONS_NONE, []),
+            (None, False, {}, []),
+            (None, False, dict.fromkeys(_TABLE_PERMISSIONS_NONE, "FULL"), ["# Permissions: FULL"]),
+            (
+                None,
+                False,
+                dict.fromkeys(_TABLE_PERMISSIONS_NONE, "WHERE a > 1"),
+                ["# Permissions: FOR select, create, update, delete WHERE a > 1"],
+            ),
+            (None, False, {"select": "FULL"}, ["# Permissions: FOR select FULL"]),
+            (
+                None,
+                False,
+                {"delete": "FULL", "update": "NONE", "create": "WHERE a, b", "select": "WHERE a, b"},
+                ["# Permissions: FOR select, create WHERE a, b, FOR update NONE, FOR delete FULL"],
+            ),
+            (
+                "1w",
+                True,
+                {"select": "FULL", "create": "NONE", "update": "FULL", "delete": "NONE"},
+                ["# Changefeed: 1w INCLUDE ORIGINAL", "# Permissions: FOR select, update FULL, FOR create, delete NONE"],
+            ),
+        ],
+        ids=["changefeed", "defaults", "no-permissions", "full", "where", "partial", "grouped", "both"],
+    )
+    def test_changefeed_and_permissions_comments(
+        self, changefeed: str | None, include_original: bool, permissions: dict[str, str], expected: list[str]
+    ) -> None:
+        """``PERMISSIONS NONE`` on every operation, the default of a table, writes no comment; ``FULL`` for all four
+        operations is written alone, and one ``WHERE`` rule for all four names them, as SurrealDB renders both."""
+        source = _generate(
+            changefeed=changefeed, changefeed_include_original=include_original, permissions=permissions, comment="c"
+        )
+        lines = _class_block(source, "T").splitlines()
+        assert lines[1] == "    # Comment: c"
+        assert lines[2 : 2 + len(expected)] == ["    " + line for line in expected]
+        assert lines[2 + len(expected)].startswith("    model_config = ")
+
+    def test_long_permissions_are_cut(self) -> None:
+        source = _generate(permissions={"select": "WHERE " + "a" * 300})
+        line = _class_block(source, "T").splitlines()[1]
+        assert line == "    # Permissions: FOR select WHERE " + "a" * 89 + "..."
+        assert len(line) == 128
+
     def test_comments(self) -> None:
         source = _generate(
             _f("a", "int"),
@@ -1874,13 +1970,17 @@ class TestClasses:
             schema_mode="SCHEMALESS",
             comment="c",
             view_query="SELECT * FROM x",
+            changefeed="1d",
+            permissions={"select": "FULL"},
             indexes={"i": IndexState(name="i", fields=("at",))},
             events={"e": EventState("e", "r", "true", "(x)")},
         )
-        assert _class_block(source, "R").splitlines()[1:9] == [
+        assert _class_block(source, "R").splitlines()[1:11] == [
             "    # Comment: c",
             "    # IN any OUT any",
             "    # View: AS SELECT * FROM x",
+            "    # Changefeed: 1d",
+            "    # Permissions: FOR select FULL",
             '    # SCHEMALESS: fields not declared here are kept (extra="allow")',
             "    # Indexes: i",
             "    # Events: e",
@@ -2303,6 +2403,8 @@ def _corpus_state() -> SchemaState:
             schema_mode="SCHEMALESS" if index % 3 else "SCHEMAFULL",
             comment=text,
             view_query=text,
+            changefeed=text,
+            permissions={"select": "WHERE " + text, "create": text, text: "FULL"},
             relation_in=(text,),
             relation_out=(text, "b"),
             fields={field.name: field for field in fields},
@@ -2427,9 +2529,11 @@ def _random_state(rng: random.Random) -> SchemaState:
         tables[name] = TableState(
             name=name,
             schema_mode=rng.choice(["SCHEMAFULL", "SCHEMALESS"]),
-            table_type=rng.choice(["normal", "any", "relation"]),
+            table_type=rng.choice(["normal", "any", "relation", "RELATION"]),
             fields=fields,
             comment=rng.choice([None, "c", "\n#"]),
+            changefeed=rng.choice([None, "1d", "\n#"]),
+            permissions=rng.choice([{}, {"select": "WHERE \n#"}, dict.fromkeys(("select", "create"), "FULL")]),
             relation_in=rng.choice([(), ("a",)]),
             enforced=rng.random() < 0.5,
         )

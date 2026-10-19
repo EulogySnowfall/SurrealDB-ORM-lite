@@ -27,7 +27,7 @@ value is read as ``Subquery(qs)`` — sends **one** statement, inside which the 
 - **Live queries** keep the sub-SELECT inline (a ``LIVE SELECT`` cannot sit in a block), which is right there: the
   server evaluates it on every notification. SurrealDB 3.x accepts one whose subquery reads a table that does not
   exist and then never notifies, so the live query first reads each such table (``RETURN [(SELECT VALUE id FROM
-  <t> LIMIT 1), …];``) and raises S11 (:func:`live_table_missing`) when the server says one is missing.
+  <t> LIMIT 1), …];``) and raises (:func:`live_table_missing`) when the server says one is missing.
 - **A subquery table that does not exist** reads as empty on 2.x and on the embedded engine. SurrealDB 3.x raises
   "The table '<t>' does not exist"; :func:`missing_table` recognises only the server's own forms of that error
   (never the sentence inside another error, which may quote a value the statement read). The ORM then asks the
@@ -40,9 +40,9 @@ value is read as ``Subquery(qs)`` — sends **one** statement, inside which the 
 ``variables()`` merged into the statement and the querysets being rendered.
 
 **One connection (v0.29.0).** A subquery runs in the database of the statement around it, so its model must run on
-the connection of the statement's model: :meth:`SubqueryCompiler.reference` raises X2 (``routing.check_subquery()``)
-otherwise, and X4 (``routing.check_links()``) for a link the inner queryset follows to a model of another connection,
-when the statement compiles — before any request, a live query included.
+the connection of the statement's model: :meth:`SubqueryCompiler.reference` raises otherwise
+(``routing.check_subquery()``), and for a link the inner queryset follows to a model of another connection
+(``routing.check_links()``), when the statement compiles — before any request, a live query included.
 
 ``query_set`` and ``utils`` import this module, never the other way round at import time: ``QuerySet`` is
 imported lazily, for ``isinstance``.
@@ -108,7 +108,7 @@ class Subquery:
         queryset: the inner ``QuerySet`` (``Model.objects()…``).
 
     Raises:
-        TypeError: ``queryset`` is not a ``QuerySet`` (S1).
+        TypeError: ``queryset`` is not a ``QuerySet``.
     """
 
     __slots__ = ("queryset",)
@@ -213,7 +213,7 @@ class SubqueryCompiler:
         empty_tables: the tables whose subqueries are bound to ``[]`` (SurrealDB 3.x confirmed they do not exist).
         outer_tx: the outer queryset's transaction; an inner queryset may share it, never have another.
         moment: the moment of an ``as_of()`` read, at which every subquery reads too (``None``: the current state).
-        outer_model: the model of the statement (v0.29.0), whose connection every subquery must run on (X2);
+        outer_model: the model of the statement (v0.29.0), whose connection every subquery must run on;
             ``None`` checks nothing.
         variables: the statement's ``variables()``: the outer queryset's, then each subquery's, merged.
         lets: the ``LET $_sq<N> = …;`` of the block, innermost first.
@@ -252,7 +252,7 @@ class SubqueryCompiler:
         A name already bound keeps its value when the new one is the same (:func:`_same_value`).
 
         Raises:
-            ValueError: a name is already bound to another value (S7): the two querysets share one statement.
+            ValueError: a name is already bound to another value: the two querysets share one statement.
         """
         for name, value in variables.items():
             if name not in self.variables:
@@ -270,9 +270,9 @@ class SubqueryCompiler:
 
         Raises:
             ValueError: the inner queryset is being rendered already — the outer queryset itself, or a queryset
-                that reaches itself through another subquery (S3). Checked before anything else about it.
-            SurrealDbError: the inner queryset's model runs on another connection than :attr:`outer_model` (X2),
-                checked next; a link the inner queryset follows leads to a model of another connection (X4), checked
+                that reaches itself through another subquery. Checked before anything else about it.
+            SurrealDbError: the inner queryset's model runs on another connection than :attr:`outer_model`,
+                checked next; a link the inner queryset follows leads to a model of another connection, checked
                 once it is rendered (its ``Q`` objects name their fields then). Its ``fetch()`` is ignored, so it
                 follows no link.
         """
@@ -333,7 +333,7 @@ def subquery_condition(
         compiler: the statement's compiler; ``None`` for a ``Q`` compiled on its own.
 
     Raises:
-        ValueError: any other lookup (S2); no compiler (S8); and what :meth:`SubqueryCompiler.reference` raises.
+        ValueError: any other lookup; no compiler; and what :meth:`SubqueryCompiler.reference` raises.
     """
     if lookup not in COLLECTION_LOOKUPS and lookup not in FIRST_VALUE_LOOKUPS:
         raise ValueError(lookup_refused(lookup))
@@ -345,16 +345,16 @@ def subquery_condition(
     return f"({ref} != [] AND {field} {op} array::first({ref}))", values, counter
 
 
-# --- the texts of the errors (spec §5.5) ----------------------------------------------------------
+# --- the texts of the errors ----------------------------------------------------------------------
 
 
 def not_a_queryset(value: object) -> str:
-    """S1: ``Subquery()`` was given something other than a QuerySet."""
+    """The refusal of a ``Subquery()`` given something other than a QuerySet."""
     return f"Subquery() takes a QuerySet (Model.objects()...), not {type(value).__name__}"
 
 
 def lookup_refused(lookup: str) -> str:
-    """S2: a lookup that can take no subquery (``isnull``, the text and the spatial lookups)."""
+    """The refusal of a lookup that can take no subquery (``isnull``, the text and the spatial lookups)."""
     return (
         f"'{lookup}' cannot take a subquery: in, not_in, containsall and containsany compare with all its values; "
         "exact, gt, gte, lt, lte, contains and not_contains with its first value"
@@ -362,12 +362,12 @@ def lookup_refused(lookup: str) -> str:
 
 
 def own_subquery() -> str:
-    """S3: a queryset is, directly or through another subquery, its own subquery."""
+    """The refusal of a queryset that is, directly or through another subquery, its own subquery."""
     return "A queryset cannot be its own subquery: build the inner queryset with a new Model.objects() call."
 
 
 def clauses_refused(offenders: list[str]) -> str:
-    """S4: the inner queryset has clauses a subquery cannot honour (*offenders*, sorted)."""
+    """The refusal of an inner queryset with clauses a subquery cannot honour (*offenders*, sorted)."""
     return (
         f"A subquery cannot honour {', '.join(offenders)}: it gives the outer filter one list of values, SELECT VALUE "
         "<one field>. Drop the clause; filter(), Q, nearby(), select() of one field, order_by(), limit(), offset() "
@@ -376,14 +376,14 @@ def clauses_refused(offenders: list[str]) -> str:
 
 
 def moment_refused() -> str:
-    """S5: the inner queryset has an ``as_of()`` moment of its own."""
+    """The refusal of an inner queryset with an ``as_of()`` moment of its own."""
     return (
         "A subquery reads at the moment of the queryset that uses it: call as_of() on the outer queryset, not on the subquery."
     )
 
 
 def transaction_refused() -> str:
-    """S6: the inner queryset has a transaction that is not the outer queryset's."""
+    """The refusal of an inner queryset with a transaction that is not the outer queryset's."""
     return (
         "A subquery runs inside the statement of the queryset that uses it, so it cannot have a transaction of its "
         "own: build it with the same objects(tx=) as the outer queryset, or with none."
@@ -391,7 +391,7 @@ def transaction_refused() -> str:
 
 
 def variable_clash(name: str) -> str:
-    """S7: a subquery's ``variables()`` binds a name the statement already binds to another value."""
+    """The refusal of a subquery whose ``variables()`` binds a name the statement already binds to another value."""
     return (
         f"The subquery binds ${name} to another value than the queryset that uses it; they share one statement: "
         "rename one of the variables()."
@@ -399,7 +399,7 @@ def variable_clash(name: str) -> str:
 
 
 def outside_a_queryset() -> str:
-    """S8: a subquery in a ``Q`` (or ``build_filter_condition``) compiled with no statement to bind it in."""
+    """The refusal of a subquery in a ``Q`` (or ``build_filter_condition``) compiled with no statement to bind it in."""
     return (
         "A subquery compiles only inside a QuerySet (filter(), get_or_create(), live()...), which binds it in the "
         "statement it sends; Q.to_sql() alone cannot."
@@ -407,7 +407,7 @@ def outside_a_queryset() -> str:
 
 
 def criterion_written(field: str) -> str:
-    """S9a: a ``get_or_create()``/``update_or_create()`` ``exact`` criterion whose value is a subquery."""
+    """The refusal of a ``get_or_create()``/``update_or_create()`` ``exact`` criterion whose value is a subquery."""
     return (
         f"Cannot create a record from the subquery given for '{field}': a subquery is a filter whose values only the "
         f"database knows. Use a lookup such as {field}__in, and pass the value to write in defaults=."
@@ -415,12 +415,12 @@ def criterion_written(field: str) -> str:
 
 
 def default_written(method: str, key: str) -> str:
-    """S9b: a ``defaults=`` value of *method* (``get_or_create`` or ``update_or_create``) that is a subquery."""
+    """The refusal of a ``defaults=`` value of *method* (``get_or_create`` or ``update_or_create``) that is a subquery."""
     return f"{method}(defaults=) cannot write the subquery given for '{key}': a subquery is a filter value, not data."
 
 
 def value_written(field: str) -> str:
-    """S10: a ``bulk_update()`` value that is a subquery."""
+    """The refusal of a ``bulk_update()`` value that is a subquery."""
     return (
         f"bulk_update() writes its values as data; '{field}' got a subquery, which is a filter value: filter() with it "
         "and pass the value to write."
@@ -428,7 +428,7 @@ def value_written(field: str) -> str:
 
 
 def live_table_missing(table: str, exc: BaseException) -> str:
-    """S11: SurrealDB 3.x says that *table*, which a live query's subquery reads, does not exist (*exc*)."""
+    """The error when SurrealDB 3.x says that *table*, which a live query's subquery reads, does not exist (*exc*)."""
     return (
         f"Cannot start a live query whose subquery reads {table!r}: the table does not exist. SurrealDB 3.x evaluates "
         "the subquery on every change and would silently never notify (2.x reads a missing table as empty). Create "
@@ -437,7 +437,8 @@ def live_table_missing(table: str, exc: BaseException) -> str:
 
 
 def reserved_alias() -> str:
-    """S13: the inner ``order_by()`` names ``_sqv`` (or a path under it) where the ordered form selects its alias."""
+    """The refusal of an inner ``order_by()`` that names ``_sqv`` (or a path under it) where the ordered form selects
+    its alias."""
     return (
         f"'{VALUE_ALIAS}' names the values of an ordered subquery: a subquery can order by the column {VALUE_ALIAS} "
         f"only when it selects {VALUE_ALIAS} itself, and never by a path under it such as {VALUE_ALIAS}.x."
@@ -445,5 +446,5 @@ def reserved_alias() -> str:
 
 
 def inside_a_list(field: str, lookup: str) -> str:
-    """S15: a subquery given as an item of a list instead of as the whole value of a lookup."""
+    """The refusal of a subquery given as an item of a list instead of as the whole value of a lookup."""
     return f"'{lookup}' takes a subquery as its whole value, not inside a list: {field}__{lookup}=Subquery(...)"

@@ -23,7 +23,7 @@ What makes a cached result right:
   delete invalidates (a deleted record's edges go with it).
 
 Internal failures never fail a read: keying, copying a hit and copying a result to store fall back to the database.
-Nothing is logged but W2's fixed text: no row, variable or key.
+Nothing is logged but the fixed warning of an SDK without a CBOR encoder: no row, variable or key.
 
 A leaf module: it imports ``_sdk``, ``encoding``, ``exceptions``, ``routing`` and the standard library only
 (``BaseSurrealModel`` under ``TYPE_CHECKING``, and lazily in :meth:`QueryCache.invalidate`).
@@ -130,13 +130,13 @@ _retired: collections.deque[int] = collections.deque()
 
 
 def ttl_seconds(value: object, where: str) -> float:
-    """``value`` as seconds >= 0 (``0.0``: never cached); C1/C2 name ``where``.
+    """``value`` as seconds >= 0 (``0.0``: never cached); the errors name ``where``.
 
     An ``int`` or a ``float`` (``numbers.Real``, never a ``bool``) or a ``timedelta``.
 
     Raises:
-        TypeError: anything else (C1).
-        ValueError: negative or not finite (C2).
+        TypeError: anything else.
+        ValueError: negative or not finite.
     """
     if isinstance(value, bool) or not isinstance(value, (numbers.Real, timedelta)):
         raise TypeError(f"{where} must be a number of seconds or a timedelta, not {type(value).__name__}")
@@ -187,7 +187,7 @@ def _fingerprint(encoder: Callable[[Any], bytes], frame: list[Any], variables: M
 def statement_key(scope: int, kind: str, statement: str, variables: Mapping[str, Any]) -> str | None:
     """The key of an ORM read: ``["orm", scope, kind, statement, variables]``; ``None`` when it cannot be keyed.
 
-    ``None`` (the read goes to the database) when the installed SDK exposes no CBOR encoder (W2, once per
+    ``None`` (the read goes to the database) when the installed SDK exposes no CBOR encoder (a warning, once per
     process) or when anything raises, such as a value the SDK cannot send: the read raises its own error then.
     """
     encoder = cbor_encode
@@ -205,7 +205,7 @@ _FAILED: Final = object()
 
 
 def _require_str(method: str, name: str, value: object) -> None:
-    """C7."""
+    """Refuse a ``value`` that is not a ``str`` (``TypeError``)."""
     if not isinstance(value, str):
         raise TypeError(f"QueryCache.{method}() {name} must be a str, not {type(value).__name__}")
 
@@ -252,17 +252,17 @@ class QueryCache:
         """Set the cache's three settings, as the full SurrealDB-ORM does: an argument left out takes its default.
 
         ``default_ttl``: the TTL of a ``cache()`` read without one, in seconds or a ``timedelta`` (``0``: such reads
-        are never cached; C1, C2). ``max_size``: the most entries kept (C4); lowering it evicts the least recently
+        are never cached). ``max_size``: the most entries kept; lowering it evicts the least recently
         used entries at once. ``enabled=False`` hides the entries without removing them: ``get()`` returns ``None``,
         ``set()`` stores nothing, ``cache()`` reads go to the database, and nothing is counted; ``enabled=True``
-        serves again the entries still valid (C5). Writes, expiry and closed connections keep removing entries while
+        serves again the entries still valid. Writes, expiry and closed connections keep removing entries while
         the cache is disabled. Never clears the cache (``clear()`` does). Every argument is checked before any
         change.
 
         Raises:
-            TypeError: ``default_ttl`` is not a number of seconds or a ``timedelta`` (C1), ``max_size`` is not an
-                ``int`` (C4), ``enabled`` is not a ``bool`` (C5).
-            ValueError: ``default_ttl`` is negative or not finite (C2), ``max_size`` is below 1 (C4).
+            TypeError: ``default_ttl`` is not a number of seconds or a ``timedelta``, ``max_size`` is not an
+                ``int``, ``enabled`` is not a ``bool``.
+            ValueError: ``default_ttl`` is negative or not finite, ``max_size`` is below 1.
         """
         seconds = ttl_seconds(default_ttl, "QueryCache.configure() default_ttl")
         if isinstance(max_size, bool) or not isinstance(max_size, numbers.Integral):
@@ -286,8 +286,8 @@ class QueryCache:
         Built from the table, the statement and the variables as the SDK would send them (its CBOR encoding), with
         the keys of every mapping sorted (SurrealDB objects ignore key order, as the full ORM's ``sort_keys=True``
         does): two keys are equal only when the requests are equivalent. Raises ``TypeError`` for a non-``str``
-        query/table or a non-mapping ``variables`` (C7), or a value the SDK cannot send (C8); ``SurrealDbError`` when
-        the installed SDK exposes no CBOR encoder (C9).
+        query/table or a non-mapping ``variables``, or a value the SDK cannot send; ``SurrealDbError`` when the
+        installed SDK exposes no CBOR encoder.
         """
         _require_str("make_key", "query", query)
         if not isinstance(variables, Mapping):
@@ -303,11 +303,12 @@ class QueryCache:
 
     @classmethod
     def get(cls, key: str) -> Any | None:
-        """A copy of the value cached under ``key``; ``None`` when missing, expired or the cache is disabled (C7).
+        """A copy of the value cached under ``key``; ``None`` when missing, expired or the cache is disabled.
 
         Also ``None`` (a miss) while an ORM write to the entry's table runs, from its start to its end (its
         ``pre_*``, ``around_*`` and ``post_*`` handlers included), as a ``cache()`` read of that table then goes to
-        the database: the write removes the entry when it ends, with any entry ``set()`` meanwhile."""
+        the database: the write removes the entry when it ends, with any entry ``set()`` meanwhile. Raises
+        ``TypeError`` for a ``key`` that is not a ``str``."""
         _require_str("get", "key", key)
         with cls._guard():
             if not cls._enabled:
@@ -332,7 +333,8 @@ class QueryCache:
         ``table`` so that ``invalidate()`` and the ORM's writes to that table remove it. No-op when disabled; a
         ``ttl`` of ``0`` stores nothing and removes the key's previous entry (as the full ORM's already-expired
         entry). Keys you build are yours: include whatever tells your callers apart (an entry set here is not scoped
-        to an identity). Raises C1/C2 on ``ttl``, C7 on ``key``/``table``."""
+        to an identity). Raises ``TypeError`` or ``ValueError`` on ``ttl`` (as
+        ``configure()`` on ``default_ttl``), ``TypeError`` on a ``key`` or ``table`` that is not a ``str``."""
         _require_str("set", "key", key)
         _require_str("set", "table", table)
         seconds = None if ttl is None else ttl_seconds(ttl, "QueryCache.set() ttl")
@@ -355,7 +357,7 @@ class QueryCache:
     def invalidate(cls, model: type[BaseSurrealModel] | str) -> int:
         """Remove the cached entries of a model's table (or of the table named), and every cached read that
         follows links (``fetch()``, a dotted path); return how many entries were removed. A read of that table
-        running meanwhile is not stored. Raises ``TypeError`` for anything but a model class or a ``str`` (C6)."""
+        running meanwhile is not stored. Raises ``TypeError`` for anything but a model class or a ``str``."""
         from .model_base import BaseSurrealModel
 
         if isinstance(model, str):
@@ -557,7 +559,7 @@ class QueryCache:
 
     @classmethod
     def _warn_no_encoder(cls) -> None:
-        """Log W2 once per process (``clear()`` keeps the flag)."""
+        """Log the missing CBOR encoder once per process (``clear()`` keeps the flag)."""
         with cls._guard():
             if cls._warned_no_encoder:
                 return
@@ -782,7 +784,7 @@ def _resolve(
 
 
 def invalidates(of: _Of, *, deletes: bool = False) -> Callable[[F], F]:
-    """Decorate an ORM write method so that it invalidates the cached reads it can change (spec §5.4).
+    """Decorate an ORM write method so that it invalidates the cached reads it can change.
 
     ``of`` says which tables the call writes, from its first argument: ``"self"`` (the instance's model table),
     ``"cls"`` (the class's), ``"queryset"`` (the queryset's table; its ``objects(tx=)`` is the transaction),

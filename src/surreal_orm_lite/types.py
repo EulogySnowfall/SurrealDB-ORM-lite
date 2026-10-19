@@ -313,7 +313,7 @@ class Duration:
 
 
 def _serialize_duration(value: Any, info: core_schema.SerializationInfo[Any]) -> Any:
-    """The ``Duration`` field serializer (spec §5.2).
+    """The ``Duration`` field serializer.
 
     Python mode returns an ORM ``Duration``: the instance itself, or — when the attribute holds a
     raw SDK ``Duration`` (``model_construct``, ``_apply_record``, ``hydrate()``'s fallback) — one built
@@ -373,7 +373,7 @@ def _timedelta_from_any_duration(value: Duration | SdkDuration) -> Any:
 
 
 def _timedelta_from_sdk(value: Any) -> Any:
-    """The read rule of a top-level ``timedelta`` field (spec §6.3): SDK ``Duration`` → ``timedelta``.
+    """The read rule of a top-level ``timedelta`` field: SDK ``Duration`` → ``timedelta``.
 
     Only an instance of exactly the SDK's ``Duration`` class is converted, floored to the
     microsecond, when its ``elapsed`` is an ``int`` (not a ``bool``) within ``0 .. timedelta.max``.
@@ -386,7 +386,7 @@ def _timedelta_from_sdk(value: Any) -> Any:
 
 
 def _duration_from_sdk(value: Any) -> Any:
-    """The read rule of a top-level ``Duration`` field (spec §6.3): SDK ``Duration`` → ORM ``Duration``.
+    """The read rule of a top-level ``Duration`` field: SDK ``Duration`` → ORM ``Duration``.
 
     Only an instance of exactly the SDK's ``Duration`` class whose ``elapsed`` is an ``int`` (not a
     ``bool``) within ``0 .. Duration.MAX_NANOSECONDS`` is converted; anything else is returned as is.
@@ -399,7 +399,7 @@ def _duration_from_sdk(value: Any) -> Any:
     return value
 
 
-# --- Range[T] (spec §5.3) --------------------------------------------------------------------------
+# --- Range[T] --------------------------------------------------------------------------------------
 
 
 def _is_open_side(side: object) -> bool:
@@ -549,7 +549,7 @@ class Range(Generic[T]):
 
 
 def _serialize_range(value: Any, info: core_schema.SerializationInfo[Any]) -> Any:
-    """The ``Range`` field serializer (spec §5.3).
+    """The ``Range`` field serializer.
 
     A raw SDK ``Range`` (``model_construct``, ``_apply_record``, ``hydrate()``'s fallback) first
     becomes an ORM ``Range`` built **unchecked** (``Range._unchecked``: its open-side markers become

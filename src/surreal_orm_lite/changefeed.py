@@ -350,7 +350,7 @@ class ChangeModelStream(Generic[T]):
                 raise StopAsyncIteration
             if self._manager is not None:
                 # Before a pending event is handed out: once the connection serves other settings, no event of the
-                # previous database is yielded and the cursor stays where it was (R13).
+                # previous database is yielded and the cursor stays where it was (_check_generation).
                 self._check_generation()
             if self._pending:
                 event, after = self._pending.popleft()
@@ -375,7 +375,7 @@ class ChangeModelStream(Generic[T]):
         return self._manager
 
     def _check_generation(self) -> None:
-        """R13: the bound connection was removed or registered again with other settings since the stream bound it.
+        """Raise when the bound connection was removed or registered again with other settings since the stream bound it.
 
         Never retried: the error is not ``retryable``, and the generation never goes back, so every later read
         raises it again.
@@ -534,8 +534,8 @@ class ChangeModelStream(Generic[T]):
 
         A cancellation of the reading task (``asyncio.timeout``, ``wait_for``, ``Task.cancel()``) is
         never retried, even when the SDK reports it as a failed request: see
-        :func:`~surreal_orm_lite.live.cancellation_lost`. Nor is R13 (:meth:`_check_generation`),
-        checked before every attempt and again once the client is in hand.
+        :func:`~surreal_orm_lite.live.cancellation_lost`. Nor is the end of the bound settings
+        (:meth:`_check_generation`), checked before every attempt and again once the client is in hand.
         """
         manager = self._bound()
         delay = float(self.reconnect_delay)
@@ -543,7 +543,7 @@ class ChangeModelStream(Generic[T]):
         while True:
             if self._stopped:
                 raise _StreamStopped
-            # Outside the try: R13 is never taken for a connection failure, and nothing is sent (nor opened) once
+            # Outside the try: a settings change is never taken for a connection failure, and nothing is sent (nor opened) once
             # the connection serves other settings.
             self._check_generation()
             attempt += 1
@@ -551,7 +551,7 @@ class ChangeModelStream(Generic[T]):
             try:
                 client = await manager.get_client()
                 # Again with the client in hand, no await before the operation: get_client() may have waited (the
-                # embedded guard) while the settings changed. Raised here, R13 is re-raised below, not retried:
+                # embedded guard) while the settings changed. Raised here, its error is re-raised below, not retried:
                 # is_connection_failure() is false for a SurrealDbConnectionError that is not retryable.
                 self._check_generation()
                 return await operation(client)
