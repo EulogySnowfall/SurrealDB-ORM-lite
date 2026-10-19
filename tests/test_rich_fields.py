@@ -2687,8 +2687,9 @@ class TestNativeContractE2E:
     @pytest.mark.asyncio
     async def test_naive_datetime_reads_back_aware_utc(self) -> None:
         async with orm_client("rf_event"):
-            await RfEvent(id="naive", at=datetime(2026, 1, 2, 3, 4, 5)).save()
+            saved = await RfEvent(id="naive", at=datetime(2026, 1, 2, 3, 4, 5)).save()
             event = await RfEvent.objects().get("naive")
+        assert saved.at is not None and saved.at.tzinfo is not None and saved.at == datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
         assert event.at is not None and event.at.tzinfo is not None
         assert event.at == datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
 
