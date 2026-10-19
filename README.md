@@ -4197,12 +4197,20 @@ class Person(BaseSurrealModel):
   is a `dict[str, Any]` instead. A nested field whose parent is not defined makes that parent
   `dict[str, Any] | None = None`, noted in the header. Item definitions (`tags.*`) add no attribute: the array's kind
   carries the item type.
-- **`DEFAULT`**: a literal that fits the annotation becomes the Python default — `DEFAULT 18` → `= 18`, `'active'` →
-  `= "active"`, `true` → `= True`, `0.5f` on a `float` → `= 0.5`, `1.5dec` → `= Decimal("1.5")`, `NONE` → `= None`.
-  Any other default — an expression such as `time::now()`, a datetime, a duration, `[]`, a literal of another type —
-  makes the field `T | None = None` and lists its attribute in `server_fields`
+- **`DEFAULT`**: a constant the model can hold exactly becomes the Python default, so the database stores the same
+  value whether you set the field or not, and stores yours when you do — `DEFAULT 18` → `= 18`, `'active'` →
+  `= "active"`, `true` → `= True`, `0.5f` on a `float` → `= 0.5`, `1.5dec` → `= Decimal("1.5")`, `NONE` → `= None`,
+  `[]` → `= Field(default_factory=list)` (`set` for a set), `[1, 2]` → `= Field(default_factory=lambda: [1, 2])`,
+  `{}` → `= Field(default_factory=dict)` or the sub-model's class, `1h30m` →
+  `= Field(default_factory=lambda: Duration.parse("1h30m"))`, `d'2030-01-01T00:00:00Z'` →
+  `= datetime.fromisoformat("2030-01-01T00:00:00Z")`, `u'…'` → `= UUID("…")`. The value is copied when the models are
+  generated: generate them again after changing a `DEFAULT`. A `{}` whose sub-model needs a value makes the field
+  required, because SurrealDB refuses a create that leaves it to that default. Any other default — an expression such
+  as `time::now()`, a record id, `math::INF`, a non-empty object, a datetime with nanoseconds, a literal of another
+  type — makes the field `T | None = None` and lists its attribute in `server_fields`
   ([section 20](#20-field-aliases-server_fields-and-mergerefreshfalse)): omitted on create, so that the server's
-  default applies, and read back after `save()`.
+  default applies, and read back after `save()`. A value you set on such a field before `save()` is not written: set
+  it with `merge()` once the record exists.
 - **`VALUE` and `COMPUTED`**: `COMPUTED e` (SurrealDB 3.x), and a `VALUE e` that reads neither `$value` nor
   `$input`, become `Computed[T] = computed("e")` ([section 16](#16-computed-fields-computed--define-field--value)):
   never written, read back after `save()`. When `computed()` refuses the expression (a `;`, even inside a string, or
@@ -4230,6 +4238,11 @@ class Person(BaseSurrealModel):
 - `update()` fails on an instance holding a `READONLY` `datetime` field, after `get()` as after `save()`: Python keeps
   microseconds, SurrealDB nanoseconds, and the server refuses the changed value. The generated class says so: change
   such a record with `merge()`.
+- A sub-field filled by a `DEFAULT` the model does not hold (`prefs.at DEFAULT time::now()`, or any `DEFAULT` under a
+  `dict[str, Any]` field) stays `None` on the instance after `save()`, which reads back only `server_fields` and
+  computed fields. A following `update()` sends it as `NONE`: the server refuses it when the sub-field is required and
+  erases it when it is optional. The generated class says so: call `refresh()` after `save()` before an `update()`, or
+  change the record with `merge()`.
 - `array<T, N>` becomes `list[T]`: the length is left to the server, which checks it differently on each line
   (SurrealDB 2.x accepts at most N items, 3.x exactly N).
 - `null | T` becomes a required `T | None`, but the ORM sends `None` as `NONE`, which `null | T` refuses: give such a
@@ -4291,6 +4304,10 @@ reads, stores, logs or writes them.
 - **`default` is SurrealQL text**: `'18'`, `"'active'"`, `'time::now()'`, with `default_always` for
   `DEFAULT ALWAYS` (full ORM: a Python value, where `'active'` and `time::now()` both become strings). A
   `FieldState` built with a `default` that is not text raises `TypeError`.
+- **Typed defaults and `server_fields`**: a constant `DEFAULT` becomes a typed Python default
+  (`Field(default_factory=list)`, `Duration.parse(…)`, `datetime.fromisoformat(…)`, `UUID(…)`), and any other
+  `DEFAULT` becomes a `server_fields` entry (full ORM: `Field(default=…)` holding the SurrealQL text as a Python
+  string, such as `'[]'` or `'time::now()'`, and no `server_fields`).
 - **`nullable` means "may be NONE"**: it is true for an optional kind (`option<T>`, rendered `none | T` by
   SurrealDB 3.x); `null | T` is not nullable, since it refuses NONE (full ORM: nullable). `field_type` is `"any"`
   for a field without `TYPE`, as in the full ORM.

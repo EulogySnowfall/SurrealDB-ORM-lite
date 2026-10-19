@@ -1918,7 +1918,7 @@ _STATED_31 = [
     "schema.issues",
     "archive.connection",
 ]
-#: Spec §11.1 item 7 (P1, P2): the 17 "Coming from the full SurrealDB-ORM" bullets, exactly, and no 18th.
+#: Spec §11.1 item 7 (P1, P2; D25 amended): the 18 "Coming from the full SurrealDB-ORM" bullets, exactly, and no 19th.
 _COMING_FROM_31 = [
     "- **Same names and call shapes**: `DatabaseIntrospector(connection).introspect()`, "
     "`ModelCodeGenerator().generate(state)`, `generate_models_from_db(output_path, connection)`, and the state "
@@ -1936,6 +1936,10 @@ _COMING_FROM_31 = [
     "- **`default` is SurrealQL text**: `'18'`, `\"'active'\"`, `'time::now()'`, with `default_always` for `DEFAULT "
     "ALWAYS` (full ORM: a Python value, where `'active'` and `time::now()` both become strings). A `FieldState` built "
     "with a `default` that is not text raises `TypeError`.",
+    "- **Typed defaults and `server_fields`**: a constant `DEFAULT` becomes a typed Python default "
+    "(`Field(default_factory=list)`, `Duration.parse(…)`, `datetime.fromisoformat(…)`, `UUID(…)`), and any other "
+    "`DEFAULT` becomes a `server_fields` entry (full ORM: `Field(default=…)` holding the SurrealQL text as a Python "
+    "string, such as `'[]'` or `'time::now()'`, and no `server_fields`).",
     '- **`nullable` means "may be NONE"**: it is true for an optional kind (`option<T>`, rendered `none | T` by '
     'SurrealDB 3.x); `null | T` is not nullable, since it refuses NONE (full ORM: nullable). `field_type` is `"any"` '
     "for a field without `TYPE`, as in the full ORM.",
@@ -1987,6 +1991,7 @@ _COMING_FROM_PHRASES_31 = (
     "Sequences are tuples",
     "'WHERE <expr>'",
     "`default` is SurrealQL text",
+    "Typed defaults and `server_fields`",
     "may be NONE",
     "Accesses are database-level",
     "`encrypted` is not provided",
@@ -1999,6 +2004,31 @@ _COMING_FROM_PHRASES_31 = (
     "instead of `ForeignKey`/`ReferencesField`",
     "No singularisation",
     "`overwrite=False` added",
+)
+#: Spec §11.1 item 1b (D25 amended, M48, §14.9): the ``DEFAULT`` bullet of "How SurrealDB kinds become fields" and the
+#: sub-field bullet of "What the generator does not do", exactly (whitespace normalised).
+_DEFAULT_BULLET_31 = (
+    "- **`DEFAULT`**: a constant the model can hold exactly becomes the Python default, so the database stores the same "
+    "value whether you set the field or not, and stores yours when you do — `DEFAULT 18` → `= 18`, `'active'` → "
+    '`= "active"`, `true` → `= True`, `0.5f` on a `float` → `= 0.5`, `1.5dec` → `= Decimal("1.5")`, `NONE` → `= None`, '
+    "`[]` → `= Field(default_factory=list)` (`set` for a set), `[1, 2]` → `= Field(default_factory=lambda: [1, 2])`, "
+    "`{}` → `= Field(default_factory=dict)` or the sub-model's class, `1h30m` → "
+    "`= Field(default_factory=lambda: Duration.parse(\"1h30m\"))`, `d'2030-01-01T00:00:00Z'` → "
+    '`= datetime.fromisoformat("2030-01-01T00:00:00Z")`, `u\'…\'` → `= UUID("…")`. The value is copied when the models '
+    "are generated: generate them again after changing a `DEFAULT`. A `{}` whose sub-model needs a value makes the "
+    "field required, because SurrealDB refuses a create that leaves it to that default. Any other default — an "
+    "expression such as `time::now()`, a record id, `math::INF`, a non-empty object, a datetime with nanoseconds, a "
+    "literal of another type — makes the field `T | None = None` and lists its attribute in `server_fields` "
+    "([section 20](#20-field-aliases-server_fields-and-mergerefreshfalse)): omitted on create, so that the server's "
+    "default applies, and read back after `save()`. A value you set on such a field before `save()` is not written: "
+    "set it with `merge()` once the record exists."
+)
+_SUB_FIELD_BULLET_31 = (
+    "- A sub-field filled by a `DEFAULT` the model does not hold (`prefs.at DEFAULT time::now()`, or any `DEFAULT` "
+    "under a `dict[str, Any]` field) stays `None` on the instance after `save()`, which reads back only "
+    "`server_fields` and computed fields. A following `update()` sends it as `NONE`: the server refuses it when the "
+    "sub-field is required and erases it when it is optional. The generated class says so: call `refresh()` after "
+    "`save()` before an `update()`, or change the record with `merge()`."
 )
 #: Spec §11.1 item 8 (D18): the key phrases and the link AC-16 names.
 _PERMISSIONS_PHRASES_31 = ("never read", "before 3.2.2", "never reads, stores, logs or writes them")
@@ -2104,6 +2134,10 @@ _PART_NEEDLES_31 = {
         "Computed[T]",
         "`computed()` refuses",
         "`$value`",
+        "`= Field(default_factory=list)`",
+        "`= datetime.fromisoformat(",
+        "generate them again after changing a `DEFAULT`",
+        "`merge()` once the record exists",
         'extra="allow"',
         "`Field(alias=",
         "`datetime_`",
@@ -2117,6 +2151,7 @@ _PART_NEEDLES_31 = {
         "`# READONLY`",
         "`update()`",
         "`merge()`",
+        "`refresh()`",
         "`array<T, N>`",
         "`null | T`",
         "`define_computed_fields()`",
@@ -2247,8 +2282,17 @@ class TestReadmeSection31:
             assert phrase in text, phrase
         assert f"]({_INFO_DOCUMENTATION})" in text
 
+    def test_default_bullets_exactly(self) -> None:
+        """Spec §11.1 item 1b: the ``DEFAULT`` bullet; the sub-field bullet right after the M29 ``update()`` bullet."""
+        kinds = _bullets(_part_31("How SurrealDB kinds become fields"))
+        assert _DEFAULT_BULLET_31 in kinds, kinds
+        assert kinds[kinds.index(_DEFAULT_BULLET_31) - 1].startswith("- **Sub-models**")
+        limits = _bullets(_part_31("What the generator does not do"))
+        assert _SUB_FIELD_BULLET_31 in limits, limits
+        assert limits[limits.index(_SUB_FIELD_BULLET_31) - 1].startswith("- `update()` fails on an instance holding")
+
     def test_coming_from_the_full_orm(self) -> None:
-        """Spec §11.1 item 7 (P1, P2): 17 bullets, exactly, and no 18th."""
+        """Spec §11.1 item 7 (P1, P2; D25 amended): 18 bullets, exactly, and no 19th."""
         assert _bullets(_part_31("Coming from the full SurrealDB-ORM")) == _COMING_FROM_31
 
     def test_coming_from_key_phrases_in_order(self) -> None:
