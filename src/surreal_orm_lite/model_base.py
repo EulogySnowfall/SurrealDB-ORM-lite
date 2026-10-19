@@ -2118,7 +2118,11 @@ class BaseSurrealModel(BaseModel):
         Update the model instance to the database.
 
         A full replace (``UPDATE $rid CONTENT …``): every field the instance holds is written, and a
-        field it does not hold is removed from the record. When ``tx`` is provided, the UPDATE
+        field it does not hold is removed from the record. After a call that applied the returned
+        row (``save()``, ``refresh()``, ``merge()``…), the instance holds the values a read gives
+        (#261), and those are written: a ``float`` field stored in a ``decimal`` column writes the
+        float's rounding (declare ``Decimal`` to keep every digit), and under ``extra="allow"`` the
+        columns in ``model_extra`` are written back, not removed. When ``tx`` is provided, the UPDATE
         statement is buffered onto the transaction instead of being executed immediately. The
         record id is bound (``$rid``), never written into the statement, so every id shape works —
         an array id such as ``follows:[User:alice, User:bob]`` included.
@@ -2457,7 +2461,9 @@ class BaseSurrealModel(BaseModel):
         Compiled to ``{field} += $amount`` — identical on 2.6.x and 3.x. Pass a negative
         ``amount`` to decrement. ``amount`` may be a ``decimal.Decimal`` for exact arithmetic
         (the value is bound, not interpolated); adding a ``Decimal`` to an int/float field
-        coerces the stored field to SurrealDB ``decimal``. Emits no signals.
+        coerces the stored field to SurrealDB ``decimal``. The instance then holds the value a
+        read gives (#261): a ``float`` field a ``float``, whose rounding a later ``update()``
+        writes back, so declare the field ``Decimal`` to keep the exact sum. Emits no signals.
 
         A duration amount raises ``TypeError`` (v0.23.0): SurrealDB 2.x ignores ``+=`` with a
         duration.

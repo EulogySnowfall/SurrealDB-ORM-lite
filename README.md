@@ -2424,8 +2424,15 @@ that does not validate, is applied as received, so these calls never fail on it.
 the server's `RecordID`. A column the model does not declare goes where a read puts it: as the SDK
 reads it into `model_extra` under `extra="allow"`, nowhere otherwise. So a column holding a Pydantic
 `@computed_field` (`model_dump()` writes it) or named like a method (`json`) never replaces that
-attribute. Writing such an instance back is safe, sub-models included, since those values are
-stored the same way.
+attribute.
+
+Writing such an instance back is safe, sub-models included: a following `update()` replaces the
+record with these values, as after `get()`. So a `float` field stored in a `decimal` column writes
+the float's rounding (`0.12345678901234567890` becomes `0.1234567890123457`: declare `Decimal` to
+keep every digit), and under `extra="allow"` the columns in `model_extra` are written back, not
+removed. An enum declared `(str, Enum)` or `(int, Enum)` holds the member, as after `get()`: it
+compares equal to its value, but `str()` and f-strings give `Color.RED`, not `red` (a `StrEnum` or
+an `IntEnum` gives the value), so use `.value` to build a key, a URL or a log line from it.
 
 #### Values the SDK cannot read
 
