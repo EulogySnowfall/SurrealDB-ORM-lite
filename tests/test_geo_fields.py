@@ -376,8 +376,8 @@ class TestGeometryApplyRecord:
             assert type(getattr(place, key)) is GeometryPoint and getattr(place, key) == GeometryPoint(*value)
         assert type(place.area) is GeometryPolygon and _all_orm(place.area)
         assert place.area == GeometryPolygon.parse_coordinates([RING, HOLE])
-        # A typed container keeps the row's values (its serializer converts them); a sub-model is validated (#228).
-        assert type(place.many[0]) is SdkPoint
+        # A typed container holds what a read gives (#261), as a sub-model does (#228).
+        assert type(place.many[0]) is GeometryPoint and place.many[0] == GeometryPoint(*A)
         assert type(place.sub) is GeoSub and type(place.sub.where) is GeometryPoint
         assert place.sub.where == GeometryPoint(*NEAR)
         assert (place.name, place.n) == ("r", 3)

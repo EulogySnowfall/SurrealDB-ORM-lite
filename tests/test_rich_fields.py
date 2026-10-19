@@ -10,16 +10,16 @@ import asyncio
 import contextlib
 import copy
 import dataclasses
+import enum
 import inspect
 import re
-import sys
 import threading
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Annotated, Any, ForwardRef, Literal, Optional, Self
+from typing import Annotated, Any, Literal, Optional, Self
 from uuid import UUID
 
 import pydantic
@@ -40,7 +40,7 @@ from pydantic import (
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 from surrealdb import RecordID
 from surrealdb.cbor import undefined
-from typing_extensions import TypeAliasType, TypedDict
+from typing_extensions import TypedDict
 
 from surreal_orm_lite import (
     AuthenticatedUserMixin,
@@ -69,7 +69,7 @@ from surreal_orm_lite import (
 from surreal_orm_lite._sdk import Bound, SurrealError
 from surreal_orm_lite.live import hydrate
 from surreal_orm_lite.testing import embedded_database
-from surreal_orm_lite.utils import build_filter_condition
+from surreal_orm_lite.utils import _KEEP_LIMIT, _KEEP_MAX_DEPTH, PLAIN_CONTENT, build_filter_condition, replace_content
 from tests._retry import retry_write
 from tests.conftest import change_feed_database, orm_client
 from tests.test_model_auth import AUTH_PASSWORD, _connect, _unique_email
@@ -773,10 +773,10 @@ class TestSetDataRule:
 
 
 class TestApplyRecordRule:
-    """§6.3 item 3 (D1): top-level durations are converted; ``date``, set and ``Range`` fields take the type a read
-    gives (#261); every other value is applied as received."""
+    """§6.3 item 3 (D1): top-level durations are converted; since #261 every other field takes the value a read gives
+    (a ``date``, a set, the ORM's ``Range`` and durations…), the row itself unchanged."""
 
-    def test_durations_converted_read_types_validated_other_values_raw(self) -> None:
+    def test_durations_converted_other_values_validated(self) -> None:
         event = RfEvent(id="x")
         day = datetime(2026, 1, 2, tzinfo=UTC)
         tags = ["a"]
@@ -798,8 +798,9 @@ class TestApplyRecordRule:
         assert type(event.day) is date and event.day == date(2026, 1, 2)
         assert type(event.tags) is set and event.tags == {"a"}
         assert type(event.hours) is Range and event.hours == Range(BoundIncluded(9), BoundExcluded(17))
-        assert event.durs is durs
+        assert [type(d) for d in event.durs] == [Duration] and event.durs == [Duration(1)]
         assert day == datetime(2026, 1, 2, tzinfo=UTC) and tags == ["a"], "the row is not changed"
+        assert [type(d) for d in durs] == [surrealdb.Duration]
 
     def test_out_of_range_values_are_kept(self) -> None:
         event = RfEvent(id="x")
@@ -817,12 +818,14 @@ class TestApplyRecordRule:
         kinds._apply_record({"pauseCol": surrealdb.Duration(60 * 10**9), "graceTime": surrealdb.Duration(7)})
         assert kinds.pause == timedelta(minutes=1) and type(kinds.grace) is Duration and kinds.grace.elapsed == 7
 
-    def test_model_without_rich_fields_sets_the_row_objects(self) -> None:
+    def test_model_without_rich_fields_sets_the_row_values(self) -> None:
         plain = RfPlain(id="p")
         row = {"id": RecordID("rf_plain", "p"), "name": "n", "tags": ["a"], "meta": {"d": surrealdb.Duration(1)}}
         plain._apply_record(row)
-        assert plain.id is row["id"] and plain.name is row["name"]
-        assert plain.tags is row["tags"] and plain.meta is row["meta"]
+        assert plain.id is row["id"], "the id stays the row's RecordID"
+        # #261: validated as a read validates them, on a copy: equal values, the row's objects left alone.
+        assert (plain.name, plain.tags, plain.meta) == ("n", ["a"], {"d": surrealdb.Duration(1)})
+        assert plain.tags is not row["tags"] and plain.meta is not row["meta"]
 
 
 class TestHydrateNeverRaises:
@@ -1347,68 +1350,17 @@ class TestSubModelSyncRule:
     """#228 (unit): the fields a write sync validates, and the fallback to the value as received."""
 
     def test_fields_validated_on_sync(self) -> None:
-        expected = {"sub", "maybe", "subs", "by_key", "data", "datas", "typed", "plain", "tds"}
+        # #261: every declared field but ``id`` and the top-level ``timedelta``/``Duration`` fields, which have their
+        # own rule (#228 validated only the fields holding a sub-model, a geometry or a nested ``timedelta``).
+        expected = {"sub", "maybe", "subs", "by_key", "data", "datas", "typed", "plain", "many", "tds", "n"}
         assert set(RfHolder._sync_fields()) == expected
         assert RfHolder._sync_fields() is RfHolder._sync_fields(), "cached per class"
-        assert RfPlain._sync_fields() == {}
-        # #261: the fields a read gives another type than the SDK's value (``date``, set, ``Range``).
-        assert set(RfEvent._sync_fields()) == {"day", "tags", "hours", "period"}
-        # A ``timedelta`` below the top level, never one the top-level rule converts (nor a subclass).
-        assert set(RfKinds._sync_fields()) == {"either", "many", "by_key", "window"}
+        assert set(RfPlain._sync_fields()) == {"name", "tags", "meta"}
+        assert set(RfEvent._sync_fields()) == set(RfEvent.model_fields) - {"id", "ttl", "grace"}
+        # Never a ``timedelta`` the top-level rule converts (a subclass is not one), nor a computed one.
+        assert set(RfKinds._sync_fields()) == {"either", "many", "by_key", "sub", "window"}
         # Python names only: ``_apply_record`` translates each column first.
         assert "stdCol" not in RfOddHolder._sync_fields() and "std_column" in RfOddHolder._sync_fields()
-
-    @pytest.mark.parametrize(
-        "annotation",
-        [
-            RfSub,
-            RfSubData,
-            RfSubDict,
-            RfPydData,
-            RfSub | None,
-            Optional[RfSub],  # noqa: UP045 (typing.Union on purpose)
-            list[RfSub],
-            dict[str, RfSub],
-            tuple[int, RfSub],
-            list[RfSub | None],
-            Annotated[RfSub, Field(description="x")],
-            Range[RfSub],
-            TypeAliasType("RfSubs", list[RfSub]),
-        ],
-    )
-    def test_structured_annotations(self, annotation: Any) -> None:
-        assert model_base._has_structured_type(annotation)
-
-    @pytest.mark.parametrize(
-        "annotation",
-        [
-            int,
-            Any,
-            list[int],
-            dict[str, Any],
-            Duration,
-            Range[int],
-            timedelta,
-            datetime,
-            Literal["a", "b"],
-            type[RfSub],
-            "RfSub",
-            ForwardRef("RfSub"),
-            Annotated[int, RfSub],
-            TypeAliasType("RfInts", list[int]),
-        ],
-    )
-    def test_other_annotations(self, annotation: Any) -> None:
-        assert not model_base._has_structured_type(annotation)
-
-    @pytest.mark.skipif(sys.version_info < (3, 12), reason="the type statement needs Python 3.12")
-    def test_type_statement_aliases(self) -> None:
-        namespace: dict[str, Any] = {"RfSub": RfSub}
-        # Recursive, resolvable, and one whose value cannot be evaluated (NameError on access).
-        exec("type Loop = list[Loop] | int\ntype Subs = list[RfSub]\ntype Bad = list[Undefined]", namespace)
-        assert not model_base._has_structured_type(namespace["Loop"])
-        assert model_base._has_structured_type(namespace["Subs"])
-        assert not model_base._has_structured_type(namespace["Bad"])
 
     def test_a_returned_row_gives_the_declared_instances(self) -> None:
         holder = RfHolder.model_construct(id="h", sub=None)
@@ -1416,8 +1368,8 @@ class TestSubModelSyncRule:
         assert type(row["sub"]["ttl"]) is surrealdb.Duration and type(row["data"]["hours"]) is surrealdb.Range
         holder._apply_record(row)
         _assert_sub_models(holder)
-        # A typed container of scalars keeps the SDK's values (out of the rule), and its serializer converts them.
-        assert [type(d) for d in holder.many] == [surrealdb.Duration]
+        # #261: a typed container of scalars holds what a read gives too, the ORM's durations.
+        assert [type(d) for d in holder.many] == [Duration]
         assert holder.model_dump()["many"] == HOLDER["many"]
 
     def test_only_still_filters(self) -> None:
@@ -1772,26 +1724,6 @@ class TestNestedTimedeltaRead:
 
         shared = RfShared.model_validate({"both": {"ttl": _SDK_TD, "td": _SDK_TD}})
         assert shared.both is not None and shared.both.ttl == Duration(_SDK_TD.elapsed) and shared.both.td == _TD
-
-    @pytest.mark.parametrize(
-        ("annotation", "expected"),
-        [
-            (list[timedelta], True),
-            (dict[str, timedelta], True),
-            (timedelta | str, True),
-            (Range[timedelta], True),
-            (Annotated[list[timedelta], Field(min_length=1)], True),
-            (TypeAliasType("RfTds", list[timedelta]), True),
-            (timedelta, True),  # a top-level one has its own rule: ``_sync_fields`` leaves it out by its read kind
-            (_SubTimedelta, False),
-            (list[_SubTimedelta], False),
-            (RfTdSub, False),  # a sub-model counts as a structured type instead
-            (Duration, False),
-            (list[int], False),
-        ],
-    )
-    def test_annotations_holding_a_timedelta(self, annotation: Any, expected: bool) -> None:
-        assert model_base._holds_timedelta(annotation) is expected
 
     def test_the_path_must_end_on_the_refused_value(self) -> None:
         value = surrealdb.Duration(5)
@@ -3040,9 +2972,7 @@ class TestWriteSyncGivesTheReadTypes:
     """#261 case 3 (unit): the rule behind the E2E above, and its fallback when the row does not validate."""
 
     def test_sync_fields(self) -> None:
-        assert set(RfShapes._sync_fields()) == {"pair", "tags", "day", "hours", "nested"}
-        assert set(RfEvent._sync_fields()) >= {"day", "hours", "period", "tags"}
-        assert "at" not in RfEvent._sync_fields() and "n" not in RfEvent._sync_fields()
+        assert set(RfShapes._sync_fields()) == {"pair", "tags", "day", "hours", "nested", "n"}
 
     def test_a_row_that_fails_validates_each_field_alone(self) -> None:
         shapes = RfShapes()
@@ -3063,6 +2993,239 @@ class TestWriteSyncGivesTheReadTypes:
         assert rejected.pair == [1, "a"] and rejected.n == -1  # as received: the model's validator may reshape anything
         rejected._apply_record({"pair": [2, "b"], "n": 1})
         assert rejected.pair == (2, "b") and rejected.n == 1
+
+
+class RfStatus(enum.StrEnum):
+    ACTIVE = "active"
+    IDLE = "idle"
+
+
+class RfLevel(enum.IntEnum):
+    LOW = 1
+    HIGH = 2
+
+
+class RfTyped(BaseSurrealModel):
+    """Scalars whose read type is not the SDK's value: a ``StrEnum``, an ``IntEnum``, a list of enums and a ``float``
+    stored in a ``decimal`` column (the SDK reads a ``str``, an ``int``, ``str`` items and a ``Decimal``)."""
+
+    model_config = SurrealConfigDict(table_name="rf_typed")
+
+    id: str | None = None
+    status: RfStatus = RfStatus.ACTIVE
+    level: RfLevel = RfLevel.HIGH
+    statuses: list[RfStatus] = Field(default_factory=lambda: [RfStatus.IDLE])
+    amount: float = 1.5
+
+
+class RfTypedLink(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="rf_typed_link")
+
+    status: RfStatus = RfStatus.ACTIVE
+    level: RfLevel = RfLevel.HIGH
+    statuses: list[RfStatus] = Field(default_factory=lambda: [RfStatus.IDLE])
+    amount: float = 1.5
+
+
+_RF_TYPED_DDL = (
+    "DEFINE TABLE rf_typed SCHEMALESS;"
+    "DEFINE FIELD amount ON rf_typed TYPE decimal;"
+    "DEFINE TABLE rf_typed_link TYPE RELATION SCHEMALESS;"
+    "DEFINE FIELD amount ON rf_typed_link TYPE decimal;"
+)
+
+
+async def _typed_after(write: str) -> RfTyped | RfTypedLink:
+    """An ``RfTyped`` (an ``RfTypedLink`` for ``edge``) after *write*, each a write that applies the returned row."""
+    if write == "save-auto-id":
+        return await RfTyped().save()
+    if write == "tx":
+        async with SurrealDBConnectionManager.transaction() as tx:
+            if not tx.is_interactive:
+                pytest.skip("a buffered transaction returns no row before commit")
+            return await RfTyped(id="t").save(tx=tx)
+    typed = await RfTyped(id="t").save()
+    if write == "edge":
+        return await RfTypedLink(in_=typed, out=typed).save()
+    if write == "upsert":
+        await typed.upsert()
+    elif write == "merge":
+        await typed.merge(amount=2.5)
+    elif write == "refresh":
+        await typed.refresh()
+    return typed
+
+
+class TestWriteSyncGivesTheReadScalarsE2E:
+    """#261 review: after a write that applies the returned row, every field holds the type a read gives, not the
+    SDK's value (an enum is the enum, not its ``str``/``int``; a ``float`` stored as ``decimal`` is a ``float``), so
+    ``model_dump()``, ``update()`` and arithmetic behave as after ``get()``, on the line under test and on ``mem://``."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    @pytest.mark.parametrize("write", ["save-explicit-id", "save-auto-id", "tx", "edge", "upsert", "merge", "refresh"])
+    async def test_read_types(self, kind: str, write: str) -> None:
+        async with _rf_engine(kind, _RF_TYPED_DDL, "rf_typed", "rf_typed_link"):
+            typed = await _typed_after(write)
+            assert type(typed.status) is RfStatus and typed.status is RfStatus.ACTIVE
+            assert type(typed.level) is RfLevel and typed.level is RfLevel.HIGH
+            assert [type(item) for item in typed.statuses] == [RfStatus]
+            assert type(typed.amount) is float and typed.amount * 1.1 > 1
+            if isinstance(typed, RfTyped):
+                rid = typed._record_id()
+                assert rid is not None
+                got = await RfTyped.objects().get(rid.id)
+                assert typed.model_dump(exclude={"id"}) == got.model_dump(exclude={"id"})
+                names = ("status", "level", "amount")
+                assert [type(getattr(typed, name)) for name in names] == [type(getattr(got, name)) for name in names]
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")  # no PydanticSerializationUnexpectedValue ("Expected `enum`")
+                typed.model_dump(exclude={"id"})  # a returned id stays the native RecordID (README, record IDs)
+                await typed.update()
+
+
+class TestWriteSyncGivesTheReadScalars:
+    """#261 review (unit): the whole returned row is validated as a read validates it; when it does not validate,
+    each field alone, and a value that still does not validate is applied as received."""
+
+    def test_every_field_takes_the_read_type(self) -> None:
+        typed = RfTyped(id="t")
+        row = {"id": RecordID("rf_typed", "t"), "status": "idle", "level": 1, "statuses": ["active"], "amount": Decimal("2.5")}
+        typed._apply_record(row)
+        assert typed.status is RfStatus.IDLE and typed.level is RfLevel.LOW and typed.statuses == [RfStatus.ACTIVE]
+        assert type(typed.amount) is float and typed.amount == 2.5
+        assert typed.id == RecordID("rf_typed", "t"), "the id stays the native RecordID"
+
+    def test_a_row_that_fails_validates_each_field_alone(self) -> None:
+        typed = RfTyped(id="t")
+        typed._apply_record({"status": "idle", "level": "nope", "amount": Decimal("2.5")})
+        assert typed.status is RfStatus.IDLE and type(typed.amount) is float
+        assert typed.level == "nope", "a value that does not validate is applied as received"
+
+
+# --- replace_content stays bounded (#261 review) ---------------------------------------------------
+
+_DT = datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC)
+
+
+def _nested(depth: int, leaf: Any, through_lists: bool = False) -> Any:
+    """*leaf* inside *depth* sub-objects (each one in a one-item list too when *through_lists*)."""
+    value = leaf
+    for _ in range(depth):
+        value = [{"k": value}] if through_lists else {"k": value}
+    return value
+
+
+class TestReplaceContentBounds:
+    """#261 review (unit): the compiled ``CONTENT`` of a full replace stays bounded whatever the shape of the data."""
+
+    def test_no_datetime_sends_data(self) -> None:
+        data = {"title": "t", "sub": {"n": 1}}
+        assert replace_content(data) == (PLAIN_CONTENT, {"data": data})
+
+    def test_a_large_list_is_sent_as_is(self) -> None:
+        log = [_DT] * 10_000
+        content, bound = replace_content({"title": "t", "created": _DT, "log": log})
+        assert content.count("$this") == 3, "only `created` keeps its stored value"
+        assert len(bound) == 6 and any(value is log for value in bound.values())
+        assert len(content) < 300
+
+    def test_kept_datetimes_are_capped(self) -> None:
+        content, bound = replace_content({f"d{i}": _DT for i in range(200)})
+        assert content.count("$this") == 3 * _KEEP_LIMIT
+        assert len(bound) == 2 * 200
+
+    def test_top_level_datetimes_come_first(self) -> None:
+        content, _ = replace_content({"log": [_DT] * _KEEP_LIMIT, "created": _DT})
+        assert content.count("$this") == 3, "`created` is kept, `log` (no budget left for all of it) is sent as is"
+        content, _ = replace_content({"log": [_DT] * (_KEEP_LIMIT - 1), "created": _DT})
+        assert content.count("$this") == 3 * _KEEP_LIMIT
+
+    def test_depth_is_capped(self) -> None:
+        content, _ = replace_content({"deep": _nested(_KEEP_MAX_DEPTH, _DT)})
+        assert content.count("$this") == 3 and content.count("object::from_entries") == 1 + _KEEP_MAX_DEPTH
+        assert replace_content({"deep": _nested(_KEEP_MAX_DEPTH + 1, _DT)})[0] == PLAIN_CONTENT
+        content, _ = replace_content({"created": _DT, "deep": _nested(60, _DT, through_lists=True)})
+        assert content.count("$this") == 3 and content.count("object::from_entries") == 1
+
+
+class RfDeep(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_deep")
+
+    id: str | None = None
+    title: str = "t"
+    created: datetime | None = None
+    doc: dict[str, Any] = {}
+    history: list[RfStampMeta] = []
+
+
+#: ``READONLY`` datetimes at the top level, three levels down (kept) and four levels down (sent as read).
+_RF_DEEP_DDL = (
+    "DEFINE TABLE rf_deep SCHEMALESS;"
+    "DEFINE FIELD created ON rf_deep TYPE option<datetime> READONLY;"
+    "DEFINE FIELD doc ON rf_deep TYPE object DEFAULT {};"
+    "DEFINE FIELD doc.a ON rf_deep TYPE option<object>;"
+    "DEFINE FIELD doc.a.b ON rf_deep TYPE option<object>;"
+    "DEFINE FIELD doc.a.b.at ON rf_deep TYPE option<datetime> READONLY;"
+    "DEFINE FIELD doc.a.b.c ON rf_deep TYPE option<object>;"
+    "DEFINE FIELD doc.a.b.c.at ON rf_deep TYPE option<datetime> READONLY;"
+)
+_RF_DEEP_SEED = (
+    "CREATE rf_deep:seed CONTENT {title: 't', created: d'2026-01-02T03:04:05.123456789Z', "
+    "doc: {a: {b: {at: d'2026-01-02T03:04:05.987654321Z', c: {}}}}};"
+)
+_RF_DEEP_STAMPS = "SELECT VALUE [<string> created, <string> doc.a.b.at] FROM ONLY rf_deep:seed;"
+#: The same record with a datetime four levels down too.
+_RF_DEEPER_SEED = _RF_DEEP_SEED.replace("c: {}", "c: {at: d'2026-01-02T03:04:05.000000001Z'}")
+
+
+class TestReplaceContentBoundsE2E:
+    """#261 review: ``update()`` of data nested past the servers' parse and computation limits, or holding long lists
+    of datetimes, passes as before #261, directly and in a transaction, on the line under test and on ``mem://``. The
+    stored datetimes it keeps are the top-level ones first, down to three levels."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    @pytest.mark.parametrize("tx", [False, True], ids=["direct", "tx"])
+    async def test_deep_and_long_payloads(self, kind: str, tx: bool) -> None:
+        async with _rf_engine(kind, "DEFINE TABLE rf_deep SCHEMALESS;", "rf_deep") as client:
+            deep = await RfDeep(
+                id="x",
+                created=_DT,
+                doc={"objects": _nested(30, _DT), "lists": _nested(20, _DT, through_lists=True)},
+                history=[RfStampMeta(at=_DT, seen=_DT) for _ in range(500)],
+            ).save()
+            deep.title = "u"
+            await _replace(deep, "update", tx)
+            got = await RfDeep.objects().get("x")
+            assert got.title == "u" and got.doc == deep.doc and got.history == deep.history
+            assert await client.query("RETURN array::len(rf_deep:x.history);", {}) == 500
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    async def test_readonly_datetimes_within_the_bounds_are_kept(self, kind: str) -> None:
+        async with _rf_engine(kind, _RF_DEEP_DDL, "rf_deep") as client:
+            await client.query(_RF_DEEP_SEED, {})
+            before = await client.query(_RF_DEEP_STAMPS, {})
+            seed = await RfDeep.objects().get("seed")
+            seed.title = "u"
+            seed.history = [RfStampMeta(at=_DT) for _ in range(_KEEP_LIMIT)]  # no budget left for all of it: sent as is
+            await seed.update()
+            assert await client.query(_RF_DEEP_STAMPS, {}) == before
+            assert (await RfDeep.objects().get("seed")).title == "u"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    async def test_a_readonly_datetime_past_the_depth_is_refused(self, kind: str) -> None:
+        """The documented limit: four levels down, the datetime is sent as the SDK read it and ``READONLY`` refuses it."""
+        async with _rf_engine(kind, _RF_DEEP_DDL, "rf_deep") as client:
+            await client.query(_RF_DEEPER_SEED, {})
+            seed = await RfDeep.objects().get("seed")
+            seed.title = "u"
+            with pytest.raises((SurrealError, SurrealDbError), match="readonly"):
+                await seed.update()
+            await seed.merge(title="u")  # the way the docs give
+            assert (await RfDeep.objects().get("seed")).title == "u"
 
 
 # --- filters and live queries (spec §5.5, §5.6, §6.5; AC-22, AC-23; D12) --------------------------

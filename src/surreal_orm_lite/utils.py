@@ -5,7 +5,7 @@ import re
 import warnings
 from collections.abc import Collection, Iterable, Mapping
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, SupportsIndex, cast
+from typing import TYPE_CHECKING, Any, Literal, SupportsIndex, TypeAlias, cast
 
 import pydantic
 
@@ -287,39 +287,98 @@ PLAIN_CONTENT = "$data"
 #: stored value of another type, or none, compares false and gives the sent value.
 _KEEP_STORED_DATETIME = "IF {sent} <= {stored} AND {stored} < {sent} + 1us THEN {stored} ELSE {sent} END"
 
+#: The most values a full replace rebuilds to keep stored datetimes (#261): each top-level ``datetime`` it keeps counts
+#: one, and so does each item of a sub-object or array it rebuilds below the top level. A kept datetime reads ``$this``
+#: three times and the server copies the value it reads each time: without a cap, the cost of a long list of datetimes
+#: grew with the square of its length.
+_KEEP_LIMIT = 32
 
-def _holds_datetime(value: Any) -> bool:
-    """Whether ``value`` is a ``datetime``, or a ``dict`` (with ``str`` keys), ``list`` or ``tuple`` holding one at any depth."""
-    if isinstance(value, datetime):
-        return True
+#: The deepest a kept ``datetime`` sits, in sub-objects and arrays below the top level (#261). Each level nests an
+#: ``object::from_entries()`` or an array in the statement, and the servers refuse one nested too deep: a datetime five
+#: sub-objects down already fails on SurrealDB 3.1.5 (17 on 3.3.4, 27 on 2.7.0 and the embedded engine).
+_KEEP_MAX_DEPTH = 3
+
+#: How :func:`replace_content` writes a value: ``True`` for a ``datetime`` that keeps the stored value, ``None`` for a
+#: value bound whole, and for a sub-object or array it rebuilds, the plan of each of its items in turn.
+_KeepPlan: TypeAlias = "Literal[True] | list[_KeepPlan | None]"
+
+
+def _keep_plan(value: Any, depth: int, left: int) -> tuple[_KeepPlan | None, int]:
+    """How a full replace writes ``value``, a sub-object or array ``depth`` levels below the top level, and what it costs (#261).
+
+    ``(None, 0)`` when ``value`` is bound whole: it is not a ``dict`` (with ``str`` keys), a ``list`` or a ``tuple``,
+    sits ``_KEEP_MAX_DEPTH`` levels down or more, has more items than ``left``, or keeps no stored datetime. Otherwise
+    its items are rebuilt: each ``datetime`` keeps the stored value, each sub-object or array is planned in turn with
+    what is left (and bound whole when it does not fit), and the cost is its number of items plus theirs, at most
+    ``left``.
+    """
+    if depth >= _KEEP_MAX_DEPTH:
+        return None, 0
     if isinstance(value, dict):
-        return all(isinstance(key, str) for key in value) and any(_holds_datetime(item) for item in value.values())
-    if isinstance(value, (list, tuple)):
-        return any(_holds_datetime(item) for item in value)
-    return False
+        if not all(isinstance(key, str) for key in value):
+            return None, 0
+        items: Iterable[Any] = value.values()
+    elif isinstance(value, (list, tuple)):
+        items = value
+    else:
+        return None, 0
+    cost = len(value)
+    if cost > left:
+        return None, 0
+    plans: list[_KeepPlan | None] = []
+    for item in items:
+        if isinstance(item, datetime):
+            plans.append(True)
+            continue
+        plan, inner = _keep_plan(item, depth + 1, left - cost)
+        plans.append(plan)
+        cost += inner
+    if all(plan is None for plan in plans):
+        return None, 0
+    return plans, cost
 
 
 def replace_content(data: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
     """Compile the ``CONTENT`` of a full replace (``UPDATE``/``UPSERT $rid CONTENT …``) of ``data`` (#261).
 
     SurrealDB stores datetimes to the nanosecond, the SDK reads them floored to the microsecond: writing a
-    ``datetime`` back unchanged would change the stored value, which a ``READONLY`` field refuses. So every
-    ``datetime`` of ``data`` — top level, in a sub-object or in an array, at any depth — keeps the stored value when
-    that value floors to it at the microsecond (``$this``, the record before the write, holds it; an ``UPSERT`` that
-    creates the record has none and writes the sent value). Any other datetime is written as sent, so a changed
-    ``READONLY`` value is still refused. ``data`` is rebuilt along the paths to its datetimes, with
-    ``object::from_entries()`` and arrays, on SurrealDB 2.x and 3.x alike; every key and value is **bound**
-    (``$c0``, ``$c1``…), nothing of ``data`` is written into the statement::
+    ``datetime`` back unchanged would change the stored value, which a ``READONLY`` field refuses. So a ``datetime`` of
+    ``data`` keeps the stored value when that value floors to it at the microsecond (``$this``, the record before the
+    write, holds it; an ``UPSERT`` that creates the record has none and writes the sent value). Any other datetime is
+    written as sent, so a changed ``READONLY`` value is still refused. ``data`` is rebuilt along the paths to the
+    datetimes it keeps, with ``object::from_entries()`` and arrays, on SurrealDB 2.x and 3.x alike; every key and value
+    is **bound** (``$c0``, ``$c1``…), nothing of ``data`` is written into the statement::
 
         replace_content({"title": "u", "created": dt})
         # ("object::from_entries([[$c0, $c1], [$c2, IF $c3 <= $this[$c2] AND $this[$c2] < $c3 + 1us THEN $this[$c2] ELSE $c3 END]])",
         #  {"c0": "title", "c1": "u", "c2": "created", "c3": dt})
 
+    The statement stays bounded whatever the data (``_KEEP_LIMIT``, ``_KEEP_MAX_DEPTH``). The top-level datetimes are
+    kept first, up to 32. Then, field by field, a sub-object or array is rebuilt to keep the datetimes it holds down to
+    three levels below the top level, as long as the values it rebuilds fit in what is left of those 32
+    (:func:`_keep_plan`). Anything past that (a long list, a large sub-object, a deeper datetime) is bound whole and
+    written as sent, and so is a set, whose items have no position to match a stored value by.
+
     Returns:
-        The expression and the variables to bind alongside it: ``(PLAIN_CONTENT, {"data": data})`` when ``data`` holds
-        no ``datetime`` (a ``dict`` with a key that is not a ``str`` is not looked into), the statement of before #261.
+        The expression and the variables to bind alongside it: ``(PLAIN_CONTENT, {"data": data})`` when it keeps no
+        stored datetime (``data`` holds none within those bounds, or has a key that is not a ``str``), the statement
+        of before #261.
     """
-    if not _holds_datetime(data):
+    if not all(isinstance(key, str) for key in data):
+        return PLAIN_CONTENT, {"data": data}
+    left = _KEEP_LIMIT
+    plans: dict[str, _KeepPlan] = {}
+    for key, value in data.items():
+        if isinstance(value, datetime) and left:
+            plans[key] = True
+            left -= 1
+    for key, value in data.items():
+        if not isinstance(value, datetime):
+            plan, cost = _keep_plan(value, 0, left)
+            if plan is not None:
+                plans[key] = plan
+                left -= cost
+    if not plans:
         return PLAIN_CONTENT, {"data": data}
     variables: dict[str, Any] = {}
 
@@ -328,21 +387,29 @@ def replace_content(data: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
         variables[name] = value
         return f"${name}"
 
-    def compile_value(value: Any, stored: str) -> str:
-        if isinstance(value, datetime):
+    def written(value: Any, plan: _KeepPlan | None, stored: str) -> str:
+        """``value`` as ``plan`` writes it, ``stored`` being its path in ``$this``."""
+        if plan is None:
+            return bind(value)
+        if plan is True:
             sent = bind(value)
             return _KEEP_STORED_DATETIME.format(sent=sent, stored=stored)
-        if not _holds_datetime(value):
-            return bind(value)
         if isinstance(value, dict):
             entries = []
-            for key, item in value.items():
+            for (key, item), inner in zip(value.items(), plan, strict=True):
                 bound = bind(key)
-                entries.append(f"[{bound}, {compile_value(item, f'{stored}[{bound}]')}]")
+                entries.append(f"[{bound}, {written(item, inner, f'{stored}[{bound}]')}]")
             return f"object::from_entries([{', '.join(entries)}])"
-        return "[" + ", ".join(compile_value(item, f"{stored}[{index}]") for index, item in enumerate(value)) + "]"
+        items = (
+            written(item, inner, f"{stored}[{index}]") for index, (item, inner) in enumerate(zip(value, plan, strict=True))
+        )
+        return "[" + ", ".join(items) + "]"
 
-    return compile_value(dict(data), "$this"), variables
+    entries = []
+    for key, value in data.items():
+        bound = bind(key)
+        entries.append(f"[{bound}, {written(value, plans.get(key), f'$this[{bound}]')}]")
+    return f"object::from_entries([{', '.join(entries)}])", variables
 
 
 def merge_extra_vars(
