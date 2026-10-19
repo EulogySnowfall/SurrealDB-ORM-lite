@@ -2484,11 +2484,11 @@ class SurrealDBConnectionManager:
         :raises ValueError: *table* is not an identifier.
         :raises SurrealDbError: *event* has ``async_mode=True`` and the connection runs SurrealDB 2.x or the
             embedded engine — before any DDL; *tx* belongs to another connection — before any request; the server
-            refused the statement (``Can't apply event definition: 'stock_guard' on table 'product' -> …``: a
-            refusal names the event and its table, never its statement, whose ``when`` and ``then`` may hold a
-            secret). In a buffered transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the
-            statement is only queued: a refusal comes back when the block commits, as the transaction's
-            ``SurrealDbError`` (``Transaction failed and rolled back: …``), never as ``SurrealDbAuthenticationError``.
+            refused the statement (``Can't apply event definition: 'stock_guard' on table 'product' -> …``:
+            without *tx*, a refusal names the event and its table, never its statement, whose ``when`` and
+            ``then`` may hold a secret). In a buffered transaction (*tx* over HTTP, on SurrealDB 2.x or the
+            embedded engine) the statement is only queued: a refusal comes back when the block commits, as the
+            transaction's own error, never as ``SurrealDbAuthenticationError``. With *tx*, an error raised when the transaction ends can still carry the server's message, statement excerpt included (#278).
         :raises SurrealDbAuthenticationError: the session may not define events.
         """
         check_call_transaction(cls._connection_name or "default", tx, operation="define_event()")
@@ -2523,9 +2523,8 @@ class SurrealDBConnectionManager:
         :raises SurrealDbAuthenticationError: the session may not remove events.
         :raises SurrealDbError: *tx* belongs to another connection — before any request; any other refusal.
             In a buffered transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the statement is
-            only queued: a refusal comes back when the block commits, as the transaction's ``SurrealDbError``
-            (``Transaction failed and rolled back: …``), never as ``SurrealDbNotFoundError`` or
-            ``SurrealDbAuthenticationError`` — ``missing_ok=False`` included.
+            only queued: a refusal comes back when the block commits, as the transaction's own ``SurrealDbError``,
+            never as ``SurrealDbNotFoundError`` or ``SurrealDbAuthenticationError`` — ``missing_ok=False`` included.
         """
         check_call_transaction(cls._connection_name or "default", tx, operation="remove_event()")
         statement = remove_event_statement(event, table, missing_ok)
@@ -2608,11 +2607,10 @@ class SurrealDBConnectionManager:
             well-formed SurrealQL — all before any request.
         :raises SurrealDbAuthenticationError: the session may not define functions.
         :raises SurrealDbError: *tx* belongs to another connection — before any request; the server refused the
-            statement (``Can't apply function definition: 'fn::greet' -> …``: a refusal names the function, never
-            its statement, whose body may hold a secret). In a buffered transaction (*tx* over HTTP, on SurrealDB 2.x
-            or the embedded engine) the statement is only queued: a refusal comes back when the block commits, as the
-            transaction's ``SurrealDbError`` (``Transaction failed and rolled back: …``), never as
-            ``SurrealDbAuthenticationError``.
+            statement (``Can't apply function definition: 'fn::greet' -> …``: without *tx*, a refusal names the
+            function, never its statement, whose body may hold a secret). In a buffered transaction (*tx* over HTTP,
+            on SurrealDB 2.x or the embedded engine) the statement is only queued: a refusal comes back when the
+            block commits, as the transaction's own error, never as ``SurrealDbAuthenticationError``. With *tx*, an error raised when the transaction ends can still carry the server's message, statement excerpt included (#278).
         """
         check_call_transaction(cls._connection_name or "default", tx, operation="define_function()")
         statement = function_ddl(
@@ -2662,9 +2660,8 @@ class SurrealDBConnectionManager:
         :raises SurrealDbAuthenticationError: the session may not remove functions.
         :raises SurrealDbError: *tx* belongs to another connection — before any request; any other refusal.
             In a buffered transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the statement is
-            only queued: a refusal comes back when the block commits, as the transaction's ``SurrealDbError``
-            (``Transaction failed and rolled back: …``), never as ``SurrealDbNotFoundError`` or
-            ``SurrealDbAuthenticationError`` — ``missing_ok=False`` included.
+            only queued: a refusal comes back when the block commits, as the transaction's own ``SurrealDbError``,
+            never as ``SurrealDbNotFoundError`` or ``SurrealDbAuthenticationError`` — ``missing_ok=False`` included.
         """
         check_call_transaction(cls._connection_name or "default", tx, operation="remove_function()")
         statement = remove_function_statement(function, missing_ok)

@@ -847,8 +847,10 @@ class BaseSurrealModel(BaseModel):
         input (``Event`` checks them for mistakes only). Applying needs a session allowed to define (a system
         user such as root, or a namespace or database ``OWNER``/``EDITOR``).
 
-        A refusal names the event and its table, never its statement, whose ``when`` and ``then`` may hold a
-        secret: ``Can't apply event definition: 'email_audit' on table 'account' -> <the server's reason>``.
+        Without *tx*, a refusal names the event and its table, never its statement, whose ``when`` and ``then``
+        may hold a secret: ``Can't apply event definition: 'email_audit' on table 'account' -> <the server's
+        reason>``. With *tx*, an error raised when the transaction ends can still carry the server's message,
+        statement excerpt included (#278).
 
         Args:
             overwrite: see :meth:`event_ddl`.
@@ -860,8 +862,8 @@ class BaseSurrealModel(BaseModel):
                 embedded engine — before any DDL; *tx* belongs to another connection — before any request; the
                 server refused a statement (``Can't apply event definition: …``). In a buffered transaction (*tx*
                 over HTTP, on SurrealDB 2.x or the embedded engine) the statements are only queued: a refusal
-                comes back when the block commits, as the transaction's ``SurrealDbError`` (``Transaction failed
-                and rolled back: …``), never as ``SurrealDbAuthenticationError``.
+                comes back when the block commits, as the transaction's own error, never as
+                ``SurrealDbAuthenticationError``.
             SurrealDbAuthenticationError: the session may not define events.
 
         Example:
@@ -899,9 +901,9 @@ class BaseSurrealModel(BaseModel):
             SurrealDbAuthenticationError: the session may not remove events.
             SurrealDbError: *tx* belongs to another connection — before any request; any other refusal. In a
                 buffered transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the statement is only
-                queued: a refusal comes back when the block commits, as the transaction's ``SurrealDbError``
-                (``Transaction failed and rolled back: …``), never as ``SurrealDbNotFoundError`` or
-                ``SurrealDbAuthenticationError`` — ``missing_ok=False`` included.
+                queued: a refusal comes back when the block commits, as the transaction's own
+                ``SurrealDbError``, never as ``SurrealDbNotFoundError`` or ``SurrealDbAuthenticationError`` —
+                ``missing_ok=False`` included.
 
         Example:
             >>> await Account.remove_event("email_audit")
