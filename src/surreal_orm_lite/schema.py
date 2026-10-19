@@ -2,30 +2,45 @@
 
 ``Event`` declares a server-side event — SurrealDB's ``DEFINE EVENT`` on a table — with the full SurrealDB-ORM's call
 shape: a name, the SurrealQL the event runs (``then``), an optional condition (``when``), SurrealDB 3.x's ``ASYNC``
-options and a comment. Every argument is checked when the object is built, before any request.
+options and a comment. Every argument is checked when the object is built, before any request. ``Event.ddl(table)``
+renders its ``DEFINE EVENT`` statement and ``function_ddl()`` a stored function's ``DEFINE FUNCTION`` statement: both
+are pure — no connection, the same text for the same input — and the appliers send what they render.
 
-**Names and expressions.** An event's name is an identifier (letters, digits, underscores; not starting with a
-digit), checked with ``fullmatch``. Expressions (``when``, ``then``) are embedded in the statement as written, since
-SurrealQL takes no bound parameter in DDL, after a structural check (``define_parser.scan_fragment()``): string
-literals and quoted identifiers terminated, brackets balanced, no SurrealQL comment marker and no NUL, and no ``;``
-outside brackets where one expression is expected. The check catches mistakes — unbalanced brackets, a comment that
-would swallow the clauses the ORM appends, a second statement where one expression is expected — and is not an
-injection defence: expressions are trusted application code, never user input. To use a value, read it from the record
-(``$after.email``) or from a ``DEFINE PARAM``; never format it into the text.
+**Names and expressions.** Event, table and parameter names are identifiers (letters, digits, underscores; not
+starting with a digit), checked with ``fullmatch``; event and table names are written in backticks, function names go
+through ``normalize_function_name()``. Expressions (``when``, ``then``, a function's body, a permissions condition) are
+embedded in the statement as written, since SurrealQL takes no bound parameter in DDL, after a structural check
+(``define_parser.scan_fragment()``): string literals and quoted identifiers terminated, brackets balanced, no SurrealQL
+comment marker and no NUL, and no ``;`` outside brackets where one expression is expected. The check catches mistakes —
+unbalanced brackets, a comment that would swallow the clauses the ORM appends, a second statement where one expression
+is expected — and is not an injection defence: expressions are trusted application code, never user input. To use a
+value, read it from the record (``$after.email``) or from a ``DEFINE PARAM``; never format it into the text. Kinds are
+parsed and written in canonical form (``option<int>``); a comment is a string literal, its backslashes and quotes
+escaped.
 
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
 it.
 """
 
+import re
+from collections.abc import Mapping
 from dataclasses import KW_ONLY, dataclass, field
 
-from .define_parser import DefineParseError, scan_fragment
+from .define_parser import DefineParseError, parse_kind, render_kind, scan_fragment
+from .functions import normalize_function_name
+from .surql_literal import _SERVER_PARAMETERS, _identifier, _quoted
 from .utils import VALID_ALIAS_PATTERN
 
-__all__ = ["Event"]
+__all__ = ["Event", "function_ddl"]
 
 #: The largest ``RETRY`` and ``MAXDEPTH`` SurrealDB accepts (an unsigned 16-bit count).
 _MAX_COUNT = 65535
+
+#: A ``WHERE`` permissions rule, matched in full on the stripped value: ``WHERE`` in any case, whitespace, a condition.
+_PERMISSIONS_WHERE = re.compile(r"WHERE\s+(.+)", re.IGNORECASE | re.DOTALL)
+
+#: The parameters SurrealDB defines itself, as F6 lists them.
+_RESERVED_PARAMETERS = ", ".join(f"${name}" for name in sorted(_SERVER_PARAMETERS))
 
 
 def _identifier_name(value: object, *, what: str) -> str:
@@ -89,6 +104,89 @@ def _count(value: object, *, subject: str, what: str) -> int | None:
     return value
 
 
+def _flag(value: object, *, what: str) -> bool:
+    """*value*, checked as the ``bool`` argument *what* (``"overwrite="``, ``"missing_ok="``)."""
+    if not isinstance(value, bool):
+        raise TypeError(f"{what} must be a bool, got {type(value).__name__}.")
+    return value
+
+
+def _overwrite_clause(value: object) -> str:
+    """``OVERWRITE`` for ``overwrite=True`` (redefine in place), ``IF NOT EXISTS`` for ``False`` (keep what exists)."""
+    return "OVERWRITE" if _flag(value, what="overwrite=") else "IF NOT EXISTS"
+
+
+def _missing_clause(value: object) -> str:
+    """`` IF EXISTS`` for ``missing_ok=True`` (a missing definition is not an error), nothing for ``False``."""
+    return " IF EXISTS" if _flag(value, what="missing_ok=") else ""
+
+
+def _kind(text: str, *, subject: str, what: str) -> str:
+    """The canonical text of the SurrealQL kind *text* (``render_kind(parse_kind(text))``), never *text* itself.
+
+    *what* names the kind in the message (``"returns="``, ``"the kind of parameter 'a'"``). A kind the parser cannot
+    read — or whose free-text generic argument holds a comment marker or a quote — is a ``ValueError``: nothing is
+    rewritten silently.
+    """
+    try:
+        return render_kind(parse_kind(text))
+    except DefineParseError as error:
+        raise ValueError(f"{subject}: {what} is not a SurrealQL kind the ORM can read: {error}.") from error
+
+
+def _parameters(value: object, *, subject: str) -> str:
+    """The parameter list of a ``DEFINE FUNCTION`` — ``$a: int, $b: option<string>`` — from the mapping *value*.
+
+    Names are identifiers without the ``$`` and not one of the parameters SurrealDB defines itself; kinds are checked
+    and written by :func:`_kind`. The mapping's order is the declaration order.
+    """
+    if value is None:
+        return ""
+    if not isinstance(value, Mapping):
+        raise TypeError(
+            f"{subject}: parameters= must be a mapping of parameter name to SurrealQL kind, got {type(value).__name__}."
+        )
+    rendered: list[str] = []
+    for parameter, kind in value.items():
+        if not isinstance(parameter, str) or VALID_ALIAS_PATTERN.fullmatch(parameter) is None:
+            raise ValueError(f"{subject}: invalid parameter name {parameter!r}: an identifier is expected, without the '$'.")
+        if parameter in _SERVER_PARAMETERS:
+            raise ValueError(
+                f"{subject}: the parameter name {parameter!r} is one SurrealDB defines itself "
+                f"({_RESERVED_PARAMETERS}); choose another."
+            )
+        if not isinstance(kind, str):
+            raise TypeError(f"{subject}: the kind of parameter {parameter!r} must be a str, got {type(kind).__name__}.")
+        rendered.append(f"${parameter}: {_kind(kind, subject=subject, what=f'the kind of parameter {parameter!r}')}")
+    return ", ".join(rendered)
+
+
+def _permissions(value: object, *, subject: str) -> str | None:
+    """The rule of a ``PERMISSIONS`` clause — ``FULL``, ``NONE`` or ``WHERE <condition>`` — or ``None`` for none.
+
+    ``FULL`` and ``NONE`` in any case, written upper-case; ``WHERE`` in any case followed by one expression, checked
+    as ``when=`` is (``scan_fragment()``, no ``;`` outside brackets) and written stripped.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{subject}: permissions= must be a str or None, got {type(value).__name__}.")
+    rule = value.strip()
+    if rule.upper() in ("FULL", "NONE"):
+        return rule.upper()
+    where = _PERMISSIONS_WHERE.fullmatch(rule)
+    if where is None:
+        raise ValueError(f"{subject}: permissions= must be 'FULL', 'NONE' or 'WHERE <condition>', got {value!r}.")
+    condition = _fragment(
+        where.group(1),
+        subject=subject,
+        what="the permissions condition",
+        empty="it is the condition a caller must meet",
+        one_expression=True,
+    )
+    return f"WHERE {condition}"
+
+
 @dataclass(frozen=True, slots=True)
 class Event:
     """A server-side event of a table: SurrealDB's ``DEFINE EVENT``, declared as the full SurrealDB-ORM does.
@@ -118,6 +216,8 @@ class Event:
     brackets, a comment that would swallow the clauses the ORM appends, a second statement where one expression is
     expected — and is not an injection defence: expressions are trusted application code, never user input. Every
     refusal is a ``TypeError`` or a ``ValueError`` raised here, before any request.
+
+    ``ddl(table)`` renders the event's ``DEFINE EVENT`` statement on a table, without a connection.
 
     Frozen, hashable, equal by value and picklable. ``repr()`` leaves ``when`` and ``then`` out, as ``EventState``
     does: an expression may hold a credential (a webhook token in a URL).
@@ -161,3 +261,113 @@ class Event:
         _comment_text(self.comment, subject=subject)
         object.__setattr__(self, "then", then)
         object.__setattr__(self, "when", when)
+
+    def ddl(self, table: str, *, overwrite: bool = True) -> str:
+        """The ``DEFINE EVENT`` statement of this event on *table* — pure: no connection, the same text every time.
+
+        ::
+
+            Event("audit", then="CREATE log SET kind = $event").ddl("person")
+            # DEFINE EVENT OVERWRITE `audit` ON `person` THEN { CREATE log SET kind = $event };
+
+        ``overwrite=True`` redefines an existing event (``OVERWRITE``), ``False`` keeps it (``IF NOT EXISTS``). The
+        clauses, in order: ``ASYNC`` with ``RETRY``/``MAXDEPTH`` when set, ``WHEN`` when given, ``THEN`` with ``then``
+        always wrapped in a ``{ … }`` block, ``COMMENT`` when given. The names are written in backticks, so a keyword
+        name (``select``) is a name. *table* is an identifier; ``TypeError``/``ValueError`` otherwise, and when
+        *overwrite* is not a ``bool``.
+        """
+        table = _identifier_name(table, what="Table")
+        clauses = [f"DEFINE EVENT {_overwrite_clause(overwrite)} {_identifier(self.name)} ON {_identifier(table)}"]
+        if self.async_mode:
+            clauses.append("ASYNC")
+            if self.retry is not None:
+                clauses.append(f"RETRY {self.retry}")
+            if self.max_depth is not None:
+                clauses.append(f"MAXDEPTH {self.max_depth}")
+        if self.when is not None:
+            clauses.append(f"WHEN {self.when}")
+        clauses.append(f"THEN {{ {self.then} }}")
+        if self.comment is not None:
+            clauses.append(f"COMMENT {_quoted(self.comment)}")
+        return " ".join(clauses) + ";"
+
+
+def function_ddl(
+    function: str,
+    body: str,
+    *,
+    parameters: Mapping[str, str] | None = None,
+    returns: str | None = None,
+    permissions: str | None = None,
+    comment: str | None = None,
+    overwrite: bool = True,
+) -> str:
+    """The ``DEFINE FUNCTION`` statement of a stored function — pure: no connection, the same text every time.
+
+    ::
+
+        function_ddl(
+            "fn::greet",
+            "RETURN string::concat('Hello ', $name);",
+            parameters={"name": "string", "times": "option<int>"},
+            returns="string",
+            comment="Greets",
+        )
+        # DEFINE FUNCTION OVERWRITE fn::greet($name: string, $times: option<int>) -> string
+        #     { RETURN string::concat('Hello ', $name); } COMMENT 'Greets';   (one line)
+
+    - ``function``: as ``call_function()`` takes it — ``"greet"``, ``"fn::greet"``, ``"fn::billing::total"`` —,
+      validated and prefixed by ``normalize_function_name()``.
+    - ``body``: the SurrealQL the function runs, one statement or several separated by ``;``; always wrapped in a
+      ``{ … }`` block.
+    - ``parameters``: a mapping of parameter name (an identifier, without the ``$``; not one of ``$access``,
+      ``$auth``, ``$parent``, ``$session``, ``$this``, ``$token``) to its SurrealQL kind, in declaration order — the
+      order of ``call_function()``'s positional ``args``.
+    - ``returns``: the SurrealQL kind of the result, or ``None``.
+    - ``permissions``: ``None`` (SurrealDB's default, ``FULL``), ``"FULL"``, ``"NONE"`` or ``"WHERE <condition>"``,
+      in any case; the condition is one expression.
+    - ``comment``: SurrealDB's ``COMMENT``, any text without a NUL. ``overwrite``: ``True`` redefines an existing
+      function (``OVERWRITE``), ``False`` keeps it (``IF NOT EXISTS``).
+
+    Kinds are parsed and written in canonical form: ``"none | int"`` and ``"int | none"`` are both written
+    ``option<int>``, and a kind the ORM cannot read is refused rather than rewritten. The body and the permissions
+    condition are checked by ``define_parser.scan_fragment()``. The check catches mistakes — unbalanced brackets, a
+    comment that would swallow the clauses the ORM appends, a second statement where one expression is expected — and
+    is not an injection defence: expressions are trusted application code, never user input. Every refusal is a
+    ``TypeError`` or a ``ValueError`` raised before any request.
+    """
+    name = normalize_function_name(function)
+    subject = f"define_function({name!r})"
+    text = _fragment(body, subject=subject, what="body=", empty="it is the SurrealQL the function runs", one_expression=False)
+    signature = _parameters(parameters, subject=subject)
+    if returns is not None and not isinstance(returns, str):
+        raise TypeError(f"{subject}: returns= must be a str or None, got {type(returns).__name__}.")
+    result = "" if returns is None else f" -> {_kind(returns, subject=subject, what='returns=')}"
+    rule = _permissions(permissions, subject=subject)
+    note = _comment_text(comment, subject=subject)
+    statement = f"DEFINE FUNCTION {_overwrite_clause(overwrite)} {name}({signature}){result} {{ {text} }}"
+    if note is not None:
+        statement += f" COMMENT {_quoted(note)}"
+    if rule is not None:
+        statement += f" PERMISSIONS {rule}"
+    return statement + ";"
+
+
+def remove_event_statement(name: str, table: str, missing_ok: bool) -> str:
+    """``REMOVE EVENT [IF EXISTS] `<name>` ON `<table>`;`` — ``IF EXISTS`` with *missing_ok*.
+
+    The names are checked as ``Event`` and ``Event.ddl()`` check them, *missing_ok* must be a ``bool``.
+    """
+    name = _identifier_name(name, what="Event")
+    table = _identifier_name(table, what="Table")
+    return f"REMOVE EVENT{_missing_clause(missing_ok)} {_identifier(name)} ON {_identifier(table)};"
+
+
+def remove_function_statement(function: str, missing_ok: bool) -> str:
+    """``REMOVE FUNCTION [IF EXISTS] fn::<name>;`` — ``IF EXISTS`` with *missing_ok*.
+
+    *function* is normalised by ``normalize_function_name()`` (``"greet"`` → ``fn::greet``), *missing_ok* must be a
+    ``bool``.
+    """
+    name = normalize_function_name(function)
+    return f"REMOVE FUNCTION{_missing_clause(missing_ok)} {name};"

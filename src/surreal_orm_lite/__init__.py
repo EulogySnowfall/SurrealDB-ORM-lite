@@ -74,7 +74,7 @@ from .model_auth import AuthenticatedUserMixin, AuthResult
 from .model_base import BaseSurrealModel, SurrealConfigDict
 from .q import Q
 from .query_set import QuerySet
-from .schema import Event
+from .schema import Event, function_ddl
 from .signals import (
     AroundSignal,
     Signal,
@@ -199,6 +199,7 @@ __all__ = [
     "SchemaIssue",
     # Server-side events and DDL (v0.31.0)
     "Event",
+    "function_ddl",
     # Exceptions
     "SurrealORMError",
     "SurrealDbError",
