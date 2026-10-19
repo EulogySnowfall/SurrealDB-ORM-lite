@@ -54,6 +54,19 @@ from .geo import (
     PointField,
     PolygonField,
 )
+from .introspection import (
+    AccessState,
+    AnalyzerState,
+    DatabaseIntrospector,
+    EventState,
+    FieldState,
+    FunctionState,
+    IndexState,
+    ParamState,
+    SchemaIssue,
+    SchemaState,
+    TableState,
+)
 from .live import LiveModelStream, LiveStream, ModelChangeEvent, ReconnectCallback
 from .model_auth import AuthenticatedUserMixin, AuthResult
 from .model_base import BaseSurrealModel, SurrealConfigDict
@@ -167,6 +180,18 @@ __all__ = [
     "MultiPolygonField",
     "GeometryCollectionField",
     "GeoDistance",
+    # Schema introspection (v0.30.0)
+    "DatabaseIntrospector",
+    "SchemaState",
+    "TableState",
+    "FieldState",
+    "IndexState",
+    "EventState",
+    "AccessState",
+    "AnalyzerState",
+    "FunctionState",
+    "ParamState",
+    "SchemaIssue",
     # Exceptions
     "SurrealORMError",
     "SurrealDbError",
