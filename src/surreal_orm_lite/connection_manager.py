@@ -33,12 +33,14 @@ from .exceptions import (
 from .functions import build_call_statement, normalize_function_name, parse_function_parameters
 from .live import (
     LiveIterator,
+    cancellation_lost,
     close_all_subscribers,
     is_connection_failure,
     is_dead,
     mark_killed,
     open_stream,
     owner_of,
+    recv_task_of,
     release_subscribers,
     require_websocket,
 )
@@ -49,6 +51,10 @@ logger = logging.getLogger(__name__)
 
 # Strong references to fire-and-forget closes, which the event loop alone would let be collected.
 _BACKGROUND: set[asyncio.Task[Any]] = set()
+
+# How long a KILL that failed on a transport error waits for the SDK's receive loop to end, before
+# deciding the connection is still up (and the failure a real one).
+_DROP_SETTLE_TIMEOUT = 1.0
 
 
 @lru_cache(maxsize=256)
@@ -2473,10 +2479,16 @@ class SurrealDBConnectionManager:
         client still cached on this loop — a stream started on a server, stopped after switching
         to the engine — receives the KILL; otherwise the call is the no-op above.
 
+        A KILL caught by a drop — sent as the connection goes down, before the SDK has noticed —
+        is not a refusal either: the live query died with the socket, so the call ends as it does
+        on a dead client, and raises nothing.
+
         :param query_uuid: the uuid of a running live query, e.g. ``stream.live_id``.
         :raises SurrealDbError: if the server refuses the kill for a reason other than an
             unknown uuid. The readers are released anyway, but the uuid is **not** recorded as
             dead — the subscription is still running, so a retry can re-attach to it.
+        :raises asyncio.CancelledError: if the calling task is cancelled, even when the SDK
+            reports the cancelled request as an ordinary error. The readers are released.
         """
         client = cls._cached_client()
         try:
@@ -2485,6 +2497,8 @@ class SurrealDBConnectionManager:
             # receive loop that died on a bad frame leaves the socket open, though, and the server
             # still running them: closing the transport is what ends them then.
             if client is None or is_dead(client):
+                # Before any await: a resubscribe woken by the same drop must find the reader gone.
+                release_subscribers(query_uuid)
                 if client is not None:
                     await cls._close_dead_socket(client)
                 mark_killed(query_uuid)
@@ -2494,13 +2508,40 @@ class SurrealDBConnectionManager:
             try:
                 await client.kill(query_uuid)
             except Exception as exc:
-                if not cls._is_unknown_live_query(exc):
+                # Before any await: a resubscribe woken by the same drop must find the reader gone,
+                # or it opens a connection for a subscription being torn down. Closing the socket
+                # below yields the loop on Python 3.11, where `wait_for` always wraps a Task.
+                release_subscribers(query_uuid)
+                if cancellation_lost(exc):
+                    raise asyncio.CancelledError from exc  # the SDK raised over the caller's cancellation
+                if await cls._dropped_under_request(client, exc):
+                    # The server never answered: the connection went down with the request in flight.
+                    await cls._close_dead_socket(client)
+                elif not cls._is_unknown_live_query(exc):
                     raise SurrealDbError(f"Failed to kill live query {query_uuid}: {exc}") from exc
             mark_killed(query_uuid)
         finally:
             # In a `finally` so that every exit — success, failure, cancellation — wakes the
-            # readers; nothing else ever would.
+            # readers; nothing else ever would. Idempotent after an early release above, and it
+            # also wakes a reader that subscribed to the uuid while this call was awaiting.
             release_subscribers(query_uuid)
+
+    @staticmethod
+    async def _dropped_under_request(client: Any, exc: Exception) -> bool:
+        """Whether a request on *client* failed with *exc* because its WebSocket dropped.
+
+        Decided on the client, never on the error alone. The SDK reports a request caught by a
+        drop as a bare ``KeyError``: its receive loop ends, cancels the pending request and clears
+        the pending-request map, so the request's own cleanup finds its id gone (surrealdb 2.0.0)
+        — by then the receive task is done. A transport error can surface a moment before that
+        loop has ended, so it gets a bounded wait to catch up; anything else is decided at once.
+        """
+        task = recv_task_of(client)
+        if task is None:
+            return False
+        if not task.done() and is_connection_failure(exc, None):
+            await asyncio.wait({task}, timeout=_DROP_SETTLE_TIMEOUT)
+        return task.done()
 
     @staticmethod
     def _is_unknown_live_query(exc: Exception) -> bool:

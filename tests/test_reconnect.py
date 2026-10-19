@@ -958,6 +958,31 @@ class TestReviewLifecycleE2E:
             assert await _direct_lives() == {}
 
     @pytest.mark.asyncio
+    async def test_kill_sent_right_after_the_drop_is_not_reported_as_refused(self) -> None:
+        """Issue #266: a KILL sent while the SDK's receive loop is still ending fails locally — the
+        loop cancels the pending request and its cleanup raises a ``KeyError``. The connection was
+        lost, the server refused nothing: the live query died with the socket."""
+        from surreal_orm_lite import live
+
+        async with proxied() as proxy:
+            stream = await Reconnected.objects().watch().start()
+            old = stream.live_id
+            assert old is not None
+            proxy.refuse()
+            proxy.cut()
+            await asyncio.sleep(0)  # the SDK has not noticed the drop yet
+
+            await SurrealDBConnectionManager.kill(old)
+            assert str(old) in live._killed()
+            proxy.accept()
+            await asyncio.sleep(0.5)
+
+            with pytest.raises(StopAsyncIteration):
+                await _next_within(stream)
+            assert proxy.connections == 1
+            assert await _direct_lives() == {}
+
+    @pytest.mark.asyncio
     async def test_subscribing_to_a_dropped_uuid_after_the_client_was_replaced_ends_at_once(self) -> None:
         """Finding #7: the old uuid used to be registered on the new client and wait forever."""
         async with proxied() as proxy:
