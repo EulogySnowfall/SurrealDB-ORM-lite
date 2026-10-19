@@ -268,6 +268,16 @@ async def test_add_namespacing_respects_word_boundary() -> None:
 
 
 @pytest.mark.asyncio
+async def test_add_renames_in_one_pass() -> None:
+    # Each $name is renamed once: a variable named like a renamed one is not renamed twice, and the parameters
+    # that are not variables ($this, $value) are left alone.
+    tx = BufferedTransaction()
+    await tx.add("RETURN [$a, $t0_a, $this, $value];", {"a": 1, "t0_a": 2})
+    assert tx.statements == ["RETURN [$t0_a, $t0_t0_a, $this, $value];"]
+    assert tx.variables == {"t0_a": 1, "t0_t0_a": 2}
+
+
+@pytest.mark.asyncio
 async def test_buffered_run_read_raises() -> None:
     tx = BufferedTransaction()
     assert tx.is_interactive is False
