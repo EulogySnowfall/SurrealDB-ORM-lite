@@ -42,8 +42,11 @@ assigns top-level keyword candidates to slots in that order, each content passin
 the weak one, refuses an empty text or one ending with an operator; ``string``, ``kind``, ``perms`` and the other
 strict ones rule bare identifiers out), and leaves no keyword inside a content where it can start its own clause.
 Exactly one reading is read; none or several raise ``DefineParseError`` — ``VALUE b ASSERT ASSERT c`` is never
-guessed. ``parse_define_table()`` and ``parse_define_field()`` build ``TableState`` and ``FieldState`` by keyword,
-``raw`` the statement; ``parse_permissions()`` reads a ``PERMISSIONS`` clause.
+guessed. ``parse_define_table()``, ``parse_define_field()``, ``parse_define_event()``, ``parse_define_analyzer()``,
+``parse_define_access()``, ``parse_define_function()`` and ``parse_define_param()`` read their clauses so, and build
+their state by keyword, ``raw`` the statement; ``parse_permissions()`` reads a ``PERMISSIONS`` clause. Two kinds have
+positional parts the clause reader does not cover: an index's ``FIELDS`` list and its flat run of options
+(``parse_define_index()``), and a function's signature and body (``parse_define_function()``).
 """
 
 import re
@@ -51,7 +54,17 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple, TypeAlias
 
-from .schema_state import FieldState, TableState
+from .functions import parse_function_parameters
+from .schema_state import (
+    AccessState,
+    AnalyzerState,
+    EventState,
+    FieldState,
+    FunctionState,
+    IndexState,
+    ParamState,
+    TableState,
+)
 
 __all__ = [
     "Clause",
@@ -66,7 +79,13 @@ __all__ = [
     "Slot",
     "canonical_name",
     "normalise_kind",
+    "parse_define_access",
+    "parse_define_analyzer",
+    "parse_define_event",
     "parse_define_field",
+    "parse_define_function",
+    "parse_define_index",
+    "parse_define_param",
     "parse_define_table",
     "parse_kind",
     "parse_kind_prefix",
@@ -1074,6 +1093,12 @@ def _valid_filter_list(span: _Span) -> bool:
     return True
 
 
+def _top_indices(span: _Span) -> list[int]:
+    """The indices of the content's tokens at its own depth, whitespace left out."""
+    tokens = span.tokens
+    return [index for index in range(span.first, span.stop) if not tokens[index].depth and tokens[index].kind != _SPACE_TOKEN]
+
+
 def _permission_rule(span: _Span, top: Sequence[int], begin: int, end: int) -> str | None:
     """The rule of a permission group — its top-level tokens ``top[begin:end]`` — as rendered: ``FULL``, ``NONE`` or
     ``WHERE <expr>``; ``None`` for anything else."""
@@ -1092,8 +1117,7 @@ def _read_permissions(span: _Span, actions: Sequence[str], unnamed: str) -> dict
     content = span.content()
     if content in ("FULL", "NONE"):
         return dict.fromkeys(actions, content)
-    top = [index for index in range(span.first, span.stop) if not span.tokens[index].depth]
-    top = [index for index in top if span.tokens[index].kind != _SPACE_TOKEN]
+    top = _top_indices(span)
 
     def comma(position: int) -> bool:
         token = span.tokens[top[position]]
@@ -1135,6 +1159,13 @@ def _valid_field_permissions(span: _Span) -> bool:
 def _valid_table_permissions(span: _Span) -> bool:
     """``perms`` of a table: actions ``select``, ``create``, ``update`` and ``delete``."""
     return _read_permissions(span, _TABLE_ACTIONS, "NONE") is not None
+
+
+def _valid_rule(span: _Span) -> bool:
+    """``perms`` of a function or a param: one rule, ``FULL``, ``NONE`` or ``WHERE <expr>`` (the content is then the
+    rule as rendered)."""
+    top = _top_indices(span)
+    return _permission_rule(span, top, 0, len(top)) is not None
 
 
 def parse_permissions(text: str, actions: Sequence[str], *, unnamed: str) -> dict[str, str]:
@@ -1551,3 +1582,522 @@ def parse_define_field(text: str) -> ParsedField:
         raw=text,
     )
     return ParsedField(state, as_written)
+
+
+# --- brackets, positional headers ----------------------------------------------------------------------------------
+
+
+def _closing(text: str, pos: int) -> int:
+    """The position after the bracket that closes the one at *pos* (strings and quoted identifiers are opaque).
+
+    Raises ``DefineParseError`` when ``text[pos:]`` does not scan or its brackets are not balanced.
+    """
+    lexemes = _lex(text, pos)
+    return lexemes[_match_brackets(text, lexemes, _BRACKETS)[0]][2]
+
+
+def _named_on(text: str, kind: str) -> tuple[str, str, int]:
+    """``(name, table, end)`` of the header ``DEFINE <kind> <ident> ON <ident>`` (an index, an event)."""
+    pos = _header(text, kind)
+    name, pos = read_identifier(text, pos)
+    pos = _expect_word(text, _expect_space(text, pos), "ON")
+    table, pos = read_identifier(text, pos)
+    return name, table, _name_end(text, pos)
+
+
+def _header_word(text: str, pos: int, words: frozenset[str]) -> tuple[str, int]:
+    """The header word at *pos*, one of *words*, and the position after it (``_R_HEADER`` otherwise)."""
+    word = _WORD.match(text, pos)
+    if word is None or word.group() not in words:
+        raise DefineParseError(_R_HEADER)
+    return word.group(), _name_end(text, word.end())
+
+
+def _comment(clauses: Mapping[str, Clause]) -> str | None:
+    """The unquoted ``COMMENT`` of a reading, or ``None``."""
+    comment = clauses.get("comment")
+    return None if comment is None else unquote(comment.content)
+
+
+# --- DEFINE INDEX --------------------------------------------------------------------------------------------------
+
+#: The index options that are flags, those followed by an integer and those followed by a word (spec §6.3.3).
+_INDEX_FLAGS = frozenset({"UNIQUE", "HIGHLIGHTS", "HNSW", "MTREE", "CONCURRENTLY"})
+_INDEX_INTEGERS = frozenset({"DIMENSION", "EFC", "M"})
+_INDEX_WORDS = frozenset({"DIST", "TYPE"})
+#: What follows an index's table: a field list, or COUNT.
+_INDEX_HEADS = frozenset({"FIELDS", "COLUMNS", "COUNT"})
+_INDEX_ATOM = re.compile(r"\S+")
+#: A number as the servers render an index option's argument (``100``, ``0.40242960438184466f``).
+_INDEX_NUMBER = re.compile(r"-?[0-9]+(?:\.[0-9]+)?(?:e[-+]?[0-9]+)?(?:f|dec)?")
+_INTEGER = re.compile(r"[0-9]+")
+_DECIMAL = re.compile(r"-?[0-9]+(?:\.[0-9]+)?")
+_OPTION_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_ANALYZER_WORD = re.compile(r"ANALYZER")
+
+
+class _IndexOptions(NamedTuple):
+    """The options of a ``DEFINE INDEX`` after its field list (or ``COUNT``)."""
+
+    flags: frozenset[str]
+    integers: Mapping[str, int]
+    words: Mapping[str, str]
+    analyzer: str | None
+    bm25: tuple[float, float] | bool | None
+    comment: str | None
+
+
+def _index_fields(text: str, pos: int) -> tuple[tuple[str, ...], int]:
+    """The canonical names of the idioms of a ``FIELDS`` list at *pos*, and the position after the last one: an
+    idiom, then a ``,`` and the next one, anything else ends the list (``FIELDS TYPE, M UNIQUE``: ``TYPE``, ``M``)."""
+    names: list[str] = []
+    while True:
+        path, pos = read_idiom(text, pos)
+        names.append(canonical_name(path))
+        after = _skip_space(text, pos)
+        if not text.startswith(",", after):
+            return tuple(names), pos
+        pos = _skip_space(text, after + 1)
+
+
+def _index_value(text: str, pos: int, pattern: re.Pattern[str]) -> tuple[str, int]:
+    """The run of non-space characters at *pos*, which *pattern* must match whole, and the position after it and the
+    whitespace after it (``_R_INDEX`` when it is missing or does not match)."""
+    atom = _INDEX_ATOM.match(text, pos)
+    if atom is None or pattern.fullmatch(atom.group()) is None:
+        raise DefineParseError(_R_INDEX)
+    return atom.group(), _skip_space(text, atom.end())
+
+
+def _bm25(text: str, pos: int) -> tuple[tuple[float, float], int]:
+    """``(k1, b)`` of the ``(k1,b)`` at *pos* after ``BM25``, and the position after it and its whitespace."""
+    close = text.find(")", pos)
+    parts = text[pos + 1 : close].split(",") if close > pos else []
+    if len(parts) != 2 or any(_DECIMAL.fullmatch(part.strip()) is None for part in parts):
+        raise DefineParseError(_R_INDEX)
+    if close + 1 < len(text) and not text[close + 1].isspace():
+        raise DefineParseError(_R_INDEX)
+    return (float(parts[0]), float(parts[1])), _skip_space(text, close + 1)
+
+
+def _index_analyzer(text: str, pos: int) -> tuple[str, int]:
+    """The analyzer of ``SEARCH|FULLTEXT ANALYZER <ident>``, *pos* after ``SEARCH|FULLTEXT`` and its whitespace."""
+    _, pos = _index_value(text, pos, _ANALYZER_WORD)
+    found = _identifier_at(text, pos)
+    if found is None or (found[1] < len(text) and not text[found[1]].isspace()):
+        raise DefineParseError(_R_INDEX)
+    return found[0], _skip_space(text, found[1])
+
+
+def _final_comment(text: str, pos: int) -> str:
+    """The ``COMMENT`` literal after *pos* (after the keyword), which must end the statement."""
+    literal = _skip_space(text, pos)
+    if literal >= len(text) or text[literal] not in _QUOTES:
+        raise DefineParseError(_R_INDEX)
+    end = _delimited_end(text, literal, text[literal])
+    if end is None:
+        raise DefineParseError(_R_STRING)
+    if _skip_space(text, end) != len(text):
+        raise DefineParseError(_R_INDEX)
+    return unquote(text[literal:end])
+
+
+def _index_options(text: str, pos: int) -> _IndexOptions:
+    """Read the flat run of index options starting at *pos* (spec §6.3.3).
+
+    ``UNIQUE``, ``HIGHLIGHTS``, ``HNSW``, ``MTREE`` and ``CONCURRENTLY`` are flags; ``SEARCH|FULLTEXT ANALYZER
+    <ident>``; ``BM25(k1,b)`` or a bare ``BM25``; ``DIMENSION``, ``EFC`` and ``M`` take an integer, ``DIST`` and
+    ``TYPE`` a word; ``COMMENT <string>`` ends the statement. Any other word is skipped with the number after it, if
+    any (``M0 24``, ``LM 0.4…f``, ``DOC_IDS_ORDER 100``, ``EXTEND_CANDIDATES``), and so is a number on its own (the
+    ``3`` of ``DIST MINKOWSKI 3``). Anything else raises ``DefineParseError`` (``_R_INDEX``).
+    """
+    flags: set[str] = set()
+    integers: dict[str, int] = {}
+    words: dict[str, str] = {}
+    analyzer: str | None = None
+    bm25: tuple[float, float] | bool | None = None
+    comment: str | None = None
+    while pos < len(text):
+        start = pos
+        atom, pos = _index_value(text, pos, _INDEX_ATOM)
+        if atom == "COMMENT":
+            comment = _final_comment(text, start + len(atom))
+            break
+        if atom.startswith("BM25("):
+            bm25, pos = _bm25(text, start + len("BM25"))
+        elif atom == "BM25":
+            bm25 = True
+        elif atom in _INDEX_FLAGS:
+            flags.add(atom)
+        elif atom in ("SEARCH", "FULLTEXT"):
+            analyzer, pos = _index_analyzer(text, pos)
+        elif atom in _INDEX_INTEGERS:
+            value, pos = _index_value(text, pos, _INTEGER)
+            integers[atom] = int(value)
+        elif atom in _INDEX_WORDS:
+            words[atom], pos = _index_value(text, pos, _OPTION_WORD)
+        elif _INDEX_NUMBER.fullmatch(atom) is None:
+            if _WORD.fullmatch(atom) is None:
+                raise DefineParseError(_R_INDEX)
+            following = _INDEX_ATOM.match(text, pos)
+            if following is not None and _INDEX_NUMBER.fullmatch(following.group()) is not None:
+                pos = _skip_space(text, following.end())
+    return _IndexOptions(frozenset(flags), integers, words, analyzer, bm25, comment)
+
+
+def parse_define_index(text: str) -> IndexState:
+    """Read a ``DEFINE INDEX`` statement as the server renders it (spec §6.3.3) into an ``IndexState``.
+
+    The header ``DEFINE INDEX <ident> ON <ident>`` is read positionally (``DEFINE INDEX COUNT ON t FIELDS M`` names the
+    index ``COUNT``), then ``FIELDS`` (or ``COLUMNS``) and its idioms one by one — ``FIELDS TYPE, M UNIQUE`` gives
+    ``("TYPE", "M")`` — or ``COUNT``, then the flat run of options (see ``_index_options()``). ``fields`` hold the
+    canonical names (``tags[*]`` and ``tags.*`` both give ``"tags.*"``), ``()`` for ``COUNT``; ``bm25`` is
+    ``(k1, b)`` as floats for ``BM25(k1,b)``. SurrealDB 2.x's ``SEARCH`` and 3.x's ``FULLTEXT`` both give
+    ``search_analyzer``. No measured engine renders ``CONCURRENTLY`` (M42); it is read all the same. Raises
+    ``DefineParseError``.
+    """
+    name, table, pos = _named_on(text, "INDEX")
+    head = _WORD.match(text, _skip_space(text, pos))
+    if head is None or head.group() not in _INDEX_HEADS:
+        raise DefineParseError(_R_INDEX)
+    count = head.group() == "COUNT"
+    pos = head.end()
+    fields: tuple[str, ...] = ()
+    if not count:
+        if pos >= len(text) or not text[pos].isspace():
+            raise DefineParseError(_R_INDEX)
+        fields, pos = _index_fields(text, _skip_space(text, pos))
+    if pos < len(text) and not text[pos].isspace():
+        raise DefineParseError(_R_INDEX)
+    options = _index_options(text, _skip_space(text, pos))
+    return IndexState(
+        name=name,
+        fields=fields,
+        unique="UNIQUE" in options.flags,
+        search_analyzer=options.analyzer,
+        bm25=options.bm25,
+        highlights="HIGHLIGHTS" in options.flags,
+        hnsw="HNSW" in options.flags,
+        dimension=options.integers.get("DIMENSION"),
+        dist=options.words.get("DIST"),
+        vector_type=options.words.get("TYPE"),
+        efc=options.integers.get("EFC"),
+        m=options.integers.get("M"),
+        concurrently="CONCURRENTLY" in options.flags,
+        table=table,
+        mtree="MTREE" in options.flags,
+        count=count,
+        comment=options.comment,
+        raw=text,
+    )
+
+
+# --- DEFINE EVENT and DEFINE ANALYZER ------------------------------------------------------------------------------
+
+#: Spec §6.3.3, an event: WHEN and THEN are always rendered.
+_EVENT_SLOTS = (
+    Slot("when", ("WHEN",), _valid_expr, required=True),
+    Slot("then", ("THEN",), _valid_body, required=True),
+    Slot("comment", ("COMMENT",), _valid_string),
+)
+
+#: Spec §6.3.3, an analyzer.
+_ANALYZER_SLOTS = (
+    Slot("function", ("FUNCTION",), _valid_fn_name),
+    Slot("tokenizers", ("TOKENIZERS",), _valid_word_list),
+    Slot("filters", ("FILTERS",), _valid_filter_list),
+    Slot("comment", ("COMMENT",), _valid_string),
+)
+
+
+def parse_define_event(text: str) -> EventState:
+    """Read a ``DEFINE EVENT`` statement as the server renders it (spec §6.3.3) into an ``EventState``.
+
+    The header ``DEFINE EVENT <ident> ON <ident>`` is read positionally (``DEFINE EVENT THEN ON t WHEN END THEN …``
+    names the event ``THEN``), then the clauses ``WHEN`` (an expression; an ``IF … END`` keeps its ``THEN`` inside),
+    ``THEN`` (``(…)`` groups separated by commas, or one ``{…}`` block) — both required — and ``COMMENT``. ``when``
+    and ``then`` are kept as rendered: SurrealDB 2.x renders a block on several lines and an ``IF`` bare, 3.x on one
+    line and parenthesised. Raises ``DefineParseError``.
+    """
+    name, table, pos = _named_on(text, "EVENT")
+    clauses = read_clauses(text, pos, _EVENT_SLOTS)
+    return EventState(
+        name=name,
+        table=table,
+        when=clauses["when"].content,
+        then=clauses["then"].content,
+        comment=_comment(clauses),
+        raw=text,
+    )
+
+
+def _analyzer_filter(item: str) -> str:
+    """One filter as spec §6.3.4 normalises it: lower-cased and without spaces, but for its string arguments, kept
+    as rendered (``SNOWBALL(ENGLISH)`` → ``snowball(english)``, ``MAPPER('path/File.txt')`` →
+    ``mapper('path/File.txt')``)."""
+    span = _scan_span(item)
+    pieces: list[str] = []
+    for token in span.tokens[span.first : span.stop]:
+        if token.kind != _SPACE_TOKEN:
+            piece = span.text[token.start : token.end]
+            pieces.append(piece if token.kind == _STRING_TOKEN else piece.lower())
+    return "".join(pieces)
+
+
+def parse_define_analyzer(text: str) -> AnalyzerState:
+    """Read a ``DEFINE ANALYZER`` statement as the server renders it (spec §6.3.3, §6.3.4) into an ``AnalyzerState``.
+
+    The header ``DEFINE ANALYZER <ident>``, then the clauses ``FUNCTION fn::…``, ``TOKENIZERS``, ``FILTERS`` and
+    ``COMMENT``. Tokenizers are lower-cased (``BLANK,CLASS`` → ``("blank", "class")``); filters are lower-cased with
+    their spaces removed, string arguments kept — so SurrealDB 2.x's ``LOWERCASE,ASCII`` and 3.x's ``LOWERCASE,
+    ASCII`` read alike. Raises ``DefineParseError``.
+    """
+    pos = _header(text, "ANALYZER")
+    name, pos = read_identifier(text, pos)
+    clauses = read_clauses(text, _name_end(text, pos), _ANALYZER_SLOTS)
+    tokenizers = clauses.get("tokenizers")
+    filters = clauses.get("filters")
+    return AnalyzerState(
+        name=name,
+        tokenizers=() if tokenizers is None else tuple(part.strip().lower() for part in tokenizers.content.split(",")),
+        filters=() if filters is None else tuple(_analyzer_filter(item) for item in split_top_level(filters.content, ",")),
+        function=_content(clauses.get("function")),
+        comment=_comment(clauses),
+        raw=text,
+    )
+
+
+# --- DEFINE ACCESS -------------------------------------------------------------------------------------------------
+
+_ACCESS_TYPES = frozenset({"RECORD", "JWT", "BEARER"})
+_BEARER_SUBJECTS = frozenset({"USER", "RECORD"})
+#: The record targets of a SIGNUP read as a table (D28, option B): every line renders them so, lower case, no space.
+_CALL_TARGETS = ("type::thing(", "type::record(")
+
+#: Spec §6.3.3, an access (M17's order; ``ALGORITHM`` and ``URL`` directly after ``TYPE JWT`` too).
+_ACCESS_SLOTS = (
+    Slot("signup", ("SIGNUP",), _valid_group),
+    Slot("signin", ("SIGNIN",), _valid_group),
+    Slot("with_refresh", ("WITH REFRESH",), _valid_flag),
+    Slot("with_jwt", ("WITH JWT",), _valid_tokens),
+    Slot("algorithm", ("ALGORITHM",), _valid_tokens),
+    Slot("url", ("URL",), _valid_tokens),
+    Slot("with_issuer", ("WITH ISSUER",), _valid_tokens),
+    Slot("authenticate", ("AUTHENTICATE",), _valid_expr),
+    Slot("duration", ("DURATION",), _valid_durations),
+    Slot("comment", ("COMMENT",), _valid_string),
+)
+
+
+def _top_level_equals(item: str) -> int | None:
+    """The position of the first ``=`` of *item* outside strings, brackets and IF units, or ``None``."""
+    for token in _scan(item):
+        if token.kind == _PUNCT_TOKEN and not token.depth and item[token.start] == "=":
+            return token.start
+    return None
+
+
+def _signup_target(content: str, pos: int) -> tuple[str, int] | None:
+    """The table a SIGNUP's ``CREATE`` targets at *pos* and the position after the target, or ``None``.
+
+    A call ``type::thing(…)`` or ``type::record(…)`` with exactly two top-level arguments, the first one string
+    literal whose value is non-empty and holds no ``:`` (spec §6.3.3, D28's guard; the second one is not read);
+    otherwise an identifier.
+    """
+    call = next((prefix for prefix in _CALL_TARGETS if content.startswith(prefix, pos)), None)
+    if call is None:
+        return _identifier_at(content, pos)
+    opening = pos + len(call) - 1
+    end = _closing(content, opening)
+    arguments = split_top_level(content[opening + 1 : end - 1], ",")
+    if len(arguments) != 2:
+        return None
+    table = unquote(arguments[0].strip())
+    return (table, end) if table and ":" not in table else None
+
+
+def _signup_items(text: str) -> dict[str, str] | None:
+    """The ``SET`` items of a SIGNUP — ``<idiom> = <expression>`` separated by top-level commas — as ``{field: value
+    as rendered}``, or ``None`` when one item breaks the rules or a field comes twice."""
+    fields: dict[str, str] = {}
+    for item in split_top_level(text, ","):
+        cut = _top_level_equals(item)
+        if cut is None:
+            return None
+        key_text = item[:cut].strip()
+        value = item[cut + 1 :].strip()
+        path, end = read_idiom(key_text, 0)
+        key = canonical_name(path)
+        if end != len(key_text) or not value or key in fields:
+            return None
+        fields[key] = value
+    return fields
+
+
+def _signup_shape(group: str) -> tuple[str, dict[str, str]]:
+    """``(table, signup_fields)`` of a SIGNUP group of the shape ``(CREATE <target> SET <item>[, <item>]*)``, read
+    positionally; ``("", {})`` for any other shape — never an error (spec §6.3.3)."""
+    content = group[1:-1].strip()
+    if not content.startswith("CREATE") or len(content) <= len("CREATE") or not content[len("CREATE")].isspace():
+        return "", {}
+    try:
+        target = _signup_target(content, _skip_space(content, len("CREATE")))
+        if target is None:
+            return "", {}
+        table, pos = target
+        keyword = _skip_space(content, pos)
+        after = keyword + len("SET")
+        if keyword == pos or not content.startswith("SET", keyword) or after >= len(content) or not content[after].isspace():
+            return "", {}
+        fields = _signup_items(content[after:])
+    except DefineParseError:
+        return "", {}
+    return ("", {}) if fields is None else (table, fields)
+
+
+def _signin_where(group: str) -> str:
+    """The condition of a SIGNIN group of the shape ``(SELECT … FROM <ident> WHERE <condition>)``: the text after the
+    ``WHERE`` that follows the first top-level ``FROM <ident>`` that has one, to the end of the group; ``""`` for any
+    other shape (``FROM ONLY user WHERE …``, no ``WHERE``) — never an error."""
+    content = group[1:-1].strip()
+    tokens = _scan(content)
+    if not content.startswith("SELECT") or len(tokens) < 2 or tokens[0].end != len("SELECT") or tokens[1].kind != _SPACE_TOKEN:
+        return ""
+    for _, position, _ in _keyword_tokens(content, tokens, ("FROM",), 0):
+        # The content scanned: a quoted identifier in it is terminated.
+        found = _identifier_at(content, _skip_space(content, position + len("FROM")))
+        if found is None or found[1] >= len(content) or not content[found[1]].isspace():
+            continue
+        where = _skip_space(content, found[1])
+        after = where + len("WHERE")
+        if content.startswith("WHERE", where) and after < len(content) and content[after].isspace():
+            return content[after:].strip()
+    return ""
+
+
+def parse_define_access(text: str) -> AccessState:
+    """Read a database ``DEFINE ACCESS`` statement as the server renders it (spec §6.3.3) into an ``AccessState``.
+
+    The header ``DEFINE ACCESS <ident> ON DATABASE TYPE <RECORD|JWT|BEARER>`` (and ``FOR USER|RECORD`` after
+    ``BEARER``) is read positionally, then the clauses ``SIGNUP``, ``SIGNIN``, ``WITH REFRESH``, ``WITH JWT``,
+    ``ALGORITHM``, ``URL``, ``WITH ISSUER``, ``AUTHENTICATE``, ``DURATION`` and ``COMMENT``. ``signup`` and ``signin``
+    keep their groups, parentheses included. ``table`` and ``signup_fields`` come from a SIGNUP ``CREATE <target> SET
+    <field> = <expr>, …`` whose target is a table name or a guarded ``type::thing('<table>', …)`` /
+    ``type::record('<table>', …)`` call; ``signin_where`` from a SIGNIN ``SELECT … FROM <table> WHERE <expr>``; any
+    other shape gives ``""`` and ``{}``, with no error (the full ORM's attributes, made exact). Durations are kept as
+    rendered (``"4w2d"``, ``"NONE"``), ``None`` for one the ``DURATION`` clause does not name. The servers render the
+    keys ``[REDACTED]``. Raises ``DefineParseError``.
+    """
+    pos = _header(text, "ACCESS")
+    name, pos = read_identifier(text, pos)
+    pos = _expect_word(text, _expect_space(text, pos), "ON")
+    pos = _expect_word(text, _expect_word(text, pos, "DATABASE"), "TYPE")
+    access_type, pos = _header_word(text, pos, _ACCESS_TYPES)
+    if access_type == "BEARER":
+        _, pos = _header_word(text, _expect_word(text, _expect_space(text, pos), "FOR"), _BEARER_SUBJECTS)
+    clauses = read_clauses(text, pos, _ACCESS_SLOTS)
+    signup = clauses.get("signup")
+    signin = clauses.get("signin")
+    duration = clauses.get("duration")
+    table, signup_fields = ("", {}) if signup is None else _signup_shape(signup.content)
+    durations = {} if duration is None else _durations(duration.content) or {}
+    return AccessState(
+        name=name,
+        table=table,
+        signup_fields=signup_fields,
+        signin_where="" if signin is None else _signin_where(signin.content),
+        duration_token=durations.get("TOKEN"),
+        duration_session=durations.get("SESSION"),
+        access_type=access_type,
+        duration_grant=durations.get("GRANT"),
+        signup=_content(signup),
+        signin=_content(signin),
+        with_refresh="with_refresh" in clauses,
+        comment=_comment(clauses),
+        raw=text,
+    )
+
+
+# --- DEFINE FUNCTION and DEFINE PARAM ------------------------------------------------------------------------------
+
+#: Spec §6.3.3, after a function's body.
+_FUNCTION_SLOTS = (
+    Slot("comment", ("COMMENT",), _valid_string),
+    Slot("permissions", ("PERMISSIONS",), _valid_rule),
+)
+
+#: Spec §6.3.3, a param: VALUE is always rendered.
+_PARAM_SLOTS = (
+    Slot("value", ("VALUE",), _valid_expr, required=True),
+    Slot("comment", ("COMMENT",), _valid_string),
+    Slot("permissions", ("PERMISSIONS",), _valid_rule),
+)
+
+
+def _rule(clauses: Mapping[str, Clause]) -> str:
+    """The ``PERMISSIONS`` rule of a function or a param as rendered; ``"FULL"``, the server's default, when there
+    is none (both lines always render it)."""
+    permissions = clauses.get("permissions")
+    return "FULL" if permissions is None else permissions.content
+
+
+def parse_define_function(text: str) -> FunctionState:
+    """Read a ``DEFINE FUNCTION`` statement as the server renders it (spec §6.3.3) into a ``FunctionState``.
+
+    Positionally: ``DEFINE FUNCTION fn::<name>(`` and its parameter list to the matching ``)`` — the names read by
+    ``functions.parse_function_parameters()``, as ``call_function()`` reads them — then an optional ``-> <kind>``
+    (an object kind ``{ a: int }`` included), whose canonical text (§6.3.5: ``option<string>`` for 2.x's
+    ``option<string>`` and 3.x's ``none | string``) is ``returns``, then the body ``{…}`` to its matching brace; then
+    the clauses ``COMMENT`` and ``PERMISSIONS`` (``FULL``, ``NONE`` or ``WHERE <expr>``). Raises ``DefineParseError``
+    (``_R_SIGNATURE`` for a signature or body that is not where expected).
+    """
+    pos = _header(text, "FUNCTION")
+    name = _FN_NAME.match(text, pos)
+    if name is None:
+        raise DefineParseError(_R_HEADER)
+    if not text.startswith("(", name.end()):
+        raise DefineParseError(_R_SIGNATURE)
+    pos = _skip_space(text, _closing(text, name.end()))
+    try:
+        parameters = parse_function_parameters(text)
+    except ValueError:
+        raise DefineParseError(_R_SIGNATURE) from None
+    returns: str | None = None
+    if text.startswith("->", pos):
+        kind, pos = parse_kind_prefix(text, pos + len("->"))
+        returns = render_kind(kind)
+    if not text.startswith("{", pos):
+        raise DefineParseError(_R_SIGNATURE)
+    pos = _closing(text, pos)
+    if pos < len(text) and not text[pos].isspace():
+        raise DefineParseError(_R_SIGNATURE)
+    clauses = read_clauses(text, pos, _FUNCTION_SLOTS)
+    return FunctionState(
+        name=name.group(),
+        parameters=parameters,
+        returns=returns,
+        permissions=_rule(clauses),
+        comment=_comment(clauses),
+        raw=text,
+    )
+
+
+def parse_define_param(text: str) -> ParamState:
+    """Read a ``DEFINE PARAM`` statement as the server renders it (spec §6.3.3) into a ``ParamState``.
+
+    The header ``DEFINE PARAM $<ident>`` (``name`` without the ``$``), then the clauses ``VALUE`` (required, kept as
+    rendered), ``COMMENT`` and ``PERMISSIONS``. The value may be a secret: it is never part of a
+    ``DefineParseError`` (none is), and ``ParamState`` keeps it out of ``repr``. Raises ``DefineParseError``.
+    """
+    pos = _header(text, "PARAM")
+    if not text.startswith("$", pos):
+        raise DefineParseError(_R_HEADER)
+    name, pos = read_identifier(text, pos + 1)
+    clauses = read_clauses(text, _name_end(text, pos), _PARAM_SLOTS)
+    return ParamState(
+        name=name,
+        value=clauses["value"].content,
+        permissions=_rule(clauses),
+        comment=_comment(clauses),
+        raw=text,
+    )

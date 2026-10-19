@@ -3,9 +3,10 @@
 The scanner (spec §6.3.1; M11, M34, M35): string literals and their decoding, identifiers and field paths, the
 top-level keyword candidates with ``IF`` units, top-level splitting; the kinds (spec §6.3.5; M7, M15, M21): their
 grammar, one canonical rendering for SurrealDB 2.x and 3.x, nullability; the clause reader and its validators (spec
-§6.3.2), ``DEFINE TABLE``, ``DEFINE FIELD`` and permissions (spec §6.3.3; M6, M8–M11, M20, M31, M34–M36, M43) on the
-golden statements of spec §9.2 — the 2.x and 3.x renderings side by side; and the fixed reasons ``DefineParseError``
-is raised with (spec §6.3.6). Unit tests only (no server).
+§6.3.2), ``DEFINE TABLE``, ``DEFINE FIELD`` and permissions (spec §6.3.3; M6, M8–M11, M20, M31, M34–M36, M43);
+``DEFINE INDEX``, ``EVENT``, ``ANALYZER``, ``ACCESS``, ``FUNCTION`` and ``PARAM`` (spec §6.3.3, §6.3.4; M12–M17, M34,
+M35, M42, M44–M46, D28) on the golden statements of spec §9.2 — the 2.x and 3.x renderings side by side; and the
+fixed reasons ``DefineParseError`` is raised with (spec §6.3.6). Unit tests only (no server).
 """
 
 import ast
@@ -22,10 +23,12 @@ from surreal_orm_lite.define_parser import (
     _R_HEADER,
     _R_IDENT,
     _R_IF,
+    _R_INDEX,
     _R_KIND,
     _R_NO_READING,
     _R_PATH,
     _R_PERMISSIONS,
+    _R_SIGNATURE,
     _R_STATEMENT,
     _R_STRING,
     Clause,
@@ -39,7 +42,13 @@ from surreal_orm_lite.define_parser import (
     Slot,
     canonical_name,
     normalise_kind,
+    parse_define_access,
+    parse_define_analyzer,
+    parse_define_event,
     parse_define_field,
+    parse_define_function,
+    parse_define_index,
+    parse_define_param,
     parse_define_table,
     parse_kind,
     parse_kind_prefix,
@@ -52,7 +61,18 @@ from surreal_orm_lite.define_parser import (
     top_level_keywords,
     unquote,
 )
-from surreal_orm_lite.schema_state import FieldState, TableState
+from surreal_orm_lite.functions import parse_function_parameters
+from surreal_orm_lite.schema_state import (
+    AccessState,
+    AnalyzerState,
+    EventState,
+    FieldState,
+    FunctionState,
+    IndexState,
+    ParamState,
+    TableState,
+    _FrozenMap,
+)
 
 #: Spec §6.3.6: the only reasons ``DefineParseError`` is raised with.
 _SPEC_REASONS = {
@@ -1894,6 +1914,910 @@ class TestPermissions:
         with pytest.raises(DefineParseError) as error:
             parse_permissions(text, _FIELD_ACTIONS, unnamed="FULL")
         assert _reason(error) == _R_PERMISSIONS
+
+
+# --- indexes (spec §6.3.3; M12, M34, M42, M46) ---------------------------------------------------------------------
+
+
+def _index(statement: str, name: str, table: str = "t", **attributes: object) -> tuple[str, IndexState]:
+    """A golden index statement and the state it reads as — every attribute by keyword, ``raw`` the statement."""
+    return statement, IndexState(name=name, **{**attributes, "table": table, "raw": statement})  # type: ignore[arg-type]
+
+
+_SEARCH_2X = (
+    "DEFINE INDEX s2 ON t FIELDS body SEARCH ANALYZER ascii BM25(1.2,0.75) DOC_IDS_ORDER 100 DOC_LENGTHS_ORDER 100"
+    " POSTINGS_ORDER 100 TERMS_ORDER 100 DOC_IDS_CACHE 100 DOC_LENGTHS_CACHE 100 POSTINGS_CACHE 100 TERMS_CACHE 100"
+)
+_SEARCH_3X = "DEFINE INDEX s2 ON t FIELDS body FULLTEXT ANALYZER ascii BM25(1.2,0.75)"
+_SEARCH: dict[str, object] = {"fields": ("body",), "search_analyzer": "ascii", "bm25": (1.2, 0.75)}
+_HNSW_TAIL = "EFC 150 M 12 M0 24 LM 0.40242960438184466f"
+_HNSW: dict[str, object] = {"fields": ("v",), "hnsw": True, "vector_type": "F32", "efc": 150, "m": 12}
+_TAGS_2X = 'DEFINE INDEX tg ON t FIELDS tags[*], `first-name`, a.b.c UNIQUE COMMENT "it\'s"'
+_TAGS_3X = 'DEFINE INDEX tg ON t FIELDS tags.*, `first-name`, a.b.c UNIQUE COMMENT "it\'s"'
+_TAGS: dict[str, object] = {"fields": ("tags.*", "first-name", "a.b.c"), "unique": True, "comment": "it's"}
+
+#: M12 (probe of 2026-10-18 on 2.7.0 and 3.3.4; both lines render alike unless both renderings are listed), M34, M42
+#: and M46. Fabricated statements are marked.
+_INDEXES = [
+    _index("DEFINE INDEX i1 ON t FIELDS age, name", "i1", fields=("age", "name")),
+    _index("DEFINE INDEX i2 ON t FIELDS email UNIQUE", "i2", fields=("email",), unique=True),
+    _index("DEFINE INDEX i3 ON t FIELDS f.x COMMENT 'ix'", "i3", fields=("f.x",), comment="ix"),
+    # M42: `… FIELDS a CONCURRENTLY` and `… FIELDS b UNIQUE CONCURRENTLY` are rendered without it.
+    _index("DEFINE INDEX ic ON t FIELDS a", "ic", fields=("a",)),
+    _index("DEFINE INDEX iu ON t FIELDS b UNIQUE", "iu", fields=("b",), unique=True),
+    # Fabricated: kept so that a future rendering is not lost.
+    _index("DEFINE INDEX ic ON t FIELDS a CONCURRENTLY", "ic", fields=("a",), concurrently=True),
+    _index("DEFINE INDEX iu ON t FIELDS b UNIQUE CONCURRENTLY", "iu", fields=("b",), unique=True, concurrently=True),
+    # Full text: SEARCH on 2.x (with its tuning tokens), FULLTEXT on 3.x.
+    _index(f"{_SEARCH_2X} HIGHLIGHTS", "s2", **_SEARCH, highlights=True),
+    _index(f"{_SEARCH_3X} HIGHLIGHTS", "s2", **_SEARCH, highlights=True),
+    _index(_SEARCH_2X, "s2", **_SEARCH),
+    _index(_SEARCH_3X, "s2", **_SEARCH),
+    # M46: a bare BM25 is rendered BM25(1.2,0.75), so these are fabricated.
+    _index("DEFINE INDEX s4 ON t FIELDS body FULLTEXT ANALYZER ascii BM25", "s4", **{**_SEARCH, "bm25": True}),
+    _index(
+        "DEFINE INDEX s4 ON t FIELDS body SEARCH ANALYZER `my an` BM25 HIGHLIGHTS",
+        "s4",
+        **{**_SEARCH, "search_analyzer": "my an", "bm25": True},
+        highlights=True,
+    ),
+    # HNSW, both lines: M0 and LM skipped with their argument, as the flags after them.
+    _index(
+        f"DEFINE INDEX hn ON t FIELDS v HNSW DIMENSION 3 DIST COSINE TYPE F32 {_HNSW_TAIL}",
+        "hn",
+        **_HNSW,
+        dimension=3,
+        dist="COSINE",
+    ),
+    _index(
+        f"DEFINE INDEX hm ON t FIELDS v HNSW DIMENSION 4 DIST MINKOWSKI 3 TYPE F32 {_HNSW_TAIL}",
+        "hm",
+        **_HNSW,
+        dimension=4,
+        dist="MINKOWSKI",
+    ),
+    _index(
+        f"DEFINE INDEX hx ON t FIELDS v HNSW DIMENSION 4 DIST EUCLIDEAN TYPE F32 {_HNSW_TAIL}"
+        " EXTEND_CANDIDATES KEEP_PRUNED_CONNECTIONS",
+        "hx",
+        **_HNSW,
+        dimension=4,
+        dist="EUCLIDEAN",
+    ),
+    # MTREE (2.x only).
+    _index(
+        "DEFINE INDEX mt ON t FIELDS v2 MTREE DIMENSION 3 DIST EUCLIDEAN TYPE F64 CAPACITY 40 DOC_IDS_ORDER 100"
+        " DOC_IDS_CACHE 100 MTREE_CACHE 100",
+        "mt",
+        fields=("v2",),
+        mtree=True,
+        dimension=3,
+        dist="EUCLIDEAN",
+        vector_type="F64",
+    ),
+    _index(
+        "DEFINE INDEX md ON t FIELDS v5 MTREE DIMENSION 4 DIST MINKOWSKI 3 TYPE F64 CAPACITY 40 DOC_IDS_ORDER 100"
+        " DOC_IDS_CACHE 100 MTREE_CACHE 100",
+        "md",
+        fields=("v5",),
+        mtree=True,
+        dimension=4,
+        dist="MINKOWSKI",
+        vector_type="F64",
+    ),
+    # COUNT (3.x and 2.7.0): no FIELDS.
+    _index("DEFINE INDEX cnt ON c COUNT COMMENT 'ix'", "cnt", "c", count=True, comment="ix"),
+    _index("DEFINE INDEX cnt ON c COUNT", "cnt", "c", count=True),
+    # Paths in the FieldState.name form: tags[*] (2.x) and tags.* (3.x); a backticked segment unescaped.
+    _index(_TAGS_2X, "tg", **_TAGS),
+    _index(_TAGS_3X, "tg", **_TAGS),
+    _index("DEFINE INDEX `we-ird` ON t FIELDS x", "we-ird", fields=("x",)),
+    _index("DEFINE INDEX i4 ON `we-ird` COLUMNS a,b", "i4", "we-ird", fields=("a", "b")),  # fabricated: COLUMNS
+    # M34: keyword-named fields, read idiom by idiom before the options.
+    _index("DEFINE INDEX ix ON t FIELDS TYPE, M UNIQUE", "ix", fields=("TYPE", "M"), unique=True),
+    _index("DEFINE INDEX ix2 ON t FIELDS COMMENT, END", "ix2", fields=("COMMENT", "END")),
+    _index("DEFINE INDEX COUNT ON t FIELDS M", "COUNT", fields=("M",)),
+    _index("DEFINE INDEX ix3 ON t FIELDS `VALUE`, DEFAULT UNIQUE", "ix3", fields=("VALUE", "DEFAULT"), unique=True),
+]
+
+
+class TestDefineIndex:
+    """Spec §6.3.3 (AC-7): the header positionally, then ``FIELDS``/``COLUMNS`` and its idioms or ``COUNT``, then a
+    flat run of option tokens, unknown ones skipped with their numeric argument, and a final ``COMMENT``."""
+
+    @pytest.mark.parametrize(
+        ("statement", "expected"), _INDEXES, ids=[f"{state.name}:{n}" for n, (_, state) in enumerate(_INDEXES)]
+    )
+    def test_golden(self, statement: str, expected: IndexState) -> None:
+        state = parse_define_index(statement)
+        assert state == expected
+        assert isinstance(state.fields, tuple)
+
+    @pytest.mark.parametrize(
+        ("two", "three"),
+        [(f"{_SEARCH_2X} HIGHLIGHTS", f"{_SEARCH_3X} HIGHLIGHTS"), (_SEARCH_2X, _SEARCH_3X), (_TAGS_2X, _TAGS_3X)],
+    )
+    def test_both_renderings_read_alike(self, two: str, three: str) -> None:
+        # AC-6: SEARCH (2.x) and FULLTEXT (3.x), tags[*] and tags.*: equal states but raw.
+        assert dataclasses.replace(parse_define_index(two), raw="") == dataclasses.replace(parse_define_index(three), raw="")
+
+    def test_bm25_holds_floats(self) -> None:
+        bm25 = parse_define_index(f"{_SEARCH_3X} HIGHLIGHTS").bm25
+        assert bm25 == (1.2, 0.75)
+        assert isinstance(bm25, tuple) and all(isinstance(value, float) for value in bm25)
+
+    @pytest.mark.parametrize(
+        ("statement", "reason"),
+        [
+            ("DEFINE TABLE t TYPE ANY SCHEMALESS PERMISSIONS NONE", _R_STATEMENT),
+            ("DEFINE INDEXES i ON t FIELDS a", _R_STATEMENT),
+            ("DEFINE INDEX", _R_HEADER),
+            ("DEFINE INDEX i t FIELDS a", _R_HEADER),
+            ("DEFINE INDEX i ON t(x) FIELDS a", _R_HEADER),
+            ("DEFINE INDEX `i ON t FIELDS a", _R_IDENT),
+            # Neither FIELDS nor COUNT.
+            ("DEFINE INDEX i ON t", _R_INDEX),
+            ("DEFINE INDEX i ON t UNIQUE", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS", _R_INDEX),
+            ("DEFINE INDEX i ON t COUNTED", _R_INDEX),
+            # The field list.
+            ("DEFINE INDEX i ON t FIELDS a, ", _R_PATH),
+            ("DEFINE INDEX i ON t FIELDS a..b", _R_PATH),
+            ("DEFINE INDEX i ON t FIELDS a(b)", _R_INDEX),
+            # The options.
+            ("DEFINE INDEX i ON t FIELDS a DIMENSION", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a DIMENSION x", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a EFC 1.5", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a HNSW DIST", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a HNSW TYPE 3", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a SEARCH ascii", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a FULLTEXT ANALYZER", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a FULLTEXT ANALYZER (x)", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a FULLTEXT ANALYZER x(y)", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a BM25(1.2)", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a BM25(1.2,x)", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a BM25(1.2,0.75", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a BM25(1.2,0.75)x", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a UNIQUE,", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a 0.5x", _R_INDEX),
+            # COMMENT ends the statement and takes one literal.
+            ("DEFINE INDEX i ON t FIELDS a COMMENT 'x' UNIQUE", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a COMMENT x", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a COMMENT", _R_INDEX),
+            ("DEFINE INDEX i ON t FIELDS a COMMENT 'x", _R_STRING),
+            # 3.x renders a COUNT condition, which IndexState does not model: an issue (I1), never a guess.
+            ("DEFINE INDEX cw ON t COUNT WHERE a > 1", _R_INDEX),
+        ],
+    )
+    def test_refused(self, statement: str, reason: str) -> None:
+        with pytest.raises(DefineParseError) as error:
+            parse_define_index(statement)
+        assert _reason(error) == reason
+
+
+# --- events (spec §6.3.3; M13, M34, M35) ---------------------------------------------------------------------------
+
+
+def _event(statement: str, name: str, when: str, then: str, **attributes: object) -> tuple[str, EventState]:
+    """A golden event statement and the state it reads as — every attribute by keyword, ``raw`` the statement."""
+    state = EventState(name=name, table="t", when=when, then=then, **{**attributes, "raw": statement})  # type: ignore[arg-type]
+    return statement, state
+
+
+_LOG = "(CREATE log SET x = 1)"
+_E1_IF = "IF $event = 'CREATE' THEN true ELSE false END"
+_E2_IF = "IF $event = 'CREATE' { true } ELSE { false }"
+_E3_IF = "IF $event = 'CREATE' THEN true ELSE IF $event = 'UPDATE' THEN true ELSE false END"
+_E3_THEN_2X = "{ IF $event = 'CREATE' { CREATE log SET x = 1; } ELSE { CREATE log SET x = 2; }; }"
+_E3_THEN_3X = "{ IF $event = 'CREATE' { CREATE log SET x = 1 } ELSE { CREATE log SET x = 2 } }"
+_EV3_THEN = "(CREATE log SET x = 1), (CREATE log SET x = 2)"
+
+#: M13 (probe of 2026-10-18 on 2.7.0 and 3.3.4) and spec §9.2's M34/M35 events: the 2.x rendering, then the 3.x one
+#: where they differ. ``when`` and ``then`` are kept as rendered.
+_EVENTS = [
+    _event(
+        "DEFINE EVENT ev1 ON t WHEN $event = 'CREATE' THEN (CREATE log SET msg = 'x')",
+        "ev1",
+        "$event = 'CREATE'",
+        "(CREATE log SET msg = 'x')",
+    ),
+    _event(
+        "DEFINE EVENT ev4 ON t WHEN true THEN (CREATE log SET a = 1), (CREATE log SET b = 2) COMMENT 'e'",
+        "ev4",
+        "true",
+        "(CREATE log SET a = 1), (CREATE log SET b = 2)",
+        comment="e",
+    ),
+    _event(
+        "DEFINE EVENT ev5 ON t WHEN true THEN {\nLET $x = 1;\nCREATE log SET x = $x;\n}",
+        "ev5",
+        "true",
+        "{\nLET $x = 1;\nCREATE log SET x = $x;\n}",
+    ),
+    _event(
+        "DEFINE EVENT ev5 ON t WHEN true THEN { LET $x = 1; CREATE log SET x = $x; }",
+        "ev5",
+        "true",
+        "{ LET $x = 1; CREATE log SET x = $x; }",
+    ),
+    # A THEN inside a string.
+    _event(
+        "DEFINE EVENT ev6 ON t WHEN $value.name = 'THEN x' THEN (CREATE log SET x = 1)", "ev6", "$value.name = 'THEN x'", _LOG
+    ),
+    _event("DEFINE EVENT ev8 ON t WHEN true THEN (CREATE log SET x = 1) COMMENT 'c'", "ev8", "true", _LOG, comment="c"),
+    # M35: the IF expressions, bare on 2.x and parenthesised on 3.x.
+    _event(f"DEFINE EVENT e1 ON t WHEN {_E1_IF} THEN {_LOG}", "e1", _E1_IF, _LOG),
+    _event(f"DEFINE EVENT e1 ON t WHEN ({_E1_IF}) THEN {_LOG}", "e1", f"({_E1_IF})", _LOG),
+    _event(f"DEFINE EVENT e2 ON t WHEN {_E2_IF} THEN {_LOG}", "e2", _E2_IF, _LOG),
+    _event(f"DEFINE EVENT e2 ON t WHEN ({_E2_IF}) THEN {_LOG}", "e2", f"({_E2_IF})", _LOG),
+    _event(f"DEFINE EVENT e3 ON t WHEN {_E3_IF} THEN {_E3_THEN_2X}", "e3", _E3_IF, _E3_THEN_2X),
+    _event(f"DEFINE EVENT e3 ON t WHEN ({_E3_IF}) THEN {_E3_THEN_3X}", "e3", f"({_E3_IF})", _E3_THEN_3X),
+    _event(
+        f"DEFINE EVENT ev3 ON t WHEN IF $event = 'CREATE' THEN (WHEN) ELSE (THEN) END THEN {_EV3_THEN} COMMENT 'c'",
+        "ev3",
+        "IF $event = 'CREATE' THEN (WHEN) ELSE (THEN) END",
+        _EV3_THEN,
+        comment="c",
+    ),
+    _event(
+        f"DEFINE EVENT ev3 ON t WHEN (IF $event = 'CREATE' THEN WHEN ELSE THEN END) THEN {_EV3_THEN} COMMENT 'c'",
+        "ev3",
+        "(IF $event = 'CREATE' THEN WHEN ELSE THEN END)",
+        _EV3_THEN,
+        comment="c",
+    ),
+    # M34: keyword-named identifiers.
+    _event(f"DEFINE EVENT THEN ON t WHEN END THEN {_LOG}", "THEN", "END", _LOG),
+    _event(f"DEFINE EVENT ev2 ON t WHEN THEN = 1 THEN {_LOG}", "ev2", "THEN = 1", _LOG),
+]
+
+
+class TestDefineEvent:
+    """Spec §6.3.3 (AC-7): ``DEFINE EVENT <ident> ON <ident>``, then ``WHEN`` (an expression) and ``THEN`` (groups or
+    a block), both required, and ``COMMENT``."""
+
+    @pytest.mark.parametrize(
+        ("statement", "expected"), _EVENTS, ids=[f"{state.name}:{n}" for n, (_, state) in enumerate(_EVENTS)]
+    )
+    def test_golden(self, statement: str, expected: EventState) -> None:
+        assert parse_define_event(statement) == expected
+
+    def test_the_table_is_read_positionally(self) -> None:
+        state = parse_define_event("DEFINE EVENT ON ON `we-ird` WHEN true THEN (CREATE log SET x = 1)")
+        assert (state.name, state.table) == ("ON", "we-ird")
+
+    @pytest.mark.parametrize(
+        ("statement", "reason"),
+        [
+            ("DEFINE FIELD e ON t", _R_STATEMENT),
+            ("DEFINE EVENT", _R_HEADER),
+            ("DEFINE EVENT e t WHEN true THEN (a)", _R_HEADER),
+            ("DEFINE EVENT e ON t(x) WHEN true THEN (a)", _R_HEADER),
+            # WHEN and THEN are both required; THEN takes groups or a block; COMMENT a literal.
+            ("DEFINE EVENT e ON t WHEN true", _R_NO_READING),
+            ("DEFINE EVENT e ON t THEN (CREATE log SET x = 1)", _R_NO_READING),
+            ("DEFINE EVENT e ON t", _R_NO_READING),
+            ("DEFINE EVENT e ON t WHEN true THEN CREATE log", _R_NO_READING),
+            ("DEFINE EVENT e ON t WHEN true THEN (a) (b)", _R_NO_READING),
+            ("DEFINE EVENT e ON t WHEN true THEN (a) COMMENT c", _R_NO_READING),
+            ("DEFINE EVENT e ON t WHEN a + THEN (a)", _R_NO_READING),
+            # 3.x renders ASYNC events (ASYNC RETRY n MAXDEPTH n), which EventState does not model: an issue (I1).
+            ("DEFINE EVENT ev7 ON t ASYNC RETRY 1 MAXDEPTH 3 WHEN true THEN (CREATE log SET x = 1)", _R_NO_READING),
+            ("DEFINE EVENT e ON t WHEN IF a THEN b THEN (x)", _R_IF),
+        ],
+    )
+    def test_refused(self, statement: str, reason: str) -> None:
+        with pytest.raises(DefineParseError) as error:
+            parse_define_event(statement)
+        assert _reason(error) == reason
+
+
+# --- analyzers (spec §6.3.3, §6.3.4; M14) --------------------------------------------------------------------------
+
+
+#: M14 (probe of 2026-10-18 on 2.7.0 and 3.3.4): ``(2.x, 3.x, name, tokenizers, filters, other attributes)`` — names
+#: upper-case on both lines, filters separated by ``,`` (2.x) or ``, `` (3.x). ``None`` where both lines render alike,
+#: and for a fabricated statement.
+_ANALYZER_PAIRS: list[tuple[str, str | None, str, tuple[str, ...], tuple[str, ...], dict[str, object]]] = [
+    (
+        "DEFINE ANALYZER an1 FUNCTION fn::an TOKENIZERS BLANK,CLASS FILTERS LOWERCASE,SNOWBALL(ENGLISH),EDGENGRAM(2,10)"
+        " COMMENT 'an'",
+        "DEFINE ANALYZER an1 FUNCTION fn::an TOKENIZERS BLANK,CLASS FILTERS LOWERCASE, SNOWBALL(ENGLISH),"
+        " EDGENGRAM(2,10) COMMENT 'an'",
+        "an1",
+        ("blank", "class"),
+        ("lowercase", "snowball(english)", "edgengram(2,10)"),
+        {"function": "fn::an", "comment": "an"},
+    ),
+    (
+        "DEFINE ANALYZER ascii TOKENIZERS CLASS FILTERS LOWERCASE,ASCII",
+        "DEFINE ANALYZER ascii TOKENIZERS CLASS FILTERS LOWERCASE, ASCII",
+        "ascii",
+        ("class",),
+        ("lowercase", "ascii"),
+        {},
+    ),
+    (
+        "DEFINE ANALYZER an5 FILTERS NGRAM(1,3),EDGENGRAM(2,10),LOWERCASE,UPPERCASE,ASCII",
+        "DEFINE ANALYZER an5 FILTERS NGRAM(1,3), EDGENGRAM(2,10), LOWERCASE, UPPERCASE, ASCII",
+        "an5",
+        (),
+        ("ngram(1,3)", "edgengram(2,10)", "lowercase", "uppercase", "ascii"),
+        {},
+    ),
+    ("DEFINE ANALYZER an3 TOKENIZERS BLANK", None, "an3", ("blank",), (), {}),
+    ("DEFINE ANALYZER an4 FILTERS LOWERCASE", None, "an4", (), ("lowercase",), {}),
+    # Fabricated: a mapper needs a readable file on the server (M14). String arguments are kept as written.
+    (
+        "DEFINE ANALYZER an2 TOKENIZERS BLANK FILTERS LOWERCASE, MAPPER('path/File.txt')",
+        None,
+        "an2",
+        ("blank",),
+        ("lowercase", "mapper('path/File.txt')"),
+        {},
+    ),
+    (
+        'DEFINE ANALYZER an6 FILTERS SNOWBALL( English ), MAPPER("Dir/A B.txt")',
+        None,
+        "an6",
+        (),
+        ("snowball(english)", 'mapper("Dir/A B.txt")'),
+        {},
+    ),
+    ("DEFINE ANALYZER an7 FUNCTION fn::a::b", None, "an7", (), (), {"function": "fn::a::b"}),
+    ("DEFINE ANALYZER COMMENT TOKENIZERS BLANK COMMENT 'x'", None, "COMMENT", ("blank",), (), {"comment": "x"}),
+]
+
+_ANALYZERS = [
+    (statement, AnalyzerState(name=name, tokenizers=tokenizers, filters=filters, **{**attributes, "raw": statement}))  # type: ignore[arg-type]
+    for two, three, name, tokenizers, filters, attributes in _ANALYZER_PAIRS
+    for statement in (two, three)
+    if statement is not None
+]
+
+
+class TestDefineAnalyzer:
+    """Spec §6.3.3 and §6.3.4 (AC-6, AC-7): ``FUNCTION``, ``TOKENIZERS``, ``FILTERS``, ``COMMENT``; tokenizers
+    lower-cased, filters lower-cased but for their string arguments, spaces removed."""
+
+    @pytest.mark.parametrize(
+        ("statement", "expected"), _ANALYZERS, ids=[f"{state.name}:{n}" for n, (_, state) in enumerate(_ANALYZERS)]
+    )
+    def test_golden(self, statement: str, expected: AnalyzerState) -> None:
+        state = parse_define_analyzer(statement)
+        assert state == expected
+        assert isinstance(state.tokenizers, tuple) and isinstance(state.filters, tuple)
+
+    @pytest.mark.parametrize(("two", "three"), [(two, three) for two, three, *_ in _ANALYZER_PAIRS if three is not None])
+    def test_both_renderings_read_alike(self, two: str, three: str) -> None:
+        state_two = parse_define_analyzer(two)
+        state_three = parse_define_analyzer(three)
+        assert dataclasses.replace(state_two, raw="") == dataclasses.replace(state_three, raw="")
+
+    @pytest.mark.parametrize(
+        ("statement", "reason"),
+        [
+            ("DEFINE ANALYZERS a TOKENIZERS BLANK", _R_STATEMENT),
+            ("DEFINE ANALYZER", _R_HEADER),
+            ("DEFINE ANALYZER a(b) TOKENIZERS BLANK", _R_HEADER),
+            ("DEFINE ANALYZER a TOKENIZERS", _R_NO_READING),
+            ("DEFINE ANALYZER a TOKENIZERS BLANK CLASS", _R_NO_READING),
+            ("DEFINE ANALYZER a TOKENIZERS BLANK(1)", _R_NO_READING),
+            ("DEFINE ANALYZER a FILTERS (x)", _R_NO_READING),
+            ("DEFINE ANALYZER a FILTERS LOWERCASE ASCII", _R_NO_READING),
+            ("DEFINE ANALYZER a FUNCTION an", _R_NO_READING),
+            ("DEFINE ANALYZER a COMMENT 'x' TOKENIZERS BLANK", _R_NO_READING),
+            ("DEFINE ANALYZER a FILTERS LOWERCASE(", _R_BRACKETS),
+        ],
+    )
+    def test_refused(self, statement: str, reason: str) -> None:
+        with pytest.raises(DefineParseError) as error:
+            parse_define_analyzer(statement)
+        assert _reason(error) == reason
+
+
+# --- accesses (spec §6.3.3, §9.2; M17, M44, M45; D28 option B with a guard) ----------------------------------------
+
+
+_KEYS = "WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]'"
+
+#: Spec §9.2's accesses, exact strings (M17 and M44; both lines unless noted): the name → its renderings.
+_ACCESS_GOLDENS = {
+    "a1": [
+        "DEFINE ACCESS a1 ON DATABASE TYPE RECORD SIGNUP (CREATE isp_user SET name = $name) SIGNIN (SELECT * FROM isp_user WHERE name = $name) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' AUTHENTICATE (IF $auth.id { RETURN $auth.id; }) DURATION FOR TOKEN 15m, FOR SESSION 12h COMMENT 'acc'",
+        "DEFINE ACCESS a1 ON DATABASE TYPE RECORD SIGNUP (CREATE isp_user SET name = $name) SIGNIN (SELECT * FROM isp_user WHERE name = $name) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' AUTHENTICATE (IF $auth.id { RETURN $auth.id }) DURATION FOR TOKEN 15m, FOR SESSION 12h COMMENT 'acc'",
+        # Probe of 2026-10-18: AUTHENTICATE given as a block (2.7.0, then 3.3.4).
+        "DEFINE ACCESS a1 ON DATABASE TYPE RECORD SIGNUP (CREATE isp_user SET name = $name) SIGNIN (SELECT * FROM isp_user WHERE name = $name) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' AUTHENTICATE { IF $auth.id { RETURN $auth.id; }; } DURATION FOR TOKEN 15m, FOR SESSION 12h COMMENT 'acc'",
+        "DEFINE ACCESS a1 ON DATABASE TYPE RECORD SIGNUP (CREATE isp_user SET name = $name) SIGNIN (SELECT * FROM isp_user WHERE name = $name) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' AUTHENTICATE { IF $auth.id { RETURN $auth.id } } DURATION FOR TOKEN 15m, FOR SESSION 12h COMMENT 'acc'",
+    ],
+    "a2": [
+        "DEFINE ACCESS a2 ON DATABASE TYPE JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 1h, FOR SESSION 1h",
+    ],
+    "a3": [
+        "DEFINE ACCESS a3 ON DATABASE TYPE RECORD SIGNIN (SELECT * FROM isp_user) WITH REFRESH WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR GRANT 4w2d, FOR TOKEN 1m, FOR SESSION NONE",
+    ],
+    "acc": [
+        "DEFINE ACCESS acc ON DATABASE TYPE RECORD SIGNUP (CREATE user SET email = $email, password = crypto::argon2::generate($password)) SIGNIN (SELECT * FROM user WHERE email = $email AND crypto::argon2::compare(password, $password)) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 15m, FOR SESSION 12h",
+    ],
+    "acc3": [
+        "DEFINE ACCESS acc3 ON DATABASE TYPE RECORD SIGNUP (CREATE `we-ird` SET `first-name` = $n) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 15m, FOR SESSION NONE",
+    ],
+    "k1": [
+        "DEFINE ACCESS k1 ON DATABASE TYPE RECORD SIGNUP (CREATE type::record('user', $email) SET email = $email) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 15m, FOR SESSION 12h",
+    ],
+    "k2": [
+        "DEFINE ACCESS k2 ON DATABASE TYPE RECORD SIGNUP (CREATE user SET a += 1, b = $b == 1, c = { x: 1, y: 2 }) SIGNIN (SELECT * FROM user WHERE a = 1 LIMIT 1) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 15m, FOR SESSION 12h",
+    ],
+    "k3": [
+        "DEFINE ACCESS k3 ON DATABASE TYPE RECORD SIGNUP (CREATE ONLY user SET a = 1) SIGNIN (SELECT * FROM ONLY user WHERE a = 1) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 15m, FOR SESSION 12h",
+    ],
+    "k4": [
+        "DEFINE ACCESS k4 ON DATABASE TYPE RECORD SIGNUP (CREATE user CONTENT { a: 1 }) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 15m, FOR SESSION 12h",
+    ],
+    "k5": [
+        "DEFINE ACCESS k5 ON DATABASE TYPE JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 1h, FOR SESSION 2h",
+    ],
+    "k6": [
+        "DEFINE ACCESS k6 ON DATABASE TYPE RECORD SIGNIN (SELECT * FROM user WHERE a = 1) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 1h, FOR SESSION NONE",
+    ],
+    "k7": [
+        "DEFINE ACCESS k7 ON DATABASE TYPE RECORD SIGNUP (CREATE user SET name = $name, name = $other) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 15m, FOR SESSION 12h",
+    ],
+    # 2.7.0 and mem:// only: 3.x refuses type::thing at DEFINE (M45).
+    "k8": [
+        "DEFINE ACCESS k8 ON DATABASE TYPE RECORD SIGNUP (CREATE type::thing('user', $email) SET email = $email) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 15m, FOR SESSION 12h",
+    ],
+    "k9": [
+        "DEFINE ACCESS k9 ON DATABASE TYPE RECORD SIGNUP (CREATE type::record('user:x', 'user') SET email = $email) WITH JWT ALGORITHM HS512 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' DURATION FOR TOKEN 15m, FOR SESSION 12h",
+    ],
+}
+
+_AccessRow = tuple[str, dict[str, str], str, str | None, str | None, str | None]
+
+#: Spec §9.2's expectation table: ``(table, signup_fields, signin_where, duration_token, duration_session,
+#: duration_grant)``.
+_ACCESS_TABLE: dict[str, _AccessRow] = {
+    "a1": ("isp_user", {"name": "$name"}, "name = $name", "15m", "12h", None),
+    "a2": ("", {}, "", "1h", "1h", None),
+    "a3": ("", {}, "", "1m", "NONE", "4w2d"),
+    "acc": (
+        "user",
+        {"email": "$email", "password": "crypto::argon2::generate($password)"},
+        "email = $email AND crypto::argon2::compare(password, $password)",
+        "15m",
+        "12h",
+        None,
+    ),
+    "acc3": ("we-ird", {"first-name": "$n"}, "", "15m", "NONE", None),
+    "k1": ("user", {"email": "$email"}, "", "15m", "12h", None),
+    "k2": ("", {}, "a = 1 LIMIT 1", "15m", "12h", None),
+    "k3": ("", {}, "", "15m", "12h", None),
+    "k4": ("", {}, "", "15m", "12h", None),
+    "k5": ("", {}, "", "1h", "2h", None),
+    "k6": ("", {}, "a = 1", "1h", "NONE", None),
+    "k7": ("", {}, "", "15m", "12h", None),
+    "k8": ("user", {"email": "$email"}, "", "15m", "12h", None),
+    "k9": ("", {}, "", "15m", "12h", None),
+}
+
+_ACCESS_ROWS = [(statement, _ACCESS_TABLE[name]) for name, statements in _ACCESS_GOLDENS.items() for statement in statements]
+
+
+def _guarded(signup: str) -> str:
+    """A fabricated record access whose SIGNUP group holds *signup*."""
+    return f"DEFINE ACCESS g ON DATABASE TYPE RECORD SIGNUP ({signup}) {_KEYS} DURATION FOR TOKEN 15m, FOR SESSION 12h"
+
+
+def _signin(signin: str) -> str:
+    """A fabricated record access whose SIGNIN group holds *signin*."""
+    return f"DEFINE ACCESS g ON DATABASE TYPE RECORD SIGNIN ({signin}) {_KEYS} DURATION FOR TOKEN 15m, FOR SESSION 12h"
+
+
+class TestDefineAccess:
+    """Spec §6.3.3 (AC-7, D6, D28): ``DEFINE ACCESS <ident> ON DATABASE TYPE <RECORD|JWT|BEARER>`` and the M17 clauses;
+    ``table``/``signup_fields`` from a ``SIGNUP (CREATE <target> SET …)`` of the plain or the guarded call shape,
+    ``signin_where`` from ``SIGNIN (SELECT … FROM <ident> WHERE …)``, durations as rendered — any other shape gives
+    ``""``/``{}``, never an error."""
+
+    @pytest.mark.parametrize(
+        ("statement", "expected"),
+        _ACCESS_ROWS,
+        ids=[f"{statement.split(' ')[2]}:{n}" for n, (statement, _) in enumerate(_ACCESS_ROWS)],
+    )
+    def test_the_expectation_table(self, statement: str, expected: _AccessRow) -> None:
+        state = parse_define_access(statement)
+        read = (
+            state.table,
+            state.signup_fields,
+            state.signin_where,
+            state.duration_token,
+            state.duration_session,
+            state.duration_grant,
+        )
+        assert read == expected
+        assert type(state.signup_fields) is _FrozenMap
+        assert state.raw == statement
+
+    def test_a1(self) -> None:
+        expected = AccessState(
+            name="a1",
+            table="isp_user",
+            signup_fields={"name": "$name"},
+            signin_where="name = $name",
+            duration_token="15m",
+            duration_session="12h",
+            access_type="RECORD",
+            duration_grant=None,
+            signup="(CREATE isp_user SET name = $name)",
+            signin="(SELECT * FROM isp_user WHERE name = $name)",
+            with_refresh=False,
+            comment="acc",
+        )
+        for statement in _ACCESS_GOLDENS["a1"]:
+            assert parse_define_access(statement) == dataclasses.replace(expected, raw=statement)
+
+    def test_a3_with_refresh(self) -> None:
+        state = parse_define_access(_ACCESS_GOLDENS["a3"][0])
+        assert state.with_refresh is True
+        assert (state.signup, state.signin, state.comment) == (None, "(SELECT * FROM isp_user)", None)
+        assert state.duration_session == "NONE"  # the text, never None
+
+    @pytest.mark.parametrize(
+        ("name", "access_type"),
+        [("a1", "RECORD"), ("a2", "JWT"), ("a3", "RECORD"), ("k5", "JWT"), ("k6", "RECORD")],
+    )
+    def test_access_type(self, name: str, access_type: str) -> None:
+        state = parse_define_access(_ACCESS_GOLDENS[name][0])
+        assert state.access_type == access_type
+        assert state.with_refresh is (name == "a3")
+
+    @pytest.mark.parametrize(
+        ("statement", "expected"),
+        [
+            # Probe of 2026-10-18 (3.3.4 only: BEARER and WITH REFRESH are experimental on 2.x).
+            (
+                "DEFINE ACCESS b1 ON DATABASE TYPE BEARER FOR USER DURATION FOR GRANT 4w2d, FOR TOKEN 1h, FOR SESSION NONE",
+                AccessState(
+                    name="b1", duration_token="1h", duration_session="NONE", access_type="BEARER", duration_grant="4w2d"
+                ),
+            ),
+            (
+                "DEFINE ACCESS b2 ON DATABASE TYPE BEARER FOR RECORD DURATION FOR GRANT 4w2d, FOR TOKEN 1h, FOR SESSION NONE",
+                AccessState(
+                    name="b2", duration_token="1h", duration_session="NONE", access_type="BEARER", duration_grant="4w2d"
+                ),
+            ),
+            # Probe of 2026-10-18, both lines: a JWT access with a URL, or with a public key, renders no FOR TOKEN.
+            (
+                "DEFINE ACCESS j2 ON DATABASE TYPE JWT URL 'https://example.com/jwks' DURATION FOR SESSION NONE",
+                AccessState(name="j2", duration_token=None, duration_session="NONE", access_type="JWT"),
+            ),
+            (
+                "DEFINE ACCESS j3 ON DATABASE TYPE JWT ALGORITHM RS256 KEY 'abc' DURATION FOR SESSION 2h",
+                AccessState(name="j3", duration_token=None, duration_session="2h", access_type="JWT"),
+            ),
+            (
+                "DEFINE ACCESS j4 ON DATABASE TYPE JWT ALGORITHM HS256 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' AUTHENTICATE { RETURN $auth; } DURATION FOR TOKEN 1h, FOR SESSION NONE COMMENT 'j'",
+                AccessState(name="j4", duration_token="1h", duration_session="NONE", access_type="JWT", comment="j"),
+            ),
+            (
+                "DEFINE ACCESS j4 ON DATABASE TYPE JWT ALGORITHM HS256 KEY '[REDACTED]' WITH ISSUER KEY '[REDACTED]' AUTHENTICATE { RETURN $auth } DURATION FOR TOKEN 1h, FOR SESSION NONE COMMENT 'j'",
+                AccessState(name="j4", duration_token="1h", duration_session="NONE", access_type="JWT", comment="j"),
+            ),
+            (
+                f"DEFINE ACCESS r0 ON DATABASE TYPE RECORD {_KEYS} DURATION FOR TOKEN 1h, FOR SESSION NONE",
+                AccessState(name="r0", duration_token="1h", duration_session="NONE"),
+            ),
+            (
+                "DEFINE ACCESS r1 ON DATABASE TYPE RECORD WITH JWT URL 'https://example.com/jwks' DURATION FOR TOKEN 1h, FOR SESSION NONE",
+                AccessState(name="r1", duration_token="1h", duration_session="NONE"),
+            ),
+            (
+                "DEFINE ACCESS r2 ON DATABASE TYPE RECORD SIGNUP (CREATE type::record('user', $email) SET email = $email)"
+                f" SIGNIN (SELECT * FROM type::record('user', $email)) {_KEYS} DURATION FOR TOKEN 1h, FOR SESSION NONE",
+                AccessState(
+                    name="r2",
+                    table="user",
+                    signup_fields={"email": "$email"},
+                    duration_token="1h",
+                    duration_session="NONE",
+                    signup="(CREATE type::record('user', $email) SET email = $email)",
+                    signin="(SELECT * FROM type::record('user', $email))",
+                ),
+            ),
+            # Fabricated: no DURATION clause → every duration None.
+            ("DEFINE ACCESS n ON DATABASE TYPE RECORD", AccessState(name="n", duration_token=None, duration_session=None)),
+            # Keyword-named.
+            (
+                f"DEFINE ACCESS SIGNUP ON DATABASE TYPE RECORD SIGNUP (CREATE SET SET SET = 1) {_KEYS}"
+                " DURATION FOR TOKEN 1h, FOR SESSION NONE",
+                AccessState(
+                    name="SIGNUP",
+                    table="SET",
+                    signup_fields={"SET": "1"},
+                    duration_token="1h",
+                    duration_session="NONE",
+                    signup="(CREATE SET SET SET = 1)",
+                ),
+            ),
+        ],
+    )
+    def test_other_renderings(self, statement: str, expected: AccessState) -> None:
+        assert parse_define_access(statement) == dataclasses.replace(expected, raw=statement)
+
+    @pytest.mark.parametrize(
+        ("signup", "table", "fields"),
+        [
+            # D28's guard: exactly two arguments, the first one string literal, non-empty, without ':'.
+            ("CREATE type::thing('user') SET email = $email", "", {}),
+            ("CREATE type::record('user', $email, 1) SET email = $email", "", {}),
+            ("CREATE type::record($tb, $email) SET email = $email", "", {}),
+            ("CREATE type::thing('', $email) SET email = $email", "", {}),
+            ("CREATE type::thing('user', $email) SET a += 1", "", {}),
+            ("CREATE type::thing('us' + 'er', $email) SET email = $email", "", {}),
+            ("CREATE type::thing(string::concat('a', 'b'), $email) SET email = $email", "", {}),
+            ("CREATE type::thing(r'user:x', $email) SET email = $email", "", {}),
+            ("CREATE type::thing('user:x', $email) SET email = $email", "", {}),
+            ("CREATE type::thing('user', $email)SET email = $email", "", {}),
+            ("CREATE type::thing ('user', $email) SET email = $email", "", {}),
+            ("CREATE TYPE::thing('user', $email) SET email = $email", "", {}),
+            ("CREATE type::thing('user', $email) SET", "", {}),
+            ('CREATE type::thing("user", $email) SET email = $email', "user", {"email": "$email"}),
+            ("CREATE type::record('it\\'s', f(a, b)) SET email = $email", "it's", {"email": "$email"}),
+            # The plain shape.
+            ("CREATE user SET email = $email", "user", {"email": "$email"}),
+            ("CREATE ⟨we ird⟩ SET a = 1", "we ird", {"a": "1"}),
+            ("CREATE user SET a.b = 1, c[*] = 2, `d-e`.* = 3", "user", {"a.b": "1", "c.*": "2", "d-e.*": "3"}),
+            ("CREATE user SET a = 'x = y, z', b = (1, 2)", "user", {"a": "'x = y, z'", "b": "(1, 2)"}),
+            ("CREATE user SET a = IF b THEN 1 ELSE 2 END", "user", {"a": "IF b THEN 1 ELSE 2 END"}),
+            ("CREATE user SET a = 1,", "", {}),
+            ("CREATE user SET = 1", "", {}),
+            ("CREATE user SET a =", "", {}),
+            ("CREATE user SET a b = 1", "", {}),
+            ("CREATE user SET a..b = 1", "", {}),
+            ("CREATE user", "", {}),
+            ("CREATE user SET", "", {}),
+            ("CREATE user SETTING a = 1", "", {}),
+            ("CREATE", "", {}),
+            ("CREATEuser SET a = 1", "", {}),
+            ("UPSERT user SET a = 1", "", {}),
+        ],
+    )
+    def test_signup_shapes(self, signup: str, table: str, fields: dict[str, str]) -> None:
+        state = parse_define_access(_guarded(signup))
+        assert (state.table, state.signup_fields) == (table, fields)
+        assert state.signup == f"({signup})"
+
+    @pytest.mark.parametrize(
+        ("signin", "where"),
+        [
+            ("SELECT * FROM user WHERE a = 1", "a = 1"),
+            ("SELECT * FROM `we-ird` WHERE a = 1 AND b = 'FROM x WHERE y'", "a = 1 AND b = 'FROM x WHERE y'"),
+            ("SELECT * FROM user", ""),
+            ("SELECT * FROM ONLY user WHERE a = 1", ""),
+            ("SELECT * FROM user, other WHERE a = 1", ""),
+            ("SELECT * FROM (SELECT * FROM user WHERE a = 1)", ""),
+            ("SELECT * FROM type::record('user', $email)", ""),
+            ("SELECT * FROM user WHERE", ""),
+            ("SELECT * FROM user WHEREVER a = 1", ""),
+            ("SELECT * FROM user WHERE  a = 1  ", "a = 1"),
+            ("SELECT (SELECT a FROM b WHERE c) AS x FROM user WHERE a = 1", "a = 1"),
+            ("SELECT * FROM a WHERE b FROM c WHERE d", "b FROM c WHERE d"),
+            ("RETURN SELECT * FROM user WHERE a = 1", ""),
+            ("SELECTED FROM user WHERE a = 1", ""),
+        ],
+    )
+    def test_signin_shapes(self, signin: str, where: str) -> None:
+        assert parse_define_access(_signin(signin)).signin_where == where
+
+    @pytest.mark.parametrize(
+        ("statement", "reason"),
+        [
+            ("DEFINE FIELD a ON t", _R_STATEMENT),
+            ("DEFINE ACCESS", _R_HEADER),
+            ("DEFINE ACCESS a ON NAMESPACE TYPE RECORD", _R_HEADER),
+            ("DEFINE ACCESS a ON DATABASE TYPE", _R_HEADER),
+            ("DEFINE ACCESS a ON DATABASE TYPE FROB", _R_HEADER),
+            ("DEFINE ACCESS a ON DATABASE TYPE RECORDS", _R_HEADER),
+            ("DEFINE ACCESS a ON DATABASE TYPE RECORD(x)", _R_HEADER),
+            ("DEFINE ACCESS a ON DATABASE KIND RECORD", _R_HEADER),
+            ("DEFINE ACCESS a ON DATABASE TYPE BEARER", _R_HEADER),
+            ("DEFINE ACCESS a ON DATABASE TYPE BEARER FOR TABLE", _R_HEADER),
+            ("DEFINE ACCESS a ON DATABASE TYPE BEARER USER", _R_HEADER),
+            ("DEFINE ACCESS a ON DATABASE TYPE BEARER FOR USERS", _R_HEADER),
+            ("DEFINE ACCESS a ON DATABASE TYPE RECORD SIGNUP CREATE user", _R_NO_READING),
+            ("DEFINE ACCESS a ON DATABASE TYPE RECORD SIGNUP (a) (b)", _R_NO_READING),
+            ("DEFINE ACCESS a ON DATABASE TYPE RECORD DURATION FOR TOKEN 1x", _R_NO_READING),
+            ("DEFINE ACCESS a ON DATABASE TYPE RECORD DURATION FOR TOKEN 1h, FOR TOKEN 2h", _R_NO_READING),
+            ("DEFINE ACCESS a ON DATABASE TYPE JWT ALGORITHM f(x)", _R_NO_READING),
+            ("DEFINE ACCESS a ON DATABASE TYPE RECORD COMMENT 'a' DURATION FOR TOKEN 1h", _R_NO_READING),
+            ("DEFINE ACCESS a ON DATABASE TYPE RECORD FROB", _R_NO_READING),
+            ("DEFINE ACCESS a ON DATABASE TYPE RECORD SIGNUP (CREATE user SET a = 'x)", _R_STRING),
+        ],
+    )
+    def test_refused(self, statement: str, reason: str) -> None:
+        with pytest.raises(DefineParseError) as error:
+            parse_define_access(statement)
+        assert _reason(error) == reason
+
+
+# --- functions (spec §6.3.3; M15, D21) -----------------------------------------------------------------------------
+
+
+def _function(statement: str, name: str, parameters: tuple[str, ...], **attributes: object) -> tuple[str, FunctionState]:
+    """A golden function statement and the state it reads as — every attribute by keyword, ``raw`` the statement."""
+    values: dict[str, object] = {"returns": None, "permissions": "FULL", "comment": None, **attributes}
+    return statement, FunctionState(name=name, parameters=parameters, **values, raw=statement)  # type: ignore[arg-type]
+
+
+_TYPED_2X = (
+    "DEFINE FUNCTION fn::typed($a: int, $b: option<string>) -> string { RETURN 'x'; } COMMENT 'fx'"
+    " PERMISSIONS WHERE $auth.admin = true"
+)
+_TYPED_3X = (
+    "DEFINE FUNCTION fn::typed($a: int, $b: none | string) -> string { RETURN 'x' } COMMENT 'fx'"
+    " PERMISSIONS WHERE $auth.admin = true"
+)
+_TYPED: dict[str, object] = {"returns": "string", "permissions": "WHERE $auth.admin = true", "comment": "fx"}
+_KW_2X = "DEFINE FUNCTION fn::kw($COMMENT: int) -> { a: int } { RETURN { a: $COMMENT }; } COMMENT 'f' PERMISSIONS FULL"
+_KW_3X = "DEFINE FUNCTION fn::kw($COMMENT: int) -> { a: int } { RETURN { a: $COMMENT } } COMMENT 'f' PERMISSIONS FULL"
+
+#: M15 (probe of 2026-10-18 on 2.7.0, then 3.3.4: the 2.x body ends its statements with ``;``) and spec §9.2.
+_FUNCTIONS = [
+    _function(_TYPED_2X, "fn::typed", ("a", "b"), **_TYPED),
+    _function(_TYPED_3X, "fn::typed", ("a", "b"), **_TYPED),
+    _function("DEFINE FUNCTION fn::greet($name: string) { RETURN 'Hello ' + $name; } PERMISSIONS FULL", "fn::greet", ("name",)),
+    _function("DEFINE FUNCTION fn::greet($name: string) { RETURN 'Hello ' + $name } PERMISSIONS FULL", "fn::greet", ("name",)),
+    # A body holding `}` in a string.
+    _function("DEFINE FUNCTION fn::brace($s: string) { RETURN '}' + $s; } PERMISSIONS FULL", "fn::brace", ("s",)),
+    _function("DEFINE FUNCTION fn::brace($s: string) { RETURN '}' + $s } PERMISSIONS FULL", "fn::brace", ("s",)),
+    # An object kind before the body; a keyword-named parameter.
+    _function(_KW_2X, "fn::kw", ("COMMENT",), returns="{ a: int }", comment="f"),
+    _function(_KW_3X, "fn::kw", ("COMMENT",), returns="{ a: int }", comment="f"),
+    # The canonical kind of `-> kind` (§6.3.5): option<…> on 2.x, none | … on 3.x.
+    _function(
+        "DEFINE FUNCTION fn::opt() -> option<string> { RETURN NONE; } PERMISSIONS FULL", "fn::opt", (), returns="option<string>"
+    ),
+    _function(
+        "DEFINE FUNCTION fn::opt() -> none | string { RETURN NONE } PERMISSIONS FULL", "fn::opt", (), returns="option<string>"
+    ),
+    _function("DEFINE FUNCTION fn::a::b() { RETURN 1; } PERMISSIONS FULL", "fn::a::b", ()),
+    _function("DEFINE FUNCTION fn::a::b() { RETURN 1 } PERMISSIONS FULL", "fn::a::b", ()),
+    # Fabricated: NONE; a parameter whose literal type holds a `)`; no PERMISSIONS clause (the server's FULL).
+    _function("DEFINE FUNCTION fn::n() { RETURN 1 } PERMISSIONS NONE", "fn::n", (), permissions="NONE"),
+    _function("DEFINE FUNCTION fn::lit($m: 'a)b' | 'c', $n: int) { RETURN $m } PERMISSIONS FULL", "fn::lit", ("m", "n")),
+    _function("DEFINE FUNCTION fn::bare() { RETURN 1 }", "fn::bare", ()),
+    _function(
+        "DEFINE FUNCTION fn::cm() { RETURN 1 } COMMENT 'PERMISSIONS NONE' PERMISSIONS FULL",
+        "fn::cm",
+        (),
+        comment="PERMISSIONS NONE",
+    ),
+]
+
+
+class TestDefineFunction:
+    """Spec §6.3.3 (AC-6, AC-7, D21): ``DEFINE FUNCTION fn::<name>(…)`` positionally, the parameters through
+    ``functions.parse_function_parameters()``, an optional ``-> kind``, the body by brace matching, then ``COMMENT``
+    and ``PERMISSIONS``."""
+
+    @pytest.mark.parametrize(
+        ("statement", "expected"), _FUNCTIONS, ids=[f"{state.name}:{n}" for n, (_, state) in enumerate(_FUNCTIONS)]
+    )
+    def test_golden(self, statement: str, expected: FunctionState) -> None:
+        state = parse_define_function(statement)
+        assert state == expected
+        assert isinstance(state.parameters, tuple)
+
+    @pytest.mark.parametrize(("two", "three"), [(_TYPED_2X, _TYPED_3X), (_KW_2X, _KW_3X)])
+    def test_both_renderings_read_alike_but_the_body(self, two: str, three: str) -> None:
+        assert dataclasses.replace(parse_define_function(two), raw="") == dataclasses.replace(
+            parse_define_function(three), raw=""
+        )
+
+    def test_the_parameters_are_those_of_call_function(self) -> None:
+        # D21: the same reading as v0.15.0's call_function() (parse_function_parameters, unchanged).
+        for statement, state in _FUNCTIONS:
+            assert state.parameters == parse_function_parameters(statement)
+
+    @pytest.mark.parametrize(
+        ("statement", "reason"),
+        [
+            ("DEFINE PARAM $a VALUE 1", _R_STATEMENT),
+            ("DEFINE FUNCTION", _R_HEADER),
+            ("DEFINE FUNCTION greet() { RETURN 1 }", _R_HEADER),
+            ("DEFINE FUNCTION fn:greet() { RETURN 1 }", _R_HEADER),
+            ("DEFINE FUNCTION fn::greet { RETURN 1 }", _R_SIGNATURE),
+            ("DEFINE FUNCTION fn::greet () { RETURN 1 }", _R_SIGNATURE),
+            ("DEFINE FUNCTION fn::greet() RETURN 1", _R_SIGNATURE),
+            ("DEFINE FUNCTION fn::greet()", _R_SIGNATURE),
+            ("DEFINE FUNCTION fn::greet() -> string RETURN 1", _R_SIGNATURE),
+            ("DEFINE FUNCTION fn::greet() { RETURN 1 }COMMENT 'x'", _R_SIGNATURE),
+            # parse_function_parameters() does not read this list (a bracket inside a quoted identifier): refused.
+            ("DEFINE FUNCTION fn::w($a: record<`x(y`>) { RETURN 1 } PERMISSIONS FULL", _R_SIGNATURE),
+            ("DEFINE FUNCTION fn::greet() -> { RETURN 1 }", _R_KIND),
+            ("DEFINE FUNCTION fn::greet() -> { RETURN 1 } { }", _R_KIND),
+            ("DEFINE FUNCTION fn::greet( { RETURN 1 }", _R_BRACKETS),
+            ("DEFINE FUNCTION fn::greet() { RETURN '}", _R_STRING),
+            ("DEFINE FUNCTION fn::greet() { RETURN 1 } PERMISSIONS FROB", _R_NO_READING),
+            ("DEFINE FUNCTION fn::greet() { RETURN 1 } PERMISSIONS WHERE", _R_NO_READING),
+            ("DEFINE FUNCTION fn::greet() { RETURN 1 } PERMISSIONS FOR select FULL", _R_NO_READING),
+            ("DEFINE FUNCTION fn::greet() { RETURN 1 } COMMENT 'a' COMMENT 'b'", _R_NO_READING),
+            ("DEFINE FUNCTION fn::greet() { RETURN 1 } { RETURN 2 }", _R_NO_READING),
+        ],
+    )
+    def test_refused(self, statement: str, reason: str) -> None:
+        with pytest.raises(DefineParseError) as error:
+            parse_define_function(statement)
+        assert _reason(error) == reason
+
+
+# --- params (spec §6.3.3; M16) -------------------------------------------------------------------------------------
+
+
+def _param(statement: str, name: str, value: str, **attributes: object) -> tuple[str, ParamState]:
+    """A golden param statement and the state it reads as — every attribute by keyword, ``raw`` the statement."""
+    values: dict[str, object] = {"permissions": "FULL", "comment": None, **attributes}
+    return statement, ParamState(name=name, value=value, **values, raw=statement)  # type: ignore[arg-type]
+
+
+#: M16 (probe of 2026-10-18; both lines render alike) and spec §9.2.
+_PARAMS = [
+    _param("DEFINE PARAM $endpoint VALUE 'https://x' PERMISSIONS FULL", "endpoint", "'https://x'"),
+    _param("DEFINE PARAM $p VALUE { a: 1, b: [1, 2] } COMMENT 'pp' PERMISSIONS FULL", "p", "{ a: 1, b: [1, 2] }", comment="pp"),
+    _param("DEFINE PARAM $p1 VALUE NONE COMMENT 'x' PERMISSIONS FULL", "p1", "NONE", comment="x"),
+    _param("DEFINE PARAM $`we-ird` VALUE 1 PERMISSIONS FULL", "we-ird", "1"),
+    # Fabricated: keyword-named, a WHERE rule, NONE, no PERMISSIONS clause (the server's FULL).
+    _param(
+        "DEFINE PARAM $k VALUE COMMENT COMMENT 'real' PERMISSIONS WHERE $auth.admin = true",
+        "k",
+        "COMMENT",
+        comment="real",
+        permissions="WHERE $auth.admin = true",
+    ),
+    _param("DEFINE PARAM $n VALUE 1 PERMISSIONS NONE", "n", "1", permissions="NONE"),
+    _param("DEFINE PARAM $bare VALUE [1, 2]", "bare", "[1, 2]"),
+    _param("DEFINE PARAM $VALUE VALUE VALUE PERMISSIONS FULL", "VALUE", "VALUE"),
+]
+
+
+class TestDefineParam:
+    """Spec §6.3.3 (AC-7, AC-10): ``DEFINE PARAM $<ident>``, then ``VALUE`` (required), ``COMMENT`` and
+    ``PERMISSIONS``; a parse failure never carries the value."""
+
+    @pytest.mark.parametrize(
+        ("statement", "expected"), _PARAMS, ids=[f"{state.name}:{n}" for n, (_, state) in enumerate(_PARAMS)]
+    )
+    def test_golden(self, statement: str, expected: ParamState) -> None:
+        assert parse_define_param(statement) == expected
+
+    def test_a_failure_does_not_carry_the_value(self) -> None:
+        # AC-10: the unterminated secret of spec §5.7.
+        with pytest.raises(DefineParseError) as error:
+            parse_define_param("DEFINE PARAM $api_key VALUE 's3cr3t-0042")
+        assert _reason(error) == _R_STRING
+        assert "s3cr3t" not in str(error.value) and "s3cr3t" not in repr(error.value)
+
+    @pytest.mark.parametrize(
+        ("statement", "reason"),
+        [
+            ("DEFINE FUNCTION fn::a() { RETURN 1 }", _R_STATEMENT),
+            ("DEFINE PARAM", _R_HEADER),
+            ("DEFINE PARAM p VALUE 1", _R_HEADER),
+            ("DEFINE PARAM $ VALUE 1", _R_HEADER),
+            ("DEFINE PARAM $p(x) VALUE 1", _R_HEADER),
+            ("DEFINE PARAM $p COMMENT 'x' PERMISSIONS FULL", _R_NO_READING),
+            ("DEFINE PARAM $p", _R_NO_READING),
+            ("DEFINE PARAM $p VALUE", _R_NO_READING),
+            ("DEFINE PARAM $p VALUE 1 +", _R_NO_READING),
+            ("DEFINE PARAM $p PERMISSIONS FULL VALUE 1", _R_NO_READING),
+            ("DEFINE PARAM $p VALUE f(", _R_BRACKETS),
+        ],
+    )
+    def test_refused(self, statement: str, reason: str) -> None:
+        with pytest.raises(DefineParseError) as error:
+            parse_define_param(statement)
+        assert _reason(error) == reason
 
 
 class TestParseErrorReasons:
