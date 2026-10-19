@@ -114,6 +114,9 @@ _PARITY: dict[type, list[tuple[str, object, bool]]] = {
         ("when", _MISSING, False),
         ("then", _MISSING, False),
         ("comment", None, True),
+        ("async_mode", False, True),
+        ("retry", None, True),
+        ("max_depth", None, True),
         ("raw", "", True),
     ],
     AccessState: [
@@ -489,6 +492,7 @@ class TestFullOrmCallShapes:
         event = EventState("e", "t", "true", "(x)")
         assert (event.name, event.table, event.when, event.then) == ("e", "t", "true", "(x)")
         assert event.comment is None
+        assert (event.async_mode, event.retry, event.max_depth) == (False, None, None)
         assert event.raw == ""
 
     def test_access_state_by_keyword(self) -> None:
@@ -867,6 +871,14 @@ class TestRepr:
         assert "parameters=('user',)" in repr(schema.functions["fn::login"])
         assert "fields=('api.token',)" in repr(schema.tables["vault"].indexes["by_token"])
         assert "message='could not parse its definition'" in repr(schema.issues[0])
+
+    def test_event_async_attributes_stay_in_repr(self) -> None:
+        """v0.31.0 (spec §5.5): ``async_mode``, ``retry`` and ``max_depth`` are flags and numbers, shown in ``repr``;
+        ``when`` and ``then`` stay out of it."""
+        text = repr(EventState("e", "t", "true", "(x)", async_mode=True, retry=2, max_depth=3))
+        assert "async_mode=True, retry=2, max_depth=3" in text
+        assert "(x)" not in text
+        assert "'true'" not in text
 
     def test_the_texts_are_still_there(self) -> None:
         schema = _secret_schema()

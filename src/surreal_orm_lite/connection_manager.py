@@ -45,7 +45,16 @@ from .live import (
     require_websocket,
 )
 from .routing import check_call_transaction, check_name
+from .schema import (
+    Event,
+    ensure_async_events_supported,
+    event_subject,
+    function_ddl,
+    remove_event_statement,
+    remove_function_statement,
+)
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
+from .utils import apply_ddl_statements
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +83,39 @@ def _type_adapter(return_type: Any) -> TypeAdapter[Any]:
         return _cached_type_adapter(return_type)
     except TypeError:
         return TypeAdapter(return_type)
+
+
+#: How many times this process has dropped cached stored-function signatures (v0.31.0). Bumped by
+#: ``SurrealDBConnectionManager._forget_function_signature()`` and ``clear_function_signature_cache()`` in the same
+#: synchronous step as what they drop; ``_function_signature()`` notes it before each ``INFO FOR DB`` and stores the
+#: answer only if it has not moved since. One counter for the whole process, outside ``_STATE``: dropping more than
+#: needed only costs one more read.
+_signature_epoch = 0
+
+
+def _bump_signature_epoch() -> None:
+    """Record that cached stored-function signatures were dropped: a read in flight is no longer stored."""
+    global _signature_epoch
+    _signature_epoch += 1
+
+
+async def _read_function_signature(client: Any, function: str) -> tuple[str, ...]:
+    """Read the declared parameter names of *function* (``"fn::…"``), in order, from ``INFO FOR DB`` on *client*.
+
+    :raises SurrealDbError: the read failed.
+    :raises SurrealDbNotFoundError: the database has no such function.
+    """
+    try:
+        info = await client.query("INFO FOR DB;", {})
+    except Exception as exc:
+        raise SurrealDbError(f"Could not read the signature of {function!r}: {exc}") from exc
+
+    functions = info.get("functions", {}) if isinstance(info, dict) else {}
+    # INFO FOR DB keys functions WITHOUT the fn:: prefix.
+    define = functions.get(function[len("fn::") :])
+    if not define:
+        raise SurrealDbNotFoundError(f"Stored function {function!r} does not exist.")
+    return parse_function_parameters(str(define))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2312,11 +2354,18 @@ class SurrealDBConnectionManager:
         the signature re-read **once**, and only a second mismatch raises. That way a function
         redefined at runtime resolves instead of failing on a cache the caller cannot see.
 
-        The one redefinition this cannot catch is a **reorder** of the same parameter names:
-        *params* is a mapping and carries no order of its own, so there is nothing to compare
-        the cached order against, and re-reading on every call would defeat the cache. Callers
-        that reorder a function's parameters must call
-        :meth:`clear_function_signature_cache`.
+        A redefinition through :meth:`define_function` or :meth:`remove_function` (v0.31.0) is
+        picked up at once, whatever the order of its parameters: both drop the function's cached
+        signature themselves (and again when their transaction commits), on every connection of
+        this process to the same namespace and database, whatever its URL. The one redefinition
+        this cannot catch is a **reorder** of the same parameter names it was not told about — by
+        raw DDL (``client.query("DEFINE FUNCTION …")``) or from another process: *params* is a
+        mapping and carries no order of its own, so there is nothing to compare the cached order
+        against, and re-reading on every call would defeat the cache. After such a redefinition,
+        call :meth:`clear_function_signature_cache`.
+
+        One window remains: a redefinition that lands between this call's signature read and its
+        ``CALL`` can bind this one call in the order it read, a signature the cache never keeps.
         """
         key = (cls.__url, cls.__namespace, cls.__database, function)
         was_cached = key in cls.__function_signatures
@@ -2341,6 +2390,13 @@ class SurrealDBConnectionManager:
         transaction: buffered transactions forbid reads, and routing it through one would make
         ``params=`` unusable inside a transaction for no benefit — a schema read needs no
         transactional isolation.
+
+        A read can be overtaken: the signature may be dropped (:meth:`_forget_function_signature`,
+        :meth:`clear_function_signature_cache`) while its ``INFO FOR DB`` answer, the order from
+        before a redefinition, is on its way back. Each read therefore notes the process-wide count
+        of those drops first and stores its answer only if the count has not moved; otherwise it
+        reads once more — a drop comes once the DDL is applied, after the commit with ``tx=``, so
+        that read sees the new order — and a second read overtaken too is returned, never stored.
         """
         key = (cls.__url, cls.__namespace, cls.__database, function)
         if refresh:
@@ -2348,18 +2404,14 @@ class SurrealDBConnectionManager:
         elif key in cls.__function_signatures:
             return cls.__function_signatures[key]
 
-        try:
-            info = await client.query("INFO FOR DB;", {})
-        except Exception as exc:
-            raise SurrealDbError(f"Could not read the signature of {function!r}: {exc}") from exc
-
-        functions = info.get("functions", {}) if isinstance(info, dict) else {}
-        # INFO FOR DB keys functions WITHOUT the fn:: prefix.
-        define = functions.get(function[len("fn::") :])
-        if not define:
-            raise SurrealDbNotFoundError(f"Stored function {function!r} does not exist.")
-
-        signature = parse_function_parameters(str(define))
+        epoch = _signature_epoch
+        signature = await _read_function_signature(client, function)
+        if epoch != _signature_epoch:
+            epoch = _signature_epoch
+            signature = await _read_function_signature(client, function)
+            if epoch != _signature_epoch:
+                return signature
+        # No await between the comparison and the store: a drop cannot slip in between.
         cls.__function_signatures[key] = signature
         return signature
 
@@ -2369,9 +2421,12 @@ class SurrealDBConnectionManager:
         """Forget every cached stored-function signature.
 
         Called by :meth:`unset_connection`; also useful in tests, and **required** after
-        redefining a function with the same parameter names in a different order — the only
-        staleness :meth:`_resolve_named_args` cannot self-heal.
+        redefining a function by raw DDL with the same parameter names in a different order —
+        the only staleness :meth:`_resolve_named_args` cannot self-heal (:meth:`define_function`
+        and :meth:`remove_function` drop the signature themselves, on every connection of this
+        process to the same namespace and database, whatever its URL).
         """
+        _bump_signature_epoch()
         cls.__function_signatures.clear()
 
     @classmethod
@@ -2394,6 +2449,259 @@ class SurrealDBConnectionManager:
         if missing:
             return SurrealDbNotFoundError(f"Stored function {function!r} does not exist: {message}")
         return SurrealDbError(f"Call to stored function {function!r} failed: {message}")
+
+    # ------------------------------------------------------------------
+    # Server-side events (v0.31.0)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    @_routed("current")
+    async def define_event(cls, event: Event, table: str, *, overwrite: bool = True, tx: Transaction | None = None) -> str:
+        """Define the server-side *event* on *table* — any table, with or without a model — and return the statement.
+
+        Runs on the current connection (the innermost ``using()`` block's, else the default one), like
+        :meth:`call_function`::
+
+            stock_guard = Event(
+                "stock_guard", when="$event != 'DELETE' AND $after.stock < 0", then="THROW 'stock cannot go below zero'"
+            )
+            await SurrealDBConnectionManager.define_event(stock_guard, "product")
+            # 'DEFINE EVENT OVERWRITE `stock_guard` ON `product` WHEN $event != 'DELETE' AND $after.stock < 0 THEN { … };'
+
+        The statement is ``event.ddl(table, overwrite=overwrite)``. The event's expressions are written into the
+        DDL as given: they are trusted application code, never user input (``Event`` checks them for mistakes
+        only). A table that does not exist yet is created by SurrealDB (schemaless). Applying needs a session
+        allowed to define (a system user such as root, or a namespace or database ``OWNER``/``EDITOR``). For a
+        model's declared events, use ``Model.define_events()``.
+
+        :param event: the :class:`~surreal_orm_lite.schema.Event` to define.
+        :param table: the table's name, an identifier (letters, digits, underscores; not starting with a digit).
+        :param overwrite: ``True`` (default) redefines an existing event (``OVERWRITE``), ``False`` keeps it
+            (``IF NOT EXISTS``).
+        :param tx: optional transaction the statement is applied with.
+        :return: the statement applied.
+        :raises TypeError: *event* is not an ``Event``, *table* not a ``str``, *overwrite* not a ``bool``.
+        :raises ValueError: *table* is not an identifier.
+        :raises SurrealDbError: *event* has ``async_mode=True`` and the connection runs SurrealDB 2.x or the
+            embedded engine — before any DDL; *tx* belongs to another connection — before any request; the server
+            refused the statement (``Can't apply event definition: 'stock_guard' on table 'product' -> …``:
+            without *tx*, a refusal names the event and its table, never its statement, whose ``when`` and
+            ``then`` may hold a secret). In a buffered transaction (*tx* over HTTP, on SurrealDB 2.x or the
+            embedded engine) the statement is only queued: a refusal comes back when the block commits, as the
+            transaction's own error, never as ``SurrealDbAuthenticationError``. With *tx*, an error raised when the transaction ends can still carry the server's message, statement excerpt included (#278).
+        :raises SurrealDbAuthenticationError: the session may not define events.
+        """
+        check_call_transaction(cls._connection_name or "default", tx, operation="define_event()")
+        if not isinstance(event, Event):
+            raise TypeError(f"define_event() takes an Event, got {type(event).__name__}.")
+        statement = event.ddl(table, overwrite=overwrite)
+        client = await cls.get_client()
+        await ensure_async_events_supported(client, (event,), embedded=cls.is_embedded())
+        subjects = [event_subject(event.name, table)]
+        await apply_ddl_statements([statement], client=client, tx=tx, what="event", classify=True, subjects=subjects)
+        return statement
+
+    @classmethod
+    @_routed("current")
+    async def remove_event(cls, event: str, table: str, *, missing_ok: bool = True, tx: Transaction | None = None) -> str:
+        """Remove the server-side event named *event* from *table* and return the statement applied.
+
+        Runs on the current connection (the innermost ``using()`` block's, else the default one)::
+
+            await SurrealDBConnectionManager.remove_event("stock_guard", "product")
+            # 'REMOVE EVENT IF EXISTS `stock_guard` ON `product`;'
+
+        :param event: the event's name, an identifier (letters, digits, underscores; not starting with a digit).
+        :param table: the table's name, an identifier.
+        :param missing_ok: ``True`` (default) emits ``REMOVE EVENT IF EXISTS …``, so a missing event is not an
+            error; ``False`` raises ``SurrealDbNotFoundError`` for it.
+        :param tx: optional transaction the statement is applied with.
+        :return: the statement applied.
+        :raises TypeError: *event* or *table* is not a ``str``, *missing_ok* not a ``bool``.
+        :raises ValueError: *event* or *table* is not an identifier.
+        :raises SurrealDbNotFoundError: ``missing_ok=False`` and the table has no such event.
+        :raises SurrealDbAuthenticationError: the session may not remove events.
+        :raises SurrealDbError: *tx* belongs to another connection — before any request; any other refusal.
+            In a buffered transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the statement is
+            only queued: a refusal comes back when the block commits, as the transaction's own ``SurrealDbError``,
+            never as ``SurrealDbNotFoundError`` or ``SurrealDbAuthenticationError`` — ``missing_ok=False`` included.
+        """
+        check_call_transaction(cls._connection_name or "default", tx, operation="remove_event()")
+        statement = remove_event_statement(event, table, missing_ok)
+        client = await cls.get_client()
+        await apply_ddl_statements(
+            [statement],
+            client=client,
+            tx=tx,
+            what="event",
+            kind="removal",
+            classify=True,
+            subjects=[event_subject(event, table)],
+        )
+        return statement
+
+    # ------------------------------------------------------------------
+    # Stored functions (v0.31.0)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    @_routed("current")
+    async def define_function(
+        cls,
+        function: str,
+        body: str,
+        *,
+        parameters: Mapping[str, str] | None = None,
+        returns: str | None = None,
+        permissions: str | None = None,
+        comment: str | None = None,
+        overwrite: bool = True,
+        tx: Transaction | None = None,
+    ) -> str:
+        """Define the stored function *function* — SurrealDB's ``DEFINE FUNCTION`` — and return the statement applied.
+
+        Runs on the current connection (the innermost ``using()`` block's, else the default one), like
+        :meth:`call_function`, which calls what this defines::
+
+            await SurrealDBConnectionManager.define_function(
+                "fn::greet",
+                "RETURN string::concat('Hello, ', $name, '!');",
+                parameters={"name": "string"},
+                returns="string",
+                comment="Says hello",
+            )
+            await SurrealDBConnectionManager.call_function("fn::greet", ["Ada"])  # 'Hello, Ada!'
+
+        The statement is ``function_ddl(function, body, ...)`` with the same arguments: *parameters* maps each
+        parameter's name (without the ``$``) to its SurrealQL kind, in declaration order — the order of
+        ``call_function()``'s positional ``args`` —, and kinds are written in canonical form (``option<int>``). The
+        body and a ``WHERE`` permissions condition are written into the DDL as given: they are trusted application
+        code, never user input (``function_ddl()`` checks them for mistakes only). Applying needs a session allowed
+        to define (a system user such as root, or a namespace or database ``OWNER``/``EDITOR``).
+
+        The function's signature cached by ``call_function(params=)`` is dropped on every connection of this
+        process to the same namespace and database, whatever its URL — this one, and an application connection when
+        an admin one applies the DDL, over ``http://`` while the application uses ``ws://`` included —, so the next
+        ``params=`` call there reads the new one: a redefinition with the same parameters in another order included.
+        Another process still needs :meth:`clear_function_signature_cache`. With *tx*, the statement is applied with
+        the transaction and the signature is dropped again once it commits.
+        ``params=`` reads the signature of the committed schema: inside the transaction that defines a function,
+        call it with positional ``args``.
+
+        :param function: ``"fn::name"``, ``"name"`` or a nested ``"fn::namespace::name"``, as ``call_function()``
+            takes it.
+        :param body: the SurrealQL the function runs, one statement or several separated by ``;``; written in a
+            ``{ … }`` block.
+        :param parameters: parameter name → SurrealQL kind (``{"name": "string", "times": "option<int>"}``).
+        :param returns: the SurrealQL kind of the result, or ``None``.
+        :param permissions: ``None`` (SurrealDB's default, ``FULL``), ``"FULL"``, ``"NONE"`` or
+            ``"WHERE <condition>"``.
+        :param comment: SurrealDB's ``COMMENT``.
+        :param overwrite: ``True`` (default) redefines an existing function (``OVERWRITE``), ``False`` keeps it
+            (``IF NOT EXISTS``).
+        :param tx: optional transaction the statement is applied with.
+        :return: the statement applied.
+        :raises TypeError: an argument has the wrong type (``function_ddl()``'s checks).
+        :raises ValueError: *function* is not a stored-function name, a parameter name is not an identifier or is
+            one SurrealDB defines itself, a kind cannot be read, *body* or the permissions condition is not
+            well-formed SurrealQL — all before any request.
+        :raises SurrealDbAuthenticationError: the session may not define functions.
+        :raises SurrealDbError: *tx* belongs to another connection — before any request; the server refused the
+            statement (``Can't apply function definition: 'fn::greet' -> …``: without *tx*, a refusal names the
+            function, never its statement, whose body may hold a secret). In a buffered transaction (*tx* over HTTP,
+            on SurrealDB 2.x or the embedded engine) the statement is only queued: a refusal comes back when the
+            block commits, as the transaction's own error, never as ``SurrealDbAuthenticationError``. With *tx*, an error raised when the transaction ends can still carry the server's message, statement excerpt included (#278).
+        """
+        check_call_transaction(cls._connection_name or "default", tx, operation="define_function()")
+        statement = function_ddl(
+            function,
+            body,
+            parameters=parameters,
+            returns=returns,
+            permissions=permissions,
+            comment=comment,
+            overwrite=overwrite,
+        )
+        name = normalize_function_name(function)
+        client = await cls.get_client()
+        await apply_ddl_statements([statement], client=client, tx=tx, what="function", classify=True, subjects=[repr(name)])
+        cls._forget_function_signature(name)
+        # With tx, again after the commit: a params= call before it reads the committed schema, the old signature.
+        if tx is not None:
+
+            async def forget() -> None:
+                cls._forget_function_signature(name)
+
+            tx.enqueue_post_commit(forget)
+        return statement
+
+    @classmethod
+    @_routed("current")
+    async def remove_function(cls, function: str, *, missing_ok: bool = True, tx: Transaction | None = None) -> str:
+        """Remove the stored function *function* and return the statement applied.
+
+        Runs on the current connection (the innermost ``using()`` block's, else the default one)::
+
+            await SurrealDBConnectionManager.remove_function("fn::greet")
+            # 'REMOVE FUNCTION IF EXISTS fn::greet;'
+
+        The function's signature cached by ``call_function(params=)`` is dropped on every connection of this process
+        to the same namespace and database, whatever its URL, as :meth:`define_function` does, and with *tx* dropped
+        again once the transaction commits.
+
+        :param function: ``"fn::name"``, ``"name"`` or a nested ``"fn::namespace::name"``.
+        :param missing_ok: ``True`` (default) emits ``REMOVE FUNCTION IF EXISTS …``, so a missing function is not an
+            error; ``False`` raises ``SurrealDbNotFoundError`` for it.
+        :param tx: optional transaction the statement is applied with.
+        :return: the statement applied.
+        :raises TypeError: *function* is not a ``str``, *missing_ok* not a ``bool``.
+        :raises ValueError: *function* is not a stored-function name.
+        :raises SurrealDbNotFoundError: ``missing_ok=False`` and the database has no such function.
+        :raises SurrealDbAuthenticationError: the session may not remove functions.
+        :raises SurrealDbError: *tx* belongs to another connection — before any request; any other refusal.
+            In a buffered transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the statement is
+            only queued: a refusal comes back when the block commits, as the transaction's own ``SurrealDbError``,
+            never as ``SurrealDbNotFoundError`` or ``SurrealDbAuthenticationError`` — ``missing_ok=False`` included.
+        """
+        check_call_transaction(cls._connection_name or "default", tx, operation="remove_function()")
+        statement = remove_function_statement(function, missing_ok)
+        name = normalize_function_name(function)
+        client = await cls.get_client()
+        await apply_ddl_statements(
+            [statement], client=client, tx=tx, what="function", kind="removal", classify=True, subjects=[repr(name)]
+        )
+        cls._forget_function_signature(name)
+        if tx is not None:
+
+            async def forget() -> None:
+                cls._forget_function_signature(name)
+
+            tx.enqueue_post_commit(forget)
+        return statement
+
+    @classmethod
+    @_routed("current")
+    def _forget_function_signature(cls, function: str) -> None:
+        """Drop the cached signature of *function* (``"fn::…"``) in this connection's database, on every registered
+        connection; never raises.
+
+        Every entry whose ``(namespace, database, function)`` is this connection's goes, **whatever its URL** — an
+        admin connection that applies the DDL and the application's connection that calls the function alike. The
+        SDK reaches one server under several URLs (``ws://`` or ``http://``, with or without ``/rpc``,
+        ``localhost`` or ``127.0.0.1``), and an admin connection read from another setting may spell it otherwise:
+        matching the URL too would leave the application's entry behind, and a connection that had cached the old
+        order would keep binding ``params=`` in it after a reorder — no error, the arguments swapped. The URL in the
+        key guards the lookup (``set_url()`` never serves a signature read elsewhere), not this invalidation:
+        dropping the entry of another server's database with the same names only costs one ``INFO FOR DB`` on its
+        next ``params=`` call. The registry and each cache are read from a snapshot, without the registry's lock,
+        like the ``"every"`` policy.
+        """
+        target = (cls.__namespace, cls.__database, function)
+        _bump_signature_epoch()
+        for connection in list(_REGISTRY.values()):
+            signatures = connection.__function_signatures
+            for key in [key for key in list(signatures) if key[1:] == target]:
+                signatures.pop(key, None)
 
     # ------------------------------------------------------------------
     # Live queries (v0.19.0)

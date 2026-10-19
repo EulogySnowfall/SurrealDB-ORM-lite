@@ -117,10 +117,12 @@ def check_transaction(model: type, tx: object, operation: str) -> None:
     )
 
 
-def check_call_transaction(name: str, tx: object) -> None:
-    """Refuse ``SurrealDBConnectionManager.call_function(tx=)`` on connection *name* with a transaction of another.
+def check_call_transaction(name: str, tx: object, *, operation: str = "call_function()") -> None:
+    """Refuse a ``SurrealDBConnectionManager`` call on connection *name* with a transaction of another.
 
-    The tag is read statically, as in :func:`check_transaction`.
+    *operation* names the call in the message: ``call_function()`` by default, ``define_event()``,
+    ``remove_event()``, ``define_function()`` or ``remove_function()`` (v0.31.0). The tag is read statically, as in
+    :func:`check_transaction`.
 
     :raises SurrealDbError: *tx* was opened on another connection than *name*.
     """
@@ -128,7 +130,7 @@ def check_call_transaction(name: str, tx: object) -> None:
     if tx_name is None or tx_name == name:
         return
     raise SurrealDbError(
-        f"call_function() cannot run in this transaction: the transaction belongs to connection {tx_name!r} and the "
+        f"{operation} cannot run in this transaction: the transaction belongs to connection {tx_name!r} and the "
         f"call runs on connection {name!r}. A transaction is one connection's (one database): call it inside "
         f"using({tx_name!r}), or open the transaction on {name!r}."
     )

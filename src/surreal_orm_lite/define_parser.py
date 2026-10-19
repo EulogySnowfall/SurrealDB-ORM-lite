@@ -34,6 +34,11 @@ simple anchored tokens:
   are candidates only, since a bare identifier may spell a keyword; the clause reader resolves them.
   ``split_top_level()`` splits at a separator at depth 0.
 
+**Hand-written fragments** (v0.31.0) — ``scan_fragment()`` is a separate, more conservative lexer for the SurrealQL
+an application writes and the ORM embeds (an event's ``WHEN``/``THEN``, a function body): it refuses NUL and comment
+markers, reads every ``/`` as an operator, requires balanced brackets and reports a top-level ``;``. The check catches
+mistakes and is not an injection defence.
+
 **Kinds** — ``parse_kind()`` reads a ``TYPE`` (or a function's ``->``) kind into a small tree (``KName``,
 ``KLiteral``, ``KUnion``, ``KObject``, ``KTuple``); ``render_kind()`` writes a tree back in one canonical form that
 both lines accept, preferring the 3.x spacing: SurrealDB 2.x renders an optional kind ``option<int>``, 3.x
@@ -53,7 +58,8 @@ Exactly one reading is read; none or several raise ``DefineParseError`` — ``VA
 guessed —, and so does a statement whose readings take more work to count than its length allows (``_R_TOO_COMPLEX``:
 thousands of keyword-named words). ``parse_define_table()``, ``parse_define_field()``, ``parse_define_event()``, ``parse_define_analyzer()``,
 ``parse_define_access()``, ``parse_define_function()`` and ``parse_define_param()`` read their clauses so, and build
-their state by keyword, ``raw`` the statement; ``parse_permissions()`` reads a ``PERMISSIONS`` clause. Two kinds have
+their state by keyword, ``raw`` the statement (an event's grammar holds SurrealDB 3.x's ``ASYNC``, ``RETRY`` and
+``MAXDEPTH`` since v0.31.0); ``parse_permissions()`` reads a ``PERMISSIONS`` clause. Two kinds have
 positional parts the clause reader does not cover: an index's ``FIELDS`` list and its flat run of options
 (``parse_define_index()``), and a function's signature and body (``parse_define_function()``).
 """
@@ -104,6 +110,7 @@ __all__ = [
     "read_identifier",
     "read_idiom",
     "render_kind",
+    "scan_fragment",
     "split_top_level",
     "top_level_keywords",
     "unquote",
@@ -134,6 +141,9 @@ _R_PERMISSIONS = "its permissions are not understood"
 _R_INDEX = "its index options are not understood"
 _R_SIGNATURE = "its function signature is not understood"
 _R_TOO_COMPLEX = "its clauses hold too many keywords to read"
+# v0.31.0: the reasons of scan_fragment(), the check of a hand-written fragment.
+_R_NUL = "it holds a NUL character (\\x00)"
+_R_COMMENT = "it holds a SurrealQL comment marker (-- , #, // or /* */)"
 
 _WORD = re.compile(r"[A-Za-z0-9_]+")
 _SPACE = re.compile(r"\s+")
@@ -144,6 +154,9 @@ _IDENTIFIER_QUOTES = {"`": "`", "⟨": "⟩"}
 _ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0"}
 _BRACKETS = {"(": ")", "[": "]", "{": "}"}
 _KIND_BRACKETS = {**_BRACKETS, "<": ">"}
+#: What opens a SurrealQL comment: a line comment (``--``, ``#``, ``//``) or a block comment (``/*``).
+_COMMENT_MARKERS = ("--", "#", "//", "/*")
+_FRAGMENT_CLOSERS = frozenset(_BRACKETS.values())
 _UNIT_WORDS = frozenset({"IF", "THEN", "ELSE", "END"})
 #: A word glued to one of these is a parameter, a path segment or a function or record part — never a unit word.
 _NOT_BARE_AFTER = frozenset("$.:")
@@ -645,6 +658,65 @@ def split_top_level(text: str, separator: str, *, angle: bool = False) -> list[s
     return parts
 
 
+# --- hand-written fragments (v0.31.0) ------------------------------------------------------------------------------
+
+
+def scan_fragment(text: str) -> bool:
+    """The conservative structural check of a hand-written fragment (v0.31.0): comment markers and NUL refused, every
+    ``/`` an operator, balanced brackets; returns whether a top-level ``;`` is present.
+
+    For the SurrealQL an application writes and the ORM embeds in a statement — an event's ``WHEN`` and ``THEN``, a
+    stored function's body, a permissions condition. It is a separate lexer from the one that reads the server's
+    ``INFO`` text above, and it reads *text* left to right:
+
+    - ``'…'`` and ``"…"`` string literals and identifiers quoted between backquotes or between ``⟨`` and ``⟩``
+      (backslash escapes skipped) are data: nothing inside them counts. One that is not closed raises
+      ``DefineParseError`` (``_R_STRING`` or ``_R_IDENT``).
+    - A NUL character anywhere raises it with ``_R_NUL``.
+    - A SurrealQL comment marker outside a literal — ``--``, ``#``, ``//`` or ``/*`` — raises it with ``_R_COMMENT``:
+      a comment would swallow the clauses the ORM appends after the fragment.
+    - Every other ``/`` is an operator, never the start of a regex, so a raw regex literal is read as plain characters:
+      one holding a bracket, a quote or a comment marker of its own is refused, and a ``;`` inside it counts. Keep such
+      a pattern in a string (a ``string::`` call) or, for the ``;``, inside a ``{ … }`` block.
+    - ``()``, ``[]`` and ``{}`` must match (``<>`` do not nest: ``<`` compares); otherwise ``_R_BRACKETS``.
+
+    It returns ``True`` when a ``;`` stands outside every bracket, so a caller expecting one expression can refuse
+    it. The check catches mistakes — unbalanced brackets, a comment that would swallow the clauses the ORM appends, a
+    second statement where one expression is expected — and is not an injection defence: expressions are trusted
+    application code, never user input.
+    """
+    if "\x00" in text:
+        raise DefineParseError(_R_NUL)
+    expected: list[str] = []
+    top_level_semicolon = False
+    index = 0
+    length = len(text)
+    while index < length:
+        char = text[index]
+        close = _quote_close(char, strings=True)
+        if close is not None:
+            end = _delimited_end(text, index, close)
+            if end is None and char in _QUOTES:
+                raise DefineParseError(_R_STRING)
+            if end is None:
+                raise DefineParseError(_R_IDENT)
+            index = end
+            continue
+        if text.startswith(_COMMENT_MARKERS, index):
+            raise DefineParseError(_R_COMMENT)
+        if char in _BRACKETS:
+            expected.append(_BRACKETS[char])
+        elif char in _FRAGMENT_CLOSERS:
+            if not expected or expected.pop() != char:
+                raise DefineParseError(_R_BRACKETS)
+        elif char == ";" and not expected:
+            top_level_semicolon = True
+        index += 1
+    if expected:
+        raise DefineParseError(_R_BRACKETS)
+    return top_level_semicolon
+
+
 # --- kinds ---------------------------------------------------------------------------------------------------------
 
 
@@ -837,14 +909,22 @@ class _KindReader:
 
     def raw_argument(self) -> str:
         """The text up to the ``>`` that closes ``name<``, stripped and non-empty: brackets (``<>`` included) must
-        match, string literals and quoted identifiers are skipped."""
+        match, quoted identifiers are skipped.
+
+        Since v0.31.0 the text holds no quote character (``'``, ``"``), no comment marker (``--``, ``#``, ``//``,
+        ``/*``) and no ``;`` — it is one expression, like the other one-expression contexts: a server renders such
+        an argument as a bare identifier (``file<bucket>``), and a kind the ORM writes into a ``DEFINE FUNCTION``
+        must not carry text the reader did not read.
+        """
         text = self.text
         start = index = self.pos
         expected: list[str] = []
         length = len(text)
         while index < length:
             char = text[index]
-            close = _quote_close(char, strings=True)
+            if char in _QUOTES:
+                raise DefineParseError(_R_KIND)
+            close = _quote_close(char, strings=False)
             if close is not None:
                 end = _delimited_end(text, index, close)
                 if end is None:
@@ -858,8 +938,11 @@ class _KindReader:
                     if expected.pop() != char:
                         raise DefineParseError(_R_KIND)
                 elif char == ">" and text[start:index].strip():
+                    argument = text[start:index].strip()
+                    if ";" in argument or any(marker in argument for marker in _COMMENT_MARKERS):
+                        raise DefineParseError(_R_KIND)
                     self.pos = index + 1
-                    return text[start:index].strip()
+                    return argument
                 else:
                     raise DefineParseError(_R_KIND)
             index += 1
@@ -1058,6 +1141,14 @@ _TABLE_ACTIONS = ("select", "create", "update", "delete")
 def _valid_flag(span: _Span) -> bool:
     """``flag``: an empty content."""
     return span.first >= span.stop
+
+
+def _valid_count(span: _Span) -> bool:
+    """``count``: one unsigned integer, a single word of digits (an event's ``RETRY 2``, ``MAXDEPTH 3``)."""
+    if span.stop - span.first != 1:
+        return False
+    word = span.word(span.first)
+    return word is not None and _INTEGER.fullmatch(word) is not None
 
 
 def _glued_tail(span: _Span) -> str:
@@ -1431,15 +1522,17 @@ class _Candidate(NamedTuple):
 _Step: TypeAlias = tuple[int | None, int, int]
 
 #: The validators that refuse any content holding a keyword candidate — a top-level word with whitespace before it:
-#: empty, one string literal, brackets and punctuation only, or ``fn::`` and its segments without whitespace. A clause
-#: they validate ends at the first candidate after its keyword, or at the end of the text when none follows.
+#: empty, one integer, one string literal, brackets and punctuation only, or ``fn::`` and its segments without
+#: whitespace. A clause they validate ends at the first candidate after its keyword, or at the end of the text when
+#: none follows.
 _CANDIDATE_FREE_VALIDATORS: frozenset[_Validator] = frozenset(
-    {_valid_flag, _valid_string, _valid_body, _valid_group, _valid_fn_name}
+    {_valid_flag, _valid_count, _valid_string, _valid_body, _valid_group, _valid_fn_name}
 )
 #: The validators that read a content's ends only, whatever its length.
 _END_VALIDATORS: frozenset[_Validator] = frozenset(
     {
         _valid_flag,
+        _valid_count,
         _valid_expr,
         _valid_string,
         _valid_default,
@@ -1982,6 +2075,12 @@ def _comment(clauses: Mapping[str, Clause]) -> str | None:
     return None if comment is None else unquote(comment.content)
 
 
+def _count(clauses: Mapping[str, Clause], slot: str) -> int | None:
+    """The integer of the *slot* clause (``RETRY``, ``MAXDEPTH``), or ``None`` when the statement has none."""
+    clause = clauses.get(slot)
+    return None if clause is None else int(clause.content)
+
+
 # --- DEFINE INDEX --------------------------------------------------------------------------------------------------
 
 #: The index options that are flags, those followed by an integer and those followed by a word.
@@ -2157,8 +2256,12 @@ def parse_define_index(text: str) -> IndexState:
 
 # --- DEFINE EVENT and DEFINE ANALYZER ------------------------------------------------------------------------------
 
-#: The clauses of an event: WHEN and THEN are always rendered.
+#: The clauses of an event: WHEN and THEN are always rendered. SurrealDB 3.x renders an ASYNC event's ``ASYNC RETRY n
+#: MAXDEPTH n`` right after the table (v0.31.0).
 _EVENT_SLOTS = (
+    Slot("async", ("ASYNC",), _valid_flag),
+    Slot("retry", ("RETRY",), _valid_count),
+    Slot("max_depth", ("MAXDEPTH",), _valid_count),
     Slot("when", ("WHEN",), _valid_expr, required=True),
     Slot("then", ("THEN",), _valid_body, required=True),
     Slot("comment", ("COMMENT",), _valid_string),
@@ -2177,10 +2280,12 @@ def parse_define_event(text: str) -> EventState:
     """Read a ``DEFINE EVENT`` statement as the server renders it into an ``EventState``.
 
     The header ``DEFINE EVENT <ident> ON <ident>`` is read positionally (``DEFINE EVENT THEN ON t WHEN END THEN …``
-    names the event ``THEN``), then the clauses ``WHEN`` (an expression; an ``IF … END`` keeps its ``THEN`` inside),
-    ``THEN`` (``(…)`` groups separated by commas, or one ``{…}`` block) — both required — and ``COMMENT``. ``when``
-    and ``then`` are kept as rendered: SurrealDB 2.x renders a block on several lines and an ``IF`` bare, 3.x on one
-    line and parenthesised. Raises ``DefineParseError``.
+    names the event ``THEN``), then the clauses ``ASYNC``, ``RETRY`` and ``MAXDEPTH`` (SurrealDB 3.x, each count one
+    unsigned integer; v0.31.0), ``WHEN`` (an expression; an ``IF … END`` keeps its ``THEN`` inside), ``THEN``
+    (``(…)`` groups separated by commas, or one ``{…}`` block) — both required — and ``COMMENT``. ``when`` and
+    ``then`` are kept as rendered: SurrealDB 2.x renders a block on several lines and an ``IF`` bare, 3.x on one line
+    and parenthesised. ``async_mode`` is whether ``ASYNC`` is present, ``retry`` and ``max_depth`` its counts
+    (``None`` when absent). Raises ``DefineParseError``.
     """
     name, table, pos = _named_on(text, "EVENT")
     clauses = read_clauses(text, pos, _EVENT_SLOTS)
@@ -2190,6 +2295,9 @@ def parse_define_event(text: str) -> EventState:
         when=clauses["when"].content,
         then=clauses["then"].content,
         comment=_comment(clauses),
+        async_mode="async" in clauses,
+        retry=_count(clauses, "retry"),
+        max_depth=_count(clauses, "max_depth"),
         raw=text,
     )
 

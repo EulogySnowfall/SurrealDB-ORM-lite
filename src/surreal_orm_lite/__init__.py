@@ -1,4 +1,4 @@
-__version__ = "0.30.8"
+__version__ = "0.31.0"
 
 from ._sdk import BoundExcluded, BoundIncluded
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
@@ -74,6 +74,7 @@ from .model_auth import AuthenticatedUserMixin, AuthResult
 from .model_base import BaseSurrealModel, SurrealConfigDict
 from .q import Q
 from .query_set import QuerySet
+from .schema import Event, function_ddl
 from .signals import (
     AroundSignal,
     Signal,
@@ -196,6 +197,9 @@ __all__ = [
     "FunctionState",
     "ParamState",
     "SchemaIssue",
+    # Server-side events and DDL (v0.31.0)
+    "Event",
+    "function_ddl",
     # Exceptions
     "SurrealORMError",
     "SurrealDbError",
