@@ -2123,7 +2123,8 @@ _ROADMAP_ROWS_31 = [
     ["v0.31.0 – v0.39.0", "Tier 3 — Advanced (search, DDL, migrations, CLI)", "📋 Planned"],
 ]
 _COMPARISON_ROW_31 = ["Schema Introspection", "✅ v0.30.0 (`DatabaseIntrospector`, `generate_models_from_db()`)", "✅"]
-#: Spec §11.1 item 5: the six rows v0.30.0 adds to the 2.x/3.x table, cell by cell, and the header's new sentence.
+#: Spec §11.1 item 5: the six rows v0.30.0 adds to the 2.x/3.x table, cell by cell, then the row of a regex the two
+#: lines close at different slashes; and the header's new sentence.
 _INTROSPECTION_ROWS = [
     [
         "Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
@@ -2159,6 +2160,14 @@ _INTROSPECTION_ROWS = [
         "v0.30.0",
     ],
     ["DDL not yet committed in a transaction, seen by schema introspection", "invisible", "invisible", "v0.30.0"],
+    [
+        "A regex with a backslash pair before a `/` (schema introspection)",
+        "`/a\\\\/b/` accepted (a backslash, then an escaped slash), `/\\\\/` refused: such a definition is a `SchemaIssue`, "
+        "not read",
+        "`/\\\\/` accepted (an escaped backslash, then the closing slash), `/a\\\\/b/` refused: such a definition is a "
+        "`SchemaIssue`, not read",
+        "v0.30.0",
+    ],
 ]
 _HEADER_SENTENCE_30 = (
     "Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs."
@@ -2404,12 +2413,13 @@ class TestReadmeSection31:
         assert comparison[firsts.index("Multi-database") + 1] == _COMPARISON_ROW_31, comparison
 
     def test_server_behaviour_rows(self) -> None:
-        """Spec §11.1 item 5: six rows, Since v0.30.0, right after the v0.29.2 row and before the table's last row."""
+        """Spec §11.1 item 5: seven rows, Since v0.30.0, right after the v0.29.2 row and before the table's last row."""
         rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
         start = rows.index(_INTROSPECTION_ROWS[0])
-        assert rows[start : start + 6] == _INTROSPECTION_ROWS, rows[start : start + 6]
+        count = len(_INTROSPECTION_ROWS)
+        assert rows[start : start + count] == _INTROSPECTION_ROWS, rows[start : start + count]
         assert rows[start - 1][3] == "v0.29.2", rows[start - 1]
-        assert start + 6 == len(rows) - 1 and rows[-1][3] == "v0.19.1", rows[-1]
+        assert start + count == len(rows) - 1 and rows[-1][3] == "v0.19.1", rows[-1]
         assert [cells for cells in rows if cells[3] == "v0.30.0"] == _INTROSPECTION_ROWS
 
     def test_server_behaviour_table_keeps_its_widths(self) -> None:
