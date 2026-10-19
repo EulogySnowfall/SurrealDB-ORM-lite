@@ -45,8 +45,8 @@ field holding a datetime below the top level (in a sub-object, a tuple, an array
 top-level fields that may hold a datetime, says that ``update()`` may fail on it (narrowed by #261).
 
 **Classes.** A ``BaseSurrealModel``, or a ``BaseSurrealEdge`` for a relation table (``table_type`` in any case). The
-table's comment, relation ends, view query, change feed, permissions (unless ``NONE``, the default), indexes and
-events are comments of its class.
+table's comment, relation ends, view query, change feed, permissions (unless all four are ``NONE``, the default),
+indexes and events are comments of its class.
 
 **Module**: a fixed docstring, the imports the classes use (standard library, then pydantic, surreal_orm_lite and
 surrealdb), a ``# Not generated:`` comment listing every table or field left out and why, then the classes. No
@@ -682,7 +682,8 @@ def _datetime_below_the_top(kind: Kind | None, depth: int) -> bool:
 
 def _may_be_a_datetime(kind: Kind | None) -> bool:
     """Whether a field of this kind may hold a ``datetime`` as its own value: ``datetime``, ``any``, a union holding
-    one of them (``option<datetime>``, ``string | datetime``), or a kind kept as written (I3), which may be anything."""
+    one of them (``option<datetime>``, ``string | datetime``), or a kind kept as written (its ``TYPE`` was not
+    understood), which may be anything."""
     if isinstance(kind, KName):
         return kind.name in ("datetime", "any")
     if isinstance(kind, KUnion):
