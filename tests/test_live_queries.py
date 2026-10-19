@@ -781,12 +781,17 @@ class TestFailedKillE2E:
 
 
 class _FakeSocket:
-    """The transport of a :class:`_DroppingClient`: records that it was closed."""
+    """The transport of a :class:`_DroppingClient`: records that it was closed — and, when given
+    a reader to *watch*, whether that reader had already been released by then."""
 
     def __init__(self) -> None:
         self.closed = False
+        self.watched: asyncio.Queue[Any] | None = None
+        self.released_before_close: bool | None = None
 
     async def close(self) -> None:
+        if self.watched is not None:
+            self.released_before_close = not self.watched.empty()
         self.closed = True
 
 
@@ -861,6 +866,40 @@ class TestKillOnADroppedConnectionUnit:
         assert self.UUID in live._killed()
         assert queue.get_nowait() is live._STREAM_END
         assert client.socket.closed is True, "a receive loop can end with the socket still open"
+
+    @pytest.mark.asyncio
+    async def test_a_kill_caught_by_a_drop_releases_the_reader_before_closing_the_socket(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Closing the dead socket can yield the loop (``wait_for`` always does on Python 3.11). A
+        resubscribe woken by the same drop runs then: it must find the reader gone, or it opens a
+        connection for a subscription that is being torn down."""
+        from surreal_orm_lite import live
+
+        client = _DroppingClient()
+        self._serve(monkeypatch, client)
+        client.socket.watched = live.register_subscriber(client, self.UUID)
+
+        await SurrealDBConnectionManager.kill(self.UUID)
+
+        assert client.socket.released_before_close is True
+
+    @pytest.mark.asyncio
+    async def test_a_kill_on_a_dead_client_releases_the_reader_before_closing_the_socket(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from surreal_orm_lite import live
+
+        client = _DroppingClient()
+        client._dropped.set()
+        await client.recv_task  # the SDK has noticed the drop: the client is dead before the KILL
+        self._serve(monkeypatch, client)
+        client.socket.watched = live.register_subscriber(client, self.UUID)
+
+        await SurrealDBConnectionManager.kill(self.UUID)
+
+        assert self.UUID in live._killed()
+        assert client.socket.released_before_close is True
 
     @pytest.mark.asyncio
     async def test_a_cancelled_kill_stays_cancelled_when_the_sdk_hides_it(self, monkeypatch: pytest.MonkeyPatch) -> None:

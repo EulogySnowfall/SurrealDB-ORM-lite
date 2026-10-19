@@ -2497,6 +2497,8 @@ class SurrealDBConnectionManager:
             # receive loop that died on a bad frame leaves the socket open, though, and the server
             # still running them: closing the transport is what ends them then.
             if client is None or is_dead(client):
+                # Before any await: a resubscribe woken by the same drop must find the reader gone.
+                release_subscribers(query_uuid)
                 if client is not None:
                     await cls._close_dead_socket(client)
                 mark_killed(query_uuid)
@@ -2506,6 +2508,10 @@ class SurrealDBConnectionManager:
             try:
                 await client.kill(query_uuid)
             except Exception as exc:
+                # Before any await: a resubscribe woken by the same drop must find the reader gone,
+                # or it opens a connection for a subscription being torn down. Closing the socket
+                # below yields the loop on Python 3.11, where `wait_for` always wraps a Task.
+                release_subscribers(query_uuid)
                 if cancellation_lost(exc):
                     raise asyncio.CancelledError from exc  # the SDK raised over the caller's cancellation
                 if await cls._dropped_under_request(client, exc):
@@ -2516,7 +2522,8 @@ class SurrealDBConnectionManager:
             mark_killed(query_uuid)
         finally:
             # In a `finally` so that every exit — success, failure, cancellation — wakes the
-            # readers; nothing else ever would.
+            # readers; nothing else ever would. Idempotent after an early release above, and it
+            # also wakes a reader that subscribed to the uuid while this call was awaiting.
             release_subscribers(query_uuid)
 
     @staticmethod
