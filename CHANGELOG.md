@@ -86,9 +86,16 @@ only. The second minor of Tier 3.
   list). A refusal raises
   `SurrealDbAuthenticationError` when the session may not define (a `VIEWER`, a record user, an
   anonymous session), `SurrealDbNotFoundError` for a removal of a missing definition with
-  `missing_ok=False`, and `SurrealDbError` otherwise (`Can't apply event definition: …`).
-  `define_events()` applies one statement per event and stops at the first refusal: pass `tx=` for
-  all or nothing. A `tx=` of another connection raises `SurrealDbError` before any request.
+  `missing_ok=False`, and `SurrealDbError` otherwise
+  (`Can't apply event definition: 'email_audit' on table 'account' -> …`). A refusal names the
+  event and its table, or the function, never the statement, whose `when`, `then` or body may hold
+  a secret, and gives the server's reason without its excerpt of the statement. A buffered
+  transaction (SurrealDB 2.x, HTTP, the embedded engine) only queues the statement, so a refusal
+  comes back when the block commits, as the transaction's `SurrealDbError` ("Transaction failed
+  and rolled back: …"), never as `SurrealDbAuthenticationError` or `SurrealDbNotFoundError`,
+  `missing_ok=False` included. `define_events()` applies one statement per event and stops at the
+  first refusal: pass `tx=` for all or nothing. A `tx=` of another connection raises
+  `SurrealDbError` before any request.
 - README section 32, "Server-side events and stored functions (`Event`, `define_events()`,
   `define_function()`)" (declaring events on a model, events without a model, asynchronous events,
   stored functions, transactions and connections, SurrealDB 2.x and 3.x, security, a note for users
@@ -126,7 +133,8 @@ only. The second minor of Tier 3.
   brackets, a comment that would swallow the clauses the ORM appends, a second statement where one
   expression is expected — and is not an injection defence. To use a value, read it from the
   record (`$after.email`) or from a `DEFINE PARAM`. Every refusal is a `TypeError` or a
-  `ValueError` raised before any request. An `Event`'s `repr()` leaves out `when` and `then`.
+  `ValueError` raised before any request. An `Event`'s `repr()` leaves out `when` and `then`, and
+  a refusal from the server names the event or the function, never its statement.
 - **Kinds are written in canonical form**: `none | int` and `option<int>` are both written
   `option<int>`, and a kind the ORM cannot read raises `ValueError` rather than being rewritten.
 - **SurrealDB 2.x and 3.x**: `ASYNC` events are 3.x only (refused before any DDL elsewhere);

@@ -4524,7 +4524,9 @@ await Account.remove_event("no_negative_balance")  # declared or not: removal is
   `"default"`) and take `overwrite=` or `missing_ok=`, and `tx=`, as the model's methods do.
 - `event.ddl(table)` renders the statement without a connection (`overwrite=False` for `IF NOT EXISTS`).
 - An `Event` is frozen, hashable and compared by value; its `repr()` leaves out `when` and `then`, which may hold a
-  secret such as a webhook token.
+  secret such as a webhook token. A refusal leaves them out too: it names the event and its table, never the
+  statement (`Can't apply event definition: 'stock_guard' on table 'product' -> …`), and gives the server's reason
+  without its excerpt of the statement (a parse error keeps its line and column).
 
 #### Asynchronous events (SurrealDB 3.x)
 
@@ -4602,7 +4604,8 @@ await SurrealDBConnectionManager.remove_function("fn::greet")
   exist raises `SurrealDbNotFoundError`. `overwrite=False` writes `IF NOT EXISTS` and keeps the function already
   defined.
 - `function_ddl()` takes the same arguments, without `tx=`, and returns the statement without applying it. A body
-  the server refuses raises `SurrealDbError` ("Can't apply function definition: …").
+  the server refuses raises `SurrealDbError` (`Can't apply function definition: 'fn::greet' -> …`), which names the
+  function, never its body.
 
 #### Transactions, connections and the query cache
 
@@ -4615,7 +4618,10 @@ await SurrealDBConnectionManager.remove_function("fn::greet")
 - A model's methods run on the model's connection (its `connection` key, or the `using()` block's); the manager's
   methods on the current connection. A `tx=` of another connection raises `SurrealDbError` before any request.
 - Defining needs a system user allowed to do it: root, or a namespace or database `OWNER` or `EDITOR`. On a server,
-  a `VIEWER`, a record user or an anonymous session gets `SurrealDbAuthenticationError`.
+  a `VIEWER`, a record user or an anonymous session gets `SurrealDbAuthenticationError`. A buffered transaction
+  (SurrealDB 2.x, HTTP, the embedded engine) only queues the statement, so a refusal comes back when the block
+  commits, as the transaction's `SurrealDbError` ("Transaction failed and rolled back: …"), never as
+  `SurrealDbAuthenticationError` or `SurrealDbNotFoundError`, `missing_ok=False` included.
 - Live queries see the rows an event writes (`watch()` on their table). The query cache
   ([section 29](#29-query-cache-cache-querycache)) does not: it forgets the tables the ORM itself writes, so a cached
   read of a table that events write stays as it was until its time to live runs out. Do not cache such reads, or call
@@ -4648,7 +4654,8 @@ is refused. The check catches mistakes — unbalanced brackets, a comment that w
 swallow the clauses the ORM appends, a second statement where one expression is expected — and is not an injection
 defence: expressions are trusted application code, never user input. To use a value, read it from the record
 (`$after.email`) or from a `DEFINE PARAM`, never format it into the text. Kinds are parsed and written in canonical
-form. An `Event`'s `repr()` leaves out its expressions. Applying a definition needs a privileged system user: run
+form. An `Event`'s `repr()` leaves out its expressions, and a refusal names the event or the function, never its
+statement. Applying a definition needs a privileged system user: run
 `define_events()` and `define_function()` at start-up or deployment, not on a record user's session.
 
 #### Coming from the full SurrealDB-ORM

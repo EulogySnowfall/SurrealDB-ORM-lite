@@ -33,6 +33,7 @@ import inspect
 import os
 import pickle
 import re
+import traceback
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from typing import Any
 
@@ -70,6 +71,7 @@ from surreal_orm_lite.routing import check_call_transaction
 from surreal_orm_lite.schema import (
     Event,
     ensure_async_events_supported,
+    event_subject,
     function_ddl,
     remove_event_statement,
     remove_function_statement,
@@ -1492,6 +1494,166 @@ class TestApplyClassification:
         assert client.queries == [(_DEFINE, {})]
 
 
+#: A secret a definition holds, which no refusal may quote (review of PR #273).
+_SECRET = "s3cr3t_k3y"
+_HOOK = f"DEFINE EVENT OVERWRITE `hook` ON `t` THEN {{ http::post('https://hooks.example/{_SECRET}', {{}}) CREATE }};"
+_HOOK_SUBJECT = "'hook' on table 't'"
+
+
+def _excerpt_3x(position: str, line: str) -> str:
+    """A SurrealDB 3.x parse error quoting *line* of the statement at *position* (as measured on 3.3.4)."""
+    return f"Parse error: Unexpected token `}}`, expected an expression\n --> [{position}]\n  |\n1 | {line}\n  |  ^\n"
+
+
+#: SurrealDB 2.x and the embedded engine: a parse error quotes the statement twice, from its start the second time.
+_EXCERPT_2X = (
+    "There was a problem with the database: Parse error: Unexpected token `CREATE` expected delimiter `}`\n"
+    " --> [1:102]\n  |\n1 | ...k3y', {}) CREATE };\n  |              ^^^^^^ \n --> [1:42]\n  |\n"
+    f"1 | DEFINE EVENT OVERWRITE `hook` ON `t` THEN {{ http::post('https://hooks.example/{_SECRET}...\n"
+    "  |                                          ^ expected this delimiter to close\n"
+)
+
+
+def _leaks(exc: BaseException, text: str) -> list[str]:
+    """Where *exc* shows *text*: its ``str()``, its ``repr()`` and its printed traceback (the chained error
+    included)."""
+    shown = {"str": str(exc), "repr": repr(exc), "traceback": "".join(traceback.format_exception(exc))}
+    return [where for where, value in shown.items() if text in value]
+
+
+class TestApplyNamesTheDefinition:
+    """Review of PR #273: with ``subjects=`` (every v0.31.0 applier) a refusal names the definition — the event and
+    its table, or the function — never its statement, whose ``when``, ``then`` or body may hold a secret. The
+    server's reason is kept whole when it does not quote the statement; a parse error's excerpt of the statement
+    is left out (its position kept), and a reason that still quotes it is dropped. Only a reason kept whole is
+    chained as ``__cause__``: otherwise the server's error stays reachable as ``__context__`` but is not printed."""
+
+    @pytest.mark.parametrize(
+        ("statement", "subject", "error"),
+        [
+            (_HOOK, _HOOK_SUBJECT, NotAllowedError("NotAllowed", _PERMISSIONS)),
+            (_HOOK, _HOOK_SUBJECT, SurrealDbError(f"Transaction failed and rolled back: {_PERMISSIONS}")),
+            (
+                "DEFINE EVENT `a_rather_long_event_name` ON `a_rather_long_table_name` THEN { NONE };",
+                "'a_rather_long_event_name' on table 'a_rather_long_table_name'",
+                InternalError("Internal", "The event 'a_rather_long_event_name' already exists"),
+            ),
+            (
+                "REMOVE FUNCTION fn::a_rather_long::function_name;",
+                "'fn::a_rather_long::function_name'",
+                InternalError("Internal", "The function 'fn::a_rather_long::function_name' does not exist"),
+            ),
+            (_HOOK, _HOOK_SUBJECT, RuntimeError("Parse error: Unexpected token `an identifier`, expected Eof")),
+            (_HOOK, _HOOK_SUBJECT, InternalError("Internal", "Unexpected token `CREATE`")),  # a short overlap
+        ],
+        ids=["permissions", "permissions-interactive", "already-exists", "missing", "no-excerpt", "a-keyword"],
+    )
+    async def test_a_reason_that_does_not_quote_the_statement_is_kept_whole(
+        self, statement: str, subject: str, error: Exception
+    ) -> None:
+        kind = "removal" if statement.startswith("REMOVE") else "definition"
+        what = "function" if "FUNCTION" in statement else "event"
+        raised = await _apply([statement], error, what=what, kind=kind, classify=True, subjects=[subject])
+        assert str(raised.value) == f"Can't apply {what} {kind}: {subject} -> {error}"
+        assert raised.value.__cause__ is error
+        assert statement not in str(raised.value)
+
+    @pytest.mark.parametrize(
+        ("error", "reason"),
+        [
+            (
+                ValidationError("Validation", _excerpt_3x("1:109", f"...{_SECRET}', {{}}) CREATE }};")),
+                "Parse error: Unexpected token `}`, expected an expression (at line 1, column 109 of the statement)",
+            ),
+            (
+                InternalError("Internal", _EXCERPT_2X),
+                "There was a problem with the database: Parse error: Unexpected token `CREATE` expected delimiter `}` "
+                "(at line 1, column 102 of the statement)",
+            ),
+            (
+                RuntimeError(_EXCERPT_2X),  # the embedded engine
+                "There was a problem with the database: Parse error: Unexpected token `CREATE` expected delimiter `}` "
+                "(at line 1, column 102 of the statement)",
+            ),
+        ],
+        ids=["3.x", "2.x", "embedded"],
+    )
+    async def test_a_parse_error_loses_its_excerpt_of_the_statement(self, error: Exception, reason: str) -> None:
+        raised = await _apply([_HOOK], error, what="event", classify=True, subjects=[_HOOK_SUBJECT])
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == f"Can't apply event definition: {_HOOK_SUBJECT} -> {reason}"
+        assert _SECRET in str(error)
+        assert _leaks(raised.value, _SECRET) == []
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is error
+        assert raised.value.__suppress_context__
+
+    async def test_an_interactive_transactions_parse_error(self) -> None:
+        # A 3.x interactive transaction reports a statement the server cannot parse with the raw response's repr(),
+        # where the excerpt's newlines are the two characters "\n".
+        raw = {"error": {"code": -32000, "message": _excerpt_3x("1:109", f"...{_SECRET}', {{}}) CREATE }};")}}
+        error = SurrealDbError(f"Transaction failed: unrecognized query_raw() response shape: {raw!r}")
+        raised = await _apply([_HOOK], error, through_tx=True, what="event", classify=True, subjects=[_HOOK_SUBJECT])
+        assert type(raised.value) is SurrealDbError
+        message = str(raised.value)
+        assert message.startswith(f"Can't apply event definition: {_HOOK_SUBJECT} -> Transaction failed: ")
+        assert message.endswith("(at line 1, column 109 of the statement)")
+        assert _leaks(raised.value, _SECRET) == []
+        assert raised.value.__context__ is error
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            InternalError("Internal", f"Cannot call http::post('https://hooks.example/{_SECRET}', {{}})"),
+            InternalError("Internal", f"Bad URL: https://hooks.example/{_SECRET}"),
+        ],
+        ids=["call", "url"],
+    )
+    async def test_a_reason_that_quotes_the_statement_is_dropped(self, error: Exception) -> None:
+        raised = await _apply([_HOOK], error, what="event", classify=True, subjects=[_HOOK_SUBJECT])
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == (
+            f"Can't apply event definition: {_HOOK_SUBJECT} -> the server's message quotes the statement, so it is left out"
+        )
+        assert _leaks(raised.value, _SECRET) == []
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is error
+
+    async def test_the_class_still_follows_the_servers_text(self) -> None:
+        missing = InternalError("Internal", _MISSING)
+        raised = await _apply([_REMOVE], missing, what="event", kind="removal", classify=True, subjects=["'e' on table 't'"])
+        assert type(raised.value) is SurrealDbNotFoundError
+        assert str(raised.value) == f"Can't apply event removal: 'e' on table 't' -> {missing}"
+
+    async def test_the_hint_still_ends_the_message(self) -> None:
+        error = InternalError("Internal", _MISSING)
+        raised = await _apply([_REMOVE], error, what="event", kind="removal", subjects=["'e' on table 't'"], hint=" (h)")
+        assert str(raised.value) == f"Can't apply event removal: 'e' on table 't' -> {error} (h)"
+
+    @pytest.mark.parametrize("through_tx", [True, False], ids=["tx", "client"])
+    async def test_a_conflict_still_propagates_unchanged(self, through_tx: bool) -> None:
+        error = SurrealDbConflictError("Transaction conflict: This transaction can be retried")
+        raised = await _apply([_HOOK], error, through_tx=through_tx, what="event", classify=True, subjects=[_HOOK_SUBJECT])
+        assert raised.value is error
+
+    async def test_each_statement_has_its_subject(self) -> None:
+        client = _FakeClient()
+        statements = [_DEFINE, _HOOK]
+        subjects = ["'e' on table 't'", _HOOK_SUBJECT]
+        assert await apply_ddl_statements(statements, client=client, what="event", subjects=subjects) == statements
+        assert client.queries == [(_DEFINE, {}), (_HOOK, {})]
+
+    async def test_one_subject_per_statement_or_nothing_is_sent(self) -> None:
+        client = _FakeClient()
+        with pytest.raises(ValueError) as raised:
+            await apply_ddl_statements([_DEFINE, _HOOK], client=client, what="event", subjects=["'e' on table 't'"])
+        assert str(raised.value) == "apply_ddl_statements(): 2 statements and 1 subjects; one subject per statement."
+        assert client.queries == []
+
+    def test_event_subject(self) -> None:
+        assert event_subject("email_audit", "account") == "'email_audit' on table 'account'"
+
+
 class TestCallTransactionOperation:
     """Spec §6.5: ``check_call_transaction(operation=)`` names the manager method in X1m; the default is unchanged."""
 
@@ -1883,6 +2045,19 @@ class EvLog(BaseSurrealModel):
     kind: str | None = None
 
 
+#: An event the server cannot parse, whose excerpt of the statement quotes the secret (checked on every engine).
+_EV_HOOK = Event("ev_hook", then=f"RETURN <{_SECRET}> 1")
+
+
+class EvHookPerson(BaseSurrealModel):
+    """``ev_hook`` on ``ev_person``, on the connection ``"evt"``: its definition holds a secret."""
+
+    model_config = SurrealConfigDict(table_name="ev_person", connection="evt", events=[_EV_HOOK])
+
+    id: str | None = None
+    name: str
+
+
 class EvAsyncPerson(BaseSurrealModel):
     """``ev_async`` on ``ev_person`` — on the connection ``"evt"`` too, so nothing lands in the default database."""
 
@@ -2080,7 +2255,7 @@ class TestEventsE2E:
 
             with pytest.raises(SurrealDbNotFoundError) as raised:
                 await EvPerson.remove_event("ev_audit", missing_ok=False)
-            assert str(raised.value).startswith("Can't apply event removal: REMOVE EVENT `ev_audit` ON `ev_person`; -> ")
+            assert str(raised.value).startswith("Can't apply event removal: 'ev_audit' on table 'ev_person' -> ")
             assert "does not exist" in str(raised.value)
 
     @pytest.mark.parametrize("kind", _KINDS)
@@ -2101,7 +2276,7 @@ class TestEventsE2E:
 
             with pytest.raises(SurrealDbNotFoundError) as raised:
                 await SurrealDBConnectionManager.remove_event("ev_stock", "ev_product", missing_ok=False)
-            assert str(raised.value).startswith("Can't apply event removal: REMOVE EVENT `ev_stock` ON `ev_product`; -> ")
+            assert str(raised.value).startswith("Can't apply event removal: 'ev_stock' on table 'ev_product' -> ")
             assert "does not exist" in str(raised.value)
 
     @pytest.mark.parametrize("kind", _KINDS)
@@ -2123,11 +2298,26 @@ class TestEventsE2E:
                 await SurrealDBConnectionManager.define_event(broken, "ev_person")
             major = await _major(client)
         assert type(raised.value) is SurrealDbError
-        assert str(raised.value).startswith(
-            "Can't apply event definition: DEFINE EVENT OVERWRITE `ev_broken` ON `ev_person` THEN { CREATE }; -> "
-        )
+        assert str(raised.value).startswith("Can't apply event definition: 'ev_broken' on table 'ev_person' -> ")
+        assert str(raised.value).endswith(" of the statement)")  # the server's excerpt is left out, not its position
         expected = RuntimeError if kind == "mem" else ValidationError if major >= 3 else InternalError
-        assert type(raised.value.__cause__) is expected
+        assert raised.value.__cause__ is None
+        assert type(raised.value.__context__) is expected
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_refusal_never_quotes_the_definition(self, kind: str) -> None:
+        # Review of PR #273: the server's excerpt quotes the secret; the ORM's error, its repr() and its traceback
+        # do not, from the model and from the manager.
+        async with _evt(kind), SurrealDBConnectionManager.using("evt"):
+            with pytest.raises(SurrealDbError) as from_model:
+                await EvHookPerson.define_events()
+            with pytest.raises(SurrealDbError) as from_manager:
+                await SurrealDBConnectionManager.define_event(_EV_HOOK, "ev_person")
+        for raised in (from_model, from_manager):
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value).startswith("Can't apply event definition: 'ev_hook' on table 'ev_person' -> ")
+            assert _SECRET in str(raised.value.__context__)
+            assert _leaks(raised.value, _SECRET) == []
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_input_differs_by_line(self, kind: str) -> None:
@@ -2330,6 +2520,26 @@ class TestEventTransactionsE2E:
             assert sorted(await _events_info(client, "ev_product")) == ["ev_stock"]
 
     @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_buffered_refusal_comes_back_at_commit(self, kind: str) -> None:
+        # Review of PR #273: a buffered transaction only queues the statement, so the refusal is the transaction's
+        # SurrealDbError when the block commits, never the classified SurrealDbNotFoundError.
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            if kind == "ws" and await _major(client) >= 3:
+                pytest.skip("buffered transactions only: HTTP, SurrealDB 2.x and the embedded engine")
+            for remove in (
+                lambda tx: EvPerson.remove_event("ev_audit", missing_ok=False, tx=tx),
+                lambda tx: SurrealDBConnectionManager.remove_event("ev_audit", "ev_person", missing_ok=False, tx=tx),
+                lambda tx: SurrealDBConnectionManager.remove_function(_GREET, missing_ok=False, tx=tx),
+            ):
+                with pytest.raises(SurrealDbError) as raised:
+                    async with SurrealDBConnectionManager.transaction() as tx:
+                        assert not tx.is_interactive
+                        await remove(tx)
+                assert type(raised.value) is SurrealDbError
+                assert str(raised.value).startswith("Transaction failed and rolled back: ")
+                assert "does not exist" in str(raised.value)
+
+    @pytest.mark.parametrize("kind", _KINDS)
     async def test_a_block_that_raises_defines_no_event(self, kind: str) -> None:
         async with _evt(kind) as client:
             with pytest.raises(_Abort):
@@ -2469,16 +2679,18 @@ class TestDdlPermissionsE2E:
                 await SurrealDBConnectionManager.invalidate()
             assert await _events_info(client, "ev_person") == {}
         removal = "REMOVE EVENT IF EXISTS `ev_audit` ON `ev_person`;"
+        first = EvPerson.get_events()[0].name
         refusals = [
-            (define_events, f"Can't apply event definition: {EvPerson.event_ddl()[0]} -> "),
-            (remove_event, f"Can't apply event removal: {removal} -> "),
-            (define_event, f"Can't apply event definition: {_EV_AUDIT.ddl('ev_person')} -> "),
-            (manager_remove_event, f"Can't apply event removal: {removal} -> "),
+            (define_events, f"Can't apply event definition: '{first}' on table 'ev_person' -> ", EvPerson.event_ddl()[0]),
+            (remove_event, "Can't apply event removal: 'ev_audit' on table 'ev_person' -> ", removal),
+            (define_event, "Can't apply event definition: 'ev_audit' on table 'ev_person' -> ", _EV_AUDIT.ddl("ev_person")),
+            (manager_remove_event, "Can't apply event removal: 'ev_audit' on table 'ev_person' -> ", removal),
         ]
-        for raised, prefix in refusals:
+        for raised, prefix, statement in refusals:
             assert type(raised.value) is SurrealDbAuthenticationError
             assert str(raised.value).startswith(prefix)
             assert "not enough permissions" in str(raised.value).lower()
+            assert statement not in str(raised.value)
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_s1_a_record_user_on_functions(self, kind: str) -> None:
@@ -2496,13 +2708,18 @@ class TestDdlPermissionsE2E:
                 await SurrealDBConnectionManager.invalidate()
             assert "ev_greet" not in (await client.query("INFO FOR DB;", {}))["functions"]
         refusals = [
-            (define_function, f"Can't apply function definition: {function_ddl(*_GREET_ARGS, **_GREET_KWARGS)} -> "),
-            (remove_function, "Can't apply function removal: REMOVE FUNCTION IF EXISTS fn::ev_greet; -> "),
+            (
+                define_function,
+                "Can't apply function definition: 'fn::ev_greet' -> ",
+                function_ddl(*_GREET_ARGS, **_GREET_KWARGS),
+            ),
+            (remove_function, "Can't apply function removal: 'fn::ev_greet' -> ", _GREET_REMOVAL),
         ]
-        for raised, prefix in refusals:
+        for raised, prefix, statement in refusals:
             assert type(raised.value) is SurrealDbAuthenticationError
             assert str(raised.value).startswith(prefix)
             assert "not enough permissions" in str(raised.value).lower()
+            assert statement not in str(raised.value)
 
 
 async def _notifications(stream: Any, n: int) -> list[Any]:
@@ -2763,7 +2980,7 @@ class TestFunctionsE2E:
             assert await SurrealDBConnectionManager.remove_function("ev_greet") == _GREET_REMOVAL
             with pytest.raises(SurrealDbNotFoundError) as raised:
                 await SurrealDBConnectionManager.remove_function(_GREET, missing_ok=False)
-        assert str(raised.value).startswith("Can't apply function removal: REMOVE FUNCTION fn::ev_greet; -> ")
+        assert str(raised.value).startswith("Can't apply function removal: 'fn::ev_greet' -> ")
         assert "does not exist" in str(raised.value)
 
     @pytest.mark.parametrize("kind", _KINDS)
@@ -2783,9 +3000,18 @@ class TestFunctionsE2E:
                 await SurrealDBConnectionManager.define_function("fn::ev_broken", "RETURN")
             assert (await client.query("INFO FOR DB;", {}))["functions"] == {}
         assert type(raised.value) is SurrealDbError
-        assert str(raised.value).startswith(
-            "Can't apply function definition: DEFINE FUNCTION OVERWRITE fn::ev_broken() { RETURN }; -> "
-        )
+        assert str(raised.value).startswith("Can't apply function definition: 'fn::ev_broken' -> ")
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_refusal_never_quotes_the_definition(self, kind: str) -> None:
+        # Review of PR #273: the server's excerpt quotes the secret the body holds; the ORM's error does not.
+        async with _evt(kind), SurrealDBConnectionManager.using("evt"):
+            with pytest.raises(SurrealDbError) as raised:
+                await SurrealDBConnectionManager.define_function("fn::ev_hook", f"RETURN <{_SECRET}> 1")
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value).startswith("Can't apply function definition: 'fn::ev_hook' -> ")
+        assert _SECRET in str(raised.value.__context__)
+        assert _leaks(raised.value, _SECRET) == []
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_a_redefinition_in_a_transaction_is_read_after_the_commit(self, kind: str) -> None:
@@ -3207,6 +3433,8 @@ _PART_NEEDLES_32 = {
         '`"default"`',
         "`event.ddl(table)`",
         "`repr()`",
+        "`Can't apply event definition: 'stock_guard' on table 'product' -> …`",
+        "excerpt of the statement",
     ),
     "Asynchronous events (SurrealDB 3.x)": (
         "`ASYNC`",
@@ -3238,7 +3466,8 @@ _PART_NEEDLES_32 = {
         "`remove_function()`",
         "`function_ddl()`",
         "`clear_function_signature_cache()`",
-        "Can't apply function definition",
+        "`Can't apply function definition: 'fn::greet' -> …`",
+        "never its body",
     ),
     "Transactions, connections and the query cache": (
         "`tx=`",
@@ -3250,6 +3479,9 @@ _PART_NEEDLES_32 = {
         "`using()`",
         "system user",
         "`SurrealDbAuthenticationError`",
+        "only queues the statement",
+        '"Transaction failed and rolled back: …"',
+        "`missing_ok=False` included",
         "`watch()`",
         "`QueryCache.invalidate(Model)`",
         "signal",
@@ -3277,6 +3509,7 @@ _PART_NEEDLES_32 = {
         "`DEFINE PARAM`",
         "canonical form",
         "`repr()`",
+        "a refusal names the event or the function, never its statement",
         "system user",
     ),
 }

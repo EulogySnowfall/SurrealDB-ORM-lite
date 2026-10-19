@@ -48,6 +48,7 @@ from .routing import check_call_transaction, check_name
 from .schema import (
     Event,
     ensure_async_events_supported,
+    event_subject,
     function_ddl,
     remove_event_statement,
     remove_function_statement,
@@ -2483,7 +2484,11 @@ class SurrealDBConnectionManager:
         :raises ValueError: *table* is not an identifier.
         :raises SurrealDbError: *event* has ``async_mode=True`` and the connection runs SurrealDB 2.x or the
             embedded engine — before any DDL; *tx* belongs to another connection — before any request; the server
-            refused the statement (``Can't apply event definition: …``).
+            refused the statement (``Can't apply event definition: 'stock_guard' on table 'product' -> …``: a
+            refusal names the event and its table, never its statement, whose ``when`` and ``then`` may hold a
+            secret). In a buffered transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the
+            statement is only queued: a refusal comes back when the block commits, as the transaction's
+            ``SurrealDbError`` (``Transaction failed and rolled back: …``), never as ``SurrealDbAuthenticationError``.
         :raises SurrealDbAuthenticationError: the session may not define events.
         """
         check_call_transaction(cls._connection_name or "default", tx, operation="define_event()")
@@ -2492,7 +2497,8 @@ class SurrealDBConnectionManager:
         statement = event.ddl(table, overwrite=overwrite)
         client = await cls.get_client()
         await ensure_async_events_supported(client, (event,), embedded=cls.is_embedded())
-        await apply_ddl_statements([statement], client=client, tx=tx, what="event", classify=True)
+        subjects = [event_subject(event.name, table)]
+        await apply_ddl_statements([statement], client=client, tx=tx, what="event", classify=True, subjects=subjects)
         return statement
 
     @classmethod
@@ -2516,11 +2522,23 @@ class SurrealDBConnectionManager:
         :raises SurrealDbNotFoundError: ``missing_ok=False`` and the table has no such event.
         :raises SurrealDbAuthenticationError: the session may not remove events.
         :raises SurrealDbError: *tx* belongs to another connection — before any request; any other refusal.
+            In a buffered transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the statement is
+            only queued: a refusal comes back when the block commits, as the transaction's ``SurrealDbError``
+            (``Transaction failed and rolled back: …``), never as ``SurrealDbNotFoundError`` or
+            ``SurrealDbAuthenticationError`` — ``missing_ok=False`` included.
         """
         check_call_transaction(cls._connection_name or "default", tx, operation="remove_event()")
         statement = remove_event_statement(event, table, missing_ok)
         client = await cls.get_client()
-        await apply_ddl_statements([statement], client=client, tx=tx, what="event", kind="removal", classify=True)
+        await apply_ddl_statements(
+            [statement],
+            client=client,
+            tx=tx,
+            what="event",
+            kind="removal",
+            classify=True,
+            subjects=[event_subject(event, table)],
+        )
         return statement
 
     # ------------------------------------------------------------------
@@ -2590,7 +2608,11 @@ class SurrealDBConnectionManager:
             well-formed SurrealQL — all before any request.
         :raises SurrealDbAuthenticationError: the session may not define functions.
         :raises SurrealDbError: *tx* belongs to another connection — before any request; the server refused the
-            statement (``Can't apply function definition: …``).
+            statement (``Can't apply function definition: 'fn::greet' -> …``: a refusal names the function, never
+            its statement, whose body may hold a secret). In a buffered transaction (*tx* over HTTP, on SurrealDB 2.x
+            or the embedded engine) the statement is only queued: a refusal comes back when the block commits, as the
+            transaction's ``SurrealDbError`` (``Transaction failed and rolled back: …``), never as
+            ``SurrealDbAuthenticationError``.
         """
         check_call_transaction(cls._connection_name or "default", tx, operation="define_function()")
         statement = function_ddl(
@@ -2602,9 +2624,9 @@ class SurrealDBConnectionManager:
             comment=comment,
             overwrite=overwrite,
         )
-        client = await cls.get_client()
-        await apply_ddl_statements([statement], client=client, tx=tx, what="function", classify=True)
         name = normalize_function_name(function)
+        client = await cls.get_client()
+        await apply_ddl_statements([statement], client=client, tx=tx, what="function", classify=True, subjects=[repr(name)])
         cls._forget_function_signature(name)
         # With tx, again after the commit: a params= call before it reads the committed schema, the old signature.
         if tx is not None:
@@ -2639,12 +2661,18 @@ class SurrealDBConnectionManager:
         :raises SurrealDbNotFoundError: ``missing_ok=False`` and the database has no such function.
         :raises SurrealDbAuthenticationError: the session may not remove functions.
         :raises SurrealDbError: *tx* belongs to another connection — before any request; any other refusal.
+            In a buffered transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the statement is
+            only queued: a refusal comes back when the block commits, as the transaction's ``SurrealDbError``
+            (``Transaction failed and rolled back: …``), never as ``SurrealDbNotFoundError`` or
+            ``SurrealDbAuthenticationError`` — ``missing_ok=False`` included.
         """
         check_call_transaction(cls._connection_name or "default", tx, operation="remove_function()")
         statement = remove_function_statement(function, missing_ok)
-        client = await cls.get_client()
-        await apply_ddl_statements([statement], client=client, tx=tx, what="function", kind="removal", classify=True)
         name = normalize_function_name(function)
+        client = await cls.get_client()
+        await apply_ddl_statements(
+            [statement], client=client, tx=tx, what="function", kind="removal", classify=True, subjects=[repr(name)]
+        )
         cls._forget_function_signature(name)
         if tx is not None:
 

@@ -376,6 +376,12 @@ def remove_function_statement(function: str, missing_ok: bool) -> str:
     return f"REMOVE FUNCTION{_missing_clause(missing_ok)} {name};"
 
 
+def event_subject(name: str, table: str) -> str:
+    """How a refusal names the event *name* of *table* (``'email_audit' on table 'account'``) — never by its statement,
+    whose ``when`` and ``then`` may hold a secret (``apply_ddl_statements(subjects=)``)."""
+    return f"{name!r} on table {table!r}"
+
+
 def check_events_config(model: type, value: object) -> None:
     """The ``events`` key of a model's ``SurrealConfigDict``, checked when the class is defined (v0.31.0).
 

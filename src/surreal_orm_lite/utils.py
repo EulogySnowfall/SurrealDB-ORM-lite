@@ -5,7 +5,7 @@ import operator
 import os
 import re
 import warnings
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal, SupportsIndex, TypeAlias, cast
 
@@ -1132,6 +1132,46 @@ def _ddl_refusal_class(statement: str, error: BaseException) -> type[SurrealDbEr
     return SurrealDbError
 
 
+#: Where a server's parse error starts quoting the statement it refused: `` --> [line:column]``, after a newline, or
+#: after the two characters ``\n`` when the error quotes a response's ``repr()`` (a 3.x interactive transaction).
+_STATEMENT_EXCERPT = re.compile(r"\s*(?:\\n\s*)?--> \[(\d+):(\d+)\]")
+#: The names of a definition the ORM writes — backquoted identifiers and ``fn::`` paths —, which a server's reason
+#: names (``The event 'x' already exists``): they are left out of the comparison below.
+_STATEMENT_NAMES = re.compile(r"`[^`]*`|\bfn::\w+(?:::\w+)*")
+#: A run of this many characters of a statement's text, its names aside, in a server's reason means the reason quotes
+#: the statement.
+_QUOTED_RUN = 12
+_REASON_LEFT_OUT = "the server's message quotes the statement, so it is left out"
+
+
+def _quotes_statement(reason: str, statement: str) -> bool:
+    """Whether *reason* holds a run of ``_QUOTED_RUN`` characters of *statement*'s text, outside its names."""
+    for part in _STATEMENT_NAMES.split(statement):
+        for start in range(len(part) - _QUOTED_RUN + 1):
+            run = part[start : start + _QUOTED_RUN]
+            if run.strip() and run in reason:
+                return True
+    return False
+
+
+def _ddl_refusal_reason(statement: str, error: BaseException) -> tuple[str, bool]:
+    """The server's reason for refusing *statement*, without any of the statement's text, and whether it is the
+    error's whole text.
+
+    A parse error's excerpt of the statement (from `` --> [line:column]`` on) is replaced by its position; a reason
+    that still quotes the statement (``_quotes_statement()``) is replaced by a fixed text.
+    """
+    text = str(error)
+    excerpt = _STATEMENT_EXCERPT.search(text)
+    if excerpt is None:
+        reason = text
+    else:
+        reason = f"{text[: excerpt.start()]} (at line {excerpt[1]}, column {excerpt[2]} of the statement)"
+    if _quotes_statement(reason, statement):
+        return _REASON_LEFT_OUT, False
+    return reason, excerpt is None
+
+
 async def apply_ddl_statements(
     statements: list[str],
     *,
@@ -1141,6 +1181,7 @@ async def apply_ddl_statements(
     hint: str = "",
     kind: str = "definition",
     classify: bool = False,
+    subjects: Sequence[str] | None = None,
 ) -> list[str]:
     """Run DDL statements one at a time, normalising every rejection to `SurrealDbError`.
 
@@ -1156,30 +1197,47 @@ async def apply_ddl_statements(
     Catching only the first leaves the interactive path propagating a bare
     "Transaction failed and rolled back" with no mention of which definition caused it.
 
-    The message is ``Can't apply {what} {kind}: {statement} -> {server message}{hint}``. By default
-    every refusal is a plain ``SurrealDbError``. With ``classify=True`` (v0.31.0's event and function
-    DDL) the class says why: ``SurrealDbAuthenticationError`` when the session may not define,
-    ``SurrealDbNotFoundError`` when a ``REMOVE`` names a missing definition, ``SurrealDbError``
-    otherwise — and a ``SurrealDbConflictError`` propagates unchanged, so ``retry_on_conflict`` still
-    sees it.
+    The message is ``Can't apply {what} {kind}: {statement} -> {server message}{hint}``, the server's
+    error chained as ``__cause__``. By default every refusal is a plain ``SurrealDbError``. With
+    ``classify=True`` (v0.31.0's event and function DDL) the class says why:
+    ``SurrealDbAuthenticationError`` when the session may not define, ``SurrealDbNotFoundError`` when a
+    ``REMOVE`` names a missing definition, ``SurrealDbError`` otherwise — and a
+    ``SurrealDbConflictError`` propagates unchanged, so ``retry_on_conflict`` still sees it.
+
+    With *subjects* (v0.31.0's event and function DDL, whose ``when``, ``then`` or body may hold a
+    secret) the message names the statement's subject instead — ``Can't apply {what} {kind}: {subject}
+    -> {reason}{hint}`` — and never quotes the statement: the reason is the server's message without
+    a parse error's excerpt of the statement (its position kept), or a fixed text when it still quotes
+    the statement. The server's error is chained as ``__cause__`` only when its whole message is the
+    reason; otherwise it stays reachable as ``__context__``, which a traceback does not print.
 
     :param what: names the kind of definition, for the message (e.g. ``"access"``).
     :param hint: appended to the message — extra guidance when the cause is likely known.
     :param kind: what the statements do, for the message: ``"definition"`` or ``"removal"``.
     :param classify: map each refusal to the class that says why (see above).
+    :param subjects: one per statement, how the message names it (``"'audit' on table 'account'"``).
     :returns: the statements applied, so callers can hand them straight back.
+    :raises ValueError: *subjects* does not have one subject per statement — before any request.
     """
-    for statement in statements:
+    if subjects is not None and len(subjects) != len(statements):
+        raise ValueError(
+            f"apply_ddl_statements(): {len(statements)} statements and {len(subjects)} subjects; one subject per statement."
+        )
+    for index, statement in enumerate(statements):
         try:
             if tx is not None:
                 await tx.add(statement, None)
             else:
                 await client.query(statement, {})
         except (ServerError, SurrealDbError, RuntimeError) as e:
-            message = f"Can't apply {what} {kind}: {statement} -> {e}{hint}"
-            if not classify:
-                raise SurrealDbError(message) from e
-            if isinstance(e, SurrealDbConflictError):
+            if classify and isinstance(e, SurrealDbConflictError):
                 raise
-            raise _ddl_refusal_class(statement, e)(message) from e
+            refusal = _ddl_refusal_class(statement, e) if classify else SurrealDbError
+            if subjects is None:
+                raise refusal(f"Can't apply {what} {kind}: {statement} -> {e}{hint}") from e
+            reason, whole = _ddl_refusal_reason(statement, e)
+            message = f"Can't apply {what} {kind}: {subjects[index]} -> {reason}{hint}"
+            if whole:
+                raise refusal(message) from e
+            raise refusal(message) from None
     return statements

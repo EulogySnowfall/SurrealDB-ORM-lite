@@ -24,7 +24,13 @@ from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, _ComputedDefault
 from .routing import check_config_connection, check_same_connection, check_transaction
-from .schema import Event, check_events_config, ensure_async_events_supported, remove_event_statement
+from .schema import (
+    Event,
+    check_events_config,
+    ensure_async_events_supported,
+    event_subject,
+    remove_event_statement,
+)
 from .signals import (
     around_delete,
     around_save,
@@ -841,6 +847,9 @@ class BaseSurrealModel(BaseModel):
         input (``Event`` checks them for mistakes only). Applying needs a session allowed to define (a system
         user such as root, or a namespace or database ``OWNER``/``EDITOR``).
 
+        A refusal names the event and its table, never its statement, whose ``when`` and ``then`` may hold a
+        secret: ``Can't apply event definition: 'email_audit' on table 'account' -> <the server's reason>``.
+
         Args:
             overwrite: see :meth:`event_ddl`.
             tx: optional transaction the statements are applied with. Without one, the first refusal stops the
@@ -849,7 +858,10 @@ class BaseSurrealModel(BaseModel):
         Raises:
             SurrealDbError: an event has ``async_mode=True`` and the connection runs SurrealDB 2.x or the
                 embedded engine — before any DDL; *tx* belongs to another connection — before any request; the
-                server refused a statement (``Can't apply event definition: …``).
+                server refused a statement (``Can't apply event definition: …``). In a buffered transaction (*tx*
+                over HTTP, on SurrealDB 2.x or the embedded engine) the statements are only queued: a refusal
+                comes back when the block commits, as the transaction's ``SurrealDbError`` (``Transaction failed
+                and rolled back: …``), never as ``SurrealDbAuthenticationError``.
             SurrealDbAuthenticationError: the session may not define events.
 
         Example:
@@ -864,7 +876,8 @@ class BaseSurrealModel(BaseModel):
         # Cheap even inside a transaction: get_client() returns the already-connected client.
         client = await manager.get_client()
         await ensure_async_events_supported(client, cls.get_events(), embedded=manager.is_embedded())
-        return await apply_ddl_statements(statements, client=client, tx=tx, what="event", classify=True)
+        subjects = [event_subject(event.name, cls.get_table_name()) for event in cls.get_events()]
+        return await apply_ddl_statements(statements, client=client, tx=tx, what="event", classify=True, subjects=subjects)
 
     @classmethod
     async def remove_event(cls, event: str, *, missing_ok: bool = True, tx: Transaction | None = None) -> str:
@@ -884,16 +897,29 @@ class BaseSurrealModel(BaseModel):
             TypeError, ValueError: *event* is not an identifier, or *missing_ok* not a ``bool``.
             SurrealDbNotFoundError: ``missing_ok=False`` and the table has no such event.
             SurrealDbAuthenticationError: the session may not remove events.
-            SurrealDbError: *tx* belongs to another connection — before any request; any other refusal.
+            SurrealDbError: *tx* belongs to another connection — before any request; any other refusal. In a
+                buffered transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the statement is only
+                queued: a refusal comes back when the block commits, as the transaction's ``SurrealDbError``
+                (``Transaction failed and rolled back: …``), never as ``SurrealDbNotFoundError`` or
+                ``SurrealDbAuthenticationError`` — ``missing_ok=False`` included.
 
         Example:
             >>> await Account.remove_event("email_audit")
             'REMOVE EVENT IF EXISTS `email_audit` ON `account`;'
         """
         check_transaction(cls, tx, f"{cls.__name__}.remove_event()")
-        statement = remove_event_statement(event, cls.get_table_name(), missing_ok)
+        table = cls.get_table_name()
+        statement = remove_event_statement(event, table, missing_ok)
         client = await cls._connection_manager().get_client()
-        await apply_ddl_statements([statement], client=client, tx=tx, what="event", kind="removal", classify=True)
+        await apply_ddl_statements(
+            [statement],
+            client=client,
+            tx=tx,
+            what="event",
+            kind="removal",
+            classify=True,
+            subjects=[event_subject(event, table)],
+        )
         return statement
 
     # ==================== Field aliases & server-owned fields (v0.18.0) ====================
