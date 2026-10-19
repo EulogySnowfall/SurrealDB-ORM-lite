@@ -5147,7 +5147,8 @@ class TestMultiDatabaseDocs:
     C4, C7, P5, P8, P9)."""
 
     def test_section_30_follows_section_29(self) -> None:
-        """Right after section 29 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        """Right after section 29 (after its "Coming from" bullets), then section 31 (v0.30.0), and before the ``---``
+        of "Configuration Options"."""
         readme = _readme()
         start_29 = readme.index(f"\n{_SECTION_29}\n")
         start_30 = readme.index(f"\n{_SECTION_30}\n")
@@ -5156,6 +5157,7 @@ class TestMultiDatabaseDocs:
         assert re.findall(r"^#{2,3} .*$", readme[start_29 + 1 : configuration], re.MULTILINE) == [
             _SECTION_29,
             _SECTION_30,
+            "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "section 30 ends before the --- of the next part"
 
@@ -5279,10 +5281,11 @@ class TestMultiDatabaseDocs:
         roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
         firsts = [cells[0] for cells in roadmap]
         start = firsts.index("v0.28.0")
-        assert roadmap[start : start + 3] == [
+        assert roadmap[start : start + 4] == [
             ["v0.28.0", "Query cache", "✅ Released"],
             ["v0.29.0", "Tier 2 — Multi-database", "✅ Released"],
-            ["v0.30.0 – v0.39.0", "Tier 3 — Advanced (search, DDL, migrations, CLI)", "📋 Planned"],
+            ["v0.30.0", "Tier 3 — Schema introspection", "✅ Released"],
+            ["v0.31.0 – v0.39.0", "Tier 3 — Advanced (search, DDL, migrations, CLI)", "📋 Planned"],
         ], roadmap
 
     def test_comparison_row(self) -> None:
@@ -5316,11 +5319,13 @@ class TestMultiDatabaseDocs:
         assert _HEADER_CLAUSE_29 in header, header
 
     def test_embedded_table_rows(self) -> None:
-        """P8: all four cells of the "Clients" row and of the new row, which comes before the catch-all last row."""
+        """P8: all four cells of the "Clients" row and of the new row, which comes after the Clients row and before
+        the catch-all last row (later versions add their rows after it)."""
         rows = [cells for _, cells in _table_rows(_readme_part(_EMBEDDED_BEHAVIOUR))]
         [clients] = [cells for cells in rows if cells[0] == "Clients"]
         assert clients == _EMBEDDED_CLIENTS_ROW, clients
-        assert rows[-2] == _EMBEDDED_CONNECTIONS_ROW, rows[-2]
+        clients_index = rows.index(clients)
+        assert clients_index < rows.index(_EMBEDDED_CONNECTIONS_ROW) < len(rows) - 1, rows
         assert rows[-1][0] == "Everything else", rows[-1]
 
     def test_connections_and_event_loops(self) -> None:

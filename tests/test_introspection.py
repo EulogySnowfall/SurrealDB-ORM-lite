@@ -11,15 +11,18 @@ suffixed ``E2E``, on the line under test (``SURREALDB_PORT``) and on ``mem://``:
 §9.3 golden source on every line (AC-9), the generated models saving and reading the fixture's rich values back
 (AC-13), ``server_fields`` by attribute name (AC-18). E2E tables are prefixed ``isp_`` (plus the fixture's ``select``
 and AC-18's ``Select``) and live in the database ``isp_db`` of namespace ``ns``, read through the named connection
-``"isp"``; a test reading the default connection passes ``tables=``.
+``"isp"``; a test reading the default connection passes ``tables=``. Last, README section 31 and the tables it touches
+(AC-16, spec §11.1), with its examples run as written on ``mem://``.
 """
 
+import ast
 import contextlib
 import importlib.util
 import inspect
 import logging
 import os
 import pathlib
+import re
 import stat
 import sys
 import uuid
@@ -67,8 +70,21 @@ from surreal_orm_lite.define_parser import (
     _R_SIGNATURE,
     _R_STRING,
 )
+from surreal_orm_lite.testing import embedded_database
 from tests.conftest import orm_client
+from tests.test_embedded import (
+    _EMBEDDED_BEHAVIOUR,
+    _cells,
+    _normalised,
+    _readme,
+    _readme_part,
+    _subsection,
+    _table_rows,
+    _tables,
+)
 from tests.test_model_generator import GOLDEN
+from tests.test_query_cache import _bullets
+from tests.test_time_travel import _SERVER_BEHAVIOUR, _SERVER_TABLE_WIDTHS
 
 #: The 13 names spec §5.8 exports (AC-1).
 _EXPORTS = (
@@ -1589,3 +1605,512 @@ class TestRoundTripE2E:
                 assert isinstance(row.created_at, datetime)
                 got = await model.objects().get(row.get_raw_id())
                 assert (got.created_at, got.note) == (row.created_at, "n")
+
+
+# --- AC-16: README section 31, the tables it touches and its examples (spec §6.5, §11.1 items 1–8; D18, D26) --------
+
+_SECTION_30 = "### 30. Multiple databases (`add_connection()`, `using()`)"
+_SECTION_31 = "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
+#: Spec §11.1 item 1: section 31's subsections, in order, after an untitled intro paragraph.
+_SUBSECTIONS_31 = [
+    "Reading the schema",
+    "Generating models",
+    "How SurrealDB kinds become fields",
+    "What the generator does not do",
+    "SurrealDB 2.x and 3.x",
+    "Permissions",
+    "Coming from the full SurrealDB-ORM",
+]
+#: Spec §11.1 item 1: the block that opens "Reading the schema", exactly (it runs on ``mem://`` as written).
+_READ_EXAMPLE = """\
+from surreal_orm_lite import DatabaseIntrospector, SurrealDBConnectionManager
+
+SurrealDBConnectionManager.set_connection(url="mem://", namespace="shop", database="main")
+client = await SurrealDBConnectionManager.get_client()
+await client.query(
+    "DEFINE TABLE person SCHEMAFULL;"
+    "DEFINE FIELD name ON person TYPE string;"
+    "DEFINE FIELD age ON person TYPE option<int> DEFAULT 18;"
+    "DEFINE FIELD address ON person TYPE option<object>;"
+    "DEFINE FIELD address.city ON person TYPE string;"
+    "DEFINE INDEX person_name ON person FIELDS name UNIQUE;",
+    {},
+)
+
+schema = await DatabaseIntrospector().introspect()
+person = schema.tables["person"]
+person.schema_mode                    # 'SCHEMAFULL'
+person.fields["age"].field_type       # 'int'
+person.fields["age"].nullable         # True: option<int> on SurrealDB 2.x, none | int on 3.x
+person.fields["age"].default          # '18': SurrealQL text
+person.fields["address.city"].path    # ('address', 'city')
+person.indexes["person_name"].unique  # True
+schema.issues                         # (): everything was read and parsed
+"""
+#: Spec §11.1 item 1: the block that opens "Generating models", exactly; the source it prints follows it.
+_GENERATE_EXAMPLE = """\
+from surreal_orm_lite import ModelCodeGenerator, generate_models_from_db
+
+source = ModelCodeGenerator().generate(schema)          # the same text as: await generate_models_from_db()
+print(source)
+await generate_models_from_db("models_generated.py")    # writes the file, replacing it if it exists (as the full ORM)
+try:
+    await generate_models_from_db("models_generated.py", overwrite=False)
+except FileExistsError as exc:
+    print(exc)  # 'models_generated.py' already exists: overwrite=False refuses to replace it.
+"""
+#: What the generate example prints after the source: E8's text for its ``overwrite=False`` call.
+_E8_PRINTED = "'models_generated.py' already exists: overwrite=False refuses to replace it.\n"
+#: The names section 31's examples state a result for (``<expression>  # <repr>[: note]``), by block.
+_STATED_31 = [
+    "person.schema_mode",
+    'person.fields["age"].field_type',
+    'person.fields["age"].nullable',
+    'person.fields["age"].default',
+    'person.fields["address.city"].path',
+    'person.indexes["person_name"].unique',
+    "schema.issues",
+    "archive.connection",
+]
+#: Spec §11.1 item 7 (P1, P2): the 17 "Coming from the full SurrealDB-ORM" bullets, exactly, and no 18th.
+_COMING_FROM_31 = [
+    "- **Same names and call shapes**: `DatabaseIntrospector(connection).introspect()`, "
+    "`ModelCodeGenerator().generate(state)`, `generate_models_from_db(output_path, connection)`, and the state "
+    "classes `SchemaState`, `TableState`, `FieldState`, `IndexState`, `EventState`, `AccessState` and "
+    "`AnalyzerState`, built by position or by keyword with the full ORM's arguments. Lite attributes (`raw`, `path`, "
+    "`table`, `comment`, …) come after them and are keyword-only. `FunctionState`, `ParamState`, `SchemaIssue` and "
+    "`tables=` are lite additions.",
+    "- **State is immutable**: frozen dataclasses with read-only maps, and every definition keeps the server's "
+    "statement in `raw` (full ORM: mutable dataclasses, no statement).",
+    "- **Sequences are tuples**: compare `index.fields`, `analyzer.tokenizers`, `analyzer.filters`, "
+    '`table.relation_in` and `table.relation_out` with tuples (`index.fields == ("email",)`); lists are accepted when '
+    'constructing, and so is the full ORM\'s pipe-joined `relation_in="person | company"`. Relation ends are `()` '
+    "where the full ORM has `None` (not a relation table, or any table).",
+    "- **Permission values are `'FULL'`, `'NONE'` or `'WHERE <expr>'`** (full ORM: the bare condition).",
+    "- **`default` is SurrealQL text**: `'18'`, `\"'active'\"`, `'time::now()'`, with `default_always` for `DEFAULT "
+    "ALWAYS` (full ORM: a Python value, where `'active'` and `time::now()` both become strings). A `FieldState` built "
+    "with a `default` that is not text raises `TypeError`.",
+    '- **`nullable` means "may be NONE"**: it is true for an optional kind (`option<T>`, rendered `none | T` by '
+    'SurrealDB 3.x); `null | T` is not nullable, since it refuses NONE (full ORM: nullable). `field_type` is `"any"` '
+    "for a field without `TYPE`, as in the full ORM.",
+    "- **Accesses are database-level**: they are in `schema.accesses`, and `TableState` has no `access` attribute; "
+    'find a table\'s with `[a for a in schema.accesses.values() if a.table == "user"]`. `table`, `signup_fields` and '
+    "`signin_where` are read from `SIGNUP (CREATE <table> SET …)` (also `CREATE type::thing('<table>', …) SET …` and "
+    "`CREATE type::record('<table>', …) SET …`, the forms `define_access()` uses for a `primary_key`) and `SIGNIN "
+    "(SELECT … FROM <table> WHERE …)`. The full ORM reads the first form only, and another shape leaves them empty, "
+    "with field names unescaped; durations are kept as rendered, `'NONE'` included.",
+    "- **`encrypted` is not provided**: the lite has no `Encrypted` type, so a hashing `VALUE` "
+    "(`crypto::argon2::generate($value)`) stays in `FieldState.value` and the field is generated as a writable field.",
+    '- **APIs and the GraphQL config are not typed**: their definitions are in `SchemaState.other["apis"]` and '
+    '`SchemaState.other["configs"]`, as SurrealDB returns them (full ORM: `ApiState`, `GraphQLConfigState`).',
+    "- **`SchemaState.diff()` and `schema_diff()` come with v0.37.0** (migrations), as does `applied_migrations`; the "
+    "`inspectdb` command comes with v0.38.0.",
+    "- **A refused or failed `INFO FOR DB` raises** `SurrealDbAuthenticationError` or `SurrealDbError`, and a "
+    "definition that cannot be read or parsed becomes a `SchemaIssue` in `schema.issues` and a logged warning (full "
+    "ORM: an empty state, and definitions dropped with a debug log).",
+    "- **`on_delete` keeps `'THEN <expr>'`** for `REFERENCE ON DELETE THEN …` (full ORM: `'THEN'` alone).",
+    "- **`connection=` is a name**: the name a connection was added with (`add_connection()`), else the current one "
+    '(`using()`, then `"default"`). A client object is refused with a `TypeError`, because a client does not carry '
+    "the ORM's connection name, which routing, reconnects and the generated models' `connection=` key need (full ORM: "
+    "an `HTTPConnection`).",
+    "- **Generated models use comments** where the full ORM writes `SurrealConfigDict(table_type=…, permissions=…, "
+    "changefeed=…, view_query=…, relation_in=…, relation_out=…, enforced=…)`: those keys arrive in the lite's "
+    "`SurrealConfigDict` with v0.31.0–v0.33.0. `READONLY` is a comment too (full ORM: `Field(readonly=True)`).",
+    "- **`RecordID` instead of `ForeignKey`/`ReferencesField`**; no `VectorField` or `Encrypted`; `computed()` "
+    "instead of `Computed()`; `Duration`, `UUID`, `Decimal` and the geometry classes instead of `str`, `dict` and "
+    "`float`; nested fields become sub-models (full ORM: dotted attribute lines).",
+    "- **No singularisation**: `game_tables` becomes `GameTables` (full ORM: a trailing `s` is stripped, so `status` "
+    "becomes `Statu`).",
+    "- **`overwrite=False` added**: `generate_models_from_db(path)` replaces an existing file as the full ORM does, "
+    "here atomically; `overwrite=False` refuses it with `FileExistsError`.",
+]
+_PERMISSIONS_31 = [
+    "Introspection needs a system user: root, a namespace user or a database user, any role. A record user or an "
+    'anonymous session gets `SurrealDbAuthenticationError` ("this session may not run INFO FOR DB"); on the embedded '
+    "engine the anonymous session owns the database and may read it.",
+    "The `users` section is never read. On SurrealDB before 3.2.2 (every 2.x release, 3.x before 3.2.2, and the "
+    "embedded engine of SDK 2.0.0), `INFO FOR DB` shows user password hashes to every role that may run `INFO` "
+    "([SurrealDB's `INFO` documentation](https://surrealdb.com/docs/surrealql/statements/info)); introspection never "
+    "reads, stores, logs or writes them.",
+]
+
+#: Spec §11.1 item 7: one key phrase per bullet, in order (AC-16).
+_COMING_FROM_PHRASES_31 = (
+    "Same names and call shapes",
+    "State is immutable",
+    "Sequences are tuples",
+    "'WHERE <expr>'",
+    "`default` is SurrealQL text",
+    "may be NONE",
+    "Accesses are database-level",
+    "`encrypted` is not provided",
+    "APIs and the GraphQL config are not typed",
+    "come with v0.37.0",
+    "`INFO FOR DB` raises",
+    "`on_delete` keeps",
+    "`connection=` is a name",
+    "Generated models use comments",
+    "instead of `ForeignKey`/`ReferencesField`",
+    "No singularisation",
+    "`overwrite=False` added",
+)
+#: Spec §11.1 item 8 (D18): the key phrases and the link AC-16 names.
+_PERMISSIONS_PHRASES_31 = ("never read", "before 3.2.2", "never reads, stores, logs or writes them")
+_INFO_DOCUMENTATION = "https://surrealdb.com/docs/surrealql/statements/info"
+#: Spec §11.1 items 2–4: the features row, the roadmap split and the comparison row.
+_FEATURES_ROW_31 = ["Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)", "✅"]
+_ROADMAP_ROWS_31 = [
+    ["v0.29.0", "Tier 2 — Multi-database", "✅ Released"],
+    ["v0.30.0", "Tier 3 — Schema introspection", "✅ Released"],
+    ["v0.31.0 – v0.39.0", "Tier 3 — Advanced (search, DDL, migrations, CLI)", "📋 Planned"],
+]
+_COMPARISON_ROW_31 = ["Schema Introspection", "✅ v0.30.0 (`DatabaseIntrospector`, `generate_models_from_db()`)", "✅"]
+#: Spec §11.1 item 5: the six rows v0.30.0 adds to the 2.x/3.x table, cell by cell, and the header's new sentence.
+_INTROSPECTION_ROWS = [
+    [
+        "Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
+        "renders `option<T>`, array items as `tags[*]`, `FLEXIBLE` before `TYPE`, IF expressions bare: kinds and field "
+        "paths are normalised to the 3.x forms",
+        "renders optional kinds with `none` first, items as `tags.*`, `FLEXIBLE` after `TYPE`, IF expressions in "
+        "parentheses: same state and model types; expressions kept as rendered",
+        "v0.30.0",
+    ],
+    [
+        "Definitions only one line has (schema introspection)",
+        "`MTREE` and `SEARCH ANALYZER` indexes, `geometry<feature>`: read and typed",
+        "`COMPUTED`, `REFERENCE`, `FULLTEXT`, kind `file`, `WITH REFRESH`, `BEARER`: read and typed; `DEFINE SEQUENCE`: "
+        "kept raw",
+        "v0.30.0",
+    ],
+    [
+        "`INFO` (schema introspection) by a record user or an anonymous session",
+        "refused: `SurrealDbAuthenticationError` (the SDK raises `InternalError`)",
+        "refused: `SurrealDbAuthenticationError` (the SDK raises `NotAllowedError`)",
+        "v0.30.0",
+    ],
+    [
+        "`array<T, N>` read by schema introspection",
+        "at most N items; the generated `list[T]` leaves the check to the server",
+        "exactly N items; the generated `list[T]` leaves the check to the server",
+        "v0.30.0",
+    ],
+    [
+        "Schema introspection of a database removed while the connection is open",
+        "empty schema",
+        "`SurrealDbError` (the database does not exist) until the database is defined again",
+        "v0.30.0",
+    ],
+    ["DDL not yet committed in a transaction, seen by schema introspection", "invisible", "invisible", "v0.30.0"],
+]
+_HEADER_SENTENCE_30 = (
+    "Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs."
+)
+#: Spec §11.1 item 6: the row v0.30.0 adds to the embedded-engine table, cell by cell.
+_EMBEDDED_INTROSPECTION_ROW = [
+    "Schema introspection (`DatabaseIntrospector`)",
+    "reads like a 2.x server (core 2.3.10): same state and same generated model types as on the servers; the anonymous "
+    "owner session may run `INFO`; `COUNT` indexes cannot be defined",
+    "need a system user (root, namespace or database user)",
+    "v0.30.0",
+]
+#: Spec §11.1 item 1: what each subsection holds, by the names it must mention.
+_PART_NEEDLES_31 = {
+    "Reading the schema": (
+        "`INFO FOR DB;`",
+        "`INFO FOR TABLE`",
+        "`schema.accesses`",
+        "`schema.analyzers`",
+        "`schema.functions`",
+        "`schema.params`",
+        "`schema.other`",
+        "`users`",
+        "`raw`",
+        "`repr()`",
+        "`SchemaIssue`",
+        "`surreal_orm_lite.introspection`",
+        "`SurrealDbAuthenticationError`",
+        "`SurrealDbNotFoundError`",
+        "`tables=`",
+        "an empty list reads none",
+        "`connection=`",
+        "`using()`",
+        "client object",
+        "`TypeError`",
+    ),
+    "Generating models": (
+        "`generate_models_from_db(output_path=None, connection=None, *, tables=None, overwrite=True)`",
+        "atomically",
+        "`os.replace()`",
+        "`overwrite=False`",
+        "`FileExistsError`",
+        "`BaseSurrealEdge`",
+        "`GameTables`",
+        "`RangeModel`",
+    ),
+    "How SurrealDB kinds become fields": (
+        "`option<T>`",
+        "`PointField = None`",
+        "sub-model",
+        "`FLEXIBLE`",
+        "`server_fields`",
+        "`time::now()`",
+        'Decimal("1.5")',
+        "Computed[T]",
+        "`computed()` refuses",
+        "`$value`",
+        'extra="allow"',
+        "`Field(alias=",
+        "`datetime_`",
+        "`select`",
+        "`Select`",
+        "not an identifier",
+    ),
+    "What the generator does not do": (
+        "`ASSERT`",
+        "`PERMISSIONS`",
+        "`# READONLY`",
+        "`update()`",
+        "`merge()`",
+        "`array<T, N>`",
+        "`null | T`",
+        "`define_computed_fields()`",
+        "128 columns",
+        "`ruff format`",
+        "`Literal`",
+    ),
+    "SurrealDB 2.x and 3.x": (
+        "`option<int>`",
+        "`none | int`",
+        "`tags[*]`",
+        "`tags.*`",
+        "`FLEXIBLE TYPE object`",
+        "`TYPE object FLEXIBLE`",
+        "`VALUE IF b THEN 1 ELSE 2 END`",
+        "`VALUE (IF b THEN 1 ELSE 2 END)`",
+        "`COMPUTED`",
+        "`MTREE`",
+        "`DEFINE SEQUENCE`",
+        "`transaction()`",
+        "`REMOVE DATABASE`",
+        "`SurrealDbError`",
+        "empty schema",
+    ),
+}
+
+
+def _section_31() -> str:
+    return _readme_part(_SECTION_31)
+
+
+def _part_31(heading: str) -> str:
+    """One ``####`` subsection of section 31, as written."""
+    return _subsection(f"#### {heading}", _section_31())
+
+
+def _python_blocks_31() -> list[str]:
+    """Section 31's ``python`` blocks, in order."""
+    blocks: list[str] = re.findall(r"^```python\n(.*?)^```$", _section_31(), re.MULTILINE | re.DOTALL)
+    assert blocks, "README section 31 has no example"
+    return blocks
+
+
+def _printed_index(blocks: list[str]) -> int:
+    """The index of the block showing what the generate example prints: the one right after that example."""
+    return blocks.index(_GENERATE_EXAMPLE) + 1
+
+
+def _stated(block: str) -> list[tuple[str, str]]:
+    """``(expression, comment)`` for each top-level line of *block* that is a bare expression stating its result in a
+    trailing comment (``person.schema_mode  # 'SCHEMAFULL'``)."""
+    stated = []
+    for expression, comment in re.findall(r"^(\S[^#\n]*?) {2,}# (.+)$", block, re.MULTILINE):
+        try:
+            compile(expression, "<README section 31>", "eval")
+        except SyntaxError:
+            continue  # an assignment, or a statement
+        if not expression.startswith(("await ", "print(")):
+            stated.append((expression, comment))
+    return stated
+
+
+class TestReadmeSection31:
+    """AC-15, AC-16: README section 31 — its place, subsections, examples (run on ``mem://`` as written), the
+    ``Permissions`` and "Coming from the full SurrealDB-ORM" texts of spec §11.1 items 7–8 — and the features,
+    roadmap, comparison and both behaviour tables (spec §11.1 items 2–6)."""
+
+    def test_section_31_follows_section_30(self) -> None:
+        """Right after section 30 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        readme = _readme()
+        start_30 = readme.index(f"\n{_SECTION_30}\n")
+        start_31 = readme.index(f"\n{_SECTION_31}\n")
+        configuration = readme.index("\n## Configuration Options\n")
+        assert start_30 < start_31 < configuration
+        assert re.findall(r"^#{2,3} .*$", readme[start_30 + 1 : configuration], re.MULTILINE) == [
+            _SECTION_30,
+            _SECTION_31,
+        ]
+        assert readme[:configuration].rstrip().endswith("\n---"), "section 31 ends before the --- of the next part"
+
+    def test_subsections_in_order(self) -> None:
+        assert re.findall(r"^#### (.*)$", _section_31(), re.MULTILINE) == _SUBSECTIONS_31
+
+    def test_the_spec_examples_open_their_subsections(self) -> None:
+        """Spec §11.1 item 1: each example exactly, first in its subsection; the printed source right after the
+        generate example; ``python`` fences only."""
+        assert _python_blocks_31()[0] == _READ_EXAMPLE
+        assert re.findall(r"^```python\n(.*?)^```$", _part_31(_SUBSECTIONS_31[0]), re.MULTILINE | re.DOTALL)[0] == (
+            _READ_EXAMPLE
+        )
+        generating = re.findall(r"^```python\n(.*?)^```$", _part_31(_SUBSECTIONS_31[1]), re.MULTILINE | re.DOTALL)
+        assert generating[0] == _GENERATE_EXAMPLE
+        assert generating[1].startswith('"""Models generated by surreal_orm_lite.generate_models_from_db()'), generating
+        fences = re.findall(r"^```(\S*)$", _section_31(), re.MULTILINE)
+        assert fences[1::2] == [""] * (len(fences) // 2) and set(fences[0::2]) == {"python"}, fences
+        assert "mem://" in _READ_EXAMPLE.splitlines()[2], "the first example says it runs on mem://"
+
+    def test_intro_paragraph(self) -> None:
+        """Read-only, the two INFO statements, a system user; one shape on both lines, expressions as rendered."""
+        intro = _normalised(_section_31().split("\n#### ", 1)[0])
+        for needle in ("`INFO FOR DB`", "`INFO FOR TABLE`", "system user", "2.x", "3.x", "as each line renders them"):
+            assert needle in intro, needle
+
+    @pytest.mark.parametrize("heading", list(_PART_NEEDLES_31))
+    def test_what_each_subsection_says(self, heading: str) -> None:
+        text = _normalised(_part_31(heading))
+        missing = [needle for needle in _PART_NEEDLES_31[heading] if needle not in text]
+        assert not missing, missing
+
+    def test_kinds_table(self) -> None:
+        """The §6.4.4 mapping as a two-column table, no pipe in a cell (a kind union is written in prose)."""
+        part = _part_31("How SurrealDB kinds become fields")
+        [lines] = _tables(part)
+        assert _cells(lines[0]) == ["SurrealDB kind", "Generated annotation"]
+        rows = dict(cells for _, cells in _table_rows(part))
+        assert rows["`number`"].startswith("`int`, `float` or `Decimal`"), rows
+        assert rows["`duration`"].startswith("`Duration`"), rows
+        assert rows["`record`, `record<…>`"] == "`RecordID`", rows
+        assert rows["`[A, B]` (a tuple)"] == "`tuple[A, B]`", rows
+
+    def test_permissions_exactly(self) -> None:
+        """Spec §11.1 item 8 (D18): both paragraphs exactly, the key phrases of AC-16 and the link."""
+        part = _part_31("Permissions")
+        paragraphs = [_normalised(paragraph) for paragraph in part.split("\n\n")[1:] if paragraph.strip()]
+        assert paragraphs == _PERMISSIONS_31, paragraphs
+        text = _normalised(part)
+        for phrase in _PERMISSIONS_PHRASES_31:
+            assert phrase in text, phrase
+        assert f"]({_INFO_DOCUMENTATION})" in text
+
+    def test_coming_from_the_full_orm(self) -> None:
+        """Spec §11.1 item 7 (P1, P2): 17 bullets, exactly, and no 18th."""
+        assert _bullets(_part_31("Coming from the full SurrealDB-ORM")) == _COMING_FROM_31
+
+    def test_coming_from_key_phrases_in_order(self) -> None:
+        """AC-16: one key phrase per bullet, in order, matched after collapsing whitespace."""
+        bullets = _bullets(_part_31("Coming from the full SurrealDB-ORM"))
+        assert len(bullets) == len(_COMING_FROM_PHRASES_31)
+        for bullet, phrase in zip(bullets, _COMING_FROM_PHRASES_31, strict=True):
+            assert phrase in bullet, (phrase, bullet)
+
+    def test_features_row(self) -> None:
+        features = [cells for _, cells in _table_rows(_readme_part("## Features"))]
+        firsts = [cells[0] for cells in features]
+        assert _FEATURES_ROW_31 in features, features
+        assert firsts.index(_FEATURES_ROW_31[0]) == firsts.index("Multiple databases (named connections, `using()`)") + 1
+
+    def test_roadmap_rows(self) -> None:
+        roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
+        start = [cells[0] for cells in roadmap].index("v0.29.0")
+        assert roadmap[start : start + 3] == _ROADMAP_ROWS_31, roadmap
+        assert roadmap[start + 3][0] == "v0.40.0", roadmap
+
+    def test_comparison_row(self) -> None:
+        """Spec §11.1 item 4: the label stays ``Schema Introspection``, the lite cell names the API, the full ORM's
+        cell stays ``✅``; right after the Multi-database row."""
+        comparison = [cells for _, cells in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        firsts = [cells[0] for cells in comparison]
+        assert comparison[firsts.index("Multi-database") + 1] == _COMPARISON_ROW_31, comparison
+
+    def test_server_behaviour_rows(self) -> None:
+        """Spec §11.1 item 5: six rows, Since v0.30.0, right after the v0.29.2 row and before the table's last row."""
+        rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
+        start = rows.index(_INTROSPECTION_ROWS[0])
+        assert rows[start : start + 6] == _INTROSPECTION_ROWS, rows[start : start + 6]
+        assert rows[start - 1][3] == "v0.29.2", rows[start - 1]
+        assert start + 6 == len(rows) - 1 and rows[-1][3] == "v0.19.1", rows[-1]
+        assert [cells for cells in rows if cells[3] == "v0.30.0"] == _INTROSPECTION_ROWS
+
+    def test_server_behaviour_table_keeps_its_widths(self) -> None:
+        """Every line 535 characters, the columns 136, 175, 181 and 38 wide: the new rows are padded to them."""
+        [lines] = _tables(_readme_part(_SERVER_BEHAVIOUR))
+        assert {len(line) for line in lines} == {535}
+        for line in lines:
+            assert [len(cell) for cell in line.split("|")[1:-1]] == _SERVER_TABLE_WIDTHS, line
+
+    def test_server_behaviour_header_sentence(self) -> None:
+        """The sentence v0.30.0 appends to the table's intro paragraph, after v0.29.2's."""
+        header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
+        v0292 = "The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5."
+        assert f"{v0292} {_HEADER_SENTENCE_30}" in header, header
+
+    def test_embedded_table_row(self) -> None:
+        """Spec §11.1 item 6: all four cells, right before the catch-all "Everything else" row; widths kept."""
+        part = _readme_part(_EMBEDDED_BEHAVIOUR)
+        rows = [cells for _, cells in _table_rows(part)]
+        assert rows[-2] == _EMBEDDED_INTROSPECTION_ROW, rows[-2]
+        assert rows[-1][0] == "Everything else", rows[-1]
+        [lines] = _tables(part)
+        assert {len(line) for line in lines} == {539}
+        for line in lines:
+            assert [len(cell) for cell in line.split("|")[1:-1]] == [69, 343, 113, 9], line
+
+    def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
+        """Every table v0.30.0 touches keeps one cell count per line and no escaped pipe."""
+        parts = [
+            _section_31(),
+            _readme_part("## Features"),
+            _readme_part(_SERVER_BEHAVIOUR),
+            _readme_part(_EMBEDDED_BEHAVIOUR),
+            _readme_part("## Roadmap"),
+            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+        ]
+        tables = [lines for part in parts for lines in _tables(part)]
+        assert len(tables) == len(parts), "section 31 has its kinds table"
+        for lines in tables:
+            assert len({len(_cells(line)) for line in lines}) == 1 and "\\|" not in "".join(lines), lines
+
+    async def test_section_31_examples(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """AC-16: every ``python`` block runs as written, in order and in one namespace, on ``mem://`` (inside
+        ``embedded_database()``, with ``tmp_path`` as the working directory); every result a comment states is the one
+        the examples got; the block after the generate example is exactly the source it prints, which is also the file
+        it writes, and the ``overwrite=False`` call prints E8's text."""
+        monkeypatch.chdir(tmp_path)
+        blocks = _python_blocks_31()
+        printed = _printed_index(blocks)
+        runnable = blocks[:printed] + blocks[printed + 1 :]
+        stated = [pair for block in runnable for pair in _stated(block)]
+        assert [expression for expression, _ in stated] == _STATED_31, stated
+        namespace: dict[str, Any] = {"__name__": "readme_section_31"}
+        try:
+            async with embedded_database():
+                for code in runnable:
+                    compiled = compile(code, "<README section 31>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                    # A doctest of this repository's own README (trusted text), top-level awaits included.
+                    outcome = eval(compiled, namespace)
+                    if inspect.iscoroutine(outcome):
+                        await outcome
+                    for expression, comment in _stated(code):
+                        value = repr(eval(expression, namespace))
+                        assert comment == value or comment.startswith(f"{value}: "), (expression, comment, value)
+
+                assert namespace["source"] == blocks[printed]
+                assert capsys.readouterr().out == blocks[printed] + "\n" + _E8_PRINTED
+                assert (tmp_path / "models_generated.py").read_text(encoding="utf-8") == blocks[printed]
+                assert list(namespace["just_person"].tables) == ["person"]
+                assert namespace["no_table"].tables == {} and namespace["no_table"].connection == "default"
+                assert namespace["archive"].tables == {}
+        finally:
+            namespace.clear()
+            await SurrealDBConnectionManager.remove_connection("archive")
