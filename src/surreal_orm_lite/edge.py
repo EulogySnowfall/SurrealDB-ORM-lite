@@ -250,7 +250,8 @@ class BaseSurrealEdge(BaseSurrealModel):
         ``id`` ``None`` outside a buffered transaction.
 
         ``server_fields`` and computed fields are left to the server on a create and read back
-        from the row it returns. ``server_values``/``extra_vars`` are not available on an edge:
+        from the row it returns, which is applied whole (#261: the sub-fields a ``DEFAULT``
+        filled too). ``server_values``/``extra_vars`` are not available on an edge:
         ``INSERT RELATION`` cannot evaluate ``SET`` expressions — use ``DEFINE FIELD …
         DEFAULT``/``VALUE`` on the edge table.
 
@@ -294,8 +295,9 @@ class BaseSurrealEdge(BaseSurrealModel):
 
         The row is :meth:`_write_payload` (column-keyed: ``in``, ``out``, the data; computed
         fields and un-named ``server_fields`` left out, as on any create) plus ``id`` when the
-        instance has one. Only ``id`` and the server-owned fields are read back from the returned
-        row: the data the caller sent is not re-applied, so nested models stay models.
+        instance has one. The returned row is applied whole, as a node's ``save()`` applies it
+        (#261): ``id``, the server-owned fields and the sub-fields a ``DEFAULT`` filled are read
+        back, each field with the type a read gives (nested models stay models).
         """
         _check_edge_id(self)
         row = self._write_payload(keep=keep)
@@ -304,5 +306,5 @@ class BaseSurrealEdge(BaseSurrealModel):
             row["id"] = record_id
         rows = await insert_edges(self.get_table_name(), [row], tx=tx, manager=type(self)._connection_manager())
         if rows:
-            self._apply_record(rows, only={"id", *self.get_server_fields()})
+            self._apply_record(rows)
         return self, True

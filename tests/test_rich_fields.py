@@ -59,14 +59,16 @@ from surreal_orm_lite import (
     Range,
     SurrealConfigDict,
     SurrealDBConnectionManager,
+    SurrealDbError,
     SurrealFunc,
     _sdk,
     computed,
     encoding,
     model_base,
 )
-from surreal_orm_lite._sdk import Bound
+from surreal_orm_lite._sdk import Bound, SurrealError
 from surreal_orm_lite.live import hydrate
+from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import build_filter_condition
 from tests._retry import retry_write
 from tests.conftest import change_feed_database, orm_client
@@ -771,9 +773,10 @@ class TestSetDataRule:
 
 
 class TestApplyRecordRule:
-    """§6.3 item 3 (D1): top-level durations are converted; every other value is applied as received."""
+    """§6.3 item 3 (D1): top-level durations are converted; ``date``, set and ``Range`` fields take the type a read
+    gives (#261); every other value is applied as received."""
 
-    def test_durations_converted_other_values_raw(self) -> None:
+    def test_durations_converted_read_types_validated_other_values_raw(self) -> None:
         event = RfEvent(id="x")
         day = datetime(2026, 1, 2, tzinfo=UTC)
         tags = ["a"]
@@ -792,7 +795,11 @@ class TestApplyRecordRule:
         )
         assert type(event.ttl) is timedelta and event.ttl == timedelta(hours=1, minutes=30)
         assert type(event.grace) is Duration and event.grace.elapsed == 5400 * 10**9 + 1
-        assert event.day is day and event.tags is tags and event.hours is hours and event.durs is durs
+        assert type(event.day) is date and event.day == date(2026, 1, 2)
+        assert type(event.tags) is set and event.tags == {"a"}
+        assert type(event.hours) is Range and event.hours == Range(BoundIncluded(9), BoundExcluded(17))
+        assert event.durs is durs
+        assert day == datetime(2026, 1, 2, tzinfo=UTC) and tags == ["a"], "the row is not changed"
 
     def test_out_of_range_values_are_kept(self) -> None:
         event = RfEvent(id="x")
@@ -1055,9 +1062,8 @@ _APPLY_CASES: dict[str, Callable[[], Awaitable[RfEvent]]] = {
 class TestApplyRecordE2E:
     """AC-18 (D1): rows applied without validation keep durations, so a write-back stays native."""
 
-    # D1 converts durations only: ``day`` and ``tags`` hold the server's datetime and list after a returned
-    # row is applied, as in v0.22.2, and Pydantic warns when ``update()`` serialises them (README section 24).
-    @pytest.mark.filterwarnings("ignore:Pydantic serializer warnings:UserWarning")
+    # #261: ``day``, ``tags``, ``hours`` and ``period`` hold the type a read gives after a returned row is applied
+    # (before, the SDK's midnight datetime, list and Range, and Pydantic warned when ``update()`` serialised them).
     @pytest.mark.asyncio
     @pytest.mark.parametrize("case", list(_APPLY_CASES))
     async def test_returned_rows_keep_durations(self, case: str) -> None:
@@ -1065,13 +1071,14 @@ class TestApplyRecordE2E:
             event = await _APPLY_CASES[case]()
             assert type(event.ttl) is timedelta and event.ttl == FULL["ttl"]
             assert type(event.grace) is Duration and event.grace == FULL["grace"]
-            if case == "refresh":
-                message = "D1 scope changed: update README section 24"
-                assert type(event.day) is datetime, message
-                assert type(event.tags) is list, message
-                assert type(event.hours) is surrealdb.Range, message
+            assert type(event.day) is date and event.day == FULL["day"]
+            assert type(event.tags) is set and event.tags == FULL["tags"]
+            assert type(event.hours) is Range and event.hours == FULL["hours"]
+            assert type(event.period) is Range and event.period == FULL["period"]
 
-            await event.update()  # the §3.7 regression: durations written back as {elapsed: …}
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", UserWarning)  # no PydanticSerializationUnexpectedValue any more
+                await event.update()  # the §3.7 regression: durations written back as {elapsed: …}
             rid = event._record_id()
             assert rid is not None
             row = await _raw(rid)
@@ -1343,7 +1350,9 @@ class TestSubModelSyncRule:
         expected = {"sub", "maybe", "subs", "by_key", "data", "datas", "typed", "plain", "tds"}
         assert set(RfHolder._sync_fields()) == expected
         assert RfHolder._sync_fields() is RfHolder._sync_fields(), "cached per class"
-        assert RfEvent._sync_fields() == {} and RfPlain._sync_fields() == {}
+        assert RfPlain._sync_fields() == {}
+        # #261: the fields a read gives another type than the SDK's value (``date``, set, ``Range``).
+        assert set(RfEvent._sync_fields()) == {"day", "tags", "hours", "period"}
         # A ``timedelta`` below the top level, never one the top-level rule converts (nor a subclass).
         assert set(RfKinds._sync_fields()) == {"either", "many", "by_key", "window"}
         # Python names only: ``_apply_record`` translates each column first.
@@ -2775,6 +2784,285 @@ class TestNativeContractE2E:
             await RfArr(id="x", tags={"b", "a"}).save()
             got = await RfArr.objects().get("x")
         assert type(got.tags) is set and got.tags == {"a", "b"}
+
+
+# --- save() reflects the stored row, update() keeps the stored datetimes (#261) -------------------
+
+
+@contextlib.asynccontextmanager
+async def _rf_engine(kind: str, ddl: str, *tables: str) -> AsyncIterator[Any]:
+    """*ddl* applied on the line under test (``ws``, *tables* dropped before and after) or on a fresh ``mem://``."""
+    if kind == "mem":
+        async with embedded_database() as client:
+            await client.query(ddl, {})
+            yield client
+        return
+    async with orm_client(*tables) as client:
+        await client.query(ddl, {})
+        yield client
+
+
+async def _replace(instance: BaseSurrealModel, write: str, tx: bool) -> None:
+    """``instance.update()`` or ``.upsert()``, directly or in a transaction (interactive on 3.x, buffered otherwise)."""
+    if not tx:
+        await getattr(instance, write)()
+        return
+    async with SurrealDBConnectionManager.transaction() as transaction:
+        await getattr(instance, write)(tx=transaction)
+
+
+class RfStampMeta(BaseModel):
+    at: datetime | None = None
+    seen: datetime | None = None
+
+
+class RfStamp(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_stamp", server_fields=["created", "log"])
+
+    id: str | None = None
+    title: str
+    created: datetime | None = None
+    meta: RfStampMeta = Field(default_factory=RfStampMeta)
+    log: list[datetime] | None = None
+
+
+class RfStampLink(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="rf_stamp_link")
+
+    meta: RfStampMeta = Field(default_factory=RfStampMeta)
+
+
+#: #261: ``READONLY`` datetimes the server fills on create (top level, in a sub-object, in an array), and an optional
+#: sub-field it fills.
+_RF_STAMP_DDL = (
+    "DEFINE TABLE rf_stamp SCHEMAFULL;"
+    "DEFINE FIELD title ON rf_stamp TYPE string;"
+    "DEFINE FIELD created ON rf_stamp TYPE datetime DEFAULT time::now() READONLY;"
+    "DEFINE FIELD log ON rf_stamp TYPE array<datetime> DEFAULT [time::now()] READONLY;"
+    "DEFINE FIELD meta ON rf_stamp TYPE object DEFAULT {};"
+    "DEFINE FIELD meta.at ON rf_stamp TYPE datetime DEFAULT time::now() READONLY;"
+    "DEFINE FIELD meta.seen ON rf_stamp TYPE option<datetime> DEFAULT time::now();"
+    "DEFINE TABLE rf_stamp_link TYPE RELATION SCHEMAFULL;"
+    "DEFINE FIELD meta ON rf_stamp_link TYPE object DEFAULT {};"
+    "DEFINE FIELD meta.at ON rf_stamp_link TYPE datetime DEFAULT time::now() READONLY;"
+    "DEFINE FIELD meta.seen ON rf_stamp_link TYPE option<datetime> DEFAULT time::now();"
+)
+#: A row whose datetimes hold nanoseconds, which the SDK floors to the microsecond.
+_RF_STAMP_SEED = (
+    "CREATE rf_stamp:seed SET title = 't', created = d'2026-01-02T03:04:05.123456789Z', "
+    "meta = {at: d'2026-01-02T03:04:05.987654321Z', seen: d'2026-01-02T03:04:05.000000001Z'}, "
+    "log = [d'2026-01-02T03:04:05.000000999Z', d'2026-01-02T03:04:05.000001001Z'];"
+)
+_RF_STAMP_SEEDED = ["2026-01-02T03:04:05.123456789Z", "2026-01-02T03:04:05.987654321Z", "2026-01-02T03:04:05.000000001Z"]
+#: Whether the seeded record's ``log`` still holds its nanoseconds.
+_RF_LOG_SEEDED = "RETURN rf_stamp:seed.log == [d'2026-01-02T03:04:05.000000999Z', d'2026-01-02T03:04:05.000001001Z'];"
+_RF_SEED = RecordID("rf_stamp", "seed")
+
+
+async def _stamps(client: Any, rid: RecordID) -> object:
+    """The stored datetimes of *rid* as the server writes them, nanoseconds included (``log`` as a whole)."""
+    return await client.query(
+        "SELECT VALUE [<string> created, <string> meta.at, <string> meta.seen, <string> log] FROM ONLY $rid;", {"rid": rid}
+    )
+
+
+async def _seed_kept(client: Any) -> bool:
+    """Whether ``rf_stamp:seed`` still holds the datetimes ``_RF_STAMP_SEED`` wrote, to the nanosecond."""
+    stamps = await _stamps(client, _RF_SEED)
+    assert isinstance(stamps, list), stamps
+    return stamps[:3] == _RF_STAMP_SEEDED and await client.query(_RF_LOG_SEEDED, {}) is True
+
+
+class TestReplaceKeepsStoredDatetimesE2E:
+    """#261 case 1: ``update()`` and ``upsert()`` of another field pass on a record whose ``READONLY`` datetimes hold
+    nanoseconds (the SDK reads microseconds), after ``save()`` and after ``get()``, directly and in a transaction, on
+    the line under test and on ``mem://``. The stored datetimes keep their nanoseconds; a changed one is still refused."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    @pytest.mark.parametrize("write", ["update", "upsert"])
+    @pytest.mark.parametrize("tx", [False, True], ids=["direct", "tx"])
+    async def test_readonly_datetimes_are_kept(self, kind: str, write: str, tx: bool) -> None:
+        async with _rf_engine(kind, _RF_STAMP_DDL, "rf_stamp", "rf_stamp_link") as client:
+            await client.query(_RF_STAMP_SEED, {})
+            saved = await RfStamp(id="saved", title="t").save()
+            seeded = await RfStamp.objects().get("seed")
+            for instance in (saved, seeded):
+                rid = instance._record_id()
+                assert rid is not None
+                before = await _stamps(client, rid)
+                instance.title = write
+                await _replace(instance, write, tx)
+                assert await _stamps(client, rid) == before, rid
+                assert (await RfStamp.objects().get(rid.id)).title == write
+            assert await _seed_kept(client)
+            assert seeded.log is not None and [d.microsecond for d in seeded.log] == [0, 1]
+
+            assert seeded.created is not None
+            seeded.created += timedelta(microseconds=1)
+            with pytest.raises((SurrealError, SurrealDbError), match="readonly"):
+                await _replace(seeded, write, tx)
+            assert await _seed_kept(client)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    async def test_an_edge_update_keeps_them(self, kind: str) -> None:
+        async with _rf_engine(kind, _RF_STAMP_DDL, "rf_stamp", "rf_stamp_link") as client:
+            await client.query(_RF_STAMP_SEED, {})
+            link = await RfStampLink(in_=_RF_SEED, out=_RF_SEED).save()
+            assert isinstance(link.meta.at, datetime) and isinstance(link.meta.seen, datetime), link.meta
+            rid = link._record_id()
+            assert rid is not None
+            query = "SELECT VALUE [<string> meta.at, <string> meta.seen] FROM ONLY $rid;"
+            before = await client.query(query, {"rid": rid})
+            await link.update()
+            assert await client.query(query, {"rid": rid}) == before
+
+
+class TestSaveReadsBackTheStoredRowE2E:
+    """#261 case 2: right after ``save()`` the instance holds what the server stored, sub-fields a ``DEFAULT`` filled
+    included, with an explicit id, an auto id and in an interactive transaction; a following ``update()`` keeps them.
+    A buffered transaction (``mem://``, 2.x) has no row before commit: the instance keeps its values, as documented."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    @pytest.mark.parametrize("how", ["explicit-id", "auto-id", "tx"])
+    async def test_default_sub_fields(self, kind: str, how: str) -> None:
+        async with _rf_engine(kind, _RF_STAMP_DDL, "rf_stamp", "rf_stamp_link") as client:
+            if how == "tx":
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    stamp = await RfStamp(id="x", title="t").save(tx=tx)
+                    interactive = tx.is_interactive
+                if not interactive:
+                    assert (stamp.created, stamp.meta.at, stamp.meta.seen, stamp.log) == (None, None, None, None)
+                    return
+            else:
+                stamp = await RfStamp(id="x" if how == "explicit-id" else None, title="t").save()
+            assert isinstance(stamp.meta, RfStampMeta), stamp.meta
+            assert stamp.log is not None and len(stamp.log) == 1, stamp.log
+            for value in (stamp.created, stamp.meta.at, stamp.meta.seen, stamp.log[0]):
+                assert type(value) is datetime and value.tzinfo is not None, stamp
+            rid = stamp._record_id()
+            assert rid is not None
+            if how != "auto-id":
+                assert stamp.id == "x"  # an explicit id stays as given
+            got = await RfStamp.objects().get(rid.id)
+            assert stamp.model_dump(exclude={"id"}) == got.model_dump(exclude={"id"})
+
+            before = await _stamps(client, rid)
+            stamp.title = "u"
+            await stamp.update()
+            assert await _stamps(client, rid) == before
+
+
+class RfShapes(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_shapes")
+
+    id: str | None = None
+    pair: tuple[int, str] = (0, "")
+    tags: set[str] = set()
+    day: date | None = None
+    hours: Range[int] | None = None
+    nested: list[tuple[int, int]] = []
+    n: int = 0
+
+
+#: Values whose type the SDK does not read back: a ``list``, a ``list``, a midnight ``datetime``, the SDK's ``Range``.
+_SHAPES: dict[str, Any] = {
+    "pair": (1, "a"),
+    "tags": {"b", "a"},
+    "day": date(2026, 1, 2),
+    "hours": Range(BoundIncluded(9), BoundExcluded(17)),
+    "nested": [(1, 2)],
+}
+
+
+async def _shapes_after(write: str) -> RfShapes:
+    """An ``RfShapes`` holding ``_SHAPES``, after *write*."""
+    if write == "save-auto-id":
+        return await RfShapes(**_SHAPES).save()
+    if write == "upsert":
+        return await RfShapes(id="s", **_SHAPES).upsert()
+    if write == "tx":
+        async with SurrealDBConnectionManager.transaction() as tx:
+            if not tx.is_interactive:
+                pytest.skip("a buffered transaction returns no row before commit")
+            return await RfShapes(id="s", **_SHAPES).save(tx=tx)
+    shapes = await RfShapes(id="s", **_SHAPES).save()
+    if write == "merge":
+        await shapes.merge(n=1)
+    elif write == "patch":
+        await shapes.patch([{"op": "replace", "path": "/n", "value": 2}])
+    elif write == "refresh":
+        await shapes.refresh()
+    return shapes
+
+
+class TestWriteSyncGivesTheReadTypesE2E:
+    """#261 case 3: after a write that returns the row, a ``tuple``, ``set``, ``date`` or ``Range`` field (also inside
+    a container) holds the type ``get()`` gives, on the line under test and on ``mem://``."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    @pytest.mark.parametrize("write", ["save-auto-id", "save-explicit-id", "upsert", "merge", "patch", "refresh", "tx"])
+    async def test_read_types(self, kind: str, write: str) -> None:
+        async with _rf_engine(kind, "DEFINE TABLE rf_shapes SCHEMALESS;", "rf_shapes"):
+            shapes = await _shapes_after(write)
+            rid = shapes._record_id()
+            assert rid is not None
+            got = await RfShapes.objects().get(rid.id)
+            for name, value in _SHAPES.items():
+                assert type(getattr(got, name)) is type(value) and getattr(got, name) == value, name
+                assert type(getattr(shapes, name)) is type(value) and getattr(shapes, name) == value, name
+            assert type(shapes.nested[0]) is tuple
+            with warnings.catch_warnings():
+                warnings.simplefilter("error")  # no PydanticSerializationUnexpectedValue on the full write
+                await shapes.update()
+
+
+class RfShapesRejected(BaseSurrealModel):
+    """Its own validator refuses every row whose ``n`` is negative."""
+
+    model_config = SurrealConfigDict(table_name="rf_shapes_rejected")
+
+    id: str | None = None
+    pair: tuple[int, str] = (0, "")
+    n: int = 0
+
+    @model_validator(mode="after")
+    def _non_negative(self) -> Self:
+        if self.n < 0:
+            raise ValueError("n must not be negative")
+        return self
+
+
+class TestWriteSyncGivesTheReadTypes:
+    """#261 case 3 (unit): the rule behind the E2E above, and its fallback when the row does not validate."""
+
+    def test_sync_fields(self) -> None:
+        assert set(RfShapes._sync_fields()) == {"pair", "tags", "day", "hours", "nested"}
+        assert set(RfEvent._sync_fields()) >= {"day", "hours", "period", "tags"}
+        assert "at" not in RfEvent._sync_fields() and "n" not in RfEvent._sync_fields()
+
+    def test_a_row_that_fails_validates_each_field_alone(self) -> None:
+        shapes = RfShapes()
+        row = {
+            "pair": [1, "a"],
+            "tags": ["a"],
+            "day": datetime(2026, 1, 2, tzinfo=UTC),
+            "hours": surrealdb.Range(BoundIncluded(9), BoundExcluded(17)),
+            "n": "x",
+        }
+        shapes._apply_record(row)
+        assert shapes.pair == (1, "a") and shapes.tags == {"a"} and type(shapes.day) is date
+        assert type(shapes.hours) is Range and shapes.n == "x"
+
+    def test_a_rejecting_model_validator_never_raises(self) -> None:
+        rejected = RfShapesRejected()
+        rejected._apply_record({"pair": [1, "a"], "n": -1})
+        assert rejected.pair == [1, "a"] and rejected.n == -1  # as received: the model's validator may reshape anything
+        rejected._apply_record({"pair": [2, "b"], "n": 1})
+        assert rejected.pair == (2, "b") and rejected.n == 1
 
 
 # --- filters and live queries (spec §5.5, §5.6, §6.5; AC-22, AC-23; D12) --------------------------

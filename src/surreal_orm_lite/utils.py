@@ -4,6 +4,7 @@ import os
 import re
 import warnings
 from collections.abc import Collection, Iterable, Mapping
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, SupportsIndex, cast
 
 import pydantic
@@ -276,6 +277,72 @@ def build_set_clause(merged: Mapping[str, Any], param_prefix: str = "_sv_") -> t
             parts.append(f"{field} = ${var_name}")
             variables[var_name] = value
     return ", ".join(parts), variables
+
+
+#: The ``CONTENT`` of a full replace that holds no ``datetime``: ``data`` bound whole, the statement sent before #261.
+PLAIN_CONTENT = "$data"
+
+#: A sent ``datetime`` (``{sent}``, its parameter) that keeps the stored value (``{stored}``, its path in ``$this``) when
+#: that value floors to it at the microsecond (#261). Measured on SurrealDB 2.7.0, 3.3.4 and the embedded engine: a
+#: stored value of another type, or none, compares false and gives the sent value.
+_KEEP_STORED_DATETIME = "IF {sent} <= {stored} AND {stored} < {sent} + 1us THEN {stored} ELSE {sent} END"
+
+
+def _holds_datetime(value: Any) -> bool:
+    """Whether ``value`` is a ``datetime``, or a ``dict`` (with ``str`` keys), ``list`` or ``tuple`` holding one at any depth."""
+    if isinstance(value, datetime):
+        return True
+    if isinstance(value, dict):
+        return all(isinstance(key, str) for key in value) and any(_holds_datetime(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_holds_datetime(item) for item in value)
+    return False
+
+
+def replace_content(data: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Compile the ``CONTENT`` of a full replace (``UPDATE``/``UPSERT $rid CONTENT …``) of ``data`` (#261).
+
+    SurrealDB stores datetimes to the nanosecond, the SDK reads them floored to the microsecond: writing a
+    ``datetime`` back unchanged would change the stored value, which a ``READONLY`` field refuses. So every
+    ``datetime`` of ``data`` — top level, in a sub-object or in an array, at any depth — keeps the stored value when
+    that value floors to it at the microsecond (``$this``, the record before the write, holds it; an ``UPSERT`` that
+    creates the record has none and writes the sent value). Any other datetime is written as sent, so a changed
+    ``READONLY`` value is still refused. ``data`` is rebuilt along the paths to its datetimes, with
+    ``object::from_entries()`` and arrays, on SurrealDB 2.x and 3.x alike; every key and value is **bound**
+    (``$c0``, ``$c1``…), nothing of ``data`` is written into the statement::
+
+        replace_content({"title": "u", "created": dt})
+        # ("object::from_entries([[$c0, $c1], [$c2, IF $c3 <= $this[$c2] AND $this[$c2] < $c3 + 1us THEN $this[$c2] ELSE $c3 END]])",
+        #  {"c0": "title", "c1": "u", "c2": "created", "c3": dt})
+
+    Returns:
+        The expression and the variables to bind alongside it: ``(PLAIN_CONTENT, {"data": data})`` when ``data`` holds
+        no ``datetime`` (a ``dict`` with a key that is not a ``str`` is not looked into), the statement of before #261.
+    """
+    if not _holds_datetime(data):
+        return PLAIN_CONTENT, {"data": data}
+    variables: dict[str, Any] = {}
+
+    def bind(value: Any) -> str:
+        name = f"c{len(variables)}"
+        variables[name] = value
+        return f"${name}"
+
+    def compile_value(value: Any, stored: str) -> str:
+        if isinstance(value, datetime):
+            sent = bind(value)
+            return _KEEP_STORED_DATETIME.format(sent=sent, stored=stored)
+        if not _holds_datetime(value):
+            return bind(value)
+        if isinstance(value, dict):
+            entries = []
+            for key, item in value.items():
+                bound = bind(key)
+                entries.append(f"[{bound}, {compile_value(item, f'{stored}[{bound}]')}]")
+            return f"object::from_entries([{', '.join(entries)}])"
+        return "[" + ", ".join(compile_value(item, f"{stored}[{index}]") for index, item in enumerate(value)) + "]"
+
+    return compile_value(dict(data), "$this"), variables
 
 
 def merge_extra_vars(
