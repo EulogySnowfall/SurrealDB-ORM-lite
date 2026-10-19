@@ -58,7 +58,8 @@ Exactly one reading is read; none or several raise ``DefineParseError`` — ``VA
 guessed —, and so does a statement whose readings take more work to count than its length allows (``_R_TOO_COMPLEX``:
 thousands of keyword-named words). ``parse_define_table()``, ``parse_define_field()``, ``parse_define_event()``, ``parse_define_analyzer()``,
 ``parse_define_access()``, ``parse_define_function()`` and ``parse_define_param()`` read their clauses so, and build
-their state by keyword, ``raw`` the statement; ``parse_permissions()`` reads a ``PERMISSIONS`` clause. Two kinds have
+their state by keyword, ``raw`` the statement (an event's grammar holds SurrealDB 3.x's ``ASYNC``, ``RETRY`` and
+``MAXDEPTH`` since v0.31.0); ``parse_permissions()`` reads a ``PERMISSIONS`` clause. Two kinds have
 positional parts the clause reader does not cover: an index's ``FIELDS`` list and its flat run of options
 (``parse_define_index()``), and a function's signature and body (``parse_define_function()``).
 """
@@ -1141,6 +1142,14 @@ def _valid_flag(span: _Span) -> bool:
     return span.first >= span.stop
 
 
+def _valid_count(span: _Span) -> bool:
+    """``count``: one unsigned integer, a single word of digits (an event's ``RETRY 2``, ``MAXDEPTH 3``)."""
+    if span.stop - span.first != 1:
+        return False
+    word = span.word(span.first)
+    return word is not None and _INTEGER.fullmatch(word) is not None
+
+
 def _glued_tail(span: _Span) -> str:
     """The last three characters of the content at most, when they are punctuation glued together (``"<-?"`` of
     ``<-likes<-?``, ``".*"`` of ``x.*``)."""
@@ -1512,15 +1521,17 @@ class _Candidate(NamedTuple):
 _Step: TypeAlias = tuple[int | None, int, int]
 
 #: The validators that refuse any content holding a keyword candidate — a top-level word with whitespace before it:
-#: empty, one string literal, brackets and punctuation only, or ``fn::`` and its segments without whitespace. A clause
-#: they validate ends at the first candidate after its keyword, or at the end of the text when none follows.
+#: empty, one integer, one string literal, brackets and punctuation only, or ``fn::`` and its segments without
+#: whitespace. A clause they validate ends at the first candidate after its keyword, or at the end of the text when
+#: none follows.
 _CANDIDATE_FREE_VALIDATORS: frozenset[_Validator] = frozenset(
-    {_valid_flag, _valid_string, _valid_body, _valid_group, _valid_fn_name}
+    {_valid_flag, _valid_count, _valid_string, _valid_body, _valid_group, _valid_fn_name}
 )
 #: The validators that read a content's ends only, whatever its length.
 _END_VALIDATORS: frozenset[_Validator] = frozenset(
     {
         _valid_flag,
+        _valid_count,
         _valid_expr,
         _valid_string,
         _valid_default,
@@ -2063,6 +2074,12 @@ def _comment(clauses: Mapping[str, Clause]) -> str | None:
     return None if comment is None else unquote(comment.content)
 
 
+def _count(clauses: Mapping[str, Clause], slot: str) -> int | None:
+    """The integer of the *slot* clause (``RETRY``, ``MAXDEPTH``), or ``None`` when the statement has none."""
+    clause = clauses.get(slot)
+    return None if clause is None else int(clause.content)
+
+
 # --- DEFINE INDEX --------------------------------------------------------------------------------------------------
 
 #: The index options that are flags, those followed by an integer and those followed by a word.
@@ -2238,8 +2255,12 @@ def parse_define_index(text: str) -> IndexState:
 
 # --- DEFINE EVENT and DEFINE ANALYZER ------------------------------------------------------------------------------
 
-#: The clauses of an event: WHEN and THEN are always rendered.
+#: The clauses of an event: WHEN and THEN are always rendered. SurrealDB 3.x renders an ASYNC event's ``ASYNC RETRY n
+#: MAXDEPTH n`` right after the table (v0.31.0).
 _EVENT_SLOTS = (
+    Slot("async", ("ASYNC",), _valid_flag),
+    Slot("retry", ("RETRY",), _valid_count),
+    Slot("max_depth", ("MAXDEPTH",), _valid_count),
     Slot("when", ("WHEN",), _valid_expr, required=True),
     Slot("then", ("THEN",), _valid_body, required=True),
     Slot("comment", ("COMMENT",), _valid_string),
@@ -2258,10 +2279,12 @@ def parse_define_event(text: str) -> EventState:
     """Read a ``DEFINE EVENT`` statement as the server renders it into an ``EventState``.
 
     The header ``DEFINE EVENT <ident> ON <ident>`` is read positionally (``DEFINE EVENT THEN ON t WHEN END THEN …``
-    names the event ``THEN``), then the clauses ``WHEN`` (an expression; an ``IF … END`` keeps its ``THEN`` inside),
-    ``THEN`` (``(…)`` groups separated by commas, or one ``{…}`` block) — both required — and ``COMMENT``. ``when``
-    and ``then`` are kept as rendered: SurrealDB 2.x renders a block on several lines and an ``IF`` bare, 3.x on one
-    line and parenthesised. Raises ``DefineParseError``.
+    names the event ``THEN``), then the clauses ``ASYNC``, ``RETRY`` and ``MAXDEPTH`` (SurrealDB 3.x, each count one
+    unsigned integer; v0.31.0), ``WHEN`` (an expression; an ``IF … END`` keeps its ``THEN`` inside), ``THEN``
+    (``(…)`` groups separated by commas, or one ``{…}`` block) — both required — and ``COMMENT``. ``when`` and
+    ``then`` are kept as rendered: SurrealDB 2.x renders a block on several lines and an ``IF`` bare, 3.x on one line
+    and parenthesised. ``async_mode`` is whether ``ASYNC`` is present, ``retry`` and ``max_depth`` its counts
+    (``None`` when absent). Raises ``DefineParseError``.
     """
     name, table, pos = _named_on(text, "EVENT")
     clauses = read_clauses(text, pos, _EVENT_SLOTS)
@@ -2271,6 +2294,9 @@ def parse_define_event(text: str) -> EventState:
         when=clauses["when"].content,
         then=clauses["then"].content,
         comment=_comment(clauses),
+        async_mode="async" in clauses,
+        retry=_count(clauses, "retry"),
+        max_depth=_count(clauses, "max_depth"),
         raw=text,
     )
 

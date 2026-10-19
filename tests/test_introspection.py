@@ -648,7 +648,7 @@ class TestIssues:
             "param": "DEFINE PARAM $p VALUE 'unterminated",
             "field": "DEFINE FIELD a ON t VALUE b ASSERT ASSERT c PERMISSIONS FULL",
             "index": "DEFINE INDEX ix ON t COUNT WHERE a > 1",
-            "event": "DEFINE EVENT e ON t ASYNC RETRY 3 MAXDEPTH 2 WHEN true THEN (CREATE x)",
+            "event": "DEFINE EVENT e ON t WHEN true THEN CREATE x",
         }
         db = _db(
             tables={"broken": broken_table, "t": "DEFINE TABLE t TYPE NORMAL SCHEMAFULL PERMISSIONS NONE"},

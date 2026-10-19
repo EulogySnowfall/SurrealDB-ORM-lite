@@ -249,8 +249,14 @@ class EventState:
     """One ``DEFINE EVENT`` of a table.
 
     The full ORM's attributes, positional and in its order: ``name``, ``table``, ``when``, ``then``. Lite additions,
-    keyword-only: ``comment``, ``raw``. ``when`` and ``then`` are the texts as the server rendered them
-    (``"$event = 'CREATE'"``, ``"(CREATE log SET …)"``, a ``{ … }`` block); they and ``raw`` are kept out of ``repr``.
+    keyword-only: ``comment``, ``async_mode``, ``retry``, ``max_depth``, ``raw``. ``when`` and ``then`` are the texts
+    as the server rendered them (``"$event = 'CREATE'"``, ``"(CREATE log SET …)"``, a ``{ … }`` block); they and
+    ``raw`` are kept out of ``repr``.
+
+    ``async_mode`` is ``True`` for a SurrealDB 3.x ``ASYNC`` event (v0.31.0), run after the write's transaction
+    commits; ``retry`` and ``max_depth`` are its ``RETRY`` and ``MAXDEPTH`` counts, ``None`` when the statement has
+    none. SurrealDB 3.x renders both with every ``ASYNC`` (``ASYNC RETRY 1 MAXDEPTH 3`` by default), so an
+    ``Event(..., async_mode=True)`` defined without them reads back ``retry=1, max_depth=3``.
     """
 
     name: str
@@ -259,6 +265,9 @@ class EventState:
     then: str = field(repr=False)
     _: KW_ONLY
     comment: str | None = None
+    async_mode: bool = False  # SurrealDB 3.x
+    retry: int | None = None
+    max_depth: int | None = None
     raw: str = field(default="", repr=False)
 
 

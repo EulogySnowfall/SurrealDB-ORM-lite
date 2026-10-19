@@ -2579,9 +2579,11 @@ class TestDefineIndex:
 # --- events (spec §6.3.3; M13, M34, M35) ---------------------------------------------------------------------------
 
 
-def _event(statement: str, name: str, when: str, then: str, **attributes: object) -> tuple[str, EventState]:
+def _event(
+    statement: str, name: str, when: str, then: str, *, table: str = "t", **attributes: object
+) -> tuple[str, EventState]:
     """A golden event statement and the state it reads as — every attribute by keyword, ``raw`` the statement."""
-    state = EventState(name=name, table="t", when=when, then=then, **{**attributes, "raw": statement})  # type: ignore[arg-type]
+    state = EventState(name=name, table=table, when=when, then=then, **{**attributes, "raw": statement})  # type: ignore[arg-type]
     return statement, state
 
 
@@ -2650,12 +2652,51 @@ _EVENTS = [
     # M34: keyword-named identifiers.
     _event(f"DEFINE EVENT THEN ON t WHEN END THEN {_LOG}", "THEN", "END", _LOG),
     _event(f"DEFINE EVENT ev2 ON t WHEN THEN = 1 THEN {_LOG}", "ev2", "THEN = 1", _LOG),
+    # v0.31.0 (spec §9.2, M11): SurrealDB 3.x's ASYNC events, rendered right after the table with both RETRY and
+    # MAXDEPTH.
+    _event(
+        f"DEFINE EVENT ev7 ON t ASYNC RETRY 1 MAXDEPTH 3 WHEN true THEN {_LOG}",
+        "ev7",
+        "true",
+        _LOG,
+        async_mode=True,
+        retry=1,
+        max_depth=3,
+    ),
+    _event(
+        "DEFINE EVENT ev_async ON ev_person ASYNC RETRY 2 MAXDEPTH 3 WHEN $event = 'CREATE' THEN"
+        " { CREATE ev_log SET kind = 'async', rid = $value.id }",
+        "ev_async",
+        "$event = 'CREATE'",
+        "{ CREATE ev_log SET kind = 'async', rid = $value.id }",
+        table="ev_person",
+        async_mode=True,
+        retry=2,
+        max_depth=3,
+    ),
+    _event(
+        "DEFINE EVENT a4 ON person ASYNC RETRY 2 MAXDEPTH 5 WHEN $event = 'CREATE' THEN (CREATE alog SET kind = 'a4')"
+        " COMMENT 'x'",
+        "a4",
+        "$event = 'CREATE'",
+        "(CREATE alog SET kind = 'a4')",
+        table="person",
+        async_mode=True,
+        retry=2,
+        max_depth=5,
+        comment="x",
+    ),
+    # Hand-written, never rendered (3.x always renders both counts): ASYNC alone.
+    _event("DEFINE EVENT e ON t ASYNC WHEN true THEN { NONE }", "e", "true", "{ NONE }", async_mode=True),
+    # A WHEN naming a field ASYNC: the ASYNC slot comes before WHEN, so it is the condition.
+    _event("DEFINE EVENT e ON t WHEN ASYNC THEN { NONE }", "e", "ASYNC", "{ NONE }"),
 ]
 
 
 class TestDefineEvent:
-    """Spec §6.3.3 (AC-7): ``DEFINE EVENT <ident> ON <ident>``, then ``WHEN`` (an expression) and ``THEN`` (groups or
-    a block), both required, and ``COMMENT``."""
+    """Spec §6.3.3 (AC-7): ``DEFINE EVENT <ident> ON <ident>``, then SurrealDB 3.x's ``ASYNC``, ``RETRY <n>`` and
+    ``MAXDEPTH <n>`` (v0.31.0), ``WHEN`` (an expression) and ``THEN`` (groups or a block), both required, and
+    ``COMMENT``."""
 
     @pytest.mark.parametrize(
         ("statement", "expected"), _EVENTS, ids=[f"{state.name}:{n}" for n, (_, state) in enumerate(_EVENTS)]
@@ -2682,8 +2723,13 @@ class TestDefineEvent:
             ("DEFINE EVENT e ON t WHEN true THEN (a) (b)", _R_NO_READING),
             ("DEFINE EVENT e ON t WHEN true THEN (a) COMMENT c", _R_NO_READING),
             ("DEFINE EVENT e ON t WHEN a + THEN (a)", _R_NO_READING),
-            # 3.x renders ASYNC events (ASYNC RETRY n MAXDEPTH n), which EventState does not model: an issue (I1).
-            ("DEFINE EVENT ev7 ON t ASYNC RETRY 1 MAXDEPTH 3 WHEN true THEN (CREATE log SET x = 1)", _R_NO_READING),
+            # RETRY and MAXDEPTH take one integer (v0.31.0, spec §9.2).
+            ("DEFINE EVENT e ON t ASYNC RETRY x WHEN true THEN { NONE }", _R_NO_READING),
+            ("DEFINE EVENT e ON t ASYNC RETRY WHEN true THEN { NONE }", _R_NO_READING),
+            ("DEFINE EVENT e ON t ASYNC MAXDEPTH 1.5 WHEN true THEN { NONE }", _R_NO_READING),
+            ("DEFINE EVENT e ON t ASYNC RETRY -1 WHEN true THEN { NONE }", _R_NO_READING),
+            ("DEFINE EVENT e ON t ASYNC RETRY 1 2 WHEN true THEN { NONE }", _R_NO_READING),
+            ("DEFINE EVENT e ON t ASYNC x WHEN true THEN { NONE }", _R_NO_READING),
             ("DEFINE EVENT e ON t WHEN IF a THEN b THEN (x)", _R_IF),
         ],
     )
