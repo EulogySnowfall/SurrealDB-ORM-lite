@@ -56,6 +56,7 @@ positional parts the clause reader does not cover: an index's ``FIELDS`` list an
 (``parse_define_index()``), and a function's signature and body (``parse_define_function()``).
 """
 
+import bisect
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -1098,8 +1099,8 @@ def _valid_names(span: _Span) -> bool:
 
 
 def _valid_table_type(span: _Span) -> bool:
-    """``table_type``: ``NORMAL``, ``ANY`` or ``RELATION``."""
-    return span.content() in _TABLE_TYPES
+    """``table_type``: ``NORMAL``, ``ANY`` or ``RELATION`` (one word: a longer content is not copied to be refused)."""
+    return span.stop - span.first == 1 and span.word(span.first) in _TABLE_TYPES
 
 
 def _default_parts(span: _Span) -> tuple[bool, _Span]:
@@ -1174,11 +1175,17 @@ def _valid_changefeed(span: _Span) -> bool:
 
 
 def _top_punctuation(span: _Span) -> str | None:
-    """The characters of the content's top-level tokens when they are all brackets or punctuation, else ``None``."""
-    top = span.top()
-    if any(token.kind != _PUNCT_TOKEN for token in top):
-        return None
-    return "".join(span.text[token.start] for token in top)
+    """The characters of the content's top-level tokens when they are all brackets or punctuation, else ``None`` (from
+    the first top-level token that is not, without reading further)."""
+    chars: list[str] = []
+    for index in range(span.first, span.stop):
+        token = span.tokens[index]
+        if token.depth or token.kind == _SPACE_TOKEN:
+            continue
+        if token.kind != _PUNCT_TOKEN:
+            return None
+        chars.append(span.text[token.start])
+    return "".join(chars)
 
 
 def _valid_body(span: _Span) -> bool:
@@ -1266,10 +1273,12 @@ def _permission_rule(span: _Span, top: Sequence[int], begin: int, end: int) -> s
 
 
 def _read_permissions(span: _Span, actions: Sequence[str], unnamed: str) -> dict[str, str] | None:
-    """The rules of a ``PERMISSIONS`` content (see ``parse_permissions()``), or ``None``."""
-    content = span.content()
-    if content in ("FULL", "NONE"):
-        return dict.fromkeys(actions, content)
+    """The rules of a ``PERMISSIONS`` content (see ``parse_permissions()``), or ``None`` — at once when the content
+    does not start with ``FOR``, whatever follows."""
+    if span.stop - span.first == 1 and span.content() in ("FULL", "NONE"):
+        return dict.fromkeys(actions, span.content())
+    if span.first >= span.stop or span.word(span.first) != "FOR":
+        return None
     top = _top_indices(span)
 
     def comma(position: int) -> bool:
@@ -1316,9 +1325,21 @@ def _valid_table_permissions(span: _Span) -> bool:
 
 def _valid_rule(span: _Span) -> bool:
     """``perms`` of a function or a param: one rule, ``FULL``, ``NONE`` or ``WHERE <expr>`` (the content is then the
-    rule as rendered)."""
-    top = _top_indices(span)
-    return _permission_rule(span, top, 0, len(top)) is not None
+    rule as rendered).
+
+    Read from the content's ends only: its first and last tokens stand at its own depth, and so does the token after a
+    first word ``WHERE`` — what ``_permission_rule()`` reads of its top-level tokens.
+    """
+    first, stop = span.first, span.stop
+    if first >= stop:
+        return False
+    word = span.word(first)
+    if stop - first == 1:
+        return word in ("FULL", "NONE")
+    second = first + 1
+    while span.tokens[second].kind == _SPACE_TOKEN:
+        second += 1
+    return word == "WHERE" and _valid_expr(_Span(span.text, span.tokens, second, stop))
 
 
 def parse_permissions(text: str, actions: Sequence[str], *, unnamed: str) -> dict[str, str]:
@@ -1376,6 +1397,11 @@ class _Candidate(NamedTuple):
 #: (the number of slots for the end) and how many readings it leads to (1, or 2 for two or more).
 _Step: TypeAlias = tuple[int | None, int, int]
 
+#: The validators that refuse any content holding a top-level word — empty, one string literal, brackets and
+#: punctuation only — and so any content holding a keyword candidate: a clause they validate ends at the first
+#: candidate after its keyword, or at the end of the text when none follows.
+_WORDLESS_VALIDATORS: frozenset[_Validator] = frozenset({_valid_flag, _valid_string, _valid_body, _valid_group})
+
 
 class _ClauseReader:
     """The readings of the clauses of one statement after its header (spec §6.3.2), counted up to two.
@@ -1388,9 +1414,26 @@ class _ClauseReader:
     keyword-named field (``VALUE a * READONLY``, ``VALUE a + ASSERT ASSERT $value > 0``) only where the keyword
     cannot start its clause, and ``VALUE b ASSERT ASSERT c`` still has two readings. Counts are memoised on
     ``(candidate, slot, names used)``: the work is polynomial in the number of candidates whatever the text.
+
+    A step after a slot only walks the candidates that can open a later slot (``_openers``), and a slot whose validator
+    refuses every word (``_WORDLESS_VALIDATORS``) only the first candidate after its keyword. A ``kind`` is read once
+    from where its content starts, on the whole text (``_kind_reach``), whatever the candidate its content ends at.
     """
 
-    __slots__ = ("_candidates", "_counts", "_first", "_fits_known", "_required", "_shared", "_slots", "_text", "_tokens")
+    __slots__ = (
+        "_candidate_tokens",
+        "_candidates",
+        "_counts",
+        "_first",
+        "_fits_known",
+        "_kind_reaches",
+        "_openers",
+        "_required",
+        "_shared",
+        "_slots",
+        "_text",
+        "_tokens",
+    )
 
     def __init__(self, text: str, start: int, slots: Sequence[Slot]) -> None:
         self._text = text
@@ -1407,6 +1450,12 @@ class _ClauseReader:
             )
             for index, position, keyword in _keyword_tokens(text, self._tokens, keywords, start)
         ]
+        # In text order: the first token of each candidate, and for each slot the candidates that can open a later one.
+        self._candidate_tokens = [candidate.token for candidate in self._candidates]
+        self._openers = [
+            [number for number, candidate in enumerate(self._candidates) if max(candidate.slots) > slot]
+            for slot in range(len(self._slots))
+        ]
         names = [slot.name for slot in self._slots]
         self._shared = frozenset(name for name in names if names.count(name) > 1)
         required = [0]
@@ -1416,6 +1465,7 @@ class _ClauseReader:
         self._first = next((index for index, token in enumerate(self._tokens) if token.kind != _SPACE_TOKEN), len(self._tokens))
         self._counts: dict[tuple[int, int, frozenset[str]], int] = {}
         self._fits_known: dict[tuple[int, int, int], bool] = {}
+        self._kind_reaches: dict[int, int | None] = {}
 
     def read(self) -> dict[str, Clause]:
         """The clauses of the one reading; ``DefineParseError`` with ``_R_NO_READING`` or ``_R_AMBIGUOUS``."""
@@ -1467,10 +1517,16 @@ class _ClauseReader:
             and self._maximal(current, slot, used, None, end)
         ):
             yield None, end, 1
-        for following in range(current + 1, len(self._candidates)):
+        # A wordless content ends at the first candidate after the keyword: none after it can close it.
+        last = self._next_candidate(after) if self._slots[slot].validator in _WORDLESS_VALIDATORS else len(self._tokens)
+        openers = self._openers[slot]
+        for position in range(bisect.bisect_right(openers, current), len(openers)):
+            following = openers[position]
             candidate = self._candidates[following]
             if candidate.token < after:
                 continue
+            if candidate.token > last:
+                break
             for opened in candidate.slots:
                 if opened <= slot or self._slots[opened].name in used or self._skips_required(slot, opened):
                     continue
@@ -1500,7 +1556,9 @@ class _ClauseReader:
         after = self._candidates[current].after
         stop = self._stop(following)
         taken = used if following is None else used | {self._slots[opened].name}
-        for between in range(current + 1, len(self._candidates)):
+        openers = self._openers[slot]
+        for position in range(bisect.bisect_right(openers, current), len(openers)):
+            between = openers[position]
             candidate = self._candidates[between]
             if candidate.token >= stop:
                 break
@@ -1517,13 +1575,47 @@ class _ClauseReader:
         return True
 
     def _fits(self, slot: int, first: int, stop: int) -> bool:
-        """Whether the tokens ``first`` to ``stop`` are a content *slot* accepts (memoised)."""
+        """Whether the tokens ``first`` to ``stop`` are a content *slot* accepts (memoised).
+
+        A wordless validator refuses a content holding a candidate without reading it; a ``kind`` passes when the kind
+        read from the content's start on the whole text ends where the content does (``_kind_reach``).
+        """
         key = (slot, first, stop)
         known = self._fits_known.get(key)
         if known is None:
-            known = self._slots[slot].validator(_trimmed(self._text, self._tokens, first, stop))
+            validator = self._slots[slot].validator
+            span = _trimmed(self._text, self._tokens, first, stop)
+            if validator in _WORDLESS_VALIDATORS and self._next_candidate(span.first) < span.stop:
+                known = False
+            elif validator is _valid_kind:
+                end = len(self._text) if stop == len(self._tokens) else self._tokens[stop].start
+                known = span.first < span.stop and self._kind_reach(span.first) == end
+            else:
+                known = validator(span)
             self._fits_known[key] = known
         return known
+
+    def _next_candidate(self, token: int) -> int:
+        """The first token of the first candidate at or after *token* (the number of tokens when there is none)."""
+        index = bisect.bisect_left(self._candidate_tokens, token)
+        return self._candidate_tokens[index] if index < len(self._candidate_tokens) else len(self._tokens)
+
+    def _kind_reach(self, first: int) -> int | None:
+        """Where the kind starting at token *first* ends, read on the whole text — after the whitespace following it,
+        as ``parse_kind_prefix()`` gives it — or ``None`` when no kind starts there (memoised).
+
+        A content ends at the end of the text, or before whitespace and a candidate, a word: where the content ends,
+        ``parse_kind()`` decides alike whether it meets the end of the content or that whitespace and word. So the
+        content is a kind exactly when the kind read from its start on the whole text ends at the candidate (or at the
+        end of the text): one reading for every candidate the content may end at.
+        """
+        if first not in self._kind_reaches:
+            try:
+                reach: int | None = parse_kind_prefix(self._text, self._tokens[first].start)[1]
+            except DefineParseError:
+                reach = None
+            self._kind_reaches[first] = reach
+        return self._kind_reaches[first]
 
     def _skips_required(self, slot: int, following: int) -> bool:
         """Whether a required slot lies strictly between *slot* (-1: the start) and *following* (the number of slots:

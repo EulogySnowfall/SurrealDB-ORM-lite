@@ -11,8 +11,11 @@ fixed reasons ``DefineParseError`` is raised with (spec §6.3.6). Unit tests onl
 
 import ast
 import dataclasses
+import gc
 import pathlib
 import time
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 
@@ -1210,6 +1213,92 @@ class TestClauseReader:
             clauses = None
         assert time.perf_counter() - started < 1.0
         assert clauses == (None if expected is None else expected | {"permissions"})
+
+    @pytest.mark.parametrize(
+        ("parse", "statement", "check"),
+        [
+            # A step walks only the candidates that may open a later slot: not 8000 READONLY after each READONLY.
+            (
+                parse_define_field,
+                "DEFINE FIELD x ON t TYPE int " + "READONLY " * 8000 + "PERMISSIONS FULL",
+                lambda parsed: parsed.type_as_written and parsed.state.readonly,
+            ),
+            (
+                parse_define_field,
+                "DEFINE FIELD x ON t TYPE int " + "FLEXIBLE " * 8000 + "PERMISSIONS FULL",
+                lambda parsed: parsed.type_as_written and parsed.state.flexible,
+            ),
+            (
+                parse_define_field,
+                "DEFINE FIELD x ON t TYPE frob" + " READONLY" * 8000 + " PERMISSIONS FULL",
+                lambda parsed: parsed.type_as_written and parsed.state.readonly,
+            ),
+            # A kind is read once from where it starts, not again up to each keyword after it.
+            (
+                parse_define_field,
+                "DEFINE FIELD x ON t TYPE int< " + "READONLY " * 3000 + "PERMISSIONS FULL",
+                lambda parsed: parsed.type_as_written and parsed.state.field_type.startswith("int< READONLY"),
+            ),
+            # Permissions not starting with FOR are refused at once, not read to the end of the text.
+            (
+                parse_define_field,
+                "DEFINE FIELD x ON t DEFAULT " + "PERMISSIONS " * 4000 + "PERMISSIONS FULL",
+                lambda parsed: parsed.state.default.startswith("PERMISSIONS"),
+            ),
+            # A body or a group ends at the first keyword after it: its content is never read past one.
+            (
+                parse_define_event,
+                "DEFINE EVENT e ON t WHEN a " + "THEN (x) " * 4000,
+                lambda parsed: parsed.then == "(x)",
+            ),
+            (
+                parse_define_event,
+                "DEFINE EVENT e ON t WHEN " + "THEN " * 5000 + "THEN (x)",
+                lambda parsed: parsed.then == "(x)",
+            ),
+            (
+                parse_define_access,
+                "DEFINE ACCESS a ON DATABASE TYPE RECORD SIGNUP (x) " + "WITH JWT " * 5000 + "DURATION FOR TOKEN 1h",
+                lambda parsed: parsed.signup == "(x)" and parsed.duration_token == "1h",
+            ),
+            # A function's or a param's rule is read from its ends.
+            (
+                parse_define_param,
+                "DEFINE PARAM $p VALUE x " + "PERMISSIONS " * 6000 + "FULL",
+                lambda parsed: parsed.permissions == "FULL",
+            ),
+        ],
+        ids=[
+            "readonly",
+            "flexible",
+            "type-as-written",
+            "unclosed-kind",
+            "default-permissions",
+            "event-thens",
+            "event-when-thens",
+            "access-groups",
+            "param-rule",
+        ],
+    )
+    def test_keyword_soups_read_in_linear_time(
+        self, parse: Callable[[str], object], statement: str, check: Callable[[Any], bool]
+    ) -> None:
+        # Server text is not trusted to be small or kind: thousands of keyword-named words, one reading or none. One
+        # scan of the statement is the yardstick, whatever the machine or a coverage tracer: reading it costs about ten,
+        # a quadratic reading a hundred or more at these sizes. No garbage collection lands in either measure.
+        gc.collect()
+        gc.disable()
+        try:
+            started = time.perf_counter()
+            top_level_keywords(statement, [])
+            scan = time.perf_counter() - started
+            started = time.perf_counter()
+            parsed = parse(statement)
+            elapsed = time.perf_counter() - started
+        finally:
+            gc.enable()
+        assert elapsed < 30 * scan
+        assert check(parsed)
 
 
 def _table(statement: str, name: str, **attributes: object) -> tuple[str, TableState]:
