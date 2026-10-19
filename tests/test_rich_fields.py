@@ -2856,7 +2856,9 @@ class TestReplaceKeepsStoredDatetimesE2E:
 class TestSaveReadsBackTheStoredRowE2E:
     """#261 case 2: right after ``save()`` the instance holds what the server stored, sub-fields a ``DEFAULT`` filled
     included, with an explicit id, an auto id and in an interactive transaction; a following ``update()`` keeps them.
-    A buffered transaction (``mem://``, 2.x) has no row before commit: the instance keeps its values, as documented."""
+    Before #261 only the explicit-id ``save()`` (directly or in a transaction) missed them; the auto-id one already
+    applied the whole row. A buffered transaction (``mem://``, 2.x) has no row before commit: the instance keeps its
+    values, as documented."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("kind", ["ws", "mem"])
@@ -3228,6 +3230,112 @@ class TestWriteSyncAppliesDeclaredFieldsE2E:
             instance.n = 1
             await instance.update()  # the extras are written back: the record keeps them
             assert (await RfShadowExtra.objects().get(rid.id)).model_extra == {"json": "shadow", "note": "kept"}
+
+
+# --- what an update() after a synced write writes back (#261 review) ------------------------------
+
+
+class RfMixedColor(str, enum.Enum):  # noqa: UP042 (the mixed-in form is the point: it is not a StrEnum)
+    RED = "red"
+
+
+class RfMixedRank(int, enum.Enum):
+    TOP = 1
+
+
+class RfWriteBack(BaseSurrealModel):
+    """A ``float`` field over a ``decimal`` column, ``(str, Enum)`` and ``(int, Enum)`` fields next to a ``StrEnum``,
+    and, under ``extra="allow"``, an undeclared column a ``DEFAULT`` fills."""
+
+    model_config = SurrealConfigDict(table_name="rf_write_back", extra="allow")
+
+    id: str | None = None
+    n: int = 0
+    price: float = 0.0
+    color: RfMixedColor = RfMixedColor.RED
+    rank: RfMixedRank = RfMixedRank.TOP
+    status: RfStatus = RfStatus.ACTIVE
+
+
+_RF_WRITE_BACK_DDL = (
+    "DEFINE TABLE rf_write_back SCHEMALESS; DEFINE FIELD price ON rf_write_back TYPE decimal;"
+    "DEFINE FIELD note ON rf_write_back DEFAULT 'srv';"
+)
+#: More digits than a ``float`` holds: a ``decimal`` column stores them all.
+_RF_EXACT = Decimal("0.12345678901234567890")
+
+
+async def _write_back_after(client: Any, write: str) -> RfWriteBack:
+    """An ``RfWriteBack`` after *write*, a call that applies the returned row. Except for ``save()``, the record is
+    created first by a query, with the exact ``decimal`` and the enums' raw values, and the call does not send them."""
+    if write == "save-explicit-id":
+        return await RfWriteBack(id="w").save()
+    if write == "save-auto-id":
+        return await RfWriteBack().save()
+    await client.query(
+        "CREATE rf_write_back:w SET n = 0, price = $price, color = 'red', rank = 1, status = 'active';",
+        {"price": _RF_EXACT},
+    )
+    instance = RfWriteBack(id="w")
+    if write == "refresh":
+        await instance.refresh()
+    elif write == "merge":
+        await instance.merge(n=1)
+    elif write == "patch":
+        await instance.patch([{"op": "replace", "path": "/n", "value": 1}])
+    elif write == "atomic":
+        await instance.atomic_increment("n")
+    return instance
+
+
+async def _stored_after_update(client: Any, instance: RfWriteBack) -> dict[str, Any]:
+    """The row ``update()`` leaves once *instance* changed only ``n``."""
+    rid = instance._record_id()
+    assert rid is not None
+    instance.n = 5
+    await instance.update()
+    row = await client.query("SELECT * FROM ONLY $rid;", {"rid": rid})
+    assert isinstance(row, dict), row
+    return row
+
+
+class TestUpdateAfterASyncedWriteE2E:
+    """#261 review: after a call that applies the returned row, the instance holds the values a read gives, and a
+    following ``update()`` (a full replace) writes those values back, as after ``get()``. On the line under test and
+    on ``mem://``; in 0.30.1 these calls kept the SDK's values and dropped the undeclared columns."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    @pytest.mark.parametrize("write", ["refresh", "merge", "patch", "atomic"])
+    async def test_a_float_field_writes_back_its_rounding(self, kind: str, write: str) -> None:
+        async with _rf_engine(kind, _RF_WRITE_BACK_DDL, "rf_write_back") as client:
+            instance = await _write_back_after(client, write)
+            stored = (await _stored_after_update(client, instance))["price"]
+        assert type(stored) is Decimal and stored != _RF_EXACT, "declare Decimal to keep every digit"
+        assert abs(stored - _RF_EXACT) < Decimal("1e-15"), stored
+        assert type(instance.price) is float, instance.price
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    @pytest.mark.parametrize("write", ["save-explicit-id", "save-auto-id", "refresh", "merge", "patch", "atomic"])
+    async def test_undeclared_columns_are_written_back(self, kind: str, write: str) -> None:
+        async with _rf_engine(kind, _RF_WRITE_BACK_DDL, "rf_write_back") as client:
+            instance = await _write_back_after(client, write)
+            stored = await _stored_after_update(client, instance)
+        assert stored.get("note") == "srv" and stored["n"] == 5, stored
+        assert instance.model_extra == {"note": "srv"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    @pytest.mark.parametrize("write", ["save-auto-id", "refresh", "merge", "patch", "atomic"])
+    async def test_a_mixed_in_enum_formats_as_its_member(self, kind: str, write: str) -> None:
+        async with _rf_engine(kind, _RF_WRITE_BACK_DDL, "rf_write_back") as client:
+            instance = await _write_back_after(client, write)
+            assert instance.color == "red" and instance.rank == 1, "a mixed-in enum still equals its value"
+            assert (f"{instance.color}", str(instance.rank)) == ("RfMixedColor.RED", "RfMixedRank.TOP")
+            assert (f"{instance.status}", f"{instance.color.value}") == ("active", "red")  # StrEnum: the value
+            stored = await _stored_after_update(client, instance)
+        assert (stored["color"], stored["rank"], stored["status"]) == ("red", 1, "active"), stored
 
 
 # --- replace_content stays bounded (#261 review) ---------------------------------------------------

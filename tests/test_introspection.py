@@ -1895,7 +1895,9 @@ class TestSubFieldDefaultsE2E:
     """AC-18c on the line under test and on ``mem://`` (M48, §14.9), inverted by #261: ``save()`` applies the row the
     server returns, so a sub-field a ``DEFAULT`` fills on create holds the server's value right after it — with an
     explicit id, an auto id and in an interactive transaction — and a following ``update()`` keeps it, required or
-    optional, to the nanosecond. The generated classes no longer carry a comment about it."""
+    optional, to the nanosecond. Before #261 only the explicit-id ``save()`` (directly or in an interactive
+    transaction) left it ``None``; the auto-id one already applied the whole row. The generated classes no longer
+    carry a comment about it."""
 
     @pytest.mark.parametrize("kind", ["ws", "mem"])
     @pytest.mark.parametrize("how", ["explicit-id", "auto-id", "tx"])
