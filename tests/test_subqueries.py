@@ -2809,8 +2809,8 @@ class TestSubqueryDocs:
     roadmap say about subqueries (spec §11, AC-12)."""
 
     def test_section_28_follows_section_27(self) -> None:
-        """Right after section 27 (after its "Coming from" bullets), then section 29 (v0.28.0) and section 30
-        (v0.29.0), and before the ``---`` of "Configuration Options"."""
+        """Right after section 27 (after its "Coming from" bullets), then section 29 (v0.28.0), section 30
+        (v0.29.0) and section 31 (v0.30.0), and before the ``---`` of "Configuration Options"."""
         readme = _readme()
         start_27 = readme.index("\n### 27. Time travel (`as_of()`)\n")
         start_28 = readme.index(f"\n{_SECTION_28}\n")
@@ -2821,6 +2821,7 @@ class TestSubqueryDocs:
             _SECTION_28,
             "### 29. Query cache (`cache()`, `QueryCache`)",
             "### 30. Multiple databases (`add_connection()`, `using()`)",
+            "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 

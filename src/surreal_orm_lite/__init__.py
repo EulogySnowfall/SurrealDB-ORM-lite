@@ -1,4 +1,4 @@
-__version__ = "0.29.3"
+__version__ = "0.30.0"
 
 from ._sdk import BoundExcluded, BoundIncluded
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
@@ -53,6 +53,21 @@ from .geo import (
     MultiPolygonField,
     PointField,
     PolygonField,
+)
+from .introspection import (
+    AccessState,
+    AnalyzerState,
+    DatabaseIntrospector,
+    EventState,
+    FieldState,
+    FunctionState,
+    IndexState,
+    ModelCodeGenerator,
+    ParamState,
+    SchemaIssue,
+    SchemaState,
+    TableState,
+    generate_models_from_db,
 )
 from .live import LiveModelStream, LiveStream, ModelChangeEvent, ReconnectCallback
 from .model_auth import AuthenticatedUserMixin, AuthResult
@@ -167,6 +182,20 @@ __all__ = [
     "MultiPolygonField",
     "GeometryCollectionField",
     "GeoDistance",
+    # Schema introspection (v0.30.0)
+    "DatabaseIntrospector",
+    "ModelCodeGenerator",
+    "generate_models_from_db",
+    "SchemaState",
+    "TableState",
+    "FieldState",
+    "IndexState",
+    "EventState",
+    "AccessState",
+    "AnalyzerState",
+    "FunctionState",
+    "ParamState",
+    "SchemaIssue",
     # Exceptions
     "SurrealORMError",
     "SurrealDbError",

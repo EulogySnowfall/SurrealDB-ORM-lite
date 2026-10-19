@@ -5,6 +5,139 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.0] - 2026-10-19
+
+Schema introspection: the ORM reads the schema of a database as immutable typed objects and
+generates `BaseSurrealModel` classes from it, with the full SurrealDB-ORM's names. It only reads
+(`INFO FOR DB`, `INFO FOR TABLE`), and the same schema gives the same state and the same generated
+types on SurrealDB 2.x, 3.x and the embedded engine. The first minor of Tier 3.
+
+### Added
+
+- **`DatabaseIntrospector(connection=None, *, tables=None).introspect()`** returns a
+  `SchemaState`: the tables (`TableState`, with their `FieldState`, `IndexState` and `EventState`)
+  and the database's accesses (`AccessState`), analyzers (`AnalyzerState`), functions
+  (`FunctionState`, keyed `"fn::name"`) and params (`ParamState`). It sends `INFO FOR DB;`, then
+  one `INFO FOR TABLE` per table, outside any transaction: no record is read, nothing is defined or
+  written. A field is keyed by its path (`"address.city"`, `"tags.*"`), with `field_type` (its kind
+  without the optional wrapper), `nullable` (whether it may be `NONE`) and its expressions
+  (`default`, `value`, `computed`, `assertion`, permission rules) as SurrealQL text; every
+  definition keeps the server's statement in `raw`, and the sections the ORM does not model are in
+  `schema.other`. `connection=` is a connection name (else the current one: `using()`, then
+  `"default"`), and `tables=` reads those tables only.
+
+  ```python
+  from surreal_orm_lite import DatabaseIntrospector
+
+  schema = await DatabaseIntrospector().introspect()
+  person = schema.tables["person"]
+  person.fields["age"].field_type       # 'int': option<int> on SurrealDB 2.x, none | int on 3.x
+  person.fields["age"].nullable         # True
+  person.fields["age"].default          # '18': SurrealQL text
+  person.indexes["person_name"].unique  # True
+  ```
+
+- **`ModelCodeGenerator().generate(state)`** and
+  **`generate_models_from_db(output_path=None, connection=None, *, tables=None, overwrite=True)`**
+  give deterministic source with one class per table: a `BaseSurrealModel`, or a `BaseSurrealEdge`
+  for a `TYPE RELATION` table. Fields use the lite's types (`Duration`, `Decimal`, `UUID`,
+  `RecordID`, `Range`, the geometry classes, `Literal`), sub-models for declared nested fields,
+  `computed()` for `COMPUTED` and for a `VALUE` that reads neither `$value` nor `$input`, aliases
+  for columns that cannot be attribute names, `extra="allow"` for `SCHEMALESS` tables, and
+  `connection=` for a schema read from a named connection. A constant `DEFAULT` becomes the Python
+  default (`DEFAULT 18` → `= 18`, `[]` → `Field(default_factory=list)`, `1h30m` →
+  `Duration.parse("1h30m")`, `u'…'` → `UUID("…")`); any other `DEFAULT` becomes a `server_fields`
+  entry. Names, comments and expressions read from the database reach the source only as escaped
+  string literals, single-line comments and generated identifiers.
+
+  ```python
+  from surreal_orm_lite import generate_models_from_db
+
+  source = await generate_models_from_db()                  # the source, as a string
+  await generate_models_from_db("app/models_generated.py")  # also writes it, replacing the file
+  await generate_models_from_db("app/models_generated.py", overwrite=False)  # FileExistsError
+  ```
+
+- **`generate_models_from_db()` replaces an existing file atomically**, as the full ORM replaces
+  it: the source goes to a temporary file in the same directory, then `os.replace()` moves it over
+  the file, so a failure leaves the previous file. `overwrite=False` refuses an existing path with
+  `FileExistsError` before reading anything.
+- **The state classes take the full SurrealDB-ORM's arguments**: `SchemaState`, `TableState`,
+  `FieldState`, `IndexState`, `EventState`, `AccessState` and `AnalyzerState` are built by
+  position or by keyword as in the full ORM, and the lite's own attributes (`raw`, `path`, `table`,
+  `comment`, …) are keyword-only. They are frozen dataclasses with read-only maps and tuples, and
+  `repr()` shows names and structure only, never a definition's text. `FunctionState`,
+  `ParamState`, `SchemaIssue` and `tables=` are lite additions. The 13 names are exported from
+  `surreal_orm_lite`.
+- **Nothing is guessed**: a definition that cannot be parsed exactly, a section of an unexpected
+  shape or a failed `INFO FOR TABLE` becomes a `SchemaIssue` in `schema.issues` and a WARNING on
+  the `surreal_orm_lite.introspection` logger, whose message never quotes the definition.
+  `introspect()` raises `SurrealDbAuthenticationError` when the session may not run
+  `INFO FOR DB`, `SurrealDbError` when it fails otherwise, and `SurrealDbNotFoundError` for a
+  `tables=` name the database does not define.
+- README section 31, "Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
+  (reading the schema, generating models, how SurrealDB kinds become fields, what the generator
+  does not do, SurrealDB 2.x and 3.x, permissions, a note for users of the full SurrealDB-ORM), a
+  features row, rows in the 2.x/3.x and embedded-engine behaviour tables, the comparison and
+  roadmap rows, and the example notebook `examples/v0.30.0_schema_introspection.ipynb`.
+
+### Fixed
+
+- **A stored function's parameter list is read in linear time** (`call_function()` with keyword
+  arguments, and now introspection): a long `DEFINE FUNCTION`, or one holding `` $` `` or `$⟨`
+  without a closing quote, no longer makes the reader copy or search the rest of the definition at
+  every `$`.
+
+### Notes
+
+- **Kinds and field paths are normalised, expressions are kept as rendered**: `option<int>` (2.x)
+  and `none | int` (3.x) both give `field_type == "int"` and `nullable is True`, and `tags[*]`
+  (2.x) and `tags.*` (3.x) both give the field `"tags.*"`. Expressions (`default`, `value`, `raw`,
+  a generated `computed("…")`) are kept as each line renders them and may differ:
+  `VALUE IF b THEN 1 ELSE 2 END` on 2.x is `VALUE (IF b THEN 1 ELSE 2 END)` on 3.x.
+- **Definitions only one line has** are read and typed on that line: on 3.x `COMPUTED`,
+  `REFERENCE`, `FULLTEXT` indexes, the `file` kind, `WITH REFRESH` and `BEARER` accesses, and
+  `DEFINE SEQUENCE` (kept raw in `schema.other`); on 2.x and the embedded engine `MTREE` and
+  `SEARCH ANALYZER` indexes and `geometry<feature>`.
+- **The `users` section is never read.** On SurrealDB before 3.2.2 (every 2.x release, 3.x before
+  3.2.2, and the embedded engine of SDK 2.0.0), `INFO FOR DB` shows user password hashes to every
+  role that may run `INFO`, per SurrealDB's `INFO` documentation; introspection never reads,
+  stores, logs or writes them. Introspection needs a system user (root, a namespace or a database
+  user): a record user or an anonymous session gets `SurrealDbAuthenticationError`, except on the
+  embedded engine, whose anonymous session owns the database.
+- **Tables not generated**, listed in the module's header and still in `schema.tables`: a table
+  named like a SurrealQL keyword, in any case (`select`, `create`, `only`, …), and a table whose
+  name is not an identifier, which the ORM's statements cannot use as a table name.
+- **`update()` and `READONLY` datetimes**: an instance holding a `READONLY` `datetime` field cannot
+  be changed with `update()`, after `get()` as after `save()`: Python keeps microseconds, SurrealDB
+  nanoseconds, and the server refuses the changed value. This predates v0.30.0; the generated class
+  says so: change such a record with `merge()`.
+- **Sub-fields a `DEFAULT` fills**: a sub-field filled by a `DEFAULT` the model does not hold
+  (`prefs.at DEFAULT time::now()`, or any `DEFAULT` under a `dict[str, Any]` field) stays `None` on
+  the instance after `save()`, which reads back only `server_fields` and computed fields; a
+  following `update()` sends it as `NONE`: the server refuses it when the sub-field is required and
+  erases the value when it is optional. The generated class says so: call `refresh()` after
+  `save()` before an `update()`, or change the record with `merge()`.
+- **Defaults are copied when the models are generated**: generate them again after changing a
+  `DEFAULT`. A value set on a `server_fields` field before `save()` is not written, as since
+  v0.18.0 and in the full ORM: set it with `merge()` once the record exists.
+- `array<T, N>` becomes `list[T]`, leaving the length to the server (SurrealDB 2.x accepts at most
+  N items, 3.x exactly N); `null | T` becomes a required `T | None`, which the ORM sends as `NONE`
+  and `null | T` refuses: declare such a field `option<T>`. `ASSERT`, `PERMISSIONS` and field
+  comments are not generated, and `READONLY` is a comment. Never call `define_computed_fields()` on
+  a generated model.
+- **Differences from the full SurrealDB-ORM**: the state is immutable, with tuples where the full
+  ORM has lists; permission values are `'FULL'`, `'NONE'` or `'WHERE <expr>'`; `default` is
+  SurrealQL text; `nullable` is false for `null | T`; accesses are database-level
+  (`schema.accesses`); a refused or failed `INFO FOR DB` raises and an unreadable definition
+  becomes a `SchemaIssue`; `connection=` is a name, and a client object raises `TypeError`;
+  generated models use comments for the `SurrealConfigDict` keys that arrive with v0.31.0–v0.33.0
+  (`table_type`, `permissions`, `changefeed`, `view_query`, `relation_in`, `relation_out`,
+  `enforced`); class names are not singularised. `schema_diff()` and `SchemaState.diff()` come with
+  v0.37.0 (migrations), the `inspectdb` command with v0.38.0 (CLI).
+- **Server pins unchanged**: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine,
+  plus 3.1.5 for backward compatibility.
+
 ## [0.29.3] - 2026-10-18
 
 `get_or_create()` and `update_or_create()` bind the queryset's `variables()` in their lookup, as

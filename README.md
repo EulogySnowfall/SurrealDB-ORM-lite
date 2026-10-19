@@ -213,6 +213,7 @@ embedded engine refuse one above `4294967295` (`2**32 - 1`), SurrealDB 3.x reads
 | Subqueries (`Subquery`, a QuerySet as a filter value)                         | ✅     |
 | Query cache (`cache()`, TTL, invalidated by ORM writes)                       | ✅     |
 | Multiple databases (named connections, `using()`)                             | ✅     |
+| Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)    | ✅     |
 
 ### Supported Filter Lookups
 
@@ -4017,6 +4018,331 @@ views = await PageView.objects().count()                # 2
   `?name=` query parameter: a request never chooses the connection (full ORM: `name` is visible and becomes a query
   parameter).
 
+### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)
+
+Since v0.30.0 the ORM reads the schema of a database — its tables with their fields, indexes and events, and its
+accesses, analyzers, functions and params — as immutable typed objects, and generates `BaseSurrealModel` classes from
+it, as the full SurrealDB-ORM does. It only reads: it sends `INFO FOR DB` and `INFO FOR TABLE`, never a statement that
+reads a record or changes the schema, so it needs a session allowed to run `INFO`: a system user
+([Permissions](#permissions)). Kinds, field paths and the generated types are the same on SurrealDB 2.x, 3.x and the
+embedded engine; expressions (`DEFAULT`, `VALUE`, `ASSERT` …) are kept as each line renders them
+([SurrealDB 2.x and 3.x](#surrealdb-2x-and-3x)). The examples of this section run on the embedded engine (`mem://`),
+with nothing to start.
+
+#### Reading the schema
+
+```python
+from surreal_orm_lite import DatabaseIntrospector, SurrealDBConnectionManager
+
+SurrealDBConnectionManager.set_connection(url="mem://", namespace="shop", database="main")
+client = await SurrealDBConnectionManager.get_client()
+await client.query(
+    "DEFINE TABLE person SCHEMAFULL;"
+    "DEFINE FIELD name ON person TYPE string;"
+    "DEFINE FIELD age ON person TYPE option<int> DEFAULT 18;"
+    "DEFINE FIELD address ON person TYPE option<object>;"
+    "DEFINE FIELD address.city ON person TYPE string;"
+    "DEFINE INDEX person_name ON person FIELDS name UNIQUE;",
+    {},
+)
+
+schema = await DatabaseIntrospector().introspect()
+person = schema.tables["person"]
+person.schema_mode                    # 'SCHEMAFULL'
+person.fields["age"].field_type       # 'int'
+person.fields["age"].nullable         # True: option<int> on SurrealDB 2.x, none | int on 3.x
+person.fields["age"].default          # '18': SurrealQL text
+person.fields["address.city"].path    # ('address', 'city')
+person.indexes["person_name"].unique  # True
+schema.issues                         # (): everything was read and parsed
+```
+
+- `introspect()` sends `INFO FOR DB;`, then one `INFO FOR TABLE` per table in codepoint order of the names (each
+  escaped as an identifier), on the connection's client and outside any transaction. No record is read, nothing is
+  defined or written.
+- `schema.tables` holds one `TableState` per table — mode, type (`"normal"`, `"relation"`, `"any"`), relation ends,
+  view query, change feed, permissions and comment — with its `fields`, `indexes` and `events`. The database's own
+  definitions are in `schema.accesses`, `schema.analyzers`, `schema.functions` (keyed `"fn::name"`) and
+  `schema.params` (keyed without `$`). The sections the ORM does not model (`apis`, `configs`, `models`, and on
+  SurrealDB 3.x `buckets`, `modules` and `sequences`) are kept in `schema.other` as SurrealDB returns them. The `users`
+  section is never read.
+- A field is keyed by its path, with `*` for array items (`"address.city"`, `"tags.*"`), and `path` holds the
+  segments, unescaped. `field_type` is its kind without the optional wrapper (`"any"` without `TYPE`), and `nullable`
+  says whether it may be `NONE`.
+- Expressions are SurrealQL text, as the server renders them: `default`, `value`, `computed`, `assertion`, an event's
+  `when` and `then`, a view's query, permission rules (`'FULL'`, `'NONE'` or `'WHERE <expr>'`). Every definition also
+  keeps the server's statement in `raw`.
+- The state is immutable: frozen dataclasses, read-only maps that iterate in sorted key order, and tuples. Printing or
+  logging a state shows names and structure only: definition texts stay in their attributes, out of `repr()` and
+  `str()`.
+- Nothing is guessed. A definition that cannot be parsed exactly, a section of an unexpected shape or an
+  `INFO FOR TABLE` that fails becomes a `SchemaIssue` in `schema.issues` (its `kind`, `name`, `table`, `message` and
+  `statement`) and one WARNING on the `surreal_orm_lite.introspection` logger; `introspect()` does not raise for them.
+  An issue's message never quotes the definition, which may hold a secret.
+- Errors: `SurrealDbAuthenticationError` when the session may not run `INFO FOR DB`, `SurrealDbError` when
+  `INFO FOR DB` fails otherwise, and `SurrealDbNotFoundError` for a `tables=` name the database does not define.
+
+```python
+SurrealDBConnectionManager.add_connection("archive", url="mem://", namespace="shop", database="archive")
+
+just_person = await DatabaseIntrospector(tables=["person"]).introspect()  # INFO FOR TABLE `person` only
+no_table = await DatabaseIntrospector(tables=[]).introspect()             # INFO FOR DB only: no_table.tables is empty
+archive = await DatabaseIntrospector("archive").introspect()              # a named connection
+async with SurrealDBConnectionManager.using("archive"):
+    archive = await DatabaseIntrospector().introspect()                   # the block's connection
+archive.connection                                                        # 'archive'
+```
+
+- `connection=` is the **name** of a connection, the one given to `add_connection()`, or `None` for the current one:
+  the innermost `using()` block's, else `"default"`. It is resolved when `introspect()` runs, and `schema.connection`
+  records it. A client object, such as `await SurrealDBConnectionManager.get_client()`, raises `TypeError`: it does
+  not carry the connection's name, which routing and the generated models' `connection=` key need.
+- `tables=` reads those tables only: `None`, the default, reads every table, and an empty list reads none (the
+  database-level sections are read all the same). A `str` raises `TypeError`: write `tables=["person"]`.
+
+#### Generating models
+
+```python
+from surreal_orm_lite import ModelCodeGenerator, generate_models_from_db
+
+source = ModelCodeGenerator().generate(schema)          # the same text as: await generate_models_from_db()
+print(source)
+await generate_models_from_db("models_generated.py")    # writes the file, replacing it if it exists (as the full ORM)
+try:
+    await generate_models_from_db("models_generated.py", overwrite=False)
+except FileExistsError as exc:
+    print(exc)  # 'models_generated.py' already exists: overwrite=False refuses to replace it.
+```
+
+It prints:
+
+```python
+"""Models generated by surreal_orm_lite.generate_models_from_db() from a SurrealDB schema.
+
+Review them before use. They describe tables that already exist: do not call
+define_computed_fields() on them, it would replace the database's field definitions.
+"""
+
+from pydantic import BaseModel
+from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict
+
+
+class PersonAddress(BaseModel):
+    city: str
+
+
+class Person(BaseSurrealModel):
+    # Indexes: person_name (UNIQUE)
+    model_config = SurrealConfigDict(table_name="person")
+
+    id: str | None = None
+    address: PersonAddress | None = None
+    age: int | None = 18
+    name: str
+```
+
+- `ModelCodeGenerator().generate(schema)` is pure: the same schema always gives the same source.
+  `generate_models_from_db(output_path=None, connection=None, *, tables=None, overwrite=True)` reads the schema
+  (`connection` and `tables` as for `DatabaseIntrospector`), generates the models and returns their source; with an
+  `output_path` it also writes the file, UTF-8 with `\n` newlines, creating its parent directories.
+- An existing file is replaced, as the full ORM replaces it, and atomically: the source goes to a temporary file in
+  the same directory, which `os.replace()` then moves over the file. A failure leaves the previous file and no
+  temporary file, and a symbolic link is replaced by the file, its target never written. `overwrite=False` refuses an
+  existing path with `FileExistsError` before reading anything, and creates the file exclusively.
+- One class per table: a `BaseSurrealModel`, or a `BaseSurrealEdge` for a `TYPE RELATION` table (which declares no
+  `id`, `in_` or `out`: the base class provides them). Its `model_config` holds the `table_name`, `connection=` when
+  the schema was read from another connection than `"default"`, then `server_fields` and `extra="allow"` (below). A
+  model declares `id: str | None = None` first, then one line per field, in codepoint order of the columns.
+- A class is named after its table in PascalCase, without singularisation (`game_tables` → `GameTables`); a name
+  that is taken — a Python keyword, a name the module imports, another table's class — gets `Model` appended (`range`
+  → `RangeModel`). The table's comment, relation ends, view query, indexes and events are comments of its class, and
+  the module's header lists every table or field left out, with the reason.
+- The source is safe to import: names, comments and expressions read from the database reach it only as escaped
+  string literals, single-line ASCII comments and identifiers the generator builds, so a schema cannot inject code
+  into it. It holds no timestamp, server address, namespace or database name, and no
+  `from __future__ import annotations`.
+
+#### How SurrealDB kinds become fields
+
+| SurrealDB kind                                                     | Generated annotation                                                                                                                                                     |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `any`, or no `TYPE`                                                | `Any = None`                                                                                                                                                             |
+| `bool`, `int`, `float`, `string`, `bytes`                          | `bool`, `int`, `float`, `str`, `bytes`                                                                                                                                   |
+| `number`                                                           | `int`, `float` or `Decimal`: their union, so each value keeps its type                                                                                                   |
+| `decimal`, `datetime`, `uuid`                                      | `Decimal`, `datetime`, `UUID`                                                                                                                                            |
+| `duration`                                                         | `Duration`, nanosecond-exact ([section 24](#24-rich-field-types))                                                                                                        |
+| `range`                                                            | `Range`                                                                                                                                                                  |
+| `record`, `record<…>`                                              | `RecordID`                                                                                                                                                               |
+| `geometry<point>`, or another single geometry kind                 | `GeometryPoint` …; optional: `PointField = None` … ([section 25](#25-geospatial-fields))                                                                                 |
+| `geometry`, `geometry<feature>`                                    | `Geometry`; optional: `GeometryField = None`                                                                                                                             |
+| `geometry<…>` with several kinds                                   | the union of their classes                                                                                                                                               |
+| `object` with declared fields (`address.city`)                     | a sub-model (below)                                                                                                                                                      |
+| `object` without declared fields, an object literal (`{ a: int }`) | `dict[str, Any]`                                                                                                                                                         |
+| `array`, `array<T>`, `array<T, N>`                                 | `list[Any]`, `list[T]`                                                                                                                                                   |
+| `set`, `set<T>`, `set<T, N>`                                       | `set[T]` when `T` is hashable (`str`, `int`, `float`, `bool`, `bytes`, `Decimal`, `UUID`, `datetime`, `Duration`, a `Literal`), else `list[T]`; `set` alone: `list[Any]` |
+| `[A, B]` (a tuple)                                                 | `tuple[A, B]`                                                                                                                                                            |
+| string, integer and boolean literals (`'a'`, `1`, `true`)          | `Literal[…]`, values in the kind's order                                                                                                                                 |
+| float and decimal literals (`1.5f`, `1.5dec`)                      | `float`, `Decimal`                                                                                                                                                       |
+| `null`                                                             | `None`                                                                                                                                                                   |
+| a union of kinds                                                   | the union of their annotations, `None` last; `Any` when one of them is `Any`                                                                                             |
+| `regex`, `function`, `file`, any other kind                        | `Any = None`                                                                                                                                                             |
+
+- An optional kind, `option<T>` (rendered `none | T` by SurrealDB 3.x), gives `T | None = None`; a single geometry
+  kind gives its field alias instead (`option<geometry<point>>` → `PointField = None`).
+- **Sub-models**: an `object` field with declared fields (`address` with `address.city`) becomes a `BaseModel` named
+  after its class and column (`PersonAddress`), written before the class; an `array<object>` whose items have
+  declared fields (`lines.*.sku`) becomes `list[<Class><Column>Item]`. The sub-model keeps undeclared keys
+  (`extra="allow"`) when the object is `FLEXIBLE` or the table `SCHEMALESS`. A nested model writes its keys by
+  attribute name, so when a nested column cannot be an attribute name as it is (`first-name`, `datetime`), its parent
+  is a `dict[str, Any]` instead. A nested field whose parent is not defined makes that parent
+  `dict[str, Any] | None = None`, noted in the header. Item definitions (`tags.*`) add no attribute: the array's kind
+  carries the item type.
+- **`DEFAULT`**: a constant the model can hold exactly becomes the Python default, so the database stores the same
+  value whether you set the field or not, and stores yours when you do — `DEFAULT 18` → `= 18`, `'active'` →
+  `= "active"`, `true` → `= True`, `0.5f` on a `float` → `= 0.5`, `1.5dec` → `= Decimal("1.5")`, `NONE` → `= None`,
+  `[]` → `= Field(default_factory=list)` (`set` for a set), `[1, 2]` → `= Field(default_factory=lambda: [1, 2])`,
+  `{}` → `= Field(default_factory=dict)` or the sub-model's class, `1h30m` →
+  `= Field(default_factory=lambda: Duration.parse("1h30m"))`, `d'2030-01-01T00:00:00Z'` →
+  `= datetime.fromisoformat("2030-01-01T00:00:00Z")`, `u'…'` → `= UUID("…")`. The value is copied when the models are
+  generated: generate them again after changing a `DEFAULT`. A `{}` whose sub-model needs a value makes the field
+  required, because SurrealDB refuses a create that leaves it to that default. Any other default — an expression such
+  as `time::now()`, a record id, `math::INF`, a non-empty object, a datetime with nanoseconds, a literal of another
+  type — makes the field `T | None = None` and lists its attribute in `server_fields`
+  ([section 20](#20-field-aliases-server_fields-and-mergerefreshfalse)): omitted on create, so that the server's
+  default applies, and read back after `save()`. A value you set on such a field before `save()` is not written: set
+  it with `merge()` once the record exists.
+- **`VALUE` and `COMPUTED`**: `COMPUTED e` (SurrealDB 3.x), and a `VALUE e` that reads neither `$value` nor
+  `$input`, become `Computed[T] = computed("e")` ([section 16](#16-computed-fields-computed--define-field--value)):
+  never written, read back after `save()`. When `computed()` refuses the expression (a `;`, even inside a string, or
+  a block `{ … }`) or the column needs an alias, the field takes the server form instead: `T | None = None`, listed in
+  `server_fields`. A `VALUE` that reads `$value` (`string::lowercase($value)`) is an ordinary field: you write the
+  value and the server transforms it.
+- **`SCHEMALESS` tables** get `extra="allow"`: the fields the table does not declare are read into `model_extra` and
+  written back.
+- **Aliases**: a column that cannot be an attribute name as it is gets one, with `Field(alias=<column>)`
+  ([section 20](#20-field-aliases-server_fields-and-mergerefreshfalse)): `first-name` → `first_name`, `class` →
+  `class_`, `_private` → `private`, `9lives` → `f_9lives`. So does a column named like a type or a name the module
+  uses (`datetime`, `computed`, `list`, `str`, `Field`, `Any`), like a model attribute (`save`, `objects`, `json`), like
+  a class of the module, or `l`, `O` or `I` (ambiguous names for linters): it gets a `_` suffix (`datetime_`, with
+  `alias="datetime"`), since the attribute would otherwise shadow that name in the annotations after it.
+- **Skipped tables**, listed in the module's header: a table whose name is not an identifier (`order-items`:
+  `table_name` refuses it), and a table named like a SurrealQL keyword, in any case, which the ORM's statements cannot
+  use as a table name (`select`, `Select`, `create`, `only`, `none` …). They are in `schema.tables` all the same.
+
+#### What the generator does not do
+
+- It reads no record: a `SCHEMALESS` table's model holds the fields the table declares (with `extra="allow"`), and an
+  object-literal kind (`{ a: int }`) stays a `dict[str, Any]`.
+- `ASSERT`, `PERMISSIONS`, `REFERENCE` (the field is a `RecordID`) and field comments are not generated: the database
+  still applies them. `READONLY` is a trailing `# READONLY` comment: no field option exists for it.
+- `update()` fails on an instance holding a `READONLY` `datetime` field, after `get()` as after `save()`: Python keeps
+  microseconds, SurrealDB nanoseconds, and the server refuses the changed value. The generated class says so: change
+  such a record with `merge()`.
+- A sub-field filled by a `DEFAULT` the model does not hold (`prefs.at DEFAULT time::now()`, or any `DEFAULT` under a
+  `dict[str, Any]` field) stays `None` on the instance after `save()`, which reads back only `server_fields` and
+  computed fields. A following `update()` sends it as `NONE`: the server refuses it when the sub-field is required and
+  erases it when it is optional. The generated class says so: call `refresh()` after `save()` before an `update()`, or
+  change the record with `merge()`.
+- `array<T, N>` becomes `list[T]`: the length is left to the server, which checks it differently on each line
+  (SurrealDB 2.x accepts at most N items, 3.x exactly N).
+- `null | T` becomes a required `T | None`, but the ORM sends `None` as `NONE`, which `null | T` refuses: give such a
+  field a value, or declare it `option<T>`, which accepts `NONE`.
+- Never call `define_computed_fields()` on a generated model: it would replace the database's field definitions with
+  `DEFINE FIELD OVERWRITE … VALUE …`, without their `TYPE`, `ASSERT` or `PERMISSIONS` (the module's docstring says so).
+- Long lines: the `model_config` line is wrapped the way `ruff format` keeps it — one keyword per line once it exceeds
+  128 columns, and the `server_fields` names one per line once their own line does. Other long lines — long names, a
+  long `Literal` union — are left on one line for your formatter. When every line fits in 128 columns, the module
+  passes `ruff check` and `ruff format --check` at that line length.
+
+#### SurrealDB 2.x and 3.x
+
+- Each line renders the same definition its own way. The reader normalises what the ORM types — kinds,
+  nullability, field paths, flags and names — to one form, the 3.x one where both lines accept it: `option<int>`
+  (2.x) and `none | int` (3.x) both give `field_type == "int"` and `nullable is True`; array items, `tags[*]` (2.x)
+  and `tags.*` (3.x), both give the field `"tags.*"`; `FLEXIBLE TYPE object` (2.x) and `TYPE object FLEXIBLE` (3.x)
+  both give `flexible is True`. The same schema gives the same state and the same generated types on every line.
+- Expressions are kept as each line renders them: `VALUE IF b THEN 1 ELSE 2 END` on 2.x is
+  `VALUE (IF b THEN 1 ELSE 2 END)` on 3.x, a block `{ … }` is one line on 3.x and several on 2.x, and `math::INF`
+  (2.x) is `math::INFINITY` (3.x). So `value`, `default`, `raw` … and a generated `computed("…")` may differ between
+  the lines; the annotations do not.
+- A definition only one line has is read and typed on that line: on 3.x `COMPUTED` (`FieldState.computed`),
+  `REFERENCE` (`reference`, `on_delete`), `FULLTEXT` indexes, the `file` kind, `WITH REFRESH` and `BEARER` accesses,
+  and `DEFINE SEQUENCE` (kept raw in `schema.other["sequences"]`); on 2.x and the embedded engine `MTREE` indexes
+  (`IndexState.mtree`), `SEARCH ANALYZER` indexes and `geometry<feature>`.
+- DDL that a `transaction()` block has not committed yet is invisible: introspection reads outside the transaction,
+  so it sees the committed schema, inside the block too.
+- A database removed (`REMOVE DATABASE`) while the connection uses it: on 3.x introspection raises `SurrealDbError`
+  (the database does not exist) until the database is defined again; 2.x answers an empty schema.
+- The embedded engine reads like a 2.x server
+  ([ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine)).
+
+#### Permissions
+
+Introspection needs a system user: root, a namespace user or a database user, any role. A record user or an
+anonymous session gets `SurrealDbAuthenticationError` ("this session may not run INFO FOR DB"); on the embedded
+engine the anonymous session owns the database and may read it.
+
+The `users` section is never read. On SurrealDB before 3.2.2 (every 2.x release, 3.x before 3.2.2, and the embedded
+engine of SDK 2.0.0), `INFO FOR DB` shows user password hashes to every role that may run `INFO`
+([SurrealDB's `INFO` documentation](https://surrealdb.com/docs/surrealql/statements/info)); introspection never
+reads, stores, logs or writes them.
+
+#### Coming from the full SurrealDB-ORM
+
+- **Same names and call shapes**: `DatabaseIntrospector(connection).introspect()`,
+  `ModelCodeGenerator().generate(state)`, `generate_models_from_db(output_path, connection)`, and the state classes
+  `SchemaState`, `TableState`, `FieldState`, `IndexState`, `EventState`, `AccessState` and `AnalyzerState`, built by
+  position or by keyword with the full ORM's arguments. Lite attributes (`raw`, `path`, `table`, `comment`, …) come
+  after them and are keyword-only. `FunctionState`, `ParamState`, `SchemaIssue` and `tables=` are lite additions.
+- **State is immutable**: frozen dataclasses with read-only maps, and every definition keeps the server's statement
+  in `raw` (full ORM: mutable dataclasses, no statement).
+- **Sequences are tuples**: compare `index.fields`, `analyzer.tokenizers`, `analyzer.filters`, `table.relation_in`
+  and `table.relation_out` with tuples (`index.fields == ("email",)`); lists are accepted when constructing, and so
+  is the full ORM's pipe-joined `relation_in="person | company"`. Relation ends are `()` where the full ORM has
+  `None` (not a relation table, or any table).
+- **Permission values are `'FULL'`, `'NONE'` or `'WHERE <expr>'`** (full ORM: the bare condition).
+- **`default` is SurrealQL text**: `'18'`, `"'active'"`, `'time::now()'`, with `default_always` for
+  `DEFAULT ALWAYS` (full ORM: a Python value, where `'active'` and `time::now()` both become strings). A
+  `FieldState` built with a `default` that is not text raises `TypeError`.
+- **Typed defaults and `server_fields`**: a constant `DEFAULT` becomes a typed Python default
+  (`Field(default_factory=list)`, `Duration.parse(…)`, `datetime.fromisoformat(…)`, `UUID(…)`), and any other
+  `DEFAULT` becomes a `server_fields` entry (full ORM: `Field(default=…)` holding the SurrealQL text as a Python
+  string, such as `'[]'` or `'time::now()'`, and no `server_fields`).
+- **`nullable` means "may be NONE"**: it is true for an optional kind (`option<T>`, rendered `none | T` by
+  SurrealDB 3.x); `null | T` is not nullable, since it refuses NONE (full ORM: nullable). `field_type` is `"any"`
+  for a field without `TYPE`, as in the full ORM.
+- **Accesses are database-level**: they are in `schema.accesses`, and `TableState` has no `access` attribute; find
+  a table's with `[a for a in schema.accesses.values() if a.table == "user"]`. `table`, `signup_fields` and
+  `signin_where` are read from `SIGNUP (CREATE <table> SET …)` (also `CREATE type::thing('<table>', …) SET …` and
+  `CREATE type::record('<table>', …) SET …`, the forms `define_access()` uses for a `primary_key`) and
+  `SIGNIN (SELECT … FROM <table> WHERE …)`. The full ORM reads the first form only, and another shape leaves them
+  empty, with field names unescaped; durations are kept as rendered, `'NONE'` included.
+- **`encrypted` is not provided**: the lite has no `Encrypted` type, so a hashing `VALUE`
+  (`crypto::argon2::generate($value)`) stays in `FieldState.value` and the field is generated as a writable field.
+- **APIs and the GraphQL config are not typed**: their definitions are in `SchemaState.other["apis"]` and
+  `SchemaState.other["configs"]`, as SurrealDB returns them (full ORM: `ApiState`, `GraphQLConfigState`).
+- **`SchemaState.diff()` and `schema_diff()` come with v0.37.0** (migrations), as does `applied_migrations`; the
+  `inspectdb` command comes with v0.38.0.
+- **A refused or failed `INFO FOR DB` raises** `SurrealDbAuthenticationError` or `SurrealDbError`, and a
+  definition that cannot be read or parsed becomes a `SchemaIssue` in `schema.issues` and a logged warning (full
+  ORM: an empty state, and definitions dropped with a debug log).
+- **`on_delete` keeps `'THEN <expr>'`** for `REFERENCE ON DELETE THEN …` (full ORM: `'THEN'` alone).
+- **`connection=` is a name**: the name a connection was added with (`add_connection()`), else the current one
+  (`using()`, then `"default"`). A client object is refused with a `TypeError`, because a client does not carry the
+  ORM's connection name, which routing, reconnects and the generated models' `connection=` key need (full ORM: an
+  `HTTPConnection`).
+- **Generated models use comments** where the full ORM writes
+  `SurrealConfigDict(table_type=…, permissions=…, changefeed=…, view_query=…, relation_in=…, relation_out=…, enforced=…)`:
+  those keys arrive in the lite's `SurrealConfigDict` with v0.31.0–v0.33.0. `READONLY` is a comment too (full ORM:
+  `Field(readonly=True)`).
+- **`RecordID` instead of `ForeignKey`/`ReferencesField`**; no `VectorField` or `Encrypted`; `computed()` instead
+  of `Computed()`; `Duration`, `UUID`, `Decimal` and the geometry classes instead of `str`, `dict` and `float`;
+  nested fields become sub-models (full ORM: dotted attribute lines).
+- **No singularisation**: `game_tables` becomes `GameTables` (full ORM: a trailing `s` is stripped, so `status`
+  becomes `Statu`).
+- **`overwrite=False` added**: `generate_models_from_db(path)` replaces an existing file as the full ORM does, here
+  atomically; `overwrite=False` refuses it with `FileExistsError`.
+
 ---
 
 ## Configuration Options
@@ -4139,7 +4465,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -4250,6 +4576,13 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | `limit(n)` or `offset(n)` above `4294967295` (`2**32 - 1`)                                                                             | the server refuses the read: `Found <n> but the LIMIT clause must evaluate to a positive integer` (`START` likewise)                                                          | read; above `2**63 - 1` the ORM raises `ValueError` when `limit()` or `offset()` is called, on both lines                                                                           | pre-existing (documented in v0.28.1) |
 | Several connections in one process (`add_connection()`, `using()`)                                                                     | each connection follows its own server: a 2.x connection's transactions are buffered, whatever the others are                                                                 | each 3.x WebSocket connection gets interactive transactions, beside 2.x connections in the same process                                                                             | v0.29.0                              |
 | Text lookups (`startswith`, `endswith`, `like`, `ilike`, `match`, `regex`)                                                             | same on both lines: string functions guarded by `(field).is_string()` (`type::is::string` is 2.x-only); a `NONE`, `NULL`, non-string or array path value never matches        | the same (`type::is_string` is 3.x-only; `a.b.is_string()` tests each element of an array path); until v0.29.1: operators SurrealQL lacks (`LIKE`…), a parse error on both lines    | v0.29.2                              |
+| Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)                                                             | renders `option<T>`, array items as `tags[*]`, `FLEXIBLE` before `TYPE`, IF expressions bare: kinds and field paths are normalised to the 3.x forms                           | renders optional kinds with `none` first, items as `tags.*`, `FLEXIBLE` after `TYPE`, IF expressions in parentheses: same state and model types; expressions kept as rendered       | v0.30.0                              |
+| Definitions only one line has (schema introspection)                                                                                   | `MTREE` and `SEARCH ANALYZER` indexes, `geometry<feature>`: read and typed                                                                                                    | `COMPUTED`, `REFERENCE`, `FULLTEXT`, kind `file`, `WITH REFRESH`, `BEARER`: read and typed; `DEFINE SEQUENCE`: kept raw                                                             | v0.30.0                              |
+| `INFO` (schema introspection) by a record user or an anonymous session                                                                 | refused: `SurrealDbAuthenticationError` (the SDK raises `InternalError`)                                                                                                      | refused: `SurrealDbAuthenticationError` (the SDK raises `NotAllowedError`)                                                                                                          | v0.30.0                              |
+| `array<T, N>` read by schema introspection                                                                                             | at most N items; the generated `list[T]` leaves the check to the server                                                                                                       | exactly N items; the generated `list[T]` leaves the check to the server                                                                                                             | v0.30.0                              |
+| Schema introspection of a database removed while the connection is open                                                                | empty schema                                                                                                                                                                  | `SurrealDbError` (the database does not exist) until the database is defined again                                                                                                  | v0.30.0                              |
+| DDL not yet committed in a transaction, seen by schema introspection                                                                   | invisible                                                                                                                                                                     | invisible                                                                                                                                                                           | v0.30.0                              |
+| A regex with a backslash pair before a `/` (schema introspection)                                                                      | `/a\\/b/` accepted (a backslash, then an escaped slash), `/\\/` refused: such a definition is a `SchemaIssue`, not read                                                       | `/\\/` accepted (an escaped backslash, then the closing slash), `/a\\/b/` refused: such a definition is a `SchemaIssue`, not read                                                   | v0.30.0                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
@@ -4281,6 +4614,7 @@ Capabilities not listed behave as on a 2.x server.
 | Parse errors                                                        | bare `RuntimeError` (the DDL helpers raise `SurrealDbError`)                                                                                                                                                                                                                                                                                          | the SDK's error classes                                                                                         | v0.25.0 |
 | Time travel (`as_of()`)                                             | `surrealkv+versioned://` only (`?versioned=true` is ignored by SDK 2.0.0); any other URL → `SurrealDbError` before any request; `fetch()` refused (2.x core)                                                                                                                                                                                          | versioned storage required (see the 2.x/3.x table)                                                              | v0.26.0 |
 | Several connections (`add_connection()`)                            | `mem://`: each name is a database of its own; an on-disk store (`surrealkv://`, `file://`) is open under one name at a time — a second name raises `SurrealDbConnectionError`                                                                                                                                                                         | each name opens its own clients; two databases on one server are isolated                                       | v0.29.0 |
+| Schema introspection (`DatabaseIntrospector`)                       | reads like a 2.x server (core 2.3.10): same state and same generated model types as on the servers; the anonymous owner session may run `INFO`; `COUNT` indexes cannot be defined                                                                                                                                                                     | need a system user (root, namespace or database user)                                                           | v0.30.0 |
 | Everything else                                                     | CRUD, QuerySet, aggregations, relations, typed edges, rich and geo fields, upsert/patch, server values, computed fields, stored functions, signals: the same as on a 2.x server                                                                                                                                                                       | unchanged                                                                                                       | v0.25.0 |
 
 ---
@@ -4325,7 +4659,8 @@ Contributions are welcome! Please:
 | v0.27.0           | Subqueries                                           | ✅ Released |
 | v0.28.0           | Query cache                                          | ✅ Released |
 | v0.29.0           | Tier 2 — Multi-database                              | ✅ Released |
-| v0.30.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)     | 📋 Planned  |
+| v0.30.0           | Tier 3 — Schema introspection                        | ✅ Released |
+| v0.31.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)     | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | 📋 Planned  |
 
@@ -4378,7 +4713,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Subqueries                    | ✅ v0.27.0 (`Subquery`, a QuerySet in `filter()`)                     | ✅                               |
 | Query Cache                   | ✅ v0.28.0 (`cache()`, `QueryCache`)                                  | ✅                               |
 | Multi-database                | ✅ v0.29.0 (`add_connection()`, `using()`)                            | ✅                               |
-| Schema Introspection          | v0.30.0                                                               | ✅                               |
+| Schema Introspection          | ✅ v0.30.0 (`DatabaseIntrospector`, `generate_models_from_db()`)      | ✅                               |
 | DEFINE EVENT                  | v0.31.0                                                               | ✅                               |
 | Materialized views            | v0.32.0                                                               | ✅                               |
 | Full-Text Search              | v0.34.0                                                               | ✅                               |
