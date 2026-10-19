@@ -350,8 +350,10 @@ class TestScanner:
             "IF a THEN " * 3000 + "1" + " END" * 3000,  # units nested 3000 deep
             "(" * 5000 + ")" * 5000,
             "IF a { 1 } ELSE " * 3000 + "{ 2 }",
+            "$a / " * 5000 + "1",  # divisions: each slash looks for a closing one up to the next slash only
+            "/a/ + " * 5000 + "1",
         ],
-        ids=["plain-ifs", "nested-units", "nested-brackets", "brace-chain"],
+        ids=["plain-ifs", "nested-units", "nested-brackets", "brace-chain", "divisions", "regexes"],
     )
     def test_scan_stays_linear(self, body: str) -> None:
         # Server text is not trusted to be small or kind: a quadratic scan of the first case takes seconds.
@@ -410,6 +412,92 @@ class TestScanner:
         with pytest.raises(DefineParseError) as error:
             split_top_level("a, 'b", ",")
         assert _reason(error) == _R_STRING
+
+    # --- regular expressions ---------------------------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "expression",
+        [
+            "$value = /a PERMISSIONS b/",
+            "/a PERMISSIONS b/",  # at the start of a content
+            "f($value, /a PERMISSIONS b/)",
+            "[/a/, /PERMISSIONS b/]",
+            "$value AND /a PERMISSIONS b/",
+            "$value INSIDE [/(PERMISSIONS b/]",  # a bracket inside a regex is not one
+            "$value = /a\\/ PERMISSIONS b/",  # an escaped slash does not close it
+            "$value = /a\\\\/ PERMISSIONS b/",  # nor does one after a backslash: the servers' lexers read \/ only
+            "$value = /a'b PERMISSIONS c/",  # a quote does not open a string in it
+            "$value ?? /a PERMISSIONS b/",
+            "!/a PERMISSIONS b/",
+            "$value = / PERMISSIONS b/",  # a regex starting with a space, after an operator
+            "a * / PERMISSIONS b/",
+            "x /a PERMISSIONS b/",  # a slash before a non-space is never a division: the servers space one
+            "(IF $value THEN /a PERMISSIONS b/ END)",
+        ],
+    )
+    def test_a_regular_expression_is_opaque(self, expression: str) -> None:
+        # M47: a regex is rendered as written, between slashes; no keyword or bracket inside it counts.
+        text = f"ASSERT {expression} PERMISSIONS FULL"
+        assert top_level_keywords(text, ["ASSERT", "PERMISSIONS"]) == [(0, "ASSERT"), (len(text) - 16, "PERMISSIONS")]
+
+    @pytest.mark.parametrize(
+        "operand",
+        [
+            "$value",
+            "(1 + 2)",
+            "a.b",
+            "[1, 2][0]",
+            "1h",
+            "1.5f",
+            "{ a: 1 }.a",
+            "$value.AND",
+            "x",
+            "'a'",
+            "`a`",
+            "/a/",
+            "x.*",
+            "<-likes<-?",
+            "$value.?",
+            "x.@",
+            "READONLY",  # a keyword no expression follows: an operand where a slash comes after it
+        ],
+    )
+    def test_a_division_stays_a_division(self, operand: str) -> None:
+        # M47: the servers render a division with a space on both sides; after an operand it divides.
+        text = f"VALUE {operand} / 2 PERMISSIONS {operand} / 3"
+        found = top_level_keywords(text, ["VALUE", "PERMISSIONS"])
+        assert [keyword for _, keyword in found] == ["VALUE", "PERMISSIONS"]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "VALUE AND / 2 PERMISSIONS FULL",  # 2.x renders a field named AND bare (M47)
+            "VALUE a * ASSERT / 2 PERMISSIONS FULL",
+        ],
+    )
+    def test_a_keyword_named_operand_divides_when_no_regex_can_follow(self, text: str) -> None:
+        found = top_level_keywords(text, ["VALUE", "PERMISSIONS"])
+        assert [keyword for _, keyword in found] == ["VALUE", "PERMISSIONS"]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "VALUE / a/ PERMISSIONS FULL",  # a regex starting with a space, or a field named VALUE divided
+            "VALUE WHERE / 2 / 3 PERMISSIONS FULL",  # the first slash would close a regex at the second one
+            "VALUE AND / 2 ASSERT $value = /x/ PERMISSIONS FULL",
+            "VALUE a * ASSERT / 2 COMMENT 'a/b' PERMISSIONS FULL",
+        ],
+    )
+    def test_a_slash_that_may_open_a_regex_or_divide_is_never_guessed(self, text: str) -> None:
+        with pytest.raises(DefineParseError) as error:
+            top_level_keywords(text, ["VALUE", "PERMISSIONS"])
+        assert _reason(error) == _R_AMBIGUOUS
+
+    def test_split_top_level_skips_regular_expressions(self) -> None:
+        assert split_top_level("/a,b/, /[(]/, $x / 2", ",") == ["/a,b/", " /[(]/", " $x / 2"]
+
+    def test_a_slash_never_closed_is_punctuation(self) -> None:
+        assert split_top_level("/a, b", ",") == ["/a", " b"]
 
     # --- read_identifier -------------------------------------------------------------------------------------------
 
@@ -984,8 +1072,33 @@ class TestClauseReader:
             ("_valid_flag", [""], ["x", "'a'"]),
             (
                 "_valid_expr",
-                ["a + 1", "x.*", "a.*", "IF b THEN 1 ELSE 2 END", "(IF b THEN 1 END)", "'a +'", "f(a, b)", "-1", "[]"],
-                ["a +", "", "(a", "a.", "a,", "IF a THEN 1", "a ->", "$x ="],
+                [
+                    "a + 1",
+                    "x.*",
+                    "a.*",
+                    "IF b THEN 1 ELSE 2 END",
+                    "(IF b THEN 1 END)",
+                    "'a +'",
+                    "f(a, b)",
+                    "-1",
+                    "[]",
+                    # M47: a regex, the graph wildcard, an open range, the recursion idiom, the optional idiom.
+                    "/a/",
+                    "$value = /^[0-9]{5}$/",
+                    "[/a/, /b/]",
+                    "<-likes<-?",
+                    "->likes->?",
+                    "<->likes<->?",
+                    "x<-?",
+                    "->?",
+                    "1..",
+                    "..",
+                    "t:..",
+                    "$value..",
+                    "x.@",
+                    "$value.?",
+                ],
+                ["a +", "", "(a", "a.", "a,", "IF a THEN 1", "a ->", "$x =", "a ?", "$a ??", "a -?", "a >?", "a @", "a /"],
             ),
             ("_valid_string", ["'a'", '"it\'s"', "''"], ["'a' 'b'", "a", "d'2020-01-01'", "'a' + 'b'", ""]),
             ("_valid_kind", ["option<int>", "none | { x: int }", "  1.5f | 2"], ["frob<", "int TYPE", ""]),
@@ -1204,6 +1317,13 @@ _TABLES = [
         "v",
         table_type="normal",
         view_query="SELECT AS FROM t",
+    ),
+    # M47 (both lines and the embedded engine render it alike): a regex ends the view's query.
+    _table(
+        "DEFINE TABLE rview TYPE ANY SCHEMALESS AS SELECT * FROM person WHERE code = /a/ PERMISSIONS FULL",
+        "rview",
+        view_query="SELECT * FROM person WHERE code = /a/",
+        permissions=dict.fromkeys(_TABLE_ACTIONS, "FULL"),
     ),
 ]
 
@@ -1679,6 +1799,113 @@ _M36_DEFAULTS = [
     ("d24", "float", "float", False, "0.0025f"),
 ]
 
+_ADMIN_WRITES = {"select": "FULL", "create": "WHERE $auth.admin = true", "update": "WHERE $auth.admin = true"}
+
+#: M47 (probe of 2026-10-19 on 2.7.0, 3.3.4 and the embedded engine): regular expressions, the graph wildcard, open
+#: ranges, ``.@`` and ``.?`` end an expression, and the clauses after them are read. Every line renders these alike
+#: but where noted (``zip``'s kind, the parentheses of an IF, ``.?`` refused by 2.x).
+_M47_FIELDS = [
+    # SurrealDB's own documentation example: the servers render VALUE before ASSERT.
+    _field(
+        "DEFINE FIELD countrycode ON person TYPE string VALUE $value OR $before OR 'GBR' ASSERT $value = /[A-Z]{3}/ "
+        "PERMISSIONS FULL",
+        "countrycode",
+        "string",
+        value="$value OR $before OR 'GBR'",
+        assertion="$value = /[A-Z]{3}/",
+    ),
+    *(
+        _field(
+            f"DEFINE FIELD zip ON person TYPE {kind} ASSERT $value = NONE OR $value = /^[0-9]{{5}}$/ PERMISSIONS FOR "
+            "select FULL, FOR create, update WHERE $auth.admin = true",
+            "zip",
+            "string",
+            nullable=True,
+            assertion="$value = NONE OR $value = /^[0-9]{5}$/",
+            permissions=_ADMIN_WRITES,
+        )
+        for kind in ("option<string>", "none | string")  # 2.x, 3.x
+    ),
+    _field(
+        "DEFINE FIELD code ON person TYPE string ASSERT $value = /^[a-z]+$/ COMMENT 'lower only' PERMISSIONS FULL",
+        "code",
+        "string",
+        assertion="$value = /^[a-z]+$/",
+        comment="lower only",
+    ),
+    _field("DEFINE FIELD fans ON person VALUE <-likes<-? PERMISSIONS FULL", "fans", value="<-likes<-?"),
+    _field(
+        "DEFINE FIELD og ON person VALUE ->likes->? COMMENT 'out' PERMISSIONS FULL", "og", value="->likes->?", comment="out"
+    ),
+    _field(
+        "DEFINE FIELD bg ON person VALUE <->likes<->? COMMENT 'both' PERMISSIONS FULL",
+        "bg",
+        value="<->likes<->?",
+        comment="both",
+    ),
+    _field(
+        "DEFINE FIELD k ON person TYPE string DEFAULT 'x' PERMISSIONS FOR select WHERE $auth.email = /@corp$/, FOR "
+        "create, update FULL",
+        "k",
+        "string",
+        default="'x'",
+        permissions={"select": "WHERE $auth.email = /@corp$/", "create": "FULL", "update": "FULL"},
+    ),
+    _field(
+        "DEFINE FIELD sl ON person TYPE string ASSERT $value = /a\\/b/ COMMENT 'slash' PERMISSIONS FULL",
+        "sl",
+        "string",
+        assertion="$value = /a\\/b/",
+        comment="slash",
+    ),
+    _field(
+        "DEFINE FIELD br ON person TYPE string ASSERT $value = /[(]/ COMMENT 'paren' PERMISSIONS FULL",
+        "br",
+        "string",
+        assertion="$value = /[(]/",
+        comment="paren",
+    ),
+    _field(
+        "DEFINE FIELD inside ON person TYPE string ASSERT $value INSIDE [/a/, /b/] COMMENT 'list' PERMISSIONS FULL",
+        "inside",
+        "string",
+        assertion="$value INSIDE [/a/, /b/]",
+        comment="list",
+    ),
+    _field(
+        "DEFINE FIELD m ON person TYPE bool VALUE string::matches($value, /x/) COMMENT 'fn' PERMISSIONS FULL",
+        "m",
+        "bool",
+        value="string::matches($value, /x/)",
+        comment="fn",
+    ),
+    _field(
+        "DEFINE FIELD dv ON person TYPE number VALUE $value / 2 COMMENT 'half' PERMISSIONS FULL",
+        "dv",
+        "number",
+        value="$value / 2",
+        comment="half",
+    ),
+    _field(  # 2.x and the embedded engine
+        "DEFINE FIELD f ON t VALUE IF $value THEN /a/ ELSE /b/ END COMMENT 'if' PERMISSIONS FULL",
+        "f",
+        value="IF $value THEN /a/ ELSE /b/ END",
+        comment="if",
+    ),
+    _field(  # 3.x
+        "DEFINE FIELD f ON t VALUE (IF $value THEN /a/ ELSE /b/ END) COMMENT 'if' PERMISSIONS FULL",
+        "f",
+        value="(IF $value THEN /a/ ELSE /b/ END)",
+        comment="if",
+    ),
+    _field("DEFINE FIELD r1 ON t VALUE 1.. PERMISSIONS FULL", "r1", value="1.."),
+    _field("DEFINE FIELD r2 ON t VALUE t:.. COMMENT 'all' PERMISSIONS FULL", "r2", value="t:..", comment="all"),
+    _field("DEFINE FIELD r3 ON t VALUE x.@ COMMENT 'rec' PERMISSIONS FULL", "r3", value="x.@", comment="rec"),
+    _field("DEFINE FIELD o ON t VALUE $value.? COMMENT 'opt' PERMISSIONS FULL", "o", value="$value.?", comment="opt"),  # 3.x
+    # Fabricated: a field named AND (2.x renders it bare) divided; no slash after it can close a regex.
+    _field("DEFINE FIELD a0 ON t VALUE AND / 2 COMMENT 'kw' PERMISSIONS FULL", "a0", value="AND / 2", comment="kw"),
+]
+
 
 class TestDefineField:
     """Spec §6.3.3 (AC-6, AC-7): ``DEFINE FIELD <idiom> ON <ident>`` read positionally, then the clauses in M10's
@@ -1738,6 +1965,15 @@ class TestDefineField:
         assert parse_define_field(statement).state == expected
 
     @pytest.mark.parametrize(
+        ("statement", "expected"), _M47_FIELDS, ids=[f"{state.name}:{n}" for n, (_, state) in enumerate(_M47_FIELDS)]
+    )
+    def test_regular_expressions_and_operator_endings(self, statement: str, expected: FieldState) -> None:
+        # M47: the expression ends where it does, and the clauses after it are read — never swallowed by it.
+        parsed = parse_define_field(statement)
+        assert parsed.state == expected
+        assert parsed.type_as_written is False
+
+    @pytest.mark.parametrize(
         ("name", "kind", "field_type", "nullable", "default"),
         _M36_DEFAULTS,
         ids=[f"{row[0]}:{n}" for n, row in enumerate(_M36_DEFAULTS)],
@@ -1784,6 +2020,9 @@ class TestDefineField:
             ("DEFINE FIELD f ON t VALUE IF a THEN 1 PERMISSIONS FULL", _R_IF),
             ("DEFINE FIELD f ON t DEFAULT 'abc PERMISSIONS FULL", _R_STRING),
             ("DEFINE FIELD f ON t VALUE f(a PERMISSIONS FULL", _R_BRACKETS),
+            # M47: a slash that may open a regex starting with a space or divide a keyword-named field.
+            ("DEFINE FIELD f ON t VALUE / a/ PERMISSIONS FULL", _R_AMBIGUOUS),
+            ("DEFINE FIELD f ON t VALUE AND / 2 ASSERT $value = /x/ PERMISSIONS FULL", _R_AMBIGUOUS),
         ],
     )
     def test_refused(self, statement: str, reason: str) -> None:
@@ -2778,6 +3017,15 @@ _PARAMS = [
     _param("DEFINE PARAM $n VALUE 1 PERMISSIONS NONE", "n", "1", permissions="NONE"),
     _param("DEFINE PARAM $bare VALUE [1, 2]", "bare", "[1, 2]"),
     _param("DEFINE PARAM $VALUE VALUE VALUE PERMISSIONS FULL", "VALUE", "VALUE"),
+    # M47 (both lines and the embedded engine): a regex value.
+    _param("DEFINE PARAM $re VALUE /^a+$/ PERMISSIONS FULL", "re", "/^a+$/"),
+    _param(
+        "DEFINE PARAM $re2 VALUE /a PERMISSIONS b/ COMMENT 'c' PERMISSIONS NONE",
+        "re2",
+        "/a PERMISSIONS b/",
+        comment="c",
+        permissions="NONE",
+    ),
 ]
 
 

@@ -1270,6 +1270,21 @@ class TestFieldLines:
     def test_default_rows(self, kind: str, nullable: bool, default: str, line: str) -> None:
         assert _line_of(_generate(_f("x", kind, nullable=nullable, default=default)), "x") == line
 
+    def test_clauses_after_a_regex_or_a_graph_wildcard_m47(self) -> None:
+        # The parser ends the expression at the regex or the wildcard: the clauses after it are not generated into
+        # the field's default or computed expression.
+        statements = [
+            "DEFINE FIELD k ON t TYPE string DEFAULT 'x' PERMISSIONS FOR select WHERE $auth.email = /@corp$/, FOR create, "
+            "update FULL",
+            "DEFINE FIELD fans ON t VALUE <-likes<-? PERMISSIONS FULL",
+            "DEFINE FIELD code ON t TYPE string ASSERT $value = /^[a-z]+$/ COMMENT 'lower only' PERMISSIONS FULL",
+        ]
+        source = _generate(*(parse_define_field(statement).state for statement in statements))
+        assert _line_of(source, "k") == 'k: str = "x"'
+        assert _line_of(source, "fans") == 'fans: Computed[Any] = computed("<-likes<-?")'
+        assert _line_of(source, "code") == "code: str"
+        assert "server_fields" not in source and "PERMISSIONS" not in source
+
     def test_server_fields_hold_attribute_names(self) -> None:
         created = parse_define_field("DEFINE FIELD `created-at` ON t TYPE datetime DEFAULT time::now() PERMISSIONS FULL")
         source = _generate(created.state, _f("x", "string", value="string::concat(a, ';', b)"))

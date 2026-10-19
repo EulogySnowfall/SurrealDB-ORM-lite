@@ -12,6 +12,12 @@ simple anchored tokens:
 
 - String literals ``'…'`` and ``"…"`` with backslash escapes are opaque; ``unquote()`` decodes one (``\n`` → a
   newline; the embedded engine renders that newline raw, which is kept). ``d'…'`` and ``u'…'`` stay opaque tokens.
+- Regex literals ``/…/`` are opaque too (``\/`` an escaped slash; no quote, bracket or keyword inside counts). The
+  servers render a division with a space on both sides (``$value / 2``), so a ``/`` before anything but a space opens
+  a regex; a ``/`` and a space open one where an operand comes — after an operator, an opening bracket, ``,``, ``:``
+  or ``;`` — and divide after an operand. After an operator word or a clause keyword (``AND``, ``VALUE``), which
+  SurrealDB 2.x also renders bare as an identifier (``AND / 2``), such a ``/`` is never guessed when a later ``/``
+  could close a regex.
 - Identifiers: bare ``[A-Za-z0-9_]+``, or quoted between backquotes or between ``⟨`` and ``⟩``, escapes decoded.
   ``read_identifier()`` reads one, ``read_idiom()`` a field path — segments separated by ``.``, a segment an
   identifier or ``*``, ``[*]`` the segment ``*`` (``tags[*]`` and ``tags.*`` are the same path) — and
@@ -39,7 +45,8 @@ both lines accept, preferring the 3.x spacing: SurrealDB 2.x renders an optional
 table: ``DEFINE FIELD TYPE ON TYPE TYPE int`` is the field ``TYPE`` of the table ``TYPE``), then the clauses with
 ``read_clauses()`` against its grammar, a sequence of ``Slot``s in the order the servers render them. A reading
 assigns top-level keyword candidates to slots in that order, each content passing its slot's validator (``expr``,
-the weak one, refuses an empty text or one ending with an operator; ``string``, ``kind``, ``perms`` and the other
+the weak one, refuses an empty text or one ending with an operator — not an operand such as ``x.*``,
+``<-likes<-?`` or ``1..``; ``string``, ``kind``, ``perms`` and the other
 strict ones rule bare identifiers out), and leaves no keyword inside a content where it can start its own clause.
 Exactly one reading is read; none or several raise ``DefineParseError`` — ``VALUE b ASSERT ASSERT c`` is never
 guessed. ``parse_define_table()``, ``parse_define_field()``, ``parse_define_event()``, ``parse_define_analyzer()``,
@@ -140,15 +147,66 @@ _NOT_BARE_AFTER = frozenset("$.:")
 _WORD_TOKEN = "word"
 _STRING_TOKEN = "string"
 _IDENT_TOKEN = "ident"
+_REGEX_TOKEN = "regex"
 _SPACE_TOKEN = "space"
 _PUNCT_TOKEN = "punct"
+
+#: Punctuation that ends an operand: a ``/`` after it divides.
+_AFTER_OPERAND = frozenset(")]}.")
+#: Punctuation that ends an operand only glued after one of the given characters — ``x.*``, ``<-likes<-?``,
+#: ``->likes->?``, ``$value.?``, ``x.@`` — and is an operator otherwise (``a * b``, ``a ?? b``, ``a @@ b``).
+_GLUED_AFTER_OPERAND = {"*": ".", "?": "->.", "@": "."}
+#: The upper-case words an expression may follow: the operator words, and the clause and statement keywords the
+#: servers render before an expression. SurrealDB 2.x renders an identifier spelling one of them bare (``AND / 2``
+#: divides the field ``AND``), so a ``/`` and a space after one of them is either a division or a regex starting
+#: with a space: never guessed.
+_EXPRESSION_KEYWORDS = frozenset(
+    {
+        "ALLINSIDE",
+        "ALWAYS",
+        "AND",
+        "ANYINSIDE",
+        "ASSERT",
+        "AUTHENTICATE",
+        "COMPUTED",
+        "CONTAINS",
+        "CONTAINSALL",
+        "CONTAINSANY",
+        "CONTAINSNONE",
+        "CONTAINSNOT",
+        "CONTENT",
+        "DEFAULT",
+        "ELSE",
+        "IF",
+        "IN",
+        "INSIDE",
+        "INTERSECTS",
+        "IS",
+        "MERGE",
+        "NONEINSIDE",
+        "NOT",
+        "NOTINSIDE",
+        "OR",
+        "OUTSIDE",
+        "PATCH",
+        "REPLACE",
+        "RETURN",
+        "SELECT",
+        "SET",
+        "THEN",
+        "THROW",
+        "VALUE",
+        "WHEN",
+        "WHERE",
+    }
+)
 
 #: ``(kind, start, end)`` of a token before its depth is known.
 _Lexeme = tuple[str, int, int]
 
 
 class _Token(NamedTuple):
-    """A token of a scanned text: its kind (word, string, ident, space or punct), its span and its depth.
+    """A token of a scanned text: its kind (word, string, ident, regex, space or punct), its span and its depth.
 
     ``depth`` counts the brackets and IF units around the token. A bracket, and the ``IF`` and ``END`` of a unit,
     stand at the depth of what surrounds them.
@@ -278,9 +336,66 @@ def canonical_name(path: Sequence[str]) -> str:
 # --- depth: brackets and IF units ----------------------------------------------------------------------------------
 
 
+def _regex_end(text: str, pos: int) -> int | None:
+    """The position after the regex literal whose opening ``/`` is at *pos*, or ``None`` when no ``/`` closes it.
+
+    As the servers' lexers read it: ``\\/`` is an escaped slash, any other backslash a character of the regex; a quote
+    opens nothing inside it.
+    """
+    index = pos + 1
+    length = len(text)
+    while index < length:
+        char = text[index]
+        if char == "/":
+            return index + 1
+        index += 2 if char == "\\" and text.startswith("/", index + 1) else 1
+    return None
+
+
+def _operand_follows(text: str, previous: _Lexeme | None, start: int) -> bool | None:
+    """Whether an operand comes after *previous*, the last token before a ``/`` that is not whitespace (``None``: the
+    start of the scanned text): ``True`` after an operator, an opening bracket, ``,``, ``:`` or ``;``; ``False`` after
+    an operand; ``None`` after a word of ``_EXPRESSION_KEYWORDS``, which a bare identifier may spell."""
+    if previous is None:
+        return True
+    kind, begin, end = previous
+    glued = text[begin - 1] if begin > start else ""
+    if kind == _WORD_TOKEN:
+        if glued and glued in _NOT_BARE_AFTER:  # $value, a.b, t:1 — never a keyword
+            return False
+        return None if text[begin:end] in _EXPRESSION_KEYWORDS else False
+    if kind != _PUNCT_TOKEN:  # a string, a quoted identifier, a regex
+        return False
+    char = text[begin]
+    if char in _AFTER_OPERAND:
+        return False
+    return not (char in _GLUED_AFTER_OPERAND and glued and glued in _GLUED_AFTER_OPERAND[char])
+
+
+def _slash(text: str, pos: int, previous: _Lexeme | None, start: int) -> tuple[str, int]:
+    """``(kind, end)`` of the token a ``/`` at *pos* starts: a regex literal up to its closing ``/``, or the division.
+
+    The servers render a division with a space on both sides, so a ``/`` before anything else opens a regex. A ``/``
+    and a space open one — a regex starting with a space — where an operand comes (``_operand_follows``). Where that
+    cannot be told (after a keyword a bare identifier may spell) and a later ``/`` could close a regex,
+    ``DefineParseError(_R_AMBIGUOUS)``: the slash is never guessed.
+    """
+    end = _regex_end(text, pos)
+    if end is None:
+        return _PUNCT_TOKEN, pos + 1
+    if not text[pos + 1].isspace():
+        return _REGEX_TOKEN, end
+    follows = _operand_follows(text, previous, start)
+    if follows is None:
+        raise DefineParseError(_R_AMBIGUOUS)
+    return (_REGEX_TOKEN, end) if follows else (_PUNCT_TOKEN, pos + 1)
+
+
 def _lex(text: str, start: int) -> list[_Lexeme]:
-    """Cut ``text[start:]`` into tokens; an unterminated literal or quoted identifier raises."""
+    """Cut ``text[start:]`` into tokens; an unterminated literal or quoted identifier raises, and so does a ``/``
+    that may open a regex or divide (``_slash``)."""
     lexemes: list[_Lexeme] = []
+    previous: _Lexeme | None = None  # the last token that is not whitespace
     pos = start
     length = len(text)
     while pos < length:
@@ -296,11 +411,16 @@ def _lex(text: str, start: int) -> list[_Lexeme]:
             if closed is None:
                 raise DefineParseError(_R_IDENT)
             kind, end = _IDENT_TOKEN, closed
+        elif char == "/":
+            kind, end = _slash(text, pos, previous, start)
         elif (word := _WORD.match(text, pos)) is not None:
             kind, end = _WORD_TOKEN, word.end()
         elif (space := _SPACE.match(text, pos)) is not None:
             kind, end = _SPACE_TOKEN, space.end()
-        lexemes.append((kind, pos, end))
+        lexeme = (kind, pos, end)
+        lexemes.append(lexeme)
+        if kind != _SPACE_TOKEN:
+            previous = lexeme
         pos = end
     return lexemes
 
@@ -414,7 +534,8 @@ def _scan(text: str, start: int = 0, *, angle: bool = False) -> list[_Token]:
     """The tokens of ``text[start:]`` with their depth (``angle``: ``<>`` nest too, inside a kind).
 
     Raises ``DefineParseError``: ``_R_STRING`` or ``_R_IDENT`` for an unterminated literal or quoted identifier,
-    ``_R_BRACKETS`` for unbalanced brackets, ``_R_IF`` for an IF unit without its ``END``.
+    ``_R_AMBIGUOUS`` for a ``/`` that may open a regex or divide, ``_R_BRACKETS`` for unbalanced brackets, ``_R_IF``
+    for an IF unit without its ``END``.
     """
     lexemes = _lex(text, start)
     matches = _match_brackets(text, lexemes, _KIND_BRACKETS if angle else _BRACKETS)
@@ -449,10 +570,11 @@ def _keyword_tokens(text: str, tokens: Sequence[_Token], keywords: Sequence[str]
 def top_level_keywords(text: str, keywords: Iterable[str], start: int = 0) -> list[tuple[int, str]]:
     """Every ``(position, keyword)`` at depth 0 of ``text[start:]`` where one of *keywords* stands as a whole word.
 
-    Outside strings and quoted identifiers, outside brackets and IF units, with whitespace or an edge of the scanned
-    text on both sides. Case-sensitive: the server renders keywords upper-case. A keyword may be two words separated
-    by the single space the server renders (``WITH REFRESH``, ``ON DELETE``). The result is in text order, keywords
-    matching at one position in the order given. These are candidates only: a bare identifier may spell a keyword.
+    Outside strings, regexes and quoted identifiers, outside brackets and IF units, with whitespace or an edge of the
+    scanned text on both sides. Case-sensitive: the server renders keywords upper-case. A keyword may be two words
+    separated by the single space the server renders (``WITH REFRESH``, ``ON DELETE``). The result is in text order,
+    keywords matching at one position in the order given. These are candidates only: a bare identifier may spell a
+    keyword.
     """
     return [(position, keyword) for _, position, keyword in _keyword_tokens(text, _scan(text, start), tuple(keywords), start)]
 
@@ -865,8 +987,11 @@ def _skip_space(text: str, pos: int) -> int:
     return pos if space is None else space.end()
 
 
-#: An expression never ends with one of these characters outside a string (spec §6.3.2, ``expr``).
+#: An expression never ends with one of these characters outside a string or a regex (spec §6.3.2, ``expr``) …
 _OPERATOR_ENDS = frozenset("+-*/%=<>!&|^,.:?~@")
+#: … but for these operands, glued: the idioms ``x.*``, ``x.@`` and ``x.?``, the graph wildcard (``<-likes<-?``,
+#: ``->likes->?``, ``<->likes<->?``) and an open range (``1..``, ``..``, ``t:..``).
+_OPERAND_TAILS = (".*", ".@", ".?", "<-?", "->?", "..")
 _TABLE_TYPES = frozenset({"NORMAL", "ANY", "RELATION"})
 _ON_DELETE_ACTIONS = frozenset({"IGNORE", "UNSET", "CASCADE", "REJECT"})
 _DURATION = r"(?:[0-9]+(?:ns|us|µs|ms|s|m|h|d|w|y))+"
@@ -884,19 +1009,30 @@ def _valid_flag(span: _Span) -> bool:
     return span.first >= span.stop
 
 
+def _glued_tail(span: _Span) -> str:
+    """The last three characters of the content at most, when they are punctuation glued together (``"<-?"`` of
+    ``<-likes<-?``, ``".*"`` of ``x.*``)."""
+    chars: list[str] = []
+    index = span.stop - 1
+    while index >= span.first and len(chars) < 3:
+        token = span.tokens[index]
+        if token.kind != _PUNCT_TOKEN or (chars and token.end != span.tokens[index + 1].start):
+            break
+        chars.append(span.text[token.start])
+        index -= 1
+    return "".join(reversed(chars))
+
+
 def _valid_expr(span: _Span) -> bool:
     """``expr`` — the weak validator: non-empty, depth-balanced (true of every content), and its last character
-    outside strings is not an operator, but for the ``*`` of the idiom ``x.*``."""
+    outside strings and regexes is not an operator, but for an operand of ``_OPERAND_TAILS`` (``x.*``,
+    ``<-likes<-?``, ``1..``)."""
     if span.first >= span.stop:
         return False
     last = span.tokens[span.stop - 1]
-    char = span.text[last.start]
-    if last.kind != _PUNCT_TOKEN or char not in _OPERATOR_ENDS:
+    if last.kind != _PUNCT_TOKEN or span.text[last.start] not in _OPERATOR_ENDS:
         return True
-    if char != "*" or span.stop - 2 < span.first:
-        return False
-    before = span.tokens[span.stop - 2]
-    return before.kind == _PUNCT_TOKEN and span.text[before.start] == "." and before.end == last.start
+    return _glued_tail(span).endswith(_OPERAND_TAILS)
 
 
 def _valid_string(span: _Span) -> bool:

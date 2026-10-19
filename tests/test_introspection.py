@@ -1491,6 +1491,67 @@ class TestOneLineItemsE2E:
             check(schema)
 
 
+#: M47: regular expressions and the graph wildcard, written as SurrealDB's documentation writes them (the
+#: ``countrycode`` example puts ASSERT before VALUE; the servers render VALUE first).
+_M47_DDL = """\
+DEFINE TABLE isp_rx SCHEMALESS;
+DEFINE FIELD countrycode ON isp_rx TYPE string ASSERT $value = /[A-Z]{3}/ VALUE $value OR $before OR 'GBR';
+DEFINE FIELD zip ON isp_rx TYPE option<string> ASSERT $value = NONE OR $value = /^[0-9]{5}$/
+    PERMISSIONS FOR select FULL, FOR create, update WHERE $auth.admin = true;
+DEFINE FIELD code ON isp_rx TYPE string ASSERT $value = /^[a-z]+$/ COMMENT 'lower only';
+DEFINE FIELD fans ON isp_rx VALUE <-isp_likes<-?;
+DEFINE FIELD k ON isp_rx TYPE string DEFAULT 'x'
+    PERMISSIONS FOR select WHERE $auth.email = /@corp$/, FOR create, update FULL;
+DEFINE FIELD half ON isp_rx TYPE option<number> VALUE $value / 2 COMMENT 'a/b';
+DEFINE TABLE isp_rview AS SELECT * FROM isp_rx WHERE code = /a/ PERMISSIONS FULL;
+DEFINE PARAM $isp_re VALUE /^a+$/;
+"""
+
+_ADMIN_WRITES = {"select": "FULL", "create": "WHERE $auth.admin = true", "update": "WHERE $auth.admin = true"}
+_TABLE_ACTIONS = ("select", "create", "update", "delete")
+
+
+class TestRegularExpressionsE2E:
+    """M47 on the line under test and on ``mem://``: a regex or the graph wildcard ends its expression, and the
+    clauses after it — ``PERMISSIONS``, ``COMMENT`` — are read, with no issue."""
+
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    async def test_clauses_after_a_regex_or_a_graph_wildcard(self, kind: str) -> None:
+        async with _isp(kind, _M47_DDL):
+            schema = await DatabaseIntrospector("isp", tables=["isp_rview", "isp_rx"]).introspect()
+        assert schema.issues == ()
+        fields = schema.tables["isp_rx"].fields
+        _check(
+            fields["countrycode"],
+            value="$value OR $before OR 'GBR'",
+            assertion="$value = /[A-Z]{3}/",
+            comment=None,
+            permissions=dict.fromkeys(("select", "create", "update"), "FULL"),
+        )
+        _check(
+            fields["zip"],
+            field_type="string",
+            nullable=True,
+            assertion="$value = NONE OR $value = /^[0-9]{5}$/",
+            permissions=_ADMIN_WRITES,
+        )
+        _check(fields["code"], assertion="$value = /^[a-z]+$/", comment="lower only")
+        _check(fields["fans"], value="<-isp_likes<-?", comment=None)
+        _check(
+            fields["k"],
+            default="'x'",
+            permissions={"select": "WHERE $auth.email = /@corp$/", "create": "FULL", "update": "FULL"},
+        )
+        _check(fields["half"], value="$value / 2", comment="a/b")
+        view = schema.tables["isp_rview"]
+        _check(view, view_query="SELECT * FROM isp_rx WHERE code = /a/", permissions=dict.fromkeys(_TABLE_ACTIONS, "FULL"))
+        _check(schema.params["isp_re"], value="/^a+$/", permissions="FULL", comment=None)
+        source = ModelCodeGenerator().generate(schema)
+        assert '    k: str = "x"\n' in source
+        assert '    fans: Computed[Any] = computed("<-isp_likes<-?")\n' in source
+        assert "PERMISSIONS" not in source
+
+
 @contextlib.contextmanager
 def _imported(path: pathlib.Path) -> Iterator[ModuleType]:
     """The module written at *path*, imported under a unique name; removed from ``sys.modules`` on exit."""
