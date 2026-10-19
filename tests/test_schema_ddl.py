@@ -2320,6 +2320,31 @@ class TestEventsE2E:
             assert _leaks(raised.value, _SECRET) == []
 
     @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_failing_then_refuses_the_write_by_line(self, kind: str) -> None:
+        # The 2.x/3.x table's row "An event whose THEN fails": 3.x names the event; 2.x gives "An error occurred: …"
+        # for a THROW and the bare cause for any other error.
+        thrower = Event("ev_throw", when="$after.k = 1", then="THROW 'nope'")
+        duplicate = Event("ev_dup", when="$after.k = 2", then="CREATE ev_log:dup")
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            await SurrealDBConnectionManager.define_event(thrower, "ev_person")
+            await SurrealDBConnectionManager.define_event(duplicate, "ev_person")
+            await client.query("CREATE ev_log:dup;", {})
+            with pytest.raises(ServerError) as thrown:
+                await client.query("CREATE ev_person:a SET k = 1;", {})
+            with pytest.raises(ServerError) as failed:
+                await client.query("CREATE ev_person:b SET k = 2;", {})
+            assert await client.query("SELECT * FROM ev_person;", {}) == []
+            major = await _major(client)
+        assert type(thrown.value).__name__ == type(failed.value).__name__ == "InternalError"
+        cause = "Database record `ev_log:dup` already exists"
+        if major >= 3:
+            assert str(thrown.value) == "Error while processing event ev_throw: An error occurred: nope"
+            assert str(failed.value) == f"Error while processing event ev_dup: {cause}"
+        else:
+            assert str(thrown.value) == "An error occurred: nope"
+            assert str(failed.value) == cause
+
+    @pytest.mark.parametrize("kind", _KINDS)
     async def test_input_differs_by_line(self, kind: str) -> None:
         # AC-7 (M5): $input is the write's input on 3.x, NONE on 2.x and the embedded engine.
         recorder = Event("ev_input", then="CREATE ev_log SET kind = 'input', inp = $input")
@@ -3561,7 +3586,7 @@ _EVENT_ROWS = [
     ],
     [
         "An event whose `THEN` fails (a `THROW`, an error)",
-        "the write is refused; the SDK's `InternalError` (`An error occurred: …`)",
+        "the write is refused; the SDK's `InternalError` (`An error occurred: …` for a `THROW`, the bare cause otherwise)",
         "the write is refused; the SDK's `InternalError` (`Error while processing event <name>: …`)",
         "v0.31.0",
     ],
