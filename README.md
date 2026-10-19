@@ -2196,8 +2196,12 @@ reads, a `timedelta` is converted from the SDK's duration at any depth too: a to
 `list[timedelta]`, `dict[str, timedelta]`, `timedelta | str` or a sub-model's `timedelta` field
 all read a `timedelta`, floored to the microsecond (declare `Duration` to keep the nanoseconds).
 Your validators (any mode) and `model_post_init` still apply once to the value read, even when they
-change it in place. A naive `datetime` stays naive on the instance and is read back as an aware UTC
-`datetime`, as before.
+change it in place. A naive `datetime` is written as UTC and read back as an aware UTC `datetime`.
+The instance keeps it naive until a call applies the row the server returns (see
+[After a write that returns the row](#after-a-write-that-returns-the-row)): after `save()` (since
+#261 with an explicit id too), `refresh()`, `merge()` (default `refresh=True`), `upsert()`,
+`patch()` or an `atomic_*` helper, the field holds that aware UTC `datetime`, so compare it with
+aware values. `update()`, and `save(tx=)` in a buffered transaction, leave it naive.
 
 #### `Duration`
 
