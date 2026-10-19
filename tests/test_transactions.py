@@ -1,3 +1,4 @@
+import asyncio
 import contextlib
 import os
 from typing import Any
@@ -1224,6 +1225,52 @@ class TestInteractiveFailedStatementUnits:
         await tx.commit()
         assert ("commit", "TXN") in c.calls
         assert ("cancel", "TXN") not in c.calls
+
+
+class _SlowTxnClient(_FakeTxnClient):
+    """``_FakeTxnClient`` whose requests never answer."""
+
+    async def query_raw(self, sql: str, params: Any = None, session_id: Any = None, txn_id: Any = None) -> dict[str, Any]:
+        self.calls.append(("query_raw", txn_id))
+        await asyncio.sleep(10)
+        raise AssertionError("unreachable")
+
+    async def query(self, sql: str, vars: Any = None, session_id: Any = None, txn_id: Any = None) -> Any:
+        self.calls.append(("query", txn_id))
+        await asyncio.sleep(10)
+
+
+class TestInterruptedStatementUnits:
+    """A statement interrupted inside the block (a timeout, a task cancellation) fails the transaction too."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["add", "run_read"])
+    async def test_commit_after_an_interrupted_statement_cancels_and_raises(self, path: str) -> None:
+        c = _SlowTxnClient()
+        tx = InteractiveTransaction(c, "TXN")
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.01):
+                await getattr(tx, path)("SELECT 1;", {})
+        with pytest.raises(SurrealDbError, match="nothing was committed"):
+            await tx.commit()
+        assert ("commit", "TXN") not in c.calls
+        assert c.calls.count(("cancel", "TXN")) == 1
+
+
+class TestFailedStatementReadme:
+    """The README's 2.x vs 3.x table says where the v0.30.3 row was measured."""
+
+    def test_server_behaviour_header_sentence(self) -> None:
+        from tests.test_embedded import _normalised, _readme_part
+        from tests.test_time_travel import _SERVER_BEHAVIOUR
+
+        header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
+        v0300 = "Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs."
+        v0303 = (
+            "The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded "
+            "engine, identical on 3.1.5."
+        )
+        assert f"{v0300} {v0303}" in header, header
 
 
 class TxFailRow(BaseSurrealModel):
