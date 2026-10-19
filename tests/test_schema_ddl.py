@@ -3,9 +3,10 @@ SurrealQL fragment (``define_parser.scan_fragment()``), the kind reader's free-t
 renderers (``Event.ddl()``, ``function_ddl()``, the removal statements).
 
 Unit tests (no server): ``scan_fragment()`` (spec §6.2), ``Event``'s construction and the exact texts of E1–E11
-(spec §5.1, §5.6; AC-2), the ``_KindReader.raw_argument()`` hardening (spec §6.2), and the golden statements of spec
-§5.2 with the exact texts of E12–E13 and F1–F9 (AC-3). The check catches mistakes and is not an injection defence:
-every refused input below is a plain malformed name, fragment or kind.
+(spec §5.1, §5.6; AC-2), the ``_KindReader.raw_argument()`` hardening (spec §6.2), the golden statements of spec
+§5.2 with the exact texts of E12–E13 and F1–F9 (AC-3), and the events of a model — ``SurrealConfigDict(events=)``,
+``get_events()``, ``event_ddl()`` and the exact texts of E14 (spec §5.3; AC-4). The check catches mistakes and is not
+an injection defence: every refused input below is a plain malformed name, fragment or kind.
 """
 
 import dataclasses
@@ -15,7 +16,7 @@ from typing import Any
 import pytest
 
 import surreal_orm_lite
-from surreal_orm_lite import SurrealDBConnectionManager, schema
+from surreal_orm_lite import BaseSurrealEdge, BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager, schema
 from surreal_orm_lite.define_parser import (
     DefineParseError,
     KLiteral,
@@ -1041,3 +1042,173 @@ class TestFunctionDdl:
         assert "canonical form" in text
         assert "cannot inject" not in text
         assert "cannot close" not in text
+
+
+# --- AC-4: events on the model (spec §5.3, §5.6 E14) ---------------------------------------------------------------
+
+_MD_RENAME = Event(
+    "ev_rename",
+    when="$event = 'UPDATE' AND $before.name != $after.name",
+    then="CREATE ev_log SET kind = 'rename', old = $before.name, new = $after.name",
+)
+_MD_AUDIT = Event("ev_audit", then=_AUDIT_THEN)
+
+
+class EvMdPerson(BaseSurrealModel):
+    """Two events, declared rename first: ``get_events()`` keeps that order (not sorted by name)."""
+
+    model_config = SurrealConfigDict(table_name="ev_md_person", events=[_MD_RENAME, _MD_AUDIT])
+
+    name: str
+
+
+class EvMdArchived(EvMdPerson):
+    """Another table, no ``events`` of its own: it inherits the parent's (D16)."""
+
+    model_config = SurrealConfigDict(table_name="ev_md_archived")
+
+
+class EvMdQuiet(EvMdPerson):
+    """``events=[]`` overrides the inherited events: none."""
+
+    model_config = SurrealConfigDict(table_name="ev_md_quiet", events=[])
+
+
+class EvMdTuple(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="ev_md_tuple", events=(_MD_AUDIT,))
+
+
+class EvMdPlain(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="ev_md_plain")
+
+
+class EvMdNone(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="ev_md_none", events=None)
+
+
+class EvMdFollows(BaseSurrealEdge):
+    """An edge model: its events fire on the edge table."""
+
+    model_config = SurrealConfigDict(table_name="ev_md_follows", events=[_MD_AUDIT])
+
+
+class TestModelEvents:
+    """AC-4: ``SurrealConfigDict(events=)``, ``get_events()``, ``event_ddl()`` and E14 (spec §5.3, §5.6)."""
+
+    def test_get_events_is_a_tuple_in_declaration_order(self) -> None:
+        events = EvMdPerson.get_events()
+        assert type(events) is tuple
+        assert events == (_MD_RENAME, _MD_AUDIT)
+        assert events[0] is _MD_RENAME
+        assert events[1] is _MD_AUDIT
+
+    def test_event_ddl_renders_every_event_on_the_model_table(self) -> None:
+        assert EvMdPerson.event_ddl() == [event.ddl("ev_md_person") for event in (_MD_RENAME, _MD_AUDIT)]
+        assert EvMdPerson.event_ddl() == [
+            "DEFINE EVENT OVERWRITE `ev_rename` ON `ev_md_person` WHEN $event = 'UPDATE' AND $before.name != "
+            "$after.name THEN { CREATE ev_log SET kind = 'rename', old = $before.name, new = $after.name };",
+            "DEFINE EVENT OVERWRITE `ev_audit` ON `ev_md_person` THEN { CREATE ev_log SET kind = $event, rid = $value.id };",
+        ]
+
+    def test_event_ddl_without_overwrite_keeps_what_exists(self) -> None:
+        statements = EvMdPerson.event_ddl(overwrite=False)
+        assert statements == [event.ddl("ev_md_person", overwrite=False) for event in (_MD_RENAME, _MD_AUDIT)]
+        assert all(statement.startswith("DEFINE EVENT IF NOT EXISTS `") for statement in statements)
+
+    def test_overwrite_is_keyword_only(self) -> None:
+        event_ddl: Any = EvMdPerson.event_ddl
+        with pytest.raises(TypeError):
+            event_ddl(False)
+
+    def test_event_ddl_is_deterministic(self) -> None:
+        assert EvMdPerson.event_ddl() == EvMdPerson.event_ddl()
+
+    @pytest.mark.parametrize("model", [EvMdPlain, EvMdNone], ids=["no-key", "None"])
+    def test_a_model_without_events(self, model: type[BaseSurrealModel]) -> None:
+        assert model.get_events() == ()
+        assert type(model.get_events()) is tuple
+        assert model.event_ddl() == []
+        assert model.event_ddl(overwrite=False) == []
+
+    def test_a_tuple_is_accepted(self) -> None:
+        assert EvMdTuple.get_events() == (_MD_AUDIT,)
+        assert EvMdTuple.event_ddl() == [_MD_AUDIT.ddl("ev_md_tuple")]
+
+    def test_a_subclass_inherits_the_events_on_its_own_table(self) -> None:
+        assert EvMdArchived.get_events() == EvMdPerson.get_events()
+        assert EvMdArchived.event_ddl() == [event.ddl("ev_md_archived") for event in (_MD_RENAME, _MD_AUDIT)]
+        # The parent still renders on its own table.
+        assert EvMdPerson.event_ddl() == [event.ddl("ev_md_person") for event in (_MD_RENAME, _MD_AUDIT)]
+
+    def test_a_subclass_can_drop_the_inherited_events(self) -> None:
+        assert EvMdQuiet.get_events() == ()
+        assert EvMdQuiet.event_ddl() == []
+        assert EvMdPerson.get_events() == (_MD_RENAME, _MD_AUDIT)
+
+    def test_an_edge_model_renders_on_its_edge_table(self) -> None:
+        assert EvMdFollows.get_events() == (_MD_AUDIT,)
+        assert EvMdFollows.event_ddl() == [
+            "DEFINE EVENT OVERWRITE `ev_audit` ON `ev_md_follows` THEN { CREATE ev_log SET kind = $event, rid = $value.id };"
+        ]
+
+    async def test_works_with_no_connection_configured(self) -> None:
+        await SurrealDBConnectionManager.unset_connection()
+        assert SurrealDBConnectionManager.is_connection_set() is False
+        assert EvMdPerson.get_events() == (_MD_RENAME, _MD_AUDIT)
+        assert EvMdPerson.event_ddl() == [event.ddl("ev_md_person") for event in (_MD_RENAME, _MD_AUDIT)]
+
+    # --- E14, at the class statement --------------------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("events", "error", "text"),
+        [
+            ("x", TypeError, "EvMdBad: model_config['events'] must be a list or tuple of Event, got str."),
+            (_MD_AUDIT, TypeError, "EvMdBad: model_config['events'] must be a list or tuple of Event, got Event."),
+            ({_MD_AUDIT}, TypeError, "EvMdBad: model_config['events'] must be a list or tuple of Event, got set."),
+            ([1], TypeError, "EvMdBad: model_config['events'] holds a int, not an Event."),
+            ((_MD_AUDIT, "e"), TypeError, "EvMdBad: model_config['events'] holds a str, not an Event."),
+            (
+                [Event("a", then="NONE"), Event("a", when="true", then="NONE")],
+                ValueError,
+                "EvMdBad: model_config['events'] declares the event 'a' more than once.",
+            ),
+            (
+                (_MD_AUDIT, _MD_RENAME, _MD_AUDIT),
+                ValueError,
+                "EvMdBad: model_config['events'] declares the event 'ev_audit' more than once.",
+            ),
+        ],
+        ids=["str", "one-event", "set", "int-item", "str-item", "duplicate-name", "duplicate-event"],
+    )
+    def test_e14_at_the_class_statement(self, events: Any, error: type[Exception], text: str) -> None:
+        with pytest.raises(error) as raised:
+
+            class EvMdBad(BaseSurrealModel):
+                model_config = SurrealConfigDict(table_name="ev_md_bad", events=events)
+
+        assert type(raised.value) is error
+        assert str(raised.value) == text
+
+    def test_e14_names_the_subclass(self) -> None:
+        with pytest.raises(TypeError) as raised:
+
+            class EvMdBadChild(EvMdPerson):
+                model_config = SurrealConfigDict(events=[_MD_AUDIT, 1])  # type: ignore[list-item]
+
+        assert str(raised.value) == "EvMdBadChild: model_config['events'] holds a int, not an Event."
+
+    def test_e14_on_an_edge_model(self) -> None:
+        with pytest.raises(ValueError) as raised:
+
+            class EvMdBadEdge(BaseSurrealEdge):
+                model_config = SurrealConfigDict(table_name="ev_md_bad_edge", events=[_MD_AUDIT, _MD_AUDIT])
+
+        assert str(raised.value) == "EvMdBadEdge: model_config['events'] declares the event 'ev_audit' more than once."
+
+    def test_a_bad_event_fails_at_the_class_statement(self) -> None:
+        with pytest.raises(ValueError) as raised:
+
+            class EvMdBadEvent(BaseSurrealModel):
+                model_config = SurrealConfigDict(events=[Event("e", then="(1")])
+
+        assert str(raised.value) == _embed_error("then", _R_BRACKETS)

@@ -371,3 +371,25 @@ def remove_function_statement(function: str, missing_ok: bool) -> str:
     """
     name = normalize_function_name(function)
     return f"REMOVE FUNCTION{_missing_clause(missing_ok)} {name};"
+
+
+def check_events_config(model: type, value: object) -> None:
+    """The ``events`` key of a model's ``SurrealConfigDict``, checked when the class is defined (v0.31.0).
+
+    ``None`` (no events) is not passed here. *value* must be a ``list`` or a ``tuple`` of ``Event`` with distinct
+    names: two events of one table cannot share a name, the second definition would replace the first. Each ``Event``
+    was checked when it was built. The messages name *model*.
+
+    :raises TypeError: *value* is not a ``list`` or a ``tuple``, or holds something other than an ``Event``.
+    :raises ValueError: two events share a name.
+    """
+    key = f"{model.__name__}: model_config['events']"
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"{key} must be a list or tuple of Event, got {type(value).__name__}.")
+    names: set[str] = set()
+    for event in value:
+        if not isinstance(event, Event):
+            raise TypeError(f"{key} holds a {type(event).__name__}, not an Event.")
+        if event.name in names:
+            raise ValueError(f"{key} declares the event {event.name!r} more than once.")
+        names.add(event.name)

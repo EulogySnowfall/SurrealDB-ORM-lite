@@ -24,6 +24,7 @@ from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, _ComputedDefault
 from .routing import check_config_connection, check_same_connection, check_transaction
+from .schema import Event, check_events_config
 from .signals import (
     around_delete,
     around_save,
@@ -540,6 +541,12 @@ class SurrealConfigDict(ConfigDict, total=False):
             SurrealDB-ORM key. Checked when the class is defined (a non-empty ``str``), inherited
             by subclasses unless they set their own; registered or not is checked at the model's
             first database call.
+        events (Sequence[Event] | None): Server-side events of the model's table (v0.31.0) —
+            ``Event(...)`` objects, rendered by ``event_ddl()`` and applied by ``define_events()``.
+            Documented as ``Event`` in the full SurrealDB-ORM; here a ``SurrealConfigDict`` key, as
+            every model option. Checked when the class is defined (a ``list`` or ``tuple`` of
+            ``Event`` with distinct names), inherited by subclasses unless they set their own — a
+            subclass with another table defines the same events on its own table.
     """
 
     table_name: str | None
@@ -547,6 +554,9 @@ class SurrealConfigDict(ConfigDict, total=False):
 
     connection: str | None
     ' The named connection this model reads and writes (v0.29.0); default: ``"default"``. Full SurrealDB-ORM key. '
+
+    events: Sequence[Event] | None
+    " Server-side events of the model's table (v0.31.0): Event(...) objects, applied by define_events(). "
 
     primary_key: str | None
     " The primary key field name for the model. "
@@ -674,7 +684,9 @@ class BaseSurrealModel(BaseModel):
         ``__init_subclass__`` runs too early: the merged ``model_config`` does not exist yet.
         A bad name fails at the ``class`` statement rather than on the first query, because
         ``get_table_name()`` is interpolated into SurrealQL. The ``connection`` key (v0.29.0) is
-        checked here too: a non-empty ``str``, or ``None`` for the default connection.
+        checked here too: a non-empty ``str``, or ``None`` for the default connection. So is the
+        ``events`` key (v0.31.0): ``None``, or a ``list`` or ``tuple`` of ``Event`` with distinct
+        names — an inherited value is checked again, the messages naming the subclass.
 
         The deprecated ``_table_name: ClassVar[str]`` is checked the same way and warns once,
         where it is defined — a subclass inheriting it does not warn again.
@@ -686,6 +698,9 @@ class BaseSurrealModel(BaseModel):
         connection = cls.model_config.get("connection")
         if connection is not None:
             check_config_connection(cls, connection)
+        events = cls.model_config.get("events")
+        if events is not None:
+            check_events_config(cls, events)
         legacy = cls.__dict__.get("_table_name")
         if isinstance(legacy, str):
             _check_table_name(cls, "_table_name", legacy)
@@ -777,6 +792,40 @@ class BaseSurrealModel(BaseModel):
         # Cheap even inside a transaction: get_client() returns the already-connected client.
         client = await cls._connection_manager().get_client()
         return await apply_ddl_statements(statements, client=client, tx=tx, what="computed field")
+
+    # ==================== Server-side events (v0.31.0) ====================
+
+    @classmethod
+    def get_events(cls) -> tuple[Event, ...]:
+        """Return the events declared in ``model_config = SurrealConfigDict(events=[...])``, in declaration order.
+
+        A tuple; ``()`` when the model declares none. A subclass inherits its parent's events unless it sets
+        ``events`` itself (``events=[]`` drops them).
+        """
+        events = cls.model_config.get("events")
+        # Checked at the class statement: a list or tuple of Event, or None.
+        return tuple(events) if isinstance(events, (list, tuple)) else ()
+
+    @classmethod
+    def event_ddl(cls, *, overwrite: bool = True) -> list[str]:
+        """Render the ``DEFINE EVENT`` statements of this model's events on its table (v0.31.0).
+
+        Pure: builds the SurrealQL without touching the database (no connection needed), the same text
+        every time, so it can be printed, diffed or fed into a migration. One statement per event of
+        :meth:`get_events`, in declaration order, each ``Event.ddl()`` on :meth:`get_table_name`; ``[]`` when the
+        model declares none.
+
+        Args:
+            overwrite: ``True`` (default) emits ``DEFINE EVENT OVERWRITE …`` — the model is the source of truth,
+                so re-running converges the database onto the code. ``False`` emits
+                ``DEFINE EVENT IF NOT EXISTS …``, which never disturbs an existing definition.
+
+        Example:
+            >>> Account.event_ddl()
+            ["DEFINE EVENT OVERWRITE `email_audit` ON `account` WHEN $before.email != $after.email THEN { … };"]
+        """
+        table = cls.get_table_name()
+        return [event.ddl(table, overwrite=overwrite) for event in cls.get_events()]
 
     # ==================== Field aliases & server-owned fields (v0.18.0) ====================
 
