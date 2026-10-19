@@ -399,7 +399,7 @@ def check_events_config(model: type, value: object) -> None:
 
 
 async def ensure_async_events_supported(client: Any, events: Iterable[Event], *, embedded: bool) -> None:
-    """C1: refuse ``ASYNC`` events on a connection that runs SurrealDB before 3.x, before any DDL is sent.
+    """Refuse ``ASYNC`` events on a connection that runs SurrealDB before 3.x, before any DDL is sent.
 
     ``ASYNC`` events exist on SurrealDB 3.x only: 2.x servers and the embedded engine fail to parse the clause. When
     one of *events* has ``async_mode=True``, the line is read from ``client.version()`` — once, and only then, so
