@@ -352,8 +352,28 @@ class TestScanner:
             "IF a { 1 } ELSE " * 3000 + "{ 2 }",
             "$a / " * 5000 + "1",  # divisions: each slash looks for a closing one up to the next slash only
             "/a/ + " * 5000 + "1",
+            # Slashes no later slash closes: each one must not search the rest of the text again.
+            "/" + "\\/" * 50000,
+            "\\/" * 50000,
+            "/a" + " \\/" * 30000,
+            "/" * 100000,
+            "/" * 100001,
+            "a / " * 50000 + "1",
         ],
-        ids=["plain-ifs", "nested-units", "nested-brackets", "brace-chain", "divisions", "regexes"],
+        ids=[
+            "plain-ifs",
+            "nested-units",
+            "nested-brackets",
+            "brace-chain",
+            "divisions",
+            "regexes",
+            "escaped-slashes",
+            "escaped-slashes-only",
+            "unclosed-regex",
+            "even-slashes",
+            "odd-slashes",
+            "many-divisions",
+        ],
     )
     def test_scan_stays_linear(self, body: str) -> None:
         # Server text is not trusted to be small or kind: a quadratic scan of the first case takes seconds.

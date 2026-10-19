@@ -336,20 +336,36 @@ def canonical_name(path: Sequence[str]) -> str:
 # --- depth: brackets and IF units ----------------------------------------------------------------------------------
 
 
-def _regex_end(text: str, pos: int) -> int | None:
-    """The position after the regex literal whose opening ``/`` is at *pos*, or ``None`` when no ``/`` closes it.
+def _closing_slash(text: str, begin: int) -> int | None:
+    """The first ``/`` at or after *begin* (``begin >= 1``) with no backslash right before it, or ``None``."""
+    index = text.find("/", begin)
+    while index != -1 and text[index - 1] == "\\":
+        index = text.find("/", index + 1)
+    return None if index == -1 else index
 
-    As the servers' lexers read it: ``\\/`` is an escaped slash, any other backslash a character of the regex; a quote
-    opens nothing inside it.
+
+class _RegexEnds:
+    """Where the regex literals opening at the slashes of one text end, asked for in increasing positions.
+
+    As the servers' lexers read a regex: ``\\/`` is an escaped slash, any other backslash a character of the regex; a
+    quote opens nothing inside it. So the ``/`` that closes a regex opening at *pos* is the first one after *pos* with
+    no backslash right before it, whatever lies between. The closing slash found for one ``/`` answers every ``/``
+    before it, and a search that found none answers every later one: the text is searched once in all, never again
+    from each slash (``/\\/\\/…\\/`` would otherwise take a time quadratic in its length).
     """
-    index = pos + 1
-    length = len(text)
-    while index < length:
-        char = text[index]
-        if char == "/":
-            return index + 1
-        index += 2 if char == "\\" and text.startswith("/", index + 1) else 1
-    return None
+
+    __slots__ = ("_closing", "_text")
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self._closing: int | None = -1  # the last closing slash found, -1 before any search, None for none at all
+
+    def end(self, pos: int) -> int | None:
+        """The position after the regex literal whose opening ``/`` is at *pos* — greater than any position asked
+        for before — or ``None`` when no ``/`` closes it."""
+        if self._closing is not None and self._closing <= pos:
+            self._closing = _closing_slash(self._text, pos + 1)
+        return None if self._closing is None else self._closing + 1
 
 
 def _operand_follows(text: str, previous: _Lexeme | None, start: int) -> bool | None:
@@ -372,15 +388,15 @@ def _operand_follows(text: str, previous: _Lexeme | None, start: int) -> bool | 
     return not (char in _GLUED_AFTER_OPERAND and glued and glued in _GLUED_AFTER_OPERAND[char])
 
 
-def _slash(text: str, pos: int, previous: _Lexeme | None, start: int) -> tuple[str, int]:
+def _slash(text: str, pos: int, previous: _Lexeme | None, start: int, regexes: _RegexEnds) -> tuple[str, int]:
     """``(kind, end)`` of the token a ``/`` at *pos* starts: a regex literal up to its closing ``/``, or the division.
 
     The servers render a division with a space on both sides, so a ``/`` before anything else opens a regex. A ``/``
     and a space open one — a regex starting with a space — where an operand comes (``_operand_follows``). Where that
     cannot be told (after a keyword a bare identifier may spell) and a later ``/`` could close a regex,
-    ``DefineParseError(_R_AMBIGUOUS)``: the slash is never guessed.
+    ``DefineParseError(_R_AMBIGUOUS)``: the slash is never guessed. *regexes* finds the closing ``/``.
     """
-    end = _regex_end(text, pos)
+    end = regexes.end(pos)
     if end is None:
         return _PUNCT_TOKEN, pos + 1
     if not text[pos + 1].isspace():
@@ -396,6 +412,7 @@ def _lex(text: str, start: int) -> list[_Lexeme]:
     that may open a regex or divide (``_slash``)."""
     lexemes: list[_Lexeme] = []
     previous: _Lexeme | None = None  # the last token that is not whitespace
+    regexes = _RegexEnds(text)
     pos = start
     length = len(text)
     while pos < length:
@@ -412,7 +429,7 @@ def _lex(text: str, start: int) -> list[_Lexeme]:
                 raise DefineParseError(_R_IDENT)
             kind, end = _IDENT_TOKEN, closed
         elif char == "/":
-            kind, end = _slash(text, pos, previous, start)
+            kind, end = _slash(text, pos, previous, start, regexes)
         elif (word := _WORD.match(text, pos)) is not None:
             kind, end = _WORD_TOKEN, word.end()
         elif (space := _SPACE.match(text, pos)) is not None:
