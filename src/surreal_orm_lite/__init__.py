@@ -67,6 +67,7 @@ from .introspection import (
     SchemaIssue,
     SchemaState,
     TableState,
+    generate_models_from_db,
 )
 from .live import LiveModelStream, LiveStream, ModelChangeEvent, ReconnectCallback
 from .model_auth import AuthenticatedUserMixin, AuthResult
@@ -184,6 +185,7 @@ __all__ = [
     # Schema introspection (v0.30.0)
     "DatabaseIntrospector",
     "ModelCodeGenerator",
+    "generate_models_from_db",
     "SchemaState",
     "TableState",
     "FieldState",

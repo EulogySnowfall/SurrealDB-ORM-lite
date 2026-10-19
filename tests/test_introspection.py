@@ -1,36 +1,50 @@
 """Schema introspection (v0.30.0): ``DatabaseIntrospector`` reads a database's schema with ``INFO FOR DB`` and one
-``INFO FOR TABLE`` per table (spec §5.1, §5.5–§5.7, §6.2, §7).
+``INFO FOR TABLE`` per table (spec §5.1, §5.5–§5.7, §6.2, §7); ``generate_models_from_db()`` writes the models generated
+from it (spec §5.3).
 
-Unit tests first, with a fake client installed on the resolved connection class (no server): the exports, the
-statements sent (AC-3), the sections read, the errors E1–E7 and E9, the issues I1–I5 with the secret check (AC-10) and
-the connection resolution (AC-4). Then the classes suffixed ``E2E``, on the line under test (``SURREALDB_PORT``) and on
-``mem://``: the portable fixture of spec §9.3 (AC-5), connections, HTTP and transactions (AC-4), a spy on the real
-client (AC-3), the one-line-only items through ``_require_ddl`` (AC-8, spec §9.4), the record-user refusal and the
-removed database (AC-10). E2E tables are prefixed ``isp_`` (plus the fixture's ``select``) and live in the database
-``isp_db`` of namespace ``ns``, read through the named connection ``"isp"``; a test reading the default connection
-passes ``tables=``.
+Unit tests first, with a fake client installed on the resolved connection class (no server): the exports (AC-1), the
+statements sent (AC-3), the sections read, the errors E1–E7 and E9, the issues I1–I5 with the secret check (AC-10),
+the connection resolution (AC-4), and ``generate_models_from_db()``'s arguments, E8 and files (AC-14). Then the classes
+suffixed ``E2E``, on the line under test (``SURREALDB_PORT``) and on ``mem://``: the portable fixture of spec §9.3
+(AC-5), connections, HTTP and transactions (AC-4), a spy on the real client (AC-3), the one-line-only items through
+``_require_ddl`` (AC-8, spec §9.4), the record-user refusal and the removed database (AC-10), and the round trip — the
+§9.3 golden source on every line (AC-9), the generated models saving and reading the fixture's rich values back
+(AC-13), ``server_fields`` by attribute name (AC-18). E2E tables are prefixed ``isp_`` (plus the fixture's ``select``
+and AC-18's ``Select``) and live in the database ``isp_db`` of namespace ``ns``, read through the named connection
+``"isp"``; a test reading the default connection passes ``tables=``.
 """
 
 import contextlib
+import importlib.util
 import inspect
 import logging
 import os
-from collections.abc import AsyncIterator, Callable, Mapping
+import pathlib
+import stat
+import sys
+import uuid
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from datetime import UTC, datetime
+from decimal import Decimal
+from types import ModuleType
 from typing import Any
 from unittest import mock
 
 import pytest
-from surrealdb import AsyncSurreal
+from surrealdb import AsyncSurreal, RecordID
 
 import surreal_orm_lite
 from surreal_orm_lite import (
     AccessState,
     AnalyzerState,
     DatabaseIntrospector,
+    Duration,
     EventState,
     FieldState,
     FunctionState,
+    GeometryPoint,
     IndexState,
+    ModelCodeGenerator,
     ParamState,
     SchemaIssue,
     SchemaState,
@@ -40,6 +54,7 @@ from surreal_orm_lite import (
     SurrealDbError,
     SurrealDbNotFoundError,
     TableState,
+    generate_models_from_db,
 )
 from surreal_orm_lite import introspection as introspection_module
 from surreal_orm_lite.define_parser import (
@@ -53,11 +68,13 @@ from surreal_orm_lite.define_parser import (
     _R_STRING,
 )
 from tests.conftest import orm_client
+from tests.test_model_generator import GOLDEN
 
-#: The names spec §5.8 exports that this module provides so far (``generate_models_from_db`` joins them later).
+#: The 13 names spec §5.8 exports (AC-1).
 _EXPORTS = (
     "DatabaseIntrospector",
     "ModelCodeGenerator",
+    "generate_models_from_db",
     "SchemaState",
     "TableState",
     "FieldState",
@@ -180,13 +197,33 @@ _TABLE_B = "DEFINE TABLE b TYPE ANY SCHEMALESS PERMISSIONS NONE"
 
 
 class TestExports:
-    """AC-1 (part): the reader and the state classes import from the package and from ``introspection``."""
+    """AC-1: the 13 names of spec §5.8 import from the package and from ``introspection``, with their signatures."""
 
     def test_names_are_exported(self) -> None:
+        assert len(_EXPORTS) == 13
         for name in _EXPORTS:
             assert name in surreal_orm_lite.__all__, name
             assert name in introspection_module.__all__, name
             assert getattr(surreal_orm_lite, name) is getattr(introspection_module, name)
+        assert sorted(introspection_module.__all__) == sorted(_EXPORTS)
+
+    def test_the_names_import(self) -> None:
+        namespace: dict[str, Any] = {}
+        exec(f"from surreal_orm_lite import {', '.join(_EXPORTS)}", namespace)
+        exec(f"from surreal_orm_lite.introspection import {', '.join(_EXPORTS)}", namespace)
+        assert all(name in namespace for name in _EXPORTS)
+
+    def test_generate_models_from_db_signature(self) -> None:
+        assert inspect.iscoroutinefunction(generate_models_from_db)
+        assert inspect.iscoroutinefunction(ModelCodeGenerator.generate) is False
+        parameters = inspect.signature(generate_models_from_db).parameters
+        assert [(p.name, p.kind, p.default) for p in parameters.values()] == [
+            ("output_path", inspect.Parameter.POSITIONAL_OR_KEYWORD, None),
+            ("connection", inspect.Parameter.POSITIONAL_OR_KEYWORD, None),
+            ("tables", inspect.Parameter.KEYWORD_ONLY, None),
+            ("overwrite", inspect.Parameter.KEYWORD_ONLY, True),
+        ]
+        assert parameters["overwrite"].default is True
 
     def test_the_state_classes_are_the_schema_state_ones(self) -> None:
         from surreal_orm_lite import schema_state
@@ -714,6 +751,274 @@ class TestConnections:
         assert (await introspector.introspect()).connection == "default"
 
 
+#: A table whose generated source holds a non-ASCII alias, so the file tests see it written as UTF-8.
+_GEN_TABLE = "DEFINE TABLE isp_gen TYPE NORMAL SCHEMAFULL PERMISSIONS NONE"
+_GEN_FIELD = "DEFINE FIELD `café` ON isp_gen TYPE option<string> PERMISSIONS FULL"
+_GEN_STATEMENTS = ["INFO FOR DB;", "INFO FOR TABLE `isp_gen`;"]
+
+
+class _HookClient(_FakeClient):
+    """A fake client that runs *hook* when it receives ``INFO FOR DB;`` — after the arguments and E8 are checked."""
+
+    def __init__(self, hook: Callable[[], None]) -> None:
+        super().__init__(_db(tables={"isp_gen": _GEN_TABLE}), tables={"isp_gen": _table(fields={"café": _GEN_FIELD})})
+        self.hook = hook
+
+    async def query(self, sql: str, vars: object = None, *args: object, **kwargs: object) -> object:
+        if sql == "INFO FOR DB;":
+            self.hook()
+        return await super().query(sql, vars, *args, **kwargs)
+
+
+def _gen_client() -> _FakeClient:
+    return _HookClient(lambda: None)
+
+
+def _e8(output_path: str | os.PathLike[str]) -> str:
+    """E8 (spec §5.6) for *output_path*."""
+    return f"{os.fspath(output_path)!r} already exists: overwrite=False refuses to replace it."
+
+
+def _temporary_files(directory: pathlib.Path) -> list[str]:
+    """The ``.<name>.<hex>.tmp`` files the atomic replacement may leave in *directory* (spec §5.3)."""
+    return sorted(path.name for path in directory.iterdir() if path.name.endswith(".tmp"))
+
+
+def _new_file_mode(directory: pathlib.Path) -> int:
+    """The permission bits ``open()`` gives a new file in *directory* (the umask's)."""
+    reference = directory / f"reference-{uuid.uuid4().hex}"
+    with open(reference, "x", encoding="utf-8"):
+        pass
+    try:
+        return stat.S_IMODE(reference.stat().st_mode)
+    finally:
+        reference.unlink()
+
+
+def _failing_writes(monkeypatch: pytest.MonkeyPatch, name: str) -> OSError:
+    """Make every ``write`` to a file named *name* or ``.<name>.*.tmp`` fail; return the error raised."""
+    error = OSError("No space left on device")
+    real_open = pathlib.Path.open
+
+    def open_(self: pathlib.Path, *args: Any, **kwargs: Any) -> Any:
+        file = real_open(self, *args, **kwargs)
+        if self.name == name or (self.name.startswith(f".{name}.") and self.name.endswith(".tmp")):
+
+            def write(text: str) -> int:
+                raise error
+
+            file.write = write
+        return file
+
+    monkeypatch.setattr(pathlib.Path, "open", open_)
+    return error
+
+
+class TestGenerateModelsFromDb:
+    """Spec §5.3, AC-14: ``generate_models_from_db()`` returns the generated source; with ``output_path`` it writes it
+    (UTF-8, ``"\\n"``), replacing an existing file atomically by default, refusing it with ``overwrite=False`` (E8,
+    before any statement; then exclusive creation). Arguments are checked first (E9, R3, E5, E6, ``os.fspath``)."""
+
+    async def test_returns_the_source_without_a_file(self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+        monkeypatch.chdir(tmp_path)
+        client = _gen_client()
+        _install(monkeypatch, client)
+        source = await generate_models_from_db()
+        assert source == ModelCodeGenerator().generate(await DatabaseIntrospector().introspect())
+        assert "class IspGen(BaseSurrealModel):" in source
+        assert 'alias="café"' in source
+        assert client.statements == _GEN_STATEMENTS * 2
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize("as_type", [str, pathlib.Path], ids=["str", "path"])
+    async def test_writes_a_new_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, as_type: Callable[[pathlib.Path], object]
+    ) -> None:
+        _install(monkeypatch, _gen_client())
+        path = tmp_path / "app" / "generated" / "models.py"
+        source = await generate_models_from_db(as_type(path))  # type: ignore[arg-type]
+        assert path.read_bytes() == source.encode("utf-8")
+        assert source.endswith("\n") and "\r" not in source
+        assert 'alias="café"' in source
+        assert _temporary_files(path.parent) == []
+        if os.name == "posix":
+            assert stat.S_IMODE(path.stat().st_mode) == _new_file_mode(path.parent)
+
+    async def test_replaces_an_existing_file(self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+        _install(monkeypatch, _gen_client())
+        path = tmp_path / "models.py"
+        path.write_text("old\r\n", encoding="utf-8")
+        if os.name == "posix":
+            path.chmod(0o600)
+        source = await generate_models_from_db(path)
+        assert path.read_bytes() == source.encode("utf-8")
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["models.py"]
+        if os.name == "posix":  # a new file's permissions, not the replaced one's
+            assert stat.S_IMODE(path.stat().st_mode) == _new_file_mode(tmp_path)
+
+    async def test_a_failing_replace_keeps_the_previous_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+    ) -> None:
+        _install(monkeypatch, _gen_client())
+        path = tmp_path / "models.py"
+        path.write_text("previous", encoding="utf-8")
+        error = OSError("cannot replace")
+
+        def replace(src: object, dst: object) -> None:
+            raise error
+
+        monkeypatch.setattr(os, "replace", replace)
+        with pytest.raises(OSError) as caught:
+            await generate_models_from_db(path)
+        assert caught.value is error
+        assert path.read_text(encoding="utf-8") == "previous"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["models.py"]
+
+    @pytest.mark.parametrize("overwrite", [True, False])
+    async def test_a_write_failure_leaves_no_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, overwrite: bool
+    ) -> None:
+        _install(monkeypatch, _gen_client())
+        path = tmp_path / "models.py"
+        if overwrite:
+            path.write_text("previous", encoding="utf-8")
+        error = _failing_writes(monkeypatch, "models.py")
+        with pytest.raises(OSError) as caught:
+            await generate_models_from_db(path, overwrite=overwrite)
+        assert caught.value is error
+        if overwrite:  # the previous file is intact, the temporary file removed
+            assert sorted(p.name for p in tmp_path.iterdir()) == ["models.py"]
+            assert path.read_text(encoding="utf-8") == "previous"
+        else:  # the file this call created is removed
+            assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.skipif(os.name != "posix", reason="symbolic links (POSIX)")
+    async def test_a_symlink_is_replaced_not_written_through(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+    ) -> None:
+        _install(monkeypatch, _gen_client())
+        target = tmp_path / "target.py"
+        target.write_text("target", encoding="utf-8")
+        path = tmp_path / "models.py"
+        path.symlink_to(target)
+        source = await generate_models_from_db(path)
+        assert not path.is_symlink()
+        assert path.read_text(encoding="utf-8") == source
+        assert target.read_text(encoding="utf-8") == "target"
+        assert _temporary_files(tmp_path) == []
+
+    @pytest.mark.parametrize("as_type", [str, pathlib.Path], ids=["str", "path"])
+    async def test_overwrite_false_e8_before_any_statement(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, as_type: Callable[[pathlib.Path], object]
+    ) -> None:
+        client = _gen_client()
+        _install(monkeypatch, client)
+        path = tmp_path / "models.py"
+        path.write_text("mine", encoding="utf-8")
+        with pytest.raises(FileExistsError) as caught:
+            await generate_models_from_db(as_type(path), overwrite=False)  # type: ignore[arg-type]
+        assert str(caught.value) == _e8(path) == f"{str(path)!r} already exists: overwrite=False refuses to replace it."
+        assert client.calls == []
+        assert path.read_text(encoding="utf-8") == "mine"
+
+    @pytest.mark.skipif(os.name != "posix", reason="symbolic links (POSIX)")
+    async def test_overwrite_false_refuses_a_dangling_symlink(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+    ) -> None:
+        client = _gen_client()
+        _install(monkeypatch, client)
+        path = tmp_path / "models.py"
+        path.symlink_to(tmp_path / "missing.py")
+        with pytest.raises(FileExistsError) as caught:
+            await generate_models_from_db(path, overwrite=False)
+        assert str(caught.value) == _e8(path)
+        assert client.calls == []
+        assert not (tmp_path / "missing.py").exists()
+
+    async def test_overwrite_false_writes_a_new_file(self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+        _install(monkeypatch, _gen_client())
+        path = tmp_path / "new" / "models.py"
+        source = await generate_models_from_db(str(path), overwrite=False)
+        assert path.read_bytes() == source.encode("utf-8")
+        assert sorted(p.name for p in path.parent.iterdir()) == ["models.py"]
+
+    async def test_overwrite_false_a_file_created_after_the_check(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+    ) -> None:
+        path = tmp_path / "models.py"
+        client = _HookClient(lambda: path.write_text("theirs", encoding="utf-8"))
+        _install(monkeypatch, client)
+        with pytest.raises(FileExistsError) as caught:
+            await generate_models_from_db(path, overwrite=False)
+        assert str(caught.value) != _e8(path)  # the OS's, from mode "x"
+        assert client.statements == _GEN_STATEMENTS
+        assert path.read_text(encoding="utf-8") == "theirs"
+
+    async def test_e9_before_e8_and_any_statement(self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+        installed = _gen_client()
+        _install(monkeypatch, installed)
+        path = tmp_path / "models.py"
+        path.write_text("mine", encoding="utf-8")
+        client = _gen_client()
+        with pytest.raises(TypeError) as caught:
+            await generate_models_from_db(path, client, overwrite=False)  # type: ignore[arg-type]
+        assert str(caught.value) == _E9
+        assert client.calls == [] and installed.calls == []
+        with pytest.raises(TypeError) as caught:
+            await generate_models_from_db(connection=mock.MagicMock())
+        assert str(caught.value) == _E9
+
+    @pytest.mark.parametrize(
+        ("arguments", "error", "message"),
+        [
+            ({"connection": 42}, TypeError, "Connection name must be a str, not int."),
+            ({"connection": object()}, TypeError, "Connection name must be a str, not object."),
+            ({"connection": ""}, ValueError, "Connection name must not be empty."),
+            ({"tables": "person"}, TypeError, "tables= takes an iterable of table names, not a str: write tables=['person']."),
+            ({"tables": ["a", 1]}, TypeError, "tables= takes table names (str), got int."),
+            ({"output_path": 42, "connection": 42}, TypeError, "Connection name must be a str, not int."),
+        ],
+        ids=["r3-int", "r3-object", "r3-empty", "e5", "e6", "arguments-first"],
+    )
+    async def test_argument_errors_before_any_statement(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, arguments: dict[str, Any], error: type, message: str
+    ) -> None:
+        client = _gen_client()
+        _install(monkeypatch, client)
+        path = tmp_path / "models.py"
+        path.write_text("mine", encoding="utf-8")
+        with pytest.raises(error) as caught:
+            await generate_models_from_db(**{"output_path": path, "overwrite": False, **arguments})
+        assert str(caught.value) == message
+        assert client.calls == []
+
+    async def test_output_path_of_another_type(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _gen_client()
+        _install(monkeypatch, client)
+        with pytest.raises(TypeError) as caught:
+            await generate_models_from_db(42)  # type: ignore[arg-type]
+        with pytest.raises(TypeError) as expected:
+            os.fspath(42)  # type: ignore[call-overload]
+        assert str(caught.value) == str(expected.value)
+        assert client.calls == []
+
+    async def test_connection_and_tables_are_forwarded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _named("isp_unit")
+        named = _FakeClient(_db(tables={"a": _TABLE_A, "b": _TABLE_B}))
+        default = _FakeClient(_db())
+        _install(monkeypatch, named, "isp_unit")
+        _install(monkeypatch, default)
+        source = await generate_models_from_db(None, "isp_unit", tables=["b"])
+        assert named.statements == ["INFO FOR DB;", "INFO FOR TABLE `b`;"]
+        assert "class B(BaseSurrealModel):" in source and "class A(" not in source
+        assert 'connection="isp_unit"' in source
+        named.calls.clear()
+        async with SurrealDBConnectionManager.using("isp_unit"):
+            assert await generate_models_from_db(tables=["b"]) == source
+        assert named.statements == ["INFO FOR DB;", "INFO FOR TABLE `b`;"]
+        assert default.calls == []
+
+
 # === E2E: the line under test and mem:// ==============================================================================
 
 #: The portable fixture of spec §9.3, exactly.
@@ -1168,3 +1473,119 @@ class TestOneLineItemsE2E:
             schema = await DatabaseIntrospector("isp", tables=["isp_x"]).introspect()
             assert schema.issues == ()
             check(schema)
+
+
+@contextlib.contextmanager
+def _imported(path: pathlib.Path) -> Iterator[ModuleType]:
+    """The module written at *path*, imported under a unique name; removed from ``sys.modules`` on exit."""
+    name = f"isp_models_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+        yield module
+    finally:
+        sys.modules.pop(name, None)
+
+
+async def _round_trip(models: Any) -> None:
+    """AC-13 on the fixture's generated module: every field of ``IspPerson`` saved and read back, ``merge()``, an edge,
+    the row the event writes."""
+    company = await models.IspCompany(name="Acme").save()
+    assert isinstance(company.id, RecordID) and company.id.table_name == "isp_company"
+
+    person = await models.IspPerson(
+        name="Ada",
+        email="ADA@Example.COM",
+        age=36,
+        status="inactive",
+        tags=["math", "engines"],
+        address=models.IspPersonAddress(city="London"),
+        meta={"k": 1, "nested": {"x": "y"}},
+        location=GeometryPoint(-0.1276, 51.5072),
+        trial=Duration.parse("1h30m"),
+        balance=Decimal("12.50"),
+        token=uuid.UUID("018f1f2e-0000-7000-8000-000000000001"),
+        employer=company.id,
+        first_name="Ada",
+        class_="vip",
+    ).save()
+    assert person.email == "ada@example.com"  # VALUE string::lowercase($value), applied by the server
+    assert isinstance(person.created, datetime) and isinstance(person.updated, datetime)  # hydrated by save()
+
+    got = await models.IspPerson.objects().get(person.get_raw_id())
+    assert got.get_raw_id() == person.get_raw_id()
+    for field in models.IspPerson.model_fields:
+        if field != "id":
+            assert getattr(got, field) == getattr(person, field), field
+    assert (got.first_name, got.class_, got.address.city) == ("Ada", "vip", "London")
+    assert (got.trial, got.balance, got.employer) == (Duration.parse("1h30m"), Decimal("12.50"), company.id)
+    assert got.location == GeometryPoint(-0.1276, 51.5072)
+    assert got.model_dump(by_alias=True)["first-name"] == "Ada"
+
+    await person.merge(name="Ada Lovelace")
+    assert person.name == "Ada Lovelace"
+    merged = await models.IspPerson.objects().get(person.get_raw_id())
+    assert (merged.name, merged.created, merged.email) == ("Ada Lovelace", person.created, "ada@example.com")
+
+    since = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    edge = await models.IspLikes(in_=person.id, out=company.id, since=since).save()
+    assert isinstance(edge.id, RecordID) and edge.id.table_name == "isp_likes"
+    stored = await models.IspLikes.objects().get(edge.get_raw_id())
+    assert (stored.in_, stored.out, stored.since) == (person.id, company.id, since)
+
+    logs = await models.IspLog.objects().all()
+    assert [log.model_extra for log in logs] == [{"msg": "created"}]
+
+
+class TestRoundTripE2E:
+    """AC-9, AC-13, AC-18 on the line under test and on ``mem://``: the fixture's source is the §9.3 golden on every
+    line, its generated module (written by ``generate_models_from_db()``) works against the database it describes, and a
+    ``server_fields`` column needing an alias is hydrated by ``save()`` (M40)."""
+
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    async def test_the_golden_source_ac9(self, kind: str) -> None:
+        async with _isp(kind):
+            source = ModelCodeGenerator().generate(await DatabaseIntrospector("isp").introspect())
+        assert source == GOLDEN
+
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    async def test_generated_models_ac13(self, kind: str, tmp_path: pathlib.Path) -> None:
+        path = tmp_path / "isp_models.py"
+        async with _isp(kind):
+            source = await generate_models_from_db(path, "isp")
+            assert source == GOLDEN
+            assert path.read_text(encoding="utf-8") == source
+            with _imported(path) as models:
+                assert models.IspPerson.get_server_fields() == frozenset({"created", "updated"})
+                await _round_trip(models)
+
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    async def test_server_fields_by_attribute_ac18(self, kind: str, tmp_path: pathlib.Path) -> None:
+        ddl = (
+            "DEFINE TABLE isp_sf SCHEMAFULL;\n"
+            "DEFINE FIELD `created-at` ON isp_sf TYPE datetime DEFAULT time::now();\n"
+            "DEFINE FIELD note ON isp_sf TYPE string;\n"
+            "DEFINE TABLE `Select` SCHEMALESS;\n"
+        )
+        tables = ["Select", "isp_sf", "select"]
+        path = tmp_path / "isp_sf_models.py"
+        async with _isp(kind, FIXTURE_DDL + ddl):
+            schema = await DatabaseIntrospector("isp", tables=tables).introspect()
+            assert (list(schema.tables), schema.issues) == (tables, ())
+            source = await generate_models_from_db(path, "isp", tables=tables)
+            assert source == ModelCodeGenerator().generate(schema)
+            assert [line for line in source.splitlines() if line.startswith("# - table")] == [
+                "# - table 'Select': its name is a SurrealQL keyword the ORM cannot use as a table name",
+                "# - table 'select': its name is a SurrealQL keyword the ORM cannot use as a table name",
+            ]
+            assert 'created_at: datetime | None = Field(default=None, alias="created-at")' in source
+            with _imported(path) as models:
+                model = models.IspSf
+                assert model.get_server_fields() == frozenset({"created_at"})
+                row = await model(note="n").save()
+                assert isinstance(row.created_at, datetime)
+                got = await model.objects().get(row.get_raw_id())
+                assert (got.created_at, got.note) == (row.created_at, "n")

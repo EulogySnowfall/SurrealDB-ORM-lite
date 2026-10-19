@@ -11,6 +11,7 @@
     schema.issues                                       # () when everything was read and parsed
 
     source = ModelCodeGenerator().generate(schema)      # the Python source of models for those tables
+    await generate_models_from_db("app/models_generated.py")  # read, generate, write the file (replacing it)
 
 **Read-only.** ``introspect()`` sends ``INFO FOR DB;`` and then one ``INFO FOR TABLE `<name>`;`` per table (in
 codepoint order of the names, each name escaped as an identifier) on the connection's client, and nothing else: no
@@ -36,10 +37,19 @@ kept in ``SchemaIssue.statement``, out of its ``repr``.
 failing otherwise, or answering something other than an object, ``SurrealDbError`` — ORM errors (a connection that
 cannot be opened …) propagate unchanged. A ``tables=`` name the database does not define raises
 ``SurrealDbNotFoundError`` before any ``INFO FOR TABLE``. Arguments are checked when the introspector is built.
+
+**Files** (``generate_models_from_db()``). The generated module is written UTF-8 with ``"\\n"`` newlines. An existing
+file is replaced atomically by default — a temporary file in the same directory, then ``os.replace()``: a failure
+leaves the previous file and no temporary file, a symbolic link is replaced (its target is never written). With
+``overwrite=False`` an existing path raises ``FileExistsError`` before anything is read, and the file is created
+exclusively (one that appears in the meantime is not replaced).
 """
 
 import dataclasses
 import logging
+import os
+import pathlib
+import uuid
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any, Protocol, TypeVar
 
@@ -85,6 +95,7 @@ __all__ = [
     "SchemaIssue",
     "SchemaState",
     "TableState",
+    "generate_models_from_db",
 ]
 
 logger = logging.getLogger(__name__)
@@ -357,3 +368,86 @@ class DatabaseIntrospector:
         client = await manager.get_client()
         info = await _info_for_db(client, name)
         return await _Reader(client, name).read(info, self._tables)
+
+
+def _replace(path: pathlib.Path, source: str) -> None:
+    """Write *source* over *path* atomically: a temporary file in the same directory, then ``os.replace()``.
+
+    On any exception once the temporary file exists, it is removed and the exception propagates: *path* is left as it
+    was. A symbolic link at *path* is replaced by the file, never written through.
+    """
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    file = temporary.open("x", encoding="utf-8", newline="\n")
+    try:
+        with file:
+            file.write(source)
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _create(path: pathlib.Path, source: str) -> None:
+    """Write *source* to *path*, which must not exist (mode ``"x"``: ``FileExistsError`` otherwise); a failure while
+    writing removes the file this call created, then propagates."""
+    file = path.open("x", encoding="utf-8", newline="\n")
+    try:
+        with file:
+            file.write(source)
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+
+
+async def generate_models_from_db(
+    output_path: str | os.PathLike[str] | None = None,
+    connection: str | None = None,
+    *,
+    tables: Iterable[str] | None = None,
+    overwrite: bool = True,
+) -> str:
+    """Read the schema and generate its models — the full SurrealDB-ORM's ``generate_models_from_db()`` (v0.30.0).
+
+    ::
+
+        source = await generate_models_from_db()                                   # print(source)
+        await generate_models_from_db("app/models_generated.py")                   # writes it, replacing an existing file
+        await generate_models_from_db("app/models_generated.py", overwrite=False)  # FileExistsError if it exists
+        await generate_models_from_db("analytics_models.py", "analytics", tables=["page_view"])
+
+    In order: the arguments are checked (:class:`DatabaseIntrospector`'s rules); with *output_path* and
+    ``overwrite=False``, an existing path raises before anything is read; the schema is read
+    (:meth:`DatabaseIntrospector.introspect`) and :class:`ModelCodeGenerator` generates the module; the file is
+    written, UTF-8 with ``"\\n"`` newlines, its parent directories created.
+
+    :param output_path: where to write the module; ``None`` writes nothing (the source is returned).
+    :param connection: the **name** of a registered connection, or ``None`` for the current one (the innermost
+        ``using()`` block's, else ``"default"``). Generated models of a named connection carry ``connection=``.
+    :param tables: the tables to read and generate; ``None`` for every table.
+    :param overwrite: ``True`` (the default, the full ORM's behaviour) replaces an existing file **atomically** — a
+        temporary file in the same directory, then ``os.replace()``: on failure the previous file is intact and no
+        temporary file is left; a symbolic link is replaced, its target never written. ``False`` refuses an existing
+        path, and creates the file exclusively (a file that appears meanwhile raises the OS's ``FileExistsError``).
+    :returns: the generated source, equal to the file's content when one is written.
+    :raises TypeError: *connection* is a client object or not a ``str``; *tables* is a ``str`` or holds a non-``str``;
+        *output_path* is not a ``str`` or path-like (from ``os.fspath``).
+    :raises ValueError: *connection* is empty, or not registered.
+    :raises FileExistsError: *output_path* exists and ``overwrite=False`` — checked before any database read.
+    :raises SurrealDbAuthenticationError, SurrealDbNotFoundError, SurrealDbError: as
+        :meth:`DatabaseIntrospector.introspect`.
+    :raises OSError: the file cannot be written (the previous one, if any, is left as it was).
+    """
+    introspector = DatabaseIntrospector(connection, tables=tables)
+    path: pathlib.Path | None = None
+    if output_path is not None:
+        path = pathlib.Path(os.fspath(output_path))
+        if not overwrite and os.path.lexists(path):
+            raise FileExistsError(f"{os.fspath(output_path)!r} already exists: overwrite=False refuses to replace it.")
+    source = ModelCodeGenerator().generate(await introspector.introspect())
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if overwrite:
+            _replace(path, source)
+        else:
+            _create(path, source)
+    return source

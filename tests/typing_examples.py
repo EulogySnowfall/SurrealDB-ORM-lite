@@ -8,12 +8,15 @@ Deliberately named ``typing_examples`` rather than ``test_*`` so pytest does not
 the assertions here are made by mypy, not at runtime.
 """
 
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, assert_type
 
 from surrealdb import RecordID
 
 from surreal_orm_lite import (
+    AccessState,
     AuthenticatedUserMixin,
     AuthResult,
     AuthTokens,
@@ -23,11 +26,14 @@ from surreal_orm_lite import (
     BoundIncluded,
     Computed,
     ConnectionConfig,
+    DatabaseIntrospector,
     Duration,
     GeometryCollectionField,
     GeometryField,
     GeometryPoint,
+    IndexState,
     LineStringField,
+    ModelCodeGenerator,
     MultiLineStringField,
     MultiPointField,
     MultiPolygonField,
@@ -37,12 +43,15 @@ from surreal_orm_lite import (
     QueryCache,
     QuerySet,
     Range,
+    SchemaState,
     Subquery,
     SurrealConfigDict,
     SurrealDBConnectionManager,
     SurrealFunc,
+    TableState,
     Transaction,
     computed,
+    generate_models_from_db,
 )
 from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
 
@@ -391,6 +400,23 @@ async def multi_database_blocks() -> None:
         pass
     async with embedded_database(connection=None):
         pass
+
+
+async def introspection_forms() -> None:
+    """v0.30.0: the reader, the generator and ``generate_models_from_db()`` are typed; the state classes take the full
+    SurrealDB-ORM's construction forms (a list for ``fields``, a pipe-joined ``relation_in``, a dict of signup fields)."""
+    state = await DatabaseIntrospector().introspect()
+    assert_type(state, SchemaState)
+    assert_type(await DatabaseIntrospector("x", tables=["t"]).introspect(), SchemaState)
+    assert_type(ModelCodeGenerator().generate(state), str)
+    assert_type(await generate_models_from_db(), str)
+    assert_type(await generate_models_from_db("m.py", overwrite=False), str)
+    assert_type(await generate_models_from_db(Path("m.py"), "x", tables=["t"]), str)
+    assert_type(state.tables["t"].fields["f"].nullable, bool)
+    assert_type(state.tables["t"].fields["f"].field_type, str)
+    assert_type(IndexState(name="i", fields=["a"]).fields, Sequence[str])
+    assert_type(TableState(name="t", relation_in="a | b"), TableState)
+    assert_type(AccessState(name="a", signup_fields={"e": "$e"}).signup_fields, Mapping[str, str])
 
 
 @fixture
