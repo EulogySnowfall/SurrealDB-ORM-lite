@@ -1712,6 +1712,8 @@ exactly what ends a stream.
 - **A failed `kill()` releases the readers but keeps the uuid alive.** When the server refuses
   the kill for any reason other than an unknown uuid, the error is raised, the readers are woken,
   and the subscription is still running — so you can subscribe to it again or retry `stop()`.
+  A kill caught by a dropped connection is not a refusal: the subscription died with the socket,
+  so `kill()` records it as ended and returns normally.
 - **The buffer is unbounded.** A stream you stop reading but never kill keeps accumulating
   notifications. Use the `async with` forms, or pair every uuid you start with a `kill()`.
 
