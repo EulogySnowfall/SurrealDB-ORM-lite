@@ -36,7 +36,7 @@ from typing import Any
 import pytest
 
 import surreal_orm_lite
-from surreal_orm_lite import ModelCodeGenerator
+from surreal_orm_lite import Duration, ModelCodeGenerator
 from surreal_orm_lite import introspection as introspection_module
 from surreal_orm_lite import model_generator as model_generator_module
 from surreal_orm_lite.define_parser import (
@@ -860,6 +860,10 @@ _FIXTURE_FIELDS_2X = {
 UPDATE_NOTE = (
     "    # update() fails on READONLY datetime fields (Python keeps microseconds, SurrealDB nanoseconds): use merge()."
 )
+#: Spec §6.4.7 (M48, §14.9): the class comment of a table whose objects hold sub-fields a ``DEFAULT`` fills on create.
+SUB_DEFAULT_NOTE = (
+    "    # update() after save() sends None for sub-fields a DEFAULT filled on create: call refresh() first, or use merge()."
+)
 
 #: ruff's options for a generated module (spec §9.1).
 _RUFF_CHECK = ["check", "--isolated", "--select", "E,F,W,I,UP,B,C4,SIM", "--target-version", "py311", "--line-length", "128"]
@@ -1116,26 +1120,33 @@ class TestTypes:
             assert _line_of(source, f"x{index:02}") == f"x{index:02}" + line[1:]
 
 
-#: Spec M36 / §9.2: the literal defaults as both lines render them (2.x first where they differ), d23 left out.
+#: Spec M36, M48 / §9.2: the constant defaults as both lines render them (2.x first where they differ), d23 left out;
+#: d5, d6, d11, d15 and d25–d30 are held as Python defaults since D25 was amended, d20, d22, d28 and d31 are not.
 LITERAL_DEFAULTS: list[tuple[str, str]] = [
     ("DEFINE FIELD d1 ON t TYPE float DEFAULT 0.5f PERMISSIONS FULL", "d1: float = 0.5"),
     ("DEFINE FIELD d2 ON t TYPE decimal DEFAULT 1.5dec PERMISSIONS FULL", 'd2: Decimal = Decimal("1.5")'),
     ("DEFINE FIELD d3 ON t TYPE float DEFAULT 1000f PERMISSIONS FULL", "d3: float = 1000.0"),
     ("DEFINE FIELD d4 ON t TYPE int DEFAULT -2 PERMISSIONS FULL", "d4: int = -2"),
-    ("DEFINE FIELD d5 ON t TYPE datetime DEFAULT d'2020-01-01T00:00:00Z' PERMISSIONS FULL", "d5: datetime | None = None"),
-    ("DEFINE FIELD d6 ON t TYPE duration DEFAULT 1h30m PERMISSIONS FULL", "d6: Duration | None = None"),
+    (
+        "DEFINE FIELD d5 ON t TYPE datetime DEFAULT d'2020-01-01T00:00:00Z' PERMISSIONS FULL",
+        'd5: datetime = datetime.fromisoformat("2020-01-01T00:00:00Z")',
+    ),
+    (
+        "DEFINE FIELD d6 ON t TYPE duration DEFAULT 1h30m PERMISSIONS FULL",
+        'd6: Duration = Field(default_factory=lambda: Duration.parse("1h30m"))',
+    ),
     ("DEFINE FIELD d7 ON t TYPE option<int> DEFAULT NONE PERMISSIONS FULL", "d7: int | None = None"),
     ("DEFINE FIELD d7 ON t TYPE none | int DEFAULT NONE PERMISSIONS FULL", "d7: int | None = None"),
     ("DEFINE FIELD d8 ON t TYPE null | int DEFAULT NULL PERMISSIONS FULL", "d8: int | None = None"),
     ("DEFINE FIELD d9 ON t TYPE bool DEFAULT true PERMISSIONS FULL", "d9: bool = True"),
     ('DEFINE FIELD d10 ON t TYPE string DEFAULT "it\'s" PERMISSIONS FULL', 'd10: str = "it\'s"'),
-    ("DEFINE FIELD d11 ON t TYPE array<int> DEFAULT [] PERMISSIONS FULL", "d11: list[int] | None = None"),
+    ("DEFINE FIELD d11 ON t TYPE array<int> DEFAULT [] PERMISSIONS FULL", "d11: list[int] = Field(default_factory=list)"),
     ("DEFINE FIELD d12 ON t TYPE float DEFAULT 1 PERMISSIONS FULL", "d12: float = 1.0"),
     ("DEFINE FIELD d13 ON t TYPE decimal DEFAULT 0.5f PERMISSIONS FULL", "d13: Decimal | None = None"),
     ("DEFINE FIELD d14 ON t TYPE int DEFAULT 9223372036854775807 PERMISSIONS FULL", "d14: int = 9223372036854775807"),
     (
         "DEFINE FIELD d15 ON t TYPE uuid DEFAULT u'0190d3b4-0000-7000-8000-000000000000' PERMISSIONS FULL",
-        "d15: UUID | None = None",
+        'd15: UUID = UUID("0190d3b4-0000-7000-8000-000000000000")',
     ),
     ("DEFINE FIELD d16 ON t TYPE float DEFAULT 0.1f PERMISSIONS FULL", "d16: float = 0.1"),
     ("DEFINE FIELD d17 ON t TYPE float DEFAULT -0f PERMISSIONS FULL", "d17: float = -0.0"),
@@ -1147,7 +1158,44 @@ LITERAL_DEFAULTS: list[tuple[str, str]] = [
     ("DEFINE FIELD d21 ON t TYPE string DEFAULT 'x' PERMISSIONS FULL", 'd21: str = "x"'),
     ("DEFINE FIELD d22 ON t TYPE record DEFAULT a:1 PERMISSIONS FULL", "d22: RecordID | None = None"),
     ("DEFINE FIELD d24 ON t TYPE float DEFAULT 0.0025f PERMISSIONS FULL", "d24: float = 0.0025"),
+    (
+        "DEFINE FIELD d25 ON t TYPE array<int> DEFAULT [1, 2] PERMISSIONS FULL",
+        "d25: list[int] = Field(default_factory=lambda: [1, 2])",
+    ),
+    ("DEFINE FIELD d26 ON t TYPE set<string> DEFAULT [] PERMISSIONS FULL", "d26: set[str] = Field(default_factory=set)"),
+    ("DEFINE FIELD d27 ON t TYPE object DEFAULT {  } PERMISSIONS FULL", "d27: dict[str, Any] = Field(default_factory=dict)"),
+    (
+        "DEFINE FIELD d28 ON t TYPE datetime DEFAULT d'2030-01-01T00:00:00.123456789Z' PERMISSIONS FULL",
+        "d28: datetime | None = None",
+    ),
+    (
+        "DEFINE FIELD d29 ON t TYPE duration DEFAULT 1h30m5ns PERMISSIONS FULL",
+        'd29: Duration = Field(default_factory=lambda: Duration.parse("1h30m5ns"))',
+    ),
+    (
+        "DEFINE FIELD d30 ON t TYPE array<array<int>> DEFAULT [[1], []] PERMISSIONS FULL",
+        "d30: list[list[int]] = Field(default_factory=lambda: [[1], []])",
+    ),
+    ("DEFINE FIELD d31 ON t TYPE set<int> DEFAULT [2, 1, 2] PERMISSIONS FULL", "d31: set[int] | None = None"),
 ]
+
+#: Spec §9.2 (M48): the sub-model rows, ``p2`` in the 2.x/emb rendering, then the 3.x one.
+SUB_MODEL_DEFAULTS: list[tuple[str, ...]] = [
+    (
+        "DEFINE FIELD p1 ON t TYPE object DEFAULT {  } PERMISSIONS FULL",
+        "DEFINE FIELD p1.theme ON t TYPE string DEFAULT 'light' PERMISSIONS FULL",
+        "DEFINE FIELD p2 ON t TYPE option<object> DEFAULT {  } PERMISSIONS FULL",
+        "DEFINE FIELD p2.theme ON t TYPE string PERMISSIONS FULL",
+    ),
+    (
+        "DEFINE FIELD p1 ON t TYPE object DEFAULT {  } PERMISSIONS FULL",
+        "DEFINE FIELD p1.theme ON t TYPE string DEFAULT 'light' PERMISSIONS FULL",
+        "DEFINE FIELD p2 ON t TYPE none | object DEFAULT {  } PERMISSIONS FULL",
+        "DEFINE FIELD p2.theme ON t TYPE string PERMISSIONS FULL",
+    ),
+]
+
+_UUID_TEXT = "0190d3b4-0000-7000-8000-000000000000"
 
 #: Further rows of spec §6.4.6's literal-default table: (kind, nullable, DEFAULT text, the generated line).
 DEFAULT_ROWS: list[tuple[str, bool, str, str]] = [
@@ -1179,6 +1227,90 @@ DEFAULT_ROWS: list[tuple[str, bool, str, str]] = [
     ("string", False, "{  }", "x: str | None = None"),
     ("geometry<point>", True, "(1, 2)", "x: PointField = None"),
     ("geometry<point>", False, "(1, 2)", "x: GeometryPoint | None = None"),
+    # D25 amended (spec §6.4.6 item 3, M48): [] on a list, a set, Any; a set written list[…]; a tuple keeps the server form.
+    ("array<int>", True, "[]", "x: list[int] | None = Field(default_factory=list)"),
+    ("array", False, "[ ]", "x: list[Any] = Field(default_factory=list)"),
+    ("set<int>", True, "[]", "x: set[int] | None = Field(default_factory=set)"),
+    ("set<record>", False, "[]", "x: list[RecordID] = Field(default_factory=list)"),
+    ("any", False, "[]", "x: Any = Field(default_factory=list)"),
+    ("[int, string]", False, "[]", "x: tuple[int, str] | None = None"),
+    ("string", False, "[]", "x: str | None = None"),
+    # [e1, …] on one array kind whose item annotation holds every element, written with that row's expression.
+    ("array<float>", False, "[1.5f, 2]", "x: list[float] = Field(default_factory=lambda: [1.5, 2.0])"),
+    (
+        "array<decimal>",
+        False,
+        "[1.5dec, 2]",
+        'x: list[Decimal] = Field(default_factory=lambda: [Decimal("1.5"), Decimal("2")])',
+    ),
+    ("array<string>", False, "['a', \"b'c\"]", 'x: list[str] = Field(default_factory=lambda: ["a", "b\'c"])'),
+    ("array<bool>", True, "[true]", "x: list[bool] | None = Field(default_factory=lambda: [True])"),
+    ("array<option<int>>", False, "[1, NONE]", "x: list[int | None] = Field(default_factory=lambda: [1, None])"),
+    ("array<'a' | 'b'>", False, "['b']", 'x: list[Literal["a", "b"]] = Field(default_factory=lambda: ["b"])'),
+    ("array", False, "[[1, 'x'], NONE, {  }]", 'x: list[Any] = Field(default_factory=lambda: [[1, "x"], None, {}])'),
+    ("any", False, "[1, [2]]", "x: Any = Field(default_factory=lambda: [1, [2]])"),
+    ("array<object>", False, "[{  }, {}]", "x: list[dict[str, Any]] = Field(default_factory=lambda: [{}, {}])"),
+    ("array<set<int>>", False, "[[]]", "x: list[set[int]] = Field(default_factory=lambda: [set()])"),
+    (
+        "array<duration>",
+        False,
+        "[1h, 0ns]",
+        'x: list[Duration] = Field(default_factory=lambda: [Duration.parse("1h"), Duration.parse("0ns")])',
+    ),
+    (
+        "array<datetime>",
+        False,
+        "[d'2030-01-01T00:00:00Z']",
+        'x: list[datetime] = Field(default_factory=lambda: [datetime.fromisoformat("2030-01-01T00:00:00Z")])',
+    ),
+    ("array<uuid>", False, f"[u'{_UUID_TEXT}']", f'x: list[UUID] = Field(default_factory=lambda: [UUID("{_UUID_TEXT}")])'),
+    ("array<int> | string", False, "[1]", "x: list[int] | str = Field(default_factory=lambda: [1])"),
+    ("array<int> | array<string>", False, "[]", "x: list[int] | list[str] = Field(default_factory=list)"),
+    ("array<int> | array<string>", False, "[1]", "x: list[int] | list[str] | None = None"),  # two array members
+    ("set<int>", False, "[1]", "x: set[int] | None = None"),  # the server reorders and deduplicates a set
+    ("set<object>", False, "[{  }]", "x: list[dict[str, Any]] | None = None"),  # a set, written list[…]
+    ("[int, string]", False, "[1, 'a']", "x: tuple[int, str] | None = None"),
+    ("array<int>", False, "[1, 'a']", "x: list[int] | None = None"),  # an element of another type
+    ("array<int>", False, "[1, time::now()]", "x: list[int] | None = None"),
+    ("array<int>", False, "[1] + [2]", "x: list[int] | None = None"),  # not one array literal
+    ("array<int>", False, "[1,]", "x: list[int] | None = None"),  # an empty element
+    ("array<int>", False, "[1, 'unterminated]", "x: list[int] | None = None"),  # not scannable
+    ("array<array<int>>", False, "[[1], 2]", "x: list[list[int]] | None = None"),
+    ("array<geometry<point>>", False, "[(1, 2)]", "x: list[GeometryPoint] | None = None"),
+    ("array", False, "[" * 32 + "]" * 32, "x: list[Any] = Field(default_factory=lambda: " + "[" * 32 + "]" * 32 + ")"),
+    ("array", False, "[" * 33 + "]" * 33, "x: list[Any] | None = None"),  # nested deeper than 32 arrays
+    # {  } on a dict, an object literal kind or Any; a non-empty object keeps the server form.
+    ("object", True, "{}", "x: dict[str, Any] | None = Field(default_factory=dict)"),
+    ("{ a: int }", False, "{ }", "x: dict[str, Any] = Field(default_factory=dict)"),
+    ("any", False, "{  }", "x: Any = Field(default_factory=dict)"),
+    ("object", False, "{ a: 1 }", "x: dict[str, Any] | None = None"),
+    # Durations Duration.parse() accepts, on a Duration or Any.
+    ("duration", True, "1h", 'x: Duration | None = Field(default_factory=lambda: Duration.parse("1h"))'),
+    ("any", False, "2w3d", 'x: Any = Field(default_factory=lambda: Duration.parse("2w3d"))'),
+    ("duration", False, "1.5h", "x: Duration | None = None"),
+    ("duration", False, "1H", "x: Duration | None = None"),
+    ("string", False, "1h", "x: str | None = None"),
+    # Datetimes: UTC, at most 6 fractional digits, a date that exists.
+    ("datetime", False, "d'2030-01-01T00:00:00.5Z'", 'x: datetime = datetime.fromisoformat("2030-01-01T00:00:00.5Z")'),
+    (
+        "datetime",
+        True,
+        "d'2030-01-01T00:00:00.123456Z'",
+        'x: datetime | None = datetime.fromisoformat("2030-01-01T00:00:00.123456Z")',
+    ),
+    ("any", False, "d'2030-01-01T00:00:00Z'", 'x: Any = datetime.fromisoformat("2030-01-01T00:00:00Z")'),
+    ("datetime", False, "d'2030-01-01T00:00:00.1234567Z'", "x: datetime | None = None"),
+    ("datetime", False, "d'2030-02-30T00:00:00Z'", "x: datetime | None = None"),
+    ("datetime", False, "d'2030-01-01T00:00:00+02:00'", "x: datetime | None = None"),
+    ("datetime", False, "'2030-01-01T00:00:00Z'", "x: datetime | None = None"),
+    ("string", False, "d'2030-01-01T00:00:00Z'", "x: str | None = None"),
+    # UUIDs in the canonical form.
+    ("uuid", True, f"u'{_UUID_TEXT}'", f'x: UUID | None = UUID("{_UUID_TEXT}")'),
+    ("any", False, f"u'{_UUID_TEXT}'", f'x: Any = UUID("{_UUID_TEXT}")'),
+    ("uuid", False, f"u'{_UUID_TEXT.upper()}'", "x: UUID | None = None"),
+    ("uuid", False, "u'x'", "x: UUID | None = None"),
+    ("uuid", False, "u''", "x: UUID | None = None"),
+    ("string", False, f"u'{_UUID_TEXT}'", "x: str | None = None"),
 ]
 
 
@@ -1262,13 +1394,23 @@ class TestFieldLines:
         fields = [parse_define_field(statement).state for statement, _ in LITERAL_DEFAULTS]
         source = _generate(*{field.name: field for field in fields}.values())
         assert _model_config(source, "T") == (
-            '    model_config = SurrealConfigDict(table_name="t", server_fields=["d11", "d13", "d15", "d20", "d22", "d5", '
-            '"d6"])'
+            '    model_config = SurrealConfigDict(table_name="t", server_fields=["d13", "d20", "d22", "d28", "d31"])'
         )
 
     @pytest.mark.parametrize(("kind", "nullable", "default", "line"), DEFAULT_ROWS)
     def test_default_rows(self, kind: str, nullable: bool, default: str, line: str) -> None:
         assert _line_of(_generate(_f("x", kind, nullable=nullable, default=default)), "x") == line
+
+    def test_default_rows_compile_pass_ruff_and_import(self, tmp_path: Path) -> None:
+        fields = [
+            _f(f"x{index:02}", kind, nullable=nullable, default=default)
+            for index, (kind, nullable, default, _) in enumerate(DEFAULT_ROWS)
+        ]
+        source = _quality(
+            tmp_path, SchemaState(tables={"rows": TableState(name="rows", fields={f.name: f for f in fields})}), "rows"
+        )
+        for index, (_, _, _, line) in enumerate(DEFAULT_ROWS):
+            assert _line_of(source, f"x{index:02}") == f"x{index:02}" + line[1:]
 
     def test_clauses_after_a_regex_or_a_graph_wildcard_m47(self) -> None:
         # The parser ends the expression at the regex or the wildcard: the clauses after it are not generated into
@@ -1315,6 +1457,24 @@ class TestFieldLines:
         assert _line_of(source, "x_y") == 'x_y: int = Field(default=18, alias="x-y")'
         assert _line_of(source, "a_b") == 'a_b: int | None = Field(default=None, alias="a-b")'
         assert _line_of(source, "class_") == 'class_: str = Field(default="k", alias="class")'
+
+    def test_alias_forms_of_constant_defaults(self) -> None:
+        """Spec §6.4.6 item 5: a factory default with an alias, and the plain forms of a datetime and a UUID."""
+        source = _generate(
+            _f("a-b", "array<int>", default="[1]"),
+            _f("c-d", "datetime", default="d'2030-01-01T00:00:00Z'"),
+            _f("e-f", "uuid", nullable=True, default=f"u'{_UUID_TEXT}'"),
+            _f("g-h", "object", default="{  }"),
+            _f("i-j", "set<int>", default="[]"),
+        )
+        assert _line_of(source, "a_b") == 'a_b: list[int] = Field(default_factory=lambda: [1], alias="a-b")'
+        assert _line_of(source, "c_d") == (
+            'c_d: datetime = Field(default=datetime.fromisoformat("2030-01-01T00:00:00Z"), alias="c-d")'
+        )
+        assert _line_of(source, "e_f") == f'e_f: UUID | None = Field(default=UUID("{_UUID_TEXT}"), alias="e-f")'
+        assert _line_of(source, "g_h") == 'g_h: dict[str, Any] = Field(default_factory=dict, alias="g-h")'
+        assert _line_of(source, "i_j") == 'i_j: set[int] = Field(default_factory=set, alias="i-j")'
+        assert "server_fields" not in source
 
     def test_ignored_clauses(self) -> None:
         field = _f(
@@ -1434,6 +1594,50 @@ class TestSubModels:
         )
         assert "server_fields" not in source and "Computed" not in source
 
+    def test_empty_object_default_on_a_sub_model(self) -> None:
+        """Spec §6.4.6 item 3 (D25 amended): ``{  }`` on a sub-model every field of which has a default → the class as
+        ``default_factory``; the same for ``[{  }]`` on items with a sub-model, written ``<Item>()``."""
+        source = _generate(
+            _f("p", "object", default="{  }"),
+            _f("p.theme", default="'light'"),
+            _f("p.n", "object", nullable=True, default="{}"),
+            _f("p.n.z", "int", default="4"),
+            _f("p.note", nullable=True),
+            _f("w", "array<object>", default="[{  }]"),
+            _f("w.*.k", "int", default="7"),
+        )
+        assert _class_block(source, "TPN") == "class TPN(BaseModel):\n    z: int = 4\n"
+        assert _class_block(source, "TP") == (
+            "class TP(BaseModel):\n"
+            "    n: TPN | None = Field(default_factory=TPN)\n"
+            "    note: str | None = None\n"
+            '    theme: str = "light"\n'
+        )
+        model = _class_block(source, "T")
+        assert _line_of(model, "p") == "p: TP = Field(default_factory=TP)"
+        assert _line_of(model, "w") == "w: list[TWItem] = Field(default_factory=lambda: [TWItem()])"
+        assert "server_fields" not in source and "update() after save()" not in source  # every DEFAULT is held
+
+    def test_empty_object_default_on_a_sub_model_needing_arguments(self) -> None:
+        """M48: the server refuses every create that leaves such an object to its ``DEFAULT`` — the field is required,
+        its annotation unchanged, nullable or not; an item that needs arguments keeps the array in the server form."""
+        source = _generate(
+            _f("p", "object", nullable=True, default="{  }"),
+            _f("p.theme"),
+            _f("q", "object", default="{  }"),
+            _f("q.r", "object", default="{  }"),
+            _f("q.r.s", "int"),
+            _f("w", "array<object>", default="[{  }]"),
+            _f("w.*.k", "int"),
+        )
+        model = _class_block(source, "T")
+        assert _line_of(model, "p") == "p: TP | None"
+        assert _class_block(source, "TQ") == "class TQ(BaseModel):\n    r: TQR\n"
+        assert _line_of(model, "q") == "q: TQ"
+        assert _line_of(model, "w") == "w: list[TWItem] | None = None"
+        assert _model_config(source, "T") == '    model_config = SurrealConfigDict(table_name="t", server_fields=["w"])'
+        assert "update() after save()" not in source
+
     def test_item_definitions_produce_no_attribute(self) -> None:
         source = _generate(_f("tags", "array<string>"), _f("tags.*"), _f("w", "array<int>"), _f("w.*", "int"))
         body = [line.strip() for line in _class_block(source, "T").splitlines()[3:]]
@@ -1535,6 +1739,62 @@ class TestClasses:
     )
     def test_no_update_note(self, fields: list[FieldState]) -> None:
         assert "update()" not in _generate(*fields)
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            [_f("prefs", "object"), _f("prefs.at", "datetime", default="time::now()")],
+            [_f("prefs", "object", nullable=True), _f("prefs.seen", "datetime", nullable=True, default="time::now()")],
+            [_f("prefs", "object"), _f("prefs.inner", "object"), _f("prefs.inner.at", "datetime", default="time::now()")],
+            [_f("p", "object", default="{  }"), _f("p.at", "datetime", default="time::now()")],
+            [_f("w", "array<object>", nullable=True), _f("w.*.at", "datetime", default="time::now()")],
+            [_f("meta", "object"), _f("meta.first-name", default="'x'", path=["meta", "first-name"])],
+            [_f("meta", "object", default="{  }"), _f("meta.datetime", "int", default="1", path=["meta", "datetime"])],
+            [_f("a.b", "int", default="1")],  # an undefined parent: dict[str, Any] | None
+        ],
+        ids=["child", "optional-child", "grandchild", "factory-parent", "item", "dict", "dict-factory", "no-parent"],
+    )
+    def test_sub_field_default_note(self, fields: list[FieldState]) -> None:
+        """Spec §6.4.7 (M48, AC-18c): a written top-level object holding a sub-field a ``DEFAULT`` the model does not
+        hold fills on create."""
+        source = _generate(*fields)
+        assert _class_block(source, "T").splitlines()[1:3] == [
+            SUB_DEFAULT_NOTE,
+            '    model_config = SurrealConfigDict(table_name="t")',
+        ]
+        assert len(SUB_DEFAULT_NOTE) == 119
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            [_f("prefs", "object"), _f("prefs.theme", default="'light'")],
+            [_f("prefs", "object"), _f("prefs.at", "datetime", default="time::now()", default_always=True)],
+            [_f("prefs", "object", default="time::now()"), _f("prefs.at", "datetime", default="time::now()")],
+            [_f("prefs", "object", computed="a"), _f("prefs.at", "datetime", default="time::now()")],
+            [_f("prefs", "object"), _f("prefs.r", "object", default="{  }"), _f("prefs.r.s", "int")],
+            [_f("tags", "array<string>"), _f("tags.*", default="'x'")],
+            [_f("prefs", "object"), _f("prefs.at", "datetime", value="time::now()")],
+            [_f("at", "datetime", default="time::now()")],
+        ],
+        ids=["held", "always", "server-field", "computed", "required", "item-definition", "value", "top-level"],
+    )
+    def test_no_sub_field_default_note(self, fields: list[FieldState]) -> None:
+        assert "update() after save()" not in _generate(*fields)
+
+    def test_sub_field_default_note_follows_the_update_note(self) -> None:
+        source = _generate(
+            _f("created", "datetime", readonly=True),
+            _f("prefs", "object"),
+            _f("prefs.at", "datetime", default="time::now()"),
+            name="e",
+            table_type="relation",
+        )
+        assert _class_block(source, "E").splitlines()[1:5] == [
+            "    # IN any OUT any",
+            UPDATE_NOTE,
+            SUB_DEFAULT_NOTE,
+            '    model_config = SurrealConfigDict(table_name="e")',
+        ]
 
     def test_update_note_on_an_edge_but_not_for_in_out(self) -> None:
         edge = _generate(_f("in", "datetime", readonly=True), name="e", table_type="relation")
@@ -1890,6 +2150,36 @@ class TestImportable:
         assert module.IspSf.get_server_fields() >= {"created_at", "x"}
         assert module.IspSf.model_fields["created_at"].alias == "created-at"
 
+    @pytest.mark.parametrize("rendering", [0, 1], ids=["2x", "3x"])
+    def test_constant_defaults_ac18b(self, tmp_path: Path, rendering: int) -> None:
+        """AC-18b (unit): the §9.2 rows d5, d6, d11, d15, d25–d31, p1 and p2 give the §6.4.6 lines; the module passes
+        ruff and imports; ``get_server_fields()`` holds d20, d22, d28 and d31 only; ``p2`` is required; the factories
+        give each instance its own value."""
+        wanted = {"d5", "d6", "d11", "d15", "d20", "d22", *(f"d{n}" for n in range(25, 32))}
+        rows = [(statement, line) for statement, line in LITERAL_DEFAULTS if statement.split()[2] in wanted]
+        d20 = "math::INF" if rendering == 0 else "math::INFINITY"
+        rows = [(s, line) for s, line in rows if not s.startswith("DEFINE FIELD d20") or d20 + " " in s]
+        fields = [parse_define_field(statement).state for statement, _ in rows]
+        fields += [parse_define_field(statement).state for statement in SUB_MODEL_DEFAULTS[rendering]]
+        state = SchemaState(tables={"t": TableState(name="t", fields={field.name: field for field in fields})})
+        source = _quality(tmp_path, state, f"ac18b_{rendering}")
+        for statement, line in rows:
+            assert _line_of(_class_block(source, "T"), statement.split()[2]) == line
+        assert _class_block(source, "TP1") == 'class TP1(BaseModel):\n    theme: str = "light"\n'
+        assert _line_of(_class_block(source, "T"), "p1") == "p1: TP1 = Field(default_factory=TP1)"
+        assert _line_of(_class_block(source, "T"), "p2") == "p2: TP2 | None"
+        module = _import(tmp_path, source)
+        model = module.T
+        assert model.get_server_fields() == frozenset({"d20", "d22", "d28", "d31"})
+        assert model.model_fields["p2"].is_required()
+        first, second = model(p2=None), model(p2=None)
+        assert (first.d5, first.d15) == (datetime.fromisoformat("2020-01-01T00:00:00Z"), uuid.UUID(_UUID_TEXT))
+        assert (first.d6, first.d29) == (Duration.parse("1h30m"), Duration.parse("1h30m5ns"))
+        assert (first.d11, first.d25, first.d26, first.d27, first.d30) == ([], [1, 2], set(), {}, [[1], []])
+        assert first.p1 == module.TP1(theme="light")
+        for name in ("d6", "d11", "d25", "d26", "d27", "d29", "d30", "p1"):
+            assert getattr(first, name) is not getattr(second, name), name
+
     def test_if_renderings_ac9(self) -> None:
         sources = [
             _generate(parse_define_field(statement).state)
@@ -1936,6 +2226,12 @@ def _corpus_state() -> SchemaState:
             FieldState(name="dl", field_type="string", nullable=False, default=_surql_string(text)),
             FieldState(name="sub", field_type="object", nullable=True),
             FieldState(name="sub.x", field_type="string", default=text),
+            # D25 amended: constant defaults whose parts are server text (array elements, durations, datetimes, UUIDs).
+            FieldState(name="arr", field_type="array<string>", nullable=False, default="[" + _surql_string(text) + ", 'b']"),
+            FieldState(name="raw_items", field_type="array", nullable=False, default="[" + text + "]"),
+            FieldState(name="dur", field_type="duration", nullable=False, default=text),
+            FieldState(name="when", field_type="datetime", nullable=False, default="d'" + text + "'"),
+            FieldState(name="uid", field_type="uuid", nullable=False, default="u'" + text + "'"),
         ]
         tables[name] = TableState(
             name=name,
@@ -2015,6 +2311,8 @@ class TestInjection:
             aliases = {field.alias for field in model.model_fields.values()}
             assert text in aliases or model.model_fields.get(text) is not None, text
             assert model.model_fields["dl"].default == text
+            factory = model.model_fields["arr"].default_factory
+            assert factory is not None and factory() == [text, "b"], text
             assert model.model_config["table_name"] == f"inj_{index}"
             assert model.model_config["connection"] == "__import__('os').system('x')"
             literal = model.model_fields["lit"].annotation
@@ -2031,7 +2329,8 @@ def _random_state(rng: random.Random) -> SchemaState:
     kinds = [kind for kind, _, _ in TYPE_ROWS] + ["object", "array<object>", "option<object>", "set<object>"]
     columns = ["a", "b", "class", "first-name", "datetime", "l", "save", "model_x", "_p", "9x", "id", "in", "out", "é", "Tbl0"]
     columns += [text for text in CORPUS if text][:12]
-    defaults = [None, "0", "1.5f", "1.5dec", "'x'", "true", "NONE", "NULL", "time::now()", "[]"]
+    defaults = [None, "0", "1.5f", "1.5dec", "'x'", "true", "NONE", "NULL", "time::now()", "[]", "[1, NONE]", "{  }"]
+    defaults += ["[[1], []]", "['a', \"b'c\"]", "1h30m", "d'2030-01-01T00:00:00Z'", "u'0190d3b4-0000-7000-8000-000000000000'"]
     expressions = [None, "time::now()", "string::concat(a, ';', b)", "$value * 2", "$input", "IF a THEN 1 ELSE 2 END", "x"]
     tables: dict[str, TableState] = {}
     for index in range(rng.randint(1, 4)):

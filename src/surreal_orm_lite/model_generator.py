@@ -33,10 +33,15 @@ ORM's types (``Duration``, ``Decimal``, ``UUID``, ``RecordID``, ``Range``, the g
 ``set[T]`` for hashable ``T`` …); an optional kind adds ``| None = None``. An ``object`` with declared children becomes
 a ``BaseModel`` sub-model written before its class; other objects are ``dict[str, Any]``. ``COMPUTED e``, and a
 ``VALUE e`` that reads neither ``$value`` nor ``$input``, become ``Computed[T] = computed("e")`` when ``computed()``
-accepts ``e`` and the column needs no alias; a literal ``DEFAULT`` matching the annotation becomes the Python default.
+accepts ``e`` and the column needs no alias. A constant ``DEFAULT`` the model holds exactly becomes its Python default
+(spec §6.4.6 item 3, D25, M48): the literals that match the annotation, ``[]`` and arrays of such constants, ``{  }``
+(a ``dict``, or the sub-model when it can be built without arguments — else the field is required), durations,
+datetimes with at most 6 fractional digits and UUIDs; mutable values (``list``, ``set``, ``dict``, a sub-model,
+``Duration``) through ``default_factory``. So the server stores the same row whether the caller sets the field or not.
 Every other ``DEFAULT`` or computed expression gives the **server form** — ``T | None = None``, the attribute listed
 in ``server_fields`` so the server's value applies on create and is read back. ``ASSERT``, ``PERMISSIONS``,
-``REFERENCE`` and field comments are not generated; ``READONLY`` is a trailing comment.
+``REFERENCE`` and field comments are not generated; ``READONLY`` is a trailing comment, and a class whose objects hold
+sub-fields a ``DEFAULT`` fills on create says that ``update()`` after ``save()`` sends them as ``None`` (§6.4.7).
 
 **Module** (spec §6.4.8): a fixed docstring, the imports the classes use (standard library, then pydantic,
 surreal_orm_lite and surrealdb), a ``# Not generated:`` comment listing every table or field left out and why, then the
@@ -51,7 +56,9 @@ import re
 import tokenize
 import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import datetime
 from typing import NamedTuple
+from uuid import UUID
 
 from pydantic import BaseModel
 
@@ -65,7 +72,9 @@ from .define_parser import (
     KObject,
     KTuple,
     KUnion,
+    _flat_members,
     _lex,
+    _scan,
     parse_kind,
     unquote,
 )
@@ -73,6 +82,7 @@ from .edge import BaseSurrealEdge
 from .functions import SurrealFunc
 from .model_base import BaseSurrealModel
 from .schema_state import FieldState, IndexState, SchemaIssue, SchemaState, TableState
+from .types import Duration
 from .utils import VALID_ALIAS_PATTERN
 
 __all__ = ["ModelCodeGenerator"]
@@ -470,6 +480,10 @@ _I5_SAME_NAME = "two definitions have the same name"
 
 #: The class comment of a table with a ``READONLY`` datetime field (spec §6.4.7, M29).
 _UPDATE_NOTE = "update() fails on READONLY datetime fields (Python keeps microseconds, SurrealDB nanoseconds): use merge()."
+#: The class comment of a table whose objects hold sub-fields a ``DEFAULT`` fills on create (spec §6.4.7, M48, §14.9).
+_SUB_DEFAULT_NOTE = (
+    "update() after save() sends None for sub-fields a DEFAULT filled on create: call refresh() first, or use merge()."
+)
 _SCHEMALESS_NOTE = 'SCHEMALESS: fields not declared here are kept (extra="allow")'
 
 #: Where each importable name comes from; the blocks in isort order (spec §6.4.8).
@@ -493,6 +507,13 @@ _IMPORT_WIDTH = 88
 _INT_TEXT = re.compile(r"-?[0-9]+")
 _FLOAT_TEXT = re.compile(r"-?[0-9]+(?:\.[0-9]+)?f")
 _DECIMAL_TEXT = re.compile(r"-?[0-9]+(?:\.[0-9]+)?dec")
+#: A datetime ``DEFAULT`` the model holds exactly: UTC, at most 6 fractional digits — ``datetime.fromisoformat()``
+#: truncates more without an error (Python 3.11 too), and the server keeps nanoseconds (spec §6.4.6 item 3, M48).
+_DATETIME_TEXT = re.compile(r"d'([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z)'")
+#: An empty object ``DEFAULT``: only whitespace between the braces (the servers render ``{}`` as ``{  }``).
+_EMPTY_OBJECT_TEXT = re.compile(r"\{\s*\}")
+#: How deep arrays may nest in a ``DEFAULT`` the generator copies; deeper ones keep the server form.
+_MAX_DEFAULT_DEPTH = 32
 
 #: ``geometry<k>`` kind → the ORM class, and the class → its nullable alias for a top-level field (spec §6.4.4).
 _GEOMETRY_CLASSES: Mapping[str, str] = {
@@ -673,8 +694,8 @@ def _computable(expression: str) -> bool:
 
 
 def _python_default(text: str, annotation: _Type) -> str | None:
-    """The Python default of a literal ``DEFAULT`` whose value matches the annotation (spec §6.4.6, D25), as source;
-    ``None`` when there is none — an expression, or a literal of another type: the field takes the server form."""
+    """The Python default of a literal ``DEFAULT`` whose value matches the annotation — the scalar rows of spec §6.4.6
+    item 3 (D25) — as source; ``None`` when there is none: :meth:`_ClassWriter.constant` tries the other rows."""
     members = frozenset(annotation.members)
     is_any = annotation.is_any
     if _INT_TEXT.fullmatch(text):
@@ -708,6 +729,87 @@ def _python_default(text: str, annotation: _Type) -> str | None:
     if text in ("NONE", "NULL"):
         return "None" if is_any or annotation.none else None
     return None
+
+
+class _Default(NamedTuple):
+    """A Python default as source: ``expression`` builds the value; ``factory`` is what ``default_factory`` takes when
+    the value is mutable (``list``, ``lambda: [1, 2]``, a sub-model class …), ``None`` for a plain default."""
+
+    expression: str
+    factory: str | None = None
+
+
+#: What :meth:`_ClassWriter.constant` answers for ``{  }`` on a sub-model that cannot be built without arguments: the
+#: field has no default (spec §6.4.6 item 3, M48: the server refuses every create that leaves it to that ``DEFAULT``).
+_REQUIRED = _Default("")
+
+_NONE_DEFAULT = _Default("None")
+
+
+def _array_elements(text: str) -> list[str] | None:
+    """The elements of one SurrealQL array literal, split at its top-level commas and stripped (``[]`` → ``[]``);
+    ``None`` when ``text`` is not exactly one array literal, or an element is empty."""
+    if not (text.startswith("[") and text.endswith("]")):
+        return None
+    try:
+        tokens = _scan(text)
+    except DefineParseError:
+        return None
+    inside = tokens[1:-1]
+    if any(not token.depth for token in inside):  # the opening bracket closes before the end: not one literal
+        return None
+    elements: list[str] = []
+    begin = 1
+    for token in inside:
+        if token.kind == _PUNCT_TOKEN and token.depth == 1 and text[token.start] == ",":
+            elements.append(text[begin : token.start].strip())
+            begin = token.end
+    last = text[begin:-1].strip()
+    if not elements and not last:
+        return []
+    elements.append(last)
+    return None if not all(elements) else elements
+
+
+def _datetime_default(text: str) -> str | None:
+    """``datetime.fromisoformat("…")`` for a ``d'…'`` the model holds exactly (UTC, at most 6 fractional digits)."""
+    match = _DATETIME_TEXT.fullmatch(text)
+    if match is None:
+        return None
+    try:
+        datetime.fromisoformat(match.group(1))
+    except ValueError:  # a date that does not exist
+        return None
+    return "datetime.fromisoformat(" + _py_str(match.group(1)) + ")"
+
+
+def _uuid_default(text: str) -> str | None:
+    """``UUID("…")`` for a ``u'…'`` in the canonical form ``str(UUID(…))`` writes back."""
+    if len(text) < 3 or not text.startswith("u'") or not text.endswith("'"):
+        return None
+    inner = text[2:-1]
+    try:
+        canonical = str(UUID(inner))
+    except ValueError:
+        return None
+    return "UUID(" + _py_str(inner) + ")" if canonical == inner else None
+
+
+def _duration_default(text: str) -> _Default | None:
+    """``Duration.parse("…")`` — a factory, ``Duration`` being mutable — for a duration ``Duration.parse()`` accepts."""
+    try:
+        Duration.parse(text)
+    except ValueError:
+        return None
+    expression = "Duration.parse(" + _py_str(text) + ")"
+    return _Default(expression, "lambda: " + expression)
+
+
+def _kind_members(kind: Kind | None) -> list[Kind]:
+    """The members of a union kind, flattened; the kind itself otherwise (none for ``None``)."""
+    if kind is None:
+        return []
+    return _flat_members(kind.members) if isinstance(kind, KUnion) else [kind]
 
 
 def _width(line: str) -> int:
@@ -753,6 +855,18 @@ class _Annotation(NamedTuple):
     base: str
 
 
+class _Line(NamedTuple):
+    """A field's line (without indentation) and what the class needs to know about it."""
+
+    text: str
+    #: Listed in ``server_fields`` (a model's field in the server form).
+    server: bool = False
+    #: ``Computed[T] = computed(…)``: never written by the ORM.
+    computed: bool = False
+    #: No default: the field must be given.
+    required: bool = False
+
+
 class _ClassWriter:
     """The source of one table: its sub-models, then its class (spec §6.4.5–§6.4.7)."""
 
@@ -766,24 +880,34 @@ class _ClassWriter:
         self.blocks: list[str] = []
         #: ``(table, field, line)`` of every field not generated (S5).
         self.skips: list[tuple[str, str, str]] = []
+        #: Path → the sub-model written there (``None``: a ``dict[str, Any]``), so that each is written once.
+        self.sub_models_at: dict[tuple[str, ...], str | None] = {}
+        #: Sub-model class → whether it can be built without arguments (every field has a default).
+        self.buildable: dict[str, bool] = {}
+        #: The paths of the sub-model fields whose ``DEFAULT`` became a Python default, or made them required.
+        self.held: set[tuple[str, ...]] = set()
 
     def write(self) -> list[str]:
         """The sub-model blocks, then the class block."""
         lines: list[str] = []
         server_fields: list[str] = []
+        written: set[str] = set()  # the top-level columns the ORM writes: neither server_fields nor Computed
         for column, (attribute, alias) in self.names.fields(self.table.name).items():
             node = self.nodes.get((column,))
             if node is None:
-                lines.append(_assigned(f"{attribute}: dict[str, Any] | None", "None", alias))
+                lines.append(_assigned(f"{attribute}: dict[str, Any] | None", _NONE_DEFAULT, alias))
                 self._skip_children(column)
+                written.add(column)
                 continue
-            line, server = self.field_line(attribute, alias, node, model=True)
-            lines.append(line)
-            if server:
+            line = self.field_line(attribute, alias, node, model=True)
+            lines.append(line.text)
+            if line.server:
                 server_fields.append(attribute)
+            elif not line.computed:
+                written.add(column)
         base = "BaseSurrealEdge" if self.edge else "BaseSurrealModel"
         block = [f"class {self.names.class_name(self.table.name)}({base}):"]
-        block.extend("    " + comment for comment in self._comments())
+        block.extend("    " + comment for comment in self._comments(written))
         block.extend(self._model_config(server_fields))
         body = lines if self.edge else ["id: str | None = None", *lines]
         if body:
@@ -798,7 +922,7 @@ class _ClassWriter:
                 line = "- field " + repr(self.table.name + "." + field.name) + ": " + _S5_NO_PARENT
                 self.skips.append((self.table.name, field.name, line))
 
-    def _comments(self) -> list[str]:
+    def _comments(self, written: set[str]) -> list[str]:
         """The class comments of spec §6.4.7, each through ``_comment()``."""
         table = self.table
         texts = []
@@ -817,6 +941,8 @@ class _ClassWriter:
             texts.append("Events: " + ", ".join(event.name for event in table.events.values()))
         if self._readonly_datetime():
             texts.append(_UPDATE_NOTE)
+        if self._sub_field_defaults(written):
+            texts.append(_SUB_DEFAULT_NOTE)
         return [_comment(text, indent=4) for text in texts]
 
     def _readonly_datetime(self) -> bool:
@@ -826,6 +952,20 @@ class _ClassWriter:
             field.readonly and _mentions_datetime(_kind(field))
             for field in self.table.fields.values()
             if field.path and field.path[0] not in provided
+        )
+
+    def _sub_field_defaults(self, written: set[str]) -> bool:
+        """Whether a top-level field the ORM writes holds, in its object (a sub-model or a ``dict[str, Any]``, array
+        items included, at any depth), a sub-field whose ``DEFAULT`` (not ``ALWAYS``) the model does not hold as a
+        Python default: ``save()`` leaves it ``None`` on the instance, and ``update()`` then sends it (M48, §14.9)."""
+        return any(
+            len(field.path) > 1
+            and field.path[0] in written
+            and field.path[-1] != "*"
+            and field.default is not None
+            and not field.default_always
+            and tuple(field.path) not in self.held
+            for field in self.table.fields.values()
         )
 
     def _model_config(self, server_fields: Sequence[str]) -> list[str]:
@@ -853,32 +993,113 @@ class _ClassWriter:
         lines.append("    )")
         return lines
 
-    def field_line(self, attribute: str, alias: str | None, field: FieldState, *, model: bool) -> tuple[str, bool]:
-        """The line declaring ``field`` (without indentation) and whether it is a server field (spec §6.4.6).
+    def field_line(self, attribute: str, alias: str | None, field: FieldState, *, model: bool) -> _Line:
+        """The line declaring ``field`` (without indentation), and whether it is a server field, a computed one or a
+        required one (spec §6.4.6).
 
         ``model`` is false for a sub-model's field: ``Computed`` and ``server_fields`` belong to models, so a computed
         or server-filled child takes the server form without being listed.
         """
         annotation = self.annotation(field, top=model)
         text = annotation.text
-        default: str | None = None
+        default: _Default | None = None
         server = False
         expression = _computed_expression(field)
         if expression is not None:
             if model and alias is None and _computable(expression):
                 line = f"{attribute}: Computed[{annotation.base}] = computed({_py_str(expression)})"
-                return _readonly(line, field), False
+                return _Line(_readonly(line, field), computed=True)
             server = True
         elif field.default is not None:
-            default = _python_default(field.default, annotation.type)
-            server = default is None
+            default = self.constant(field.default, _kind(field), annotation.type, tuple(field.path))
+            if default is None:
+                server = True
+            elif not model:  # held, or required: no create leaves it to its DEFAULT (M48)
+                self.held.add(tuple(field.path))
+            if default is _REQUIRED:
+                default = None
         elif field.nullable or annotation.type.is_any:
-            default = "None"
+            default = _NONE_DEFAULT
         if server:
             if not (annotation.type.none or annotation.type.is_any):
                 text += " | None"
-            default = "None"
-        return _readonly(_assigned(f"{attribute}: {text}", default, alias), field), server and model
+            default = _NONE_DEFAULT
+        line = _readonly(_assigned(f"{attribute}: {text}", default, alias), field)
+        return _Line(line, server=server and model, required=default is None)
+
+    def constant(
+        self, text: str, kind: Kind | None, annotation: _Type, path: tuple[str, ...] | None, depth: int = 0
+    ) -> _Default | None:
+        """The Python default of a constant ``DEFAULT`` the model holds exactly (spec §6.4.6 item 3, D25, M48); ``None``
+        when there is none (the server form); :data:`_REQUIRED` for ``{  }`` on a sub-model that needs arguments.
+
+        ``kind`` and ``path`` (a field's own, or ``None``) find an array's items and their sub-model; ``depth`` counts the
+        arrays around ``text``.
+        """
+        scalar = _python_default(text, annotation)
+        if scalar is not None:
+            return _Default(scalar)
+        members = frozenset(annotation.members)
+        is_any = annotation.is_any
+        if text.startswith("["):
+            return self._array(text, kind, annotation, path, depth)
+        if _EMPTY_OBJECT_TEXT.fullmatch(text):
+            if is_any or "dict[str, Any]" in members:
+                return _Default("{}", "dict")
+            for member in annotation.members:
+                if member in self.buildable:
+                    return _Default(member + "()", member) if self.buildable[member] else _REQUIRED
+            return None
+        if is_any or "Duration" in members:
+            duration = _duration_default(text)
+            if duration is not None:
+                return duration
+        if is_any or "datetime" in members:
+            moment = _datetime_default(text)
+            if moment is not None:
+                return _Default(moment)
+        if is_any or "UUID" in members:
+            identifier = _uuid_default(text)
+            if identifier is not None:
+                return _Default(identifier)
+        return None
+
+    def _array(
+        self, text: str, kind: Kind | None, annotation: _Type, path: tuple[str, ...] | None, depth: int
+    ) -> _Default | None:
+        """``[]`` on a ``list[…]``, a ``set[…]`` or ``Any``; ``[e1, …]`` on an ``array`` kind (or ``Any``) whose item
+        annotation holds every element (spec §6.4.6 item 3). A non-empty array on a set, whose order and duplicates
+        the server changes, or on a tuple keeps the server form."""
+        elements = _array_elements(text) if depth < _MAX_DEFAULT_DEPTH else None
+        if elements is None:
+            return None
+        if not elements:
+            if annotation.is_any or any(member.startswith("list[") for member in annotation.members):
+                return _Default("[]", "list")
+            if any(member.startswith("set[") for member in annotation.members):
+                return _Default("set()", "set")
+            return None
+        item_kind: Kind | None = None
+        item_type = _ANY
+        if not annotation.is_any:
+            arrays = [member for member in _kind_members(kind) if isinstance(member, KName) and member.name == "array"]
+            if len(arrays) != 1:
+                return None
+            item_kind = _array_item(arrays[0])
+            # The items' sub-model, when the field's own kind is this array (as kind_type() found it).
+            item_model = self.sub_model((*path, "*")) if path is not None and arrays[0] is kind else None
+            if item_model is not None:
+                item_type = _Type((item_model,))
+            elif item_kind is not None:
+                item_type = self.kind_type(item_kind, None)
+        values = []
+        for element in elements:
+            value = self.constant(element, item_kind, item_type, None, depth + 1)
+            if value is None or value is _REQUIRED:
+                return None
+            values.append(value.expression)
+        expression = "[" + ", ".join(values) + "]"
+        return _Default(expression, "lambda: " + expression)
 
     def annotation(self, field: FieldState, *, top: bool) -> _Annotation:
         """The annotation of ``field`` (spec §6.4.4): a top-level geometry of one kind takes its nullable alias."""
@@ -925,30 +1146,41 @@ class _ClassWriter:
         return _NAMED_TYPES.get(kind.name, _ANY)
 
     def sub_model(self, path: tuple[str, ...]) -> str | None:
-        """The sub-model class at ``path``, written to ``blocks`` (after its own sub-models); ``None`` when there is no
-        candidate there or a child cannot be one of its fields as it is (spec §6.4.5). Each path is asked for once:
-        by the annotation of the field it belongs to."""
+        """The sub-model class at ``path``, written to ``blocks`` (after its own sub-models) the first time it is asked
+        for; ``None`` when there is no candidate there or a child cannot be one of its fields as it is (spec §6.4.5)."""
+        if path in self.sub_models_at:
+            return self.sub_models_at[path]
         name = self.names.sub_models.get((self.table.name, path))
         children = _children(self.nodes, path)
         if name is None or not children or not all(self.names.usable_child(child) for child in children):
+            self.sub_models_at[path] = None
             return None
+        self.sub_models_at[path] = name
         node = self.nodes.get(path)
         lines = [f"class {name}(BaseModel):"]
         if self.schemaless or (node is not None and node.flexible):
             lines.extend(['    model_config = ConfigDict(extra="allow")', ""])
+        buildable = True
         for child in children:
-            line, _ = self.field_line(child, None, self.nodes[(*path, child)], model=False)
-            lines.append("    " + line)
+            line = self.field_line(child, None, self.nodes[(*path, child)], model=False)
+            lines.append("    " + line.text)
+            buildable = buildable and not line.required
+        self.buildable[name] = buildable
         self.blocks.append("\n".join(lines))
         return name
 
 
-def _assigned(declaration: str, default: str | None, alias: str | None) -> str:
-    """``declaration`` with its default — ``= <default>``, or ``Field(…, alias=…)`` for an aliased column."""
+def _assigned(declaration: str, default: _Default | None, alias: str | None) -> str:
+    """``declaration`` with its default — ``= <default>``, ``Field(default_factory=…)`` for a mutable one, and
+    ``Field(…, alias=…)`` for an aliased column (spec §6.4.6 item 5)."""
+    arguments = []
+    if default is not None:
+        arguments.append("default=" + default.expression if default.factory is None else "default_factory=" + default.factory)
     if alias is not None:
-        arguments = "alias=" + _py_str(alias) if default is None else "default=" + default + ", alias=" + _py_str(alias)
-        return declaration + " = Field(" + arguments + ")"
-    return declaration if default is None else declaration + " = " + default
+        arguments.append("alias=" + _py_str(alias))
+    if alias is None and default is not None and default.factory is None:
+        return declaration + " = " + default.expression
+    return declaration + " = Field(" + ", ".join(arguments) + ")" if arguments else declaration
 
 
 def _readonly(line: str, field: FieldState) -> str:
