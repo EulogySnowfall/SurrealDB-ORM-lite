@@ -780,6 +780,129 @@ class TestFailedKillE2E:
         assert envelopes[0]["result"]["name"] == "retry"
 
 
+class _FakeSocket:
+    """The transport of a :class:`_DroppingClient`: records that it was closed."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _DroppingClient:
+    """An SDK-shaped WebSocket client whose connection drops while a KILL is in flight (issue #266).
+
+    The SDK's receive loop ends on the drop and cancels the pending request; the request's own
+    cleanup then finds its id gone from the cleared map and raises a ``KeyError`` over the
+    cancellation (surrealdb 2.0.0). With ``cancelled=True`` the KILL instead waits until the calling
+    task is cancelled, and the drop surfaces then — the SDK hiding the caller's cancellation.
+    """
+
+    def __init__(self, *, cancelled: bool = False) -> None:
+        self.live_queues: dict[str, Any] = {}
+        self.socket = _FakeSocket()
+        self.waiting = asyncio.Event()
+        self._cancelled = cancelled
+        self._dropped = asyncio.Event()
+        self.recv_task: asyncio.Task[Any] = asyncio.get_running_loop().create_task(self._dropped.wait())
+
+    async def kill(self, query_uuid: Any) -> None:
+        cancellation: BaseException = asyncio.CancelledError()
+        if self._cancelled:
+            self.waiting.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError as exc:
+                cancellation = exc
+        self._dropped.set()
+        await self.recv_task
+        error = KeyError(str(query_uuid))
+        error.__context__ = cancellation
+        raise error
+
+
+class _ClosingClient(_DroppingClient):
+    """The transport reports the drop a moment before the SDK's receive loop has ended."""
+
+    def __init__(self, *, ends: bool = True) -> None:
+        super().__init__()
+        self._ends = ends
+
+    async def kill(self, query_uuid: Any) -> None:
+        if self._ends:
+            asyncio.get_running_loop().call_later(0.05, self._dropped.set)
+        raise ConnectionResetError("connection reset by peer")
+
+
+class TestKillOnADroppedConnectionUnit:
+    """Issue #266: a KILL caught by a drop is a lost connection, not a refusal — the live query
+    died with the socket. Driven with fakes, so each ordering can be produced on demand."""
+
+    UUID = "44444444-4444-4444-4444-444444444444"
+
+    @staticmethod
+    def _serve(monkeypatch: pytest.MonkeyPatch, client: Any) -> None:
+        SurrealDBConnectionManager.set_connection(
+            url="ws://unused.invalid/rpc", user="root", password="root", namespace="ns", database="db"
+        )
+        monkeypatch.setattr(SurrealDBConnectionManager, "_cached_client", classmethod(lambda cls: client))
+
+    @pytest.mark.asyncio
+    async def test_a_kill_caught_by_a_drop_marks_the_uuid_dead(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from surreal_orm_lite import live
+
+        client = _DroppingClient()
+        self._serve(monkeypatch, client)
+        queue = live.register_subscriber(client, self.UUID)
+
+        await SurrealDBConnectionManager.kill(self.UUID)
+
+        assert self.UUID in live._killed()
+        assert queue.get_nowait() is live._STREAM_END
+        assert client.socket.closed is True, "a receive loop can end with the socket still open"
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_kill_stays_cancelled_when_the_sdk_hides_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from surreal_orm_lite import live
+
+        client = _DroppingClient(cancelled=True)
+        self._serve(monkeypatch, client)
+        queue = live.register_subscriber(client, self.UUID)
+
+        task = asyncio.create_task(SurrealDBConnectionManager.kill(self.UUID))
+        await asyncio.wait_for(client.waiting.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+        assert queue.get_nowait() is live._STREAM_END
+
+    @pytest.mark.asyncio
+    async def test_a_transport_error_waits_for_the_receive_loop_to_end(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from surreal_orm_lite import live
+
+        client = _ClosingClient()
+        self._serve(monkeypatch, client)
+
+        await SurrealDBConnectionManager.kill(self.UUID)
+
+        assert self.UUID in live._killed()
+        assert client.recv_task.done()
+
+    @pytest.mark.asyncio
+    async def test_a_transport_error_on_a_connection_that_stays_up_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from surreal_orm_lite import connection_manager, live
+
+        monkeypatch.setattr(connection_manager, "_DROP_SETTLE_TIMEOUT", 0.05)
+        client = _ClosingClient(ends=False)
+        self._serve(monkeypatch, client)
+
+        with pytest.raises(SurrealDbError, match="Failed to kill live query"):
+            await SurrealDBConnectionManager.kill(self.UUID)
+        assert self.UUID not in live._killed()
+        client.recv_task.cancel()
+
+
 class TestCancelledReadE2E:
     @pytest.mark.asyncio
     async def test_a_timed_out_read_leaves_the_stream_alive(self) -> None:
