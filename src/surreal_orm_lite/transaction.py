@@ -36,6 +36,9 @@ from . import cache as _cache
 from . import encoding as _encoding
 from .exceptions import SurrealDbConflictError, SurrealDbError
 
+#: A ``$name`` parameter of a statement, its name in group 1, matched whole (``BufferedTransaction.add``).
+_PARAMETER = re.compile(r"\$(\w+)")
+
 _NOT_EXECUTED_FILLER = "The query was not executed due to a failed transaction"
 
 #: The error ``InteractiveTransaction.commit()`` raises after a failed statement (issue #268), followed by that
@@ -228,16 +231,20 @@ class BufferedTransaction(Transaction):
     async def add(self, statement: str, variables: dict[str, Any] | None = None) -> None:
         """Append a statement, renaming its ``$vars`` with a per-statement prefix.
 
-        Each ``$name`` becomes ``$t<N>_name`` (matched at a word boundary so a name that
-        is a prefix of another is not corrupted). Returns None: nothing executes until
-        commit, so buffered writes cannot return rows.
+        Each ``$name`` of ``variables`` becomes ``$t<N>_name``, in a single pass over the statement (#261): a name is
+        matched whole, so one that is a prefix of another is not corrupted, a renamed name is never renamed again, and
+        a parameter that is not one of ``variables`` (``$this``, ``$value``…) is left alone. Returns None: nothing
+        executes until commit, so buffered writes cannot return rows.
         """
         variables = _encoding.encode(variables)
         prefix = f"t{self._counter}_"
         renamed = statement
         if variables:
+            renamed = _PARAMETER.sub(
+                lambda match: f"${prefix}{match[1]}" if match[1] in variables else match[0],
+                statement,
+            )
             for name, value in variables.items():
-                renamed = re.sub(rf"\${re.escape(name)}\b", f"${prefix}{name}", renamed)
                 self.variables[f"{prefix}{name}"] = value
         self.statements.append(renamed)
         self._counter += 1

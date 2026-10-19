@@ -68,6 +68,7 @@ from surreal_orm_lite.schema_state import (
     SchemaState,
     TableState,
 )
+from surreal_orm_lite.utils import _KEEP_LIMIT
 
 # Spec §8 / AC-12: the injection corpus — quotes, backslashes, line breaks, separators, payloads, non-ASCII.
 CORPUS: tuple[str, ...] = (
@@ -761,7 +762,6 @@ class IspPersonAddress(BaseModel):
 class IspPerson(BaseSurrealModel):
     # Indexes: isp_person_email (UNIQUE)
     # Events: isp_person_created
-    # update() fails on READONLY datetime fields (Python keeps microseconds, SurrealDB nanoseconds): use merge().
     model_config = SurrealConfigDict(table_name="isp_person", connection="isp", server_fields=["created"])
 
     id: str | None = None
@@ -856,14 +856,9 @@ _FIXTURE_FIELDS_2X = {
     ],
 }
 
-#: The update() note of spec §6.4.7, exactly (fixed text, 113 columns at indent 4).
-UPDATE_NOTE = (
-    "    # update() fails on READONLY datetime fields (Python keeps microseconds, SurrealDB nanoseconds): use merge()."
-)
-#: Spec §6.4.7 (M48, §14.9): the class comment of a table whose objects hold sub-fields a ``DEFAULT`` fills on create.
-SUB_DEFAULT_NOTE = (
-    "    # update() after save() sends None for sub-fields a DEFAULT filled on create: call refresh() first, or use merge()."
-)
+#: The update() note of spec §6.4.7, exactly (fixed text, 124 columns at indent 4), narrowed by #261 to the datetimes
+#: update() may not keep: below the top level, or past the first _KEEP_LIMIT top-level ones.
+UPDATE_NOTE = "    # update() may fail on READONLY datetimes below the top level or past the 32nd (Python keeps microseconds): use merge()."
 
 #: ruff's options for a generated module (spec §9.1).
 _RUFF_CHECK = ["check", "--isolated", "--select", "E,F,W,I,UP,B,C4,SIM", "--target-version", "py311", "--line-length", "128"]
@@ -903,6 +898,10 @@ def _f(name: str, kind: str = "string", **kwargs: Any) -> FieldState:
     """A field built by keyword; not nullable unless ``nullable=True`` is given."""
     kwargs.setdefault("nullable", False)
     return FieldState(name=name, field_type=kind, **kwargs)
+
+
+#: #261 review: a ``READONLY`` datetime in a sub-object, after a timestamped array.
+_META_AT = [_f("meta", "object"), _f("meta.at", "datetime", readonly=True)]
 
 
 def _line_of(source: str, attribute: str) -> str:
@@ -1711,20 +1710,72 @@ class TestClasses:
     @pytest.mark.parametrize(
         "fields",
         [
-            [_f("created", "datetime", readonly=True, default="time::now()")],
-            [_f("created", "datetime", nullable=True, readonly=True)],
+            [_f("tags", "set<datetime>", readonly=True)],
+            [_f("tags", "option<set<datetime>>", readonly=True)],
+            [_f("w", "array<set<datetime>>", readonly=True)],
+            [_f("address", "object"), _f("address.at", "set<datetime>", readonly=True)],
+            [_f("union", "string | set<datetime>", readonly=True)],
             [_f("dates", "array<datetime>", readonly=True)],
-            [_f("address", "object"), _f("address.at", "datetime", readonly=True)],
+            [_f("dates", "option<array<datetime, 3>>", readonly=True)],
             [_f("w", "array<object>"), _f("w.*.at", "option<datetime>", readonly=True)],
+            [_f("w", "array<object>", readonly=True), _f("w.*.at", "datetime")],  # a READONLY parent's sub-field
+            [
+                _f("a", "object"),
+                _f("a.b", "object"),
+                _f("a.b.c", "object"),
+                _f("a.b.c.d", "object"),
+                _f("a.b.c.d.at", "datetime", readonly=True),
+            ],
+            [_f("a", "object"), _f("a.b", "object"), _f("a.b.c", "{ d: { at: datetime } }", readonly=True)],
+            # #261 review: below the top level, what update() keeps depends on the fields before it (a list of
+            # timestamped items is enough to use the budget up), so a sub-object's or a tuple's datetime says so too.
+            [_f("address", "object"), _f("address.at", "datetime", readonly=True)],
+            [_f("address", "object", readonly=True), _f("address.at", "option<datetime>")],
             [_f("pair", "[int, datetime]", readonly=True)],
             [_f("lit", "{ at: datetime }", readonly=True)],
-            [_f("union", "string | set<datetime>", readonly=True)],
+            [_f("a", "object"), _f("a.b", "object"), _f("a.b.c", "object"), _f("a.b.c.at", "datetime", readonly=True)],
+            [_f("a", "object"), _f("a.b", "object"), _f("a.b.c", "{ at: datetime }", readonly=True)],
+            [_f("history", "array<object>"), _f("history.*.at", "datetime"), *_META_AT],
+        ],
+        ids=[
+            "set",
+            "optional-set",
+            "array-of-sets",
+            "nested-set",
+            "union-set",
+            "array",
+            "sized-array",
+            "array-item",
+            "readonly-parent",
+            "four-levels",
+            "four-levels-literal",
+            "sub-object",
+            "readonly-object",
+            "tuple",
+            "literal-object",
+            "three-levels",
+            "three-levels-literal",
+            "after-a-timestamped-array",
         ],
     )
     def test_update_note(self, fields: list[FieldState]) -> None:
+        """#261: a ``READONLY`` field holding a datetime ``update()`` may not keep — anywhere below the top level: in a
+        sub-object, a tuple, a set or an array — still says so."""
         source = _generate(*fields)
         assert _class_block(source, "T").splitlines()[1] == UPDATE_NOTE
-        assert len(UPDATE_NOTE) == 113
+        assert len(UPDATE_NOTE) == 124
+
+    @pytest.mark.parametrize(
+        ("count", "note"),
+        [(_KEEP_LIMIT, False), (_KEEP_LIMIT + 1, True)],
+    )
+    @pytest.mark.parametrize("kind", ["datetime", "option<datetime>", "string | datetime", "any"])
+    def test_update_note_past_the_kept_top_level_datetimes(self, count: int, note: bool, kind: str) -> None:
+        """#261 review: ``update()`` keeps the first ``_KEEP_LIMIT`` top-level datetimes only, so a class with more
+        top-level fields that may hold one says so when one of them is ``READONLY`` (here the last, ``d99``)."""
+        fields = [_f(f"d{index:02}", kind) for index in range(count - 1)] + [_f("d99", "datetime", readonly=True)]
+        assert (UPDATE_NOTE in _generate(*fields).splitlines()) is note
+        assert "update()" not in _generate(*fields[:-1], _f("d99", "datetime"), _f("n", "int"))
 
     @pytest.mark.parametrize(
         "fields",
@@ -1735,6 +1786,15 @@ class TestClasses:
             [_f("id", "datetime", readonly=True)],
             [_f("pair", "[int, string]", readonly=True), _f("lit", "{ at: int }", readonly=True)],
             [_f("bad", "datetime<", readonly=True)],  # I3: the kind is not known
+            [_f("tags", "set<string>", readonly=True)],
+            # #261: update() keeps every stored top-level datetime it did not change, up to _KEEP_LIMIT, whatever the
+            # fields before it hold.
+            [_f("created", "datetime", readonly=True, default="time::now()")],
+            [_f("created", "datetime", nullable=True, readonly=True)],
+            [_f("created", "string | datetime", readonly=True)],
+            [_f("dates", "array<datetime>"), _f("created", "datetime", readonly=True)],  # the array is not READONLY
+            [_f("history", "array<object>"), _f("history.*.at", "datetime"), _f("created", "datetime", readonly=True)],
+            [_f("address", "object"), _f("address.at", "datetime"), _f("address.n", "int", readonly=True)],
         ],
     )
     def test_no_update_note(self, fields: list[FieldState]) -> None:
@@ -1751,22 +1811,6 @@ class TestClasses:
             [_f("meta", "object"), _f("meta.first-name", default="'x'", path=["meta", "first-name"])],
             [_f("meta", "object", default="{  }"), _f("meta.datetime", "int", default="1", path=["meta", "datetime"])],
             [_f("a.b", "int", default="1")],  # an undefined parent: dict[str, Any] | None
-        ],
-        ids=["child", "optional-child", "grandchild", "factory-parent", "item", "dict", "dict-factory", "no-parent"],
-    )
-    def test_sub_field_default_note(self, fields: list[FieldState]) -> None:
-        """Spec §6.4.7 (M48, AC-18c): a written top-level object holding a sub-field a ``DEFAULT`` the model does not
-        hold fills on create."""
-        source = _generate(*fields)
-        assert _class_block(source, "T").splitlines()[1:3] == [
-            SUB_DEFAULT_NOTE,
-            '    model_config = SurrealConfigDict(table_name="t")',
-        ]
-        assert len(SUB_DEFAULT_NOTE) == 119
-
-    @pytest.mark.parametrize(
-        "fields",
-        [
             [_f("prefs", "object"), _f("prefs.theme", default="'light'")],
             [_f("prefs", "object"), _f("prefs.at", "datetime", default="time::now()", default_always=True)],
             [_f("prefs", "object", default="time::now()"), _f("prefs.at", "datetime", default="time::now()")],
@@ -1776,35 +1820,55 @@ class TestClasses:
             [_f("prefs", "object"), _f("prefs.at", "datetime", value="time::now()")],
             [_f("at", "datetime", default="time::now()")],
         ],
-        ids=["held", "always", "server-field", "computed", "required", "item-definition", "value", "top-level"],
+        ids=[
+            "child",
+            "optional-child",
+            "grandchild",
+            "factory-parent",
+            "item",
+            "dict",
+            "dict-factory",
+            "no-parent",
+            "held",
+            "always",
+            "server-field",
+            "computed",
+            "required",
+            "item-definition",
+            "value",
+            "top-level",
+        ],
     )
     def test_no_sub_field_default_note(self, fields: list[FieldState]) -> None:
-        assert "update() after save()" not in _generate(*fields)
+        """#261: ``save()`` reads back the sub-fields a ``DEFAULT`` fills on create, so no class says otherwise (the
+        comment of spec §6.4.7, M48, is gone)."""
+        source = _generate(*fields)
+        assert "update() after save()" not in source
+        assert _class_block(source, "T").splitlines()[1].startswith("    model_config = ")
 
-    def test_sub_field_default_note_follows_the_update_note(self) -> None:
+    def test_update_note_follows_the_edge_ends(self) -> None:
         source = _generate(
-            _f("created", "datetime", readonly=True),
+            _f("created", "set<datetime>", readonly=True),
             _f("prefs", "object"),
             _f("prefs.at", "datetime", default="time::now()"),
             name="e",
             table_type="relation",
         )
-        assert _class_block(source, "E").splitlines()[1:5] == [
+        assert _class_block(source, "E").splitlines()[1:4] == [
             "    # IN any OUT any",
             UPDATE_NOTE,
-            SUB_DEFAULT_NOTE,
             '    model_config = SurrealConfigDict(table_name="e")',
         ]
 
     def test_update_note_on_an_edge_but_not_for_in_out(self) -> None:
-        edge = _generate(_f("in", "datetime", readonly=True), name="e", table_type="relation")
+        edge = _generate(_f("in", "set<datetime>", readonly=True), name="e", table_type="relation")
         assert "update()" not in edge
-        edge = _generate(_f("at", "datetime", readonly=True), name="e", table_type="relation")
+        edge = _generate(_f("at", "set<datetime>", readonly=True), name="e", table_type="relation")
         assert _class_block(edge, "E").splitlines()[2] == UPDATE_NOTE
 
     def test_comment_order(self) -> None:
         source = _generate(
-            _f("at", "datetime", readonly=True),
+            _f("at", "set<datetime>", readonly=True),
             name="r",
             table_type="relation",
             schema_mode="SCHEMALESS",

@@ -1,6 +1,5 @@
 import contextlib
 import copy
-import dataclasses
 import functools
 import logging
 import os
@@ -39,12 +38,14 @@ from .signals import (
 from .transaction import Transaction
 from .types import Duration, _duration_from_sdk, _timedelta_from_sdk
 from .utils import (
+    PLAIN_CONTENT,
     VALID_ALIAS_PATTERN,
     apply_ddl_statements,
     build_set_clause,
     coerce_endpoint,
     format_record_id,
     merge_extra_vars,
+    replace_content,
     user_stacklevel,
     validate_alias_name,
     validate_edge_name,
@@ -157,62 +158,6 @@ def _read_kind(annotation: Any) -> str | None:
     if annotation is Duration:
         return "duration"
     return None
-
-
-def _annotation_holds(annotation: Any, leaf: Callable[[type], bool], _aliases: frozenset[int] = frozenset()) -> bool:
-    """Whether a field annotation holds, at any depth, a class for which ``leaf`` is true.
-
-    Walks ``Annotated`` (its first argument), unions, the arguments of generic types
-    (``list[Sub]``, ``dict[str, Sub]``, ``Sub | None``, ``Range[Sub]``…) and the value of a
-    ``type`` alias (each alias once, so a recursive one ends). A string or ``ForwardRef``, the
-    values of a ``Literal`` and ``type[...]`` hold none. Used by :func:`_has_structured_type`
-    and :func:`_holds_timedelta` (#228).
-    """
-    origin = typing.get_origin(annotation)
-    if origin is typing.Annotated:
-        return _annotation_holds(typing.get_args(annotation)[0], leaf, _aliases)
-    if origin is typing.Literal or origin is type:
-        return False
-    if origin is not None:
-        return any(_annotation_holds(arg, leaf, _aliases) for arg in typing.get_args(annotation))
-    if not isinstance(annotation, type):
-        if not hasattr(annotation, "__type_params__") or id(annotation) in _aliases:
-            return False
-        try:
-            value = annotation.__value__  # a ``type`` alias, evaluated lazily
-        except Exception:
-            return False
-        return _annotation_holds(value, leaf, _aliases | {id(annotation)})
-    return leaf(annotation)
-
-
-def _is_structured(cls: type) -> bool:
-    """Whether ``cls`` is a ``BaseModel``, a dataclass or a ``TypedDict``.
-
-    A ``TypedDict`` is recognised by its shape, since ``typing.is_typeddict`` misses
-    ``typing_extensions.TypedDict``, the form Pydantic requires before Python 3.12.
-    """
-    if issubclass(cls, BaseModel) or dataclasses.is_dataclass(cls):
-        return True
-    return issubclass(cls, dict) and hasattr(cls, "__required_keys__")
-
-
-def _has_structured_type(annotation: Any) -> bool:
-    """Whether a field annotation holds a structured type at any depth: a ``BaseModel``, a dataclass or a ``TypedDict``.
-
-    See :func:`_annotation_holds` for the walk. Used by :meth:`BaseSurrealModel._sync_fields` (#228).
-    """
-    return _annotation_holds(annotation, _is_structured)
-
-
-def _holds_timedelta(annotation: Any) -> bool:
-    """Whether a field annotation holds exactly ``timedelta`` at any depth (``list[timedelta]``, ``timedelta | str``…).
-
-    A ``timedelta`` subclass does not count: Pydantic validates it by instance, so the SDK's
-    ``Duration`` is never converted for it (see :func:`_with_sdk_timedeltas`). Used by
-    :meth:`BaseSurrealModel._sync_fields` (#228).
-    """
-    return _annotation_holds(annotation, lambda cls: cls is timedelta)
 
 
 def _is_input(node: Any, value: Any, copies: Mapping[int, Any] | None) -> bool:
@@ -903,27 +848,26 @@ class BaseSurrealModel(BaseModel):
 
     @classmethod
     def _sync_fields(cls) -> dict[str, Any]:
-        """Return the fields a write sync validates, by Python name, cached per class (#228).
+        """Return the fields a write sync validates, by Python name, cached per class (#228, #261).
 
-        ``{"sub": Sub | None, "location": Annotated[GeometryPoint | None, GeoField['point']]}``: every
-        field whose annotation holds a structured type at any depth (a ``BaseModel``, a dataclass or a
-        ``TypedDict``, alone or in ``list[...]``, ``dict[..., ...]``, ``X | None``…, see
-        ``_has_structured_type``), every geometry field (``_read_kind``) and every field holding a
-        ``timedelta`` below the top level (``list[timedelta]``, ``timedelta | str``…, see
-        ``_holds_timedelta``; a top-level one has its own rule). Each maps to its full
-        annotation, ``Annotated`` constraints included (``FieldInfo.rebuild_annotation()``), plus the
-        field's discriminator. :meth:`_apply_record` receives rows keyed by column but translates each
-        key to its Python name first, so the map needs no column keys. Cached once Pydantic has
-        completed the class, like :meth:`_read_kinds`; never mutate the returned dict.
+        ``{"status": Status, "sub": Sub | None, "location": Annotated[GeometryPoint | None, GeoField['point']]…}``:
+        every declared field but ``id``, which keeps the native ``RecordID`` a row comes back with, and the top-level
+        ``timedelta`` and ``Duration`` fields, which :meth:`_apply_record` converts by their read kind
+        (:meth:`_read_kinds`). Before #261 only a field holding a sub-model, a geometry or a ``timedelta`` below the
+        top level was validated, and every other one kept the SDK's value even where a read gives another type: an
+        enum's ``str`` or ``int``, a ``list`` for a ``tuple`` or a set, a midnight ``datetime`` for a ``date``, the
+        SDK's ``Range``, a ``Decimal`` for a ``float`` stored as ``decimal``. Each maps to its full annotation,
+        ``Annotated`` constraints included (``FieldInfo.rebuild_annotation()``), plus the field's discriminator.
+        :meth:`_apply_record` receives rows keyed by column but translates each key to its Python name first, so the
+        map needs no column keys. Cached once Pydantic has completed the class, like :meth:`_read_kinds`; never mutate
+        the returned dict.
         """
         cached = _SYNC_FIELDS.get(cls)
         if cached is not None:
             return cached
         fields: dict[str, Any] = {}
         for name, info in cls.model_fields.items():
-            kind = _read_kind(info.annotation)
-            nested_timedelta = kind is None and _holds_timedelta(info.annotation)
-            if kind != "geometry" and not nested_timedelta and not _has_structured_type(info.annotation):
+            if name == "id" or _read_kind(info.annotation) in ("timedelta", "duration"):
                 continue
             annotation = info.rebuild_annotation()
             if info.discriminator is not None:
@@ -1059,11 +1003,13 @@ class BaseSurrealModel(BaseModel):
         (:meth:`_validated_row`). A sub-model's ``dict`` becomes the declared instance, with the
         ORM's durations, ranges and geometries; a stored GeoJSON object in a geometry field becomes
         the ORM's geometry; a ``timedelta`` below the top level reads the SDK's ``Duration``, as in
-        a read (``_validated_with_sdk_timedeltas``). That is what a read gives unless the model's
-        own validators reshape the field, which a field validated alone cannot run: a field in
-        :meth:`_sync_reshaped` gives ``value`` back unchanged. So do a value that does not
-        validate, a validator that raises anything else and a field without an adapter (see
-        :meth:`_sync_adapter`): never raises. When the model may run code of the user's on its
+        a read (``_validated_with_sdk_timedeltas``); and since #261 an enum's value becomes the
+        enum, a ``list`` the declared ``tuple`` or set, a midnight ``datetime`` the declared
+        ``date``, the SDK's ``Range`` the ORM's and a ``Decimal`` the declared ``float``. That is
+        what a read gives unless the model's own validators reshape the field, which a field
+        validated alone cannot run: a field in :meth:`_sync_reshaped` gives ``value`` back
+        unchanged. So do a value that does not validate, a validator that raises anything else
+        and a field without an adapter (see :meth:`_sync_adapter`): never raises. When the model may run code of the user's on its
         input (:meth:`_runs_input_code`), a deep copy of ``value`` is validated, so ``value`` is
         given back as received, never as that code changed it in place.
         """
@@ -1469,7 +1415,9 @@ class BaseSurrealModel(BaseModel):
           ``DEFAULT`` is a create-time default on both 2.6.x and 3.x, so an omitted optional
           column is *deleted* and an omitted required one is a hard server error. The instance's
           value is therefore kept, which round-trips the server's own value for any record that
-          was loaded or saved through the ORM.
+          was loaded or saved through the ORM: ``save()`` reads the whole returned row back
+          (#261), and a ``datetime`` the instance holds floored to the microsecond keeps the stored
+          nanoseconds, within the bounds of :func:`~surreal_orm_lite.utils.replace_content`.
 
         Args:
             replace: ``True`` for the full-replace paths (``update()``, ``upsert()``), which
@@ -1681,6 +1629,13 @@ class BaseSurrealModel(BaseModel):
         explicit record id, which is bound (``$rid``), never written into the statement,
         so every id shape works: a compound id such as ``pair:[User:alice, User:bob]``
         included. ``keep`` is forwarded to :meth:`_write_payload`.
+
+        The row the server returns is applied to the instance (:meth:`_apply_record`), with an
+        explicit id as without one, directly as in an interactive transaction (#261): the
+        instance then holds what the record holds, ``DEFAULT``-filled sub-fields, values the
+        server coerced and the types a read gives included. An explicit id is kept as given
+        (a ``str`` stays a ``str``); an auto id is the server's ``RecordID``. A buffered
+        transaction returns no row before commit: the instance keeps its values there.
         """
         record_id = self._record_id()
         data = self._write_payload(keep=keep)
@@ -1689,11 +1644,11 @@ class BaseSurrealModel(BaseModel):
         if tx is not None:
             if record_id is not None:
                 rows = await tx.add("CREATE $rid CONTENT $data;", {"rid": record_id, "data": data})
-                # An interactive transaction (3.x/WebSocket) answers with the created row, so
-                # hydrate the server-owned fields exactly as the non-tx path does. A buffered
-                # transaction defers the statement and has nothing to return yet — its
-                # server-owned fields stay None until the instance is refreshed after commit.
-                self._apply_record(rows, only=self.get_server_fields())
+                # An interactive transaction (3.x/WebSocket) answers with the created row, applied
+                # exactly as the non-tx path does. A buffered transaction defers the statement and
+                # has nothing to return yet: the instance keeps its values (server-owned fields stay
+                # None) until it is refreshed after commit.
+                self._apply_record(rows, exclude=("id",))
                 return self, True
             if not tx.is_interactive:
                 raise SurrealDbError(
@@ -1718,13 +1673,11 @@ class BaseSurrealModel(BaseModel):
                 if "already exists" in str(e).lower():
                     raise SurrealDbError(f"There was a problem with the database: {e}") from e
                 raise
-            # Pull back the fields the SERVER owns — computed fields (DEFINE FIELD … VALUE) and
-            # `server_fields` entries — so they are readable straight after save().
-            # Deliberately narrow: the instance already holds the values it just wrote, while the
-            # whole row would leave top-level `date`, `set` and `Range` fields with the SDK's
-            # values (see _apply_record). A model that declares neither is untouched, exactly as
-            # before v0.14.0.
-            self._apply_record(record, only=self.get_server_fields())
+            # Apply the whole row (#261): the fields the SERVER owns (computed fields, `server_fields`),
+            # the sub-fields a DEFAULT filled and the values it coerced are readable straight after
+            # save(), and a following update() writes them back unchanged. _apply_record gives each
+            # field the type a read gives. The id stays the one the caller gave.
+            self._apply_record(record, exclude=("id",))
             return self, True
 
         # Auto-generate the ID
@@ -1869,6 +1822,13 @@ class BaseSurrealModel(BaseModel):
             ...     extra_vars={"password": raw_password},
             ... )
 
+        The row the server returns is applied to the instance (#261), with an explicit id as
+        without one: right after ``save()`` it holds what the record holds — ``server_fields``,
+        computed fields, the sub-fields a ``DEFAULT`` filled, the values the server coerced —
+        each field with the value a read gives, the model's validators included (an enum, a
+        ``tuple``, a set, a ``date``, a ``float`` stored as ``decimal``…). An explicit id stays as
+        given; an auto id becomes the server's ``RecordID``.
+
         Note:
             In a **buffered** transaction (HTTP or SurrealDB 2.6.x) the server-computed
             values are unknown until commit, so the instance keeps its pre-save values for
@@ -1882,46 +1842,48 @@ class BaseSurrealModel(BaseModel):
             return await self._save_with_signals(do_op, tx)
         return await self._save_with_signals(self._do_save, tx)
 
-    def _apply_record(self, record: Any, only: Iterable[str] | None = None) -> None:
+    def _apply_record(self, record: Any, only: Iterable[str] | None = None, exclude: Collection[str] = ()) -> None:
         """Copy a returned DB row's fields onto this instance (id kept as native ``RecordID``).
 
         Accepts the raw SDK result (a row dict, a single-element list, or ``None``) and applies
-        only attributes the model actually declares. Shared by every write path that gets a row
-        back (``_do_save``, ``_do_upsert``, ``patch``, the atomic helpers, the ``server_values``
-        paths) so the "apply the row the server gave back" step lives in one place. A
-        ``None``/empty result is a no-op — callers that must distinguish "no row" from "nothing
-        to apply" check first.
+        only the fields the model declares, and its extras (:meth:`_set_synced`). Shared by every
+        write path that gets a row back (``_do_save``, ``_do_upsert``, ``patch``, the atomic
+        helpers, the ``server_values`` paths) so the "apply the row the server gave back" step
+        lives in one place. A ``None``/empty result is a no-op — callers that must distinguish
+        "no row" from "nothing to apply" check first.
 
-        Values are written with ``object.__setattr__``, i.e. without validating the instance
-        itself: a frozen field is still updated, and only the fields described below go through
-        validation. That is why ``only`` exists: a caller that needs just a few known fields
-        should say so rather than re-applying the whole row.
+        Values are written without validating the instance itself (:meth:`_set_synced`): a
+        frozen field is still updated. ``only`` restricts the copy to a few known fields.
 
         A row arrives keyed by **column**, so each key is translated back to its Python field
-        name first (v0.18.0). ``only`` is therefore matched on Python names — the same
-        vocabulary the callers use, since they pass things like ``get_server_fields()``.
+        name first (v0.18.0). ``only`` and ``exclude`` are therefore matched on Python names —
+        the same vocabulary the callers use, since they pass things like ``get_server_fields()``.
 
-        Top-level ``timedelta`` and ``Duration`` fields get the SDK's ``Duration`` converted
-        (v0.23.0), and top-level geometry fields the SDK's geometries, as the ORM's geometry
-        classes (v0.24.0). A field that holds a sub-model (a ``BaseModel``, a dataclass or a
-        ``TypedDict``, at any depth of its annotation), a field that holds a ``timedelta`` below
-        the top level (``list[timedelta]``, ``timedelta | str``…) and a geometry field holding
-        anything other than an SDK geometry (a stored GeoJSON object…) get the value a read gives
-        (#228, see :meth:`_sync_fields`): when the row holds such a field, the whole row is
-        validated as :meth:`from_db` validates it, the model's own validators included
-        (:meth:`_validated_row`), and those fields take their validated value. A sub-model field
-        then holds its declared instance, with the ORM's durations, ``timedelta``s, ranges and
-        geometries (:meth:`_read_nested_timedeltas`). When the row does not validate, each such
-        field is validated alone (:meth:`_validated_on_sync`), unless the model's own validators
-        may reshape it, and a value that still does not validate is applied as received, so this
-        never raises. Every other value is applied as received: a typed container of other
-        scalars such as ``list[Duration]`` or ``list[GeometryPoint]`` keeps the SDK's values,
-        which its serializer converts at the next ``model_dump()``, and top-level ``date``,
-        ``set`` and ``Range`` fields hold the SDK's value.
+        Each field takes the value a read gives (#228; every field since #261, see
+        :meth:`_sync_fields`). The ``id`` keeps the native ``RecordID``. Top-level ``timedelta``
+        and ``Duration`` fields get the SDK's ``Duration`` converted (v0.23.0), and top-level
+        geometry fields the SDK's geometries, as the ORM's geometry classes (v0.24.0). Every
+        other declared field (a geometry field holding anything but an SDK geometry, a stored
+        GeoJSON object…, included) takes its value from the whole row validated as
+        :meth:`from_db` validates it, the model's own validators included
+        (:meth:`_validated_row`): a sub-model field holds its declared instance, with the ORM's
+        durations, ``timedelta``s, ranges and geometries (:meth:`_read_nested_timedeltas`); an
+        enum field the enum, not the SDK's ``str`` or ``int``; a ``tuple``, set, ``date`` or
+        ``Range`` field its declared type, not the SDK's ``list``, midnight ``datetime`` or
+        ``Range``; a ``float`` field stored as ``decimal`` a ``float``, not a ``Decimal``. When
+        the row does not validate, each field is validated alone (:meth:`_validated_on_sync`),
+        unless the model's own validators may reshape it, and a value that still does not
+        validate is applied as received, so this never raises. A column the model does not
+        declare goes, as received, where a read puts it (:meth:`_set_synced`): to the extras under
+        ``extra="allow"``, nowhere otherwise. Since the row holds what ``model_dump()`` wrote, that
+        includes a Pydantic ``@computed_field``'s column, which never reaches the property (#261
+        review).
 
         Args:
             only: restrict the copy to these field names. ``None`` (default) applies every field
                 in the row.
+            exclude: field names never copied (#261: ``save()`` with an explicit id keeps the id it
+                was given).
         """
         if isinstance(record, list):
             record = record[0] if record else None
@@ -1934,7 +1896,7 @@ class BaseSurrealModel(BaseModel):
         pending: list[str] = []
         for column, value in record.items():
             key = self.to_py_field(column)
-            if (allowed is not None and key not in allowed) or not hasattr(self, key):
+            if (allowed is not None and key not in allowed) or key in exclude:
                 continue
             kind = kinds.get(key)
             if kind == "timedelta":
@@ -1950,8 +1912,24 @@ class BaseSurrealModel(BaseModel):
             row = self._validated_row(record)
             for key in pending:
                 values[key] = getattr(row, key) if row is not None else self._validated_on_sync(key, values[key])
+        self._set_synced(values)
+
+    def _set_synced(self, values: Mapping[str, Any]) -> None:
+        """Write ``values``, keyed by Python name, where a read holds them, without validating the instance (#261 review).
+
+        A field the model declares is set with ``object.__setattr__``, so a frozen field is still updated. Any other
+        key but ``id`` goes to ``__pydantic_extra__`` under ``extra="allow"``, where :meth:`from_db` puts the columns
+        the model does not declare, and is dropped otherwise. So a key naming a property (a Pydantic
+        ``@computed_field``, whose value ``model_dump()`` writes to the record), a method (``json``) or any other
+        class attribute never becomes an attribute of the instance: it neither raises nor hides that attribute.
+        """
+        fields = type(self).model_fields
+        extra = self.__pydantic_extra__
         for key, value in values.items():
-            object.__setattr__(self, key, value)
+            if key in fields:
+                object.__setattr__(self, key, value)
+            elif extra is not None and key != "id":
+                extra[key] = value
 
     def _sync_after_merge(
         self,
@@ -1981,11 +1959,10 @@ class BaseSurrealModel(BaseModel):
         The fallback whenever no row comes back: a buffered transaction (nothing has run yet)
         or ``refresh=False`` (the row was deliberately not requested). A kwarg that
         ``server_values`` overrode is skipped — writing it would leave the instance holding a
-        value that never reached the database. Keys here are Python field names.
+        value that never reached the database. Keys here are Python field names, written as
+        :meth:`_set_synced` writes them.
         """
-        for key, value in data.items():
-            if key not in server_values and hasattr(self, key):
-                object.__setattr__(self, key, value)
+        self._set_synced({key: value for key, value in data.items() if key not in server_values})
 
     async def _run_update(
         self,
@@ -2071,7 +2048,8 @@ class BaseSurrealModel(BaseModel):
         statement, so every id shape works: a compound id such as
         ``pair:[User:alice, User:bob]`` included. ``created`` is read from the statement's
         ``$before`` (``None`` → the row did not exist), so the ``post_save`` signal reports it
-        truthfully — at no extra round-trip.
+        truthfully — at no extra round-trip. A payload holding a ``datetime`` keeps the stored
+        datetimes it did not change, as :meth:`update` does (#261, :func:`replace_content`).
 
         When ``tx`` is provided the ``UPSERT`` statement is buffered (deferred to commit);
         on an interactive transaction the returned row is applied to ``self``.
@@ -2087,8 +2065,9 @@ class BaseSurrealModel(BaseModel):
         # RETURN $before, $after reports both states of the row in a single statement, so
         # `created` is the truth rather than an assumption (issue #156). Verified on
         # SurrealDB 2.6.x and 3.x alike.
-        statement = "UPSERT $rid CONTENT $data RETURN $before AS before, $after AS after;"
-        variables = {"rid": record_id, "data": data}
+        content, bound = replace_content(data)
+        statement = f"UPSERT $rid CONTENT {content} RETURN $before AS before, $after AS after;"
+        variables = {"rid": record_id, **bound}
 
         if tx is not None:
             rows = await tx.add(statement, variables)
@@ -2123,6 +2102,9 @@ class BaseSurrealModel(BaseModel):
         Runs ``UPSERT $rid CONTENT $data``, the record id bound as a query parameter: this is
         REPLACE semantics, so any field omitted from the model is removed from the stored
         record. For a partial update use ``merge()`` instead. An explicit id is required.
+        A ``datetime`` written back unchanged keeps the stored nanoseconds, as in :meth:`update`;
+        as there, SurrealDB 2.x refuses to replace an existing record when the model leaves out a
+        field with a non-optional ``TYPE`` and a ``VALUE`` clause, a ``Computed`` one (#267).
 
         When ``tx`` is provided, the ``UPSERT`` is buffered onto the transaction.
 
@@ -2138,14 +2120,45 @@ class BaseSurrealModel(BaseModel):
         """
         Update the model instance to the database.
 
-        When ``tx`` is provided, the UPDATE statement is buffered onto the
-        transaction instead of being executed immediately. The record id is bound
-        (``$rid``), never written into the statement, so every id shape works —
+        A full replace (``UPDATE $rid CONTENT …``): every field the instance holds is written, and a
+        field it does not hold is removed from the record. After a call that applied the returned
+        row (``save()``, ``refresh()``, ``merge()``…), the instance holds the values a read gives
+        (#261), and those are written: a ``float`` field stored in a ``decimal`` column writes the
+        float's rounding (declare ``Decimal`` to keep every digit), and under ``extra="allow"`` the
+        columns in ``model_extra`` are written back, not removed. When ``tx`` is provided, the UPDATE
+        statement is buffered onto the transaction instead of being executed immediately. The
+        record id is bound (``$rid``), never written into the statement, so every id shape works —
         an array id such as ``follows:[User:alice, User:bob]`` included.
+
+        A ``datetime`` keeps the stored value when that value floors to it at the microsecond
+        (#261): SurrealDB stores nanoseconds, which Python and the SDK read floored to the
+        microsecond, so writing a datetime back unchanged would change the stored one and a
+        ``READONLY`` field would refuse it. An instance loaded with ``get()`` or written with
+        ``save()`` therefore updates a record whose ``READONLY`` datetimes are top-level fields, on
+        SurrealDB 2.x, 3.x and the embedded engine, and the stored datetimes keep their
+        nanoseconds; a datetime you changed is written as you set it (and still refused by a
+        ``READONLY`` field). So that the statement stays bounded, only the top-level datetimes are
+        sure to be kept, up to 32. Below the top level (in a sub-model, a ``list`` or a ``tuple``,
+        down to three levels) a datetime is kept only while the values rebuilt to reach it fit in
+        what the fields before it left of those 32, which depends on the data: a list of
+        timestamped items before a sub-model is enough to use it up. A datetime not kept, and one in
+        a set, is written as sent, so a ``READONLY`` field holding one may refuse ``update()``:
+        change such a record with :meth:`merge`. See
+        :func:`~surreal_orm_lite.utils.replace_content`. Without a datetime to keep, the statement
+        is the SDK's ``update()``, as before.
+
+        SurrealDB 2.x still refuses a full replace that leaves out a field declared with a
+        non-optional ``TYPE`` and a ``VALUE`` clause, which the model does not write (a
+        ``Computed`` field, such as a generated ``updated: Computed[datetime]``): there, change
+        such a record with :meth:`merge` (#267). SurrealDB 3.x recomputes the field.
 
         Emits pre_update, post_update, and around_update signals. In tx mode,
         ``around_update`` is skipped (the write is deferred to commit) and
         ``post_update`` only fires after a successful commit.
+
+        Returns:
+            The updated row as the SDK reads it (``[]`` for a record that does not exist), or
+            ``None`` in a transaction.
         """
         self._reject_snapshot_write("update()")
         sender = self.__class__
@@ -2153,34 +2166,51 @@ class BaseSurrealModel(BaseModel):
         record_id = self._record_id()
         if record_id is None:
             raise SurrealDbError("Can't update data, no id found.")
+        content, bound = replace_content(data)
 
         has_signals = pre_update.has_handlers(sender) or post_update.has_handlers(sender) or around_update.has_handlers(sender)
 
         if tx is not None:
-            variables = {"rid": record_id, "data": data}
+            statement = f"UPDATE $rid CONTENT {content};"
+            variables = {"rid": record_id, **bound}
             if not has_signals:
-                await tx.add("UPDATE $rid CONTENT $data;", variables)
+                await tx.add(statement, variables)
                 return None
             update_fields = self._py_fields(data)
             await pre_update.send(sender, instance=self, update_fields=update_fields)
-            await tx.add("UPDATE $rid CONTENT $data;", variables)
+            await tx.add(statement, variables)
             tx.enqueue_post_commit(lambda: post_update.send(sender, instance=self, update_fields=update_fields))
             return None
 
         client = await type(self)._connection_manager().get_client()
 
         if not has_signals:
-            return await client.update(record_id, _encoding.encode(data))
+            return await self._replace_direct(client, record_id, data, content, bound)
 
         update_fields = self._py_fields(data)
         await pre_update.send(sender, instance=self, update_fields=update_fields)
 
         async with around_update.wrap(sender, instance=self, update_fields=update_fields):
-            result = await client.update(record_id, _encoding.encode(data))
+            result = await self._replace_direct(client, record_id, data, content, bound)
 
         await post_update.send(sender, instance=self, update_fields=update_fields)
 
         return result
+
+    @staticmethod
+    async def _replace_direct(
+        client: Any, record_id: RecordID, data: dict[str, Any], content: str, bound: dict[str, Any]
+    ) -> Any:
+        """Run ``update()`` outside a transaction, ``content`` and ``bound`` being :func:`replace_content` of ``data``.
+
+        A payload without a ``datetime`` to keep goes through the SDK's ``update()``, as before #261. Otherwise the compiled
+        ``UPDATE $rid CONTENT …`` goes through ``client.query()``, and its single row is unwrapped as the SDK's
+        ``update()`` unwraps it, so ``update()`` returns the same thing either way.
+        """
+        if content == PLAIN_CONTENT:
+            return await client.update(record_id, _encoding.encode(data))
+        rows = await client.query(f"UPDATE $rid CONTENT {content};", _encoding.encode({"rid": record_id, **bound}))
+        return rows[0] if isinstance(rows, list) and len(rows) == 1 else rows
 
     async def _merge_server(
         self,
@@ -2439,7 +2469,9 @@ class BaseSurrealModel(BaseModel):
         Compiled to ``{field} += $amount`` — identical on 2.6.x and 3.x. Pass a negative
         ``amount`` to decrement. ``amount`` may be a ``decimal.Decimal`` for exact arithmetic
         (the value is bound, not interpolated); adding a ``Decimal`` to an int/float field
-        coerces the stored field to SurrealDB ``decimal``. Emits no signals.
+        coerces the stored field to SurrealDB ``decimal``. The instance then holds the value a
+        read gives (#261): a ``float`` field a ``float``, whose rounding a later ``update()``
+        writes back, so declare the field ``Decimal`` to keep the exact sum. Emits no signals.
 
         A duration amount raises ``TypeError`` (v0.23.0): SurrealDB 2.x ignores ``+=`` with a
         duration.

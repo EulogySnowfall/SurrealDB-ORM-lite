@@ -5,6 +5,97 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.7] - 2026-10-19
+
+An instance stays in step with its stored row (#261): `save()` applies the whole row the server
+returns, every call that applies a returned row validates it as a read does, and `update()` keeps
+the stored nanoseconds of a datetime it did not change, so a record with a top-level `READONLY`
+datetime can be updated. No new public API, but what an instance holds after a write changes for
+every model: read **Changed** before upgrading.
+
+### Fixed
+
+- **`update()` after `save()` or `get()` on a `READONLY` top-level `datetime`** is no longer
+  refused by the server (#261). SurrealDB stores nanoseconds and the SDK reads microseconds, so
+  `update()` wrote back a changed value. See item 5 under Changed.
+- **Sub-fields a `DEFAULT` fills** (`prefs.at DEFAULT time::now()`) are on the instance right after
+  `save()` (explicit id, auto id, interactive transaction), so a following `update()` no longer
+  sends them as `NONE`, which the server refused for a required sub-field and which erased an
+  optional one (#261).
+- **`tuple` and `set` fields** hold their declared type after `save()`, `upsert()`, `merge()` and
+  `patch()`, as after `get()` (item 2 under Changed), not the SDK's `list` (#261).
+- **A returned column named like a Pydantic `@computed_field` or a model method** (`json`) no
+  longer replaces that attribute (#261). In 0.30.1, with a `@computed_field` (which `model_dump()`
+  writes), auto-id `save()`, `refresh()` and `merge()` raised `AttributeError` after the record was
+  stored.
+- **`generate_models_from_db()`**: generated classes no longer carry the note about `DEFAULT`
+  sub-fields, and the `READONLY` `update()` note remains only for a datetime below the top level
+  or a top-level one past the 32nd (#261).
+- **Buffered transactions**: a statement's parameters are renamed in one pass (#261). In 0.30.1,
+  `$a` next to a variable named `t0_a` was renamed twice and bound to `t0_a`'s value, and a
+  statement with thousands of bound values was slow to queue.
+
+```python
+# DEFINE FIELD created ON event TYPE datetime DEFAULT time::now() READONLY;
+event = await Event.objects().get("launch")  # created read to the microsecond
+event.title = "Launch day"
+await event.update()  # was refused ("readonly"); the stored created keeps its nanoseconds
+```
+
+### Changed
+
+Each item was measured against 0.30.1 on SurrealDB 3.3.4, 2.7.0 and the embedded engine
+(`mem://`) and holds on all three unless stated.
+
+1. **Explicit-id `save()`, an edge's `save()` and interactive `save(tx=)` apply the whole stored
+   row** (#261). In 0.30.1, explicit-id `save()` and interactive `save(tx=)` read back only the
+   `server_fields` and computed fields, and an edge's `save()` (either id) only its `id` and
+   `server_fields`: the instance kept the values passed in. Now a naive `datetime` becomes the
+   aware UTC `datetime` a read gives (compare it with aware values), a sub-model field holds a new
+   instance (not the object passed in), and values a `VALUE` clause rewrote or the server coerced
+   replace the ones sent (`VALUE string::lowercase($value)` turns `"AbC"` into `"abc"` on the
+   instance). Interactive transactions exist on SurrealDB 3.x over WebSocket only; a buffered
+   transaction (HTTP, 2.x, the embedded engine) still leaves the instance as it was.
+2. **Every call that applies the returned row validates it like a read** (#261): `save()` with
+   either id, an edge's `save()`, `refresh()`, `merge()` (default `refresh=True`), `upsert()`,
+   `patch()` and the `atomic_*` helpers. An enum field holds the enum member, not the raw
+   `str`/`int` (a `str` or `int` enum still compares equal to its value, a plain `Enum` member no
+   longer does); `tuple`, `set`, `date` and `Range` fields hold their declared type instead of the
+   SDK's `list`, midnight `datetime` and `Range`; a `float` field stored in a `decimal` column holds
+   a `float`, not a `Decimal`; a `list[Duration]` holds the ORM's `Duration`s, not the SDK's. In
+   0.30.1, `refresh()`, `merge()`, auto-id `save()`, `upsert()`, `patch()` and `atomic_*` kept the
+   SDK's values for these fields (explicit-id `save()` kept the values passed in).
+3. **The model's validators run on the returned row for every model** (#261). Field and model
+   validators (any mode) and `model_post_init` run once per call listed in item 2, on a validated
+   copy of the row, and their result is applied to every field. In 0.30.1 they ran only when the
+   row held a sub-model field, a nested `timedelta` field or a geometry field stored as a GeoJSON
+   object, and their result reached only those fields; otherwise they did not run at all. A
+   validator that is not idempotent is applied again, as on `get()`, and a following `update()`
+   writes that value back: with `label` validated as `v + "!"`, `Model(id="a", label="x")`,
+   `save()` then `update()` stored `x!` in 0.30.1 and stores `x!!` now; `merge()` then `update()`
+   gives the same difference.
+4. **Under `extra="allow"`, the returned row's undeclared columns go to `model_extra`** after the
+   calls listed in item 2, where a read puts them (0.30.1 dropped them), and `merge(refresh=False)`
+   with an undeclared key updates `model_extra` (#261).
+5. **`update()` and `upsert()` keep the stored nanoseconds of a datetime written back unchanged**
+   (one that still floors to the stored value at the microsecond), for every top-level datetime up
+   to 32 per record, so a record whose `READONLY` datetimes are top-level fields can be updated
+   after `get()` or `save()` (#261). Below the top level (a sub-model, a `list`, a `tuple`, a set)
+   this depends on the data: change such a record with `merge()`.
+
+### Notes
+
+- SurrealDB 2.x still refuses `update()` and `upsert()` of an existing record that has a field
+  with a non-optional `TYPE` and a `VALUE` clause the model does not write, such as a generated
+  `updated: Computed[datetime]` (#267): change such a record with `merge()` there. 0.30.1 behaved
+  the same way before this release; SurrealDB 3.x recomputes the field. The v0.30.0 example
+  notebook changes its generated `NbPerson` with `merge()` for that reason.
+- The README's "After a write that returns the row", "Precision and `Decimal`" and "What the
+  generator does not do" sections, and a new row of the 2.x vs 3.x behaviour table, describe these
+  changes.
+- Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine, plus
+  3.1.5 for backward compatibility.
+
 ## [0.30.5] - 2026-10-19
 
 `SurrealDBConnectionManager.kill()` no longer reports a connection lost under the request as a
