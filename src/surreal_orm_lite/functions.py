@@ -558,7 +558,7 @@ def build_call_statement(function: str, args: Sequence[Any]) -> tuple[str, dict[
     ``BEGIN … COMMIT`` batch terminates the transaction early — and silently, on both
     SurrealDB 2.6.x and 3.x — so every statement queued after it is reported as successful
     and never runs. The bare form returns the same value, in every context, without that
-    hazard. See the v0.15.0 design spec.
+    hazard.
 
     *function* is expected to be already normalised by :func:`normalize_function_name`.
     """

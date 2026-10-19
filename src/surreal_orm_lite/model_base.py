@@ -1183,7 +1183,7 @@ class BaseSurrealModel(BaseModel):
     def _connection_manager(cls) -> type[SurrealDBConnectionManager]:
         """The connection class of :meth:`get_connection_name` (v0.29.0): the one way a model reaches its connection.
 
-        :raises ValueError: the connection is not registered (R2) — at the model's first database call, never at
+        :raises ValueError: the connection is not registered — at the model's first database call, never at
             class definition nor in a queryset builder.
         """
         name = cls.get_connection_name()
@@ -2927,7 +2927,7 @@ class BaseSurrealModel(BaseModel):
         return await instance._save_naming(names, tx=tx)
 
     def _check_relation(self, method: str, *models: type | None) -> None:
-        """X3 (v0.29.0): refuse the relation helper *method* when *models* run on another connection than this record.
+        """Refuse the relation helper *method* when *models* run on another connection than this record (v0.29.0).
 
         *models* are the target's model, the edge model and ``model_class``, in the order the error names them;
         ``None`` (a ``RecordID`` or ``"table:id"`` target, an edge table name) is skipped. Connection names are

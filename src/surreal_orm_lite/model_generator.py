@@ -18,36 +18,42 @@ format placeholder of the generator's own:
   imported name, a builtin used in annotations or a name ruff calls ambiguous; a column whose name cannot be used as it
   is gets an attribute name of its own and ``Field(alias=<column>)``.
 
-**Tables.** A table is modelled when its name is an identifier (``table_name`` refuses anything else, S1) and is not
-one of the SurrealQL words the ORM's unescaped statements cannot use as a table name, whatever the case (S6, M37:
-``select``, ``Select``, ``only`` …); the others are listed in the module's header instead.
+**Tables.** A table is modelled when its name is an identifier (``table_name`` refuses anything else) and is not
+one of the SurrealQL words the ORM's unescaped statements cannot use as a table name, whatever the case (``select``,
+``Select``, ``only`` …); the others are listed in the module's header instead.
 
 **Names are allocated in two passes**, so that no attribute can shadow a class of the module: first the class names —
 tables in codepoint order of their names, each followed by its sub-model candidates (an ``object`` field with
 declared children, recursively; an ``array<object>``'s items) — then each table's attribute names, columns in
 codepoint order. The same schema always gives the same names.
 
-**Fields** (spec §6.4.3–§6.4.6). ``id`` is declared first by every model (an edge's ``id``, ``in_`` and ``out`` come
-from ``BaseSurrealEdge``); each top-level field becomes one line, in codepoint order of its column. Kinds map to the
-ORM's types (``Duration``, ``Decimal``, ``UUID``, ``RecordID``, ``Range``, the geometry classes, ``Literal``,
-``set[T]`` for hashable ``T`` …); an optional kind adds ``| None = None``. An ``object`` with declared children becomes
-a ``BaseModel`` sub-model written before its class; other objects are ``dict[str, Any]``. ``COMPUTED e``, and a
+**Fields.** ``id`` is declared first by every model (an edge's ``id``, ``in_`` and ``out`` come from
+``BaseSurrealEdge``); each top-level field becomes one line, in codepoint order of its column. Kinds map to the ORM's
+types (``Duration``, ``Decimal``, ``UUID``, ``RecordID``, ``Range``, the geometry classes, ``Literal``, ``set[T]`` for
+hashable ``T`` …); an optional kind adds ``| None = None``. An ``object`` with declared children becomes a
+``BaseModel`` sub-model written before its class; other objects are ``dict[str, Any]``. ``COMPUTED e``, and a
 ``VALUE e`` that reads neither ``$value`` nor ``$input``, become ``Computed[T] = computed("e")`` when ``computed()``
-accepts ``e`` and the column needs no alias. A constant ``DEFAULT`` the model holds exactly becomes its Python default
-(spec §6.4.6 item 3, D25, M48): the literals that match the annotation, ``[]`` and arrays of such constants, ``{  }``
-(a ``dict``, or the sub-model when it can be built without arguments — else the field is required), durations,
-datetimes with at most 6 fractional digits and UUIDs; mutable values (``list``, ``set``, ``dict``, a sub-model,
+accepts ``e`` and the column needs no alias. A constant ``DEFAULT`` the model holds exactly becomes its Python default:
+the literals that match the annotation, ``[]`` and arrays of such constants, ``{  }`` (a ``dict``, or the sub-model
+when it can be built without arguments — else the field is required), durations, datetimes with at most 6 fractional
+digits and UUIDs; mutable values (``list``, ``set``, ``dict``, a sub-model,
 ``Duration``) through ``default_factory``. So the server stores the same row whether the caller sets the field or not.
 Every other ``DEFAULT`` or computed expression gives the **server form** — ``T | None = None``, the attribute listed
 in ``server_fields`` so the server's value applies on create and is read back. ``ASSERT``, ``PERMISSIONS``,
 ``REFERENCE`` and field comments are not generated; ``READONLY`` is a trailing comment, and a class with a ``READONLY``
 field holding a datetime below the top level (in a sub-object, a tuple, an array or a set), or with more than 32
-top-level fields that may hold a datetime, says that ``update()`` may fail on it (§6.4.7, narrowed by #261).
+top-level fields that may hold a datetime, says that ``update()`` may fail on it (narrowed by #261).
 
-**Module** (spec §6.4.8): a fixed docstring, the imports the classes use (standard library, then pydantic,
-surreal_orm_lite and surrealdb), a ``# Not generated:`` comment listing every table or field left out and why, then the
-classes. No timestamp, server address, namespace or database name. No ``from __future__ import annotations``: the
-annotations are evaluated, which is why no attribute may shadow a name they use.
+**Classes.** A ``BaseSurrealModel``, or a ``BaseSurrealEdge`` for a relation table (``table_type`` in any case). The
+table's comment, relation ends, view query, change feed, permissions (unless ``NONE``, the default), indexes and
+events are comments of its class.
+
+**Module**: a fixed docstring, the imports the classes use (standard library, then pydantic, surreal_orm_lite and
+surrealdb), a ``# Not generated:`` comment listing every table or field left out and why, then the classes. No
+timestamp, server address, namespace or database name. No ``from __future__ import annotations``: the annotations are
+evaluated, which is why no attribute may shadow a name they use.
+
+README section 31, "Schema introspection", describes the generated module for users.
 """
 
 import io
@@ -88,8 +94,8 @@ from .utils import _KEEP_LIMIT, VALID_ALIAS_PATTERN
 
 __all__ = ["ModelCodeGenerator"]
 
-#: Every name the generated module may import (spec §6.4.4 and §6.4.8), used or not, so that a table or a column
-#: never takes one of them — and adding a type to a schema never renames anything.
+#: Every name the generated module may import, used or not, so that a table or a column never takes one of them — and
+#: adding a type to a schema never renames anything.
 _IMPORTABLE = frozenset(
     {
         "Any",
@@ -132,7 +138,7 @@ _IMPORTABLE = frozenset(
 #: ``str`` annotations into ``None`` silently.
 _ANNOTATION_BUILTINS = frozenset({"str", "int", "float", "bool", "bytes", "list", "set", "dict", "tuple"})
 
-#: Names ruff reports as ambiguous (E741 for an attribute, E742 for a class — M41).
+#: Names ruff reports as ambiguous (E741 for an attribute, E742 for a class).
 _AMBIGUOUS = frozenset({"l", "O", "I"})
 
 #: Python keywords and soft keywords. The soft keywords are fixed — those of Python 3.11 to 3.15 — so the generated
@@ -140,7 +146,7 @@ _AMBIGUOUS = frozenset({"l", "O", "I"})
 _KEYWORDS = frozenset(keyword.kwlist) | frozenset(keyword.softkwlist) | frozenset({"_", "case", "lazy", "match", "type"})
 
 #: SurrealQL words the ORM's statements cannot use as a table name (they interpolate it unescaped:
-#: ``SELECT * FROM <table>``, ``CREATE <table> …``), compared lower-cased (M37, spec §6.4.2; §14.7 tracks the ORM).
+#: ``SELECT * FROM <table>``, ``CREATE <table> …``), compared lower-cased.
 _UNQUERYABLE_TABLE_NAMES = frozenset(
     {
         "alter",
@@ -174,7 +180,7 @@ _UNQUERYABLE_TABLE_NAMES = frozenset(
     }
 )
 
-#: Why a table is not generated (spec §6.4.8: the header's skip lines S1 and S6).
+#: Why a table is not generated, by its name (lines of the module's ``# Not generated:`` comment).
 _S1_NOT_IDENTIFIER = "its name is not an identifier, which table_name requires"
 _S6_KEYWORD = "its name is a SurrealQL keyword the ORM cannot use as a table name"
 
@@ -237,7 +243,7 @@ def _comment(text: str, *, indent: int) -> str:
 
 
 def _skip_reason(table: str) -> str | None:
-    """Return why the table named ``table`` is not generated (S1, S6), or ``None`` when it is modelled."""
+    """Return why the table named ``table`` is not generated (by its name), or ``None`` when it is modelled."""
     if not VALID_ALIAS_PATTERN.fullmatch(table):
         return _S1_NOT_IDENTIFIER
     if table.lower() in _UNQUERYABLE_TABLE_NAMES:
@@ -246,7 +252,7 @@ def _skip_reason(table: str) -> str | None:
 
 
 def _modelable(table: str) -> bool:
-    """Whether a model can be generated for the table named ``table`` (spec §6.4.2)."""
+    """Whether a model can be generated for the table named ``table``."""
     return _skip_reason(table) is None
 
 
@@ -265,7 +271,7 @@ def _base_attribute(name: str) -> bool:
 
 
 def _kind(field: FieldState) -> Kind | None:
-    """The parsed kind of ``field``, or ``None`` when its ``TYPE`` was kept as written (I3)."""
+    """The parsed kind of ``field``, or ``None`` when its ``TYPE`` was kept as written (not understood)."""
     try:
         return parse_kind(field.field_type)
     except DefineParseError:
@@ -290,7 +296,7 @@ def _is_edge(table: TableState) -> bool:
 
 
 class _Names:
-    """The class and attribute names of one generated module (spec §6.4.2), allocated in two passes.
+    """The class and attribute names of one generated module, allocated in two passes.
 
     1. **Class names**, tables in codepoint order of their names, each followed by its sub-model candidates. The
        class of a table is its name in PascalCase (``isp_company`` → ``IspCompany``; ``Table`` when nothing is left,
@@ -462,9 +468,9 @@ def _children(nodes: Mapping[tuple[str, ...], FieldState], path: tuple[str, ...]
     return sorted(child[-1] for child in nodes if len(child) == depth and child[: len(path)] == path and child[-1] != "*")
 
 
-# --- the generated module (spec §6.4.3–§6.4.8) ----------------------------------------------------------------------
+# --- the generated module -------------------------------------------------------------------------------------------
 
-#: The generated module's docstring (spec §6.4.8).
+#: The generated module's docstring.
 _DOCSTRING = (
     '"""Models generated by surreal_orm_lite.generate_models_from_db() from a SurrealDB schema.\n'
     "\n"
@@ -473,19 +479,19 @@ _DOCSTRING = (
     '"""'
 )
 
-#: Why a table or a field is not generated (spec §6.4.8: the header's skip lines S2–S5; S1 and S6 are above).
+#: Why a table or a field is not generated, from what the reader found (the reasons by name are above).
 _S2_NOT_READ = "it could not be read (see SchemaState.issues)"
 _S3_NOT_PARSED = "its definition could not be parsed (see SchemaState.issues)"
 _S4_NOT_PARSED = _S3_NOT_PARSED
 _S4_SAME_NAME = "another definition has the same name (see SchemaState.issues)"
 _S5_NO_PARENT = "its parent is not defined (the parent is a dict[str, Any])"
 
-#: The reader's issue texts the generator tells apart (spec §5.7): I3 keeps the field (typed ``Any``), I5 drops the
-#: second definition.
+#: The reader's issue texts the generator tells apart: a ``TYPE`` kept as written keeps the field (typed ``Any``), a
+#: second definition with the same name is left out.
 _I3_TYPE_AS_WRITTEN = "its TYPE clause was not understood and is kept as written"
 _I5_SAME_NAME = "two definitions have the same name"
 
-#: The class comment of a table with a ``READONLY`` field holding a datetime ``update()`` may not keep (spec §6.4.7, M29).
+#: The class comment of a table with a ``READONLY`` field holding a datetime ``update()`` may not keep.
 #: Since #261 ``update()`` keeps every stored datetime it did not change at the top level, up to 32 (``_KEEP_LIMIT``).
 #: Below the top level it keeps one only while the values it rebuilds to reach it fit in what the fields before it left
 #: of those 32, which depends on the data (a list of timestamped items is enough), so that is no guarantee
@@ -497,7 +503,7 @@ _SCHEMALESS_NOTE = 'SCHEMALESS: fields not declared here are kept (extra="allow"
 #: The operations of a table's ``PERMISSIONS``, in the order SurrealDB renders them.
 _OPERATIONS = ("select", "create", "update", "delete")
 
-#: Where each importable name comes from; the blocks in isort order (spec §6.4.8).
+#: Where each importable name comes from; the blocks in isort order.
 _STANDARD_MODULES = ("datetime", "decimal", "typing", "uuid")
 _THIRD_PARTY_MODULES = ("pydantic", "surreal_orm_lite", "surrealdb")
 _IMPORTED_FROM: Mapping[str, str] = {
@@ -512,21 +518,21 @@ _IMPORTED_FROM: Mapping[str, str] = {
     "Field": "pydantic",
     "RecordID": "surrealdb",
 }
-#: An import that fits stays on one line (spec §6.4.8).
+#: An import that fits stays on one line.
 _IMPORT_WIDTH = 88
 
 _INT_TEXT = re.compile(r"-?[0-9]+")
 _FLOAT_TEXT = re.compile(r"-?[0-9]+(?:\.[0-9]+)?f")
 _DECIMAL_TEXT = re.compile(r"-?[0-9]+(?:\.[0-9]+)?dec")
 #: A datetime ``DEFAULT`` the model holds exactly: UTC, at most 6 fractional digits — ``datetime.fromisoformat()``
-#: truncates more without an error (Python 3.11 too), and the server keeps nanoseconds (spec §6.4.6 item 3, M48).
+#: truncates more without an error (Python 3.11 too), and the server keeps nanoseconds.
 _DATETIME_TEXT = re.compile(r"d'([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z)'")
 #: An empty object ``DEFAULT``: only whitespace between the braces (the servers render ``{}`` as ``{  }``).
 _EMPTY_OBJECT_TEXT = re.compile(r"\{\s*\}")
 #: How deep arrays may nest in a ``DEFAULT`` the generator copies; deeper ones keep the server form.
 _MAX_DEFAULT_DEPTH = 32
 
-#: ``geometry<k>`` kind → the ORM class, and the class → its nullable alias for a top-level field (spec §6.4.4).
+#: ``geometry<k>`` kind → the ORM class, and the class → its nullable alias for a top-level field.
 _GEOMETRY_CLASSES: Mapping[str, str] = {
     "point": "GeometryPoint",
     "line": "GeometryLine",
@@ -547,7 +553,7 @@ _GEOMETRY_ALIASES: Mapping[str, str] = {
     "Geometry": "GeometryField",
 }
 
-#: The member types a ``set[T]`` may hold: hashable values (spec §6.4.4, README "Sets").
+#: The member types a ``set[T]`` may hold: hashable values (README section 24, "Sets").
 _HASHABLE = frozenset({"str", "int", "float", "bool", "bytes", "Decimal", "UUID", "datetime", "Duration"})
 
 _LiteralValue = str | int | bool
@@ -583,7 +589,7 @@ class _Type(NamedTuple):
 _ANY = _Type(("Any",))
 _NONE = _Type(none=True)
 
-#: Named kinds with a fixed annotation (spec §6.4.4); a name not here (``regex``, ``function``, ``file``, an unknown
+#: Named kinds with a fixed annotation; a name not here (``regex``, ``function``, ``file``, an unknown
 #: one) is ``Any``.
 _NAMED_TYPES: Mapping[str, _Type] = {
     "any": _ANY,
@@ -721,8 +727,8 @@ def _computable(expression: str) -> bool:
 
 
 def _python_default(text: str, annotation: _Type) -> str | None:
-    """The Python default of a literal ``DEFAULT`` whose value matches the annotation — the scalar rows of spec §6.4.6
-    item 3 (D25) — as source; ``None`` when there is none: :meth:`_ClassWriter.constant` tries the other rows."""
+    """The Python default of a literal ``DEFAULT`` whose value matches the annotation — a number, a string, a boolean,
+    ``NONE`` or ``NULL`` — as source; ``None`` when there is none: :meth:`_ClassWriter.constant` tries the other kinds."""
     members = frozenset(annotation.members)
     is_any = annotation.is_any
     if _INT_TEXT.fullmatch(text):
@@ -767,7 +773,7 @@ class _Default(NamedTuple):
 
 
 #: What :meth:`_ClassWriter.constant` answers for ``{  }`` on a sub-model that cannot be built without arguments: the
-#: field has no default (spec §6.4.6 item 3, M48: the server refuses every create that leaves it to that ``DEFAULT``).
+#: field has no default (the server refuses every create that leaves it to that ``DEFAULT``).
 _REQUIRED = _Default("")
 
 _NONE_DEFAULT = _Default("None")
@@ -895,7 +901,7 @@ class _Line(NamedTuple):
 
 
 class _ClassWriter:
-    """The source of one table: its sub-models, then its class (spec §6.4.5–§6.4.7)."""
+    """The source of one table: its sub-models, then its class."""
 
     def __init__(self, table: TableState, names: _Names, connection: str) -> None:
         self.table = table
@@ -905,7 +911,7 @@ class _ClassWriter:
         self.schemaless = table.schema_mode.upper() == "SCHEMALESS"
         self.nodes = {tuple(field.path): field for field in table.fields.values()}
         self.blocks: list[str] = []
-        #: ``(table, field, line)`` of every field not generated (S5).
+        #: ``(table, field, line)`` of every field not generated (its parent is not defined).
         self.skips: list[tuple[str, str, str]] = []
         #: Path → the sub-model written there (``None``: a ``dict[str, Any]``), so that each is written once.
         self.sub_models_at: dict[tuple[str, ...], str | None] = {}
@@ -937,14 +943,14 @@ class _ClassWriter:
         return [*self.blocks, "\n".join(block)]
 
     def _skip_children(self, column: str) -> None:
-        """S5: the fields under the undefined top-level ``column``."""
+        """Record as not generated the fields under the undefined top-level ``column``."""
         for field in sorted(self.table.fields.values(), key=lambda field: field.name):
             if field.path and field.path[0] == column:
                 line = "- field " + repr(self.table.name + "." + field.name) + ": " + _S5_NO_PARENT
                 self.skips.append((self.table.name, field.name, line))
 
     def _comments(self) -> list[str]:
-        """The class comments of spec §6.4.7, each through ``_comment()``."""
+        """The class comments, each through ``_comment()``."""
         table = self.table
         texts = []
         if table.comment is not None:
@@ -971,7 +977,7 @@ class _ClassWriter:
 
     def _readonly_datetime_not_kept(self) -> bool:
         """Whether a ``READONLY`` field of the class — top level or nested — holds a datetime ``update()`` may not keep
-        (M29, #261): one below the top level, in its kind or in a sub-field's (``address.at``, ``items.*.at``,
+        (#261): one below the top level, in its kind or in a sub-field's (``address.at``, ``items.*.at``,
         ``_datetime_below_the_top``), or one at the top level of a class with more than ``_KEEP_LIMIT`` top-level fields
         that may hold a datetime (``_may_be_a_datetime``), since ``update()`` keeps the first ones only."""
         provided = {"id", "in", "out"} if self.edge else {"id"}
@@ -988,7 +994,7 @@ class _ClassWriter:
         return len(top) > _KEEP_LIMIT and any(field.readonly for field in top)
 
     def _model_config(self, server_fields: Sequence[str]) -> list[str]:
-        """The ``model_config`` line, wrapped as ``ruff format`` keeps it above 128 columns (spec §6.4.7, D20)."""
+        """The ``model_config`` line, wrapped as ``ruff format`` keeps it above 128 columns."""
         keywords = ["table_name=" + _py_str(self.table.name)]
         if self.connection != "default":
             keywords.append("connection=" + _py_str(self.connection))
@@ -1014,7 +1020,7 @@ class _ClassWriter:
 
     def field_line(self, attribute: str, alias: str | None, field: FieldState, *, model: bool) -> _Line:
         """The line declaring ``field`` (without indentation), and whether it is a server field, a computed one or a
-        required one (spec §6.4.6).
+        required one.
 
         ``model`` is false for a sub-model's field: ``Computed`` and ``server_fields`` belong to models, so a computed
         or server-filled child takes the server form without being listed.
@@ -1047,7 +1053,7 @@ class _ClassWriter:
     def constant(
         self, text: str, kind: Kind | None, annotation: _Type, path: tuple[str, ...] | None, depth: int = 0
     ) -> _Default | None:
-        """The Python default of a constant ``DEFAULT`` the model holds exactly (spec §6.4.6 item 3, D25, M48); ``None``
+        """The Python default of a constant ``DEFAULT`` the model holds exactly; ``None``
         when there is none (the server form); :data:`_REQUIRED` for ``{  }`` on a sub-model that needs arguments.
 
         ``kind`` and ``path`` (a field's own, or ``None``) find an array's items and their sub-model; ``depth`` counts the
@@ -1085,7 +1091,7 @@ class _ClassWriter:
         self, text: str, kind: Kind | None, annotation: _Type, path: tuple[str, ...] | None, depth: int
     ) -> _Default | None:
         """``[]`` on a ``list[…]``, a ``set[…]`` or ``Any``; ``[e1, …]`` on an ``array`` kind (or ``Any``) whose item
-        annotation holds every element (spec §6.4.6 item 3). A non-empty array on a set, whose order and duplicates
+        annotation holds every element. A non-empty array on a set, whose order and duplicates
         the server changes, or on a tuple keeps the server form."""
         elements = _array_elements(text) if depth < _MAX_DEFAULT_DEPTH else None
         if elements is None:
@@ -1119,7 +1125,7 @@ class _ClassWriter:
         return _Default(expression, "lambda: " + expression)
 
     def annotation(self, field: FieldState, *, top: bool) -> _Annotation:
-        """The annotation of ``field`` (spec §6.4.4): a top-level geometry of one kind takes its nullable alias."""
+        """The annotation of ``field``: a top-level geometry of one kind takes its nullable alias."""
         kind = _kind(field)
         path = tuple(field.path)
         if top and isinstance(kind, KName) and kind.name == "geometry":
@@ -1136,7 +1142,7 @@ class _ClassWriter:
 
     def kind_type(self, kind: Kind | None, path: tuple[str, ...] | None) -> _Type:
         """The annotation of a kind; ``path`` (a field's own kind only) finds its sub-model or its items' sub-model."""
-        if kind is None:  # I3: the TYPE kept as written
+        if kind is None:  # the TYPE kept as written (not understood)
             return _ANY
         if isinstance(kind, KUnion):
             return _union(self.kind_type(member, None) for member in kind.members)
@@ -1164,7 +1170,7 @@ class _ClassWriter:
 
     def sub_model(self, path: tuple[str, ...]) -> str | None:
         """The sub-model class at ``path``, written to ``blocks`` (after its own sub-models) the first time it is asked
-        for; ``None`` when there is no candidate there or a child cannot be one of its fields as it is (spec §6.4.5)."""
+        for; ``None`` when there is no candidate there or a child cannot be one of its fields as it is."""
         if path in self.sub_models_at:
             return self.sub_models_at[path]
         name = self.names.sub_models.get((self.table.name, path))
@@ -1189,7 +1195,7 @@ class _ClassWriter:
 
 def _assigned(declaration: str, default: _Default | None, alias: str | None) -> str:
     """``declaration`` with its default — ``= <default>``, ``Field(default_factory=…)`` for a mutable one, and
-    ``Field(…, alias=…)`` for an aliased column (spec §6.4.6 item 5)."""
+    ``Field(…, alias=…)`` for an aliased column."""
     arguments = []
     if default is not None:
         arguments.append("default=" + default.expression if default.factory is None else "default_factory=" + default.factory)
@@ -1235,8 +1241,8 @@ def _index_label(index: IndexState) -> str:
 
 
 def _skipped_tables(state: SchemaState) -> dict[str, str]:
-    """Table name → why it is not generated: S1 or S6 by its name, else S2 (``INFO FOR TABLE`` failed: the table is
-    kept without definitions) or S3 (its definition could not be parsed: it is not in ``state.tables``)."""
+    """Table name → why it is not generated: its name, else ``INFO FOR TABLE`` failed (the table is kept without
+    definitions) or its definition could not be parsed (it is not in ``state.tables``)."""
     present = {table.name for table in state.tables.values()}
     with_issue = {issue.name for issue in state.issues if issue.kind == "table"}
     reasons = {}
@@ -1250,7 +1256,8 @@ def _skipped_tables(state: SchemaState) -> dict[str, str]:
 
 
 def _field_skip(issue: SchemaIssue) -> tuple[str, str, str] | None:
-    """S4: a field issue that left a field out (I1, I5); ``None`` for I3, whose field is generated (typed ``Any``)."""
+    """The skip line of a field issue that left a field out (not parsed, or a second definition with its name); ``None``
+    for a ``TYPE`` kept as written, whose field is generated (typed ``Any``)."""
     if issue.kind != "field" or issue.table is None or issue.message == _I3_TYPE_AS_WRITTEN:
         return None
     reason = _S4_SAME_NAME if issue.message == _I5_SAME_NAME else _S4_NOT_PARSED
@@ -1279,10 +1286,10 @@ class ModelCodeGenerator:
     __slots__ = ()
 
     def generate(self, state: SchemaState) -> str:
-        """Return the source of one module for ``state`` (spec §6.4), ending with a newline.
+        """Return the source of one module for ``state``, ending with a newline.
 
         Pure and synchronous: the same state gives the same string. Server text — names, comments, expressions —
-        reaches the source only as string literals, comments and names the generator builds (spec §8).
+        reaches the source only as string literals, comments and names the generator builds.
         """
         skipped = _skipped_tables(state)
         tables = sorted(

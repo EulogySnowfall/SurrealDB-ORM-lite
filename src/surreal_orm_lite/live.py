@@ -678,7 +678,7 @@ class LiveStream:
     def _resolve_connection(self) -> type[SurrealDBConnectionManager]:
         """The connection a start runs on: the one given at construction, else the current one.
 
-        :raises ValueError: the connection is not registered (R1, or R2 for a model's).
+        :raises ValueError: the connection, or a model's connection, is not registered.
         """
         if self._connection is not None:
             return self._connection()

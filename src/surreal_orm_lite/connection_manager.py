@@ -121,13 +121,13 @@ _STATE: Final[tuple[tuple[str, Callable[[], Any]], ...]] = (
     ("generation", lambda: 0),
 )
 
-#: Which connection a routed classmethod acts on when called on the router (spec §5.4): the current one (the
+#: Which connection a routed classmethod acts on when called on the router: the current one (the
 #: explicit name, else the ``using()`` override, else ``"default"``), always the default one, every registered one,
 #: or the one whose live stream started the uuid.
 _Policy = Literal["current", "default", "every", "live"]
 
-#: What :meth:`SurrealDBConnectionManager._route` does with a connection name that is not registered: raise R1, or
-#: answer ``None`` so the routed method returns ``None`` without running (``close_connection`` only, spec D10, P6).
+#: What :meth:`SurrealDBConnectionManager._route` does with a connection name that is not registered: raise
+#: ``ValueError``, or answer ``None`` so the routed method returns ``None`` without running (``close_connection`` only).
 _UnknownName = Literal["raise", "ignore"]
 
 _P = ParamSpec("_P")
@@ -155,7 +155,7 @@ def _routed(
     under ``@_cache.invalidates(...)`` too (``signup``), whose wrapper stays outermost.
 
     A method that takes ``name`` (``get_client``, ``close_connection``, ``transaction``) keeps it in code and for
-    type checkers, but its wrapper's ``__signature__`` leaves it out (spec D26): ``inspect.signature()`` shows what
+    type checkers, but its wrapper's ``__signature__`` leaves it out: ``inspect.signature()`` shows what
     it showed in v0.28.0, so a framework that fills parameters from a request (FastAPI's
     ``Depends(SurrealDBConnectionManager.get_client)``) never lets request data choose the connection.
     ``inspect.unwrap()`` still reaches the declared ``name``.
@@ -201,7 +201,7 @@ def _routed(
                     return None
                 target = target_of(cls, args, kwargs)
                 if target is None:
-                    return None  # unknown_name="ignore": a name that is not registered (spec D10, P6)
+                    return None  # unknown_name="ignore": a name that is not registered
                 return await body(target, *args, **kwargs)
 
             wrapper = routed_coroutine
@@ -215,7 +215,7 @@ def _routed(
             wrapper = routed
         wrapper.__surreal_routed__ = policy
         if takes_name:
-            # Hidden from introspection only (spec D26): ``cls`` stays, without it ``inspect.signature()`` of the
+            # Hidden from introspection only: ``cls`` stays, without it ``inspect.signature()`` of the
             # bound method raises; later parameters and the return annotation stay too.
             wrapper.__signature__ = signature.replace(
                 parameters=[parameter for index, parameter in enumerate(signature.parameters.values()) if index != 1]
@@ -296,7 +296,7 @@ class SurrealDBConnectionManager:
     __lost_identity: "weakref.WeakSet[asyncio.AbstractEventLoop]" = weakref.WeakSet()
 
     # The SDK's in-process engine (v0.25.0): ONE client for the whole process, in this slot beside
-    # the per-loop cache. Measured with SDK 2.0.0 (spec M6-M8): an embedded client is not bound to a
+    # the per-loop cache. Measured with SDK 2.0.0: an embedded client is not bound to a
     # loop — one client serves every loop and thread — while each new client on ``mem://`` is a new,
     # empty database, and two clients on one ``surrealkv://`` path are two engines that miss each
     # other's writes. The per-loop rule of issue #163 would give every loop and thread a database of
@@ -305,7 +305,7 @@ class SurrealDBConnectionManager:
     #
     # A namespace/database change is a new *selection* on that one engine, and it resets the shared
     # session — invalidate(), back to the in-process owner, then use() — instead of replaying the
-    # stored token (spec M28, M29): a record session cannot write in another database and reads
+    # stored token: a record session cannot write in another database and reads
     # nothing there, and replaying a token moves the session back to the database it was issued for,
     # silently undoing the selection. ``__embedded_selection`` is ``None`` while a client is in the
     # slot when the selection is *stale* (a reset failed, or is under way): the next get_client()
@@ -318,7 +318,7 @@ class SurrealDBConnectionManager:
     # The settings generation (v0.29.0): "these settings are still the ones this connection serves". Bumped only by
     # _retire_server_clients() — add_connection() with other settings, remove_connection() of a named connection —
     # never by set_connection(), unset_connection() or the setters, which keep their v0.28.0 tolerance. A client
-    # opening (R11), an open transaction (R12) and a change feed (R13) compare it with the one they started under.
+    # opening, an open transaction and a change feed compare it with the one they started under.
     __generation: int = 0
 
     #: The connection ``async with SurrealDBConnectionManager():`` resolved on entry, closed on exit.
@@ -345,10 +345,10 @@ class SurrealDBConnectionManager:
         router, ``"default"`` is the default connection and every other policy the current one: the ``using()``
         override, else ``"default"``. Never takes ``_REGISTRY_LOCK``: one ``dict`` lookup.
 
-        :param unknown_name: ``"ignore"`` answers ``None`` instead of raising R1 for a name that is not registered,
-            explicit or the active override removed meanwhile (``close_connection`` alone, spec D10, P6).
-        :raises TypeError: *name* is not a ``str`` (R3).
-        :raises ValueError: *name* is empty (R3); *name*, or the active override, is not a registered connection (R1).
+        :param unknown_name: ``"ignore"`` answers ``None`` instead of raising ``ValueError`` for a name that is not
+            registered, explicit or the active override removed meanwhile (``close_connection`` alone).
+        :raises TypeError: *name* is not a ``str``.
+        :raises ValueError: *name* is empty; *name*, or the active override, is not a registered connection.
         """
         if name is None:
             if cls._connection_name is not None:
@@ -370,8 +370,8 @@ class SurrealDBConnectionManager:
     def _manager_for(cls, name: str | None = None) -> "type[SurrealDBConnectionManager]":
         """The connection class of *name*, else of the current connection: the one resolver other modules use.
 
-        :raises TypeError: *name* is not a ``str`` (R3).
-        :raises ValueError: *name* is empty (R3) or not a registered connection (R1).
+        :raises TypeError: *name* is not a ``str``.
+        :raises ValueError: *name* is empty or not a registered connection.
         """
         connection = cls._route(name, policy="current")
         assert connection is not None  # unknown_name="raise" never answers None
@@ -468,7 +468,7 @@ class SurrealDBConnectionManager:
             connection = _REGISTRY.get(name)
             if connection is None:
                 connection = _REGISTRY[name] = _new_connection_class(name)
-        # After the lock (spec §6.1): never held while a method of a connection class runs.
+        # After the lock: never held while a method of a connection class runs.
         if connection._settings() == (url, user, password, namespace, database):
             return
         connection.set_connection(url=url, user=user, password=password, namespace=namespace, database=database)
@@ -488,8 +488,8 @@ class SurrealDBConnectionManager:
         fails, an HTTP client keeps its namespace and database, and an embedded client is the previous engine (with
         SDK 2.x still running), so stop using it, as after :meth:`close_connection`. A no-op for a name that is not
         registered (after the name's type check). ``remove_connection("default")`` is :meth:`unset_connection`,
-        unchanged (the default is never unregistered). A model routed to a removed name raises R2 at its next database
-        call. The name is free again as soon as this is called: an ``add_connection()`` of it, even while the old one
+        unchanged (the default is never unregistered). A model routed to a removed name raises ``ValueError`` at its next
+        database call. The name is free again as soon as this is called: an ``add_connection()`` of it, even while the old one
         is closing, registers a new connection.
 
         :raises TypeError: *name* is not a ``str``.
@@ -509,7 +509,7 @@ class SurrealDBConnectionManager:
             return
         # Settings cleared before the generation bump, as add_connection() writes the new ones before it: a call that
         # reads the new generation (another thread let through the embedded guard during the removal, say) reads no
-        # settings and opens nothing; one that read the old generation is refused when it publishes its client (R11),
+        # settings and opens nothing; one that read the old generation is refused when it publishes its client,
         # or published it before the bump, and the retirement below or unset_connection() closes it.
         connection._clear_settings()
         connection._retire_server_clients()
@@ -588,13 +588,13 @@ class SurrealDBConnectionManager:
     @classmethod
     @_routed("current")
     def _settings_generation(cls) -> int:
-        """The connection's settings generation: the one way other modules read it (change feeds, R13)."""
+        """The connection's settings generation: the one way other modules read it (change feeds)."""
         return cls.__generation
 
     @classmethod
     @_routed("current")
     def _retire_server_clients(cls) -> None:
-        """Stop serving the connection's previous settings (D7): bump its generation, end its live readers on every
+        """Stop serving the connection's previous settings: bump its generation, end its live readers on every
         event loop and retire its server clients on every loop.
 
         Synchronous, with or without a running event loop (``add_connection()`` may run at import time). Each loop's
@@ -1038,7 +1038,7 @@ class SurrealDBConnectionManager:
         replayed = cls._fingerprint(cls.__url, cls.__namespace, cls.__database, cls.__user, cls.__session_token)
         configured = cls._fingerprint(cls.__url, cls.__namespace, cls.__database, cls.__user, None)
         # The settings generation this client is built under (v0.29.0), read with the settings themselves: a
-        # re-registration with other settings, or a removal, while it opens makes _publish() refuse it (R11).
+        # re-registration with other settings, or a removal, while it opens makes _publish() refuse it.
         generation = cls.__generation
 
         # Establish the connection
@@ -1114,7 +1114,7 @@ class SurrealDBConnectionManager:
         """Stamp and cache a freshly built client — unless the reconnect that asked for it was
         abandoned meanwhile (the application closed the connection, stopped the stream), or the
         connection's settings changed while it opened (v0.29.0: *generation*, the settings
-        generation it was built under; the client is then closed unused and R11 raised)."""
+        generation it was built under; the client is then closed unused and a retryable ``SurrealDbConnectionError`` raised)."""
         if still_wanted is not None and not still_wanted():
             closing = asyncio.get_running_loop().create_task(client.close())
             _BACKGROUND.add(closing)
@@ -1201,7 +1201,7 @@ class SurrealDBConnectionManager:
 
         The settings generation (v0.29.0) is read first, before any await: when ``add_connection()`` registers the
         name again with other settings, or ``remove_connection()`` removes it, while the engine opens or its session
-        is selected again, the call raises R11 (retryable) instead of serving the old settings
+        is selected again, the call raises a retryable ``SurrealDbConnectionError`` instead of serving the old settings
         (:meth:`_refuse_retired_embedded`).
         """
         if not is_embedded_url(cls.__url):
@@ -1239,7 +1239,7 @@ class SurrealDBConnectionManager:
     @classmethod
     @_routed("current")
     async def _refuse_retired_embedded(cls, generation: int, cause: BaseException | None = None) -> None:
-        """R11 on the embedded engine: raise when the settings generation is no longer *generation*, the one the caller
+        """Raise on the embedded engine when the settings generation is no longer *generation*, the one the caller
         of :meth:`_held_embedded_client` started under. Caller holds the guard, and the slot holds the client it
         opened or selected again.
 
@@ -1293,7 +1293,8 @@ class SurrealDBConnectionManager:
         slot. Caller holds the guard, and the slot is empty.
 
         An on-disk store is claimed for this connection first (v0.29.0): another connection of the process that has
-        it open makes this raise X5 before anything opens. The claim is released when no client ends up in the slot.
+        it open makes this raise ``SurrealDbConnectionError`` before anything opens. The claim is released when no
+        client ends up in the slot.
         """
         url, namespace, database = cls.__url, cls.__namespace, cls.__database
         claimed = _claim_store(url, cls)
@@ -2061,7 +2062,7 @@ class SurrealDBConnectionManager:
         what a reconnect restores). The slot's selection is stale until ``use()`` succeeds, so
         nobody takes the fast path meanwhile; on failure it stays stale — the next
         :meth:`get_client` selects again — and nothing is closed: :meth:`close_connection` would
-        discard a ``mem://`` database (spec D18).
+        discard a ``mem://`` database.
         """
         held = cls.__embedded_client is client
         if held:
@@ -2830,8 +2831,8 @@ async def _close_quietly(client: Any) -> None:
 
 
 def _opening_retired_text(name: str | None) -> str:
-    """R11: a client finished opening on settings connection *name* no longer serves (it was removed or registered
-    again with other settings meanwhile), and was closed unused."""
+    """The message when a client finished opening on settings connection *name* no longer serves (it was removed or
+    registered again with other settings meanwhile), and was closed unused."""
     return (
         f"Connection {name!r} was removed or registered again with other settings while a client was opening on the "
         "old ones; that client was closed unused. Retry the call."
@@ -2839,7 +2840,7 @@ def _opening_retired_text(name: str | None) -> str:
 
 
 def _transaction_retired_text(name: str | None) -> str:
-    """R12: why a transaction whose connection was removed or registered again with other settings committed
+    """Why a transaction whose connection was removed or registered again with other settings committed
     nothing — the error of a committing exit, and the note added to a body's own exception."""
     return (
         f"Connection {name!r} was removed or registered again with other settings while this transaction was open "
@@ -2857,7 +2858,7 @@ def _claim_store(url: str | None, connection: type[SurrealDBConnectionManager]) 
     :return: the store's key when this call claimed it; ``None`` for an in-memory or server URL, or a store
         *connection* already holds (a connection may open its own store again: an ``embedded_database()`` block on
         its path).
-    :raises SurrealDbConnectionError: X5 — another connection of the process has that store open; never retryable.
+    :raises SurrealDbConnectionError: another connection of the process has that store open; never retryable.
     """
     key = store_key(url)
     if key is None:
@@ -2919,7 +2920,7 @@ _REGISTRY_LOCK = threading.Lock()
 
 #: The on-disk embedded stores open in this process (v0.29.0): store key (:func:`~surreal_orm_lite.embedded.store_key`)
 #: → the connection class whose engine has it open — the class, not its name: a name registered again is another
-#: connection. Two in-process engines on one store miss each other's writes, so a second connection is refused (X5)
+#: connection. Two in-process engines on one store miss each other's writes, so a second connection is refused
 #: until the first one closes its engine.
 _STORE_CLAIMS: dict[str, type[SurrealDBConnectionManager]] = {}
 _STORE_LOCK = threading.Lock()

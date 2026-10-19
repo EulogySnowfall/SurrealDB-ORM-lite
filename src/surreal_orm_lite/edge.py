@@ -33,8 +33,8 @@ from .utils import coerce_endpoint
 _ENDPOINT_FIELDS = frozenset({"in_", "out"})
 _ENDPOINT_COLUMNS = frozenset({"in", "out"})
 
-# ``INSERT RELATION`` that refuses an explicit id which already exists, the same way on every line
-# (spec §2.4). The raw statement does not: SurrealDB 2.7.0 and 3.1.5 silently keep the stored edge
+# ``INSERT RELATION`` that refuses an explicit id which already exists, the same way on every line.
+# The raw statement does not: SurrealDB 2.7.0 and 3.1.5 silently keep the stored edge
 # and return it as if it had been inserted, while 3.3.3 raises. ``$before`` is the stored record
 # (``NONE`` for a new one), so the ``THROW`` turns the silent case into an error whose text matches
 # 3.3.3's own. It is built server-side from ``$before.id``: no caller text enters the statement. On

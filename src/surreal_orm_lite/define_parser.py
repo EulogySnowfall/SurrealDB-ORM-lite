@@ -370,7 +370,7 @@ class _RegexEnds:
     ``/`` closes it after an even run of backslashes: ``/\\\\/`` is a regex on 3.x (an escaped backslash), and
     2.x refuses it as unclosed; ``/a\\\\/b/`` is one on 2.x, which 3.x refuses. The two ends differ exactly when a
     ``/`` after an even run of backslashes comes before 2.x's end, or when 2.x finds none; the parser does not know
-    the line (spec §4), so ``_slash`` never reads such a regex.
+    which line rendered the statement, so ``_slash`` never reads such a regex.
 
     The closing slash found for one ``/`` answers every ``/`` before it, and a search that found none answers every
     later one: the text is searched once in all for each line, never again from each slash (``/\\/\\/…\\/``
@@ -689,7 +689,7 @@ class KTuple:
     items: tuple["Kind", ...]
 
 
-#: A parsed kind (spec §6.3.5).
+#: A parsed kind.
 Kind: TypeAlias = KName | KLiteral | KUnion | KObject | KTuple
 
 _KIND_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -716,7 +716,7 @@ def _quote_close(char: str, *, strings: bool) -> str | None:
 
 
 class _KindReader:
-    """A recursive-descent reader of the kind grammar of spec §6.3.5, from a position of a text.
+    """A recursive-descent reader of the kind grammar, from a position of a text.
 
     ::
 
@@ -1005,7 +1005,7 @@ class _Span(NamedTuple):
         return self.text[token.start : token.end] if token.kind == _WORD_TOKEN else None
 
 
-#: A validator says whether a clause's content is one its slot accepts (spec §6.3.2's table).
+#: A validator says whether a clause's content is one its slot accepts.
 _Validator: TypeAlias = Callable[[_Span], bool]
 
 
@@ -1038,7 +1038,7 @@ def _skip_space(text: str, pos: int) -> int:
     return pos if space is None else space.end()
 
 
-#: An expression never ends with one of these characters outside a string or a regex (spec §6.3.2, ``expr``) …
+#: An expression never ends with one of these characters outside a string or a regex (``expr``) …
 _OPERATOR_ENDS = frozenset("+-*/%=<>!&|^,.:?~@")
 #: … but for these operands, glued: the idioms ``x.*``, ``x.@`` and ``x.?``, the graph wildcard (``<-likes<-?``,
 #: ``->likes->?``, ``<->likes<->?``) and an open range (``1..``, ``..``, ``t:..``).
@@ -1101,7 +1101,7 @@ def _valid_kind(span: _Span) -> bool:
 
 
 def _valid_type_as_written(span: _Span) -> bool:
-    """The ``TYPE`` of the second pass of spec §6.3.2 item 4 (I3): non-empty — every content is depth-balanced."""
+    """The ``TYPE`` of the second pass (its kind kept as written): non-empty — every content is depth-balanced."""
     return span.first < span.stop
 
 
@@ -1399,7 +1399,7 @@ def parse_permissions(text: str, actions: Sequence[str], *, unnamed: str) -> dic
 
 
 class Slot(NamedTuple):
-    """One clause of a ``DEFINE`` grammar (spec §6.3.3): its name in the result, the keywords that open it (two for
+    """One clause of a ``DEFINE`` grammar: its name in the result, the keywords that open it (two for
     ``SCHEMAFULL|SCHEMALESS``, ``IN``/``FROM`` …), the validator of its content, and whether a reading must use it.
     Two slots may share a name (``FLEXIBLE`` before and after ``TYPE``): a reading uses one of them at most."""
 
@@ -1469,7 +1469,7 @@ _STEP_WORK = 8
 
 
 class _ClauseReader:
-    """The readings of the clauses of one statement after its header (spec §6.3.2), counted up to two.
+    """The readings of the clauses of one statement after its header, counted up to two.
 
     A reading picks a strictly increasing run of top-level keyword candidates, the first one where the text starts,
     and gives each a slot after the previous one's; every content must pass its slot's validator and every required
@@ -1779,13 +1779,13 @@ _TABLE_TAIL_SLOTS = (
     Slot("changefeed", ("CHANGEFEED",), _valid_changefeed),
     Slot("permissions", ("PERMISSIONS",), _valid_table_permissions),
 )
-#: Spec §6.3.3, a table: ``IN``, ``OUT`` and ``ENFORCED`` only after ``TYPE RELATION``.
+#: The clauses of a table: ``IN``, ``OUT`` and ``ENFORCED`` only after ``TYPE RELATION``.
 _TABLE_SLOTS = (_TABLE_TYPE_SLOT, *_TABLE_TAIL_SLOTS)
 _RELATION_TABLE_SLOTS = (_TABLE_TYPE_SLOT, *_RELATION_SLOTS, *_TABLE_TAIL_SLOTS)
 #: ``TYPE RELATION`` right after a table's name: every reading of the clauses then has that TYPE, and no other does.
 _RELATION_TYPE = re.compile(r"\s+TYPE\s+RELATION(?:\s|\Z)")
 
-#: Spec §6.3.3, a field (M10's order; ``FLEXIBLE`` before ``TYPE`` on 2.x, after it on 3.x, M9).
+#: The clauses of a field, in the order the servers render them (``FLEXIBLE`` before ``TYPE`` on 2.x, after it on 3.x).
 _FIELD_SLOTS = (
     Slot("flexible", ("FLEXIBLE",), _valid_flag),
     Slot("type", ("TYPE",), _valid_kind),
@@ -1799,7 +1799,7 @@ _FIELD_SLOTS = (
     Slot("comment", ("COMMENT",), _valid_string),
     Slot("permissions", ("PERMISSIONS",), _valid_field_permissions),
 )
-#: The second pass of spec §6.3.2 item 4 (I3): ``TYPE`` only non-empty.
+#: The second pass, which keeps a kind as written: ``TYPE`` only non-empty.
 _FIELD_SLOTS_TYPE_AS_WRITTEN = tuple(
     slot._replace(validator=_valid_type_as_written) if slot.name == "type" else slot for slot in _FIELD_SLOTS
 )
@@ -1839,7 +1839,7 @@ def _content(clause: Clause | None) -> str | None:
 
 
 def parse_define_table(text: str) -> TableState:
-    r"""Read a ``DEFINE TABLE`` statement as the server renders it (spec §6.3.3) into a ``TableState``.
+    r"""Read a ``DEFINE TABLE`` statement as the server renders it into a ``TableState``.
 
     The header ``DEFINE TABLE <ident>`` is read positionally (``DEFINE TABLE TYPE TYPE ANY …`` names the table
     ``TYPE``; ``\``we\`ird\``` gives ``we`ird``), then the clauses ``TYPE``, ``IN``/``FROM``, ``OUT``/``TO`` and
@@ -1878,14 +1878,14 @@ def parse_define_table(text: str) -> TableState:
 
 class ParsedField(NamedTuple):
     """What ``parse_define_field()`` read: the state, and whether its ``TYPE`` was kept as written because
-    ``parse_kind()`` does not understand it (the reader reports it as issue I3; ``FieldState`` has no such flag)."""
+    ``parse_kind()`` does not understand it (the reader reports it as an issue; ``FieldState`` has no such flag)."""
 
     state: FieldState
     type_as_written: bool
 
 
 def parse_define_field(text: str) -> ParsedField:
-    """Read a ``DEFINE FIELD`` statement as the server renders it (spec §6.3.3) into a ``FieldState``.
+    """Read a ``DEFINE FIELD`` statement as the server renders it into a ``FieldState``.
 
     The header ``DEFINE FIELD <idiom> ON <ident>`` is read positionally (``DEFINE FIELD TYPE ON TYPE TYPE int``,
     ``DEFINE FIELD ON ON t``): ``name`` is the path's canonical name (``tags[*]`` and ``tags.*`` both give
@@ -1896,7 +1896,7 @@ def parse_define_field(text: str) -> ParsedField:
     ``field_type="int"``, ``nullable=True``); no ``TYPE`` gives ``"any"``, not nullable (as ``TYPE any``; ``raw``
     keeps the two apart). Expression texts are kept as rendered. When no reading fits, the clauses are read once more
     with ``TYPE`` only non-empty: exactly one reading then gives the field with its ``TYPE`` text as ``field_type``,
-    not nullable, and ``type_as_written=True`` (spec §6.3.2 item 4). Raises ``DefineParseError``.
+    not nullable, and ``type_as_written=True``. Raises ``DefineParseError``.
     """
     pos = _header(text, "FIELD")
     if _identifier_at(text, pos) is None:
@@ -1984,7 +1984,7 @@ def _comment(clauses: Mapping[str, Clause]) -> str | None:
 
 # --- DEFINE INDEX --------------------------------------------------------------------------------------------------
 
-#: The index options that are flags, those followed by an integer and those followed by a word (spec §6.3.3).
+#: The index options that are flags, those followed by an integer and those followed by a word.
 _INDEX_FLAGS = frozenset({"UNIQUE", "HIGHLIGHTS", "HNSW", "MTREE", "CONCURRENTLY"})
 _INDEX_INTEGERS = frozenset({"DIMENSION", "EFC", "M"})
 _INDEX_WORDS = frozenset({"DIST", "TYPE"})
@@ -2066,7 +2066,7 @@ def _final_comment(text: str, pos: int) -> str:
 
 
 def _index_options(text: str, pos: int) -> _IndexOptions:
-    """Read the flat run of index options starting at *pos* (spec §6.3.3).
+    """Read the flat run of index options starting at *pos*.
 
     ``UNIQUE``, ``HIGHLIGHTS``, ``HNSW``, ``MTREE`` and ``CONCURRENTLY`` are flags; ``SEARCH|FULLTEXT ANALYZER
     <ident>``; ``BM25(k1,b)`` or a bare ``BM25``; ``DIMENSION``, ``EFC`` and ``M`` take an integer, ``DIST`` and
@@ -2109,14 +2109,14 @@ def _index_options(text: str, pos: int) -> _IndexOptions:
 
 
 def parse_define_index(text: str) -> IndexState:
-    """Read a ``DEFINE INDEX`` statement as the server renders it (spec §6.3.3) into an ``IndexState``.
+    """Read a ``DEFINE INDEX`` statement as the server renders it into an ``IndexState``.
 
     The header ``DEFINE INDEX <ident> ON <ident>`` is read positionally (``DEFINE INDEX COUNT ON t FIELDS M`` names the
     index ``COUNT``), then ``FIELDS`` (or ``COLUMNS``) and its idioms one by one — ``FIELDS TYPE, M UNIQUE`` gives
     ``("TYPE", "M")`` — or ``COUNT``, then the flat run of options (see ``_index_options()``). ``fields`` hold the
     canonical names (``tags[*]`` and ``tags.*`` both give ``"tags.*"``), ``()`` for ``COUNT``; ``bm25`` is
     ``(k1, b)`` as floats for ``BM25(k1,b)``. SurrealDB 2.x's ``SEARCH`` and 3.x's ``FULLTEXT`` both give
-    ``search_analyzer``. No measured engine renders ``CONCURRENTLY`` (M42); it is read all the same. Raises
+    ``search_analyzer``. No measured engine renders ``CONCURRENTLY``; it is read all the same. Raises
     ``DefineParseError``.
     """
     name, table, pos = _named_on(text, "INDEX")
@@ -2157,14 +2157,14 @@ def parse_define_index(text: str) -> IndexState:
 
 # --- DEFINE EVENT and DEFINE ANALYZER ------------------------------------------------------------------------------
 
-#: Spec §6.3.3, an event: WHEN and THEN are always rendered.
+#: The clauses of an event: WHEN and THEN are always rendered.
 _EVENT_SLOTS = (
     Slot("when", ("WHEN",), _valid_expr, required=True),
     Slot("then", ("THEN",), _valid_body, required=True),
     Slot("comment", ("COMMENT",), _valid_string),
 )
 
-#: Spec §6.3.3, an analyzer.
+#: The clauses of an analyzer.
 _ANALYZER_SLOTS = (
     Slot("function", ("FUNCTION",), _valid_fn_name),
     Slot("tokenizers", ("TOKENIZERS",), _valid_word_list),
@@ -2174,7 +2174,7 @@ _ANALYZER_SLOTS = (
 
 
 def parse_define_event(text: str) -> EventState:
-    """Read a ``DEFINE EVENT`` statement as the server renders it (spec §6.3.3) into an ``EventState``.
+    """Read a ``DEFINE EVENT`` statement as the server renders it into an ``EventState``.
 
     The header ``DEFINE EVENT <ident> ON <ident>`` is read positionally (``DEFINE EVENT THEN ON t WHEN END THEN …``
     names the event ``THEN``), then the clauses ``WHEN`` (an expression; an ``IF … END`` keeps its ``THEN`` inside),
@@ -2195,7 +2195,7 @@ def parse_define_event(text: str) -> EventState:
 
 
 def _analyzer_filter(item: str) -> str:
-    """One filter as spec §6.3.4 normalises it: lower-cased and without spaces, but for its string arguments, kept
+    """One filter, normalised: lower-cased and without spaces, but for its string arguments, kept
     as rendered (``SNOWBALL(ENGLISH)`` → ``snowball(english)``, ``MAPPER('path/File.txt')`` →
     ``mapper('path/File.txt')``)."""
     span = _scan_span(item)
@@ -2208,7 +2208,7 @@ def _analyzer_filter(item: str) -> str:
 
 
 def parse_define_analyzer(text: str) -> AnalyzerState:
-    """Read a ``DEFINE ANALYZER`` statement as the server renders it (spec §6.3.3, §6.3.4) into an ``AnalyzerState``.
+    """Read a ``DEFINE ANALYZER`` statement as the server renders it into an ``AnalyzerState``.
 
     The header ``DEFINE ANALYZER <ident>``, then the clauses ``FUNCTION fn::…``, ``TOKENIZERS``, ``FILTERS`` and
     ``COMMENT``. Tokenizers are lower-cased (``BLANK,CLASS`` → ``("blank", "class")``); filters are lower-cased with
@@ -2234,10 +2234,11 @@ def parse_define_analyzer(text: str) -> AnalyzerState:
 
 _ACCESS_TYPES = frozenset({"RECORD", "JWT", "BEARER"})
 _BEARER_SUBJECTS = frozenset({"USER", "RECORD"})
-#: The record targets of a SIGNUP read as a table (D28, option B): every line renders them so, lower case, no space.
+#: The record targets of a SIGNUP read as a table: every line renders them so, lower case, no space.
 _CALL_TARGETS = ("type::thing(", "type::record(")
 
-#: Spec §6.3.3, an access (M17's order; ``ALGORITHM`` and ``URL`` directly after ``TYPE JWT`` too).
+#: The clauses of an access, in the order the servers render them (``ALGORITHM`` and ``URL`` directly after
+#: ``TYPE JWT`` too).
 _ACCESS_SLOTS = (
     Slot("signup", ("SIGNUP",), _valid_group),
     Slot("signin", ("SIGNIN",), _valid_group),
@@ -2264,7 +2265,7 @@ def _signup_target(content: str, pos: int) -> tuple[str, int] | None:
     """The table a SIGNUP's ``CREATE`` targets at *pos* and the position after the target, or ``None``.
 
     A call ``type::thing(…)`` or ``type::record(…)`` with exactly two top-level arguments, the first one string
-    literal whose value is non-empty and holds no ``:`` (spec §6.3.3, D28's guard; the second one is not read);
+    literal whose value is non-empty and holds no ``:`` (the second one is not read);
     otherwise an identifier.
     """
     call = next((prefix for prefix in _CALL_TARGETS if content.startswith(prefix, pos)), None)
@@ -2299,7 +2300,7 @@ def _signup_items(text: str) -> dict[str, str] | None:
 
 def _signup_shape(group: str) -> tuple[str, dict[str, str]]:
     """``(table, signup_fields)`` of a SIGNUP group of the shape ``(CREATE <target> SET <item>[, <item>]*)``, read
-    positionally; ``("", {})`` for any other shape — never an error (spec §6.3.3)."""
+    positionally; ``("", {})`` for any other shape — never an error."""
     content = group[1:-1].strip()
     if not content.startswith("CREATE") or len(content) <= len("CREATE") or not content[len("CREATE")].isspace():
         return "", {}
@@ -2339,7 +2340,7 @@ def _signin_where(group: str) -> str:
 
 
 def parse_define_access(text: str) -> AccessState:
-    """Read a database ``DEFINE ACCESS`` statement as the server renders it (spec §6.3.3) into an ``AccessState``.
+    """Read a database ``DEFINE ACCESS`` statement as the server renders it into an ``AccessState``.
 
     The header ``DEFINE ACCESS <ident> ON DATABASE TYPE <RECORD|JWT|BEARER>`` (and ``FOR USER|RECORD`` after
     ``BEARER``) is read positionally, then the clauses ``SIGNUP``, ``SIGNIN``, ``WITH REFRESH``, ``WITH JWT``,
@@ -2383,13 +2384,13 @@ def parse_define_access(text: str) -> AccessState:
 
 # --- DEFINE FUNCTION and DEFINE PARAM ------------------------------------------------------------------------------
 
-#: Spec §6.3.3, after a function's body.
+#: The clauses after a function's body.
 _FUNCTION_SLOTS = (
     Slot("comment", ("COMMENT",), _valid_string),
     Slot("permissions", ("PERMISSIONS",), _valid_rule),
 )
 
-#: Spec §6.3.3, a param: VALUE is always rendered.
+#: The clauses of a param: VALUE is always rendered.
 _PARAM_SLOTS = (
     Slot("value", ("VALUE",), _valid_expr, required=True),
     Slot("comment", ("COMMENT",), _valid_string),
@@ -2405,11 +2406,11 @@ def _rule(clauses: Mapping[str, Clause]) -> str:
 
 
 def parse_define_function(text: str) -> FunctionState:
-    """Read a ``DEFINE FUNCTION`` statement as the server renders it (spec §6.3.3) into a ``FunctionState``.
+    """Read a ``DEFINE FUNCTION`` statement as the server renders it into a ``FunctionState``.
 
     Positionally: ``DEFINE FUNCTION fn::<name>(`` and its parameter list to the matching ``)`` — the names read by
     ``functions.parse_function_parameters()``, as ``call_function()`` reads them — then an optional ``-> <kind>``
-    (an object kind ``{ a: int }`` included), whose canonical text (§6.3.5: ``option<string>`` for 2.x's
+    (an object kind ``{ a: int }`` included), whose canonical text (``option<string>`` for 2.x's
     ``option<string>`` and 3.x's ``none | string``) is ``returns``, then the body ``{…}`` to its matching brace; then
     the clauses ``COMMENT`` and ``PERMISSIONS`` (``FULL``, ``NONE`` or ``WHERE <expr>``). Raises ``DefineParseError``
     (``_R_SIGNATURE`` for a signature or body that is not where expected).
@@ -2446,7 +2447,7 @@ def parse_define_function(text: str) -> FunctionState:
 
 
 def parse_define_param(text: str) -> ParamState:
-    """Read a ``DEFINE PARAM`` statement as the server renders it (spec §6.3.3) into a ``ParamState``.
+    """Read a ``DEFINE PARAM`` statement as the server renders it into a ``ParamState``.
 
     The header ``DEFINE PARAM $<ident>`` (``name`` without the ``$``), then the clauses ``VALUE`` (required, kept as
     rendered), ``COMMENT`` and ``PERMISSIONS``. The value may be a secret: it is never part of a

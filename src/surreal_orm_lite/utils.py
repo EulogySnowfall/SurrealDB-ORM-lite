@@ -800,7 +800,7 @@ def _guarded(field: str, function: str, argument: str) -> str:
 
 
 def _list_item(item: Any, field: str, lookup: str) -> Any:
-    """An item of a sequence lookup's list, returned unchanged; a subquery there raises S15 (v0.27.0)."""
+    """An item of a sequence lookup's list, returned unchanged; a subquery there raises ``ValueError`` (v0.27.0)."""
     if subquery_of(item) is not None:
         raise ValueError(inside_a_list(field, lookup))
     return item
@@ -947,7 +947,7 @@ def build_filter_condition(
             string column may legitimately hold ``"a:b"``.
         subqueries: The compiler of the statement the condition goes into (v0.27.0), which binds a subquery
             value in a ``LET`` (or inline, for a live query). ``None`` — a ``Q`` compiled on its own — refuses a
-            subquery (S8).
+            subquery.
 
     Returns:
         A tuple of (sql_fragment, variables_dict, next_counter).
@@ -962,8 +962,8 @@ def build_filter_condition(
             to an endpoint column (v0.24.0). ``InvalidGeometryError`` (a ``ValueError``) for a
             malformed GeoJSON object. A text lookup given a value that is neither a ``str`` nor a ``Var``, or
             ``like``/``ilike`` given a ``Var`` (#251). With a subquery (v0.27.0): a lookup that takes none —
-            ``isnull``, the text and the spatial lookups — (S2); a subquery as an item of a list (S15); no
-            *subqueries* compiler (S8); and the inner queryset's refusals (S3–S7, S13).
+            ``isnull``, the text and the spatial lookups; a subquery as an item of a list; no *subqueries*
+            compiler; and the inner queryset's refusals (README section 28).
     """
     validate_field_name(field, "filter field")
     sub = subquery_of(value)

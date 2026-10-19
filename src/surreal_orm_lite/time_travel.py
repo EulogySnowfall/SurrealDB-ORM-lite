@@ -101,7 +101,7 @@ def _utc(moment: datetime) -> datetime:
 
 
 def _absolute(at: Any, moment: datetime) -> AsOf:
-    """An absolute moment given to ``as_of()``, in UTC; T11 outside the bounds."""
+    """An absolute moment given to ``as_of()``, in UTC; ``ValueError`` outside the bounds."""
     utc = _utc(moment)
     if not in_range(utc):
         raise ValueError(moment_out_of_range(utc))
@@ -109,7 +109,7 @@ def _absolute(at: Any, moment: datetime) -> AsOf:
 
 
 def _refused_duration(at: Any) -> ValueError:
-    """T3: a negative duration, or an SDK ``Duration`` the ORM ``Duration`` refuses."""
+    """The refusal of a negative duration, or of an SDK ``Duration`` the ORM ``Duration`` refuses."""
     return ValueError(f"as_of() takes how long ago as a duration >= 0 in whole nanoseconds, got {at!r}")
 
 
@@ -117,10 +117,10 @@ def normalise_as_of(at: object) -> AsOf | None:
     """Normalise the value given to ``QuerySet.as_of()``; ``None`` clears the moment.
 
     :raises TypeError: none of the accepted forms — a ``date`` that is not a ``datetime``, a number, a
-        ``bool``, ``bytes``… (T1).
-    :raises ValueError: a string ``datetime.fromisoformat`` refuses (T2); a negative ``timedelta``, or an
-        SDK ``Duration`` whose ``elapsed`` is not an ``int`` >= 0 within ``Duration.MAX_NANOSECONDS`` (T3); an
-        absolute moment outside :data:`MIN_MOMENT` … :data:`MAX_MOMENT`, compared in UTC (T11).
+        ``bool``, ``bytes``….
+    :raises ValueError: a string ``datetime.fromisoformat`` refuses; a negative ``timedelta``, or an SDK
+        ``Duration`` whose ``elapsed`` is not an ``int`` >= 0 within ``Duration.MAX_NANOSECONDS``; an absolute
+        moment outside :data:`MIN_MOMENT` … :data:`MAX_MOMENT`, compared in UTC.
     """
     if at is None:
         return None
@@ -158,9 +158,9 @@ async def resolve(as_of: AsOf, client: Any, variables: Mapping[str, Any]) -> dat
     One ``RETURN`` request for ``ago`` (``time::now() - $_as_of_ago``, bound) or ``expression`` (inlined,
     with the queryset's ``variables`` bound); none for an absolute ``moment``, already checked.
 
-    :raises SurrealDbError: the database could not evaluate it (T10b, chained to the SDK's ``ServerError``
-        or the embedded engine's ``RuntimeError``), it did not give a ``datetime`` (T10a), or it gave a
-        moment outside :data:`MIN_MOMENT` … :data:`MAX_MOMENT` (T10c) — the read is never sent then.
+    :raises SurrealDbError: the database could not evaluate it (chained to the SDK's ``ServerError`` or the
+        embedded engine's ``RuntimeError``), it did not give a ``datetime``, or it gave a moment outside
+        :data:`MIN_MOMENT` … :data:`MAX_MOMENT` — the read is never sent then.
     """
     if as_of.moment is not None:
         return as_of.moment
@@ -193,7 +193,7 @@ def line_major(version: object) -> int:
 
 
 def transaction_refused() -> str:
-    """T4: ``as_of()`` on a queryset bound to a transaction (``objects(tx=)``)."""
+    """The refusal of ``as_of()`` on a queryset bound to a transaction (``objects(tx=)``)."""
     return (
         "as_of() reads the database's history, which a transaction cannot join: run this read on "
         "Model.objects(), outside objects(tx=)."
@@ -201,7 +201,7 @@ def transaction_refused() -> str:
 
 
 def queryset_refused(method: str) -> str:
-    """T5: a write or stream (*method*, with its ``()``) on a queryset read ``as_of()``."""
+    """The refusal of a write or stream (*method*, with its ``()``) on a queryset read ``as_of()``."""
     return (
         f"{method} is not available on a queryset read as_of(): a time-travel read is read-only and cannot be "
         "streamed. Call it on a queryset without as_of()."
@@ -209,7 +209,7 @@ def queryset_refused(method: str) -> str:
 
 
 def server_refused(exc: BaseException) -> str:
-    """T7: the server's storage keeps no history (*exc* is its ``ServerError``)."""
+    """The refusal when the server's storage keeps no history (*exc* is its ``ServerError``)."""
     return (
         f"as_of() needs a store that keeps history, and this SurrealDB server's storage does not ({exc}). Start "
         "SurrealDB 3.x with surrealkv://<path>?versioned=true or rocksdb://<path>?versioned=true, SurrealDB 2.x "
@@ -218,7 +218,7 @@ def server_refused(exc: BaseException) -> str:
 
 
 def fetch_refused() -> str:
-    """T8: ``fetch()`` under ``as_of()`` on SurrealDB 2.x, for a read that returns the fetched records."""
+    """The refusal of ``fetch()`` under ``as_of()`` on SurrealDB 2.x, for a read that returns the fetched records."""
     return (
         "fetch() under as_of() needs SurrealDB 3.x: SurrealDB 2.x (servers and the embedded engine of the "
         "surrealdb SDK 2.x) resolves fetched links to their current state, not as they were at that moment. "
@@ -227,7 +227,8 @@ def fetch_refused() -> str:
 
 
 def snapshot_write_refused(model: str, method: str, moment: datetime) -> str:
-    """T9: a write (*method*, with its ``()``) on an instance of *model* read at *moment* with ``as_of()``."""
+    """The refusal of a write (*method*, with its ``()``) on an instance of *model* read at *moment* with
+    ``as_of()``."""
     return (
         f"{model}.{method} cannot run on an instance read with as_of(): it holds the record as it was at "
         f"{moment.isoformat()}, not the current record. To restore that state, build a new instance from it "
@@ -237,17 +238,17 @@ def snapshot_write_refused(model: str, method: str, moment: datetime) -> str:
 
 
 def not_a_datetime(spec: str, value: object) -> str:
-    """T10a: the duration or expression *spec* (the ``repr`` given to ``as_of()``) did not give a datetime."""
+    """The error when the duration or expression *spec* (the ``repr`` given to ``as_of()``) did not give a datetime."""
     return f"as_of({spec}) must give a datetime; the database returned {value!r}"
 
 
 def evaluation_failed(spec: str, exc: BaseException) -> str:
-    """T10b: the database could not evaluate the duration or expression *spec*."""
+    """The error when the database could not evaluate the duration or expression *spec*."""
     return f"as_of({spec}) could not be evaluated by the database: {exc}"
 
 
 def resolved_out_of_range(spec: str, value: datetime) -> str:
-    """T10c: the duration or expression *spec* gave *value*, outside the moments a version can address."""
+    """The error when the duration or expression *spec* gave *value*, outside the moments a version can address."""
     return (
         f"as_of({spec}) gave {value.isoformat()}, outside the moments SurrealDB versions can address "
         f"({MIN_MOMENT.isoformat()} to {MAX_MOMENT.isoformat()}): SurrealDB 2.x would read an earlier moment as "
@@ -256,7 +257,7 @@ def resolved_out_of_range(spec: str, value: datetime) -> str:
 
 
 def moment_out_of_range(moment: datetime) -> str:
-    """T11: an absolute moment (in UTC) outside the moments a version can address."""
+    """The refusal of an absolute moment (in UTC) outside the moments a version can address."""
     return (
         f"as_of() takes a moment from {MIN_MOMENT.isoformat()} to {MAX_MOMENT.isoformat()}, the instants "
         "SurrealDB versions can address (SurrealDB 2.x reads an earlier moment as the current state), got "

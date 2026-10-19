@@ -105,7 +105,7 @@ def keeps_history(url: str | None) -> bool:
 
 
 def require_supported_url(url: str | None) -> None:
-    """Raise E11 when the SDK's parser refuses *url*; nothing for ``None``/``""`` or an accepted URL.
+    """Raise when the SDK's parser refuses *url*; nothing for ``None``/``""`` or an accepted URL.
 
     Parses again on the refusal path only (``url_kind`` is cached and keeps no exception), so the error is
     chained to the SDK's own exception.
@@ -124,7 +124,7 @@ def require_supported_url(url: str | None) -> None:
 
 
 def unsupported_url_message(url: str, exc: BaseException) -> str:
-    """E11: the installed SDK cannot open *url* (``exc`` is its parser's exception)."""
+    """The message when the installed SDK cannot open *url* (``exc`` is its parser's exception)."""
     schemes = ", ".join(sorted(s.value for s in SdkUrlScheme))
     hint = ""
     with contextlib.suppress(ValueError):  # a URL ``urlsplit`` cannot split gets no hint
@@ -137,7 +137,7 @@ def unsupported_url_message(url: str, exc: BaseException) -> str:
 
 
 def live_unsupported(url: str | None) -> str:
-    """E1: a live query (``live()``, ``watch()``, ``subscribe_live()``) on the embedded engine."""
+    """The message refusing a live query (``live()``, ``watch()``, ``subscribe_live()``) on the embedded engine."""
     return (
         f"Live queries need a WebSocket server connection (ws:// or wss://): the embedded engine ({url!r}) has no "
         "notification channel to deliver them. Read the table's change feed with Model.objects().changes() "
@@ -146,7 +146,7 @@ def live_unsupported(url: str | None) -> str:
 
 
 def ephemeral_unsupported(url: str | None) -> str:
-    """E2: ``SurrealDBConnectionManager.ephemeral_client()`` on the embedded engine."""
+    """The message refusing ``SurrealDBConnectionManager.ephemeral_client()`` on the embedded engine."""
     return (
         f"ephemeral_client() opens a second session on the configured database, which the embedded engine "
         f"({url!r}) cannot do: every in-process client is a database of its own. Use the shared client "
@@ -155,7 +155,8 @@ def ephemeral_unsupported(url: str | None) -> str:
 
 
 def model_auth_unsupported(model: str, label: str, url: str | None) -> str:
-    """E3: model-level auth (``signup``/``signin``/``authenticate``/``refresh``) without ``bind=True``."""
+    """The message refusing model-level auth (``signup``/``signin``/``authenticate``/``refresh``) without
+    ``bind=True`` on the embedded engine."""
     return (
         f"{model}.{label}() runs on a session of its own so that the shared connection keeps its identity, and "
         f"the embedded engine ({url!r}) has a single session per database. Pass bind=True to sign that session "
@@ -164,7 +165,7 @@ def model_auth_unsupported(model: str, label: str, url: str | None) -> str:
 
 
 def changes_since_datetime_unsupported() -> str:
-    """E4: ``changes(since=<datetime>)`` on the embedded engine of the surrealdb SDK 2.x."""
+    """The message refusing ``changes(since=<datetime>)`` on the embedded engine of the surrealdb SDK 2.x."""
     return (
         "changes(since=<datetime>) is not available on the embedded engine of the surrealdb SDK 2.x: it keeps "
         "no timestamps for change-feed positions, so a datetime cannot be resolved. Pass a cursor "
@@ -173,7 +174,8 @@ def changes_since_datetime_unsupported() -> str:
 
 
 def history_unsupported(url: str | None) -> str:
-    """T6: a time-travel read (``as_of()``) on an embedded URL that :func:`keeps_history` refuses (v0.26.0)."""
+    """The message refusing a time-travel read (``as_of()``) on an embedded URL that :func:`keeps_history` refuses
+    (v0.26.0)."""
     return (
         f"as_of() needs a store that keeps history, and the embedded engine at {url!r} keeps none. Open a "
         "surrealkv+versioned://<path> database (the surrealdb SDK 2.x ignores ?versioned=true), or connect to a "
