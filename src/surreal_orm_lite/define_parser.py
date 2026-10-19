@@ -911,9 +911,10 @@ class _KindReader:
         """The text up to the ``>`` that closes ``name<``, stripped and non-empty: brackets (``<>`` included) must
         match, quoted identifiers are skipped.
 
-        Since v0.31.0 the text holds no quote character (``'``, ``"``) and no comment marker (``--``, ``#``, ``//``,
-        ``/*``): a server renders such an argument as a bare identifier (``file<bucket>``), and a kind the ORM writes
-        into a ``DEFINE FUNCTION`` must not carry text the reader did not read.
+        Since v0.31.0 the text holds no quote character (``'``, ``"``), no comment marker (``--``, ``#``, ``//``,
+        ``/*``) and no ``;`` — it is one expression, like the other one-expression contexts: a server renders such
+        an argument as a bare identifier (``file<bucket>``), and a kind the ORM writes into a ``DEFINE FUNCTION``
+        must not carry text the reader did not read.
         """
         text = self.text
         start = index = self.pos
@@ -938,7 +939,7 @@ class _KindReader:
                         raise DefineParseError(_R_KIND)
                 elif char == ">" and text[start:index].strip():
                     argument = text[start:index].strip()
-                    if any(marker in argument for marker in _COMMENT_MARKERS):
+                    if ";" in argument or any(marker in argument for marker in _COMMENT_MARKERS):
                         raise DefineParseError(_R_KIND)
                     self.pos = index + 1
                     return argument

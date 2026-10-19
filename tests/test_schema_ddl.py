@@ -469,8 +469,9 @@ class TestEvent:
 
 
 class TestKindReaderHardening:
-    """Spec §6.2 (D18): the free text of an unknown generic argument (``file<…>``) refuses a comment marker and a quote
-    character; every other kind reads as before."""
+    """Spec §6.2 (D18): the free text of an unknown generic argument (``file<…>``) refuses a comment marker, a quote
+    character and a ``;`` (one expression, like the other one-expression contexts); every other kind reads as
+    before."""
 
     @pytest.mark.parametrize(
         "text",
@@ -488,6 +489,26 @@ class TestKindReaderHardening:
         ],
     )
     def test_a_comment_marker_or_a_quote_in_a_free_text_argument_is_refused(self, text: str) -> None:
+        with pytest.raises(DefineParseError) as error:
+            parse_kind(text)
+        assert _reason(error) == _R_KIND
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "file<x; y>",
+            "file<x;y>",
+            "file<;>",
+            "file<x;>",
+            "option<file<x; y>>",
+            "frob<a<b>; c>",
+            "frob<a (b; c)>",  # inside brackets too
+            "frob<a { b; c }>",
+            "file<`a;b`>",  # the whole argument text is checked
+            "int | file<x; y>",
+        ],
+    )
+    def test_a_semicolon_in_a_free_text_argument_is_refused(self, text: str) -> None:
         with pytest.raises(DefineParseError) as error:
             parse_kind(text)
         assert _reason(error) == _R_KIND
@@ -839,11 +860,22 @@ _FUNCTION_ERRORS = [
             _kind_error("the kind of parameter 'a'"),
             id=f"F7-parameter-{kind!r}",
         )
-        for kind in ["int>", "", "  ", "int; x", "file<x -- y>", "file<x # y>", "file<'z'>", "file<x//y>"]
+        for kind in [
+            "int>",
+            "",
+            "  ",
+            "int; x",
+            "file<x -- y>",
+            "file<x # y>",
+            "file<'z'>",
+            "file<x//y>",
+            "file<x; y>",
+            "option<file<a;b>>",
+        ]
     ],
     *[
         pytest.param(("x", "RETURN 1"), {"returns": kind}, ValueError, _kind_error("returns="), id=f"F7-returns-{kind!r}")
-        for kind in ["array<", 'file<"q">', "file<a/*b>", ""]
+        for kind in ["array<", 'file<"q">', "file<a/*b>", "", "file<x; y>"]
     ],
     # F8
     *[
@@ -2846,6 +2878,12 @@ class TestFunctionsE2E:
             with pytest.raises(ValueError) as raised:
                 await SurrealDBConnectionManager.define_function("fn::x;y", "RETURN 1;")
             assert str(raised.value) == _INVALID_FUNCTION.format("fn::x;y")
+            with pytest.raises(ValueError) as raised:
+                await SurrealDBConnectionManager.define_function("fn::x", "RETURN 1;", parameters={"a": "file<x; y>"})
+            assert str(raised.value) == _kind_error("the kind of parameter 'a'")
+            with pytest.raises(ValueError) as raised:
+                await SurrealDBConnectionManager.define_function("fn::x", "RETURN 1;", returns="file<x; y>")
+            assert str(raised.value) == _kind_error("returns=")
             with pytest.raises(ValueError) as raised:
                 await SurrealDBConnectionManager.remove_function("fn::x;y")
             assert str(raised.value) == _INVALID_FUNCTION.format("fn::x;y")

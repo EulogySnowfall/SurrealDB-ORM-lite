@@ -128,8 +128,8 @@ def _kind(text: str, *, subject: str, what: str) -> str:
     """The canonical text of the SurrealQL kind *text* (``render_kind(parse_kind(text))``), never *text* itself.
 
     *what* names the kind in the message (``"returns="``, ``"the kind of parameter 'a'"``). A kind the parser cannot
-    read — or whose free-text generic argument holds a comment marker or a quote — is a ``ValueError``: nothing is
-    rewritten silently.
+    read — or whose free-text generic argument holds a comment marker, a quote or a ``;`` — is a ``ValueError``:
+    nothing is rewritten silently.
     """
     try:
         return render_kind(parse_kind(text))
