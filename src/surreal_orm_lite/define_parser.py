@@ -17,7 +17,8 @@ simple anchored tokens:
   a regex; a ``/`` and a space open one where an operand comes — after an operator, an opening bracket, ``,``, ``:``
   or ``;`` — and divide after an operand. After an operator word or a clause keyword (``AND``, ``VALUE``), which
   SurrealDB 2.x also renders bare as an identifier (``AND / 2``), such a ``/`` is never guessed when a later ``/``
-  could close a regex.
+  could close a regex. Nor is a regex that the two lines close at different slashes: on 3.x a backslash escapes the
+  next character (``\\`` then the closing ``/``), on 2.x only ``\/`` is an escape (``\`` and ``\/``).
 - Identifiers: bare ``[A-Za-z0-9_]+``, or quoted between backquotes or between ``⟨`` and ``⟩``, escapes decoded.
   ``read_identifier()`` reads one, ``read_idiom()`` a field path — segments separated by ``.``, a segment an
   identifier or ``*``, ``[*]`` the segment ``*`` (``tags[*]`` and ``tags.*`` are the same path) — and
@@ -339,36 +340,61 @@ def canonical_name(path: Sequence[str]) -> str:
 # --- depth: brackets and IF units ----------------------------------------------------------------------------------
 
 
-def _closing_slash(text: str, begin: int) -> int | None:
-    """The first ``/`` at or after *begin* (``begin >= 1``) with no backslash right before it, or ``None``."""
+def _backslashes_before(text: str, index: int, begin: int) -> int:
+    """How many backslashes stand right before *index*, counting none before *begin*."""
+    run = index
+    while run > begin and text[run - 1] == "\\":
+        run -= 1
+    return index - run
+
+
+def _closing_slash(text: str, begin: int, *, paired: bool) -> int | None:
+    """The first ``/`` at or after *begin* (``begin >= 1``) that closes a regex opening before *begin*, or ``None``.
+
+    With ``paired=False``, SurrealDB 2.x's rule: a ``/`` with no backslash right before it. With ``paired=True``, 3.x's:
+    a ``/`` after an even run of backslashes (none, ``\\\\``, …), each backslash escaping the next character. The
+    runs before two slashes never overlap (a run stops at a ``/``), so one search reads each character once.
+    """
     index = text.find("/", begin)
-    while index != -1 and text[index - 1] == "\\":
+    while index != -1 and text[index - 1] == "\\" and (not paired or _backslashes_before(text, index, begin) % 2):
         index = text.find("/", index + 1)
     return None if index == -1 else index
 
 
 class _RegexEnds:
-    """Where the regex literals opening at the slashes of one text end, asked for in increasing positions.
+    """Where the regex literals opening at the slashes of one text end on each line, asked for in increasing positions.
 
-    As the servers' lexers read a regex: ``\\/`` is an escaped slash, any other backslash a character of the regex; a
-    quote opens nothing inside it. So the ``/`` that closes a regex opening at *pos* is the first one after *pos* with
-    no backslash right before it, whatever lies between. The closing slash found for one ``/`` answers every ``/``
-    before it, and a search that found none answers every later one: the text is searched once in all, never again
-    from each slash (``/\\/\\/…\\/`` would otherwise take a time quadratic in its length).
+    The servers' lexers read a regex alike but for its backslashes, and a quote opens nothing inside it. SurrealDB 2.x
+    reads ``\\/`` as an escaped slash and any other backslash as a character of the regex, so a ``/`` with a
+    backslash right before it never closes the regex. 3.x reads a backslash as escaping the next character, so a
+    ``/`` closes it after an even run of backslashes: ``/\\\\/`` is a regex on 3.x (an escaped backslash), and
+    2.x refuses it as unclosed; ``/a\\\\/b/`` is one on 2.x, which 3.x refuses. The two ends differ exactly when a
+    ``/`` after an even run of backslashes comes before 2.x's end, or when 2.x finds none; the parser does not know
+    the line (spec §4), so ``_slash`` never reads such a regex.
+
+    The closing slash found for one ``/`` answers every ``/`` before it, and a search that found none answers every
+    later one: the text is searched once in all for each line, never again from each slash (``/\\/\\/…\\/``
+    would otherwise take a time quadratic in its length).
     """
 
     __slots__ = ("_closing", "_text")
 
     def __init__(self, text: str) -> None:
         self._text = text
-        self._closing: int | None = -1  # the last closing slash found, -1 before any search, None for none at all
+        # The last closing slash found with 2.x's rule (False) and 3.x's (True): -1 before any search, None for none.
+        self._closing: dict[bool, int | None] = {False: -1, True: -1}
 
-    def end(self, pos: int) -> int | None:
-        """The position after the regex literal whose opening ``/`` is at *pos* — greater than any position asked
-        for before — or ``None`` when no ``/`` closes it."""
-        if self._closing is not None and self._closing <= pos:
-            self._closing = _closing_slash(self._text, pos + 1)
-        return None if self._closing is None else self._closing + 1
+    def _end(self, pos: int, paired: bool) -> int | None:
+        closing = self._closing[paired]
+        if closing is not None and closing <= pos:
+            closing = self._closing[paired] = _closing_slash(self._text, pos + 1, paired=paired)
+        return None if closing is None else closing + 1
+
+    def ends(self, pos: int) -> tuple[int | None, int | None]:
+        """The position after the regex literal whose opening ``/`` is at *pos* — greater than any position asked for
+        before — read with SurrealDB 2.x's rule, then with 3.x's; ``None`` when no ``/`` closes it. 3.x's end is never
+        after 2.x's, and it is ``None`` only when 2.x's is."""
+        return self._end(pos, False), self._end(pos, True)
 
 
 def _operand_follows(text: str, previous: _Lexeme | None, start: int) -> bool | None:
@@ -397,17 +423,22 @@ def _slash(text: str, pos: int, previous: _Lexeme | None, start: int, regexes: _
     The servers render a division with a space on both sides, so a ``/`` before anything else opens a regex. A ``/``
     and a space open one — a regex starting with a space — where an operand comes (``_operand_follows``). Where that
     cannot be told (after a keyword a bare identifier may spell) and a later ``/`` could close a regex,
-    ``DefineParseError(_R_AMBIGUOUS)``: the slash is never guessed. *regexes* finds the closing ``/``.
+    ``DefineParseError(_R_AMBIGUOUS)``: the slash is never guessed. *regexes* finds the closing ``/`` on each line; a
+    regex the two lines close at different slashes (``_RegexEnds``: ``/\\\\/`` on 3.x, ``/a\\\\/b/`` on 2.x)
+    raises ``DefineParseError(_R_AMBIGUOUS)`` too, rather than swallow the clauses after it on one of the lines.
     """
-    end = regexes.end(pos)
-    if end is None:
+    end, paired_end = regexes.ends(pos)
+    if paired_end is None:  # no later ``/`` closes a regex on either line
         return _PUNCT_TOKEN, pos + 1
-    if not text[pos + 1].isspace():
-        return _REGEX_TOKEN, end
-    follows = _operand_follows(text, previous, start)
-    if follows is None:
+    if text[pos + 1].isspace():
+        follows = _operand_follows(text, previous, start)
+        if follows is None:
+            raise DefineParseError(_R_AMBIGUOUS)
+        if not follows:
+            return _PUNCT_TOKEN, pos + 1
+    if end != paired_end:
         raise DefineParseError(_R_AMBIGUOUS)
-    return (_REGEX_TOKEN, end) if follows else (_PUNCT_TOKEN, pos + 1)
+    return _REGEX_TOKEN, paired_end
 
 
 def _lex(text: str, start: int) -> list[_Lexeme]:

@@ -364,6 +364,9 @@ class TestScanner:
             "/" * 20000,
             "/" * 20001,
             "a / " * 10000 + "1",
+            # 3.x's rule counts the backslashes before each slash: each run must be counted once.
+            "/" + "\\\\\\/" * 7000,
+            "/" + "\\" * 20001 + "/",
         ],
         ids=[
             "plain-ifs",
@@ -378,6 +381,8 @@ class TestScanner:
             "even-slashes",
             "odd-slashes",
             "many-divisions",
+            "odd-backslash-runs",
+            "long-backslash-run",
         ],
     )
     def test_scan_stays_linear(self, body: str) -> None:
@@ -450,7 +455,8 @@ class TestScanner:
             "$value AND /a PERMISSIONS b/",
             "$value INSIDE [/(PERMISSIONS b/]",  # a bracket inside a regex is not one
             "$value = /a\\/ PERMISSIONS b/",  # an escaped slash does not close it
-            "$value = /a\\\\/ PERMISSIONS b/",  # nor does one after a backslash: the servers' lexers read \/ only
+            "$value = /a\\\\\\/ PERMISSIONS b/",  # nor an escaped backslash then an escaped slash (3.x), \ and \/ (2.x)
+            "$value = /a\\\\b PERMISSIONS c/",  # a backslash pair before anything but a slash: both lines alike
             "$value = /a'b PERMISSIONS c/",  # a quote does not open a string in it
             "$value ?? /a PERMISSIONS b/",
             "!/a PERMISSIONS b/",
@@ -464,6 +470,32 @@ class TestScanner:
         # M47: a regex is rendered as written, between slashes; no keyword or bracket inside it counts.
         text = f"ASSERT {expression} PERMISSIONS FULL"
         assert top_level_keywords(text, ["ASSERT", "PERMISSIONS"]) == [(0, "ASSERT"), (len(text) - 16, "PERMISSIONS")]
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # 2.x reads \\/ as a backslash then an escaped slash, 3.x as an escaped backslash then the closing slash.
+            "ASSERT $value = /a\\\\/ PERMISSIONS b/ PERMISSIONS FULL",  # 2.x's form: 3.x would close it after a\\
+            "VALUE name = /\\\\/ PERMISSIONS FULL",  # 3.x's form: no slash closes it on 2.x
+            "VALUE /\\\\/ PERMISSIONS FULL",  # at the start of a content
+            "ASSERT $value = /a\\\\\\\\/ COMMENT 'x' PERMISSIONS FULL",  # two escaped backslashes on 3.x
+            "ASSERT $value = /a\\\\/ COMMENT 'x' PERMISSIONS FULL",
+            "VALUE $value = / \\\\/ PERMISSIONS FULL",  # a regex starting with a space, after an operator
+        ],
+    )
+    def test_a_regex_the_two_lines_close_apart_is_never_guessed(self, text: str) -> None:
+        # The parser does not know the line (spec §4): a regex that SurrealDB 2.x and 3.x close at different slashes
+        # is refused rather than read with one line's rule, which swallows the clauses after it on the other line.
+        with pytest.raises(DefineParseError) as error:
+            top_level_keywords(text, ["VALUE", "ASSERT", "COMMENT", "PERMISSIONS"])
+        assert _reason(error) == _R_AMBIGUOUS
+
+    def test_a_backslash_pair_before_a_slash_in_a_string_leaves_a_division_alone(self) -> None:
+        # A division is never a regex on either line: the slash in the string, which 3.x would close a regex at, counts
+        # for nothing (M11: the servers render a backslash of a string doubled).
+        text = "VALUE $value / 2 COMMENT 'a\\\\/b' PERMISSIONS FULL"
+        found = top_level_keywords(text, ["VALUE", "COMMENT", "PERMISSIONS"])
+        assert [keyword for _, keyword in found] == ["VALUE", "COMMENT", "PERMISSIONS"]
 
     @pytest.mark.parametrize(
         "operand",
@@ -2200,6 +2232,16 @@ class TestDefineField:
             # M47: a slash that may open a regex starting with a space or divide a keyword-named field.
             ("DEFINE FIELD f ON t VALUE / a/ PERMISSIONS FULL", _R_AMBIGUOUS),
             ("DEFINE FIELD f ON t VALUE AND / 2 ASSERT $value = /x/ PERMISSIONS FULL", _R_AMBIGUOUS),
+            # A regex the two lines close at different slashes: 3.3.4 and 3.1.5 renderings (2.x refuses the DDL), never
+            # read with a clause swallowed into it; then 2.7.0's and the embedded engine's (3.x refuses the DDL).
+            ("DEFINE FIELD has_bs ON t VALUE name = /\\\\/ PERMISSIONS FULL", _R_AMBIGUOUS),
+            (
+                "DEFINE FIELD zip ON t TYPE string ASSERT $value = /a\\\\/ PERMISSIONS FOR select WHERE $auth.admin = true,"
+                " FOR create, update FULL",
+                _R_AMBIGUOUS,
+            ),
+            ("DEFINE FIELD cmt ON t TYPE string ASSERT $value = /a\\\\/ COMMENT 'x' PERMISSIONS FULL", _R_AMBIGUOUS),
+            ("DEFINE FIELD two ON t TYPE string ASSERT $value = /a\\\\/b/ COMMENT 'x' PERMISSIONS FULL", _R_AMBIGUOUS),
         ],
     )
     def test_refused(self, statement: str, reason: str) -> None:

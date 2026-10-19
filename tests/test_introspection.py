@@ -660,6 +660,30 @@ class TestIssues:
         assert "s3cr3t-0042" not in repr(schema)
         assert "s3cr3t-0042" not in caplog.text
 
+    async def test_i1_a_regex_the_two_lines_close_apart(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # SurrealDB 3.3.4's renderings of regexes ending with an escaped backslash, which 2.x refuses: read with 2.x's
+        # rule, the regex ran on to the end and swallowed the clauses after it, with no issue. Each one is reported.
+        statements = {
+            "has_bs": r"DEFINE FIELD has_bs ON t VALUE name = /\\/ PERMISSIONS FULL",
+            "zip": (
+                r"DEFINE FIELD zip ON t TYPE string ASSERT $value = /a\\/ PERMISSIONS FOR select WHERE $auth.admin = true,"
+                " FOR create, update FULL"
+            ),
+            "cmt": r"DEFINE FIELD cmt ON t TYPE string ASSERT $value = /a\\/ COMMENT 'x' PERMISSIONS FULL",
+        }
+        t = _table(fields={**statements, "ok": "DEFINE FIELD ok ON t TYPE int PERMISSIONS FULL"})
+        client = _FakeClient(_db(tables={"t": "DEFINE TABLE t TYPE NORMAL SCHEMAFULL PERMISSIONS NONE"}), {"t": t})
+        _install(monkeypatch, client)
+        schema = await DatabaseIntrospector().introspect()
+        assert list(schema.tables["t"].fields) == ["ok"]
+        assert [(i.kind, i.name, i.table, i.message, i.statement) for i in schema.issues] == [
+            ("field", name, "t", _parse_failure(_R_AMBIGUOUS), statements[name]) for name in sorted(statements)
+        ]
+        source = ModelCodeGenerator().generate(schema)
+        assert "computed(" not in source and "PERMISSIONS" not in source and "COMMENT" not in source
+        for name in statements:
+            assert f"- field 't.{name}': " in source
+
     async def test_i2_info_for_table_failing(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
         caplog.set_level(logging.WARNING, logger=_LOGGER)
         error = Exception("A user generated conversion error occured")
@@ -1575,6 +1599,64 @@ class TestRegularExpressionsE2E:
         assert '    k: str = "x"\n' in source
         assert '    fans: Computed[Any] = computed("<-isp_likes<-?")\n' in source
         assert "PERMISSIONS" not in source
+
+
+#: Regexes that SurrealDB 2.x and 3.x close at different slashes (a backslash pair before a ``/``): each line refuses
+#: the other's form, and the parser, which does not know the line, reports the definition (I1) rather than read a
+#: clause into the regex. ``(line, item, statement, name, rendering)``; the 3.x renderings are 3.3.4's and 3.1.5's.
+_SPLIT_REGEXES = [
+    (
+        3,
+        "a regex ending with an escaped backslash",
+        r"DEFINE FIELD has_bs ON isp_x VALUE name = /\\/;",
+        "has_bs",
+        r"DEFINE FIELD has_bs ON isp_x VALUE name = /\\/ PERMISSIONS FULL",
+    ),
+    (
+        3,
+        "a regex ending with an escaped backslash, before PERMISSIONS",
+        r"DEFINE FIELD zip ON isp_x TYPE string ASSERT $value = /a\\/"
+        " PERMISSIONS FOR select WHERE $auth.admin = true, FOR create, update FULL;",
+        "zip",
+        r"DEFINE FIELD zip ON isp_x TYPE string ASSERT $value = /a\\/"
+        " PERMISSIONS FOR select WHERE $auth.admin = true, FOR create, update FULL",
+    ),
+    (
+        3,
+        "a regex ending with an escaped backslash, before COMMENT",
+        r"DEFINE FIELD cmt ON isp_x TYPE string ASSERT $value = /a\\/ COMMENT 'x';",
+        "cmt",
+        r"DEFINE FIELD cmt ON isp_x TYPE string ASSERT $value = /a\\/ COMMENT 'x' PERMISSIONS FULL",
+    ),
+    (
+        2,
+        "a regex holding a backslash then an escaped slash",
+        r"DEFINE FIELD two ON isp_x TYPE string ASSERT $value = /a\\/b/ COMMENT 'x';",
+        "two",
+        r"DEFINE FIELD two ON isp_x TYPE string ASSERT $value = /a\\/b/ COMMENT 'x' PERMISSIONS FULL",
+    ),
+]
+
+
+class TestSplitRegularExpressionsE2E:
+    """A regex the two lines close at different slashes, on the line that accepts it (``_require_ddl``: skipped on the
+    other line, and the 3.x forms on ``mem://``): an I1 issue that keeps the statement, never a clause read into it."""
+
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    @pytest.mark.parametrize(
+        ("line", "item", "statement", "name", "rendering"), _SPLIT_REGEXES, ids=[row[3] for row in _SPLIT_REGEXES]
+    )
+    async def test_reported_not_read(self, kind: str, line: int, item: str, statement: str, name: str, rendering: str) -> None:
+        async with _isp(kind, "DEFINE TABLE isp_x SCHEMALESS;") as client:
+            await _require_ddl(client, statement, line=line, item=item)
+            schema = await DatabaseIntrospector("isp", tables=["isp_x"]).introspect()
+        assert schema.tables["isp_x"].fields == {}
+        assert [(i.kind, i.name, i.table, i.message, i.statement) for i in schema.issues] == [
+            ("field", name, "isp_x", _parse_failure(_R_AMBIGUOUS), rendering)
+        ]
+        source = ModelCodeGenerator().generate(schema)
+        assert f"- field 'isp_x.{name}': " in source
+        assert "computed(" not in source and "PERMISSIONS" not in source and "COMMENT" not in source
 
 
 @contextlib.contextmanager
