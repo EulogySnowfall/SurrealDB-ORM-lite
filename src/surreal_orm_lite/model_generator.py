@@ -283,6 +283,12 @@ def _array_item(kind: KName) -> Kind | None:
     return None
 
 
+def _is_edge(table: TableState) -> bool:
+    """Whether ``table`` is a relation table, whatever the case of its ``table_type`` (the reader writes it lower-case,
+    a hand-built state may not): its class is a ``BaseSurrealEdge``, which provides ``in_`` and ``out``."""
+    return table.table_type.lower() == "relation"
+
+
 class _Names:
     """The class and attribute names of one generated module (spec §6.4.2), allocated in two passes.
 
@@ -417,7 +423,7 @@ class _Names:
         return name
 
     def _allocate_fields(self, table: TableState) -> dict[str, tuple[str, str | None]]:
-        provided = _EDGE_PROVIDED if table.table_type == "relation" else _MODEL_PROVIDED
+        provided = _EDGE_PROVIDED if _is_edge(table) else _MODEL_PROVIDED
         allocated: dict[str, tuple[str, str | None]] = {}
         used: set[str] = set()
         for column in _top_level_columns(table):
@@ -446,7 +452,7 @@ def _top_level_columns(table: TableState) -> list[str]:
 
     ``id`` is left out (every class provides it), and ``in`` and ``out`` on an edge (``BaseSurrealEdge`` provides them).
     """
-    skipped = {"id", "in", "out"} if table.table_type == "relation" else {"id"}
+    skipped = {"id", "in", "out"} if _is_edge(table) else {"id"}
     return sorted({field.path[0] for field in table.fields.values() if field.path} - skipped)
 
 
@@ -488,6 +494,8 @@ _UPDATE_NOTE = (
     "update() may fail on READONLY datetimes below the top level or past the 32nd (Python keeps microseconds): use merge()."
 )
 _SCHEMALESS_NOTE = 'SCHEMALESS: fields not declared here are kept (extra="allow")'
+#: The operations of a table's ``PERMISSIONS``, in the order SurrealDB renders them.
+_OPERATIONS = ("select", "create", "update", "delete")
 
 #: Where each importable name comes from; the blocks in isort order (spec §6.4.8).
 _STANDARD_MODULES = ("datetime", "decimal", "typing", "uuid")
@@ -893,7 +901,7 @@ class _ClassWriter:
         self.table = table
         self.names = names
         self.connection = connection
-        self.edge = table.table_type.lower() == "relation"
+        self.edge = _is_edge(table)
         self.schemaless = table.schema_mode.upper() == "SCHEMALESS"
         self.nodes = {tuple(field.path): field for field in table.fields.values()}
         self.blocks: list[str] = []
@@ -946,6 +954,11 @@ class _ClassWriter:
             texts.append("IN " + ends[0] + " OUT " + ends[1] + (" ENFORCED" if table.enforced else ""))
         if table.view_query is not None:
             texts.append("View: AS " + table.view_query)
+        if table.changefeed is not None:
+            texts.append("Changefeed: " + table.changefeed + (" INCLUDE ORIGINAL" if table.changefeed_include_original else ""))
+        permissions = _permissions_text(table.permissions)
+        if permissions is not None:
+            texts.append("Permissions: " + permissions)
         if self.schemaless:
             texts.append(_SCHEMALESS_NOTE)
         if table.indexes:
@@ -1190,6 +1203,21 @@ def _assigned(declaration: str, default: _Default | None, alias: str | None) -> 
 def _readonly(line: str, field: FieldState) -> str:
     """``line`` with the trailing ``# READONLY`` comment of a ``READONLY`` field (no ``Field`` option exists)."""
     return line + "  # READONLY" if field.readonly else line
+
+
+def _permissions_text(permissions: Mapping[str, str]) -> str | None:
+    """A table's ``PERMISSIONS`` as SurrealDB renders them: ``FULL`` when one rule covers the four operations, else
+    ``FOR select WHERE …, FOR create, update FULL`` — operations in SurrealQL's order, grouped by rule in the order the
+    rules first appear. ``None`` when there is none, or every rule is ``NONE`` (a table's default)."""
+    if all(rule == "NONE" for rule in permissions.values()):
+        return None
+    order = {operation: position for position, operation in enumerate(_OPERATIONS)}
+    groups: dict[str, list[str]] = {}
+    for operation in sorted(permissions, key=lambda operation: (order.get(operation, len(order)), operation)):
+        groups.setdefault(permissions[operation], []).append(operation)
+    if len(groups) == 1 and permissions.keys() == order.keys():
+        return next(iter(groups))
+    return ", ".join("FOR " + ", ".join(operations) + " " + rule for rule, operations in groups.items())
 
 
 def _index_label(index: IndexState) -> str:
