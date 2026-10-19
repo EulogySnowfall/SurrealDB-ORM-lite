@@ -6,8 +6,8 @@ The following versions of Surreal-ORM-Lite are currently supported with security
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.30.x  | :white_check_mark: |
-| < 0.30  | :x:                |
+| 0.31.x  | :white_check_mark: |
+| < 0.31  | :x:                |
 
 ## Embedded Engine
 
@@ -37,6 +37,15 @@ that cannot be parsed is reported without its text, which may hold a secret: nei
 the state classes keep definition texts out of `repr()`. Files written by
 `generate_models_from_db()` are replaced atomically; pass `overwrite=False` to refuse an existing
 file.
+
+## Server-side events and stored functions
+
+Since 0.31.0, `Event` expressions, `define_function()` bodies, kinds and permission conditions are
+SurrealQL written into DDL as given: trusted application code, never user input. Their structural
+check catches mistakes — unbalanced brackets, a comment that would swallow the clauses the ORM
+appends, a second statement where one expression is expected — and is not an injection defence.
+Event, table, parameter and function names are validated as identifiers (event and table names
+also quoted), comments are escaped literals; applying needs a privileged system user.
 
 ## Reporting a Vulnerability
 

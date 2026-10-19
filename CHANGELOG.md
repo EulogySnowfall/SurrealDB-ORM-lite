@@ -5,6 +5,160 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.0] - 2026-10-19
+
+Server-side events and DDL helpers: the ORM writes and applies `DEFINE EVENT` and
+`DEFINE FUNCTION` statements from Python. Events are declared on the model, next to its fields,
+and applied idempotently; stored functions are defined for `call_function()` to call. The same
+code runs on SurrealDB 2.x, 3.x and the embedded engine; asynchronous events and `$input` are 3.x
+only. The second minor of Tier 3.
+
+### Added
+
+- **`Event(name, *, then, when=None, async_mode=False, retry=None, max_depth=None, comment=None)`**
+  and **`SurrealConfigDict(events=[...])`**: a model declares its server-side events, which
+  SurrealDB runs on every `CREATE`, `UPDATE` and `DELETE` of the table, whoever writes it (the
+  ORM, a raw query or another client). `Model.event_ddl()` renders their `DEFINE EVENT` statements
+  without a connection, `await Model.define_events()` applies them on the model's connection
+  (`DEFINE EVENT OVERWRITE`: run it at start-up) and returns them, and
+  `await Model.remove_event("name")` removes one by name, declared or not. `overwrite=False` writes
+  `IF NOT EXISTS`, `missing_ok=False` raises `SurrealDbNotFoundError` for a missing event, and
+  `Model.get_events()` lists the declared events. A subclass inherits `events` unless it sets its
+  own, and typed edges take events too.
+
+  ```python
+  class Account(BaseSurrealModel):
+      model_config = SurrealConfigDict(
+          table_name="account",
+          events=[
+              Event(
+                  "email_audit",
+                  when="$event = 'UPDATE' AND $before.email != $after.email",
+                  then="CREATE audit_log SET account = $value.id, old = $before.email, new = $after.email",
+              ),
+              Event(
+                  "no_negative_balance",
+                  when="$event != 'DELETE' AND $after.balance < 0",
+                  then="THROW 'balance cannot be negative'",
+              ),
+          ],
+      )
+
+      id: str | None = None
+      email: str
+      balance: int = 0
+
+
+  Account.event_ddl()            # the DEFINE EVENT statements, no connection needed
+  await Account.define_events()  # idempotent
+  await Account(id="ada", email="ada@example.com", balance=-5).save()  # InternalError: refused
+  ```
+
+- **`SurrealDBConnectionManager.define_event(event, table)`** and
+  **`remove_event(event, table)`** apply an `Event` to any table, with or without a model, on the
+  current connection (the `using()` block's, else `"default"`); `event.ddl(table)` renders the
+  statement. The `then` clause is always written as a block (`THEN { … }`), so several statements,
+  `LET` and `THROW` work on both lines.
+- **Asynchronous events (SurrealDB 3.x)**: `Event(..., async_mode=True, retry=3, max_depth=2)`
+  writes `ASYNC RETRY 3 MAXDEPTH 2`. Such an event runs after the write's transaction commits, so
+  it does not hold the write up. On SurrealDB 2.x and the embedded engine, which cannot parse
+  `ASYNC`, every applier raises `SurrealDbError` before sending any DDL, and no event of the call
+  is defined; `event.ddl()` renders an asynchronous event on any line.
+- **`SurrealDBConnectionManager.define_function(function, body, *, parameters=None, ...)`**,
+  **`remove_function(function)`** and the pure **`function_ddl()`** (exported from
+  `surreal_orm_lite`): stored functions defined from Python, named as `call_function()` names them
+  (`"greet"`, `"fn::greet"`, `"fn::billing::total"`). `parameters` maps each parameter name to its
+  SurrealQL kind in declaration order, the order of `call_function()`'s positional `args`;
+  `returns` is the result's kind, `permissions` is `"FULL"`, `"NONE"` or `"WHERE <condition>"`,
+  and `comment=` and `overwrite=` work as for events.
+
+  ```python
+  await SurrealDBConnectionManager.define_function(
+      "fn::greet",
+      "RETURN string::concat('Hello, ', $name, '!');",
+      parameters={"name": "string"},
+      returns="string",
+  )
+  await SurrealDBConnectionManager.call_function("fn::greet", ["Ada"])  # 'Hello, Ada!'
+  ```
+
+- **Every applier takes `tx=`** and returns the statement it applied (`define_events()`: the
+  list). A refusal raises
+  `SurrealDbAuthenticationError` when the session may not define (a `VIEWER`, a record user, an
+  anonymous session), `SurrealDbNotFoundError` for a removal of a missing definition with
+  `missing_ok=False`, and `SurrealDbError` otherwise (`Can't apply event definition: …`).
+  `define_events()` applies one statement per event and stops at the first refusal: pass `tx=` for
+  all or nothing. A `tx=` of another connection raises `SurrealDbError` before any request.
+- README section 32, "Server-side events and stored functions (`Event`, `define_events()`,
+  `define_function()`)" (declaring events on a model, events without a model, asynchronous events,
+  stored functions, transactions and connections, SurrealDB 2.x and 3.x, security, a note for users
+  of the full SurrealDB-ORM), a features row, seven rows in the 2.x/3.x behaviour table and one in
+  the embedded-engine table, the comparison and roadmap rows, and the example notebook
+  `examples/v0.31.0_events_ddl_helpers.ipynb`. Section 17's example declares its function with
+  `define_function()`.
+
+### Changed
+
+- **`EventState` gains `async_mode`, `retry` and `max_depth`** (keyword-only, after `comment`;
+  `False`, `None` and `None` by default), and **`DatabaseIntrospector` reads SurrealDB 3.x
+  `ASYNC` events**: 0.30.x reported such an event as a `SchemaIssue`. SurrealDB 3.x renders
+  `RETRY` and `MAXDEPTH` with every `ASYNC`, so an event defined without them reads back
+  `retry=1, max_depth=3`.
+- **`call_function(params=)` follows a redefinition made with `define_function()` or
+  `remove_function()` at once**: both drop the function's cached signature on every connection of
+  this process to the same namespace and database, whatever its URL (an admin connection applying
+  the DDL over `http://` and the application's `ws://` connection alike), so even a reorder of the
+  same parameter names is picked up. A signature read that such a drop, or
+  `clear_function_signature_cache()`, overtakes is read again rather than cached. A function
+  redefined with raw DDL or from another process still needs `clear_function_signature_cache()`.
+
+### Notes
+
+- **Names are validated and quoted, comments escaped**: event, table, parameter and function names
+  are checked as identifiers before any request, event and table names are written in backticks
+  (`update` or `delete` work as event names), and a comment is an escaped string literal. A
+  parameter name SurrealDB defines itself (`auth`, `session`, `this`, …) is refused.
+- **Expressions are trusted application code, never user input.** `when`, `then`, function
+  bodies, kinds and permission conditions are written into the statement as given, since SurrealDB
+  takes no bound parameter in a definition. Their structural check (strings terminated, brackets
+  balanced, no NUL, no SurrealQL comment marker outside a literal, every `/` read as an operator,
+  no `;` outside brackets where one expression is expected) catches mistakes — unbalanced
+  brackets, a comment that would swallow the clauses the ORM appends, a second statement where one
+  expression is expected — and is not an injection defence. To use a value, read it from the
+  record (`$after.email`) or from a `DEFINE PARAM`. Every refusal is a `TypeError` or a
+  `ValueError` raised before any request. An `Event`'s `repr()` leaves out `when` and `then`.
+- **Kinds are written in canonical form**: `none | int` and `option<int>` are both written
+  `option<int>`, and a kind the ORM cannot read raises `ValueError` rather than being rewritten.
+- **SurrealDB 2.x and 3.x**: `ASYNC` events are 3.x only (refused before any DDL elsewhere);
+  `$input` holds the fields the write sent on 3.x and is `NONE` on 2.x and the embedded engine; a
+  write that changes nothing fires no event, except on 3.x an `UPSERT` (the ORM's `upsert()` of an
+  unchanged record), which fires one `UPDATE` event; read back, each line renders event and
+  function definitions its own way (README section 32 and the 2.x/3.x table).
+- **A write an event refuses** (a `THROW`, an error in `then`) raises the SDK's `InternalError`,
+  as any server refusal of a write does, and nothing is written. Every applier takes `tx=`, and
+  events work inside `transaction()` like any other statement.
+- **Query cache, live queries and signals**: the query cache forgets the tables the ORM itself
+  writes, not the rows an event writes, so do not cache reads of a table events write, or call
+  `QueryCache.invalidate(Model)` after the write. Live queries see those rows. Applying DDL and the
+  rows events write fire no ORM signal.
+- **Applying a definition needs a privileged system user** (root, or a namespace or database
+  `OWNER` or `EDITOR`): run `define_events()` and `define_function()` at start-up or deployment.
+- **Differences from the full SurrealDB-ORM**: events are declared in
+  `SurrealConfigDict(events=[...])` rather than a `class Meta`, and the lite's `Event` adds
+  `max_depth=`; `then` is written `THEN { … }` where the full ORM writes `THEN (…)`, in which `LET`
+  and `THROW` fail; names are quoted and comments escaped with a backslash; `define_function()`
+  has no full-ORM equivalent (the full ORM uses `RawSQL`).
+- **Deferred**: the migration operations (`DefineEvent`, `RemoveEvent`, a function operation) and
+  the removal of events a model no longer declares come with v0.37.0 (migrations):
+  `define_events()` leaves such an event defined until `remove_event()` removes it.
+  `generate_models_from_db()` lists a table's events in a class comment, not as `events=[...]`.
+- The `SurrealConfigDict` keys that generated classes stand in for with comments (`table_type`,
+  `permissions`, `changefeed`, `view_query`, `relation_in`, `relation_out`, `enforced`), which the
+  0.30.0 and 0.30.8 notes placed in v0.31.0–v0.33.0, are not part of this release: README section
+  31 now places them in v0.32.0–v0.34.0.
+- **Server pins unchanged**: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine,
+  plus 3.1.5 for backward compatibility.
+
 ## [0.30.8] - 2026-10-19
 
 Follow-ups to the v0.30.0 schema introspection (#260): a connection lost while the schema is read

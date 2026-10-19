@@ -39,7 +39,8 @@
 | v0.28.0           | Tier 2 — Query cache                                | Done    |
 | v0.29.0           | Tier 2 — Multi-database                             | Done    |
 | v0.30.0           | Tier 3 — Schema introspection                       | Done    |
-| v0.31.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 9 minors | Planned |
+| v0.31.0           | Tier 3 — Server-side events & DDL helpers           | Done    |
+| v0.32.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 8 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                  | Planned |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)              | Planned |
 | v2.1.0+           | Future (post-GA)                                    | Future  |
@@ -95,8 +96,8 @@ pieces stay out.
 | Query cache (TTL)                      | client-side cache (SDK-independent)                   | ✅ v0.28.0     |
 | Multi-database                         | multiple `AsyncSurreal` instances                     | ✅ v0.29.0     |
 | Schema introspection                   | `INFO FOR DB` / `INFO FOR TABLE`                      | ✅ v0.30.0     |
-| `DEFINE EVENT` (triggers)              | DDL via `query()`                                     | v0.31.0        |
-| `define_function()` DDL helper         | `DEFINE FUNCTION` via `query()` (`schema.py`)         | v0.31.0        |
+| `DEFINE EVENT` (triggers)              | DDL via `query()`                                     | ✅ v0.31.0     |
+| `define_function()` DDL helper         | `DEFINE FUNCTION` via `query()` (`schema.py`)         | ✅ v0.31.0     |
 | Materialized views                     | `DEFINE TABLE … AS SELECT`                            | v0.32.0        |
 | `TYPE RELATION` enforcement            | `DEFINE TABLE … TYPE RELATION`                        | v0.33.0        |
 | Full-Text Search (BM25)                | `DEFINE ANALYZER` + `SEARCH` index + `search::*`      | v0.34.0        |
@@ -159,7 +160,7 @@ moves it to the `surrealdb[embedded]` extra.
 | Query cache (TTL)             | yes        | ✅ v0.28.0                  |
 | Multi-database                | yes        | ✅ v0.29.0                  |
 | Schema introspection          | yes        | ✅ v0.30.0                  |
-| DEFINE EVENT                  | yes        | v0.31.0                     |
+| DEFINE EVENT                  | yes        | ✅ v0.31.0                  |
 | Materialized views            | yes        | v0.32.0                     |
 | TYPE RELATION enforcement     | yes        | v0.33.0                     |
 | Full-Text Search (BM25)       | yes        | v0.34.0                     |
@@ -613,6 +614,32 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   `SchemaState.diff()` → v0.37.0 (migrations), the `inspectdb` command → v0.38.0 (CLI),
   object-literal kinds as sub-models, typed 3.x sequences, APIs and configs
 
+### Version 0.31.0 — Server-side events and DDL helpers
+
+- `Event(name, *, then, when=, async_mode=, retry=, max_depth=, comment=)` declared in
+  `SurrealConfigDict(events=[...])`, the full SurrealDB-ORM's `Event` plus `max_depth=`;
+  `Model.event_ddl()` (pure), `Model.define_events()` (idempotent, `OVERWRITE`) and
+  `Model.remove_event()`; `SurrealDBConnectionManager.define_event(event, table)` and
+  `remove_event(event, table)` for any table. `then` is always written as a block, so several
+  statements, `LET` and `THROW` work on both lines
+- `SurrealDBConnectionManager.define_function()`, `remove_function()` and the pure
+  `function_ddl()`: stored functions for `call_function()`, whose cached signature they drop on
+  every connection of the process to the same database, so a redefinition is seen at once
+- Every applier takes `overwrite=` (`OVERWRITE` / `IF NOT EXISTS`) or `missing_ok=`, and `tx=`;
+  refusals are classified (`SurrealDbAuthenticationError`, `SurrealDbNotFoundError`,
+  `SurrealDbError`). Names are validated and quoted, comments escaped; expressions are trusted
+  application code whose structural check catches mistakes and is not an injection defence; kinds
+  are written in canonical form (`option<int>`)
+- `ASYNC` events (`RETRY`, `MAXDEPTH`) are SurrealDB 3.x only: on 2.x and the embedded engine the
+  ORM raises `SurrealDbError` before any DDL. `$input` is 3.x only, and on 3.x an unchanged
+  `UPSERT` fires one `UPDATE` event; read back, each line renders definitions its own way.
+  `EventState` gains `async_mode`, `retry` and `max_depth`, so `DatabaseIntrospector` reads
+  `ASYNC` events (a `SchemaIssue` in 0.30.x)
+- Same code on 2.7.0, 3.3.4 and the embedded engine (3.1.5 retro identical). Deferred: the
+  migration operations and the removal of events a model no longer declares → v0.37.0
+  (migrations), declarative `events=[...]` in generated models, query-cache invalidation of the
+  tables events write
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -817,7 +844,7 @@ servers (3.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too.
 | Version    | Theme                                                                          | SDK 2.0 realization              |
 | ---------- | ------------------------------------------------------------------------------ | -------------------------------- |
 | ✅ v0.30.0 | Schema introspection (inspectdb, read-only)                                    | `INFO FOR DB` / `INFO FOR TABLE` |
-| v0.31.0    | `DEFINE EVENT` (server-side triggers)                                          | DDL via `query()`                |
+| ✅ v0.31.0 | `DEFINE EVENT` (server-side triggers)                                          | DDL via `query()`                |
 | v0.32.0    | Materialized views (read-only models)                                          | `DEFINE TABLE … AS SELECT`       |
 | v0.33.0    | `TYPE RELATION` enforcement (graph constraints), building on `BaseSurrealEdge` | `DEFINE TABLE … TYPE RELATION`   |
 
