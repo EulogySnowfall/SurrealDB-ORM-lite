@@ -10,6 +10,8 @@
     schema.tables["person"].fields["age"].field_type    # 'int' — read as option<int> (2.x) or none | int (3.x)
     schema.issues                                       # () when everything was read and parsed
 
+    source = ModelCodeGenerator().generate(schema)      # the Python source of models for those tables
+
 **Read-only.** ``introspect()`` sends ``INFO FOR DB;`` and then one ``INFO FOR TABLE `<name>`;`` per table (in
 codepoint order of the names, each name escaped as an identifier) on the connection's client, and nothing else: no
 record is read, nothing is defined or written. It never goes through a transaction — inside an open
@@ -54,6 +56,7 @@ from .define_parser import (
     parse_define_table,
 )
 from .exceptions import SurrealDbAuthenticationError, SurrealDbError, SurrealDbNotFoundError, SurrealORMError
+from .model_generator import ModelCodeGenerator
 from .routing import check_name
 from .schema_state import (
     AccessState,
@@ -77,6 +80,7 @@ __all__ = [
     "FieldState",
     "FunctionState",
     "IndexState",
+    "ModelCodeGenerator",
     "ParamState",
     "SchemaIssue",
     "SchemaState",

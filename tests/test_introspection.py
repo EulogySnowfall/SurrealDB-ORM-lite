@@ -54,10 +54,10 @@ from surreal_orm_lite.define_parser import (
 )
 from tests.conftest import orm_client
 
-#: The names spec §5.8 exports that this module provides so far (``ModelCodeGenerator`` and
-#: ``generate_models_from_db`` join them later).
+#: The names spec §5.8 exports that this module provides so far (``generate_models_from_db`` joins them later).
 _EXPORTS = (
     "DatabaseIntrospector",
+    "ModelCodeGenerator",
     "SchemaState",
     "TableState",
     "FieldState",

@@ -62,6 +62,7 @@ from .introspection import (
     FieldState,
     FunctionState,
     IndexState,
+    ModelCodeGenerator,
     ParamState,
     SchemaIssue,
     SchemaState,
@@ -182,6 +183,7 @@ __all__ = [
     "GeoDistance",
     # Schema introspection (v0.30.0)
     "DatabaseIntrospector",
+    "ModelCodeGenerator",
     "SchemaState",
     "TableState",
     "FieldState",
