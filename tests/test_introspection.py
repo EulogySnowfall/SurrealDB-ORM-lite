@@ -16,6 +16,7 @@ and AC-18's ``Select``) and live in the database ``isp_db`` of namespace ``ns``,
 """
 
 import ast
+import asyncio
 import contextlib
 import importlib.util
 import inspect
@@ -34,8 +35,11 @@ from types import ModuleType
 from typing import Any
 from unittest import mock
 
+import aiohttp
 import pytest
 from surrealdb import AsyncSurreal, RecordID
+from surrealdb.errors import InternalError, NotAllowedError, NotFoundError, ThrownError, ValidationError
+from websockets.exceptions import ConnectionClosedError
 
 import surreal_orm_lite
 from surreal_orm_lite import (
@@ -72,7 +76,9 @@ from surreal_orm_lite.define_parser import (
     _R_STRING,
     _R_TOO_COMPLEX,
 )
+from surreal_orm_lite.live import is_connection_failure, is_dead
 from surreal_orm_lite.testing import embedded_database
+from tests._proxy import CuttableProxy
 from tests.conftest import orm_client
 from tests.test_embedded import (
     _EMBEDDED_BEHAVIOUR,
@@ -84,7 +90,7 @@ from tests.test_embedded import (
     _table_rows,
     _tables,
 )
-from tests.test_model_generator import GOLDEN
+from tests.test_model_generator import DOCSTRING, GOLDEN
 from tests.test_query_cache import _bullets
 from tests.test_time_travel import _SERVER_BEHAVIOUR, _SERVER_TABLE_WIDTHS
 
@@ -127,6 +133,31 @@ def _e1(name: str, exc: object) -> str:
 def _parse_failure(reason: str) -> str:
     """I1's message (spec §5.7) for a fixed parse *reason*."""
     return f"could not parse its definition: {reason}"
+
+
+#: What the server answers to an ``INFO FOR TABLE`` it cannot run: an SDK ``ServerError`` (3.x, 2.x, the embedded
+#: engine), and the embedded engine's bare ``RuntimeError`` for a statement it cannot parse (measured with SDK 2.0.0).
+_SERVER_ERRORS = [
+    ValidationError("Validation", "Parse error: Unexpected token `WHERE`, expected Eof"),
+    InternalError("Internal", "There was a problem with the database: Parse error: Unexpected token `WHERE`"),
+    NotFoundError("NotFound", "The table 'a' does not exist"),
+    ThrownError("Thrown", "An error occurred: boom"),
+    RuntimeError("There was a problem with the database: Parse error: Unexpected token `WHERE`, expected Eof"),
+]
+_SERVER_ERROR_IDS = ["3.x-validation", "2.x-internal", "not-found", "thrown", "embedded-runtime"]
+
+#: An ``INFO FOR TABLE`` the server never answered: the ORM's errors, and what the transports raise for a connection
+#: lost after ``INFO FOR DB`` (``websockets``, ``aiohttp``, an ``OSError``, the SDK's ``KeyError`` for a request caught
+#: by a drop).
+_LOST_CONNECTION_ERRORS = [
+    SurrealDbConnectionError("the connection dropped"),
+    SurrealDbError("the ORM refused it"),
+    ConnectionClosedError(None, None),
+    aiohttp.ServerDisconnectedError(),
+    ConnectionResetError(104, "Connection reset by peer"),
+    KeyError("4f0c2a10-5d5e-4c1d-9d5b-1a2b3c4d5e6f"),
+]
+_LOST_CONNECTION_IDS = ["orm-connection", "orm-error", "websockets", "aiohttp", "os-error", "sdk-key-error"]
 
 
 # --- the fake client -------------------------------------------------------------------------------------------------
@@ -497,6 +528,48 @@ class TestErrors:
             await DatabaseIntrospector().introspect()
         assert caught.value is error
 
+    @pytest.mark.parametrize("error", _LOST_CONNECTION_ERRORS, ids=_LOST_CONNECTION_IDS)
+    async def test_info_for_table_without_an_answer_propagates(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, error: BaseException
+    ) -> None:
+        """An ``INFO FOR TABLE`` the server did not answer — the connection dropped after ``INFO FOR DB``, an ORM
+        error — propagates unchanged: no issue, no state, and no table read after it."""
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
+        client = _FakeClient(_db(tables={"a": _TABLE_A, "b": _TABLE_B}), errors={_info_table("a"): error})
+        _install(monkeypatch, client)
+        with pytest.raises(type(error)) as caught:
+            await DatabaseIntrospector().introspect()
+        assert caught.value is error
+        assert client.statements == ["INFO FOR DB;", _info_table("a")]
+        assert _issue_records(caplog) == []
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            NotAllowedError("NotAllowed", "Anonymous access not allowed: Not enough permissions to perform this action"),
+            InternalError("Internal", "IAM error: Not enough permissions to perform this action"),
+        ],
+        ids=["3.x", "2.x"],
+    )
+    async def test_info_for_table_refused_after_info_for_db(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, error: Exception
+    ) -> None:
+        """A session that ran ``INFO FOR DB`` may run ``INFO FOR TABLE``: a refusal means it lost its rights meanwhile
+        (its client was closed and reopened anonymously, its token expired), not that the table cannot be read."""
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
+        _named("isp_unit")
+        client = _FakeClient(_db(tables={"a": _TABLE_A, "b": _TABLE_B}), errors={_info_table("a"): error})
+        _install(monkeypatch, client, "isp_unit")
+        with pytest.raises(SurrealDbAuthenticationError) as caught:
+            await DatabaseIntrospector("isp_unit").introspect()
+        assert str(caught.value) == (
+            "Cannot read the schema of connection 'isp_unit': INFO FOR TABLE 'a' was refused after INFO FOR DB "
+            f"succeeded; the session lost its rights while it was read. Server said: {error}"
+        )
+        assert caught.value.__cause__ is error
+        assert client.statements == ["INFO FOR DB;", _info_table("a")]
+        assert _issue_records(caplog) == []
+
     @pytest.mark.parametrize(("answer", "kind"), [([], "list"), (None, "NoneType"), ("x", "str")])
     async def test_e3_not_an_object(self, monkeypatch: pytest.MonkeyPatch, answer: object, kind: str) -> None:
         client = _FakeClient(answer)
@@ -685,7 +758,7 @@ class TestIssues:
 
     async def test_i2_info_for_table_failing(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
         caplog.set_level(logging.WARNING, logger=_LOGGER)
-        error = Exception("A user generated conversion error occured")
+        error = InternalError("Internal", "A user generated conversion error occured")
         db = _db(
             tables={
                 "a": "DEFINE TABLE a TYPE NORMAL SCHEMAFULL COMMENT 'kept' PERMISSIONS NONE",
@@ -725,6 +798,23 @@ class TestIssues:
         ((kind, name, table, message),) = [(i.kind, i.name, i.table, i.message) for i in schema.issues]
         assert (kind, name, table) == ("table", "a\x00b", "a\x00b")
         assert message.startswith("INFO FOR TABLE failed: A value containing a NUL character")
+
+    @pytest.mark.parametrize("error", _SERVER_ERRORS, ids=_SERVER_ERROR_IDS)
+    async def test_i2_a_server_error(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, error: Exception
+    ) -> None:
+        """What the server answers to ``INFO FOR TABLE`` itself — an SDK ``ServerError`` on every line, a bare
+        ``RuntimeError`` from the embedded engine for a statement it cannot parse — is an issue of that table only."""
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
+        client = _FakeClient(_db(tables={"a": _TABLE_A, "b": _TABLE_B}), errors={_info_table("a"): error})
+        _install(monkeypatch, client)
+        schema = await DatabaseIntrospector().introspect()
+        assert client.statements == ["INFO FOR DB;", _info_table("a"), _info_table("b")]
+        assert list(schema.tables) == ["a", "b"]
+        assert schema.issues == (SchemaIssue("table", "a", "a", f"INFO FOR TABLE failed: {error}"),)
+        assert [record.getMessage() for record in _issue_records(caplog)] == [
+            f"Schema introspection: INFO FOR TABLE failed: {error} (table 'a')"
+        ]
 
     async def test_i3_type_kept_as_written(self, monkeypatch: pytest.MonkeyPatch) -> None:
         statement = "DEFINE FIELD f ON t TYPE frob< PERMISSIONS FULL"
@@ -769,7 +859,7 @@ class TestIssues:
             params={"p": "DEFINE PARAM $p VALUE 'x"},
         )
         t = _table(fields={"f": "DEFINE FIELD f ON t TYPE frob< PERMISSIONS FULL"})
-        client = _FakeClient(db, {"t": t}, errors={_info_table("u"): Exception("gone")})
+        client = _FakeClient(db, {"t": t}, errors={_info_table("u"): InternalError("Internal", "gone")})
         _install(monkeypatch, client)
         schema = await DatabaseIntrospector().introspect()
         assert [(i.kind, i.name) for i in schema.issues] == [
@@ -956,6 +1046,29 @@ class TestGenerateModelsFromDb:
         else:  # the file this call created is removed
             assert list(tmp_path.iterdir()) == []
 
+    @pytest.mark.parametrize("overwrite", [True, False])
+    @pytest.mark.parametrize("error", _LOST_CONNECTION_ERRORS[:3], ids=_LOST_CONNECTION_IDS[:3])
+    async def test_a_lost_connection_leaves_the_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, error: BaseException, overwrite: bool
+    ) -> None:
+        """A connection lost after ``INFO FOR DB`` raises before anything is generated: an existing file is left byte
+        for byte (it is not replaced by a module whose tables "could not be read"), and none is created."""
+        client = _FakeClient(_db(tables={"isp_gen": _GEN_TABLE}), errors={_info_table("isp_gen"): error})
+        _install(monkeypatch, client)
+        path = tmp_path / "models.py"
+        previous = b"# the working models\r\nclass IspGen: ...\n"
+        if overwrite:
+            path.write_bytes(previous)
+        with pytest.raises(type(error)) as caught:
+            await generate_models_from_db(path, overwrite=overwrite)
+        assert caught.value is error
+        assert client.statements == _GEN_STATEMENTS
+        if overwrite:
+            assert path.read_bytes() == previous
+            assert sorted(p.name for p in tmp_path.iterdir()) == ["models.py"]
+        else:
+            assert list(tmp_path.iterdir()) == []
+
     @pytest.mark.skipif(os.name != "posix", reason="symbolic links (POSIX)")
     async def test_a_symlink_is_replaced_not_written_through(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
@@ -1122,6 +1235,42 @@ DEFINE PARAM $isp_endpoint VALUE 'https://example.com';
 #: The fixture's tables, in codepoint order.
 _FIXTURE_TABLES = ["isp-weird", "isp_company", "isp_likes", "isp_log", "isp_person", "select"]
 
+#: Two tables with a change feed and permissions other than the default ``NONE``.
+_FEED_DDL = """
+DEFINE TABLE isp_feed SCHEMAFULL CHANGEFEED 1d INCLUDE ORIGINAL
+    PERMISSIONS FOR select WHERE $auth.id = owner, FOR create, update FULL, FOR delete NONE;
+DEFINE FIELD owner ON isp_feed TYPE option<record>;
+DEFINE TABLE isp_open SCHEMALESS CHANGEFEED 3h PERMISSIONS FULL;
+"""
+
+#: The module generated from ``_FEED_DDL`` on SurrealDB 3.x, 2.x and the embedded engine.
+_FEED_SOURCE = (
+    DOCSTRING
+    + """
+
+from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict
+from surrealdb import RecordID
+
+
+class IspFeed(BaseSurrealModel):
+    # Changefeed: 1d INCLUDE ORIGINAL
+    # Permissions: FOR select WHERE $auth.id = owner, FOR create, update FULL, FOR delete NONE
+    model_config = SurrealConfigDict(table_name="isp_feed", connection="isp")
+
+    id: str | None = None
+    owner: RecordID | None = None
+
+
+class IspOpen(BaseSurrealModel):
+    # Changefeed: 3h
+    # Permissions: FULL
+    # SCHEMALESS: fields not declared here are kept (extra="allow")
+    model_config = SurrealConfigDict(table_name="isp_open", connection="isp", extra="allow")
+
+    id: str | None = None
+"""
+)
+
 
 def _url(kind: str) -> str:
     """The URL of *kind*: ``ws`` or ``http`` on the line under test (``SURREALDB_PORT``), or ``mem``."""
@@ -1198,6 +1347,29 @@ def _spy(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[tuple[object, ...
 
     monkeypatch.setattr(client, "query", query)
     return calls
+
+
+def _cut_at(
+    monkeypatch: pytest.MonkeyPatch, client: Any, proxy: CuttableProxy, statement: str, *, websocket: bool
+) -> list[str]:
+    """Record the statements sent through *client*, and cut its connection (new ones refused) right before
+    *statement* — on a WebSocket, once the SDK has seen the socket close, so that the request fails as it is sent."""
+    sent: list[str] = []
+    real_query = client.query
+
+    async def query(sql: str, *args: object, **kwargs: object) -> object:
+        sent.append(sql)
+        if sql == statement:
+            proxy.refuse()
+            proxy.cut()
+            for _ in range(500):  # the SDK's receive task ends within milliseconds of the cut
+                if not websocket or is_dead(client):
+                    break
+                await asyncio.sleep(0.01)
+        return await real_query(sql, *args, **kwargs)
+
+    monkeypatch.setattr(client, "query", query)
+    return sent
 
 
 def _info_calls(*tables: str) -> list[tuple[object, ...]]:
@@ -1415,6 +1587,71 @@ class TestIntrospectionE2E:
             assert list((await DatabaseIntrospector().introspect()).tables)[:2] == ["isp-weird", "isp_company"]
         assert str(caught.value) == _e1("isp", caught.value.__cause__)
         assert "not enough permissions" in str(caught.value).lower()
+
+    @pytest.mark.parametrize("kind", ["ws", "http", "mem"])
+    async def test_i2_a_server_error_on_info_for_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The server's own error for one ``INFO FOR TABLE`` — 3.x's ``ValidationError``, 2.x's ``InternalError``, the
+        embedded engine's ``RuntimeError`` — is issue I2 of that table; the other tables are read."""
+        async with _isp(kind) as client:
+            statement = _info_table("isp_company")
+            real_query = client.query
+
+            async def query(sql: str, *args: object, **kwargs: object) -> object:
+                return await real_query(sql.replace(";", " WHERE;") if sql == statement else sql, *args, **kwargs)
+
+            monkeypatch.setattr(client, "query", query)
+            schema = await DatabaseIntrospector("isp").introspect()
+        assert list(schema.tables) == _FIXTURE_TABLES
+        ((kind_, name, table, message),) = [(i.kind, i.name, i.table, i.message) for i in schema.issues]
+        assert (kind_, name, table) == ("table", "isp_company", "isp_company")
+        assert message.startswith("INFO FOR TABLE failed: ") and "WHERE" in message, message
+        company = schema.tables["isp_company"]
+        assert (company.comment, company.fields) == ("Companies", {})
+        assert "email" in schema.tables["isp_person"].fields
+
+    @pytest.mark.parametrize("call", ["introspect", "generate"])
+    @pytest.mark.parametrize("kind", ["ws", "http"])
+    async def test_a_connection_lost_after_info_for_db(
+        self,
+        kind: str,
+        call: str,
+        tmp_path: pathlib.Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The connection drops between ``INFO FOR DB`` and an ``INFO FOR TABLE`` (a proxy cuts it and refuses new
+        ones): the transport's error propagates, no issue is recorded, and ``generate_models_from_db()`` leaves the
+        existing file byte for byte."""
+        caplog.set_level(logging.WARNING, logger=_LOGGER)
+        path = tmp_path / "models.py"
+        previous = b"# the working models\r\nclass IspPerson: ...\n"
+        path.write_bytes(previous)
+        async with _isp(kind), CuttableProxy() as proxy:
+            SurrealDBConnectionManager.add_connection(
+                "isp_cut", url=proxy.url(kind), user="root", password="root", namespace="ns", database="isp_db"
+            )
+            try:
+                client = await SurrealDBConnectionManager.get_client("isp_cut")
+                sent = _cut_at(monkeypatch, client, proxy, _info_table("isp_likes"), websocket=kind == "ws")
+                with pytest.raises(Exception) as caught:
+                    if call == "introspect":
+                        await DatabaseIntrospector("isp_cut").introspect()
+                    else:
+                        await generate_models_from_db(path, "isp_cut")
+            finally:
+                await SurrealDBConnectionManager.remove_connection("isp_cut")
+        assert is_connection_failure(caught.value, None), repr(caught.value)
+        assert sent == ["INFO FOR DB;", *map(_info_table, _FIXTURE_TABLES[:3])]
+        assert path.read_bytes() == previous
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["models.py"]
+        assert _issue_records(caplog) == []
+
+    @pytest.mark.parametrize("kind", ["ws", "http", "mem"])
+    async def test_changefeed_and_permissions_comments(self, kind: str) -> None:
+        """A table's change feed and permissions are comments of its class, the same text on every line."""
+        async with _isp(kind, _FEED_DDL):
+            source = await generate_models_from_db(None, "isp")
+        assert source == _FEED_SOURCE
 
     async def test_a_removed_database(self) -> None:
         """AC-10 (server lines): another client removes ``isp_db`` under the ``isp`` session — 3.x fails (E2), 2.x

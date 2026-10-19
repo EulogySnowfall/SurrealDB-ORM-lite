@@ -28,15 +28,19 @@ goes to ``TableState.other``. Kinds, nullability, field paths, flags and names a
 SurrealDB 2.x, 3.x and the embedded engine; expression texts are kept as each line rendered them.
 
 **Nothing is guessed.** A definition the parser cannot read exactly, a section of the wrong shape, an ``INFO FOR
-TABLE`` that fails: each becomes a :class:`SchemaIssue` in ``SchemaState.issues`` (in the order found) and one
-WARNING on this module's logger — the reader never raises for them. An issue's message is a fixed text with names
-only, never a definition's text, which may hold a credential (``DEFINE PARAM $api_key VALUE '…'``); the statement is
-kept in ``SchemaIssue.statement``, out of its ``repr``.
+TABLE`` the server answers with an error: each becomes a :class:`SchemaIssue` in ``SchemaState.issues`` (in the order
+found) and one WARNING on this module's logger — the reader never raises for them. An issue's message is a fixed text
+with names only, never a definition's text, which may hold a credential (``DEFINE PARAM $api_key VALUE '…'``); the
+statement is kept in ``SchemaIssue.statement``, out of its ``repr``.
 
 **Errors.** ``INFO FOR DB`` refused (a record user, an anonymous session) raises ``SurrealDbAuthenticationError``;
 failing otherwise, or answering something other than an object, ``SurrealDbError`` — ORM errors (a connection that
 cannot be opened …) propagate unchanged. A ``tables=`` name the database does not define raises
-``SurrealDbNotFoundError`` before any ``INFO FOR TABLE``. Arguments are checked when the introspector is built.
+``SurrealDbNotFoundError`` before any ``INFO FOR TABLE``. An ``INFO FOR TABLE`` refused after ``INFO FOR DB``
+succeeded (the session lost its rights meanwhile) raises ``SurrealDbAuthenticationError``, and one the server never
+answered — the connection dropped, an ORM error — raises that error unchanged: neither is an issue, so
+``generate_models_from_db()`` never replaces a file with models of tables it could not read. Arguments are checked
+when the introspector is built.
 
 **Files** (``generate_models_from_db()``). The generated module is written UTF-8 with ``"\\n"`` newlines. An existing
 file is replaced atomically by default — a temporary file in the same directory, then ``os.replace()``: a failure
@@ -53,6 +57,7 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any, Protocol, TypeVar
 
+from ._sdk import ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .define_parser import (
     DefineParseError,
@@ -155,6 +160,11 @@ def _definitions(value: object) -> dict[str, str] | None:
     return dict(value)
 
 
+def _refused(exc: BaseException) -> bool:
+    """Whether the server refused the statement to this session (the same text on SurrealDB 2.x and 3.x)."""
+    return "not enough permissions" in str(exc).lower()
+
+
 async def _info_for_db(client: Any, name: str) -> dict[str, Any]:
     """``INFO FOR DB`` on *client*: E1 when the session may not run it, E2 when it fails otherwise, E3 for an answer
     that is not an object; an ORM error propagates unchanged."""
@@ -163,7 +173,7 @@ async def _info_for_db(client: Any, name: str) -> dict[str, Any]:
     except SurrealORMError:
         raise
     except Exception as exc:
-        if "not enough permissions" in str(exc).lower():
+        if _refused(exc):
             raise SurrealDbAuthenticationError(
                 f"Cannot read the schema of connection {name!r}: this session may not run INFO FOR DB. Schema "
                 "introspection needs a system user (root, namespace or database user, any role); a record user or "
@@ -235,15 +245,26 @@ class _Reader:
 
     async def table(self, name: str, statement: str) -> TableState | None:
         """The table *name* with its fields, indexes and events; ``None`` when its definition cannot be parsed (I1).
-        When ``INFO FOR TABLE`` fails, the table is kept with empty sections (I2)."""
+        When the server answers ``INFO FOR TABLE`` with an error, the table is kept with empty sections (I2); an error
+        that is not the server's answer (a dropped connection, an ORM error) propagates."""
         try:
             state = parse_define_table(statement)
         except DefineParseError as error:
             self.issue("table", name, name, f"could not parse its definition: {error}", statement)
             return None
         try:
-            info = await self.client.query(f"INFO FOR TABLE {_identifier(name)};", {})
-        except Exception as exc:
+            info_for_table = f"INFO FOR TABLE {_identifier(name)};"
+        except TypeError as exc:  # a name SurrealQL cannot hold (a NUL): never sent
+            self.issue("table", name, name, f"INFO FOR TABLE failed: {exc}")
+            return state
+        try:
+            info = await self.client.query(info_for_table, {})
+        except (ServerError, RuntimeError) as exc:  # the server's answer (the embedded engine's: a RuntimeError)
+            if _refused(exc):  # INFO FOR DB passed: the session lost its rights meanwhile, the table is not at fault
+                raise SurrealDbAuthenticationError(
+                    f"Cannot read the schema of connection {self.name!r}: INFO FOR TABLE {name!r} was refused after "
+                    f"INFO FOR DB succeeded; the session lost its rights while it was read. Server said: {exc}"
+                ) from exc
             self.issue("table", name, name, f"INFO FOR TABLE failed: {exc}")
             return state
         if not isinstance(info, dict):
@@ -353,15 +374,21 @@ class DatabaseIntrospector:
     async def introspect(self) -> SchemaState:
         """Read the schema: ``INFO FOR DB;``, then ``INFO FOR TABLE`` for each wanted table, outside any transaction.
 
-        Reusable: it holds no state between calls. What cannot be read or parsed is reported in
-        ``SchemaState.issues`` (and logged), never raised.
+        Reusable: it holds no state between calls. What cannot be read or parsed — a definition, a section, an
+        ``INFO FOR TABLE`` the server answers with an error — is reported in ``SchemaState.issues`` (and logged), never
+        raised.
 
         :raises ValueError: the connection is not registered, or not configured.
         :raises SurrealDbAuthenticationError: the session may not run ``INFO FOR DB`` (a record user, an anonymous
-            session).
+            session), or was refused an ``INFO FOR TABLE`` after ``INFO FOR DB`` succeeded (it lost its rights
+            meanwhile).
         :raises SurrealDbNotFoundError: a ``tables=`` name is not a table of the database.
         :raises SurrealDbError: ``INFO FOR DB`` failed otherwise, or did not answer an object.
         :raises SurrealDbConnectionError: what ``get_client()`` raises, unchanged.
+        :raises Exception: an ``INFO FOR TABLE`` the server never answered propagates its error unchanged, and the
+            tables after it are not read: the transport's (``OSError``, ``websockets``' ``ConnectionClosed``,
+            ``aiohttp``'s ``ClientConnectionError`` …) when the connection drops after ``INFO FOR DB``, or an ORM error
+            (``SurrealORMError``).
         """
         manager = SurrealDBConnectionManager._manager_for(self._connection)
         name = manager._connection_name or "default"
@@ -435,6 +462,9 @@ async def generate_models_from_db(
     :raises FileExistsError: *output_path* exists and ``overwrite=False`` — checked before any database read.
     :raises SurrealDbAuthenticationError, SurrealDbNotFoundError, SurrealDbError: as
         :meth:`DatabaseIntrospector.introspect`.
+    :raises Exception: as :meth:`DatabaseIntrospector.introspect`, an ``INFO FOR TABLE`` the server never answered
+        (the connection dropped after ``INFO FOR DB``) — before anything is written: an existing file is left as it
+        was.
     :raises OSError: the file cannot be written (the previous one, if any, is left as it was).
     """
     introspector = DatabaseIntrospector(connection, tables=tables)
