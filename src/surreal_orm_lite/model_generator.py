@@ -40,8 +40,8 @@ datetimes with at most 6 fractional digits and UUIDs; mutable values (``list``, 
 ``Duration``) through ``default_factory``. So the server stores the same row whether the caller sets the field or not.
 Every other ``DEFAULT`` or computed expression gives the **server form** — ``T | None = None``, the attribute listed
 in ``server_fields`` so the server's value applies on create and is read back. ``ASSERT``, ``PERMISSIONS``,
-``REFERENCE`` and field comments are not generated; ``READONLY`` is a trailing comment, and a class whose objects hold
-sub-fields a ``DEFAULT`` fills on create says that ``update()`` after ``save()`` sends them as ``None`` (§6.4.7).
+``REFERENCE`` and field comments are not generated; ``READONLY`` is a trailing comment, and a class with a ``READONLY``
+field holding datetimes in a set says that ``update()`` fails on it (§6.4.7, narrowed by #261).
 
 **Module** (spec §6.4.8): a fixed docstring, the imports the classes use (standard library, then pydantic,
 surreal_orm_lite and surrealdb), a ``# Not generated:`` comment listing every table or field left out and why, then the
@@ -478,12 +478,10 @@ _S5_NO_PARENT = "its parent is not defined (the parent is a dict[str, Any])"
 _I3_TYPE_AS_WRITTEN = "its TYPE clause was not understood and is kept as written"
 _I5_SAME_NAME = "two definitions have the same name"
 
-#: The class comment of a table with a ``READONLY`` datetime field (spec §6.4.7, M29).
-_UPDATE_NOTE = "update() fails on READONLY datetime fields (Python keeps microseconds, SurrealDB nanoseconds): use merge()."
-#: The class comment of a table whose objects hold sub-fields a ``DEFAULT`` fills on create (spec §6.4.7, M48, §14.9).
-_SUB_DEFAULT_NOTE = (
-    "update() after save() sends None for sub-fields a DEFAULT filled on create: call refresh() first, or use merge()."
-)
+#: The class comment of a table with a ``READONLY`` field holding datetimes in a set (spec §6.4.7, M29). Since #261
+#: ``update()`` keeps every other stored datetime it did not change (top level, in an object, in an array or a tuple);
+#: the items of a set have no position to match them with, and on SurrealDB 2.x a set keeps its insertion order.
+_UPDATE_NOTE = "update() fails on READONLY datetimes in a set (Python keeps microseconds, SurrealDB nanoseconds): use merge()."
 _SCHEMALESS_NOTE = 'SCHEMALESS: fields not declared here are kept (extra="allow")'
 
 #: Where each importable name comes from; the blocks in isort order (spec §6.4.8).
@@ -642,18 +640,21 @@ def _hashable(item: _Type) -> bool:
     return not item.is_any and bool(item.members or item.none) and all(m == "" or m in _HASHABLE for m in item.members)
 
 
-def _mentions_datetime(kind: Kind | None) -> bool:
-    """Whether the kind holds ``datetime`` anywhere (``datetime``, ``option<datetime>``, ``array<datetime>`` …)."""
+def _datetime_in_set(kind: Kind | None, in_set: bool = False) -> bool:
+    """Whether the kind holds ``datetime`` inside a ``set<…>`` (``set<datetime>``, ``option<set<datetime>>``,
+    ``array<set<datetime>>``, ``string | set<datetime>`` …): the one place ``update()`` cannot keep a stored datetime
+    it did not change (#261)."""
     if isinstance(kind, KName):
-        return kind.name == "datetime" or any(
-            _mentions_datetime(argument) for argument in kind.args if not isinstance(argument, str)
-        )
+        if kind.name == "datetime":
+            return in_set
+        inside = in_set or kind.name == "set"
+        return any(_datetime_in_set(argument, inside) for argument in kind.args if not isinstance(argument, str))
     if isinstance(kind, KUnion):
-        return any(_mentions_datetime(member) for member in kind.members)
+        return any(_datetime_in_set(member, in_set) for member in kind.members)
     if isinstance(kind, KTuple):
-        return any(_mentions_datetime(item) for item in kind.items)
+        return any(_datetime_in_set(item, in_set) for item in kind.items)
     if isinstance(kind, KObject):
-        return any(_mentions_datetime(value) for _, value in kind.items)
+        return any(_datetime_in_set(value, in_set) for _, value in kind.items)
     return False
 
 
@@ -884,30 +885,24 @@ class _ClassWriter:
         self.sub_models_at: dict[tuple[str, ...], str | None] = {}
         #: Sub-model class → whether it can be built without arguments (every field has a default).
         self.buildable: dict[str, bool] = {}
-        #: The paths of the sub-model fields whose ``DEFAULT`` became a Python default, or made them required.
-        self.held: set[tuple[str, ...]] = set()
 
     def write(self) -> list[str]:
         """The sub-model blocks, then the class block."""
         lines: list[str] = []
         server_fields: list[str] = []
-        written: set[str] = set()  # the top-level columns the ORM writes: neither server_fields nor Computed
         for column, (attribute, alias) in self.names.fields(self.table.name).items():
             node = self.nodes.get((column,))
             if node is None:
                 lines.append(_assigned(f"{attribute}: dict[str, Any] | None", _NONE_DEFAULT, alias))
                 self._skip_children(column)
-                written.add(column)
                 continue
             line = self.field_line(attribute, alias, node, model=True)
             lines.append(line.text)
             if line.server:
                 server_fields.append(attribute)
-            elif not line.computed:
-                written.add(column)
         base = "BaseSurrealEdge" if self.edge else "BaseSurrealModel"
         block = [f"class {self.names.class_name(self.table.name)}({base}):"]
-        block.extend("    " + comment for comment in self._comments(written))
+        block.extend("    " + comment for comment in self._comments())
         block.extend(self._model_config(server_fields))
         body = lines if self.edge else ["id: str | None = None", *lines]
         if body:
@@ -922,7 +917,7 @@ class _ClassWriter:
                 line = "- field " + repr(self.table.name + "." + field.name) + ": " + _S5_NO_PARENT
                 self.skips.append((self.table.name, field.name, line))
 
-    def _comments(self, written: set[str]) -> list[str]:
+    def _comments(self) -> list[str]:
         """The class comments of spec §6.4.7, each through ``_comment()``."""
         table = self.table
         texts = []
@@ -939,33 +934,17 @@ class _ClassWriter:
             texts.append("Indexes: " + ", ".join(_index_label(index) for index in table.indexes.values()))
         if table.events:
             texts.append("Events: " + ", ".join(event.name for event in table.events.values()))
-        if self._readonly_datetime():
+        if self._readonly_set_datetime():
             texts.append(_UPDATE_NOTE)
-        if self._sub_field_defaults(written):
-            texts.append(_SUB_DEFAULT_NOTE)
         return [_comment(text, indent=4) for text in texts]
 
-    def _readonly_datetime(self) -> bool:
-        """Whether a ``READONLY`` field of the class — top level or nested — holds a datetime (M29)."""
+    def _readonly_set_datetime(self) -> bool:
+        """Whether a ``READONLY`` field of the class — top level or nested — holds datetimes in a set (M29, #261)."""
         provided = {"id", "in", "out"} if self.edge else {"id"}
         return any(
-            field.readonly and _mentions_datetime(_kind(field))
+            field.readonly and _datetime_in_set(_kind(field))
             for field in self.table.fields.values()
             if field.path and field.path[0] not in provided
-        )
-
-    def _sub_field_defaults(self, written: set[str]) -> bool:
-        """Whether a top-level field the ORM writes holds, in its object (a sub-model or a ``dict[str, Any]``, array
-        items included, at any depth), a sub-field whose ``DEFAULT`` (not ``ALWAYS``) the model does not hold as a
-        Python default: ``save()`` leaves it ``None`` on the instance, and ``update()`` then sends it (M48, §14.9)."""
-        return any(
-            len(field.path) > 1
-            and field.path[0] in written
-            and field.path[-1] != "*"
-            and field.default is not None
-            and not field.default_always
-            and tuple(field.path) not in self.held
-            for field in self.table.fields.values()
         )
 
     def _model_config(self, server_fields: Sequence[str]) -> list[str]:
@@ -1014,8 +993,6 @@ class _ClassWriter:
             default = self.constant(field.default, _kind(field), annotation.type, tuple(field.path))
             if default is None:
                 server = True
-            elif not model:  # held, or required: no create leaves it to its DEFAULT (M48)
-                self.held.add(tuple(field.path))
             if default is _REQUIRED:
                 default = None
         elif field.nullable or annotation.type.is_any:

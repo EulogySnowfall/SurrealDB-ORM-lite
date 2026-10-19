@@ -61,7 +61,6 @@ from surreal_orm_lite import (
     generate_models_from_db,
 )
 from surreal_orm_lite import introspection as introspection_module
-from surreal_orm_lite._sdk import SurrealError
 from surreal_orm_lite.define_parser import (
     _R_AMBIGUOUS,
     _R_BRACKETS,
@@ -85,7 +84,7 @@ from tests.test_embedded import (
     _table_rows,
     _tables,
 )
-from tests.test_model_generator import GOLDEN, SUB_DEFAULT_NOTE
+from tests.test_model_generator import GOLDEN
 from tests.test_query_cache import _bullets
 from tests.test_time_travel import _SERVER_BEHAVIOUR, _SERVER_TABLE_WIDTHS
 
@@ -1820,7 +1819,7 @@ class TestConstantDefaultsE2E:
             source = await generate_models_from_db(path, "isp", tables=["isp_cd"])
             assert source.split("    id: str | None = None\n", 1)[1].splitlines() == _CONSTANT_DEFAULT_LINES
             assert 'class IspCdPrefs(BaseModel):\n    theme: str = "light"\n' in source
-            assert SUB_DEFAULT_NOTE not in source
+            assert "update() after save()" not in source
             with _imported(path) as models:
                 model = models.IspCd
                 assert model.get_server_fields() == frozenset({"created"})
@@ -1860,13 +1859,6 @@ class TestConstantDefaultsE2E:
                 assert (await model.objects().get("ex")).nums == [3]
 
 
-#: Spec §14.9: the follow-up whose fix flips :class:`TestSubFieldDefaultsE2E` (and drops the generated comment line).
-_ISSUE_14_9 = "Models: save() does not read back fields the server fills on create, so update() then refuses or erases them"
-_FLIP_14_9 = (
-    f"{_ISSUE_14_9!r} looks fixed: drop the generated 'update() after save()' comment line and its README bullet, "
-    "and invert this test (spec §14.9, D26 clause)"
-)
-
 #: Spec AC-18c (M48): a required and an optional sub-field filled by a ``DEFAULT`` expression on create.
 _SUB_FIELD_DEFAULTS_DDL = """\
 DEFINE TABLE isp_sfd SCHEMAFULL;
@@ -1881,58 +1873,56 @@ DEFINE FIELD prefs.seen ON isp_sfo TYPE option<datetime> DEFAULT time::now();
 """
 
 
-async def _stored(client: Any, query: str) -> object:
-    """The one value ``SELECT VALUE …`` returns."""
-    values = await client.query(query, {})
-    assert isinstance(values, list) and len(values) == 1, values
-    return values[0]
+async def _stored_at(client: Any, record: RecordID, column: str) -> list[object]:
+    """``prefs.<column>`` of *record* as the SDK reads it, then as the server writes it (nanoseconds included)."""
+    query = f"SELECT VALUE [prefs.{column}, <string> prefs.{column}] FROM ONLY $rid;"  # column: a constant of the test
+    values = await client.query(query, {"rid": record})
+    assert isinstance(values, list) and len(values) == 2, values
+    return values
+
+
+async def _save_how(instance: Any, how: str) -> Any:
+    """``instance.save()``, or ``save(tx=)`` in an interactive transaction on the connection ``"isp"``."""
+    if how != "tx":
+        return await instance.save()
+    async with SurrealDBConnectionManager.transaction("isp") as tx:
+        if not tx.is_interactive:
+            pytest.skip("a buffered transaction returns no row before commit: save() keeps the instance's values")
+        return await instance.save(tx=tx)
 
 
 class TestSubFieldDefaultsE2E:
-    """AC-18c on the line under test and on ``mem://`` (M48, §14.9): ``save()`` reads back only ``server_fields`` and
-    computed fields, so a sub-field a ``DEFAULT`` fills on create stays ``None`` on the instance, and ``update()`` then
-    sends it as ``NONE`` — refused for a required sub-field, erased for an optional one; ``refresh()`` first keeps both.
-    The generated classes say so. The assertion messages name §14.9's issue, whose fix flips them."""
+    """AC-18c on the line under test and on ``mem://`` (M48, §14.9), inverted by #261: ``save()`` applies the row the
+    server returns, so a sub-field a ``DEFAULT`` fills on create holds the server's value right after it — with an
+    explicit id, an auto id and in an interactive transaction — and a following ``update()`` keeps it, required or
+    optional, to the nanosecond. The generated classes no longer carry a comment about it."""
 
     @pytest.mark.parametrize("kind", ["ws", "mem"])
-    async def test_update_after_save_ac18c(self, kind: str, tmp_path: pathlib.Path) -> None:
+    @pytest.mark.parametrize("how", ["explicit-id", "auto-id", "tx"])
+    async def test_update_after_save_ac18c(self, kind: str, how: str, tmp_path: pathlib.Path) -> None:
         path = tmp_path / "isp_sfd_models.py"
         async with _isp(kind, _SUB_FIELD_DEFAULTS_DDL) as client:
             source = await generate_models_from_db(path, "isp", tables=["isp_sfd", "isp_sfo"])
+            assert "update() after save()" not in source
             for name in ("IspSfd", "IspSfo"):
                 block = source.split(f"class {name}(BaseSurrealModel):\n", 1)[1]
-                assert block.splitlines()[0] == SUB_DEFAULT_NOTE, name
+                assert block.splitlines()[0].startswith("    model_config = "), name
             with _imported(path) as models:
-                required = await models.IspSfd(id="r", title="t", prefs=models.IspSfdPrefs()).save()
-                assert isinstance(await _stored(client, "SELECT VALUE prefs.at FROM isp_sfd:r;"), datetime)
-                assert required.prefs.at is None, _FLIP_14_9
-                required.title = "u"
-                try:
-                    await required.update()
-                except SurrealError:
-                    refused = True
-                else:
-                    refused = False
-                assert refused, _FLIP_14_9
-
-                optional = await models.IspSfo(id="o", title="t", prefs=models.IspSfoPrefs()).save()
-                assert isinstance(await _stored(client, "SELECT VALUE prefs.seen FROM isp_sfo:o;"), datetime)
-                optional.title = "u"
-                await optional.update()
-                assert await _stored(client, "SELECT VALUE prefs.seen FROM isp_sfo:o;") is None, _FLIP_14_9
-
                 for model, prefs, column in (
-                    (models.IspSfd, models.IspSfdPrefs, "at"),
-                    (models.IspSfo, models.IspSfoPrefs, "seen"),
+                    (models.IspSfd, models.IspSfdPrefs, "at"),  # required
+                    (models.IspSfo, models.IspSfoPrefs, "seen"),  # optional
                 ):
-                    fresh = await model(id="f", title="t", prefs=prefs()).save()
-                    await fresh.refresh()
-                    value = getattr(fresh.prefs, column)
-                    assert isinstance(value, datetime), column
-                    fresh.title = "u"
-                    await fresh.update()
-                    stored = await _stored(client, f"SELECT VALUE prefs.{column} FROM {model.get_table_name()}:f;")
-                    assert stored == value, column
+                    instance = model(id=None if how == "auto-id" else "x", title="t", prefs=prefs())
+                    saved = await _save_how(instance, how)
+                    record = saved._record_id()
+                    assert record is not None and record.table_name == model.get_table_name()
+                    stored, written = await _stored_at(client, record, column)
+                    assert isinstance(stored, datetime), column
+                    assert getattr(saved.prefs, column) == stored, column
+                    saved.title = "u"
+                    await saved.update()
+                    assert await _stored_at(client, record, column) == [stored, written], column
+                    assert (await model.objects().get(record.id)).title == "u"
 
 
 # --- AC-16: README section 31, the tables it touches and its examples (spec §6.5, §11.1 items 1–8; D18, D26) --------
@@ -2087,8 +2077,9 @@ _COMING_FROM_PHRASES_31 = (
     "No singularisation",
     "`overwrite=False` added",
 )
-#: Spec §11.1 item 1b (D25 amended, M48, §14.9): the ``DEFAULT`` bullet of "How SurrealDB kinds become fields" and the
-#: sub-field bullet of "What the generator does not do", exactly (whitespace normalised).
+#: Spec §11.1 item 1b (D25 amended, M48): the ``DEFAULT`` bullet of "How SurrealDB kinds become fields", and the
+#: ``update()`` bullet of "What the generator does not do" as #261 narrowed it (the sub-field bullet is gone), exactly
+#: (whitespace normalised).
 _DEFAULT_BULLET_31 = (
     "- **`DEFAULT`**: a constant the model can hold exactly becomes the Python default, so the database stores the same "
     "value whether you set the field or not, and stores yours when you do — `DEFAULT 18` → `= 18`, `'active'` → "
@@ -2105,12 +2096,12 @@ _DEFAULT_BULLET_31 = (
     "default applies, and read back after `save()`. A value you set on such a field before `save()` is not written: "
     "set it with `merge()` once the record exists."
 )
-_SUB_FIELD_BULLET_31 = (
-    "- A sub-field filled by a `DEFAULT` the model does not hold (`prefs.at DEFAULT time::now()`, or any `DEFAULT` "
-    "under a `dict[str, Any]` field) stays `None` on the instance after `save()`, which reads back only "
-    "`server_fields` and computed fields. A following `update()` sends it as `NONE`: the server refuses it when the "
-    "sub-field is required and erases it when it is optional. The generated class says so: call `refresh()` after "
-    "`save()` before an `update()`, or change the record with `merge()`."
+_UPDATE_BULLET_31 = (
+    "- `update()` fails on an instance holding a `READONLY` field of datetimes in a set (`set<datetime>`), after "
+    "`get()` as after `save()`: Python keeps microseconds, SurrealDB nanoseconds, and the server refuses the changed "
+    "value. Any other `READONLY` datetime is kept to the nanosecond by `update()` (see "
+    "[Precision and `Decimal`](#precision-and-decimal)). The generated class says so: change such a record with "
+    "`merge()`."
 )
 #: Spec §11.1 item 8 (D18): the key phrases and the link AC-16 names.
 _PERMISSIONS_PHRASES_31 = ("never read", "before 3.2.2", "never reads, stores, logs or writes them")
@@ -2242,7 +2233,7 @@ _PART_NEEDLES_31 = {
         "`# READONLY`",
         "`update()`",
         "`merge()`",
-        "`refresh()`",
+        "`set<datetime>`",
         "`array<T, N>`",
         "`null | T`",
         "`define_computed_fields()`",
@@ -2374,13 +2365,15 @@ class TestReadmeSection31:
         assert f"]({_INFO_DOCUMENTATION})" in text
 
     def test_default_bullets_exactly(self) -> None:
-        """Spec §11.1 item 1b: the ``DEFAULT`` bullet; the sub-field bullet right after the M29 ``update()`` bullet."""
+        """Spec §11.1 item 1b: the ``DEFAULT`` bullet; the M29 ``update()`` bullet, narrowed by #261, and no sub-field
+        bullet after it (``save()`` reads the sub-fields a ``DEFAULT`` fills back)."""
         kinds = _bullets(_part_31("How SurrealDB kinds become fields"))
         assert _DEFAULT_BULLET_31 in kinds, kinds
         assert kinds[kinds.index(_DEFAULT_BULLET_31) - 1].startswith("- **Sub-models**")
         limits = _bullets(_part_31("What the generator does not do"))
-        assert _SUB_FIELD_BULLET_31 in limits, limits
-        assert limits[limits.index(_SUB_FIELD_BULLET_31) - 1].startswith("- `update()` fails on an instance holding")
+        assert _UPDATE_BULLET_31 in limits, limits
+        assert limits[limits.index(_UPDATE_BULLET_31) + 1].startswith("- `array<T, N>` becomes `list[T]`")
+        assert not any("after `save()`, which reads back only" in bullet for bullet in limits), limits
 
     def test_coming_from_the_full_orm(self) -> None:
         """Spec §11.1 item 7 (P1, P2; D25 amended): 18 bullets, exactly, and no 19th."""
@@ -2413,13 +2406,16 @@ class TestReadmeSection31:
         assert comparison[firsts.index("Multi-database") + 1] == _COMPARISON_ROW_31, comparison
 
     def test_server_behaviour_rows(self) -> None:
-        """Spec §11.1 item 5: seven rows, Since v0.30.0, right after the v0.29.2 row and before the table's last row."""
+        """Spec §11.1 item 5: seven rows, Since v0.30.0, right after the v0.29.2 row; only rows of later versions (#261's)
+        between them and the table's last row."""
         rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
         start = rows.index(_INTROSPECTION_ROWS[0])
         count = len(_INTROSPECTION_ROWS)
         assert rows[start : start + count] == _INTROSPECTION_ROWS, rows[start : start + count]
         assert rows[start - 1][3] == "v0.29.2", rows[start - 1]
-        assert start + count == len(rows) - 1 and rows[-1][3] == "v0.19.1", rows[-1]
+        assert rows[-1][3] == "v0.19.1", rows[-1]
+        later = rows[start + count : -1]
+        assert all(tuple(int(n) for n in cells[3][1:].split(".")) > (0, 30, 0) for cells in later), later
         assert [cells for cells in rows if cells[3] == "v0.30.0"] == _INTROSPECTION_ROWS
 
     def test_server_behaviour_table_keeps_its_widths(self) -> None:
