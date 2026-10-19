@@ -29,9 +29,11 @@ notes described. No new public API.
 - **Generated classes comment their change feed and permissions** (#260), as the v0.30.0 notes
   said: `# Changefeed: 1d INCLUDE ORIGINAL` and
   `# Permissions: FOR select WHERE $auth.id = owner, FOR create, update FULL`, grouped the way
-  SurrealDB renders them (`# Permissions: FULL` when one rule covers the four operations). A table
+  SurrealDB renders them (`# Permissions: FULL` when `FULL` covers the four operations). A table
   left at the default `PERMISSIONS NONE` gets no permissions comment. The database still applies
-  both; the `SurrealConfigDict` keys for them arrive with v0.31.0–v0.33.0.
+  both; the `SurrealConfigDict` keys for them arrive with v0.31.0–v0.33.0. Unlike what those notes
+  listed, `table_type` is not a comment: it shows through the base class, `BaseSurrealEdge` for a
+  relation table.
 
 ### Changed
 
