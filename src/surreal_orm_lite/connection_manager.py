@@ -84,6 +84,39 @@ def _type_adapter(return_type: Any) -> TypeAdapter[Any]:
         return TypeAdapter(return_type)
 
 
+#: How many times this process has dropped cached stored-function signatures (v0.31.0). Bumped by
+#: ``SurrealDBConnectionManager._forget_function_signature()`` and ``clear_function_signature_cache()`` in the same
+#: synchronous step as what they drop; ``_function_signature()`` notes it before each ``INFO FOR DB`` and stores the
+#: answer only if it has not moved since. One counter for the whole process, outside ``_STATE``: dropping more than
+#: needed only costs one more read.
+_signature_epoch = 0
+
+
+def _bump_signature_epoch() -> None:
+    """Record that cached stored-function signatures were dropped: a read in flight is no longer stored."""
+    global _signature_epoch
+    _signature_epoch += 1
+
+
+async def _read_function_signature(client: Any, function: str) -> tuple[str, ...]:
+    """Read the declared parameter names of *function* (``"fn::…"``), in order, from ``INFO FOR DB`` on *client*.
+
+    :raises SurrealDbError: the read failed.
+    :raises SurrealDbNotFoundError: the database has no such function.
+    """
+    try:
+        info = await client.query("INFO FOR DB;", {})
+    except Exception as exc:
+        raise SurrealDbError(f"Could not read the signature of {function!r}: {exc}") from exc
+
+    functions = info.get("functions", {}) if isinstance(info, dict) else {}
+    # INFO FOR DB keys functions WITHOUT the fn:: prefix.
+    define = functions.get(function[len("fn::") :])
+    if not define:
+        raise SurrealDbNotFoundError(f"Stored function {function!r} does not exist.")
+    return parse_function_parameters(str(define))
+
+
 @dataclasses.dataclass(frozen=True)
 class _ManagerState:
     """The connection state ``embedded_database()`` puts back after its block. Secrets stay out of the repr.
@@ -2329,6 +2362,9 @@ class SurrealDBConnectionManager:
         mapping and carries no order of its own, so there is nothing to compare the cached order
         against, and re-reading on every call would defeat the cache. After such a redefinition,
         call :meth:`clear_function_signature_cache`.
+
+        One window remains: a redefinition that lands between this call's signature read and its
+        ``CALL`` can bind this one call in the order it read, a signature the cache never keeps.
         """
         key = (cls.__url, cls.__namespace, cls.__database, function)
         was_cached = key in cls.__function_signatures
@@ -2353,6 +2389,13 @@ class SurrealDBConnectionManager:
         transaction: buffered transactions forbid reads, and routing it through one would make
         ``params=`` unusable inside a transaction for no benefit — a schema read needs no
         transactional isolation.
+
+        A read can be overtaken: the signature may be dropped (:meth:`_forget_function_signature`,
+        :meth:`clear_function_signature_cache`) while its ``INFO FOR DB`` answer, the order from
+        before a redefinition, is on its way back. Each read therefore notes the process-wide count
+        of those drops first and stores its answer only if the count has not moved; otherwise it
+        reads once more — a drop comes once the DDL is applied, after the commit with ``tx=``, so
+        that read sees the new order — and a second read overtaken too is returned, never stored.
         """
         key = (cls.__url, cls.__namespace, cls.__database, function)
         if refresh:
@@ -2360,18 +2403,14 @@ class SurrealDBConnectionManager:
         elif key in cls.__function_signatures:
             return cls.__function_signatures[key]
 
-        try:
-            info = await client.query("INFO FOR DB;", {})
-        except Exception as exc:
-            raise SurrealDbError(f"Could not read the signature of {function!r}: {exc}") from exc
-
-        functions = info.get("functions", {}) if isinstance(info, dict) else {}
-        # INFO FOR DB keys functions WITHOUT the fn:: prefix.
-        define = functions.get(function[len("fn::") :])
-        if not define:
-            raise SurrealDbNotFoundError(f"Stored function {function!r} does not exist.")
-
-        signature = parse_function_parameters(str(define))
+        epoch = _signature_epoch
+        signature = await _read_function_signature(client, function)
+        if epoch != _signature_epoch:
+            epoch = _signature_epoch
+            signature = await _read_function_signature(client, function)
+            if epoch != _signature_epoch:
+                return signature
+        # No await between the comparison and the store: a drop cannot slip in between.
         cls.__function_signatures[key] = signature
         return signature
 
@@ -2386,6 +2425,7 @@ class SurrealDBConnectionManager:
         and :meth:`remove_function` drop the signature themselves, on every connection of this
         process to the same namespace and database, whatever its URL).
         """
+        _bump_signature_epoch()
         cls.__function_signatures.clear()
 
     @classmethod
@@ -2632,6 +2672,7 @@ class SurrealDBConnectionManager:
         like the ``"every"`` policy.
         """
         target = (cls.__namespace, cls.__database, function)
+        _bump_signature_epoch()
         for connection in list(_REGISTRY.values()):
             signatures = connection.__function_signatures
             for key in [key for key in list(signatures) if key[1:] == target]:

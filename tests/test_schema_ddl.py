@@ -27,12 +27,13 @@ AC-11, AC-12, AC-15).
 import ast
 import asyncio
 import contextlib
+import contextvars
 import dataclasses
 import inspect
 import os
 import pickle
 import re
-from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from typing import Any
 
 import pytest
@@ -1517,6 +1518,48 @@ class TestForgetFunctionSignature:
         assert app == kept
         assert admin == {}
 
+    @pytest.mark.parametrize("drop", ["forget", "clear"])
+    @pytest.mark.parametrize(
+        ("drops", "reads", "signature", "cached"),
+        [(0, 1, ("a", "b"), [("a", "b")]), (1, 2, ("b", "a"), [("b", "a")]), (2, 2, ("b", "a"), [])],
+    )
+    async def test_a_read_overtaken_by_a_drop_is_read_again_never_stored(
+        self, drop: str, drops: int, reads: int, signature: tuple[str, ...], cached: list[tuple[str, ...]]
+    ) -> None:
+        # The first read answers the order before a reorder; a drop while it is on its way back makes the second
+        # read (the new order) the one stored, and a drop during that one too leaves nothing in the cache.
+        SurrealDBConnectionManager.add_connection(
+            "evt", url="ws://localhost:8000/rpc", user="root", password="root", namespace="ns", database="evt_db"
+        )
+        async with SurrealDBConnectionManager.using("evt"):
+            client = _OvertakenReads(
+                drops,
+                SurrealDBConnectionManager.clear_function_signature_cache
+                if drop == "clear"
+                else lambda: SurrealDBConnectionManager._forget_function_signature("fn::pair"),
+            )
+            assert await SurrealDBConnectionManager._function_signature(client, "fn::pair") == signature
+        assert client.reads == reads
+        assert list(_evt_signatures().values()) == cached
+
+
+class _OvertakenReads:
+    """A client whose ``INFO FOR DB`` answers ``fn::pair($a, $b)``, then ``fn::pair($b, $a)`` on every later read;
+    the first *drops* reads run *drop* while their answer is on its way back."""
+
+    def __init__(self, drops: int, drop: Callable[[], None]) -> None:
+        self.drops = drops
+        self.drop = drop
+        self.reads = 0
+
+    async def query(self, statement: str, variables: Mapping[str, Any]) -> Any:
+        assert (statement, variables) == ("INFO FOR DB;", {})
+        self.reads += 1
+        if self.reads <= self.drops:
+            self.drop()
+        order = "$a: string, $b: string" if self.reads == 1 else "$b: string, $a: string"
+        return {"functions": {"pair": f"DEFINE FUNCTION fn::pair({order}) {{ RETURN 1; }} PERMISSIONS FULL"}}
+
 
 def _c1(engine: str, names: str) -> str:
     """C1's exact text (spec §5.6)."""
@@ -2480,6 +2523,52 @@ class TestEventLiveAndCacheE2E:
 #: What ``remove_function()`` applies for ``fn::ev_greet`` by default (``missing_ok=True``).
 _GREET_REMOVAL = "REMOVE FUNCTION IF EXISTS fn::ev_greet;"
 
+#: ``fn::ev_pair`` with its two string parameters, as ``(function, body)``: bound in the wrong order, it answers
+#: ``"B/A"`` instead of ``"A/B"`` without any error.
+_PAIR = ("fn::ev_pair", "RETURN string::concat($a, '/', $b);")
+
+
+@contextlib.asynccontextmanager
+async def _evt_admin(kind: str) -> AsyncIterator[Any]:
+    """A second connection ``"evt_admin"`` to ``evt_db`` over the other transport than *kind* (``ws`` or ``http``),
+    as an application that applies DDL over HTTP and runs live queries over WebSocket would; its client, and the
+    connection unregistered on exit."""
+    SurrealDBConnectionManager.add_connection(
+        "evt_admin",
+        url=_url("http" if kind == "ws" else "ws"),
+        user="root",
+        password="root",
+        namespace="ns",
+        database="evt_db",
+    )
+    try:
+        yield await SurrealDBConnectionManager.get_client("evt_admin")
+    finally:
+        await SurrealDBConnectionManager.remove_connection("evt_admin")
+
+
+def _hold_signature_read(monkeypatch: pytest.MonkeyPatch, client: Any) -> tuple[asyncio.Event, asyncio.Event]:
+    """Hold back the answer to *client*'s next ``INFO FOR DB``: the first event is set once the server has answered,
+    and the answer reaches its caller once the second one is set. Every later read goes straight through."""
+    real = client.query
+    answered, release = asyncio.Event(), asyncio.Event()
+
+    async def query(statement: str, *args: Any, **kwargs: Any) -> Any:
+        result = await real(statement, *args, **kwargs)
+        if statement.startswith("INFO FOR DB") and not release.is_set():
+            answered.set()
+            await release.wait()
+        return result
+
+    monkeypatch.setattr(client, "query", query)
+    return answered, release
+
+
+def _evt_signatures() -> dict[tuple[str | None, str | None, str | None, str], tuple[str, ...]]:
+    """The ``params=`` signature cache of the connection ``"evt"`` (white box)."""
+    manager = SurrealDBConnectionManager._manager_for("evt")
+    return manager._SurrealDBConnectionManager__function_signatures  # type: ignore[attr-defined,no-any-return]
+
 
 class TestFunctionsE2E:
     """AC-10, AC-8d, AC-9 (functions) and AC-15 (i, functions): stored functions defined, called, redefined and
@@ -2556,6 +2645,71 @@ class TestFunctionsE2E:
             finally:
                 await SurrealDBConnectionManager.remove_function(pair[0])
                 await SurrealDBConnectionManager.remove_connection("evt_admin")
+
+    # A params= call whose INFO FOR DB answer (the old order) is still on its way back while the function is reordered
+    # and its signature dropped: the read is overtaken, so it is read again — the call in flight binds in the new
+    # order, and the old one never lands in the cache, where every later call would have bound in it ("B/A"). The
+    # answer is held back by wrapping the application client's query(), never by sleeping.
+
+    @pytest.mark.parametrize("kind", ["ws", "http"])
+    async def test_a_reorder_by_another_connection_overtakes_a_signature_read(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        both = {"a": "A", "b": "B"}
+        async with _evt(kind) as client, _evt_admin(kind), SurrealDBConnectionManager.using("evt"):
+            await SurrealDBConnectionManager.define_function(*_PAIR, parameters={"a": "string", "b": "string"})
+            answered, release = _hold_signature_read(monkeypatch, client)
+            in_flight = asyncio.create_task(SurrealDBConnectionManager.call_function(_PAIR[0], params=both))
+            async with asyncio.timeout(10):
+                await answered.wait()
+            async with SurrealDBConnectionManager.using("evt_admin"):
+                await SurrealDBConnectionManager.define_function(*_PAIR, parameters={"b": "string", "a": "string"})
+            release.set()
+            assert await in_flight == "A/B"
+            assert await SurrealDBConnectionManager.call_function(_PAIR[0], params=both) == "A/B"
+            assert list(_evt_signatures().values()) == [("b", "a")]
+
+    @pytest.mark.parametrize("kind", ["ws", "http"])
+    async def test_a_reorder_committed_by_a_transaction_overtakes_a_signature_read(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The read starts inside the admin's transaction, so it answers the committed schema — the old order — and
+        # only the signature dropped once the transaction commits can overtake it. The call runs in the context
+        # copied before using("evt_admin"): created inside the block, it would run on the admin connection.
+        both = {"a": "A", "b": "B"}
+        async with _evt(kind) as client, _evt_admin(kind), SurrealDBConnectionManager.using("evt"):
+            await SurrealDBConnectionManager.define_function(*_PAIR, parameters={"a": "string", "b": "string"})
+            answered, release = _hold_signature_read(monkeypatch, client)
+            application = contextvars.copy_context()
+            async with SurrealDBConnectionManager.using("evt_admin"), SurrealDBConnectionManager.transaction() as tx:
+                await SurrealDBConnectionManager.define_function(*_PAIR, parameters={"b": "string", "a": "string"}, tx=tx)
+                in_flight = application.run(
+                    lambda: asyncio.create_task(SurrealDBConnectionManager.call_function(_PAIR[0], params=both))
+                )
+                async with asyncio.timeout(10):
+                    await answered.wait()
+            release.set()
+            assert await in_flight == "A/B"
+            assert await SurrealDBConnectionManager.call_function(_PAIR[0], params=both) == "A/B"
+            assert list(_evt_signatures().values()) == [("b", "a")]
+
+    @pytest.mark.parametrize("kind", ["ws", "http"])
+    async def test_a_cache_clear_after_raw_ddl_overtakes_a_signature_read(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        both = {"a": "A", "b": "B"}
+        async with _evt(kind) as client, _evt_admin(kind) as admin, SurrealDBConnectionManager.using("evt"):
+            await SurrealDBConnectionManager.define_function(*_PAIR, parameters={"a": "string", "b": "string"})
+            answered, release = _hold_signature_read(monkeypatch, client)
+            in_flight = asyncio.create_task(SurrealDBConnectionManager.call_function(_PAIR[0], params=both))
+            async with asyncio.timeout(10):
+                await answered.wait()
+            await _apply_ddl(admin, f"DEFINE FUNCTION OVERWRITE {_PAIR[0]}($b: string, $a: string) {{ {_PAIR[1]} }};")
+            SurrealDBConnectionManager.clear_function_signature_cache()
+            release.set()
+            assert await in_flight == "A/B"
+            assert await SurrealDBConnectionManager.call_function(_PAIR[0], params=both) == "A/B"
+            assert list(_evt_signatures().values()) == [("b", "a")]
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_remove_function(self, kind: str) -> None:
