@@ -27,9 +27,10 @@ AC-11, AC-12, AC-15).
 import asyncio
 import contextlib
 import dataclasses
+import inspect
 import os
 import pickle
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from typing import Any
 
 import pytest
@@ -48,6 +49,7 @@ from surreal_orm_lite import (
     SurrealDBConnectionManager,
     SurrealDbError,
     SurrealDbNotFoundError,
+    Transaction,
     schema,
 )
 from surreal_orm_lite._sdk import ServerError
@@ -1533,6 +1535,159 @@ class TestAsyncCheck:
         assert await ensure_async_events_supported(client, [_NOTIFY, _RETRYING], embedded=embedded) is None
         assert client.version_calls == 1
         assert client.queries == []
+
+
+# --- AC-1: the public API — exports, coroutines and signatures (spec §5.1–§5.4, §5.7) ------------------------------
+
+
+def _parameter(
+    name: str, annotation: Any, default: Any = inspect.Parameter.empty, *, keyword: bool = False
+) -> inspect.Parameter:
+    """One expected ``inspect.Parameter``: positional-or-keyword, or keyword-only with *keyword*."""
+    kind = inspect.Parameter.KEYWORD_ONLY if keyword else inspect.Parameter.POSITIONAL_OR_KEYWORD
+    return inspect.Parameter(name, kind, default=default, annotation=annotation)
+
+
+_OVERWRITE = _parameter("overwrite", bool, True, keyword=True)
+_MISSING_OK = _parameter("missing_ok", bool, True, keyword=True)
+_TX = _parameter("tx", Transaction | None, None, keyword=True)
+_FUNCTION_OPTIONS = [
+    _parameter("parameters", Mapping[str, str] | None, None, keyword=True),
+    _parameter("returns", str | None, None, keyword=True),
+    _parameter("permissions", str | None, None, keyword=True),
+    _parameter("comment", str | None, None, keyword=True),
+    _OVERWRITE,
+]
+
+#: What ``inspect.signature()`` shows for each public v0.31.0 callable, ``cls`` bound (spec §5.1–§5.4): names, kinds,
+#: defaults, annotations and the return annotation.
+_SIGNATURES: dict[str, inspect.Signature] = {
+    "Event": inspect.Signature(
+        [
+            _parameter("name", str),
+            _parameter("then", str, keyword=True),
+            _parameter("when", str | None, None, keyword=True),
+            _parameter("async_mode", bool, False, keyword=True),
+            _parameter("retry", int | None, None, keyword=True),
+            _parameter("max_depth", int | None, None, keyword=True),
+            _parameter("comment", str | None, None, keyword=True),
+        ],
+        return_annotation=None,
+    ),
+    "Event.ddl": inspect.Signature(
+        [_parameter("self", inspect.Parameter.empty), _parameter("table", str), _OVERWRITE], return_annotation=str
+    ),
+    "function_ddl": inspect.Signature(
+        [_parameter("function", str), _parameter("body", str), *_FUNCTION_OPTIONS], return_annotation=str
+    ),
+    "BaseSurrealModel.get_events": inspect.Signature([], return_annotation=tuple[Event, ...]),
+    "BaseSurrealModel.event_ddl": inspect.Signature([_OVERWRITE], return_annotation=list[str]),
+    "BaseSurrealModel.define_events": inspect.Signature([_OVERWRITE, _TX], return_annotation=list[str]),
+    "BaseSurrealModel.remove_event": inspect.Signature([_parameter("event", str), _MISSING_OK, _TX], return_annotation=str),
+    "SurrealDBConnectionManager.define_event": inspect.Signature(
+        [_parameter("event", Event), _parameter("table", str), _OVERWRITE, _TX], return_annotation=str
+    ),
+    "SurrealDBConnectionManager.remove_event": inspect.Signature(
+        [_parameter("event", str), _parameter("table", str), _MISSING_OK, _TX], return_annotation=str
+    ),
+    "SurrealDBConnectionManager.define_function": inspect.Signature(
+        [_parameter("function", str), _parameter("body", str), *_FUNCTION_OPTIONS, _TX], return_annotation=str
+    ),
+    "SurrealDBConnectionManager.remove_function": inspect.Signature(
+        [_parameter("function", str), _MISSING_OK, _TX], return_annotation=str
+    ),
+}
+
+#: The six coroutines that apply DDL (spec §5.3, §5.4).
+_APPLIERS = [
+    "BaseSurrealModel.define_events",
+    "BaseSurrealModel.remove_event",
+    "SurrealDBConnectionManager.define_event",
+    "SurrealDBConnectionManager.remove_event",
+    "SurrealDBConnectionManager.define_function",
+    "SurrealDBConnectionManager.remove_function",
+]
+
+#: The pure ones: they build SurrealQL without a connection, so they are plain functions.
+_PURE = ["BaseSurrealModel.get_events", "BaseSurrealModel.event_ddl", "Event.ddl", "function_ddl"]
+
+#: The four manager methods, each ``@classmethod @_routed("current")`` (spec §5.4).
+_MANAGER_METHODS = ["define_event", "remove_event", "define_function", "remove_function"]
+
+
+def _public(path: str) -> Any:
+    """The callable *path* names (``"Owner.method"`` or a bare name), as a user reaches it."""
+    owners: dict[str, Any] = {
+        "Event": Event,
+        "function_ddl": function_ddl,
+        "BaseSurrealModel": BaseSurrealModel,
+        "SurrealDBConnectionManager": SurrealDBConnectionManager,
+    }
+    owner, _, attribute = path.partition(".")
+    return getattr(owners[owner], attribute) if attribute else owners[owner]
+
+
+class TestPublicApi:
+    """AC-1 (spec §5.1–§5.4, §5.7): the exports, which callables are coroutines, and every signature, pinned — the
+    manager's ``remove_event`` takes ``event``, never ``name`` (D17)."""
+
+    def test_exports(self) -> None:
+        names = surreal_orm_lite.__all__
+        assert schema.__all__ == ["Event", "function_ddl"]
+        for name in schema.__all__:
+            assert names.count(name) == 1, name
+            assert getattr(surreal_orm_lite, name) is getattr(schema, name), name
+        # The "Server-side events and DDL (v0.31.0)" group follows the schema introspection group.
+        assert names.index("function_ddl") == names.index("Event") + 1
+        assert names.index("Event") > names.index("generate_models_from_db")
+
+    @pytest.mark.parametrize("path", _APPLIERS)
+    def test_appliers_are_coroutine_functions(self, path: str) -> None:
+        assert inspect.iscoroutinefunction(_public(path)) is True
+
+    @pytest.mark.parametrize("path", _PURE)
+    def test_renderers_are_plain_functions(self, path: str) -> None:
+        assert inspect.iscoroutinefunction(_public(path)) is False
+
+    @pytest.mark.parametrize("path", sorted(_SIGNATURES))
+    def test_signature(self, path: str) -> None:
+        assert inspect.signature(_public(path)) == _SIGNATURES[path]
+
+    def test_a_model_subclass_shows_the_same_signatures(self) -> None:
+        for path in _SIGNATURES:
+            if path.startswith("BaseSurrealModel."):
+                method = path.partition(".")[2]
+                assert inspect.signature(getattr(EvMdPerson, method)) == _SIGNATURES[path], method
+
+    @pytest.mark.parametrize("method", _MANAGER_METHODS)
+    def test_manager_methods_are_routed_with_nothing_hidden(self, method: str) -> None:
+        """The current connection's policy, the same coroutine and signature on the router and on a connection class,
+        and the declared signature is the visible one plus ``cls``: ``_routed`` hid no ``name`` (D17)."""
+        function = vars(SurrealDBConnectionManager)[method].__func__
+        assert function.__surreal_routed__ == "current"
+        expected = _SIGNATURES[f"SurrealDBConnectionManager.{method}"]
+        default = SurrealDBConnectionManager._manager_for("default")
+        assert inspect.iscoroutinefunction(getattr(default, method)) is True
+        assert inspect.signature(getattr(default, method)) == expected
+        declared = inspect.signature(inspect.unwrap(function))
+        assert list(declared.parameters)[0] == "cls"
+        assert declared.replace(parameters=list(declared.parameters.values())[1:]) == expected
+        assert "name" not in declared.parameters
+
+    def test_remove_event_takes_event_never_name(self) -> None:
+        """D17: a first ``name`` parameter would be read by ``_routed`` as a connection name and hidden."""
+        visible = inspect.signature(SurrealDBConnectionManager.remove_event).parameters
+        assert list(visible) == ["event", "table", "missing_ok", "tx"]
+        assert "name" not in visible
+        assert [visible[name].kind for name in ("missing_ok", "tx")] == [inspect.Parameter.KEYWORD_ONLY] * 2
+        declared = inspect.signature(inspect.unwrap(vars(SurrealDBConnectionManager)["remove_event"].__func__))
+        assert list(declared.parameters) == ["cls", "event", "table", "missing_ok", "tx"]
+        assert list(inspect.signature(BaseSurrealModel.remove_event).parameters) == ["event", "missing_ok", "tx"]
+
+    def test_events_is_a_config_key(self) -> None:
+        assert "events" in SurrealConfigDict.__annotations__
+        assert SurrealConfigDict.__annotations__["events"] == Sequence[Event] | None
+        assert "events" in SurrealConfigDict.__optional_keys__
 
 
 # === E2E (spec §9.3): the connection "evt" on the database evt_db, over WebSocket and HTTP, and mem:// ================

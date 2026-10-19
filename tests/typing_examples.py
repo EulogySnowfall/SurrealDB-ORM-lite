@@ -28,6 +28,7 @@ from surreal_orm_lite import (
     ConnectionConfig,
     DatabaseIntrospector,
     Duration,
+    Event,
     GeometryCollectionField,
     GeometryField,
     GeometryPoint,
@@ -51,6 +52,7 @@ from surreal_orm_lite import (
     TableState,
     Transaction,
     computed,
+    function_ddl,
     generate_models_from_db,
 )
 from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
@@ -417,6 +419,60 @@ async def introspection_forms() -> None:
     assert_type(IndexState(name="i", fields=["a"]).fields, Sequence[str])
     assert_type(TableState(name="t", relation_in="a | b"), TableState)
     assert_type(AccessState(name="a", signup_fields={"e": "$e"}).signup_fields, Mapping[str, str])
+
+
+class EventfulMember(BaseSurrealModel):
+    """v0.31.0: ``SurrealConfigDict(events=[Event(...)])`` — a sequence of ``Event``, every key still optional."""
+
+    model_config = SurrealConfigDict(
+        table_name="eventful_member",
+        events=[Event("audit", when="$before.name != $after.name", then="CREATE log SET kind = $event")],
+    )
+
+    id: str | None = None
+    name: str
+
+
+async def events_forms(tx: Transaction) -> None:
+    """v0.31.0: ``Event`` and its renderer, the model's events and the manager's DDL appliers are typed; the pure
+    renderers return ``str``/``list[str]``, the appliers coroutines of the statements they applied."""
+    audit = Event("audit", then="CREATE log SET kind = $event")
+    assert_type(audit, Event)
+    assert_type(
+        Event("notify", when="$event = 'CREATE'", then="NONE", async_mode=True, retry=2, max_depth=3, comment="c"),
+        Event,
+    )
+    assert_type(audit.ddl("person"), str)
+    assert_type(audit.ddl("person", overwrite=False), str)
+    assert_type(EventfulMember.get_events(), tuple[Event, ...])
+    assert_type(EventfulMember.event_ddl(), list[str])
+    assert_type(EventfulMember.event_ddl(overwrite=False), list[str])
+    assert_type(await EventfulMember.define_events(), list[str])
+    assert_type(await EventfulMember.define_events(overwrite=False, tx=tx), list[str])
+    assert_type(await EventfulMember.remove_event("x"), str)
+    assert_type(await EventfulMember.remove_event("x", missing_ok=False, tx=tx), str)
+    assert_type(await SurrealDBConnectionManager.define_event(audit, "person"), str)
+    assert_type(await SurrealDBConnectionManager.define_event(audit, "person", overwrite=False, tx=tx), str)
+    assert_type(await SurrealDBConnectionManager.remove_event("audit", "person"), str)
+    assert_type(await SurrealDBConnectionManager.remove_event("audit", "person", missing_ok=False, tx=tx), str)
+    assert_type(await SurrealDBConnectionManager.define_function("fn::greet", "RETURN 'hi';"), str)
+    assert_type(
+        await SurrealDBConnectionManager.define_function(
+            "greet",
+            "RETURN string::concat('Hello ', $name);",
+            parameters={"name": "string", "times": "option<int>"},
+            returns="string",
+            permissions="FULL",
+            comment="Greets",
+            overwrite=False,
+            tx=tx,
+        ),
+        str,
+    )
+    assert_type(await SurrealDBConnectionManager.remove_function("fn::greet"), str)
+    assert_type(await SurrealDBConnectionManager.remove_function("greet", missing_ok=False, tx=tx), str)
+    assert_type(function_ddl("fn::greet", "RETURN $name;", parameters={"name": "string"}, returns="string"), str)
+    assert_type(function_ddl("greet", "RETURN 1;", permissions="WHERE $auth.admin = true", overwrite=False), str)
 
 
 @fixture
