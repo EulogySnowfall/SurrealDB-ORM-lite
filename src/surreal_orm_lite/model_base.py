@@ -2102,6 +2102,9 @@ class BaseSurrealModel(BaseModel):
         Runs ``UPSERT $rid CONTENT $data``, the record id bound as a query parameter: this is
         REPLACE semantics, so any field omitted from the model is removed from the stored
         record. For a partial update use ``merge()`` instead. An explicit id is required.
+        A ``datetime`` written back unchanged keeps the stored nanoseconds, as in :meth:`update`;
+        as there, SurrealDB 2.x refuses to replace an existing record when the model leaves out a
+        field with a non-optional ``TYPE`` and a ``VALUE`` clause, a ``Computed`` one (#267).
 
         When ``tx`` is provided, the ``UPSERT`` is buffered onto the transaction.
 
@@ -2143,6 +2146,11 @@ class BaseSurrealModel(BaseModel):
         change such a record with :meth:`merge`. See
         :func:`~surreal_orm_lite.utils.replace_content`. Without a datetime to keep, the statement
         is the SDK's ``update()``, as before.
+
+        SurrealDB 2.x still refuses a full replace that leaves out a field declared with a
+        non-optional ``TYPE`` and a ``VALUE`` clause, which the model does not write (a
+        ``Computed`` field, such as a generated ``updated: Computed[datetime]``): there, change
+        such a record with :meth:`merge` (#267). SurrealDB 3.x recomputes the field.
 
         Emits pre_update, post_update, and around_update signals. In tx mode,
         ``around_update`` is skipped (the write is deferred to commit) and
