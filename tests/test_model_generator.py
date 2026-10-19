@@ -1729,7 +1729,12 @@ class TestClasses:
             (None, False, _TABLE_PERMISSIONS_NONE, []),
             (None, False, {}, []),
             (None, False, dict.fromkeys(_TABLE_PERMISSIONS_NONE, "FULL"), ["# Permissions: FULL"]),
-            (None, False, dict.fromkeys(_TABLE_PERMISSIONS_NONE, "WHERE a > 1"), ["# Permissions: WHERE a > 1"]),
+            (
+                None,
+                False,
+                dict.fromkeys(_TABLE_PERMISSIONS_NONE, "WHERE a > 1"),
+                ["# Permissions: FOR select, create, update, delete WHERE a > 1"],
+            ),
             (None, False, {"select": "FULL"}, ["# Permissions: FOR select FULL"]),
             (
                 None,
@@ -1749,8 +1754,8 @@ class TestClasses:
     def test_changefeed_and_permissions_comments(
         self, changefeed: str | None, include_original: bool, permissions: dict[str, str], expected: list[str]
     ) -> None:
-        """``PERMISSIONS NONE`` on every operation, the default of a table, writes no comment; one rule for all four
-        operations is written alone, as SurrealDB renders it."""
+        """``PERMISSIONS NONE`` on every operation, the default of a table, writes no comment; ``FULL`` for all four
+        operations is written alone, and one ``WHERE`` rule for all four names them, as SurrealDB renders both."""
         source = _generate(
             changefeed=changefeed, changefeed_include_original=include_original, permissions=permissions, comment="c"
         )

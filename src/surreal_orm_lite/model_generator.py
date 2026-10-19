@@ -1212,17 +1212,18 @@ def _readonly(line: str, field: FieldState) -> str:
 
 
 def _permissions_text(permissions: Mapping[str, str]) -> str | None:
-    """A table's ``PERMISSIONS`` as SurrealDB renders them: ``FULL`` when one rule covers the four operations, else
+    """A table's ``PERMISSIONS`` as SurrealDB renders them: ``FULL`` when ``FULL`` covers the four operations, else
     ``FOR select WHERE …, FOR create, update FULL`` — operations in SurrealQL's order, grouped by rule in the order the
-    rules first appear. ``None`` when there is none, or every rule is ``NONE`` (a table's default)."""
+    rules first appear, so one ``WHERE`` rule for all four reads ``FOR select, create, update, delete WHERE …``.
+    ``None`` when there is none, or every rule is ``NONE`` (a table's default)."""
     if all(rule == "NONE" for rule in permissions.values()):
         return None
     order = {operation: position for position, operation in enumerate(_OPERATIONS)}
     groups: dict[str, list[str]] = {}
     for operation in sorted(permissions, key=lambda operation: (order.get(operation, len(order)), operation)):
         groups.setdefault(permissions[operation], []).append(operation)
-    if len(groups) == 1 and permissions.keys() == order.keys():
-        return next(iter(groups))
+    if set(groups) == {"FULL"} and permissions.keys() == order.keys():
+        return "FULL"
     return ", ".join("FOR " + ", ".join(operations) + " " + rule for rule, operations in groups.items())
 
 

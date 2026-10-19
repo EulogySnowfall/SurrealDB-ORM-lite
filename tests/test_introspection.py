@@ -1235,12 +1235,14 @@ DEFINE PARAM $isp_endpoint VALUE 'https://example.com';
 #: The fixture's tables, in codepoint order.
 _FIXTURE_TABLES = ["isp-weird", "isp_company", "isp_likes", "isp_log", "isp_person", "select"]
 
-#: Two tables with a change feed and permissions other than the default ``NONE``.
+#: Tables with a change feed or permissions other than the default ``NONE`` — ``isp_owned`` has one ``WHERE`` rule
+#: for the four operations, which SurrealDB renders ``FOR select, create, update, delete WHERE …``.
 _FEED_DDL = """
 DEFINE TABLE isp_feed SCHEMAFULL CHANGEFEED 1d INCLUDE ORIGINAL
     PERMISSIONS FOR select WHERE $auth.id = owner, FOR create, update FULL, FOR delete NONE;
 DEFINE FIELD owner ON isp_feed TYPE option<record>;
 DEFINE TABLE isp_open SCHEMALESS CHANGEFEED 3h PERMISSIONS FULL;
+DEFINE TABLE isp_owned SCHEMAFULL PERMISSIONS FOR select, create, update, delete WHERE $auth.id = owner;
 """
 
 #: The module generated from ``_FEED_DDL`` on SurrealDB 3.x, 2.x and the embedded engine.
@@ -1266,6 +1268,13 @@ class IspOpen(BaseSurrealModel):
     # Permissions: FULL
     # SCHEMALESS: fields not declared here are kept (extra="allow")
     model_config = SurrealConfigDict(table_name="isp_open", connection="isp", extra="allow")
+
+    id: str | None = None
+
+
+class IspOwned(BaseSurrealModel):
+    # Permissions: FOR select, create, update, delete WHERE $auth.id = owner
+    model_config = SurrealConfigDict(table_name="isp_owned", connection="isp")
 
     id: str | None = None
 """
