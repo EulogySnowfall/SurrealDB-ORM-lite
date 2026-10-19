@@ -3862,8 +3862,8 @@ class TestQueryCacheDocs:
     roadmap say about the query cache (spec §11, AC-14; P1, P2, P3, P5)."""
 
     def test_section_29_follows_section_28(self) -> None:
-        """Right after section 28 (after its "Coming from" bullets), then section 30 (v0.29.0) and section 31
-        (v0.30.0), and before the ``---`` of "Configuration Options"."""
+        """Right after section 28 (after its "Coming from" bullets), then section 30 (v0.29.0), section 31
+        (v0.30.0) and section 32 (v0.31.0), and before the ``---`` of "Configuration Options"."""
         readme = _readme()
         start_28 = readme.index(f"\n{_SECTION_28}\n")
         start_29 = readme.index(f"\n{_SECTION_29}\n")
@@ -3874,6 +3874,7 @@ class TestQueryCacheDocs:
             _SECTION_29,
             "### 30. Multiple databases (`add_connection()`, `using()`)",
             "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
+            "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "section 29 ends before the --- of the next part"
 

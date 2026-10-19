@@ -2286,7 +2286,7 @@ _COMING_FROM_31 = [
     "- **Generated models use comments** where the full ORM writes `SurrealConfigDict(permissions=…, changefeed=…, "
     "view_query=…, relation_in=…, relation_out=…, enforced=…)` (`# Permissions: …`, `# Changefeed: …`, "
     "`# View: AS …`, `# IN … OUT … ENFORCED`), and the base class where it writes `table_type=` (`BaseSurrealEdge` "
-    "for a relation table): those keys arrive in the lite's `SurrealConfigDict` with v0.31.0–v0.33.0. `READONLY` is "
+    "for a relation table): those keys arrive in the lite's `SurrealConfigDict` with v0.32.0–v0.34.0. `READONLY` is "
     "a comment too (full ORM: `Field(readonly=True)`).",
     "- **`RecordID` instead of `ForeignKey`/`ReferencesField`**; no `VectorField` or `Encrypted`; `computed()` "
     "instead of `Computed()`; `Duration`, `UUID`, `Decimal` and the geometry classes instead of `str`, `dict` and "
@@ -2363,7 +2363,8 @@ _FEATURES_ROW_31 = ["Schema introspection (`DatabaseIntrospector`, `generate_mod
 _ROADMAP_ROWS_31 = [
     ["v0.29.0", "Tier 2 — Multi-database", "✅ Released"],
     ["v0.30.0", "Tier 3 — Schema introspection", "✅ Released"],
-    ["v0.31.0 – v0.39.0", "Tier 3 — Advanced (search, DDL, migrations, CLI)", "📋 Planned"],
+    ["v0.31.0", "Tier 3 — Server-side events and DDL helpers", "✅ Released"],
+    ["v0.32.0 – v0.39.0", "Tier 3 — Advanced (search, DDL, migrations, CLI)", "📋 Planned"],
 ]
 _COMPARISON_ROW_31 = ["Schema Introspection", "✅ v0.30.0 (`DatabaseIntrospector`, `generate_models_from_db()`)", "✅"]
 #: Spec §11.1 item 5: the six rows v0.30.0 adds to the 2.x/3.x table, cell by cell, then the row of a regex the two
@@ -2554,7 +2555,8 @@ class TestReadmeSection31:
     roadmap, comparison and both behaviour tables (spec §11.1 items 2–6)."""
 
     def test_section_31_follows_section_30(self) -> None:
-        """Right after section 30 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        """Right after section 30 (after its "Coming from" bullets), then section 32 (v0.31.0), and before the
+        ``---`` of "Configuration Options"."""
         readme = _readme()
         start_30 = readme.index(f"\n{_SECTION_30}\n")
         start_31 = readme.index(f"\n{_SECTION_31}\n")
@@ -2563,8 +2565,9 @@ class TestReadmeSection31:
         assert re.findall(r"^#{2,3} .*$", readme[start_30 + 1 : configuration], re.MULTILINE) == [
             _SECTION_30,
             _SECTION_31,
+            "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
         ]
-        assert readme[:configuration].rstrip().endswith("\n---"), "section 31 ends before the --- of the next part"
+        assert readme[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
     def test_subsections_in_order(self) -> None:
         assert re.findall(r"^#### (.*)$", _section_31(), re.MULTILINE) == _SUBSECTIONS_31
@@ -2647,8 +2650,8 @@ class TestReadmeSection31:
     def test_roadmap_rows(self) -> None:
         roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
         start = [cells[0] for cells in roadmap].index("v0.29.0")
-        assert roadmap[start : start + 3] == _ROADMAP_ROWS_31, roadmap
-        assert roadmap[start + 3][0] == "v0.40.0", roadmap
+        assert roadmap[start : start + 4] == _ROADMAP_ROWS_31, roadmap
+        assert roadmap[start + 4][0] == "v0.40.0", roadmap
 
     def test_comparison_row(self) -> None:
         """Spec §11.1 item 4: the label stays ``Schema Introspection``, the lite cell names the API, the full ORM's
@@ -2658,8 +2661,8 @@ class TestReadmeSection31:
         assert comparison[firsts.index("Multi-database") + 1] == _COMPARISON_ROW_31, comparison
 
     def test_server_behaviour_rows(self) -> None:
-        """Spec §11.1 item 5: seven rows, Since v0.30.0, right after the v0.29.2 row; only rows of later versions (#261's)
-        between them and the table's last row."""
+        """Spec §11.1 item 5: seven rows, Since v0.30.0, right after the v0.29.2 row; only rows of later versions
+        (v0.30.x follow-ups, v0.31.0 and after) between them and the table's last row."""
         rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
         start = rows.index(_INTROSPECTION_ROWS[0])
         count = len(_INTROSPECTION_ROWS)
@@ -2684,10 +2687,12 @@ class TestReadmeSection31:
         assert f"{v0292} {_HEADER_SENTENCE_30}" in header, header
 
     def test_embedded_table_row(self) -> None:
-        """Spec §11.1 item 6: all four cells, right before the catch-all "Everything else" row; widths kept."""
+        """Spec §11.1 item 6: all four cells, before the v0.31.0 row and the catch-all "Everything else" row; widths
+        kept."""
         part = _readme_part(_EMBEDDED_BEHAVIOUR)
         rows = [cells for _, cells in _table_rows(part)]
-        assert rows[-2] == _EMBEDDED_INTROSPECTION_ROW, rows[-2]
+        assert _EMBEDDED_INTROSPECTION_ROW in rows, rows
+        assert rows.index(_EMBEDDED_INTROSPECTION_ROW) < len(rows) - 2, rows
         assert rows[-1][0] == "Everything else", rows[-1]
         [lines] = _tables(part)
         assert {len(line) for line in lines} == {539}

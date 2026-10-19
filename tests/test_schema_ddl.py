@@ -24,12 +24,14 @@ refused, and every definition read back by the schema introspection on each line
 AC-11, AC-12, AC-15).
 """
 
+import ast
 import asyncio
 import contextlib
 import dataclasses
 import inspect
 import os
 import pickle
+import re
 from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
 from typing import Any
 
@@ -71,8 +73,21 @@ from surreal_orm_lite.schema import (
     remove_event_statement,
     remove_function_statement,
 )
+from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import apply_ddl_statements
 from tests.conftest import default_connection_class
+from tests.test_embedded import (
+    _EMBEDDED_BEHAVIOUR,
+    _cells,
+    _normalised,
+    _readme,
+    _readme_part,
+    _subsection,
+    _table_rows,
+)
+from tests.test_embedded import _tables as _md_tables
+from tests.test_query_cache import _bullets
+from tests.test_time_travel import _SERVER_BEHAVIOUR, _SERVER_TABLE_WIDTHS
 
 # The fixed DefineParseError reasons, written out: the tests pin the exact texts.
 _R_BRACKETS = "its brackets are not balanced"
@@ -2749,3 +2764,545 @@ class TestRoundTripE2E:
             3,
         )
         assert event.raw == _EV_ASYNC_INFO_3X
+
+
+# --- README: section 32, section 17 and the tables (spec §11.1; AC-17) ----------------------------------------------
+
+_SECTION_17 = "### 17. Stored functions: `call_function()`"
+_SECTION_31 = "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
+_SECTION_32 = "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)"
+#: Spec §11.1 item 1: section 32's subsections, in order, after an untitled intro paragraph.
+_SUBSECTIONS_32 = [
+    "Declaring events on a model",
+    "Events without a model",
+    "Asynchronous events (SurrealDB 3.x)",
+    "Stored functions: `define_function()`",
+    "Transactions, connections and the query cache",
+    "SurrealDB 2.x and 3.x",
+    "Security",
+    "Coming from the full SurrealDB-ORM",
+]
+#: Spec §11.1 item 1, example A, exactly: it opens "Declaring events on a model".
+_EXAMPLE_A = """\
+from surrealdb import ServerError
+
+from surreal_orm_lite import BaseSurrealModel, Event, SurrealConfigDict, SurrealDBConnectionManager
+
+
+class Account(BaseSurrealModel):
+    model_config = SurrealConfigDict(
+        table_name="account",
+        events=[
+            Event(
+                "email_audit",
+                when="$event = 'UPDATE' AND $before.email != $after.email",
+                then="CREATE audit_log SET account = $value.id, old = $before.email, new = $after.email",
+                comment="Keeps every e-mail change",
+            ),
+            Event("no_negative_balance", when="$after.balance < 0", then="THROW 'balance cannot be negative'"),
+        ],
+    )
+
+    id: str | None = None
+    email: str
+    balance: int = 0
+
+
+for statement in Account.event_ddl():
+    print(statement)
+# DEFINE EVENT OVERWRITE `email_audit` ON `account` WHEN $event = 'UPDATE' AND $before.email != $after.email THEN { CREATE audit_log SET account = $value.id, old = $before.email, new = $after.email } COMMENT 'Keeps every e-mail change';
+# DEFINE EVENT OVERWRITE `no_negative_balance` ON `account` WHEN $after.balance < 0 THEN { THROW 'balance cannot be negative' };
+
+await Account.define_events()  # idempotent (OVERWRITE): run it at start-up
+
+account = Account(id="ada", email="ada@old.example", balance=10)
+await account.save()
+await account.merge(email="ada@new.example")
+client = await SurrealDBConnectionManager.get_client()
+print(await client.query("SELECT old, new FROM audit_log;", {}))
+# [{'new': 'ada@new.example', 'old': 'ada@old.example'}]
+
+try:
+    await account.merge(balance=-5)
+except ServerError as exc:  # the event refused the write: nothing changed
+    print(type(exc).__name__)
+# InternalError
+"""
+#: Example B, exactly: it opens "Events without a model".
+_EXAMPLE_B = """\
+stock_guard = Event("stock_guard", when="$after.stock < 0", then="THROW 'stock cannot go below zero'")
+print(await SurrealDBConnectionManager.define_event(stock_guard, "product"))
+# DEFINE EVENT OVERWRITE `stock_guard` ON `product` WHEN $after.stock < 0 THEN { THROW 'stock cannot go below zero' };
+
+await SurrealDBConnectionManager.remove_event("stock_guard", "product")
+await Account.remove_event("no_negative_balance")  # declared or not: removal is by name
+"""
+#: Example C, exactly: it opens "Asynchronous events (SurrealDB 3.x)"; on ``mem://`` it prints C1.
+_EXAMPLE_C = """\
+from surreal_orm_lite import SurrealDbError
+
+notify = Event(
+    "notify_shipping",
+    when="$event = 'CREATE'",
+    then="CREATE outbox SET shipment = $value.id, at = time::now()",
+    async_mode=True,
+    retry=3,
+)
+print(notify.ddl("shipment"))
+# DEFINE EVENT OVERWRITE `notify_shipping` ON `shipment` ASYNC RETRY 3 WHEN $event = 'CREATE' THEN { CREATE outbox SET shipment = $value.id, at = time::now() };
+
+try:
+    await SurrealDBConnectionManager.define_event(notify, "shipment")
+except SurrealDbError as exc:  # the embedded engine is a 2.x core, like a SurrealDB 2.x server
+    print(exc)
+# ASYNC events need SurrealDB 3.x, and this connection runs the embedded engine (a SurrealDB 2.x core): 'notify_shipping' cannot be defined with async_mode=True. Drop async_mode, retry and max_depth, or connect to a SurrealDB 3.x server. Nothing was defined.
+"""
+#: Example D, exactly: it opens "Stored functions: `define_function()`".
+_EXAMPLE_D = """\
+await SurrealDBConnectionManager.define_function(
+    "fn::greet",
+    "RETURN string::concat('Hello, ', $name, '!');",
+    parameters={"name": "string"},
+    returns="string",
+    comment="Says hello",
+)
+print(await SurrealDBConnectionManager.call_function("fn::greet", ["Ada"]))
+# Hello, Ada!
+
+await SurrealDBConnectionManager.define_function(
+    "fn::greet",
+    "RETURN string::concat($greeting, ', ', $name, '!');",
+    parameters={"greeting": "string", "name": "string"},
+    returns="string",
+)
+print(await SurrealDBConnectionManager.call_function("fn::greet", params={"name": "Ada", "greeting": "Hi"}))
+# Hi, Ada!
+
+await SurrealDBConnectionManager.remove_function("fn::greet")
+"""
+_EXAMPLES_32 = [_EXAMPLE_A, _EXAMPLE_B, _EXAMPLE_C, _EXAMPLE_D]
+#: Spec §8 and §11.1 item 1 (D18, binding): the sentence the "Security" subsection carries, whitespace normalised.
+_D18_SENTENCE = (
+    "The check catches mistakes — unbalanced brackets, a comment that would swallow the clauses the ORM appends, a "
+    "second statement where one expression is expected — and is not an injection defence: expressions are trusted "
+    "application code, never user input."
+)
+#: Spec §11.1 item 1: what the intro and each subsection must mention.
+_INTRO_NEEDLES_32 = (
+    "`SurrealConfigDict(events=[…])`",
+    "`call_function()`",
+    "section 31",
+    "`$input`",
+    "2.x",
+    "3.x",
+    "`mem://`",
+)
+_PART_NEEDLES_32 = {
+    "Declaring events on a model": (
+        "`{ … }`",
+        "`LET`",
+        "`THROW`",
+        "`WHEN true`",
+        "`$event`",
+        "`$before`",
+        "`$after`",
+        "`$value`",
+        "`$input`",
+        "columns",
+        "`Field(alias=…)`",
+        "`update`",
+        "`DEFINE EVENT OVERWRITE`",
+        "`overwrite=False`",
+        "`IF NOT EXISTS`",
+        "`tx=`",
+        "`event_ddl()`",
+        '`Account.remove_event("email_audit")`',
+        "`missing_ok=False`",
+        "`SurrealDbNotFoundError`",
+        "v0.37.0",
+        "`BaseSurrealEdge`",
+        "`SCHEMALESS`",
+        "`InternalError`",
+        "signal",
+    ),
+    "Events without a model": (
+        "`SurrealDBConnectionManager.define_event(event, table)`",
+        "`remove_event(event, table)`",
+        "`using()`",
+        '`"default"`',
+        "`event.ddl(table)`",
+        "`repr()`",
+    ),
+    "Asynchronous events (SurrealDB 3.x)": (
+        "`ASYNC`",
+        "`RETRY`",
+        "`MAXDEPTH`",
+        "commits",
+        "cancelled",
+        "`retry`",
+        "`max_depth`",
+        "`0` to `65535`",
+        "`async_mode=True`",
+        "`EventState`",
+        "`SurrealDbError`",
+        "before sending anything",
+        "`event.ddl()`",
+    ),
+    "Stored functions: `define_function()`": (
+        "`call_function()`",
+        '`"fn::billing::total"`',
+        "positional",
+        "canonical form",
+        "`option<int>`",
+        "`none | int`",
+        "never rewritten",
+        "`returns`",
+        '`"FULL"`',
+        '`"NONE"`',
+        '`"WHERE <condition>"`',
+        "`remove_function()`",
+        "`function_ddl()`",
+        "`clear_function_signature_cache()`",
+        "Can't apply function definition",
+    ),
+    "Transactions, connections and the query cache": (
+        "`tx=`",
+        "buffered",
+        "interactive",
+        "a block that raises leaves nothing defined",
+        "positional `args`",
+        "`connection`",
+        "`using()`",
+        "system user",
+        "`SurrealDbAuthenticationError`",
+        "`watch()`",
+        "`QueryCache.invalidate(Model)`",
+        "signal",
+    ),
+    "SurrealDB 2.x and 3.x": (
+        "`ASYNC`",
+        "`$input`",
+        "`NONE`",
+        "`upsert()`",
+        "`UPDATE`",
+        "`none | int`",
+        "`option<int>`",
+    ),
+    "Security": (
+        "identifiers",
+        "quoted",
+        "escaped",
+        "`--`",
+        "`#`",
+        "`//`",
+        "`/* */`",
+        "NUL",
+        "every `/`",
+        "`$after.email`",
+        "`DEFINE PARAM`",
+        "canonical form",
+        "`repr()`",
+        "system user",
+    ),
+}
+#: Spec §11.1 item 1: one key phrase per "Coming from the full SurrealDB-ORM" bullet, in order.
+_COMING_FROM_PHRASES_32 = (
+    "`DefineEvent(name, table, when, then, comment)`",
+    "`Event(…, async_mode=True, retry=3)`",
+    "`then` is a block",
+    "comments escaped with a backslash",
+    "`define_function()` has no full-ORM equivalent",
+    "come with migrations (v0.37.0)",
+)
+#: Spec §11.1 items 3–5: the features row, the roadmap split and the comparison rows.
+_FEATURES_ROW_32 = ["Server-side events & function DDL (`Event`, `define_function()`)", "✅"]
+_ROADMAP_ROWS_32 = [
+    ["v0.30.0", "Tier 3 — Schema introspection", "✅ Released"],
+    ["v0.31.0", "Tier 3 — Server-side events and DDL helpers", "✅ Released"],
+    ["v0.32.0 – v0.39.0", "Tier 3 — Advanced (search, DDL, migrations, CLI)", "📋 Planned"],
+    ["v0.40.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+]
+_COMPARISON_ROWS_32 = [
+    ["Schema Introspection", "✅ v0.30.0 (`DatabaseIntrospector`, `generate_models_from_db()`)", "✅"],
+    ["DEFINE EVENT", "✅ v0.31.0 (`Event`, `define_events()`, `ASYNC` on 3.x)", "✅ migrations (`DefineEvent`)"],
+    ["`define_function()` (DDL)", "✅ v0.31.0", "❌"],
+    ["Materialized views", "v0.32.0", "✅"],
+]
+#: Spec §11.1 item 6 (D14): exactly seven rows v0.31.0 adds to the 2.x/3.x table, cell by cell.
+_EVENT_ROWS = [
+    [
+        "Server-side events (`define_events()`, `define_event()`, `remove_event()`)",
+        "same on both lines: defined, fired on `CREATE`, `UPDATE` and `DELETE`, `WHEN` honoured; `$event`, `$before`, "
+        "`$after`, `$value` alike",
+        "the same; names are quoted, so `update` or `delete` work as event names (3.x refuses them bare)",
+        "v0.31.0",
+    ],
+    [
+        "Asynchronous events (`Event(async_mode=True, retry=…, max_depth=…)`)",
+        "`SurrealDbError` before any DDL: 2.x cannot parse `ASYNC`",
+        "run after the write's transaction commits, never for a cancelled one; read back with `async_mode`, `retry`, "
+        "`max_depth`",
+        "v0.31.0",
+    ],
+    ["`$input` in an event", "`NONE`", "the fields the write sent (`{ name: 'a' }` for `SET name = 'a'`)", "v0.31.0"],
+    [
+        "A write that changes nothing, on a table with an event",
+        "fires no event",
+        "fires no event, except an `UPSERT` (the ORM's `upsert()`): one `UPDATE` event",
+        "v0.31.0",
+    ],
+    [
+        "An event whose `THEN` fails (a `THROW`, an error)",
+        "the write is refused; the SDK's `InternalError` (`An error occurred: …`)",
+        "the write is refused; the SDK's `InternalError` (`Error while processing event <name>: …`)",
+        "v0.31.0",
+    ],
+    [
+        "Event and function definitions read back (`EventState`, `FunctionState`)",
+        "a block on several lines, each statement ending with `;`; `option<T>` parameters as written",
+        "a block on one line, no `;` after a single statement; optional parameters rendered with `none` first",
+        "v0.31.0",
+    ],
+    [
+        "`define_function()`, `remove_function()` and `call_function()`",
+        "same on both lines: the next `call_function()` sees a redefinition (the signature cache is dropped)",
+        "the same",
+        "v0.31.0",
+    ],
+]
+_HEADER_SENTENCE_303 = (
+    "The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded "
+    "engine, identical on 3.1.5."
+)
+_HEADER_SENTENCE_31 = "Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5."
+#: Spec §11.1 item 7: the row v0.31.0 adds to the embedded-engine table, cell by cell.
+_EMBEDDED_EVENTS_ROW = [
+    "Server-side events and stored functions (v0.31.0)",
+    "as on a 2.x server: `$input` is `NONE`; `Event(async_mode=True)` raises `SurrealDbError` before any DDL",
+    "`ASYNC` events on 3.x",
+    "v0.31.0",
+]
+#: Spec §11.1 item 8: section 17's signature-cache paragraph, whitespace normalised.
+_SIGNATURE_CACHE_32 = (
+    "Signature caching is transparent. `define_function()` and `remove_function()` "
+    "([section 32](#32-server-side-events-and-stored-functions-event-define_events-define_function)) drop the "
+    "function's cached signature themselves, so the next call sees a redefinition made through them at once, even "
+    "one that only changes the order of the same parameter names. For a function redefined out of band, with raw DDL "
+    '(`client.query("DEFINE FUNCTION …")`), two helpers are available: '
+    "`SurrealDBConnectionManager.clear_function_signature_cache()` and `function_signature_cache_size()`. The cache "
+    "is keyed by URL, namespace and database, so `set_url()`, `set_namespace()` and `set_database()` cannot serve a "
+    "signature read elsewhere; it is cleared outright by `set_connection()` and `unset_connection()`. After a raw-DDL "
+    "redefinition, a signature whose parameter _names_ changed self-heals on its own — but one with the **same names "
+    "in a different order** cannot be detected, since `params=` is a mapping and carries no order to compare "
+    "against: call `clear_function_signature_cache()`, or `params=` keeps binding in the stale order."
+)
+
+
+def _section_32() -> str:
+    return _readme_part(_SECTION_32)
+
+
+def _part_32(heading: str) -> str:
+    """One ``####`` subsection of section 32, as written."""
+    return _subsection(f"#### {heading}", _section_32())
+
+
+def _python_blocks(text: str) -> list[str]:
+    """The ``python`` blocks of *text*, in order."""
+    blocks: list[str] = re.findall(r"^```python\n(.*?)^```$", text, re.MULTILINE | re.DOTALL)
+    return blocks
+
+
+def _printed(block: str) -> list[str]:
+    """What a section 32 example prints: its comment lines that start a line (``# <printed line>``), in order."""
+    return re.findall(r"^# (.*)$", block, re.MULTILINE)
+
+
+def _anchor(heading: str) -> str:
+    """GitHub's anchor of a README heading: lower case, punctuation but ``-`` and ``_`` dropped, spaces as ``-``."""
+    return re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-")
+
+
+class TestReadmeSection32:
+    """AC-17: README section 32 — its place, subsections, examples (run on ``mem://`` as written, each printed line
+    equal to its comment), the Security wording (D18) and the canonical kinds (P1) — section 17's first example and
+    signature-cache paragraph, the generated-models bullet, and the features, roadmap, comparison and both behaviour
+    tables (spec §11.1)."""
+
+    def test_section_32_follows_section_31(self) -> None:
+        """Right after section 31 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        readme = _readme()
+        start_31 = readme.index(f"\n{_SECTION_31}\n")
+        start_32 = readme.index(f"\n{_SECTION_32}\n")
+        configuration = readme.index("\n## Configuration Options\n")
+        assert start_31 < start_32 < configuration
+        assert re.findall(r"^#{2,3} .*$", readme[start_31 + 1 : configuration], re.MULTILINE) == [
+            _SECTION_31,
+            _SECTION_32,
+        ]
+        assert readme[:configuration].rstrip().endswith("\n---"), "section 32 ends before the --- of the next part"
+
+    def test_subsections_in_order(self) -> None:
+        assert re.findall(r"^#### (.*)$", _section_32(), re.MULTILINE) == _SUBSECTIONS_32
+
+    def test_the_spec_examples_open_their_subsections(self) -> None:
+        """Examples A–D exactly, each the first block of its subsection, and no other block; ``python`` fences only."""
+        assert _python_blocks(_section_32()) == _EXAMPLES_32
+        for heading, example in zip(_SUBSECTIONS_32, _EXAMPLES_32, strict=False):
+            part = _part_32(heading)
+            assert _python_blocks(part)[0] == example, heading
+            assert part.split("\n\n", 1)[1].startswith(f"```python\n{example}```"), heading
+        fences = re.findall(r"^```(\S*)$", _section_32(), re.MULTILINE)
+        assert fences == ["python", ""] * len(_EXAMPLES_32), fences
+
+    def test_intro_paragraph(self) -> None:
+        intro = _normalised(_section_32().split("\n#### ", 1)[0])
+        missing = [needle for needle in _INTRO_NEEDLES_32 if needle not in intro]
+        assert not missing, missing
+
+    @pytest.mark.parametrize("heading", list(_PART_NEEDLES_32))
+    def test_what_each_subsection_says(self, heading: str) -> None:
+        text = _normalised(_part_32(heading))
+        missing = [needle for needle in _PART_NEEDLES_32[heading] if needle not in text]
+        assert not missing, missing
+
+    def test_security_wording(self) -> None:
+        """D18: the binding sentence, and no stronger claim about fragments."""
+        text = _normalised(_part_32("Security"))
+        assert _D18_SENTENCE in text, text
+        for claim in ("cannot inject", "cannot close", "boundary", "sound"):
+            assert claim not in _normalised(_section_32()), claim
+
+    def test_kinds_are_written_in_canonical_form(self) -> None:
+        """P1: the functions prose says kinds are written in canonical form, with ``option<int>`` as the example."""
+        text = _normalised(_part_32("Stored functions: `define_function()`"))
+        assert "written in canonical form" in text, text
+        assert text.index("canonical form") < text.index("`option<int>`"), text
+
+    def test_coming_from_the_full_orm(self) -> None:
+        """One key phrase per bullet, in order."""
+        bullets = _bullets(_part_32("Coming from the full SurrealDB-ORM"))
+        assert len(bullets) == len(_COMING_FROM_PHRASES_32), bullets
+        for bullet, phrase in zip(bullets, _COMING_FROM_PHRASES_32, strict=True):
+            assert phrase in bullet, (phrase, bullet)
+        assert "`RemoveEvent(name, table)`" in bullets[0] and ".remove_event(event, table)`" in bullets[0]
+
+    def test_links_resolve(self) -> None:
+        """Every in-page link of section 32 and of section 17's new paragraph names a heading of the README."""
+        anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
+        links = re.findall(r"\]\(#([^)]+)\)", _section_32() + _readme_part(_SECTION_17))
+        assert links, "section 32 links to sections 17 and 31"
+        assert [link for link in links if link not in anchors] == []
+
+    def test_features_row(self) -> None:
+        features = [cells for _, cells in _table_rows(_readme_part("## Features"))]
+        firsts = [cells[0] for cells in features]
+        assert _FEATURES_ROW_32 in features, features
+        introspection = "Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
+        assert firsts.index(_FEATURES_ROW_32[0]) == firsts.index(introspection) + 1
+
+    def test_roadmap_rows(self) -> None:
+        roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
+        start = [cells[0] for cells in roadmap].index("v0.30.0")
+        assert roadmap[start : start + 4] == _ROADMAP_ROWS_32, roadmap
+
+    def test_comparison_rows(self) -> None:
+        """The DEFINE EVENT row filled in and a ``define_function()`` row after it, between the introspection row and
+        the materialized views."""
+        comparison = [cells for _, cells in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        start = [cells[0] for cells in comparison].index("Schema Introspection")
+        assert comparison[start : start + 4] == _COMPARISON_ROWS_32, comparison
+
+    def test_server_behaviour_rows(self) -> None:
+        """Exactly seven rows, Since v0.31.0, right after the last v0.30.0 row and before the table's last row."""
+        rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
+        start = rows.index(_EVENT_ROWS[0])
+        assert rows[start : start + len(_EVENT_ROWS)] == _EVENT_ROWS, rows[start : start + len(_EVENT_ROWS)]
+        assert rows[start - 1][3] == "v0.30.0", rows[start - 1]
+        assert start + len(_EVENT_ROWS) == len(rows) - 1 and rows[-1][3] == "v0.19.1", rows[-1]
+        assert [cells for cells in rows if cells[3] == "v0.31.0"] == _EVENT_ROWS
+
+    def test_server_behaviour_table_keeps_its_widths(self) -> None:
+        """Every line 535 characters, the columns 136, 175, 181 and 38 wide: the new rows are padded to them."""
+        [lines] = _md_tables(_readme_part(_SERVER_BEHAVIOUR))
+        assert {len(line) for line in lines} == {535}
+        for line in lines:
+            assert [len(cell) for cell in line.split("|")[1:-1]] == _SERVER_TABLE_WIDTHS, line
+
+    def test_server_behaviour_header_sentence(self) -> None:
+        """The sentence v0.31.0 appends to the table's intro paragraph, after v0.30.3's."""
+        header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
+        assert f"{_HEADER_SENTENCE_303} {_HEADER_SENTENCE_31}" in header, header
+
+    def test_embedded_table_row(self) -> None:
+        """All four cells, right before the catch-all "Everything else" row; widths kept (69, 343, 113, 9)."""
+        part = _readme_part(_EMBEDDED_BEHAVIOUR)
+        rows = [cells for _, cells in _table_rows(part)]
+        assert rows[-2] == _EMBEDDED_EVENTS_ROW, rows[-2]
+        assert rows[-3][0] == "Schema introspection (`DatabaseIntrospector`)", rows[-3]
+        assert rows[-1][0] == "Everything else", rows[-1]
+        [lines] = _md_tables(part)
+        assert {len(line) for line in lines} == {539}
+        for line in lines:
+            assert [len(cell) for cell in line.split("|")[1:-1]] == [69, 343, 113, 9], line
+
+    def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
+        """Every table v0.31.0 touches keeps one cell count per line and no escaped pipe."""
+        parts = [
+            _readme_part("## Features"),
+            _readme_part(_SERVER_BEHAVIOUR),
+            _readme_part(_EMBEDDED_BEHAVIOUR),
+            _readme_part("## Roadmap"),
+            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+        ]
+        tables = [lines for part in parts for lines in _md_tables(part)]
+        assert len(tables) == len(parts)
+        assert _md_tables(_section_32()) == [], "section 32 has no table"
+        for lines in tables:
+            assert len({len(_cells(line)) for line in lines}) == 1 and "\\|" not in "".join(lines), lines
+
+    def test_signature_cache_paragraph(self) -> None:
+        """Spec §11.1 item 8: a redefinition through ``define_function()``/``remove_function()`` is followed at once;
+        only raw DDL still needs ``clear_function_signature_cache()``."""
+        paragraphs = [_normalised(paragraph) for paragraph in _readme_part(_SECTION_17).split("\n\n")]
+        assert _SIGNATURE_CACHE_32 in paragraphs, [p for p in paragraphs if p.startswith("Signature caching")]
+
+    async def test_section_17_declares_its_function_with_define_function(self) -> None:
+        """Spec §11.1 item 2: the first example declares ``fn::acquire_lock`` with ``define_function()``; run on
+        ``mem://`` up to its positional call, which returns the function's object."""
+        section = _readme_part(_SECTION_17)
+        block = _python_blocks(section)[0]
+        assert 'await SurrealDBConnectionManager.define_function(\n    "fn::acquire_lock",' in block, block
+        assert "client.query(" not in block and "lands in v0.31.0" not in section
+        module = ast.parse(block)
+        # The last statement calls a function the example does not define (``billing::total``).
+        assert "billing::total" in ast.unparse(module.body[-1])
+        module.body = module.body[:-1]
+        compiled = compile(module, "<README section 17>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+        namespace: dict[str, Any] = {"__name__": "readme_section_17"}
+        try:
+            async with embedded_database():
+                # A doctest of this repository's own README (trusted text), top-level awaits included.
+                outcome = eval(compiled, namespace)
+                if inspect.iscoroutine(outcome):
+                    await outcome
+                assert namespace["lock"] == {"acquired": True, "holder": "pod-a"}
+        finally:
+            namespace.clear()
+
+    async def test_section_32_examples(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-17: every ``python`` block runs as written, in order and in one namespace, on ``mem://`` (inside
+        ``embedded_database()``); what each block prints is, line by line, its ``# `` comment lines."""
+        capsys.readouterr()
+        namespace: dict[str, Any] = {"__name__": "readme_section_32"}
+        try:
+            async with embedded_database():
+                for code in _python_blocks(_section_32()):
+                    compiled = compile(code, "<README section 32>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                    # A doctest of this repository's own README (trusted text), top-level awaits included.
+                    outcome = eval(compiled, namespace)
+                    if inspect.iscoroutine(outcome):
+                        await outcome
+                    assert capsys.readouterr().out.splitlines() == _printed(code), code
+        finally:
+            namespace.clear()
