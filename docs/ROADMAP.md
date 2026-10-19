@@ -337,7 +337,9 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   therefore `AuthTokens.refresh` and `signin(refresh=)` — 2.6.x cannot parse the clause, and
   those tests self-skip. Refresh tokens **rotate**: a spent one is rejected immediately
 - Model-level auth (`AuthenticatedUserMixin`, `User.signup()` returning an instance) is v0.17.0;
-  a `define_access()` DDL helper belongs with `schema.py` at v0.31.0
+  a `define_access()` DDL helper belongs with `schema.py` at v0.31.0 — v0.31.0 ships none: the
+  v0.17.0 model method `define_access()` stays the way to apply `DEFINE ACCESS`, and the full
+  ORM's `DefineAccess` operation comes with migrations (v0.37.0)
 
 ### Version 0.19.0 — Live queries (base)
 
