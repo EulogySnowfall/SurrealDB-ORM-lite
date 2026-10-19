@@ -14,7 +14,11 @@ E2E tests (classes suffixed ``E2E``) on the line under test over WebSocket and H
 connection ``"evt"`` on the database ``evt_db``, reset before each test (spec §9.3) — events applied and removed from a
 model and from the manager, fired by ORM and raw writes, ``ASYNC`` events on 3.x and refused before any DDL on 2.x and
 the embedded engine, the per-line facts (``$input``, an unchanged ``upsert()``), server refusals classified, names
-refused before any request and comments read back (spec §5.3, §5.4; AC-5, AC-6, AC-7, AC-13, AC-15).
+refused before any request and comments read back (spec §5.3, §5.4; AC-5, AC-6, AC-7, AC-13, AC-15); events applied
+with ``tx=`` on both transaction strategies and a write a guard event refuses inside ``transaction()``, the model's and
+the manager's connection with a transaction of another one refused before any request, a record user refused (S1),
+and the rows events write seen by ``watch()`` and by the query cache once invalidated (spec §7; AC-8 a–b, AC-9, AC-12,
+AC-16).
 """
 
 import asyncio
@@ -22,7 +26,7 @@ import contextlib
 import dataclasses
 import os
 import pickle
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 import pytest
@@ -33,6 +37,8 @@ from surreal_orm_lite import (
     BaseSurrealEdge,
     BaseSurrealModel,
     DatabaseIntrospector,
+    LiveAction,
+    QueryCache,
     SurrealConfigDict,
     SurrealDbAuthenticationError,
     SurrealDbConflictError,
@@ -61,6 +67,7 @@ from surreal_orm_lite.schema import (
     remove_function_statement,
 )
 from surreal_orm_lite.utils import apply_ddl_statements
+from tests.conftest import default_connection_class
 
 # The fixed DefineParseError reasons, written out: the tests pin the exact texts.
 _R_BRACKETS = "its brackets are not balanced"
@@ -1993,3 +2000,240 @@ class TestAsyncEventsE2E:
         for raised in (from_model, from_manager, in_model_tx, in_manager_tx):
             assert type(raised.value) is SurrealDbError
             assert str(raised.value) == expected
+
+
+class _Abort(Exception):
+    """Raised by a test to leave a ``transaction()`` block."""
+
+
+class TestEventTransactionsE2E:
+    """AC-8 (a, b): events applied with ``tx=`` on every engine and both strategies — interactive (WebSocket on 3.x)
+    and buffered (HTTP, WebSocket on 2.x, the embedded engine) — and a write a guard event refuses inside a
+    ``transaction()`` block."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_events_defined_in_the_block_fire_for_its_writes(self, kind: str) -> None:
+        async with _evt(kind) as client:
+            interactive = kind == "ws" and await _major(client) >= 3
+            async with SurrealDBConnectionManager.transaction("evt") as tx:
+                assert tx.is_interactive is interactive
+                assert await EvPerson.define_events(tx=tx) == EvPerson.event_ddl()
+                await EvPerson(id="ada", name="Ada").save(tx=tx)
+            assert sorted(await _events_info(client, "ev_person")) == ["ev_audit", "ev_guard", "ev_rename", "ev_upper"]
+            assert await _log(client) == _sorted(
+                [("CREATE", "ev_person:ada", None, None, None), ("upper", None, None, None, "ADA")]
+            )
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_removal_and_the_manager_apply_with_the_block(self, kind: str) -> None:
+        stock_guard = Event("ev_stock", when="$after.stock < 0", then="THROW 'stock refused'")
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            await EvPerson.define_events()
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert await EvPerson.remove_event("ev_audit", tx=tx) == "REMOVE EVENT IF EXISTS `ev_audit` ON `ev_person`;"
+                assert await SurrealDBConnectionManager.define_event(stock_guard, "ev_product", tx=tx) == stock_guard.ddl(
+                    "ev_product"
+                )
+                assert await SurrealDBConnectionManager.remove_event("ev_upper", "ev_person", tx=tx) == (
+                    "REMOVE EVENT IF EXISTS `ev_upper` ON `ev_person`;"
+                )
+            assert sorted(await _events_info(client, "ev_person")) == ["ev_guard", "ev_rename"]
+            assert sorted(await _events_info(client, "ev_product")) == ["ev_stock"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_block_that_raises_defines_no_event(self, kind: str) -> None:
+        async with _evt(kind) as client:
+            with pytest.raises(_Abort):
+                async with SurrealDBConnectionManager.transaction("evt") as tx:
+                    await EvPerson.define_events(tx=tx)
+                    async with SurrealDBConnectionManager.using("evt"):
+                        await SurrealDBConnectionManager.define_event(_EV_AUDIT, "ev_product", tx=tx)
+                    raise _Abort
+            assert await _events_info(client, "ev_person") == {}
+            assert "ev_product" not in (await client.query("INFO FOR DB;", {}))["tables"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_write_the_guard_refuses_cancels_the_block(self, kind: str) -> None:
+        # M24: the refusal propagates out of transaction(), which cancels the block: nothing is written.
+        async with _evt(kind) as client:
+            await EvPerson.define_events()
+            with pytest.raises(SurrealDbError) as raised:
+                async with SurrealDBConnectionManager.transaction("evt") as tx:
+                    await EvPerson(id="ok", name="Ok").save(tx=tx)
+                    await EvPerson(id="bad", name="forbidden").save(tx=tx)
+            assert "name refused: forbidden" in str(raised.value)
+            assert await EvPerson.objects().exec() == []
+            assert await _log(client) == []
+
+
+def _x1(operation: str, model: str = "EvPerson") -> str:
+    """X1: ``routing.check_transaction()``'s text for *operation* of *model* (on ``"evt"``) with a default tx."""
+    return (
+        f"{operation} cannot run in this transaction: the transaction belongs to connection 'default' and {model} "
+        "runs on connection 'evt'. A transaction is one connection's (one database): open it on 'evt' — "
+        "SurrealDBConnectionManager.transaction('evt') — or run the block inside using('default')."
+    )
+
+
+def _x1m(operation: str) -> str:
+    """X1m: ``routing.check_call_transaction()``'s text for *operation* on ``"evt"`` with a default tx."""
+    return (
+        f"{operation} cannot run in this transaction: the transaction belongs to connection 'default' and the call "
+        "runs on connection 'evt'. A transaction is one connection's (one database): call it inside "
+        "using('default'), or open the transaction on 'evt'."
+    )
+
+
+@contextlib.asynccontextmanager
+async def _default(kind: str) -> AsyncIterator[Any]:
+    """The default connection on the line under test (``ns``/``db``) — over *kind*, WebSocket for ``mem`` — and its
+    client; its previous settings put back on exit."""
+    saved_url, *saved = default_connection_class()._settings()
+    url = _url("ws" if kind == "mem" else kind)
+    SurrealDBConnectionManager.set_connection(url=url, user="root", password="root", namespace="ns", database="db")
+    try:
+        yield await SurrealDBConnectionManager.get_client()
+    finally:
+        await SurrealDBConnectionManager.unset_connection()
+        if saved_url is not None:
+            SurrealDBConnectionManager.set_connection(saved_url, *saved)
+
+
+async def _tables(client: Any) -> dict[str, Any]:
+    """The tables of *client*'s database."""
+    return dict((await client.query("INFO FOR DB;", {}))["tables"])
+
+
+class TestEventConnectionsE2E:
+    """AC-9 (events): the model's connection, the manager's current connection, and a transaction of another
+    connection refused before any request (X1, X1m)."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_model_defines_on_its_own_connection(self, kind: str) -> None:
+        async with _default(kind) as default, _evt(kind) as client:
+            await EvPerson.define_events()
+            assert sorted(await _events_info(client, "ev_person")) == ["ev_audit", "ev_guard", "ev_rename", "ev_upper"]
+            # A DEFINE EVENT creates its table (M16): the default database has none, so nothing landed there.
+            assert "ev_person" not in await _tables(default)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_manager_defines_on_the_current_connection(self, kind: str) -> None:
+        async with _default(kind) as default, _evt(kind) as client:
+            async with SurrealDBConnectionManager.using("evt"):
+                await SurrealDBConnectionManager.define_event(_EV_AUDIT, "ev_product")
+            assert sorted(await _events_info(client, "ev_product")) == ["ev_audit"]
+            assert "ev_product" not in await _tables(default)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_x1_a_transaction_of_another_connection(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _default(kind) as default, _evt(kind) as client:
+            async with SurrealDBConnectionManager.transaction() as tx:
+                evt_calls = _spy(monkeypatch, client)
+                default_calls = _spy(monkeypatch, default)
+                with pytest.raises(SurrealDbError) as define_events:
+                    await EvPerson.define_events(tx=tx)
+                with pytest.raises(SurrealDbError) as remove_event:
+                    await EvPerson.remove_event("ev_audit", tx=tx)
+                async with SurrealDBConnectionManager.using("evt"):
+                    with pytest.raises(SurrealDbError) as define_event:
+                        await SurrealDBConnectionManager.define_event(_EV_AUDIT, "ev_person", tx=tx)
+                    with pytest.raises(SurrealDbError) as manager_remove_event:
+                        await SurrealDBConnectionManager.remove_event("ev_audit", "ev_person", tx=tx)
+                assert evt_calls == []
+                assert default_calls == []
+                assert getattr(tx, "statements", []) == []
+            assert await _events_info(client, "ev_person") == {}
+        assert str(define_events.value) == _x1("EvPerson.define_events()")
+        assert str(remove_event.value) == _x1("EvPerson.remove_event()")
+        assert str(define_event.value) == _x1m("define_event()")
+        assert str(manager_remove_event.value) == _x1m("remove_event()")
+
+
+#: A record access on ``evt_db``: a user signed up through it is a record user, who may not define (M22).
+_EVT_ACCESS = (
+    "DEFINE ACCESS evt_acc ON DATABASE TYPE RECORD SIGNUP (CREATE evt_user SET name = $name) "
+    "SIGNIN (SELECT * FROM evt_user WHERE name = $name);"
+)
+
+
+class TestDdlPermissionsE2E:
+    """AC-12 (events): a session that may not define — a record user — gets S1 (``SurrealDbAuthenticationError``) on
+    both server lines; the embedded engine's session is its owner, which may always define."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_s1_a_record_user(self, kind: str) -> None:
+        if kind == "mem":
+            pytest.skip("the embedded engine's session is its owner: it may always define")
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            await _apply_ddl(client, _EVT_ACCESS)
+            await SurrealDBConnectionManager.signup(access="evt_acc", variables={"name": "evt-user"})
+            try:
+                with pytest.raises(SurrealDbError) as define_events:
+                    await EvPerson.define_events()
+                with pytest.raises(SurrealDbError) as remove_event:
+                    await EvPerson.remove_event("ev_audit")
+                with pytest.raises(SurrealDbError) as define_event:
+                    await SurrealDBConnectionManager.define_event(_EV_AUDIT, "ev_person")
+                with pytest.raises(SurrealDbError) as manager_remove_event:
+                    await SurrealDBConnectionManager.remove_event("ev_audit", "ev_person")
+            finally:
+                await SurrealDBConnectionManager.invalidate()
+            assert await _events_info(client, "ev_person") == {}
+        removal = "REMOVE EVENT IF EXISTS `ev_audit` ON `ev_person`;"
+        refusals = [
+            (define_events, f"Can't apply event definition: {EvPerson.event_ddl()[0]} -> "),
+            (remove_event, f"Can't apply event removal: {removal} -> "),
+            (define_event, f"Can't apply event definition: {_EV_AUDIT.ddl('ev_person')} -> "),
+            (manager_remove_event, f"Can't apply event removal: {removal} -> "),
+        ]
+        for raised, prefix in refusals:
+            assert type(raised.value) is SurrealDbAuthenticationError
+            assert str(raised.value).startswith(prefix)
+            assert "not enough permissions" in str(raised.value).lower()
+
+
+async def _notifications(stream: Any, n: int) -> list[Any]:
+    """The next *n* notifications of *stream*, within ten seconds."""
+    received: list[Any] = []
+    async with asyncio.timeout(10):
+        while len(received) < n:
+            received.append(await anext(stream))
+    return received
+
+
+@pytest.fixture
+def _fresh_query_cache() -> Iterator[None]:
+    """The query cache's default settings and an empty store around the test: the cache is process-wide."""
+    QueryCache.configure()
+    QueryCache.clear()
+    yield
+    QueryCache.configure()
+    QueryCache.clear()
+
+
+class TestEventLiveAndCacheE2E:
+    """AC-16: a row an event writes reaches a live query on its table (M23), and is not seen by the query cache's
+    invalidation, which covers the tables the ORM itself writes — ``QueryCache.invalidate()`` makes it visible."""
+
+    async def test_watch_sees_the_rows_an_event_writes(self) -> None:
+        async with _evt("ws"):
+            await EvPerson.define_events()
+            async with EvLog.objects().watch() as stream:
+                await EvPerson(id="ada", name="Ada").save()
+                received = await _notifications(stream, 2)
+        assert {notification["action"] for notification in received} == {LiveAction.CREATE}
+        assert sorted(notification["result"]["kind"] for notification in received) == ["CREATE", "upper"]
+
+    @pytest.mark.usefixtures("_fresh_query_cache")
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_cached_read_stays_stale_until_invalidated(self, kind: str) -> None:
+        async with _evt(kind):
+            await EvPerson.define_events()
+            assert await EvLog.objects().cache().exec() == []
+            await EvPerson(id="ada", name="Ada").save()
+            hits = QueryCache.stats()["hits"]
+            assert await EvLog.objects().cache().exec() == []
+            assert QueryCache.stats()["hits"] == hits + 1
+            assert QueryCache.invalidate(EvLog) == 1
+            rows = await EvLog.objects().cache().exec()
+        assert sorted(row.kind for row in rows) == ["CREATE", "upper"]
