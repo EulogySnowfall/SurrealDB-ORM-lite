@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import inspect
 import operator
 import os
@@ -605,7 +607,7 @@ def coerce_record_id(value: Any, table: str) -> RecordID:
     return RecordID(table, raw)
 
 
-def _instance_record_id(instance: "BaseSurrealModel") -> RecordID:
+def _instance_record_id(instance: BaseSurrealModel) -> RecordID:
     """Return the record id of a model instance, refusing an unsaved one."""
     record_id = instance._record_id()
     if record_id is None:
