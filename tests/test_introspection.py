@@ -2097,12 +2097,13 @@ _DEFAULT_BULLET_31 = (
     "set it with `merge()` once the record exists."
 )
 _UPDATE_BULLET_31 = (
-    "- `update()` may fail on an instance holding a `READONLY` datetime in a set (`set<datetime>`), in an array "
-    "(`array<datetime>`, `items.*.at`) or more than three levels down, after `get()` as after `save()`: Python keeps "
-    "microseconds, SurrealDB nanoseconds, and the server refuses the changed value. `update()` keeps the other "
-    "`READONLY` datetimes to the nanosecond, and those of an array only while it is short (see "
-    "[Precision and `Decimal`](#precision-and-decimal)). The generated class says so: change such a record with "
-    "`merge()`."
+    "- `update()` may fail on an instance holding a `READONLY` datetime below the top level, in a sub-model "
+    "(`address.at`), a `tuple`, an array (`array<datetime>`, `items.*.at`) or a set, after `get()` as after `save()`: "
+    "Python keeps microseconds, SurrealDB nanoseconds, and the server refuses the changed value. `update()` keeps the "
+    "top-level `READONLY` datetimes to the nanosecond, up to 32 per record; below the top level it keeps one only while "
+    "the fields before it leave room, which depends on the data (see [Precision and `Decimal`](#precision-and-decimal)). "
+    "The generated class says so, as does a class with more than 32 top-level fields that may hold a datetime: change "
+    "such a record with `merge()`."
 )
 #: Spec §11.1 item 8 (D18): the key phrases and the link AC-16 names.
 _PERMISSIONS_PHRASES_31 = ("never read", "before 3.2.2", "never reads, stores, logs or writes them")
@@ -2234,7 +2235,7 @@ _PART_NEEDLES_31 = {
         "`# READONLY`",
         "`update()`",
         "`merge()`",
-        "`set<datetime>`",
+        "below the top level",
         "`array<T, N>`",
         "`null | T`",
         "`define_computed_fields()`",

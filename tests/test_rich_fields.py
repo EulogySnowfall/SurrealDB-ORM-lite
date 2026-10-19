@@ -3308,7 +3308,8 @@ _RF_DEEPER_SEED = _RF_DEEP_SEED.replace("c: {}", "c: {at: d'2026-01-02T03:04:05.
 class TestReplaceContentBoundsE2E:
     """#261 review: ``update()`` of data nested past the servers' parse and computation limits, or holding long lists
     of datetimes, passes as before #261, directly and in a transaction, on the line under test and on ``mem://``. The
-    stored datetimes it keeps are the top-level ones first, down to three levels."""
+    stored datetimes it keeps are the top-level ones first, then, while the budget the fields before them left allows,
+    those down to three levels (see ``TestReplaceKeepsTopLevelDatetimesE2E``)."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("kind", ["ws", "mem"])
@@ -3330,6 +3331,7 @@ class TestReplaceContentBoundsE2E:
     @pytest.mark.asyncio
     @pytest.mark.parametrize("kind", ["ws", "mem"])
     async def test_readonly_datetimes_within_the_bounds_are_kept(self, kind: str) -> None:
+        """``doc`` comes before ``history`` in the data: its datetime three levels down still fits in the budget."""
         async with _rf_engine(kind, _RF_DEEP_DDL, "rf_deep") as client:
             await client.query(_RF_DEEP_SEED, {})
             before = await client.query(_RF_DEEP_STAMPS, {})
@@ -3352,6 +3354,76 @@ class TestReplaceContentBoundsE2E:
                 await seed.update()
             await seed.merge(title="u")  # the way the docs give
             assert (await RfDeep.objects().get("seed")).title == "u"
+
+
+class RfHistory(BaseSurrealModel):
+    """A list of timestamped items before a sub-object's datetime and a top-level one (#261 review)."""
+
+    model_config = SurrealConfigDict(table_name="rf_history")
+
+    id: str | None = None
+    title: str = "t"
+    history: list[RfStampMeta] = []
+    meta: RfStampMeta = Field(default_factory=RfStampMeta)
+    created: datetime | None = None
+
+
+def _rf_history_ddl(meta_at: str) -> str:
+    """``rf_history`` with a ``READONLY`` top-level ``created``, and ``meta.at`` defined with *meta_at* clauses."""
+    return (
+        "DEFINE TABLE rf_history SCHEMALESS;"
+        "DEFINE FIELD created ON rf_history TYPE datetime READONLY;"
+        "DEFINE FIELD meta ON rf_history TYPE object;"
+        f"DEFINE FIELD meta.at ON rf_history TYPE datetime {meta_at};"
+    )
+
+
+#: A record whose datetimes hold nanoseconds, which the SDK floors to the microsecond.
+_RF_HISTORY_SEED = (
+    "CREATE rf_history:x CONTENT {title: 't', history: [], created: d'2026-01-02T03:04:05.123456789Z', "
+    "meta: {at: d'2026-01-02T03:04:05.987654321Z', seen: d'2026-01-02T03:04:05.000000001Z'}};"
+)
+_RF_HISTORY_STAMPS = "SELECT VALUE [<string> created, <string> meta.at] FROM ONLY rf_history:x;"
+
+
+class TestReplaceKeepsTopLevelDatetimesE2E:
+    """#261 review: ``update()`` keeps every stored top-level datetime it did not change (up to ``_KEEP_LIMIT``),
+    whatever the fields before it hold. Below the top level it keeps one only while the values it rebuilds fit in what
+    the fields before it left of that budget, which depends on the data: a ``READONLY`` datetime there may be refused,
+    the limit the README and the generator's class comment state. On the line under test and on ``mem://``."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    @pytest.mark.parametrize("events", [0, 10, 11, 500])
+    async def test_a_top_level_readonly_datetime_is_kept(self, kind: str, events: int) -> None:
+        async with _rf_engine(kind, _rf_history_ddl(""), "rf_history") as client:
+            await client.query(_RF_HISTORY_SEED, {})
+            stamp = await RfHistory.objects().get("x")
+            stamp.title = "u"
+            stamp.history = [RfStampMeta(at=_DT, seen=_DT) for _ in range(events)]
+            await stamp.update()
+            stamps = await client.query(_RF_HISTORY_STAMPS, {})
+            assert isinstance(stamps, list) and stamps[0] == "2026-01-02T03:04:05.123456789Z", stamps
+            got = await RfHistory.objects().get("x")
+            assert got.title == "u" and len(got.history) == events
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    async def test_a_readonly_datetime_below_the_top_level_depends_on_the_data(self, kind: str) -> None:
+        """``meta.at`` is kept with no event, then refused once ten timestamped events, before it, use the budget up."""
+        async with _rf_engine(kind, _rf_history_ddl("READONLY"), "rf_history") as client:
+            await client.query(_RF_HISTORY_SEED, {})
+            before = await client.query(_RF_HISTORY_STAMPS, {})
+            stamp = await RfHistory.objects().get("x")
+            stamp.title = "u"
+            await stamp.update()
+            assert await client.query(_RF_HISTORY_STAMPS, {}) == before
+            stamp.history = [RfStampMeta(at=_DT, seen=_DT) for _ in range(10)]
+            with pytest.raises((SurrealError, SurrealDbError), match="readonly"):
+                await stamp.update()
+            await stamp.merge(title="v")  # the way the docs give
+            assert await client.query(_RF_HISTORY_STAMPS, {}) == before
+            assert (await RfHistory.objects().get("x")).title == "v"
 
 
 # --- filters and live queries (spec §5.5, §5.6, §6.5; AC-22, AC-23; D12) --------------------------

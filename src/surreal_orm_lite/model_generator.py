@@ -41,8 +41,8 @@ datetimes with at most 6 fractional digits and UUIDs; mutable values (``list``, 
 Every other ``DEFAULT`` or computed expression gives the **server form** — ``T | None = None``, the attribute listed
 in ``server_fields`` so the server's value applies on create and is read back. ``ASSERT``, ``PERMISSIONS``,
 ``REFERENCE`` and field comments are not generated; ``READONLY`` is a trailing comment, and a class with a ``READONLY``
-field holding a datetime in a set, in an array or more than three levels down says that ``update()`` may fail on it
-(§6.4.7, narrowed by #261).
+field holding a datetime below the top level (in a sub-object, a tuple, an array or a set), or with more than 32
+top-level fields that may hold a datetime, says that ``update()`` may fail on it (§6.4.7, narrowed by #261).
 
 **Module** (spec §6.4.8): a fixed docstring, the imports the classes use (standard library, then pydantic,
 surreal_orm_lite and surrealdb), a ``# Not generated:`` comment listing every table or field left out and why, then the
@@ -84,7 +84,7 @@ from .functions import SurrealFunc
 from .model_base import BaseSurrealModel
 from .schema_state import FieldState, IndexState, SchemaIssue, SchemaState, TableState
 from .types import Duration
-from .utils import _KEEP_MAX_DEPTH, VALID_ALIAS_PATTERN
+from .utils import _KEEP_LIMIT, VALID_ALIAS_PATTERN
 
 __all__ = ["ModelCodeGenerator"]
 
@@ -480,11 +480,12 @@ _I3_TYPE_AS_WRITTEN = "its TYPE clause was not understood and is kept as written
 _I5_SAME_NAME = "two definitions have the same name"
 
 #: The class comment of a table with a ``READONLY`` field holding a datetime ``update()`` may not keep (spec §6.4.7, M29).
-#: Since #261 ``update()`` keeps a stored datetime it did not change at the top level and in sub-objects down to three
-#: levels; not in a set (its items have no position to match them with), nor in an array the schema cannot bound below
-#: the values ``update()`` rebuilds, nor deeper (``replace_content``).
+#: Since #261 ``update()`` keeps every stored datetime it did not change at the top level, up to 32 (``_KEEP_LIMIT``).
+#: Below the top level it keeps one only while the values it rebuilds to reach it fit in what the fields before it left
+#: of those 32, which depends on the data (a list of timestamped items is enough), so that is no guarantee
+#: (``replace_content``).
 _UPDATE_NOTE = (
-    "update() may fail on READONLY datetimes in sets, arrays or past 3 levels (Python keeps microseconds): use merge()."
+    "update() may fail on READONLY datetimes below the top level or past the 32nd (Python keeps microseconds): use merge()."
 )
 _SCHEMALESS_NOTE = 'SCHEMALESS: fields not declared here are kept (extra="allow")'
 
@@ -644,25 +645,35 @@ def _hashable(item: _Type) -> bool:
     return not item.is_any and bool(item.members or item.none) and all(m == "" or m in _HASHABLE for m in item.members)
 
 
-def _datetime_not_kept(kind: Kind | None, depth: int, contained: bool = False) -> bool:
-    """Whether the kind of a value ``depth`` levels below the top level holds a ``datetime`` ``update()`` may not keep.
+def _datetime_below_the_top(kind: Kind | None, depth: int) -> bool:
+    """Whether the kind of a value ``depth`` levels below the top level holds a ``datetime`` below the top level.
 
-    ``update()`` keeps a stored datetime it did not change at the top level and in sub-objects or tuples down to
-    ``_KEEP_MAX_DEPTH`` levels (#261, ``replace_content``). A datetime deeper, or in a ``set<…>`` or an ``array<…>``
-    (``contained``: an item of a set has no position, an array has no bound below what ``update()`` rebuilds) is not
-    kept: ``set<datetime>``, ``array<datetime>``, ``option<array<datetime>>``, ``string | set<datetime>`` …
+    That is a datetime anywhere but as the value of a top-level field itself: in a sub-object, a tuple, an array or a
+    set (``{ at: datetime }``, ``[int, datetime]``, ``array<datetime>``, ``option<set<datetime>>``,
+    ``string | array<datetime>`` …). ``update()`` keeps a stored datetime it did not change there only while the
+    budget the fields before it left allows, which depends on the data (#261, ``replace_content``).
     """
     if isinstance(kind, KName):
         if kind.name == "datetime":
-            return contained or depth > _KEEP_MAX_DEPTH
-        return any(_datetime_not_kept(argument, depth + 1, True) for argument in kind.args if not isinstance(argument, str))
+            return depth > 0
+        return any(_datetime_below_the_top(argument, depth + 1) for argument in kind.args if not isinstance(argument, str))
     if isinstance(kind, KUnion):
-        return any(_datetime_not_kept(member, depth, contained) for member in kind.members)
+        return any(_datetime_below_the_top(member, depth) for member in kind.members)
     if isinstance(kind, KTuple):
-        return any(_datetime_not_kept(item, depth + 1, contained) for item in kind.items)
+        return any(_datetime_below_the_top(item, depth + 1) for item in kind.items)
     if isinstance(kind, KObject):
-        return any(_datetime_not_kept(value, depth + 1, contained) for _, value in kind.items)
+        return any(_datetime_below_the_top(value, depth + 1) for _, value in kind.items)
     return False
+
+
+def _may_be_a_datetime(kind: Kind | None) -> bool:
+    """Whether a field of this kind may hold a ``datetime`` as its own value: ``datetime``, ``any``, a union holding
+    one of them (``option<datetime>``, ``string | datetime``), or a kind kept as written (I3), which may be anything."""
+    if isinstance(kind, KName):
+        return kind.name in ("datetime", "any")
+    if isinstance(kind, KUnion):
+        return any(_may_be_a_datetime(member) for member in kind.members)
+    return kind is None
 
 
 def _reads_input(expression: str) -> bool:
@@ -946,18 +957,22 @@ class _ClassWriter:
         return [_comment(text, indent=4) for text in texts]
 
     def _readonly_datetime_not_kept(self) -> bool:
-        """Whether a ``READONLY`` field of the class — top level or nested — holds, in its kind or in a sub-field's, a
-        datetime ``update()`` may not keep: in a set or an array (an array item, ``*`` in its path, too) or more than
-        three levels down (M29, #261, ``_datetime_not_kept``)."""
+        """Whether a ``READONLY`` field of the class — top level or nested — holds a datetime ``update()`` may not keep
+        (M29, #261): one below the top level, in its kind or in a sub-field's (``address.at``, ``items.*.at``,
+        ``_datetime_below_the_top``), or one at the top level of a class with more than ``_KEEP_LIMIT`` top-level fields
+        that may hold a datetime (``_may_be_a_datetime``), since ``update()`` keeps the first ones only."""
         provided = {"id", "in", "out"} if self.edge else {"id"}
         fields = [field for field in self.table.fields.values() if field.path and field.path[0] not in provided]
-        return any(
-            _datetime_not_kept(_kind(inner), len(inner.path) - 1, "*" in inner.path)
-            for field in fields
-            if field.readonly
+        readonly = [field for field in fields if field.readonly]
+        if any(
+            _datetime_below_the_top(_kind(inner), len(inner.path) - 1)
+            for field in readonly
             for inner in fields
             if tuple(inner.path[: len(field.path)]) == tuple(field.path)
-        )
+        ):
+            return True
+        top = [field for field in fields if len(field.path) == 1 and _may_be_a_datetime(_kind(field))]
+        return len(top) > _KEEP_LIMIT and any(field.readonly for field in top)
 
     def _model_config(self, server_fields: Sequence[str]) -> list[str]:
         """The ``model_config`` line, wrapped as ``ruff format`` keeps it above 128 columns (spec §6.4.7, D20)."""

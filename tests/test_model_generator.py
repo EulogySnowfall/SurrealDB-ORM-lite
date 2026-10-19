@@ -68,6 +68,7 @@ from surreal_orm_lite.schema_state import (
     SchemaState,
     TableState,
 )
+from surreal_orm_lite.utils import _KEEP_LIMIT
 
 # Spec §8 / AC-12: the injection corpus — quotes, backslashes, line breaks, separators, payloads, non-ASCII.
 CORPUS: tuple[str, ...] = (
@@ -855,11 +856,9 @@ _FIXTURE_FIELDS_2X = {
     ],
 }
 
-#: The update() note of spec §6.4.7, exactly (fixed text, 120 columns at indent 4), narrowed by #261 to the datetimes
-#: update() may not keep: in a set, in an array or more than three levels down.
-UPDATE_NOTE = (
-    "    # update() may fail on READONLY datetimes in sets, arrays or past 3 levels (Python keeps microseconds): use merge()."
-)
+#: The update() note of spec §6.4.7, exactly (fixed text, 124 columns at indent 4), narrowed by #261 to the datetimes
+#: update() may not keep: below the top level, or past the first _KEEP_LIMIT top-level ones.
+UPDATE_NOTE = "    # update() may fail on READONLY datetimes below the top level or past the 32nd (Python keeps microseconds): use merge()."
 
 #: ruff's options for a generated module (spec §9.1).
 _RUFF_CHECK = ["check", "--isolated", "--select", "E,F,W,I,UP,B,C4,SIM", "--target-version", "py311", "--line-length", "128"]
@@ -899,6 +898,10 @@ def _f(name: str, kind: str = "string", **kwargs: Any) -> FieldState:
     """A field built by keyword; not nullable unless ``nullable=True`` is given."""
     kwargs.setdefault("nullable", False)
     return FieldState(name=name, field_type=kind, **kwargs)
+
+
+#: #261 review: a ``READONLY`` datetime in a sub-object, after a timestamped array.
+_META_AT = [_f("meta", "object"), _f("meta.at", "datetime", readonly=True)]
 
 
 def _line_of(source: str, attribute: str) -> str:
@@ -1724,6 +1727,15 @@ class TestClasses:
                 _f("a.b.c.d.at", "datetime", readonly=True),
             ],
             [_f("a", "object"), _f("a.b", "object"), _f("a.b.c", "{ d: { at: datetime } }", readonly=True)],
+            # #261 review: below the top level, what update() keeps depends on the fields before it (a list of
+            # timestamped items is enough to use the budget up), so a sub-object's or a tuple's datetime says so too.
+            [_f("address", "object"), _f("address.at", "datetime", readonly=True)],
+            [_f("address", "object", readonly=True), _f("address.at", "option<datetime>")],
+            [_f("pair", "[int, datetime]", readonly=True)],
+            [_f("lit", "{ at: datetime }", readonly=True)],
+            [_f("a", "object"), _f("a.b", "object"), _f("a.b.c", "object"), _f("a.b.c.at", "datetime", readonly=True)],
+            [_f("a", "object"), _f("a.b", "object"), _f("a.b.c", "{ at: datetime }", readonly=True)],
+            [_f("history", "array<object>"), _f("history.*.at", "datetime"), *_META_AT],
         ],
         ids=[
             "set",
@@ -1737,14 +1749,33 @@ class TestClasses:
             "readonly-parent",
             "four-levels",
             "four-levels-literal",
+            "sub-object",
+            "readonly-object",
+            "tuple",
+            "literal-object",
+            "three-levels",
+            "three-levels-literal",
+            "after-a-timestamped-array",
         ],
     )
     def test_update_note(self, fields: list[FieldState]) -> None:
-        """#261: a ``READONLY`` field holding a datetime ``update()`` may not keep — in a set, in an array (its length is
-        not bounded by what ``update()`` rebuilds) or more than three levels down — still says so."""
+        """#261: a ``READONLY`` field holding a datetime ``update()`` may not keep — anywhere below the top level: in a
+        sub-object, a tuple, a set or an array — still says so."""
         source = _generate(*fields)
         assert _class_block(source, "T").splitlines()[1] == UPDATE_NOTE
-        assert len(UPDATE_NOTE) == 120
+        assert len(UPDATE_NOTE) == 124
+
+    @pytest.mark.parametrize(
+        ("count", "note"),
+        [(_KEEP_LIMIT, False), (_KEEP_LIMIT + 1, True)],
+    )
+    @pytest.mark.parametrize("kind", ["datetime", "option<datetime>", "string | datetime", "any"])
+    def test_update_note_past_the_kept_top_level_datetimes(self, count: int, note: bool, kind: str) -> None:
+        """#261 review: ``update()`` keeps the first ``_KEEP_LIMIT`` top-level datetimes only, so a class with more
+        top-level fields that may hold one says so when one of them is ``READONLY`` (here the last, ``d99``)."""
+        fields = [_f(f"d{index:02}", kind) for index in range(count - 1)] + [_f("d99", "datetime", readonly=True)]
+        assert (UPDATE_NOTE in _generate(*fields).splitlines()) is note
+        assert "update()" not in _generate(*fields[:-1], _f("d99", "datetime"), _f("n", "int"))
 
     @pytest.mark.parametrize(
         "fields",
@@ -1756,15 +1787,14 @@ class TestClasses:
             [_f("pair", "[int, string]", readonly=True), _f("lit", "{ at: int }", readonly=True)],
             [_f("bad", "datetime<", readonly=True)],  # I3: the kind is not known
             [_f("tags", "set<string>", readonly=True)],
-            # #261: update() keeps a stored datetime it did not change, top level and down to three levels.
+            # #261: update() keeps every stored top-level datetime it did not change, up to _KEEP_LIMIT, whatever the
+            # fields before it hold.
             [_f("created", "datetime", readonly=True, default="time::now()")],
             [_f("created", "datetime", nullable=True, readonly=True)],
-            [_f("address", "object"), _f("address.at", "datetime", readonly=True)],
-            [_f("pair", "[int, datetime]", readonly=True)],
-            [_f("lit", "{ at: datetime }", readonly=True)],
-            [_f("a", "object"), _f("a.b", "object"), _f("a.b.c", "object"), _f("a.b.c.at", "datetime", readonly=True)],
-            [_f("a", "object"), _f("a.b", "object"), _f("a.b.c", "{ at: datetime }", readonly=True)],
+            [_f("created", "string | datetime", readonly=True)],
             [_f("dates", "array<datetime>"), _f("created", "datetime", readonly=True)],  # the array is not READONLY
+            [_f("history", "array<object>"), _f("history.*.at", "datetime"), _f("created", "datetime", readonly=True)],
+            [_f("address", "object"), _f("address.at", "datetime"), _f("address.n", "int", readonly=True)],
         ],
     )
     def test_no_update_note(self, fields: list[FieldState]) -> None:

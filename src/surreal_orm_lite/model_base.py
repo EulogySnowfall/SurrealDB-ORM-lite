@@ -2127,14 +2127,16 @@ class BaseSurrealModel(BaseModel):
         (#261): SurrealDB stores nanoseconds, which Python and the SDK read floored to the
         microsecond, so writing a datetime back unchanged would change the stored one and a
         ``READONLY`` field would refuse it. An instance loaded with ``get()`` or written with
-        ``save()`` therefore updates such a record, ``READONLY`` datetimes included, on SurrealDB
-        2.x, 3.x and the embedded engine, and the stored datetimes keep their nanoseconds; a
-        datetime you changed is written as you set it (and still refused by a ``READONLY`` field).
-        So that the statement stays bounded, this covers the top-level datetimes first (up to 32),
-        then those in a sub-model, a ``list`` or a ``tuple`` down to three levels, as long as the
-        values rebuilt to reach them fit in what is left of those 32: a datetime in a long list or a
-        large sub-model, a deeper one and one in a set are written as sent, so a ``READONLY`` field
-        holding one still refuses ``update()`` (change such a record with :meth:`merge`). See
+        ``save()`` therefore updates a record whose ``READONLY`` datetimes are top-level fields, on
+        SurrealDB 2.x, 3.x and the embedded engine, and the stored datetimes keep their
+        nanoseconds; a datetime you changed is written as you set it (and still refused by a
+        ``READONLY`` field). So that the statement stays bounded, only the top-level datetimes are
+        sure to be kept, up to 32. Below the top level (in a sub-model, a ``list`` or a ``tuple``,
+        down to three levels) a datetime is kept only while the values rebuilt to reach it fit in
+        what the fields before it left of those 32, which depends on the data: a list of
+        timestamped items before a sub-model is enough to use it up. A datetime not kept, and one in
+        a set, is written as sent, so a ``READONLY`` field holding one may refuse ``update()``:
+        change such a record with :meth:`merge`. See
         :func:`~surreal_orm_lite.utils.replace_content`. Without a datetime to keep, the statement
         is the SDK's ``update()``, as before.
 

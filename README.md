@@ -2323,15 +2323,16 @@ both lines.
   `d'2026-01-02T03:04:05.123456789Z'` reads `…05.123456`. `update()` and `upsert()` rewrite the
   whole record, but a `datetime` you did not change (it still floors to the stored value) keeps
   the stored nanoseconds, on both lines and the embedded engine: a record whose `READONLY`
-  datetime holds nanoseconds can be updated after `get()` or `save()`
-  ([#261](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/261)). A datetime you
-  changed is written as you set it, and a `READONLY` field still refuses it. So that the statement
-  stays small whatever the data, this covers the top-level datetimes first, up to 32, then, field
-  by field, those in a sub-model, a `list` or a `tuple` down to three levels below the top level,
-  as long as the values rebuilt to reach them fit in what is left of those 32. A datetime in a
-  long list or a large sub-model, one deeper down and one in a set (its items have no position to
-  match a stored value by) are written as sent: a `READONLY` field holding one still refuses
-  `update()`, so change such a record with `merge()`.
+  datetimes are top-level fields can be updated after `get()` or `save()`, even when they hold
+  nanoseconds ([#261](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/261)). A
+  datetime you changed is written as you set it, and a `READONLY` field still refuses it. So that
+  the statement stays small whatever the data, only the top-level datetimes are sure to be kept,
+  up to 32 per record. Below the top level (in a sub-model, a `list` or a `tuple`, down to three
+  levels) a datetime is kept only while the values rebuilt to reach it fit in what the fields
+  before it left of those 32, so it depends on the data: an `update()` that passes in a test can
+  fail once a list of timestamped items before the sub-model grows. A datetime not kept, and one
+  in a set (its items have no position to match a stored value by), is written as sent: a
+  `READONLY` field holding one may refuse `update()`, so change such a record with `merge()`.
 - `timedelta`: floored to the microsecond on read (`1h30m1ns` reads `timedelta(seconds=5400)`).
 - `Duration`: exact, to the nanosecond.
 - `Decimal`: a value whose `str()` writes no exponent is sent as before. A value written with an
@@ -4279,11 +4280,13 @@ class Person(BaseSurrealModel):
   object-literal kind (`{ a: int }`) stays a `dict[str, Any]`.
 - `ASSERT`, `PERMISSIONS`, `REFERENCE` (the field is a `RecordID`) and field comments are not generated: the database
   still applies them. `READONLY` is a trailing `# READONLY` comment: no field option exists for it.
-- `update()` may fail on an instance holding a `READONLY` datetime in a set (`set<datetime>`), in an array
-  (`array<datetime>`, `items.*.at`) or more than three levels down, after `get()` as after `save()`: Python keeps
-  microseconds, SurrealDB nanoseconds, and the server refuses the changed value. `update()` keeps the other `READONLY`
-  datetimes to the nanosecond, and those of an array only while it is short (see
-  [Precision and `Decimal`](#precision-and-decimal)). The generated class says so: change such a record with `merge()`.
+- `update()` may fail on an instance holding a `READONLY` datetime below the top level, in a sub-model (`address.at`),
+  a `tuple`, an array (`array<datetime>`, `items.*.at`) or a set, after `get()` as after `save()`: Python keeps
+  microseconds, SurrealDB nanoseconds, and the server refuses the changed value. `update()` keeps the top-level
+  `READONLY` datetimes to the nanosecond, up to 32 per record; below the top level it keeps one only while the fields
+  before it leave room, which depends on the data (see [Precision and `Decimal`](#precision-and-decimal)). The
+  generated class says so, as does a class with more than 32 top-level fields that may hold a datetime: change such a
+  record with `merge()`.
 - `array<T, N>` becomes `list[T]`: the length is left to the server, which checks it differently on each line
   (SurrealDB 2.x accepts at most N items, 3.x exactly N).
 - `null | T` becomes a required `T | None`, but the ORM sends `None` as `NONE`, which `null | T` refuses: give such a
@@ -4625,7 +4628,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | Schema introspection of a database removed while the connection is open                                                                | empty schema                                                                                                                                                                  | `SurrealDbError` (the database does not exist) until the database is defined again                                                                                                  | v0.30.0                              |
 | DDL not yet committed in a transaction, seen by schema introspection                                                                   | invisible                                                                                                                                                                     | invisible                                                                                                                                                                           | v0.30.0                              |
 | A regex with a backslash pair before a `/` (schema introspection)                                                                      | `/a\\/b/` accepted (a backslash, then an escaped slash), `/\\/` refused: such a definition is a `SchemaIssue`, not read                                                       | `/\\/` accepted (an escaped backslash, then the closing slash), `/a\\/b/` refused: such a definition is a `SchemaIssue`, not read                                                   | v0.30.0                              |
-| `save()` applies the returned row (explicit id, edges); `update()`/`upsert()` keep an unchanged stored `datetime` (nanoseconds)        | same on both lines: the stored row, read types (enums, sets…) included, after `save()`; a `READONLY` datetime updates, unless in a set, a long list or 4+ levels down         | same on both lines (verified on 3.3.4 and 3.1.5); `save(tx=)` in an interactive transaction applies the row too, a buffered one (HTTP, embedded) leaves the instance as it was      | v0.30.2                              |
+| `save()` applies the returned row (explicit id, edges); `update()`/`upsert()` keep an unchanged stored `datetime` (nanoseconds)        | same on both lines: the stored row, read types (enums, sets…) included, after `save()`; a top-level `READONLY` datetime updates, one below it may not                         | same on both lines (verified on 3.3.4 and 3.1.5); `save(tx=)` in an interactive transaction applies the row too, a buffered one (HTTP, embedded) leaves the instance as it was      | v0.30.2                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.

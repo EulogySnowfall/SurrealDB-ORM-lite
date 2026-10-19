@@ -290,7 +290,9 @@ _KEEP_STORED_DATETIME = "IF {sent} <= {stored} AND {stored} < {sent} + 1us THEN 
 #: The most values a full replace rebuilds to keep stored datetimes (#261): each top-level ``datetime`` it keeps counts
 #: one, and so does each item of a sub-object or array it rebuilds below the top level. A kept datetime reads ``$this``
 #: three times and the server copies the value it reads each time: without a cap, the cost of a long list of datetimes
-#: grew with the square of its length.
+#: grew with the square of its length. The top-level datetimes take it first, so up to 32 of them are always kept; what
+#: is left goes to the fields below the top level in the order of the data, so whether one of those is kept depends on
+#: the fields before it (#261 review).
 _KEEP_LIMIT = 32
 
 #: The deepest a kept ``datetime`` sits, in sub-objects and arrays below the top level (#261). Each level nests an
@@ -354,9 +356,11 @@ def replace_content(data: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
         #  {"c0": "title", "c1": "u", "c2": "created", "c3": dt})
 
     The statement stays bounded whatever the data (``_KEEP_LIMIT``, ``_KEEP_MAX_DEPTH``). The top-level datetimes are
-    kept first, up to 32. Then, field by field, a sub-object or array is rebuilt to keep the datetimes it holds down to
-    three levels below the top level, as long as the values it rebuilds fit in what is left of those 32
-    (:func:`_keep_plan`). Anything past that (a long list, a large sub-object, a deeper datetime) is bound whole and
+    kept first, up to 32: that is the guarantee, whatever the other fields hold. Then, field by field in the order of
+    ``data``, a sub-object or array is rebuilt to keep the datetimes it holds down to three levels below the top level,
+    as long as the values it rebuilds fit in what is left of those 32 (:func:`_keep_plan`). That part depends on the
+    data: a list of timestamped items before a sub-object can use up what is left, and the sub-object's datetime is then
+    written as sent. Anything past the budget (a long list, a large sub-object, a deeper datetime) is bound whole and
     written as sent, and so is a set, whose items have no position to match a stored value by.
 
     Returns:
