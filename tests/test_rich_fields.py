@@ -68,6 +68,7 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite._sdk import Bound, SurrealError
 from surreal_orm_lite.live import hydrate
+from surreal_orm_lite.signals import post_save
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import _KEEP_LIMIT, _KEEP_MAX_DEPTH, PLAIN_CONTENT, build_filter_condition, replace_content
 from tests._retry import retry_write
@@ -3101,6 +3102,131 @@ class TestWriteSyncGivesTheReadScalars:
         typed._apply_record({"status": "idle", "level": "nope", "amount": Decimal("2.5")})
         assert typed.status is RfStatus.IDLE and type(typed.amount) is float
         assert typed.level == "nope", "a value that does not validate is applied as received"
+
+
+class RfFullName(BaseSurrealModel):
+    """A Pydantic ``@computed_field``: ``model_dump()`` writes the property's value, so the row a write returns holds
+    that column."""
+
+    model_config = SurrealConfigDict(table_name="rf_full_name")
+
+    id: str | None = None
+    first: str = "Ada"
+    last: str = "Lovelace"
+
+    @pydantic.computed_field  # type: ignore[prop-decorator]
+    @property
+    def full(self) -> str:
+        return f"{self.first} {self.last}"
+
+
+class RfFullNameLink(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="rf_full_name_link")
+
+    first: str = "Ada"
+
+    @pydantic.computed_field  # type: ignore[prop-decorator]
+    @property
+    def full(self) -> str:
+        return self.first.upper()
+
+
+_RF_FULL_NAME_DDL = "DEFINE TABLE rf_full_name SCHEMALESS; DEFINE TABLE rf_full_name_link TYPE RELATION SCHEMALESS;"
+
+
+async def _full_name_after(write: str) -> RfFullName | RfFullNameLink:
+    """An ``RfFullName`` (an ``RfFullNameLink`` for ``edge``) after *write*, each a write that returns the row."""
+    if write == "save-auto-id":
+        return await RfFullName().save()
+    if write == "tx":
+        async with SurrealDBConnectionManager.transaction() as tx:
+            return await RfFullName(id="p").save(tx=tx)  # interactive: the row is applied; buffered: none yet
+    person = await RfFullName(id="p").save()
+    if write == "edge":
+        return await RfFullNameLink(in_=person, out=person).save()
+    if write == "merge":
+        await person.merge(first="Grace")
+    elif write == "refresh":
+        await person.refresh()
+    elif write == "upsert":
+        await person.upsert()
+    return person
+
+
+class RfShadow(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_shadow")
+
+    id: str | None = None
+    n: int = 0
+
+
+class RfShadowExtra(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="rf_shadow_extra", extra="allow")
+
+    id: str | None = None
+    n: int = 0
+
+
+#: Columns the models do not declare, filled by a ``DEFAULT``: one named like a ``BaseModel`` method.
+_RF_SHADOW_DDL = (
+    "DEFINE TABLE rf_shadow SCHEMALESS; DEFINE FIELD json ON rf_shadow DEFAULT 'shadow';"
+    "DEFINE TABLE rf_shadow_extra SCHEMALESS; DEFINE FIELD json ON rf_shadow_extra DEFAULT 'shadow';"
+    "DEFINE FIELD note ON rf_shadow_extra DEFAULT 'kept';"
+)
+
+
+class TestWriteSyncAppliesDeclaredFieldsE2E:
+    """#261 review: the row a write returns is applied to the fields the model declares and, under ``extra="allow"``,
+    to its extras, as a read holds them. A column holding a Pydantic ``@computed_field`` (``model_dump()`` writes it)
+    or named like a ``BaseModel`` method never becomes an attribute of the instance: the write does not raise once the
+    record has changed, ``post_save`` fires, and the method stays a method; on the line under test and on ``mem://``."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    @pytest.mark.parametrize("write", ["save-explicit-id", "save-auto-id", "tx", "edge", "merge", "refresh", "upsert"])
+    async def test_a_computed_field_column(self, kind: str, write: str) -> None:
+        saved: list[str] = []
+
+        async def on_save(sender: Any, instance: Any, created: bool, **kwargs: Any) -> None:
+            saved.append(type(instance).__name__)
+
+        post_save.connect(RfFullName)(on_save)
+        post_save.connect(RfFullNameLink)(on_save)
+        try:
+            async with _rf_engine(kind, _RF_FULL_NAME_DDL, "rf_full_name", "rf_full_name_link") as client:
+                instance = await _full_name_after(write)
+                rid = instance._record_id()
+                assert rid is not None
+                if isinstance(instance, RfFullName):
+                    assert instance.full == f"{instance.first} {instance.last}"
+                    assert (await RfFullName.objects().get(rid.id)).full == instance.full
+                else:
+                    assert instance.full == "ADA"
+                assert "full" not in instance.__dict__
+                stored = await client.query("SELECT VALUE full FROM ONLY $rid;", {"rid": rid})
+                assert stored == ("Ada Lovelace" if isinstance(instance, RfFullName) else "ADA"), stored
+        finally:
+            post_save.clear(RfFullName)
+            post_save.clear(RfFullNameLink)
+        assert saved[-1] == type(instance).__name__, saved
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    @pytest.mark.parametrize("write", ["save-explicit-id", "save-auto-id", "refresh"])
+    async def test_a_column_named_like_a_method(self, kind: str, write: str) -> None:
+        async with _rf_engine(kind, _RF_SHADOW_DDL, "rf_shadow", "rf_shadow_extra"):
+            for model in (RfShadow, RfShadowExtra):
+                instance = await model(id=None if write == "save-auto-id" else "x").save()
+                if write == "refresh":
+                    await instance.refresh()
+                assert callable(instance.json) and "json" not in instance.__dict__, model
+                rid = instance._record_id()
+                assert rid is not None
+                assert instance.model_extra == (await model.objects().get(rid.id)).model_extra, model
+            assert instance.model_extra == {"json": "shadow", "note": "kept"}
+            instance.n = 1
+            await instance.update()  # the extras are written back: the record keeps them
+            assert (await RfShadowExtra.objects().get(rid.id)).model_extra == {"json": "shadow", "note": "kept"}
 
 
 # --- replace_content stays bounded (#261 review) ---------------------------------------------------

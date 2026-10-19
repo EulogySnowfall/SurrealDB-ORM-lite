@@ -2416,9 +2416,11 @@ midnight `datetime` or `Range`; a `float` field stored in a `decimal` column hol
 each field is validated on its own, except one that the model's own validators could reshape (a
 `field_validator` on that field, a `model_validator`, a `model_post_init`): that one, like a value
 that does not validate, is applied as received, so these calls never fail on it. The `id` keeps
-the server's `RecordID`, and a column the model does not declare (`extra="allow"`) is applied as
-the SDK reads it. Writing such an instance back is safe, sub-models included, since those values
-are stored the same way.
+the server's `RecordID`. A column the model does not declare goes where a read puts it: as the SDK
+reads it into `model_extra` under `extra="allow"`, nowhere otherwise. So a column holding a Pydantic
+`@computed_field` (`model_dump()` writes it) or named like a method (`json`) never replaces that
+attribute. Writing such an instance back is safe, sub-models included, since those values are
+stored the same way.
 
 #### Values the SDK cannot read
 

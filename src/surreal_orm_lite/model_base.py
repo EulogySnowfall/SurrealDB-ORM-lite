@@ -1846,15 +1846,14 @@ class BaseSurrealModel(BaseModel):
         """Copy a returned DB row's fields onto this instance (id kept as native ``RecordID``).
 
         Accepts the raw SDK result (a row dict, a single-element list, or ``None``) and applies
-        only attributes the model actually declares. Shared by every write path that gets a row
-        back (``_do_save``, ``_do_upsert``, ``patch``, the atomic helpers, the ``server_values``
-        paths) so the "apply the row the server gave back" step lives in one place. A
-        ``None``/empty result is a no-op — callers that must distinguish "no row" from "nothing
-        to apply" check first.
+        only the fields the model declares, and its extras (:meth:`_set_synced`). Shared by every
+        write path that gets a row back (``_do_save``, ``_do_upsert``, ``patch``, the atomic
+        helpers, the ``server_values`` paths) so the "apply the row the server gave back" step
+        lives in one place. A ``None``/empty result is a no-op — callers that must distinguish
+        "no row" from "nothing to apply" check first.
 
-        Values are written with ``object.__setattr__``, i.e. without validating the instance
-        itself: a frozen field is still updated. ``only`` restricts the copy to a few known
-        fields.
+        Values are written without validating the instance itself (:meth:`_set_synced`): a
+        frozen field is still updated. ``only`` restricts the copy to a few known fields.
 
         A row arrives keyed by **column**, so each key is translated back to its Python field
         name first (v0.18.0). ``only`` and ``exclude`` are therefore matched on Python names —
@@ -1875,7 +1874,10 @@ class BaseSurrealModel(BaseModel):
         the row does not validate, each field is validated alone (:meth:`_validated_on_sync`),
         unless the model's own validators may reshape it, and a value that still does not
         validate is applied as received, so this never raises. A column the model does not
-        declare (``extra="allow"``) is applied as received.
+        declare goes, as received, where a read puts it (:meth:`_set_synced`): to the extras under
+        ``extra="allow"``, nowhere otherwise. Since the row holds what ``model_dump()`` wrote, that
+        includes a Pydantic ``@computed_field``'s column, which never reaches the property (#261
+        review).
 
         Args:
             only: restrict the copy to these field names. ``None`` (default) applies every field
@@ -1894,7 +1896,7 @@ class BaseSurrealModel(BaseModel):
         pending: list[str] = []
         for column, value in record.items():
             key = self.to_py_field(column)
-            if (allowed is not None and key not in allowed) or key in exclude or not hasattr(self, key):
+            if (allowed is not None and key not in allowed) or key in exclude:
                 continue
             kind = kinds.get(key)
             if kind == "timedelta":
@@ -1910,8 +1912,24 @@ class BaseSurrealModel(BaseModel):
             row = self._validated_row(record)
             for key in pending:
                 values[key] = getattr(row, key) if row is not None else self._validated_on_sync(key, values[key])
+        self._set_synced(values)
+
+    def _set_synced(self, values: Mapping[str, Any]) -> None:
+        """Write ``values``, keyed by Python name, where a read holds them, without validating the instance (#261 review).
+
+        A field the model declares is set with ``object.__setattr__``, so a frozen field is still updated. Any other
+        key but ``id`` goes to ``__pydantic_extra__`` under ``extra="allow"``, where :meth:`from_db` puts the columns
+        the model does not declare, and is dropped otherwise. So a key naming a property (a Pydantic
+        ``@computed_field``, whose value ``model_dump()`` writes to the record), a method (``json``) or any other
+        class attribute never becomes an attribute of the instance: it neither raises nor hides that attribute.
+        """
+        fields = type(self).model_fields
+        extra = self.__pydantic_extra__
         for key, value in values.items():
-            object.__setattr__(self, key, value)
+            if key in fields:
+                object.__setattr__(self, key, value)
+            elif extra is not None and key != "id":
+                extra[key] = value
 
     def _sync_after_merge(
         self,
@@ -1941,11 +1959,10 @@ class BaseSurrealModel(BaseModel):
         The fallback whenever no row comes back: a buffered transaction (nothing has run yet)
         or ``refresh=False`` (the row was deliberately not requested). A kwarg that
         ``server_values`` overrode is skipped — writing it would leave the instance holding a
-        value that never reached the database. Keys here are Python field names.
+        value that never reached the database. Keys here are Python field names, written as
+        :meth:`_set_synced` writes them.
         """
-        for key, value in data.items():
-            if key not in server_values and hasattr(self, key):
-                object.__setattr__(self, key, value)
+        self._set_synced({key: value for key, value in data.items() if key not in server_values})
 
     async def _run_update(
         self,
