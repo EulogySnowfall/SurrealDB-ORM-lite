@@ -2259,6 +2259,7 @@ _CLASSIFIED: dict[type, dict[str, frozenset[str]]] = {
     BaseSurrealModel: {
         "invalidating writes": _INVALIDATING_WRITES[BaseSurrealModel],
         "raw, refused or not cached": frozenset({"raw_query", "call_function", "refresh", "get_related", "traverse"}),
+        "DDL that changes no row": frozenset({"define_events", "remove_event"}),
     },
     BaseSurrealEdge: {
         "invalidating writes": _INVALIDATING_WRITES[BaseSurrealEdge],
@@ -2278,6 +2279,7 @@ _CLASSIFIED: dict[type, dict[str, frozenset[str]]] = {
         "invalidating writes": _INVALIDATING_WRITES[SurrealDBConnectionManager],
         "identity": frozenset({"signin", "authenticate", "invalidate"}),
         "raw, refused or not cached": frozenset({"call_function"}),
+        "DDL that changes no row": frozenset({"define_event", "remove_event"}),
         "other": frozenset(
             {
                 "unset_connection",

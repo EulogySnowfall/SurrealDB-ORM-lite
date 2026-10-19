@@ -9,10 +9,20 @@ Unit tests (no server): ``scan_fragment()`` (spec §6.2), ``Event``'s constructi
 refusals ``apply_ddl_statements(classify=True)`` classifies (S1–S3), ``check_call_transaction(operation=)`` and the
 ``ASYNC`` check C1 (spec §5.6, §6.4, §6.5; AC-13). The check catches mistakes and is not an injection defence: every
 refused input below is a plain malformed name, fragment or kind.
+
+E2E tests (classes suffixed ``E2E``) on the line under test over WebSocket and HTTP, and on ``mem://``: the named
+connection ``"evt"`` on the database ``evt_db``, reset before each test (spec §9.3) — events applied and removed from a
+model and from the manager, fired by ORM and raw writes, ``ASYNC`` events on 3.x and refused before any DDL on 2.x and
+the embedded engine, the per-line facts (``$input``, an unchanged ``upsert()``), server refusals classified, names
+refused before any request and comments read back (spec §5.3, §5.4; AC-5, AC-6, AC-7, AC-13, AC-15).
 """
 
+import asyncio
+import contextlib
 import dataclasses
+import os
 import pickle
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
@@ -22,6 +32,7 @@ import surreal_orm_lite
 from surreal_orm_lite import (
     BaseSurrealEdge,
     BaseSurrealModel,
+    DatabaseIntrospector,
     SurrealConfigDict,
     SurrealDbAuthenticationError,
     SurrealDbConflictError,
@@ -30,6 +41,7 @@ from surreal_orm_lite import (
     SurrealDbNotFoundError,
     schema,
 )
+from surreal_orm_lite._sdk import ServerError
 from surreal_orm_lite.define_parser import (
     DefineParseError,
     KLiteral,
@@ -1113,8 +1125,22 @@ class EvMdFollows(BaseSurrealEdge):
     model_config = SurrealConfigDict(table_name="ev_md_follows", events=[_MD_AUDIT])
 
 
+class EvMdUnrouted(BaseSurrealModel):
+    """No events, on a connection that is never registered: reaching it would raise."""
+
+    model_config = SurrealConfigDict(table_name="ev_md_unrouted", connection="ev_md_unregistered")
+
+
 class TestModelEvents:
     """AC-4: ``SurrealConfigDict(events=)``, ``get_events()``, ``event_ddl()`` and E14 (spec §5.3, §5.6)."""
+
+    @pytest.mark.parametrize("model", [EvMdUnrouted, EvMdPlain, EvMdQuiet])
+    async def test_define_events_without_events_sends_nothing(self, model: type[BaseSurrealModel]) -> None:
+        # No statement, no request: the connection is not even resolved (EvMdUnrouted's is not registered, and no
+        # default connection is configured).
+        await SurrealDBConnectionManager.unset_connection()
+        assert await model.define_events() == []
+        assert await model.define_events(overwrite=False) == []
 
     def test_get_events_is_a_tuple_in_declaration_order(self) -> None:
         events = EvMdPerson.get_events()
@@ -1497,3 +1523,473 @@ class TestAsyncCheck:
         assert await ensure_async_events_supported(client, [_NOTIFY, _RETRYING], embedded=embedded) is None
         assert client.version_calls == 1
         assert client.queries == []
+
+
+# === E2E (spec §9.3): the connection "evt" on the database evt_db, over WebSocket and HTTP, and mem:// ================
+
+#: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
+_KINDS = ["ws", "http", "mem"]
+
+#: The reset of spec §9.3, in one query: ``ev_log`` and ``ev_person`` are defined up front, so a raw ``SELECT`` of
+#: them reads ``[]`` before any event has written (3.x refuses a raw ``SELECT`` of a table that does not exist).
+_EVT_RESET = (
+    "REMOVE DATABASE IF EXISTS evt_db; DEFINE DATABASE evt_db; "
+    "DEFINE TABLE ev_log TYPE ANY SCHEMALESS; DEFINE TABLE ev_person TYPE ANY SCHEMALESS;"
+)
+
+#: The events of spec §5.2, applied through the ORM.
+_EV_AUDIT = Event("ev_audit", then=_AUDIT_THEN)
+_EV_RENAME = Event(
+    "ev_rename",
+    when="$event = 'UPDATE' AND $before.name != $after.name",
+    then="CREATE ev_log SET kind = 'rename', old = $before.name, new = $after.name",
+    comment="it's renamed",
+)
+_EV_GUARD = Event("ev_guard", when="$after.name = 'forbidden'", then="THROW 'name refused: ' + $after.name")
+_EV_UPPER = Event(
+    "ev_upper",
+    when="$event = 'CREATE'",
+    then="LET $n = string::uppercase($after.name); CREATE ev_log SET kind = 'upper', name = $n",
+)
+_EV_ASYNC = Event(
+    "ev_async",
+    when="$event = 'CREATE'",
+    then="CREATE ev_log SET kind = 'async', rid = $value.id",
+    async_mode=True,
+    retry=2,
+)
+
+#: ``ev_async`` as SurrealDB 3.x reads it back (spec §3): ``ASYNC`` always with both values.
+_EV_ASYNC_INFO_3X = (
+    "DEFINE EVENT ev_async ON ev_person ASYNC RETRY 2 MAXDEPTH 3 WHEN $event = 'CREATE' "
+    "THEN { CREATE ev_log SET kind = 'async', rid = $value.id }"
+)
+
+
+class EvPerson(BaseSurrealModel):
+    """The four synchronous events of spec §5.2 on ``ev_person``, in the database of the connection ``"evt"``."""
+
+    model_config = SurrealConfigDict(
+        table_name="ev_person", connection="evt", events=[_EV_AUDIT, _EV_RENAME, _EV_GUARD, _EV_UPPER]
+    )
+
+    id: str | None = None
+    name: str
+    age: int | None = None
+
+
+class EvLog(BaseSurrealModel):
+    """The rows the events write; any column besides ``kind`` is kept as an extra."""
+
+    model_config = SurrealConfigDict(table_name="ev_log", connection="evt", extra="allow")
+
+    id: str | None = None
+    kind: str | None = None
+
+
+class EvAsyncPerson(BaseSurrealModel):
+    """``ev_async`` on ``ev_person`` — on the connection ``"evt"`` too, so nothing lands in the default database."""
+
+    model_config = SurrealConfigDict(table_name="ev_person", connection="evt", events=[_EV_ASYNC])
+
+    id: str | None = None
+    name: str
+    age: int | None = None
+
+
+def _url(kind: str) -> str:
+    """The URL of *kind*: ``ws`` or ``http`` on the line under test (``SURREALDB_PORT``), or ``mem``."""
+    if kind == "mem":
+        return "mem://"
+    host = os.environ.get("SURREALDB_HOST", "localhost")
+    port = os.environ.get("SURREALDB_PORT", "8000")
+    return f"ws://{host}:{port}/rpc" if kind == "ws" else f"http://{host}:{port}"
+
+
+def _register_evt(kind: str) -> None:
+    if kind == "mem":
+        SurrealDBConnectionManager.add_connection("evt", url="mem://", namespace="ns", database="evt_db")
+    else:
+        SurrealDBConnectionManager.add_connection(
+            "evt", url=_url(kind), user="root", password="root", namespace="ns", database="evt_db"
+        )
+
+
+async def _apply_ddl(client: Any, ddl: str) -> None:
+    """Run *ddl* and check every statement: ``query()`` checks only the first one."""
+    response = await client.query_raw(ddl, {})
+    assert "error" not in response, response["error"]
+    refused = [result for result in response["result"] if result["status"] != "OK"]
+    assert response["result"] and not refused, refused
+
+
+@contextlib.asynccontextmanager
+async def _evt(kind: str) -> AsyncIterator[Any]:
+    """The connection ``"evt"`` on *kind*, its database ``evt_db`` reset in one query; removed, then unregistered,
+    on exit."""
+    _register_evt(kind)
+    client = await SurrealDBConnectionManager.get_client("evt")
+    await _apply_ddl(client, _EVT_RESET)
+    try:
+        yield client
+    finally:
+        with contextlib.suppress(Exception):
+            cleanup = await SurrealDBConnectionManager.get_client("evt")
+            await cleanup.query("REMOVE DATABASE IF EXISTS evt_db;", {})
+        await SurrealDBConnectionManager.remove_connection("evt")
+
+
+async def _major(client: Any) -> int:
+    """The major version of the engine *client* talks to: ``"surrealdb-3.3.4"`` → 3; ``mem://`` → 2."""
+    return int((await client.version()).rsplit("-", 1)[-1].split(".", 1)[0])
+
+
+async def _require_line(client: Any, line: int, item: str) -> None:
+    """A *line*-only *item*: the test runs on that line, where a refusal fails it, and is skipped on the other."""
+    if await _major(client) != line:
+        pytest.skip(f"SurrealDB {line}.x only: {item}")
+
+
+def _spy(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[tuple[str, tuple[object, ...]]]:
+    """Record every ``query``, ``query_raw`` and ``version`` call *client* receives (and let it through)."""
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def recording(method: str) -> Any:
+        real = getattr(client, method)
+
+        async def call(*args: object, **kwargs: object) -> object:
+            calls.append((method, args))
+            return await real(*args, **kwargs)
+
+        return call
+
+    for method in ("query", "query_raw", "version"):
+        monkeypatch.setattr(client, method, recording(method))
+    return calls
+
+
+async def _wait_rows(queryset: Any, n: int, timeout: float = 5.0) -> list[Any]:
+    """The rows of *queryset* once there are at least *n* — polled through the ORM every 20 ms, for an ``ASYNC``
+    event's rows; fails after *timeout* seconds."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        rows: list[Any] = await queryset.exec()
+        if len(rows) >= n:
+            return rows
+        if loop.time() >= deadline:
+            pytest.fail(f"{n} row(s) expected within {timeout} s, {len(rows)} read")
+        await asyncio.sleep(0.02)
+
+
+async def _events_info(client: Any, table: str) -> dict[str, str]:
+    """The ``events`` of ``INFO FOR TABLE`` *table* (a constant name of these tests): name → definition."""
+    info = await client.query(f"INFO FOR TABLE {table};", {})
+    return dict(info["events"])
+
+
+async def _log(client: Any) -> list[tuple[Any, ...]]:
+    """Every ``ev_log`` row as ``(kind, rid, old, new, name)`` — ``rid`` as text, an absent column ``None`` —,
+    sorted (row ids are random)."""
+    rows = await client.query("SELECT * FROM ev_log;", {})
+    return _sorted(
+        (
+            row.get("kind"),
+            None if row.get("rid") is None else str(row["rid"]),
+            row.get("old"),
+            row.get("new"),
+            row.get("name"),
+        )
+        for row in rows
+    )
+
+
+def _sorted(rows: Any) -> list[tuple[Any, ...]]:
+    return sorted(rows, key=repr)
+
+
+#: The names AC-15 (i) refuses — a ``;``, a backtick, a space, a trailing newline, nothing.
+_BAD_NAMES = ["a;b", "a`b", "a b", "a\n", ""]
+
+
+class TestEventsE2E:
+    """AC-5, AC-7, AC-13 (S3) and AC-15 (i, iii): synchronous events defined, fired and removed — from a model and
+    from the manager — on every engine."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_events_fire_on_orm_writes(self, kind: str) -> None:
+        async with _evt(kind) as client:
+            applied = await EvPerson.define_events()
+            assert applied == EvPerson.event_ddl()
+            assert sorted(await _events_info(client, "ev_person")) == ["ev_audit", "ev_guard", "ev_rename", "ev_upper"]
+
+            person = EvPerson(id="ada", name="Ada", age=30)
+            await person.save()
+            await person.merge(name="Bea")
+            await person.merge(age=31)
+            await person.delete()
+            assert await _log(client) == _sorted(
+                [
+                    ("CREATE", "ev_person:ada", None, None, None),
+                    ("upper", None, None, None, "ADA"),
+                    ("UPDATE", "ev_person:ada", None, None, None),
+                    ("rename", None, "Ada", "Bea", None),
+                    ("UPDATE", "ev_person:ada", None, None, None),
+                    ("DELETE", "ev_person:ada", None, None, None),
+                ]
+            )
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_guard_event_refuses_the_write(self, kind: str) -> None:
+        async with _evt(kind):
+            await EvPerson.define_events()
+            with pytest.raises(ServerError) as raised:
+                await EvPerson(id="bad", name="forbidden").save()
+            assert "name refused: forbidden" in str(raised.value)
+            assert await EvPerson.objects().filter(name="forbidden").exec() == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_define_events_is_idempotent(self, kind: str) -> None:
+        async with _evt(kind) as client:
+            first = await EvPerson.define_events()
+            before = await _events_info(client, "ev_person")
+            assert await EvPerson.define_events() == first
+            assert await _events_info(client, "ev_person") == before
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_overwrite_false_keeps_an_existing_event(self, kind: str) -> None:
+        async with _evt(kind) as client:
+            await _apply_ddl(client, "DEFINE EVENT ev_audit ON ev_person WHEN false THEN { CREATE ev_log SET kind = 'kept' };")
+            applied = await EvPerson.define_events(overwrite=False)
+            assert applied == EvPerson.event_ddl(overwrite=False)
+            assert all(statement.startswith("DEFINE EVENT IF NOT EXISTS ") for statement in applied)
+            events = await _events_info(client, "ev_person")
+            assert sorted(events) == ["ev_audit", "ev_guard", "ev_rename", "ev_upper"]
+            assert "WHEN false" in events["ev_audit"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_model_remove_event(self, kind: str) -> None:
+        async with _evt(kind) as client:
+            await EvPerson.define_events()
+            assert await EvPerson.remove_event("ev_audit") == "REMOVE EVENT IF EXISTS `ev_audit` ON `ev_person`;"
+            assert sorted(await _events_info(client, "ev_person")) == ["ev_guard", "ev_rename", "ev_upper"]
+            await EvPerson(id="cy", name="Cy").save()
+            assert await _log(client) == [("upper", None, None, None, "CY")]
+
+            # Removal is by name: a second call passes (IF EXISTS), and so does an event the model never declared.
+            assert await EvPerson.remove_event("ev_audit") == "REMOVE EVENT IF EXISTS `ev_audit` ON `ev_person`;"
+            await _apply_ddl(client, "DEFINE EVENT ev_extra ON ev_person THEN { NONE };")
+            await EvPerson.remove_event("ev_extra")
+            assert sorted(await _events_info(client, "ev_person")) == ["ev_guard", "ev_rename", "ev_upper"]
+
+            with pytest.raises(SurrealDbNotFoundError) as raised:
+                await EvPerson.remove_event("ev_audit", missing_ok=False)
+            assert str(raised.value).startswith("Can't apply event removal: REMOVE EVENT `ev_audit` ON `ev_person`; -> ")
+            assert "does not exist" in str(raised.value)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_manager_define_and_remove_event_on_a_table_without_a_model(self, kind: str) -> None:
+        stock_guard = Event("ev_stock", when="$after.stock < 0", then="THROW 'stock refused'")
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            statement = await SurrealDBConnectionManager.define_event(stock_guard, "ev_product")
+            assert statement == stock_guard.ddl("ev_product")
+            assert sorted(await _events_info(client, "ev_product")) == ["ev_stock"]
+            with pytest.raises(ServerError, match="stock refused"):
+                await client.query("CREATE ev_product:p1 SET stock = -1;", {})
+
+            removal = "REMOVE EVENT IF EXISTS `ev_stock` ON `ev_product`;"
+            assert await SurrealDBConnectionManager.remove_event("ev_stock", "ev_product") == removal
+            assert await _events_info(client, "ev_product") == {}
+            await client.query("CREATE ev_product:p1 SET stock = -1;", {})
+            assert await SurrealDBConnectionManager.remove_event("ev_stock", "ev_product") == removal
+
+            with pytest.raises(SurrealDbNotFoundError) as raised:
+                await SurrealDBConnectionManager.remove_event("ev_stock", "ev_product", missing_ok=False)
+            assert str(raised.value).startswith("Can't apply event removal: REMOVE EVENT `ev_stock` ON `ev_product`; -> ")
+            assert "does not exist" in str(raised.value)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_overwrite_false_through_the_manager(self, kind: str) -> None:
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            await _apply_ddl(client, "DEFINE EVENT ev_audit ON ev_person WHEN false THEN { NONE };")
+            statement = await SurrealDBConnectionManager.define_event(_EV_AUDIT, "ev_person", overwrite=False)
+            assert statement == _EV_AUDIT.ddl("ev_person", overwrite=False)
+            assert "WHEN false" in (await _events_info(client, "ev_person"))["ev_audit"]
+            await SurrealDBConnectionManager.define_event(_EV_AUDIT, "ev_person")
+            assert "WHEN false" not in (await _events_info(client, "ev_person"))["ev_audit"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_server_refusal_is_s3(self, kind: str) -> None:
+        # AC-13: well formed for the ORM, refused by the server's parser.
+        broken = Event("ev_broken", then="CREATE")
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            with pytest.raises(SurrealDbError) as raised:
+                await SurrealDBConnectionManager.define_event(broken, "ev_person")
+            major = await _major(client)
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value).startswith(
+            "Can't apply event definition: DEFINE EVENT OVERWRITE `ev_broken` ON `ev_person` THEN { CREATE }; -> "
+        )
+        expected = RuntimeError if kind == "mem" else ValidationError if major >= 3 else InternalError
+        assert type(raised.value.__cause__) is expected
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_input_differs_by_line(self, kind: str) -> None:
+        # AC-7 (M5): $input is the write's input on 3.x, NONE on 2.x and the embedded engine.
+        recorder = Event("ev_input", then="CREATE ev_log SET kind = 'input', inp = $input")
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            await SurrealDBConnectionManager.define_event(recorder, "ev_person")
+            await client.query("CREATE ev_person:i SET name = 'x';", {})
+            rows = await client.query("SELECT * FROM ev_log WHERE kind = 'input';", {})
+            expected = {"name": "x"} if await _major(client) >= 3 else None
+        assert [row.get("inp") for row in rows] == [expected]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_unchanged_writes_differ_by_line(self, kind: str) -> None:
+        # AC-7 (M6): an unchanged merge() fires no event anywhere; an unchanged upsert() one UPDATE event on 3.x only.
+        async with _evt(kind) as client:
+            await EvPerson.define_events()
+            person = EvPerson(id="ada", name="Ada", age=30)
+            await person.save()
+            await client.query("DELETE ev_log;", {})
+            await person.merge(name="Ada")
+            assert await _log(client) == []
+            await person.upsert()
+            expected = [("UPDATE", "ev_person:ada", None, None, None)] if await _major(client) >= 3 else []
+            assert await _log(client) == expected
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_names_are_refused_before_any_request(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        # AC-15 (i): each name refused by the ORM, before anything reaches the server.
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            calls = _spy(monkeypatch, client)
+            for bad in _BAD_NAMES:
+                event_error = f"Invalid event name {bad!r}: {_IDENTIFIER_EXPECTED}"
+                table_error = f"Invalid table name {bad!r}: {_IDENTIFIER_EXPECTED}"
+                with pytest.raises(ValueError) as raised:
+                    await SurrealDBConnectionManager.define_event(Event(bad, then="NONE"), "ev_person")
+                assert str(raised.value) == event_error
+                with pytest.raises(ValueError) as raised:
+                    await SurrealDBConnectionManager.remove_event(bad, "ev_person")
+                assert str(raised.value) == event_error
+                with pytest.raises(ValueError) as raised:
+                    await EvPerson.remove_event(bad)
+                assert str(raised.value) == event_error
+                with pytest.raises(ValueError) as raised:
+                    await SurrealDBConnectionManager.define_event(_EV_AUDIT, bad)
+                assert str(raised.value) == table_error
+                with pytest.raises(ValueError) as raised:
+                    await SurrealDBConnectionManager.remove_event("ev_audit", bad)
+                assert str(raised.value) == table_error
+            assert calls == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_arguments_are_refused_before_any_request(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        # E15, E13 and E1, each before anything reaches the server.
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(TypeError) as raised:
+                await SurrealDBConnectionManager.define_event("ev_audit", "ev_person")  # type: ignore[arg-type]
+            assert str(raised.value) == "define_event() takes an Event, got str."
+            with pytest.raises(TypeError) as raised:
+                await SurrealDBConnectionManager.define_event(_EV_AUDIT, "ev_person", overwrite=1)  # type: ignore[arg-type]
+            assert str(raised.value) == "overwrite= must be a bool, got int."
+            with pytest.raises(TypeError) as raised:
+                await SurrealDBConnectionManager.remove_event("ev_audit", "ev_person", missing_ok="yes")  # type: ignore[arg-type]
+            assert str(raised.value) == "missing_ok= must be a bool, got str."
+            with pytest.raises(TypeError) as raised:
+                await EvPerson.remove_event("ev_audit", missing_ok=1)  # type: ignore[arg-type]
+            assert str(raised.value) == "missing_ok= must be a bool, got int."
+            with pytest.raises(TypeError) as raised:
+                await EvPerson.remove_event(_EV_AUDIT)  # type: ignore[arg-type]
+            assert str(raised.value) == "Event name must be a str, got Event."
+            with pytest.raises(TypeError) as raised:
+                await SurrealDBConnectionManager.define_event(_EV_AUDIT, 1)  # type: ignore[arg-type]
+            assert str(raised.value) == "Table name must be a str, got int."
+            with pytest.raises(TypeError) as raised:
+                await EvPerson.define_events(overwrite=1)  # type: ignore[arg-type]
+            assert str(raised.value) == "overwrite= must be a bool, got int."
+            assert calls == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_model_without_events_sends_nothing(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        # AC-4: no statement to apply, so no request at all — not even version().
+        async with _evt(kind) as client:
+            calls = _spy(monkeypatch, client)
+            assert await EvLog.define_events() == []
+            assert calls == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_comments_round_trip(self, kind: str) -> None:
+        # AC-15 (iii): a quote, double quotes, a backslash and a newline, escaped by the ORM and read back as written.
+        comments = {"ev_c1": "it's", "ev_c2": 'say "hi"', "ev_c3": "back\\slash", "ev_c4": "two\nlines"}
+        async with _evt(kind), SurrealDBConnectionManager.using("evt"):
+            for name, comment in comments.items():
+                await SurrealDBConnectionManager.define_event(Event(name, then="NONE", comment=comment), "ev_person")
+            schema = await DatabaseIntrospector("evt", tables=["ev_person"]).introspect()
+        assert schema.issues == ()
+        assert {name: event.comment for name, event in schema.tables["ev_person"].events.items()} == comments
+
+
+class TestAsyncEventsE2E:
+    """AC-6: ``ASYNC`` events defined and fired on SurrealDB 3.x; refused before any DDL (C1) on 2.x and the
+    embedded engine."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_model_defines_an_async_event_on_3x(self, kind: str) -> None:
+        async with _evt(kind) as client:
+            await _require_line(client, 3, "ASYNC events")
+            assert await EvAsyncPerson.define_events() == [_EV_ASYNC.ddl("ev_person")]
+            assert await _events_info(client, "ev_person") == {"ev_async": _EV_ASYNC_INFO_3X}
+            await EvAsyncPerson(id="ann", name="Ann").save()
+            rows = await _wait_rows(EvLog.objects().filter(kind="async"), 1)
+        assert [str(row.rid) for row in rows] == ["ev_person:ann"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_manager_defines_an_async_event_on_3x(self, kind: str) -> None:
+        async with _evt(kind) as client, SurrealDBConnectionManager.using("evt"):
+            await _require_line(client, 3, "ASYNC events")
+            assert await SurrealDBConnectionManager.define_event(_EV_ASYNC, "ev_person") == _EV_ASYNC.ddl("ev_person")
+            assert await _events_info(client, "ev_person") == {"ev_async": _EV_ASYNC_INFO_3X}
+            await client.query("CREATE ev_person:bo SET name = 'Bo';", {})
+            rows = await _wait_rows(EvLog.objects().filter(kind="async"), 1)
+        assert [str(row.rid) for row in rows] == ["ev_person:bo"]
+
+    async def test_an_async_event_runs_after_its_transaction_commits(self) -> None:
+        # Interactive transactions: WebSocket on 3.x. The event runs once the transaction commits, so it has not run
+        # while the transaction is open.
+        async with _evt("ws") as client:
+            await _require_line(client, 3, "ASYNC events")
+            await EvAsyncPerson.define_events()
+            async with SurrealDBConnectionManager.transaction("evt") as tx:
+                assert tx.is_interactive
+                await EvAsyncPerson(id="tx", name="Tx").save(tx=tx)
+                assert await EvLog.objects(tx=tx).filter(kind="async").exec() == []
+            rows = await _wait_rows(EvLog.objects().filter(kind="async"), 1)
+        assert [str(row.rid) for row in rows] == ["ev_person:tx"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_c1_before_any_ddl_on_2x_and_the_embedded_engine(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _evt(kind) as client:
+            if await _major(client) >= 3:
+                pytest.skip("SurrealDB 2.x and the embedded engine only: ASYNC events refused before any DDL (C1)")
+            engine = "the embedded engine (a SurrealDB 2.x core)" if kind == "mem" else "SurrealDB 2.x"
+            expected = _c1(engine, "'ev_async'")
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as from_model:
+                await EvAsyncPerson.define_events()
+            async with SurrealDBConnectionManager.using("evt"):
+                with pytest.raises(SurrealDbError) as from_manager:
+                    await SurrealDBConnectionManager.define_event(_EV_ASYNC, "ev_person")
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    assert not tx.is_interactive
+                    with pytest.raises(SurrealDbError) as in_model_tx:
+                        await EvAsyncPerson.define_events(tx=tx)
+                    with pytest.raises(SurrealDbError) as in_manager_tx:
+                        await SurrealDBConnectionManager.define_event(_EV_ASYNC, "ev_person", tx=tx)
+                    assert tx.statements == []
+            assert [method for method, _ in calls] == ["version"] * 4
+            assert "ev_async" not in await _events_info(client, "ev_person")
+        for raised in (from_model, from_manager, in_model_tx, in_manager_tx):
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value) == expected

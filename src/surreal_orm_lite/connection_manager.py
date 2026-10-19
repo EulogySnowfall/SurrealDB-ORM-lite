@@ -45,7 +45,9 @@ from .live import (
     require_websocket,
 )
 from .routing import check_call_transaction, check_name
+from .schema import Event, ensure_async_events_supported, remove_event_statement
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
+from .utils import apply_ddl_statements
 
 logger = logging.getLogger(__name__)
 
@@ -2394,6 +2396,78 @@ class SurrealDBConnectionManager:
         if missing:
             return SurrealDbNotFoundError(f"Stored function {function!r} does not exist: {message}")
         return SurrealDbError(f"Call to stored function {function!r} failed: {message}")
+
+    # ------------------------------------------------------------------
+    # Server-side events (v0.31.0)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    @_routed("current")
+    async def define_event(cls, event: Event, table: str, *, overwrite: bool = True, tx: Transaction | None = None) -> str:
+        """Define the server-side *event* on *table* — any table, with or without a model — and return the statement.
+
+        Runs on the current connection (the innermost ``using()`` block's, else the default one), like
+        :meth:`call_function`::
+
+            stock_guard = Event("stock_guard", when="$after.stock < 0", then="THROW 'stock cannot go below zero'")
+            await SurrealDBConnectionManager.define_event(stock_guard, "product")
+            # 'DEFINE EVENT OVERWRITE `stock_guard` ON `product` WHEN $after.stock < 0 THEN { … };'
+
+        The statement is ``event.ddl(table, overwrite=overwrite)``. The event's expressions are written into the
+        DDL as given: they are trusted application code, never user input (``Event`` checks them for mistakes
+        only). A table that does not exist yet is created by SurrealDB (schemaless). Applying needs a session
+        allowed to define (a system user such as root, or a namespace or database ``OWNER``/``EDITOR``). For a
+        model's declared events, use ``Model.define_events()``.
+
+        :param event: the :class:`~surreal_orm_lite.schema.Event` to define.
+        :param table: the table's name, an identifier (letters, digits, underscores; not starting with a digit).
+        :param overwrite: ``True`` (default) redefines an existing event (``OVERWRITE``), ``False`` keeps it
+            (``IF NOT EXISTS``).
+        :param tx: optional transaction the statement is applied with.
+        :return: the statement applied.
+        :raises TypeError: *event* is not an ``Event``, *table* not a ``str``, *overwrite* not a ``bool``.
+        :raises ValueError: *table* is not an identifier.
+        :raises SurrealDbError: *event* has ``async_mode=True`` and the connection runs SurrealDB 2.x or the
+            embedded engine — before any DDL; *tx* belongs to another connection — before any request; the server
+            refused the statement (``Can't apply event definition: …``).
+        :raises SurrealDbAuthenticationError: the session may not define events.
+        """
+        check_call_transaction(cls._connection_name or "default", tx, operation="define_event()")
+        if not isinstance(event, Event):
+            raise TypeError(f"define_event() takes an Event, got {type(event).__name__}.")
+        statement = event.ddl(table, overwrite=overwrite)
+        client = await cls.get_client()
+        await ensure_async_events_supported(client, (event,), embedded=cls.is_embedded())
+        await apply_ddl_statements([statement], client=client, tx=tx, what="event", classify=True)
+        return statement
+
+    @classmethod
+    @_routed("current")
+    async def remove_event(cls, event: str, table: str, *, missing_ok: bool = True, tx: Transaction | None = None) -> str:
+        """Remove the server-side event named *event* from *table* and return the statement applied.
+
+        Runs on the current connection (the innermost ``using()`` block's, else the default one)::
+
+            await SurrealDBConnectionManager.remove_event("stock_guard", "product")
+            # 'REMOVE EVENT IF EXISTS `stock_guard` ON `product`;'
+
+        :param event: the event's name, an identifier (letters, digits, underscores; not starting with a digit).
+        :param table: the table's name, an identifier.
+        :param missing_ok: ``True`` (default) emits ``REMOVE EVENT IF EXISTS …``, so a missing event is not an
+            error; ``False`` raises ``SurrealDbNotFoundError`` for it.
+        :param tx: optional transaction the statement is applied with.
+        :return: the statement applied.
+        :raises TypeError: *event* or *table* is not a ``str``, *missing_ok* not a ``bool``.
+        :raises ValueError: *event* or *table* is not an identifier.
+        :raises SurrealDbNotFoundError: ``missing_ok=False`` and the table has no such event.
+        :raises SurrealDbAuthenticationError: the session may not remove events.
+        :raises SurrealDbError: *tx* belongs to another connection — before any request; any other refusal.
+        """
+        check_call_transaction(cls._connection_name or "default", tx, operation="remove_event()")
+        statement = remove_event_statement(event, table, missing_ok)
+        client = await cls.get_client()
+        await apply_ddl_statements([statement], client=client, tx=tx, what="event", kind="removal", classify=True)
+        return statement
 
     # ------------------------------------------------------------------
     # Live queries (v0.19.0)
