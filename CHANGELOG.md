@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.5] - 2026-10-19
+
+`SurrealDBConnectionManager.kill()` no longer reports a connection lost under the request as a
+KILL the server refused. No new public API.
+
+### Fixed
+
+- **A `kill()` caught by a dropped connection returns normally** (#266). A KILL sent as the
+  WebSocket went down, before the SDK had noticed the drop, failed inside the SDK (its receive loop
+  clears the pending requests, so the request's own cleanup raised a `KeyError`), and `kill()`
+  turned that into `SurrealDbError: Failed to kill live query …` although the server never
+  answered. `kill()` now asks the client: when its connection dropped under the request (the SDK's
+  receive task has ended, after a wait of at most one second when the error came from the
+  transport), it closes the dead socket and records the live query as ended, as it already did for
+  a client found dead before the call, and the stream's readers end. A refusal from a live server
+  still raises `SurrealDbError` and keeps the uuid alive, so a retry can re-attach to it.
+- **A cancelled `kill()` raises `asyncio.CancelledError`** (#266), even when the SDK reports the
+  cancelled request as an ordinary error; it used to become `SurrealDbError`. The readers are
+  released either way.
+- **`kill()` releases the stream's readers before it closes a dead socket** (#266), so an
+  automatic resubscribe woken by the same drop cannot reopen a subscription that is being stopped.
+  The window was open where closing the socket yields to the event loop, as on Python 3.11.
+
+### Notes
+
+- Docs: the README live-queries section says that a kill caught by a dropped connection is not a
+  refusal.
+- Same behaviour on SurrealDB 2.x and 3.x (live queries are WebSocket-only). Server pins
+  unchanged: tested against SurrealDB 3.3.4 and 2.7.0, plus 3.1.5 for backward compatibility.
+
 ## [0.30.3] - 2026-10-19
 
 A statement that fails inside `transaction()` fails the whole transaction on every strategy: a

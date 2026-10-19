@@ -2414,7 +2414,7 @@ wheels = [
 
 [[package]]
 name = "surreal-orm-lite"
-version = "0.30.3"
+version = "0.30.5"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },
