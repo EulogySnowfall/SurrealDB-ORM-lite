@@ -3308,10 +3308,6 @@ _EVENT_ROWS = [
         "v0.31.0",
     ],
 ]
-_HEADER_SENTENCE_303 = (
-    "The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded "
-    "engine, identical on 3.1.5."
-)
 _HEADER_SENTENCE_31 = "Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5."
 #: Spec §11.1 item 7: the row v0.31.0 adds to the embedded-engine table, cell by cell.
 _EMBEDDED_EVENTS_ROW = [
@@ -3363,6 +3359,30 @@ def _printed(block: str) -> list[str]:
 def _anchor(heading: str) -> str:
     """GitHub's anchor of a README heading: lower case, punctuation but ``-`` and ``_`` dropped, spaces as ``-``."""
     return re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-")
+
+
+def _release(text: str) -> tuple[int, int, int]:
+    """The release *text* names (``v0.30.7``, ``pre-existing (documented in v0.28.1)``) as a comparable triple."""
+    match = re.search(r"\bv(\d+)\.(\d+)\.(\d+)\b", text)
+    assert match is not None, text
+    major, minor, patch = (int(part) for part in match.groups())
+    return major, minor, patch
+
+
+def _assert_release_rows_in_order(rows: list[list[str]], block: list[list[str]], tail: int) -> None:
+    """*block* is in *rows* once, contiguous, and holds every row whose last cell names its release; the rows above it
+    name earlier releases and those below it, but for the table's *tail* final rows, later ones.
+
+    Which release sits next to *block* is not checked: a release prepared in parallel inserts its rows in version order
+    without changing this test.
+    """
+    release = _release(block[0][-1])
+    start = rows.index(block[0])
+    end = start + len(block)
+    assert rows[start:end] == block, rows[start:end]
+    assert [cells for cells in rows if _release(cells[-1]) == release] == block
+    assert all(_release(cells[-1]) < release for cells in rows[:start]), rows[:start]
+    assert all(_release(cells[-1]) > release for cells in rows[end : len(rows) - tail]), rows[end:]
 
 
 class TestReadmeSection32:
@@ -3456,13 +3476,11 @@ class TestReadmeSection32:
         assert comparison[start : start + 4] == _COMPARISON_ROWS_32, comparison
 
     def test_server_behaviour_rows(self) -> None:
-        """Exactly seven rows, Since v0.31.0, right after the last v0.30.0 row and before the table's last row."""
+        """Exactly seven rows, Since v0.31.0, together and in version order: earlier releases above them, later ones
+        below them, then the table's last row (v0.19.1's re-run)."""
         rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
-        start = rows.index(_EVENT_ROWS[0])
-        assert rows[start : start + len(_EVENT_ROWS)] == _EVENT_ROWS, rows[start : start + len(_EVENT_ROWS)]
-        assert rows[start - 1][3] == "v0.30.0", rows[start - 1]
-        assert start + len(_EVENT_ROWS) == len(rows) - 1 and rows[-1][3] == "v0.19.1", rows[-1]
-        assert [cells for cells in rows if cells[3] == "v0.31.0"] == _EVENT_ROWS
+        assert rows[-1][3] == "v0.19.1", rows[-1]
+        _assert_release_rows_in_order(rows, _EVENT_ROWS, tail=1)
 
     def test_server_behaviour_table_keeps_its_widths(self) -> None:
         """Every line 535 characters, the columns 136, 175, 181 and 38 wide: the new rows are padded to them."""
@@ -3472,17 +3490,21 @@ class TestReadmeSection32:
             assert [len(cell) for cell in line.split("|")[1:-1]] == _SERVER_TABLE_WIDTHS, line
 
     def test_server_behaviour_header_sentence(self) -> None:
-        """The sentence v0.31.0 appends to the table's intro paragraph, after v0.30.3's."""
+        """The sentence v0.31.0 adds to the table's intro paragraph, once, among sentences naming their releases in
+        increasing version order."""
         header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
-        assert f"{_HEADER_SENTENCE_303} {_HEADER_SENTENCE_31}" in header, header
+        assert header.count(_HEADER_SENTENCE_31) == 1, header
+        releases = [_release(name) for name in re.findall(r"\badded in (v\d+\.\d+\.\d+)", header)]
+        assert releases == sorted(set(releases)), releases
+        assert (0, 31, 0) in releases, releases
 
     def test_embedded_table_row(self) -> None:
-        """All four cells, right before the catch-all "Everything else" row; widths kept (69, 343, 113, 9)."""
+        """All four cells, in version order (earlier releases above, later ones below) before the catch-all
+        "Everything else" row; widths kept (69, 343, 113, 9)."""
         part = _readme_part(_EMBEDDED_BEHAVIOUR)
         rows = [cells for _, cells in _table_rows(part)]
-        assert rows[-2] == _EMBEDDED_EVENTS_ROW, rows[-2]
-        assert rows[-3][0] == "Schema introspection (`DatabaseIntrospector`)", rows[-3]
         assert rows[-1][0] == "Everything else", rows[-1]
+        _assert_release_rows_in_order(rows, [_EMBEDDED_EVENTS_ROW], tail=1)
         [lines] = _md_tables(part)
         assert {len(line) for line in lines} == {539}
         for line in lines:
