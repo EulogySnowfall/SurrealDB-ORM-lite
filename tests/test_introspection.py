@@ -25,6 +25,7 @@ import pathlib
 import re
 import stat
 import sys
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from datetime import UTC, datetime
@@ -69,6 +70,7 @@ from surreal_orm_lite.define_parser import (
     _R_NO_READING,
     _R_SIGNATURE,
     _R_STRING,
+    _R_TOO_COMPLEX,
 )
 from surreal_orm_lite.testing import embedded_database
 from tests.conftest import orm_client
@@ -634,6 +636,28 @@ class TestIssues:
         for record in caplog.records:
             assert "s3cr3t-0042" not in record.getMessage()
             assert "s3cr3t-0042" not in repr(record.args)
+
+    async def test_i1_a_keyword_soup_is_refused_in_bounded_time(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Server text is not trusted to be small or kind: a definition whose clauses take more work to read than its
+        # length allows is reported, kept, and the rest of the schema read.
+        caplog.set_level(logging.DEBUG)
+        statement = "DEFINE FIELD a ON t DEFAULT 's3cr3t-0042' " + "VALUE x ASSERT x " * 3000 + "+"
+        t = _table(fields={"a": statement, "ok": "DEFINE FIELD ok ON t TYPE int PERMISSIONS FULL"})
+        client = _FakeClient(_db(tables={"t": "DEFINE TABLE t TYPE NORMAL SCHEMAFULL PERMISSIONS NONE"}), {"t": t})
+        _install(monkeypatch, client)
+        started = time.perf_counter()
+        schema = await DatabaseIntrospector().introspect()
+        assert time.perf_counter() - started < 10.0  # unbounded, it took a quarter of a minute
+        assert list(schema.tables["t"].fields) == ["ok"]
+        (issue,) = schema.issues
+        assert (issue.kind, issue.name, issue.table) == ("field", "a", "t")
+        assert issue.message == _parse_failure(_R_TOO_COMPLEX)
+        assert issue.statement == statement
+        assert "s3cr3t-0042" not in repr(issue)
+        assert "s3cr3t-0042" not in repr(schema)
+        assert "s3cr3t-0042" not in caplog.text
 
     async def test_i2_info_for_table_failing(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
         caplog.set_level(logging.WARNING, logger=_LOGGER)

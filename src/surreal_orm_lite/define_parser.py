@@ -49,7 +49,8 @@ the weak one, refuses an empty text or one ending with an operator — not an op
 ``<-likes<-?`` or ``1..``; ``string``, ``kind``, ``perms`` and the other
 strict ones rule bare identifiers out), and leaves no keyword inside a content where it can start its own clause.
 Exactly one reading is read; none or several raise ``DefineParseError`` — ``VALUE b ASSERT ASSERT c`` is never
-guessed. ``parse_define_table()``, ``parse_define_field()``, ``parse_define_event()``, ``parse_define_analyzer()``,
+guessed —, and so does a statement whose readings take more work to count than its length allows (``_R_TOO_COMPLEX``:
+thousands of keyword-named words). ``parse_define_table()``, ``parse_define_field()``, ``parse_define_event()``, ``parse_define_analyzer()``,
 ``parse_define_access()``, ``parse_define_function()`` and ``parse_define_param()`` read their clauses so, and build
 their state by keyword, ``raw`` the statement; ``parse_permissions()`` reads a ``PERMISSIONS`` clause. Two kinds have
 positional parts the clause reader does not cover: an index's ``FIELDS`` list and its flat run of options
@@ -131,6 +132,7 @@ _R_KIND = "its kind is not understood"
 _R_PERMISSIONS = "its permissions are not understood"
 _R_INDEX = "its index options are not understood"
 _R_SIGNATURE = "its function signature is not understood"
+_R_TOO_COMPLEX = "its clauses hold too many keywords to read"
 
 _WORD = re.compile(r"[A-Za-z0-9_]+")
 _SPACE = re.compile(r"\s+")
@@ -1397,10 +1399,42 @@ class _Candidate(NamedTuple):
 #: (the number of slots for the end) and how many readings it leads to (1, or 2 for two or more).
 _Step: TypeAlias = tuple[int | None, int, int]
 
-#: The validators that refuse any content holding a top-level word — empty, one string literal, brackets and
-#: punctuation only — and so any content holding a keyword candidate: a clause they validate ends at the first
-#: candidate after its keyword, or at the end of the text when none follows.
-_WORDLESS_VALIDATORS: frozenset[_Validator] = frozenset({_valid_flag, _valid_string, _valid_body, _valid_group})
+#: The validators that refuse any content holding a keyword candidate — a top-level word with whitespace before it:
+#: empty, one string literal, brackets and punctuation only, or ``fn::`` and its segments without whitespace. A clause
+#: they validate ends at the first candidate after its keyword, or at the end of the text when none follows.
+_CANDIDATE_FREE_VALIDATORS: frozenset[_Validator] = frozenset(
+    {_valid_flag, _valid_string, _valid_body, _valid_group, _valid_fn_name}
+)
+#: The validators that read a content's ends only, whatever its length.
+_END_VALIDATORS: frozenset[_Validator] = frozenset(
+    {
+        _valid_flag,
+        _valid_expr,
+        _valid_string,
+        _valid_default,
+        _valid_reference,
+        _valid_view,
+        _valid_type_as_written,
+        _valid_table_type,
+        _valid_rule,
+    }
+)
+#: The validators that refuse at once a content not starting with ``FOR`` (or ``FULL``/``NONE`` alone).
+_PERMISSION_VALIDATORS: frozenset[_Validator] = frozenset({_valid_field_permissions, _valid_table_permissions})
+#: The validators that scan their content again (``split_top_level()``, then its items): what reading a character of
+#: it costs, in characters scanned.
+_RESCANNING_VALIDATORS: dict[_Validator, int] = {_valid_durations: 3, _valid_filter_list: 4}
+
+#: The clause reader's work bound, in characters of content read — each about the cost of scanning a character: this
+#: many per character of the clauses' text, plus ``_WORK_FLOOR``. A step from one candidate to another counts
+#: ``_STEP_WORK``; a content handed to a validator that reads all of it, its length (times its scans for a rescanning
+#: one; one for a validator that reads its ends only); a kind read on the whole text, the rest of the text. The
+#: statements the servers render read within a tenth of it (tested; about five per character at most); past it, the
+#: statement is refused with ``_R_TOO_COMPLEX`` — text crafted with thousands of keyword-named words, whose readings
+#: would take a time quadratic in their number to count. Reading a statement so costs a few dozen scans of it at most.
+_WORK_PER_CHAR = 16
+_WORK_FLOOR = 65536
+_STEP_WORK = 8
 
 
 class _ClauseReader:
@@ -1413,11 +1447,13 @@ class _ClauseReader:
     and both contents still valid — the reading that swallows it is not counted. So an expression keeps a
     keyword-named field (``VALUE a * READONLY``, ``VALUE a + ASSERT ASSERT $value > 0``) only where the keyword
     cannot start its clause, and ``VALUE b ASSERT ASSERT c`` still has two readings. Counts are memoised on
-    ``(candidate, slot, names used)``: the work is polynomial in the number of candidates whatever the text.
+    ``(candidate, slot, names used)``, and the work of counting is bounded by the length of the text
+    (``_WORK_PER_CHAR``): past the bound, ``DefineParseError(_R_TOO_COMPLEX)``.
 
     A step after a slot only walks the candidates that can open a later slot (``_openers``), and a slot whose validator
-    refuses every word (``_WORDLESS_VALIDATORS``) only the first candidate after its keyword. A ``kind`` is read once
-    from where its content starts, on the whole text (``_kind_reach``), whatever the candidate its content ends at.
+    refuses every candidate (``_CANDIDATE_FREE_VALIDATORS``) only the first candidate after its keyword. A ``kind`` is
+    read once from where its content starts, on the whole text (``_kind_reach``), and ``tokens`` are checked with a
+    count of the tokens they refuse (``_refused_tokens``), whatever the candidate a content ends at.
     """
 
     __slots__ = (
@@ -1428,11 +1464,13 @@ class _ClauseReader:
         "_fits_known",
         "_kind_reaches",
         "_openers",
+        "_refused",
         "_required",
         "_shared",
         "_slots",
         "_text",
         "_tokens",
+        "_work",
     )
 
     def __init__(self, text: str, start: int, slots: Sequence[Slot]) -> None:
@@ -1466,9 +1504,16 @@ class _ClauseReader:
         self._counts: dict[tuple[int, int, frozenset[str]], int] = {}
         self._fits_known: dict[tuple[int, int, int], bool] = {}
         self._kind_reaches: dict[int, int | None] = {}
+        self._refused: list[int] | None = None
+        # The work left to count the readings; None once they are counted.
+        self._work: int | None = _WORK_PER_CHAR * (len(text) - start) + _WORK_FLOOR
 
     def read(self) -> dict[str, Clause]:
-        """The clauses of the one reading; ``DefineParseError`` with ``_R_NO_READING`` or ``_R_AMBIGUOUS``."""
+        """The clauses of the one reading; ``DefineParseError`` with ``_R_NO_READING``, ``_R_AMBIGUOUS`` or
+        ``_R_TOO_COMPLEX``.
+
+        Once the readings are counted, walking the one reading repeats part of that work: it is not counted again.
+        """
         total = 0
         for *_, readings in self._starts():
             total += readings
@@ -1476,6 +1521,7 @@ class _ClauseReader:
                 raise DefineParseError(_R_AMBIGUOUS)
         if not total:
             raise DefineParseError(_R_NO_READING)
+        self._work = None
         clauses: dict[str, Clause] = {}
         following, slot, _ = next(self._starts())
         used = frozenset[str]()
@@ -1517,10 +1563,11 @@ class _ClauseReader:
             and self._maximal(current, slot, used, None, end)
         ):
             yield None, end, 1
-        # A wordless content ends at the first candidate after the keyword: none after it can close it.
-        last = self._next_candidate(after) if self._slots[slot].validator in _WORDLESS_VALIDATORS else len(self._tokens)
+        # A candidate-free content ends at the first candidate after the keyword: none after it can close it.
+        last = self._next_candidate(after) if self._slots[slot].validator in _CANDIDATE_FREE_VALIDATORS else len(self._tokens)
         openers = self._openers[slot]
         for position in range(bisect.bisect_right(openers, current), len(openers)):
+            self._spend(_STEP_WORK)
             following = openers[position]
             candidate = self._candidates[following]
             if candidate.token < after:
@@ -1558,6 +1605,7 @@ class _ClauseReader:
         taken = used if following is None else used | {self._slots[opened].name}
         openers = self._openers[slot]
         for position in range(bisect.bisect_right(openers, current), len(openers)):
+            self._spend(_STEP_WORK)
             between = openers[position]
             candidate = self._candidates[between]
             if candidate.token >= stop:
@@ -1577,19 +1625,24 @@ class _ClauseReader:
     def _fits(self, slot: int, first: int, stop: int) -> bool:
         """Whether the tokens ``first`` to ``stop`` are a content *slot* accepts (memoised).
 
-        A wordless validator refuses a content holding a candidate without reading it; a ``kind`` passes when the kind
-        read from the content's start on the whole text ends where the content does (``_kind_reach``).
+        A candidate-free validator refuses a content holding a candidate without reading it; a ``kind`` passes when the
+        kind read from the content's start on the whole text ends where the content does (``_kind_reach``); ``tokens``
+        pass when the content holds none of the tokens they refuse (``_refused_tokens``).
         """
         key = (slot, first, stop)
         known = self._fits_known.get(key)
         if known is None:
             validator = self._slots[slot].validator
             span = _trimmed(self._text, self._tokens, first, stop)
-            if validator in _WORDLESS_VALIDATORS and self._next_candidate(span.first) < span.stop:
+            self._spend(self._reading_work(validator, span))
+            if validator in _CANDIDATE_FREE_VALIDATORS and self._next_candidate(span.first) < span.stop:
                 known = False
             elif validator is _valid_kind:
                 end = len(self._text) if stop == len(self._tokens) else self._tokens[stop].start
                 known = span.first < span.stop and self._kind_reach(span.first) == end
+            elif validator is _valid_tokens:
+                refused = self._refused_tokens()
+                known = span.first >= span.stop or refused[span.stop] == refused[span.first]
             else:
                 known = validator(span)
             self._fits_known[key] = known
@@ -1610,12 +1663,45 @@ class _ClauseReader:
         end of the text): one reading for every candidate the content may end at.
         """
         if first not in self._kind_reaches:
+            self._spend(len(self._text) - self._tokens[first].start)
             try:
                 reach: int | None = parse_kind_prefix(self._text, self._tokens[first].start)[1]
             except DefineParseError:
                 reach = None
             self._kind_reaches[first] = reach
         return self._kind_reaches[first]
+
+    def _refused_tokens(self) -> list[int]:
+        """For each token index, how many tokens before it ``_valid_tokens()`` refuses (computed once)."""
+        if self._refused is None:
+            refused = [0]
+            for token in self._tokens:
+                good = token.kind in (_WORD_TOKEN, _STRING_TOKEN, _SPACE_TOKEN) or (
+                    token.kind == _PUNCT_TOKEN and self._text[token.start] in "-."
+                )
+                refused.append(refused[-1] + (not good))
+            self._refused = refused
+        return self._refused
+
+    def _reading_work(self, validator: _Validator, span: _Span) -> int:
+        """The work of checking *span* against *validator* (see ``_WORK_PER_CHAR``): one for a validator that reads the
+        content's ends only — or a candidate-free one refusing a content that holds a candidate, a kind (read once from
+        its start, ``_kind_reach``) or tokens (``_refused_tokens``) — else the length of the content."""
+        if span.first >= span.stop or validator in _END_VALIDATORS or validator in (_valid_kind, _valid_tokens):
+            return 1
+        if validator in _CANDIDATE_FREE_VALIDATORS and self._next_candidate(span.first) < span.stop:
+            return 1
+        if validator in _PERMISSION_VALIDATORS and span.word(span.first) != "FOR":
+            return 1
+        length = self._tokens[span.stop - 1].end - self._tokens[span.first].start
+        return length * _RESCANNING_VALIDATORS.get(validator, 1)
+
+    def _spend(self, work: int) -> None:
+        """Count *work* while the readings are counted: ``DefineParseError(_R_TOO_COMPLEX)`` past the bound."""
+        if self._work is not None:
+            self._work -= work
+            if self._work < 0:
+                raise DefineParseError(_R_TOO_COMPLEX)
 
     def _skips_required(self, slot: int, following: int) -> bool:
         """Whether a required slot lies strictly between *slot* (-1: the start) and *following* (the number of slots:
@@ -1639,8 +1725,9 @@ def read_clauses(text: str, start: int, slots: Sequence[Slot]) -> dict[str, Clau
     each content — the stripped text up to the next chosen keyword, the last one to the end — passes its slot's
     validator; every required slot is used; and no keyword is left inside a content where it could open its own
     clause (see ``_ClauseReader``). Exactly one reading gives the clauses; none raises ``DefineParseError``
-    (``_R_NO_READING``), two or more ``_R_AMBIGUOUS`` — never a guess. A text that does not scan raises its scan
-    error (``_R_STRING``, ``_R_IDENT``, ``_R_BRACKETS``, ``_R_IF``).
+    (``_R_NO_READING``), two or more ``_R_AMBIGUOUS`` — never a guess —, and counting them past a work bound linear
+    in the length of the text ``_R_TOO_COMPLEX``. A text that does not scan raises its scan error (``_R_STRING``,
+    ``_R_IDENT``, ``_R_BRACKETS``, ``_R_IF``).
     """
     return _ClauseReader(text, start, slots).read()
 

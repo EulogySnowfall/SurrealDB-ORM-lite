@@ -34,6 +34,7 @@ from surreal_orm_lite.define_parser import (
     _R_SIGNATURE,
     _R_STATEMENT,
     _R_STRING,
+    _R_TOO_COMPLEX,
     Clause,
     DefineParseError,
     KLiteral,
@@ -92,6 +93,7 @@ _SPEC_REASONS = {
     "_R_PERMISSIONS": "its permissions are not understood",
     "_R_INDEX": "its index options are not understood",
     "_R_SIGNATURE": "its function signature is not understood",
+    "_R_TOO_COMPLEX": "its clauses hold too many keywords to read",
 }
 
 _UNIT_WORDS = ["IF", "THEN", "ELSE", "END"]
@@ -1299,6 +1301,72 @@ class TestClauseReader:
             gc.enable()
         assert elapsed < 30 * scan
         assert check(parsed)
+
+    @pytest.mark.parametrize(
+        ("parse", "statement"),
+        [
+            # Every VALUE walks every later ASSERT, and every step is a dead end: the readings are counted in a time
+            # quadratic in the number of keywords, unless the work is bounded.
+            (parse_define_field, "DEFINE FIELD x ON t DEFAULT x " + "VALUE x ASSERT x " * 3000 + "+"),
+            (parse_define_field, "DEFINE FIELD x ON t VALUE x " + "COMPUTED x ASSERT x " * 3000 + "+"),
+            # A content read again, from its start, for every keyword it may end at.
+            (parse_define_analyzer, "DEFINE ANALYZER a FILTERS " + "lowercase," * 3000 + "x y" + " COMMENT" * 3000),
+            (
+                parse_define_access,
+                "DEFINE ACCESS a ON DATABASE TYPE RECORD DURATION FOR TOKEN 1h, FOR SESSION "
+                + "1µs" * 3000
+                + " x"
+                + " COMMENT" * 3000,
+            ),
+            (
+                parse_define_access,
+                "DEFINE ACCESS a ON DATABASE TYPE RECORD WITH JWT ALGORITHM "
+                + "a " * 3000
+                + "DURATION " * 3000
+                + "FOR TOKEN 1h",
+            ),
+            (
+                parse_define_field,
+                "DEFINE FIELD x ON t DEFAULT "
+                + "FOR select WHERE x PERMISSIONS " * 3000
+                + "FOR select WHERE x, FOR select FULL",
+            ),
+            (parse_define_table, "DEFINE TABLE t TYPE RELATION IN " + "a | " * 3000 + "x y" + " COMMENT" * 3000),
+            (parse_define_analyzer, "DEFINE ANALYZER a TOKENIZERS " + "a," * 3000 + "b c" + " COMMENT" * 3000),
+            (
+                parse_define_table,
+                "DEFINE TABLE t TYPE ANY CHANGEFEED " + "1d" * 3000 + " x" + " PERMISSIONS" * 3000 + " NONE",
+            ),
+        ],
+        ids=[
+            "value-assert-soup",
+            "computed-assert-soup",
+            "filters",
+            "durations",
+            "algorithm",
+            "permission-suffixes",
+            "in-chain",
+            "word-list",
+            "changefeed",
+        ],
+    )
+    def test_keyword_soups_take_bounded_work(self, parse: Callable[[str], object], statement: str) -> None:
+        # Server text is not trusted to be small or kind: the clause reader's work is bounded by the length of the
+        # statement. Past it, the statement is refused with its own fixed reason, never read for minutes.
+        gc.collect()
+        gc.disable()
+        try:
+            started = time.perf_counter()
+            top_level_keywords(statement, [])
+            scan = time.perf_counter() - started
+            started = time.perf_counter()
+            with pytest.raises(DefineParseError) as error:
+                parse(statement)
+            elapsed = time.perf_counter() - started
+        finally:
+            gc.enable()
+        assert elapsed < 30 * scan
+        assert _reason(error) == _R_TOO_COMPLEX
 
 
 def _table(statement: str, name: str, **attributes: object) -> tuple[str, TableState]:
@@ -3238,3 +3306,39 @@ class TestParseErrorReasons:
         assert issubclass(DefineParseError, ValueError)
         with pytest.raises(ValueError, match="^a string literal is not terminated$"):
             unquote("'s3cr3t-0042")
+
+
+class TestWorkBound:
+    """Spec §6.3.6: the clause reader's work is bounded by the length of the statement, ``_R_TOO_COMPLEX`` past it —
+    far above what any statement a server renders needs."""
+
+    @pytest.mark.parametrize(
+        ("parse", "statements"),
+        [
+            (parse_define_table, [statement for statement, _ in _TABLES]),
+            (parse_define_field, [statement for statement, _ in _FIELD_GOLDENS]),
+            (parse_define_event, [statement for statement, _ in _EVENTS]),
+            (parse_define_analyzer, [statement for statement, _ in _ANALYZERS]),
+            (parse_define_access, [statement for statement, _ in _ACCESS_ROWS]),
+            (parse_define_function, [statement for statement, _ in _FUNCTIONS]),
+            (parse_define_param, [statement for statement, _ in _PARAMS]),
+        ],
+        ids=["tables", "fields", "events", "analyzers", "accesses", "functions", "params"],
+    )
+    def test_goldens_read_alike_within_a_tenth_of_the_bound(
+        self, monkeypatch: pytest.MonkeyPatch, parse: Callable[[str], object], statements: list[str]
+    ) -> None:
+        assert statements
+        read = [parse(statement) for statement in statements]
+        monkeypatch.setattr(define_parser, "_WORK_PER_CHAR", define_parser._WORK_PER_CHAR // 10)
+        monkeypatch.setattr(define_parser, "_WORK_FLOOR", define_parser._WORK_FLOOR // 10)
+        assert [parse(statement) for statement in statements] == read
+
+    def test_the_bound_is_the_reason_past_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        statement = "DEFINE FIELD x ON t TYPE int READONLY PERMISSIONS FULL"
+        assert parse_define_field(statement).state.readonly
+        monkeypatch.setattr(define_parser, "_WORK_PER_CHAR", 0)
+        monkeypatch.setattr(define_parser, "_WORK_FLOOR", 0)
+        with pytest.raises(DefineParseError) as error:
+            parse_define_field(statement)
+        assert _reason(error) == _R_TOO_COMPLEX
