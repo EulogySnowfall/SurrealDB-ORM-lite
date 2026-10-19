@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.30.3] - 2026-10-19
+
+A statement that fails inside `transaction()` fails the whole transaction on every strategy: a
+transaction block now behaves the same on SurrealDB 2.x and 3.x, over WebSocket, over HTTP and on
+the embedded engine. No new public API.
+
+### Changed
+
+- **A failed statement fails the whole `transaction()` block, on every strategy** (#268). After a
+  statement fails inside the block, even when the block catches its error and carries on, the
+  transaction is cancelled when the block ends, nothing of the block is committed, and leaving the
+  block raises `SurrealDbError`, or `SurrealDbConflictError` when the failure was a retryable
+  conflict, so `retry_on_conflict` retries the block. Interactive transactions (SurrealDB 3.x over
+  WebSocket) now behave like the buffered ones (SurrealDB 2.x, HTTP, the embedded engine), which
+  already failed as a whole at commit: the failed statement raises its error at once, then leaving
+  the block raises "The transaction was cancelled: a statement in it failed; nothing was committed
+  (…)", chained to that error.
+  - An explicit `tx.commit()` after a failed statement raises the same error and cancels the
+    transaction.
+  - When the block's own exception propagates, that exception is the one raised, as before.
+  - Reads the ORM answers itself do not fail the transaction: a table that does not exist reads as
+    no rows, and `get()` raises `SurrealDbNotFoundError`.
+  - A statement interrupted inside the block (a timeout or a task cancellation) fails the
+    transaction too.
+
+  Upgrade note: a block that catches a statement's error and carries on now raises when it ends,
+  on every strategy, as it already did on the buffered ones. To carry on after such an error, run
+  that statement in a transaction of its own or outside the transaction.
+
+```python
+async with SurrealDBConnectionManager.transaction() as tx:
+    await User(id="alice", name="Alice").save(tx=tx)
+    try:
+        await Order(id="o2", user="User:alice", total=-1).save(tx=tx)  # refused by a field ASSERT
+    except SurrealDbError:
+        pass  # caught, but the transaction can no longer commit
+# leaving the block raised SurrealDbError: alice was not saved either
+```
+
+### Fixed
+
+- **The error of a failed statement, "Transaction failed and rolled back: …", now describes what
+  happens on every strategy** (#268): on an interactive transaction as on a buffered one, nothing
+  of the block is committed.
+
+### Notes
+
+- Docs: the README transactions section (11) states the rule with an example, and the "ORM
+  behaviour: SurrealDB 2.x vs 3.x" table gains a row for a statement that fails inside
+  `transaction()` with its error caught in the block.
+
 ## [0.30.0] - 2026-10-19
 
 Schema introspection: the ORM reads the schema of a database as immutable typed objects and

@@ -674,6 +674,27 @@ async with SurrealDBConnectionManager.transaction() as tx:
   tx raise; `save(tx=)` requires an explicit `id`. `bulk_update`/`bulk_delete` return `0`
   (the row count is not knowable before commit).
 
+**A failed statement fails the whole transaction, on every strategy.** After a statement fails
+inside the block — even when the block catches its error and carries on — the transaction is
+cancelled when the block ends, nothing of the block is committed, and leaving the block raises
+`SurrealDbError` (`SurrealDbConflictError` for a retryable conflict, so `retry_on_conflict` still
+retries the block). A buffered transaction fails as a whole at commit; an interactive one raises
+the failed statement's error at once, then, when the block ends, "The transaction was cancelled: a
+statement in it failed; nothing was committed (…)", chained to that error. An explicit
+`tx.commit()` after a failure raises the same error. When the block's own exception propagates,
+that exception wins, as before. Reads the ORM answers itself are not failed statements: a table
+that does not exist reads as no rows, and `get()` raises `SurrealDbNotFoundError`.
+
+```python
+async with SurrealDBConnectionManager.transaction() as tx:
+    await User(id="alice", name="Alice").save(tx=tx)
+    try:
+        await Order(id="o2", user="User:alice", total=-1).save(tx=tx)  # refused by a field ASSERT
+    except SurrealDbError:
+        pass  # caught, but the transaction can no longer commit
+# leaving the block raised SurrealDbError: alice was not saved either
+```
+
 ### 12. Upsert & get_or_create / update_or_create
 
 ```python
@@ -4465,7 +4486,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -4498,6 +4519,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | `call_function(tx=)` — return value                                                                                                    | `None` (buffered: queued until commit)                                                                                                                                        | the function's value (interactive returns it immediately)                                                                                                                           | v0.15.0                              |
 | `call_function(tx=, return_type=)`                                                                                                     | raises `ValueError` (no value to coerce yet)                                                                                                                                  | coerces the returned value                                                                                                                                                          | v0.15.0                              |
 | Missing function called inside a transaction                                                                                           | surfaces at COMMIT as `SurrealDbError` (buffered: the call is only queued)                                                                                                    | raises `SurrealDbNotFoundError` at call time                                                                                                                                        | v0.15.0                              |
+| A statement that fails inside `transaction()`, its error caught in the block                                                           | leaving the block raises `SurrealDbError`, nothing of the block committed (the buffered batch fails as a whole)                                                               | same on both lines; over WebSocket the statement raises at once, then the block's end cancels the transaction and raises `SurrealDbError`                                           | v0.30.3                              |
 | Declared parameter name that collides with a reserved word, as echoed by `INFO FOR DB`                                                 | quoted: `` $`by` `` — parser accepts it                                                                                                                                       | bare: `$by`                                                                                                                                                                         | v0.15.0                              |
 | Auth methods (`signin`, `signup`, `authenticate`, `invalidate`, `info`)                                                                | same on both lines (native SDK primitives, verified on 2.6.5)                                                                                                                 | same on both lines (verified on 3.2.4)                                                                                                                                              | v0.16.0                              |
 | Auth failure — raw SDK exception for a wrong password                                                                                  | `InternalError`                                                                                                                                                               | `NotFoundError`                                                                                                                                                                     | v0.16.0                              |

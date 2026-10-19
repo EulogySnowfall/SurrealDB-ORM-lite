@@ -1114,7 +1114,15 @@ class QuerySet:
             try:
                 return await self._tx.run_read(query, vars_)  # type: ignore[no-any-return]
             except ServerError as exc:
-                if await self._reads_as_empty(exc, subquery_tables):
+                # A read the ORM answers itself (no rows, or sent again without the missing subquery table) does not
+                # fail the transaction (issue #268); an error relayed does.
+                try:
+                    empty = await self._reads_as_empty(exc, subquery_tables)
+                except _subquery._MissingSubqueryTable:
+                    self._tx._absorb_failure(exc)
+                    raise
+                if empty:
+                    self._tx._absorb_failure(exc)
                     return []
                 raise
         client = await self._manager().get_client()
@@ -1174,8 +1182,13 @@ class QuerySet:
                 client = await self._manager().get_client()
                 await client.query(_subquery.TABLE_PROBE, _encoding.encode(variables))
         except NotFoundError as exc:
+            # The check's answer, never a failed statement of the transaction (issue #268).
+            if self._tx is not None:
+                self._tx._absorb_failure(exc)
             return _subquery.missing_table(exc) == table
-        except ServerError:
+        except ServerError as exc:
+            if self._tx is not None:
+                self._tx._absorb_failure(exc)
             return False
         return False
 
@@ -1431,7 +1444,9 @@ class QuerySet:
             if self._tx is not None:
                 try:
                     rows = await self._tx.run_read("SELECT * FROM $rid;", {"rid": record_id})
-                except NotFoundError:
+                except NotFoundError as exc:
+                    # "No record" is an answer, not a failed statement of the transaction (issue #268).
+                    self._tx._absorb_failure(exc)
                     raise SurrealDbNotFoundError("No result found.") from None
                 data = rows[0] if isinstance(rows, list) and rows else rows
                 if not data:
@@ -1481,7 +1496,9 @@ class QuerySet:
         if self._tx is not None:
             try:
                 rows = await self._tx.run_read(f"SELECT * FROM {self._model_table};", {})
-            except NotFoundError:
+            except NotFoundError as exc:
+                # A missing table reads as no rows: not a failed statement of the transaction (issue #268).
+                self._tx._absorb_failure(exc)
                 return self.model.from_db([])
             return self.model.from_db(rows if isinstance(rows, list) else [])
 

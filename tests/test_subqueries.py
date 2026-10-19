@@ -1655,9 +1655,11 @@ class TestAnErrorQuotingTheSentenceE2E:
             await _seed()
             await _boom_quotes_the_sentence(client, how)
             calls = _record_queries(monkeypatch, client)
-            async with SurrealDBConnectionManager.transaction() as tx:
-                inner = SqPerson.objects().select("boom")
-                await _assert_relayed(SqPost.objects(tx=tx).filter(author__not_in=Subquery(inner)).exec(), calls)
+            # The relayed read is a failed statement: leaving the block raises, nothing is committed (issue #268).
+            with pytest.raises(SurrealDbError, match="nothing was committed"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    inner = SqPerson.objects().select("boom")
+                    await _assert_relayed(SqPost.objects(tx=tx).filter(author__not_in=Subquery(inner)).exec(), calls)
 
 
 @pytest.mark.parametrize("kind", ["ws", "http"])
@@ -1717,6 +1719,9 @@ class _RaisingTx(_RaisingClient):
 
     async def add(self, sql: str, variables: dict[str, Any] | None = None) -> Any:
         raise AssertionError("no write expected")
+
+    def _absorb_failure(self, error: BaseException) -> None:
+        """A read the ORM answers itself does not fail the transaction (issue #268): nothing to record here."""
 
 
 def _raising_queryset(

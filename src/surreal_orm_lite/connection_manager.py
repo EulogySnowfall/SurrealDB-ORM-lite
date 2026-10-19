@@ -1627,6 +1627,16 @@ class SurrealDBConnectionManager:
         ``commit()`` BEFORE deferred ``post_*`` signals fire. An exception from a deferred
         handler surfaces AFTER a durable commit (not a rollback).
 
+        A failed statement fails the transaction on every strategy (issue #268): after a statement
+        fails inside the block — even when the block catches its error and carries on — the
+        transaction is cancelled when the block ends, nothing is committed, and leaving the block
+        raises ``SurrealDbError`` (``SurrealDbConflictError`` for a retryable conflict, so
+        ``retry_on_conflict`` still retries). A buffered batch fails as a whole at commit; an
+        interactive transaction raises "The transaction was cancelled: a statement in it failed;
+        nothing was committed (…)", chained to the failed statement's error. When the body's own
+        exception propagates, that exception wins. A read the ORM answers itself (a missing table
+        read as no rows, ``get()`` raising ``SurrealDbNotFoundError``) is not a failed statement.
+
         SurrealDB has no savepoints/nested transactions; nested ``transaction()`` calls
         open INDEPENDENT transactions, not savepoints.
 
