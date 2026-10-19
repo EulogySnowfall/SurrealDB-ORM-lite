@@ -34,14 +34,27 @@ both lines accept, preferring the 3.x spacing: SurrealDB 2.x renders an optional
 ``normalise_kind()`` gives ``(field_type, nullable)``: the top-level optional is stripped and read as ``nullable``
 (``"none | int"`` and ``"option<int>"`` both give ``("int", True)``). ``null`` is a value, not ``none``:
 ``null | int`` stays as it is.
+
+**Statements** — each ``parse_define_*`` reads its header positionally (``DEFINE <KIND>``, the name, ``ON`` and the
+table: ``DEFINE FIELD TYPE ON TYPE TYPE int`` is the field ``TYPE`` of the table ``TYPE``), then the clauses with
+``read_clauses()`` against its grammar, a sequence of ``Slot``s in the order the servers render them. A reading
+assigns top-level keyword candidates to slots in that order, each content passing its slot's validator (``expr``,
+the weak one, refuses an empty text or one ending with an operator; ``string``, ``kind``, ``perms`` and the other
+strict ones rule bare identifiers out), and leaves no keyword inside a content where it can start its own clause.
+Exactly one reading is read; none or several raise ``DefineParseError`` — ``VALUE b ASSERT ASSERT c`` is never
+guessed. ``parse_define_table()`` and ``parse_define_field()`` build ``TableState`` and ``FieldState`` by keyword,
+``raw`` the statement; ``parse_permissions()`` reads a ``PERMISSIONS`` clause.
 """
 
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple, TypeAlias
 
+from .schema_state import FieldState, TableState
+
 __all__ = [
+    "Clause",
     "DefineParseError",
     "KLiteral",
     "KName",
@@ -49,10 +62,16 @@ __all__ = [
     "KTuple",
     "KUnion",
     "Kind",
+    "ParsedField",
+    "Slot",
     "canonical_name",
     "normalise_kind",
+    "parse_define_field",
+    "parse_define_table",
     "parse_kind",
     "parse_kind_prefix",
+    "parse_permissions",
+    "read_clauses",
     "read_identifier",
     "read_idiom",
     "render_kind",
@@ -393,6 +412,21 @@ def _scan(text: str, start: int = 0, *, angle: bool = False) -> list[_Token]:
     return tokens
 
 
+def _keyword_tokens(text: str, tokens: Sequence[_Token], keywords: Sequence[str], start: int) -> list[tuple[int, int, str]]:
+    """``(token index, position, keyword)`` of every top-level keyword candidate among the *tokens* of
+    ``text[start:]`` — what ``top_level_keywords()`` returns, with the index of the keyword's first token."""
+    length = len(text)
+    found: list[tuple[int, int, str]] = []
+    for index, token in enumerate(tokens):
+        if token.kind != _WORD_TOKEN or token.depth or (token.start > start and not text[token.start - 1].isspace()):
+            continue
+        for keyword in keywords:
+            end = token.start + len(keyword)
+            if text.startswith(keyword, token.start) and (end == length or text[end].isspace()):
+                found.append((index, token.start, keyword))
+    return found
+
+
 def top_level_keywords(text: str, keywords: Iterable[str], start: int = 0) -> list[tuple[int, str]]:
     """Every ``(position, keyword)`` at depth 0 of ``text[start:]`` where one of *keywords* stands as a whole word.
 
@@ -401,17 +435,7 @@ def top_level_keywords(text: str, keywords: Iterable[str], start: int = 0) -> li
     by the single space the server renders (``WITH REFRESH``, ``ON DELETE``). The result is in text order, keywords
     matching at one position in the order given. These are candidates only: a bare identifier may spell a keyword.
     """
-    wanted = tuple(keywords)
-    length = len(text)
-    found: list[tuple[int, str]] = []
-    for token in _scan(text, start):
-        if token.kind != _WORD_TOKEN or token.depth or (token.start > start and not text[token.start - 1].isspace()):
-            continue
-        for keyword in wanted:
-            end = token.start + len(keyword)
-            if text.startswith(keyword, token.start) and (end == length or text[end].isspace()):
-                found.append((token.start, keyword))
-    return found
+    return [(position, keyword) for _, position, keyword in _keyword_tokens(text, _scan(text, start), tuple(keywords), start)]
 
 
 def split_top_level(text: str, separator: str, *, angle: bool = False) -> list[str]:
@@ -755,3 +779,775 @@ def normalise_kind(text: str) -> tuple[str, bool]:
         if rest and len(rest) < len(members):
             return render_kind(rest[0] if len(rest) == 1 else KUnion(rest)), True
     return render_kind(kind), False
+
+
+# --- clause contents and their validators --------------------------------------------------------------------------
+
+
+class _Span(NamedTuple):
+    """The content of a clause: the tokens ``first`` to ``stop`` (excluded) of a scanned text, the whitespace around
+    them left out.
+
+    A content runs between two top-level keywords, or from one to the end of the text: every bracket and IF unit
+    opened in it closes in it, and its own tokens stand at depth 0.
+    """
+
+    text: str
+    tokens: Sequence[_Token]
+    first: int
+    stop: int
+
+    def content(self) -> str:
+        """The text of the content (``""`` when it is empty)."""
+        if self.first >= self.stop:
+            return ""
+        return self.text[self.tokens[self.first].start : self.tokens[self.stop - 1].end]
+
+    def top(self) -> list[_Token]:
+        """The tokens at the content's own depth, whitespace left out."""
+        return [token for token in self.tokens[self.first : self.stop] if not token.depth and token.kind != _SPACE_TOKEN]
+
+    def word(self, index: int) -> str | None:
+        """The text of the token at *index* when it is a word, else ``None``."""
+        token = self.tokens[index]
+        return self.text[token.start : token.end] if token.kind == _WORD_TOKEN else None
+
+
+#: A validator says whether a clause's content is one its slot accepts (spec §6.3.2's table).
+_Validator: TypeAlias = Callable[[_Span], bool]
+
+
+def _trimmed(text: str, tokens: Sequence[_Token], first: int, stop: int) -> _Span:
+    """The tokens ``first`` to ``stop`` of *text*, the whitespace tokens at both ends left out."""
+    while first < stop and tokens[first].kind == _SPACE_TOKEN:
+        first += 1
+    while stop > first and tokens[stop - 1].kind == _SPACE_TOKEN:
+        stop -= 1
+    return _Span(text, tokens, first, stop)
+
+
+def _scan_span(content: str) -> _Span:
+    """*content* scanned on its own, as a span; raises ``DefineParseError`` as ``_scan()``."""
+    tokens = _scan(content)
+    return _trimmed(content, tokens, 0, len(tokens))
+
+
+def _validates(validator: _Validator, content: str) -> bool:
+    """Whether *validator* accepts *content* scanned on its own (a text that does not scan is refused)."""
+    try:
+        span = _scan_span(content)
+    except DefineParseError:
+        return False
+    return validator(span)
+
+
+def _skip_space(text: str, pos: int) -> int:
+    space = _SPACE.match(text, pos)
+    return pos if space is None else space.end()
+
+
+#: An expression never ends with one of these characters outside a string (spec §6.3.2, ``expr``).
+_OPERATOR_ENDS = frozenset("+-*/%=<>!&|^,.:?~@")
+_TABLE_TYPES = frozenset({"NORMAL", "ANY", "RELATION"})
+_ON_DELETE_ACTIONS = frozenset({"IGNORE", "UNSET", "CASCADE", "REJECT"})
+_DURATION = r"(?:[0-9]+(?:ns|us|µs|ms|s|m|h|d|w|y))+"
+_CHANGEFEED = re.compile(rf"({_DURATION})( INCLUDE ORIGINAL)?")
+_DURATION_ITEM = re.compile(rf"FOR (GRANT|TOKEN|SESSION) ({_DURATION}|NONE)")
+_GROUPS = re.compile(r"\(\)(?:,\(\))*")
+_FN_NAME = re.compile(r"fn(?:::[A-Za-z0-9_]+)+")
+_WORD_LIST = re.compile(r"[A-Za-z0-9_]+(?:\s*,\s*[A-Za-z0-9_]+)*")
+_FIELD_ACTIONS = ("select", "create", "update")
+_TABLE_ACTIONS = ("select", "create", "update", "delete")
+
+
+def _valid_flag(span: _Span) -> bool:
+    """``flag``: an empty content."""
+    return span.first >= span.stop
+
+
+def _valid_expr(span: _Span) -> bool:
+    """``expr`` — the weak validator: non-empty, depth-balanced (true of every content), and its last character
+    outside strings is not an operator, but for the ``*`` of the idiom ``x.*``."""
+    if span.first >= span.stop:
+        return False
+    last = span.tokens[span.stop - 1]
+    char = span.text[last.start]
+    if last.kind != _PUNCT_TOKEN or char not in _OPERATOR_ENDS:
+        return True
+    if char != "*" or span.stop - 2 < span.first:
+        return False
+    before = span.tokens[span.stop - 2]
+    return before.kind == _PUNCT_TOKEN and span.text[before.start] == "." and before.end == last.start
+
+
+def _valid_string(span: _Span) -> bool:
+    """``string``: exactly one string literal."""
+    return span.stop - span.first == 1 and span.tokens[span.first].kind == _STRING_TOKEN
+
+
+def _valid_kind(span: _Span) -> bool:
+    """``kind``: ``parse_kind()`` reads all of it."""
+    try:
+        parse_kind(span.content())
+    except DefineParseError:
+        return False
+    return True
+
+
+def _valid_type_as_written(span: _Span) -> bool:
+    """The ``TYPE`` of the second pass of spec §6.3.2 item 4 (I3): non-empty — every content is depth-balanced."""
+    return span.first < span.stop
+
+
+def _relation_names(content: str) -> tuple[str, ...] | None:
+    """The names of an ``IN``/``OUT`` clause — identifiers separated by ``|`` (``person | company``) — unescaped, or
+    ``None`` when *content* is not such a list."""
+    names: list[str] = []
+    pos = 0
+    try:
+        while True:
+            found = _identifier_at(content, pos)
+            if found is None:
+                return None
+            names.append(found[0])
+            pos = _skip_space(content, found[1])
+            if pos == len(content):
+                return tuple(names)
+            if content[pos] != "|":
+                return None
+            pos = _skip_space(content, pos + 1)
+    except DefineParseError:
+        return None
+
+
+def _valid_names(span: _Span) -> bool:
+    """``names``: identifiers separated by ``|``."""
+    return _relation_names(span.content()) is not None
+
+
+def _valid_table_type(span: _Span) -> bool:
+    """``table_type``: ``NORMAL``, ``ANY`` or ``RELATION``."""
+    return span.content() in _TABLE_TYPES
+
+
+def _default_parts(span: _Span) -> tuple[bool, _Span]:
+    """``(always, expression)`` of a ``DEFAULT`` content: a content starting with the word ``ALWAYS`` followed by more
+    text is ``DEFAULT ALWAYS <expression>``; anything else is the expression (a field named ``ALWAYS``)."""
+    first = span.first
+    if span.stop - first > 2 and span.word(first) == "ALWAYS" and span.tokens[first + 1].kind == _SPACE_TOKEN:
+        return True, _trimmed(span.text, span.tokens, first + 2, span.stop)
+    return False, span
+
+
+def _valid_default(span: _Span) -> bool:
+    """``default``: ``ALWAYS <expr>`` or ``<expr>``."""
+    return _valid_expr(_default_parts(span)[1])
+
+
+def _split_default(content: str) -> tuple[bool, str]:
+    """``(default_always, default)`` of a ``DEFAULT`` content that ``_valid_default`` accepted."""
+    always, expression = _default_parts(_scan_span(content))
+    return always, expression.content()
+
+
+def _reference_parts(span: _Span) -> tuple[bool, str | None]:
+    """``(valid, on_delete)`` of a ``REFERENCE`` content: empty (``None``), or ``ON DELETE`` followed by ``IGNORE``,
+    ``UNSET``, ``CASCADE``, ``REJECT`` or ``THEN <expr>`` — that text, as rendered."""
+    first, stop = span.first, span.stop
+    if first >= stop:
+        return True, None
+    head = stop - first >= 5 and span.word(first) == "ON" and span.word(first + 2) == "DELETE"
+    if not head or span.tokens[first + 1].kind != _SPACE_TOKEN or span.tokens[first + 3].kind != _SPACE_TOKEN:
+        return False, None
+    action = first + 4
+    word = span.word(action)
+    if stop - action == 1 and word in _ON_DELETE_ACTIONS:
+        return True, word
+    then = (
+        word == "THEN"
+        and stop - action > 2
+        and span.tokens[action + 1].kind == _SPACE_TOKEN
+        and _valid_expr(_trimmed(span.text, span.tokens, action + 2, stop))
+    )
+    if then:
+        return True, span.text[span.tokens[action].start : span.tokens[stop - 1].end]
+    return False, None
+
+
+def _valid_reference(span: _Span) -> bool:
+    """``reference``: empty, or ``ON DELETE`` and its action."""
+    return _reference_parts(span)[0]
+
+
+def _valid_view(span: _Span) -> bool:
+    """``view``: starts with ``SELECT `` and passes ``expr``."""
+    first = span.first
+    return (
+        span.stop - first > 2
+        and span.word(first) == "SELECT"
+        and span.tokens[first + 1].kind == _SPACE_TOKEN
+        and _valid_expr(span)
+    )
+
+
+def _changefeed_parts(content: str) -> tuple[str, bool] | None:
+    """``(duration, include_original)`` of a ``CHANGEFEED`` content, or ``None``."""
+    match = _CHANGEFEED.fullmatch(content)
+    return None if match is None else (match.group(1), match.group(2) is not None)
+
+
+def _valid_changefeed(span: _Span) -> bool:
+    """``changefeed``: a duration, optionally followed by ``INCLUDE ORIGINAL``."""
+    return _changefeed_parts(span.content()) is not None
+
+
+def _top_punctuation(span: _Span) -> str | None:
+    """The characters of the content's top-level tokens when they are all brackets or punctuation, else ``None``."""
+    top = span.top()
+    if any(token.kind != _PUNCT_TOKEN for token in top):
+        return None
+    return "".join(span.text[token.start] for token in top)
+
+
+def _valid_body(span: _Span) -> bool:
+    """``body``: one ``{…}`` block, or ``(…)`` groups separated by top-level commas — nothing else."""
+    shape = _top_punctuation(span)
+    return shape is not None and (shape == "{}" or _GROUPS.fullmatch(shape) is not None)
+
+
+def _valid_group(span: _Span) -> bool:
+    """``group``: one ``(…)`` group."""
+    return _top_punctuation(span) == "()"
+
+
+def _durations(content: str) -> dict[str, str] | None:
+    """``{"GRANT" | "TOKEN" | "SESSION": duration or "NONE"}`` of a ``DURATION`` content, or ``None``."""
+    try:
+        items = split_top_level(content, ",")
+    except DefineParseError:
+        return None
+    durations: dict[str, str] = {}
+    for item in items:
+        match = _DURATION_ITEM.fullmatch(item.strip())
+        if match is None or match.group(1) in durations:
+            return None
+        durations[match.group(1)] = match.group(2)
+    return durations
+
+
+def _valid_durations(span: _Span) -> bool:
+    """``durations``: ``FOR GRANT|TOKEN|SESSION <duration|NONE>`` items separated by commas, each kind once."""
+    return _durations(span.content()) is not None
+
+
+def _valid_tokens(span: _Span) -> bool:
+    """``tokens``: words, numbers and string literals only (no brackets); empty is accepted."""
+    return all(
+        token.kind in (_WORD_TOKEN, _STRING_TOKEN, _SPACE_TOKEN)
+        or (token.kind == _PUNCT_TOKEN and span.text[token.start] in "-.")
+        for token in span.tokens[span.first : span.stop]
+    )
+
+
+def _valid_fn_name(span: _Span) -> bool:
+    """``fn_name``: ``fn::`` followed by ``::``-separated identifiers."""
+    return _FN_NAME.fullmatch(span.content()) is not None
+
+
+def _valid_word_list(span: _Span) -> bool:
+    """``word_list``: words separated by commas (spaces optional)."""
+    return _WORD_LIST.fullmatch(span.content()) is not None
+
+
+def _valid_filter_list(span: _Span) -> bool:
+    """``filter_list``: ``WORD`` or ``WORD(args)`` items separated by commas, spaces optional after a comma."""
+    try:
+        items = [_scan_span(item) for item in split_top_level(span.content(), ",")]
+    except DefineParseError:
+        return False
+    for item in items:
+        top = item.top()
+        if not top or top[0].kind != _WORD_TOKEN:
+            return False
+        if len(top) != 1 and "".join(item.text[token.start : token.end] for token in top[1:]) != "()":
+            return False
+    return True
+
+
+def _permission_rule(span: _Span, top: Sequence[int], begin: int, end: int) -> str | None:
+    """The rule of a permission group — its top-level tokens ``top[begin:end]`` — as rendered: ``FULL``, ``NONE`` or
+    ``WHERE <expr>``; ``None`` for anything else."""
+    if begin >= end:
+        return None
+    word = span.word(top[begin])
+    if end - begin == 1 and word in ("FULL", "NONE"):
+        return word
+    if word == "WHERE" and end - begin > 1 and _valid_expr(_Span(span.text, span.tokens, top[begin + 1], top[end - 1] + 1)):
+        return span.text[span.tokens[top[begin]].start : span.tokens[top[end - 1]].end]
+    return None
+
+
+def _read_permissions(span: _Span, actions: Sequence[str], unnamed: str) -> dict[str, str] | None:
+    """The rules of a ``PERMISSIONS`` content (see ``parse_permissions()``), or ``None``."""
+    content = span.content()
+    if content in ("FULL", "NONE"):
+        return dict.fromkeys(actions, content)
+    top = [index for index in range(span.first, span.stop) if not span.tokens[index].depth]
+    top = [index for index in top if span.tokens[index].kind != _SPACE_TOKEN]
+
+    def comma(position: int) -> bool:
+        token = span.tokens[top[position]]
+        return token.kind == _PUNCT_TOKEN and span.text[token.start] == ","
+
+    # A group starts at a top-level FOR followed by an action, at the start or after a top-level comma.
+    starts = [
+        position
+        for position in range(len(top) - 1)
+        if span.word(top[position]) == "FOR"
+        and span.word(top[position + 1]) in actions
+        and (position == 0 or comma(position - 1))
+    ]
+    if not starts or starts[0] != 0:
+        return None
+    rules: dict[str, str] = {}
+    for number, begin in enumerate(starts):
+        end = starts[number + 1] - 1 if number + 1 < len(starts) else len(top)  # the comma before the next FOR
+        named = [span.word(top[begin + 1])]
+        position = begin + 2
+        while position + 1 < end and comma(position) and span.word(top[position + 1]) in actions:
+            named.append(span.word(top[position + 1]))
+            position += 2
+        rule = _permission_rule(span, top, position, end)
+        if rule is None:
+            return None
+        for action in named:
+            if action is None or action in rules:
+                return None
+            rules[action] = rule
+    return {action: rules.get(action, unnamed) for action in actions}
+
+
+def _valid_field_permissions(span: _Span) -> bool:
+    """``perms`` of a field: actions ``select``, ``create`` and ``update``."""
+    return _read_permissions(span, _FIELD_ACTIONS, "FULL") is not None
+
+
+def _valid_table_permissions(span: _Span) -> bool:
+    """``perms`` of a table: actions ``select``, ``create``, ``update`` and ``delete``."""
+    return _read_permissions(span, _TABLE_ACTIONS, "NONE") is not None
+
+
+def parse_permissions(text: str, actions: Sequence[str], *, unnamed: str) -> dict[str, str]:
+    """The rules of a ``PERMISSIONS`` clause's content: ``{action: rule}`` for every one of *actions*.
+
+    ``NONE`` or ``FULL`` gives that rule to every action. Otherwise the content is groups ``FOR a[, b] <rule>`` (the
+    actions lower-case), each starting at a top-level ``FOR`` followed by an action — at the start of the content or
+    after a top-level comma; a rule is ``FULL``, ``NONE`` or ``WHERE <expr>``, kept as rendered (``"WHERE owner =
+    $auth.id"``). An action no group names gets *unnamed* — ``"FULL"`` for a field, ``"NONE"`` for a table (a
+    fallback only: both lines render every action). Anything else, an action named twice included, raises
+    ``DefineParseError`` (``_R_PERMISSIONS``).
+    """
+    try:
+        span = _scan_span(text)
+    except DefineParseError:
+        raise DefineParseError(_R_PERMISSIONS) from None
+    rules = _read_permissions(span, actions, unnamed)
+    if rules is None:
+        raise DefineParseError(_R_PERMISSIONS)
+    return rules
+
+
+# --- the clause reader ---------------------------------------------------------------------------------------------
+
+
+class Slot(NamedTuple):
+    """One clause of a ``DEFINE`` grammar (spec §6.3.3): its name in the result, the keywords that open it (two for
+    ``SCHEMAFULL|SCHEMALESS``, ``IN``/``FROM`` …), the validator of its content, and whether a reading must use it.
+    Two slots may share a name (``FLEXIBLE`` before and after ``TYPE``): a reading uses one of them at most."""
+
+    name: str
+    keywords: tuple[str, ...]
+    validator: _Validator
+    required: bool = False
+
+
+class Clause(NamedTuple):
+    """A clause of the reading: the keyword that opened it and its content, stripped (``""`` for a flag)."""
+
+    keyword: str
+    content: str
+
+
+class _Candidate(NamedTuple):
+    """A top-level keyword: its first token, the token after it (the length of the tokens at the end of the text),
+    the keyword and the slots it may open."""
+
+    token: int
+    after: int
+    keyword: str
+    slots: tuple[int, ...]
+
+
+#: A step of a reading: the candidate that opens the next clause (``None``: the end of the text), the slot it opens
+#: (the number of slots for the end) and how many readings it leads to (1, or 2 for two or more).
+_Step: TypeAlias = tuple[int | None, int, int]
+
+
+class _ClauseReader:
+    """The readings of the clauses of one statement after its header (spec §6.3.2), counted up to two.
+
+    A reading picks a strictly increasing run of top-level keyword candidates, the first one where the text starts,
+    and gives each a slot after the previous one's; every content must pass its slot's validator and every required
+    slot be used. A reading must also leave no keyword where it can open its own clause: when a candidate inside a
+    content could open a free slot between that content's slot and the next one — its keyword starting the clause
+    and both contents still valid — the reading that swallows it is not counted. So an expression keeps a
+    keyword-named field (``VALUE a * READONLY``, ``VALUE a + ASSERT ASSERT $value > 0``) only where the keyword
+    cannot start its clause, and ``VALUE b ASSERT ASSERT c`` still has two readings. Counts are memoised on
+    ``(candidate, slot, names used)``: the work is polynomial in the number of candidates whatever the text.
+    """
+
+    __slots__ = ("_candidates", "_counts", "_first", "_fits_known", "_required", "_shared", "_slots", "_text", "_tokens")
+
+    def __init__(self, text: str, start: int, slots: Sequence[Slot]) -> None:
+        self._text = text
+        self._slots = tuple(slots)
+        self._tokens = _scan(text, start)
+        token_at = {token.start: index for index, token in enumerate(self._tokens)}
+        keywords = tuple(dict.fromkeys(keyword for slot in self._slots for keyword in slot.keywords))
+        self._candidates = [
+            _Candidate(
+                index,
+                token_at.get(position + len(keyword), len(self._tokens)),
+                keyword,
+                tuple(number for number, slot in enumerate(self._slots) if keyword in slot.keywords),
+            )
+            for index, position, keyword in _keyword_tokens(text, self._tokens, keywords, start)
+        ]
+        names = [slot.name for slot in self._slots]
+        self._shared = frozenset(name for name in names if names.count(name) > 1)
+        required = [0]
+        for slot in self._slots:
+            required.append(required[-1] + int(slot.required))
+        self._required = required
+        self._first = next((index for index, token in enumerate(self._tokens) if token.kind != _SPACE_TOKEN), len(self._tokens))
+        self._counts: dict[tuple[int, int, frozenset[str]], int] = {}
+        self._fits_known: dict[tuple[int, int, int], bool] = {}
+
+    def read(self) -> dict[str, Clause]:
+        """The clauses of the one reading; ``DefineParseError`` with ``_R_NO_READING`` or ``_R_AMBIGUOUS``."""
+        total = 0
+        for *_, readings in self._starts():
+            total += readings
+            if total > 1:
+                raise DefineParseError(_R_AMBIGUOUS)
+        if not total:
+            raise DefineParseError(_R_NO_READING)
+        clauses: dict[str, Clause] = {}
+        following, slot, _ = next(self._starts())
+        used = frozenset[str]()
+        while following is not None:
+            current = following
+            used = self._uses(used, slot)
+            following, opened, _ = next(self._steps(current, slot, used))
+            candidate = self._candidates[current]
+            content = _trimmed(self._text, self._tokens, candidate.after, self._stop(following)).content()
+            clauses[self._slots[slot].name] = Clause(candidate.keyword, content)
+            slot = opened
+        return clauses
+
+    def _starts(self) -> Iterator[_Step]:
+        """The first steps: a candidate where the text starts (or the end of an empty text)."""
+        end = len(self._slots)
+        if self._first == len(self._tokens):
+            if not self._skips_required(-1, end):
+                yield None, end, 1
+            return
+        for number, candidate in enumerate(self._candidates):
+            if candidate.token != self._first:
+                continue
+            for opened in candidate.slots:
+                if self._skips_required(-1, opened):
+                    continue
+                readings = self._count(number, opened, self._uses(frozenset(), opened))
+                if readings:
+                    yield number, opened, readings
+
+    def _steps(self, current: int, slot: int, used: frozenset[str]) -> Iterator[_Step]:
+        """The steps that complete a reading after candidate *current* opened *slot* (*used*: the shared names of the
+        slots used so far, *slot*'s included)."""
+        after = self._candidates[current].after
+        end = len(self._slots)
+        if (
+            not self._skips_required(slot, end)
+            and self._fits(slot, after, len(self._tokens))
+            and self._maximal(current, slot, used, None, end)
+        ):
+            yield None, end, 1
+        for following in range(current + 1, len(self._candidates)):
+            candidate = self._candidates[following]
+            if candidate.token < after:
+                continue
+            for opened in candidate.slots:
+                if opened <= slot or self._slots[opened].name in used or self._skips_required(slot, opened):
+                    continue
+                if not self._fits(slot, after, candidate.token):
+                    break
+                readings = self._count(following, opened, self._uses(used, opened))
+                if readings and self._maximal(current, slot, used, following, opened):
+                    yield following, opened, readings
+
+    def _count(self, current: int, slot: int, used: frozenset[str]) -> int:
+        """The readings (0, 1, or 2 for two or more) that complete after candidate *current* opened *slot*."""
+        key = (current, slot, used)
+        known = self._counts.get(key)
+        if known is None:
+            known = 0
+            for *_, readings in self._steps(current, slot, used):
+                known += readings
+                if known > 1:
+                    break
+            known = min(known, 2)
+            self._counts[key] = known
+        return known
+
+    def _maximal(self, current: int, slot: int, used: frozenset[str], following: int | None, opened: int) -> bool:
+        """Whether no candidate between *current* and *following* can open a free slot between *slot* and *opened*
+        with both contents valid — the content of *slot* then swallows no keyword that can start its clause."""
+        after = self._candidates[current].after
+        stop = self._stop(following)
+        taken = used if following is None else used | {self._slots[opened].name}
+        for between in range(current + 1, len(self._candidates)):
+            candidate = self._candidates[between]
+            if candidate.token >= stop:
+                break
+            if candidate.token < after or candidate.after > stop:
+                continue
+            for inserted in candidate.slots:
+                if (
+                    slot < inserted < opened
+                    and self._slots[inserted].name not in taken
+                    and self._fits(slot, after, candidate.token)
+                    and self._fits(inserted, candidate.after, stop)
+                ):
+                    return False
+        return True
+
+    def _fits(self, slot: int, first: int, stop: int) -> bool:
+        """Whether the tokens ``first`` to ``stop`` are a content *slot* accepts (memoised)."""
+        key = (slot, first, stop)
+        known = self._fits_known.get(key)
+        if known is None:
+            known = self._slots[slot].validator(_trimmed(self._text, self._tokens, first, stop))
+            self._fits_known[key] = known
+        return known
+
+    def _skips_required(self, slot: int, following: int) -> bool:
+        """Whether a required slot lies strictly between *slot* (-1: the start) and *following* (the number of slots:
+        the end)."""
+        return self._required[following] - self._required[slot + 1] > 0
+
+    def _uses(self, used: frozenset[str], slot: int) -> frozenset[str]:
+        name = self._slots[slot].name
+        return used | {name} if name in self._shared else used
+
+    def _stop(self, following: int | None) -> int:
+        return len(self._tokens) if following is None else self._candidates[following].token
+
+
+def read_clauses(text: str, start: int, slots: Sequence[Slot]) -> dict[str, Clause]:
+    """Read the clauses of ``text[start:]`` — what follows a statement's header — against the grammar *slots*, in
+    their order: ``{slot name: Clause(keyword, content)}`` for the clauses of the one reading.
+
+    The text after the header is empty or starts, after whitespace, at a top-level keyword. A reading assigns a
+    strictly increasing run of top-level keyword candidates to slots in their order, each slot (each name) once;
+    each content — the stripped text up to the next chosen keyword, the last one to the end — passes its slot's
+    validator; every required slot is used; and no keyword is left inside a content where it could open its own
+    clause (see ``_ClauseReader``). Exactly one reading gives the clauses; none raises ``DefineParseError``
+    (``_R_NO_READING``), two or more ``_R_AMBIGUOUS`` — never a guess. A text that does not scan raises its scan
+    error (``_R_STRING``, ``_R_IDENT``, ``_R_BRACKETS``, ``_R_IF``).
+    """
+    return _ClauseReader(text, start, slots).read()
+
+
+# --- DEFINE TABLE and DEFINE FIELD ---------------------------------------------------------------------------------
+
+_TABLE_TYPE_SLOT = Slot("type", ("TYPE",), _valid_table_type)
+_RELATION_SLOTS = (
+    Slot("in", ("IN", "FROM"), _valid_names),
+    Slot("out", ("OUT", "TO"), _valid_names),
+    Slot("enforced", ("ENFORCED",), _valid_flag),
+)
+_TABLE_TAIL_SLOTS = (
+    Slot("drop", ("DROP",), _valid_flag),
+    Slot("schema", ("SCHEMAFULL", "SCHEMALESS"), _valid_flag),
+    Slot("comment", ("COMMENT",), _valid_string),
+    Slot("as", ("AS",), _valid_view),
+    Slot("changefeed", ("CHANGEFEED",), _valid_changefeed),
+    Slot("permissions", ("PERMISSIONS",), _valid_table_permissions),
+)
+#: Spec §6.3.3, a table: ``IN``, ``OUT`` and ``ENFORCED`` only after ``TYPE RELATION``.
+_TABLE_SLOTS = (_TABLE_TYPE_SLOT, *_TABLE_TAIL_SLOTS)
+_RELATION_TABLE_SLOTS = (_TABLE_TYPE_SLOT, *_RELATION_SLOTS, *_TABLE_TAIL_SLOTS)
+#: ``TYPE RELATION`` right after a table's name: every reading of the clauses then has that TYPE, and no other does.
+_RELATION_TYPE = re.compile(r"\s+TYPE\s+RELATION(?:\s|\Z)")
+
+#: Spec §6.3.3, a field (M10's order; ``FLEXIBLE`` before ``TYPE`` on 2.x, after it on 3.x, M9).
+_FIELD_SLOTS = (
+    Slot("flexible", ("FLEXIBLE",), _valid_flag),
+    Slot("type", ("TYPE",), _valid_kind),
+    Slot("flexible", ("FLEXIBLE",), _valid_flag),
+    Slot("reference", ("REFERENCE",), _valid_reference),
+    Slot("default", ("DEFAULT",), _valid_default),
+    Slot("readonly", ("READONLY",), _valid_flag),
+    Slot("value", ("VALUE",), _valid_expr),
+    Slot("computed", ("COMPUTED",), _valid_expr),
+    Slot("assert", ("ASSERT",), _valid_expr),
+    Slot("comment", ("COMMENT",), _valid_string),
+    Slot("permissions", ("PERMISSIONS",), _valid_field_permissions),
+)
+#: The second pass of spec §6.3.2 item 4 (I3): ``TYPE`` only non-empty.
+_FIELD_SLOTS_TYPE_AS_WRITTEN = tuple(
+    slot._replace(validator=_valid_type_as_written) if slot.name == "type" else slot for slot in _FIELD_SLOTS
+)
+
+
+def _header(text: str, kind: str) -> int:
+    """The position after ``DEFINE <kind>`` and the whitespace after it; ``_R_STATEMENT`` for another statement."""
+    prefix = f"DEFINE {kind}"
+    if not text.startswith(prefix) or (len(text) > len(prefix) and not text[len(prefix)].isspace()):
+        raise DefineParseError(_R_STATEMENT)
+    return _skip_space(text, len(prefix))
+
+
+def _expect_space(text: str, pos: int) -> int:
+    """The position after the whitespace at *pos*, which must be there (``_R_HEADER``)."""
+    if pos >= len(text) or not text[pos].isspace():
+        raise DefineParseError(_R_HEADER)
+    return _skip_space(text, pos)
+
+
+def _expect_word(text: str, pos: int, word: str) -> int:
+    """The position after the header word *word* at *pos* and the whitespace after it (``_R_HEADER``)."""
+    if not text.startswith(word, pos):
+        raise DefineParseError(_R_HEADER)
+    return _expect_space(text, pos + len(word))
+
+
+def _name_end(text: str, pos: int) -> int:
+    """*pos*, where a header name ends: the end of the text or whitespace (``_R_HEADER`` otherwise)."""
+    if pos < len(text) and not text[pos].isspace():
+        raise DefineParseError(_R_HEADER)
+    return pos
+
+
+def _content(clause: Clause | None) -> str | None:
+    return None if clause is None else clause.content
+
+
+def parse_define_table(text: str) -> TableState:
+    r"""Read a ``DEFINE TABLE`` statement as the server renders it (spec §6.3.3) into a ``TableState``.
+
+    The header ``DEFINE TABLE <ident>`` is read positionally (``DEFINE TABLE TYPE TYPE ANY …`` names the table
+    ``TYPE``; ``\``we\`ird\``` gives ``we`ird``), then the clauses ``TYPE``, ``IN``/``FROM``, ``OUT``/``TO`` and
+    ``ENFORCED`` (after ``TYPE RELATION`` only), ``DROP``, ``SCHEMAFULL|SCHEMALESS``, ``COMMENT``, ``AS``,
+    ``CHANGEFEED`` and ``PERMISSIONS`` with ``read_clauses()``. No ``TYPE`` gives ``"any"``, no schema keyword
+    ``"SCHEMALESS"``, no ``PERMISSIONS`` an empty mapping. ``fields``, ``indexes``, ``events`` and ``other`` are left
+    empty: they come from ``INFO FOR TABLE``. Raises ``DefineParseError``.
+    """
+    pos = _header(text, "TABLE")
+    name, pos = read_identifier(text, pos)
+    _name_end(text, pos)
+    relation = _RELATION_TYPE.match(text, pos) is not None
+    clauses = read_clauses(text, pos, _RELATION_TABLE_SLOTS if relation else _TABLE_SLOTS)
+    changefeed = clauses.get("changefeed")
+    feed = None if changefeed is None else _changefeed_parts(changefeed.content)
+    comment = clauses.get("comment")
+    permissions = clauses.get("permissions")
+    relation_in = clauses.get("in")
+    relation_out = clauses.get("out")
+    return TableState(
+        name=name,
+        schema_mode=clauses["schema"].keyword if "schema" in clauses else "SCHEMALESS",
+        table_type=clauses["type"].content.lower() if "type" in clauses else "any",
+        changefeed=None if feed is None else feed[0],
+        permissions={} if permissions is None else parse_permissions(permissions.content, _TABLE_ACTIONS, unnamed="NONE"),
+        view_query=_content(clauses.get("as")),
+        relation_in=() if relation_in is None else _relation_names(relation_in.content) or (),
+        relation_out=() if relation_out is None else _relation_names(relation_out.content) or (),
+        enforced="enforced" in clauses,
+        comment=None if comment is None else unquote(comment.content),
+        drop="drop" in clauses,
+        changefeed_include_original=feed is not None and feed[1],
+        raw=text,
+    )
+
+
+class ParsedField(NamedTuple):
+    """What ``parse_define_field()`` read: the state, and whether its ``TYPE`` was kept as written because
+    ``parse_kind()`` does not understand it (the reader reports it as issue I3; ``FieldState`` has no such flag)."""
+
+    state: FieldState
+    type_as_written: bool
+
+
+def parse_define_field(text: str) -> ParsedField:
+    """Read a ``DEFINE FIELD`` statement as the server renders it (spec §6.3.3) into a ``FieldState``.
+
+    The header ``DEFINE FIELD <idiom> ON <ident>`` is read positionally (``DEFINE FIELD TYPE ON TYPE TYPE int``,
+    ``DEFINE FIELD ON ON t``): ``name`` is the path's canonical name (``tags[*]`` and ``tags.*`` both give
+    ``"tags.*"``) and ``path`` its unescaped segments, ``table`` the identifier after ``ON``. The clauses —
+    ``FLEXIBLE`` (before ``TYPE`` on 2.x, after it on 3.x), ``TYPE``, ``REFERENCE``, ``DEFAULT [ALWAYS]``,
+    ``READONLY``, ``VALUE``, ``COMPUTED``, ``ASSERT``, ``COMMENT``, ``PERMISSIONS`` — are read with
+    ``read_clauses()``. The kind goes through ``normalise_kind()`` (``option<int>`` and ``none | int`` both give
+    ``field_type="int"``, ``nullable=True``); no ``TYPE`` gives ``"any"``, not nullable (as ``TYPE any``; ``raw``
+    keeps the two apart). Expression texts are kept as rendered. When no reading fits, the clauses are read once more
+    with ``TYPE`` only non-empty: exactly one reading then gives the field with its ``TYPE`` text as ``field_type``,
+    not nullable, and ``type_as_written=True`` (spec §6.3.2 item 4). Raises ``DefineParseError``.
+    """
+    pos = _header(text, "FIELD")
+    if _identifier_at(text, pos) is None:
+        raise DefineParseError(_R_HEADER)
+    path, pos = read_idiom(text, pos)
+    pos = _expect_word(text, _expect_space(text, pos), "ON")
+    table, pos = read_identifier(text, pos)
+    _name_end(text, pos)
+    try:
+        clauses = read_clauses(text, pos, _FIELD_SLOTS)
+        as_written = False
+    except DefineParseError as error:
+        if error.args[0] != _R_NO_READING:
+            raise
+        clauses = read_clauses(text, pos, _FIELD_SLOTS_TYPE_AS_WRITTEN)
+        as_written = True
+    kind = clauses.get("type")
+    if kind is None:
+        field_type, nullable = "any", False
+    elif as_written:
+        field_type, nullable = kind.content, False
+    else:
+        field_type, nullable = normalise_kind(kind.content)
+    default = clauses.get("default")
+    default_always, default_text = (False, None) if default is None else _split_default(default.content)
+    reference = clauses.get("reference")
+    comment = clauses.get("comment")
+    permissions = clauses.get("permissions")
+    state = FieldState(
+        name=canonical_name(path),
+        field_type=field_type,
+        nullable=nullable,
+        default=default_text,
+        assertion=_content(clauses.get("assert")),
+        flexible="flexible" in clauses,
+        readonly="readonly" in clauses,
+        value=_content(clauses.get("value")),
+        reference=reference is not None,
+        on_delete=None if reference is None else _reference_parts(_scan_span(reference.content))[1],
+        comment=None if comment is None else unquote(comment.content),
+        path=path,
+        table=table,
+        default_always=default_always,
+        computed=_content(clauses.get("computed")),
+        permissions={} if permissions is None else parse_permissions(permissions.content, _FIELD_ACTIONS, unnamed="FULL"),
+        raw=text,
+    )
+    return ParsedField(state, as_written)
