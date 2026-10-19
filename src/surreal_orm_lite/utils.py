@@ -14,7 +14,7 @@ import pydantic
 from . import geo as _geo
 from ._sdk import RecordID, SdkRange, ServerError
 from .constants import GEOMETRY_LOOKUP_OPERATORS, LOOKUP_OPERATORS, SESSION_PARAMETERS, TEXT_LOOKUP_FUNCTIONS
-from .exceptions import SurrealDbError
+from .exceptions import SurrealDbAuthenticationError, SurrealDbConflictError, SurrealDbError, SurrealDbNotFoundError
 from .functions import SurrealFunc, Var
 from .subquery import SubqueryCompiler, inside_a_list, lookup_refused, subquery_condition, subquery_of
 from .types import Range
@@ -1116,6 +1116,22 @@ def validate_patch_operations(operations: Any) -> None:
             validate_json_pointer(op["from"], f"operation #{i} from")
 
 
+def _ddl_refusal_class(statement: str, error: BaseException) -> type[SurrealDbError]:
+    """The ORM class of a refused DDL *statement* (``apply_ddl_statements(classify=True)``), from the server's text.
+
+    ``SurrealDbAuthenticationError`` when the session may not define (``IAM error: Not enough permissions …``, on
+    every line and through an interactive transaction alike); ``SurrealDbNotFoundError`` when a ``REMOVE`` names a
+    definition that ``does not exist``; ``SurrealDbError`` for anything else (a parse error, a definition that
+    already exists, a body the server refuses).
+    """
+    text = str(error).lower()
+    if "not enough permissions" in text:
+        return SurrealDbAuthenticationError
+    if statement.startswith("REMOVE ") and "does not exist" in text:
+        return SurrealDbNotFoundError
+    return SurrealDbError
+
+
 async def apply_ddl_statements(
     statements: list[str],
     *,
@@ -1123,6 +1139,8 @@ async def apply_ddl_statements(
     tx: Any = None,
     what: str,
     hint: str = "",
+    kind: str = "definition",
+    classify: bool = False,
 ) -> list[str]:
     """Run DDL statements one at a time, normalising every rejection to `SurrealDbError`.
 
@@ -1138,8 +1156,17 @@ async def apply_ddl_statements(
     Catching only the first leaves the interactive path propagating a bare
     "Transaction failed and rolled back" with no mention of which definition caused it.
 
+    The message is ``Can't apply {what} {kind}: {statement} -> {server message}{hint}``. By default
+    every refusal is a plain ``SurrealDbError``. With ``classify=True`` (v0.31.0's event and function
+    DDL) the class says why: ``SurrealDbAuthenticationError`` when the session may not define,
+    ``SurrealDbNotFoundError`` when a ``REMOVE`` names a missing definition, ``SurrealDbError``
+    otherwise — and a ``SurrealDbConflictError`` propagates unchanged, so ``retry_on_conflict`` still
+    sees it.
+
     :param what: names the kind of definition, for the message (e.g. ``"access"``).
     :param hint: appended to the message — extra guidance when the cause is likely known.
+    :param kind: what the statements do, for the message: ``"definition"`` or ``"removal"``.
+    :param classify: map each refusal to the class that says why (see above).
     :returns: the statements applied, so callers can hand them straight back.
     """
     for statement in statements:
@@ -1149,5 +1176,10 @@ async def apply_ddl_statements(
             else:
                 await client.query(statement, {})
         except (ServerError, SurrealDbError, RuntimeError) as e:
-            raise SurrealDbError(f"Can't apply {what} definition: {statement} -> {e}{hint}") from e
+            message = f"Can't apply {what} {kind}: {statement} -> {e}{hint}"
+            if not classify:
+                raise SurrealDbError(message) from e
+            if isinstance(e, SurrealDbConflictError):
+                raise
+            raise _ddl_refusal_class(statement, e)(message) from e
     return statements

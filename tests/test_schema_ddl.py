@@ -5,8 +5,10 @@ renderers (``Event.ddl()``, ``function_ddl()``, the removal statements).
 Unit tests (no server): ``scan_fragment()`` (spec §6.2), ``Event``'s construction and the exact texts of E1–E11
 (spec §5.1, §5.6; AC-2), the ``_KindReader.raw_argument()`` hardening (spec §6.2), the golden statements of spec
 §5.2 with the exact texts of E12–E13 and F1–F9 (AC-3), and the events of a model — ``SurrealConfigDict(events=)``,
-``get_events()``, ``event_ddl()`` and the exact texts of E14 (spec §5.3; AC-4). The check catches mistakes and is not
-an injection defence: every refused input below is a plain malformed name, fragment or kind.
+``get_events()``, ``event_ddl()`` and the exact texts of E14 (spec §5.3; AC-4), and applying DDL with fakes — the
+refusals ``apply_ddl_statements(classify=True)`` classifies (S1–S3), ``check_call_transaction(operation=)`` and the
+``ASYNC`` check C1 (spec §5.6, §6.4, §6.5; AC-13). The check catches mistakes and is not an injection defence: every
+refused input below is a plain malformed name, fragment or kind.
 """
 
 import dataclasses
@@ -14,9 +16,20 @@ import pickle
 from typing import Any
 
 import pytest
+from surrealdb import InternalError, NotAllowedError, ValidationError
 
 import surreal_orm_lite
-from surreal_orm_lite import BaseSurrealEdge, BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager, schema
+from surreal_orm_lite import (
+    BaseSurrealEdge,
+    BaseSurrealModel,
+    SurrealConfigDict,
+    SurrealDbAuthenticationError,
+    SurrealDbConflictError,
+    SurrealDBConnectionManager,
+    SurrealDbError,
+    SurrealDbNotFoundError,
+    schema,
+)
 from surreal_orm_lite.define_parser import (
     DefineParseError,
     KLiteral,
@@ -27,7 +40,15 @@ from surreal_orm_lite.define_parser import (
     render_kind,
     scan_fragment,
 )
-from surreal_orm_lite.schema import Event, function_ddl, remove_event_statement, remove_function_statement
+from surreal_orm_lite.routing import check_call_transaction
+from surreal_orm_lite.schema import (
+    Event,
+    ensure_async_events_supported,
+    function_ddl,
+    remove_event_statement,
+    remove_function_statement,
+)
+from surreal_orm_lite.utils import apply_ddl_statements
 
 # The fixed DefineParseError reasons, written out: the tests pin the exact texts.
 _R_BRACKETS = "its brackets are not balanced"
@@ -1212,3 +1233,267 @@ class TestModelEvents:
                 model_config = SurrealConfigDict(events=[Event("e", then="(1")])
 
         assert str(raised.value) == _embed_error("then", _R_BRACKETS)
+
+
+# --- AC-13 (unit): applying DDL — refusals classified, the transaction check, the ASYNC check (spec §5.6, §6.4, §6.5) -
+
+_DEFINE = "DEFINE EVENT OVERWRITE `e` ON `t` THEN { CREATE log };"
+_REMOVE = "REMOVE EVENT `e` ON `t`;"
+_PERMISSIONS = "IAM error: Not enough permissions to perform this action"
+_MISSING = "The event 'e' does not exist"
+_ACCESS = "DEFINE ACCESS OVERWRITE a ON DATABASE TYPE RECORD;"
+
+
+class _FakeClient:
+    """A client whose ``query()`` records each call and raises *error* when one is given, and whose ``version()``
+    answers *version* and counts its calls."""
+
+    def __init__(self, error: BaseException | None = None, version: object = "surrealdb-3.3.4") -> None:
+        self.error = error
+        self.answer = version
+        self.queries: list[tuple[str, object]] = []
+        self.version_calls = 0
+
+    async def query(self, statement: str, variables: object) -> list[object]:
+        self.queries.append((statement, variables))
+        if self.error is not None:
+            raise self.error
+        return []
+
+    async def version(self) -> object:
+        self.version_calls += 1
+        return self.answer
+
+
+class _FakeTransaction:
+    """A transaction whose ``add()`` records each statement and raises *error* when one is given, as an interactive
+    transaction's ``add()`` raises the ORM's own error once it has read the response."""
+
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.error = error
+        self.added: list[tuple[str, object]] = []
+
+    async def add(self, statement: str, variables: object) -> None:
+        self.added.append((statement, variables))
+        if self.error is not None:
+            raise self.error
+
+
+class _TaggedTransaction:
+    """A transaction opened on the connection *name*, as the manager tags one (``_connection_name``)."""
+
+    def __init__(self, name: str) -> None:
+        self._connection_name = name
+
+
+async def _apply(
+    statements: list[str], error: BaseException, *, through_tx: bool = False, **options: Any
+) -> pytest.ExceptionInfo[BaseException]:
+    """Apply *statements* with a client (or a transaction) that raises *error*; the raised exception."""
+    client = _FakeClient(None if through_tx else error)
+    tx = _FakeTransaction(error) if through_tx else None
+    with pytest.raises(BaseException) as raised:
+        await apply_ddl_statements(statements, client=client, tx=tx, **options)
+    return raised
+
+
+class TestApplyClassification:
+    """Spec §6.4, §5.6 S1–S3: ``apply_ddl_statements(kind=, classify=)`` — the message names the statement, and with
+    ``classify=True`` the class says why the server refused it; without the new keywords nothing changes."""
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            NotAllowedError("NotAllowed", _PERMISSIONS),  # SurrealDB 3.x
+            InternalError("Internal", _PERMISSIONS),  # SurrealDB 2.x
+            InternalError("Internal", "IAM ERROR: NOT ENOUGH PERMISSIONS TO PERFORM THIS ACTION"),
+        ],
+        ids=["3.x", "2.x", "upper-case"],
+    )
+    @pytest.mark.parametrize("statement", [_DEFINE, _REMOVE], ids=["define", "remove"])
+    async def test_s1_a_permissions_refusal(self, error: Exception, statement: str) -> None:
+        kind = "removal" if statement.startswith("REMOVE") else "definition"
+        raised = await _apply([statement], error, what="event", kind=kind, classify=True)
+        assert type(raised.value) is SurrealDbAuthenticationError
+        assert str(raised.value) == f"Can't apply event {kind}: {statement} -> {error}"
+        assert raised.value.__cause__ is error
+
+    async def test_s1_inside_an_interactive_transaction(self) -> None:
+        error = SurrealDbError(f"Transaction failed and rolled back: {_PERMISSIONS}")
+        raised = await _apply([_DEFINE], error, through_tx=True, what="event", classify=True)
+        assert type(raised.value) is SurrealDbAuthenticationError
+        assert str(raised.value) == f"Can't apply event definition: {_DEFINE} -> {error}"
+
+    @pytest.mark.parametrize(
+        "error",
+        [InternalError("Internal", _MISSING), InternalError("Internal", "The function 'fn::greet' does not exist")],
+        ids=["event", "function"],
+    )
+    async def test_s2_a_removal_of_a_missing_definition(self, error: Exception) -> None:
+        raised = await _apply([_REMOVE], error, what="event", kind="removal", classify=True)
+        assert type(raised.value) is SurrealDbNotFoundError
+        assert str(raised.value) == f"Can't apply event removal: {_REMOVE} -> {error}"
+        assert raised.value.__cause__ is error
+
+    async def test_s2_is_for_a_removal_only(self) -> None:
+        error = InternalError("Internal", _MISSING)
+        raised = await _apply([_DEFINE], error, what="event", classify=True)
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == f"Can't apply event definition: {_DEFINE} -> {error}"
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            RuntimeError("Parse error: Unexpected token `an identifier`, expected Eof"),  # the embedded engine
+            ValidationError("Validation", "Parse error: Unexpected end of file"),  # SurrealDB 3.x
+            InternalError("Internal", "The event 'e' already exists"),
+            SurrealDbError("Transaction failed and rolled back: Parse error"),  # an interactive transaction
+        ],
+        ids=["runtime", "validation", "already-exists", "interactive"],
+    )
+    async def test_s3_any_other_refusal(self, error: Exception) -> None:
+        raised = await _apply([_DEFINE], error, what="function", classify=True)
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == f"Can't apply function definition: {_DEFINE} -> {error}"
+        assert raised.value.__cause__ is error
+
+    @pytest.mark.parametrize("through_tx", [True, False], ids=["tx", "client"])
+    async def test_a_conflict_propagates_unchanged(self, through_tx: bool) -> None:
+        error = SurrealDbConflictError("Transaction conflict: This transaction can be retried")
+        raised = await _apply([_DEFINE], error, through_tx=through_tx, what="event", classify=True)
+        assert raised.value is error
+
+    @pytest.mark.parametrize(
+        ("statement", "error"),
+        [
+            (_ACCESS, NotAllowedError("NotAllowed", _PERMISSIONS)),
+            (_REMOVE, InternalError("Internal", _MISSING)),
+            (_ACCESS, SurrealDbConflictError("Transaction conflict: This transaction can be retried")),
+            (_ACCESS, RuntimeError("Parse error")),
+        ],
+        ids=["permissions", "missing", "conflict", "runtime"],
+    )
+    async def test_without_the_new_keywords_nothing_changes(self, statement: str, error: Exception) -> None:
+        raised = await _apply([statement], error, what="access")
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == f"Can't apply access definition: {statement} -> {error}"
+        assert raised.value.__cause__ is error
+
+    async def test_the_hint_ends_the_message(self) -> None:
+        error = InternalError("Internal", _MISSING)
+        raised = await _apply([_REMOVE], error, what="event", kind="removal", classify=True, hint=" (a hint)")
+        assert type(raised.value) is SurrealDbNotFoundError
+        assert str(raised.value) == f"Can't apply event removal: {_REMOVE} -> {error} (a hint)"
+
+    async def test_statements_are_sent_one_by_one_and_returned(self) -> None:
+        client = _FakeClient()
+        statements = [_DEFINE, _REMOVE]
+        applied = await apply_ddl_statements(statements, client=client, what="event", kind="removal", classify=True)
+        assert applied == statements
+        assert client.queries == [(_DEFINE, {}), (_REMOVE, {})]
+
+    async def test_a_transaction_queues_without_variables(self) -> None:
+        client = _FakeClient()
+        tx = _FakeTransaction()
+        assert await apply_ddl_statements([_DEFINE], client=client, tx=tx, what="event", classify=True) == [_DEFINE]
+        assert tx.added == [(_DEFINE, None)]
+        assert client.queries == []
+
+    async def test_the_first_refusal_stops_the_rest(self) -> None:
+        client = _FakeClient(InternalError("Internal", "The event 'e' already exists"))
+        with pytest.raises(SurrealDbError):
+            await apply_ddl_statements([_DEFINE, _REMOVE], client=client, what="event", classify=True)
+        assert client.queries == [(_DEFINE, {})]
+
+
+class TestCallTransactionOperation:
+    """Spec §6.5: ``check_call_transaction(operation=)`` names the manager method in X1m; the default is unchanged."""
+
+    @staticmethod
+    def _x1m(operation: str) -> str:
+        return (
+            f"{operation} cannot run in this transaction: the transaction belongs to connection 'other' and the call "
+            "runs on connection 'default'. A transaction is one connection's (one database): call it inside "
+            "using('other'), or open the transaction on 'default'."
+        )
+
+    @pytest.mark.parametrize("operation", ["define_event()", "remove_event()", "define_function()", "remove_function()"])
+    def test_x1m_names_the_operation(self, operation: str) -> None:
+        with pytest.raises(SurrealDbError) as raised:
+            check_call_transaction("default", _TaggedTransaction("other"), operation=operation)
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == self._x1m(operation)
+
+    def test_the_default_text_is_unchanged(self) -> None:
+        with pytest.raises(SurrealDbError) as raised:
+            check_call_transaction("default", _TaggedTransaction("other"))
+        assert str(raised.value) == self._x1m("call_function()")
+
+    @pytest.mark.parametrize("tx", [None, _TaggedTransaction("default"), object()], ids=["none", "same", "untagged"])
+    def test_a_transaction_of_the_same_connection_passes(self, tx: object) -> None:
+        assert check_call_transaction("default", tx, operation="define_event()") is None
+
+
+def _c1(engine: str, names: str) -> str:
+    """C1's exact text (spec §5.6)."""
+    return (
+        f"ASYNC events need SurrealDB 3.x, and this connection runs {engine}: {names} cannot be defined with "
+        "async_mode=True. Drop async_mode, retry and max_depth, or connect to a SurrealDB 3.x server. Nothing was "
+        "defined."
+    )
+
+
+_SYNC = Event("sync_one", then="NONE")
+_NOTIFY = Event("notify", when="$event = 'CREATE'", then="CREATE outbox SET id = $after.id", async_mode=True)
+_RETRYING = Event("retrying", then="NONE", async_mode=True, retry=2, max_depth=3)
+
+
+class TestAsyncCheck:
+    """Spec §4, §5.6 C1, D5: ``ensure_async_events_supported()`` refuses ``ASYNC`` events on a connection before
+    SurrealDB 3.x, before any DDL, and asks the version only when an event is asynchronous."""
+
+    @pytest.mark.parametrize("events", [[], (), [_SYNC], (_SYNC, Event("other", then="NONE"))])
+    @pytest.mark.parametrize("embedded", [False, True])
+    async def test_no_async_event_never_asks_the_version(self, events: Any, embedded: bool) -> None:
+        client = _FakeClient(version="surrealdb-2.7.0")
+        assert await ensure_async_events_supported(client, events, embedded=embedded) is None
+        assert client.version_calls == 0
+        assert client.queries == []
+
+    async def test_c1_on_a_2x_server(self) -> None:
+        client = _FakeClient(version="surrealdb-2.7.0")
+        with pytest.raises(SurrealDbError) as raised:
+            await ensure_async_events_supported(client, [_SYNC, _NOTIFY], embedded=False)
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _c1("SurrealDB 2.x", "'notify'")
+        assert client.version_calls == 1
+        assert client.queries == []
+
+    async def test_c1_on_the_embedded_engine(self) -> None:
+        client = _FakeClient(version="surrealdb-2.0.0")
+        with pytest.raises(SurrealDbError) as raised:
+            await ensure_async_events_supported(client, (_NOTIFY,), embedded=True)
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _c1("the embedded engine (a SurrealDB 2.x core)", "'notify'")
+        assert client.queries == []
+
+    async def test_c1_names_every_async_event_in_order(self) -> None:
+        client = _FakeClient(version="surrealdb-2.7.0")
+        with pytest.raises(SurrealDbError) as raised:
+            await ensure_async_events_supported(client, [_RETRYING, _SYNC, _NOTIFY], embedded=False)
+        assert str(raised.value) == _c1("SurrealDB 2.x", "'retrying', 'notify'")
+        assert client.version_calls == 1
+
+    async def test_c1_names_the_major(self) -> None:
+        client = _FakeClient(version="surrealdb-1.5.4")
+        with pytest.raises(SurrealDbError) as raised:
+            await ensure_async_events_supported(client, [_NOTIFY], embedded=False)
+        assert str(raised.value) == _c1("SurrealDB 1.x", "'notify'")
+
+    @pytest.mark.parametrize("version", ["surrealdb-3.3.4", "surrealdb-3.1.5", "surrealdb-4.0.0", "dev", "", None])
+    @pytest.mark.parametrize("embedded", [False, True])
+    async def test_3x_or_an_unreadable_version_passes(self, version: object, embedded: bool) -> None:
+        client = _FakeClient(version=version)
+        assert await ensure_async_events_supported(client, [_NOTIFY, _RETRYING], embedded=embedded) is None
+        assert client.version_calls == 1
+        assert client.queries == []

@@ -23,12 +23,15 @@ it.
 """
 
 import re
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import KW_ONLY, dataclass, field
+from typing import Any
 
 from .define_parser import DefineParseError, parse_kind, render_kind, scan_fragment
+from .exceptions import SurrealDbError
 from .functions import normalize_function_name
 from .surql_literal import _SERVER_PARAMETERS, _identifier, _quoted
+from .time_travel import line_major
 from .utils import VALID_ALIAS_PATTERN
 
 __all__ = ["Event", "function_ddl"]
@@ -393,3 +396,36 @@ def check_events_config(model: type, value: object) -> None:
         if event.name in names:
             raise ValueError(f"{key} declares the event {event.name!r} more than once.")
         names.add(event.name)
+
+
+async def ensure_async_events_supported(client: Any, events: Iterable[Event], *, embedded: bool) -> None:
+    """C1: refuse ``ASYNC`` events on a connection that runs SurrealDB before 3.x, before any DDL is sent.
+
+    ``ASYNC`` events exist on SurrealDB 3.x only: 2.x servers and the embedded engine fail to parse the clause. When
+    one of *events* has ``async_mode=True``, the line is read from ``client.version()`` — once, and only then, so
+    applying synchronous events costs no request — with the lite's rule (``time_travel.line_major()``): a version
+    that cannot be read counts as 3.x and the server decides. *embedded* says the connection is the embedded engine,
+    named so in the message.
+
+    On the embedded engine ``version()`` answers the SDK's version (``surrealdb-2.0.0``), not its bundled core's
+    (2.3.10); both are 2.x today. Should an SDK release ship a 3.x core under a 2.x version, this check would refuse
+    an ``ASYNC`` event that core could run — an accepted, documented limit while the SDK bundles a 2.x core.
+
+    :param client: the SDK client of the connection the events are applied on (outside any transaction:
+        ``version()`` takes none).
+    :raises SurrealDbError: an event has ``async_mode=True`` and the connection runs SurrealDB before 3.x; the
+        message names every such event.
+    """
+    names = [event.name for event in events if event.async_mode]
+    if not names:
+        return
+    major = line_major(await client.version())
+    if major >= 3:
+        return
+    engine = "the embedded engine (a SurrealDB 2.x core)" if embedded else f"SurrealDB {major}.x"
+    listed = ", ".join(repr(name) for name in names)
+    raise SurrealDbError(
+        f"ASYNC events need SurrealDB 3.x, and this connection runs {engine}: {listed} cannot be defined with "
+        "async_mode=True. Drop async_mode, retry and max_depth, or connect to a SurrealDB 3.x server. Nothing was "
+        "defined."
+    )
