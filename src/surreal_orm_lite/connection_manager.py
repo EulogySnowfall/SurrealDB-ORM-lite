@@ -2322,14 +2322,13 @@ class SurrealDBConnectionManager:
 
         A redefinition through :meth:`define_function` or :meth:`remove_function` (v0.31.0) is
         picked up at once, whatever the order of its parameters: both drop the function's cached
-        signature themselves (and again when their transaction commits), on every connection set
-        up with the same URL, namespace and database. The one redefinition this cannot catch is a
-        **reorder** of the same parameter names it was not told about — by raw DDL
-        (``client.query("DEFINE FUNCTION …")``), from another process, or through a connection
-        that reaches the database under another URL: *params* is a mapping and carries no order of
-        its own, so there is nothing to compare the cached order against, and re-reading on
-        every call would defeat the cache. After such a redefinition, call
-        :meth:`clear_function_signature_cache`.
+        signature themselves (and again when their transaction commits), on every connection of
+        this process to the same namespace and database, whatever its URL. The one redefinition
+        this cannot catch is a **reorder** of the same parameter names it was not told about — by
+        raw DDL (``client.query("DEFINE FUNCTION …")``) or from another process: *params* is a
+        mapping and carries no order of its own, so there is nothing to compare the cached order
+        against, and re-reading on every call would defeat the cache. After such a redefinition,
+        call :meth:`clear_function_signature_cache`.
         """
         key = (cls.__url, cls.__namespace, cls.__database, function)
         was_cached = key in cls.__function_signatures
@@ -2384,8 +2383,8 @@ class SurrealDBConnectionManager:
         Called by :meth:`unset_connection`; also useful in tests, and **required** after
         redefining a function by raw DDL with the same parameter names in a different order —
         the only staleness :meth:`_resolve_named_args` cannot self-heal (:meth:`define_function`
-        and :meth:`remove_function` drop the signature themselves, on every connection set up
-        with the same URL, namespace and database).
+        and :meth:`remove_function` drop the signature themselves, on every connection of this
+        process to the same namespace and database, whatever its URL).
         """
         cls.__function_signatures.clear()
 
@@ -2524,11 +2523,11 @@ class SurrealDBConnectionManager:
         to define (a system user such as root, or a namespace or database ``OWNER``/``EDITOR``).
 
         The function's signature cached by ``call_function(params=)`` is dropped on every connection of this
-        process set up with the same URL, namespace and database — this one, and an application connection when an
-        admin one applies the DDL —, so the next ``params=`` call there reads the new one: a redefinition with the
-        same parameters in another order included. A connection that reaches the database under another URL, or
-        another process, still needs :meth:`clear_function_signature_cache`. With *tx*, the statement is applied
-        with the transaction and the signature is dropped again once it commits.
+        process to the same namespace and database, whatever its URL — this one, and an application connection when
+        an admin one applies the DDL, over ``http://`` while the application uses ``ws://`` included —, so the next
+        ``params=`` call there reads the new one: a redefinition with the same parameters in another order included.
+        Another process still needs :meth:`clear_function_signature_cache`. With *tx*, the statement is applied with
+        the transaction and the signature is dropped again once it commits.
         ``params=`` reads the signature of the committed schema: inside the transaction that defines a function,
         call it with positional ``args``.
 
@@ -2586,9 +2585,9 @@ class SurrealDBConnectionManager:
             await SurrealDBConnectionManager.remove_function("fn::greet")
             # 'REMOVE FUNCTION IF EXISTS fn::greet;'
 
-        The function's signature cached by ``call_function(params=)`` is dropped on every connection set up with the
-        same URL, namespace and database, as :meth:`define_function` does, and with *tx* dropped again once the
-        transaction commits.
+        The function's signature cached by ``call_function(params=)`` is dropped on every connection of this process
+        to the same namespace and database, whatever its URL, as :meth:`define_function` does, and with *tx* dropped
+        again once the transaction commits.
 
         :param function: ``"fn::name"``, ``"name"`` or a nested ``"fn::namespace::name"``.
         :param missing_ok: ``True`` (default) emits ``REMOVE FUNCTION IF EXISTS …``, so a missing function is not an
@@ -2621,15 +2620,22 @@ class SurrealDBConnectionManager:
         """Drop the cached signature of *function* (``"fn::…"``) in this connection's database, on every registered
         connection; never raises.
 
-        The key is this connection's ``(url, namespace, database, function)``, so the entry goes from every
-        connection set up with the same URL, namespace and database — an admin connection that applies the DDL
-        and the application's connection that calls the function —, and from none other. Without that, a
-        connection that had cached the old order would keep binding ``params=`` in it after a reorder: no error,
-        the arguments swapped. The registry is read from a snapshot, without its lock, like the ``"every"`` policy.
+        Every entry whose ``(namespace, database, function)`` is this connection's goes, **whatever its URL** — an
+        admin connection that applies the DDL and the application's connection that calls the function alike. The
+        SDK reaches one server under several URLs (``ws://`` or ``http://``, with or without ``/rpc``,
+        ``localhost`` or ``127.0.0.1``), and an admin connection read from another setting may spell it otherwise:
+        matching the URL too would leave the application's entry behind, and a connection that had cached the old
+        order would keep binding ``params=`` in it after a reorder — no error, the arguments swapped. The URL in the
+        key guards the lookup (``set_url()`` never serves a signature read elsewhere), not this invalidation:
+        dropping the entry of another server's database with the same names only costs one ``INFO FOR DB`` on its
+        next ``params=`` call. The registry and each cache are read from a snapshot, without the registry's lock,
+        like the ``"every"`` policy.
         """
-        key = (cls.__url, cls.__namespace, cls.__database, function)
+        target = (cls.__namespace, cls.__database, function)
         for connection in list(_REGISTRY.values()):
-            connection.__function_signatures.pop(key, None)
+            signatures = connection.__function_signatures
+            for key in [key for key in list(signatures) if key[1:] == target]:
+                signatures.pop(key, None)
 
     # ------------------------------------------------------------------
     # Live queries (v0.19.0)

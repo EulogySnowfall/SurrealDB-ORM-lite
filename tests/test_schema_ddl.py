@@ -1487,6 +1487,37 @@ class TestCallTransactionOperation:
         assert check_call_transaction("default", tx, operation="define_event()") is None
 
 
+class TestForgetFunctionSignature:
+    """What ``define_function()`` and ``remove_function()`` drop from the ``params=`` signature cache: the function's
+    entry on every connection of the process to the same namespace and database, whatever URL it was cached under —
+    the SDK reaches one server as ``ws://…/rpc``, ``ws://…``, ``http://…``, ``localhost`` or ``127.0.0.1`` alike.
+    White box and no request: the caches are filled by hand, nothing is ever connected."""
+
+    async def test_every_url_goes_other_names_stay(self) -> None:
+        for name, url in (("evt", "ws://localhost:8000/rpc"), ("evt_admin", "http://127.0.0.1:8000")):
+            SurrealDBConnectionManager.add_connection(
+                name, url=url, user="root", password="root", namespace="ns", database="evt_db"
+            )
+        app, admin = (
+            SurrealDBConnectionManager._manager_for(name)._SurrealDBConnectionManager__function_signatures  # type: ignore[attr-defined]
+            for name in ("evt", "evt_admin")
+        )
+        kept = {
+            ("ws://localhost:8000/rpc", "ns", "evt_db", "fn::other"): ("a",),
+            ("ws://localhost:8000/rpc", "ns", "db", "fn::pair"): ("a", "b"),
+            ("ws://localhost:8000/rpc", "other_ns", "evt_db", "fn::pair"): ("a", "b"),
+        }
+        app.update(kept)
+        app[("ws://localhost:8000", "ns", "evt_db", "fn::pair")] = ("a", "b")
+        app[("ws://localhost:8000/rpc", "ns", "evt_db", "fn::pair")] = ("a", "b")
+        admin[("http://127.0.0.1:8000", "ns", "evt_db", "fn::pair")] = ("a", "b")
+
+        async with SurrealDBConnectionManager.using("evt_admin"):
+            SurrealDBConnectionManager._forget_function_signature("fn::pair")
+        assert app == kept
+        assert admin == {}
+
+
 def _c1(engine: str, names: str) -> str:
     """C1's exact text (spec §5.6)."""
     return (
@@ -2482,15 +2513,21 @@ class TestFunctionsE2E:
 
     @pytest.mark.parametrize("kind", ["ws", "http"])
     async def test_a_reorder_reaches_every_connection_to_the_database(self, kind: str) -> None:
-        # The DDL runs on a second connection to evt_db (an admin one, say); "evt" had cached the old order. Two
-        # string parameters: a stale order binds without any error, "B/A" instead of "A/B". The default connection,
-        # on another database, keeps its own cached signature of a function with the same name. Not on mem://, where
-        # each connection is an engine of its own.
+        # The DDL runs on a second connection to evt_db (an admin one, say), set up with another URL for the same
+        # server — the other transport, as an application that applies DDL over HTTP and runs live queries over
+        # WebSocket would —; "evt" had cached the old order. Two string parameters: a stale order binds without any
+        # error, "B/A" instead of "A/B". The default connection, on another database, keeps its own cached signature
+        # of a function with the same name. Not on mem://, where each connection is an engine of its own.
         pair = ("fn::ev_pair", "RETURN string::concat($a, '/', $b);")
         both = {"a": "A", "b": "B"}
         async with _default(kind), _evt(kind):
             SurrealDBConnectionManager.add_connection(
-                "evt_admin", url=_url(kind), user="root", password="root", namespace="ns", database="evt_db"
+                "evt_admin",
+                url=_url("http" if kind == "ws" else "ws"),
+                user="root",
+                password="root",
+                namespace="ns",
+                database="evt_db",
             )
             try:
                 await SurrealDBConnectionManager.define_function(*pair, parameters={"a": "string", "b": "string"})
@@ -3111,8 +3148,8 @@ _EVENT_ROWS = [
     ],
     [
         "`define_function()`, `remove_function()` and `call_function()`",
-        "same on both lines: the next `call_function()` sees a redefinition on every connection to the same URL, "
-        "namespace and database (their signature cache is dropped)",
+        "same on both lines: the next `call_function()` sees a redefinition on every connection of this process to "
+        "the same namespace and database, whatever its URL",
         "the same",
         "v0.31.0",
     ],
@@ -3133,12 +3170,12 @@ _EMBEDDED_EVENTS_ROW = [
 _SIGNATURE_CACHE_32 = (
     "Signature caching is transparent. `define_function()` and `remove_function()` "
     "([section 32](#32-server-side-events-and-stored-functions-event-define_events-define_function)) drop the "
-    "function's cached signature themselves, on every connection set up with the same URL, namespace and database, "
-    "so the next call sees a redefinition made through them at once, even one that only changes the order of the "
-    "same parameter names, and even on another connection than the one that applied the DDL. For a function "
-    'redefined out of band — with raw DDL (`client.query("DEFINE FUNCTION …")`), from another process, or through '
-    "a connection that reaches the database under another URL — two helpers are available, both on the current "
-    "connection: `SurrealDBConnectionManager.clear_function_signature_cache()` and "
+    "function's cached signature themselves, on every connection of this process to the same namespace and "
+    "database, whatever its URL (`ws://` or `http://`, with or without `/rpc`, `localhost` or `127.0.0.1`), so the "
+    "next call sees a redefinition made through them at once, even one that only changes the order of the same "
+    "parameter names, and even on another connection than the one that applied the DDL. For a function redefined "
+    'out of band — with raw DDL (`client.query("DEFINE FUNCTION …")`) or from another process — two helpers are '
+    "available, both on the current connection: `SurrealDBConnectionManager.clear_function_signature_cache()` and "
     "`function_signature_cache_size()`. The cache is keyed by URL, namespace and database, so `set_url()`, "
     "`set_namespace()` and `set_database()` cannot serve a signature read elsewhere; it is cleared outright by "
     "`set_connection()` and `unset_connection()`. After an out-of-band redefinition, a signature whose parameter "
@@ -3314,7 +3351,7 @@ class TestReadmeSection32:
 
     def test_signature_cache_paragraph(self) -> None:
         """Spec §11.1 item 8: a redefinition through ``define_function()``/``remove_function()`` is followed at once,
-        on every connection to the same database; only an out-of-band one still needs
+        on every connection to the same database, whatever its URL; only an out-of-band one still needs
         ``clear_function_signature_cache()``."""
         paragraphs = [_normalised(paragraph) for paragraph in _readme_part(_SECTION_17).split("\n\n")]
         assert _SIGNATURE_CACHE_32 in paragraphs, [p for p in paragraphs if p.startswith("Signature caching")]
