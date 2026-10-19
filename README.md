@@ -4219,9 +4219,9 @@ class Person(BaseSurrealModel):
 - A class is named after its table in PascalCase, without singularisation (`game_tables` → `GameTables`); a name
   that is taken — a Python keyword, a name the module imports, another table's class — gets `Model` appended (`range`
   → `RangeModel`). The table's comment, relation ends, view query, change feed (`# Changefeed: 1d`), permissions
-  (`# Permissions: FOR select WHERE …, FOR create, update FULL`, left out when they are `NONE`, a table's default),
-  indexes and events are comments of its class, and the module's header lists every table or field left out, with
-  the reason.
+  (`# Permissions: FOR select WHERE …, FOR create, update FULL, FOR delete NONE`, left out when all four are `NONE`,
+  a table's default), indexes and events are comments of its class, and the module's header lists every table or
+  field left out, with the reason.
 - The source is safe to import: names, comments and expressions read from the database reach it only as escaped
   string literals, single-line ASCII comments and identifiers the generator builds, so a schema cannot inject code
   into it. It holds no timestamp, server address, namespace or database name, and no
