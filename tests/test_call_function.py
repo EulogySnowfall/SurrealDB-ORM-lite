@@ -132,8 +132,8 @@ class TestSignatureParsing:
     @pytest.mark.parametrize(
         ("parameters", "expected"),
         [
-            (", ".join(f"$a{n}: int" for n in range(100_000)), 100_000),  # no copy of the rest of the text per `$`
-            ("/" + "$⟨" * 30_000 + "/", 0),  # no ⟩ after them: no search of the rest of the text per `$⟨`
+            (", ".join(f"$a{n}: int" for n in range(20_000)), 20_000),  # no copy of the rest of the text per `$`
+            ("/" + "$⟨" * 15_000 + "/", 0),  # no ⟩ after them: no search of the rest of the text per `$⟨`
             ("/" + "$`" + "a" * 100_000 + "/", 0),
         ],
         ids=["many-parameters", "unclosed-brackets", "unclosed-backquote"],

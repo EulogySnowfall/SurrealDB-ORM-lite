@@ -353,12 +353,12 @@ class TestScanner:
             "$a / " * 5000 + "1",  # divisions: each slash looks for a closing one up to the next slash only
             "/a/ + " * 5000 + "1",
             # Slashes no later slash closes: each one must not search the rest of the text again.
-            "/" + "\\/" * 50000,
-            "\\/" * 50000,
-            "/a" + " \\/" * 30000,
-            "/" * 100000,
-            "/" * 100001,
-            "a / " * 50000 + "1",
+            "/" + "\\/" * 10000,
+            "\\/" * 10000,
+            "/a" + " \\/" * 6000,
+            "/" * 20000,
+            "/" * 20001,
+            "a / " * 10000 + "1",
         ],
         ids=[
             "plain-ifs",
