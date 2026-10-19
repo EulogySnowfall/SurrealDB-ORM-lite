@@ -79,7 +79,7 @@ from surreal_orm_lite.schema_state import (
     _FrozenMap,
 )
 
-#: Spec §6.3.6: the only reasons ``DefineParseError`` is raised with.
+#: Spec §6.3.6: the only reasons ``DefineParseError`` is raised with — and v0.31.0's two for ``scan_fragment()``.
 _SPEC_REASONS = {
     "_R_STATEMENT": "not the expected DEFINE statement",
     "_R_HEADER": "its name or ON clause is not where expected",
@@ -95,6 +95,8 @@ _SPEC_REASONS = {
     "_R_INDEX": "its index options are not understood",
     "_R_SIGNATURE": "its function signature is not understood",
     "_R_TOO_COMPLEX": "its clauses hold too many keywords to read",
+    "_R_NUL": "it holds a NUL character (\\x00)",
+    "_R_COMMENT": "it holds a SurrealQL comment marker (-- , #, // or /* */)",
 }
 
 _UNIT_WORDS = ["IF", "THEN", "ELSE", "END"]
@@ -771,7 +773,8 @@ class TestKinds:
             ("record<`weird-name` | b>", KName("record", ("`weird-name`", "b"))),  # names kept as rendered
             ("geometry<point | polygon>", KName("geometry", ("point", "polygon"))),
             ("file<bucket>", KName("file", ("bucket",))),  # other arguments: their text, as rendered
-            ("frob<a<b>, 'c>'>", KName("frob", ("a<b>, 'c>'",))),
+            # A quoted identifier holding > is skipped (v0.31.0: a quote character is refused, test_schema_ddl.py).
+            ("frob<a<b>, `c>`>", KName("frob", ("a<b>, `c>`",))),
             ("'a' | 'b'", KUnion((KLiteral("'a'"), KLiteral("'b'")))),
             ("'dq' | \"it's\"", KUnion((KLiteral("'dq'"), KLiteral('"it\'s"')))),
             ("1.5f | 2", KUnion((KLiteral("1.5f"), KLiteral("2")))),
