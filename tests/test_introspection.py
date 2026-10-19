@@ -61,6 +61,7 @@ from surreal_orm_lite import (
     generate_models_from_db,
 )
 from surreal_orm_lite import introspection as introspection_module
+from surreal_orm_lite._sdk import SurrealError
 from surreal_orm_lite.define_parser import (
     _R_AMBIGUOUS,
     _R_BRACKETS,
@@ -84,7 +85,7 @@ from tests.test_embedded import (
     _table_rows,
     _tables,
 )
-from tests.test_model_generator import GOLDEN
+from tests.test_model_generator import GOLDEN, SUB_DEFAULT_NOTE
 from tests.test_query_cache import _bullets
 from tests.test_time_travel import _SERVER_BEHAVIOUR, _SERVER_TABLE_WIDTHS
 
@@ -1690,6 +1691,166 @@ class TestRoundTripE2E:
                 assert isinstance(row.created_at, datetime)
                 got = await model.objects().get(row.get_raw_id())
                 assert (got.created_at, got.note) == (row.created_at, "n")
+
+
+#: Spec AC-18b (D25 amended, M48): one column per kind of constant ``DEFAULT``, plus one the model does not hold.
+_CONSTANT_DEFAULTS_DDL = """\
+DEFINE TABLE isp_cd SCHEMAFULL;
+DEFINE FIELD title ON isp_cd TYPE string;
+DEFINE FIELD tags ON isp_cd TYPE array<string> DEFAULT [];
+DEFINE FIELD nums ON isp_cd TYPE array<int> DEFAULT [1, 2];
+DEFINE FIELD prefs ON isp_cd TYPE object DEFAULT {};
+DEFINE FIELD prefs.theme ON isp_cd TYPE string DEFAULT 'light';
+DEFINE FIELD ttl ON isp_cd TYPE duration DEFAULT 1h;
+DEFINE FIELD due ON isp_cd TYPE datetime DEFAULT d'2030-01-01T00:00:00Z';
+DEFINE FIELD token ON isp_cd TYPE uuid DEFAULT u'0190d3b4-0000-7000-8000-000000000000';
+DEFINE FIELD created ON isp_cd TYPE datetime DEFAULT time::now();
+"""
+_CONSTANT_DEFAULT_LINES = [
+    "    created: datetime | None = None",
+    '    due: datetime = datetime.fromisoformat("2030-01-01T00:00:00Z")',
+    "    nums: list[int] = Field(default_factory=lambda: [1, 2])",
+    "    prefs: IspCdPrefs = Field(default_factory=IspCdPrefs)",
+    "    tags: list[str] = Field(default_factory=list)",
+    "    title: str",
+    '    token: UUID = UUID("0190d3b4-0000-7000-8000-000000000000")',
+    '    ttl: Duration = Field(default_factory=lambda: Duration.parse("1h"))',
+]
+_TOKEN = uuid.UUID("0190d3b4-0000-7000-8000-000000000000")
+
+
+async def _row(client: Any, record: str) -> object:
+    """The stored row of *record* without ``id`` and ``created`` (the column the model does not hold)."""
+    rows = await client.query(f"SELECT * OMIT id, created FROM {record};", {})
+    assert isinstance(rows, list) and len(rows) == 1, rows
+    return rows[0]
+
+
+class TestConstantDefaultsE2E:
+    """AC-18b on the line under test and on ``mem://``: a constant ``DEFAULT`` copied into a typed Python default stores,
+    when the caller sets nothing, exactly the row the server's own ``DEFAULT`` stores, and the caller's value otherwise;
+    ``update()`` after ``save()`` passes; a ``DEFAULT`` expression stays in ``server_fields`` (M48)."""
+
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    async def test_constant_defaults_ac18b(self, kind: str, tmp_path: pathlib.Path) -> None:
+        path = tmp_path / "isp_cd_models.py"
+        async with _isp(kind, _CONSTANT_DEFAULTS_DDL) as client:
+            source = await generate_models_from_db(path, "isp", tables=["isp_cd"])
+            assert source.split("    id: str | None = None\n", 1)[1].splitlines() == _CONSTANT_DEFAULT_LINES
+            assert 'class IspCdPrefs(BaseModel):\n    theme: str = "light"\n' in source
+            assert SUB_DEFAULT_NOTE not in source
+            with _imported(path) as models:
+                model = models.IspCd
+                assert model.get_server_fields() == frozenset({"created"})
+
+                await client.query("CREATE isp_cd:raw SET title = 't';", {})
+                saved = await model(id="py", title="t").save()
+                assert await _row(client, "isp_cd:py") == await _row(client, "isp_cd:raw")
+                assert isinstance(saved.created, datetime)  # in server_fields: the server's value, read back
+                raw = await model.objects().get("raw")
+                assert saved.model_dump(exclude={"id", "created"}) == raw.model_dump(exclude={"id", "created"})
+                assert (saved.tags, saved.nums, saved.prefs.theme, saved.ttl, saved.token) == (
+                    [],
+                    [1, 2],
+                    "light",
+                    Duration.parse("1h"),
+                    _TOKEN,
+                )
+                assert saved.due == datetime(2030, 1, 1, tzinfo=UTC)
+                saved.title = "u"
+                await saved.update()
+                assert (await model.objects().get("py")).title == "u"
+
+                values = {
+                    "tags": ["a"],
+                    "nums": [3],
+                    "ttl": Duration.parse("5m"),
+                    "due": datetime(2031, 2, 3, 4, 5, 6, tzinfo=UTC),
+                    "token": uuid.UUID("0190d3b4-0000-7000-8000-000000000001"),
+                }
+                explicit = await model(id="ex", title="t", prefs=models.IspCdPrefs(theme="dark"), **values).save()
+                got = await model.objects().get("ex")
+                for name, value in values.items():
+                    assert getattr(explicit, name) == getattr(got, name) == value, name
+                assert explicit.prefs.theme == got.prefs.theme == "dark"
+                explicit.title = "v"
+                await explicit.update()
+                assert (await model.objects().get("ex")).nums == [3]
+
+
+#: Spec §14.9: the follow-up whose fix flips :class:`TestSubFieldDefaultsE2E` (and drops the generated comment line).
+_ISSUE_14_9 = "Models: save() does not read back fields the server fills on create, so update() then refuses or erases them"
+_FLIP_14_9 = (
+    f"{_ISSUE_14_9!r} looks fixed: drop the generated 'update() after save()' comment line and its README bullet, "
+    "and invert this test (spec §14.9, D26 clause)"
+)
+
+#: Spec AC-18c (M48): a required and an optional sub-field filled by a ``DEFAULT`` expression on create.
+_SUB_FIELD_DEFAULTS_DDL = """\
+DEFINE TABLE isp_sfd SCHEMAFULL;
+DEFINE FIELD title ON isp_sfd TYPE string;
+DEFINE FIELD prefs ON isp_sfd TYPE object;
+DEFINE FIELD prefs.theme ON isp_sfd TYPE string DEFAULT 'light';
+DEFINE FIELD prefs.at ON isp_sfd TYPE datetime DEFAULT time::now();
+DEFINE TABLE isp_sfo SCHEMAFULL;
+DEFINE FIELD title ON isp_sfo TYPE string;
+DEFINE FIELD prefs ON isp_sfo TYPE object;
+DEFINE FIELD prefs.seen ON isp_sfo TYPE option<datetime> DEFAULT time::now();
+"""
+
+
+async def _stored(client: Any, query: str) -> object:
+    """The one value ``SELECT VALUE …`` returns."""
+    values = await client.query(query, {})
+    assert isinstance(values, list) and len(values) == 1, values
+    return values[0]
+
+
+class TestSubFieldDefaultsE2E:
+    """AC-18c on the line under test and on ``mem://`` (M48, §14.9): ``save()`` reads back only ``server_fields`` and
+    computed fields, so a sub-field a ``DEFAULT`` fills on create stays ``None`` on the instance, and ``update()`` then
+    sends it as ``NONE`` — refused for a required sub-field, erased for an optional one; ``refresh()`` first keeps both.
+    The generated classes say so. The assertion messages name §14.9's issue, whose fix flips them."""
+
+    @pytest.mark.parametrize("kind", ["ws", "mem"])
+    async def test_update_after_save_ac18c(self, kind: str, tmp_path: pathlib.Path) -> None:
+        path = tmp_path / "isp_sfd_models.py"
+        async with _isp(kind, _SUB_FIELD_DEFAULTS_DDL) as client:
+            source = await generate_models_from_db(path, "isp", tables=["isp_sfd", "isp_sfo"])
+            for name in ("IspSfd", "IspSfo"):
+                block = source.split(f"class {name}(BaseSurrealModel):\n", 1)[1]
+                assert block.splitlines()[0] == SUB_DEFAULT_NOTE, name
+            with _imported(path) as models:
+                required = await models.IspSfd(id="r", title="t", prefs=models.IspSfdPrefs()).save()
+                assert isinstance(await _stored(client, "SELECT VALUE prefs.at FROM isp_sfd:r;"), datetime)
+                assert required.prefs.at is None, _FLIP_14_9
+                required.title = "u"
+                try:
+                    await required.update()
+                except SurrealError:
+                    refused = True
+                else:
+                    refused = False
+                assert refused, _FLIP_14_9
+
+                optional = await models.IspSfo(id="o", title="t", prefs=models.IspSfoPrefs()).save()
+                assert isinstance(await _stored(client, "SELECT VALUE prefs.seen FROM isp_sfo:o;"), datetime)
+                optional.title = "u"
+                await optional.update()
+                assert await _stored(client, "SELECT VALUE prefs.seen FROM isp_sfo:o;") is None, _FLIP_14_9
+
+                for model, prefs, column in (
+                    (models.IspSfd, models.IspSfdPrefs, "at"),
+                    (models.IspSfo, models.IspSfoPrefs, "seen"),
+                ):
+                    fresh = await model(id="f", title="t", prefs=prefs()).save()
+                    await fresh.refresh()
+                    value = getattr(fresh.prefs, column)
+                    assert isinstance(value, datetime), column
+                    fresh.title = "u"
+                    await fresh.update()
+                    stored = await _stored(client, f"SELECT VALUE prefs.{column} FROM {model.get_table_name()}:f;")
+                    assert stored == value, column
 
 
 # --- AC-16: README section 31, the tables it touches and its examples (spec §6.5, §11.1 items 1–8; D18, D26) --------
