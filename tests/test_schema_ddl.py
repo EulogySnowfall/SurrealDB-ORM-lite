@@ -2480,6 +2480,46 @@ class TestFunctionsE2E:
             assert await SurrealDBConnectionManager.call_function(_GREET, params=both) == "Hello Ada"
             assert await SurrealDBConnectionManager.call_function(_GREET, [1, "Bea"]) == "Hello Bea"
 
+    @pytest.mark.parametrize("kind", ["ws", "http"])
+    async def test_a_reorder_reaches_every_connection_to_the_database(self, kind: str) -> None:
+        # The DDL runs on a second connection to evt_db (an admin one, say); "evt" had cached the old order. Two
+        # string parameters: a stale order binds without any error, "B/A" instead of "A/B". The default connection,
+        # on another database, keeps its own cached signature of a function with the same name. Not on mem://, where
+        # each connection is an engine of its own.
+        pair = ("fn::ev_pair", "RETURN string::concat($a, '/', $b);")
+        both = {"a": "A", "b": "B"}
+        async with _default(kind), _evt(kind):
+            SurrealDBConnectionManager.add_connection(
+                "evt_admin", url=_url(kind), user="root", password="root", namespace="ns", database="evt_db"
+            )
+            try:
+                await SurrealDBConnectionManager.define_function(*pair, parameters={"a": "string", "b": "string"})
+                assert await SurrealDBConnectionManager.call_function(pair[0], params=both) == "A/B"
+                async with SurrealDBConnectionManager.using("evt_admin"):
+                    await SurrealDBConnectionManager.define_function(*pair, parameters={"a": "string", "b": "string"})
+                async with SurrealDBConnectionManager.using("evt"):
+                    assert await SurrealDBConnectionManager.call_function(pair[0], params=both) == "A/B"
+                    assert SurrealDBConnectionManager.function_signature_cache_size() == 1
+
+                async with SurrealDBConnectionManager.using("evt_admin"):
+                    await SurrealDBConnectionManager.define_function(*pair, parameters={"b": "string", "a": "string"})
+                async with SurrealDBConnectionManager.using("evt"):
+                    assert SurrealDBConnectionManager.function_signature_cache_size() == 0
+                    assert await SurrealDBConnectionManager.call_function(pair[0], params=both) == "A/B"
+                    assert await SurrealDBConnectionManager.call_function(pair[0], ["B", "A"]) == "A/B"
+                assert SurrealDBConnectionManager.function_signature_cache_size() == 1
+
+                async with SurrealDBConnectionManager.using("evt_admin"):
+                    await SurrealDBConnectionManager.remove_function(pair[0])
+                async with SurrealDBConnectionManager.using("evt"):
+                    assert SurrealDBConnectionManager.function_signature_cache_size() == 0
+                    with pytest.raises(SurrealDbNotFoundError):
+                        await SurrealDBConnectionManager.call_function(pair[0], params=both)
+                assert SurrealDBConnectionManager.function_signature_cache_size() == 1
+            finally:
+                await SurrealDBConnectionManager.remove_function(pair[0])
+                await SurrealDBConnectionManager.remove_connection("evt_admin")
+
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_remove_function(self, kind: str) -> None:
         both = {"name": "Ada", "times": 1}
@@ -3071,7 +3111,8 @@ _EVENT_ROWS = [
     ],
     [
         "`define_function()`, `remove_function()` and `call_function()`",
-        "same on both lines: the next `call_function()` sees a redefinition (the signature cache is dropped)",
+        "same on both lines: the next `call_function()` sees a redefinition on every connection to the same URL, "
+        "namespace and database (their signature cache is dropped)",
         "the same",
         "v0.31.0",
     ],
@@ -3092,15 +3133,19 @@ _EMBEDDED_EVENTS_ROW = [
 _SIGNATURE_CACHE_32 = (
     "Signature caching is transparent. `define_function()` and `remove_function()` "
     "([section 32](#32-server-side-events-and-stored-functions-event-define_events-define_function)) drop the "
-    "function's cached signature themselves, so the next call sees a redefinition made through them at once, even "
-    "one that only changes the order of the same parameter names. For a function redefined out of band, with raw DDL "
-    '(`client.query("DEFINE FUNCTION …")`), two helpers are available: '
-    "`SurrealDBConnectionManager.clear_function_signature_cache()` and `function_signature_cache_size()`. The cache "
-    "is keyed by URL, namespace and database, so `set_url()`, `set_namespace()` and `set_database()` cannot serve a "
-    "signature read elsewhere; it is cleared outright by `set_connection()` and `unset_connection()`. After a raw-DDL "
-    "redefinition, a signature whose parameter _names_ changed self-heals on its own — but one with the **same names "
-    "in a different order** cannot be detected, since `params=` is a mapping and carries no order to compare "
-    "against: call `clear_function_signature_cache()`, or `params=` keeps binding in the stale order."
+    "function's cached signature themselves, on every connection set up with the same URL, namespace and database, "
+    "so the next call sees a redefinition made through them at once, even one that only changes the order of the "
+    "same parameter names, and even on another connection than the one that applied the DDL. For a function "
+    'redefined out of band — with raw DDL (`client.query("DEFINE FUNCTION …")`), from another process, or through '
+    "a connection that reaches the database under another URL — two helpers are available, both on the current "
+    "connection: `SurrealDBConnectionManager.clear_function_signature_cache()` and "
+    "`function_signature_cache_size()`. The cache is keyed by URL, namespace and database, so `set_url()`, "
+    "`set_namespace()` and `set_database()` cannot serve a signature read elsewhere; it is cleared outright by "
+    "`set_connection()` and `unset_connection()`. After an out-of-band redefinition, a signature whose parameter "
+    "_names_ changed self-heals on its own — but one with the **same names in a different order** cannot be "
+    "detected, since `params=` is a mapping and carries no order to compare against: call "
+    "`clear_function_signature_cache()` on each connection that calls the function, or `params=` keeps binding in "
+    "the stale order."
 )
 
 
@@ -3268,8 +3313,9 @@ class TestReadmeSection32:
             assert len({len(_cells(line)) for line in lines}) == 1 and "\\|" not in "".join(lines), lines
 
     def test_signature_cache_paragraph(self) -> None:
-        """Spec §11.1 item 8: a redefinition through ``define_function()``/``remove_function()`` is followed at once;
-        only raw DDL still needs ``clear_function_signature_cache()``."""
+        """Spec §11.1 item 8: a redefinition through ``define_function()``/``remove_function()`` is followed at once,
+        on every connection to the same database; only an out-of-band one still needs
+        ``clear_function_signature_cache()``."""
         paragraphs = [_normalised(paragraph) for paragraph in _readme_part(_SECTION_17).split("\n\n")]
         assert _SIGNATURE_CACHE_32 in paragraphs, [p for p in paragraphs if p.startswith("Signature caching")]
 

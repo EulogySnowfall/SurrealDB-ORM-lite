@@ -1076,15 +1076,18 @@ at call time and surfaces at commit as `SurrealDbError`.
 
 Signature caching is transparent. `define_function()` and `remove_function()`
 ([section 32](#32-server-side-events-and-stored-functions-event-define_events-define_function)) drop the
-function's cached signature themselves, so the next call sees a redefinition made through them at once, even one
-that only changes the order of the same parameter names. For a function redefined out of band, with raw DDL
-(`client.query("DEFINE FUNCTION …")`), two helpers are available:
+function's cached signature themselves, on every connection set up with the same URL, namespace and database, so the
+next call sees a redefinition made through them at once, even one that only changes the order of the same parameter
+names, and even on another connection than the one that applied the DDL. For a function redefined out of band —
+with raw DDL (`client.query("DEFINE FUNCTION …")`), from another process, or through a connection that reaches the
+database under another URL — two helpers are available, both on the current connection:
 `SurrealDBConnectionManager.clear_function_signature_cache()` and `function_signature_cache_size()`. The cache is
 keyed by URL, namespace and database, so `set_url()`, `set_namespace()` and `set_database()` cannot serve a
-signature read elsewhere; it is cleared outright by `set_connection()` and `unset_connection()`. After a raw-DDL
-redefinition, a signature whose parameter _names_ changed self-heals on its own — but one with the **same names in
-a different order** cannot be detected, since `params=` is a mapping and carries no order to compare against: call
-`clear_function_signature_cache()`, or `params=` keeps binding in the stale order.
+signature read elsewhere; it is cleared outright by `set_connection()` and `unset_connection()`. After an
+out-of-band redefinition, a signature whose parameter _names_ changed self-heals on its own — but one with the
+**same names in a different order** cannot be detected, since `params=` is a mapping and carries no order to compare
+against: call `clear_function_signature_cache()` on each connection that calls the function, or `params=` keeps
+binding in the stale order.
 
 ---
 
@@ -4590,8 +4593,11 @@ await SurrealDBConnectionManager.remove_function("fn::greet")
   result's kind.
 - `permissions` is `"FULL"`, `"NONE"` or `"WHERE <condition>"`, in any case; left out, SurrealDB applies `FULL`.
 - `call_function()` follows a redefinition at once: `define_function()` and `remove_function()` drop the signature
-  `params=` had cached, even when only the order of the parameters changed. A function redefined with raw DDL still
-  needs `clear_function_signature_cache()` ([section 17](#17-stored-functions-call_function)).
+  `params=` had cached, even when only the order of the parameters changed, on every connection set up with the same
+  URL, namespace and database — the admin connection a `using()` block applies the DDL on and the application's
+  connection alike. A function redefined with raw DDL, from another process, or through a connection that reaches the
+  database under another URL still needs `clear_function_signature_cache()` on each connection that calls it
+  ([section 17](#17-stored-functions-call_function)).
 - `remove_function("fn::greet")` writes `REMOVE FUNCTION IF EXISTS`; with `missing_ok=False` a function that does not
   exist raises `SurrealDbNotFoundError`. `overwrite=False` writes `IF NOT EXISTS` and keeps the function already
   defined.
@@ -4908,7 +4914,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | A write that changes nothing, on a table with an event                                                                                 | fires no event                                                                                                                                                                | fires no event, except an `UPSERT` (the ORM's `upsert()`): one `UPDATE` event                                                                                                       | v0.31.0                              |
 | An event whose `THEN` fails (a `THROW`, an error)                                                                                      | the write is refused; the SDK's `InternalError` (`An error occurred: …`)                                                                                                      | the write is refused; the SDK's `InternalError` (`Error while processing event <name>: …`)                                                                                          | v0.31.0                              |
 | Event and function definitions read back (`EventState`, `FunctionState`)                                                               | a block on several lines, each statement ending with `;`; `option<T>` parameters as written                                                                                   | a block on one line, no `;` after a single statement; optional parameters rendered with `none` first                                                                                | v0.31.0                              |
-| `define_function()`, `remove_function()` and `call_function()`                                                                         | same on both lines: the next `call_function()` sees a redefinition (the signature cache is dropped)                                                                           | the same                                                                                                                                                                            | v0.31.0                              |
+| `define_function()`, `remove_function()` and `call_function()`                                                                         | same on both lines: the next `call_function()` sees a redefinition on every connection to the same URL, namespace and database (their signature cache is dropped)             | the same                                                                                                                                                                            | v0.31.0                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
