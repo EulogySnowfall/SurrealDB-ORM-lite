@@ -2419,9 +2419,11 @@ class SurrealDBConnectionManager:
         Runs on the current connection (the innermost ``using()`` block's, else the default one), like
         :meth:`call_function`::
 
-            stock_guard = Event("stock_guard", when="$after.stock < 0", then="THROW 'stock cannot go below zero'")
+            stock_guard = Event(
+                "stock_guard", when="$event != 'DELETE' AND $after.stock < 0", then="THROW 'stock cannot go below zero'"
+            )
             await SurrealDBConnectionManager.define_event(stock_guard, "product")
-            # 'DEFINE EVENT OVERWRITE `stock_guard` ON `product` WHEN $after.stock < 0 THEN { … };'
+            # 'DEFINE EVENT OVERWRITE `stock_guard` ON `product` WHEN $event != 'DELETE' AND $after.stock < 0 THEN { … };'
 
         The statement is ``event.ddl(table, overwrite=overwrite)``. The event's expressions are written into the
         DDL as given: they are trusted application code, never user input (``Event`` checks them for mistakes

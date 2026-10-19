@@ -4444,7 +4444,11 @@ class Account(BaseSurrealModel):
                 then="CREATE audit_log SET account = $value.id, old = $before.email, new = $after.email",
                 comment="Keeps every e-mail change",
             ),
-            Event("no_negative_balance", when="$after.balance < 0", then="THROW 'balance cannot be negative'"),
+            Event(
+                "no_negative_balance",
+                when="$event != 'DELETE' AND $after.balance < 0",
+                then="THROW 'balance cannot be negative'",
+            ),
         ],
     )
 
@@ -4456,7 +4460,7 @@ class Account(BaseSurrealModel):
 for statement in Account.event_ddl():
     print(statement)
 # DEFINE EVENT OVERWRITE `email_audit` ON `account` WHEN $event = 'UPDATE' AND $before.email != $after.email THEN { CREATE audit_log SET account = $value.id, old = $before.email, new = $after.email } COMMENT 'Keeps every e-mail change';
-# DEFINE EVENT OVERWRITE `no_negative_balance` ON `account` WHEN $after.balance < 0 THEN { THROW 'balance cannot be negative' };
+# DEFINE EVENT OVERWRITE `no_negative_balance` ON `account` WHEN $event != 'DELETE' AND $after.balance < 0 THEN { THROW 'balance cannot be negative' };
 
 await Account.define_events()  # idempotent (OVERWRITE): run it at start-up
 
@@ -4481,6 +4485,8 @@ except ServerError as exc:  # the event refused the write: nothing changed
   and after the write (`NONE` before a create and after a delete), `$value` is the record (as it was, for a delete),
   and on SurrealDB 3.x `$input` holds the fields the write sent. Expressions name **columns**: a field declared with
   `Field(alias=…)` is read by its alias.
+- A guard on `$after` names `$event != 'DELETE'`, as `no_negative_balance` does: after a delete `$after.balance` is
+  `NONE`, and `NONE < 0` is true, so without it the guard would refuse every delete.
 - Event and table names are written quoted, so `update` or `delete` work as event names; a comment is written as an
   escaped string literal.
 - `define_events()` writes `DEFINE EVENT OVERWRITE`: it is idempotent, so run it at start-up or deployment.
@@ -4500,9 +4506,11 @@ except ServerError as exc:  # the event refused the write: nothing changed
 #### Events without a model
 
 ```python
-stock_guard = Event("stock_guard", when="$after.stock < 0", then="THROW 'stock cannot go below zero'")
+stock_guard = Event(
+    "stock_guard", when="$event != 'DELETE' AND $after.stock < 0", then="THROW 'stock cannot go below zero'"
+)
 print(await SurrealDBConnectionManager.define_event(stock_guard, "product"))
-# DEFINE EVENT OVERWRITE `stock_guard` ON `product` WHEN $after.stock < 0 THEN { THROW 'stock cannot go below zero' };
+# DEFINE EVENT OVERWRITE `stock_guard` ON `product` WHEN $event != 'DELETE' AND $after.stock < 0 THEN { THROW 'stock cannot go below zero' };
 
 await SurrealDBConnectionManager.remove_event("stock_guard", "product")
 await Account.remove_event("no_negative_balance")  # declared or not: removal is by name
