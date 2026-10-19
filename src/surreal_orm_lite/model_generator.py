@@ -41,7 +41,8 @@ datetimes with at most 6 fractional digits and UUIDs; mutable values (``list``, 
 Every other ``DEFAULT`` or computed expression gives the **server form** — ``T | None = None``, the attribute listed
 in ``server_fields`` so the server's value applies on create and is read back. ``ASSERT``, ``PERMISSIONS``,
 ``REFERENCE`` and field comments are not generated; ``READONLY`` is a trailing comment, and a class with a ``READONLY``
-field holding datetimes in a set says that ``update()`` fails on it (§6.4.7, narrowed by #261).
+field holding a datetime in a set, in an array or more than three levels down says that ``update()`` may fail on it
+(§6.4.7, narrowed by #261).
 
 **Module** (spec §6.4.8): a fixed docstring, the imports the classes use (standard library, then pydantic,
 surreal_orm_lite and surrealdb), a ``# Not generated:`` comment listing every table or field left out and why, then the
@@ -83,7 +84,7 @@ from .functions import SurrealFunc
 from .model_base import BaseSurrealModel
 from .schema_state import FieldState, IndexState, SchemaIssue, SchemaState, TableState
 from .types import Duration
-from .utils import VALID_ALIAS_PATTERN
+from .utils import _KEEP_MAX_DEPTH, VALID_ALIAS_PATTERN
 
 __all__ = ["ModelCodeGenerator"]
 
@@ -478,10 +479,13 @@ _S5_NO_PARENT = "its parent is not defined (the parent is a dict[str, Any])"
 _I3_TYPE_AS_WRITTEN = "its TYPE clause was not understood and is kept as written"
 _I5_SAME_NAME = "two definitions have the same name"
 
-#: The class comment of a table with a ``READONLY`` field holding datetimes in a set (spec §6.4.7, M29). Since #261
-#: ``update()`` keeps every other stored datetime it did not change (top level, in an object, in an array or a tuple);
-#: the items of a set have no position to match them with, and on SurrealDB 2.x a set keeps its insertion order.
-_UPDATE_NOTE = "update() fails on READONLY datetimes in a set (Python keeps microseconds, SurrealDB nanoseconds): use merge()."
+#: The class comment of a table with a ``READONLY`` field holding a datetime ``update()`` may not keep (spec §6.4.7, M29).
+#: Since #261 ``update()`` keeps a stored datetime it did not change at the top level and in sub-objects down to three
+#: levels; not in a set (its items have no position to match them with), nor in an array the schema cannot bound below
+#: the values ``update()`` rebuilds, nor deeper (``replace_content``).
+_UPDATE_NOTE = (
+    "update() may fail on READONLY datetimes in sets, arrays or past 3 levels (Python keeps microseconds): use merge()."
+)
 _SCHEMALESS_NOTE = 'SCHEMALESS: fields not declared here are kept (extra="allow")'
 
 #: Where each importable name comes from; the blocks in isort order (spec §6.4.8).
@@ -640,21 +644,24 @@ def _hashable(item: _Type) -> bool:
     return not item.is_any and bool(item.members or item.none) and all(m == "" or m in _HASHABLE for m in item.members)
 
 
-def _datetime_in_set(kind: Kind | None, in_set: bool = False) -> bool:
-    """Whether the kind holds ``datetime`` inside a ``set<…>`` (``set<datetime>``, ``option<set<datetime>>``,
-    ``array<set<datetime>>``, ``string | set<datetime>`` …): the one place ``update()`` cannot keep a stored datetime
-    it did not change (#261)."""
+def _datetime_not_kept(kind: Kind | None, depth: int, contained: bool = False) -> bool:
+    """Whether the kind of a value ``depth`` levels below the top level holds a ``datetime`` ``update()`` may not keep.
+
+    ``update()`` keeps a stored datetime it did not change at the top level and in sub-objects or tuples down to
+    ``_KEEP_MAX_DEPTH`` levels (#261, ``replace_content``). A datetime deeper, or in a ``set<…>`` or an ``array<…>``
+    (``contained``: an item of a set has no position, an array has no bound below what ``update()`` rebuilds) is not
+    kept: ``set<datetime>``, ``array<datetime>``, ``option<array<datetime>>``, ``string | set<datetime>`` …
+    """
     if isinstance(kind, KName):
         if kind.name == "datetime":
-            return in_set
-        inside = in_set or kind.name == "set"
-        return any(_datetime_in_set(argument, inside) for argument in kind.args if not isinstance(argument, str))
+            return contained or depth > _KEEP_MAX_DEPTH
+        return any(_datetime_not_kept(argument, depth + 1, True) for argument in kind.args if not isinstance(argument, str))
     if isinstance(kind, KUnion):
-        return any(_datetime_in_set(member, in_set) for member in kind.members)
+        return any(_datetime_not_kept(member, depth, contained) for member in kind.members)
     if isinstance(kind, KTuple):
-        return any(_datetime_in_set(item, in_set) for item in kind.items)
+        return any(_datetime_not_kept(item, depth + 1, contained) for item in kind.items)
     if isinstance(kind, KObject):
-        return any(_datetime_in_set(value, in_set) for _, value in kind.items)
+        return any(_datetime_not_kept(value, depth + 1, contained) for _, value in kind.items)
     return False
 
 
@@ -934,17 +941,22 @@ class _ClassWriter:
             texts.append("Indexes: " + ", ".join(_index_label(index) for index in table.indexes.values()))
         if table.events:
             texts.append("Events: " + ", ".join(event.name for event in table.events.values()))
-        if self._readonly_set_datetime():
+        if self._readonly_datetime_not_kept():
             texts.append(_UPDATE_NOTE)
         return [_comment(text, indent=4) for text in texts]
 
-    def _readonly_set_datetime(self) -> bool:
-        """Whether a ``READONLY`` field of the class — top level or nested — holds datetimes in a set (M29, #261)."""
+    def _readonly_datetime_not_kept(self) -> bool:
+        """Whether a ``READONLY`` field of the class — top level or nested — holds, in its kind or in a sub-field's, a
+        datetime ``update()`` may not keep: in a set or an array (an array item, ``*`` in its path, too) or more than
+        three levels down (M29, #261, ``_datetime_not_kept``)."""
         provided = {"id", "in", "out"} if self.edge else {"id"}
+        fields = [field for field in self.table.fields.values() if field.path and field.path[0] not in provided]
         return any(
-            field.readonly and _datetime_in_set(_kind(field))
-            for field in self.table.fields.values()
-            if field.path and field.path[0] not in provided
+            _datetime_not_kept(_kind(inner), len(inner.path) - 1, "*" in inner.path)
+            for field in fields
+            if field.readonly
+            for inner in fields
+            if tuple(inner.path[: len(field.path)]) == tuple(field.path)
         )
 
     def _model_config(self, server_fields: Sequence[str]) -> list[str]:

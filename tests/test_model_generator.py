@@ -855,9 +855,10 @@ _FIXTURE_FIELDS_2X = {
     ],
 }
 
-#: The update() note of spec §6.4.7, exactly (fixed text, 116 columns at indent 4), narrowed by #261 to datetimes in a set.
+#: The update() note of spec §6.4.7, exactly (fixed text, 120 columns at indent 4), narrowed by #261 to the datetimes
+#: update() may not keep: in a set, in an array or more than three levels down.
 UPDATE_NOTE = (
-    "    # update() fails on READONLY datetimes in a set (Python keeps microseconds, SurrealDB nanoseconds): use merge()."
+    "    # update() may fail on READONLY datetimes in sets, arrays or past 3 levels (Python keeps microseconds): use merge()."
 )
 
 #: ruff's options for a generated module (spec §9.1).
@@ -1711,13 +1712,39 @@ class TestClasses:
             [_f("w", "array<set<datetime>>", readonly=True)],
             [_f("address", "object"), _f("address.at", "set<datetime>", readonly=True)],
             [_f("union", "string | set<datetime>", readonly=True)],
+            [_f("dates", "array<datetime>", readonly=True)],
+            [_f("dates", "option<array<datetime, 3>>", readonly=True)],
+            [_f("w", "array<object>"), _f("w.*.at", "option<datetime>", readonly=True)],
+            [_f("w", "array<object>", readonly=True), _f("w.*.at", "datetime")],  # a READONLY parent's sub-field
+            [
+                _f("a", "object"),
+                _f("a.b", "object"),
+                _f("a.b.c", "object"),
+                _f("a.b.c.d", "object"),
+                _f("a.b.c.d.at", "datetime", readonly=True),
+            ],
+            [_f("a", "object"), _f("a.b", "object"), _f("a.b.c", "{ d: { at: datetime } }", readonly=True)],
+        ],
+        ids=[
+            "set",
+            "optional-set",
+            "array-of-sets",
+            "nested-set",
+            "union-set",
+            "array",
+            "sized-array",
+            "array-item",
+            "readonly-parent",
+            "four-levels",
+            "four-levels-literal",
         ],
     )
     def test_update_note(self, fields: list[FieldState]) -> None:
-        """#261: only a ``READONLY`` field holding datetimes in a set still makes ``update()`` fail."""
+        """#261: a ``READONLY`` field holding a datetime ``update()`` may not keep — in a set, in an array (its length is
+        not bounded by what ``update()`` rebuilds) or more than three levels down — still says so."""
         source = _generate(*fields)
         assert _class_block(source, "T").splitlines()[1] == UPDATE_NOTE
-        assert len(UPDATE_NOTE) == 116
+        assert len(UPDATE_NOTE) == 120
 
     @pytest.mark.parametrize(
         "fields",
@@ -1729,14 +1756,15 @@ class TestClasses:
             [_f("pair", "[int, string]", readonly=True), _f("lit", "{ at: int }", readonly=True)],
             [_f("bad", "datetime<", readonly=True)],  # I3: the kind is not known
             [_f("tags", "set<string>", readonly=True)],
-            # #261: update() keeps every stored datetime it did not change, outside a set.
+            # #261: update() keeps a stored datetime it did not change, top level and down to three levels.
             [_f("created", "datetime", readonly=True, default="time::now()")],
             [_f("created", "datetime", nullable=True, readonly=True)],
-            [_f("dates", "array<datetime>", readonly=True)],
             [_f("address", "object"), _f("address.at", "datetime", readonly=True)],
-            [_f("w", "array<object>"), _f("w.*.at", "option<datetime>", readonly=True)],
             [_f("pair", "[int, datetime]", readonly=True)],
             [_f("lit", "{ at: datetime }", readonly=True)],
+            [_f("a", "object"), _f("a.b", "object"), _f("a.b.c", "object"), _f("a.b.c.at", "datetime", readonly=True)],
+            [_f("a", "object"), _f("a.b", "object"), _f("a.b.c", "{ at: datetime }", readonly=True)],
+            [_f("dates", "array<datetime>"), _f("created", "datetime", readonly=True)],  # the array is not READONLY
         ],
     )
     def test_no_update_note(self, fields: list[FieldState]) -> None:

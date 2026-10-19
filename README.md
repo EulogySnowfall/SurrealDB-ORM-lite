@@ -2322,13 +2322,16 @@ both lines.
 - `datetime`: to the microsecond. The SDK truncates the server's nanoseconds, so a stored
   `d'2026-01-02T03:04:05.123456789Z'` reads `…05.123456`. `update()` and `upsert()` rewrite the
   whole record, but a `datetime` you did not change (it still floors to the stored value) keeps
-  the stored nanoseconds, top level, in a sub-model, a `list` or a `tuple`, on both lines and the
-  embedded engine: a record whose `READONLY` datetime holds nanoseconds can be updated after
-  `get()` or `save()` ([#261](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/261)).
-  A datetime you changed is written as you set it, and a `READONLY` field still refuses it. The
-  items of a set have no position to match them by (SurrealDB 2.x keeps a set's insertion order),
-  so a `READONLY` field of datetimes in a set still refuses `update()`: change such a record with
-  `merge()`.
+  the stored nanoseconds, on both lines and the embedded engine: a record whose `READONLY`
+  datetime holds nanoseconds can be updated after `get()` or `save()`
+  ([#261](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/261)). A datetime you
+  changed is written as you set it, and a `READONLY` field still refuses it. So that the statement
+  stays small whatever the data, this covers the top-level datetimes first, up to 32, then, field
+  by field, those in a sub-model, a `list` or a `tuple` down to three levels below the top level,
+  as long as the values rebuilt to reach them fit in what is left of those 32. A datetime in a
+  long list or a large sub-model, one deeper down and one in a set (its items have no position to
+  match a stored value by) are written as sent: a `READONLY` field holding one still refuses
+  `update()`, so change such a record with `merge()`.
 - `timedelta`: floored to the microsecond on read (`1h30m1ns` reads `timedelta(seconds=5400)`).
 - `Duration`: exact, to the nanosecond.
 - `Decimal`: a value whose `str()` writes no exponent is sent as before. A value written with an
@@ -2402,21 +2405,20 @@ SurrealDB 2.x, the embedded engine) returns no row before commit: there `save(tx
 instance as it was, and `refresh()` after the commit reads the row.
 
 The top-level `timedelta`, `Duration` and geometry fields (since v0.24.0, see
-[section 25](#25-geospatial-fields)) are converted on the way. A field that holds a sub-model (a
-Pydantic model, a dataclass or a `TypedDict`, also inside `list[...]`, `dict[..., ...]` or
-`X | None`), a `timedelta` below the top level (`list[timedelta]`, `timedelta | str`…) or a
-`tuple`, a set, a `date` or a `Range` at any depth (`tuple[int, str]`, `set[str]`, `date | None`,
-`list[tuple[int, int]]`…, which the SDK reads as a `list`, a midnight `datetime` or its own
-`Range`) gets the value a read gives: the row goes through the model's validation, the model's own
-validators included, and a sub-model field holds its model instance, not the row's `dict`, with
-the ORM's durations, `timedelta`s, ranges and geometries inside, while a `tuple`, set, `date` or
-`Range` field holds its declared type. When the row as a whole does not validate, each such field
-is validated on its own, except one that the model's own validators could reshape (a
+[section 25](#25-geospatial-fields)) are converted on the way, and every other field gets the
+value a read gives (#261; before, only a field holding a sub-model, a geometry or a nested
+`timedelta` did): the row goes through the model's validation, the model's own validators
+included. A sub-model field holds its model instance, not the row's `dict`, with the ORM's
+durations, `timedelta`s, ranges and geometries inside; an enum field holds the enum, not its `str`
+or `int`; a `tuple`, set, `date` or `Range` field holds its declared type, not the SDK's `list`,
+midnight `datetime` or `Range`; a `float` field stored in a `decimal` column holds a `float`, not a
+`Decimal`; a `list[Duration]` holds the ORM's durations. When the row as a whole does not validate,
+each field is validated on its own, except one that the model's own validators could reshape (a
 `field_validator` on that field, a `model_validator`, a `model_post_init`): that one, like a value
-that does not validate, is applied as received, so these calls never fail on it. Other values are
-applied as the SDK reads them: a typed container of other values (`list[Duration]`…) keeps the
-SDK's values, which serialise the same way. Writing such an instance back is safe, sub-models
-included, since those values are stored the same way.
+that does not validate, is applied as received, so these calls never fail on it. The `id` keeps
+the server's `RecordID`, and a column the model does not declare (`extra="allow"`) is applied as
+the SDK reads it. Writing such an instance back is safe, sub-models included, since those values
+are stored the same way.
 
 #### Values the SDK cannot read
 
@@ -2462,10 +2464,9 @@ refused value raises `ValueError` before anything is sent.
 
 Plain `datetime`, `Decimal` and `UUID` annotations work as they do there. The full ORM has no
 `timedelta` or `Range` fields and its `Duration` is a string: `timedelta`, `Duration` and
-`Range[T]` fields are lite additions. The full ORM also validates the rows its writes return; lite
-validates the fields of those rows whose read type differs from the SDK's value (sub-models,
-geometries, nested `timedelta`s, `tuple`s, sets, `date`s and `Range`s) and converts top-level
-durations (see [After a write that returns the row](#after-a-write-that-returns-the-row)).
+`Range[T]` fields are lite additions. The full ORM also validates the rows its writes return; so
+does lite, every field but the `id` since #261, with top-level durations converted (see
+[After a write that returns the row](#after-a-write-that-returns-the-row)).
 
 ### 25. Geospatial fields
 
@@ -4276,9 +4277,10 @@ class Person(BaseSurrealModel):
   object-literal kind (`{ a: int }`) stays a `dict[str, Any]`.
 - `ASSERT`, `PERMISSIONS`, `REFERENCE` (the field is a `RecordID`) and field comments are not generated: the database
   still applies them. `READONLY` is a trailing `# READONLY` comment: no field option exists for it.
-- `update()` fails on an instance holding a `READONLY` field of datetimes in a set (`set<datetime>`), after `get()` as
-  after `save()`: Python keeps microseconds, SurrealDB nanoseconds, and the server refuses the changed value. Any other
-  `READONLY` datetime is kept to the nanosecond by `update()` (see
+- `update()` may fail on an instance holding a `READONLY` datetime in a set (`set<datetime>`), in an array
+  (`array<datetime>`, `items.*.at`) or more than three levels down, after `get()` as after `save()`: Python keeps
+  microseconds, SurrealDB nanoseconds, and the server refuses the changed value. `update()` keeps the other `READONLY`
+  datetimes to the nanosecond, and those of an array only while it is short (see
   [Precision and `Decimal`](#precision-and-decimal)). The generated class says so: change such a record with `merge()`.
 - `array<T, N>` becomes `list[T]`: the length is left to the server, which checks it differently on each line
   (SurrealDB 2.x accepts at most N items, 3.x exactly N).
@@ -4502,7 +4504,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -4621,7 +4623,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | Schema introspection of a database removed while the connection is open                                                                | empty schema                                                                                                                                                                  | `SurrealDbError` (the database does not exist) until the database is defined again                                                                                                  | v0.30.0                              |
 | DDL not yet committed in a transaction, seen by schema introspection                                                                   | invisible                                                                                                                                                                     | invisible                                                                                                                                                                           | v0.30.0                              |
 | A regex with a backslash pair before a `/` (schema introspection)                                                                      | `/a\\/b/` accepted (a backslash, then an escaped slash), `/\\/` refused: such a definition is a `SchemaIssue`, not read                                                       | `/\\/` accepted (an escaped backslash, then the closing slash), `/a\\/b/` refused: such a definition is a `SchemaIssue`, not read                                                   | v0.30.0                              |
-| `save()` applies the returned row (explicit id, edges); `update()`/`upsert()` keep an unchanged stored `datetime` (nanoseconds)        | same on both lines: `DEFAULT`-filled sub-fields and the read types (`tuple`, set, `date`, `Range`) after `save()`; a `READONLY` datetime updates, unless in a set             | same on both lines (verified on 3.3.4 and 3.1.5); `save(tx=)` in an interactive transaction applies the row too, a buffered one (HTTP, embedded) leaves the instance as it was      | v0.30.2                              |
+| `save()` applies the returned row (explicit id, edges); `update()`/`upsert()` keep an unchanged stored `datetime` (nanoseconds)        | same on both lines: the stored row, read types (enums, sets…) included, after `save()`; a `READONLY` datetime updates, unless in a set, a long list or 4+ levels down         | same on both lines (verified on 3.3.4 and 3.1.5); `save(tx=)` in an interactive transaction applies the row too, a buffered one (HTTP, embedded) leaves the instance as it was      | v0.30.2                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.

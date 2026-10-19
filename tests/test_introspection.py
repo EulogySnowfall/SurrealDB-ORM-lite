@@ -2097,9 +2097,10 @@ _DEFAULT_BULLET_31 = (
     "set it with `merge()` once the record exists."
 )
 _UPDATE_BULLET_31 = (
-    "- `update()` fails on an instance holding a `READONLY` field of datetimes in a set (`set<datetime>`), after "
-    "`get()` as after `save()`: Python keeps microseconds, SurrealDB nanoseconds, and the server refuses the changed "
-    "value. Any other `READONLY` datetime is kept to the nanosecond by `update()` (see "
+    "- `update()` may fail on an instance holding a `READONLY` datetime in a set (`set<datetime>`), in an array "
+    "(`array<datetime>`, `items.*.at`) or more than three levels down, after `get()` as after `save()`: Python keeps "
+    "microseconds, SurrealDB nanoseconds, and the server refuses the changed value. `update()` keeps the other "
+    "`READONLY` datetimes to the nanosecond, and those of an array only while it is short (see "
     "[Precision and `Decimal`](#precision-and-decimal)). The generated class says so: change such a record with "
     "`merge()`."
 )
