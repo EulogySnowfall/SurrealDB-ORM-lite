@@ -14,6 +14,12 @@ Two strategies share one public interface:
 
 ``connection_manager.transaction()`` probes ``client.begin()`` to pick the strategy.
 
+A failed statement fails the transaction on both strategies (issue #268). A buffered batch fails as a whole at
+commit. The interactive strategy records every statement that fails (a write or a read whose error the ORM does not
+answer itself, e.g. a missing table read as no rows); ``commit()`` then cancels instead of committing and raises,
+so leaving a ``transaction()`` block after a failed statement raises and nothing of the block is committed, even
+when the block caught the statement's error.
+
 Query cache (v0.28.0): an ORM write that joins a transaction notes the tables it writes on it
 (``_note_cache_write``); the commit puts them in flight and invalidates their cached reads when
 it returns or raises (a failed commit's state is unknown). ``cancel()`` forgets them: nothing
@@ -31,6 +37,10 @@ from . import encoding as _encoding
 from .exceptions import SurrealDbConflictError, SurrealDbError
 
 _NOT_EXECUTED_FILLER = "The query was not executed due to a failed transaction"
+
+#: The error ``InteractiveTransaction.commit()`` raises after a failed statement (issue #268), followed by that
+#: statement's error.
+_CANCELLED_AFTER_FAILURE = "The transaction was cancelled: a statement in it failed; nothing was committed"
 
 
 def _is_pure_filler(result: Any) -> bool:
@@ -75,6 +85,25 @@ class Transaction(ABC):
         # Query cache: the tables written in this transaction, invalidated at commit.
         self._cache_tables: set[str] = set()
         self._cache_all = False
+        # Issue #268: the errors of the statements that failed in this transaction (interactive strategy).
+        self._failures: list[BaseException] = []
+
+    def _note_failure(self, error: BaseException) -> None:
+        """Record that a statement run in this transaction failed with *error*: the transaction can no longer commit."""
+        self._failures.append(error)
+
+    def _absorb_failure(self, error: BaseException) -> None:
+        """Forget the failure *error*, which the ORM answered itself (issue #268).
+
+        A read the ORM reads as an answer — a missing table read as no rows, ``get()`` raising "not found", the
+        missing-table check of a subquery — does not fail the transaction. Matched by identity; an error that was
+        not recorded is ignored.
+        """
+        self._failures = [failure for failure in self._failures if failure is not error]
+
+    def _first_failure(self) -> BaseException | None:
+        """The error of the first statement that failed in this transaction and was not absorbed, else ``None``."""
+        return self._failures[0] if self._failures else None
 
     def _note_cache_write(self, tables: Iterable[str] | None) -> None:
         """Note the tables an ORM write in this transaction changes (``None``: every table).
@@ -139,8 +168,10 @@ class Transaction(ABC):
 
         ``query()`` silently returns ``None`` on a failed transaction, so the
         commit/write paths use ``query_raw()`` and call this. Any statement with
-        ``status == "ERR"`` means the transaction rolled back. Prefers the root cause
-        (the first ERR whose ``details.kind`` is not ``"NotExecuted"``).
+        ``status == "ERR"`` means the transaction is rolled back: a buffered batch at once, an
+        interactive transaction when it ends (its ``commit()`` cancels after a failed statement,
+        issue #268). Prefers the root cause (the first ERR whose ``details.kind`` is not
+        ``"NotExecuted"``).
         """
         if not isinstance(raw, dict) or not isinstance(raw.get("result"), list):
             raise SurrealDbError(f"Transaction failed: unrecognized query_raw() response shape: {raw!r}")
@@ -255,37 +286,72 @@ class InteractiveTransaction(Transaction):
     (done by the connection manager). Every operation passes ``txn_id=`` so it joins the
     server-side transaction; reads see uncommitted writes and are isolated from other
     operations on the same connection.
+
+    A statement that fails — its request raises, or the server reports an error — is recorded
+    (issue #268); its error still raises at once. ``commit()`` then cancels the transaction
+    instead of committing it and raises :data:`_CANCELLED_AFTER_FAILURE`, so the transaction fails
+    as a whole, as a buffered one does, even when the caller caught the statement's error.
     """
 
     def __init__(self, client: Any, txn_id: Any) -> None:
         super().__init__()
         self._client = client
         self._txn_id = txn_id
+        self._cancelled = False
 
     @property
     def is_interactive(self) -> bool:
         return True
 
     async def add(self, statement: str, variables: dict[str, Any] | None = None) -> Any:
-        """Run a write inside the transaction; inspect status; return its rows."""
+        """Run a write inside the transaction; inspect status; return its rows.
+
+        A failure is recorded before it raises: the transaction will not commit (issue #268).
+        """
         payload = _encoding.encode(variables or {})
         try:
-            raw = await self._client.query_raw(statement, payload, txn_id=self._txn_id)
-        except Exception as exc:
-            raise _as_conflict(exc) from exc
-        self.raise_for_status(raw)
+            try:
+                raw = await self._client.query_raw(statement, payload, txn_id=self._txn_id)
+            except Exception as exc:
+                raise _as_conflict(exc) from exc
+            self.raise_for_status(raw)
+        except BaseException as failure:
+            self._note_failure(failure)
+            raise
         statements = raw["result"]
         return statements[-1]["result"] if statements else []
 
     async def run_read(self, statement: str, variables: dict[str, Any] | None = None) -> Any:
-        """Run a read inside the transaction and return rows directly."""
+        """Run a read inside the transaction and return rows directly.
+
+        A failure is recorded before it raises (issue #268); the ORM forgets it when it reads the
+        error as an answer (:meth:`_absorb_failure`).
+        """
         payload = _encoding.encode(variables or {})
         try:
-            return await self._client.query(statement, payload, txn_id=self._txn_id)
-        except Exception as exc:
-            raise _as_conflict(exc) from exc
+            try:
+                return await self._client.query(statement, payload, txn_id=self._txn_id)
+            except Exception as exc:
+                raise _as_conflict(exc) from exc
+        except BaseException as failure:
+            self._note_failure(failure)
+            raise
 
     async def commit(self) -> None:
+        """Commit the transaction; after a failed statement, cancel it and raise instead (issue #268).
+
+        Raises:
+            SurrealDbError: a statement failed in this transaction (:data:`_CANCELLED_AFTER_FAILURE`, followed by that
+                statement's error, which is chained as the cause): the transaction was cancelled, nothing was
+                committed. ``SurrealDbConflictError`` when that statement's error was a retryable conflict.
+        """
+        failure = self._first_failure()
+        if failure is not None:
+            from .concurrency import is_conflict_error
+
+            await self.cancel()
+            error_type = SurrealDbConflictError if is_conflict_error(failure) else SurrealDbError
+            raise error_type(f"{_CANCELLED_AFTER_FAILURE} ({str(failure) or type(failure).__name__})") from failure
         # The tables noted are in flight during the commit and invalidated when it returns
         # or raises (a failed commit's state is unknown).
         try:
@@ -298,7 +364,11 @@ class InteractiveTransaction(Transaction):
             self._forget_cache_writes()
 
     async def cancel(self) -> None:
-        # Nothing became visible: the tables noted are forgotten, not invalidated.
+        # Nothing became visible: the tables noted are forgotten, not invalidated. Sent once: a
+        # commit() that cancelled after a failed statement is cancelled again by transaction().
         self._forget_cache_writes()
+        if self._cancelled:
+            return
+        self._cancelled = True
         with contextlib.suppress(Exception):
             await self._client.cancel(self._txn_id)

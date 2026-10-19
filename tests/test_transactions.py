@@ -872,6 +872,7 @@ class _FakeTx:
         self.read_calls: list[tuple[str, dict[str, Any]]] = []
         self.add_calls: list[tuple[str, dict[str, Any] | None]] = []
         self.post_commit: list[Any] = []
+        self.absorbed: list[BaseException] = []
 
     @property
     def is_interactive(self) -> bool:
@@ -890,6 +891,9 @@ class _FakeTx:
     def enqueue_post_commit(self, cb: Any) -> None:
         self.post_commit.append(cb)
 
+    def _absorb_failure(self, error: BaseException) -> None:
+        self.absorbed.append(error)
+
 
 class TestTxRoutedQuerySetUnits:
     @pytest.mark.asyncio
@@ -897,9 +901,20 @@ class TestTxRoutedQuerySetUnits:
         # query_set.py: _execute_query NotFoundError branch on the tx path.
         from surreal_orm_lite._sdk import NotFoundError
 
-        qs = TxUser.objects(tx=_FakeTx(read_rows=NotFoundError("NotFound", "nope")))
-        rows = await qs._execute_query("SELECT * FROM TxUser;", {})
+        error = NotFoundError("NotFound", "nope")
+        tx = _FakeTx(read_rows=error)
+        rows = await TxUser.objects(tx=tx)._execute_query("SELECT * FROM TxUser;", {})
         assert rows == []
+        assert tx.absorbed == [error]  # read as no rows: not a failed statement (issue #268)
+
+    @pytest.mark.asyncio
+    async def test_execute_query_tx_relayed_error_is_not_absorbed(self) -> None:
+        from surreal_orm_lite._sdk import ServerError
+
+        tx = _FakeTx(read_rows=ServerError("Internal", "boom"))
+        with pytest.raises(ServerError, match="boom"):
+            await TxUser.objects(tx=tx)._execute_query("SELECT * FROM TxUser;", {})
+        assert tx.absorbed == []  # relayed: the transaction's failure stands (issue #268)
 
     @pytest.mark.asyncio
     async def test_get_tx_returns_record(self) -> None:
@@ -923,9 +938,11 @@ class TestTxRoutedQuerySetUnits:
         from surreal_orm_lite._sdk import NotFoundError
         from surreal_orm_lite.exceptions import SurrealDbNotFoundError
 
-        tx = _FakeTx(read_rows=NotFoundError("NotFound", "missing table"))
+        error = NotFoundError("NotFound", "missing table")
+        tx = _FakeTx(read_rows=error)
         with pytest.raises(SurrealDbNotFoundError):
             await TxUser.objects(tx=tx).get("a")
+        assert tx.absorbed == [error]
 
     @pytest.mark.asyncio
     async def test_all_tx_returns_rows(self) -> None:
@@ -937,9 +954,11 @@ class TestTxRoutedQuerySetUnits:
     async def test_all_tx_notfound_returns_empty_list(self) -> None:
         from surreal_orm_lite._sdk import NotFoundError
 
-        tx = _FakeTx(read_rows=NotFoundError("NotFound", "table missing"))
+        error = NotFoundError("NotFound", "table missing")
+        tx = _FakeTx(read_rows=error)
         rows = await TxUser.objects(tx=tx).all()
         assert rows == []
+        assert tx.absorbed == [error]
 
     @pytest.mark.asyncio
     async def test_bulk_create_tx_buffered_returns_inputs(self) -> None:
@@ -1058,3 +1077,307 @@ class TestTxRoutedModelUnits:
         tx = _FakeTx()
         qs = TxUser.objects(tx=tx)
         assert qs._tx is tx
+
+
+# =============================================================================
+# Issue #268: after a failed statement, the transaction is cancelled when the block ends and leaving
+# the block raises — on every strategy, as buffered transactions already fail as a whole.
+# =============================================================================
+
+
+class _FailingTxnClient(_FakeTxnClient):
+    """``_FakeTxnClient`` whose reads raise ``read_error`` and whose writes raise ``write_error`` when set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_error: BaseException | None = None
+        self.write_error: BaseException | None = None
+
+    async def query_raw(self, sql: str, params: Any = None, session_id: Any = None, txn_id: Any = None) -> dict[str, Any]:
+        if self.write_error is not None:
+            self.calls.append(("query_raw", txn_id))
+            raise self.write_error
+        return await super().query_raw(sql, params, session_id, txn_id)
+
+    async def query(self, sql: str, vars: Any = None, session_id: Any = None, txn_id: Any = None) -> Any:
+        if self.read_error is not None:
+            self.calls.append(("query", txn_id))
+            raise self.read_error
+        return await super().query(sql, vars, session_id, txn_id)
+
+
+class TestInteractiveFailedStatementUnits:
+    """The interactive strategy records every statement that fails; ``commit()`` then cancels and raises."""
+
+    @pytest.mark.asyncio
+    async def test_commit_after_a_failed_write_cancels_and_raises(self) -> None:
+        c = _FailingTxnClient()
+        tx = InteractiveTransaction(c, "TXN")
+        await tx.add("CREATE User:1 CONTENT $data;", {"data": {}})
+        c.err_envelope = {"result": [{"status": "ERR", "result": "boom"}]}
+        with pytest.raises(SurrealDbError, match="rolled back: boom") as failed:
+            await tx.add("CREATE User:2 CONTENT $data;", {"data": {}})
+        with pytest.raises(SurrealDbError, match="nothing was committed") as info:
+            await tx.commit()
+        assert type(info.value) is SurrealDbError
+        assert info.value.__cause__ is failed.value
+        assert "boom" in str(info.value)
+        assert ("commit", "TXN") not in c.calls
+        assert c.calls.count(("cancel", "TXN")) == 1
+
+    @pytest.mark.asyncio
+    async def test_commit_after_a_request_that_raised_cancels_and_raises(self) -> None:
+        c = _FailingTxnClient()
+        c.write_error = RuntimeError("socket closed")
+        tx = InteractiveTransaction(c, "TXN")
+        with pytest.raises(RuntimeError, match="socket closed"):
+            await tx.add("CREATE User:1;", {})
+        with pytest.raises(SurrealDbError, match="nothing was committed"):
+            await tx.commit()
+        assert ("commit", "TXN") not in c.calls
+        assert ("cancel", "TXN") in c.calls
+
+    @pytest.mark.asyncio
+    async def test_commit_after_a_failed_read_cancels_and_raises(self) -> None:
+        from surreal_orm_lite._sdk import ServerError
+
+        c = _FailingTxnClient()
+        c.read_error = ServerError("Internal", "read refused")
+        tx = InteractiveTransaction(c, "TXN")
+        await tx.add("CREATE User:1;", {})
+        with pytest.raises(ServerError, match="read refused"):
+            await tx.run_read("SELECT * FROM User;", {})
+        with pytest.raises(SurrealDbError, match="nothing was committed"):
+            await tx.commit()
+        assert ("commit", "TXN") not in c.calls
+        assert ("cancel", "TXN") in c.calls
+
+    @pytest.mark.asyncio
+    async def test_a_failure_the_orm_reads_as_an_answer_does_not_fail_the_transaction(self) -> None:
+        """A missing table reads as no rows: the ORM absorbs that read's error, and the transaction commits."""
+        from surreal_orm_lite._sdk import NotFoundError
+
+        c = _FailingTxnClient()
+        c.read_error = NotFoundError("NotFound", "The table 'User' does not exist")
+        tx = InteractiveTransaction(c, "TXN")
+        with pytest.raises(NotFoundError) as info:
+            await tx.run_read("SELECT * FROM User;", {})
+        tx._absorb_failure(info.value)
+        await tx.commit()
+        assert ("commit", "TXN") in c.calls
+        assert ("cancel", "TXN") not in c.calls
+
+    @pytest.mark.asyncio
+    async def test_a_conflict_raises_a_conflict_at_commit(self) -> None:
+        c = _FailingTxnClient()
+        c.write_error = RuntimeError(
+            "Transaction conflict: Write conflict, retry the transaction. This transaction can be retried"
+        )
+        tx = InteractiveTransaction(c, "TXN")
+        with pytest.raises(SurrealDbConflictError):
+            await tx.add("UPDATE counter:c SET n += 1;", {})
+        with pytest.raises(SurrealDbConflictError, match="nothing was committed"):
+            await tx.commit()
+        assert ("commit", "TXN") not in c.calls
+
+    @pytest.mark.asyncio
+    async def test_retry_on_conflict_retries_a_transaction_whose_conflict_was_caught(self) -> None:
+        from surreal_orm_lite.concurrency import retry_on_conflict
+
+        attempts: list[_FailingTxnClient] = []
+
+        @retry_on_conflict(max_retries=2, base_delay=0.001, jitter=False)
+        async def work() -> str:
+            c = _FailingTxnClient()
+            if not attempts:
+                c.write_error = RuntimeError("Transaction conflict: Write conflict. This transaction can be retried")
+            attempts.append(c)
+            tx = InteractiveTransaction(c, "TXN")
+            with contextlib.suppress(SurrealDbConflictError):
+                await tx.add("UPDATE counter:c SET n += 1;", {})
+            await tx.commit()
+            return "done"
+
+        assert await work() == "done"
+        assert len(attempts) == 2
+        assert ("commit", "TXN") not in attempts[0].calls
+        assert ("commit", "TXN") in attempts[1].calls
+
+    @pytest.mark.asyncio
+    async def test_cancel_is_sent_once(self) -> None:
+        c = _FailingTxnClient()
+        tx = InteractiveTransaction(c, "TXN")
+        c.err_envelope = {"result": [{"status": "ERR", "result": "boom"}]}
+        with pytest.raises(SurrealDbError):
+            await tx.add("CREATE User:1;", {})
+        with pytest.raises(SurrealDbError, match="nothing was committed"):
+            await tx.commit()
+        await tx.cancel()  # transaction() cancels again after a failed commit
+        assert c.calls.count(("cancel", "TXN")) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_transaction_without_failure_commits(self) -> None:
+        c = _FailingTxnClient()
+        tx = InteractiveTransaction(c, "TXN")
+        await tx.add("CREATE User:1;", {})
+        await tx.run_read("SELECT * FROM User;", {})
+        await tx.commit()
+        assert ("commit", "TXN") in c.calls
+        assert ("cancel", "TXN") not in c.calls
+
+
+class TxFailRow(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="tx_fail_row", primary_key="id")
+    id: str | None = None
+    age: int | str
+
+
+#: ``age`` must be a non-negative ``int``: ``-1`` fails the field's ASSERT, ``"abc"`` its type.
+_TX_FAIL_SCHEMA = "DEFINE TABLE tx_fail_row SCHEMAFULL; DEFINE FIELD age ON tx_fail_row TYPE int ASSERT $value >= 0;"
+
+
+@contextlib.asynccontextmanager
+async def _tx_fail_db(transport: str) -> Any:
+    """Connect over *transport* (``ws``/``http``) with ``tx_fail_row`` defined fresh; drop it afterwards."""
+    host, port = os.environ.get("SURREALDB_HOST", "localhost"), os.environ.get("SURREALDB_PORT", "8000")
+    url = f"ws://{host}:{port}/rpc" if transport == "ws" else f"http://{host}:{port}"
+    SurrealDBConnectionManager.set_connection(url=url, user="root", password="root", namespace="ns", database="db")
+    client = await SurrealDBConnectionManager.get_client()
+    with contextlib.suppress(Exception):
+        await client.query("REMOVE TABLE tx_fail_row;", {})
+    await client.query(_TX_FAIL_SCHEMA, {})
+    try:
+        yield client
+    finally:
+        with contextlib.suppress(Exception):
+            await client.query("REMOVE TABLE tx_fail_row;", {})
+        await SurrealDBConnectionManager.close_connection()
+
+
+async def _stored_ages(client: Any) -> dict[str, Any]:
+    rows = await client.query("SELECT * FROM tx_fail_row;", {})
+    return {str(row["id"].id): row["age"] for row in rows or []}
+
+
+async def _fail_assert(tx: Transaction) -> None:
+    await TxFailRow(id="bad", age=-1).save(tx=tx)
+
+
+async def _fail_type(tx: Transaction) -> None:
+    await TxFailRow(id="bad", age="abc").save(tx=tx)
+
+
+async def _fail_write_by_filter(tx: Transaction) -> None:
+    await TxFailRow.objects(tx=tx).filter(age=1).bulk_update(age="abc")
+
+
+async def _fail_call_function(tx: Transaction) -> None:
+    await SurrealDBConnectionManager.call_function("fn::tx_fail_missing", tx=tx)
+
+
+_FAILING_STATEMENTS = {
+    "field-assert": _fail_assert,
+    "type-error": _fail_type,
+    "write-by-filter": _fail_write_by_filter,
+    "call-function": _fail_call_function,
+}
+
+
+@pytest.mark.parametrize("transport", ["ws", "http"])
+class TestFailedStatementFailsTheTransactionE2E:
+    """On every strategy — interactive (3.x over WebSocket), buffered (2.x, HTTP) — a statement that fails inside the
+    block, its error caught there, makes leaving the block raise, and nothing of the block is committed."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failing", sorted(_FAILING_STATEMENTS))
+    async def test_a_caught_failure_raises_at_exit_and_commits_nothing(self, transport: str, failing: str) -> None:
+        async with _tx_fail_db(transport) as client:
+            with pytest.raises(SurrealDbError):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    with contextlib.suppress(SurrealDbError):
+                        await _FAILING_STATEMENTS[failing](tx)
+            assert await _stored_ages(client) == {}
+
+    @pytest.mark.asyncio
+    async def test_the_block_s_own_exception_wins(self, transport: str) -> None:
+        async with _tx_fail_db(transport) as client:
+            with pytest.raises(RuntimeError, match="the block's own"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    with contextlib.suppress(SurrealDbError):
+                        await _fail_assert(tx)
+                    raise RuntimeError("the block's own")
+            assert await _stored_ages(client) == {}
+
+    @pytest.mark.asyncio
+    async def test_a_block_without_failure_commits(self, transport: str) -> None:
+        async with _tx_fail_db(transport) as client:
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await TxFailRow(id="a", age=1).save(tx=tx)
+                await TxFailRow(id="b", age=2).save(tx=tx)
+            assert await _stored_ages(client) == {"a": 1, "b": 2}
+
+    @pytest.mark.asyncio
+    async def test_the_next_transaction_commits(self, transport: str) -> None:
+        async with _tx_fail_db(transport) as client:
+            with pytest.raises(SurrealDbError):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    with contextlib.suppress(SurrealDbError):
+                        await _fail_type(tx)
+            async with SurrealDBConnectionManager.transaction() as tx:
+                await TxFailRow(id="next", age=3).save(tx=tx)
+            assert await _stored_ages(client) == {"next": 3}
+
+
+class TestInteractiveFailedStatementE2E:
+    """SurrealDB 3.x over WebSocket: the interactive strategy's exit error, and the reads the ORM answers itself."""
+
+    @pytest.mark.asyncio
+    async def test_the_exit_error_names_the_failed_statement(self) -> None:
+        async with _tx_fail_db("ws") as client:
+            if not await _native_txn_supported():
+                pytest.skip("requires SurrealDB 3.x")
+            with pytest.raises(SurrealDbError, match="nothing was committed") as info:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    assert tx.is_interactive
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    with pytest.raises(SurrealDbError, match="rolled back") as failed:
+                        await _fail_assert(tx)
+            assert info.value.__cause__ is failed.value
+            assert await _stored_ages(client) == {}
+
+    @pytest.mark.asyncio
+    async def test_explicit_commit_after_a_failure_raises_and_cancels(self) -> None:
+        async with _tx_fail_db("ws") as client:
+            if not await _native_txn_supported():
+                pytest.skip("requires SurrealDB 3.x")
+            with pytest.raises(SurrealDbError, match="nothing was committed"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    with contextlib.suppress(SurrealDbError):
+                        await _fail_type(tx)
+                    await tx.commit()
+            assert await _stored_ages(client) == {}
+
+    @pytest.mark.asyncio
+    async def test_reads_of_a_missing_table_do_not_fail_the_transaction(self) -> None:
+        """A table never written reads as no rows (``exec()``, ``all()``, ``count()``) and ``get()`` raises "not
+        found": the ORM answers those reads itself, so the block still commits."""
+        from surreal_orm_lite.exceptions import SurrealDbNotFoundError
+
+        async with _tx_fail_db("ws") as client:
+            if not await _native_txn_supported():
+                pytest.skip("requires SurrealDB 3.x")
+            await _clear(client)
+            with contextlib.suppress(Exception):
+                await client.query("REMOVE TABLE TxUser;", {})
+            async with SurrealDBConnectionManager.transaction() as tx:
+                assert await TxUser.objects(tx=tx).filter(name="x").exec() == []
+                assert await TxUser.objects(tx=tx).all() == []
+                assert await TxUser.objects(tx=tx).count() == 0
+                with pytest.raises(SurrealDbNotFoundError):
+                    await TxUser.objects(tx=tx).get("nobody")
+                await TxFailRow(id="ok", age=1).save(tx=tx)
+            assert await _stored_ages(client) == {"ok": 1}

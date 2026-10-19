@@ -1165,6 +1165,15 @@ class Mark(BaseSurrealModel):
     tag: str = ""
 
 
+class EmbTxRow(BaseSurrealModel):
+    """``age`` accepts what the table refuses (issue #268): ``-1`` fails its ASSERT, ``"abc"`` its type."""
+
+    model_config = SurrealConfigDict(table_name="emb_tx_row")
+
+    id: str | None = None
+    age: int | str
+
+
 #: Reference points as (longitude, latitude), the values of ``tests/test_geo_types.py``: NEAR is 697.5 m from
 #: B, A 1395.0 m, PARIS thousands of kilometres.
 _B = (-73.99, 40.75)
@@ -1469,6 +1478,21 @@ class TestTransactionsEmbeddedE2E:
                     await Person(id="a", name="A").save(tx=tx)
                     raise RuntimeError("boom")
             assert await Person.objects().count() == 0
+
+    @pytest.mark.parametrize("age", [-1, "abc"], ids=["field-assert", "type-error"])
+    async def test_a_caught_failed_statement_raises_at_exit_and_commits_nothing(self, age: int | str) -> None:
+        """Issue #268: as on every strategy, a statement that fails — its error caught in the block — makes leaving
+        the block raise, and nothing of the block is committed."""
+        async with embedded() as client:
+            await client.query(
+                "DEFINE TABLE emb_tx_row SCHEMAFULL; DEFINE FIELD age ON emb_tx_row TYPE int ASSERT $value >= 0;"
+            )
+            with pytest.raises(SurrealDbError):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await EmbTxRow(id="ok", age=1).save(tx=tx)
+                    with contextlib.suppress(SurrealDbError):
+                        await EmbTxRow(id="bad", age=age).save(tx=tx)
+            assert await EmbTxRow.objects().count() == 0
 
     async def test_a_read_inside_the_transaction_raises_as_on_2x(self) -> None:
         async with embedded():
