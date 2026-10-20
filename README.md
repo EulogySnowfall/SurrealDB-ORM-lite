@@ -691,10 +691,11 @@ are not failed statements: a table that does not exist reads as no rows, and `ge
 the query as a whole (a statement it cannot parse), the error gives the server's reason and the
 position, without the server's excerpt of the statement: a buffered commit raises "Transaction
 failed: the server refused statement 2 of 3: Parse error: … (at line 1, column 7 of the
-statement)", the embedded engine included, and a statement of an interactive transaction raises
-"Transaction failed: the server refused the statement: … (at line 1, column 7 of the statement)".
-The server's full text stays reachable as the error's `__context__`, which a traceback does not
-print.
+statement)", the embedded engine included, and a write or a definition in an interactive
+transaction raises "Transaction failed: the server refused the statement: … (at line 1, column 7
+of the statement)". The server's full text stays reachable as the error's `__context__`, which a
+traceback does not print. A read in a transaction is not affected: it raises the SDK's own error,
+as it does outside a transaction.
 
 ```python
 async with SurrealDBConnectionManager.transaction() as tx:

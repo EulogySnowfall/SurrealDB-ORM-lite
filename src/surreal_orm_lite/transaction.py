@@ -27,9 +27,11 @@ became visible.
 
 Errors (issue #278): the errors a failed transaction raises give the server's reason and the failed statement's
 position, without the server's excerpt of the statement; the server's own text stays reachable as their suppressed
-``__context__``. A buffered commit fails with ``SurrealDbError`` on every engine (the embedded engine's bare
-``RuntimeError`` included), ``SurrealDbConflictError`` for a retryable conflict. After a failed statement, an
-interactive transaction's cancellation error names only that statement's error type.
+``__context__``. A query the server or the embedded engine refuses at a buffered commit raises ``SurrealDbError`` on
+every engine (the embedded engine's bare ``RuntimeError`` included), ``SurrealDbConflictError`` for a retryable
+conflict; a transport error (a lost connection, a timeout) is not a refusal and propagates unchanged, since the
+commit's outcome is unknown. A read relays the SDK's own error, as outside a transaction. After a failed statement,
+an interactive transaction's cancellation error names only that statement's error type.
 """
 
 import contextlib

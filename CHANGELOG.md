@@ -19,15 +19,17 @@ new public API.
   statement included. It now gives the server's reason and the position:
   - at a buffered commit (SurrealDB 2.x, HTTP, the embedded engine), "Transaction failed: the
     server refused statement 2 of 3: Parse error: … (at line 1, column 7 of the statement)";
-  - for a statement of an interactive transaction (SurrealDB 3.x over WebSocket), "Transaction
-    failed: the server refused the statement: … (at line 1, column 7 of the statement)";
+  - for a write or a definition in an interactive transaction (SurrealDB 3.x over WebSocket),
+    "Transaction failed: the server refused the statement: … (at line 1, column 7 of the
+    statement)";
   - a failed statement's error, "Transaction failed and rolled back: …", keeps only the first line
     of a reason that quotes the query;
   - a response of any other shape raises "Transaction failed: unrecognized query_raw() response
     shape (<type>)", without the response.
 
   The server's full text stays reachable as the error's `__context__`, which a formatted traceback
-  does not print.
+  does not print. A read in a transaction still raises the SDK's own error, as it does outside a
+  transaction.
 - **A buffered commit on the embedded engine raises `SurrealDbError`** (#278). The engine reports a
   query it cannot parse as a bare `RuntimeError`, which propagated out of the `transaction()` block;
   the commit now raises `SurrealDbError`, or `SurrealDbConflictError` for a retryable conflict, as
