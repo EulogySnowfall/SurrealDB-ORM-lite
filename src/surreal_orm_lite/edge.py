@@ -27,6 +27,7 @@ from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import SurrealFunc
 from .model_base import BaseSurrealModel, _own_annotation_names
+from .schema import relation_tables
 from .transaction import Transaction
 from .utils import coerce_endpoint
 
@@ -176,6 +177,22 @@ class BaseSurrealEdge(BaseSurrealModel):
     endpoint change is one the server silently ignores.
 
     ``id`` keeps the ``RecordID`` a row comes back with, or takes a plain string id.
+
+    **Relation constraint (v0.33.0).** An edge model's table is SurrealDB's ``TYPE RELATION``
+    (``get_table_type()`` is ``TableType.RELATION``). The full SurrealDB-ORM's keys declare which
+    tables its endpoints may come from and point to, and whether they must exist::
+
+        class Likes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(
+                table_name="likes",
+                relation_in="person",
+                relation_out=["post", "book"],
+                enforced=True,
+            )
+
+    They are checked at the ``class`` statement and read back by :meth:`get_relation_in`,
+    :meth:`get_relation_out` and :meth:`is_enforced`; ``table_type=TableType.RELATION`` may be
+    written, and any other ``table_type`` is refused on an edge.
     """
 
     __surreal_edge__: ClassVar[bool] = True
@@ -209,6 +226,31 @@ class BaseSurrealEdge(BaseSurrealModel):
                 f"{cls.__name__}: 'in_'/'out' are the endpoints declared by BaseSurrealEdge and cannot be "
                 "redeclared (a redeclared endpoint loses its column mapping and its immutability)."
             )
+
+    @classmethod
+    def get_relation_in(cls) -> tuple[str, ...]:
+        """The tables an edge's ``in`` may come from — ``relation_in`` as a tuple, in declared order (v0.33.0).
+
+        Each name stripped, a repeated name kept (as SurrealDB stores ``IN a | a``); ``()`` for any table
+        (``relation_in`` left out, ``None`` or empty). The same shape as ``TableState.relation_in``, so
+        ``Likes.get_relation_in() == table_state.relation_in`` compares the model with the database.
+        """
+        # Checked at the class statement, so this only reads the names.
+        return relation_tables(cls.model_config.get("relation_in"), model=cls.__name__, key="relation_in")
+
+    @classmethod
+    def get_relation_out(cls) -> tuple[str, ...]:
+        """The tables an edge's ``out`` may point to, as :meth:`get_relation_in` reads ``relation_in``; ``()`` for any
+        table (v0.33.0)."""
+        return relation_tables(cls.model_config.get("relation_out"), model=cls.__name__, key="relation_out")
+
+    @classmethod
+    def is_enforced(cls) -> bool:
+        """``enforced=True``: SurrealDB refuses an edge whose endpoint record does not exist (v0.33.0).
+
+        ``False`` when ``enforced`` is left out, ``None`` or ``False``.
+        """
+        return cls.model_config.get("enforced") is True
 
     @classmethod
     def _implicit_aliases(cls) -> dict[str, str]:

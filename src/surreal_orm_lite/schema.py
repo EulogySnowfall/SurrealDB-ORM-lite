@@ -1,4 +1,4 @@
-"""Server-side events and DDL helpers (v0.31.0), materialized views (v0.32.0).
+"""Server-side events and DDL helpers (v0.31.0), materialized views (v0.32.0), relation constraints (v0.33.0).
 
 ``Event`` declares a server-side event — SurrealDB's ``DEFINE EVENT`` on a table — with the full SurrealDB-ORM's call
 shape: a name, the SurrealQL the event runs (``then``), an optional condition (``when``), SurrealDB 3.x's ``ASYNC``
@@ -42,6 +42,14 @@ removal the block has already queued, ``dependents_not_removed()``) and, when th
 and the embedded engine before any DDL (``ensure_view_removable()``, G5): those engines would remove it and turn those
 views into ordinary tables that no longer update, where 3.x refuses the removal itself.
 
+**Relation constraints (v0.33.0).** An edge model (``BaseSurrealEdge``) declares its table's ``TYPE RELATION``
+constraint with the full SurrealDB-ORM's keys, ``SurrealConfigDict(table_type=TableType.RELATION, relation_in=…,
+relation_out=…, enforced=…)``. ``check_relation_config()`` checks them when the class is defined — ``table_type`` a
+``TableType`` (``RELATION`` on an edge), the three relation keys on an edge model only — and ``relation_tables()`` reads
+``relation_in``/``relation_out``: ``None``, ``""``, ``[]`` or ``()`` for any table, else table names given as one
+``str`` (several separated by ``|``) or a ``list``/``tuple``, each stripped and an identifier, kept in order (a repeated
+name too, as SurrealDB stores it).
+
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
 it.
 """
@@ -64,6 +72,7 @@ from .exceptions import SurrealDbError
 from .functions import normalize_function_name
 from .surql_literal import _SERVER_PARAMETERS, _identifier, _quoted
 from .time_travel import line_major
+from .types import TableType
 from .utils import VALID_ALIAS_PATTERN, _ddl_refusal_class
 
 __all__ = ["Event", "function_ddl"]
@@ -1201,3 +1210,112 @@ async def ensure_view_removable(client: Any, table: str, dependents: Sequence[st
         "ordinary tables that keep their last records and no longer update. Remove those views first. Nothing was "
         "removed."
     )
+
+
+# --- relation constraints (v0.33.0) ----------------------------------------------------------------------------------
+
+
+def relation_tables(value: object, *, model: str, key: str) -> tuple[str, ...]:
+    """The table names of a model's ``relation_in`` or ``relation_out`` (*key*), checked (v0.33.0).
+
+    ``None``, ``""``, ``[]`` and ``()`` mean any table: ``()``, no ``IN`` (or ``OUT``) clause. Otherwise *value* is a
+    ``str`` naming one table or several separated by ``|`` (SurrealQL's spelling, the full SurrealDB-ORM's pipe-joined
+    string: ``"person | company"``), or a ``list`` or ``tuple`` of table names. Each name is stripped and returned in
+    order; a repeated name is kept, as SurrealDB stores it (``IN a | a``), so the result compares with
+    ``TableState.relation_in``/``relation_out``. In order, each refusal naming *model* (the class name) and *key*:
+
+    - R2, ``TypeError``: *value* is neither a ``str``, a ``list``, a ``tuple`` nor ``None``;
+    - R3, ``TypeError``: an item of the ``list`` or ``tuple`` is not a ``str``;
+    - R4, ``ValueError``: a non-empty string that is blank (``"  "``);
+    - R5, ``ValueError``: a name, after stripping, is not an identifier (letters, digits, underscores; not starting
+      with a digit) — ``''`` for a part or an item blank after stripping (``"a||b"``, ``[""]``), ``'a | b'`` for the
+      item ``"a | b"`` (an item is one name).
+
+    Pure: no connection.
+    """
+    subject = f"{model}: model_config['{key}']"
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        if not value:
+            return ()
+        if not value.strip():
+            raise ValueError(f"{subject} names no table; leave it out (None) to accept any table.")
+        names = tuple(part.strip() for part in value.split("|"))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            if not isinstance(item, str):
+                raise TypeError(f"{subject} holds a {type(item).__name__}, not a table name.")
+        names = tuple(item.strip() for item in value)
+    else:
+        raise TypeError(
+            f"{subject} must be a table name, several separated by '|', or a list or tuple of table names, got "
+            f"{type(value).__name__}."
+        )
+    for name in names:
+        if VALID_ALIAS_PATTERN.fullmatch(name) is None:
+            raise ValueError(
+                f"{subject} names {name!r}, which is not a table name the ORM can write: an identifier is expected "
+                "(letters, digits, underscores; not starting with a digit)."
+            )
+    return names
+
+
+def check_relation_config(
+    model: type,
+    *,
+    edge: bool,
+    table_type: object,
+    relation_in: object,
+    relation_out: object,
+    enforced: object,
+) -> None:
+    """The ``table_type``, ``relation_in``, ``relation_out`` and ``enforced`` keys of a model's ``SurrealConfigDict``,
+    checked when the class is defined (v0.33.0).
+
+    Called when any of the four is not ``None`` (an empty value and ``enforced=False`` included), inherited values
+    included. *edge* tells an edge model (``BaseSurrealEdge``) from a node. In order — the first failure raises, the
+    messages naming *model*:
+
+    - T1, ``TypeError``: *table_type* is not a ``TableType`` (a plain ``"relation"`` string included);
+    - T2, ``TypeError``: an edge model with a *table_type* other than ``TableType.RELATION``;
+    - T3, ``TypeError``: ``TableType.RELATION`` on a model that is not an edge (the lite's relation model is
+      ``BaseSurrealEdge``);
+    - R1, ``TypeError``: *relation_in*, *relation_out* or *enforced* not ``None`` on a model that is not an edge;
+    - R2–R5: :func:`relation_tables` of *relation_in*, then of *relation_out*;
+    - R7, ``TypeError``: *enforced* is not a ``bool`` (and not ``None``).
+
+    On a node model, the other ``TableType`` members are accepted: recorded, returned by ``get_table_type()``, with
+    no effect before the table DDL of v0.37.0.
+
+    :raises TypeError: T1–T3, R1, R2, R3, R7.
+    :raises ValueError: R4, R5.
+    """
+    name = model.__name__
+    if table_type is not None:
+        if not isinstance(table_type, TableType):
+            raise TypeError(
+                f"{name}: model_config['table_type'] must be a surreal_orm_lite.TableType, got {type(table_type).__name__}."
+            )
+        if edge and table_type is not TableType.RELATION:
+            raise TypeError(
+                f"{name}: an edge model's table is TYPE RELATION; leave table_type out or set TableType.RELATION, "
+                f"got TableType.{table_type.name}."
+            )
+        if not edge and table_type is TableType.RELATION:
+            raise TypeError(
+                f"{name}: table_type=TableType.RELATION needs an edge model: derive {name} from BaseSurrealEdge, "
+                "which declares the endpoints in_ and out."
+            )
+    if not edge:
+        relation = {"relation_in": relation_in, "relation_out": relation_out, "enforced": enforced}
+        keys = [key for key, value in relation.items() if value is not None]
+        if keys:
+            raise TypeError(
+                f"{name}: relation constraints ({', '.join(keys)}) apply to an edge model only: derive {name} from "
+                "BaseSurrealEdge."
+            )
+    relation_tables(relation_in, model=name, key="relation_in")
+    relation_tables(relation_out, model=name, key="relation_out")
+    if enforced is not None and not isinstance(enforced, bool):
+        raise TypeError(f"{name}: model_config['enforced'] must be a bool or None, got {type(enforced).__name__}.")
