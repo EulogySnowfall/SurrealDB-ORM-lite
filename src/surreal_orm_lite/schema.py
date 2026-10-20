@@ -37,8 +37,9 @@ the DDL, not a lock. Before the guard, ``define_view()`` refuses on SurrealDB 2.
 projection those engines compute once per source record (``ensure_view_query_supported()``, C1), reading the line
 from ``client.version()`` only when the query holds one; 3.x keeps such a view up to date or refuses it itself. On the
 guard's one ``INFO FOR DB``, ``remove_view()`` finds the views that read the view it removes (``dependent_views()``,
-through the plain ``FROM`` targets ``view_reads_table()`` reads) and, when there is one, refuses on SurrealDB 2.x and
-the embedded engine before any DDL (``ensure_view_removable()``, G5): those engines would remove it and turn those
+through the plain ``FROM`` targets ``view_reads_table()`` reads; in a buffered transaction, without those whose
+removal the block has already queued, ``dependents_not_removed()``) and, when there is one, refuses on SurrealDB 2.x
+and the embedded engine before any DDL (``ensure_view_removable()``, G5): those engines would remove it and turn those
 views into ordinary tables that no longer update, where 3.x refuses the removal itself.
 
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
@@ -1142,6 +1143,33 @@ def dependent_views(tables: Mapping[str, Any], table: str) -> tuple[str, ...]:
     return tuple(sorted(names))
 
 
+def dependents_not_removed(dependents: Sequence[str], statements: Sequence[str]) -> tuple[str, ...]:
+    """The views of *dependents* that the *statements* queued in a buffered transaction do not remove, in order
+    (v0.32.1, issue #286).
+
+    G5 (:func:`ensure_view_removable`) reads committed state, where a view whose removal the same buffered block has
+    already queued is still listed: removing a chain of views outer view first in one block would be refused. A
+    dependent is left out when the last of *statements* that names it — as a whole name, in any case, quoted or not —
+    is exactly the removal ``remove_view()`` queues for it (:func:`remove_view_statement`, with ``missing_ok`` ``True``
+    or ``False``). It is kept when no statement names it, when a statement names it after its removal (a
+    ``DEFINE TABLE … AS`` that defines it again, or any other), when its removal was written by hand
+    (``tx.add("REMOVE TABLE …")``), and when its name is not an identifier: a reading of the text, not a parser, that
+    errs on the side of the refusal. Pure.
+    """
+    left: list[str] = []
+    for name in dependents:
+        try:
+            removals = {remove_view_statement(name, True), remove_view_statement(name, False)}
+        except (TypeError, ValueError):
+            left.append(name)
+            continue
+        naming = re.compile(rf"(?<!\w){re.escape(name)}(?!\w)", re.IGNORECASE)
+        last = next((statement for statement in reversed(statements) if naming.search(statement)), None)
+        if last not in removals:
+            left.append(name)
+    return tuple(left)
+
+
 async def ensure_view_removable(client: Any, table: str, dependents: Sequence[str], *, model: str, embedded: bool) -> None:
     """Refuse, on a connection before SurrealDB 3.x, to remove the view *table* that other views read — before any
     DDL (G5, v0.32.0).
@@ -1149,7 +1177,9 @@ async def ensure_view_removable(client: Any, table: str, dependents: Sequence[st
     While a view reads a table — a source table or an inner view —, SurrealDB 3.x refuses to remove it (``Cannot
     delete table … on which a view is defined``). SurrealDB 2.x and the embedded engine remove it, and every view that
     read it loses its ``AS`` clause: an ordinary table that keeps its last records and no longer updates. *dependents*
-    are those views (:func:`dependent_views`, over the table guard's one ``INFO FOR DB``): none, and nothing is read.
+    are those views (:func:`dependent_views`, over the table guard's one ``INFO FOR DB``; in a buffered transaction,
+    without those whose removal the block has already queued, :func:`dependents_not_removed`): none, and nothing is
+    read.
     Else the line is read from ``client.version()`` with the lite's rule (``time_travel.line_major()``): on 3.x — or a
     version that cannot be read — the removal goes on and the server refuses it; before 3.x, G5 names the dependent
     views, sorted. On the embedded engine ``version()`` answers the SDK's version (``surrealdb-2.0.0``), whose bundled

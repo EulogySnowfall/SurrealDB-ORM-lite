@@ -89,6 +89,7 @@ from surreal_orm_lite import (
     AuthenticatedUserMixin,
     BaseSurrealEdge,
     BaseSurrealModel,
+    BufferedTransaction,
     Computed,
     DatabaseIntrospector,
     Event,
@@ -2475,6 +2476,162 @@ class TestRemovalGuard:
         assert client.version_calls == 0
 
 
+#: ``mv_stats_totals``' removal, as ``remove_view()`` queues it (``missing_ok`` True, then False).
+_REMOVE_MV_TOTALS = "REMOVE TABLE IF EXISTS `mv_stats_totals`;"
+_REMOVE_MV_TOTALS_STRICT = "REMOVE TABLE `mv_stats_totals`;"
+
+
+def _buffered(connection: str = "mv") -> BufferedTransaction:
+    """A buffered transaction of *connection*, as ``transaction()`` opens one on SurrealDB 2.x (nothing is sent before
+    its commit)."""
+    tx = BufferedTransaction(client=None)
+    tx._connection_name = connection
+    return tx
+
+
+#: ``(queued statements, dependents left)`` for the dependents ``("mv_b", "mv_stats_totals")`` (issue #286).
+_QUEUED_REMOVALS = [
+    pytest.param([], ("mv_b", "mv_stats_totals"), id="nothing-queued"),
+    pytest.param([_REMOVE_MV_TOTALS], ("mv_b",), id="removed-if-exists"),
+    pytest.param([_REMOVE_MV_TOTALS_STRICT], ("mv_b",), id="removed-strict"),
+    pytest.param([_REMOVE_MV_TOTALS, "REMOVE TABLE IF EXISTS `mv_b`;"], (), id="both-removed"),
+    pytest.param(
+        ["CREATE mv_orders:o9 SET status = 'new';", _REMOVE_MV_TOTALS, "REMOVE TABLE IF EXISTS `mv_other`;"],
+        ("mv_b",),
+        id="other-statements-around",
+    ),
+    pytest.param(
+        [_REMOVE_MV_TOTALS, "DEFINE TABLE OVERWRITE `mv_stats_totals` AS (SELECT total FROM mv_order_stats);"],
+        ("mv_b", "mv_stats_totals"),
+        id="defined-again-after",
+    ),
+    pytest.param(
+        [_REMOVE_MV_TOTALS, "DEFINE TABLE mv_stats_totals AS SELECT total FROM mv_order_stats;"],
+        ("mv_b", "mv_stats_totals"),
+        id="hand-written-define-after",
+    ),
+    pytest.param(
+        [_REMOVE_MV_TOTALS, "CREATE MV_STATS_TOTALS SET total = 1;"],
+        ("mv_b", "mv_stats_totals"),
+        id="named-again-after-in-any-case",
+    ),
+    pytest.param(
+        ["DEFINE TABLE OVERWRITE `mv_stats_totals` AS (SELECT total FROM mv_order_stats);", _REMOVE_MV_TOTALS],
+        ("mv_b",),
+        id="defined-then-removed",
+    ),
+    pytest.param(["REMOVE TABLE mv_stats_totals;"], ("mv_b", "mv_stats_totals"), id="hand-written-removal"),
+    pytest.param(["REMOVE TABLE IF EXISTS `mv_stats_totals`; "], ("mv_b", "mv_stats_totals"), id="not-the-exact-text"),
+    pytest.param(["REMOVE TABLE IF EXISTS `mv_stats_totals_2`;"], ("mv_b", "mv_stats_totals"), id="a-longer-name"),
+    pytest.param(["REMOVE TABLE IF EXISTS `mv_stats`;"], ("mv_b", "mv_stats_totals"), id="a-shorter-name"),
+]
+
+
+class TestQueuedRemovals:
+    """Issue #286 (G5 in a buffered transaction): ``dependents_not_removed()`` leaves out a dependent view only when
+    the last queued statement that names it is ``remove_view()``'s exact removal of it; ``remove_view(tx=tx)`` applies
+    it to a :class:`BufferedTransaction` before G5, so a chain removed outer view first in one block is accepted, and
+    every other case is still refused."""
+
+    @pytest.mark.parametrize(("statements", "left"), _QUEUED_REMOVALS)
+    def test_dependents_not_removed(self, statements: list[str], left: tuple[str, ...]) -> None:
+        assert schema.dependents_not_removed(("mv_b", "mv_stats_totals"), statements) == left
+
+    def test_the_order_of_the_dependents_is_kept(self) -> None:
+        assert schema.dependents_not_removed(["zeta", "alpha"], []) == ("zeta", "alpha")
+        assert schema.dependents_not_removed(("zeta", "mid", "alpha"), ["REMOVE TABLE IF EXISTS `mid`;"]) == (
+            "zeta",
+            "alpha",
+        )
+
+    def test_a_name_that_is_no_identifier_is_kept(self) -> None:
+        """``remove_view()`` never removes such a table (a model's table name is an identifier): it stays counted."""
+        assert schema.dependents_not_removed(("my-view",), ["REMOVE TABLE IF EXISTS `my-view`;"]) == ("my-view",)
+
+    async def test_the_chain_outer_view_first_in_one_block(self, use_mv_client: Callable[..., None]) -> None:
+        """The issue's block on SurrealDB 2.x: both removals queued, G5 not raised, ``version()`` never read."""
+        client = _removal_client("mv_stats_totals", version="surrealdb-2.7.0")
+        use_mv_client(client)
+        tx = _buffered()
+        assert await MvStatsTotals.remove_view(tx=tx) == _REMOVE_MV_TOTALS
+        assert await MvStats.remove_view(tx=tx) == _REMOVE_MV_STATS
+        assert tx.statements == [_REMOVE_MV_TOTALS, _REMOVE_MV_STATS]
+        assert client.queries == [_INFO, _INFO]
+        assert client.version_calls == 0
+
+    @pytest.mark.parametrize("embedded", [False, True], ids=["server", "embedded"])
+    async def test_missing_ok_false_and_the_embedded_engine(self, use_mv_client: Callable[..., None], embedded: bool) -> None:
+        client = _removal_client("mv_stats_totals", version="surrealdb-2.0.0" if embedded else "surrealdb-2.7.0")
+        use_mv_client(client, embedded=embedded)
+        tx = _buffered()
+        assert await MvStatsTotals.remove_view(missing_ok=False, tx=tx) == _REMOVE_MV_TOTALS_STRICT
+        assert await MvStats.remove_view(missing_ok=False, tx=tx) == "REMOVE TABLE `mv_order_stats`;"
+        assert tx.statements == [_REMOVE_MV_TOTALS_STRICT, "REMOVE TABLE `mv_order_stats`;"]
+        assert client.version_calls == 0
+
+    async def test_only_the_dependents_removed_are_left_out(self, use_mv_client: Callable[..., None]) -> None:
+        client = _removal_client("mv_stats_totals", "mv_b", version="surrealdb-2.7.0")
+        use_mv_client(client)
+        tx = _buffered()
+        await MvStatsTotals.remove_view(tx=tx)
+        with pytest.raises(SurrealDbError) as raised:
+            await MvStats.remove_view(tx=tx)
+        assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_b'", _ENGINE_2X)
+        assert tx.statements == [_REMOVE_MV_TOTALS]
+
+    async def test_the_inner_view_first_is_still_refused(self, use_mv_client: Callable[..., None]) -> None:
+        client = _removal_client("mv_stats_totals", version="surrealdb-2.7.0")
+        use_mv_client(client)
+        tx = _buffered()
+        with pytest.raises(SurrealDbError) as raised:
+            await MvStats.remove_view(tx=tx)
+        assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_stats_totals'", _ENGINE_2X)
+        assert tx.statements == []
+        assert client.version_calls == 1
+
+    async def test_removed_in_another_transaction_is_still_refused(self, use_mv_client: Callable[..., None]) -> None:
+        client = _removal_client("mv_stats_totals", version="surrealdb-2.7.0")
+        use_mv_client(client)
+        other, tx = _buffered(), _buffered()
+        await MvStatsTotals.remove_view(tx=other)
+        with pytest.raises(SurrealDbError) as raised:
+            await MvStats.remove_view(tx=tx)
+        assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_stats_totals'", _ENGINE_2X)
+        assert (other.statements, tx.statements) == ([_REMOVE_MV_TOTALS], [])
+
+    async def test_defined_again_after_its_removal_is_still_refused(self, use_mv_client: Callable[..., None]) -> None:
+        client = _removal_client("mv_stats_totals", version="surrealdb-2.7.0")
+        use_mv_client(client)
+        tx = _buffered()
+        await MvStatsTotals.remove_view(tx=tx)
+        await MvStatsTotals.define_view(tx=tx)
+        with pytest.raises(SurrealDbError) as raised:
+            await MvStats.remove_view(tx=tx)
+        assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_stats_totals'", _ENGINE_2X)
+        assert tx.statements == [_REMOVE_MV_TOTALS, MvStatsTotals.view_ddl()]
+
+    async def test_a_hand_written_removal_is_still_refused(self, use_mv_client: Callable[..., None]) -> None:
+        """Only the ORM's exact statement is read: a removal added by hand leaves the refusal on the safe side."""
+        client = _removal_client("mv_stats_totals", version="surrealdb-2.7.0")
+        use_mv_client(client)
+        tx = _buffered()
+        await tx.add("REMOVE TABLE mv_stats_totals;")
+        with pytest.raises(SurrealDbError) as raised:
+            await MvStats.remove_view(tx=tx)
+        assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_stats_totals'", _ENGINE_2X)
+
+    async def test_an_interactive_transaction_is_unchanged(self, use_mv_client: Callable[..., None]) -> None:
+        """Not a buffered transaction (SurrealDB 3.x over WebSocket): its statements are not read, and 3.x decides."""
+        client = _removal_client("mv_stats_totals", version="surrealdb-3.3.4")
+        use_mv_client(client)
+        tx = _QueuingTx()
+        tx._connection_name = "mv"
+        await MvStatsTotals.remove_view(tx=tx)  # type: ignore[arg-type]
+        assert await MvStats.remove_view(tx=tx) == _REMOVE_MV_STATS  # type: ignore[arg-type]
+        assert client.version_calls == 1
+        assert tx.added == [(_REMOVE_MV_TOTALS, None), (_REMOVE_MV_STATS, None)]
+
+
 class TestCoerceArrayIds:
     """AC-13 (unit): ``utils.coerce_record_id()`` reads a ``list`` or a ``tuple`` as an array record id — a grouped
     view's (M4) — and every row of its table before v0.32.0 is unchanged."""
@@ -3726,6 +3883,43 @@ class TestViewRemovalE2E:
             assert "mv_stats_totals" not in tables
             assert "mv_order_stats" not in tables
             assert len(await _rows(client, "mv_orders")) == 3
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_chain_in_one_transaction_block(self, kind: str) -> None:
+        """Issue #286: the outer view, then the inner one, in one ``transaction()`` block — buffered on SurrealDB 2.x,
+        HTTP and the embedded engine, where G5 leaves out the outer view the block already removes; interactive on 3.x
+        over WebSocket, where the server decides — commits on every line, and both views are gone."""
+        async with _mv(kind) as client:
+            await _save_orders()
+            await MvStats.define_view()
+            await MvStatsTotals.define_view()
+            async with SurrealDBConnectionManager.transaction("mv") as tx:
+                assert await MvStatsTotals.remove_view(tx=tx) == "REMOVE TABLE IF EXISTS `mv_stats_totals`;"
+                assert await MvStats.remove_view(tx=tx) == _REMOVE_MV_STATS
+            tables = await _tables(client)
+            assert "mv_stats_totals" not in tables
+            assert "mv_order_stats" not in tables
+            assert len(await _rows(client, "mv_orders")) == 3
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_g5_when_the_block_defines_the_outer_view_again(self, kind: str) -> None:
+        """Issue #286: a ``define_view()`` of the outer view queued after its removal puts it back: G5 refuses the
+        inner view's removal, the block commits nothing, both views stay."""
+        async with _mv(kind) as client:
+            await _require_line(client, 2, "SurrealDB 2.x and the embedded engine would remove a view another view reads")
+            await _save_orders()
+            await MvStats.define_view()
+            await MvStatsTotals.define_view()
+            with pytest.raises(SurrealDbError) as raised:
+                async with SurrealDBConnectionManager.transaction("mv") as tx:
+                    await MvStatsTotals.remove_view(tx=tx)
+                    await MvStatsTotals.define_view(tx=tx)
+                    await MvStats.remove_view(tx=tx)
+            tables = await _tables(client)
+            assert (tables["mv_order_stats"], tables["mv_stats_totals"]) == (_MV_STATS_RENDERED, _MV_TOTALS_RENDERED)
+            assert await _totals() == {"new": 1, "paid": 2}
+        engine = _ENGINE_EMBEDDED if kind == "mem" else _ENGINE_2X
+        assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_stats_totals'", engine)
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_g5_before_anything_is_queued(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
