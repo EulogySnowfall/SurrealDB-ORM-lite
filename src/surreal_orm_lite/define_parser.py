@@ -37,7 +37,8 @@ simple anchored tokens:
 **Hand-written fragments** (v0.31.0) — ``scan_fragment()`` is a separate, more conservative lexer for the SurrealQL
 an application writes and the ORM embeds (an event's ``WHEN``/``THEN``, a function body): it refuses NUL and comment
 markers, reads every ``/`` as an operator, requires balanced brackets and reports a top-level ``;``. The check catches
-mistakes and is not an injection defence.
+mistakes and is not an injection defence. ``blank_literals()`` (v0.32.0) walks such a fragment the same way and blanks
+the content of its literals, so a reading of a materialized view's query never sees what a literal holds.
 
 **Kinds** — ``parse_kind()`` reads a ``TYPE`` (or a function's ``->``) kind into a small tree (``KName``,
 ``KLiteral``, ``KUnion``, ``KObject``, ``KTuple``); ``render_kind()`` writes a tree back in one canonical form that
@@ -93,6 +94,7 @@ __all__ = [
     "Kind",
     "ParsedField",
     "Slot",
+    "blank_literals",
     "canonical_name",
     "normalise_kind",
     "parse_define_access",
@@ -715,6 +717,41 @@ def scan_fragment(text: str) -> bool:
     if expected:
         raise DefineParseError(_R_BRACKETS)
     return top_level_semicolon
+
+
+def blank_literals(text: str) -> str:
+    """*text* with the content of every literal and quoted identifier replaced by spaces (v0.32.0).
+
+    The same left-to-right walk as :func:`scan_fragment`: ``'…'`` and ``"…"`` string literals and identifiers quoted
+    between backquotes or between ``⟨`` and ``⟩`` (backslash escapes skipped). Their delimiters are kept and the
+    length is unchanged, so a position in the result is the same position in *text*: a reading of the text's
+    structure (a keyword, a bracket, a comma) can run on the result without seeing what a literal holds —
+    ``SELECT 'a(b' AS x`` gives ``SELECT '   ' AS x``.
+
+    Meant for a text :func:`scan_fragment` accepted. An unterminated literal cannot occur there; should one occur, the
+    rest of the text after its opening delimiter is blanked.
+    """
+    pieces: list[str] = []
+    begin = 0
+    index = 0
+    length = len(text)
+    while index < length:
+        close = _quote_close(text[index], strings=True)
+        if close is None:
+            index += 1
+            continue
+        end = _delimited_end(text, index, close)
+        if end is None:
+            pieces.append(text[begin : index + 1])
+            pieces.append(" " * (length - index - 1))
+            return "".join(pieces)
+        pieces.append(text[begin : index + 1])
+        pieces.append(" " * (end - index - 2))
+        pieces.append(text[end - 1])
+        begin = end
+        index = end
+    pieces.append(text[begin:])
+    return "".join(pieces)
 
 
 # --- kinds ---------------------------------------------------------------------------------------------------------
