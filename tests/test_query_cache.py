@@ -2223,7 +2223,8 @@ class TestUncachedUnchanged:
 
 # --- AC-11, AC-12: every public coroutine is classified; every write is wrapped ------------------------------
 
-#: The 26 writes of spec §5.4, by the class that defines them (``vars(cls)``).
+#: The 26 writes of spec §5.4, by the class that defines them (``vars(cls)``), and v0.32.0's ``define_view`` and
+#: ``remove_view``.
 _INVALIDATING_WRITES: dict[type, frozenset[str]] = {
     BaseSurrealModel: frozenset(
         {
@@ -2244,6 +2245,8 @@ _INVALIDATING_WRITES: dict[type, frozenset[str]] = {
             "remove_relation",
             "remove_all_relations",
             "define_computed_fields",
+            "define_view",
+            "remove_view",
         }
     ),
     BaseSurrealEdge: frozenset({"save"}),
@@ -2303,6 +2306,8 @@ _CLASSIFIED: dict[type, dict[str, frozenset[str]]] = {
 #: The writes defined as class methods: ``invalidates()`` is the inner decorator there.
 _CLASS_METHOD_WRITES = {
     (BaseSurrealModel, "define_computed_fields"),
+    (BaseSurrealModel, "define_view"),
+    (BaseSurrealModel, "remove_view"),
     (AuthenticatedUserMixin, "define_access"),
     (AuthenticatedUserMixin, "signup"),
     (SurrealDBConnectionManager, "signup"),
@@ -2333,8 +2338,8 @@ class TestExhaustiveness:
         assert len(classified) == len(set(classified)), "a coroutine is in two classes"
         assert _public_coroutines(cls) == set(classified)
 
-    def test_the_26_writes_of_the_spec(self) -> None:
-        assert sum(len(names) for names in _INVALIDATING_WRITES.values()) == 26
+    def test_the_28_writes_of_the_spec(self) -> None:
+        assert sum(len(names) for names in _INVALIDATING_WRITES.values()) == 28
 
     @pytest.mark.parametrize("cls", list(_CLASSIFIED), ids=_ids(_CLASSIFIED))
     def test_every_invalidating_write_is_wrapped_and_nothing_else(self, cls: type) -> None:
@@ -3855,7 +3860,7 @@ class TestQueryCacheDocs:
 
     def test_section_29_follows_section_28(self) -> None:
         """Right after section 28 (after its "Coming from" bullets), then section 30 (v0.29.0), section 31
-        (v0.30.0) and section 32 (v0.31.0), and before the ``---`` of "Configuration Options"."""
+        (v0.30.0), section 32 (v0.31.0) and section 33 (v0.32.0), and before the ``---`` of "Configuration Options"."""
         readme = _readme()
         start_28 = readme.index(f"\n{_SECTION_28}\n")
         start_29 = readme.index(f"\n{_SECTION_29}\n")
@@ -3867,6 +3872,7 @@ class TestQueryCacheDocs:
             "### 30. Multiple databases (`add_connection()`, `using()`)",
             "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
             "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
+            "### 33. Materialized views (`view_query`, `define_view()`)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "section 29 ends before the --- of the next part"
 

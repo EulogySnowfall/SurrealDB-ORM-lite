@@ -1057,6 +1057,9 @@ def to_change_event(model: type[T], envelope: dict[str, Any], *, diff: bool) -> 
     end the consumer's ``async for`` and kill the subscription. The event carries the error in
     ``validation_error`` and an unvalidated instance, the way ``QuerySet.exec()`` falls back to
     plain rows instead of failing.
+
+    SurrealDB 3.x's notifications of a materialized view carry no ``id`` (v0.32.0): the instance of a view model
+    takes the notification's record id, while ``raw`` stays the record as received.
     """
     record = envelope.get("record")
     result = envelope.get("result")
@@ -1077,6 +1080,8 @@ def to_change_event(model: type[T], envelope: dict[str, Any], *, diff: bool) -> 
                 if name not in changed:
                     changed.append(name)
     error: ValidationError | None = None
+    if isinstance(payload, dict) and "id" not in payload and record is not None and model._is_view():
+        payload = {**payload, "id": record}
     if isinstance(payload, dict):
         instance, error = hydrate(model, payload)
     else:

@@ -2290,10 +2290,11 @@ _COMING_FROM_31 = [
     "the ORM's connection name, which routing, reconnects and the generated models' `connection=` key need (full ORM: "
     "an `HTTPConnection`).",
     "- **Generated models use comments** where the full ORM writes `SurrealConfigDict(permissions=…, changefeed=…, "
-    "view_query=…, relation_in=…, relation_out=…, enforced=…)` (`# Permissions: …`, `# Changefeed: …`, "
-    "`# View: AS …`, `# IN … OUT … ENFORCED`), and the base class where it writes `table_type=` (`BaseSurrealEdge` "
-    "for a relation table): those keys arrive in the lite's `SurrealConfigDict` with v0.32.0–v0.34.0. `READONLY` is "
-    "a comment too (full ORM: `Field(readonly=True)`).",
+    "relation_in=…, relation_out=…, enforced=…)` (`# Permissions: …`, `# Changefeed: …`, `# IN … OUT … ENFORCED`), "
+    "and the base class where it writes `table_type=` (`BaseSurrealEdge` for a relation table): those keys arrive in "
+    "the lite's `SurrealConfigDict` with later minors. A view is generated with `view_query=…` since v0.32.0, as in "
+    "the full ORM (a `# View: AS …` comment when the lite cannot declare it: an edge, a computed field, a query it "
+    "refuses). `READONLY` is a comment too (full ORM: `Field(readonly=True)`).",
     "- **`RecordID` instead of `ForeignKey`/`ReferencesField`**; no `VectorField` or `Encrypted`; `computed()` "
     "instead of `Computed()`; `Duration`, `UUID`, `Decimal` and the geometry classes instead of `str`, `dict` and "
     "`float`; nested fields become sub-models (full ORM: dotted attribute lines).",
@@ -2370,7 +2371,7 @@ _ROADMAP_ROWS_31 = [
     ["v0.29.0", "Tier 2 — Multi-database", "✅ Released"],
     ["v0.30.0", "Tier 3 — Schema introspection", "✅ Released"],
     ["v0.31.0", "Tier 3 — Server-side events and DDL helpers", "✅ Released"],
-    ["v0.32.0 – v0.39.0", "Tier 3 — Advanced (search, DDL, migrations, CLI)", "📋 Planned"],
+    ["v0.32.0", "Tier 3 — Materialized views", "✅ Released"],
 ]
 _COMPARISON_ROW_31 = ["Schema Introspection", "✅ v0.30.0 (`DatabaseIntrospector`, `generate_models_from_db()`)", "✅"]
 #: Spec §11.1 item 5: the six rows v0.30.0 adds to the 2.x/3.x table, cell by cell, then the row of a regex the two
@@ -2561,8 +2562,8 @@ class TestReadmeSection31:
     roadmap, comparison and both behaviour tables (spec §11.1 items 2–6)."""
 
     def test_section_31_follows_section_30(self) -> None:
-        """Right after section 30 (after its "Coming from" bullets), then section 32 (v0.31.0), and before the
-        ``---`` of "Configuration Options"."""
+        """Right after section 30 (after its "Coming from" bullets), then section 32 (v0.31.0), then section 33
+        (v0.32.0), and before the ``---`` of "Configuration Options"."""
         readme = _readme()
         start_30 = readme.index(f"\n{_SECTION_30}\n")
         start_31 = readme.index(f"\n{_SECTION_31}\n")
@@ -2572,6 +2573,7 @@ class TestReadmeSection31:
             _SECTION_30,
             _SECTION_31,
             "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
+            "### 33. Materialized views (`view_query`, `define_view()`)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
@@ -2657,7 +2659,7 @@ class TestReadmeSection31:
         roadmap = [cells for _, cells in _table_rows(_readme_part("## Roadmap"))]
         start = [cells[0] for cells in roadmap].index("v0.29.0")
         assert roadmap[start : start + 4] == _ROADMAP_ROWS_31, roadmap
-        assert roadmap[start + 4][0] == "v0.40.0", roadmap
+        assert roadmap[start + 4][0] == "v0.33.0 – v0.39.0", roadmap
 
     def test_comparison_row(self) -> None:
         """Spec §11.1 item 4: the label stays ``Schema Introspection``, the lite cell names the API, the full ORM's

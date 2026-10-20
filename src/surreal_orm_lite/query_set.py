@@ -618,7 +618,8 @@ class QuerySet:
         connection, with the same identity, less than ``ttl`` seconds ago, and no ORM write that can change its result
         has completed since: a write to a table it reads; any write, when it follows links (``fetch()``, a dotted path
         such as ``filter(**{"author.name": …})``, a ``select()`` item that is not a plain field, such as
-        ``"author.*"``); any delete, when it reads an edge model (a deleted record's edges go with it).
+        ``"author.*"``) or a materialized view model (``view_query``, v0.32.0), directly or through a ``Subquery``;
+        any delete, when it reads an edge model (a deleted record's edges go with it).
         Each hit builds new instances from a copy of the cached rows: changing one never changes the cache.
 
         ``ttl`` is the oldest result this read accepts, in seconds (an ``int`` or a ``float`` >= 0) or a ``timedelta``;
@@ -640,10 +641,10 @@ class QuerySet:
         another process or client, raw SurrealQL (``raw_query()``, ``QuerySet.query()``, ``call_function()``,
         ``Transaction.add()``), a write cancelled or failed client-side after its request was sent, writes made by an
         access method's own ``SIGNIN``/``SIGNUP`` clauses, what the server derives on its own (``DEFINE EVENT``,
-        ``REFERENCE … ON DELETE``, views over other tables), values computed when the read runs (``Var()`` of a
-        ``DEFINE PARAM``, ``<future>``/``COMPUTED`` fields, time functions in a ``select()`` expression): the TTL bounds
-        them; call ``QueryCache.invalidate(Model)`` after such a write, ``QueryCache.clear()`` after changing the session
-        behind the ORM's back.
+        ``REFERENCE … ON DELETE``, views over other tables read by a model without ``view_query``), values computed
+        when the read runs (``Var()`` of a ``DEFINE PARAM``, ``<future>``/``COMPUTED`` fields, time functions in a
+        ``select()`` expression): the TTL bounds them; call ``QueryCache.invalidate(Model)`` after such a write,
+        ``QueryCache.clear()`` after changing the session behind the ORM's back.
 
         Returns:
             Self: the queryset, for chaining.
@@ -664,8 +665,8 @@ class QuerySet:
     def _reject_time_travel(self, method: str) -> None:
         """Refuse *method* (a write or a stream, named with its ``()``) on a queryset read ``as_of()`` (v0.26.0).
 
-        A time-travel read is read-only and cannot be streamed: the first statement of each such method, so
-        nothing is sent and no client is acquired.
+        A time-travel read is read-only and cannot be streamed: called at the start of each such method — right
+        after a write's materialized-view check (v0.32.0) —, so nothing is sent and no client is acquired.
         """
         if self._as_of is not None:
             raise SurrealDbError(_time_travel.queryset_refused(method))
@@ -787,6 +788,8 @@ class QuerySet:
         parts: list[str] = []
         variables: dict[str, Any] = {}
         endpoint_columns = self.model._endpoint_columns()
+        # A view model's id__in compiles "$_f0 CONTAINS id" (v0.32.0): SurrealDB 3.x answers no record to "id IN".
+        view = self.model._is_view()
 
         # Regular keyword filters (AND-joined)
         for field_name, lookup_name, value in self._filters:
@@ -798,13 +801,16 @@ class QuerySet:
                 self._model_table,
                 endpoint_columns=endpoint_columns,
                 subqueries=subqueries,
+                view=view,
             )
             parts.append(sql)
             variables.update(vars_)
 
         # Q object filters
         for q in self._q_filters:
-            sql, vars_, counter = q.to_sql(counter, self._model_table, self._column, endpoint_columns, subqueries=subqueries)
+            sql, vars_, counter = q.to_sql(
+                counter, self._model_table, self._column, endpoint_columns, subqueries=subqueries, view=view
+            )
             if sql:
                 parts.append(sql)
                 variables.update(vars_)
@@ -898,6 +904,8 @@ class QuerySet:
         compiler.tables.add(table)
         if self.model.__surreal_edge__:
             compiler.edge_tables.add(table)
+        if self.model._is_view():
+            compiler.view_tables.add(table)
         compiler.merge_variables(self._variables)
         if table in compiler.empty_tables:
             return "[]", {}, counter
@@ -1255,7 +1263,8 @@ class QuerySet:
         table and every table a subquery reads; ``EDGES`` when one of them is an edge model's (every delete
         invalidates it); "any table" when the statement follows links (``FETCH``, a dotted path, a graph arrow) or
         a ``select()`` item is neither ``*`` nor a plain field path (``author.*``: projection semantics read the
-        linked table). On a miss :meth:`_run_uncached` sends it, compiling it again
+        linked table), or it reads a materialized view model (v0.32.0), its own or a subquery's: SurrealDB recomputes
+        the view from tables the ORM does not track. On a miss :meth:`_run_uncached` sends it, compiling it again
         (compilation is pure), so the missing-subquery-table re-send happens inside the read; only the first
         compilation gives the filter values' warnings, once per read.
         """
@@ -1269,6 +1278,8 @@ class QuerySet:
             " FETCH " in query
             or follows_links(query)
             or any(item != "*" and not VALID_FIELD_PATTERN.match(item) for item in self.select_item)
+            or self.model._is_view()
+            or bool(compiler.view_tables)
         )
         return await self._cached_read(
             "query",
@@ -1528,7 +1539,8 @@ class QuerySet:
 
     async def _cached_select(self, target: RecordID | str, tables: frozenset[str], missing: Any) -> Any:
         """The SDK's ``select(target)`` through :meth:`_cached_read` (v0.28.0): keyed on the target,
-        tagged with its table (and ``EDGES`` on an edge model); *missing* when the server says it does not exist."""
+        tagged with its table (and ``EDGES`` on an edge model; "any table" on a materialized view model, v0.32.0);
+        *missing* when the server says it does not exist."""
         if self.model.__surreal_edge__:
             tables |= {EDGES}
 
@@ -1539,7 +1551,7 @@ class QuerySet:
             except NotFoundError:
                 return missing
 
-        return await self._cached_read("select", "", {"target": target}, tables, False, run)
+        return await self._cached_read("select", "", {"target": target}, tables, self.model._is_view(), run)
 
     @_cache.invalidates("table", deletes=True)
     async def delete_table(self) -> bool:
@@ -1554,6 +1566,7 @@ class QuerySet:
         not bring the rows back), so the cached reads of the table — and of every edge table,
         whose edges die with the records — are invalidated when it ends, never at a commit.
         """
+        self.model._reject_view_write("objects().delete_table()")
         self._reject_time_travel("delete_table()")
         client = await self._manager().get_client()
         with contextlib.suppress(NotFoundError):
@@ -1863,6 +1876,7 @@ class QuerySet:
                 any other refusal of an edge batch by the server; a model read with ``as_of()``
                 (a read-only snapshot) in ``models``, before any call (v0.26.0).
             SurrealDbNotFoundError: an endpoint of an ``ENFORCED`` relation that does not exist.
+            TypeError: the model is a materialized view (v0.32.0), before any call.
             ValueError: an edge id that is a ``RecordID`` of another table, or a ``bool``.
 
         Example::
@@ -1875,6 +1889,7 @@ class QuerySet:
                 Purchased(in_=bob, out=widget, quantity=1),
             ])  # one insert_relation() round-trip
         """
+        self.model._reject_view_write("objects().bulk_create()")
         self._reject_time_travel("bulk_create()")
         for model in models:
             moment = _snapshot_moment(model) if isinstance(model, BaseSurrealModel) else None
@@ -1946,6 +1961,7 @@ class QuerySet:
             The number of updated records (``0`` inside a buffered transaction, whose statements run at commit).
 
         Raises:
+            TypeError: the model is a materialized view (v0.32.0), before any request.
             ValueError: a value is a ``Subquery`` or a QuerySet (v0.27.0), before any request: filter with it, and
                 pass the value to write.
 
@@ -1954,6 +1970,7 @@ class QuerySet:
             count = await User.objects().filter(status="pending").bulk_update(status="active")
             count = await Post.objects().filter(author__in=Subquery(banned)).bulk_update(hidden=True)
         """
+        self.model._reject_view_write("objects().bulk_update()")
         self._reject_time_travel("bulk_update()")
         if not kwargs:
             return 0
@@ -1993,6 +2010,7 @@ class QuerySet:
             count = await User.objects().filter(status="inactive").bulk_delete()
             count = await Post.objects().filter(author__in=Subquery(banned)).bulk_delete()
         """
+        self.model._reject_view_write("objects().bulk_delete()")
         self._reject_time_travel("bulk_delete()")
 
         def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
@@ -2019,6 +2037,7 @@ class QuerySet:
                 [{"op": "replace", "path": "/plan", "value": "free"}]
             )
         """
+        self.model._reject_view_write("objects().patch()")
         self._reject_time_travel("patch()")
         validate_patch_operations(operations)
         self.model._reject_computed_patch(operations, "patch()")
@@ -2367,6 +2386,7 @@ class QuerySet:
         itself, or use ``regex``): ``members__contains=Var("auth")``. On an edge endpoint such a string raises the
         lookup's ``ValueError``.
         """
+        self.model._reject_view_write("objects().update_or_create()")
         self._reject_time_travel("update_or_create()")
         self._reject_subquery_writes(criteria, defaults, "update_or_create")
         self._reject_string_references(criteria)
@@ -2439,6 +2459,7 @@ class QuerySet:
         ``SurrealDbError``: a session parameter's value is only known to the database and cannot be written, nor can
         a name no ``variables()`` gives. On an edge endpoint such a string raises the lookup's ``ValueError``.
         """
+        self.model._reject_view_write("objects().get_or_create()")
         self._reject_time_travel("get_or_create()")
         self._reject_subquery_writes(criteria, defaults, "get_or_create")
         self._reject_string_references(criteria)

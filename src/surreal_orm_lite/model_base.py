@@ -27,9 +27,21 @@ from .routing import check_config_connection, check_same_connection, check_trans
 from .schema import (
     Event,
     check_events_config,
+    check_view_config,
+    check_view_query,
+    dependent_views,
     ensure_async_events_supported,
+    ensure_view_query_supported,
+    ensure_view_removable,
     event_subject,
+    read_table_definitions,
     remove_event_statement,
+    remove_view_statement,
+    table_holds_records,
+    table_kind,
+    view_statement,
+    view_table_refused,
+    view_write_refused,
 )
 from .signals import (
     around_delete,
@@ -553,6 +565,12 @@ class SurrealConfigDict(ConfigDict, total=False):
             every model option. Checked when the class is defined (a ``list`` or ``tuple`` of
             ``Event`` with distinct names), inherited by subclasses unless they set their own — a
             subclass with another table defines the same events on its own table.
+        view_query (str | None): The SELECT of a materialized view (v0.32.0) — SurrealDB's
+            DEFINE TABLE … AS SELECT: the model's table is computed by the server from this query
+            and kept up to date as its source tables change. Full SurrealDB-ORM key. Checked when
+            the class is defined; applied by define_view(); every write of the model raises
+            TypeError. Inherited by subclasses unless they set their own (view_query=None makes a
+            subclass an ordinary model).
     """
 
     table_name: str | None
@@ -563,6 +581,9 @@ class SurrealConfigDict(ConfigDict, total=False):
 
     events: Sequence[Event] | None
     " Server-side events of the model's table (v0.31.0): Event(...) objects, applied by define_events(). "
+
+    view_query: str | None
+    " A materialized view's SELECT (v0.32.0): the model reads a table SurrealDB computes from it; its writes raise. Full SurrealDB-ORM key. "
 
     primary_key: str | None
     " The primary key field name for the model. "
@@ -637,9 +658,10 @@ class BaseSurrealModel(BaseModel):
     def _reject_snapshot_write(self, method: str) -> None:
         """Refuse *method* (named with its ``()``) on a snapshot, an instance read with ``as_of()`` (v0.26.0).
 
-        The first statement of every instance write, so nothing runs before it: no signal, no transaction, no
-        request. The marker is read through :func:`_snapshot_moment`, the only reader (an instance pickled by
-        v0.25.x may have no private state).
+        Called at the start of every instance write — right after the materialized-view check of the writes that
+        have one (:meth:`_reject_view_write`, v0.32.0) —, so no signal, transaction or request runs before it. The
+        marker is read through :func:`_snapshot_moment`, the only reader (an instance pickled by v0.25.x may have no
+        private state).
 
         Raises:
             SurrealDbError: the instance holds the record as it was at a moment, not the current record.
@@ -692,7 +714,10 @@ class BaseSurrealModel(BaseModel):
         ``get_table_name()`` is interpolated into SurrealQL. The ``connection`` key (v0.29.0) is
         checked here too: a non-empty ``str``, or ``None`` for the default connection. So is the
         ``events`` key (v0.31.0): ``None``, or a ``list`` or ``tuple`` of ``Event`` with distinct
-        names — an inherited value is checked again, the messages naming the subclass.
+        names — an inherited value is checked again, the messages naming the subclass. So is the
+        ``view_query`` key (v0.32.0): ``None``, or one ``SELECT`` (``schema.check_view_query()``)
+        on a model that is not an edge, does not mix in ``AuthenticatedUserMixin`` and declares no
+        computed field (``schema.check_view_config()``) — inherited values included.
 
         The deprecated ``_table_name: ClassVar[str]`` is checked the same way and warns once,
         where it is defined — a subclass inheriting it does not warn again.
@@ -707,6 +732,18 @@ class BaseSurrealModel(BaseModel):
         events = cls.model_config.get("events")
         if events is not None:
             check_events_config(cls, events)
+        view_query = cls.model_config.get("view_query")
+        if view_query is not None:
+            # Imported here, only for a view model: model_auth sits above this module.
+            from .model_auth import AuthenticatedUserMixin
+
+            check_view_config(
+                cls,
+                view_query,
+                edge=cls.__surreal_edge__,
+                user=issubclass(cls, AuthenticatedUserMixin),
+                computed=tuple(cls.__surreal_computed__),
+            )
         legacy = cls.__dict__.get("_table_name")
         if isinstance(legacy, str):
             _check_table_name(cls, "_table_name", legacy)
@@ -921,6 +958,238 @@ class BaseSurrealModel(BaseModel):
             kind="removal",
             classify=True,
             subjects=[event_subject(event, table)],
+        )
+        return statement
+
+    # ==================== Materialized views (v0.32.0) ====================
+
+    @classmethod
+    def get_view_query(cls) -> str | None:
+        """Return the ``SELECT`` of this model's materialized view, or ``None`` for an ordinary model (v0.32.0).
+
+        A model with ``model_config = SurrealConfigDict(view_query="SELECT …")`` reads a table SurrealDB computes
+        from that query (``DEFINE TABLE … AS SELECT``) and keeps up to date as the tables it selects from change;
+        every write of the model raises ``TypeError`` — write to those tables instead. The query is returned
+        stripped, one final ``;`` dropped: the text :meth:`view_ddl` embeds. A subclass inherits it unless it sets
+        its own (``view_query=None`` makes the subclass an ordinary model).
+        """
+        value = cls.model_config.get("view_query")
+        if value is None:
+            return None
+        # Checked at the class statement, so this only strips the text.
+        return check_view_query(value, model=cls.__name__)
+
+    @classmethod
+    def _is_view(cls) -> bool:
+        """``True`` when the model is a materialized view — ``view_query`` is set (v0.32.0; the full ORM's name).
+
+        The same answer as ``get_view_query() is not None``, without reading the query again: ``view_query`` was
+        checked when the class was defined.
+        """
+        return cls.model_config.get("view_query") is not None
+
+    @classmethod
+    def _reject_view_write(cls, call: str) -> None:
+        """Refuse *call* (``"save()"``, ``"objects().bulk_update()"``) on a materialized view model (v0.32.0).
+
+        SurrealDB computes a view's records from its ``view_query``, so the ORM never writes them: the first statement
+        of every ORM write of the model — the instance writes and the queryset's — before the snapshot check, any
+        signal, transaction use or request. The relation helpers write the edge table, not the view, and stay
+        allowed; raw SurrealQL is never guarded.
+
+        Raises:
+            TypeError: the model is a materialized view (W1, naming the class and *call*).
+        """
+        if cls._is_view():
+            raise TypeError(view_write_refused(cls.get_table_name(), f"{cls.__name__}.{call}"))
+
+    @classmethod
+    def _require_view(cls, method: str) -> str:
+        """The model's view query (:meth:`get_view_query`), or V11 naming *method* (``"view_ddl()"``) (v0.32.0).
+
+        Raises:
+            TypeError: the model is not a materialized view (no ``view_query``).
+        """
+        query = cls.get_view_query()
+        if query is None:
+            raise TypeError(
+                f'{cls.__name__} is not a materialized view: set model_config = SurrealConfigDict(view_query="SELECT …") '
+                f"to use {method}."
+            )
+        return query
+
+    @classmethod
+    def view_ddl(cls, *, overwrite: bool = True) -> str:
+        """Render the ``DEFINE TABLE … AS (…)`` statement of this materialized view (v0.32.0).
+
+        Pure: builds the SurrealQL without touching the database (no connection needed), the same text every time,
+        so it can be printed, diffed or fed into a migration. ``DEFINE TABLE {OVERWRITE | IF NOT EXISTS} `<table>`
+        AS (<query>);`` — the table of :meth:`get_table_name` in backticks, :meth:`get_view_query` inside one pair
+        of parentheses (the full SurrealDB-ORM's form). SurrealDB computes the view's records from the query and
+        keeps them up to date as the tables it selects from change; every write of the model raises ``TypeError``.
+
+        The query is written into the DDL as declared: a view's query is trusted application code, never user
+        input. The check made when the class was defined catches mistakes — unbalanced brackets, a comment that
+        would swallow the parenthesis the ORM appends, a second statement where one SELECT is expected — and is not
+        an injection defence. To filter on a value, store it in a record or a ``DEFINE PARAM`` and read it from the
+        query; never format it into the text.
+
+        Args:
+            overwrite: ``True`` (default) emits ``DEFINE TABLE OVERWRITE …``, which recomputes the view from the
+                query — the model is the source of truth, so re-running converges the database onto the code.
+                ``False`` emits ``DEFINE TABLE IF NOT EXISTS …``, which leaves an existing table as it is.
+
+        Raises:
+            TypeError: the model is not a materialized view (no ``view_query``); *overwrite* is not a ``bool``.
+
+        Example:
+            >>> OrderStats.view_ddl()
+            'DEFINE TABLE OVERWRITE `order_stats` AS (SELECT status, count() AS total FROM orders GROUP BY status);'
+        """
+        query = cls._require_view("view_ddl()")
+        return view_statement(cls.get_table_name(), query, overwrite)
+
+    @classmethod
+    @_cache.invalidates("cls")
+    async def define_view(cls, *, overwrite: bool = True, tx: Transaction | None = None) -> str:
+        """Apply this materialized view to the database (v0.32.0) and return the statement applied.
+
+        Sends :meth:`view_ddl` on the model's connection (the ``using()`` block's, else
+        ``SurrealConfigDict(connection=…)``, else ``"default"``). SurrealDB fills the view from the tables its query
+        selects from at once, then keeps it up to date as they change; every write of the model raises
+        ``TypeError`` — write to those tables instead. Those source tables must exist (``DEFINE TABLE`` them, or
+        write a record first): the refusal names a missing one. Safe to call at application start-up: with the
+        default ``overwrite=True`` each call recomputes the view from the query, so the database converges onto the
+        model.
+
+        ``OVERWRITE`` recomputes the view and drops the events, fields and indexes defined on its table: run
+        :meth:`define_events` **after** ``define_view()``. ``overwrite=False`` (``IF NOT EXISTS``) leaves an existing
+        view as it is, whatever its query.
+
+        On SurrealDB 2.x and the embedded engine, a grouped view is refused before any DDL when its projection holds
+        an element those engines compute once per source record instead of keeping it up to date —
+        ``math::stddev()``/``math::variance()``, an expression around an aggregate (``math::sum(amount) / count()``),
+        a field outside ``GROUP BY`` and outside an aggregate, a ``GROUP BY`` on an alias: the view would hold a wrong
+        value or one group, or every write to its source table would be refused. SurrealDB 3.x keeps such a view up
+        to date (or refuses a field outside ``GROUP BY`` itself). The line is read from ``client.version()`` only when
+        the query holds such an element; what a reading of the text cannot see (a sub-select, a graph path, a
+        backquoted field, a field's type) is left to the server.
+
+        Before the DDL, a table guard reads ``INFO FOR DB`` once (and, for an ordinary table, ``SELECT id … LIMIT
+        1``), on committed state, outside any transaction: the view never replaces an ordinary table that holds
+        records — ``OVERWRITE`` would delete them —, an empty ordinary table (one an event or a 2.x live query
+        created first) becomes the view, and ``overwrite=False`` refuses an ordinary table, which ``IF NOT EXISTS``
+        would leave as it is. The guard is a check, then the DDL, not a lock: a record another process writes in
+        between is not seen.
+
+        The query is written into the DDL as declared: a view's query is trusted application code, never user
+        input. The check made when the class was defined catches mistakes — unbalanced brackets, a comment that
+        would swallow the parenthesis the ORM appends, a second statement where one SELECT is expected — and is not
+        an injection defence. A refusal names the view's table and keeps the server's reason (``Can't apply view
+        definition: 'order_stats' -> The table 'orders' does not exist``), never the statement. Applying needs a
+        session allowed to define (a system user such as root, or a namespace or database ``OWNER``/``EDITOR``).
+
+        Args:
+            overwrite: see :meth:`view_ddl`.
+            tx: optional transaction the statement is applied with; the guard reads before anything is queued.
+
+        Raises:
+            TypeError: the model is not a materialized view; *overwrite* is not a ``bool`` — before any request.
+            SurrealDbError: *tx* belongs to another connection — before any request; the connection runs SurrealDB
+                2.x or the embedded engine and the grouped projection holds an element they compute once per source
+                record — before any request but ``version()``; the table exists, is not a view and holds records, or
+                ``overwrite=False`` meets an ordinary table, or its definition cannot be read — before any DDL; the
+                server refused the statement (``Can't apply view definition: …``). In a buffered transaction (*tx*
+                over HTTP, on SurrealDB 2.x or the embedded engine) the statement is only queued: a refusal comes back
+                when the block commits, as the transaction's own error, never as ``SurrealDbAuthenticationError``.
+            SurrealDbAuthenticationError: the session may not read the database's definitions or define the view.
+
+        Example:
+            >>> await OrderStats.define_view()
+            'DEFINE TABLE OVERWRITE `order_stats` AS (SELECT status, count() AS total FROM orders GROUP BY status);'
+        """
+        query = cls._require_view("define_view()")
+        statement = cls.view_ddl(overwrite=overwrite)
+        table = cls.get_table_name()
+        manager = cls._connection_manager()
+        # Cheap even inside a transaction: get_client() returns the already-connected client.
+        client = await manager.get_client()
+        await ensure_view_query_supported(client, query, model=cls.__name__, embedded=manager.is_embedded())
+        tables = await read_table_definitions(client, table, kind="definition")
+        existing = table_kind(tables, table)
+        if existing is not None and existing != "view":
+            if not overwrite:
+                raise SurrealDbError(view_table_refused("G4" if existing == "table" else "G3", cls.__name__, table))
+            if await table_holds_records(client, table, kind="definition"):
+                raise SurrealDbError(view_table_refused("G1" if existing == "table" else "G3", cls.__name__, table))
+        await apply_ddl_statements(
+            [statement], client=client, tx=tx, what="view", classify=True, subjects=[repr(table)], redact=False
+        )
+        return statement
+
+    @classmethod
+    @_cache.invalidates("cls")
+    async def remove_view(cls, *, missing_ok: bool = True, tx: Transaction | None = None) -> str:
+        """Remove this materialized view from the database (v0.32.0) and return the statement applied.
+
+        Sends ``REMOVE TABLE [IF EXISTS] `<table>`;`` on the model's connection: the view, its records and the
+        events defined on it are removed; the tables it selects from are left as they are. Before it, a table guard
+        reads ``INFO FOR DB`` once, on committed state, outside any transaction: ``remove_view()`` removes views only,
+        never an ordinary table (removing one would delete its records, fields, indexes and events).
+
+        **Remove the views that read another view first.** While a view reads this one, SurrealDB 3.x refuses the
+        removal itself (``Can't apply view removal: '<table>' -> … Cannot delete table …``, the server's reason
+        whole). SurrealDB 2.x and the embedded engine would remove it and turn every view that reads it into an
+        ordinary table that keeps its last records and no longer updates: on them ``remove_view()`` raises before any
+        DDL, naming those views. They are found in the same ``INFO FOR DB``, through the plain ``FROM`` targets of
+        their queries only (a view reading the table through a graph path or a sub-select is left to the server), and
+        the line is read from ``client.version()`` only when one is found.
+
+        Args:
+            missing_ok: ``True`` (default) emits ``REMOVE TABLE IF EXISTS …``, so a missing view is not an error;
+                ``False`` raises ``SurrealDbNotFoundError`` for it.
+            tx: optional transaction the statement is applied with; the guard reads before anything is queued.
+
+        Raises:
+            TypeError: the model is not a materialized view; *missing_ok* is not a ``bool`` — before any request.
+            SurrealDbNotFoundError: ``missing_ok=False`` and the table does not exist.
+            SurrealDbAuthenticationError: the session may not read the database's definitions or remove the view.
+            SurrealDbError: *tx* belongs to another connection — before any request; the table is not a view, or its
+                definition cannot be read — before any DDL; other views read it and the connection runs SurrealDB 2.x
+                or the embedded engine — before any request but ``version()``; any other refusal (``Can't apply view
+                removal: …``), such as SurrealDB 3.x refusing to remove a view another view reads. In a buffered
+                transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the statement is only queued: a
+                refusal comes back when the block commits, as the transaction's own ``SurrealDbError``, never as
+                ``SurrealDbNotFoundError`` or ``SurrealDbAuthenticationError`` — ``missing_ok=False`` included.
+
+        Example:
+            >>> await OrderStats.remove_view()
+            'REMOVE TABLE IF EXISTS `order_stats`;'
+        """
+        cls._require_view("remove_view()")
+        table = cls.get_table_name()
+        statement = remove_view_statement(table, missing_ok)
+        manager = cls._connection_manager()
+        client = await manager.get_client()
+        tables = await read_table_definitions(client, table, kind="removal")
+        existing = table_kind(tables, table)
+        if existing == "table":
+            raise SurrealDbError(view_table_refused("G2", cls.__name__, table))
+        if existing == "unreadable":
+            raise SurrealDbError(view_table_refused("G3", cls.__name__, table, removal=True))
+        if existing == "view":
+            await ensure_view_removable(
+                client, table, dependent_views(tables, table), model=cls.__name__, embedded=manager.is_embedded()
+            )
+        await apply_ddl_statements(
+            [statement],
+            client=client,
+            tx=tx,
+            what="view",
+            kind="removal",
+            classify=True,
+            subjects=[repr(table)],
+            redact=False,
         )
         return statement
 
@@ -1980,6 +2249,7 @@ class BaseSurrealModel(BaseModel):
             values are unknown until commit, so the instance keeps its pre-save values for
             those fields — ``refresh()`` after commit if you need them.
         """
+        self._reject_view_write("save()")
         self._reject_snapshot_write("save()")
         self._validate_server_values(server_values, extra_vars)
         if server_values:
@@ -2258,6 +2528,7 @@ class BaseSurrealModel(BaseModel):
         in a transaction ``around_save`` is skipped and ``post_save`` is deferred to a
         successful commit (consistent with ``save(tx=)``).
         """
+        self._reject_view_write("upsert()")
         self._reject_snapshot_write("upsert()")
         return await self._save_with_signals(self._do_upsert, tx)
 
@@ -2306,6 +2577,7 @@ class BaseSurrealModel(BaseModel):
             The updated row as the SDK reads it (``[]`` for a record that does not exist), or
             ``None`` in a transaction.
         """
+        self._reject_view_write("update()")
         self._reject_snapshot_write("update()")
         sender = self.__class__
         data = self._write_payload(replace=True)
@@ -2469,6 +2741,7 @@ class BaseSurrealModel(BaseModel):
             >>> await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
             >>> await user.merge(last_seen=now, refresh=False)  # fire-and-forget
         """
+        self._reject_view_write("merge()")
         self._reject_snapshot_write("merge()")
         self._reject_computed_writes(data, "merge()")
         self._validate_server_values(server_values, extra_vars)
@@ -2531,6 +2804,7 @@ class BaseSurrealModel(BaseModel):
         name a field either way — ``/password`` or its column ``/password_hash`` — and are
         rewritten to the column before they are sent.
         """
+        self._reject_view_write("patch()")
         self._reject_snapshot_write("patch()")
         validate_patch_operations(operations)
         self._reject_computed_patch(operations, "patch()")
@@ -2554,8 +2828,10 @@ class BaseSurrealModel(BaseModel):
         (robust for any id type; anti-injection); only the validated ``set_expr`` is inlined.
         Non-tx and interactive-tx apply the returned row to ``self``; a buffered tx leaves
         ``self`` stale (the new value is computed server-side, unknown until commit).
-        ``label`` is the calling method's name with its ``()``, for the snapshot refusal (v0.26.0).
+        ``label`` is the calling method's name with its ``()``, for the view refusal (v0.32.0) and the snapshot
+        refusal (v0.26.0).
         """
+        self._reject_view_write(label)
         self._reject_snapshot_write(label)
         record_id = self._record_id()
         if record_id is None:
@@ -2702,6 +2978,7 @@ class BaseSurrealModel(BaseModel):
         ``around_delete`` is skipped (the write is deferred to commit) and
         ``post_delete`` only fires after a successful commit.
         """
+        self._reject_view_write("delete()")
         self._reject_snapshot_write("delete()")
         sender = self.__class__
         record_id = self._record_id()

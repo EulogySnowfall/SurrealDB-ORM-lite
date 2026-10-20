@@ -40,7 +40,8 @@
 | v0.29.0           | Tier 2 — Multi-database                             | Done    |
 | v0.30.0           | Tier 3 — Schema introspection                       | Done    |
 | v0.31.0           | Tier 3 — Server-side events & DDL helpers           | Done    |
-| v0.32.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 8 minors | Planned |
+| v0.32.0           | Tier 3 — Materialized views                         | Done    |
+| v0.33.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 7 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                  | Planned |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)              | Planned |
 | v2.1.0+           | Future (post-GA)                                    | Future  |
@@ -98,7 +99,7 @@ pieces stay out.
 | Schema introspection                   | `INFO FOR DB` / `INFO FOR TABLE`                      | ✅ v0.30.0     |
 | `DEFINE EVENT` (triggers)              | DDL via `query()`                                     | ✅ v0.31.0     |
 | `define_function()` DDL helper         | `DEFINE FUNCTION` via `query()` (`schema.py`)         | ✅ v0.31.0     |
-| Materialized views                     | `DEFINE TABLE … AS SELECT`                            | v0.32.0        |
+| Materialized views                     | `DEFINE TABLE … AS SELECT`                            | ✅ v0.32.0     |
 | `TYPE RELATION` enforcement            | `DEFINE TABLE … TYPE RELATION`                        | v0.33.0        |
 | Full-Text Search (BM25)                | `DEFINE ANALYZER` + `SEARCH` index + `search::*`      | v0.34.0        |
 | Vector Search (KNN, HNSW/MTREE)        | `DEFINE INDEX … HNSW/MTREE` + KNN operator            | v0.35.0        |
@@ -161,7 +162,7 @@ moves it to the `surrealdb[embedded]` extra.
 | Multi-database                | yes        | ✅ v0.29.0                  |
 | Schema introspection          | yes        | ✅ v0.30.0                  |
 | DEFINE EVENT                  | yes        | ✅ v0.31.0                  |
-| Materialized views            | yes        | v0.32.0                     |
+| Materialized views            | yes        | ✅ v0.32.0                  |
 | TYPE RELATION enforcement     | yes        | v0.33.0                     |
 | Full-Text Search (BM25)       | yes        | v0.34.0                     |
 | Vector Search (KNN/HNSW)      | yes        | v0.35.0                     |
@@ -642,6 +643,37 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   (migrations), declarative `events=[...]` in generated models, query-cache invalidation of the
   tables events write
 
+### Version 0.32.0 — Materialized views
+
+- `SurrealConfigDict(view_query="SELECT …")`, the full SurrealDB-ORM's key, declares a read-only
+  model over a table SurrealDB computes from that query; `get_view_query()` and `_is_view()`;
+  `Model.view_ddl()` (pure, ``DEFINE TABLE OVERWRITE `<table>` AS (…)``), `Model.define_view()`
+  (idempotent, `OVERWRITE`; `overwrite=False` for `IF NOT EXISTS`) and `Model.remove_view()`,
+  both with `tx=`. The query is checked when the class is defined (one `SELECT`, no `ORDER BY`,
+  `LIMIT`, `FETCH` or `SELECT VALUE`); it is trusted application code, and the check catches
+  mistakes and is not an injection defence
+- The ORM refuses: every write of a view model (`TypeError` before any request, the full ORM's
+  first words, on every write path); on SurrealDB 2.x and the embedded engine, the grouped
+  projections those engines compute per source record (`math::stddev()`/`math::variance()`, an
+  expression around an aggregate, a field outside `GROUP BY`, a `GROUP BY` on an alias), before
+  any DDL; turning a table that holds records into a view, `IF NOT EXISTS` over an ordinary table
+  and removing a table that is not a view (the table guard); and, on 2.x and the embedded engine,
+  removing a view that another view reads (3.x refuses it itself)
+- Grouped views' ids are arrays: `get(["paid"])` and `filter(id=[...])` address them (a list or
+  tuple given as a record id is an array id for every model). `generate_models_from_db()` writes
+  view models with `view_query=`; reads of a view model are dropped from the query cache by every
+  ORM write; on a view model `id__in` is sent as `CONTAINS`, and on 3.x `live()` instances take
+  their id from the notification's record
+- Measured differences: raw writes to a view accepted by 2.x and 3.1, refused by 3.2+; `int` sums
+  and `Decimal` means on 2.x, `float` on 3.x; `count()` of an array field; an emptied group
+  notified as `UPDATE` then `DELETE` on 2.x, `DELETE` on 3.x; on 3.x a live query on a view
+  filtered on `id` never notifies; 3.1 refuses to redefine a view that holds records. Same code
+  on 2.7.0, 3.3.4 and the embedded engine (3.1.5 retro)
+- Deferred: migrations (`CreateTable`/`AlterTable` with `view_query`) and `define_table()` →
+  v0.37.0, whose `define_table()` will accept a view model and apply it through `view_ddl()`;
+  table permissions for record users (a view is defined with SurrealDB's default
+  `PERMISSIONS NONE`) and a view query built from a QuerySet
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -847,7 +879,7 @@ servers (3.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too.
 | ---------- | ------------------------------------------------------------------------------ | -------------------------------- |
 | ✅ v0.30.0 | Schema introspection (inspectdb, read-only)                                    | `INFO FOR DB` / `INFO FOR TABLE` |
 | ✅ v0.31.0 | `DEFINE EVENT` (server-side triggers)                                          | DDL via `query()`                |
-| v0.32.0    | Materialized views (read-only models)                                          | `DEFINE TABLE … AS SELECT`       |
+| ✅ v0.32.0 | Materialized views (read-only models)                                          | `DEFINE TABLE … AS SELECT`       |
 | v0.33.0    | `TYPE RELATION` enforcement (graph constraints), building on `BaseSurrealEdge` | `DEFINE TABLE … TYPE RELATION`   |
 
 ### 🔎 Phase G — Advanced search

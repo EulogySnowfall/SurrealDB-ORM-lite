@@ -13,6 +13,11 @@ the field lines (``Computed`` and its server-form fallback, literal defaults, ``
 aliases, ``READONLY``), sub-models, class blocks, the three ``model_config`` forms with their 128-column boundaries,
 the module layout (imports, skip lines S1–S6), and generated modules that compile, pass ruff (isolated, the options
 of spec §9.1) and import — with the injection corpus at every position. Unit tests only (no server).
+
+Materialized views (v0.32.0, spec §6.7, D12; AC-16 unit part): a view table is generated as a view model
+(``view_query="…"``, ``# Read-only materialized view``, ``id: RecordID | None = None``), a long query on one line; an
+edge, a class with a ``Computed`` field and a query ``check_view_query()`` refuses keep v0.30.0's output. The round trip
+against the servers is ``tests/test_views.py``'s ``TestViewRoundTripE2E``.
 """
 
 import ast
@@ -34,6 +39,7 @@ from types import ModuleType
 from typing import Any
 
 import pytest
+from surrealdb import RecordID
 
 import surreal_orm_lite
 from surreal_orm_lite import Duration, ModelCodeGenerator
@@ -60,6 +66,7 @@ from surreal_orm_lite.model_generator import (
     _skip_reason,
     _width,
 )
+from surreal_orm_lite.schema import ViewHazard, check_view_query, view_query_hazards, view_query_outline
 from surreal_orm_lite.schema_state import (
     EventState,
     FieldState,
@@ -1771,6 +1778,9 @@ class TestClasses:
         assert len(line) == 128
 
     def test_comments(self) -> None:
+        """v0.32.0 (spec §6.7, D12): a view table whose query passes the model's check is a view model — its
+        ``view_query`` in ``model_config`` after ``table_name=``, the full ORM's comment in the place of ``View: AS …``,
+        and a ``RecordID`` id (a grouped view's ids are arrays)."""
         source = _generate(
             _f("a", "int"),
             name="v1",
@@ -1789,13 +1799,19 @@ class TestClasses:
                 "e1": EventState("e1", "v1", "true", "(x)"),
             },
         )
-        assert _class_block(source, "V1").splitlines()[:5] == [
-            "class V1(BaseSurrealModel):",
-            "    # Comment: it's a view",
-            "    # View: AS SELECT count() AS total FROM src GROUP ALL",
-            "    # Indexes: by_a (UNIQUE), cnt (COUNT), ft (FULLTEXT), hn (HNSW), mt (MTREE), plain",
-            "    # Events: e1, e2",
-        ]
+        assert _class_block(source, "V1") == (
+            "class V1(BaseSurrealModel):\n"
+            "    # Comment: it's a view\n"
+            "    # Read-only materialized view\n"
+            "    # Indexes: by_a (UNIQUE), cnt (COUNT), ft (FULLTEXT), hn (HNSW), mt (MTREE), plain\n"
+            "    # Events: e1, e2\n"
+            '    model_config = SurrealConfigDict(table_name="v1", view_query="SELECT count() AS total FROM src GROUP ALL")\n'
+            "\n"
+            "    id: RecordID | None = None\n"
+            "    a: int\n"
+        )
+        assert "\nfrom surrealdb import RecordID\n" in source
+        assert "View: AS" not in source
 
     def test_long_comment_is_cut(self) -> None:
         source = _generate(comment="z" * 300)
@@ -1992,6 +2008,155 @@ class TestClasses:
         assert _class_block(_generate(), "T") == (
             'class T(BaseSurrealModel):\n    model_config = SurrealConfigDict(table_name="t")\n\n    id: str | None = None\n'
         )
+
+
+#: v0.32.0: a grouped view query and a ``GROUP ALL`` one, as ``INFO FOR DB`` renders them.
+_STATS_VIEW = "SELECT status, count() AS total, math::sum(amount) AS revenue FROM orders GROUP BY status"
+_TOTALS_VIEW = "SELECT count() AS total FROM src GROUP ALL"
+
+#: Spec §6.7: view queries ``check_view_query()`` refuses (V3–V7): the class keeps v0.30.0's output.
+_REFUSED_VIEW_QUERIES = [
+    "SELECT * FROM t WHERE x = /a(/",
+    "SELECT VALUE a FROM t",
+    "SELECT a FROM t; SELECT b FROM t",
+    "SELECT g, math::median(v) AS m FROM t GROUP BY g",
+    "RETURN 1",
+]
+
+#: A view query of 160 characters: its ``view_query="…"`` line is longer than 128 columns.
+_LONG_VIEW = "SELECT status, count() AS total FROM orders WHERE note != '" + "x" * 84 + "' GROUP BY status"
+
+
+class TestViewModels:
+    """v0.32.0 (spec §6.7, D12; AC-16 unit part): a view table becomes a view model — ``view_query="…"`` after
+    ``table_name=``, the ``# Read-only materialized view`` comment, ``id: RecordID | None = None`` — when the model
+    accepts it: not an edge, no ``Computed`` field, a query ``check_view_query()`` passes. Otherwise v0.30.0's output
+    (``# View: AS …``, ``id: str | None = None``) is kept."""
+
+    def test_a_view_module_imports_and_its_class_is_a_view(self, tmp_path: Path) -> None:
+        table = TableState(name="order_stats", schema_mode="SCHEMALESS", view_query=_STATS_VIEW)
+        source = _quality(tmp_path, SchemaState(tables={"order_stats": table}), "view")
+        assert _class_block(source, "OrderStats") == (
+            "class OrderStats(BaseSurrealModel):\n"
+            "    # Read-only materialized view\n"
+            '    # SCHEMALESS: fields not declared here are kept (extra="allow")\n'
+            "    model_config = SurrealConfigDict(\n"
+            '        table_name="order_stats",\n'
+            f'        view_query="{_STATS_VIEW}",\n'
+            '        extra="allow",\n'
+            "    )\n"
+            "\n"
+            "    id: RecordID | None = None\n"
+        )
+        model = _guarded_exec(source)["OrderStats"]
+        assert model._is_view()
+        assert model.get_view_query() == _STATS_VIEW
+        assert model.view_ddl() == f"DEFINE TABLE OVERWRITE `order_stats` AS ({_STATS_VIEW});"
+        assert model.model_fields["id"].annotation == (RecordID | None)
+
+    def test_view_query_comes_before_the_connection(self) -> None:
+        """On one line up to 128 columns, wrapped past them — the rule of every ``model_config``."""
+        one_line = _model_config(_generate(name="v", connection="mv12", view_query=_TOTALS_VIEW))
+        assert (
+            one_line == f'    model_config = SurrealConfigDict(table_name="v", view_query="{_TOTALS_VIEW}", connection="mv12")'
+        )
+        assert _width(one_line) == 128
+        assert _model_config(_generate(name="v", connection="mv123", view_query=_TOTALS_VIEW)) == (
+            "    model_config = SurrealConfigDict(\n"
+            '        table_name="v",\n'
+            f'        view_query="{_TOTALS_VIEW}",\n'
+            '        connection="mv123",\n'
+            "    )"
+        )
+
+    def test_an_edge_view_keeps_the_v0_30_output(self) -> None:
+        source = _generate(name="e", table_type="relation", view_query=_TOTALS_VIEW)
+        assert _class_block(source, "E") == (
+            "class E(BaseSurrealEdge):\n"
+            "    # IN any OUT any\n"
+            f"    # View: AS {_TOTALS_VIEW}\n"
+            '    model_config = SurrealConfigDict(table_name="e")\n'
+        )
+        assert "RecordID" not in source
+
+    @pytest.mark.parametrize(
+        "field",
+        [_f("k", "int", computed="count"), _f("k", "int", value="total * 2")],
+        ids=["computed", "value"],
+    )
+    def test_a_view_with_a_computed_field_keeps_the_v0_30_output(self, tmp_path: Path, field: FieldState) -> None:
+        """``view_query`` refuses a ``Computed`` field (V10), so the class stays an ordinary model."""
+        source = _generate(field, name="v", view_query=_TOTALS_VIEW)
+        expression = field.computed or field.value
+        assert _class_block(source, "V") == (
+            "class V(BaseSurrealModel):\n"
+            f"    # View: AS {_TOTALS_VIEW}\n"
+            '    model_config = SurrealConfigDict(table_name="v")\n'
+            "\n"
+            "    id: str | None = None\n"
+            f'    k: Computed[int] = computed("{expression}")\n'
+        )
+        assert not _import(tmp_path, source).V._is_view()
+
+    def test_a_server_filled_field_is_no_computed_field(self) -> None:
+        """A computed expression ``computed()`` refuses takes the server form (``server_fields``): no ``Computed``
+        field, so the class is a view model."""
+        source = _generate(_f("k", "int", computed="a; b"), name="v", view_query=_TOTALS_VIEW)
+        assert _model_config(source) == (
+            "    model_config = SurrealConfigDict(\n"
+            '        table_name="v",\n'
+            f'        view_query="{_TOTALS_VIEW}",\n'
+            '        server_fields=["k"],\n'
+            "    )"
+        )
+        assert _guarded_exec(source)["V"]._is_view()
+
+    @pytest.mark.parametrize("query", _REFUSED_VIEW_QUERIES)
+    def test_a_query_the_check_refuses_keeps_the_v0_30_output(self, tmp_path: Path, query: str) -> None:
+        with pytest.raises(ValueError):
+            check_view_query(query, model="V")
+        source = _generate(_f("n", "int"), name="v", view_query=query)
+        assert _class_block(source, "V") == (
+            "class V(BaseSurrealModel):\n"
+            f"    # View: AS {query}\n"
+            '    model_config = SurrealConfigDict(table_name="v")\n'
+            "\n"
+            "    id: str | None = None\n"
+            "    n: int\n"
+        )
+        assert "RecordID" not in source
+        assert not _import(tmp_path, source).V._is_view()
+
+    def test_a_line_hazard_is_still_a_view(self) -> None:
+        """C1 (``math::sum(v) / count()`` grouped, refused on SurrealDB 2.x) is a check of ``define_view()`` on the
+        connection's line, not of the class: the class is a view model."""
+        query = "SELECT g, math::sum(v) / count() AS a FROM t GROUP BY g"
+        assert view_query_hazards(view_query_outline(query)) == (ViewHazard("wrapped", "math::sum(v) / count()", "math::sum"),)
+        source = _generate(name="v", view_query=query)
+        assert _model_config(source) == f'    model_config = SurrealConfigDict(table_name="v", view_query="{query}")'
+        assert _line_of(source, "id") == "id: RecordID | None = None"
+        assert _guarded_exec(source)["V"]._is_view()
+
+    def test_a_long_view_query_stays_on_one_line(self, tmp_path: Path) -> None:
+        """Spec §6.7: the generator never splits a string, so a long view query's line is longer than 128 columns (the
+        ``ModelCodeGenerator`` docstring says so); ``ruff format`` leaves it as it is and the module compiles."""
+        assert len(_LONG_VIEW) == 160
+        source = _generate(name="long_view", view_query=_LONG_VIEW)
+        assert _model_config(source) == (
+            f'    model_config = SurrealConfigDict(\n        table_name="long_view",\n        view_query="{_LONG_VIEW}",\n    )'
+        )
+        line = next(line for line in source.splitlines() if "view_query=" in line)
+        assert _width(line) == 182
+        compile(source, "long_view.py", "exec")
+        path = tmp_path / "gen_long_view.py"
+        path.write_text(source, encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, "-m", "ruff", *_RUFF_FORMAT, str(path)], capture_output=True, text=True, cwd=tmp_path, check=False
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        model = _guarded_exec(source)["LongView"]
+        assert model._is_view()
+        assert model.get_view_query() == _LONG_VIEW
 
 
 #: Spec §6.4.7, form 2 — exactly as the spec prints it.

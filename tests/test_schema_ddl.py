@@ -3566,14 +3566,14 @@ _FEATURES_ROW_32 = ["Server-side events & function DDL (`Event`, `define_functio
 _ROADMAP_ROWS_32 = [
     ["v0.30.0", "Tier 3 — Schema introspection", "✅ Released"],
     ["v0.31.0", "Tier 3 — Server-side events and DDL helpers", "✅ Released"],
-    ["v0.32.0 – v0.39.0", "Tier 3 — Advanced (search, DDL, migrations, CLI)", "📋 Planned"],
-    ["v0.40.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+    ["v0.32.0", "Tier 3 — Materialized views", "✅ Released"],
+    ["v0.33.0 – v0.39.0", "Tier 3 — Advanced (search, DDL, migrations, CLI)", "📋 Planned"],
 ]
 _COMPARISON_ROWS_32 = [
     ["Schema Introspection", "✅ v0.30.0 (`DatabaseIntrospector`, `generate_models_from_db()`)", "✅"],
     ["DEFINE EVENT", "✅ v0.31.0 (`Event`, `define_events()`, `ASYNC` on 3.x)", "✅ migrations (`DefineEvent`)"],
     ["`define_function()` (DDL)", "✅ v0.31.0", "❌"],
-    ["Materialized views", "v0.32.0", "✅"],
+    ["Materialized views", "✅ v0.32.0 (`view_query`, `define_view()`)", "✅"],
 ]
 #: Spec §11.1 item 6 (D14): exactly seven rows v0.31.0 adds to the 2.x/3.x table, cell by cell.
 _EVENT_ROWS = [
@@ -3678,7 +3678,8 @@ class TestReadmeSection32:
     tables (spec §11.1)."""
 
     def test_section_32_follows_section_31(self) -> None:
-        """Right after section 31 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        """Right after section 31 (after its "Coming from" bullets), then section 33 (v0.32.0), and before the ``---``
+        of "Configuration Options"."""
         readme = _readme()
         start_31 = readme.index(f"\n{_SECTION_31}\n")
         start_32 = readme.index(f"\n{_SECTION_32}\n")
@@ -3687,8 +3688,9 @@ class TestReadmeSection32:
         assert re.findall(r"^#{2,3} .*$", readme[start_31 + 1 : configuration], re.MULTILINE) == [
             _SECTION_31,
             _SECTION_32,
+            "### 33. Materialized views (`view_query`, `define_view()`)",
         ]
-        assert readme[:configuration].rstrip().endswith("\n---"), "section 32 ends before the --- of the next part"
+        assert readme[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
     def test_subsections_in_order(self) -> None:
         assert re.findall(r"^#### (.*)$", _section_32(), re.MULTILINE) == _SUBSECTIONS_32

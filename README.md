@@ -215,6 +215,7 @@ embedded engine refuse one above `4294967295` (`2**32 - 1`), SurrealDB 3.x reads
 | Multiple databases (named connections, `using()`)                             | ✅     |
 | Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)    | ✅     |
 | Server-side events & function DDL (`Event`, `define_function()`)              | ✅     |
+| Materialized views (`view_query`, `define_view()`, read-only)                 | ✅     |
 
 ### Supported Filter Lookups
 
@@ -4248,15 +4249,18 @@ class Person(BaseSurrealModel):
   temporary file, and a symbolic link is replaced by the file, its target never written. `overwrite=False` refuses an
   existing path with `FileExistsError` before reading anything, and creates the file exclusively.
 - One class per table: a `BaseSurrealModel`, or a `BaseSurrealEdge` for a `TYPE RELATION` table (which declares no
-  `id`, `in_` or `out`: the base class provides them). Its `model_config` holds the `table_name`, `connection=` when
-  the schema was read from another connection than `"default"`, then `server_fields` and `extra="allow"` (below). A
-  model declares `id: str | None = None` first, then one line per field, in codepoint order of the columns.
+  `id`, `in_` or `out`: the base class provides them). Its `model_config` holds the `table_name`, `view_query` for a
+  view table (since v0.32.0: a materialized view model, [section 33](#33-materialized-views-view_query-define_view)),
+  `connection=` when the schema was read from another connection than `"default"`, then `server_fields` and
+  `extra="allow"` (below). A model declares `id: str | None = None` first (`id: RecordID | None = None` for a view: a
+  grouped view's ids are arrays), then one line per field, in codepoint order of the columns.
 - A class is named after its table in PascalCase, without singularisation (`game_tables` → `GameTables`); a name
   that is taken — a Python keyword, a name the module imports, another table's class — gets `Model` appended (`range`
-  → `RangeModel`). The table's comment, relation ends, view query, change feed (`# Changefeed: 1d`), permissions
+  → `RangeModel`). The table's comment, relation ends, change feed (`# Changefeed: 1d`), permissions
   (`# Permissions: FOR select WHERE …, FOR create, update FULL, FOR delete NONE`, left out when all four are `NONE`,
   a table's default), indexes and events are comments of its class, and the module's header lists every table or
-  field left out, with the reason.
+  field left out, with the reason. A view model's class says `# Read-only materialized view`; a view the lite cannot
+  declare — an edge, a computed field, a query `view_query` refuses — keeps its query as a `# View: AS …` comment.
 - The source is safe to import: names, comments and expressions read from the database reach it only as escaped
   string literals, single-line ASCII comments and identifiers the generator builds, so a schema cannot inject code
   into it. It holds no timestamp, server address, namespace or database name, and no
@@ -4351,8 +4355,8 @@ class Person(BaseSurrealModel):
   `DEFINE FIELD OVERWRITE … VALUE …`, without their `TYPE`, `ASSERT` or `PERMISSIONS` (the module's docstring says so).
 - Long lines: the `model_config` line is wrapped the way `ruff format` keeps it — one keyword per line once it exceeds
   128 columns, and the `server_fields` names one per line once their own line does. Other long lines — long names, a
-  long `Literal` union — are left on one line for your formatter. When every line fits in 128 columns, the module
-  passes `ruff check` and `ruff format --check` at that line length.
+  long `Literal` union, a long view query (`view_query="…"`) — are left on one line for your formatter. When every
+  line fits in 128 columns, the module passes `ruff check` and `ruff format --check` at that line length.
 
 #### SurrealDB 2.x and 3.x
 
@@ -4432,10 +4436,11 @@ reads, stores, logs or writes them.
   ORM's connection name, which routing, reconnects and the generated models' `connection=` key need (full ORM: an
   `HTTPConnection`).
 - **Generated models use comments** where the full ORM writes
-  `SurrealConfigDict(permissions=…, changefeed=…, view_query=…, relation_in=…, relation_out=…, enforced=…)`
-  (`# Permissions: …`, `# Changefeed: …`, `# View: AS …`, `# IN … OUT … ENFORCED`), and the base class where it writes
-  `table_type=` (`BaseSurrealEdge` for a relation table): those keys arrive in the lite's `SurrealConfigDict` with
-  v0.32.0–v0.34.0. `READONLY` is a comment too (full ORM: `Field(readonly=True)`).
+  `SurrealConfigDict(permissions=…, changefeed=…, relation_in=…, relation_out=…, enforced=…)` (`# Permissions: …`,
+  `# Changefeed: …`, `# IN … OUT … ENFORCED`), and the base class where it writes `table_type=` (`BaseSurrealEdge`
+  for a relation table): those keys arrive in the lite's `SurrealConfigDict` with later minors. A view is generated
+  with `view_query=…` since v0.32.0, as in the full ORM (a `# View: AS …` comment when the lite cannot declare it: an
+  edge, a computed field, a query it refuses). `READONLY` is a comment too (full ORM: `Field(readonly=True)`).
 - **`RecordID` instead of `ForeignKey`/`ReferencesField`**; no `VectorField` or `Encrypted`; `computed()` instead
   of `Computed()`; `Duration`, `UUID`, `Decimal` and the geometry classes instead of `str`, `dict` and `float`;
   nested fields become sub-models (full ORM: dotted attribute lines).
@@ -4706,6 +4711,240 @@ system user: run `define_events()` and `define_function()` at start-up or deploy
 - **The migration operations** (`DefineEvent`, `RemoveEvent`, `RawSQL`) and the removal of the events a model no
   longer declares **come with migrations (v0.37.0)**.
 
+### 33. Materialized views (`view_query`, `define_view()`)
+
+Since v0.32.0 a model can read a **materialized view**: a table SurrealDB computes from a `SELECT` and keeps up to
+date as its source table changes — counts, sums, filtered copies. The view is declared on the model with
+`view_query`, applied idempotently with `define_view()` and read like any model, and every write of the model is
+refused: SurrealDB computes the view's records itself. The same code runs on SurrealDB 2.x, 3.x and the embedded
+engine, except where the [2.x/3.x table](#orm-behaviour-surrealdb-2x-vs-3x) says otherwise. The examples assume a
+configured connection: they run as written on the embedded engine (`mem://`).
+
+```python
+from surrealdb import RecordID
+
+from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict
+
+
+class Order(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="orders")
+
+    id: str | None = None
+    status: str
+    amount: float
+    customer: str | None = None
+
+
+class OrderStats(BaseSurrealModel):
+    model_config = SurrealConfigDict(
+        table_name="order_stats",
+        view_query="SELECT status, count() AS total, math::sum(amount) AS revenue FROM orders GROUP BY status",
+    )
+
+    id: RecordID | None = None
+    status: str
+    total: int
+    revenue: float
+
+
+print(OrderStats.view_ddl())
+# DEFINE TABLE OVERWRITE `order_stats` AS (SELECT status, count() AS total, math::sum(amount) AS revenue FROM orders GROUP BY status);
+
+await Order(id="o1", status="paid", amount=10.0, customer="ada").save()  # the source table exists first
+await OrderStats.define_view()  # idempotent (OVERWRITE): run it at start-up
+
+await Order(id="o2", status="paid", amount=5.5, customer="bob").save()
+await Order(id="o3", status="new", amount=1.0, customer="ada").save()
+for stats in await OrderStats.objects().order_by("status").exec():
+    print(stats.status, stats.total, stats.revenue)
+# new 1 1.0
+# paid 2 15.5
+
+paid = await OrderStats.objects().get(["paid"])
+print(paid.id, paid.total)
+# order_stats:['paid'] 2
+
+try:
+    await paid.merge(total=0)
+except TypeError as error:
+    print(error)
+# Cannot modify materialized view 'order_stats': OrderStats.merge() writes to it, and SurrealDB computes a view's records from its view_query. Write to the tables it selects from instead.
+```
+
+#### Declaring a view
+
+```python
+class PaidOrder(BaseSurrealModel):
+    model_config = SurrealConfigDict(
+        table_name="paid_orders", view_query="SELECT customer, amount FROM orders WHERE status = 'paid'"
+    )
+
+    id: RecordID | None = None
+    customer: str | None = None
+    amount: float
+
+
+await PaidOrder.define_view()
+print([(str(order.id), order.amount) for order in await PaidOrder.objects().order_by("amount").exec()])
+# [('paid_orders:o2', 5.5), ('paid_orders:o1', 10.0)]
+```
+
+- `view_query` is one `SELECT … FROM <table> [WHERE …] [GROUP BY … | GROUP ALL]` (a final `;` is dropped), checked
+  when the class is defined: a mistake raises `TypeError` or `ValueError` at the `class` statement. It takes no
+  `ORDER BY`, `LIMIT` or `FETCH` (SurrealDB refuses them in a view), and it is not a `SELECT VALUE`: a view stores
+  records. The model's `get_view_query()` returns it as checked.
+- **A grouped view** selects its `GROUP BY` fields (or expressions of them) and aggregates SurrealDB keeps up to
+  date: `count()`, `math::sum()`, `math::mean()`, `math::min()`, `math::max()`, `time::min()`, `time::max()` (and
+  `math::stddev()`, `math::variance()` on 3.x), whatever their argument (`math::sum(amount ?? 0)`). `math::median()`,
+  `array::group()`, `array::distinct()`, `array::join()` and `vector::sum()` are refused (inside an aggregate's
+  argument they are allowed). On SurrealDB 3.x an expression around an aggregate (`math::sum(amount) / count()`) and
+  a `GROUP BY` on an alias work; on 2.x and the embedded engine `define_view()` refuses them (see "SurrealDB 2.x and
+  3.x" below).
+- Every source write runs the view's query for that record: when it fails — a function given a value of the wrong
+  type, an aggregated field missing
+  ([surrealdb/surrealdb#7447](https://github.com/surrealdb/surrealdb/issues/7447)) — SurrealDB refuses the write, on
+  every line.
+- **Ids**: a plain view keeps the source records' ids (`paid_orders:o1`); a grouped view's id is the array of its
+  group values (`order_stats:['paid']`), and `GROUP ALL` gives `[]`. Declare `id: RecordID | None = None` and look a
+  group up with `get(["paid"])` or `filter(id=["paid"])`; read a `GROUP ALL` view with `first()`. Declare sums and
+  means `float`: SurrealDB 2.x and the embedded engine compute an `int` sum of integers and a `Decimal` mean, which a
+  `float` field reads as a float.
+- A view model cannot be an edge (`BaseSurrealEdge`), use `AuthenticatedUserMixin` or declare computed fields: each
+  raises `TypeError` at the `class` statement. A subclass inherits `view_query` and defines the view on its own
+  table; `view_query=None` makes it an ordinary model. The `table_name` is any identifier the ORM reads (a SurrealQL
+  keyword such as `select` is defined, but not read by the QuerySet, as for every model).
+
+#### Applying and removing
+
+- `define_view()` writes `DEFINE TABLE OVERWRITE … AS (…)`: SurrealDB fills the view from the source's records, and
+  each call recomputes the view and drops the events, fields and indexes defined on it, so at start-up it costs one
+  pass over the source. `overwrite=False` writes `IF NOT EXISTS` and keeps a view already defined, whatever its
+  query. It returns the statement it applied; `view_ddl()` returns the statement without applying it.
+- The source table must exist (a record saved, or a `DEFINE TABLE`), else `SurrealDbError` naming it
+  (`Can't apply view definition: 'order_stats' -> The table 'orders' does not exist`).
+- Redefining a view drops the events, fields and indexes defined on it: run `define_events()` after `define_view()`.
+- `remove_view()` writes `REMOVE TABLE IF EXISTS`, which removes the view and its records; with `missing_ok=False` a
+  view that does not exist raises `SurrealDbNotFoundError`.
+- The table guard: when the model's table already exists as an ordinary table **without records** — SurrealDB
+  creates one when `define_events()` or, on 2.x, a `watch()` runs before `define_view()` — `define_view()` turns it
+  into the view. When it holds records, `define_view()` raises `SurrealDbError` before any DDL, because SurrealDB
+  would delete them (the message gives the `raw_query("REMOVE TABLE …")` to run if they are not needed).
+  `define_view(overwrite=False)` raises on any ordinary table, which `IF NOT EXISTS` would silently keep, and
+  `remove_view()` raises on a table that is not a view.
+- A view may read another view: it is updated when the inner view changes, but not recomputed when the inner one is
+  redefined.
+- **Remove the views that read another view first.** SurrealDB 3.x refuses to remove a table that a view reads — a
+  source table or an inner view — and `remove_view()` passes that refusal on (`SurrealDbError`,
+  `Cannot delete table … on which a view is defined`). On 2.x and the embedded engine `remove_view()` raises
+  `SurrealDbError` before any DDL, because those engines would remove it and turn every view reading it into an
+  ordinary table that keeps its last records and no longer updates; the ORM finds those views by their plain `FROM`
+  targets. A raw `REMOVE TABLE` of a source table does that on 2.x and the embedded engine: such a former view then
+  makes `define_view()` refuse (it holds records: run the `raw_query("REMOVE TABLE …")` the message gives) and
+  `remove_view()` refuse (it is not a view).
+
+#### Reading
+
+- Every read works — filters, `order_by()`, aggregates, `get()`, `refresh()`, `Subquery`, `fetch()`, `using()`, and
+  on WebSocket `live()`/`watch()`, which receive the records SurrealDB recomputes. `relate()` and `remove_relation()`
+  from or to a view record write the edge table and are allowed.
+- On a view model, `filter(id__in=...)` is sent as `$ids CONTAINS id`: SurrealDB 3.x (3.1 and 3.3 measured) answers
+  no record to `id IN` on a view table, while `CONTAINS` is right on every line; write raw SurrealQL over a view the
+  same way.
+- `live()` instances carry the record id on both lines; `watch()` yields the server's envelopes as received: on 3.x
+  their `result` has no `id`, read `record`.
+- On SurrealDB 3.x a live query on a view filtered on `id` never notifies (the server's view notifications carry no
+  id); filter on the view's fields, e.g. `filter(status="paid")`.
+
+#### Writes are refused
+
+- Every ORM write of a view model raises `TypeError` before any signal, transaction or request: the instance
+  methods `save()`, `upsert()`, `update()`, `merge()`, `patch()`, `delete()` and the atomic helpers
+  `atomic_append()`, `atomic_remove()`, `atomic_set_add()`, `atomic_increment()`, `atomic_append_many()`,
+  `atomic_set_add_many()`, `atomic_remove_many()`, and the QuerySet methods `bulk_create()`, `bulk_update()`,
+  `bulk_delete()`, `patch()`, `update_or_create()`, `get_or_create()` (even when the record exists) and
+  `delete_table()`. The message starts with the full ORM's `Cannot modify materialized view '<table>'` and names the
+  call: write to the tables the view selects from instead.
+- `refresh()`, `relate()`, `remove_relation()`, `remove_all_relations()`, `define_events()` and `remove_event()` stay
+  allowed: they do not write the view's table.
+- Raw SurrealQL (`raw_query()`, `QuerySet.query()`, the client's `query()`) is not checked: SurrealDB 3.2 and later
+  refuse a write to a view, 2.x and 3.1 accept it and change the view's records.
+
+#### Transactions, connections and the query cache
+
+- `define_view()` and `remove_view()` take `tx=`. In a buffered transaction (SurrealDB 2.x, HTTP, the embedded
+  engine) the statement is applied at commit, and the block's later source writes update the view; in an interactive
+  one (WebSocket and SurrealDB 3.x) it is applied in the transaction, which reads the view and its own source writes
+  (`objects(tx=tx)`), unseen outside the block until it commits. Either way, a block that raises leaves no view. The
+  table guard and the 2.x checks run before anything is queued, on committed state; a refusal of a queued statement
+  comes back when the block commits, as the transaction's own error.
+- Both run on the model's connection (its `connection` key, or the `using()` block's); a `tx=` of another connection
+  raises `SurrealDbError` before any request. A view and its source tables live in one database: give a view model
+  its sources' connection.
+- The query cache ([section 29](#29-query-cache-cache-querycache)): reads of a view model, and reads whose subqueries
+  read one, are dropped by every ORM write, since a write to a source table changes the view and the ORM does not know
+  which tables a view reads. `define_view()` and `remove_view()` drop cached reads like every write. Writes by raw
+  SurrealQL or by another process are not seen, as for every table.
+- Defining and removing need a system user allowed to define: root, or a namespace or database `OWNER` or `EDITOR`.
+  On a server, a `VIEWER` or a record user gets `SurrealDbAuthenticationError`.
+- Applying DDL fires no signal, and neither do the records SurrealDB computes for a view.
+
+#### SurrealDB 2.x and 3.x
+
+- Raw writes to a view are accepted by 2.x and 3.1, which change the view's records, and refused by 3.2 and later.
+  The ORM refuses its own writes on every line.
+- Grouped views: 2.x and the embedded engine keep up to date only whole aggregates and `GROUP BY` fields, and
+  compute anything else once per source record. So `define_view()` raises `SurrealDbError` before any DDL there for
+  `math::stddev()` and `math::variance()`, an expression around an aggregate (`math::sum(amount) / count()`), a field
+  outside `GROUP BY` and outside an aggregate (3.x refuses that one too), and a `GROUP BY` on an alias (2.x would put
+  every record in one group).
+- Value types: `int` sums and `Decimal` means on 2.x, `float` on 3.x; `count()` of an array field adds the arrays'
+  lengths on 2.x, and counts the records whose array is not empty on 3.x.
+- Live queries and events see an emptied group as an `UPDATE` then a `DELETE` on 2.x, a `DELETE` on 3.x.
+- Removing a view, or a source table, that another view reads: 3.x refuses it; on 2.x `remove_view()` raises before
+  any DDL, and a raw `REMOVE TABLE` leaves the views reading it as ordinary tables keeping their last records.
+- On every line, a source write missing an aggregated field is refused
+  ([surrealdb/surrealdb#7447](https://github.com/surrealdb/surrealdb/issues/7447)): write `math::sum(amount ?? 0)`.
+- The [2.x/3.x table](#orm-behaviour-surrealdb-2x-vs-3x) lists these differences; the embedded engine behaves as a
+  2.x server.
+
+#### Security
+
+The table name is checked as an identifier and written quoted in every statement the ORM sends. The query is written
+into `AS (…)` as it is, since SurrealDB takes no bound parameter in a definition; when the class is defined the ORM
+checks its structure: string literals and quoted identifiers terminated, brackets balanced, no NUL character, no
+SurrealQL comment marker outside a literal, one `SELECT` and no `;` outside brackets. The check catches mistakes —
+unbalanced brackets, a comment that would swallow the parenthesis the ORM appends, a second statement where one
+SELECT is expected — and is not an injection defence: a view's query is trusted application code, never user input.
+To filter on a value, store it in a record or a `DEFINE PARAM` and read it from the query; never format it into the
+text. A refusal names the view's table, never the statement, and keeps the server's reason whole, which names the
+source table to create.
+
+Destructive DDL is guarded: `define_view()` never turns a table that holds records into a view and never lets
+`IF NOT EXISTS` keep an ordinary table, and `remove_view()` never removes a table that is not a view nor, on 2.x and
+the embedded engine, a view that another view reads. The guard is a check-then-act on committed state, not a lock: a
+record written or a table created by another process between its reads and the DDL is not seen. The write refusal
+guards against mistakes and is not an access control: on 2.x and 3.1 the server accepts writes to a view from any
+session allowed to write the table. A view is defined without a `PERMISSIONS` clause, so SurrealDB applies its
+default `PERMISSIONS NONE`: a record user reads nothing from a view, and `define_view()` resets permissions set by
+hand on it. Applying a view needs a privileged system user: run `define_view()` at start-up or deployment, not on a
+record user's session.
+
+#### Coming from the full SurrealDB-ORM
+
+- **`view_query` is the same key** (`SurrealConfigDict(view_query="SELECT …")`); `get_view_query()` is added and
+  `_is_view()` kept.
+- **`TypeError` with the same first words** (`Cannot modify materialized view '<table>'`), on every write path above
+  (full ORM: `save()`, `update()`, `merge()`, `delete()` only).
+- **`define_view()`/`remove_view()`/`view_ddl()`** apply, remove and render the view, where the full ORM applies one
+  through migrations (`CreateTable`/`AlterTable`) or `define_table()`. Those come with v0.37.0, whose
+  `define_table()` accepts a view model and applies it through `view_ddl()`, so full-ORM code calling
+  `define_table()` on a view works from then on.
+- **`AS (…)` as in the full ORM, the table name quoted** (``DEFINE TABLE OVERWRITE `order_stats` AS (…)``).
+- **Generated models write `view_query=`**, as the full ORM's do
+  ([section 31](#31-schema-introspection-databaseintrospector-generate_models_from_db)).
+- **The documented `MaterializedView` base class with `source_query` is not shipped by the full ORM either**: declare
+  `view_query` on a `BaseSurrealModel`.
+
 ---
 
 ## Configuration Options
@@ -4828,7 +5067,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.7 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four. Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.31.1 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.7 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four. Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.31.1 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.32.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 but accepts raw writes to a view.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -4956,6 +5195,14 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | Event and function definitions read back (`EventState`, `FunctionState`)                                                               | a block on several lines, each statement ending with `;`; `option<T>` parameters as written                                                                                   | a block on one line, no `;` after a single statement; optional parameters rendered with `none` first                                                                                | v0.31.0                              |
 | `define_function()`, `remove_function()` and `call_function()`                                                                         | same on both lines: the next `call_function()` sees a redefinition on every connection of this process to the same namespace and database, whatever its URL                   | the same                                                                                                                                                                            | v0.31.0                              |
 | Reading a datetime before year 1 or after year 9999 (SurrealDB stores years -262143 to +262142)                                        | its RFC 3339 text, as `<string>` gives it (`"+10000-01-01T00:00:00Z"`): an untyped field holds it, a `datetime` field refuses it (`ValidationError`)                          | same on both lines                                                                                                                                                                  | v0.31.1                              |
+| Writes to a materialized view (`save()`, `merge()`, `delete()`, bulk writes … of a `view_query` model)                                 | `TypeError` before any request; a raw write is accepted by the server and changes the view's records                                                                          | `TypeError` before any request; the server refuses raw writes too (3.2 and later; 3.1 accepts them)                                                                                 | v0.32.0                              |
+| Aggregates in a grouped view (`view_query` with `GROUP BY` or `GROUP ALL`)                                                             | `count()`, `math::sum()`, `math::mean()`, `math::min()`, `math::max()`, `time::min()`, `time::max()`; `math::stddev()`, `math::variance()`: `SurrealDbError` before any DDL   | the same, plus `math::stddev()` and `math::variance()`                                                                                                                              | v0.32.0                              |
+| An expression around an aggregate in a grouped view (`math::sum(amount) / count()`, `math::round(math::mean(amount))`, `count() * 2`)  | `SurrealDbError` before any DDL: the server would compute it once per source record (a wrong `count()`, or every source write refused)                                        | kept up to date                                                                                                                                                                     | v0.32.0                              |
+| A grouped view selecting a field outside `GROUP BY` and outside an aggregate (`amount`, `math::percentile(amount, 50)`, `*`)           | `SurrealDbError` before any DDL: the server would keep the last source record's value, or refuse every source write                                                           | `SurrealDbError` when the view is defined (the server refuses it)                                                                                                                   | v0.32.0                              |
+| A grouped view whose `GROUP BY` names the alias of a computed field (`time::month(at) AS month` … `GROUP BY month`)                    | `SurrealDbError` before any DDL: the server would put every source record in one group                                                                                        | one group per computed value                                                                                                                                                        | v0.32.0                              |
+| Values a view computes (`math::sum()`, `math::mean()`, `count()` of an array)                                                          | a sum of integers is an `int`, a mean a `Decimal`; `count(tags)` of an array field adds the arrays' lengths                                                                   | both are `float`; `count(tags)` counts the records whose array is not empty                                                                                                         | v0.32.0                              |
+| Live queries and events on a view (a group emptied by a delete; a live query filtered on `id`)                                         | an emptied group: an `UPDATE` with the emptied values (a `count()` of 0), then a `DELETE`; a filter on `id` notifies                                                          | an emptied group: a `DELETE`; a filter on `id` never notifies (the view's notifications carry no `id`): filter on the view's fields                                                 | v0.32.0                              |
+| Removing a materialized view, or a source table, that another view reads (`remove_view()`, `REMOVE TABLE`)                             | `remove_view()` raises `SurrealDbError` before any DDL; a raw `REMOVE TABLE` succeeds and turns each view reading the table into an ordinary table keeping its last records   | `SurrealDbError` from the server (`Cannot delete table … on which a view is defined`): remove the views that read it first                                                          | v0.32.0                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
@@ -4989,6 +5236,7 @@ Capabilities not listed behave as on a 2.x server.
 | Several connections (`add_connection()`)                            | `mem://`: each name is a database of its own; an on-disk store (`surrealkv://`, `file://`) is open under one name at a time — a second name raises `SurrealDbConnectionError`                                                                                                                                                                         | each name opens its own clients; two databases on one server are isolated                                       | v0.29.0 |
 | Schema introspection (`DatabaseIntrospector`)                       | reads like a 2.x server (core 2.3.10): same state and same generated model types as on the servers; the anonymous owner session may run `INFO`; `COUNT` indexes cannot be defined                                                                                                                                                                     | need a system user (root, namespace or database user)                                                           | v0.30.0 |
 | Server-side events and stored functions (v0.31.0)                   | as on a 2.x server: `$input` is `NONE`; `Event(async_mode=True)` raises `SurrealDbError` before any DDL                                                                                                                                                                                                                                               | `ASYNC` events on 3.x                                                                                           | v0.31.0 |
+| Materialized views (v0.32.0)                                        | as on a 2.x server: `int` sums and `Decimal` means; in a grouped view, `math::stddev()`/`math::variance()`, an expression around an aggregate, a field outside `GROUP BY` and a `GROUP BY` on an alias raise `SurrealDbError` before any DDL; writes to a view refused by the ORM (the engine would accept them); no live queries                     | `float` sums and means on 3.x                                                                                   | v0.32.0 |
 | Everything else                                                     | CRUD, QuerySet, aggregations, relations, typed edges, rich and geo fields, upsert/patch, server values, computed fields, stored functions, signals: the same as on a 2.x server                                                                                                                                                                       | unchanged                                                                                                       | v0.25.0 |
 
 ---
@@ -5035,7 +5283,8 @@ Contributions are welcome! Please:
 | v0.29.0           | Tier 2 — Multi-database                              | ✅ Released |
 | v0.30.0           | Tier 3 — Schema introspection                        | ✅ Released |
 | v0.31.0           | Tier 3 — Server-side events and DDL helpers          | ✅ Released |
-| v0.32.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)     | 📋 Planned  |
+| v0.32.0           | Tier 3 — Materialized views                          | ✅ Released |
+| v0.33.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)     | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | 📋 Planned  |
 
@@ -5091,7 +5340,7 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | Schema Introspection          | ✅ v0.30.0 (`DatabaseIntrospector`, `generate_models_from_db()`)      | ✅                               |
 | DEFINE EVENT                  | ✅ v0.31.0 (`Event`, `define_events()`, `ASYNC` on 3.x)               | ✅ migrations (`DefineEvent`)    |
 | `define_function()` (DDL)     | ✅ v0.31.0                                                            | ❌                               |
-| Materialized views            | v0.32.0                                                               | ✅                               |
+| Materialized views            | ✅ v0.32.0 (`view_query`, `define_view()`)                            | ✅                               |
 | Full-Text Search              | v0.34.0                                                               | ✅                               |
 | Vector Search (KNN/HNSW)      | v0.35.0                                                               | ✅                               |
 | Hybrid Search (RRF)           | v0.36.0                                                               | ✅                               |

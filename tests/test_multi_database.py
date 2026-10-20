@@ -2811,6 +2811,7 @@ _TX_CALLS: dict[str, Callable[[Any, Any], Any]] = {
     "define_access": lambda m, tx: type(m).define_access(tx=tx),
     "define_computed_fields": lambda m, tx: type(m).define_computed_fields(tx=tx),
     "define_events": lambda m, tx: type(m).define_events(tx=tx),
+    "define_view": lambda m, tx: type(m).define_view(tx=tx),
     "delete": lambda m, tx: m.delete(tx=tx),
     "merge": lambda m, tx: m.merge(tx=tx, n=1),
     "objects": lambda m, tx: type(m).objects(tx=tx),
@@ -2819,6 +2820,7 @@ _TX_CALLS: dict[str, Callable[[Any, Any], Any]] = {
     "relate": lambda m, tx: m.relate("md_follows", MdEvent(id="b"), tx=tx),
     "remove_all_relations": lambda m, tx: m.remove_all_relations("md_follows", tx=tx),
     "remove_event": lambda m, tx: type(m).remove_event("md_audit", tx=tx),
+    "remove_view": lambda m, tx: type(m).remove_view(tx=tx),
     "remove_relation": lambda m, tx: m.remove_relation("md_follows", MdEvent(id="b"), tx=tx),
     "save": lambda m, tx: m.save(tx=tx),
     "update": lambda m, tx: m.update(tx=tx),
@@ -5152,7 +5154,7 @@ class TestMultiDatabaseDocs:
 
     def test_section_30_follows_section_29(self) -> None:
         """Right after section 29 (after its "Coming from" bullets), then section 31 (v0.30.0), then section 32
-        (v0.31.0), and before the ``---`` of "Configuration Options"."""
+        (v0.31.0), then section 33 (v0.32.0), and before the ``---`` of "Configuration Options"."""
         readme = _readme()
         start_29 = readme.index(f"\n{_SECTION_29}\n")
         start_30 = readme.index(f"\n{_SECTION_30}\n")
@@ -5163,6 +5165,7 @@ class TestMultiDatabaseDocs:
             _SECTION_30,
             "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
             "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
+            "### 33. Materialized views (`view_query`, `define_view()`)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "section 30 ends before the --- of the next part"
 
@@ -5291,7 +5294,7 @@ class TestMultiDatabaseDocs:
             ["v0.29.0", "Tier 2 — Multi-database", "✅ Released"],
             ["v0.30.0", "Tier 3 — Schema introspection", "✅ Released"],
             ["v0.31.0", "Tier 3 — Server-side events and DDL helpers", "✅ Released"],
-            ["v0.32.0 – v0.39.0", "Tier 3 — Advanced (search, DDL, migrations, CLI)", "📋 Planned"],
+            ["v0.32.0", "Tier 3 — Materialized views", "✅ Released"],
         ], roadmap
 
     def test_comparison_row(self) -> None:

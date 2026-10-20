@@ -589,7 +589,10 @@ def coerce_record_id(value: Any, table: str) -> RecordID:
     ``"`5`"``           ``RecordID(table, "5")`` — backticks stripped, as ``get()`` does
     ``"table:d"``       ``RecordID(table, "d")`` — only when the prefix is *this* table
     ``"Other:d"``       ``RecordID(table, "Other:d")`` — may genuinely be the string id
+    ``["paid"]``        ``RecordID(table, ["paid"])`` — an array id, a grouped view's (v0.32.0)
     ==================  ==========================
+
+    A ``tuple`` is an array id too (``("paid",)``), copied into a ``list``.
     """
     if isinstance(value, RecordID):
         return value
@@ -597,6 +600,8 @@ def coerce_record_id(value: Any, table: str) -> RecordID:
         raise ValueError("a record id cannot be a boolean")
     if isinstance(value, int):
         return RecordID(table, value)
+    if isinstance(value, (list, tuple)):
+        return RecordID(table, list(value))
 
     raw = str(value)
     prefix = f"{table}:"
@@ -893,6 +898,7 @@ def build_filter_condition(
     *,
     endpoint_columns: Collection[str] = (),
     subqueries: SubqueryCompiler | None = None,
+    view: bool = False,
 ) -> tuple[str, dict[str, Any], int]:
     """
     Build a single parameterized filter condition.
@@ -932,6 +938,9 @@ def build_filter_condition(
     ``contains`` and ``not_contains`` with its first value (no record when it is empty). Its values are compared
     as stored: no record-id or endpoint coercion. The ``id`` and endpoint columns keep their refusals.
 
+    On a view model's id column, ``in`` compiles ``$_f0 CONTAINS id``: SurrealDB 3.x answers no record to ``id IN``
+    on a view table (v0.32.0).
+
     Args:
         field: The field name.
         lookup: The lookup type (e.g. ``"exact"``, ``"gt"``, ``"in"``).
@@ -948,6 +957,9 @@ def build_filter_condition(
         subqueries: The compiler of the statement the condition goes into (v0.27.0), which binds a subquery
             value in a ``LET`` (or inline, for a live query). ``None`` — a ``Q`` compiled on its own — refuses a
             subquery.
+        view: The queried model is a materialized view (v0.32.0), set by the QuerySet: ``in`` on the ``id``
+            column compiles ``<values> CONTAINS id``, the same values bound. ``False`` leaves every condition as
+            before.
 
     Returns:
         A tuple of (sql_fragment, variables_dict, next_counter).
@@ -995,7 +1007,7 @@ def build_filter_condition(
     op = LOOKUP_OPERATORS[lookup]
     var_name = f"_f{counter}"
     if sub is not None:
-        return subquery_condition(field, lookup, op, sub, counter, subqueries)
+        return subquery_condition(field, lookup, op, sub, counter, subqueries, view=view and is_record_id_column)
 
     if lookup == "isnull":
         if not isinstance(value, bool):
@@ -1028,6 +1040,8 @@ def build_filter_condition(
         items = [as_record_value(_list_item(item, field, lookup)) for item in value]
         if is_record_id_column and lookup in _RECORD_ID_SEQUENCE_LOOKUPS:
             items = [coerce_record_id(item, cast(str, record_table)) for item in items]
+            if view and lookup == "in":
+                return f"${var_name} CONTAINS {field}", {var_name: items}, counter + 1
         elif is_endpoint_column and lookup in _RECORD_ID_SEQUENCE_LOOKUPS:
             items = [coerce_endpoint(item) for item in items]
         return f"{field} {op} ${var_name}", {var_name: items}, counter + 1
@@ -1154,12 +1168,14 @@ def _quotes_statement(reason: str, statement: str) -> bool:
     return False
 
 
-def _ddl_refusal_reason(statement: str, error: BaseException) -> tuple[str, bool]:
+def _ddl_refusal_reason(statement: str, error: BaseException, *, redact: bool = True) -> tuple[str, bool]:
     """The server's reason for refusing *statement*, without any of the statement's text, and whether it is the
     error's whole text.
 
-    A parse error's excerpt of the statement (from `` --> [line:column]`` on) is replaced by its position; a reason
-    that still quotes the statement (``_quotes_statement()``) is replaced by a fixed text.
+    A parse error's excerpt of the statement (from `` --> [line:column]`` on) is replaced by its position; with
+    *redact* (the default), a reason that still quotes the statement (``_quotes_statement()``) is replaced by a fixed
+    text. ``redact=False`` (v0.32.0's view DDL) keeps such a reason: a view's query is trusted application code, and
+    its refusals name its source tables (``The table 'order_archive' does not exist``).
     """
     text = str(error)
     excerpt = _STATEMENT_EXCERPT.search(text)
@@ -1167,7 +1183,7 @@ def _ddl_refusal_reason(statement: str, error: BaseException) -> tuple[str, bool
         reason = text
     else:
         reason = f"{text[: excerpt.start()]} (at line {excerpt[1]}, column {excerpt[2]} of the statement)"
-    if _quotes_statement(reason, statement):
+    if redact and _quotes_statement(reason, statement):
         return _REASON_LEFT_OUT, False
     return reason, excerpt is None
 
@@ -1182,6 +1198,7 @@ async def apply_ddl_statements(
     kind: str = "definition",
     classify: bool = False,
     subjects: Sequence[str] | None = None,
+    redact: bool = True,
 ) -> list[str]:
     """Run DDL statements one at a time, normalising every rejection to `SurrealDbError`.
 
@@ -1211,11 +1228,16 @@ async def apply_ddl_statements(
     the statement. The server's error is chained as ``__cause__`` only when its whole message is the
     reason; otherwise it stays reachable as ``__context__``, which a traceback does not print.
 
+    With ``redact=False`` (v0.32.0's view DDL, whose query is trusted application code and whose refusals
+    name its source tables) a reason that quotes the statement is kept; a parse error's excerpt is still
+    replaced by its position.
+
     :param what: names the kind of definition, for the message (e.g. ``"access"``).
     :param hint: appended to the message — extra guidance when the cause is likely known.
     :param kind: what the statements do, for the message: ``"definition"`` or ``"removal"``.
     :param classify: map each refusal to the class that says why (see above).
     :param subjects: one per statement, how the message names it (``"'audit' on table 'account'"``).
+    :param redact: with *subjects*, replace a reason that still quotes the statement by a fixed text (default).
     :returns: the statements applied, so callers can hand them straight back.
     :raises ValueError: *subjects* does not have one subject per statement — before any request.
     """
@@ -1235,7 +1257,7 @@ async def apply_ddl_statements(
             refusal = _ddl_refusal_class(statement, e) if classify else SurrealDbError
             if subjects is None:
                 raise refusal(f"Can't apply {what} {kind}: {statement} -> {e}{hint}") from e
-            reason, whole = _ddl_refusal_reason(statement, e)
+            reason, whole = _ddl_refusal_reason(statement, e, redact=redact)
             message = f"Can't apply {what} {kind}: {subjects[index]} -> {reason}{hint}"
             if whole:
                 raise refusal(message) from e

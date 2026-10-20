@@ -2,8 +2,9 @@ r"""Generate ``BaseSurrealModel`` source from a ``SchemaState`` (v0.30.0) — pr
 
 ``ModelCodeGenerator`` (re-exported by :mod:`surreal_orm_lite.introspection`) is implemented here:
 ``ModelCodeGenerator().generate(state)`` returns the source of one module — a ``BaseSurrealModel`` class per table
-(``BaseSurrealEdge`` for a relation table), with ``model_config = SurrealConfigDict(table_name=…)``, the connection's
-name when it is not ``"default"``, ``server_fields`` and ``extra="allow"`` for a ``SCHEMALESS`` table. Pure and
+(``BaseSurrealEdge`` for a relation table), with ``model_config = SurrealConfigDict(table_name=…)``, ``view_query``
+for a view table, the connection's name when it is not ``"default"``, ``server_fields`` and ``extra="allow"`` for a
+``SCHEMALESS`` table. Pure and
 deterministic: the same state always gives the same string. The schema it
 reads came from the server: table and field names, comments and expressions are server text, and the generated
 module is source code someone will import. So server text reaches that source in exactly three ways, and through no
@@ -46,7 +47,11 @@ top-level fields that may hold a datetime, says that ``update()`` may fail on it
 
 **Classes.** A ``BaseSurrealModel``, or a ``BaseSurrealEdge`` for a relation table (``table_type`` in any case). The
 table's comment, relation ends, view query, change feed, permissions (unless all four are ``NONE``, the default),
-indexes and events are comments of its class.
+indexes and events are comments of its class. A view table (``DEFINE TABLE … AS SELECT``) is a materialized view model
+(v0.32.0): ``view_query="…"`` right after ``table_name=``, the full SurrealDB-ORM's ``# Read-only materialized view``
+comment in the place of the query's, and ``id: RecordID | None = None`` (a grouped view's record ids are arrays) —
+unless the class statement would refuse it: an edge, a class with a ``Computed`` field, or a query
+``check_view_query()`` refuses keep v0.30.0's output (``# View: AS …``, ``id: str | None = None``).
 
 **Module**: a fixed docstring, the imports the classes use (standard library, then pydantic, surreal_orm_lite and
 surrealdb), a ``# Not generated:`` comment listing every table or field left out and why, then the classes. No
@@ -88,6 +93,7 @@ from .define_parser import (
 from .edge import BaseSurrealEdge
 from .functions import SurrealFunc
 from .model_base import BaseSurrealModel
+from .schema import check_view_query
 from .schema_state import FieldState, IndexState, SchemaIssue, SchemaState, TableState
 from .types import Duration
 from .utils import _KEEP_LIMIT, VALID_ALIAS_PATTERN
@@ -500,6 +506,8 @@ _UPDATE_NOTE = (
     "update() may fail on READONLY datetimes below the top level or past the 32nd (Python keeps microseconds): use merge()."
 )
 _SCHEMALESS_NOTE = 'SCHEMALESS: fields not declared here are kept (extra="allow")'
+#: The class comment of a materialized view model (v0.32.0), the full SurrealDB-ORM's, in the place of ``View: AS …``.
+_VIEW_NOTE = "Read-only materialized view"
 #: The operations of a table's ``PERMISSIONS``, in the order SurrealDB renders them.
 _OPERATIONS = ("select", "create", "update", "delete")
 
@@ -923,6 +931,7 @@ class _ClassWriter:
         """The sub-model blocks, then the class block."""
         lines: list[str] = []
         server_fields: list[str] = []
+        computed = False
         for column, (attribute, alias) in self.names.fields(self.table.name).items():
             node = self.nodes.get((column,))
             if node is None:
@@ -931,13 +940,16 @@ class _ClassWriter:
                 continue
             line = self.field_line(attribute, alias, node, model=True)
             lines.append(line.text)
+            computed = computed or line.computed
             if line.server:
                 server_fields.append(attribute)
+        view_query = self._view_query(computed=computed)
         base = "BaseSurrealEdge" if self.edge else "BaseSurrealModel"
         block = [f"class {self.names.class_name(self.table.name)}({base}):"]
-        block.extend("    " + comment for comment in self._comments())
-        block.extend(self._model_config(server_fields))
-        body = lines if self.edge else ["id: str | None = None", *lines]
+        block.extend("    " + comment for comment in self._comments(view=view_query is not None))
+        block.extend(self._model_config(server_fields, view_query))
+        identifier = "id: str | None = None" if view_query is None else "id: RecordID | None = None"
+        body = lines if self.edge else [identifier, *lines]
         if body:
             block.append("")
             block.extend("    " + line for line in body)
@@ -950,8 +962,25 @@ class _ClassWriter:
                 line = "- field " + repr(self.table.name + "." + field.name) + ": " + _S5_NO_PARENT
                 self.skips.append((self.table.name, field.name, line))
 
-    def _comments(self) -> list[str]:
-        """The class comments, each through ``_comment()``."""
+    def _view_query(self, *, computed: bool) -> str | None:
+        """The table's view query when the class is a materialized view model (v0.32.0, spec §6.7), else ``None``.
+
+        A view model when the class statement would accept ``view_query``: the class is not an edge (V8), gets no
+        ``Computed`` field (*computed*, V10), and ``check_view_query()`` accepts the query (V1–V7). Otherwise the query
+        stays a comment, as v0.30.0 wrote it. The hazards that depend on the server line (C1) are ``define_view()``'s
+        check, not the class's: such a view is still a view model.
+        """
+        query = self.table.view_query
+        if query is None or self.edge or computed:
+            return None
+        try:
+            check_view_query(query, model=self.names.class_name(self.table.name))
+        except (TypeError, ValueError):
+            return None
+        return query
+
+    def _comments(self, *, view: bool) -> list[str]:
+        """The class comments, each through ``_comment()``; *view* for a materialized view model."""
         table = self.table
         texts = []
         if table.comment is not None:
@@ -960,7 +989,7 @@ class _ClassWriter:
             ends = " | ".join(table.relation_in) or "any", " | ".join(table.relation_out) or "any"
             texts.append("IN " + ends[0] + " OUT " + ends[1] + (" ENFORCED" if table.enforced else ""))
         if table.view_query is not None:
-            texts.append("View: AS " + table.view_query)
+            texts.append(_VIEW_NOTE if view else "View: AS " + table.view_query)
         if table.changefeed is not None:
             texts.append("Changefeed: " + table.changefeed + (" INCLUDE ORIGINAL" if table.changefeed_include_original else ""))
         permissions = _permissions_text(table.permissions)
@@ -994,9 +1023,12 @@ class _ClassWriter:
         top = [field for field in fields if len(field.path) == 1 and _may_be_a_datetime(_kind(field))]
         return len(top) > _KEEP_LIMIT and any(field.readonly for field in top)
 
-    def _model_config(self, server_fields: Sequence[str]) -> list[str]:
-        """The ``model_config`` line, wrapped as ``ruff format`` keeps it above 128 columns."""
+    def _model_config(self, server_fields: Sequence[str], view_query: str | None) -> list[str]:
+        """The ``model_config`` line, wrapped as ``ruff format`` keeps it above 128 columns; ``view_query=`` after
+        ``table_name=`` for a materialized view model (one string literal on one line, however long)."""
         keywords = ["table_name=" + _py_str(self.table.name)]
+        if view_query is not None:
+            keywords.append("view_query=" + _py_str(view_query))
         if self.connection != "default":
             keywords.append("connection=" + _py_str(self.connection))
         listed = [_py_str(attribute) for attribute in server_fields]
@@ -1275,10 +1307,12 @@ class ModelCodeGenerator:
         source = ModelCodeGenerator().generate(schema)
 
     One ``BaseSurrealModel`` class per table (``BaseSurrealEdge`` for a relation table) whose name is an identifier the
-    ORM can query, in codepoint order of the table names, each preceded by its sub-models. The module imports and
-    passes ``ruff check`` and ``ruff format`` (line length 128) as long as its lines fit: comments are cut to 128
-    columns and ``model_config`` is wrapped, but a long name or ``Literal`` union stays on one line. Tables and fields
-    that are not generated are listed, with the reason, in the module's ``# Not generated:`` comment.
+    ORM can query, in codepoint order of the table names, each preceded by its sub-models; a view table becomes a
+    materialized view model (``view_query="…"``, v0.32.0). The module imports and passes ``ruff check`` and
+    ``ruff format`` (line length 128) as long as its lines fit: comments are cut to 128 columns and ``model_config``
+    is wrapped, but a long name, a long ``Literal`` union or a long view query (``view_query="…"``) stays on one
+    line. Tables and fields that are not generated are listed, with the reason, in the module's ``# Not generated:``
+    comment.
 
     Review the result before use: ``ASSERT``, ``PERMISSIONS`` and ``REFERENCE`` clauses are not generated,
     ``READONLY`` is a comment, and the models describe tables that exist — never call ``define_computed_fields()`` on
