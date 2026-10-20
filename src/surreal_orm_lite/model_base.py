@@ -31,8 +31,13 @@ from .schema import (
     check_view_query,
     ensure_async_events_supported,
     event_subject,
+    read_table_definitions,
     remove_event_statement,
+    remove_view_statement,
+    table_holds_records,
+    table_kind,
     view_statement,
+    view_table_refused,
     view_write_refused,
 )
 from .signals import (
@@ -1040,6 +1045,127 @@ class BaseSurrealModel(BaseModel):
         """
         query = cls._require_view("view_ddl()")
         return view_statement(cls.get_table_name(), query, overwrite)
+
+    @classmethod
+    @_cache.invalidates("cls")
+    async def define_view(cls, *, overwrite: bool = True, tx: Transaction | None = None) -> str:
+        """Apply this materialized view to the database (v0.32.0) and return the statement applied.
+
+        Sends :meth:`view_ddl` on the model's connection (the ``using()`` block's, else
+        ``SurrealConfigDict(connection=…)``, else ``"default"``). SurrealDB fills the view from the tables its query
+        selects from at once, then keeps it up to date as they change; every write of the model raises
+        ``TypeError`` — write to those tables instead. Those source tables must exist (``DEFINE TABLE`` them, or
+        write a record first): the refusal names a missing one. Safe to call at application start-up: with the
+        default ``overwrite=True`` each call recomputes the view from the query, so the database converges onto the
+        model.
+
+        ``OVERWRITE`` recomputes the view and drops the events, fields and indexes defined on its table: run
+        :meth:`define_events` **after** ``define_view()``. ``overwrite=False`` (``IF NOT EXISTS``) leaves an existing
+        view as it is, whatever its query.
+
+        Before the DDL, a table guard reads ``INFO FOR DB`` once (and, for an ordinary table, ``SELECT id … LIMIT
+        1``), on committed state, outside any transaction: the view never replaces an ordinary table that holds
+        records — ``OVERWRITE`` would delete them —, an empty ordinary table (one an event or a 2.x live query
+        created first) becomes the view, and ``overwrite=False`` refuses an ordinary table, which ``IF NOT EXISTS``
+        would leave as it is. The guard is a check, then the DDL, not a lock: a record another process writes in
+        between is not seen.
+
+        The query is written into the DDL as declared: a view's query is trusted application code, never user
+        input. The check made when the class was defined catches mistakes — unbalanced brackets, a comment that
+        would swallow the parenthesis the ORM appends, a second statement where one SELECT is expected — and is not
+        an injection defence. A refusal names the view's table and keeps the server's reason (``Can't apply view
+        definition: 'order_stats' -> The table 'orders' does not exist``), never the statement. Applying needs a
+        session allowed to define (a system user such as root, or a namespace or database ``OWNER``/``EDITOR``).
+
+        Args:
+            overwrite: see :meth:`view_ddl`.
+            tx: optional transaction the statement is applied with; the guard reads before anything is queued.
+
+        Raises:
+            TypeError: the model is not a materialized view; *overwrite* is not a ``bool`` — before any request.
+            SurrealDbError: *tx* belongs to another connection — before any request; the table exists, is not a view
+                and holds records, or ``overwrite=False`` meets an ordinary table, or its definition cannot be read —
+                before any DDL; the server refused the statement (``Can't apply view definition: …``). In a buffered
+                transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the statement is only queued:
+                a refusal comes back when the block commits, as the transaction's own error, never as
+                ``SurrealDbAuthenticationError``.
+            SurrealDbAuthenticationError: the session may not read the database's definitions or define the view.
+
+        Example:
+            >>> await OrderStats.define_view()
+            'DEFINE TABLE OVERWRITE `order_stats` AS (SELECT status, count() AS total FROM orders GROUP BY status);'
+        """
+        cls._require_view("define_view()")
+        statement = cls.view_ddl(overwrite=overwrite)
+        table = cls.get_table_name()
+        manager = cls._connection_manager()
+        # Cheap even inside a transaction: get_client() returns the already-connected client.
+        client = await manager.get_client()
+        tables = await read_table_definitions(client, table, kind="definition")
+        existing = table_kind(tables, table)
+        if existing is not None and existing != "view":
+            if not overwrite:
+                raise SurrealDbError(view_table_refused("G4" if existing == "table" else "G3", cls.__name__, table))
+            if await table_holds_records(client, table, kind="definition"):
+                raise SurrealDbError(view_table_refused("G1" if existing == "table" else "G3", cls.__name__, table))
+        await apply_ddl_statements(
+            [statement], client=client, tx=tx, what="view", classify=True, subjects=[repr(table)], redact=False
+        )
+        return statement
+
+    @classmethod
+    @_cache.invalidates("cls")
+    async def remove_view(cls, *, missing_ok: bool = True, tx: Transaction | None = None) -> str:
+        """Remove this materialized view from the database (v0.32.0) and return the statement applied.
+
+        Sends ``REMOVE TABLE [IF EXISTS] `<table>`;`` on the model's connection: the view, its records and the
+        events defined on it are removed; the tables it selects from are left as they are. Before it, a table guard
+        reads ``INFO FOR DB`` once, on committed state, outside any transaction: ``remove_view()`` removes views only,
+        never an ordinary table (removing one would delete its records, fields, indexes and events). Remove the
+        views that read another view first.
+
+        Args:
+            missing_ok: ``True`` (default) emits ``REMOVE TABLE IF EXISTS …``, so a missing view is not an error;
+                ``False`` raises ``SurrealDbNotFoundError`` for it.
+            tx: optional transaction the statement is applied with; the guard reads before anything is queued.
+
+        Raises:
+            TypeError: the model is not a materialized view; *missing_ok* is not a ``bool`` — before any request.
+            SurrealDbNotFoundError: ``missing_ok=False`` and the table does not exist.
+            SurrealDbAuthenticationError: the session may not read the database's definitions or remove the view.
+            SurrealDbError: *tx* belongs to another connection — before any request; the table is not a view, or its
+                definition cannot be read — before any DDL; any other refusal (``Can't apply view removal: …``). In
+                a buffered transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the statement is
+                only queued: a refusal comes back when the block commits, as the transaction's own
+                ``SurrealDbError``, never as ``SurrealDbNotFoundError`` or ``SurrealDbAuthenticationError`` —
+                ``missing_ok=False`` included.
+
+        Example:
+            >>> await OrderStats.remove_view()
+            'REMOVE TABLE IF EXISTS `order_stats`;'
+        """
+        cls._require_view("remove_view()")
+        table = cls.get_table_name()
+        statement = remove_view_statement(table, missing_ok)
+        manager = cls._connection_manager()
+        client = await manager.get_client()
+        tables = await read_table_definitions(client, table, kind="removal")
+        existing = table_kind(tables, table)
+        if existing == "table":
+            raise SurrealDbError(view_table_refused("G2", cls.__name__, table))
+        if existing == "unreadable":
+            raise SurrealDbError(view_table_refused("G3", cls.__name__, table, removal=True))
+        await apply_ddl_statements(
+            [statement],
+            client=client,
+            tx=tx,
+            what="view",
+            kind="removal",
+            classify=True,
+            subjects=[repr(table)],
+            redact=False,
+        )
+        return statement
 
     # ==================== Field aliases & server-owned fields (v0.18.0) ====================
 

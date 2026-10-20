@@ -29,7 +29,11 @@ SurrealDB 2.x computes once per source record instead of keeping it up to date; 
 text, not a parser: it serves the line checks and leaves what it cannot read — a sub-select, a graph path, a quoted
 field name — to the server. ``view_statement()`` and ``remove_view_statement()`` render the statements, the table name
 in backticks and the query inside ``AS ( … )``; ``view_write_refused()`` is the text every ORM write of a view model
-raises.
+raises. The table guard of ``define_view()`` and ``remove_view()`` reads ``INFO FOR DB`` once
+(``read_table_definitions()``), tells a view from an ordinary table (``table_kind()``) and, for an ordinary table,
+whether it holds a record (``table_holds_records()``), so a view never replaces a table that holds records and
+``remove_view()`` never removes an ordinary table (``view_table_refused()``). It reads committed state: a check, then
+the DDL, not a lock.
 
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
 it.
@@ -40,12 +44,20 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import KW_ONLY, dataclass, field
 from typing import Any, Literal
 
-from .define_parser import DefineParseError, blank_literals, parse_kind, render_kind, scan_fragment
+from ._sdk import ServerError
+from .define_parser import (
+    DefineParseError,
+    blank_literals,
+    parse_define_table,
+    parse_kind,
+    render_kind,
+    scan_fragment,
+)
 from .exceptions import SurrealDbError
 from .functions import normalize_function_name
 from .surql_literal import _SERVER_PARAMETERS, _identifier, _quoted
 from .time_travel import line_major
-from .utils import VALID_ALIAS_PATTERN
+from .utils import VALID_ALIAS_PATTERN, _ddl_refusal_class
 
 __all__ = ["Event", "function_ddl"]
 
@@ -855,4 +867,106 @@ def view_write_refused(table: str, call: str) -> str:
     return (
         f"Cannot modify materialized view '{table}': {call} writes to it, and SurrealDB computes a view's records "
         "from its view_query. Write to the tables it selects from instead."
+    )
+
+
+# --- the table guard of define_view() and remove_view() (v0.32.0) ---------------------------------------------------
+
+#: The guard's one read of the database's definitions.
+_INFO_FOR_DB = "INFO FOR DB;"
+
+#: What ``table_kind()`` answers for a table that exists: a view, an ordinary table, or a definition it cannot read.
+_TableKind = Literal["view", "table", "unreadable"]
+
+
+def _guard_read_refused(statement: str, error: BaseException, *, kind: str, table: str) -> SurrealDbError:
+    """The refusal of one of the guard's reads (*statement*): S1 when the session may not read, else S3 — the text of
+    a refused view DDL, ``Can't apply view {kind}: '<table>' -> <the server's message>``."""
+    refusal = _ddl_refusal_class(statement, error)
+    return refusal(f"Can't apply view {kind}: {table!r} -> {error}")
+
+
+async def read_table_definitions(client: Any, table: str, *, kind: str) -> dict[str, Any]:
+    """The ``tables`` map of ``INFO FOR DB`` — table name → its ``DEFINE TABLE`` statement — read once by the table
+    guard of ``define_view()`` and ``remove_view()`` (v0.32.0).
+
+    A copy; ``{}`` when the answer is not a mapping or holds no ``tables`` mapping (a database never defined answers
+    ``tables: {}``). It reads committed state, on *client* outside any transaction.
+
+    :param kind: ``"definition"`` or ``"removal"``, for the message of a refusal; *table* only names the view there.
+    :raises SurrealDbAuthenticationError: the session may not read the database's definitions (a record user).
+    :raises SurrealDbError: any other refusal of the ``INFO``.
+    """
+    try:
+        info = await client.query(_INFO_FOR_DB, {})
+    except (ServerError, SurrealDbError, RuntimeError) as error:
+        raise _guard_read_refused(_INFO_FOR_DB, error, kind=kind, table=table) from error
+    tables = info.get("tables") if isinstance(info, dict) else None
+    return dict(tables) if isinstance(tables, dict) else {}
+
+
+def table_kind(tables: Mapping[str, Any], table: str) -> _TableKind | None:
+    """What *table* is in *tables* (``read_table_definitions()``'s map): ``None`` when it does not exist, ``"view"``
+    when its definition has an ``AS`` clause, ``"table"`` when it has none, ``"unreadable"`` when the definition is
+    not a ``str`` or ``define_parser.parse_define_table()`` cannot read it (v0.32.0). Pure."""
+    definition = tables.get(table)
+    if definition is None:
+        return None
+    if not isinstance(definition, str):
+        return "unreadable"
+    try:
+        state = parse_define_table(definition)
+    except DefineParseError:
+        return "unreadable"
+    return "view" if state.view_query is not None else "table"
+
+
+async def table_holds_records(client: Any, table: str, *, kind: str) -> bool:
+    """Whether *table* holds a record: ``SELECT id FROM `<table>` LIMIT 1;`` answers a row (v0.32.0).
+
+    The table guard of ``define_view()`` sends it only for an ordinary or unreadable table with ``overwrite=True``,
+    on *client* outside any transaction. *table* is checked as an identifier and written in backticks.
+
+    :param kind: ``"definition"`` or ``"removal"``, for the message of a refusal.
+    :raises SurrealDbAuthenticationError: the session may not read the table.
+    :raises SurrealDbError: any other refusal of the ``SELECT``.
+    """
+    statement = f"SELECT id FROM {_identifier(_identifier_name(table, what='Table'))} LIMIT 1;"
+    try:
+        rows = await client.query(statement, {})
+    except (ServerError, SurrealDbError, RuntimeError) as error:
+        raise _guard_read_refused("SELECT", error, kind=kind, table=table) from error
+    return isinstance(rows, list) and len(rows) > 0
+
+
+def view_table_refused(guard: Literal["G1", "G2", "G3", "G4"], model: str, table: str, *, removal: bool = False) -> str:
+    """The table guard's refusals (v0.32.0): the text of *guard* for the view model *model* on *table*. Pure.
+
+    - ``G1``: ``define_view()`` would turn an ordinary table that holds records into the view, deleting them;
+    - ``G2``: ``remove_view()`` would remove an ordinary table;
+    - ``G3``: the table's definition cannot be read (``removal`` says which applier refuses);
+    - ``G4``: ``define_view(overwrite=False)`` would leave an ordinary table as it is (``IF NOT EXISTS``).
+    """
+    if guard == "G1":
+        return (
+            f"{model}.define_view(): the table '{table}' exists, is not a view and holds records; defining the view "
+            "would delete them, with the table's fields, indexes and events. If they are not needed, remove the table "
+            f'first (await {model}.raw_query("REMOVE TABLE `{table}`;")); otherwise give the model another '
+            "table_name. Nothing was defined."
+        )
+    if guard == "G2":
+        return (
+            f"{model}.remove_view(): the table '{table}' is not a view; remove_view() removes views only (removing it "
+            "would delete its records, fields, indexes and events). Nothing was removed."
+        )
+    if guard == "G4":
+        return (
+            f"{model}.define_view(overwrite=False): the table '{table}' exists and is not a view; DEFINE TABLE IF NOT "
+            f"EXISTS would leave it as it is, and {model} would not read a view. Call define_view() with "
+            "overwrite=True, which turns a table that holds no record into the view. Nothing was defined."
+        )
+    method, done = ("remove_view()", "removed") if removal else ("define_view()", "defined")
+    return (
+        f"{model}.{method}: the definition of the table '{table}' could not be read, so the ORM cannot tell whether "
+        f"it is a view. Nothing was {done}."
     )

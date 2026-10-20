@@ -14,6 +14,12 @@ The write guard (spec §5.4, §5.6 W1; AC-6): each of the 20 ORM writes of a vie
 signal, transaction use or request — unit, and E2E on the connection ``"mv"`` (database ``mv_db``, spec §9.2) over
 WebSocket, HTTP and ``mem://`` on both server lines, where the view's records stay as they were, the relation helpers
 still write their edge table (M16), and a raw ``DELETE`` of the view is pinned per line (M6: refused from 3.2).
+
+Applying and removing (spec §5.2, §5.6 G1–G4, S1–S3, §6.6; AC-5, AC-8, AC-9, AC-12, AC-17): the refusal reason of view
+DDL kept whole (``redact=False``, D16), the table guard — ``read_table_definitions()``, ``table_kind()``,
+``table_holds_records()`` on fake clients, then through ``define_view()``/``remove_view()``, one ``INFO FOR DB`` per
+call —, and E2E on both lines: the view defined, read and kept up to date, removed, refused on a table that holds
+records, named in every refusal, defined on the model's connection, and refused to a record user.
 """
 
 import contextlib
@@ -25,7 +31,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from surrealdb import InternalError, RecordID
+from surrealdb import InternalError, NotAllowedError, NotFoundError, RecordID
 
 import surreal_orm_lite
 from surreal_orm_lite import (
@@ -33,9 +39,13 @@ from surreal_orm_lite import (
     BaseSurrealEdge,
     BaseSurrealModel,
     Computed,
+    Event,
     SurrealConfigDict,
+    SurrealDbAuthenticationError,
     SurrealDBConnectionManager,
     SurrealDbError,
+    SurrealDbNotFoundError,
+    Transaction,
     computed,
     define_parser,
     pre_delete,
@@ -57,6 +67,7 @@ from surreal_orm_lite.schema import (
     view_statement,
 )
 from surreal_orm_lite.utils import apply_ddl_statements
+from tests.conftest import default_connection_class
 
 # --- the goldens of spec §5.3 ----------------------------------------------------------------------------------------
 
@@ -1338,6 +1349,448 @@ class TestRefusalReason:
             assert parameter.default is True
 
 
+# --- the table guard (spec §5.2, §5.6 G1–G4, S1–S3, §6.1; AC-8's unit half) -----------------------------------------
+
+
+def _g1(model: str, table: str) -> str:
+    return (
+        f"{model}.define_view(): the table '{table}' exists, is not a view and holds records; defining the view would "
+        "delete them, with the table's fields, indexes and events. If they are not needed, remove the table first "
+        f'(await {model}.raw_query("REMOVE TABLE `{table}`;")); otherwise give the model another table_name. Nothing '
+        "was defined."
+    )
+
+
+def _g2(model: str, table: str) -> str:
+    return (
+        f"{model}.remove_view(): the table '{table}' is not a view; remove_view() removes views only (removing it "
+        "would delete its records, fields, indexes and events). Nothing was removed."
+    )
+
+
+def _g3(model: str, table: str, method: str, done: str) -> str:
+    return (
+        f"{model}.{method}: the definition of the table '{table}' could not be read, so the ORM cannot tell whether "
+        f"it is a view. Nothing was {done}."
+    )
+
+
+def _g4(model: str, table: str) -> str:
+    return (
+        f"{model}.define_view(overwrite=False): the table '{table}' exists and is not a view; DEFINE TABLE IF NOT "
+        f"EXISTS would leave it as it is, and {model} would not read a view. Call define_view() with overwrite=True, "
+        "which turns a table that holds no record into the view. Nothing was defined."
+    )
+
+
+_PERMISSIONS = "IAM error: Not enough permissions to perform this action"
+_INFO = "INFO FOR DB;"
+_SELECT_ONE = "SELECT id FROM `order_stats` LIMIT 1;"
+_REMOVE_DDL = "REMOVE TABLE IF EXISTS `order_stats`;"
+_KEEP_DDL = (
+    "DEFINE TABLE IF NOT EXISTS `order_stats` AS (SELECT status, count() AS total, math::sum(amount) AS revenue FROM "
+    "orders GROUP BY status);"
+)
+
+#: Spec §3's golden renderings, as ``INFO FOR DB`` reads them back on every engine (M18).
+_RENDERED = {
+    "order_stats": "DEFINE TABLE order_stats TYPE ANY SCHEMALESS AS SELECT status, count() AS total, "
+    "math::sum(amount) AS revenue FROM orders GROUP BY status PERMISSIONS NONE",
+    "paid_orders": "DEFINE TABLE paid_orders TYPE ANY SCHEMALESS AS SELECT customer, amount FROM orders WHERE "
+    "status = 'paid' PERMISSIONS NONE",
+    "order_totals": "DEFINE TABLE order_totals TYPE ANY SCHEMALESS AS SELECT count() AS orders, math::sum(amount) AS "
+    "revenue FROM orders GROUP ALL PERMISSIONS NONE",
+}
+
+#: An ordinary table, as ``INFO FOR DB`` renders one an event or a write created (M19).
+_ORDINARY = "DEFINE TABLE order_stats TYPE ANY SCHEMALESS PERMISSIONS NONE"
+
+#: A definition ``parse_define_table()`` cannot read (a clause it does not know).
+_UNREADABLE = "DEFINE TABLE order_stats TYPE ANY SCHEMALESS SOMEDAY 1 PERMISSIONS NONE"
+
+#: The table kinds of the guard, as the fake ``INFO FOR DB`` holds them.
+_DEFINITIONS: dict[str, object] = {"view": _RENDERED["order_stats"], "table": _ORDINARY, "unreadable": _UNREADABLE}
+
+
+class _GuardClient:
+    """A client answering ``INFO FOR DB;`` with *info* (``{"tables": tables}`` by default) and ``SELECT id … LIMIT 1;``
+    with *rows*, every other statement with ``[]``; it records each statement and raises the error given for the
+    ``INFO``, the ``SELECT`` or the DDL. ``version()`` answers *version* and is counted."""
+
+    def __init__(
+        self,
+        tables: dict[str, object] | None = None,
+        rows: object = (),
+        *,
+        info: object = None,
+        info_error: BaseException | None = None,
+        select_error: BaseException | None = None,
+        ddl_error: BaseException | None = None,
+        version: str = "surrealdb-3.3.4",
+    ) -> None:
+        self.info = {"tables": dict(tables or {}), "functions": {}} if info is None else info
+        self.rows = list(rows) if isinstance(rows, tuple) else rows
+        self.info_error = info_error
+        self.select_error = select_error
+        self.ddl_error = ddl_error
+        self.answer = version
+        self.queries: list[str] = []
+        self.version_calls = 0
+
+    async def query(self, statement: str, variables: object) -> object:
+        assert variables == {}
+        self.queries.append(statement)
+        if statement == _INFO:
+            if self.info_error is not None:
+                raise self.info_error
+            return self.info
+        if statement.startswith("SELECT "):
+            if self.select_error is not None:
+                raise self.select_error
+            return self.rows
+        if self.ddl_error is not None:
+            raise self.ddl_error
+        return []
+
+    async def version(self) -> str:
+        self.version_calls += 1
+        return self.answer
+
+
+class _QueuingTx:
+    """A transaction of the default connection whose ``add()`` records each statement."""
+
+    _connection_name = "default"
+
+    def __init__(self) -> None:
+        self.added: list[tuple[str, object]] = []
+
+    async def add(self, statement: str, variables: object) -> None:
+        self.added.append((statement, variables))
+
+
+@pytest.fixture
+def use_client(monkeypatch: pytest.MonkeyPatch) -> Callable[[Any], None]:
+    """Make ``SurrealDBConnectionManager.get_client()`` answer the client given."""
+
+    def use(client: Any) -> None:
+        async def get_client(*args: Any, **kwargs: Any) -> Any:
+            return client
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+
+    return use
+
+
+class TestTableKind:
+    """Spec §6.1: ``read_table_definitions()`` (the guard's one ``INFO FOR DB``), ``table_kind()`` (pure) and
+    ``table_holds_records()`` (``SELECT id … LIMIT 1``), with their refusals S1 and S3."""
+
+    async def test_read_table_definitions(self) -> None:
+        client = _GuardClient({"order_stats": _ORDINARY, "orders": _ORDINARY})
+        tables = await schema.read_table_definitions(client, "order_stats", kind="definition")
+        assert tables == {"order_stats": _ORDINARY, "orders": _ORDINARY}
+        assert client.queries == [_INFO]
+        tables["x"] = "y"
+        assert "x" not in client.info["tables"]  # type: ignore[index]
+
+    @pytest.mark.parametrize(
+        "info",
+        [[], None, "INFO", {"functions": {}}, {"tables": []}, {"tables": None}],
+        ids=["list", "none", "str", "no-tables", "list-tables", "none-tables"],
+    )
+    async def test_an_answer_without_a_tables_map(self, info: object) -> None:
+        assert await schema.read_table_definitions(_GuardClient(info=info), "t", kind="definition") == {}
+
+    @pytest.mark.parametrize(
+        ("tables", "expected"),
+        [
+            ({}, None),
+            ({"other": _ORDINARY}, None),
+            ({"order_stats": _RENDERED["order_stats"]}, "view"),
+            ({"order_stats": _RENDERED["paid_orders"]}, "view"),
+            ({"order_stats": _RENDERED["order_totals"]}, "view"),
+            ({"order_stats": _ORDINARY}, "table"),
+            ({"order_stats": "DEFINE TABLE mv_orders TYPE ANY SCHEMALESS PERMISSIONS NONE"}, "table"),
+            ({"order_stats": _UNREADABLE}, "unreadable"),
+            ({"order_stats": 1}, "unreadable"),
+            ({"order_stats": {"sql": _ORDINARY}}, "unreadable"),
+        ],
+        ids=["empty", "missing", "view", "plain-view", "group-all", "table", "other-name", "unparseable", "int", "dict"],
+    )
+    def test_table_kind(self, tables: dict[str, object], expected: str | None) -> None:
+        assert schema.table_kind(tables, "order_stats") == expected
+
+    def test_the_unreadable_definition_does_not_parse(self) -> None:
+        with pytest.raises(define_parser.DefineParseError):
+            define_parser.parse_define_table(_UNREADABLE)
+
+    @pytest.mark.parametrize(
+        ("rows", "expected"),
+        [([{"id": RecordID("order_stats", 1)}], True), ([], False), ({}, False), (None, False)],
+        ids=["a-record", "none", "dict", "null"],
+    )
+    async def test_table_holds_records(self, rows: object, expected: bool) -> None:
+        client = _GuardClient(rows=rows)
+        assert await schema.table_holds_records(client, "order_stats", kind="definition") is expected
+        assert client.queries == [_SELECT_ONE]
+
+    @pytest.mark.parametrize(
+        ("table", "statement"),
+        [("mv_orders", "SELECT id FROM `mv_orders` LIMIT 1;"), ("select", "SELECT id FROM `select` LIMIT 1;")],
+    )
+    async def test_the_select_quotes_the_table(self, table: str, statement: str) -> None:
+        client = _GuardClient()
+        await schema.table_holds_records(client, table, kind="definition")
+        assert client.queries == [statement]
+
+    @pytest.mark.parametrize(
+        "error",
+        [NotAllowedError("NotAllowed", _PERMISSIONS), InternalError("Internal", _PERMISSIONS)],
+        ids=["3.x", "2.x"],
+    )
+    @pytest.mark.parametrize("kind", ["definition", "removal"])
+    @pytest.mark.parametrize("read", ["info", "select"])
+    async def test_s1_a_refused_read(self, error: Exception, kind: str, read: str) -> None:
+        raised = await self._refused_read(error, kind, read)
+        assert type(raised.value) is SurrealDbAuthenticationError
+        assert str(raised.value) == f"Can't apply view {kind}: 'order_stats' -> {_PERMISSIONS}"
+        assert raised.value.__cause__ is error
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            InternalError("Internal", "There was a problem with the database"),
+            NotFoundError("NotFound", "The table 'order_stats' does not exist"),
+            RuntimeError("the engine stopped"),
+            SurrealDbError("Transaction failed"),
+        ],
+        ids=["internal", "not-found", "runtime", "orm"],
+    )
+    @pytest.mark.parametrize("kind", ["definition", "removal"])
+    @pytest.mark.parametrize("read", ["info", "select"])
+    async def test_s3_any_other_refused_read(self, error: Exception, kind: str, read: str) -> None:
+        raised = await self._refused_read(error, kind, read)
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == f"Can't apply view {kind}: 'order_stats' -> {error}"
+        assert raised.value.__cause__ is error
+
+    @staticmethod
+    async def _refused_read(error: Exception, kind: str, read: str) -> pytest.ExceptionInfo[BaseException]:
+        with pytest.raises(BaseException) as raised:
+            if read == "info":
+                await schema.read_table_definitions(_GuardClient(info_error=error), "order_stats", kind=kind)
+            else:
+                await schema.table_holds_records(_GuardClient(select_error=error), "order_stats", kind=kind)
+        return raised
+
+
+#: The guard of ``define_view()`` (spec §5.2 step f): (the table's kind, its records, ``overwrite``, what is sent, the
+#: refusal or ``None``). ``"none"`` is no such table.
+_DEFINE_GUARD = [
+    ("none", False, True, [_INFO, _STATS_DDL], None),
+    ("none", False, False, [_INFO, _KEEP_DDL], None),
+    ("view", True, True, [_INFO, _STATS_DDL], None),
+    ("view", True, False, [_INFO, _KEEP_DDL], None),
+    ("table", True, True, [_INFO, _SELECT_ONE], _g1("OrderStats", "order_stats")),
+    ("table", False, True, [_INFO, _SELECT_ONE, _STATS_DDL], None),
+    ("table", True, False, [_INFO], _g4("OrderStats", "order_stats")),
+    ("table", False, False, [_INFO], _g4("OrderStats", "order_stats")),
+    ("unreadable", True, True, [_INFO, _SELECT_ONE], _g3("OrderStats", "order_stats", "define_view()", "defined")),
+    ("unreadable", False, True, [_INFO, _SELECT_ONE, _STATS_DDL], None),
+    ("unreadable", True, False, [_INFO], _g3("OrderStats", "order_stats", "define_view()", "defined")),
+    ("unreadable", False, False, [_INFO], _g3("OrderStats", "order_stats", "define_view()", "defined")),
+]
+
+#: The guard of ``remove_view()`` (spec §5.2 step e): (the table's kind, its records, what is sent, the refusal).
+_REMOVE_GUARD = [
+    ("none", False, [_INFO, _REMOVE_DDL], None),
+    ("view", True, [_INFO, _REMOVE_DDL], None),
+    ("table", True, [_INFO], _g2("OrderStats", "order_stats")),
+    ("table", False, [_INFO], _g2("OrderStats", "order_stats")),
+    ("unreadable", True, [_INFO], _g3("OrderStats", "order_stats", "remove_view()", "removed")),
+    ("unreadable", False, [_INFO], _g3("OrderStats", "order_stats", "remove_view()", "removed")),
+]
+
+
+def _guard_client(existing: str, records: bool, **errors: Any) -> _GuardClient:
+    tables = {} if existing == "none" else {"order_stats": _DEFINITIONS[existing], "orders": _ORDINARY}
+    return _GuardClient(tables, [{"id": RecordID("order_stats", 1)}] if records else [], **errors)
+
+
+class TestTableKindGuard:
+    """AC-8 (unit): the table guard of ``define_view()``/``remove_view()`` on fake clients — one ``INFO FOR DB`` per
+    call, the ``SELECT … LIMIT 1`` only for an ordinary or unreadable table with ``overwrite=True``, G1–G4 before any
+    DDL, and the DDL's refusals S1–S3 naming the view's table (``removal`` for a removal, P3)."""
+
+    @pytest.mark.parametrize(("existing", "records", "overwrite", "sent", "refusal"), _DEFINE_GUARD)
+    async def test_define_view(
+        self,
+        use_client: Callable[[Any], None],
+        existing: str,
+        records: bool,
+        overwrite: bool,
+        sent: list[str],
+        refusal: str | None,
+    ) -> None:
+        client = _guard_client(existing, records)
+        use_client(client)
+        if refusal is None:
+            statement = OrderStats.view_ddl(overwrite=overwrite)
+            assert await OrderStats.define_view(overwrite=overwrite) == statement
+            assert client.queries == sent
+        else:
+            with pytest.raises(SurrealDbError) as raised:
+                await OrderStats.define_view(overwrite=overwrite)
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value) == refusal
+            assert client.queries == sent
+        assert client.queries.count(_INFO) == 1
+        assert client.version_calls == 0
+
+    @pytest.mark.parametrize(("existing", "records", "sent", "refusal"), _REMOVE_GUARD)
+    async def test_remove_view(
+        self, use_client: Callable[[Any], None], existing: str, records: bool, sent: list[str], refusal: str | None
+    ) -> None:
+        client = _guard_client(existing, records)
+        use_client(client)
+        if refusal is None:
+            assert await OrderStats.remove_view() == _REMOVE_DDL
+        else:
+            with pytest.raises(SurrealDbError) as raised:
+                await OrderStats.remove_view()
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value) == refusal
+        assert client.queries == sent
+        assert client.version_calls == 0
+
+    async def test_a_transaction_gets_the_ddl_only(self, use_client: Callable[[Any], None]) -> None:
+        """Spec §7: the guard reads committed state on the client, outside the transaction; the DDL is queued."""
+        client = _guard_client("table", False)
+        use_client(client)
+        tx = _QueuingTx()
+        assert await OrderStats.define_view(tx=tx) == _STATS_DDL  # type: ignore[arg-type]
+        assert client.queries == [_INFO, _SELECT_ONE]
+        assert tx.added == [(_STATS_DDL, None)]
+        removal = _QueuingTx()
+        client.queries.clear()
+        client.info = {"tables": {"order_stats": _RENDERED["order_stats"]}}
+        assert await OrderStats.remove_view(missing_ok=False, tx=removal) == "REMOVE TABLE `order_stats`;"  # type: ignore[arg-type]
+        assert client.queries == [_INFO]
+        assert removal.added == [("REMOVE TABLE `order_stats`;", None)]
+
+    async def test_p3_a_removal_the_server_refuses(self, use_client: Callable[[Any], None]) -> None:
+        reason = (
+            "Invalid query: Cannot delete table `order_stats` on which a view is defined, table(s) `x` are defined as "
+            "a view on this table."
+        )
+        error = InternalError("Internal", reason)
+        client = _guard_client("view", True, ddl_error=error)
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await OrderStats.remove_view()
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == f"Can't apply view removal: 'order_stats' -> {reason}"
+        assert raised.value.__cause__ is error
+        assert client.queries == [_INFO, _REMOVE_DDL]
+
+    async def test_s2_a_missing_table(self, use_client: Callable[[Any], None]) -> None:
+        error = NotFoundError("NotFound", "The table 'order_stats' does not exist")
+        use_client(_guard_client("none", False, ddl_error=error))
+        with pytest.raises(SurrealDbError) as raised:
+            await OrderStats.remove_view(missing_ok=False)
+        assert type(raised.value) is SurrealDbNotFoundError
+        assert str(raised.value) == "Can't apply view removal: 'order_stats' -> The table 'order_stats' does not exist"
+        assert raised.value.__cause__ is error
+
+    @pytest.mark.parametrize("remove", [False, True], ids=["define", "remove"])
+    async def test_s1_a_refused_ddl(self, use_client: Callable[[Any], None], remove: bool) -> None:
+        error = NotAllowedError("NotAllowed", _PERMISSIONS)
+        use_client(_guard_client("view", True, ddl_error=error))
+        with pytest.raises(SurrealDbError) as raised:
+            await (OrderStats.remove_view() if remove else OrderStats.define_view())
+        kind = "removal" if remove else "definition"
+        assert type(raised.value) is SurrealDbAuthenticationError
+        assert str(raised.value) == f"Can't apply view {kind}: 'order_stats' -> {_PERMISSIONS}"
+
+    @pytest.mark.parametrize("remove", [False, True], ids=["define", "remove"])
+    async def test_s1_a_refused_info(self, use_client: Callable[[Any], None], remove: bool) -> None:
+        client = _GuardClient(info_error=InternalError("Internal", _PERMISSIONS))
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await (OrderStats.remove_view() if remove else OrderStats.define_view())
+        kind = "removal" if remove else "definition"
+        assert type(raised.value) is SurrealDbAuthenticationError
+        assert str(raised.value) == f"Can't apply view {kind}: 'order_stats' -> {_PERMISSIONS}"
+        assert client.queries == [_INFO]
+
+    async def test_s3_a_refused_select(self, use_client: Callable[[Any], None]) -> None:
+        error = InternalError("Internal", "There was a problem with the database")
+        client = _guard_client("table", False, select_error=error)
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await OrderStats.define_view()
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == f"Can't apply view definition: 'order_stats' -> {error}"
+        assert client.queries == [_INFO, _SELECT_ONE]
+
+    async def test_s3_names_a_missing_source_table(self, use_client: Callable[[Any], None]) -> None:
+        """M9, D16: the reason that names the missing source table is kept whole, never the statement."""
+        error = InternalError("Internal", "The table 'orders' does not exist")
+        use_client(_guard_client("none", False, ddl_error=error))
+        with pytest.raises(SurrealDbError) as raised:
+            await OrderStats.define_view()
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == "Can't apply view definition: 'order_stats' -> The table 'orders' does not exist"
+
+
+def _txn_signature(name: str) -> inspect.Signature:
+    return inspect.Signature([_keyword(name, bool, True), _keyword("tx", Transaction | None, None)], return_annotation=str)
+
+
+class TestViewAppliers:
+    """AC-1, AC-4: ``define_view()``/``remove_view()`` are coroutine class methods with spec §5.2's signatures, wrapped
+    by the query cache; V11 on an ordinary model and E13 before any request."""
+
+    @pytest.mark.parametrize(
+        ("method", "signature"),
+        [("define_view", _txn_signature("overwrite")), ("remove_view", _txn_signature("missing_ok"))],
+    )
+    def test_signatures(self, method: str, signature: inspect.Signature) -> None:
+        function = getattr(BaseSurrealModel, method)
+        assert inspect.iscoroutinefunction(function)
+        assert inspect.signature(function) == signature
+        assert inspect.signature(getattr(OrderStats, method)) == signature
+        assert isinstance(inspect.getattr_static(BaseSurrealModel, method), classmethod)
+        assert vars(BaseSurrealModel)[method].__func__.__surreal_cache_writes__ is True
+
+    @pytest.mark.parametrize("method", ["define_view", "remove_view"])
+    async def test_v11_before_any_request(self, client_requests: list[str], method: str) -> None:
+        await SurrealDBConnectionManager.unset_connection()
+        with pytest.raises(TypeError) as raised:
+            await getattr(PlainOrder, method)()
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _v11("PlainOrder", f"{method}()")
+        assert client_requests == []
+
+    @pytest.mark.parametrize(
+        ("call", "text"),
+        [
+            (lambda: OrderStats.define_view(overwrite=1), "overwrite= must be a bool, got int."),
+            (lambda: OrderStats.remove_view(missing_ok="yes"), "missing_ok= must be a bool, got str."),
+        ],
+        ids=["overwrite", "missing_ok"],
+    )
+    async def test_e13_before_any_request(
+        self, client_requests: list[str], call: Callable[[], Awaitable[Any]], text: str
+    ) -> None:
+        with pytest.raises(TypeError) as raised:
+            await call()
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == text
+        assert client_requests == []
+
+
 # === E2E (spec §9.2): the connection "mv" on the database mv_db, over WebSocket and HTTP, and mem:// ================
 
 #: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
@@ -1542,3 +1995,426 @@ class TestViewWritesE2E:
             else:
                 await client.query("DELETE mv_order_stats;", {})
                 assert await _rows(client, "mv_order_stats") == []
+
+
+# --- define_view() and remove_view() on the engines (spec §5.2, §5.6 G1–G4, S1–S3; AC-5, AC-8, AC-9, AC-12, AC-17) ---
+
+#: Spec §3's golden for ``mv_order_stats``, as ``INFO FOR DB`` renders it on every engine (M18).
+_MV_STATS_RENDERED = (
+    "DEFINE TABLE mv_order_stats TYPE ANY SCHEMALESS AS SELECT status, count() AS total, math::sum(amount) AS revenue "
+    "FROM mv_orders GROUP BY status PERMISSIONS NONE"
+)
+
+#: ``mv_order_stats`` as an empty ordinary table, created by a ``DEFINE EVENT`` on it (M19).
+_MV_STATS_TABLE = "DEFINE TABLE mv_order_stats TYPE ANY SCHEMALESS PERMISSIONS NONE"
+
+
+class MvPaid(BaseSurrealModel):
+    """The ``WHERE`` golden of spec §5.3 over ``mv_orders``: a plain view keeps the source ids (M4)."""
+
+    model_config = SurrealConfigDict(
+        table_name="mv_paid_orders", connection="mv", view_query="SELECT customer, amount FROM mv_orders WHERE status = 'paid'"
+    )
+
+    id: RecordID | None = None
+    customer: str | None = None
+    amount: float
+
+
+class MvTotals(BaseSurrealModel):
+    """The ``GROUP ALL`` golden of spec §5.3 over ``mv_orders``: one record, id ``mv_order_totals:[]`` (M4)."""
+
+    model_config = SurrealConfigDict(
+        table_name="mv_order_totals",
+        connection="mv",
+        view_query="SELECT count() AS orders, math::sum(amount) AS revenue FROM mv_orders GROUP ALL",
+    )
+
+    id: RecordID | None = None
+    orders: int
+    revenue: float
+
+
+class MvOnSource(BaseSurrealModel):
+    """A view model whose table is the source ``mv_orders`` itself: G1, G2, G4 (AC-8 a)."""
+
+    model_config = SurrealConfigDict(table_name="mv_orders", connection="mv", view_query=_MV_STATS_QUERY)
+
+    id: RecordID | None = None
+
+
+class MvTaken(BaseSurrealModel):
+    """The grouped golden over ``mv_orders`` on a table a raw write took first: G1 and its remedy (AC-8 d)."""
+
+    model_config = SurrealConfigDict(table_name="mv_taken", connection="mv", view_query=_MV_STATS_QUERY)
+
+    id: RecordID | None = None
+    status: str
+    total: int
+    revenue: float
+
+
+class MvArchiveStats(BaseSurrealModel):
+    """A view over ``mv_order_archive`` (16 characters), never created: S3 names it (AC-9)."""
+
+    model_config = SurrealConfigDict(
+        table_name="mv_archive_stats",
+        connection="mv",
+        view_query="SELECT status, count() AS total FROM mv_order_archive GROUP BY status",
+    )
+
+    id: RecordID | None = None
+    status: str
+    total: int
+
+
+class MvStatsEvents(MvStats):
+    """``MvStats`` with an event on the view (D14): ``OVERWRITE`` drops it, ``define_events()`` restores it."""
+
+    model_config = SurrealConfigDict(
+        table_name="mv_order_stats", events=[Event("mv_seen", then="CREATE mv_log SET at = time::now()")]
+    )
+
+
+class MvCurrentStats(BaseSurrealModel):
+    """The grouped golden over ``mv_orders`` with no ``connection``: it defines on the ``using()`` block's (AC-12)."""
+
+    model_config = SurrealConfigDict(table_name="mv_order_stats", view_query=_MV_STATS_QUERY)
+
+    id: RecordID | None = None
+    status: str
+    total: int
+    revenue: float
+
+
+#: A record access on ``mv_db``: a user signed up through it is a record user, who may not define (M15).
+_MV_ACCESS = (
+    "DEFINE ACCESS mv_acc ON DATABASE TYPE RECORD SIGNUP (CREATE mv_user SET name = $name) "
+    "SIGNIN (SELECT * FROM mv_user WHERE name = $name);"
+)
+
+
+async def _major(client: Any) -> int:
+    """The major version of the engine *client* talks to: ``"surrealdb-3.3.4"`` → 3; ``mem://`` → 2."""
+    return (await _line(client))[0]
+
+
+async def _require_line(client: Any, line: int, item: str) -> None:
+    """A *line*-only *item*: the test runs on that line, where a refusal fails it, and is skipped on the other."""
+    if await _major(client) != line:
+        pytest.skip(f"SurrealDB {line}.x only: {item}")
+
+
+def _spy(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[tuple[str, tuple[object, ...]]]:
+    """Record every ``query``, ``query_raw`` and ``version`` call *client* receives, with its arguments (and let it
+    through) — v0.31.0's spy."""
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def recording(method: str) -> Any:
+        real = getattr(client, method)
+
+        async def call(*args: object, **kwargs: object) -> object:
+            calls.append((method, args))
+            return await real(*args, **kwargs)
+
+        return call
+
+    for method in ("query", "query_raw", "version"):
+        monkeypatch.setattr(client, method, recording(method))
+    return calls
+
+
+def _sent(calls: list[tuple[str, tuple[object, ...]]]) -> list[object]:
+    """The statements *calls* (:func:`_spy`'s) sent through ``query()``, after checking that nothing else was sent: no
+    ``version()``, and a ``query_raw()`` only for those statements (the SDK's ``query()`` runs it itself)."""
+    statements = [args[0] for method, args in calls if method == "query"]
+    assert [method for method, _ in calls if method == "version"] == []
+    assert [args[0] for method, args in calls if method == "query_raw"] == statements
+    return statements
+
+
+async def _tables(client: Any) -> dict[str, Any]:
+    """The ``tables`` of ``INFO FOR DB`` on *client*'s database."""
+    return dict((await client.query("INFO FOR DB;", {}))["tables"])
+
+
+async def _events_info(client: Any, table: str) -> dict[str, Any]:
+    """The ``events`` of ``INFO FOR TABLE`` *table* (a constant name of these tests)."""
+    return dict((await client.query(f"INFO FOR TABLE {table};", {}))["events"])
+
+
+@contextlib.asynccontextmanager
+async def _default(kind: str) -> AsyncIterator[Any]:
+    """The default connection on the line under test (``ns``/``db``) — over *kind*, WebSocket for ``mem`` — and its
+    client; its previous settings put back on exit."""
+    saved_url, *saved = default_connection_class()._settings()
+    url = _url("ws" if kind == "mem" else kind)
+    SurrealDBConnectionManager.set_connection(url=url, user="root", password="root", namespace="ns", database="db")
+    try:
+        yield await SurrealDBConnectionManager.get_client()
+    finally:
+        await SurrealDBConnectionManager.unset_connection()
+        if saved_url is not None:
+            SurrealDBConnectionManager.set_connection(saved_url, *saved)
+
+
+async def _save_orders() -> None:
+    """Spec AC-5's three orders, saved through the ORM: ``paid`` 10.0 and 5.5, ``new`` 1.0."""
+    await MvOrder(id="o1", status="paid", amount=10.0, customer="ann").save()
+    await MvOrder(id="o2", status="paid", amount=5.5, customer="bob").save()
+    await MvOrder(id="o3", status="new", amount=1.0, customer="ann").save()
+
+
+async def _groups() -> dict[str, tuple[int, float]]:
+    """``MvStats``' groups, read through the ORM: status → (total, revenue)."""
+    return {stats.status: (stats.total, stats.revenue) for stats in await MvStats.objects().exec()}
+
+
+class TestDefineViewE2E:
+    """AC-5, AC-9, AC-12 (E2E, both lines, WebSocket, HTTP and ``mem://``): ``define_view()`` applies the view and
+    returns its statement, SurrealDB fills it and keeps it up to date, a second call converges, ``overwrite=False``
+    keeps what exists, ``remove_view()`` removes it; a missing source table is named by the refusal; the view lands on
+    the model's connection."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_define_and_read(self, kind: str) -> None:
+        async with _mv(kind) as client:
+            await _save_orders()
+            assert await MvStats.define_view() == MvStats.view_ddl()
+            assert (await _tables(client))["mv_order_stats"] == _MV_STATS_RENDERED
+            stats = await MvStats.objects().order_by("status").exec()
+            assert all(type(row) is MvStats for row in stats)
+            assert [(row.id, row.status, row.total, row.revenue) for row in stats] == [
+                (RecordID("mv_order_stats", ["new"]), "new", 1, 1.0),
+                (RecordID("mv_order_stats", ["paid"]), "paid", 2, 15.5),
+            ]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_source_writes_are_reflected_at_once(self, kind: str) -> None:
+        async with _mv(kind):
+            await _save_orders()
+            await MvStats.define_view()
+            await MvOrder(id="o4", status="new", amount=2.0).save()
+            assert await _groups() == {"new": (2, 3.0), "paid": (2, 15.5)}
+            await (await MvOrder.objects().get("o1")).merge(amount=20.0)
+            assert await _groups() == {"new": (2, 3.0), "paid": (2, 25.5)}
+            await (await MvOrder.objects().get("o3")).delete()
+            assert await _groups() == {"new": (1, 2.0), "paid": (2, 25.5)}
+            await (await MvOrder.objects().get("o4")).delete()
+            assert await _groups() == {"paid": (2, 25.5)}
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_plain_view_and_a_group_all_view(self, kind: str) -> None:
+        async with _mv(kind):
+            await _save_orders()
+            assert await MvPaid.define_view() == MvPaid.view_ddl()
+            assert await MvTotals.define_view() == MvTotals.view_ddl()
+            paid = await MvPaid.objects().order_by("customer").exec()
+            assert [(row.id, row.customer, row.amount) for row in paid] == [
+                (RecordID("mv_paid_orders", "o1"), "ann", 10.0),
+                (RecordID("mv_paid_orders", "o2"), "bob", 5.5),
+            ]
+            totals = await MvTotals.objects().first()
+            assert totals is not None
+            assert (totals.id, totals.orders, totals.revenue) == (RecordID("mv_order_totals", []), 3, 16.5)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_idempotent_and_overwrite_false_keeps_what_exists(self, kind: str) -> None:
+        """A second ``define_view()`` converges (``INFO`` unchanged) — except on SurrealDB 3.1, measured on 3.1.5 over
+        WebSocket and HTTP: its key-value store refuses ``DEFINE TABLE OVERWRITE … AS`` on a view that holds records
+        (S3), and the view stays as it was; 3.3, 2.x and the embedded engine recompute it."""
+        async with _mv(kind) as client:
+            await _save_orders()
+            await MvStats.define_view()
+            before = await _tables(client)
+            if await _line(client) == (3, 1):
+                with pytest.raises(SurrealDbError) as raised:
+                    await MvStats.define_view()
+                assert type(raised.value) is SurrealDbError
+                assert str(raised.value) == (
+                    "Can't apply view definition: 'mv_order_stats' -> There was a problem with the key-value store: The "
+                    "key being inserted already exists"
+                )
+            else:
+                assert await MvStats.define_view() == MvStats.view_ddl()
+            assert await _tables(client) == before
+            assert await _groups() == {"new": (1, 1.0), "paid": (2, 15.5)}
+            await _apply_ddl(
+                client,
+                "REMOVE TABLE mv_order_stats; DEFINE TABLE mv_order_stats AS SELECT status, count() AS total, "
+                "math::sum(amount) AS revenue FROM mv_orders WHERE status = 'x' GROUP BY status;",
+            )
+            by_hand = (await _tables(client))["mv_order_stats"]
+            assert "WHERE status = 'x'" in by_hand
+            assert await MvStats.define_view(overwrite=False) == MvStats.view_ddl(overwrite=False)
+            assert (await _tables(client))["mv_order_stats"] == by_hand
+            assert await MvStats.objects().exec() == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_remove_view(self, kind: str) -> None:
+        async with _mv(kind) as client:
+            await _save_orders()
+            await MvStats.define_view()
+            assert await MvStats.remove_view() == "REMOVE TABLE IF EXISTS `mv_order_stats`;"
+            tables = await _tables(client)
+            assert "mv_order_stats" not in tables
+            assert "mv_orders" in tables
+            assert len(await _rows(client, "mv_orders")) == 3
+            assert await MvStats.remove_view() == "REMOVE TABLE IF EXISTS `mv_order_stats`;"
+            with pytest.raises(SurrealDbError) as raised:
+                await MvStats.remove_view(missing_ok=False)
+            assert type(raised.value) is SurrealDbNotFoundError
+            assert str(raised.value) == (
+                "Can't apply view removal: 'mv_order_stats' -> The table 'mv_order_stats' does not exist"
+            )
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_s3_names_a_missing_source_table(self, kind: str) -> None:
+        """AC-9 (M9, D16): the refusal keeps the server's reason, which names the source table, and never quotes the
+        statement. The raw ``REMOVE TABLE mv_orders`` runs before any view reads it (3.x refuses it then, M11)."""
+        async with _mv(kind) as client:
+            with pytest.raises(SurrealDbError) as archive:
+                await MvArchiveStats.define_view()
+            assert "mv_archive_stats" not in await _tables(client)
+            await _apply_ddl(client, "REMOVE TABLE mv_orders;")
+            with pytest.raises(SurrealDbError) as orders:
+                await MvStats.define_view()
+            assert "mv_order_stats" not in await _tables(client)
+        for raised, view, source in (
+            (archive, "mv_archive_stats", "mv_order_archive"),
+            (orders, "mv_order_stats", "mv_orders"),
+        ):
+            text = str(raised.value)
+            assert type(raised.value) is SurrealDbError
+            assert text.startswith(f"Can't apply view definition: '{view}' -> ")
+            assert f"The table '{source}' does not exist" in text
+            assert "quotes the statement" not in text
+            assert "DEFINE TABLE" not in text
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_model_defines_on_its_own_connection(self, kind: str) -> None:
+        async with _default(kind) as default, _mv(kind) as client:
+            await _save_orders()
+            await MvStats.define_view()
+            assert (await _tables(client))["mv_order_stats"] == _MV_STATS_RENDERED
+            assert "mv_order_stats" not in await _tables(default)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_model_without_connection_defines_on_the_current_one(self, kind: str) -> None:
+        async with _default(kind) as default, _mv(kind) as client:
+            await _save_orders()
+            async with SurrealDBConnectionManager.using("mv"):
+                assert await MvCurrentStats.define_view() == MvCurrentStats.view_ddl()
+            assert (await _tables(client))["mv_order_stats"] == _MV_STATS_RENDERED
+            assert "mv_order_stats" not in await _tables(default)
+
+
+class TestViewGuardE2E:
+    """AC-8 (E2E): the table guard on both lines — never a table that holds records (G1), never ``IF NOT EXISTS`` on an
+    ordinary table (G4), never the removal of an ordinary table (G2) — and an empty ordinary table, created by an event
+    or a 2.x live query, becomes the view."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_source_table_is_never_touched(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _mv(kind) as client:
+            await _save_orders()
+            before = await _rows(client, "mv_orders")
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as g1:
+                await MvOnSource.define_view()
+            assert _sent(calls) == ["INFO FOR DB;", "SELECT id FROM `mv_orders` LIMIT 1;"]
+            calls.clear()
+            with pytest.raises(SurrealDbError) as g4:
+                await MvOnSource.define_view(overwrite=False)
+            assert _sent(calls) == ["INFO FOR DB;"]
+            calls.clear()
+            with pytest.raises(SurrealDbError) as g2:
+                await MvOnSource.remove_view()
+            assert _sent(calls) == ["INFO FOR DB;"]
+            assert await _rows(client, "mv_orders") == before
+            assert "AS SELECT" not in (await _tables(client))["mv_orders"]
+        assert (type(g1.value), str(g1.value)) == (SurrealDbError, _g1("MvOnSource", "mv_orders"))
+        assert (type(g4.value), str(g4.value)) == (SurrealDbError, _g4("MvOnSource", "mv_orders"))
+        assert (type(g2.value), str(g2.value)) == (SurrealDbError, _g2("MvOnSource", "mv_orders"))
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_table_an_event_created_becomes_the_view(self, kind: str) -> None:
+        """M19, D14: ``define_events()`` first creates the table, empty; ``define_view()`` turns it into the view and
+        its ``OVERWRITE`` drops the event, which the next ``define_events()`` restores."""
+        async with _mv(kind) as client:
+            await _save_orders()
+            await MvStatsEvents.define_events()
+            assert (await _tables(client))["mv_order_stats"] == _MV_STATS_TABLE
+            with pytest.raises(SurrealDbError) as g4:
+                await MvStatsEvents.define_view(overwrite=False)
+            assert str(g4.value) == _g4("MvStatsEvents", "mv_order_stats")
+            assert await MvStatsEvents.define_view() == MvStatsEvents.view_ddl()
+            assert (await _tables(client))["mv_order_stats"] == _MV_STATS_RENDERED
+            assert await _groups() == {"new": (1, 1.0), "paid": (2, 15.5)}
+            assert "mv_seen" not in await _events_info(client, "mv_order_stats")
+            # Measured: on 3.x the event, defined before the OVERWRITE, fired once per group the view was filled
+            # with, and was dropped after; 2.x and the embedded engine dropped it first.
+            assert len(await _rows(client, "mv_log")) == (2 if await _major(client) >= 3 else 0)
+            logged = len(await _rows(client, "mv_log"))
+            await MvStatsEvents.define_events()
+            assert list(await _events_info(client, "mv_order_stats")) == ["mv_seen"]
+            await MvOrder(id="o4", status="paid", amount=1.0).save()
+            assert len(await _rows(client, "mv_log")) == logged + 1
+
+    async def test_a_table_a_2x_live_query_created_becomes_the_view(self) -> None:
+        """M19: on 2.x a live query creates the table; ``define_view()`` then turns it into the view. WebSocket only
+        (the embedded engine has no live queries); 3.x refuses a live query on a missing table."""
+        async with _mv("ws") as client:
+            await _require_line(client, 2, "a live query creates the table it watches")
+            async with MvStats.objects().watch():
+                pass
+            assert "mv_order_stats" in await _tables(client)
+            await _save_orders()
+            assert await MvStats.define_view() == MvStats.view_ddl()
+            assert (await _tables(client))["mv_order_stats"] == _MV_STATS_RENDERED
+            assert await _groups() == {"new": (1, 1.0), "paid": (2, 15.5)}
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_g1_then_its_remedy_as_written(self, kind: str) -> None:
+        async with _mv(kind) as client:
+            await _save_orders()
+            await _apply_ddl(client, "CREATE mv_taken:1 SET a = 1;")
+            with pytest.raises(SurrealDbError) as g1:
+                await MvTaken.define_view()
+            assert str(g1.value) == _g1("MvTaken", "mv_taken")
+            assert await _rows(client, "mv_taken") == [{"id": RecordID("mv_taken", 1), "a": 1}]
+            await MvTaken.raw_query("REMOVE TABLE `mv_taken`;")
+            assert await MvTaken.define_view() == MvTaken.view_ddl()
+            assert {row.status: row.total for row in await MvTaken.objects().exec()} == {"new": 1, "paid": 2}
+
+
+class TestViewPermissionsE2E:
+    """AC-17 (servers): a record user may not define nor remove a view — S1 from the guard's ``INFO FOR DB`` — and
+    reads ``[]`` from a view defined without ``PERMISSIONS`` (``PERMISSIONS NONE``, M15, D13). The embedded engine's
+    session is its owner, which may always define."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_s1_a_record_user(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        if kind == "mem":
+            pytest.skip("the embedded engine's session is its owner: it may always define")
+        async with _mv(kind) as client, SurrealDBConnectionManager.using("mv"):
+            await _save_orders()
+            await MvStats.define_view()
+            await _apply_ddl(client, _MV_ACCESS)
+            await SurrealDBConnectionManager.signup(access="mv_acc", variables={"name": "mv-user"})
+            try:
+                calls = _spy(monkeypatch, client)
+                with pytest.raises(SurrealDbError) as define:
+                    await MvStats.define_view()
+                with pytest.raises(SurrealDbError) as remove:
+                    await MvStats.remove_view()
+                assert _sent(calls) == ["INFO FOR DB;"] * 2
+                rows = await MvStats.objects().exec()
+            finally:
+                await SurrealDBConnectionManager.invalidate()
+            assert rows == []
+            assert (await _tables(client))["mv_order_stats"] == _MV_STATS_RENDERED
+        for raised, kind_ in ((define, "definition"), (remove, "removal")):
+            assert type(raised.value) is SurrealDbAuthenticationError
+            assert str(raised.value).startswith(f"Can't apply view {kind_}: 'mv_order_stats' -> ")
+            assert "not enough permissions" in str(raised.value).lower()
