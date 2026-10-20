@@ -35,7 +35,11 @@ whether it holds a record (``table_holds_records()``), so a view never replaces 
 ``remove_view()`` never removes an ordinary table (``view_table_refused()``). It reads committed state: a check, then
 the DDL, not a lock. Before the guard, ``define_view()`` refuses on SurrealDB 2.x and the embedded engine a grouped
 projection those engines compute once per source record (``ensure_view_query_supported()``, C1), reading the line
-from ``client.version()`` only when the query holds one; 3.x keeps such a view up to date or refuses it itself.
+from ``client.version()`` only when the query holds one; 3.x keeps such a view up to date or refuses it itself. On the
+guard's one ``INFO FOR DB``, ``remove_view()`` finds the views that read the view it removes (``dependent_views()``,
+through the plain ``FROM`` targets ``view_reads_table()`` reads) and, when there is one, refuses on SurrealDB 2.x and
+the embedded engine before any DDL (``ensure_view_removable()``, G5): those engines would remove it and turn those
+views into ordinary tables that no longer update, where 3.x refuses the removal itself.
 
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
 it.
@@ -522,6 +526,10 @@ _VIEW_GROUP = re.compile(r"\bGROUP\s+(BY|ALL)\b", re.IGNORECASE)
 #: The ``FROM`` keyword — not the word ``from`` of a function path (``time::from::unix()``), a field path or a
 #: parameter.
 _VIEW_FROM = re.compile(r"(?<![\w$.:])FROM(?![\w:])", re.IGNORECASE)
+#: The first clause after a view query's ``FROM`` targets (``view_reads_table()``).
+_VIEW_TARGETS_END = re.compile(
+    r"\b(?:WHERE|GROUP|SPLIT|ORDER|LIMIT|START|FETCH|TIMEOUT|PARALLEL|EXPLAIN|WITH)\b", re.IGNORECASE
+)
 #: A projection element's alias, at its end: ``… AS name``, ``… AS `a name```, ``… AS ⟨a name⟩``.
 _VIEW_ALIAS = re.compile(r"\s+AS\s+(`[^`]*`|⟨[^⟩]*⟩|[^\s`⟨]+)\s*$", re.IGNORECASE)
 #: A sub-select or a graph path: an element the reading leaves to the server.
@@ -1055,3 +1063,81 @@ async def ensure_view_query_supported(client: Any, query: str, *, model: str, em
     if major >= 3:
         return
     raise SurrealDbError(view_hazard_refused(model, hazards[0], _engine_name(major, embedded)))
+
+
+# --- the removal check of remove_view(): G5 (v0.32.0) ----------------------------------------------------------------
+
+
+def view_reads_table(view_query: str, table: str) -> bool:
+    """Whether the view query *view_query* reads *table* through one of its plain ``FROM`` targets (v0.32.0).
+
+    A reading of the text, not a parser: literals and quoted names are blanked and brackets skipped
+    (``_top_level()``); the targets run from the top-level ``FROM`` to the first clause after it (``WHERE``,
+    ``GROUP``, ``SPLIT``, ``ORDER``, ``LIMIT``, ``START``, ``FETCH``, ``TIMEOUT``, ``PARALLEL``, ``EXPLAIN``,
+    ``WITH``) or the end, split at their top-level commas; each, stripped and without one pair of enclosing
+    backquotes or ``⟨⟩``, is compared with *table* exactly — so ``FROM `select``` (2.x's rendering) and ``FROM
+    select`` (3.x's) both read ``select``. It reads the plain ``FROM`` targets only: a graph path
+    (``->knows->person``), a record id (``t:1``), ``ONLY t`` or a sub-select never equals a table name, and a view
+    that reads the table that way is left to the server. Pure.
+    """
+    _, top = _top_level(view_query)
+    clause = _VIEW_FROM.search(top)
+    if clause is None:
+        return False
+    end = _VIEW_TARGETS_END.search(top, clause.end())
+    stop = len(view_query) if end is None else end.start()
+    return any(
+        _unquoted_name(view_query[start:finish].strip()) == table for start, finish in _top_spans(top, clause.end(), stop)
+    )
+
+
+def dependent_views(tables: Mapping[str, Any], table: str) -> tuple[str, ...]:
+    """The views of *tables* (``read_table_definitions()``'s map) whose query reads *table*, sorted (v0.32.0).
+
+    A view is listed when ``define_parser.parse_define_table()`` reads its definition with an ``AS`` clause whose query
+    reads *table* through a plain ``FROM`` target (:func:`view_reads_table`). *table* itself is never listed; an
+    ordinary table, a definition that is not a ``str`` and one the parser cannot read are skipped: the server decides
+    for them. Pure.
+    """
+    names: list[str] = []
+    for name, definition in tables.items():
+        if name == table or not isinstance(definition, str):
+            continue
+        try:
+            view_query = parse_define_table(definition).view_query
+        except DefineParseError:
+            continue
+        if view_query is not None and view_reads_table(view_query, table):
+            names.append(name)
+    return tuple(sorted(names))
+
+
+async def ensure_view_removable(client: Any, table: str, dependents: Sequence[str], *, model: str, embedded: bool) -> None:
+    """Refuse, on a connection before SurrealDB 3.x, to remove the view *table* that other views read — before any
+    DDL (G5, v0.32.0).
+
+    While a view reads a table — a source table or an inner view —, SurrealDB 3.x refuses to remove it (``Cannot
+    delete table … on which a view is defined``). SurrealDB 2.x and the embedded engine remove it, and every view that
+    read it loses its ``AS`` clause: an ordinary table that keeps its last records and no longer updates. *dependents*
+    are those views (:func:`dependent_views`, over the table guard's one ``INFO FOR DB``): none, and nothing is read.
+    Else the line is read from ``client.version()`` with the lite's rule (``time_travel.line_major()``): on 3.x — or a
+    version that cannot be read — the removal goes on and the server refuses it; before 3.x, G5 names the dependent
+    views, sorted. On the embedded engine ``version()`` answers the SDK's version (``surrealdb-2.0.0``), whose bundled
+    core is 2.x too; *embedded* names it so in the message.
+
+    :param client: the SDK client of the model's connection (outside any transaction: ``version()`` takes none).
+    :param model: the class name the message starts with.
+    :raises SurrealDbError: other views read *table* and the connection runs SurrealDB before 3.x.
+    """
+    if not dependents:
+        return
+    major = line_major(await client.version())
+    if major >= 3:
+        return
+    names = ", ".join(repr(name) for name in sorted(dependents))
+    raise SurrealDbError(
+        f"{model}.remove_view(): other views read the table '{table}' ({names}); SurrealDB 3.x refuses to remove it, "
+        f"and this connection runs {_engine_name(major, embedded)}, which would remove it and turn those views into "
+        "ordinary tables that keep their last records and no longer update. Remove those views first. Nothing was "
+        "removed."
+    )

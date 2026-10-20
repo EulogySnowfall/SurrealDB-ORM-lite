@@ -29,8 +29,10 @@ from .schema import (
     check_events_config,
     check_view_config,
     check_view_query,
+    dependent_views,
     ensure_async_events_supported,
     ensure_view_query_supported,
+    ensure_view_removable,
     event_subject,
     read_table_definitions,
     remove_event_statement,
@@ -1133,8 +1135,15 @@ class BaseSurrealModel(BaseModel):
         Sends ``REMOVE TABLE [IF EXISTS] `<table>`;`` on the model's connection: the view, its records and the
         events defined on it are removed; the tables it selects from are left as they are. Before it, a table guard
         reads ``INFO FOR DB`` once, on committed state, outside any transaction: ``remove_view()`` removes views only,
-        never an ordinary table (removing one would delete its records, fields, indexes and events). Remove the
-        views that read another view first.
+        never an ordinary table (removing one would delete its records, fields, indexes and events).
+
+        **Remove the views that read another view first.** While a view reads this one, SurrealDB 3.x refuses the
+        removal itself (``Can't apply view removal: '<table>' -> … Cannot delete table …``, the server's reason
+        whole). SurrealDB 2.x and the embedded engine would remove it and turn every view that reads it into an
+        ordinary table that keeps its last records and no longer updates: on them ``remove_view()`` raises before any
+        DDL, naming those views. They are found in the same ``INFO FOR DB``, through the plain ``FROM`` targets of
+        their queries only (a view reading the table through a graph path or a sub-select is left to the server), and
+        the line is read from ``client.version()`` only when one is found.
 
         Args:
             missing_ok: ``True`` (default) emits ``REMOVE TABLE IF EXISTS …``, so a missing view is not an error;
@@ -1146,11 +1155,12 @@ class BaseSurrealModel(BaseModel):
             SurrealDbNotFoundError: ``missing_ok=False`` and the table does not exist.
             SurrealDbAuthenticationError: the session may not read the database's definitions or remove the view.
             SurrealDbError: *tx* belongs to another connection — before any request; the table is not a view, or its
-                definition cannot be read — before any DDL; any other refusal (``Can't apply view removal: …``). In
-                a buffered transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the statement is
-                only queued: a refusal comes back when the block commits, as the transaction's own
-                ``SurrealDbError``, never as ``SurrealDbNotFoundError`` or ``SurrealDbAuthenticationError`` —
-                ``missing_ok=False`` included.
+                definition cannot be read — before any DDL; other views read it and the connection runs SurrealDB 2.x
+                or the embedded engine — before any request but ``version()``; any other refusal (``Can't apply view
+                removal: …``), such as SurrealDB 3.x refusing to remove a view another view reads. In a buffered
+                transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the statement is only queued: a
+                refusal comes back when the block commits, as the transaction's own ``SurrealDbError``, never as
+                ``SurrealDbNotFoundError`` or ``SurrealDbAuthenticationError`` — ``missing_ok=False`` included.
 
         Example:
             >>> await OrderStats.remove_view()
@@ -1167,6 +1177,10 @@ class BaseSurrealModel(BaseModel):
             raise SurrealDbError(view_table_refused("G2", cls.__name__, table))
         if existing == "unreadable":
             raise SurrealDbError(view_table_refused("G3", cls.__name__, table, removal=True))
+        if existing == "view":
+            await ensure_view_removable(
+                client, table, dependent_views(tables, table), model=cls.__name__, embedded=manager.is_embedded()
+            )
         await apply_ddl_statements(
             [statement],
             client=client,

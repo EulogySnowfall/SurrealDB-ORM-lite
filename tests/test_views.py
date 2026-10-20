@@ -26,6 +26,13 @@ read only when the grouped projection holds a hazard, the exact texts, then from
 guard — and E2E: on SurrealDB 2.x and the embedded engine each C1 kind refused with ``version()`` as the only request,
 on 3.x the same views kept up to date or refused by the server (``Found idiom``), ``math::sum()``/``math::mean()``
 value types per line (M5), and a source write missing an aggregated field refused on every line (M8).
+
+Removing a view that another view reads (spec §1.4, §5.6 G5 and S3, §6.1; AC-20; M11): ``view_reads_table()`` and
+``dependent_views()`` (pure), G5 — ``ensure_view_removable()`` reading ``version()`` only when another view reads the
+table — on fake clients, then E2E: on SurrealDB 2.x and the embedded engine ``remove_view()`` of the inner view raises
+G5 before any DDL (in a transaction too), on 3.x the server refuses it (``Can't apply view removal: …``), both views
+stay; the outer view first, then the inner one, is removed on every line; a raw ``REMOVE TABLE`` of the source table is
+pinned per line.
 """
 
 import contextlib
@@ -2026,6 +2033,257 @@ class TestC1:
         assert client.version_calls == 1
 
 
+# --- G5: removing a view that another view reads (spec §1.4, §4, §5.2 step e′, §5.6 G5, §6.1; AC-20) -----------------
+
+#: ``view_reads_table()``'s cases (spec §6.1, ruling P5): (view query, table, whether the query reads the table).
+_READS_TABLE = [
+    ("SELECT n FROM inner_v", "inner_v", True),
+    ("SELECT * FROM a, inner_v WHERE x", "inner_v", True),
+    # 3.x renders a keyword table name bare, 2.x in backquotes (M18).
+    ("SELECT * FROM `select`", "select", True),
+    ("SELECT * FROM select", "select", True),
+    ("SELECT * FROM inner_vx", "inner_v", False),
+    ("SELECT * FROM a WHERE x INSIDE (SELECT VALUE id FROM inner_v)", "inner_v", False),
+    ("SELECT status, count() AS n FROM orders GROUP BY status", "orders", True),
+    ("SELECT * FROM ⟨inner_v⟩", "inner_v", True),
+    ("SELECT n", "inner_v", False),
+    # Left to the server: a graph path, a record id, ONLY.
+    ("SELECT * FROM ->knows->person", "person", False),
+    ("SELECT * FROM inner_v:1", "inner_v", False),
+    ("SELECT * FROM ONLY inner_v", "inner_v", False),
+    # The targets end at the first clause keyword; ``from`` in a function path is not the clause.
+    ("select n from inner_v split n", "inner_v", True),
+    ("SELECT time::from::unix(at) AS t FROM inner_v", "inner_v", True),
+    ("SELECT * FROM a, b", "inner_v", False),
+]
+
+_READS_TABLE_IDS = [
+    "one",
+    "second-of-two",
+    "backquoted-keyword",
+    "bare-keyword",
+    "longer-name",
+    "sub-select",
+    "group-by",
+    "angle-quoted",
+    "no-from",
+    "graph-path",
+    "record-id",
+    "only",
+    "lower-case-split",
+    "from-in-a-function-path",
+    "other-tables",
+]
+
+#: The view over ``MvStats``' view (AC-20), as ``INFO FOR DB`` renders it on every engine.
+_MV_TOTALS_RENDERED = "DEFINE TABLE mv_stats_totals TYPE ANY SCHEMALESS AS SELECT total FROM mv_order_stats PERMISSIONS NONE"
+
+#: A view definition ``parse_define_table()`` cannot read, though its text names ``mv_order_stats`` after ``FROM``.
+_MV_UNREADABLE_VIEW = "DEFINE TABLE mv_bad TYPE ANY SCHEMALESS SOMEDAY 1 AS SELECT total FROM mv_order_stats PERMISSIONS NONE"
+
+#: ``mv_orders``, an ordinary table, as ``INFO FOR DB`` renders it.
+_MV_ORDERS_TABLE = "DEFINE TABLE mv_orders TYPE ANY SCHEMALESS PERMISSIONS NONE"
+
+_REMOVE_MV_STATS = "REMOVE TABLE IF EXISTS `mv_order_stats`;"
+
+
+def _g5(model: str, table: str, names: str, engine: str) -> str:
+    return (
+        f"{model}.remove_view(): other views read the table '{table}' ({names}); SurrealDB 3.x refuses to remove it, "
+        f"and this connection runs {engine}, which would remove it and turn those views into ordinary tables that keep "
+        "their last records and no longer update. Remove those views first. Nothing was removed."
+    )
+
+
+def _removal_client(*dependents: str, version: str, ddl_error: BaseException | None = None) -> _GuardClient:
+    """A fake client whose ``INFO FOR DB`` holds ``mv_order_stats``, its source and a view over it per *dependents*."""
+    tables: dict[str, object] = {"mv_order_stats": _MV_STATS_RENDERED, "mv_orders": _MV_ORDERS_TABLE}
+    for name in dependents:
+        tables[name] = f"DEFINE TABLE {name} TYPE ANY SCHEMALESS AS SELECT total FROM mv_order_stats PERMISSIONS NONE"
+    return _GuardClient(tables, version=version, ddl_error=ddl_error)
+
+
+@pytest.fixture
+def use_mv_client(monkeypatch: pytest.MonkeyPatch) -> Callable[..., None]:
+    """Route ``MvStats`` and ``MvStatsTotals`` to the client given — through a fake connection class, embedded or not —
+    without registering the connection ``"mv"``."""
+
+    def use(client: Any, *, embedded: bool = False) -> None:
+        class Manager:
+            @staticmethod
+            async def get_client() -> Any:
+                return client
+
+            @staticmethod
+            def is_embedded() -> bool:
+                return embedded
+
+        for model in (MvStats, MvStatsTotals):
+            monkeypatch.setattr(model, "_connection_manager", classmethod(lambda cls: Manager))
+
+    return use
+
+
+class TestViewReadsTable:
+    """Spec §6.1, ruling P5 (pure): ``view_reads_table()`` reads the plain ``FROM`` targets of a view query and leaves
+    graph paths, record ids and sub-selects to the server; ``dependent_views()`` lists, sorted, the other views of an
+    ``INFO FOR DB`` map whose query reads a table."""
+
+    @pytest.mark.parametrize(("query", "table", "reads"), _READS_TABLE, ids=_READS_TABLE_IDS)
+    def test_view_reads_table(self, query: str, table: str, reads: bool) -> None:
+        assert schema.view_reads_table(query, table) is reads
+
+    @pytest.mark.parametrize("view", sorted(_RENDERED))
+    def test_the_golden_renderings(self, view: str) -> None:
+        query = define_parser.parse_define_table(_RENDERED[view]).view_query
+        assert query is not None
+        assert schema.view_reads_table(query, "orders") is True
+        assert schema.view_reads_table(query, "order_stats") is False
+        assert schema.view_reads_table(query, view) is False
+
+    def test_dependent_views(self) -> None:
+        with pytest.raises(define_parser.DefineParseError):
+            define_parser.parse_define_table(_MV_UNREADABLE_VIEW)
+        tables: dict[str, object] = {
+            "mv_order_stats": _MV_STATS_RENDERED,
+            "mv_stats_totals": _MV_TOTALS_RENDERED,
+            "mv_b": "DEFINE TABLE mv_b TYPE ANY SCHEMALESS AS SELECT status FROM mv_order_stats WHERE total > 1 "
+            "PERMISSIONS NONE",
+            "mv_orders": _MV_ORDERS_TABLE,
+            "mv_bad": _MV_UNREADABLE_VIEW,
+            "mv_odd": 42,
+        }
+        assert schema.dependent_views(tables, "mv_order_stats") == ("mv_b", "mv_stats_totals")
+        assert schema.dependent_views(tables, "mv_orders") == ("mv_order_stats",)
+        assert schema.dependent_views(tables, "mv_stats_totals") == ()
+        assert schema.dependent_views(tables, "mv_missing") == ()
+        assert schema.dependent_views({}, "mv_order_stats") == ()
+
+    def test_the_table_itself_is_never_listed(self) -> None:
+        tables = {"loop": "DEFINE TABLE loop TYPE ANY SCHEMALESS AS SELECT * FROM loop PERMISSIONS NONE"}
+        assert schema.view_reads_table("SELECT * FROM loop", "loop") is True
+        assert schema.dependent_views(tables, "loop") == ()
+
+
+class TestRemovalGuard:
+    """Spec §5.2 step (e′), §5.6 G5, AC-20 (unit, fake clients): ``ensure_view_removable()`` reads ``version()`` only
+    when another view reads the table, refuses the removal on SurrealDB 2.x and the embedded engine with G5's exact
+    text, and lets 3.x refuse it itself (S3, ``removal``); ``remove_view()`` runs it on the guard's one ``INFO FOR
+    DB``, before any DDL and before anything is queued."""
+
+    async def test_no_dependent_no_request(self) -> None:
+        client = _GuardClient(version="surrealdb-2.7.0")
+        assert await schema.ensure_view_removable(client, "t", (), model="M", embedded=False) is None
+        assert client.queries == []
+        assert client.version_calls == 0
+
+    async def test_the_text_names_the_dependents_sorted(self) -> None:
+        client = _GuardClient(version="surrealdb-2.7.0")
+        with pytest.raises(SurrealDbError) as raised:
+            await schema.ensure_view_removable(client, "t", ["zeta", "alpha"], model="M", embedded=False)
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _g5("M", "t", "'alpha', 'zeta'", _ENGINE_2X)
+        assert client.queries == []
+        assert client.version_calls == 1
+
+    @pytest.mark.parametrize("version", ["surrealdb-3.3.4", "surrealdb-3.1.5", "surrealdb", ""])
+    async def test_3x_and_an_unreadable_version_leave_it_to_the_server(self, version: str) -> None:
+        client = _GuardClient(version=version)
+        assert await schema.ensure_view_removable(client, "t", ("u",), model="M", embedded=False) is None
+        assert client.queries == []
+        assert client.version_calls == 1
+
+    async def test_g5_from_remove_view(self, use_mv_client: Callable[..., None]) -> None:
+        """AC-20: the exact text of the spec; the spy sees ``INFO FOR DB;`` and ``version()`` only, no ``REMOVE``."""
+        client = _removal_client("mv_stats_totals", version="surrealdb-2.7.0")
+        use_mv_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await MvStats.remove_view()
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == (
+            "MvStats.remove_view(): other views read the table 'mv_order_stats' ('mv_stats_totals'); SurrealDB 3.x "
+            "refuses to remove it, and this connection runs SurrealDB 2.x, which would remove it and turn those views "
+            "into ordinary tables that keep their last records and no longer update. Remove those views first. Nothing "
+            "was removed."
+        )
+        assert client.queries == [_INFO]
+        assert client.version_calls == 1
+
+    async def test_two_dependents_sorted(self, use_mv_client: Callable[..., None]) -> None:
+        client = _removal_client("mv_totals", "mv_b", version="surrealdb-2.7.0")
+        use_mv_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await MvStats.remove_view(missing_ok=False)
+        assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_b', 'mv_totals'", _ENGINE_2X)
+        assert client.queries == [_INFO]
+        assert client.version_calls == 1
+
+    async def test_the_embedded_wording(self, use_mv_client: Callable[..., None]) -> None:
+        client = _removal_client("mv_stats_totals", version="surrealdb-2.0.0")
+        use_mv_client(client, embedded=True)
+        with pytest.raises(SurrealDbError) as raised:
+            await MvStats.remove_view()
+        assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_stats_totals'", _ENGINE_EMBEDDED)
+        assert client.queries == [_INFO]
+        assert client.version_calls == 1
+
+    async def test_before_anything_is_queued(self, use_mv_client: Callable[..., None]) -> None:
+        client = _removal_client("mv_stats_totals", version="surrealdb-2.7.0")
+        use_mv_client(client)
+        tx = _QueuingTx()
+        tx._connection_name = "mv"
+        with pytest.raises(SurrealDbError) as raised:
+            await MvStats.remove_view(tx=tx)  # type: ignore[arg-type]
+        assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_stats_totals'", _ENGINE_2X)
+        assert tx.added == []
+        assert client.queries == [_INFO]
+
+    @pytest.mark.parametrize("version", ["surrealdb-3.3.4", "surrealdb-3.1.5", "surrealdb"])
+    async def test_3x_sends_the_removal(self, use_mv_client: Callable[..., None], version: str) -> None:
+        client = _removal_client("mv_stats_totals", version=version)
+        use_mv_client(client)
+        assert await MvStats.remove_view() == _REMOVE_MV_STATS
+        assert client.queries == [_INFO, _REMOVE_MV_STATS]
+        assert client.version_calls == 1
+
+    async def test_s3_the_removal_3x_refuses(self, use_mv_client: Callable[..., None]) -> None:
+        """P3: the server's reason whole, ``removal``."""
+        reason = (
+            "Invalid query: Cannot delete table `mv_order_stats` on which a view is defined, table(s) `mv_stats_totals` "
+            "are defined as a view on this table."
+        )
+        error = InternalError("Internal", reason)
+        client = _removal_client("mv_stats_totals", version="surrealdb-3.3.4", ddl_error=error)
+        use_mv_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await MvStats.remove_view()
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == f"Can't apply view removal: 'mv_order_stats' -> {reason}"
+        assert raised.value.__cause__ is error
+        assert client.queries == [_INFO, _REMOVE_MV_STATS]
+
+    @pytest.mark.parametrize("embedded", [False, True], ids=["server", "embedded"])
+    async def test_no_dependent_view_no_version(self, use_mv_client: Callable[..., None], embedded: bool) -> None:
+        """The outer view first: no view reads it, so no ``version()``, on every line."""
+        client = _removal_client("mv_stats_totals", version="surrealdb-2.7.0")
+        use_mv_client(client, embedded=embedded)
+        assert await MvStatsTotals.remove_view() == "REMOVE TABLE IF EXISTS `mv_stats_totals`;"
+        assert client.queries == [_INFO, "REMOVE TABLE IF EXISTS `mv_stats_totals`;"]
+        assert client.version_calls == 0
+
+    async def test_an_ordinary_table_is_g2_without_version(self, use_mv_client: Callable[..., None]) -> None:
+        """Step (e) first: a table a view still reads but that is not a view itself is G2, not G5."""
+        client = _GuardClient(
+            {"mv_order_stats": _MV_STATS_TABLE, "mv_stats_totals": _MV_TOTALS_RENDERED}, version="surrealdb-2.7.0"
+        )
+        use_mv_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await MvStats.remove_view()
+        assert str(raised.value) == _g2("MvStats", "mv_order_stats")
+        assert client.queries == [_INFO]
+        assert client.version_calls == 0
+
+
 # === E2E (spec §9.2): the connection "mv" on the database mv_db, over WebSocket and HTTP, and mem:// ================
 
 #: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
@@ -2852,3 +3110,135 @@ class TestViewLinesE2E:
             await MvOrder(id="x", status="paid").save()
             assert [row["id"] for row in await _rows(client, "mv_orders")] == [RecordID("mv_orders", "x")]
             assert [(row.status, row.revenue) for row in await MvSafeSum.objects().exec()] == [("paid", 0.0)]
+
+
+# --- removing a view that another view reads (spec §1.4, §4, §7, §5.6 G5 and S3; AC-20; M11) -------------------------
+
+
+class MvStatsTotals(BaseSurrealModel):
+    """A view over ``MvStats``' view (revision 3, AC-20): SurrealDB updates it when the inner view changes (M3)."""
+
+    model_config = SurrealConfigDict(
+        table_name="mv_stats_totals", connection="mv", view_query="SELECT total FROM mv_order_stats"
+    )
+
+    id: RecordID | None = None
+    total: int
+
+
+async def _totals() -> dict[str, int]:
+    """``MvStatsTotals``' records, read through the ORM: the group of ``mv_order_stats`` it copies → its total."""
+    totals: dict[str, int] = {}
+    for row in await MvStatsTotals.objects().exec():
+        assert row.id is not None
+        totals[row.id.id[0]] = row.total
+    return totals
+
+
+def _requests(calls: list[tuple[str, tuple[object, ...]]]) -> list[tuple[str, object]]:
+    """What :func:`_spy` saw, as ``(method, statement)`` — ``None`` for ``version()`` — without the ``query_raw()``
+    the SDK's ``query()`` runs itself."""
+    return [(method, args[0] if args else None) for method, args in calls if method != "query_raw"]
+
+
+class TestViewRemovalE2E:
+    """AC-20 (E2E, both lines, WebSocket, HTTP and ``mem://``; 3.1.5 is a 3.x line): removing a view that another
+    view reads — G5 before any DDL on SurrealDB 2.x and the embedded engine, the server's refusal on 3.x (S3,
+    ``removal``) — leaves both views as they were; the outer view first, then the inner one, works everywhere; a raw
+    ``REMOVE TABLE`` of the source table (not an ORM path, README row 8) is pinned per line (M11)."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_inner_view_is_kept(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _mv(kind) as client:
+            await _save_orders()
+            await MvStats.define_view()
+            await MvStatsTotals.define_view()
+            assert await _totals() == {"new": 1, "paid": 2}
+            major = await _major(client)
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await MvStats.remove_view()
+            requests = _requests(calls)
+            tables = await _tables(client)
+            assert (tables["mv_order_stats"], tables["mv_stats_totals"]) == (_MV_STATS_RENDERED, _MV_TOTALS_RENDERED)
+            await MvOrder(id="o4", status="new", amount=2.0).save()
+            assert await _totals() == {"new": 2, "paid": 2}
+        assert type(raised.value) is SurrealDbError
+        if major >= 3:
+            assert str(raised.value).startswith("Can't apply view removal: 'mv_order_stats' -> ")
+            assert "Cannot delete table" in str(raised.value)
+            assert requests == [("query", "INFO FOR DB;"), ("version", None), ("query", _REMOVE_MV_STATS)]
+        else:
+            engine = _ENGINE_EMBEDDED if kind == "mem" else _ENGINE_2X
+            assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_stats_totals'", engine)
+            assert requests == [("query", "INFO FOR DB;"), ("version", None)]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_outer_view_first_then_the_inner_one(self, kind: str) -> None:
+        async with _mv(kind) as client:
+            await _save_orders()
+            await MvStats.define_view()
+            await MvStatsTotals.define_view()
+            assert await MvStatsTotals.remove_view() == "REMOVE TABLE IF EXISTS `mv_stats_totals`;"
+            assert await MvStats.remove_view() == _REMOVE_MV_STATS
+            tables = await _tables(client)
+            assert "mv_stats_totals" not in tables
+            assert "mv_order_stats" not in tables
+            assert len(await _rows(client, "mv_orders")) == 3
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_g5_before_anything_is_queued(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Inside a ``transaction()`` block (buffered on SurrealDB 2.x and the embedded engine), G5 is raised on
+        committed state before the removal is queued; it leaves the block, which commits nothing."""
+        async with _mv(kind) as client:
+            await _require_line(client, 2, "SurrealDB 2.x and the embedded engine would remove a view another view reads")
+            await _save_orders()
+            await MvStats.define_view()
+            await MvStatsTotals.define_view()
+            calls = _spy(monkeypatch, client)
+            queued: list[str] | None = None
+            with pytest.raises(SurrealDbError) as raised:
+                async with SurrealDBConnectionManager.transaction("mv") as tx:
+                    assert not tx.is_interactive
+                    try:
+                        await MvStats.remove_view(tx=tx)
+                    finally:
+                        queued = list(tx.statements)
+            assert queued == []
+            assert _requests(calls) == [("query", "INFO FOR DB;"), ("version", None)]
+            tables = await _tables(client)
+            assert (tables["mv_order_stats"], tables["mv_stats_totals"]) == (_MV_STATS_RENDERED, _MV_TOTALS_RENDERED)
+        engine = _ENGINE_EMBEDDED if kind == "mem" else _ENGINE_2X
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_stats_totals'", engine)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_raw_removal_of_the_source_table(self, kind: str) -> None:
+        """README row 8 (N7: a raw ``REMOVE TABLE`` is not an ORM path): SurrealDB 3.x refuses to remove a table a view
+        reads; 2.x and the embedded engine remove it, and the view becomes an ordinary table that keeps its last
+        records — its ``define_view()`` then raises G1 and its ``remove_view()`` G2."""
+        async with _mv(kind) as client:
+            await _save_orders()
+            await MvStats.define_view()
+            if await _major(client) >= 3:
+                with pytest.raises(InternalError) as raised:
+                    await client.query("REMOVE TABLE mv_orders;", {})
+                assert "Cannot delete table" in str(raised.value)
+                tables = await _tables(client)
+                assert tables["mv_order_stats"] == _MV_STATS_RENDERED
+                assert "mv_orders" in tables
+                await MvOrder(id="o4", status="new", amount=2.0).save()
+                assert await _groups() == {"new": (2, 3.0), "paid": (2, 15.5)}
+            else:
+                await client.query("REMOVE TABLE mv_orders;", {})
+                tables = await _tables(client)
+                assert "mv_orders" not in tables
+                assert tables["mv_order_stats"] == _MV_STATS_TABLE
+                assert await _rows(client, "mv_order_stats") == _MV_STATS_ROWS
+                with pytest.raises(SurrealDbError) as g1:
+                    await MvStats.define_view()
+                assert (type(g1.value), str(g1.value)) == (SurrealDbError, _g1("MvStats", "mv_order_stats"))
+                with pytest.raises(SurrealDbError) as g2:
+                    await MvStats.remove_view()
+                assert (type(g2.value), str(g2.value)) == (SurrealDbError, _g2("MvStats", "mv_order_stats"))
+                assert await _rows(client, "mv_order_stats") == _MV_STATS_ROWS
