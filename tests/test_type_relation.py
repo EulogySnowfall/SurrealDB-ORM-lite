@@ -66,14 +66,24 @@ the ORM. ``TestExistingRecordsE2E``: the edges already in the table stay; a nonc
 SDK's error, a dangling one's succeeds, the two README recipes find each. ``TestChangeFeedAndLiveE2E``:
 ``changes(since=0)`` yields the edges written before and after the define and nothing else, a raw ``SHOW CHANGES``
 shows both ``define_table`` entries, and a live query registered before is still listed.
+
+The generator (spec §6.5, D10, P1; AC-14): ``TestRoundTripE2E`` defines three edge tables — ``RelLikes``' ends, none,
+a name repeated on each side —, generates their models back with ``generate_models_from_db()``, imports them and
+applies their ``relation_ddl()`` to a fresh database: the same relation definitions are read back. The generator's unit
+cases are ``tests/test_model_generator.py``'s ``TestRelationKeys``.
 """
 
 import asyncio
 import contextlib
+import importlib.util
 import inspect
 import os
 import re
+import sys
+import uuid
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -91,6 +101,7 @@ from surreal_orm_lite import (
     SurrealORMError,
     TableType,
     Transaction,
+    generate_models_from_db,
     is_conflict_error,
     model_generator,
     schema,
@@ -2785,3 +2796,114 @@ class TestChangeFeedAndLiveE2E:
             finally:
                 with contextlib.suppress(Exception):
                     await client.kill(live_id)
+
+
+# === introspection: the generator writes the keys back (spec §6.5, D10, P1; AC-14; M22) =============================
+
+
+class RelLoose(BaseSurrealEdge):
+    """No key: an unconstrained relation table, generated with neither key nor comment."""
+
+    model_config = SurrealConfigDict(table_name="rel_loose", connection="rel")
+
+
+class RelTwice(BaseSurrealEdge):
+    """A name repeated on each side, as SurrealDB stores it (P1 b, M22): the generator writes it back."""
+
+    model_config = SurrealConfigDict(
+        table_name="rel_twice",
+        connection="rel",
+        relation_in=["rel_person", "rel_person"],
+        relation_out=["rel_post", "rel_Post"],
+    )
+
+
+#: Table → the edge model the round trip defines, then generates back.
+_ROUND_TRIP: dict[str, type[BaseSurrealEdge]] = {"rel_likes": RelLikes, "rel_loose": RelLoose, "rel_twice": RelTwice}
+
+#: The classes ``generate_models_from_db()`` writes for :data:`_ROUND_TRIP`, exactly (the same on every engine).
+_GENERATED_EDGES = """\
+class RelLikes(BaseSurrealEdge):
+    # SCHEMALESS: fields not declared here are kept (extra="allow")
+    model_config = SurrealConfigDict(
+        table_name="rel_likes",
+        relation_in="rel_person",
+        relation_out=["rel_post", "rel_book"],
+        enforced=True,
+        connection="rel",
+        extra="allow",
+    )
+
+
+class RelLoose(BaseSurrealEdge):
+    # SCHEMALESS: fields not declared here are kept (extra="allow")
+    model_config = SurrealConfigDict(table_name="rel_loose", connection="rel", extra="allow")
+
+
+class RelTwice(BaseSurrealEdge):
+    # SCHEMALESS: fields not declared here are kept (extra="allow")
+    model_config = SurrealConfigDict(
+        table_name="rel_twice",
+        relation_in=["rel_person", "rel_person"],
+        relation_out=["rel_post", "rel_Post"],
+        connection="rel",
+        extra="allow",
+    )
+"""
+
+
+def _import_generated(path: Path) -> ModuleType:
+    """Import the module written at *path* (removed from ``sys.modules`` afterwards)."""
+    name = f"generated_relations_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        del sys.modules[name]
+    return module
+
+
+def _relation_fields(state: TableState) -> tuple[str, tuple[str, ...], tuple[str, ...], bool]:
+    """The relation part of a stored definition: its type, ends and ``ENFORCED``."""
+    return state.table_type, tuple(state.relation_in), tuple(state.relation_out), state.enforced
+
+
+class TestRoundTripE2E:
+    """AC-14 (E2E, every engine of both lines): after ``define_relation()``, ``generate_models_from_db()`` writes each
+    edge class with the table's keys — none for an unconstrained table, a repeated name kept —; the module imports, the
+    generated classes' getters and ``relation_ddl()`` equal the models', and each ``relation_ddl()`` applied to a fresh
+    database reads back the same relation definition."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_generated_edges_define_the_same_relations(self, kind: str, tmp_path: Path) -> None:
+        async with _rel(kind) as client:
+            for model in _ROUND_TRIP.values():
+                assert await model.define_relation() == model.relation_ddl()
+            tables = await _tables(client)
+            stored = {table: _relation_fields(parse_define_table(tables[table])) for table in _ROUND_TRIP}
+
+            path = tmp_path / "rel_models.py"
+            source = await generate_models_from_db(path, "rel", tables=sorted(_ROUND_TRIP))
+            assert path.read_text(encoding="utf-8") == source
+            assert source.endswith("\n\n" + _GENERATED_EDGES)
+            assert "# IN " not in source
+            module = _import_generated(path)
+            generated = {table: getattr(module, model.__name__) for table, model in _ROUND_TRIP.items()}
+            for table, model in _ROUND_TRIP.items():
+                edge = generated[table]
+                assert issubclass(edge, BaseSurrealEdge) and edge is not model
+                assert edge.get_table_name() == table
+                assert edge.get_relation_in() == model.get_relation_in() == stored[table][1]
+                assert edge.get_relation_out() == model.get_relation_out() == stored[table][2]
+                assert edge.is_enforced() is model.is_enforced() is stored[table][3]
+                assert edge.relation_ddl() == model.relation_ddl()
+
+            await _apply_ddl(client, _REL_RESET)
+            assert await _tables(client) == {}
+            for edge in generated.values():
+                await _apply_ddl(client, edge.relation_ddl())
+            tables = await _tables(client)
+            assert {table: _relation_fields(parse_define_table(tables[table])) for table in _ROUND_TRIP} == stored
