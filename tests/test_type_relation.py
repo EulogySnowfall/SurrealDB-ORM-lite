@@ -36,6 +36,14 @@ form, idempotent), on AC-6's table — K6 exactly, its other clauses, fields, in
 it kept, the view still counting, a wrong-table endpoint refused at once on a second connection too —, RG1 on a view,
 RG3 on a ``TYPE ANY`` table, ``overwrite=False`` leaving a relation table's ends. ``TestRelationPermissionsE2E``: a
 record user gets S1. The query cache classifies it as DDL that changes no row (``tests/test_query_cache.py``).
+
+Edge creation refusals (spec §5.7, §5.8 W1–W2, §6.3, §6.4; AC-7, AC-8; D6, D7, D15): ``utils.edge_write_error()`` is
+v0.22.0's rule of ``insert_edges()``, moved and shared — ``SurrealDbNotFoundError`` for a missing endpoint, else
+``SurrealDbError`` (``TestEdgeWriteError``) —, and the string ``relate()`` raises it outside a transaction, the SDK's
+error as its ``__cause__`` (``TestStringRelateError``). ``TestEnforcementE2E``: after ``define_relation()`` every ORM
+edge creation path — the typed and the string ``relate()``, an edge's ``save()``, ``bulk_create()`` — raises W1 or W2
+and writes nothing, the class of an endpoint both outside ``IN``/``OUT`` and missing pinned per line; a node model's
+``save()`` into the relation table keeps the SDK's error.
 """
 
 import contextlib
@@ -46,7 +54,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import pytest
-from surrealdb import InternalError, NotAllowedError, RecordID
+from surrealdb import InternalError, NotAllowedError, NotFoundError, RecordID, ServerError
 
 import surreal_orm_lite
 from surreal_orm_lite import (
@@ -56,12 +64,17 @@ from surreal_orm_lite import (
     SurrealDbAuthenticationError,
     SurrealDBConnectionManager,
     SurrealDbError,
+    SurrealDbNotFoundError,
+    SurrealORMError,
     TableType,
     Transaction,
+    is_conflict_error,
     model_generator,
     schema,
+    utils,
 )
 from surreal_orm_lite.define_parser import parse_define_table
+from surreal_orm_lite.edge import insert_edges
 from surreal_orm_lite.schema_state import TableState
 
 # --- the exact texts of spec §5.8 ----------------------------------------------------------------------------------
@@ -1767,3 +1780,369 @@ class TestRelationPermissionsE2E:
         assert type(raised.value) is SurrealDbAuthenticationError
         assert str(raised.value).startswith("Can't apply relation definition: 'rel_likes' -> ")
         assert "not enough permissions" in str(raised.value).lower()
+
+
+# === edge creation refusals (spec §5.7, §5.8 W1–W2, §6.3, §6.4; AC-7, AC-8; D6, D7, D15; M11, M12, M20) ============
+
+
+def _w(message: str) -> str:
+    """W1/W2's text (spec §5.8) for the server message *message*."""
+    return f"There was a problem with the database: {message}"
+
+
+def _sdk_error(kind: str, message: str) -> Exception:
+    """A fresh SDK error of *kind* (``"NotFound"`` or ``"Internal"``), as the SDK raises it for a refused statement."""
+    return NotFoundError(kind, message) if kind == "NotFound" else InternalError(kind, message)
+
+
+#: (id, SDK error kind, server message, the ORM class it becomes): the refusals of an edge creation measured on the
+#: four engines (M11), with the class ``edge_write_error()`` gives them — W2 for a missing endpoint (the SDK's
+#: ``NotFoundError``, or "does not exist" in any case), W1 for anything else.
+_EDGE_REFUSALS: list[tuple[str, str, str, type[SurrealDbError]]] = [
+    ("3x-missing", "NotFound", "The record 'person:ghost' does not exist", SurrealDbNotFoundError),
+    ("not-found-class", "NotFound", "The record is gone", SurrealDbNotFoundError),
+    ("2x-missing", "Internal", "The record 'person:ghost' does not exist", SurrealDbNotFoundError),
+    ("upper-case", "Internal", "The record 'person:ghost' DOES NOT EXIST", SurrealDbNotFoundError),
+    (
+        "2x-wrong-table",
+        "Internal",
+        "Found company:c for field `in`, with record `likes:e1`, but expected a record<person>",
+        SurrealDbError,
+    ),
+    (
+        "3x-wrong-table",
+        "Internal",
+        "Couldn't coerce value for field `in` of `likes:e1`: Expected `record<person>` but found `company:c`",
+        SurrealDbError,
+    ),
+    (
+        "unique-duplicate",
+        "Internal",
+        "Database index `likes_pair` already contains [person:ada, post:p1], with record `likes:e2`",
+        SurrealDbError,
+    ),
+    ("type-normal", "Internal", "Found record: `likes:e1` which is a relation, but expected a NORMAL", SurrealDbError),
+]
+_EDGE_REFUSAL_IDS = [case[0] for case in _EDGE_REFUSALS]
+
+
+class WriteNode(BaseSurrealModel):
+    """A node on the default connection: the source of the string ``relate()``'s unit tests."""
+
+    model_config = SurrealConfigDict(table_name="person")
+
+    id: str | None = None
+
+
+class _RefusingClient:
+    """A client whose ``query()`` and ``insert_relation()`` record the call and raise *error*."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.calls: list[str] = []
+
+    async def query(self, statement: str, variables: object) -> object:
+        self.calls.append(statement)
+        raise self.error
+
+    async def insert_relation(self, table: str, data: object) -> object:
+        self.calls.append(f"insert_relation({table!r})")
+        raise self.error
+
+
+class _RefusingTx:
+    """A transaction of the default connection whose ``add()`` records the statement and raises *error*."""
+
+    def __init__(self, error: BaseException) -> None:
+        self._connection_name = "default"
+        self.error = error
+        self.added: list[str] = []
+
+    async def add(self, statement: str, variables: object) -> object:
+        self.added.append(statement)
+        raise self.error
+
+
+class TestEdgeWriteError:
+    """AC-8 (unit): ``utils.edge_write_error()`` is v0.22.0's rule of ``insert_edges()``, moved and shared —
+    ``SurrealDbNotFoundError`` for the SDK's ``NotFoundError`` or a "does not exist" message in any case, exactly
+    ``SurrealDbError`` otherwise, the text ``There was a problem with the database: {error}`` (W1, W2) —, and
+    ``insert_edges()`` raises it with the SDK's error as ``__cause__``, its classes and texts unchanged."""
+
+    @pytest.mark.parametrize(("kind", "message", "expected"), [case[1:] for case in _EDGE_REFUSALS], ids=_EDGE_REFUSAL_IDS)
+    def test_the_class_and_the_text(self, kind: str, message: str, expected: type[SurrealDbError]) -> None:
+        error = _sdk_error(kind, message)
+        result = utils.edge_write_error(error)
+        assert type(result) is expected
+        assert str(result) == _w(message)
+        assert result.__cause__ is None  # the caller chains it: raise edge_write_error(exc) from exc
+
+    def test_a_conflict_is_still_recognised(self) -> None:
+        """``retry_on_conflict`` reads the text: a conflict refused the same way stays a conflict."""
+        error = InternalError("Internal", "Transaction conflict: Resource busy. This transaction can be retried")
+        result = utils.edge_write_error(error)
+        assert type(result) is SurrealDbError
+        assert is_conflict_error(result)
+
+    @pytest.mark.parametrize("with_id", [False, True], ids=["insert_relation", "guarded-statement"])
+    @pytest.mark.parametrize(("kind", "message", "expected"), [case[1:] for case in _EDGE_REFUSALS], ids=_EDGE_REFUSAL_IDS)
+    async def test_insert_edges_raises_it(self, kind: str, message: str, expected: type[SurrealDbError], with_id: bool) -> None:
+        """The typed paths' one write (``relate(EdgeModel, …)``, an edge's ``save()``, ``bulk_create()``)."""
+        error = _sdk_error(kind, message)
+        client = _RefusingClient(error)
+
+        class _Manager:
+            @classmethod
+            async def get_client(cls) -> Any:
+                return client
+
+        row: dict[str, Any] = {"in": RecordID("person", "ada"), "out": RecordID("post", "p1")}
+        if with_id:
+            row["id"] = "e1"
+        with pytest.raises(SurrealDbError) as raised:
+            await insert_edges("likes", [row], tx=None, manager=_Manager)  # type: ignore[arg-type]
+        assert type(raised.value) is expected
+        assert str(raised.value) == _w(message)
+        assert raised.value.__cause__ is error
+        assert len(client.calls) == 1
+
+
+class TestStringRelateError:
+    """AC-8 (unit, D7): outside a transaction, ``relate("<edge table>", …)`` raises ``edge_write_error()`` of the SDK's
+    error, which stays its ``__cause__`` — ``SurrealDbNotFoundError`` for a missing endpoint, ``SurrealDbError``
+    otherwise; with ``tx=`` nothing changes: the transaction's own error propagates as it is."""
+
+    @pytest.mark.parametrize(("kind", "message", "expected"), [case[1:] for case in _EDGE_REFUSALS], ids=_EDGE_REFUSAL_IDS)
+    async def test_a_refusal_becomes_the_orms_error(
+        self, use_client: Callable[[Any], None], kind: str, message: str, expected: type[SurrealDbError]
+    ) -> None:
+        error = _sdk_error(kind, message)
+        client = _RefusingClient(error)
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await WriteNode(id="ada").relate("likes", RecordID("post", "p1"))
+        assert type(raised.value) is expected
+        assert str(raised.value) == _w(message)
+        assert raised.value.__cause__ is error
+        assert client.calls == ["RELATE $src->likes->$dst;"]
+
+    async def test_reverse_and_fields_go_the_same_way(self, use_client: Callable[[Any], None]) -> None:
+        error = _sdk_error("NotFound", "The record 'post:ghost' does not exist")
+        client = _RefusingClient(error)
+        use_client(client)
+        with pytest.raises(SurrealDbNotFoundError) as raised:
+            await WriteNode(id="ada").relate("likes", "post:ghost", reverse=True, data={"stars": 2})
+        assert raised.value.__cause__ is error
+        assert client.calls == ["RELATE $dst->likes->$src SET stars = $_rd0;"]
+
+    async def test_a_conflict_is_still_recognised(self, use_client: Callable[[Any], None]) -> None:
+        error = InternalError("Internal", "Transaction conflict: Resource busy. This transaction can be retried")
+        use_client(_RefusingClient(error))
+        with pytest.raises(SurrealDbError) as raised:
+            await WriteNode(id="ada").relate("likes", RecordID("post", "p1"))
+        assert is_conflict_error(raised.value)
+
+    async def test_another_error_is_not_translated(self, use_client: Callable[[Any], None]) -> None:
+        """Only the server's refusals (``ServerError``) are translated: a lost connection propagates as it is."""
+        error = ConnectionError("connection lost")
+        use_client(_RefusingClient(error))
+        with pytest.raises(ConnectionError) as raised:
+            await WriteNode(id="ada").relate("likes", RecordID("post", "p1"))
+        assert raised.value is error
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            SurrealDbError("Transaction failed and rolled back: Found company:c for field `in`"),
+            InternalError("Internal", "The record 'post:ghost' does not exist"),
+        ],
+        ids=["transaction-error", "sdk-error"],
+    )
+    async def test_in_a_transaction_nothing_changes(self, use_client: Callable[[Any], None], error: Exception) -> None:
+        client = _RefusingClient(AssertionError("the client is not used in a transaction"))
+        use_client(client)
+        tx = _RefusingTx(error)
+        with pytest.raises(type(error)) as raised:
+            await WriteNode(id="ada").relate("likes", RecordID("post", "p1"), tx=tx)  # type: ignore[arg-type]
+        assert raised.value is error
+        assert tx.added == ["RELATE $src->likes->$dst;"]
+        assert client.calls == []
+
+
+class RelPlain(BaseSurrealModel):
+    """A node model declared on the relation table ``rel_likes`` (AC-7, M20, D15): its ``save()`` is refused by the
+    server, and keeps the SDK's error."""
+
+    model_config = SurrealConfigDict(table_name="rel_likes", connection="rel")
+
+    id: str | None = None
+    stars: int = 1
+
+
+#: The node models of the E2E classes by table: the source of a ``relate()`` from a ``RecordID``.
+_REL_NODES: dict[str, type[BaseSurrealModel]] = {
+    "rel_person": RelPerson,
+    "rel_post": RelPost,
+    "rel_book": RelBook,
+    "rel_company": RelCompany,
+}
+
+_ADA = RecordID("rel_person", "ada")
+_P1 = RecordID("rel_post", "p1")
+
+#: Every ORM path that creates an edge (spec §5.7): the typed ``relate()``, an edge's ``save()`` without and with an
+#: id (``insert_relation()``, then the guarded statement), ``bulk_create()`` of a batch whose second edge is the one
+#: refused, and the string ``relate()`` (D7).
+_CREATION_PATHS = ["relate", "save", "save-with-id", "bulk_create", "relate-by-name"]
+
+
+async def _create_edge(path: str, start: RecordID, end: RecordID) -> None:
+    """Create the ``rel_likes`` edge ``start → end`` through *path* (outside a transaction)."""
+    if path == "relate":
+        await _REL_NODES[start.table_name](id=start.id).relate(RelLikes, end)
+    elif path == "save":
+        await RelLikes(in_=start, out=end).save()
+    elif path == "save-with-id":
+        await RelLikes(id="x1", in_=start, out=end).save()
+    elif path == "bulk_create":
+        await RelLikes.objects().bulk_create([RelLikes(in_=_ADA, out=_P1), RelLikes(in_=start, out=end)])
+    else:
+        await _REL_NODES[start.table_name](id=start.id).relate("rel_likes", end)
+
+
+async def _enforced(client: Any) -> None:
+    """``rel_likes`` defined by ``RelLikes.define_relation()`` on a missing table (``IN rel_person OUT rel_post |
+    rel_book ENFORCED``), then the nodes ``ada``, ``bob``, ``p1``, ``b1`` and ``c`` saved."""
+    assert await RelLikes.define_relation() == _REL_G1
+    await RelPerson(id="ada").save()
+    await RelPerson(id="bob").save()
+    await RelPost(id="p1").save()
+    await RelBook(id="b1").save()
+    await RelCompany(id="c").save()
+
+
+def _assert_refusal(raised: pytest.ExceptionInfo[SurrealDbError], expected: type[SurrealDbError]) -> None:
+    """*raised* is exactly *expected* with W1/W2's text, the SDK's error as its ``__cause__``."""
+    cause = raised.value.__cause__
+    assert type(raised.value) is expected, f"{type(raised.value).__name__}: {raised.value}"
+    assert isinstance(cause, ServerError), repr(cause)
+    assert str(raised.value) == _w(str(cause))
+
+
+class TestEnforcementE2E:
+    """AC-7, AC-8 (E2E, every engine of both lines): after ``define_relation()``, SurrealDB refuses every edge creation
+    the constraint forbids, and every ORM creation path raises the ORM's error with the SDK's as its ``__cause__`` — W1
+    (``SurrealDbError``) for an endpoint outside ``IN``/``OUT``, W2 (``SurrealDbNotFoundError``) for a missing
+    ``ENFORCED`` endpoint —, nothing written. The class of an endpoint both outside ``IN``/``OUT`` and missing depends
+    on the line (D6). The string ``relate()`` translates too (D7): a ``UNIQUE`` duplicate and a ``TYPE NORMAL`` table
+    as well; inside a transaction the transaction's error is unchanged. A node model's ``save()`` into the relation
+    table keeps the SDK's error (D15, M20)."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("path", _CREATION_PATHS)
+    async def test_a_wrong_table_endpoint(self, kind: str, path: str) -> None:
+        async with _rel(kind) as client:
+            await _enforced(client)
+            with pytest.raises(SurrealDbError) as raised:
+                await _create_edge(path, RecordID("rel_company", "c"), _P1)
+            _assert_refusal(raised, SurrealDbError)
+            assert await _edge_ids(client) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("path", _CREATION_PATHS)
+    async def test_a_missing_endpoint(self, kind: str, path: str) -> None:
+        async with _rel(kind) as client:
+            await _enforced(client)
+            with pytest.raises(SurrealDbNotFoundError) as raised:
+                await _create_edge(path, RecordID("rel_person", "ghost"), _P1)
+            _assert_refusal(raised, SurrealDbNotFoundError)
+            assert "does not exist" in str(raised.value)
+            assert await _edge_ids(client) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("path", _CREATION_PATHS)
+    async def test_an_endpoint_outside_the_ends_and_missing_is_pinned_by_line(self, kind: str, path: str) -> None:
+        """D6: SurrealDB 2.x and the embedded engine report the missing record (``SurrealDbNotFoundError``), 3.x the
+        table mismatch (``SurrealDbError``); the ORM does not even them out."""
+        async with _rel(kind) as client:
+            await _enforced(client)
+            expected = SurrealDbError if await _major(client) >= 3 else SurrealDbNotFoundError
+            with pytest.raises(SurrealDbError) as raised:
+                await _create_edge(path, RecordID("rel_company", "ghost"), _P1)
+            _assert_refusal(raised, expected)
+            assert await _edge_ids(client) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("path", _CREATION_PATHS)
+    async def test_the_declared_ends_are_accepted(self, kind: str, path: str) -> None:
+        async with _rel(kind) as client:
+            await _enforced(client)
+            await _create_edge(path, _ADA, RecordID("rel_book", "b1"))
+            ends = await client.query("SELECT VALUE [in, out] FROM rel_likes;", {})
+            expected = [[_ADA, RecordID("rel_book", "b1")]]
+            if path == "bulk_create":
+                expected.append([_ADA, _P1])
+            assert sorted(ends, key=str) == sorted(expected, key=str)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_endpoint_saved_earlier_in_the_transaction(self, kind: str) -> None:
+        """M11: ``ENFORCED`` sees a node created earlier in the same transaction (buffered or interactive)."""
+        async with _rel(kind) as client:
+            await _enforced(client)
+            async with SurrealDBConnectionManager.transaction("rel") as tx:
+                eve = await RelPerson(id="eve").save(tx=tx)
+                await eve.relate(RelLikes, _P1, tx=tx)
+                await eve.relate("rel_likes", RecordID("rel_book", "b1"), tx=tx)
+            ends = await client.query("SELECT VALUE [in, out] FROM rel_likes;", {})
+            eve_id = RecordID("rel_person", "eve")
+            assert sorted(ends, key=str) == sorted([[eve_id, _P1], [eve_id, RecordID("rel_book", "b1")]], key=str)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("with_id", [True, False], ids=["with-id", "without-id"])
+    async def test_a_node_models_save_keeps_the_sdks_error(self, kind: str, with_id: bool) -> None:
+        """D15, M20: a refused write that is not an edge creation keeps the SDK's error (``InternalError``)."""
+        async with _rel(kind) as client:
+            await _enforced(client)
+            plain = RelPlain(id="plain") if with_id else RelPlain()
+            with pytest.raises(ServerError) as raised:
+                await plain.save()
+            assert "RELATION" in str(raised.value)
+            assert not isinstance(raised.value, SurrealORMError)
+            assert await _edge_ids(client) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_by_name_a_unique_duplicate(self, kind: str) -> None:
+        """README section 23's idempotent edges: a ``UNIQUE`` index on ``(in, out)`` refuses the second pair."""
+        async with _rel(kind) as client:
+            await _enforced(client)
+            await _apply_ddl(client, "DEFINE INDEX rel_follows_pair ON rel_follows FIELDS in, out UNIQUE;")
+            ada, bob = RelPerson(id="ada"), RelPerson(id="bob")
+            await ada.relate("rel_follows", bob)
+            with pytest.raises(SurrealDbError) as raised:
+                await ada.relate("rel_follows", bob)
+            _assert_refusal(raised, SurrealDbError)
+            assert "rel_follows_pair" in str(raised.value)
+            assert len(await client.query("SELECT VALUE id FROM rel_follows;", {})) == 1
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_by_name_a_type_normal_table(self, kind: str) -> None:
+        async with _rel(kind) as client:
+            await _enforced(client)
+            await _apply_ddl(client, "DEFINE TABLE rel_normal TYPE NORMAL;")
+            with pytest.raises(SurrealDbError) as raised:
+                await RelPerson(id="ada").relate("rel_normal", _P1)
+            _assert_refusal(raised, SurrealDbError)
+            assert await client.query("SELECT VALUE id FROM rel_normal;", {}) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_by_name_in_a_transaction(self, kind: str) -> None:
+        """Inside a transaction the transaction layer's error is unchanged (interactive: at the ``relate()``;
+        buffered: at the block's exit)."""
+        async with _rel(kind) as client:
+            await _enforced(client)
+            with pytest.raises(SurrealDbError, match="Transaction failed and rolled back") as raised:
+                async with SurrealDBConnectionManager.transaction("rel") as tx:
+                    await RelPerson(id="bob").relate("rel_likes", _P1, tx=tx)
+                    await RelCompany(id="c").relate("rel_likes", _P1, tx=tx)
+            assert not str(raised.value).startswith(_w(""))
+            assert await _edge_ids(client) == []

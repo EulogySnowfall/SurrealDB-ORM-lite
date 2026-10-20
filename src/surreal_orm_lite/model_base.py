@@ -64,6 +64,7 @@ from .utils import (
     apply_ddl_statements,
     build_set_clause,
     coerce_endpoint,
+    edge_write_error,
     format_record_id,
     merge_extra_vars,
     replace_content,
@@ -3299,7 +3300,9 @@ class BaseSurrealModel(BaseModel):
           declare (unless it sets ``extra="allow"``); this is checked before any call. A
           ``server_fields`` field named there is written instead of being left to the server.
         - **An edge table name** — the v0.6.0 ``RELATE`` (any target table), the edge fields
-          written with ``SET``; returns the rows the database sent back.
+          written with ``SET``; returns the rows the database sent back. Since v0.33.0 a refusal
+          by the server outside a transaction raises the ORM's errors, as the typed form does,
+          with the SDK's error as their ``__cause__`` (it raised the SDK's ``ServerError`` before).
 
         In both forms the source and the target are bound as record ids (only the edge name and
         the field names are written into the statement), so a node saved with an id such as
@@ -3335,10 +3338,14 @@ class BaseSurrealModel(BaseModel):
             ValueError: a malformed name or ``"table:id"`` string; the fields name an endpoint
                 or a computed field (typed form).
             SurrealDbError: an unsaved source or target; the fields name an undeclared field
-                (typed form); the write is refused; this record was read with ``as_of()`` (a
+                (typed form); the write is refused — an endpoint outside the table's ``TYPE
+                RELATION IN … OUT …``, a ``UNIQUE`` index duplicate, a ``TYPE NORMAL`` table (both
+                forms; the string form since v0.33.0) —; this record was read with ``as_of()`` (a
                 read-only snapshot, v0.26.0); this record, a model target or the edge model run on
                 two connections (v0.29.0: a relation is stored in one database), before any request
                 or signal.
+            SurrealDbNotFoundError: an endpoint of an ``ENFORCED`` relation does not exist (the
+                string form too, since v0.33.0). It is a ``SurrealDbError``.
             pydantic.ValidationError: the fields are invalid for the edge model (nothing
                 written).
 
@@ -3379,7 +3386,11 @@ class BaseSurrealModel(BaseModel):
             return rows if isinstance(rows, list) else []
 
         client = await type(self)._connection_manager().get_client()
-        result = await client.query(query, _encoding.encode(variables))
+        try:
+            result = await client.query(query, _encoding.encode(variables))
+        except ServerError as exc:
+            # The rule of every edge creation (v0.33.0): the ORM's error, the SDK's as its cause.
+            raise edge_write_error(exc) from exc
         return result if isinstance(result, list) else []
 
     async def _relate_typed(

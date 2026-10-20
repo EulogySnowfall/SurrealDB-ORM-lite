@@ -22,10 +22,10 @@ from pydantic import AliasChoices, Field, field_validator
 from . import cache as _cache
 from . import encoding as _encoding
 from . import routing as _routing
-from ._sdk import NotFoundError, RecordID, ServerError
+from ._sdk import RecordID, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .define_parser import parse_define_table
-from .exceptions import SurrealDbError, SurrealDbNotFoundError
+from .exceptions import SurrealDbError
 from .functions import SurrealFunc
 from .model_base import BaseSurrealModel, _own_annotation_names
 from .schema import (
@@ -38,7 +38,7 @@ from .schema import (
     table_kind,
 )
 from .transaction import Transaction
-from .utils import apply_ddl_statements, coerce_endpoint
+from .utils import apply_ddl_statements, coerce_endpoint, edge_write_error
 
 _ENDPOINT_FIELDS = frozenset({"in_", "out"})
 _ENDPOINT_COLUMNS = frozenset({"in", "out"})
@@ -102,10 +102,12 @@ async def insert_edges(
       ``insert_relation()`` — no duplicate is possible. Otherwise the guarded statement
       (:data:`_GUARDED_INSERT`), so a duplicate explicit id raises on SurrealDB 2.x and 3.x alike,
       through ``client.query()`` or, under ``tx``, ``tx.add()``. The rows are bound as ``$data``.
-    - **Errors** outside a transaction: a server refusal becomes :class:`SurrealDbNotFoundError`
-      for a missing endpoint of an ``ENFORCED`` relation (``NotFoundError`` on 3.x, a "does not
-      exist" message on 2.x), else :class:`SurrealDbError` — a duplicate id ("already exists"), a
-      ``TYPE RELATION IN … OUT …`` mismatch, a ``TYPE NORMAL`` table. Inside a transaction the
+    - **Errors** outside a transaction: a server refusal becomes
+      :func:`~surreal_orm_lite.utils.edge_write_error` of it, the SDK's error as ``__cause__`` —
+      :class:`SurrealDbNotFoundError` for a missing endpoint of an ``ENFORCED`` relation
+      (``NotFoundError`` on 3.x, a "does not exist" message on 2.x), else :class:`SurrealDbError`: a
+      duplicate id ("already exists"), a ``TYPE RELATION IN … OUT …`` mismatch, a ``TYPE NORMAL``
+      table. The string ``relate()`` raises the same since v0.33.0. Inside a transaction the
       transaction layer's own errors apply.
     - **Refused writes**: the server answers a create its ``PERMISSIONS`` refuse — or a row this
       user may not select — with fewer rows and no error. When the statement ran (no transaction,
@@ -128,10 +130,7 @@ async def insert_edges(
             else:
                 result = await client.insert_relation(table, _encoding.encode(data))
         except ServerError as exc:
-            message = f"There was a problem with the database: {exc}"
-            if isinstance(exc, NotFoundError) or "does not exist" in str(exc).lower():
-                raise SurrealDbNotFoundError(message) from exc
-            raise SurrealDbError(message) from exc
+            raise edge_write_error(exc) from exc
     returned = _as_rows(result)
     if len(returned) < len(rows):
         if len(rows) == 1:
