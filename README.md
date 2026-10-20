@@ -697,7 +697,7 @@ async with SurrealDBConnectionManager.transaction() as tx:
 # leaving the block raised SurrealDbError: alice was not saved either
 ```
 
-**Transaction errors leave out the server's excerpt of the statement** (v0.31.1). When the server
+**Transaction errors leave out the server's excerpt of the statement** (v0.31.2). When the server
 refuses the query as a whole (a statement it cannot parse), the error gives the server's reason and
 the position, without the server's excerpt of the statement: a buffered commit raises "Transaction
 failed: the server refused statement 2 of 3: … (at line 1, column 7 of the statement)", the
@@ -4650,7 +4650,7 @@ await SurrealDBConnectionManager.remove_function("fn::greet")
   commits, as the transaction's own error, never as `SurrealDbAuthenticationError` or `SurrealDbNotFoundError`,
   `missing_ok=False` included. When a definition is applied in a transaction (`tx=`), an error raised when the
   transaction ends gives the server's reason and the statement's position, without the server's excerpt of the
-  statement (v0.31.1, [#278](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/278)).
+  statement (v0.31.2, [#278](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/278)).
 - Live queries see the rows an event writes (`watch()` on their table). The query cache
   ([section 29](#29-query-cache-cache-querycache)) does not: it forgets the tables the ORM itself writes, so a cached
   read of a table that events write stays as it was until its time to live runs out. Do not cache such reads, or call
@@ -4685,7 +4685,7 @@ defence: expressions are trusted application code, never user input. To use a va
 (`$after.email`) or from a `DEFINE PARAM`, never format it into the text. Kinds are parsed and written in canonical
 form. An `Event`'s `repr()` leaves out its expressions, and a refusal raised without `tx=` names the event or the
 function, never its statement; with `tx=`, an error raised when the transaction ends gives the server's reason and
-the statement's position, without the server's excerpt of the statement (v0.31.1,
+the statement's position, without the server's excerpt of the statement (v0.31.2,
 [#278](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/278)). Applying a definition needs a privileged
 system user: run `define_events()` and `define_function()` at start-up or deployment, not on a record user's session.
 

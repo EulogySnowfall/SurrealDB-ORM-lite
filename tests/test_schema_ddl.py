@@ -3519,7 +3519,7 @@ _PART_NEEDLES_32 = {
         "only queues the statement",
         "the transaction's own error",
         "`missing_ok=False` included",
-        "without the server's excerpt of the statement (v0.31.1, [#278](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/278))",
+        "without the server's excerpt of the statement (v0.31.2, [#278](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/278))",
         "`watch()`",
         "`QueryCache.invalidate(Model)`",
         "signal",
@@ -3548,7 +3548,7 @@ _PART_NEEDLES_32 = {
         "canonical form",
         "`repr()`",
         "a refusal raised without `tx=` names the event or the function, never its statement",
-        "without the server's excerpt of the statement (v0.31.1, [#278](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/278))",
+        "without the server's excerpt of the statement (v0.31.2, [#278](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/278))",
         "system user",
     ),
 }
