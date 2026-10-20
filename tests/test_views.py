@@ -53,16 +53,26 @@ The query cache (spec §6.4, §6.5, D11; AC-15): a read of a view model — ``ex
 a read whose ``Subquery`` reads one (``SubqueryCompiler.view_tables``) are tagged "any table" (``_cached_read`` spied,
 no client); E2E on both lines, such a cached read is read again after an ORM write to the view's source table, with no
 ``QueryCache.invalidate()``, and after ``define_view()``/``remove_view()``.
+
+The round trip (spec §6.7, D12; AC-16; M18): E2E on both lines, ``DatabaseIntrospector`` reads back the ``view_query``
+of each §5.3 view as spec §3 renders it, ``generate_models_from_db()`` writes view models whose module imports, and each
+generated class's ``view_ddl()``, applied to a fresh database, reads back the same query (the generator's unit cases
+are in ``tests/test_model_generator.py``).
 """
 
 import asyncio
 import contextlib
+import importlib.util
 import inspect
 import os
 import re
+import sys
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -74,6 +84,7 @@ from surreal_orm_lite import (
     BaseSurrealEdge,
     BaseSurrealModel,
     Computed,
+    DatabaseIntrospector,
     Event,
     LiveAction,
     Q,
@@ -88,6 +99,7 @@ from surreal_orm_lite import (
     Transaction,
     computed,
     define_parser,
+    generate_models_from_db,
     live,
     pre_delete,
     pre_save,
@@ -4139,3 +4151,96 @@ class TestViewCacheE2E:
             await MvStats.remove_view()
             assert await _cached_stats().exec() == []
             assert _hits() == hits + 2
+
+
+# --- the round trip: introspection and the generator (spec §6.7, D12; AC-16; M18) ------------------------------------
+
+#: Spec §3's renderings of the three goldens over ``mv_orders``: the ``view_query`` ``INFO FOR DB`` reads back, the
+#: same on every engine (M18) — and the same text as the models declare.
+_MV_ROUND_TRIP = {
+    "mv_order_stats": _MV_STATS_QUERY,
+    "mv_order_totals": "SELECT count() AS orders, math::sum(amount) AS revenue FROM mv_orders GROUP ALL",
+    "mv_paid_orders": "SELECT customer, amount FROM mv_orders WHERE status = 'paid'",
+}
+
+#: The generated class of each view table.
+_MV_GENERATED = {"mv_order_stats": "MvOrderStats", "mv_order_totals": "MvOrderTotals", "mv_paid_orders": "MvPaidOrders"}
+
+
+def _generated_view(table: str) -> str:
+    """The class ``generate_models_from_db()`` writes for the view *table* of :data:`_MV_ROUND_TRIP` (spec §6.7)."""
+    return (
+        f"class {_MV_GENERATED[table]}(BaseSurrealModel):\n"
+        "    # Read-only materialized view\n"
+        '    # SCHEMALESS: fields not declared here are kept (extra="allow")\n'
+        "    model_config = SurrealConfigDict(\n"
+        f'        table_name="{table}",\n'
+        f'        view_query="{_MV_ROUND_TRIP[table]}",\n'
+        '        connection="mv",\n'
+        '        extra="allow",\n'
+        "    )\n"
+        "\n"
+        "    id: RecordID | None = None\n"
+    )
+
+
+def _import_generated(path: Path) -> ModuleType:
+    """Import the module written at *path* (removed from ``sys.modules`` afterwards)."""
+    name = f"generated_views_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        del sys.modules[name]
+    return module
+
+
+async def _view_queries() -> dict[str, str | None]:
+    """The ``view_query`` of each table of :data:`_MV_ROUND_TRIP`, read by ``DatabaseIntrospector`` with no issue."""
+    schema = await DatabaseIntrospector("mv", tables=sorted(_MV_ROUND_TRIP)).introspect()
+    assert schema.issues == ()
+    return {table: schema.tables[table].view_query for table in _MV_ROUND_TRIP}
+
+
+class TestViewRoundTripE2E:
+    """AC-16 (E2E, both lines, WebSocket, HTTP and ``mem://``): after ``define_view()`` of the §5.3 views,
+    ``DatabaseIntrospector`` reads each ``view_query`` as spec §3 renders it; ``generate_models_from_db()`` writes view
+    models (``view_query="…"``, ``# Read-only materialized view``, ``id: RecordID | None = None``) whose module imports;
+    each generated class's ``view_ddl()``, applied to a fresh ``mv_db``, reads back the same ``view_query``, and the
+    generated class reads the view's records."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_introspect_generate_and_define_again(self, kind: str, tmp_path: Path) -> None:
+        async with _mv(kind) as client:
+            await _save_orders()
+            for model in (MvStats, MvPaid, MvTotals):
+                await model.define_view()
+            assert await _view_queries() == _MV_ROUND_TRIP
+            path = tmp_path / "mv_models.py"
+            source = await generate_models_from_db(path, "mv", tables=sorted(_MV_ROUND_TRIP))
+            assert path.read_text(encoding="utf-8") == source
+            for table in _MV_ROUND_TRIP:
+                assert _generated_view(table) in source
+            assert "\nfrom surrealdb import RecordID\n" in source
+            assert "View: AS" not in source
+            module = _import_generated(path)
+            generated = {table: getattr(module, name) for table, name in _MV_GENERATED.items()}
+            for table, model in generated.items():
+                assert model._is_view()
+                assert model.get_table_name() == table
+                assert model.get_view_query() == _MV_ROUND_TRIP[table]
+            assert generated["mv_order_stats"].view_ddl() == MvStats.view_ddl()
+
+            await _apply_ddl(client, _MV_RESET)
+            await _save_orders()
+            for model in generated.values():
+                assert await model.define_view() == model.view_ddl()
+            assert await _view_queries() == _MV_ROUND_TRIP
+            rows = await generated["mv_order_stats"].objects().order_by("status").exec()
+            assert [(row.id, row.status, row.total, row.revenue) for row in rows] == [
+                (_NEW, "new", 1, 1.0),
+                (_PAID, "paid", 2, 15.5),
+            ]
