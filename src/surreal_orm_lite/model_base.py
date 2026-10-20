@@ -849,8 +849,8 @@ class BaseSurrealModel(BaseModel):
 
         Without *tx*, a refusal names the event and its table, never its statement, whose ``when`` and ``then``
         may hold a secret: ``Can't apply event definition: 'email_audit' on table 'account' -> <the server's
-        reason>``. With *tx*, an error raised when the transaction ends can still carry the server's message,
-        statement excerpt included (#278).
+        reason>``. With *tx*, an error raised when the transaction ends gives the server's reason and the
+        statement's position, without the server's excerpt of the statement (#278).
 
         Args:
             overwrite: see :meth:`event_ddl`.

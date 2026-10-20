@@ -1595,17 +1595,21 @@ class TestApplyNamesTheDefinition:
         assert raised.value.__suppress_context__
 
     async def test_an_interactive_transactions_parse_error(self) -> None:
-        # A 3.x interactive transaction reports a statement the server cannot parse with the raw response's repr(),
-        # where the excerpt's newlines are the two characters "\n".
+        # A 3.x interactive transaction's add() reads a statement the server cannot parse from the response's error
+        # envelope: since #278 its error gives the server's reason and the position, not the excerpt.
+        from surreal_orm_lite.transaction import Transaction
+
         raw = {"error": {"code": -32000, "message": _excerpt_3x("1:109", f"...{_SECRET}', {{}}) CREATE }};")}}
-        error = SurrealDbError(f"Transaction failed: unrecognized query_raw() response shape: {raw!r}")
+        with pytest.raises(SurrealDbError) as built:
+            Transaction.raise_for_status(raw)
+        error = built.value
         raised = await _apply([_HOOK], error, through_tx=True, what="event", classify=True, subjects=[_HOOK_SUBJECT])
         assert type(raised.value) is SurrealDbError
         message = str(raised.value)
-        assert message.startswith(f"Can't apply event definition: {_HOOK_SUBJECT} -> Transaction failed: ")
+        assert message == f"Can't apply event definition: {_HOOK_SUBJECT} -> {error}"
         assert message.endswith("(at line 1, column 109 of the statement)")
         assert _leaks(raised.value, _SECRET) == []
-        assert raised.value.__context__ is error
+        assert raised.value.__cause__ is error
 
     @pytest.mark.parametrize(
         "error",
@@ -3515,7 +3519,7 @@ _PART_NEEDLES_32 = {
         "only queues the statement",
         "the transaction's own error",
         "`missing_ok=False` included",
-        "statement excerpt included ([#278](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/278))",
+        "without the server's excerpt of the statement (v0.31.2, [#278](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/278))",
         "`watch()`",
         "`QueryCache.invalidate(Model)`",
         "signal",
@@ -3544,7 +3548,7 @@ _PART_NEEDLES_32 = {
         "canonical form",
         "`repr()`",
         "a refusal raised without `tx=` names the event or the function, never its statement",
-        "statement excerpt included ([#278](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/278))",
+        "without the server's excerpt of the statement (v0.31.2, [#278](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/278))",
         "system user",
     ),
 }

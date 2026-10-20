@@ -58,6 +58,29 @@ def test_is_conflict_error_walks_cause_chain() -> None:
     assert is_conflict_error(outer) is True
 
 
+def test_is_conflict_error_walks_an_implicit_context() -> None:
+    try:
+        try:
+            raise RuntimeError(CONFLICT_3X)
+        except RuntimeError:
+            raise SurrealDbError("raised while handling it")  # noqa: B904
+    except SurrealDbError as outer:
+        assert is_conflict_error(outer) is True
+
+
+def test_is_conflict_error_skips_a_suppressed_context() -> None:
+    """A context suppressed with ``raise … from None`` is not part of the chain (#278): the ORM keeps a server's
+    full text there, and a statement it quotes may hold conflict words."""
+    try:
+        try:
+            raise SurrealDbError(f"Parse error … {CONFLICT_3X}")
+        except SurrealDbError:
+            raise SurrealDbError("Transaction failed: the server refused the statement: Parse error") from None
+    except SurrealDbError as outer:
+        assert outer.__context__ is not None
+        assert is_conflict_error(outer) is False
+
+
 def _record_sleep(monkeypatch) -> list[float]:
     """Patch the decorator's asyncio.sleep to record delays without waiting."""
     slept: list[float] = []

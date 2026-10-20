@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import os
+import traceback
 from typing import Any
 
 import pytest
@@ -11,9 +12,15 @@ from surreal_orm_lite import (
     SurrealConfigDict,
     SurrealDBConnectionManager,
 )
+from surreal_orm_lite.concurrency import is_conflict_error
 from surreal_orm_lite.exceptions import SurrealDbConflictError, SurrealDbError
 from surreal_orm_lite.signals import post_delete, post_save
-from surreal_orm_lite.transaction import BufferedTransaction, InteractiveTransaction, Transaction
+from surreal_orm_lite.transaction import (
+    _CANCELLED_AFTER_FAILURE,
+    BufferedTransaction,
+    InteractiveTransaction,
+    Transaction,
+)
 from tests._readme_tables import assert_server_header_sentence
 
 
@@ -111,7 +118,7 @@ def test_raise_for_status_rejects_unrecognized_shape() -> None:
     # Defensive: a response missing "result" (or where "result" isn't a list) must NOT
     # be treated as success — that would silently report a failed transaction as
     # committed if a server version ever returned a top-level error envelope.
-    with pytest.raises(SurrealDbError, match="unrecognized"):
+    with pytest.raises(SurrealDbError, match="the server refused the query: auth failed"):
         Transaction.raise_for_status({"error": {"message": "auth failed"}})
     with pytest.raises(SurrealDbError, match="unrecognized"):
         Transaction.raise_for_status({"result": None})
@@ -366,11 +373,14 @@ def _connect() -> None:
 
 
 async def _clear(client) -> None:
-    """Delete all TxUser rows, tolerating a never-created table.
+    """Empty TxUser, defining it first when it does not exist.
 
-    On SurrealDB 3.x, DELETE on a table that does not exist yet raises NotFoundError;
-    suppress it so test setup is idempotent across server versions.
+    On SurrealDB 3.x, reading a table that does not exist raises NotFoundError: a test that reads TxUser after a
+    rolled-back transaction must not depend on an earlier test having created it. DELETE on such a table raises too,
+    hence the suppression.
     """
+    with contextlib.suppress(Exception):
+        await client.query("DEFINE TABLE IF NOT EXISTS TxUser;", {})
     with contextlib.suppress(Exception):
         await client.query("DELETE TxUser;", {})
 
@@ -1133,7 +1143,7 @@ class TestInteractiveFailedStatementUnits:
             await tx.commit()
         assert type(info.value) is SurrealDbError
         assert info.value.__cause__ is failed.value
-        assert "boom" in str(info.value)
+        assert str(info.value) == f"{_CANCELLED_AFTER_FAILURE} (SurrealDbError)"  # the type name only (#278)
         assert ("commit", "TXN") not in c.calls
         assert c.calls.count(("cancel", "TXN")) == 1
 
@@ -1277,6 +1287,14 @@ class TestFailedStatementReadme:
             "The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded "
             "engine, identical on 3.1.5."
         )
+
+
+class TxNeverWritten(BaseSurrealModel):
+    """A table no test writes: reading a missing table without removing one that other tests use."""
+
+    model_config = SurrealConfigDict(table_name="tx_never_written", primary_key="id")
+    id: str | None = None
+    name: str
 
 
 class TxFailRow(BaseSurrealModel):
@@ -1423,14 +1441,467 @@ class TestInteractiveFailedStatementE2E:
         async with _tx_fail_db("ws") as client:
             if not await _native_txn_supported():
                 pytest.skip("requires SurrealDB 3.x")
-            await _clear(client)
             with contextlib.suppress(Exception):
-                await client.query("REMOVE TABLE TxUser;", {})
+                await client.query("REMOVE TABLE tx_never_written;", {})
             async with SurrealDBConnectionManager.transaction() as tx:
-                assert await TxUser.objects(tx=tx).filter(name="x").exec() == []
-                assert await TxUser.objects(tx=tx).all() == []
-                assert await TxUser.objects(tx=tx).count() == 0
+                assert await TxNeverWritten.objects(tx=tx).filter(name="x").exec() == []
+                assert await TxNeverWritten.objects(tx=tx).all() == []
+                assert await TxNeverWritten.objects(tx=tx).count() == 0
                 with pytest.raises(SurrealDbNotFoundError):
-                    await TxUser.objects(tx=tx).get("nobody")
+                    await TxNeverWritten.objects(tx=tx).get("nobody")
                 await TxFailRow(id="ok", age=1).save(tx=tx)
             assert await _stored_ages(client) == {"ok": 1}
+
+
+# =============================================================================
+# Issue #278: the errors the ORM raises when a transaction fails give the server's reason and the failed statement's
+# position, without the server's excerpt of the statement; the embedded engine's commit error is a SurrealDbError too.
+# =============================================================================
+
+#: A literal the tests below put in a statement the server cannot parse: no error the ORM raises may show it.
+_LITERAL = "tx-literal-5f1e9a"
+#: A statement no SurrealDB line can parse (``SELEC``), holding ``_LITERAL``. The server reports it at column 7.
+_UNPARSABLE = f"SELEC '{_LITERAL}' FRM tx_fail_row;"
+#: A statement no SurrealDB line can parse, whose literal holds a retryable conflict's words.
+_CONFLICT_WORDS = "SELEC 'write conflict' FRM tx_fail_row;"
+
+
+def _shown(exc: BaseException, text: str) -> list[str]:
+    """Where *exc* shows *text*: its ``str()``, its ``repr()`` and its formatted traceback (chained errors included)."""
+    shown = {"str": str(exc), "repr": repr(exc), "traceback": "".join(traceback.format_exception(exc))}
+    return [where for where, value in shown.items() if text in value]
+
+
+def _parse_error(position: str, line: str) -> str:
+    """A SurrealDB 3.x parse error at *position*, quoting *line* of the query (the shape measured on 3.3.4)."""
+    return f"Parse error: Unexpected token `a strand`, expected Eof\n --> [{position}]\n  |\n{line}\n  |       ^^^^^\n"
+
+
+class TestRaiseForStatusStatementTextUnits:
+    """``raise_for_status()`` builds its error from the server's reason and the position it gives."""
+
+    def test_an_error_envelope_gives_the_reason_and_the_position(self) -> None:
+        message = _parse_error("1:7", f"1 | {_UNPARSABLE}")
+        with pytest.raises(SurrealDbError) as info:
+            Transaction.raise_for_status({"error": {"code": -32000, "message": message}})
+        assert type(info.value) is SurrealDbError
+        assert str(info.value) == (
+            "Transaction failed: the server refused the statement: Parse error: Unexpected token `a strand`, "
+            "expected Eof (at line 1, column 7 of the statement)"
+        )
+        assert _shown(info.value, _LITERAL) == []
+        assert info.value.__cause__ is None
+        assert info.value.__suppress_context__
+        assert str(info.value.__context__) == message  # the server's error stays reachable
+
+    def test_an_error_envelope_without_a_position(self) -> None:
+        with pytest.raises(SurrealDbError) as info:
+            Transaction.raise_for_status({"error": {"code": -32000, "message": "There was a problem with authentication"}})
+        assert str(info.value) == "Transaction failed: the server refused the query: There was a problem with authentication"
+
+    def test_a_retryable_conflict_in_an_error_envelope_is_a_conflict(self) -> None:
+        message = "Transaction conflict: Write conflict, retry the transaction. This transaction can be retried"
+        with pytest.raises(SurrealDbConflictError, match="can be retried"):
+            Transaction.raise_for_status({"error": {"code": -32000, "message": message}})
+
+    @pytest.mark.parametrize("envelope", [True, False], ids=["error-envelope", "statement-error"])
+    def test_a_parse_error_quoting_conflict_words_is_not_a_conflict(self, envelope: bool) -> None:
+        """The conflict typing reads the server's reason, not its excerpt of the statement."""
+        message = _parse_error("1:7", f"1 | {_CONFLICT_WORDS}")
+        raw = (
+            {"error": {"code": -32000, "message": message}} if envelope else {"result": [{"status": "ERR", "result": message}]}
+        )
+        with pytest.raises(SurrealDbError) as info:
+            Transaction.raise_for_status(raw)
+        assert type(info.value) is SurrealDbError
+        assert not is_conflict_error(info.value)
+
+    @pytest.mark.parametrize("raw", [{"result": None}, {"error": {"message": None}}, None, [_LITERAL]])
+    def test_an_unrecognized_shape_is_not_quoted(self, raw: Any) -> None:
+        with pytest.raises(SurrealDbError, match="unrecognized query_raw\\(\\) response shape") as info:
+            Transaction.raise_for_status(raw)
+        assert _shown(info.value, _LITERAL) == []
+        assert _shown(info.value, "result") == []
+        assert str(info.value.__context__) == repr(raw)
+        assert info.value.__suppress_context__
+
+    def test_a_statement_error_that_quotes_the_query_keeps_its_first_line(self) -> None:
+        # A value parsed at run time can be refused with a parse error quoting it (SurrealDB 2.x).
+        message = (
+            "Parse error: Unexpected token `an identifier`, expected no more tokens\n --> [1:5]\n  |\n"
+            f"1 | {_LITERAL} x(\n  |     ^^^ \n"
+        )
+        raw = {"result": [{"status": "ERR", "result": message}]}
+        with pytest.raises(SurrealDbError) as info:
+            Transaction.raise_for_status(raw)
+        assert str(info.value) == (
+            "Transaction failed and rolled back: Parse error: Unexpected token `an identifier`, expected no more tokens"
+        )
+        assert _shown(info.value, _LITERAL) == []
+        assert str(info.value.__context__) == message
+
+    def test_a_statement_error_without_an_excerpt_is_kept_whole(self) -> None:
+        raw = {"result": [{"status": "ERR", "result": "Database record `probe:c` already exists"}]}
+        with pytest.raises(SurrealDbError) as info:
+            Transaction.raise_for_status(raw)
+        assert str(info.value) == "Transaction failed and rolled back: Database record `probe:c` already exists"
+        assert info.value.__context__ is None
+
+
+class _EnvelopeClient:
+    """A client whose ``query_raw()`` answers with an error envelope carrying *message*, as a server does for a query
+    it refuses as a whole."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+    async def query_raw(self, sql: str, params: Any = None) -> dict[str, Any]:
+        return {"error": {"code": -32000, "message": self.message}}
+
+
+#: The reason ``_parse_error()`` gives.
+_REASON = "Parse error: Unexpected token `a strand`, expected Eof"
+
+
+class TestBufferedPositionUnits:
+    """A buffered commit names the queued statement a position falls in, and gives the line and column in the text
+    the caller queued: the ORM's ``$name`` → ``$t<N>_name`` renaming does not shift the column."""
+
+    @staticmethod
+    async def _commit_error(queued: list[tuple[str, dict[str, Any] | None]], message: str) -> str:
+        tx = BufferedTransaction(_EnvelopeClient(message))
+        for statement, variables in queued:
+            await tx.add(statement, variables)
+        with pytest.raises(SurrealDbError) as info:
+            await tx.commit()
+        return str(info.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("queued", "position", "expected"),
+        [
+            ([("CREATE a:1;", None), ("SELEC 'x' FRM t;", None)], "3:7", "statement 2 of 2: {r} (at line 1, column 7"),
+            (
+                [("CREATE a:1\nSET b = 1;", None), ("RETURN 1;\nSELEC 'x';\nRETURN 2;", None)],
+                "5:9",
+                "statement 2 of 2: {r} (at line 2, column 9",
+            ),
+            ([("CREATE t SET a = $v, b = 'x' c;", {"v": 1})], "2:33", "statement 1 of 1: {r} (at line 1, column 30"),
+            (
+                [("RETURN 0;", None), ("CREATE t SET a = $v,\n  b = $w + $v x;", {"v": 1, "w": 2})],
+                "4:21",
+                "statement 2 of 2: {r} (at line 2, column 15",
+            ),
+            ([("CREATE t SET a = $v, b = 'x' c;", {"v": 1})], "2:20", "statement 1 of 1: {r} (at line 1, column 19"),
+            ([("CREATE t SET a = $v, b = 'x' c;", {"other": 1})], "2:30", "statement 1 of 1: {r} (at line 1, column 30"),
+            ([("RETURN (1 +", None)], "3:8", "the query: {r} (at line 3, column 8 of the query)"),
+        ],
+        ids=[
+            "one-line-statements",
+            "multi-line-statements",
+            "a-renamed-parameter-before-the-column",
+            "renamed-parameters-on-earlier-lines-and-after-the-column",
+            "inside-a-renamed-parameter",
+            "a-parameter-not-renamed",
+            "outside-every-statement",
+        ],
+    )
+    async def test_the_position_names_the_statement_as_queued(
+        self, queued: list[tuple[str, dict[str, Any] | None]], position: str, expected: str
+    ) -> None:
+        message = await self._commit_error(queued, _parse_error(position, "…"))
+        assert message.startswith("Transaction failed: the server refused " + expected.format(r=_REASON)), message
+
+    @pytest.mark.asyncio
+    async def test_a_position_on_the_commit_line_falls_back_to_one_in_a_statement(self) -> None:
+        """An unclosed delimiter in the last statement is reported on the ``COMMIT`` line first, then where it opens."""
+        message = (
+            "Parse error: Unexpected token `COMMIT` expected delimiter `}`\n --> [4:1]\n  |\n4 | COMMIT TRANSACTION;\n"
+            "  | ^^^^^^\n --> [3:8]\n  |\n3 | RETURN { a: 1\n  |        ^ expected this delimiter to close\n"
+        )
+        error = await self._commit_error([("CREATE a:1;", None), ("RETURN { a: 1", None)], message)
+        assert error == (
+            "Transaction failed: the server refused statement 2 of 2: Parse error: Unexpected token `COMMIT` expected "
+            "delimiter `}` (at line 1, column 8 of the statement)"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("queued", "stop", "opened", "expected"),
+        [
+            (
+                [("RETURN { a: 1", None), ("CREATE a:1;", None)],
+                "3:1",
+                "2:8",
+                "statement 1 of 2: Parse error: Unexpected token `CREATE` expected delimiter `}` (at line 1, column 8 of",
+            ),
+            (
+                [("CREATE a:1;", None), ("RETURN { a: 1 ;", None)],
+                "3:15",
+                "3:8",
+                "statement 2 of 2: Parse error: Unexpected token `CREATE` expected delimiter `}` (at line 1, column 15 of",
+            ),
+        ],
+        ids=["the-delimiter-opens-in-an-earlier-statement", "both-positions-in-one-statement"],
+    )
+    async def test_an_unclosed_delimiter_names_the_statement_it_opens_in(
+        self, queued: list[tuple[str, dict[str, Any] | None]], stop: str, opened: str, expected: str
+    ) -> None:
+        """The server reports where it stopped, then where the delimiter opens: the statement named is the one the
+        delimiter opens in, at the first position the server gives in it (where it stopped, when that is in it too)."""
+        message = (
+            f"Parse error: Unexpected token `CREATE` expected delimiter `}}`\n --> [{stop}]\n  |\n3 | …\n  | ^\n"
+            f" --> [{opened}]\n  |\n2 | …\n  |        ^ expected this delimiter to close\n"
+        )
+        error = await self._commit_error(queued, message)
+        assert error.startswith("Transaction failed: the server refused " + expected), error
+
+
+class _RaisingClient:
+    """A client whose ``query_raw()`` raises *error* (not the embedded engine)."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    async def query_raw(self, sql: str, params: Any = None) -> dict[str, Any]:
+        raise self.error
+
+
+class TestCancellationErrorTextUnits:
+    """The error ``commit()`` raises after a failed statement names only that error's type (issue #278)."""
+
+    @pytest.mark.asyncio
+    async def test_the_cancellation_error_names_the_failure_s_type(self) -> None:
+        c = _FailingTxnClient()
+        c.err_envelope = {"error": {"code": -32000, "message": _parse_error("1:7", f"1 | {_UNPARSABLE}")}}
+        tx = InteractiveTransaction(c, "TXN")
+        with pytest.raises(SurrealDbError) as failed:
+            await tx.add(f"CREATE {_UNPARSABLE}", {})
+        with pytest.raises(SurrealDbError) as info:
+            await tx.commit()
+        assert type(info.value) is SurrealDbError
+        assert str(info.value) == f"{_CANCELLED_AFTER_FAILURE} (SurrealDbError)"
+        assert info.value.__cause__ is failed.value
+        assert _shown(info.value, _LITERAL) == []
+
+    @pytest.mark.asyncio
+    async def test_a_conflict_s_cancellation_error_is_a_conflict(self) -> None:
+        c = _FailingTxnClient()
+        c.write_error = RuntimeError(f"{_LITERAL}: Write conflict. This transaction can be retried")
+        tx = InteractiveTransaction(c, "TXN")
+        with pytest.raises(SurrealDbConflictError):
+            await tx.add("UPDATE counter:c SET n += 1;", {})
+        with pytest.raises(SurrealDbConflictError) as info:
+            await tx.commit()
+        assert str(info.value) == f"{_CANCELLED_AFTER_FAILURE} (SurrealDbConflictError)"
+        assert _LITERAL not in str(info.value)
+
+    @pytest.mark.asyncio
+    async def test_a_runtime_error_of_a_server_client_is_not_rewritten(self) -> None:
+        tx = BufferedTransaction(_RaisingClient(RuntimeError("Event loop is closed")))
+        await tx.add("CREATE User:1;", None)
+        with pytest.raises(RuntimeError, match="Event loop is closed"):
+            await tx.commit()
+
+
+@pytest.mark.parametrize("transport", ["ws", "http"])
+class TestBufferedCommitErrorTextE2E:
+    """A buffered commit (SurrealDB 2.x over WebSocket, HTTP on both lines) that the server refuses raises
+    ``SurrealDbError`` naming the statement, without its text."""
+
+    @pytest.mark.asyncio
+    async def test_the_commit_error_keeps_the_statement_text_out(self, transport: str) -> None:
+        async with _tx_fail_db(transport) as client:
+            if transport == "ws" and await _native_txn_supported():
+                pytest.skip("WebSocket on SurrealDB 3.x runs interactive transactions")
+            with pytest.raises(SurrealDbError) as info:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    assert not tx.is_interactive
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    await tx.add(_UNPARSABLE)
+                    queued = len(tx.statements)
+            assert type(info.value) is SurrealDbError
+            message = str(info.value)
+            assert message.startswith(f"Transaction failed: the server refused statement {queued} of {queued}: ")
+            assert "Parse error: " in message
+            assert message.endswith("(at line 1, column 7 of the statement)")
+            assert _shown(info.value, _LITERAL) == []
+            assert info.value.__cause__ is None
+            assert _LITERAL in str(info.value.__context__)  # the server's error stays reachable
+            assert await _stored_ages(client) == {}
+
+    @pytest.mark.asyncio
+    async def test_the_column_is_the_one_in_the_queued_text(self, transport: str) -> None:
+        """The ORM renames ``$v`` to ``$t1_v`` before sending: the column given is still the caller's."""
+        statement = "CREATE tx_fail_row SET age = $v, note = 'x' oops;"
+        async with _tx_fail_db(transport):
+            if transport == "ws" and await _native_txn_supported():
+                pytest.skip("WebSocket on SurrealDB 3.x runs interactive transactions")
+            with pytest.raises(SurrealDbError) as info:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    await tx.add(statement, {"v": 2})
+            column = statement.index("oops") + 1
+            assert str(info.value).endswith(f"(at line 1, column {column} of the statement)"), str(info.value)
+
+    @pytest.mark.asyncio
+    async def test_an_unclosed_last_statement_is_named(self, transport: str) -> None:
+        """The server reports the unclosed delimiter on the ``COMMIT`` line first: the statement is still named."""
+        async with _tx_fail_db(transport):
+            if transport == "ws" and await _native_txn_supported():
+                pytest.skip("WebSocket on SurrealDB 3.x runs interactive transactions")
+            with pytest.raises(SurrealDbError) as info:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    await tx.add("RETURN { a: 1")
+                    queued = len(tx.statements)
+            message = str(info.value)
+            assert message.startswith(f"Transaction failed: the server refused statement {queued} of {queued}: "), message
+            assert message.endswith("(at line 1, column 8 of the statement)"), message
+
+    @pytest.mark.asyncio
+    async def test_an_unclosed_statement_followed_by_another_is_named(self, transport: str) -> None:
+        """The server stops in the next statement, then points back to where the delimiter opens."""
+        async with _tx_fail_db(transport):
+            if transport == "ws" and await _native_txn_supported():
+                pytest.skip("WebSocket on SurrealDB 3.x runs interactive transactions")
+            with pytest.raises(SurrealDbError) as info:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    await tx.add("RETURN { a: 1")
+                    unclosed = len(tx.statements)
+                    await tx.add("CREATE a:1;")
+                    queued = len(tx.statements)
+            message = str(info.value)
+            assert message.startswith(f"Transaction failed: the server refused statement {unclosed} of {queued}: "), message
+            assert message.endswith("(at line 1, column 8 of the statement)"), message
+
+    @pytest.mark.asyncio
+    async def test_a_parse_error_quoting_conflict_words_is_not_a_conflict(self, transport: str) -> None:
+        async with _tx_fail_db(transport) as client:
+            if transport == "ws" and await _native_txn_supported():
+                pytest.skip("WebSocket on SurrealDB 3.x runs interactive transactions")
+            with pytest.raises(SurrealDbError) as info:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    await tx.add(_CONFLICT_WORDS)
+            assert type(info.value) is SurrealDbError
+            assert not is_conflict_error(info.value)
+            assert await _stored_ages(client) == {}
+
+
+class TestInteractiveErrorTextE2E:
+    """SurrealDB 3.x over WebSocket: a statement the server cannot parse fails inside the block, the block catches its
+    error; neither that error nor the cancellation error shows the statement's text."""
+
+    @pytest.mark.asyncio
+    async def test_the_exit_error_keeps_the_statement_text_out(self) -> None:
+        async with _tx_fail_db("ws") as client:
+            if not await _native_txn_supported():
+                pytest.skip("requires SurrealDB 3.x")
+            with pytest.raises(SurrealDbError) as info:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    assert tx.is_interactive
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    with pytest.raises(SurrealDbError) as failed:
+                        await tx.add(_UNPARSABLE)
+            assert type(info.value) is SurrealDbError
+            assert str(info.value) == f"{_CANCELLED_AFTER_FAILURE} (SurrealDbError)"
+            assert info.value.__cause__ is failed.value
+            assert str(failed.value) == (
+                "Transaction failed: the server refused the statement: Parse error: Unexpected token `a strand`, "
+                "expected Eof (at line 1, column 7 of the statement)"
+            )
+            assert _shown(info.value, _LITERAL) == []
+            assert _shown(failed.value, _LITERAL) == []
+            assert _LITERAL in str(failed.value.__context__)  # the server's error stays reachable
+            assert await _stored_ages(client) == {}
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_commit_s_error_keeps_the_statement_text_out(self) -> None:
+        async with _tx_fail_db("ws") as client:
+            if not await _native_txn_supported():
+                pytest.skip("requires SurrealDB 3.x")
+            with pytest.raises(SurrealDbError) as info:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    with pytest.raises(SurrealDbError) as failed:
+                        await tx.add(_UNPARSABLE)
+                    await tx.commit()
+            assert str(info.value) == f"{_CANCELLED_AFTER_FAILURE} (SurrealDbError)"
+            assert info.value.__cause__ is failed.value
+            assert _shown(info.value, _LITERAL) == []
+            assert await _stored_ages(client) == {}
+
+    @pytest.mark.asyncio
+    async def test_a_parse_error_quoting_conflict_words_is_not_a_conflict(self) -> None:
+        async with _tx_fail_db("ws") as client:
+            if not await _native_txn_supported():
+                pytest.skip("requires SurrealDB 3.x")
+            with pytest.raises(SurrealDbError) as info:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    with pytest.raises(SurrealDbError) as failed:
+                        await tx.add(_CONFLICT_WORDS)
+            assert type(failed.value) is SurrealDbError
+            assert type(info.value) is SurrealDbError
+            assert str(info.value) == f"{_CANCELLED_AFTER_FAILURE} (SurrealDbError)"
+            assert not is_conflict_error(info.value)
+            assert await _stored_ages(client) == {}
+
+
+def _require_embedded_engine() -> None:
+    """Skip when the installed SDK has no in-process engine."""
+    from tests.test_embedded import _embedded_engine_available
+
+    if not _embedded_engine_available():
+        pytest.skip("the installed surrealdb SDK has no embedded engine")
+
+
+@contextlib.asynccontextmanager
+async def _embedded_tx_db() -> Any:
+    """The embedded engine (``mem://``) with ``tx_fail_row`` defined; unset afterwards."""
+    _require_embedded_engine()
+    SurrealDBConnectionManager.set_connection(url="mem://", namespace="t", database="t")
+    try:
+        client = await SurrealDBConnectionManager.get_client()
+        await client.query(_TX_FAIL_SCHEMA, {})
+        yield client
+    finally:
+        await SurrealDBConnectionManager.unset_connection()
+
+
+class TestEmbeddedCommitErrorE2E:
+    """The embedded engine raises a bare ``RuntimeError`` for a query it cannot parse: the commit raises
+    ``SurrealDbError`` (``SurrealDbConflictError`` for a retryable conflict), as on a server."""
+
+    @pytest.mark.asyncio
+    async def test_the_commit_error_is_a_surreal_db_error_without_the_statement_text(self) -> None:
+        async with _embedded_tx_db() as client:
+            with pytest.raises(SurrealDbError) as info:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    await tx.add(_UNPARSABLE)
+                    queued = len(tx.statements)
+            assert type(info.value) is SurrealDbError
+            message = str(info.value)
+            assert message.startswith(f"Transaction failed: the server refused statement {queued} of {queued}: ")
+            assert message.endswith("(at line 1, column 7 of the statement)")
+            assert _shown(info.value, _LITERAL) == []
+            assert info.value.__cause__ is None
+            assert isinstance(info.value.__context__, RuntimeError)  # the engine's error stays reachable
+            assert _LITERAL in str(info.value.__context__)
+            assert await _stored_ages(client) == {}
+
+    @pytest.mark.asyncio
+    async def test_a_retryable_conflict_is_a_conflict(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from surrealdb import AsyncEmbeddedSurrealConnection
+
+        async def conflict(self: Any, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("Failed to commit transaction due to a read or write conflict. This transaction can be retried")
+
+        async with _embedded_tx_db():
+            monkeypatch.setattr(AsyncEmbeddedSurrealConnection, "query_raw", conflict)
+            with pytest.raises(SurrealDbConflictError, match="can be retried"):
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
