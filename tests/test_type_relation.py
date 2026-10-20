@@ -71,8 +71,13 @@ The generator (spec §6.5, D10, P1; AC-14): ``TestRoundTripE2E`` defines three e
 a name repeated on each side —, generates their models back with ``generate_models_from_db()``, imports them and
 applies their ``relation_ddl()`` to a fresh database: the same relation definitions are read back. The generator's unit
 cases are ``tests/test_model_generator.py``'s ``TestRelationKeys``.
+
+The README (spec §11.1; AC-17; P1–P4): section 34's place and subsections, its examples run in order on ``mem://``
+(each printed line equal to its comment), the key phrases of each subsection, sections 23 and 31's new sentences, and
+the features, roadmap, comparison and both behaviour tables (``TestReadmeSection34``).
 """
 
+import ast
 import asyncio
 import contextlib
 import importlib.util
@@ -110,6 +115,20 @@ from surreal_orm_lite import (
 from surreal_orm_lite.define_parser import parse_define_field, parse_define_table
 from surreal_orm_lite.edge import insert_edges
 from surreal_orm_lite.schema_state import TableState
+from surreal_orm_lite.testing import embedded_database
+from tests._readme_tables import (
+    assert_embedded_rows,
+    assert_server_header_sentence,
+    assert_server_rows,
+    assert_server_table,
+)
+from tests._readme_tables import cells as _cells
+from tests._readme_tables import normalised as _normalised
+from tests._readme_tables import readme as _readme
+from tests._readme_tables import readme_part as _readme_part
+from tests._readme_tables import subsection as _subsection
+from tests._readme_tables import table_rows as _table_rows
+from tests._readme_tables import tables as _md_tables
 
 # --- the exact texts of spec §5.8 ----------------------------------------------------------------------------------
 
@@ -2907,3 +2926,642 @@ class TestRoundTripE2E:
                 await _apply_ddl(client, edge.relation_ddl())
             tables = await _tables(client)
             assert {table: _relation_fields(parse_define_table(tables[table])) for table in _ROUND_TRIP} == stored
+
+
+# === README: section 34, sections 23 and 31, the tables (spec §11.1; AC-17; P1–P4) ==================================
+
+_SECTION_23 = "### 23. Typed edges (`BaseSurrealEdge`)"
+_SECTION_31 = "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
+_SECTION_33 = "### 33. Materialized views (`view_query`, `define_view()`)"
+_SECTION_34 = "### 34. Relation constraints (`relation_in`, `define_relation()`)"
+_SERVER_BEHAVIOUR = "### ORM behaviour: SurrealDB 2.x vs 3.x"
+_EMBEDDED_BEHAVIOUR = "### ORM behaviour: the embedded engine"
+#: Spec §11.1 item 1: section 34's subsections, in order, after an untitled intro paragraph that holds example A.
+_SUBSECTIONS_34 = [
+    "Declaring the constraint",
+    "Applying it",
+    "What SurrealDB refuses",
+    "Records already in the table",
+    "Removing the constraint",
+    "Transactions, connections and the query cache",
+    "SurrealDB 2.x and 3.x",
+    "Security",
+    "Coming from the full SurrealDB-ORM",
+]
+#: Spec §11.1 item 1, example A, exactly: the intro's block.
+_README_EXAMPLE_A = """\
+from surrealdb import RecordID
+
+from surreal_orm_lite import (
+    BaseSurrealEdge,
+    BaseSurrealModel,
+    SurrealConfigDict,
+    SurrealDbError,
+    SurrealDbNotFoundError,
+    TableType,
+)
+
+
+class Person(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="person")
+
+    id: str | None = None
+    name: str
+
+
+class Company(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="company")
+
+    id: str | None = None
+    name: str
+
+
+class Post(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="post")
+
+    id: str | None = None
+    title: str
+
+
+class Likes(BaseSurrealEdge):
+    model_config = SurrealConfigDict(
+        table_name="likes",
+        table_type=TableType.RELATION,  # optional: an edge model's table is TYPE RELATION
+        relation_in="person",
+        relation_out=["post", "book"],
+        enforced=True,
+    )
+
+    stars: int = 1
+
+
+print(Likes.relation_ddl())
+# DEFINE TABLE OVERWRITE `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;
+print(await Likes.define_relation())
+# DEFINE TABLE OVERWRITE `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;
+
+ada = await Person(id="ada", name="Ada").save()
+acme = await Company(id="acme", name="Acme").save()
+graphs = await Post(id="graphs", title="Graphs").save()
+
+edge = await ada.relate(Likes, graphs, stars=5)
+print(edge.in_, edge.out)
+# person:ada post:graphs
+try:
+    await acme.relate(Likes, graphs)  # a company is not a person
+except SurrealDbError as exc:
+    print(type(exc).__name__)
+# SurrealDbError
+try:
+    await ada.relate(Likes, RecordID("book", "missing"))  # ENFORCED: the book must exist
+except SurrealDbNotFoundError as exc:
+    print(exc)
+# There was a problem with the database: The record 'book:missing' does not exist
+"""
+#: The getters, closing "Declaring the constraint".
+_README_GETTERS = """\
+print(Likes.get_relation_in(), Likes.get_relation_out(), Likes.is_enforced(), Likes.get_table_type())
+# ('person',) ('post', 'book') True relation
+"""
+#: Spec §11.1 item 1, example B, exactly: it opens "Applying it".
+_README_EXAMPLE_B = """\
+from surreal_orm_lite import SurrealDBConnectionManager
+
+
+class Follows(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="follows", relation_in="person", relation_out="person")
+
+
+client = await SurrealDBConnectionManager.get_client()
+await client.query("DEFINE TABLE follows SCHEMAFULL CHANGEFEED 1d PERMISSIONS FOR select FULL;", {})
+print(Follows.relation_ddl())
+# DEFINE TABLE OVERWRITE `follows` TYPE RELATION IN `person` OUT `person`;
+print(await Follows.define_relation())
+# DEFINE TABLE OVERWRITE `follows` TYPE RELATION IN `person` OUT `person` SCHEMAFULL CHANGEFEED 1d PERMISSIONS FOR select FULL, FOR create, update, delete NONE;
+"""
+#: Spec §11.1 item 1 (M5, M15, M20): an edge stored before the constraint, its refused update, the two recipes and its
+#: deletion — "Records already in the table".
+_README_RECORDS = """\
+from surrealdb import ServerError
+
+await ada.relate("knows", acme)  # written before any constraint: acme is a company
+
+
+class Knows(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="knows", relation_in="person", relation_out="person")
+
+    since: int | None = None
+
+
+await Knows.define_relation()
+[old] = await Knows.objects().exec()  # the edge stays
+try:
+    await old.merge(since=2020)
+except ServerError as exc:
+    print(type(exc).__name__)
+# InternalError
+
+outside = await Knows.raw_query(
+    "SELECT VALUE id FROM knows WHERE record::tb(in) NOT IN ['person'] OR record::tb(out) NOT IN ['person']"
+)
+dangling = await Knows.raw_query("SELECT VALUE id FROM knows WHERE in.id IS NONE OR out.id IS NONE")
+print(outside == [old.id], dangling)
+# True []
+await old.delete()
+"""
+#: Spec §11.1 item 1 (G6, D14, K7's form): a model without keys removes the constraint — "Removing the constraint".
+_README_REMOVAL = """\
+class LikesAny(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="likes")  # no relation key: any table, not enforced
+
+
+print(await LikesAny.define_relation())
+# DEFINE TABLE OVERWRITE `likes` TYPE RELATION;
+edge = await acme.relate(LikesAny, graphs)  # accepted now
+print(edge.in_, edge.out)
+# company:acme post:graphs
+"""
+_README_EXAMPLES_34 = [_README_EXAMPLE_A, _README_GETTERS, _README_EXAMPLE_B, _README_RECORDS, _README_REMOVAL]
+#: The ``python`` blocks of each part of section 34 (the intro is the text before the first subsection).
+_BLOCKS_BY_PART_34 = {
+    "": [_README_EXAMPLE_A],
+    "Declaring the constraint": [_README_GETTERS],
+    "Applying it": [_README_EXAMPLE_B],
+    "What SurrealDB refuses": [],
+    "Records already in the table": [_README_RECORDS],
+    "Removing the constraint": [_README_REMOVAL],
+    "Transactions, connections and the query cache": [],
+    "SurrealDB 2.x and 3.x": [],
+    "Security": [],
+    "Coming from the full SurrealDB-ORM": [],
+}
+#: P3, exactly (whitespace normalised): in "What SurrealDB refuses" and in "SurrealDB 2.x and 3.x".
+_P3_SENTENCE = (
+    "`SurrealDbNotFoundError` is a `SurrealDbError`, so `except SurrealDbError` handles every refused edge creation the "
+    "same way on both lines."
+)
+#: P4, exactly (whitespace normalised): in "Applying it".
+_P4_SENTENCE = (
+    "Each `define_relation()` on a table with a change feed adds a `define_table` entry to it; `changes()` skips it, a "
+    "raw `SHOW CHANGES` shows it."
+)
+#: Spec §11.1 item 1: what the intro and each subsection say (key phrases, whitespace normalised).
+_INTRO_NEEDLES_34 = (
+    "Since v0.33.0",
+    "(#23-typed-edges-basesurrealedge)",
+    "`TYPE RELATION IN … OUT … ENFORCED`",
+    "the full SurrealDB-ORM's keys",
+    "`relation_in`, `relation_out`, `enforced` and `table_type=TableType.RELATION`",
+    "`define_relation()` applies the constraint",
+    "SurrealDB enforces it",
+    "SurrealDB 2.x, 3.x and the embedded engine",
+    "(#orm-behaviour-surrealdb-2x-vs-3x)",
+    "`mem://`",
+)
+_PART_NEEDLES_34 = {
+    "Declaring the constraint": (
+        '`None`, `""`, `[]` and `()` mean any table',
+        "several separated by `|`",
+        "a list or tuple of names",
+        "Each name is stripped and must be an identifier",
+        "written in backquotes, in the order given",
+        "a repeated name is kept, as SurrealDB keeps it",
+        "`enforced=True` makes SurrealDB refuse an edge whose endpoint record does not exist",
+        "`table_type=TableType.RELATION` is optional",
+        "`NORMAL`, `USER`, `STREAM`, `HASH`, `RELATION`, `ANY`",
+        "recorded for the table DDL of v0.37.0",
+        "checked when the class is defined",
+        'a plain `"relation"` string included',
+        "`TypeError`",
+        "`ValueError`",
+        "even empty or `False`",
+        "derive the model from `BaseSurrealEdge`",
+        "A subclass inherits the keys",
+        "`get_relation_in()` and `get_relation_out()` return tuples (`()` for any table)",
+        "`TableState.relation_in`",
+        "`is_enforced()`",
+        "`get_table_type()`",
+        "else `TableType.NORMAL`",
+    ),
+    "Applying it": (
+        "reads the table's definition once (`INFO FOR DB`)",
+        "one `DEFINE TABLE OVERWRITE`",
+        "keeps the table's schema mode, `DROP`, comment, change feed and permissions",
+        "`relation_ddl()` returns the bare statement",
+        "`PERMISSIONS NONE`, which hides every edge from record users",
+        "the views that read it ([section 33](#33-materialized-views-view_query-define_view))",
+        "the views keep counting the edges written afterwards",
+        "its live queries and its change feed's history are kept",
+        _P4_SENTENCE,
+        "enforced at once, on every connection",
+        "idempotent: run it at start-up",
+        "`overwrite=False` writes `DEFINE TABLE IF NOT EXISTS`",
+        "whatever its ends",
+        "not a relation table it raises `SurrealDbError` before any DDL",
+        "on a materialized view",
+        "a definition the ORM cannot read back",
+        "an `ASSERT` written on them by hand is lost",
+        "Why not `ALTER TABLE`",
+        "is not enforced until a `DEFINE TABLE OVERWRITE`",
+    ),
+    "What SurrealDB refuses": (
+        "through every creation path",
+        "`relate()` with an edge model or by table name (the string form since v0.33.0), an edge's `save()`, "
+        "`objects().bulk_create()`",
+        "outside `IN`/`OUT` raises `SurrealDbError`",
+        "with `ENFORCED`, an endpoint record that does not exist raises `SurrealDbNotFoundError`",
+        "`__cause__`",
+        "A batch with one refused edge writes nothing",
+        '"Transaction failed and rolled back: …"',
+        "**Writing a plain record**",
+        'the SDK\'s `InternalError` ("Found record: … but expected a RELATION …")',
+        "**Updating** an edge the constraint refuses",
+        "`InternalError` too",
+        "`surrealdb.ServerError`s",
+        "an event's `THROW`",
+        "a failed `patch()` test",
+        _P3_SENTENCE,
+    ),
+    "Records already in the table": (
+        "not the records already in the table",
+        "a nonconforming edge",
+        "is still traversed",
+        "`merge()`, `update()`, `patch()`, `atomic_*()` and `objects().bulk_update()`",
+        "the SDK's `InternalError`",
+        "a dangling edge",
+        "can still be updated",
+        "plain records stay",
+        "`delete()` always works",
+        "`raw_query()`",
+        "`record::tb(in) NOT IN [...]`",
+        "`in.id IS NONE OR out.id IS NONE`",
+    ),
+    "Removing the constraint": (
+        "The model is the source of truth",
+        "leave `relation_in`, `relation_out` and `enforced` out (or set them to `None`",
+        'empty ends — `""`, `[]`, `()` — and `enforced=False` do the same',
+        "`TYPE RELATION` with no ends, at once on every connection",
+        "keeps its other clauses, records, fields, indexes and events",
+        "`overwrite=False` removes nothing",
+        "`TYPE ANY` is not offered, and it does not lift the constraint",
+        "`TYPE record<person>`",
+        "`ALTER TABLE … TYPE ANY`",
+        "`DEFINE TABLE OVERWRITE … TYPE ANY`",
+        "`REMOVE FIELD in ON likes; REMOVE FIELD out ON likes;`",
+        "`REMOVE TABLE likes` removes the table and its edges",
+        "`remove_relation()` deletes edges, not the constraint",
+    ),
+    "Transactions, connections and the query cache": (
+        "`tx=`",
+        "buffered",
+        "interactive",
+        "A block that raises applies nothing",
+        "later in the same block fails it",
+        "before anything is queued, on committed state",
+        "a definition of the same table queued earlier in the block",
+        "is not seen by `define_relation()` and is replaced at commit",
+        "define the table's other clauses before the block",
+        "not a lock",
+        "`connection`",
+        "`using()`",
+        "another connection raises `SurrealDbError` before any request",
+        "(#29-query-cache-cache-querycache)",
+        "drops no cached read",
+        "`OWNER` or `EDITOR`",
+        "`SurrealDbAuthenticationError`",
+        "signal",
+    ),
+    "SurrealDB 2.x and 3.x": (
+        "the same on every line and on the embedded engine",
+        "The wording of the server's refusals differs",
+        "`Found … but expected a record<…>`",
+        "`Couldn't coerce value for field …`",
+        "both outside `IN`/`OUT` and missing",
+        "`SurrealDbNotFoundError` on 2.x and the embedded engine",
+        "`SurrealDbError` on 3.x",
+        _P3_SENTENCE,
+        "A raw `ALTER TABLE … TYPE RELATION …` of a table already written to is not enforced on 2.x",
+        "The ORM never sends `ALTER TABLE`",
+        "(#orm-behaviour-surrealdb-2x-vs-3x)",
+        "(#orm-behaviour-the-embedded-engine)",
+    ),
+    "Security": (
+        "checked as identifiers",
+        "written in backquotes",
+        "the database's own definition sent back to it",
+        "re-checked",
+        "they are not an injection defence",
+        "names the table, never the statement",
+        "not an access control",
+        "privileged session",
+    ),
+}
+#: Spec §11.1 item 1: one key phrase per "Coming from the full SurrealDB-ORM" bullet, in order (the product owner's
+#: list of accepted differences, epic #287).
+_COMING_FROM_PHRASES_34 = (
+    "**The keys and `TableType` are the same**",
+    "**The relation model is `BaseSurrealEdge`**",
+    "**`relation_ddl()` and `define_relation()` on the edge model**",
+    "**The table's other clauses are kept from the database**",
+    "**Names are identifiers, written in backquotes, and a pipe-joined string is parsed**",
+    "**A `table_type` that is not a `TableType` and an `enforced` that is not a bool raise `TypeError`**",
+    "**`get_table_type()` is `TableType.RELATION` for every edge model**",
+    "**A refused edge creation raises the ORM's `SurrealDbError` or `SurrealDbNotFoundError`, a refused update the "
+    "official SDK's `InternalError`**",
+    "**Generated edge models carry the keys but no `table_type=`**",
+    "**`TableType`'s other members have no effect until v0.37.0.**",
+    "**`remove_relation()` deletes edges, not a constraint**",
+    "**Upgrading from 0.32 or earlier**",
+)
+#: Spec §11.1 item 2: section 23's "defined by hand" sentence and the end of item 3 of its migration list.
+_SECTION_23_DEFINED_BY_HAND = (
+    "Since v0.33.0 the model declares it (`relation_in`, `relation_out`, `enforced`) and `define_relation()` applies "
+    "it: see [section 34](#34-relation-constraints-relation_in-define_relation)."
+)
+_SECTION_23_MIGRATING_3 = "lite gets those keys, with those names, on `BaseSurrealEdge` (section 34)."
+#: Spec §11.1 item 3: section 23's "Idempotent edges" sentence (D7: the string form translates server errors).
+_SECTION_23_IDEMPOTENT = (
+    'A second string `relate("likes", …)` for the same pair fails as well, with `SurrealDbError` (the string form '
+    "translates server errors since v0.33.0)."
+)
+#: Spec §11.1 item 6: section 31's generated-models bullet, exactly (whitespace normalised). The same constant is
+#: pinned by tests/test_introspection.py and tests/test_views.py.
+_GENERATED_MODELS_BULLET_31 = (
+    "- **Generated models use comments** where the full ORM writes `SurrealConfigDict(permissions=…, changefeed=…)` "
+    "(`# Permissions: …`, `# Changefeed: …`): those keys arrive in the lite's `SurrealConfigDict` with later minors. A "
+    "view is generated with `view_query=…` since v0.32.0, and a relation table's ends with `relation_in=…`, "
+    "`relation_out=…` and `enforced=True` since v0.33.0, as in the full ORM (a `# View: AS …` comment when the lite "
+    "cannot declare the view: an edge, a computed field, a query it refuses; an `# IN … OUT …` comment when a table "
+    "name is not an identifier). The base class says what the full ORM's `table_type=` says (`BaseSurrealEdge` for a "
+    "relation table). `READONLY` is a comment too (full ORM: `Field(readonly=True)`)."
+)
+#: Spec §11.1 item 6: section 31's "One class per table" bullet names the relation keys.
+_ONE_CLASS_PER_TABLE_31 = (
+    "`relation_in`/`relation_out`/`enforced` for a relation table (since v0.33.0, "
+    "[section 34](#34-relation-constraints-relation_in-define_relation))"
+)
+#: Spec §11.1 items 7–9: the features row, the roadmap rows and the comparison rows.
+_FEATURES_ROW_34 = ["Relation constraints (`relation_in`, `define_relation()`, `TYPE RELATION`)", "✅"]
+_ROADMAP_ROWS_34 = [
+    ["v0.32.0", "Tier 3 — Materialized views", "✅ Released"],
+    ["v0.33.0", "Tier 3 — `TYPE RELATION` constraints", "✅ Released"],
+    ["v0.34.0 – v0.39.0", "Tier 3 — Advanced (search, migrations, CLI)", "📋 Planned"],
+    ["v0.40.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+]
+_COMPARISON_TYPED_RELATIONS = ["Native typed relations", "✅ v0.22.0 (typed edge models)", "✅ DDL only (TableType.RELATION)"]
+_COMPARISON_ROWS_34 = [
+    ["Materialized views", "✅ v0.32.0 (`view_query`, `define_view()`)", "✅"],
+    [
+        "TYPE RELATION enforcement",
+        "✅ v0.33.0 (`relation_in`, `define_relation()`)",
+        "✅ DDL (`TableType.RELATION`, migrations)",
+    ],
+    ["Full-Text Search", "v0.34.0", "✅"],
+]
+#: Spec §11.1 item 4 (§3 measured): exactly three rows v0.33.0 adds to the 2.x/3.x table, cell by cell.
+_RELATION_ROWS = [
+    [
+        "Relation constraints from an edge model (`define_relation()`: `TYPE RELATION IN … OUT … ENFORCED`)",
+        "same on both lines: one `DEFINE TABLE OVERWRITE` that keeps the table's other clauses, records, fields, indexes "
+        "and events, enforced at once",
+        "the same",
+        "v0.33.0",
+    ],
+    [
+        _ALTER_ROW,
+        "`INFO` shows the new type, but writes keep the old constraint until a `DEFINE TABLE OVERWRITE`; the ORM never "
+        "sends `ALTER TABLE`",
+        "enforced at once; the ORM still sends `DEFINE TABLE OVERWRITE`",
+        "v0.33.0",
+    ],
+    [
+        "An edge endpoint outside `IN`/`OUT` (`relate()`, typed or by table name, edge `save()`, `bulk_create()`)",
+        "`SurrealDbError` (`Found … but expected a record<…>`); with `ENFORCED` and no such record, "
+        "`SurrealDbNotFoundError` (`does not exist`)",
+        "`SurrealDbError` (`Couldn't coerce value for field …`), whether the record exists or not",
+        "v0.33.0",
+    ],
+]
+_HEADER_SENTENCE_33 = "Rows added in v0.33.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4."
+#: Spec §11.1 item 5: the row v0.33.0 adds to the embedded-engine table, cell by cell.
+_EMBEDDED_RELATION_ROW = [
+    "TYPE RELATION constraints (v0.33.0)",
+    "as on a 2.x server: a raw `ALTER TABLE … TYPE` of a table already written to is not enforced (`define_relation()` "
+    "sends `DEFINE TABLE OVERWRITE`); an endpoint outside `IN`/`OUT` whose record does not exist raises "
+    "`SurrealDbNotFoundError`",
+    "`SurrealDbError` for that endpoint on 3.x",
+    "v0.33.0",
+]
+
+
+def _section_34() -> str:
+    return _readme_part(_SECTION_34)
+
+
+def _part_34(heading: str) -> str:
+    """One ``####`` subsection of section 34, as written (the intro for ``""``)."""
+    if not heading:
+        return _section_34().split("\n#### ", 1)[0]
+    return _subsection(f"#### {heading}", _section_34())
+
+
+def _readme_blocks(text: str) -> list[str]:
+    """The ``python`` blocks of *text*, in order."""
+    blocks: list[str] = re.findall(r"^```python\n(.*?)^```$", text, re.MULTILINE | re.DOTALL)
+    return blocks
+
+
+def _readme_printed(block: str) -> list[str]:
+    """What a README example prints: its comment lines that start a line (``# <printed line>``), in order."""
+    return re.findall(r"^# (.*)$", block, re.MULTILINE)
+
+
+def _readme_bullets(text: str) -> list[str]:
+    """The ``- `` bullets of *text*, each with its continuation lines, whitespace normalised."""
+    return [_normalised(bullet) for bullet in re.findall(r"^- .*?(?=^- |^\s*$|\Z)", text, re.MULTILINE | re.DOTALL)]
+
+
+def _anchor(heading: str) -> str:
+    """GitHub's anchor of a README heading: lower case, punctuation but ``-`` and ``_`` dropped, spaces as ``-``."""
+    return re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-")
+
+
+class TestReadmeSection34:
+    """AC-17: README section 34 — its place, subsections, examples (run on ``mem://`` as written, each printed line
+    equal to its comment), the key phrases of each subsection (P1–P4 included) —, sections 23 and 31's new sentences,
+    and the features, roadmap, comparison and both behaviour tables (spec §11.1)."""
+
+    def test_section_34_follows_section_33(self) -> None:
+        """Right after section 33 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        text = _readme()
+        start_33 = text.index(f"\n{_SECTION_33}\n")
+        start_34 = text.index(f"\n{_SECTION_34}\n")
+        configuration = text.index("\n## Configuration Options\n")
+        assert start_33 < start_34 < configuration
+        assert re.findall(r"^#{2,3} .*$", text[start_33 + 1 : configuration], re.MULTILINE) == [
+            _SECTION_33,
+            _SECTION_34,
+        ]
+        assert text[:configuration].rstrip().endswith("\n---"), "section 34 ends before the --- of the next part"
+
+    def test_subsections_in_order(self) -> None:
+        assert re.findall(r"^#### (.*)$", _section_34(), re.MULTILINE) == _SUBSECTIONS_34
+
+    def test_the_examples_and_where_they_stand(self) -> None:
+        """Example A exactly, the block of the untitled intro; example B exactly, the first thing of "Applying it";
+        the getters, the records and the removal blocks in their parts; no other block; ``python`` fences only."""
+        section = _section_34()
+        assert _readme_blocks(section) == _README_EXAMPLES_34
+        for heading, blocks in _BLOCKS_BY_PART_34.items():
+            assert _readme_blocks(_part_34(heading)) == blocks, heading
+        part = _part_34("Applying it")
+        assert part.split("\n\n", 1)[1].startswith(f"```python\n{_README_EXAMPLE_B}```"), part
+        fences = re.findall(r"^```(\S*)$", section, re.MULTILINE)
+        assert fences == ["python", ""] * len(_README_EXAMPLES_34), fences
+
+    def test_intro_paragraph(self) -> None:
+        intro = _normalised(_section_34().split("\n```python\n", 1)[0])
+        missing = [needle for needle in _INTRO_NEEDLES_34 if needle not in intro]
+        assert not missing, missing
+
+    @pytest.mark.parametrize("heading", list(_PART_NEEDLES_34))
+    def test_what_each_subsection_says(self, heading: str) -> None:
+        text = _normalised(_part_34(heading))
+        missing = [needle for needle in _PART_NEEDLES_34[heading] if needle not in text]
+        assert not missing, missing
+
+    def test_p3_sentence_in_both_subsections(self) -> None:
+        """P3: the exact sentence, once in "What SurrealDB refuses" and once in "SurrealDB 2.x and 3.x"."""
+        for heading in ("What SurrealDB refuses", "SurrealDB 2.x and 3.x"):
+            assert _normalised(_part_34(heading)).count(_P3_SENTENCE) == 1, heading
+
+    def test_no_claim_about_every_path(self) -> None:
+        """D15: the ORM's errors cover every edge creation path, not every write path (a refused update keeps the
+        SDK's error), so section 34 never says "every path" or "every write path"."""
+        section = _normalised(_section_34()).lower()
+        for claim in ("every path", "every write path"):
+            assert claim not in section, claim
+
+    def test_coming_from_the_full_orm(self) -> None:
+        """One key phrase per bullet, in order; the upgrade bullet says what turns into a ``TypeError`` at import."""
+        bullets = _readme_bullets(_part_34("Coming from the full SurrealDB-ORM"))
+        assert len(bullets) == len(_COMING_FROM_PHRASES_34), bullets
+        for bullet, phrase in zip(bullets, _COMING_FROM_PHRASES_34, strict=True):
+            assert phrase in bullet, (phrase, bullet)
+        upgrade = bullets[-1]
+        for needle in (
+            "accepted and ignored before 0.33.0",
+            "checked at the `class` statement",
+            "a node model carrying `relation_in`, `relation_out` or `enforced`",
+            "`table_type=TableType.RELATION`",
+            '(`"relation"`)',
+            "raises `TypeError` at import",
+            "derive the model from `BaseSurrealEdge`, import `TableType`",
+        ):
+            assert needle in upgrade, needle
+        assert "v0.37.0" in bullets[2] and "through `define_relation()`" in bullets[2], bullets[2]
+        assert "`QueryError` for both" in bullets[7], bullets[7]
+
+    def test_links_resolve(self) -> None:
+        """Every in-page link of section 34, and of section 23's new sentence, names a heading of the README."""
+        anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
+        links = re.findall(r"\]\(#([^)]+)\)", _section_34() + _SECTION_23_DEFINED_BY_HAND + _ONE_CLASS_PER_TABLE_31)
+        assert len(links) >= 10, links
+        assert [link for link in links if link not in anchors] == []
+
+    def test_section_23_sentences(self) -> None:
+        """Spec §11.1 items 2 and 3: section 23 points to section 34 and says that the string ``relate()`` translates
+        server errors since v0.33.0; the v0.33.0 announcements and the SDK's ``ServerError`` sentence are gone."""
+        section_23 = _normalised(_readme_part(_SECTION_23))
+        for sentence in (_SECTION_23_DEFINED_BY_HAND, _SECTION_23_MIGRATING_3, _SECTION_23_IDEMPOTENT):
+            assert section_23.count(sentence) == 1, sentence
+        for stale in (
+            "is planned for v0.33.0",
+            "`BaseSurrealEdge` in v0.33.0",
+            "the string form does not translate server errors",
+            "with the SDK's `ServerError`",
+        ):
+            assert stale not in section_23, stale
+
+    def test_section_31_generated_models(self) -> None:
+        """Spec §11.1 item 6: section 31's generated-models bullet exactly, its "One class per table" bullet names the
+        relation keys, and its class-comments sentence no longer lists the relation ends."""
+        section_31 = _readme_part(_SECTION_31)
+        bullets = _readme_bullets(_subsection("#### Coming from the full SurrealDB-ORM", section_31))
+        assert _GENERATED_MODELS_BULLET_31 in bullets, [bullet for bullet in bullets if "Generated models" in bullet]
+        generating = _normalised(_subsection("#### Generating models", section_31))
+        assert _ONE_CLASS_PER_TABLE_31 in generating
+        assert "relation ends" not in generating
+        assert "`# IN … OUT …` comment" in generating
+
+    def test_features_row(self) -> None:
+        features = [row for _, row in _table_rows(_readme_part("## Features"))]
+        firsts = [row[0] for row in features]
+        assert _FEATURES_ROW_34 in features, features
+        views = "Materialized views (`view_query`, `define_view()`, read-only)"
+        assert firsts.index(_FEATURES_ROW_34[0]) == firsts.index(views) + 1
+
+    def test_roadmap_rows(self) -> None:
+        roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
+        start = [row[0] for row in roadmap].index("v0.32.0")
+        assert roadmap[start : start + 4] == _ROADMAP_ROWS_34, roadmap
+        assert "v0.33.0 – v0.39.0" not in [row[0] for row in roadmap]
+
+    def test_comparison_rows(self) -> None:
+        """The "Native typed relations" row no longer announces v0.33.0; the ``TYPE RELATION`` row comes right after
+        the materialized views, before full-text search."""
+        comparison = [row for _, row in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        assert _COMPARISON_TYPED_RELATIONS in comparison, comparison
+        start = [row[0] for row in comparison].index("Materialized views")
+        assert comparison[start : start + 3] == _COMPARISON_ROWS_34, comparison
+
+    def test_server_behaviour_rows(self) -> None:
+        """Exactly three rows, Since v0.33.0, together and in version order: earlier releases above them, later ones
+        below them, then the table's last row (v0.19.1's re-run)."""
+        assert_server_rows(_RELATION_ROWS)
+
+    def test_server_behaviour_table_keeps_its_widths(self) -> None:
+        """Every line 535 characters, the columns 136, 175, 181 and 38 wide: the new rows are padded to them."""
+        assert_server_table()
+
+    def test_server_behaviour_header_sentence(self) -> None:
+        """The sentence v0.33.0 adds to the table's intro paragraph, once, among sentences naming their releases in
+        increasing version order."""
+        assert_server_header_sentence(_HEADER_SENTENCE_33)
+
+    def test_embedded_table_row(self) -> None:
+        """All four cells, in version order before the catch-all "Everything else" row; widths kept (69, 343, 113,
+        9)."""
+        assert_embedded_rows([_EMBEDDED_RELATION_ROW])
+
+    def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
+        """Every table v0.33.0 touches keeps one cell count per line and no escaped pipe; section 34 has no table."""
+        parts = [
+            _readme_part("## Features"),
+            _readme_part(_SERVER_BEHAVIOUR),
+            _readme_part(_EMBEDDED_BEHAVIOUR),
+            _readme_part("## Roadmap"),
+            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+        ]
+        found = [lines for part in parts for lines in _md_tables(part)]
+        assert len(found) == len(parts)
+        assert _md_tables(_section_34()) == [], "section 34 has no table"
+        for lines in found:
+            assert len({len(_cells(line)) for line in lines}) == 1 and "\\|" not in "".join(lines), lines
+
+    async def test_section_34_examples(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-17: every ``python`` block runs as written, in order and in one namespace, on ``mem://`` (inside
+        ``embedded_database()``); what each block prints is, line by line, its ``# `` comment lines."""
+        capsys.readouterr()
+        namespace: dict[str, Any] = {"__name__": "readme_section_34"}
+        try:
+            async with embedded_database():
+                for code in _readme_blocks(_section_34()):
+                    compiled = compile(code, "<README section 34>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                    # A doctest of this repository's own README (trusted text), top-level awaits included.
+                    outcome = eval(compiled, namespace)
+                    if inspect.iscoroutine(outcome):
+                        await outcome
+                    assert capsys.readouterr().out.splitlines() == _readme_printed(code), code
+        finally:
+            namespace.clear()

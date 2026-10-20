@@ -216,6 +216,7 @@ embedded engine refuse one above `4294967295` (`2**32 - 1`), SurrealDB 3.x reads
 | Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)    | ✅     |
 | Server-side events & function DDL (`Event`, `define_function()`)              | ✅     |
 | Materialized views (`view_query`, `define_view()`, read-only)                 | ✅     |
+| Relation constraints (`relation_in`, `define_relation()`, `TYPE RELATION`)    | ✅     |
 
 ### Supported Filter Lookups
 
@@ -2038,8 +2039,8 @@ await bob.relate(Likes, alice)                    # the reverse pair is another 
 ```
 
 The index is directional, so the reverse pair is allowed. A second string `relate("likes", …)`
-for the same pair fails as well, with the SDK's `ServerError` (the string form does not translate
-server errors).
+for the same pair fails as well, with `SurrealDbError` (the string form translates server errors
+since v0.33.0).
 
 #### Refused writes and permissions
 
@@ -2107,9 +2108,9 @@ Typed edges work with whatever table exists: one created by the first edge, a `T
 or a `TYPE RELATION [IN … OUT …] [ENFORCED]` table you define. The server's refusals come back as
 ORM errors on both lines: an endpoint from the wrong table raises `SurrealDbError`; with
 `ENFORCED`, an endpoint record that does not exist raises `SurrealDbNotFoundError`; a
-`TYPE NORMAL` table raises `SurrealDbError`. A helper that writes this DDL from the model (the
-full ORM's `table_type=TableType.RELATION`, `relation_in`, `relation_out` and `enforced` keys, on
-`BaseSurrealEdge`) is planned for v0.33.0.
+`TYPE NORMAL` table raises `SurrealDbError`. Since v0.33.0 the model declares it (`relation_in`,
+`relation_out`, `enforced`) and `define_relation()` applies it: see
+[section 34](#34-relation-constraints-relation_in-define_relation).
 
 #### Migrating from SurrealDB-ORM (graph API)
 
@@ -2127,7 +2128,7 @@ its table as the `remove_relation()` target): change the import from `surreal_or
 3. Typed edge models (`BaseSurrealEdge`, `relate(EdgeModel, …)`) are lite-only. The full ORM
    declares a relation table with `table_type=TableType.RELATION` (plus `relation_in`,
    `relation_out` and `enforced`), which is DDL only; lite gets those keys, with those names, on
-   `BaseSurrealEdge` in v0.33.0.
+   `BaseSurrealEdge` (section 34).
 4. `table_name` is validated as an identifier when the class is defined, because it is written
    into SurrealQL.
 5. `upsert()` and `save(server_values=…)` are refused on an edge (an `UPSERT` stores a plain
@@ -4251,16 +4252,20 @@ class Person(BaseSurrealModel):
 - One class per table: a `BaseSurrealModel`, or a `BaseSurrealEdge` for a `TYPE RELATION` table (which declares no
   `id`, `in_` or `out`: the base class provides them). Its `model_config` holds the `table_name`, `view_query` for a
   view table (since v0.32.0: a materialized view model, [section 33](#33-materialized-views-view_query-define_view)),
-  `connection=` when the schema was read from another connection than `"default"`, then `server_fields` and
-  `extra="allow"` (below). A model declares `id: str | None = None` first (`id: RecordID | None = None` for a view: a
-  grouped view's ids are arrays), then one line per field, in codepoint order of the columns.
+  `relation_in`/`relation_out`/`enforced` for a relation table (since v0.33.0,
+  [section 34](#34-relation-constraints-relation_in-define_relation)), `connection=` when the schema was read from
+  another connection than `"default"`, then `server_fields` and `extra="allow"` (below). A model declares
+  `id: str | None = None` first (`id: RecordID | None = None` for a view: a grouped view's ids are arrays), then one
+  line per field, in codepoint order of the columns.
 - A class is named after its table in PascalCase, without singularisation (`game_tables` → `GameTables`); a name
   that is taken — a Python keyword, a name the module imports, another table's class — gets `Model` appended (`range`
-  → `RangeModel`). The table's comment, relation ends, change feed (`# Changefeed: 1d`), permissions
+  → `RangeModel`). The table's comment, change feed (`# Changefeed: 1d`), permissions
   (`# Permissions: FOR select WHERE …, FOR create, update FULL, FOR delete NONE`, left out when all four are `NONE`,
   a table's default), indexes and events are comments of its class, and the module's header lists every table or
   field left out, with the reason. A view model's class says `# Read-only materialized view`; a view the lite cannot
   declare — an edge, a computed field, a query `view_query` refuses — keeps its query as a `# View: AS …` comment.
+  A relation table whose ends the lite cannot declare (a table name that is not an identifier) keeps them as an
+  `# IN … OUT …` comment.
 - The source is safe to import: names, comments and expressions read from the database reach it only as escaped
   string literals, single-line ASCII comments and identifiers the generator builds, so a schema cannot inject code
   into it. It holds no timestamp, server address, namespace or database name, and no
@@ -4435,12 +4440,13 @@ reads, stores, logs or writes them.
   (`using()`, then `"default"`). A client object is refused with a `TypeError`, because a client does not carry the
   ORM's connection name, which routing, reconnects and the generated models' `connection=` key need (full ORM: an
   `HTTPConnection`).
-- **Generated models use comments** where the full ORM writes
-  `SurrealConfigDict(permissions=…, changefeed=…, relation_in=…, relation_out=…, enforced=…)` (`# Permissions: …`,
-  `# Changefeed: …`, `# IN … OUT … ENFORCED`), and the base class where it writes `table_type=` (`BaseSurrealEdge`
-  for a relation table): those keys arrive in the lite's `SurrealConfigDict` with later minors. A view is generated
-  with `view_query=…` since v0.32.0, as in the full ORM (a `# View: AS …` comment when the lite cannot declare it: an
-  edge, a computed field, a query it refuses). `READONLY` is a comment too (full ORM: `Field(readonly=True)`).
+- **Generated models use comments** where the full ORM writes `SurrealConfigDict(permissions=…, changefeed=…)`
+  (`# Permissions: …`, `# Changefeed: …`): those keys arrive in the lite's `SurrealConfigDict` with later minors. A
+  view is generated with `view_query=…` since v0.32.0, and a relation table's ends with `relation_in=…`,
+  `relation_out=…` and `enforced=True` since v0.33.0, as in the full ORM (a `# View: AS …` comment when the lite
+  cannot declare the view: an edge, a computed field, a query it refuses; an `# IN … OUT …` comment when a table name
+  is not an identifier). The base class says what the full ORM's `table_type=` says (`BaseSurrealEdge` for a relation
+  table). `READONLY` is a comment too (full ORM: `Field(readonly=True)`).
 - **`RecordID` instead of `ForeignKey`/`ReferencesField`**; no `VectorField` or `Encrypted`; `computed()` instead
   of `Computed()`; `Duration`, `UUID`, `Decimal` and the geometry classes instead of `str`, `dict` and `float`;
   nested fields become sub-models (full ORM: dotted attribute lines).
@@ -4951,6 +4957,323 @@ record user's session.
 - **The documented `MaterializedView` base class with `source_query` is not shipped by the full ORM either**: declare
   `view_query` on a `BaseSurrealModel`.
 
+### 34. Relation constraints (`relation_in`, `define_relation()`)
+
+Since v0.33.0 an edge model ([section 23](#23-typed-edges-basesurrealedge)) declares which tables its edges may join
+and whether both ends must exist — SurrealDB's `TYPE RELATION IN … OUT … ENFORCED` — with the full SurrealDB-ORM's
+keys: `relation_in`, `relation_out`, `enforced` and `table_type=TableType.RELATION`. `define_relation()` applies the
+constraint to the table and SurrealDB enforces it on every write, the same on SurrealDB 2.x, 3.x and the embedded
+engine, except where the [2.x/3.x table](#orm-behaviour-surrealdb-2x-vs-3x) says otherwise. The examples assume a
+configured connection: they run as written on the embedded engine (`mem://`).
+
+```python
+from surrealdb import RecordID
+
+from surreal_orm_lite import (
+    BaseSurrealEdge,
+    BaseSurrealModel,
+    SurrealConfigDict,
+    SurrealDbError,
+    SurrealDbNotFoundError,
+    TableType,
+)
+
+
+class Person(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="person")
+
+    id: str | None = None
+    name: str
+
+
+class Company(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="company")
+
+    id: str | None = None
+    name: str
+
+
+class Post(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="post")
+
+    id: str | None = None
+    title: str
+
+
+class Likes(BaseSurrealEdge):
+    model_config = SurrealConfigDict(
+        table_name="likes",
+        table_type=TableType.RELATION,  # optional: an edge model's table is TYPE RELATION
+        relation_in="person",
+        relation_out=["post", "book"],
+        enforced=True,
+    )
+
+    stars: int = 1
+
+
+print(Likes.relation_ddl())
+# DEFINE TABLE OVERWRITE `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;
+print(await Likes.define_relation())
+# DEFINE TABLE OVERWRITE `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;
+
+ada = await Person(id="ada", name="Ada").save()
+acme = await Company(id="acme", name="Acme").save()
+graphs = await Post(id="graphs", title="Graphs").save()
+
+edge = await ada.relate(Likes, graphs, stars=5)
+print(edge.in_, edge.out)
+# person:ada post:graphs
+try:
+    await acme.relate(Likes, graphs)  # a company is not a person
+except SurrealDbError as exc:
+    print(type(exc).__name__)
+# SurrealDbError
+try:
+    await ada.relate(Likes, RecordID("book", "missing"))  # ENFORCED: the book must exist
+except SurrealDbNotFoundError as exc:
+    print(exc)
+# There was a problem with the database: The record 'book:missing' does not exist
+```
+
+#### Declaring the constraint
+
+- `relation_in` names the tables an edge's `in` may come from, `relation_out` the tables its `out` may point to: one
+  table (`"person"`), several separated by `|` as SurrealQL writes them (`"post | book"`), or a list or tuple of names
+  (`["post", "book"]`). Each name is stripped and must be an identifier (letters, digits, underscores, not starting
+  with a digit); the names are written in backquotes, in the order given, and a repeated name is kept, as SurrealDB
+  keeps it. `None`, `""`, `[]` and `()` mean any table: no `IN` (or `OUT`) clause.
+- `enforced=True` makes SurrealDB refuse an edge whose endpoint record does not exist (`ENFORCED`); `False` and `None`
+  write nothing.
+- `table_type=TableType.RELATION` is optional: an edge model's table is always `TYPE RELATION`, and an edge model
+  with another `TableType` raises `TypeError`. `TableType` is the full ORM's enum (`NORMAL`, `USER`, `STREAM`, `HASH`,
+  `RELATION`, `ANY`); its other members are recorded for the table DDL of v0.37.0 and have no effect before it.
+- The keys are checked when the class is defined: a `table_type` that is not a `TableType` (a plain `"relation"`
+  string included), an `enforced` that is not a bool, or a value that is not a string, a list or a tuple raises
+  `TypeError`; a name that is not an identifier, or a string of spaces only, raises `ValueError`. On a node model
+  (`BaseSurrealModel`), `relation_in`, `relation_out` and `enforced` — even empty or `False` — and
+  `table_type=TableType.RELATION` raise `TypeError`: derive the model from `BaseSurrealEdge`. A subclass inherits the
+  keys; setting one to `None` resets it.
+- The getters read the declaration back: `get_relation_in()` and `get_relation_out()` return tuples (`()` for any
+  table), the shape of introspection's `TableState.relation_in` and `relation_out`
+  ([section 31](#31-schema-introspection-databaseintrospector-generate_models_from_db)), so a model compares with the
+  database; `is_enforced()` returns a bool; `get_table_type()`, on every model as in the full ORM, returns
+  `TableType.RELATION` for an edge model, else the configured `table_type`, else `TableType.NORMAL`.
+
+```python
+print(Likes.get_relation_in(), Likes.get_relation_out(), Likes.is_enforced(), Likes.get_table_type())
+# ('person',) ('post', 'book') True relation
+```
+
+#### Applying it
+
+```python
+from surreal_orm_lite import SurrealDBConnectionManager
+
+
+class Follows(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="follows", relation_in="person", relation_out="person")
+
+
+client = await SurrealDBConnectionManager.get_client()
+await client.query("DEFINE TABLE follows SCHEMAFULL CHANGEFEED 1d PERMISSIONS FOR select FULL;", {})
+print(Follows.relation_ddl())
+# DEFINE TABLE OVERWRITE `follows` TYPE RELATION IN `person` OUT `person`;
+print(await Follows.define_relation())
+# DEFINE TABLE OVERWRITE `follows` TYPE RELATION IN `person` OUT `person` SCHEMAFULL CHANGEFEED 1d PERMISSIONS FOR select FULL, FOR create, update, delete NONE;
+```
+
+- `define_relation()` reads the table's definition once (`INFO FOR DB`), then sends one `DEFINE TABLE OVERWRITE` that
+  writes the model's `TYPE RELATION` clause and keeps the table's schema mode, `DROP`, comment, change feed and
+  permissions. It returns the statement it applied; `relation_ddl()` returns the bare statement, without a
+  connection. Applied by hand, that bare `OVERWRITE` would reset the other clauses to SurrealDB's defaults —
+  `SCHEMALESS`, no change feed, `PERMISSIONS NONE`, which hides every edge from record users.
+- The table's records, fields, indexes and events, the views that read it
+  ([section 33](#33-materialized-views-view_query-define_view)), its live queries and its change feed's history are
+  kept; the views keep counting the edges written afterwards. Each `define_relation()` on a table with a change feed
+  adds a `define_table` entry to it; `changes()` skips it, a raw `SHOW CHANGES` shows it.
+- The constraint is enforced at once, on every connection. A missing table is defined as a relation table. The call
+  is idempotent: run it at start-up.
+- `overwrite=False` writes `DEFINE TABLE IF NOT EXISTS`: it defines a missing table and leaves a relation table as it
+  is, whatever its ends. On a table that exists and is not a relation table it raises `SurrealDbError` before any
+  DDL, because `IF NOT EXISTS` would leave the constraint unapplied: call it with `overwrite=True`, which keeps the
+  other clauses.
+- `define_relation()` raises `SurrealDbError` before any DDL on a materialized view (the `OVERWRITE` would drop its
+  query) and on a definition the ORM cannot read back (it could not keep the other clauses).
+- SurrealDB rewrites the `in` and `out` field definitions from `IN` and `OUT` (`TYPE record<person>`): an `ASSERT`
+  written on them by hand is lost. Declare the tables with `relation_in` and `relation_out` instead.
+- Why not `ALTER TABLE`, which keeps the other clauses too: on SurrealDB 2.x and the embedded engine, a raw
+  `ALTER TABLE … TYPE RELATION …` of a table already written to is not enforced until a `DEFINE TABLE OVERWRITE` of
+  the table. The ORM sends `DEFINE TABLE OVERWRITE` on every line.
+
+#### What SurrealDB refuses
+
+- **Creating an edge**, through every creation path — `relate()` with an edge model or by table name (the string
+  form since v0.33.0), an edge's `save()`, `objects().bulk_create()`: an endpoint from a table outside `IN`/`OUT`
+  raises `SurrealDbError`; with `ENFORCED`, an endpoint record that does not exist raises `SurrealDbNotFoundError`.
+  The SDK's error is the `__cause__`. A batch with one refused edge writes nothing. Inside a transaction the refusal
+  is the transaction's `SurrealDbError` ("Transaction failed and rolled back: …").
+- **Writing a plain record** into the relation table — the `save()` of a node model declared on it, with or without
+  an id — raises the SDK's `InternalError` ("Found record: … but expected a RELATION …"). The ORM never sends one for
+  an edge.
+- **Updating** an edge the constraint refuses (one stored before it, next subsection) raises the SDK's
+  `InternalError` too.
+- Both are `surrealdb.ServerError`s, as every update the server refuses in the lite (an event's `THROW`,
+  [section 32](#32-server-side-events-and-stored-functions-event-define_events-define_function); a failed `patch()`
+  test, [section 13](#13-patch--atomic-fieldarray-operations)).
+
+`SurrealDbNotFoundError` is a `SurrealDbError`, so `except SurrealDbError` handles every refused edge creation the
+same way on both lines.
+
+#### Records already in the table
+
+SurrealDB checks the writes made after `define_relation()`, not the records already in the table:
+
+- a nonconforming edge (from or to a table outside `IN`/`OUT`) stays and is still traversed, but its `merge()`,
+  `update()`, `patch()`, `atomic_*()` and `objects().bulk_update()` raise the SDK's `InternalError` (the mismatch
+  text);
+- a dangling edge (an endpoint record that no longer exists) stays and can still be updated: `ENFORCED` is checked
+  when an edge is created;
+- plain records stay.
+
+`delete()` always works. Two raw queries find the edges to fix or delete, through the model's `raw_query()`: those
+outside the ends (`record::tb(in) NOT IN [...]`) and the dangling ones (`in.id IS NONE OR out.id IS NONE`).
+
+```python
+from surrealdb import ServerError
+
+await ada.relate("knows", acme)  # written before any constraint: acme is a company
+
+
+class Knows(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="knows", relation_in="person", relation_out="person")
+
+    since: int | None = None
+
+
+await Knows.define_relation()
+[old] = await Knows.objects().exec()  # the edge stays
+try:
+    await old.merge(since=2020)
+except ServerError as exc:
+    print(type(exc).__name__)
+# InternalError
+
+outside = await Knows.raw_query(
+    "SELECT VALUE id FROM knows WHERE record::tb(in) NOT IN ['person'] OR record::tb(out) NOT IN ['person']"
+)
+dangling = await Knows.raw_query("SELECT VALUE id FROM knows WHERE in.id IS NONE OR out.id IS NONE")
+print(outside == [old.id], dangling)
+# True []
+await old.delete()
+```
+
+#### Removing the constraint
+
+The model is the source of truth: leave `relation_in`, `relation_out` and `enforced` out (or set them to `None`;
+empty ends — `""`, `[]`, `()` — and `enforced=False` do the same) and call `define_relation()` again. The table
+becomes `TYPE RELATION` with no ends, at once on every connection, and keeps its other clauses, records, fields,
+indexes and events:
+
+```python
+class LikesAny(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="likes")  # no relation key: any table, not enforced
+
+
+print(await LikesAny.define_relation())
+# DEFINE TABLE OVERWRITE `likes` TYPE RELATION;
+edge = await acme.relate(LikesAny, graphs)  # accepted now
+print(edge.in_, edge.out)
+# company:acme post:graphs
+```
+
+- `overwrite=False` removes nothing: `IF NOT EXISTS` leaves a relation table as it is.
+- Turning the table back into `TYPE ANY` is not offered, and it does not lift the constraint: SurrealDB keeps the
+  `in` and `out` field definitions (`TYPE record<person>`) through `ALTER TABLE … TYPE ANY` and
+  `DEFINE TABLE OVERWRITE … TYPE ANY`, on every line. With raw SurrealQL,
+  `REMOVE FIELD in ON likes; REMOVE FIELD out ON likes;` drops them.
+- `REMOVE TABLE likes` removes the table and its edges. `remove_relation()` deletes edges, not the constraint.
+
+#### Transactions, connections and the query cache
+
+- `define_relation()` takes `tx=`. In a buffered transaction (SurrealDB 2.x, HTTP, the embedded engine) the
+  statement is applied at commit; in an interactive one (WebSocket and SurrealDB 3.x) it is applied in the
+  transaction. A block that raises applies nothing. An edge the constraint refuses later in the same block fails it,
+  with `SurrealDbError` ("Transaction failed and rolled back: …"): inside the block when it is interactive, at its
+  exit when it is buffered.
+- The read of the table's definition runs before anything is queued, on committed state. So a definition of the same
+  table queued earlier in the block (`tx.add("DEFINE TABLE likes … SCHEMAFULL …")`) is not seen by
+  `define_relation()` and is replaced at commit by the statement it builds: define the table's other clauses before
+  the block.
+- The read and the definition are a check, then the DDL, not a lock: a clause another process changes between the
+  two is overwritten with the value read.
+- `define_relation()` runs on the model's connection (its `connection` key, or the `using()` block's); a `tx=` of
+  another connection raises `SurrealDbError` before any request.
+- The query cache ([section 29](#29-query-cache-cache-querycache)): `define_relation()` changes no record, so it drops
+  no cached read.
+- Defining needs a system user allowed to define: root, or a namespace or database `OWNER` or `EDITOR`. A session
+  that may not read the definitions or define the table gets `SurrealDbAuthenticationError` (a record user, at the
+  read). Applying DDL fires no signal.
+
+#### SurrealDB 2.x and 3.x
+
+- `define_relation()` is the same on every line and on the embedded engine: one `INFO FOR DB`, one
+  `DEFINE TABLE OVERWRITE`, enforced at once.
+- The wording of the server's refusals differs: `Found … but expected a record<…>` on 2.x and the embedded engine,
+  `Couldn't coerce value for field …` on 3.x.
+- An endpoint both outside `IN`/`OUT` and missing, on an `ENFORCED` table, raises `SurrealDbNotFoundError` on 2.x and
+  the embedded engine (the server reports it missing) and `SurrealDbError` on 3.x. `SurrealDbNotFoundError` is a
+  `SurrealDbError`, so `except SurrealDbError` handles every refused edge creation the same way on both lines.
+- A raw `ALTER TABLE … TYPE RELATION …` of a table already written to is not enforced on 2.x and the embedded engine
+  until a `DEFINE TABLE OVERWRITE` of the table; 3.x enforces it at once. The ORM never sends `ALTER TABLE`.
+- The [2.x/3.x table](#orm-behaviour-surrealdb-2x-vs-3x) and the
+  [embedded engine's](#orm-behaviour-the-embedded-engine) list these rows.
+
+#### Security
+
+The table name and every `relation_in`/`relation_out` name are checked as identifiers when the class is defined and
+written in backquotes; no other value of yours reaches the statement, and a definition takes no bound parameter. The
+clauses `define_relation()` keeps are the database's own definition sent back to it: the comment re-quoted, each
+permission rule re-checked (literals terminated, brackets balanced, no comment marker, no `;` outside brackets). A
+value that fails is not written: `define_relation()` raises before any DDL. These checks catch a definition the ORM
+would misread; they are not an injection defence, since the source is the database itself. A refusal names the
+table, never the statement, which may carry permission rules that hold secrets.
+
+The constraint is SurrealDB's: the ORM adds no check of its own before a write, and the constraint is not an access
+control — a session allowed to write the table writes any edge the constraint accepts. `define_relation()` needs a
+privileged session (a system user allowed to define): run it at start-up or deployment, not on a record user's
+session.
+
+#### Coming from the full SurrealDB-ORM
+
+- **The keys and `TableType` are the same**: `table_type=TableType.RELATION`, `relation_in`, `relation_out` and
+  `enforced`, and `TableType`'s six members and values.
+- **The relation model is `BaseSurrealEdge`**: a `BaseSurrealModel` with `table_type=TableType.RELATION` (the full
+  ORM's `class Likes(BaseSurrealModel)` form) raises `TypeError`; derive it from `BaseSurrealEdge`.
+- **`relation_ddl()` and `define_relation()` on the edge model** render and apply the constraint, where the full ORM
+  applies the DDL through migrations or `define_table()`. Those come with v0.37.0, which will apply an edge model
+  through `define_relation()`.
+- **The table's other clauses are kept from the database** rather than rendered from the model: the lite has no
+  schema-mode, permissions, change-feed or comment keys yet.
+- **Names are identifiers, written in backquotes, and a pipe-joined string is parsed** (the full ORM writes the value
+  verbatim).
+- **A `table_type` that is not a `TableType` and an `enforced` that is not a bool raise `TypeError`** (the full ORM
+  ignores the first and takes the truthiness of the second).
+- **`get_table_type()` is `TableType.RELATION` for every edge model**, and the lite adds `get_relation_in()`,
+  `get_relation_out()` and `is_enforced()`.
+- **A refused edge creation raises the ORM's `SurrealDbError` or `SurrealDbNotFoundError`, a refused update the
+  official SDK's `InternalError`** (full ORM: its SDK's `QueryError` for both).
+- **Generated edge models carry the keys but no `table_type=`**
+  ([section 31](#31-schema-introspection-databaseintrospector-generate_models_from_db)): their base class,
+  `BaseSurrealEdge`, says it.
+- **`TableType`'s other members have no effect until v0.37.0.**
+- **`remove_relation()` deletes edges, not a constraint**: the name is the graph API's (section 7); a keyless
+  `define_relation()` removes the constraint.
+- **Upgrading from 0.32 or earlier**: these keys were accepted and ignored before 0.33.0. They are now checked at the
+  `class` statement, so a node model carrying `relation_in`, `relation_out` or `enforced`, or
+  `table_type=TableType.RELATION`, or a `table_type` given as a plain string (`"relation"`), raises `TypeError` at
+  import: derive the model from `BaseSurrealEdge`, import `TableType`.
+
 ---
 
 ## Configuration Options
@@ -5073,7 +5396,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.7 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four. Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.31.1 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.32.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 but accepts raw writes to a view.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.7 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four. Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.31.1 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.32.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 but accepts raw writes to a view. Rows added in v0.33.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -5209,6 +5532,9 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | Values a view computes (`math::sum()`, `math::mean()`, `count()` of an array)                                                          | a sum of integers is an `int`, a mean a `Decimal`; `count(tags)` of an array field adds the arrays' lengths                                                                   | both are `float`; `count(tags)` counts the records whose array is not empty                                                                                                         | v0.32.0                              |
 | Live queries and events on a view (a group emptied by a delete; a live query filtered on `id`)                                         | an emptied group: an `UPDATE` with the emptied values (a `count()` of 0), then a `DELETE`; a filter on `id` notifies                                                          | an emptied group: a `DELETE`; a filter on `id` never notifies (the view's notifications carry no `id`): filter on the view's fields                                                 | v0.32.0                              |
 | Removing a materialized view, or a source table, that another view reads (`remove_view()`, `REMOVE TABLE`)                             | `remove_view()` raises `SurrealDbError` before any DDL, unless its transaction removes those views first; a raw `REMOVE TABLE` makes them ordinary tables, last records kept  | `SurrealDbError` from the server (`Cannot delete table … on which a view is defined`): remove the views that read it first                                                          | v0.32.0                              |
+| Relation constraints from an edge model (`define_relation()`: `TYPE RELATION IN … OUT … ENFORCED`)                                     | same on both lines: one `DEFINE TABLE OVERWRITE` that keeps the table's other clauses, records, fields, indexes and events, enforced at once                                  | the same                                                                                                                                                                            | v0.33.0                              |
+| A raw `ALTER TABLE … TYPE RELATION …` of a table already written to                                                                    | `INFO` shows the new type, but writes keep the old constraint until a `DEFINE TABLE OVERWRITE`; the ORM never sends `ALTER TABLE`                                             | enforced at once; the ORM still sends `DEFINE TABLE OVERWRITE`                                                                                                                      | v0.33.0                              |
+| An edge endpoint outside `IN`/`OUT` (`relate()`, typed or by table name, edge `save()`, `bulk_create()`)                               | `SurrealDbError` (`Found … but expected a record<…>`); with `ENFORCED` and no such record, `SurrealDbNotFoundError` (`does not exist`)                                        | `SurrealDbError` (`Couldn't coerce value for field …`), whether the record exists or not                                                                                            | v0.33.0                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
@@ -5243,6 +5569,7 @@ Capabilities not listed behave as on a 2.x server.
 | Schema introspection (`DatabaseIntrospector`)                       | reads like a 2.x server (core 2.3.10): same state and same generated model types as on the servers; the anonymous owner session may run `INFO`; `COUNT` indexes cannot be defined                                                                                                                                                                     | need a system user (root, namespace or database user)                                                           | v0.30.0 |
 | Server-side events and stored functions (v0.31.0)                   | as on a 2.x server: `$input` is `NONE`; `Event(async_mode=True)` raises `SurrealDbError` before any DDL                                                                                                                                                                                                                                               | `ASYNC` events on 3.x                                                                                           | v0.31.0 |
 | Materialized views (v0.32.0)                                        | as on a 2.x server: `int` sums and `Decimal` means; in a grouped view, `math::stddev()`/`math::variance()`, an expression around an aggregate, a field outside `GROUP BY` and a `GROUP BY` on an alias raise `SurrealDbError` before any DDL; writes to a view refused by the ORM (the engine would accept them); no live queries                     | `float` sums and means on 3.x                                                                                   | v0.32.0 |
+| TYPE RELATION constraints (v0.33.0)                                 | as on a 2.x server: a raw `ALTER TABLE … TYPE` of a table already written to is not enforced (`define_relation()` sends `DEFINE TABLE OVERWRITE`); an endpoint outside `IN`/`OUT` whose record does not exist raises `SurrealDbNotFoundError`                                                                                                         | `SurrealDbError` for that endpoint on 3.x                                                                       | v0.33.0 |
 | Everything else                                                     | CRUD, QuerySet, aggregations, relations, typed edges, rich and geo fields, upsert/patch, server values, computed fields, stored functions, signals: the same as on a 2.x server                                                                                                                                                                       | unchanged                                                                                                       | v0.25.0 |
 
 ---
@@ -5290,7 +5617,8 @@ Contributions are welcome! Please:
 | v0.30.0           | Tier 3 — Schema introspection                        | ✅ Released |
 | v0.31.0           | Tier 3 — Server-side events and DDL helpers          | ✅ Released |
 | v0.32.0           | Tier 3 — Materialized views                          | ✅ Released |
-| v0.33.0 – v0.39.0 | Tier 3 — Advanced (search, DDL, migrations, CLI)     | 📋 Planned  |
+| v0.33.0           | Tier 3 — `TYPE RELATION` constraints                 | ✅ Released |
+| v0.34.0 – v0.39.0 | Tier 3 — Advanced (search, migrations, CLI)          | 📋 Planned  |
 | v0.40.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | 📋 Planned  |
 
@@ -5310,51 +5638,52 @@ Both projects target the same feature set; the difference is **how** (official S
 SDK) and **server support**. Everything below is on the lite roadmap via the official SDK 2.0
 — only the custom-SDK internals stay exclusive to the full ORM; the official SDK's in-process engine (section 26) is lite-only.
 
-| Feature                       | ORM-lite (official SDK)                                               | ORM (custom SDK)                 |
-| ----------------------------- | --------------------------------------------------------------------- | -------------------------------- |
-| Supported SurrealDB           | **2.6/2.7 + 3.2/3.3**                                                 | 3.x only                         |
-| CRUD & QuerySet               | ✅                                                                    | ✅                               |
-| Aggregations & GROUP BY       | ✅                                                                    | ✅                               |
-| Model Signals                 | ✅                                                                    | ✅                               |
-| Bulk Operations               | ✅                                                                    | ✅                               |
-| Q Objects (OR/AND/NOT)        | ✅                                                                    | ✅                               |
-| Parameterized Filters         | ✅                                                                    | ✅                               |
-| Relations & Graph             | ✅ (reverse, keyword edge fields, tx= on every write helper: v0.22.0) | ✅                               |
-| FETCH clause                  | ✅                                                                    | ✅                               |
-| Transactions (tx=)            | ✅ v0.8 (core), v0.9 QS                                               | ✅                               |
-| Interactive tx (3.x native)   | ✅ v0.9                                                               | ✅                               |
-| upsert / update_or_create     | ✅ v0.10.0                                                            | ✅                               |
-| Atomic field/array operations | ✅ v0.11.0                                                            | ✅                               |
-| Retry on conflict             | ✅ v0.12.0                                                            | ✅                               |
-| SurrealFunc & server values   | ✅ v0.13.0                                                            | ✅                               |
-| Computed fields               | ✅ v0.14.0                                                            | ✅                               |
-| `call_function()` (`fn::`)    | ✅ v0.15.0                                                            | ✅                               |
-| JWT Authentication            | ✅ v0.16.0 (connection)                                               | ✅                               |
-| Model auth mixin              | ✅ v0.17.0                                                            | ✅                               |
-| Field Aliases & DX            | ✅ v0.18.0                                                            | ✅                               |
-| Live queries (raw notifs)     | ✅ v0.19.0                                                            | ✅                               |
-| Typed live queries            | ✅ v0.20.0                                                            | ✅                               |
-| Live auto-resubscribe / CDC   | ✅ v0.21.0                                                            | ✅                               |
-| Native typed relations        | ✅ v0.22.0 (typed edge models; relation DDL in v0.33.0)               | ✅ DDL only (TableType.RELATION) |
-| Rich field types              | ✅ v0.23.0                                                            | ✅                               |
-| Geospatial Fields             | ✅ v0.24.0                                                            | ✅                               |
-| Embedded engine               | ✅ v0.25.0 (mem://, surrealkv://; rocksdb:// #233)                    | ❌ (HTTP/WebSocket only)         |
-| Time travel (`VERSION`)       | ✅ v0.26.0 (`as_of()`)                                                | ❌                               |
-| Subqueries                    | ✅ v0.27.0 (`Subquery`, a QuerySet in `filter()`)                     | ✅                               |
-| Query Cache                   | ✅ v0.28.0 (`cache()`, `QueryCache`)                                  | ✅                               |
-| Multi-database                | ✅ v0.29.0 (`add_connection()`, `using()`)                            | ✅                               |
-| Schema Introspection          | ✅ v0.30.0 (`DatabaseIntrospector`, `generate_models_from_db()`)      | ✅                               |
-| DEFINE EVENT                  | ✅ v0.31.0 (`Event`, `define_events()`, `ASYNC` on 3.x)               | ✅ migrations (`DefineEvent`)    |
-| `define_function()` (DDL)     | ✅ v0.31.0                                                            | ❌                               |
-| Materialized views            | ✅ v0.32.0 (`view_query`, `define_view()`)                            | ✅                               |
-| Full-Text Search              | v0.34.0                                                               | ✅                               |
-| Vector Search (KNN/HNSW)      | v0.35.0                                                               | ✅                               |
-| Hybrid Search (RRF)           | v0.36.0                                                               | ✅                               |
-| Migrations & CLI              | v0.37 – v0.38                                                         | ✅                               |
-| Test Fixtures & Factories     | ✅ v0.25.0 SurrealFixture; factories v0.39.0                          | ✅                               |
-| Retry, Logging, Metrics       | v0.40.0                                                               | ✅                               |
-| Connection Pool               | post-GA (tentative)                                                   | ✅                               |
-| Custom SDK / CBOR Protocol    | ❌ never                                                              | ✅                               |
+| Feature                       | ORM-lite (official SDK)                                               | ORM (custom SDK)                          |
+| ----------------------------- | --------------------------------------------------------------------- | ----------------------------------------- |
+| Supported SurrealDB           | **2.6/2.7 + 3.2/3.3**                                                 | 3.x only                                  |
+| CRUD & QuerySet               | ✅                                                                    | ✅                                        |
+| Aggregations & GROUP BY       | ✅                                                                    | ✅                                        |
+| Model Signals                 | ✅                                                                    | ✅                                        |
+| Bulk Operations               | ✅                                                                    | ✅                                        |
+| Q Objects (OR/AND/NOT)        | ✅                                                                    | ✅                                        |
+| Parameterized Filters         | ✅                                                                    | ✅                                        |
+| Relations & Graph             | ✅ (reverse, keyword edge fields, tx= on every write helper: v0.22.0) | ✅                                        |
+| FETCH clause                  | ✅                                                                    | ✅                                        |
+| Transactions (tx=)            | ✅ v0.8 (core), v0.9 QS                                               | ✅                                        |
+| Interactive tx (3.x native)   | ✅ v0.9                                                               | ✅                                        |
+| upsert / update_or_create     | ✅ v0.10.0                                                            | ✅                                        |
+| Atomic field/array operations | ✅ v0.11.0                                                            | ✅                                        |
+| Retry on conflict             | ✅ v0.12.0                                                            | ✅                                        |
+| SurrealFunc & server values   | ✅ v0.13.0                                                            | ✅                                        |
+| Computed fields               | ✅ v0.14.0                                                            | ✅                                        |
+| `call_function()` (`fn::`)    | ✅ v0.15.0                                                            | ✅                                        |
+| JWT Authentication            | ✅ v0.16.0 (connection)                                               | ✅                                        |
+| Model auth mixin              | ✅ v0.17.0                                                            | ✅                                        |
+| Field Aliases & DX            | ✅ v0.18.0                                                            | ✅                                        |
+| Live queries (raw notifs)     | ✅ v0.19.0                                                            | ✅                                        |
+| Typed live queries            | ✅ v0.20.0                                                            | ✅                                        |
+| Live auto-resubscribe / CDC   | ✅ v0.21.0                                                            | ✅                                        |
+| Native typed relations        | ✅ v0.22.0 (typed edge models)                                        | ✅ DDL only (TableType.RELATION)          |
+| Rich field types              | ✅ v0.23.0                                                            | ✅                                        |
+| Geospatial Fields             | ✅ v0.24.0                                                            | ✅                                        |
+| Embedded engine               | ✅ v0.25.0 (mem://, surrealkv://; rocksdb:// #233)                    | ❌ (HTTP/WebSocket only)                  |
+| Time travel (`VERSION`)       | ✅ v0.26.0 (`as_of()`)                                                | ❌                                        |
+| Subqueries                    | ✅ v0.27.0 (`Subquery`, a QuerySet in `filter()`)                     | ✅                                        |
+| Query Cache                   | ✅ v0.28.0 (`cache()`, `QueryCache`)                                  | ✅                                        |
+| Multi-database                | ✅ v0.29.0 (`add_connection()`, `using()`)                            | ✅                                        |
+| Schema Introspection          | ✅ v0.30.0 (`DatabaseIntrospector`, `generate_models_from_db()`)      | ✅                                        |
+| DEFINE EVENT                  | ✅ v0.31.0 (`Event`, `define_events()`, `ASYNC` on 3.x)               | ✅ migrations (`DefineEvent`)             |
+| `define_function()` (DDL)     | ✅ v0.31.0                                                            | ❌                                        |
+| Materialized views            | ✅ v0.32.0 (`view_query`, `define_view()`)                            | ✅                                        |
+| TYPE RELATION enforcement     | ✅ v0.33.0 (`relation_in`, `define_relation()`)                       | ✅ DDL (`TableType.RELATION`, migrations) |
+| Full-Text Search              | v0.34.0                                                               | ✅                                        |
+| Vector Search (KNN/HNSW)      | v0.35.0                                                               | ✅                                        |
+| Hybrid Search (RRF)           | v0.36.0                                                               | ✅                                        |
+| Migrations & CLI              | v0.37 – v0.38                                                         | ✅                                        |
+| Test Fixtures & Factories     | ✅ v0.25.0 SurrealFixture; factories v0.39.0                          | ✅                                        |
+| Retry, Logging, Metrics       | v0.40.0                                                               | ✅                                        |
+| Connection Pool               | post-GA (tentative)                                                   | ✅                                        |
+| Custom SDK / CBOR Protocol    | ❌ never                                                              | ✅                                        |
 
 **Choose ORM-lite** if you want the official SDK, minimal dependencies, support for SurrealDB
 2.x (2.6 / 2.7) **and** 3.x (3.2 / 3.3), and a full feature roadmap built entirely on the official SDK.

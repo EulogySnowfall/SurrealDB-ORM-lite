@@ -4962,8 +4962,8 @@ _FEATURES_ROW_33 = ["Materialized views (`view_query`, `define_view()`, read-onl
 _ROADMAP_ROWS_33 = [
     ["v0.31.0", "Tier 3 — Server-side events and DDL helpers", "✅ Released"],
     ["v0.32.0", "Tier 3 — Materialized views", "✅ Released"],
-    ["v0.33.0 – v0.39.0", "Tier 3 — Advanced (search, DDL, migrations, CLI)", "📋 Planned"],
-    ["v0.40.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+    ["v0.33.0", "Tier 3 — `TYPE RELATION` constraints", "✅ Released"],
+    ["v0.34.0 – v0.39.0", "Tier 3 — Advanced (search, migrations, CLI)", "📋 Planned"],
 ]
 _COMPARISON_ROW_33 = ["Materialized views", "✅ v0.32.0 (`view_query`, `define_view()`)", "✅"]
 #: Spec §11.1 item 5 (P4, A3): exactly eight rows v0.32.0 adds to the 2.x/3.x table, cell by cell.
@@ -5038,14 +5038,16 @@ _EMBEDDED_VIEWS_ROW = [
     "`float` sums and means on 3.x",
     "v0.32.0",
 ]
-#: Spec §11.1 item 7: section 31's generated-models bullet, whitespace normalised.
+#: Spec §11.1 item 7: section 31's generated-models bullet, whitespace normalised (v0.33.0's text: the relation keys
+#: are generated since then).
 _GENERATED_MODELS_BULLET_31 = (
-    "- **Generated models use comments** where the full ORM writes `SurrealConfigDict(permissions=…, changefeed=…, "
-    "relation_in=…, relation_out=…, enforced=…)` (`# Permissions: …`, `# Changefeed: …`, `# IN … OUT … ENFORCED`), "
-    "and the base class where it writes `table_type=` (`BaseSurrealEdge` for a relation table): those keys arrive in "
-    "the lite's `SurrealConfigDict` with later minors. A view is generated with `view_query=…` since v0.32.0, as in "
-    "the full ORM (a `# View: AS …` comment when the lite cannot declare it: an edge, a computed field, a query it "
-    "refuses). `READONLY` is a comment too (full ORM: `Field(readonly=True)`)."
+    "- **Generated models use comments** where the full ORM writes `SurrealConfigDict(permissions=…, changefeed=…)` "
+    "(`# Permissions: …`, `# Changefeed: …`): those keys arrive in the lite's `SurrealConfigDict` with later minors. A "
+    "view is generated with `view_query=…` since v0.32.0, and a relation table's ends with `relation_in=…`, "
+    "`relation_out=…` and `enforced=True` since v0.33.0, as in the full ORM (a `# View: AS …` comment when the lite "
+    "cannot declare the view: an edge, a computed field, a query it refuses; an `# IN … OUT …` comment when a table "
+    "name is not an identifier). The base class says what the full ORM's `table_type=` says (`BaseSurrealEdge` for a "
+    "relation table). `READONLY` is a comment too (full ORM: `Field(readonly=True)`)."
 )
 #: Spec §11.1 item 7: section 31's long-line sentence, whitespace normalised.
 _LONG_LINES_31 = (
@@ -5098,7 +5100,8 @@ class TestReadmeSection33:
     (spec §11.1)."""
 
     def test_section_33_follows_section_32(self) -> None:
-        """Right after section 32 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        """Right after section 32 (after its "Coming from" bullets), then section 34 (v0.33.0), and before the ``---``
+        of "Configuration Options"."""
         text = _readme()
         start_32 = text.index(f"\n{_SECTION_32}\n")
         start_33 = text.index(f"\n{_SECTION_33}\n")
@@ -5107,8 +5110,9 @@ class TestReadmeSection33:
         assert re.findall(r"^#{2,3} .*$", text[start_32 + 1 : configuration], re.MULTILINE) == [
             _SECTION_32,
             _SECTION_33,
+            "### 34. Relation constraints (`relation_in`, `define_relation()`)",
         ]
-        assert text[:configuration].rstrip().endswith("\n---"), "section 33 ends before the --- of the next part"
+        assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 
     def test_subsections_in_order(self) -> None:
         assert re.findall(r"^#### (.*)$", _section_33(), re.MULTILINE) == _SUBSECTIONS_33
@@ -5191,12 +5195,13 @@ class TestReadmeSection33:
         assert roadmap[start : start + 4] == _ROADMAP_ROWS_33, roadmap
 
     def test_comparison_row(self) -> None:
-        """The materialized views row filled in, after the ``define_function()`` row and before full-text search."""
+        """The materialized views row filled in, after the ``define_function()`` row and before the ``TYPE RELATION``
+        row (v0.33.0)."""
         comparison = [row for _, row in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
         firsts = [row[0] for row in comparison]
         start = firsts.index("`define_function()` (DDL)")
         assert comparison[start + 1] == _COMPARISON_ROW_33, comparison
-        assert firsts[start + 2] == "Full-Text Search", firsts
+        assert firsts[start + 2] == "TYPE RELATION enforcement", firsts
 
     def test_server_behaviour_rows(self) -> None:
         """Exactly eight rows, Since v0.32.0, together and in version order: earlier releases above them, later ones
