@@ -33,6 +33,12 @@ table — on fake clients, then E2E: on SurrealDB 2.x and the embedded engine ``
 G5 before any DDL (in a transaction too), on 3.x the server refuses it (``Can't apply view removal: …``), both views
 stay; the outer view first, then the inner one, is removed on every line; a raw ``REMOVE TABLE`` of the source table is
 pinned per line.
+
+Transactions, connections, ``OVERWRITE`` and events (spec §7; AC-10, AC-11, AC-12; M10, M14): ``OVERWRITE`` drops the
+view's events and ``define_events()`` restores them (3.1 refusing ``OVERWRITE`` on a view that holds records, pinned);
+``define_view(tx=tx)`` and ``remove_view(tx=tx)`` apply with the block's source writes, buffered or interactive, and a
+block that raises applies neither; on 3.x over WebSocket the block reads its own view and writes, unseen outside it
+until the commit; a transaction of another connection is refused (X1) before any request.
 """
 
 import contextlib
@@ -2664,10 +2670,10 @@ async def _groups() -> dict[str, tuple[int, float]]:
 
 
 class TestDefineViewE2E:
-    """AC-5, AC-9, AC-12 (E2E, both lines, WebSocket, HTTP and ``mem://``): ``define_view()`` applies the view and
+    """AC-5, AC-9, AC-10 (E2E, both lines, WebSocket, HTTP and ``mem://``): ``define_view()`` applies the view and
     returns its statement, SurrealDB fills it and keeps it up to date, a second call converges, ``overwrite=False``
-    keeps what exists, ``remove_view()`` removes it; a missing source table is named by the refusal; the view lands on
-    the model's connection."""
+    keeps what exists, ``remove_view()`` removes it; a missing source table is named by the refusal; ``OVERWRITE``
+    drops the view's events, which ``define_events()`` restores."""
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_define_and_read(self, kind: str) -> None:
@@ -2785,21 +2791,44 @@ class TestDefineViewE2E:
             assert "DEFINE TABLE" not in text
 
     @pytest.mark.parametrize("kind", _KINDS)
-    async def test_a_model_defines_on_its_own_connection(self, kind: str) -> None:
-        async with _default(kind) as default, _mv(kind) as client:
-            await _save_orders()
-            await MvStats.define_view()
+    @pytest.mark.parametrize("filled", [False, True], ids=["empty", "filled"])
+    async def test_overwrite_drops_the_events_define_events_restores_them(self, kind: str, filled: bool) -> None:
+        """AC-10 (M10, D14): ``define_view()`` then ``define_events()`` puts the event on the view; the next
+        ``define_view()`` (``OVERWRITE``) drops it, the next ``define_events()`` restores it, and it fires on a source
+        write. Measured with orders saved (``filled``), over WebSocket and HTTP: on 3.3 the event fires once per group
+        the ``OVERWRITE`` recomputes, then is dropped; 2.x and the embedded engine drop it first; 3.1 refuses
+        ``OVERWRITE`` on a view that holds records (S3: the view and its event are kept) and drops the event of an
+        empty view as every line does."""
+        async with _mv(kind) as client:
+            await _apply_ddl(client, "DEFINE TABLE mv_log TYPE ANY SCHEMALESS;")
+            if filled:
+                await _save_orders()
+            line = await _line(client)
+            assert await MvStatsEvents.define_view() == MvStatsEvents.view_ddl()
+            await MvStatsEvents.define_events()
+            assert list(await _events_info(client, "mv_order_stats")) == ["mv_seen"]
+            assert await _rows(client, "mv_log") == []
+            if filled and line == (3, 1):
+                with pytest.raises(SurrealDbError) as raised:
+                    await MvStatsEvents.define_view()
+                assert type(raised.value) is SurrealDbError
+                assert str(raised.value) == (
+                    "Can't apply view definition: 'mv_order_stats' -> There was a problem with the key-value store: The "
+                    "key being inserted already exists"
+                )
+                assert list(await _events_info(client, "mv_order_stats")) == ["mv_seen"]
+                fired = 0
+            else:
+                assert await MvStatsEvents.define_view() == MvStatsEvents.view_ddl()
+                assert await _events_info(client, "mv_order_stats") == {}
+                fired = 2 if filled and line[0] >= 3 else 0
+            assert len(await _rows(client, "mv_log")) == fired
             assert (await _tables(client))["mv_order_stats"] == _MV_STATS_RENDERED
-            assert "mv_order_stats" not in await _tables(default)
-
-    @pytest.mark.parametrize("kind", _KINDS)
-    async def test_a_model_without_connection_defines_on_the_current_one(self, kind: str) -> None:
-        async with _default(kind) as default, _mv(kind) as client:
-            await _save_orders()
-            async with SurrealDBConnectionManager.using("mv"):
-                assert await MvCurrentStats.define_view() == MvCurrentStats.view_ddl()
-            assert (await _tables(client))["mv_order_stats"] == _MV_STATS_RENDERED
-            assert "mv_order_stats" not in await _tables(default)
+            assert await _groups() == ({"new": (1, 1.0), "paid": (2, 15.5)} if filled else {})
+            await MvStatsEvents.define_events()
+            assert list(await _events_info(client, "mv_order_stats")) == ["mv_seen"]
+            await MvOrder(id="o4", status="paid", amount=1.0).save()
+            assert len(await _rows(client, "mv_log")) == fired + 1
 
 
 class TestViewGuardE2E:
@@ -3242,3 +3271,193 @@ class TestViewRemovalE2E:
                     await MvStats.remove_view()
                 assert (type(g2.value), str(g2.value)) == (SurrealDbError, _g2("MvStats", "mv_order_stats"))
                 assert await _rows(client, "mv_order_stats") == _MV_STATS_ROWS
+
+
+# --- transactions and connections (spec §7; AC-11, AC-12) -----------------------------------------------------------
+
+
+class _Rollback(Exception):
+    """Raised inside a ``transaction()`` block to roll it back."""
+
+
+async def _native_txn_supported(client: Any) -> bool:
+    """Whether *client* opens native interactive transactions (SurrealDB 3.x over WebSocket): the testing-dual-db
+    probe, on the connection ``"mv"``."""
+    try:
+        txn = await client.begin()
+    except Exception:
+        return False
+    with contextlib.suppress(Exception):
+        await client.cancel(txn)
+    return True
+
+
+async def _require_interactive(client: Any) -> None:
+    """Skip without native transactions: SurrealDB 2.x buffers a WebSocket transaction (reads in it raise)."""
+    if not await _native_txn_supported(client):
+        pytest.skip("requires native interactive transactions (SurrealDB 3.x over WebSocket)")
+
+
+class TestViewTransactionsE2E:
+    """AC-11 (E2E, both lines, WebSocket, HTTP and ``mem://``): ``define_view(tx=tx)`` and ``remove_view(tx=tx)`` with
+    a source write in the same block — buffered (HTTP, SurrealDB 2.x, the embedded engine) or interactive (3.x over
+    WebSocket) — apply together at the end of the block, and a block that raises applies neither (M14); interactive
+    only, the block reads its own view and source writes, which nothing outside it sees before the commit."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_define_view_and_a_source_write_commit_together(self, kind: str) -> None:
+        async with _mv(kind) as client:
+            await _save_orders()
+            interactive = kind == "ws" and await _major(client) >= 3
+            async with SurrealDBConnectionManager.transaction("mv") as tx:
+                assert tx.is_interactive is interactive
+                assert await MvStats.define_view(tx=tx) == MvStats.view_ddl()
+                await MvOrder(id="o4", status="new", amount=2.0).save(tx=tx)
+            assert (await _tables(client))["mv_order_stats"] == _MV_STATS_RENDERED
+            assert await _groups() == {"new": (2, 3.0), "paid": (2, 15.5)}
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_block_that_raises_leaves_no_view(self, kind: str) -> None:
+        async with _mv(kind) as client:
+            await _save_orders()
+            with pytest.raises(_Rollback):
+                async with SurrealDBConnectionManager.transaction("mv") as tx:
+                    await MvStats.define_view(tx=tx)
+                    await MvOrder(id="o4", status="new", amount=2.0).save(tx=tx)
+                    raise _Rollback
+            assert "mv_order_stats" not in await _tables(client)
+            assert len(await _rows(client, "mv_orders")) == 3
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_remove_view_and_a_source_write_commit_together(self, kind: str) -> None:
+        async with _mv(kind) as client:
+            await _save_orders()
+            await MvStats.define_view()
+            async with SurrealDBConnectionManager.transaction("mv") as tx:
+                assert await MvStats.remove_view(tx=tx) == _REMOVE_MV_STATS
+                await MvOrder(id="o4", status="new", amount=2.0).save(tx=tx)
+            tables = await _tables(client)
+            assert "mv_order_stats" not in tables
+            assert tables["mv_orders"] == _MV_ORDERS_TABLE
+            assert len(await _rows(client, "mv_orders")) == 4
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_block_that_raises_keeps_the_view(self, kind: str) -> None:
+        async with _mv(kind) as client:
+            await _save_orders()
+            await MvStats.define_view()
+            with pytest.raises(_Rollback):
+                async with SurrealDBConnectionManager.transaction("mv") as tx:
+                    await MvStats.remove_view(tx=tx)
+                    await MvOrder(id="o4", status="new", amount=2.0).save(tx=tx)
+                    raise _Rollback
+            assert (await _tables(client))["mv_order_stats"] == _MV_STATS_RENDERED
+            assert await _groups() == {"new": (1, 1.0), "paid": (2, 15.5)}
+            assert len(await _rows(client, "mv_orders")) == 3
+
+    async def test_the_block_reads_the_view_it_defines(self) -> None:
+        """Interactive only: the view defined in the block holds the block's own source write when the block reads
+        it; outside the block, on the same connection, the view does not exist until the commit (a missing table
+        reads as no rows)."""
+        async with _mv("ws") as client:
+            await _require_interactive(client)
+            await _save_orders()
+            async with SurrealDBConnectionManager.transaction("mv") as tx:
+                assert tx.is_interactive
+                await MvStats.define_view(tx=tx)
+                await MvOrder(id="o4", status="new", amount=2.0).save(tx=tx)
+                inside = {row.status: (row.total, row.revenue) for row in await MvStats.objects(tx=tx).exec()}
+                outside = await MvStats.objects().exec()
+                tables = await _tables(client)
+            assert inside == {"new": (2, 3.0), "paid": (2, 15.5)}
+            assert outside == []
+            assert "mv_order_stats" not in tables
+            assert await _groups() == {"new": (2, 3.0), "paid": (2, 15.5)}
+
+    async def test_a_source_write_of_the_block_is_seen_inside_only(self) -> None:
+        """Interactive only: with the view defined before the block, the block's source write is in the view the block
+        reads, not in the one read outside it, until the commit."""
+        async with _mv("ws") as client:
+            await _require_interactive(client)
+            await _save_orders()
+            await MvStats.define_view()
+            async with SurrealDBConnectionManager.transaction("mv") as tx:
+                await MvOrder(id="o4", status="new", amount=2.0).save(tx=tx)
+                inside = {row.status: (row.total, row.revenue) for row in await MvStats.objects(tx=tx).exec()}
+                outside = await _groups()
+            assert inside == {"new": (2, 3.0), "paid": (2, 15.5)}
+            assert outside == {"new": (1, 1.0), "paid": (2, 15.5)}
+            assert await _groups() == {"new": (2, 3.0), "paid": (2, 15.5)}
+
+    async def test_the_block_removes_the_view_for_itself_first(self) -> None:
+        """Interactive only: after ``remove_view(tx=tx)`` the block reads no view (a missing table reads as no rows);
+        outside the block the view is still there, kept up to date, until the commit."""
+        async with _mv("ws") as client:
+            await _require_interactive(client)
+            await _save_orders()
+            await MvStats.define_view()
+            async with SurrealDBConnectionManager.transaction("mv") as tx:
+                assert await MvStats.remove_view(tx=tx) == _REMOVE_MV_STATS
+                inside = await MvStats.objects(tx=tx).exec()
+                outside = await _groups()
+                tables = await _tables(client)
+            assert inside == []
+            assert outside == {"new": (1, 1.0), "paid": (2, 15.5)}
+            assert tables["mv_order_stats"] == _MV_STATS_RENDERED
+            assert "mv_order_stats" not in await _tables(client)
+
+
+def _x1(model: str, call: str, tx_connection: str, connection: str) -> str:
+    """X1 (spec §5.6): ``routing.check_transaction()``'s text for *call* of *model* (on *connection*) given a
+    transaction of *tx_connection*."""
+    return (
+        f"{model}.{call} cannot run in this transaction: the transaction belongs to connection {tx_connection!r} and "
+        f"{model} runs on connection {connection!r}. A transaction is one connection's (one database): open it on "
+        f"{connection!r} — SurrealDBConnectionManager.transaction({connection!r}) — or run the block inside "
+        f"using({tx_connection!r})."
+    )
+
+
+class TestViewConnectionsE2E:
+    """AC-12 (E2E, both lines, WebSocket, HTTP and ``mem://``; the default connection over WebSocket for ``mem``):
+    a view model applies its view on its own connection, one without ``connection`` on the ``using()`` block's, and a
+    transaction of another connection is refused (X1) before any request."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_model_defines_on_its_own_connection(self, kind: str) -> None:
+        async with _default(kind) as default, _mv(kind) as client:
+            await _save_orders()
+            await MvStats.define_view()
+            assert (await _tables(client))["mv_order_stats"] == _MV_STATS_RENDERED
+            assert "mv_order_stats" not in await _tables(default)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_model_without_connection_defines_on_the_current_one(self, kind: str) -> None:
+        async with _default(kind) as default, _mv(kind) as client:
+            await _save_orders()
+            async with SurrealDBConnectionManager.using("mv"):
+                assert await MvCurrentStats.define_view() == MvCurrentStats.view_ddl()
+            assert (await _tables(client))["mv_order_stats"] == _MV_STATS_RENDERED
+            assert "mv_order_stats" not in await _tables(default)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("method", ["define_view", "remove_view"])
+    async def test_x1_a_transaction_of_another_connection(
+        self, kind: str, method: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with _default(kind) as default, _mv(kind) as client:
+            await _save_orders()
+            await MvStats.define_view()
+            async with SurrealDBConnectionManager.transaction() as tx:
+                calls = _spy(monkeypatch, client)
+                default_calls = _spy(monkeypatch, default)
+                with pytest.raises(SurrealDbError) as raised:
+                    await getattr(MvStats, method)(tx=tx)
+                assert (calls, default_calls) == ([], [])
+                if not tx.is_interactive:
+                    assert tx.statements == []
+            assert (await _tables(client))["mv_order_stats"] == _MV_STATS_RENDERED
+            assert "mv_order_stats" not in await _tables(default)
+            assert await _groups() == {"new": (1, 1.0), "paid": (2, 15.5)}
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _x1("MvStats", f"{method}()", "default", "mv")
