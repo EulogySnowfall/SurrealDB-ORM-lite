@@ -6,8 +6,8 @@ The following versions of Surreal-ORM-Lite are currently supported with security
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.31.x  | :white_check_mark: |
-| < 0.31  | :x:                |
+| 0.32.x  | :white_check_mark: |
+| < 0.32  | :x:                |
 
 ## Embedded Engine
 
@@ -46,6 +46,18 @@ check catches mistakes — unbalanced brackets, a comment that would swallow the
 appends, a second statement where one expression is expected — and is not an injection defence.
 Event, table, parameter and function names are validated as identifiers (event and table names
 also quoted), comments are escaped literals; applying needs a privileged system user.
+
+## Materialized views
+
+Since 0.32.0, a model's `view_query` is SurrealQL written into `DEFINE TABLE … AS (…)` as given:
+trusted application code, never user input. Its structural check catches mistakes and is not an
+injection defence; the table name is validated and quoted. `define_view()` refuses to turn a table
+that holds records into a view and `remove_view()` refuses to remove a table that is not a view,
+since SurrealDB would delete its records (and, on SurrealDB 2.x and the embedded engine, a view
+that other views read, which would turn them into stale ordinary tables); the ORM's refusal to
+write to a view guards against mistakes in application code and is not an access control
+(SurrealDB 2.x and 3.1 accept writes to a view from any session allowed to write it). A view is
+defined with SurrealDB's default permissions (`NONE`); applying needs a privileged system user.
 
 ## Reporting a Vulnerability
 
