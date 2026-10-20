@@ -52,8 +52,23 @@ after K6, the table reads back without ends, ``in``/``out`` as ``TYPE record``, 
 and edges kept; edges from another table and to a missing record are accepted at once, on a second connection too;
 ``RelLikes.define_relation()`` puts K6 back; ``overwrite=False`` removes nothing; in a transaction the removal is
 applied at commit, and not at all when the block raises.
+
+Transactions, line facts, records already in the table, change feeds and live queries (spec §5.4, §7; AC-10, AC-12,
+AC-13, AC-16; D15, D16, P4, P5): ``TestRelationTransactionsE2E`` — on every engine, the kind of transaction asserted
+from ``tx.is_interactive`` — reads ``INFO FOR DB`` before the statement joins the block, applies it with the block (at
+the commit when buffered, in the block when interactive), applies nothing when the block raises, fails the block on a
+refused edge later in it (typed and by name; the table stays ``TYPE ANY``), refuses a transaction of another
+connection before any request, and pins the documented limit: a definition of the same table queued earlier in the
+block is replaced at the commit. ``TestRelationLineFactsE2E`` pins two raw facts per line: a bare ``OVERWRITE`` resets
+the table's other clauses, and a raw ``ALTER TABLE … TYPE RELATION …`` of a table already written to is not enforced
+on SurrealDB 2.x and the embedded engine — a server defect: when it changes, the test and the README row change, not
+the ORM. ``TestExistingRecordsE2E``: the edges already in the table stay; a nonconforming one's ``merge()`` keeps the
+SDK's error, a dangling one's succeeds, the two README recipes find each. ``TestChangeFeedAndLiveE2E``:
+``changes(since=0)`` yields the edges written before and after the define and nothing else, a raw ``SHOW CHANGES``
+shows both ``define_table`` entries, and a live query registered before is still listed.
 """
 
+import asyncio
 import contextlib
 import inspect
 import os
@@ -2382,3 +2397,391 @@ class TestRemoveConstraintE2E:
                 await nodes["c"].relate(RelLikesAny, nodes["p1"])
             assert type(refused.value) is SurrealDbError
             assert await _edge_ids(client) == ["rel_likes:e1", "rel_likes:e2"]
+
+
+# === transactions, line facts, records already in the table, change feeds, live queries (AC-10, AC-12, AC-13, AC-16) ===
+
+
+#: ``rel_likes`` defined by hand as SurrealDB's default table (``TYPE ANY``), and how SurrealDB stores it.
+_REL_ANY = "DEFINE TABLE rel_likes TYPE ANY;"
+_REL_ANY_STORED = "DEFINE TABLE rel_likes TYPE ANY SCHEMALESS PERMISSIONS NONE"
+
+#: A definition of ``rel_likes`` queued in a transaction before ``define_relation(tx=tx)``: not seen by its read.
+_QUEUED = "DEFINE TABLE OVERWRITE rel_likes TYPE ANY SCHEMAFULL COMMENT 'queued';"
+
+#: The failure of the queued-definition test once ``define_relation(tx=…)`` sees a definition queued in its block.
+_QUEUED_SEEN = (
+    "define_relation(tx=…) now keeps a definition of the same table queued earlier in the block: rewrite the "
+    "README section 34 paragraph 'Transactions, connections and the query cache', define_relation()'s docstring and "
+    "this test"
+)
+
+
+async def _plain_likes(client: Any) -> dict[str, BaseSurrealModel]:
+    """``rel_likes`` defined ``TYPE ANY`` by hand, then the nodes ``ada``, ``p1``, ``b1`` and ``c`` saved. Returns the
+    nodes by name."""
+    await _apply_ddl(client, _REL_ANY)
+    assert (await _tables(client))["rel_likes"] == _REL_ANY_STORED
+    return {
+        "ada": await RelPerson(id="ada").save(),
+        "p1": await RelPost(id="p1").save(),
+        "b1": await RelBook(id="b1").save(),
+        "c": await RelCompany(id="c").save(),
+    }
+
+
+def _x1(model: str, call: str, tx_connection: str, connection: str) -> str:
+    """``routing.check_transaction()``'s text for *call* of *model* (on *connection*) given a transaction of
+    *tx_connection*."""
+    return (
+        f"{model}.{call} cannot run in this transaction: the transaction belongs to connection {tx_connection!r} and "
+        f"{model} runs on connection {connection!r}. A transaction is one connection's (one database): open it on "
+        f"{connection!r} — SurrealDBConnectionManager.transaction({connection!r}) — or run the block inside "
+        f"using({tx_connection!r})."
+    )
+
+
+class TestRelationTransactionsE2E:
+    """``define_relation(tx=tx)`` on every engine of both lines, in a buffered transaction (HTTP, SurrealDB 2.x, the
+    embedded engine) or an interactive one (3.x over WebSocket): its read of ``INFO FOR DB`` runs on the committed
+    state before its statement joins the block; the statement applies with the block — at the commit when buffered,
+    in the block when interactive — and not at all when the block raises; a write the new constraint refuses later in
+    the same block fails the whole block (inside it when interactive, at its exit when buffered), the table keeping its
+    type; a transaction of another connection is refused before any request. A definition of the same table queued
+    earlier in the block is not seen by the read, a documented limit."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_read_comes_first_and_the_block_applies_the_statement(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with _rel(kind) as client:
+            nodes = await _plain_likes(client)
+            interactive = kind == "ws" and await _major(client) >= 3
+            async with SurrealDBConnectionManager.transaction("rel") as tx:
+                assert tx.is_interactive is interactive
+                calls = _spy(monkeypatch, client)
+                assert await RelLikes.define_relation(tx=tx) == _REL_G1
+                sent = [(method, args[0]) for method, args in calls]
+                if interactive:
+                    # Sent at once, through the transaction, after the read of the committed state.
+                    assert sent == [("query", _INFO), ("query_raw", _INFO), ("query_raw", _REL_G1)]
+                    assert parse_define_table((await tx.run_read("INFO FOR DB;"))["tables"]["rel_likes"]).enforced
+                else:
+                    # Queued, after the read: nothing but the read has reached the server.
+                    assert sent == [("query", _INFO), ("query_raw", _INFO)]
+                    assert getattr(tx, "statements", None) == [_REL_G1]
+                monkeypatch.undo()
+                # Outside the block, until the commit, the table is as it was.
+                assert (await _tables(client))["rel_likes"] == _REL_ANY_STORED
+                await nodes["ada"].relate(RelLikes, nodes["p1"], tx=tx)
+            assert (await _tables(client))["rel_likes"] == _REL_G1_READ_BACK
+            assert await _ends(client) == [[_ADA, _P1]]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_block_that_raises_applies_nothing(self, kind: str) -> None:
+        async with _rel(kind) as client:
+            await _plain_likes(client)
+            interactive = kind == "ws" and await _major(client) >= 3
+            with pytest.raises(_Rollback):
+                async with SurrealDBConnectionManager.transaction("rel") as tx:
+                    assert tx.is_interactive is interactive
+                    assert await RelLikes.define_relation(tx=tx) == _REL_G1
+                    raise _Rollback
+            assert (await _tables(client))["rel_likes"] == _REL_ANY_STORED
+            assert parse_define_table((await _tables(client))["rel_likes"]).table_type == "any"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("form", ["typed", "by-name"])
+    async def test_a_violating_relate_fails_the_block(self, kind: str, form: str) -> None:
+        """The edge ``rel_company:c → rel_post:p1``, refused by the constraint defined earlier in the same block,
+        fails the block: interactive, the ``relate()`` raises; buffered, the block's exit does."""
+        async with _rel(kind) as client:
+            nodes = await _plain_likes(client)
+            company, post = nodes["c"], nodes["p1"]
+            interactive = kind == "ws" and await _major(client) >= 3
+            reached = False
+            with pytest.raises(SurrealDbError, match="Transaction failed and rolled back"):
+                async with SurrealDBConnectionManager.transaction("rel") as tx:
+                    assert tx.is_interactive is interactive
+                    await RelLikes.define_relation(tx=tx)
+                    if form == "typed":
+                        await company.relate(RelLikes, post, tx=tx)
+                    else:
+                        await company.relate("rel_likes", post, tx=tx)
+                    reached = True
+            assert reached is not interactive
+            assert parse_define_table((await _tables(client))["rel_likes"]).table_type == "any"
+            assert await _edge_ids(client) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_transaction_of_another_connection(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _rel(kind) as client:
+            await _plain_likes(client)
+            _register_rel(kind, "rel2")
+            try:
+                async with SurrealDBConnectionManager.transaction("rel2") as tx:
+                    other = await SurrealDBConnectionManager.get_client("rel2")
+                    calls = _spy(monkeypatch, client)
+                    other_calls = _spy(monkeypatch, other)
+                    with pytest.raises(SurrealDbError) as raised:
+                        await RelLikes.define_relation(tx=tx)
+                    assert (calls, other_calls) == ([], [])
+                    if not tx.is_interactive:
+                        assert getattr(tx, "statements", None) == []
+                    monkeypatch.undo()
+            finally:
+                await SurrealDBConnectionManager.remove_connection("rel2")
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value) == _x1("RelLikes", "define_relation()", "rel2", "rel")
+            assert (await _tables(client))["rel_likes"] == _REL_ANY_STORED
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_definition_queued_earlier_in_the_block_is_replaced(self, kind: str) -> None:
+        """A documented limit, to be lifted: ``define_relation(tx=…)`` reads the table's committed definition, so a
+        definition of the same table queued earlier in the block is not seen, and the statement it queues replaces
+        that definition at the commit — here the queued ``SCHEMAFULL`` and comment are gone, the table is stored
+        ``SCHEMALESS`` without a comment. README section 34, "Transactions, connections and the query cache", says so:
+        define the table's other clauses before the block. The same on a buffered and an interactive transaction."""
+        async with _rel(kind) as client:
+            await _apply_ddl(client, _REL_ANY)
+            assert (await _tables(client))["rel_likes"] == _REL_ANY_STORED
+            interactive = kind == "ws" and await _major(client) >= 3
+            async with SurrealDBConnectionManager.transaction("rel") as tx:
+                assert tx.is_interactive is interactive
+                await tx.add(_QUEUED, None)
+                assert await RelLikes.define_relation(tx=tx) == _REL_G1, _QUEUED_SEEN
+            assert (await _tables(client))["rel_likes"] == _REL_G1_READ_BACK, _QUEUED_SEEN
+
+
+class RelAlter(BaseSurrealEdge):
+    """The edge model of the raw ``ALTER TABLE`` pin: ``rel_alter``'s new ends."""
+
+    model_config = SurrealConfigDict(
+        table_name="rel_alter", connection="rel", relation_in="rel_person", relation_out="rel_post"
+    )
+
+
+#: ``rel_alter`` defined with its old ends and written once, then the raw ``ALTER TABLE`` to its new ends.
+_ALTER_TABLE = "DEFINE TABLE rel_alter TYPE RELATION IN rel_company OUT rel_post;"
+_ALTER_WRITE = "INSERT RELATION INTO rel_alter {id: 'a1', in: rel_company:c, out: rel_post:p1};"
+_ALTER = "ALTER TABLE rel_alter TYPE RELATION IN rel_person OUT rel_post;"
+
+#: The README 2.x/3.x row the raw ``ALTER TABLE`` pin backs, by its first cell.
+_ALTER_ROW = "A raw `ALTER TABLE … TYPE RELATION …` of a table already written to"
+
+#: The failure of the raw ``ALTER TABLE`` pin once a SurrealDB line changes.
+_ALTER_CHANGED = (
+    "SurrealDB changed how this line enforces a raw ALTER TABLE … TYPE RELATION … of a table already written to: "
+    f"re-measure it, then update this test's expectation and the README 2.x/3.x row '{_ALTER_ROW}' — not the ORM's "
+    "code (define_relation() sends DEFINE TABLE OVERWRITE on every line)"
+)
+
+
+async def _refusal(client: Any, statement: str) -> str | None:
+    """Run the one *statement* raw: ``None`` when SurrealDB accepts it, else its error text."""
+    response = await client.query_raw(statement, {})
+    assert "error" not in response, response["error"]
+    [result] = response["result"]
+    return None if result["status"] == "OK" else str(result["result"])
+
+
+def _alter_edge(key: str, start: str) -> str:
+    """``INSERT RELATION`` of the ``rel_alter`` edge *key* from *start* (a constant record of these tests) to
+    ``rel_post:p1``."""
+    return f"INSERT RELATION INTO rel_alter {{id: '{key}', in: {start}, out: rel_post:p1}};"
+
+
+class TestRelationLineFactsE2E:
+    """Raw SurrealQL facts ``define_relation()`` is built around, on every engine of both lines: a bare ``DEFINE TABLE
+    OVERWRITE … TYPE RELATION`` resets the table's other clauses, and a raw ``ALTER TABLE … TYPE RELATION …`` of a
+    table already written to is enforced at once on SurrealDB 3.x only."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_bare_overwrite_resets_the_other_clauses(self, kind: str) -> None:
+        """``relation_ddl()``'s text applied by hand resets the schema mode, comment, change feed and permissions
+        (and ``DROP``) to SurrealDB's defaults; the records, fields, index and event stay. ``define_relation()`` carries
+        those clauses instead."""
+        async with _rel(kind) as client:
+            await _ac6(client)
+            await _apply_ddl(client, "DEFINE TABLE rel_dropped TYPE ANY DROP;")
+            await _apply_ddl(client, RelLikes.relation_ddl())
+            await _apply_ddl(client, "DEFINE TABLE OVERWRITE rel_dropped TYPE RELATION;")
+            tables = await _tables(client)
+            assert tables["rel_likes"] == _REL_G1_READ_BACK
+            state = parse_define_table(tables["rel_likes"])
+            assert (state.schema_mode, state.comment, state.changefeed, state.permissions) == (
+                "SCHEMALESS",
+                None,
+                None,
+                dict.fromkeys(_TABLE_OPERATIONS, "NONE"),
+            )
+            stored = parse_define_table(_K6_STORED)
+            assert (stored.schema_mode, stored.comment, stored.changefeed) == ("SCHEMAFULL", "keep", "1h")
+            assert tables["rel_dropped"] == "DEFINE TABLE rel_dropped TYPE RELATION SCHEMALESS PERMISSIONS NONE"
+            assert await _edge_ids(client) == ["rel_likes:e1", "rel_likes:e2"]
+            info = await _table_info(client, "rel_likes")
+            assert {"in", "out", "stars"} <= set(info["fields"])
+            assert list(info["indexes"]) == ["rel_likes_pair"]
+            assert list(info["events"]) == ["rel_likes_ev"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_raw_alter_of_a_table_already_written_to(self, kind: str) -> None:
+        """Pins a SurrealDB defect. On SurrealDB 2.x and the embedded engine, a raw ``ALTER TABLE … TYPE RELATION …``
+        of a table already written to shows the new type in ``INFO`` but is not enforced: writes keep the old
+        constraint until a ``DEFINE TABLE OVERWRITE`` of the table. SurrealDB 3.x (3.1 included) enforces it at once.
+        ``define_relation()`` never sends ``ALTER TABLE``: its ``DEFINE TABLE OVERWRITE`` is enforced at once on every
+        line.
+
+        When this test fails — a 2.7.x release that fixes it, or an SDK embedding another core, seen first by the 2.x
+        monitor or a Dependabot run —, re-measure, then update this expectation and the README 2.x/3.x row "A raw
+        `ALTER TABLE … TYPE RELATION …` of a table already written to"; never the ORM's code."""
+        async with _rel(kind) as client:
+            await _apply_ddl(client, _ALTER_TABLE)
+            await _apply_ddl(client, _ALTER_WRITE)
+            await _apply_ddl(client, _ALTER)
+            state = parse_define_table((await _tables(client))["rel_alter"])
+            assert (state.relation_in, state.relation_out) == (("rel_person",), ("rel_post",))
+
+            refusal = await _refusal(client, _alter_edge("a2", "rel_person:ada"))
+            if await _major(client) >= 3:
+                assert refusal is None, f"{_ALTER_CHANGED}; refused: {refusal}"
+            else:
+                assert refusal is not None, _ALTER_CHANGED
+                assert "rel_company" in refusal, f"{_ALTER_CHANGED}; refused: {refusal}"
+
+            assert (
+                await RelAlter.define_relation()
+                == "DEFINE TABLE OVERWRITE `rel_alter` TYPE RELATION IN `rel_person` OUT `rel_post`;"
+            )
+            assert await _refusal(client, _alter_edge("a3", "rel_person:ada")) is None
+            refused = await _refusal(client, _alter_edge("a4", "rel_company:c"))
+            assert refused is not None
+            assert "rel_person" in refused
+            written = await client.query("SELECT VALUE id FROM rel_alter;", {})
+            expected = ["a1", "a2", "a3"] if await _major(client) >= 3 else ["a1", "a3"]
+            assert sorted(str(record.id) for record in written) == expected
+
+
+#: Two edges written raw before the constraint: ``odd`` joins a company to a post (outside ``IN``), ``dangling`` starts
+#: at a person that does not exist.
+_EXISTING_EDGES = (
+    "INSERT RELATION INTO rel_likes [{id: 'odd', in: rel_company:c, out: rel_post:p1, stars: 1}, "
+    "{id: 'dangling', in: rel_person:ghost, out: rel_post:p1, stars: 1}];"
+)
+
+#: README section 34's two recipes on ``rel_likes``: the edges outside ``RelLikes``' ends, and the edges whose endpoint
+#: no longer exists.
+_NONCONFORMING_EDGES = (
+    "SELECT VALUE id FROM rel_likes WHERE record::tb(in) NOT IN ['rel_person'] "
+    "OR record::tb(out) NOT IN ['rel_post', 'rel_book']"
+)
+_DANGLING_EDGES = "SELECT VALUE id FROM rel_likes WHERE in.id IS NONE OR out.id IS NONE"
+
+
+class TestExistingRecordsE2E:
+    """AC-13 (E2E, every engine of both lines; M5, M15, M20, D15): SurrealDB checks the writes made after
+    ``define_relation()``, not the records already in the table. A nonconforming edge and a dangling one stay; the
+    nonconforming one can no longer be updated — ``merge()`` raises the SDK's error, unchanged, and the edge stays as
+    it was —, the dangling one can; the two recipes find each of them; ``delete()`` removes the nonconforming one."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_records_already_in_the_table(self, kind: str) -> None:
+        async with _rel(kind) as client:
+            await _plain_likes(client)
+            await _apply_ddl(client, _EXISTING_EDGES)
+            assert await RelLikes.define_relation() == _REL_G1
+            assert await _edge_ids(client) == ["rel_likes:dangling", "rel_likes:odd"]
+
+            odd = await RelLikes.objects().get("odd")
+            stored = await client.query("SELECT * FROM rel_likes:odd;", {})
+            with pytest.raises(ServerError) as raised:
+                await odd.merge(stars=5)
+            assert not isinstance(raised.value, SurrealORMError)
+            assert "`in`" in str(raised.value)
+            assert "rel_person" in str(raised.value)
+            assert await client.query("SELECT * FROM rel_likes:odd;", {}) == stored
+
+            dangling = await RelLikes.objects().get("dangling")
+            await dangling.merge(stars=4)
+            assert await client.query("SELECT VALUE stars FROM rel_likes:dangling;", {}) == [4]
+
+            assert await RelLikes.raw_query(_NONCONFORMING_EDGES) == [RecordID("rel_likes", "odd")]
+            assert await RelLikes.raw_query(_DANGLING_EDGES) == [RecordID("rel_likes", "dangling")]
+
+            await odd.delete()
+            assert await _edge_ids(client) == ["rel_likes:dangling"]
+
+
+#: ``rel_likes`` with a change feed, defined by hand (``TYPE ANY`` spelled out), and its two first edges, one statement
+#: each.
+_FEED_TABLE = "DEFINE TABLE rel_likes TYPE ANY CHANGEFEED 1h;"
+_FEED_EDGES = (
+    "INSERT RELATION INTO rel_likes {id: 'e1', in: rel_person:ada, out: rel_post:p1}; "
+    "INSERT RELATION INTO rel_likes {id: 'e2', in: rel_person:ada, out: rel_book:b1};"
+)
+
+#: ``RelLikes.define_relation()`` on ``_FEED_TABLE``: the change feed carried.
+_FEED_DEFINE = (
+    "DEFINE TABLE OVERWRITE `rel_likes` TYPE RELATION IN `rel_person` OUT `rel_post` | `rel_book` ENFORCED CHANGEFEED 1h;"
+)
+
+
+async def _take(stream: Any, count: int) -> list[Any]:
+    """The *count* next events of *stream*; the timeout is a safety net against a hang, not a timing assertion."""
+    events: list[Any] = []
+    async with asyncio.timeout(5):
+        while len(events) < count:
+            events.append(await anext(stream))
+    return events
+
+
+async def _feed(client: Any) -> None:
+    """``_FEED_TABLE``, the nodes ``ada``, ``bob``, ``p1`` and ``b1``, then the edges ``e1`` and ``e2``."""
+    await _apply_ddl(client, _FEED_TABLE)
+    for node in (RelPerson(id="ada"), RelPerson(id="bob"), RelPost(id="p1"), RelBook(id="b1")):
+        await node.save()
+    await _apply_ddl(client, _FEED_EDGES)
+
+
+class TestChangeFeedAndLiveE2E:
+    """AC-16 (E2E, every engine of both lines; M4, M24, P4): ``define_relation()`` keeps a table's change feed and its
+    history, and its live queries. Each ``DEFINE TABLE`` of a table with a change feed — the one written by hand, then
+    ``define_relation()``'s — adds a ``define_table`` entry to it, on every line; ``changes()`` skips them and yields
+    the edges only, a raw ``SHOW CHANGES`` shows them."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_changes_yields_the_edges_around_the_define(self, kind: str) -> None:
+        async with _rel(kind) as client:
+            await _feed(client)
+            assert await RelLikes.define_relation() == _FEED_DEFINE
+            e3 = await RelPerson(id="bob").relate(RelLikes, _P1)
+
+            stream = RelLikes.objects().changes(since=0)
+            try:
+                events = await _take(stream, 3)
+            finally:
+                stream.stop()
+            assert [event.record_id for event in events] == ["rel_likes:e1", "rel_likes:e2", str(e3.id)]
+            assert all(isinstance(event.instance, RelLikes) for event in events)
+
+            entries = await client.query("SHOW CHANGES FOR TABLE rel_likes SINCE 0 LIMIT 100;", {})
+            kinds = [change_kind for entry in entries for change in entry["changes"] for change_kind in change]
+            assert kinds == ["define_table", "update", "update", "define_table", "update"]
+
+    async def test_a_live_query_registered_before_is_kept(self) -> None:
+        """Over WebSocket (a live query needs one): a raw ``LIVE SELECT`` on the table, registered before
+        ``define_relation()``, is still listed by ``INFO FOR TABLE`` after it."""
+        async with _rel("ws") as client:
+            await _feed(client)
+            response = await client.query_raw("LIVE SELECT * FROM rel_likes;", {})
+            [result] = response["result"]
+            assert result["status"] == "OK", result
+            live_id = result["result"]
+            try:
+                lives = {str(live_id): "LIVE SELECT * FROM rel_likes"}
+                assert (await _table_info(client, "rel_likes"))["lives"] == lives
+                assert await RelLikes.define_relation() == _FEED_DEFINE
+                assert (await _table_info(client, "rel_likes"))["lives"] == lives
+            finally:
+                with contextlib.suppress(Exception):
+                    await client.kill(live_id)
