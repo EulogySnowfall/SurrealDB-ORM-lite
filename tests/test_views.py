@@ -35,12 +35,14 @@ from surreal_orm_lite import (
     Computed,
     SurrealConfigDict,
     SurrealDBConnectionManager,
+    SurrealDbError,
     computed,
     define_parser,
     pre_delete,
     pre_save,
     pre_update,
     schema,
+    utils,
 )
 from surreal_orm_lite.define_parser import blank_literals
 from surreal_orm_lite.schema import (
@@ -54,6 +56,7 @@ from surreal_orm_lite.schema import (
     view_query_outline,
     view_statement,
 )
+from surreal_orm_lite.utils import apply_ddl_statements
 
 # --- the goldens of spec §5.3 ----------------------------------------------------------------------------------------
 
@@ -1242,6 +1245,97 @@ class TestWriteGuard:
         assert str(raised.value) == _w1("order_stats", "OrderStats.save()")
         assert PlainStats._reject_view_write("save()") is None
         assert BaseSurrealModel._reject_view_write("save()") is None
+
+
+# --- the refusal reason of view DDL (spec §6.6, D16; AC-9's unit half) ----------------------------------------------
+
+#: A view over a source table that does not exist (M9): the server's reason names that table, whose name is long
+#: enough to be a run of the statement's text.
+_ARCHIVE_DDL = "DEFINE TABLE OVERWRITE `order_stats` AS (SELECT status, count() AS total FROM order_archive GROUP BY status);"
+_ARCHIVE_MISSING = "The table 'order_archive' does not exist"
+
+#: A parse error quoting the statement from ``--> [1:20]`` on (SurrealDB 3.x's shape).
+_ARCHIVE_PARSE_ERROR = (
+    "Parse error: Unexpected token `AS`, expected Eof\n --> [1:20]\n  |\n1 | DEFINE TABLE OVERWRITE `order_stats` AS (SELECT "
+    "status\n  |                    ^^\n"
+)
+
+
+class _RefusingClient:
+    """A client whose ``query()`` records each statement and raises *error*."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.queries: list[str] = []
+
+    async def query(self, statement: str, variables: object) -> object:
+        self.queries.append(statement)
+        raise self.error
+
+
+class TestRefusalReason:
+    """D16 (spec §6.6): with ``redact=False`` — the view DDL's — a refusal reason that quotes the statement is kept
+    whole, since a view's query is trusted application code and its refusals name its source tables (M9); a parse
+    error's excerpt is still replaced by its position. The default keeps v0.31.0's redaction."""
+
+    def test_a_reason_naming_a_source_table_is_kept(self) -> None:
+        reason = utils._ddl_refusal_reason(_ARCHIVE_DDL, Exception(_ARCHIVE_MISSING), redact=False)
+        assert reason == (_ARCHIVE_MISSING, True)
+
+    def test_the_default_still_redacts(self) -> None:
+        left_out = ("the server's message quotes the statement, so it is left out", False)
+        assert utils._ddl_refusal_reason(_ARCHIVE_DDL, Exception(_ARCHIVE_MISSING)) == left_out
+        assert utils._ddl_refusal_reason(_ARCHIVE_DDL, Exception(_ARCHIVE_MISSING), redact=True) == left_out
+
+    @pytest.mark.parametrize("redact", [False, True])
+    def test_a_parse_error_keeps_only_the_position(self, redact: bool) -> None:
+        reason = utils._ddl_refusal_reason(_ARCHIVE_DDL, Exception(_ARCHIVE_PARSE_ERROR), redact=redact)
+        assert reason == ("Parse error: Unexpected token `AS`, expected Eof (at line 1, column 20 of the statement)", False)
+
+    async def test_apply_ddl_statements_keeps_the_reason(self) -> None:
+        error = InternalError("Internal", _ARCHIVE_MISSING)
+        client = _RefusingClient(error)
+        with pytest.raises(SurrealDbError) as raised:
+            await apply_ddl_statements(
+                [_ARCHIVE_DDL], client=client, what="view", classify=True, subjects=["'order_stats'"], redact=False
+            )
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == f"Can't apply view definition: 'order_stats' -> {_ARCHIVE_MISSING}"
+        assert raised.value.__cause__ is error
+        assert client.queries == [_ARCHIVE_DDL]
+
+    async def test_apply_ddl_statements_redacts_by_default(self) -> None:
+        error = InternalError("Internal", _ARCHIVE_MISSING)
+        with pytest.raises(SurrealDbError) as raised:
+            await apply_ddl_statements(
+                [_ARCHIVE_DDL], client=_RefusingClient(error), what="view", classify=True, subjects=["'order_stats'"]
+            )
+        assert str(raised.value) == (
+            "Can't apply view definition: 'order_stats' -> the server's message quotes the statement, so it is left out"
+        )
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is error
+
+    async def test_a_parse_error_is_not_chained(self) -> None:
+        error = InternalError("Internal", _ARCHIVE_PARSE_ERROR)
+        client = _RefusingClient(error)
+        with pytest.raises(SurrealDbError) as raised:
+            await apply_ddl_statements(
+                [_ARCHIVE_DDL], client=client, what="view", classify=True, subjects=["'order_stats'"], redact=False
+            )
+        assert str(raised.value) == (
+            "Can't apply view definition: 'order_stats' -> Parse error: Unexpected token `AS`, expected Eof (at line 1, "
+            "column 20 of the statement)"
+        )
+        assert "DEFINE TABLE" not in str(raised.value)
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is error
+
+    def test_the_keyword_defaults_to_true(self) -> None:
+        for function in (utils._ddl_refusal_reason, apply_ddl_statements):
+            parameter = inspect.signature(function).parameters["redact"]
+            assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+            assert parameter.default is True
 
 
 # === E2E (spec §9.2): the connection "mv" on the database mv_db, over WebSocket and HTTP, and mem:// ================
