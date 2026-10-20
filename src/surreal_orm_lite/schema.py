@@ -48,7 +48,9 @@ relation_out=…, enforced=…)``. ``check_relation_config()`` checks them when 
 ``TableType`` (``RELATION`` on an edge), the three relation keys on an edge model only — and ``relation_tables()`` reads
 ``relation_in``/``relation_out``: ``None``, ``""``, ``[]`` or ``()`` for any table, else table names given as one
 ``str`` (several separated by ``|``) or a ``list``/``tuple``, each stripped and an identifier, kept in order (a repeated
-name too, as SurrealDB stores it).
+name too, as SurrealDB stores it). ``relation_type_clause()`` writes those names as ``TYPE RELATION[ IN `a` | `b`][ OUT
+`c`][ ENFORCED]`` and ``relation_statement()`` the bare statement an edge model's ``relation_ddl()`` returns,
+``DEFINE TABLE {OVERWRITE | IF NOT EXISTS} `<table>` <clause>;`` — both pure, the names in backticks.
 
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
 it.
@@ -1319,3 +1321,32 @@ def check_relation_config(
     relation_tables(relation_out, model=name, key="relation_out")
     if enforced is not None and not isinstance(enforced, bool):
         raise TypeError(f"{name}: model_config['enforced'] must be a bool or None, got {type(enforced).__name__}.")
+
+
+def relation_type_clause(relation_in: Sequence[str], relation_out: Sequence[str], enforced: bool) -> str:
+    """``TYPE RELATION[ IN `a` | `b`][ OUT `c`][ ENFORCED]`` — the type clause of a relation table (v0.33.0).
+
+    *relation_in* and *relation_out* are names :func:`relation_tables` returned: each written in backticks, joined
+    with `` | `` in order (a repeated name written twice, as SurrealDB stores ``IN a | a``); an empty sequence writes no
+    ``IN`` (or ``OUT``) clause — any table. ``ENFORCED`` follows the ends: SurrealDB 2.x, 3.1 and the embedded engine
+    refuse it before them. ``enforced=False`` writes nothing. Pure.
+    """
+    clause = "TYPE RELATION"
+    if relation_in:
+        clause += " IN " + " | ".join(_identifier(name) for name in relation_in)
+    if relation_out:
+        clause += " OUT " + " | ".join(_identifier(name) for name in relation_out)
+    if enforced:
+        clause += " ENFORCED"
+    return clause
+
+
+def relation_statement(table: str, clause: str, overwrite: object) -> str:
+    """``DEFINE TABLE {OVERWRITE | IF NOT EXISTS} `<table>` <clause>;`` — a relation table's bare statement (v0.33.0).
+
+    *clause* is a text :func:`relation_type_clause` returned; *table* is checked as an identifier and written in
+    backticks. ``overwrite=True`` redefines an existing table (``OVERWRITE``, which resets the clauses the statement
+    does not write: schema mode, permissions, change feed, comment, ``DROP``), ``False`` keeps it (``IF NOT EXISTS``);
+    a non-``bool`` is a ``TypeError``. Pure.
+    """
+    return f"DEFINE TABLE {_overwrite_clause(overwrite)} {_identifier(_identifier_name(table, what='Table'))} {clause};"

@@ -13,15 +13,34 @@ The getters (spec §5.3; AC-1): ``get_table_type()`` on every model (``RELATION`
 value, else ``NORMAL``), ``get_relation_in()``, ``get_relation_out()`` and ``is_enforced()`` on an edge model, with
 the tuple shape of ``TableState.relation_in``/``relation_out``; a subclass inherits them, and ``None`` or an empty
 value resets one.
+
+``relation_ddl()`` (spec §5.4, §5.5 G1–G8, §6.1; AC-3): ``schema.relation_type_clause()`` and
+``schema.relation_statement()`` render ``DEFINE TABLE {OVERWRITE | IF NOT EXISTS} `<table>` TYPE RELATION[ IN …][ OUT
+…][ ENFORCED];`` — pure, no connection, E1 for a non-``bool`` ``overwrite``. ``TestRelationDdlE2E`` applies each golden
+on ``ws``, ``http`` and ``mem`` (spec §9.2: the connection ``"rel"`` on the database ``rel_db``, reset before each
+test) and reads it back with ``parse_define_table()``: the model's getters equal the stored ``TableState`` (M2, M16,
+M22).
 """
 
+import contextlib
+import inspect
+import os
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
 from surrealdb import RecordID
 
 import surreal_orm_lite
-from surreal_orm_lite import BaseSurrealEdge, BaseSurrealModel, SurrealConfigDict, TableType, schema
+from surreal_orm_lite import (
+    BaseSurrealEdge,
+    BaseSurrealModel,
+    SurrealConfigDict,
+    SurrealDBConnectionManager,
+    TableType,
+    schema,
+)
+from surreal_orm_lite.define_parser import parse_define_table
 
 # --- the exact texts of spec §5.8 ----------------------------------------------------------------------------------
 
@@ -623,3 +642,287 @@ class TestGetters:
 
         assert LikesLoose.is_enforced() is False
         assert Likes.is_enforced() is True
+
+
+# === relation_ddl() (spec §5.4, §5.5 G1–G8; AC-3) =================================================================
+
+
+class G1Likes(BaseSurrealEdge):
+    """G1: both ends and ``ENFORCED``."""
+
+    model_config = SurrealConfigDict(table_name="likes", relation_in="person", relation_out=["post", "book"], enforced=True)
+
+
+class G2Follows(BaseSurrealEdge):
+    """G2: no key — any table on both sides."""
+
+    model_config = SurrealConfigDict(table_name="follows")
+
+
+class G3Enforced(BaseSurrealEdge):
+    """G3: ``enforced=True`` only."""
+
+    model_config = SurrealConfigDict(table_name="e3", enforced=True)
+
+
+class G4Out(BaseSurrealEdge):
+    """G4: ``relation_out`` only."""
+
+    model_config = SurrealConfigDict(table_name="e4", relation_out="post")
+
+
+class G5Piped(BaseSurrealEdge):
+    """G5: two tables in one pipe-joined string."""
+
+    model_config = SurrealConfigDict(table_name="e5", relation_in="person | company")
+
+
+class G5Bare(BaseSurrealEdge):
+    """G5, written without spaces."""
+
+    model_config = SurrealConfigDict(table_name="e5", relation_in="person|company")
+
+
+class G5Tuple(BaseSurrealEdge):
+    """G5, as a tuple."""
+
+    model_config = SurrealConfigDict(table_name="e5", relation_in=("person", "company"))
+
+
+class G6Keywords(BaseSurrealEdge):
+    """G6: keyword names, the table's included."""
+
+    model_config = SurrealConfigDict(table_name="select", relation_in="order", relation_out="select")
+
+
+class G7Loose(BaseSurrealEdge):
+    """G7: ``enforced=False`` writes nothing."""
+
+    model_config = SurrealConfigDict(table_name="e7", enforced=False)
+
+
+class G7EmptyStr(BaseSurrealEdge):
+    """G7: an empty string means any table (P1 a)."""
+
+    model_config = SurrealConfigDict(table_name="e7", relation_in="")
+
+
+class G7EmptyList(BaseSurrealEdge):
+    """G7: an empty list means any table (P1 a)."""
+
+    model_config = SurrealConfigDict(table_name="e7", relation_in=[])
+
+
+class G7EmptyTuple(BaseSurrealEdge):
+    """G7: an empty tuple means any table (P1 a)."""
+
+    model_config = SurrealConfigDict(table_name="e7", relation_out=())
+
+
+class G8Twice(BaseSurrealEdge):
+    """G8: a repeated name is kept, in order (P1 b, M22)."""
+
+    model_config = SurrealConfigDict(table_name="e8", relation_in=["a", "a"])
+
+
+_G1 = "DEFINE TABLE OVERWRITE `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;"
+_G1_KEEP = "DEFINE TABLE IF NOT EXISTS `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;"
+_G5 = "DEFINE TABLE OVERWRITE `e5` TYPE RELATION IN `person` | `company`;"
+_G7 = "DEFINE TABLE OVERWRITE `e7` TYPE RELATION;"
+
+#: (model, overwrite, the exact statement of spec §5.5).
+_GOLDENS: list[tuple[type[BaseSurrealEdge], bool, str]] = [
+    (G1Likes, True, _G1),
+    (G1Likes, False, _G1_KEEP),
+    (G2Follows, True, "DEFINE TABLE OVERWRITE `follows` TYPE RELATION;"),
+    (G3Enforced, True, "DEFINE TABLE OVERWRITE `e3` TYPE RELATION ENFORCED;"),
+    (G4Out, True, "DEFINE TABLE OVERWRITE `e4` TYPE RELATION OUT `post`;"),
+    (G5Piped, True, _G5),
+    (G5Bare, True, _G5),
+    (G5Tuple, True, _G5),
+    (G6Keywords, True, "DEFINE TABLE OVERWRITE `select` TYPE RELATION IN `order` OUT `select`;"),
+    (G7Loose, True, _G7),
+    (G7EmptyStr, True, _G7),
+    (G7EmptyList, True, _G7),
+    (G7EmptyTuple, True, _G7),
+    (G8Twice, True, "DEFINE TABLE OVERWRITE `e8` TYPE RELATION IN `a` | `a`;"),
+]
+
+_GOLDEN_IDS = [f"{model.__name__}-{'overwrite' if overwrite else 'if-not-exists'}" for model, overwrite, _ in _GOLDENS]
+
+#: (relation_in, relation_out, enforced, the type clause) — the ends of each G-case.
+_CLAUSES: list[tuple[tuple[str, ...], tuple[str, ...], bool, str]] = [
+    (("person",), ("post", "book"), True, "TYPE RELATION IN `person` OUT `post` | `book` ENFORCED"),
+    ((), (), False, "TYPE RELATION"),
+    ((), (), True, "TYPE RELATION ENFORCED"),
+    ((), ("post",), False, "TYPE RELATION OUT `post`"),
+    (("person", "company"), (), False, "TYPE RELATION IN `person` | `company`"),
+    (("order",), ("select",), False, "TYPE RELATION IN `order` OUT `select`"),
+    (("a", "a"), (), False, "TYPE RELATION IN `a` | `a`"),
+]
+
+
+class TestRelationDdl:
+    """AC-3: ``relation_ddl()`` renders G1–G8 exactly — pure, the same text every time, no connection needed; E1 for a
+    non-``bool`` ``overwrite``."""
+
+    @pytest.mark.parametrize(("relation_in", "relation_out", "enforced", "clause"), _CLAUSES, ids=repr)
+    def test_relation_type_clause(
+        self, relation_in: tuple[str, ...], relation_out: tuple[str, ...], enforced: bool, clause: str
+    ) -> None:
+        assert schema.relation_type_clause(relation_in, relation_out, enforced) == clause
+        assert schema.relation_type_clause(list(relation_in), list(relation_out), enforced) == clause
+
+    @pytest.mark.parametrize(
+        ("overwrite", "statement"),
+        [
+            (True, "DEFINE TABLE OVERWRITE `likes` TYPE RELATION ENFORCED;"),
+            (False, "DEFINE TABLE IF NOT EXISTS `likes` TYPE RELATION ENFORCED;"),
+        ],
+    )
+    def test_relation_statement(self, overwrite: bool, statement: str) -> None:
+        assert schema.relation_statement("likes", "TYPE RELATION ENFORCED", overwrite) == statement
+
+    @pytest.mark.parametrize(("table", "error"), [("a-b", ValueError), ("1a", ValueError), (3, TypeError)], ids=repr)
+    def test_relation_statement_checks_the_table_name(self, table: Any, error: type[Exception]) -> None:
+        with pytest.raises(error):
+            schema.relation_statement(table, "TYPE RELATION", True)
+
+    @pytest.mark.parametrize(("model", "overwrite", "statement"), _GOLDENS, ids=_GOLDEN_IDS)
+    def test_golden_statements(self, model: type[BaseSurrealEdge], overwrite: bool, statement: str) -> None:
+        assert model.relation_ddl(overwrite=overwrite) == statement
+
+    def test_overwrite_by_default(self) -> None:
+        assert G1Likes.relation_ddl() == G1Likes.relation_ddl(overwrite=True) == _G1
+
+    def test_deterministic(self) -> None:
+        assert [G1Likes.relation_ddl() for _ in range(3)] == [_G1] * 3
+
+    def test_signature(self) -> None:
+        signature = inspect.signature(BaseSurrealEdge.relation_ddl)
+        assert list(signature.parameters) == ["overwrite"]
+        parameter = signature.parameters["overwrite"]
+        assert (parameter.kind, parameter.default) == (inspect.Parameter.KEYWORD_ONLY, True)
+        assert signature.return_annotation is str
+        assert isinstance(inspect.getattr_static(BaseSurrealEdge, "relation_ddl"), classmethod)
+        assert not hasattr(BaseSurrealModel, "relation_ddl")
+
+    def test_a_subclass_renders_its_own_table(self) -> None:
+        class Loves(G1Likes):
+            model_config = SurrealConfigDict(table_name="loves")
+
+        assert Loves.relation_ddl() == "DEFINE TABLE OVERWRITE `loves` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;"
+        assert G1Likes.relation_ddl() == _G1
+
+    @pytest.mark.parametrize(("overwrite", "type_name"), [("yes", "str"), (1, "int"), (None, "NoneType")], ids=repr)
+    def test_e1_overwrite_must_be_a_bool(self, overwrite: Any, type_name: str) -> None:
+        with pytest.raises(TypeError) as raised:
+            G1Likes.relation_ddl(overwrite=overwrite)
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == f"overwrite= must be a bool, got {type_name}."
+
+    async def test_works_with_no_connection_configured(self) -> None:
+        await SurrealDBConnectionManager.unset_connection()
+        assert SurrealDBConnectionManager.is_connection_set() is False
+        assert G1Likes.relation_ddl() == _G1
+        assert G8Twice.relation_ddl(overwrite=False) == "DEFINE TABLE IF NOT EXISTS `e8` TYPE RELATION IN `a` | `a`;"
+
+
+# === E2E (spec §9.2): the connection "rel" on the database rel_db, over WebSocket and HTTP, and mem:// ===========
+
+#: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
+_KINDS = ["ws", "http", "mem"]
+
+#: The reset of spec §9.2, in one query.
+_REL_RESET = "REMOVE DATABASE IF EXISTS rel_db; DEFINE DATABASE rel_db;"
+
+
+def _url(kind: str) -> str:
+    """The URL of *kind*: ``ws`` or ``http`` on the line under test (``SURREALDB_PORT``), or ``mem``."""
+    if kind == "mem":
+        return "mem://"
+    host = os.environ.get("SURREALDB_HOST", "localhost")
+    port = os.environ.get("SURREALDB_PORT", "8000")
+    return f"ws://{host}:{port}/rpc" if kind == "ws" else f"http://{host}:{port}"
+
+
+def _register_rel(kind: str, name: str = "rel") -> None:
+    if kind == "mem":
+        SurrealDBConnectionManager.add_connection(name, url="mem://", namespace="ns", database="rel_db")
+    else:
+        SurrealDBConnectionManager.add_connection(
+            name, url=_url(kind), user="root", password="root", namespace="ns", database="rel_db"
+        )
+
+
+async def _apply_ddl(client: Any, ddl: str) -> None:
+    """Run *ddl* and check every statement: ``query()`` checks only the first one."""
+    response = await client.query_raw(ddl, {})
+    assert "error" not in response, response["error"]
+    refused = [result for result in response["result"] if result["status"] != "OK"]
+    assert response["result"] and not refused, refused
+
+
+@contextlib.asynccontextmanager
+async def _rel(kind: str) -> AsyncIterator[Any]:
+    """The connection ``"rel"`` on *kind*, its database ``rel_db`` reset in one query; removed, then unregistered, on
+    exit (spec §9.2)."""
+    _register_rel(kind)
+    client = await SurrealDBConnectionManager.get_client("rel")
+    await _apply_ddl(client, _REL_RESET)
+    try:
+        yield client
+    finally:
+        with contextlib.suppress(Exception):
+            cleanup = await SurrealDBConnectionManager.get_client("rel")
+            await cleanup.query("REMOVE DATABASE IF EXISTS rel_db;", {})
+        await SurrealDBConnectionManager.remove_connection("rel")
+
+
+async def _tables(client: Any) -> dict[str, Any]:
+    """The ``tables`` of ``INFO FOR DB`` on *client*'s database."""
+    return dict((await client.query("INFO FOR DB;", {}))["tables"])
+
+
+class TestRelationDdlE2E:
+    """AC-3 (E2E): each golden applied raw on every engine of both lines is accepted and read back by
+    ``parse_define_table()`` as a relation table whose ends and ``ENFORCED`` equal the model's getters (M1, M2, M16),
+    the keyword names of G6 and the repeated name of G8 included (M22)."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize(("model", "overwrite", "statement"), _GOLDENS, ids=_GOLDEN_IDS)
+    async def test_each_golden_is_applied_and_read_back(
+        self, kind: str, model: type[BaseSurrealEdge], overwrite: bool, statement: str
+    ) -> None:
+        async with _rel(kind) as client:
+            ddl = model.relation_ddl(overwrite=overwrite)
+            assert ddl == statement
+            await _apply_ddl(client, ddl)
+            table = model.get_table_name()
+            state = parse_define_table((await _tables(client))[table])
+            assert state.name == table
+            assert state.table_type == "relation"
+            assert state.relation_in == model.get_relation_in()
+            assert state.relation_out == model.get_relation_out()
+            assert state.enforced is model.is_enforced()
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_g8_keeps_the_repeated_name(self, kind: str) -> None:
+        """M22: ``IN `a` | `a``` is stored and read back with the name twice, as ``get_relation_in()`` returns it."""
+        async with _rel(kind) as client:
+            await _apply_ddl(client, G8Twice.relation_ddl())
+            state = parse_define_table((await _tables(client))["e8"])
+            assert state.relation_in == ("a", "a") == G8Twice.get_relation_in()
+            assert state.relation_out == ()
+            assert state.enforced is False
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_reapplying_a_golden_changes_nothing(self, kind: str) -> None:
+        """The statement is the same text every time; applied twice (``OVERWRITE``, then ``IF NOT EXISTS``), the table
+        reads back the same definition."""
+        async with _rel(kind) as client:
+            await _apply_ddl(client, G1Likes.relation_ddl())
+            first = (await _tables(client))["likes"]
+            await _apply_ddl(client, G1Likes.relation_ddl())
+            await _apply_ddl(client, G1Likes.relation_ddl(overwrite=False))
+            assert (await _tables(client))["likes"] == first

@@ -27,7 +27,7 @@ from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import SurrealFunc
 from .model_base import BaseSurrealModel, _own_annotation_names
-from .schema import relation_tables
+from .schema import relation_statement, relation_tables, relation_type_clause
 from .transaction import Transaction
 from .utils import coerce_endpoint
 
@@ -192,7 +192,8 @@ class BaseSurrealEdge(BaseSurrealModel):
 
     They are checked at the ``class`` statement and read back by :meth:`get_relation_in`,
     :meth:`get_relation_out` and :meth:`is_enforced`; ``table_type=TableType.RELATION`` may be
-    written, and any other ``table_type`` is refused on an edge.
+    written, and any other ``table_type`` is refused on an edge. :meth:`relation_ddl` renders the
+    table's ``DEFINE TABLE … TYPE RELATION`` statement.
     """
 
     __surreal_edge__: ClassVar[bool] = True
@@ -251,6 +252,37 @@ class BaseSurrealEdge(BaseSurrealModel):
         ``False`` when ``enforced`` is left out, ``None`` or ``False``.
         """
         return cls.model_config.get("enforced") is True
+
+    @classmethod
+    def relation_ddl(cls, *, overwrite: bool = True) -> str:
+        """Render the ``DEFINE TABLE … TYPE RELATION`` statement of this edge model's table (v0.33.0).
+
+        Pure: builds the SurrealQL without touching the database (no connection needed), the same text every time,
+        so it can be printed, diffed or fed into a migration::
+
+            DEFINE TABLE {OVERWRITE | IF NOT EXISTS} `<table>` TYPE RELATION[ IN `a` | `b`][ OUT `c`][ ENFORCED];
+
+        The table of :meth:`get_table_name` and the names of :meth:`get_relation_in` and :meth:`get_relation_out`
+        are written in backticks, several joined with ``|`` in declared order; ``IN`` (or ``OUT``) is left out for
+        any table, and ``ENFORCED`` when :meth:`is_enforced` is false. A model without keys renders
+        ``TYPE RELATION`` alone: a relation table whose edges may come from and point to any table.
+
+        Applied by hand, ``OVERWRITE`` resets the table's other clauses — schema mode, permissions, change feed,
+        comment, ``DROP`` — to SurrealDB's defaults: ``define_relation()`` keeps them.
+
+        Args:
+            overwrite: ``True`` (default) emits ``DEFINE TABLE OVERWRITE …``, which redefines an existing table.
+                ``False`` emits ``DEFINE TABLE IF NOT EXISTS …``, which leaves an existing table as it is.
+
+        Raises:
+            TypeError: *overwrite* is not a ``bool``.
+
+        Example:
+            >>> Likes.relation_ddl()
+            'DEFINE TABLE OVERWRITE `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;'
+        """
+        clause = relation_type_clause(cls.get_relation_in(), cls.get_relation_out(), cls.is_enforced())
+        return relation_statement(cls.get_table_name(), clause, overwrite)
 
     @classmethod
     def _implicit_aliases(cls) -> dict[str, str]:
