@@ -1458,6 +1458,23 @@ class TestReadHookEmbeddedE2E:
             assert (await EmbReadAny.objects().get("one")).v == expected
             assert (await EmbReadAny.objects().exec())[0].v == expected
 
+    @pytest.mark.parametrize(
+        ("literal", "expected"),
+        [
+            ("d'0000-06-01T00:00:00Z'", "0000-06-01T00:00:00Z"),
+            ("d'9999-12-31T23:59:59Z' + 1s + 500ms", "+10000-01-01T00:00:00.500Z"),
+        ],
+        ids=["year-0", "year-10000"],
+    )
+    async def test_out_of_range_datetime_reads_as_its_text(self, literal: str, expected: str) -> None:
+        """#279: a datetime outside years 1-9999 reads as the server's RFC 3339 text, and the client keeps working."""
+        _require_read_hook()
+        async with embedded() as client:
+            await client.query(f"CREATE emb_read:one SET v = {literal} RETURN NONE;", {})
+            assert (await EmbReadAny.objects().get("one")).v == expected
+            assert await client.query(f"RETURN <string> ({literal});", {}) == expected
+            assert await client.query("RETURN 1;", {}) == 1
+
 
 class TestTransactionsEmbeddedE2E:
     """AC-7, no server: the buffered strategy, as on 2.x; a conflicting pair ends committed (P4, spec M33)."""

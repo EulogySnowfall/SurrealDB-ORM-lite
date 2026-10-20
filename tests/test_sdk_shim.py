@@ -306,6 +306,9 @@ def test_sdk_shim_read_hook_exports() -> None:
 
     assert _sdk.cbor_tag_decoder is surrealdb.data.cbor.tag_decoder
     assert "cbor_tag_decoder" in _sdk.__all__
+    # #279: the compact datetime tag, read when its value is outside years 1-9999.
+    assert _sdk.TAG_DATETIME_COMPACT == surrealdb.TAG_DATETIME_COMPACT == 12
+    assert "TAG_DATETIME_COMPACT" in _sdk.__all__
     for alias, name in _SDK_CONNECTION_CLASSES.items():
         assert getattr(_sdk, alias) is getattr(surrealdb, name), alias
         assert alias in _sdk.__all__, alias

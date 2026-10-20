@@ -30,12 +30,16 @@ then that module.
 
 v0.27.0 adds ``ThrownError`` (a top-level export of SDK 2.0.0): SurrealDB 3.1 reports a table that does not
 exist, read by a ``LET`` inside a block, as a ``ThrownError`` instead of a ``NotFoundError``.
+
+#279 adds ``TAG_DATETIME_COMPACT`` (a top-level export of SDK 2.0.0, like ``TAG_DURATION_COMPACT``): the read
+hook reads a datetime outside years 1-9999, which the SDK's ``tag_decoder`` refuses.
 """
 
 import importlib
 from typing import TYPE_CHECKING, Any, Final
 
 from surrealdb import (  # noqa: F401
+    TAG_DATETIME_COMPACT,
     TAG_DECIMAL_STRING,
     TAG_DURATION_COMPACT,
     AlreadyExistsError,
@@ -157,8 +161,9 @@ __all__ = [
     "cbor_encode",
     "cbor_decode",
     "SdkInvalidDurationError",
-    # Read hook (#235)
+    # Read hook (#235); a datetime outside years 1-9999 (#279)
     "cbor_tag_decoder",
+    "TAG_DATETIME_COMPACT",
     "SdkAsyncWsConnection",
     "SdkAsyncHttpConnection",
     "SdkAsyncEmbeddedConnection",
