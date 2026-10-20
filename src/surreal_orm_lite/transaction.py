@@ -35,7 +35,7 @@ interactive transaction's cancellation error names only that statement's error t
 import contextlib
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, NoReturn
 
 from . import _sdk
@@ -55,6 +55,11 @@ _CANCELLED_AFTER_FAILURE = "The transaction was cancelled: a statement in it fai
 #: Where a server's error starts quoting the query it refused (issue #278): a parse error's `` --> [line:column]``, on
 #: a line of its own, followed by an excerpt of the query.
 _QUERY_EXCERPT = re.compile(r"\n\s*--> \[(\d+):(\d+)\]")
+
+#: Maps a position of a buffered batch's query (line, column) to the queued statement it falls in (issue #278):
+#: ``(number, count, line, column)``, the line and column in the text the caller queued; ``None`` outside every
+#: statement (:meth:`BufferedTransaction._locate`).
+_Locate = Callable[[int, int], tuple[int, int, int, int] | None]
 
 
 def _is_pure_filler(result: Any) -> bool:
@@ -96,15 +101,14 @@ def _server_reason(message: str) -> tuple[str, tuple[int, int] | None]:
     return message.partition("\n")[0].rstrip(), (int(excerpt[1]), int(excerpt[2]))
 
 
-def _refusal(message: str, statement_spans: Sequence[tuple[int, int]] = ()) -> SurrealDbError:
+def _refusal(message: str, locate: _Locate | None = None) -> SurrealDbError:
     """The ORM's error for a query the server refused as a whole with *message* (issue #278).
 
     ``Transaction failed: the server refused <what>: <reason> (at line <l>, column <c> of <where>)``: the reason is
-    :func:`_server_reason`'s, never the query's text. With *statement_spans* (a buffered batch: the first and last
-    line of each queued statement in the query), the position names the queued statement, ``statement 2 of 3``, and
-    the line within it; without them, the position is the statement's (an interactive transaction runs one at a
-    time). ``SurrealDbConflictError`` when the reason reports a retryable conflict: the excerpt, which may quote
-    conflict words, is not read.
+    :func:`_server_reason`'s, never the query's text. With *locate* (a buffered batch), the position names the queued
+    statement, ``statement 2 of 3``, with the line and column in the text the caller queued; without it, the position
+    is the statement's (an interactive transaction runs one at a time). ``SurrealDbConflictError`` when the reason
+    reports a retryable conflict: the excerpt, which may quote conflict words, is not read.
     """
     reason, position = _server_reason(message)
     error_type = _error_type(reason)
@@ -112,12 +116,13 @@ def _refusal(message: str, statement_spans: Sequence[tuple[int, int]] = ()) -> S
         return error_type(f"Transaction failed: the server refused the query: {reason}")
     line, column = position
     what, where = "the statement", "the statement"
-    if statement_spans:
-        what, where = "the query", "the query"
-        for number, (first, last) in enumerate(statement_spans, 1):
-            if first <= line <= last:
-                what, where, line = f"statement {number} of {len(statement_spans)}", "the statement", line - first + 1
-                break
+    if locate is not None:
+        found = locate(line, column)
+        if found is None:
+            what, where = "the query", "the query"
+        else:
+            number, count, line, column = found
+            what = f"statement {number} of {count}"
     at = f"at line {line}, column {column} of {where}"
     return error_type(f"Transaction failed: the server refused {what}: {reason} ({at})")
 
@@ -134,17 +139,14 @@ def _raise_hiding(error: SurrealDbError, server_text: str) -> NoReturn:
         raise error from None
 
 
-def _raise_for_status(raw: Any, statement_spans: Sequence[tuple[int, int]] = ()) -> None:
-    """:meth:`Transaction.raise_for_status`, with *statement_spans* for a buffered batch (issue #278).
-
-    *statement_spans*: the first and last line of each queued statement in the query, so that a position names the
-    statement (``statement 2 of 3``).
-    """
+def _raise_for_status(raw: Any, locate: _Locate | None = None) -> None:
+    """:meth:`Transaction.raise_for_status`, with *locate* for a buffered batch (issue #278): a position then names
+    the queued statement (``statement 2 of 3``)."""
     if not isinstance(raw, dict) or not isinstance(raw.get("result"), list):
         envelope = raw.get("error") if isinstance(raw, dict) else None
         message = envelope.get("message") if isinstance(envelope, dict) else None
         if isinstance(message, str) and message:
-            _raise_hiding(_refusal(message, statement_spans), message)
+            _raise_hiding(_refusal(message, locate), message)
         _raise_hiding(
             SurrealDbError(f"Transaction failed: unrecognized query_raw() response shape ({type(raw).__name__})"),
             repr(raw),
@@ -314,6 +316,9 @@ class BufferedTransaction(Transaction):
         self.statements: list[str] = []
         self.variables: dict[str, Any] = {}
         self._counter: int = 0
+        # Issue #278: per queued statement, the length of its prefix and where add() inserted it (offsets in the
+        # caller's text), so that a position the server gives is moved back to the caller's column.
+        self._renamed_at: list[tuple[int, list[int]]] = []
 
     @property
     def is_interactive(self) -> bool:
@@ -329,19 +334,27 @@ class BufferedTransaction(Transaction):
         Each ``$name`` of ``variables`` becomes ``$t<N>_name``, in a single pass over the statement (#261): a name is
         matched whole, so one that is a prefix of another is not corrupted, a renamed name is never renamed again, and
         a parameter that is not one of ``variables`` (``$this``, ``$value``…) is left alone. Returns None: nothing
-        executes until commit, so buffered writes cannot return rows.
+        executes until commit, so buffered writes cannot return rows. Where each prefix goes is noted, so that a
+        position the server reports at commit is given in the caller's text (issue #278).
         """
         variables = _encoding.encode(variables)
         prefix = f"t{self._counter}_"
         renamed = statement
+        inserted: list[int] = []
         if variables:
-            renamed = _PARAMETER.sub(
-                lambda match: f"${prefix}{match[1]}" if match[1] in variables else match[0],
-                statement,
-            )
+            names = set(variables)
+
+            def rename(match: re.Match[str]) -> str:
+                if match[1] not in names:
+                    return match[0]
+                inserted.append(match.start() + 1)  # right after the "$"
+                return f"${prefix}{match[1]}"
+
+            renamed = _PARAMETER.sub(rename, statement)
             for name, value in variables.items():
                 self.variables[f"{prefix}{name}"] = value
         self.statements.append(renamed)
+        self._renamed_at.append((len(prefix), inserted))
         self._counter += 1
         return None
 
@@ -359,18 +372,41 @@ class BufferedTransaction(Transaction):
         body = "\n".join(self.statements)
         return f"BEGIN TRANSACTION;\n{body}\nCOMMIT TRANSACTION;"
 
-    def _statement_spans(self) -> list[tuple[int, int]]:
-        """The first and last line of each queued statement in :meth:`build_query`'s query (issue #278).
+    def _locate(self, line: int, column: int) -> tuple[int, int, int, int] | None:
+        """The queued statement that *line* of :meth:`build_query`'s query falls in, and the position in the caller's
+        text: ``(number, count, line, column)``; ``None`` outside every statement (issue #278).
 
         Line 1 is ``BEGIN TRANSACTION;``; each statement starts on the line after the previous one ends.
         """
-        spans: list[tuple[int, int]] = []
         first = 2
-        for statement in self.statements:
+        for index, statement in enumerate(self.statements):
             last = first + statement.count("\n")
-            spans.append((first, last))
+            if first <= line <= last:
+                own_line = line - first + 1
+                return index + 1, len(self.statements), own_line, self._caller_column(index, own_line, column)
             first = last + 1
-        return spans
+        return None
+
+    def _caller_column(self, index: int, line: int, column: int) -> int:
+        """*column* of *line* of the queued statement *index*, moved back over the prefixes :meth:`add` inserted
+        before it on that line. SurrealDB counts columns in characters, as Python does; a column inside a prefix
+        becomes the name's first character. Unchanged when ``statements`` no longer matches what :meth:`add` noted.
+        """
+        if len(self._renamed_at) != len(self.statements):
+            return column
+        size, inserted = self._renamed_at[index]
+        line_start = sum(len(text) + 1 for text in self.statements[index].split("\n")[: line - 1])
+        offset = line_start + column - 1
+        on_earlier_lines = before = 0
+        for earlier, original in enumerate(inserted):
+            start = original + earlier * size  # where this prefix starts in the queued text
+            if start + size <= line_start:
+                on_earlier_lines += 1
+            if start + size <= offset:
+                before += 1
+            elif start <= offset:
+                return start - line_start + 1 - (before - on_earlier_lines) * size
+        return column - (before - on_earlier_lines) * size
 
     async def commit(self) -> None:
         # The tables noted are in flight during the commit and invalidated when it returns
@@ -390,8 +426,8 @@ class BufferedTransaction(Transaction):
                     embedded = _sdk.SdkAsyncEmbeddedConnection
                     if embedded is None or not isinstance(self._client, embedded):
                         raise
-                    raise _refusal(str(exc), self._statement_spans()) from None
-                _raise_for_status(raw, self._statement_spans())
+                    raise _refusal(str(exc), self._locate) from None
+                _raise_for_status(raw, self._locate)
         finally:
             self._forget_cache_writes()
 
@@ -401,6 +437,7 @@ class BufferedTransaction(Transaction):
         self._forget_cache_writes()
         self.statements = []
         self.variables = {}
+        self._renamed_at = []
 
 
 class InteractiveTransaction(Transaction):

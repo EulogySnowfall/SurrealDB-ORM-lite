@@ -20,7 +20,6 @@ from surreal_orm_lite.transaction import (
     BufferedTransaction,
     InteractiveTransaction,
     Transaction,
-    _raise_for_status,
 )
 from tests._readme_tables import assert_server_header_sentence
 
@@ -1485,22 +1484,6 @@ class TestRaiseForStatusStatementTextUnits:
         assert info.value.__suppress_context__
         assert str(info.value.__context__) == message  # the server's error stays reachable
 
-    @pytest.mark.parametrize(
-        ("position", "spans", "expected"),
-        [
-            ("3:7", [(2, 2), (3, 3)], "statement 2 of 2: Parse error: {reason} (at line 1, column 7 of the statement)"),
-            ("5:9", [(2, 3), (4, 6)], "statement 2 of 2: Parse error: {reason} (at line 2, column 9 of the statement)"),
-            ("1:3", [(2, 2)], "the query: Parse error: {reason} (at line 1, column 3 of the query)"),
-        ],
-        ids=["one-line-statements", "multi-line-statements", "outside-the-statements"],
-    )
-    def test_a_buffered_batch_names_the_statement(self, position: str, spans: list[tuple[int, int]], expected: str) -> None:
-        raw = {"error": {"code": -32000, "message": _parse_error(position, f"3 | {_UNPARSABLE}")}}
-        with pytest.raises(SurrealDbError) as info:
-            _raise_for_status(raw, spans)
-        reason = "Unexpected token `a strand`, expected Eof"
-        assert str(info.value) == "Transaction failed: the server refused " + expected.format(reason=reason)
-
     def test_an_error_envelope_without_a_position(self) -> None:
         with pytest.raises(SurrealDbError) as info:
             Transaction.raise_for_status({"error": {"code": -32000, "message": "There was a problem with authentication"}})
@@ -1553,6 +1536,71 @@ class TestRaiseForStatusStatementTextUnits:
             Transaction.raise_for_status(raw)
         assert str(info.value) == "Transaction failed and rolled back: Database record `probe:c` already exists"
         assert info.value.__context__ is None
+
+
+class _EnvelopeClient:
+    """A client whose ``query_raw()`` answers with an error envelope carrying *message*, as a server does for a query
+    it refuses as a whole."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+
+    async def query_raw(self, sql: str, params: Any = None) -> dict[str, Any]:
+        return {"error": {"code": -32000, "message": self.message}}
+
+
+#: The reason ``_parse_error()`` gives.
+_REASON = "Parse error: Unexpected token `a strand`, expected Eof"
+
+
+class TestBufferedPositionUnits:
+    """A buffered commit names the queued statement a position falls in, and gives the line and column in the text
+    the caller queued: the ORM's ``$name`` → ``$t<N>_name`` renaming does not shift the column."""
+
+    @staticmethod
+    async def _commit_error(queued: list[tuple[str, dict[str, Any] | None]], message: str) -> str:
+        tx = BufferedTransaction(_EnvelopeClient(message))
+        for statement, variables in queued:
+            await tx.add(statement, variables)
+        with pytest.raises(SurrealDbError) as info:
+            await tx.commit()
+        return str(info.value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("queued", "position", "expected"),
+        [
+            ([("CREATE a:1;", None), ("SELEC 'x' FRM t;", None)], "3:7", "statement 2 of 2: {r} (at line 1, column 7"),
+            (
+                [("CREATE a:1\nSET b = 1;", None), ("RETURN 1;\nSELEC 'x';\nRETURN 2;", None)],
+                "5:9",
+                "statement 2 of 2: {r} (at line 2, column 9",
+            ),
+            ([("CREATE t SET a = $v, b = 'x' c;", {"v": 1})], "2:33", "statement 1 of 1: {r} (at line 1, column 30"),
+            (
+                [("RETURN 0;", None), ("CREATE t SET a = $v,\n  b = $w + $v x;", {"v": 1, "w": 2})],
+                "4:21",
+                "statement 2 of 2: {r} (at line 2, column 15",
+            ),
+            ([("CREATE t SET a = $v, b = 'x' c;", {"v": 1})], "2:20", "statement 1 of 1: {r} (at line 1, column 19"),
+            ([("CREATE t SET a = $v, b = 'x' c;", {"other": 1})], "2:30", "statement 1 of 1: {r} (at line 1, column 30"),
+            ([("RETURN (1 +", None)], "3:8", "the query: {r} (at line 3, column 8 of the query)"),
+        ],
+        ids=[
+            "one-line-statements",
+            "multi-line-statements",
+            "a-renamed-parameter-before-the-column",
+            "renamed-parameters-on-earlier-lines-and-after-the-column",
+            "inside-a-renamed-parameter",
+            "a-parameter-not-renamed",
+            "outside-every-statement",
+        ],
+    )
+    async def test_the_position_names_the_statement_as_queued(
+        self, queued: list[tuple[str, dict[str, Any] | None]], position: str, expected: str
+    ) -> None:
+        message = await self._commit_error(queued, _parse_error(position, "…"))
+        assert message.startswith("Transaction failed: the server refused " + expected.format(r=_REASON)), message
 
 
 class _RaisingClient:
@@ -1627,6 +1675,20 @@ class TestBufferedCommitErrorTextE2E:
             assert info.value.__cause__ is None
             assert _LITERAL in str(info.value.__context__)  # the server's error stays reachable
             assert await _stored_ages(client) == {}
+
+    @pytest.mark.asyncio
+    async def test_the_column_is_the_one_in_the_queued_text(self, transport: str) -> None:
+        """The ORM renames ``$v`` to ``$t1_v`` before sending: the column given is still the caller's."""
+        statement = "CREATE tx_fail_row SET age = $v, note = 'x' oops;"
+        async with _tx_fail_db(transport):
+            if transport == "ws" and await _native_txn_supported():
+                pytest.skip("WebSocket on SurrealDB 3.x runs interactive transactions")
+            with pytest.raises(SurrealDbError) as info:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    await tx.add(statement, {"v": 2})
+            column = statement.index("oops") + 1
+            assert str(info.value).endswith(f"(at line 1, column {column} of the statement)"), str(info.value)
 
     @pytest.mark.asyncio
     async def test_a_parse_error_quoting_conflict_words_is_not_a_conflict(self, transport: str) -> None:
