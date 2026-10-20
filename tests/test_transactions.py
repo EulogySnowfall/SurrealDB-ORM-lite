@@ -373,11 +373,14 @@ def _connect() -> None:
 
 
 async def _clear(client) -> None:
-    """Delete all TxUser rows, tolerating a never-created table.
+    """Empty TxUser, defining it first when it does not exist.
 
-    On SurrealDB 3.x, DELETE on a table that does not exist yet raises NotFoundError;
-    suppress it so test setup is idempotent across server versions.
+    On SurrealDB 3.x, reading a table that does not exist raises NotFoundError: a test that reads TxUser after a
+    rolled-back transaction must not depend on an earlier test having created it. DELETE on such a table raises too,
+    hence the suppression.
     """
+    with contextlib.suppress(Exception):
+        await client.query("DEFINE TABLE IF NOT EXISTS TxUser;", {})
     with contextlib.suppress(Exception):
         await client.query("DELETE TxUser;", {})
 
@@ -1286,6 +1289,14 @@ class TestFailedStatementReadme:
         )
 
 
+class TxNeverWritten(BaseSurrealModel):
+    """A table no test writes: reading a missing table without removing one that other tests use."""
+
+    model_config = SurrealConfigDict(table_name="tx_never_written", primary_key="id")
+    id: str | None = None
+    name: str
+
+
 class TxFailRow(BaseSurrealModel):
     model_config = SurrealConfigDict(table_name="tx_fail_row", primary_key="id")
     id: str | None = None
@@ -1430,22 +1441,21 @@ class TestInteractiveFailedStatementE2E:
         async with _tx_fail_db("ws") as client:
             if not await _native_txn_supported():
                 pytest.skip("requires SurrealDB 3.x")
-            await _clear(client)
             with contextlib.suppress(Exception):
-                await client.query("REMOVE TABLE TxUser;", {})
+                await client.query("REMOVE TABLE tx_never_written;", {})
             async with SurrealDBConnectionManager.transaction() as tx:
-                assert await TxUser.objects(tx=tx).filter(name="x").exec() == []
-                assert await TxUser.objects(tx=tx).all() == []
-                assert await TxUser.objects(tx=tx).count() == 0
+                assert await TxNeverWritten.objects(tx=tx).filter(name="x").exec() == []
+                assert await TxNeverWritten.objects(tx=tx).all() == []
+                assert await TxNeverWritten.objects(tx=tx).count() == 0
                 with pytest.raises(SurrealDbNotFoundError):
-                    await TxUser.objects(tx=tx).get("nobody")
+                    await TxNeverWritten.objects(tx=tx).get("nobody")
                 await TxFailRow(id="ok", age=1).save(tx=tx)
             assert await _stored_ages(client) == {"ok": 1}
 
 
 # =============================================================================
 # Issue #278: the errors the ORM raises when a transaction fails give the server's reason and the failed statement's
-# position, never the statement's text; the embedded engine's commit error is a SurrealDbError too.
+# position, without the server's excerpt of the statement; the embedded engine's commit error is a SurrealDbError too.
 # =============================================================================
 
 #: A literal the tests below put in a statement the server cannot parse: no error the ORM raises may show it.
