@@ -28,7 +28,8 @@ never user input. ``view_query_outline()`` and ``view_query_hazards()`` read a g
 SurrealDB 2.x computes once per source record instead of keeping it up to date; that reading is a reading of the
 text, not a parser: it serves the line checks and leaves what it cannot read — a sub-select, a graph path, a quoted
 field name — to the server. ``view_statement()`` and ``remove_view_statement()`` render the statements, the table name
-in backticks and the query inside ``AS ( … )``.
+in backticks and the query inside ``AS ( … )``; ``view_write_refused()`` is the text every ORM write of a view model
+raises.
 
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
 it.
@@ -842,3 +843,16 @@ def remove_view_statement(table: str, missing_ok: object) -> str:
     """
     table = _identifier_name(table, what="Table")
     return f"REMOVE TABLE{_missing_clause(missing_ok)} {_identifier(table)};"
+
+
+def view_write_refused(table: str, call: str) -> str:
+    """W1's text: *call* (``"OrderStats.save()"``) would write to the materialized view *table* (v0.32.0).
+
+    SurrealDB computes a view's records from its query, so every ORM write of a view model is refused with this text
+    before any signal, transaction use or request (``BaseSurrealModel._reject_view_write()``). It starts with the full
+    SurrealDB-ORM's ``Cannot modify materialized view '<table>'``. Pure.
+    """
+    return (
+        f"Cannot modify materialized view '{table}': {call} writes to it, and SurrealDB computes a view's records "
+        "from its view_query. Write to the tables it selects from instead."
+    )

@@ -9,13 +9,23 @@ and is not an injection defence: every refused query below is a plain malformed 
 On the model (spec §5.1, §5.2; AC-1, AC-3, AC-4): ``SurrealConfigDict(view_query=…)`` checked at the ``class``
 statement (V1–V10, ``schema.check_view_config()``), ``get_view_query()``, ``_is_view()``, inheritance and
 ``view_query=None``, and ``view_ddl()`` — pure, the goldens of spec §5.3, V11, E13, no connection needed.
+
+The write guard (spec §5.4, §5.6 W1; AC-6): each of the 20 ORM writes of a view model raises ``TypeError`` before any
+signal, transaction use or request — unit, and E2E on the connection ``"mv"`` (database ``mv_db``, spec §9.2) over
+WebSocket, HTTP and ``mem://`` on both server lines, where the view's records stay as they were, the relation helpers
+still write their edge table (M16), and a raw ``DELETE`` of the view is pinned per line (M6: refused from 3.2).
 """
 
+import contextlib
 import inspect
+import os
+import re
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
-from surrealdb import RecordID
+from surrealdb import InternalError, RecordID
 
 import surreal_orm_lite
 from surreal_orm_lite import (
@@ -27,6 +37,9 @@ from surreal_orm_lite import (
     SurrealDBConnectionManager,
     computed,
     define_parser,
+    pre_delete,
+    pre_save,
+    pre_update,
     schema,
 )
 from surreal_orm_lite.define_parser import blank_literals
@@ -1007,3 +1020,431 @@ class TestViewDdl:
         """No new top-level name (spec §5.7): the view helpers are private to the package."""
         assert [name for name in surreal_orm_lite.__all__ if "view" in name.lower()] == []
         assert schema.__all__ == ["Event", "function_ddl"]
+
+
+# --- the write guard (spec §5.4, §5.6 W1, §6.3, §6.4; AC-6) ----------------------------------------------------------
+
+
+def _w1(table: str, call: str) -> str:
+    """W1 of spec §5.6; *call* names the class and the method, as ``OrderStats.save()``."""
+    return (
+        f"Cannot modify materialized view '{table}': {call} writes to it, and SurrealDB computes a view's records "
+        "from its view_query. Write to the tables it selects from instead."
+    )
+
+
+_PATCH_TOTAL = [{"op": "replace", "path": "/total", "value": 9}]
+
+#: The 20 refused paths of spec §5.4: (test id, the call as W1 names it after the class name, the call made on an
+#: instance *s* of the model with the transaction *tx*). The QuerySet paths run on ``type(s).objects(tx=tx)``.
+_VIEW_WRITES: list[tuple[str, str, Callable[[Any, Any], Awaitable[Any]]]] = [
+    ("save", "save()", lambda s, tx: s.save(tx=tx)),
+    ("upsert", "upsert()", lambda s, tx: s.upsert(tx=tx)),
+    ("update", "update()", lambda s, tx: s.update(tx=tx)),
+    ("merge", "merge()", lambda s, tx: s.merge(tx=tx, total=9)),
+    ("patch", "patch()", lambda s, tx: s.patch(_PATCH_TOTAL, tx=tx)),
+    ("delete", "delete()", lambda s, tx: s.delete(tx=tx)),
+    ("atomic_append", "atomic_append()", lambda s, tx: s.atomic_append("status", "x", tx=tx)),
+    ("atomic_remove", "atomic_remove()", lambda s, tx: s.atomic_remove("status", "x", tx=tx)),
+    ("atomic_set_add", "atomic_set_add()", lambda s, tx: s.atomic_set_add("status", "x", tx=tx)),
+    ("atomic_increment", "atomic_increment()", lambda s, tx: s.atomic_increment("total", tx=tx)),
+    ("atomic_append_many", "atomic_append_many()", lambda s, tx: s.atomic_append_many("status", ["x"], tx=tx)),
+    ("atomic_set_add_many", "atomic_set_add_many()", lambda s, tx: s.atomic_set_add_many("status", ["x"], tx=tx)),
+    ("atomic_remove_many", "atomic_remove_many()", lambda s, tx: s.atomic_remove_many("status", ["x"], tx=tx)),
+    ("bulk_create", "objects().bulk_create()", lambda s, tx: type(s).objects(tx=tx).bulk_create([s])),
+    (
+        "bulk_update",
+        "objects().bulk_update()",
+        lambda s, tx: type(s).objects(tx=tx).filter(status="paid").bulk_update(total=9),
+    ),
+    ("bulk_delete", "objects().bulk_delete()", lambda s, tx: type(s).objects(tx=tx).bulk_delete()),
+    ("queryset_patch", "objects().patch()", lambda s, tx: type(s).objects(tx=tx).patch(_PATCH_TOTAL)),
+    (
+        "update_or_create",
+        "objects().update_or_create()",
+        lambda s, tx: type(s).objects(tx=tx).update_or_create(status="paid", defaults={"total": 9}),
+    ),
+    # Refused even when the record exists (D4): the E2E class reads it first.
+    ("get_or_create", "objects().get_or_create()", lambda s, tx: type(s).objects(tx=tx).get_or_create(status="paid")),
+    ("delete_table", "objects().delete_table()", lambda s, tx: type(s).objects(tx=tx).delete_table()),
+]
+
+_WRITE_IDS = [row[0] for row in _VIEW_WRITES]
+
+
+class _UntouchableTx:
+    """A transaction a refused write must never reach: any use of it fails the test."""
+
+    def __getattr__(self, name: str) -> Any:
+        pytest.fail(f"the transaction was used ({name})")
+
+
+class _ClientRequested(Exception):
+    """Raised by the patched ``SurrealDBConnectionManager.get_client``: the call went past the guard."""
+
+
+@pytest.fixture
+def client_requests(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every ``get_client()`` call from now on, each one refused with :class:`_ClientRequested`."""
+    requests: list[str] = []
+
+    async def get_client(*args: Any, **kwargs: Any) -> Any:
+        requests.append("get_client")
+        raise _ClientRequested
+
+    monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+    return requests
+
+
+@contextlib.contextmanager
+def _pre_signals(model: type[BaseSurrealModel]) -> Iterator[list[str]]:
+    """Count the ``pre_save``/``pre_update``/``pre_delete`` calls for *model*; the handlers leave on exit."""
+    fired: list[str] = []
+
+    async def on_save(sender: type, **kwargs: Any) -> None:
+        fired.append("pre_save")
+
+    async def on_update(sender: type, **kwargs: Any) -> None:
+        fired.append("pre_update")
+
+    async def on_delete(sender: type, **kwargs: Any) -> None:
+        fired.append("pre_delete")
+
+    pre_save.connect(model)(on_save)
+    pre_update.connect(model)(on_update)
+    pre_delete.connect(model)(on_delete)
+    try:
+        yield fired
+    finally:
+        pre_save.disconnect(on_save, model)
+        pre_update.disconnect(on_update, model)
+        pre_delete.disconnect(on_delete, model)
+
+
+class PlainStats(BaseSurrealModel):
+    """An ordinary model with :class:`OrderStats`'s fields: the guard lets its writes through."""
+
+    model_config = SurrealConfigDict(table_name="plain_stats")
+
+    id: RecordID | None = None
+    status: str
+    total: int
+    revenue: float
+
+
+def _stats(model: type[BaseSurrealModel] = OrderStats, table: str = "order_stats") -> Any:
+    """An instance of *model* holding the ``paid`` group, with its array id (spec §5.5)."""
+    return model(id=RecordID(table, ["paid"]), status="paid", total=2, revenue=15.5)
+
+
+class TestWriteGuard:
+    """AC-6 (unit): each of the 20 writes of spec §5.4 raises W1 as its first statement — with or without a
+    transaction, which it never touches —, fires no ``pre_*`` signal and asks for no client; an ordinary model's same
+    calls go through to the client."""
+
+    @pytest.mark.parametrize("in_tx", [False, True], ids=["no-tx", "tx"])
+    @pytest.mark.parametrize(("name", "call", "write"), _VIEW_WRITES, ids=_WRITE_IDS)
+    async def test_every_write_is_refused(
+        self,
+        client_requests: list[str],
+        in_tx: bool,
+        name: str,
+        call: str,
+        write: Callable[[Any, Any], Awaitable[Any]],
+    ) -> None:
+        stats = _stats()
+        with _pre_signals(OrderStats) as fired, pytest.raises(TypeError) as raised:
+            await write(stats, _UntouchableTx() if in_tx else None)
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _w1("order_stats", f"OrderStats.{call}")
+        assert str(raised.value).startswith("Cannot modify materialized view 'order_stats'")
+        assert fired == []
+        assert client_requests == []
+
+    @pytest.mark.parametrize(("name", "call", "write"), _VIEW_WRITES, ids=_WRITE_IDS)
+    async def test_an_ordinary_model_is_not_refused(
+        self, client_requests: list[str], name: str, call: str, write: Callable[[Any, Any], Awaitable[Any]]
+    ) -> None:
+        with pytest.raises(_ClientRequested):
+            await write(_stats(PlainStats, "plain_stats"), None)
+        assert client_requests == ["get_client"]
+
+    @pytest.mark.parametrize(("name", "call", "write"), _VIEW_WRITES, ids=_WRITE_IDS)
+    async def test_a_subclass_is_refused_under_its_own_name(
+        self, client_requests: list[str], name: str, call: str, write: Callable[[Any, Any], Awaitable[Any]]
+    ) -> None:
+        """AC-3: a subclass inherits ``view_query``, and W1 names the subclass and its own table."""
+
+        class ArchivedStats(OrderStats):
+            model_config = SurrealConfigDict(table_name="archived_stats")
+
+        with pytest.raises(TypeError) as raised:
+            await write(_stats(ArchivedStats, "archived_stats"), None)
+        assert str(raised.value) == _w1("archived_stats", f"ArchivedStats.{call}")
+        assert client_requests == []
+
+    @pytest.mark.parametrize(("name", "call", "write"), _VIEW_WRITES, ids=_WRITE_IDS)
+    async def test_view_query_none_lets_a_subclass_write(
+        self, client_requests: list[str], name: str, call: str, write: Callable[[Any, Any], Awaitable[Any]]
+    ) -> None:
+        class OrdinaryStats(OrderStats):
+            model_config = SurrealConfigDict(table_name="ordinary_stats", view_query=None)
+
+        with pytest.raises(_ClientRequested):
+            await write(_stats(OrdinaryStats, "ordinary_stats"), None)
+        assert client_requests == ["get_client"]
+
+    @pytest.mark.parametrize(("name", "call", "write"), _VIEW_WRITES[:13], ids=_WRITE_IDS[:13])
+    async def test_before_the_snapshot_refusal(
+        self, client_requests: list[str], name: str, call: str, write: Callable[[Any, Any], Awaitable[Any]]
+    ) -> None:
+        """Spec §7: an instance of a view model read with ``as_of()`` gets W1, not the snapshot refusal."""
+        stats = _stats()
+        assert stats.__pydantic_private__ is not None
+        stats.__pydantic_private__["_surreal_as_of"] = datetime(2021, 1, 1, tzinfo=UTC)
+        with pytest.raises(TypeError) as raised:
+            await write(stats, None)
+        assert str(raised.value) == _w1("order_stats", f"OrderStats.{call}")
+
+    @pytest.mark.parametrize(
+        ("call", "write"),
+        [
+            ("bulk_update()", lambda qs: qs.bulk_update(total=9)),
+            ("bulk_delete()", lambda qs: qs.bulk_delete()),
+            ("patch()", lambda qs: qs.patch(_PATCH_TOTAL)),
+            ("update_or_create()", lambda qs: qs.update_or_create(status="paid")),
+            ("get_or_create()", lambda qs: qs.get_or_create(status="paid")),
+            ("delete_table()", lambda qs: qs.delete_table()),
+            ("bulk_create()", lambda qs: qs.bulk_create([])),
+        ],
+    )
+    async def test_before_the_time_travel_refusal(
+        self, client_requests: list[str], call: str, write: Callable[[Any], Awaitable[Any]]
+    ) -> None:
+        """Spec §5.4: on a queryset read ``as_of()``, W1 comes first."""
+        queryset = OrderStats.objects().as_of(datetime(2021, 1, 1, tzinfo=UTC))
+        with pytest.raises(TypeError) as raised:
+            await write(queryset)
+        assert str(raised.value) == _w1("order_stats", f"OrderStats.objects().{call}")
+        assert client_requests == []
+
+    async def test_an_empty_bulk_create_is_refused(self, client_requests: list[str]) -> None:
+        with pytest.raises(TypeError) as raised:
+            await OrderStats.objects().bulk_create([])
+        assert str(raised.value) == _w1("order_stats", "OrderStats.objects().bulk_create()")
+
+    def test_the_refusal_text(self) -> None:
+        assert schema.view_write_refused("order_stats", "OrderStats.save()") == _w1("order_stats", "OrderStats.save()")
+
+    def test_reject_view_write(self) -> None:
+        with pytest.raises(TypeError) as raised:
+            OrderStats._reject_view_write("save()")
+        assert str(raised.value) == _w1("order_stats", "OrderStats.save()")
+        assert PlainStats._reject_view_write("save()") is None
+        assert BaseSurrealModel._reject_view_write("save()") is None
+
+
+# === E2E (spec §9.2): the connection "mv" on the database mv_db, over WebSocket and HTTP, and mem:// ================
+
+#: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
+_KINDS = ["ws", "http", "mem"]
+
+#: The reset of spec §9.2, in one query: the source table exists (M9).
+_MV_RESET = "REMOVE DATABASE IF EXISTS mv_db; DEFINE DATABASE mv_db; DEFINE TABLE mv_orders TYPE ANY SCHEMALESS;"
+
+#: The grouped golden of spec §5.3 over ``mv_orders``.
+_MV_STATS_QUERY = "SELECT status, count() AS total, math::sum(amount) AS revenue FROM mv_orders GROUP BY status"
+
+#: Three orders, then ``mv_order_stats`` defined by hand (``define_view()`` comes in Task 4): two groups.
+_MV_SETUP = (
+    "CREATE mv_orders:o1 SET status = 'paid', amount = 10.0, customer = 'ann'; "
+    "CREATE mv_orders:o2 SET status = 'paid', amount = 5.5, customer = 'bob'; "
+    "CREATE mv_orders:o3 SET status = 'new', amount = 1.0, customer = 'ann'; "
+    f"DEFINE TABLE mv_order_stats AS ({_MV_STATS_QUERY});"
+)
+
+#: The two groups of ``_MV_SETUP``, as a raw ``SELECT * FROM mv_order_stats ORDER BY id`` reads them.
+_MV_STATS_ROWS = [
+    {"id": RecordID("mv_order_stats", ["new"]), "revenue": 1.0, "status": "new", "total": 1},
+    {"id": RecordID("mv_order_stats", ["paid"]), "revenue": 15.5, "status": "paid", "total": 2},
+]
+
+#: M6: SurrealDB 3.2+ refuses a raw write to a view table.
+_M6 = (
+    "Cannot write to the `mv_order_stats` table, as it is a view (defined with `AS SELECT`); view tables are "
+    "read-only and their records are computed from the source query"
+)
+
+#: The SDK methods a refused write must reach none of (AC-6).
+_SDK_METHODS = (
+    "query",
+    "query_raw",
+    "create",
+    "insert",
+    "insert_relation",
+    "update",
+    "merge",
+    "patch",
+    "upsert",
+    "delete",
+    "select",
+)
+
+
+class MvOrder(BaseSurrealModel):
+    """The source table of the E2E views (spec §9.2)."""
+
+    model_config = SurrealConfigDict(table_name="mv_orders", connection="mv")
+
+    id: str | None = None
+    status: str
+    amount: float | None = None
+    customer: str | None = None
+
+
+class MvStats(BaseSurrealModel):
+    """The grouped golden of spec §5.3 over ``mv_orders``."""
+
+    model_config = SurrealConfigDict(table_name="mv_order_stats", connection="mv", view_query=_MV_STATS_QUERY)
+
+    id: RecordID | None = None
+    status: str
+    total: int
+    revenue: float
+
+
+def _url(kind: str) -> str:
+    """The URL of *kind*: ``ws`` or ``http`` on the line under test (``SURREALDB_PORT``), or ``mem``."""
+    if kind == "mem":
+        return "mem://"
+    host = os.environ.get("SURREALDB_HOST", "localhost")
+    port = os.environ.get("SURREALDB_PORT", "8000")
+    return f"ws://{host}:{port}/rpc" if kind == "ws" else f"http://{host}:{port}"
+
+
+def _register_mv(kind: str) -> None:
+    if kind == "mem":
+        SurrealDBConnectionManager.add_connection("mv", url="mem://", namespace="ns", database="mv_db")
+    else:
+        SurrealDBConnectionManager.add_connection(
+            "mv", url=_url(kind), user="root", password="root", namespace="ns", database="mv_db"
+        )
+
+
+async def _apply_ddl(client: Any, ddl: str) -> None:
+    """Run *ddl* and check every statement: ``query()`` checks only the first one."""
+    response = await client.query_raw(ddl, {})
+    assert "error" not in response, response["error"]
+    refused = [result for result in response["result"] if result["status"] != "OK"]
+    assert response["result"] and not refused, refused
+
+
+@contextlib.asynccontextmanager
+async def _mv(kind: str) -> AsyncIterator[Any]:
+    """The connection ``"mv"`` on *kind*, its database ``mv_db`` reset in one query; removed, then unregistered, on
+    exit (spec §9.2)."""
+    _register_mv(kind)
+    client = await SurrealDBConnectionManager.get_client("mv")
+    await _apply_ddl(client, _MV_RESET)
+    try:
+        yield client
+    finally:
+        with contextlib.suppress(Exception):
+            cleanup = await SurrealDBConnectionManager.get_client("mv")
+            await cleanup.query("REMOVE DATABASE IF EXISTS mv_db;", {})
+        await SurrealDBConnectionManager.remove_connection("mv")
+
+
+async def _line(client: Any) -> tuple[int, int]:
+    """``(major, minor)`` of the engine *client* talks to: ``"surrealdb-3.1.5"`` → ``(3, 1)``; ``mem://`` →
+    ``(2, 0)`` (the SDK's version, whose core is 2.x)."""
+    match = re.search(r"(\d+)\.(\d+)", await client.version())
+    assert match is not None
+    return int(match.group(1)), int(match.group(2))
+
+
+async def _rows(client: Any, table: str) -> list[dict[str, Any]]:
+    """Every record of *table* (a constant name of these tests), ordered by id, read raw."""
+    rows: list[dict[str, Any]] = await client.query(f"SELECT * FROM {table} ORDER BY id;", {})
+    return rows
+
+
+def _spy_sdk(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[str]:
+    """Record the name of every SDK method of :data:`_SDK_METHODS` *client* is called with (and let it through)."""
+    calls: list[str] = []
+
+    def recording(method: str) -> Any:
+        real = getattr(client, method)
+
+        async def call(*args: object, **kwargs: object) -> object:
+            calls.append(method)
+            return await real(*args, **kwargs)
+
+        return call
+
+    for method in _SDK_METHODS:
+        monkeypatch.setattr(client, method, recording(method))
+    return calls
+
+
+class TestViewWritesE2E:
+    """AC-6 (E2E): on every engine of both lines, each of the 20 writes raises W1 with no SDK call and leaves the
+    view's records as they were; the relation helpers write the edge table (M16); a raw write is pinned per line (M6)."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize(("name", "call", "write"), _VIEW_WRITES, ids=_WRITE_IDS)
+    async def test_every_write_is_refused(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        kind: str,
+        name: str,
+        call: str,
+        write: Callable[[Any, Any], Awaitable[Any]],
+    ) -> None:
+        async with _mv(kind) as client:
+            await _apply_ddl(client, _MV_SETUP)
+            assert await _rows(client, "mv_order_stats") == _MV_STATS_ROWS
+            stats = await MvStats.objects().get(RecordID("mv_order_stats", ["paid"]))
+            assert (stats.status, stats.total, stats.revenue) == ("paid", 2, 15.5)
+            calls = _spy_sdk(monkeypatch, client)
+            for tx in (None, _UntouchableTx()):
+                with _pre_signals(MvStats) as fired, pytest.raises(TypeError) as raised:
+                    await write(stats, tx)
+                assert str(raised.value) == _w1("mv_order_stats", f"MvStats.{call}")
+                assert fired == []
+            assert calls == []
+            assert await _rows(client, "mv_order_stats") == _MV_STATS_ROWS
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("reverse", [False, True], ids=["view-to-order", "order-to-view"])
+    async def test_relations_write_the_edge_table(self, kind: str, reverse: bool) -> None:
+        """M16: ``relate()`` and ``remove_relation()`` from a view instance write the edge table only, on every line
+        (3.x included)."""
+        async with _mv(kind) as client:
+            await _apply_ddl(client, _MV_SETUP)
+            stats = await MvStats.objects().get(RecordID("mv_order_stats", ["paid"]))
+            order = MvOrder(id="o1", status="paid")
+            view_id, order_id = RecordID("mv_order_stats", ["paid"]), RecordID("mv_orders", "o1")
+            ends = (order_id, view_id) if reverse else (view_id, order_id)
+            rows = await stats.relate("mv_watches", order, reverse=reverse)
+            assert [(row["in"], row["out"]) for row in rows] == [ends]
+            edges = await client.query("SELECT in, out FROM mv_watches;", {})
+            assert [(edge["in"], edge["out"]) for edge in edges] == [ends]
+            await stats.remove_relation("mv_watches", order, reverse=reverse)
+            assert await client.query("SELECT * FROM mv_watches;", {}) == []
+            assert await _rows(client, "mv_order_stats") == _MV_STATS_ROWS
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_raw_write_follows_the_server_line(self, kind: str) -> None:
+        """M6, not an ORM path: SurrealDB 3.2 and later refuse a raw ``DELETE`` of a view table; 2.x, 3.1 and the
+        embedded engine accept it and empty the view — what W1 keeps the ORM's own writes from doing."""
+        async with _mv(kind) as client:
+            await _apply_ddl(client, _MV_SETUP)
+            if await _line(client) >= (3, 2):
+                with pytest.raises(InternalError) as raised:
+                    await client.query("DELETE mv_order_stats;", {})
+                assert str(raised.value) == _M6
+                assert await _rows(client, "mv_order_stats") == _MV_STATS_ROWS
+            else:
+                await client.query("DELETE mv_order_stats;", {})
+                assert await _rows(client, "mv_order_stats") == []

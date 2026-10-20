@@ -33,6 +33,7 @@ from .schema import (
     event_subject,
     remove_event_statement,
     view_statement,
+    view_write_refused,
 )
 from .signals import (
     around_delete,
@@ -649,9 +650,10 @@ class BaseSurrealModel(BaseModel):
     def _reject_snapshot_write(self, method: str) -> None:
         """Refuse *method* (named with its ``()``) on a snapshot, an instance read with ``as_of()`` (v0.26.0).
 
-        The first statement of every instance write, so nothing runs before it: no signal, no transaction, no
-        request. The marker is read through :func:`_snapshot_moment`, the only reader (an instance pickled by
-        v0.25.x may have no private state).
+        Called at the start of every instance write — right after the materialized-view check of the writes that
+        have one (:meth:`_reject_view_write`, v0.32.0) —, so no signal, transaction or request runs before it. The
+        marker is read through :func:`_snapshot_moment`, the only reader (an instance pickled by v0.25.x may have no
+        private state).
 
         Raises:
             SurrealDbError: the instance holds the record as it was at a moment, not the current record.
@@ -977,6 +979,21 @@ class BaseSurrealModel(BaseModel):
         checked when the class was defined.
         """
         return cls.model_config.get("view_query") is not None
+
+    @classmethod
+    def _reject_view_write(cls, call: str) -> None:
+        """Refuse *call* (``"save()"``, ``"objects().bulk_update()"``) on a materialized view model (v0.32.0).
+
+        SurrealDB computes a view's records from its ``view_query``, so the ORM never writes them: the first statement
+        of every ORM write of the model — the instance writes and the queryset's — before the snapshot check, any
+        signal, transaction use or request. The relation helpers write the edge table, not the view, and stay
+        allowed; raw SurrealQL is never guarded.
+
+        Raises:
+            TypeError: the model is a materialized view (W1, naming the class and *call*).
+        """
+        if cls._is_view():
+            raise TypeError(view_write_refused(cls.get_table_name(), f"{cls.__name__}.{call}"))
 
     @classmethod
     def _require_view(cls, method: str) -> str:
@@ -2080,6 +2097,7 @@ class BaseSurrealModel(BaseModel):
             values are unknown until commit, so the instance keeps its pre-save values for
             those fields — ``refresh()`` after commit if you need them.
         """
+        self._reject_view_write("save()")
         self._reject_snapshot_write("save()")
         self._validate_server_values(server_values, extra_vars)
         if server_values:
@@ -2358,6 +2376,7 @@ class BaseSurrealModel(BaseModel):
         in a transaction ``around_save`` is skipped and ``post_save`` is deferred to a
         successful commit (consistent with ``save(tx=)``).
         """
+        self._reject_view_write("upsert()")
         self._reject_snapshot_write("upsert()")
         return await self._save_with_signals(self._do_upsert, tx)
 
@@ -2406,6 +2425,7 @@ class BaseSurrealModel(BaseModel):
             The updated row as the SDK reads it (``[]`` for a record that does not exist), or
             ``None`` in a transaction.
         """
+        self._reject_view_write("update()")
         self._reject_snapshot_write("update()")
         sender = self.__class__
         data = self._write_payload(replace=True)
@@ -2569,6 +2589,7 @@ class BaseSurrealModel(BaseModel):
             >>> await user.merge(plan="pro", server_values={"updated_at": SurrealFunc("time::now()")})
             >>> await user.merge(last_seen=now, refresh=False)  # fire-and-forget
         """
+        self._reject_view_write("merge()")
         self._reject_snapshot_write("merge()")
         self._reject_computed_writes(data, "merge()")
         self._validate_server_values(server_values, extra_vars)
@@ -2631,6 +2652,7 @@ class BaseSurrealModel(BaseModel):
         name a field either way — ``/password`` or its column ``/password_hash`` — and are
         rewritten to the column before they are sent.
         """
+        self._reject_view_write("patch()")
         self._reject_snapshot_write("patch()")
         validate_patch_operations(operations)
         self._reject_computed_patch(operations, "patch()")
@@ -2654,8 +2676,10 @@ class BaseSurrealModel(BaseModel):
         (robust for any id type; anti-injection); only the validated ``set_expr`` is inlined.
         Non-tx and interactive-tx apply the returned row to ``self``; a buffered tx leaves
         ``self`` stale (the new value is computed server-side, unknown until commit).
-        ``label`` is the calling method's name with its ``()``, for the snapshot refusal (v0.26.0).
+        ``label`` is the calling method's name with its ``()``, for the view refusal (v0.32.0) and the snapshot
+        refusal (v0.26.0).
         """
+        self._reject_view_write(label)
         self._reject_snapshot_write(label)
         record_id = self._record_id()
         if record_id is None:
@@ -2802,6 +2826,7 @@ class BaseSurrealModel(BaseModel):
         ``around_delete`` is skipped (the write is deferred to commit) and
         ``post_delete`` only fires after a successful commit.
         """
+        self._reject_view_write("delete()")
         self._reject_snapshot_write("delete()")
         sender = self.__class__
         record_id = self._record_id()

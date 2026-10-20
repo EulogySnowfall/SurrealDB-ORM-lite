@@ -664,8 +664,8 @@ class QuerySet:
     def _reject_time_travel(self, method: str) -> None:
         """Refuse *method* (a write or a stream, named with its ``()``) on a queryset read ``as_of()`` (v0.26.0).
 
-        A time-travel read is read-only and cannot be streamed: the first statement of each such method, so
-        nothing is sent and no client is acquired.
+        A time-travel read is read-only and cannot be streamed: called at the start of each such method — right
+        after a write's materialized-view check (v0.32.0) —, so nothing is sent and no client is acquired.
         """
         if self._as_of is not None:
             raise SurrealDbError(_time_travel.queryset_refused(method))
@@ -1554,6 +1554,7 @@ class QuerySet:
         not bring the rows back), so the cached reads of the table — and of every edge table,
         whose edges die with the records — are invalidated when it ends, never at a commit.
         """
+        self.model._reject_view_write("objects().delete_table()")
         self._reject_time_travel("delete_table()")
         client = await self._manager().get_client()
         with contextlib.suppress(NotFoundError):
@@ -1863,6 +1864,7 @@ class QuerySet:
                 any other refusal of an edge batch by the server; a model read with ``as_of()``
                 (a read-only snapshot) in ``models``, before any call (v0.26.0).
             SurrealDbNotFoundError: an endpoint of an ``ENFORCED`` relation that does not exist.
+            TypeError: the model is a materialized view (v0.32.0), before any call.
             ValueError: an edge id that is a ``RecordID`` of another table, or a ``bool``.
 
         Example::
@@ -1875,6 +1877,7 @@ class QuerySet:
                 Purchased(in_=bob, out=widget, quantity=1),
             ])  # one insert_relation() round-trip
         """
+        self.model._reject_view_write("objects().bulk_create()")
         self._reject_time_travel("bulk_create()")
         for model in models:
             moment = _snapshot_moment(model) if isinstance(model, BaseSurrealModel) else None
@@ -1946,6 +1949,7 @@ class QuerySet:
             The number of updated records (``0`` inside a buffered transaction, whose statements run at commit).
 
         Raises:
+            TypeError: the model is a materialized view (v0.32.0), before any request.
             ValueError: a value is a ``Subquery`` or a QuerySet (v0.27.0), before any request: filter with it, and
                 pass the value to write.
 
@@ -1954,6 +1958,7 @@ class QuerySet:
             count = await User.objects().filter(status="pending").bulk_update(status="active")
             count = await Post.objects().filter(author__in=Subquery(banned)).bulk_update(hidden=True)
         """
+        self.model._reject_view_write("objects().bulk_update()")
         self._reject_time_travel("bulk_update()")
         if not kwargs:
             return 0
@@ -1993,6 +1998,7 @@ class QuerySet:
             count = await User.objects().filter(status="inactive").bulk_delete()
             count = await Post.objects().filter(author__in=Subquery(banned)).bulk_delete()
         """
+        self.model._reject_view_write("objects().bulk_delete()")
         self._reject_time_travel("bulk_delete()")
 
         def compile_statement(compiler: SubqueryCompiler) -> tuple[str, dict[str, Any]]:
@@ -2019,6 +2025,7 @@ class QuerySet:
                 [{"op": "replace", "path": "/plan", "value": "free"}]
             )
         """
+        self.model._reject_view_write("objects().patch()")
         self._reject_time_travel("patch()")
         validate_patch_operations(operations)
         self.model._reject_computed_patch(operations, "patch()")
@@ -2367,6 +2374,7 @@ class QuerySet:
         itself, or use ``regex``): ``members__contains=Var("auth")``. On an edge endpoint such a string raises the
         lookup's ``ValueError``.
         """
+        self.model._reject_view_write("objects().update_or_create()")
         self._reject_time_travel("update_or_create()")
         self._reject_subquery_writes(criteria, defaults, "update_or_create")
         self._reject_string_references(criteria)
@@ -2439,6 +2447,7 @@ class QuerySet:
         ``SurrealDbError``: a session parameter's value is only known to the database and cannot be written, nor can
         a name no ``variables()`` gives. On an edge endpoint such a string raises the lookup's ``ValueError``.
         """
+        self.model._reject_view_write("objects().get_or_create()")
         self._reject_time_travel("get_or_create()")
         self._reject_subquery_writes(criteria, defaults, "get_or_create")
         self._reject_string_references(criteria)
