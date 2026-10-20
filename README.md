@@ -687,16 +687,6 @@ the block's own exception propagates, that exception wins, as before. Reads the 
 are not failed statements: a table that does not exist reads as no rows, and `get()` raises
 `SurrealDbNotFoundError`.
 
-**Transaction errors name the failed statement, not its text** (v0.31.1). When the server refuses
-the query as a whole (a statement it cannot parse), the error gives the server's reason and the
-position, without the server's excerpt of the statement: a buffered commit raises "Transaction
-failed: the server refused statement 2 of 3: Parse error: … (at line 1, column 7 of the
-statement)", the embedded engine included, and a write or a definition in an interactive
-transaction raises "Transaction failed: the server refused the statement: … (at line 1, column 7
-of the statement)". The server's full text stays reachable as the error's `__context__`, which a
-traceback does not print. A read in a transaction is not affected: it raises the SDK's own error,
-as it does outside a transaction.
-
 ```python
 async with SurrealDBConnectionManager.transaction() as tx:
     await User(id="alice", name="Alice").save(tx=tx)
@@ -706,6 +696,17 @@ async with SurrealDBConnectionManager.transaction() as tx:
         pass  # caught, but the transaction can no longer commit
 # leaving the block raised SurrealDbError: alice was not saved either
 ```
+
+**Transaction errors leave out the server's excerpt of the statement** (v0.31.1). When the server
+refuses the query as a whole (a statement it cannot parse), the error gives the server's reason and
+the position, without the server's excerpt of the statement: a buffered commit raises "Transaction
+failed: the server refused statement 2 of 3: … (at line 1, column 7 of the statement)", the
+embedded engine included, and a write or a definition in an interactive transaction raises
+"Transaction failed: the server refused the statement: … (at line 1, column 7 of the statement)".
+The line and column are those of the statement as written, before the ORM renames its `$name`
+parameters for the batch. The server's full text stays reachable as the error's `__context__`,
+which a traceback does not print. A read in a transaction is not affected: it raises the SDK's own
+error, as it does outside a transaction.
 
 ### 12. Upsert & get_or_create / update_or_create
 
@@ -851,7 +852,9 @@ except SurrealDbConflictError:
 - Total attempts = `max_retries + 1`; after they are exhausted the conflict is re-raised as
   `SurrealDbConflictError`. The numeric parameters are validated at decoration time.
 - Detection anchors on SurrealDB's own retryable marker ("This transaction can be retried"), so
-  a non-retryable failure (e.g. a duplicate-key error) is **not** retried.
+  a non-retryable failure (e.g. a duplicate-key error) is **not** retried. `is_conflict_error()`
+  reads the exception and its chain as a traceback prints it: a context suppressed with
+  `raise … from None` is not read (v0.31.1).
 - The exception type is identical on 2.6.x and 3.x; conflicts simply arise more often on 3.x
   (optimistic MVCC) than on 2.6.x (see the behaviour table), except on change-feed tables, where
   2.x refuses concurrent writes that 3.x accepts (see [section 22](#22-change-feeds-changes)).

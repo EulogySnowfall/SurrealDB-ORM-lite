@@ -7,18 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.31.1] - 2026-10-19
 
-Transaction errors give the server's reason and the failed statement's position instead of quoting
-the statement, and a buffered commit raises `SurrealDbError` on the embedded engine too (#278). No
-new public API.
+Transaction errors give the server's reason and the failed statement's position, without the
+server's excerpt of the statement, and a buffered commit raises `SurrealDbError` on the embedded
+engine too (#278). No new public API.
 
 ### Fixed
 
-- **Transaction errors keep the statement's text out** (#278). When the server refused the query
-  as a whole (a statement it cannot parse), the error read "Transaction failed: unrecognized
+- **Transaction errors give the server's reason and the statement's position, without the
+  server's excerpt of the statement** (#278). When the server refused the query as a whole (a statement it cannot parse), the error read "Transaction failed: unrecognized
   query_raw() response shape: {…}" and quoted the server's raw response, its excerpt of the
   statement included. It now gives the server's reason and the position:
   - at a buffered commit (SurrealDB 2.x, HTTP, the embedded engine), "Transaction failed: the
-    server refused statement 2 of 3: Parse error: … (at line 1, column 7 of the statement)";
+    server refused statement 2 of 3: … (at line 1, column 7 of the statement)", the line and column
+    of the statement as written, before the ORM renames its `$name` parameters for the batch; when
+    the server first reports a statement left unclosed on the batch's `COMMIT` line, the statement
+    is still named;
   - for a write or a definition in an interactive transaction (SurrealDB 3.x over WebSocket),
     "Transaction failed: the server refused the statement: … (at line 1, column 7 of the
     statement)";
@@ -34,6 +37,10 @@ new public API.
   query it cannot parse as a bare `RuntimeError`, which propagated out of the `transaction()` block;
   the commit now raises `SurrealDbError`, or `SurrealDbConflictError` for a retryable conflict, as
   on a server.
+- **A statement holding conflict words is not taken for a conflict** (#278). A query the server
+  could not parse, whose statement held words such as "write conflict", was typed
+  `SurrealDbConflictError`, so `retry_on_conflict` retried it. The typing now reads the server's
+  reason, not its excerpt of the statement.
 
 ### Changed
 
@@ -44,6 +51,9 @@ new public API.
   holds that error's type name, for example `(SurrealDbError)`. The error itself is still chained
   as `__cause__`, and a retryable conflict still raises `SurrealDbConflictError`, so
   `retry_on_conflict` behaves as before.
+- **`is_conflict_error()` follows the chain a traceback prints** (#278): a context suppressed with
+  `raise … from None` is no longer read. The ORM keeps the server's full text there, which may
+  quote the statement.
 
 ### Notes
 
