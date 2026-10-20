@@ -58,8 +58,14 @@ The round trip (spec §6.7, D12; AC-16; M18): E2E on both lines, ``DatabaseIntro
 of each §5.3 view as spec §3 renders it, ``generate_models_from_db()`` writes view models whose module imports, and each
 generated class's ``view_ddl()``, applied to a fresh database, reads back the same query (the generator's unit cases
 are in ``tests/test_model_generator.py``).
+
+The README (spec §11.1; AC-18): section 33's place and subsections, its examples run in order on ``mem://`` (each
+printed line equal to its comment), the key phrases of each part and the Security wording (D18), section 31's
+generated-models bullet and long-line sentence, and the rows v0.32.0 adds to the features, roadmap and comparison
+tables and to both behaviour tables (exact cells, widths kept, in version order).
 """
 
+import ast
 import asyncio
 import contextlib
 import importlib.util
@@ -120,7 +126,23 @@ from surreal_orm_lite.schema import (
     view_statement,
 )
 from surreal_orm_lite.subquery import SubqueryCompiler
+from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import apply_ddl_statements
+from tests._readme_tables import EMBEDDED_BEHAVIOUR as _EMBEDDED_BEHAVIOUR
+from tests._readme_tables import SERVER_BEHAVIOUR as _SERVER_BEHAVIOUR
+from tests._readme_tables import (
+    assert_embedded_rows,
+    assert_server_header_sentence,
+    assert_server_rows,
+    assert_server_table,
+)
+from tests._readme_tables import cells as _cells
+from tests._readme_tables import normalised as _normalised
+from tests._readme_tables import readme as _readme
+from tests._readme_tables import readme_part as _readme_part
+from tests._readme_tables import subsection as _subsection
+from tests._readme_tables import table_rows as _table_rows
+from tests._readme_tables import tables as _md_tables
 from tests.conftest import default_connection_class
 
 # --- the goldens of spec §5.3 ----------------------------------------------------------------------------------------
@@ -4244,3 +4266,553 @@ class TestViewRoundTripE2E:
                 (_NEW, "new", 1, 1.0),
                 (_PAID, "paid", 2, 15.5),
             ]
+
+
+# --- README: section 33, section 31 and the tables (spec §11.1; AC-18) -----------------------------------------------
+
+_SECTION_31 = "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
+_SECTION_32 = "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)"
+_SECTION_33 = "### 33. Materialized views (`view_query`, `define_view()`)"
+#: Spec §11.1 item 1: section 33's subsections, in order, after an untitled intro paragraph that holds example A.
+_SUBSECTIONS_33 = [
+    "Declaring a view",
+    "Applying and removing",
+    "Reading",
+    "Writes are refused",
+    "Transactions, connections and the query cache",
+    "SurrealDB 2.x and 3.x",
+    "Security",
+    "Coming from the full SurrealDB-ORM",
+]
+#: Spec §11.1 item 1, example A, exactly: the intro's block.
+_README_EXAMPLE_A = """\
+from surrealdb import RecordID
+
+from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict
+
+
+class Order(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="orders")
+
+    id: str | None = None
+    status: str
+    amount: float
+    customer: str | None = None
+
+
+class OrderStats(BaseSurrealModel):
+    model_config = SurrealConfigDict(
+        table_name="order_stats",
+        view_query="SELECT status, count() AS total, math::sum(amount) AS revenue FROM orders GROUP BY status",
+    )
+
+    id: RecordID | None = None
+    status: str
+    total: int
+    revenue: float
+
+
+print(OrderStats.view_ddl())
+# DEFINE TABLE OVERWRITE `order_stats` AS (SELECT status, count() AS total, math::sum(amount) AS revenue FROM orders GROUP BY status);
+
+await Order(id="o1", status="paid", amount=10.0, customer="ada").save()  # the source table exists first
+await OrderStats.define_view()  # idempotent (OVERWRITE): run it at start-up
+
+await Order(id="o2", status="paid", amount=5.5, customer="bob").save()
+await Order(id="o3", status="new", amount=1.0, customer="ada").save()
+for stats in await OrderStats.objects().order_by("status").exec():
+    print(stats.status, stats.total, stats.revenue)
+# new 1 1.0
+# paid 2 15.5
+
+paid = await OrderStats.objects().get(["paid"])
+print(paid.id, paid.total)
+# order_stats:['paid'] 2
+
+try:
+    await paid.merge(total=0)
+except TypeError as error:
+    print(error)
+# Cannot modify materialized view 'order_stats': OrderStats.merge() writes to it, and SurrealDB computes a view's records from its view_query. Write to the tables it selects from instead.
+"""
+#: Spec §11.1 item 1, example B, exactly: it opens "Declaring a view".
+_README_EXAMPLE_B = """\
+class PaidOrder(BaseSurrealModel):
+    model_config = SurrealConfigDict(
+        table_name="paid_orders", view_query="SELECT customer, amount FROM orders WHERE status = 'paid'"
+    )
+
+    id: RecordID | None = None
+    customer: str | None = None
+    amount: float
+
+
+await PaidOrder.define_view()
+print([(str(order.id), order.amount) for order in await PaidOrder.objects().order_by("amount").exec()])
+# [('paid_orders:o2', 5.5), ('paid_orders:o1', 10.0)]
+"""
+_README_EXAMPLES_33 = [_README_EXAMPLE_A, _README_EXAMPLE_B]
+#: Spec §8 and §11.1 item 1 (D18, binding, adapted to views): the sentence "Security" carries, whitespace normalised.
+_D18_SENTENCE_33 = (
+    "The check catches mistakes — unbalanced brackets, a comment that would swallow the parenthesis the ORM appends, a "
+    "second statement where one SELECT is expected — and is not an injection defence: a view's query is trusted "
+    "application code, never user input."
+)
+#: Spec §11.1 item 1: what the intro and each subsection say (key phrases, whitespace normalised).
+_INTRO_NEEDLES_33 = (
+    "Since v0.32.0",
+    "materialized view",
+    "`SELECT`",
+    "keeps up to date",
+    "counts, sums, filtered copies",
+    "`view_query`",
+    "idempotently",
+    "every write of the model is refused",
+    "SurrealDB 2.x, 3.x and the embedded engine",
+    "(#orm-behaviour-surrealdb-2x-vs-3x)",
+    "`mem://`",
+)
+_PART_NEEDLES_33 = {
+    "Declaring a view": (
+        "`view_query` is one `SELECT … FROM <table> [WHERE …] [GROUP BY … | GROUP ALL]`",
+        "a final `;` is dropped",
+        "checked when the class is defined",
+        "`ORDER BY`",
+        "`LIMIT`",
+        "`FETCH`",
+        "`SELECT VALUE`",
+        "**A grouped view**",
+        "`count()`, `math::sum()`, `math::mean()`, `math::min()`, `math::max()`, `time::min()`, `time::max()`",
+        "`math::stddev()`, `math::variance()` on 3.x",
+        "whatever their argument (`math::sum(amount ?? 0)`)",
+        "`math::median()`, `array::group()`, `array::distinct()`, `array::join()`",
+        "`vector::sum()`",
+        "inside an aggregate's argument they are allowed",
+        "`math::sum(amount) / count()`",
+        "a `GROUP BY` on an alias",
+        "on 2.x and the embedded engine `define_view()` refuses them",
+        "Every source write runs the view's query for that record",
+        "surrealdb#7447",
+        "on every line",
+        "a plain view keeps the source records' ids",
+        "`order_stats:['paid']`",
+        "`GROUP ALL` gives `[]`",
+        "`id: RecordID | None = None`",
+        '`get(["paid"])`',
+        '`filter(id=["paid"])`',
+        "`first()`",
+        "Declare sums and means `float`",
+        "`BaseSurrealEdge`",
+        "`AuthenticatedUserMixin`",
+        "computed fields",
+        "`select`",
+        "`get_view_query()`",
+    ),
+    "Applying and removing": (
+        "`DEFINE TABLE OVERWRITE … AS (…)`",
+        "SurrealDB fills the view from the source's records",
+        "each call recomputes the view and drops the events, fields and indexes defined on it",
+        "one pass over the source",
+        "`overwrite=False` writes `IF NOT EXISTS` and keeps a view already defined, whatever its query",
+        "The source table must exist",
+        "`SurrealDbError` naming it",
+        "run `define_events()` after `define_view()`",
+        "`REMOVE TABLE IF EXISTS`",
+        "`missing_ok=False`",
+        "`SurrealDbNotFoundError`",
+        "**without records**",
+        "`watch()`",
+        "turns it into the view",
+        "SurrealDB would delete them",
+        '`raw_query("REMOVE TABLE …")`',
+        "which `IF NOT EXISTS` would silently keep",
+        "`remove_view()` raises on a table that is not a view",
+        "`view_ddl()` returns the statement without applying it",
+        "not recomputed when the inner one is redefined",
+        "Remove the views that read another view first",
+        "`Cannot delete table … on which a view is defined`",
+        "no longer updates",
+        "it is not a view",
+        "plain `FROM` targets",
+    ),
+    "Reading": (
+        "`order_by()`",
+        "`get()`",
+        "`refresh()`",
+        "`Subquery`",
+        "`fetch()`",
+        "`using()`",
+        "`live()`/`watch()`",
+        "`relate()` and `remove_relation()`",
+        "write the edge table and are allowed",
+        "On a view model, `filter(id__in=...)` is sent as `$ids CONTAINS id`: SurrealDB 3.x (3.1 and 3.3 measured) "
+        "answers no record to `id IN` on a view table, while `CONTAINS` is right on every line; write raw SurrealQL "
+        "over a view the same way.",
+        "`live()` instances carry the record id on both lines; `watch()` yields the server's envelopes as received: on "
+        "3.x their `result` has no `id`, read `record`.",
+        "On SurrealDB 3.x a live query on a view filtered on `id` never notifies (the server's view notifications carry "
+        'no id); filter on the view\'s fields, e.g. `filter(status="paid")`.',
+    ),
+    "Writes are refused": (
+        "`TypeError`",
+        "before any signal, transaction or request",
+        "`save()`, `upsert()`, `update()`, `merge()`, `patch()`, `delete()`",
+        "`atomic_append()`, `atomic_remove()`, `atomic_set_add()`, `atomic_increment()`, `atomic_append_many()`, "
+        "`atomic_set_add_many()`, `atomic_remove_many()`",
+        "`bulk_create()`, `bulk_update()`, `bulk_delete()`, `patch()`, `update_or_create()`, `get_or_create()`",
+        "even when the record exists",
+        "`delete_table()`",
+        "`Cannot modify materialized view '<table>'`",
+        "Raw SurrealQL",
+        "is not checked",
+        "SurrealDB 3.2 and later refuse",
+        "2.x and 3.1 accept",
+        "change the view's records",
+    ),
+    "Transactions, connections and the query cache": (
+        "`tx=`",
+        "buffered",
+        "interactive",
+        "`objects(tx=tx)`",
+        "a block that raises leaves no view",
+        "before anything is queued",
+        "the transaction's own error",
+        "`connection`",
+        "`using()`",
+        "another connection raises `SurrealDbError` before any request",
+        "(#29-query-cache-cache-querycache)",
+        "dropped by every ORM write",
+        "a write to a source table changes the view",
+        "system user",
+        "`VIEWER`",
+        "`SurrealDbAuthenticationError`",
+        "signal",
+    ),
+    "SurrealDB 2.x and 3.x": (
+        "Raw writes",
+        "3.2 and later",
+        "keep up to date only whole aggregates and `GROUP BY` fields",
+        "once per source record",
+        "`define_view()` raises `SurrealDbError` before any DDL",
+        "`math::stddev()`",
+        "`math::variance()`",
+        "`math::sum(amount) / count()`",
+        "a field outside `GROUP BY` and outside an aggregate (3.x refuses that one too)",
+        "a `GROUP BY` on an alias",
+        "every record in one group",
+        "`int` sums and `Decimal` means on 2.x, `float` on 3.x",
+        "`count()` of an array field adds the arrays' lengths on 2.x",
+        "an emptied group",
+        "3.x refuses it",
+        "a raw `REMOVE TABLE`",
+        "keeping their last records",
+        "surrealdb#7447",
+        "`math::sum(amount ?? 0)`",
+        "(#orm-behaviour-surrealdb-2x-vs-3x)",
+    ),
+    "Security": (
+        "identifier",
+        "quoted",
+        "`DEFINE PARAM`",
+        "names the view's table, never the statement",
+        "check-then-act on committed state",
+        "not an access control",
+        "`PERMISSIONS NONE`",
+        "a record user reads nothing from a view",
+        "resets permissions set by hand",
+        "privileged system user",
+    ),
+}
+#: Spec §11.1 item 1: one key phrase per "Coming from the full SurrealDB-ORM" bullet, in order.
+_COMING_FROM_PHRASES_33 = (
+    "**`view_query` is the same key**",
+    "**`TypeError` with the same first words**",
+    "**`define_view()`/`remove_view()`/`view_ddl()`**",
+    "**`AS (…)` as in the full ORM, the table name quoted**",
+    "**generated models write `view_query=`**",
+    "**the documented `MaterializedView` base class with `source_query` is not shipped by the full ORM either**",
+)
+#: Spec §11.1 items 2–4: the features row, the roadmap rows and the comparison row.
+_FEATURES_ROW_33 = ["Materialized views (`view_query`, `define_view()`, read-only)", "✅"]
+_ROADMAP_ROWS_33 = [
+    ["v0.31.0", "Tier 3 — Server-side events and DDL helpers", "✅ Released"],
+    ["v0.32.0", "Tier 3 — Materialized views", "✅ Released"],
+    ["v0.33.0 – v0.39.0", "Tier 3 — Advanced (search, DDL, migrations, CLI)", "📋 Planned"],
+    ["v0.40.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+]
+_COMPARISON_ROW_33 = ["Materialized views", "✅ v0.32.0 (`view_query`, `define_view()`)", "✅"]
+#: Spec §11.1 item 5 (P4, A3): exactly eight rows v0.32.0 adds to the 2.x/3.x table, cell by cell.
+_VIEW_ROWS = [
+    [
+        "Writes to a materialized view (`save()`, `merge()`, `delete()`, bulk writes … of a `view_query` model)",
+        "`TypeError` before any request; a raw write is accepted by the server and changes the view's records",
+        "`TypeError` before any request; the server refuses raw writes too (3.2 and later; 3.1 accepts them)",
+        "v0.32.0",
+    ],
+    [
+        "Aggregates in a grouped view (`view_query` with `GROUP BY` or `GROUP ALL`)",
+        "`count()`, `math::sum()`, `math::mean()`, `math::min()`, `math::max()`, `time::min()`, `time::max()`; "
+        "`math::stddev()`, `math::variance()`: `SurrealDbError` before any DDL",
+        "the same, plus `math::stddev()` and `math::variance()`",
+        "v0.32.0",
+    ],
+    [
+        "An expression around an aggregate in a grouped view (`math::sum(amount) / count()`, "
+        "`math::round(math::mean(amount))`, `count() * 2`)",
+        "`SurrealDbError` before any DDL: the server would compute it once per source record (a wrong `count()`, or "
+        "every source write refused)",
+        "kept up to date",
+        "v0.32.0",
+    ],
+    [
+        "A grouped view selecting a field outside `GROUP BY` and outside an aggregate (`amount`, "
+        "`math::percentile(amount, 50)`, `*`)",
+        "`SurrealDbError` before any DDL: the server would keep the last source record's value, or refuse every source write",
+        "`SurrealDbError` when the view is defined (the server refuses it)",
+        "v0.32.0",
+    ],
+    [
+        "A grouped view whose `GROUP BY` names the alias of a computed field (`time::month(at) AS month` … `GROUP BY month`)",
+        "`SurrealDbError` before any DDL: the server would put every source record in one group",
+        "one group per computed value",
+        "v0.32.0",
+    ],
+    [
+        "Values a view computes (`math::sum()`, `math::mean()`, `count()` of an array)",
+        "a sum of integers is an `int`, a mean a `Decimal`; `count(tags)` of an array field adds the arrays' lengths",
+        "both are `float`; `count(tags)` counts the records whose array is not empty",
+        "v0.32.0",
+    ],
+    [
+        "Live queries and events on a view (a group emptied by a delete; a live query filtered on `id`)",
+        "an emptied group: an `UPDATE` with the emptied values (a `count()` of 0), then a `DELETE`; a filter on `id` notifies",
+        "an emptied group: a `DELETE`; a filter on `id` never notifies (the view's notifications carry no `id`): "
+        "filter on the view's fields",
+        "v0.32.0",
+    ],
+    [
+        "Removing a materialized view, or a source table, that another view reads (`remove_view()`, `REMOVE TABLE`)",
+        "`remove_view()` raises `SurrealDbError` before any DDL; a raw `REMOVE TABLE` succeeds and turns each view "
+        "reading the table into an ordinary table keeping its last records",
+        "`SurrealDbError` from the server (`Cannot delete table … on which a view is defined`): remove the views that "
+        "read it first",
+        "v0.32.0",
+    ],
+]
+_HEADER_SENTENCE_32 = (
+    "Rows added in v0.32.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 but accepts "
+    "raw writes to a view."
+)
+#: Spec §11.1 item 6: the row v0.32.0 adds to the embedded-engine table, cell by cell.
+_EMBEDDED_VIEWS_ROW = [
+    "Materialized views (v0.32.0)",
+    "as on a 2.x server: `int` sums and `Decimal` means; in a grouped view, `math::stddev()`/`math::variance()`, an "
+    "expression around an aggregate, a field outside `GROUP BY` and a `GROUP BY` on an alias raise `SurrealDbError` "
+    "before any DDL; writes to a view refused by the ORM (the engine would accept them); no live queries",
+    "`float` sums and means on 3.x",
+    "v0.32.0",
+]
+#: Spec §11.1 item 7: section 31's generated-models bullet, whitespace normalised.
+_GENERATED_MODELS_BULLET_31 = (
+    "- **Generated models use comments** where the full ORM writes `SurrealConfigDict(permissions=…, changefeed=…, "
+    "relation_in=…, relation_out=…, enforced=…)` (`# Permissions: …`, `# Changefeed: …`, `# IN … OUT … ENFORCED`), "
+    "and the base class where it writes `table_type=` (`BaseSurrealEdge` for a relation table): those keys arrive in "
+    "the lite's `SurrealConfigDict` with later minors. A view is generated with `view_query=…` since v0.32.0, as in "
+    "the full ORM (a `# View: AS …` comment when the lite cannot declare it: an edge, a computed field, a query it "
+    "refuses). `READONLY` is a comment too (full ORM: `Field(readonly=True)`)."
+)
+#: Spec §11.1 item 7: section 31's long-line sentence, whitespace normalised.
+_LONG_LINES_31 = (
+    'Other long lines — long names, a long `Literal` union, a long view query (`view_query="…"`) — are left on one '
+    "line for your formatter."
+)
+#: Spec §11.1 item 7: section 31's prose on generated classes says the same as the bullet.
+_GENERATING_NEEDLES_31 = (
+    "`view_query` for a view table",
+    "`id: RecordID | None = None` for a view",
+    "`# Read-only materialized view`",
+    "`# View: AS …`",
+)
+
+
+def _section_33() -> str:
+    return _readme_part(_SECTION_33)
+
+
+def _part_33(heading: str) -> str:
+    """One ``####`` subsection of section 33, as written."""
+    return _subsection(f"#### {heading}", _section_33())
+
+
+def _readme_blocks(text: str) -> list[str]:
+    """The ``python`` blocks of *text*, in order."""
+    blocks: list[str] = re.findall(r"^```python\n(.*?)^```$", text, re.MULTILINE | re.DOTALL)
+    return blocks
+
+
+def _readme_printed(block: str) -> list[str]:
+    """What a README example prints: its comment lines that start a line (``# <printed line>``), in order."""
+    return re.findall(r"^# (.*)$", block, re.MULTILINE)
+
+
+def _readme_bullets(text: str) -> list[str]:
+    """The ``- `` bullets of *text*, each with its continuation lines, whitespace normalised."""
+    return [_normalised(bullet) for bullet in re.findall(r"^- .*?(?=^- |^\s*$|\Z)", text, re.MULTILINE | re.DOTALL)]
+
+
+def _anchor(heading: str) -> str:
+    """GitHub's anchor of a README heading: lower case, punctuation but ``-`` and ``_`` dropped, spaces as ``-``."""
+    return re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-")
+
+
+class TestReadmeSection33:
+    """AC-18: README section 33 — its place, subsections, examples (run on ``mem://`` as written, each printed line
+    equal to its comment), the Security wording (D18), the removal prose (P1) and the D2/D6 wording —, section 31's
+    generated-models bullet and long-line sentence, and the features, roadmap, comparison and both behaviour tables
+    (spec §11.1)."""
+
+    def test_section_33_follows_section_32(self) -> None:
+        """Right after section 32 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        text = _readme()
+        start_32 = text.index(f"\n{_SECTION_32}\n")
+        start_33 = text.index(f"\n{_SECTION_33}\n")
+        configuration = text.index("\n## Configuration Options\n")
+        assert start_32 < start_33 < configuration
+        assert re.findall(r"^#{2,3} .*$", text[start_32 + 1 : configuration], re.MULTILINE) == [
+            _SECTION_32,
+            _SECTION_33,
+        ]
+        assert text[:configuration].rstrip().endswith("\n---"), "section 33 ends before the --- of the next part"
+
+    def test_subsections_in_order(self) -> None:
+        assert re.findall(r"^#### (.*)$", _section_33(), re.MULTILINE) == _SUBSECTIONS_33
+
+    def test_the_spec_examples_open_their_parts(self) -> None:
+        """Example A exactly, the first block of the untitled intro; example B exactly, the first block of "Declaring a
+        view"; no other block; ``python`` fences only."""
+        section = _section_33()
+        assert _readme_blocks(section) == _README_EXAMPLES_33
+        intro = section.split("\n#### ", 1)[0]
+        assert _readme_blocks(intro) == [_README_EXAMPLE_A]
+        part = _part_33("Declaring a view")
+        assert part.split("\n\n", 1)[1].startswith(f"```python\n{_README_EXAMPLE_B}```"), part
+        fences = re.findall(r"^```(\S*)$", section, re.MULTILINE)
+        assert fences == ["python", ""] * len(_README_EXAMPLES_33), fences
+
+    def test_intro_paragraph(self) -> None:
+        intro = _normalised(_section_33().split("\n```python\n", 1)[0])
+        missing = [needle for needle in _INTRO_NEEDLES_33 if needle not in intro]
+        assert not missing, missing
+
+    @pytest.mark.parametrize("heading", list(_PART_NEEDLES_33))
+    def test_what_each_subsection_says(self, heading: str) -> None:
+        text = _normalised(_part_33(heading))
+        missing = [needle for needle in _PART_NEEDLES_33[heading] if needle not in text]
+        assert not missing, missing
+
+    def test_security_wording(self) -> None:
+        """D18: the binding sentence, and no stronger claim about the query check anywhere in the section."""
+        assert _D18_SENTENCE_33 in _normalised(_part_33("Security"))
+        section = _normalised(_section_33())
+        for claim in ("cannot inject", "cannot close", "boundary", "sound"):
+            assert claim not in section, claim
+
+    def test_coming_from_the_full_orm(self) -> None:
+        """One key phrase per bullet, in order; D2: ``define_table()`` of v0.37.0 accepts a view model."""
+        bullets = _readme_bullets(_part_33("Coming from the full SurrealDB-ORM"))
+        assert len(bullets) == len(_COMING_FROM_PHRASES_33), bullets
+        for bullet, phrase in zip(bullets, _COMING_FROM_PHRASES_33, strict=True):
+            assert phrase.lower() in bullet.lower(), (phrase, bullet)
+        assert "v0.37.0" in bullets[2] and "`define_table()` accepts a view model" in bullets[2], bullets[2]
+        assert "`CreateTable`/`AlterTable`" in bullets[2], bullets[2]
+        assert "`get_view_query()`" in bullets[0] and "`_is_view()`" in bullets[0], bullets[0]
+        assert "`save()`, `update()`, `merge()`, `delete()` only" in bullets[1], bullets[1]
+
+    def test_links_resolve(self) -> None:
+        """Every in-page link of section 33 names a heading of the README."""
+        anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
+        links = re.findall(r"\]\(#([^)]+)\)", _section_33())
+        assert links, "section 33 links to the behaviour tables and to section 29"
+        assert [link for link in links if link not in anchors] == []
+
+    def test_features_row(self) -> None:
+        features = [row for _, row in _table_rows(_readme_part("## Features"))]
+        firsts = [row[0] for row in features]
+        assert _FEATURES_ROW_33 in features, features
+        events = "Server-side events & function DDL (`Event`, `define_function()`)"
+        assert firsts.index(_FEATURES_ROW_33[0]) == firsts.index(events) + 1
+
+    def test_roadmap_rows(self) -> None:
+        roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
+        start = [row[0] for row in roadmap].index("v0.31.0")
+        assert roadmap[start : start + 4] == _ROADMAP_ROWS_33, roadmap
+
+    def test_comparison_row(self) -> None:
+        """The materialized views row filled in, after the ``define_function()`` row and before full-text search."""
+        comparison = [row for _, row in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        firsts = [row[0] for row in comparison]
+        start = firsts.index("`define_function()` (DDL)")
+        assert comparison[start + 1] == _COMPARISON_ROW_33, comparison
+        assert firsts[start + 2] == "Full-Text Search", firsts
+
+    def test_server_behaviour_rows(self) -> None:
+        """Exactly eight rows, Since v0.32.0, together and in version order: earlier releases above them, later ones
+        below them, then the table's last row (v0.19.1's re-run)."""
+        assert_server_rows(_VIEW_ROWS)
+
+    def test_server_behaviour_table_keeps_its_widths(self) -> None:
+        """Every line 535 characters, the columns 136, 175, 181 and 38 wide: the new rows are padded to them."""
+        assert_server_table()
+
+    def test_server_behaviour_header_sentence(self) -> None:
+        """The sentence v0.32.0 adds to the table's intro paragraph, once, among sentences naming their releases in
+        increasing version order."""
+        assert_server_header_sentence(_HEADER_SENTENCE_32)
+
+    def test_embedded_table_row(self) -> None:
+        """All four cells, in version order before the catch-all "Everything else" row; widths kept (69, 343, 113,
+        9)."""
+        assert_embedded_rows([_EMBEDDED_VIEWS_ROW])
+
+    def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
+        """Every table v0.32.0 touches keeps one cell count per line and no escaped pipe; section 33 has no table."""
+        parts = [
+            _readme_part("## Features"),
+            _readme_part(_SERVER_BEHAVIOUR),
+            _readme_part(_EMBEDDED_BEHAVIOUR),
+            _readme_part("## Roadmap"),
+            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+        ]
+        found = [lines for part in parts for lines in _md_tables(part)]
+        assert len(found) == len(parts)
+        assert _md_tables(_section_33()) == [], "section 33 has no table"
+        for lines in found:
+            assert len({len(_cells(line)) for line in lines}) == 1 and "\\|" not in "".join(lines), lines
+
+    def test_section_31_generated_models(self) -> None:
+        """Spec §11.1 item 7: section 31's generated-models bullet, its long-line sentence and its prose on generated
+        classes say that a view is generated with ``view_query=``."""
+        section_31 = _readme_part(_SECTION_31)
+        bullets = _readme_bullets(_subsection("#### Coming from the full SurrealDB-ORM", section_31))
+        assert _GENERATED_MODELS_BULLET_31 in bullets, [b for b in bullets if "Generated models" in b]
+        assert _LONG_LINES_31 in _normalised(_subsection("#### What the generator does not do", section_31))
+        generating = _normalised(_subsection("#### Generating models", section_31))
+        missing = [needle for needle in _GENERATING_NEEDLES_31 if needle not in generating]
+        assert not missing, missing
+
+    async def test_section_33_examples(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-18: every ``python`` block runs as written, in order and in one namespace, on ``mem://`` (inside
+        ``embedded_database()``); what each block prints is, line by line, its ``# `` comment lines."""
+        capsys.readouterr()
+        namespace: dict[str, Any] = {"__name__": "readme_section_33"}
+        try:
+            async with embedded_database():
+                for code in _readme_blocks(_section_33()):
+                    compiled = compile(code, "<README section 33>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                    # A doctest of this repository's own README (trusted text), top-level awaits included.
+                    outcome = eval(compiled, namespace)
+                    if inspect.iscoroutine(outcome):
+                        await outcome
+                    assert capsys.readouterr().out.splitlines() == _readme_printed(code), code
+        finally:
+            namespace.clear()

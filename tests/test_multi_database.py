@@ -5154,7 +5154,7 @@ class TestMultiDatabaseDocs:
 
     def test_section_30_follows_section_29(self) -> None:
         """Right after section 29 (after its "Coming from" bullets), then section 31 (v0.30.0), then section 32
-        (v0.31.0), and before the ``---`` of "Configuration Options"."""
+        (v0.31.0), then section 33 (v0.32.0), and before the ``---`` of "Configuration Options"."""
         readme = _readme()
         start_29 = readme.index(f"\n{_SECTION_29}\n")
         start_30 = readme.index(f"\n{_SECTION_30}\n")
@@ -5165,6 +5165,7 @@ class TestMultiDatabaseDocs:
             _SECTION_30,
             "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
             "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
+            "### 33. Materialized views (`view_query`, `define_view()`)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "section 30 ends before the --- of the next part"
 
@@ -5293,7 +5294,7 @@ class TestMultiDatabaseDocs:
             ["v0.29.0", "Tier 2 — Multi-database", "✅ Released"],
             ["v0.30.0", "Tier 3 — Schema introspection", "✅ Released"],
             ["v0.31.0", "Tier 3 — Server-side events and DDL helpers", "✅ Released"],
-            ["v0.32.0 – v0.39.0", "Tier 3 — Advanced (search, DDL, migrations, CLI)", "📋 Planned"],
+            ["v0.32.0", "Tier 3 — Materialized views", "✅ Released"],
         ], roadmap
 
     def test_comparison_row(self) -> None:
