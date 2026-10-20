@@ -78,6 +78,12 @@ from surreal_orm_lite.schema import (
 )
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import apply_ddl_statements
+from tests._readme_tables import (
+    assert_embedded_rows,
+    assert_server_header_sentence,
+    assert_server_rows,
+    assert_server_table,
+)
 from tests.conftest import default_connection_class
 from tests.test_embedded import (
     _EMBEDDED_BEHAVIOUR,
@@ -90,7 +96,7 @@ from tests.test_embedded import (
 )
 from tests.test_embedded import _tables as _md_tables
 from tests.test_query_cache import _bullets
-from tests.test_time_travel import _SERVER_BEHAVIOUR, _SERVER_TABLE_WIDTHS
+from tests.test_time_travel import _SERVER_BEHAVIOUR
 
 # The fixed DefineParseError reasons, written out: the tests pin the exact texts.
 _R_BRACKETS = "its brackets are not balanced"
@@ -3661,30 +3667,6 @@ def _anchor(heading: str) -> str:
     return re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-")
 
 
-def _release(text: str) -> tuple[int, int, int]:
-    """The release *text* names (``v0.30.7``, ``pre-existing (documented in v0.28.1)``) as a comparable triple."""
-    match = re.search(r"\bv(\d+)\.(\d+)\.(\d+)\b", text)
-    assert match is not None, text
-    major, minor, patch = (int(part) for part in match.groups())
-    return major, minor, patch
-
-
-def _assert_release_rows_in_order(rows: list[list[str]], block: list[list[str]], tail: int) -> None:
-    """*block* is in *rows* once, contiguous, and holds every row whose last cell names its release; the rows above it
-    name earlier releases and those below it, but for the table's *tail* final rows, later ones.
-
-    Which release sits next to *block* is not checked: a release prepared in parallel inserts its rows in version order
-    without changing this test.
-    """
-    release = _release(block[0][-1])
-    start = rows.index(block[0])
-    end = start + len(block)
-    assert rows[start:end] == block, rows[start:end]
-    assert [cells for cells in rows if _release(cells[-1]) == release] == block
-    assert all(_release(cells[-1]) < release for cells in rows[:start]), rows[:start]
-    assert all(_release(cells[-1]) > release for cells in rows[end : len(rows) - tail]), rows[end:]
-
-
 class TestReadmeSection32:
     """AC-17: README section 32 — its place, subsections, examples (run on ``mem://`` as written, each printed line
     equal to its comment), the Security wording (D18) and the canonical kinds (P1) — section 17's first example and
@@ -3778,37 +3760,21 @@ class TestReadmeSection32:
     def test_server_behaviour_rows(self) -> None:
         """Exactly seven rows, Since v0.31.0, together and in version order: earlier releases above them, later ones
         below them, then the table's last row (v0.19.1's re-run)."""
-        rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
-        assert rows[-1][3] == "v0.19.1", rows[-1]
-        _assert_release_rows_in_order(rows, _EVENT_ROWS, tail=1)
+        assert_server_rows(_EVENT_ROWS)
 
     def test_server_behaviour_table_keeps_its_widths(self) -> None:
         """Every line 535 characters, the columns 136, 175, 181 and 38 wide: the new rows are padded to them."""
-        [lines] = _md_tables(_readme_part(_SERVER_BEHAVIOUR))
-        assert {len(line) for line in lines} == {535}
-        for line in lines:
-            assert [len(cell) for cell in line.split("|")[1:-1]] == _SERVER_TABLE_WIDTHS, line
+        assert_server_table()
 
     def test_server_behaviour_header_sentence(self) -> None:
         """The sentence v0.31.0 adds to the table's intro paragraph, once, among sentences naming their releases in
         increasing version order."""
-        header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
-        assert header.count(_HEADER_SENTENCE_31) == 1, header
-        releases = [_release(name) for name in re.findall(r"\badded in (v\d+\.\d+\.\d+)", header)]
-        assert releases == sorted(set(releases)), releases
-        assert (0, 31, 0) in releases, releases
+        assert_server_header_sentence(_HEADER_SENTENCE_31)
 
     def test_embedded_table_row(self) -> None:
         """All four cells, in version order (earlier releases above, later ones below) before the catch-all
         "Everything else" row; widths kept (69, 343, 113, 9)."""
-        part = _readme_part(_EMBEDDED_BEHAVIOUR)
-        rows = [cells for _, cells in _table_rows(part)]
-        assert rows[-1][0] == "Everything else", rows[-1]
-        _assert_release_rows_in_order(rows, [_EMBEDDED_EVENTS_ROW], tail=1)
-        [lines] = _md_tables(part)
-        assert {len(line) for line in lines} == {539}
-        for line in lines:
-            assert [len(cell) for cell in line.split("|")[1:-1]] == [69, 343, 113, 9], line
+        assert_embedded_rows([_EMBEDDED_EVENTS_ROW])
 
     def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
         """Every table v0.31.0 touches keeps one cell count per line and no escaped pipe."""
