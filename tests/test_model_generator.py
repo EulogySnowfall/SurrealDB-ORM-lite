@@ -18,6 +18,11 @@ Materialized views (v0.32.0, spec §6.7, D12; AC-16 unit part): a view table is 
 (``view_query="…"``, ``# Read-only materialized view``, ``id: RecordID | None = None``), a long query on one line; an
 edge, a class with a ``Computed`` field and a query ``check_view_query()`` refuses keep v0.30.0's output. The round trip
 against the servers is ``tests/test_views.py``'s ``TestViewRoundTripE2E``.
+
+Relation keys (v0.33.0, spec §6.5, D10, P1; AC-14 unit part): an edge class gets ``relation_in=``, ``relation_out=``
+and ``enforced=True`` after ``table_name=`` instead of the ``# IN … OUT …`` comment, a list exploded past 128 columns as
+``server_fields``; a name that is not an identifier keeps the comment and no key at all, a name stored twice gets the
+key. The round trip against the servers is ``tests/test_type_relation.py``'s ``TestRoundTripE2E``.
 """
 
 import ast
@@ -753,8 +758,12 @@ class IspCompany(BaseSurrealModel):
 
 
 class IspLikes(BaseSurrealEdge):
-    # IN isp_person OUT isp_person | isp_company
-    model_config = SurrealConfigDict(table_name="isp_likes", connection="isp")
+    model_config = SurrealConfigDict(
+        table_name="isp_likes",
+        relation_in="isp_person",
+        relation_out=["isp_person", "isp_company"],
+        connection="isp",
+    )
 
     since: datetime | None = None
 
@@ -1012,7 +1021,7 @@ class TestGolden:
 
     def test_default_connection_has_no_connection_key(self) -> None:
         source = ModelCodeGenerator().generate(_fixture_state(3, connection="default"))
-        assert source == GOLDEN.replace(', connection="isp"', "")
+        assert source == GOLDEN.replace(', connection="isp"', "").replace('        connection="isp",\n', "")
         assert "connection=" not in source
 
     def test_golden_passes_ruff_and_imports(self, tmp_path: Path) -> None:
@@ -1026,6 +1035,9 @@ class TestGolden:
         assert person.model_fields["class_"].alias == "class"
         assert module.IspLog.model_config["extra"] == "allow"
         assert issubclass(module.IspLikes, surreal_orm_lite.BaseSurrealEdge)
+        assert module.IspLikes.get_relation_in() == ("isp_person",)
+        assert module.IspLikes.get_relation_out() == ("isp_person", "isp_company")
+        assert module.IspLikes.is_enforced() is False
 
 
 #: Spec §6.4.4: one field per row — (kind, nullable, the generated line).
@@ -1672,17 +1684,15 @@ class TestClasses:
         )
         assert _class_block(source, "E") == (
             "class E(BaseSurrealEdge):\n"
-            "    # IN any OUT b | c ENFORCED\n"
-            '    model_config = SurrealConfigDict(table_name="e")\n'
+            '    model_config = SurrealConfigDict(table_name="e", relation_out=["b", "c"], enforced=True)\n'
             "\n"
             "    since: datetime | None = None\n"
         )
         bare = _generate(name="r", table_type="relation", relation_in="a | b", schema_mode="SCHEMALESS")
         assert _class_block(bare, "R") == (
             "class R(BaseSurrealEdge):\n"
-            "    # IN a | b OUT any\n"
             '    # SCHEMALESS: fields not declared here are kept (extra="allow")\n'
-            '    model_config = SurrealConfigDict(table_name="r", extra="allow")\n'
+            '    model_config = SurrealConfigDict(table_name="r", relation_in=["a", "b"], extra="allow")\n'
         )
 
     @pytest.mark.parametrize("table_type", ["relation", "RELATION", "Relation"])
@@ -1703,7 +1713,6 @@ class TestClasses:
         assert {"in_", "out", "since"} <= set(module.Likes.model_fields)
         assert _class_block(source, "Likes") == (
             "class Likes(BaseSurrealEdge):\n"
-            "    # IN any OUT any\n"
             '    model_config = SurrealConfigDict(table_name="likes")\n'
             "\n"
             "    since: datetime | None = None\n"
@@ -1958,7 +1967,8 @@ class TestClasses:
         assert "update() after save()" not in source
         assert _class_block(source, "T").splitlines()[1].startswith("    model_config = ")
 
-    def test_update_note_follows_the_edge_ends(self) -> None:
+    def test_update_note_on_an_edge_without_ends(self) -> None:
+        """An unconstrained relation table gets no relation comment (v0.33.0): the note comes first."""
         source = _generate(
             _f("created", "set<datetime>", readonly=True),
             _f("prefs", "object"),
@@ -1966,8 +1976,7 @@ class TestClasses:
             name="e",
             table_type="relation",
         )
-        assert _class_block(source, "E").splitlines()[1:4] == [
-            "    # IN any OUT any",
+        assert _class_block(source, "E").splitlines()[1:3] == [
             UPDATE_NOTE,
             '    model_config = SurrealConfigDict(table_name="e")',
         ]
@@ -1976,7 +1985,7 @@ class TestClasses:
         edge = _generate(_f("in", "set<datetime>", readonly=True), name="e", table_type="relation")
         assert "update()" not in edge
         edge = _generate(_f("at", "set<datetime>", readonly=True), name="e", table_type="relation")
-        assert _class_block(edge, "E").splitlines()[2] == UPDATE_NOTE
+        assert _class_block(edge, "E").splitlines()[1] == UPDATE_NOTE
 
     def test_comment_order(self) -> None:
         source = _generate(
@@ -1991,9 +2000,8 @@ class TestClasses:
             indexes={"i": IndexState(name="i", fields=("at",))},
             events={"e": EventState("e", "r", "true", "(x)")},
         )
-        assert _class_block(source, "R").splitlines()[1:11] == [
+        assert _class_block(source, "R").splitlines()[1:10] == [
             "    # Comment: c",
-            "    # IN any OUT any",
             "    # View: AS SELECT * FROM x",
             "    # Changefeed: 1d",
             "    # Permissions: FOR select FULL",
@@ -2008,6 +2016,209 @@ class TestClasses:
         assert _class_block(_generate(), "T") == (
             'class T(BaseSurrealModel):\n    model_config = SurrealConfigDict(table_name="t")\n\n    id: str | None = None\n'
         )
+
+
+#: v0.33.0: eight names of 14 characters — a ``relation_out=[…]`` line of 166 columns.
+_LONG_ENDS = tuple(f"long_table_{index:03d}" for index in range(8))
+
+
+class TestRelationKeys:
+    """v0.33.0 (spec §6.5, D10, P1; AC-14 unit part): an edge class carries its table's ends as ``relation_in=``,
+    ``relation_out=`` and ``enforced=True`` — after ``table_name=``, before ``connection=``; a ``str`` for one name, a
+    list for several, in server order — when the class statement accepts them (``schema.relation_tables()``), and no
+    ``# IN … OUT …`` comment. A name that is not an identifier keeps v0.30.0's comment and no key at all; a name stored
+    twice gets the key; an unconstrained relation table gets neither."""
+
+    def test_identifier_ends_become_keys(self, tmp_path: Path) -> None:
+        table = _parsed_table(
+            "DEFINE TABLE likes TYPE RELATION IN person OUT post | book ENFORCED SCHEMAFULL PERMISSIONS NONE",
+            ["DEFINE FIELD stars ON likes TYPE int PERMISSIONS FULL"],
+        )
+        source = _quality(tmp_path, SchemaState(tables={"likes": table}), "ends")
+        assert _class_block(source, "Likes") == (
+            "class Likes(BaseSurrealEdge):\n"
+            '    model_config = SurrealConfigDict(table_name="likes", relation_in="person", relation_out=["post", "book"], '
+            "enforced=True)\n"
+            "\n"
+            "    stars: int\n"
+        )
+        likes = _guarded_exec(source)["Likes"]
+        assert likes.get_relation_in() == ("person",)
+        assert likes.get_relation_out() == ("post", "book")
+        assert likes.is_enforced() is True
+        assert likes.relation_ddl() == "DEFINE TABLE OVERWRITE `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;"
+
+    @pytest.mark.parametrize(
+        ("ends", "config"),
+        [
+            ({"relation_in": ("a",)}, 'table_name="e", relation_in="a"'),
+            ({"relation_out": ("b",)}, 'table_name="e", relation_out="b"'),
+            ({"enforced": True}, 'table_name="e", enforced=True'),
+            ({"relation_in": ("a", "b"), "relation_out": ("c",)}, 'table_name="e", relation_in=["a", "b"], relation_out="c"'),
+            (
+                {"relation_in": ("select",), "relation_out": ("order",)},
+                'table_name="e", relation_in="select", relation_out="order"',
+            ),
+            ({}, 'table_name="e"'),
+        ],
+        ids=["in", "out", "enforced", "in-and-out", "keywords", "unconstrained"],
+    )
+    def test_each_form(self, tmp_path: Path, ends: dict[str, Any], config: str) -> None:
+        state = SchemaState(tables={"e": TableState(name="e", table_type="relation", **ends)})
+        source = _quality(tmp_path, state, "form")
+        assert _class_block(source, "E") == f"class E(BaseSurrealEdge):\n    model_config = SurrealConfigDict({config})\n"
+        edge = _guarded_exec(source)["E"]
+        assert edge.get_relation_in() == state.tables["e"].relation_in
+        assert edge.get_relation_out() == state.tables["e"].relation_out
+        assert edge.is_enforced() is state.tables["e"].enforced
+
+    @pytest.mark.parametrize(
+        ("ends", "comment"),
+        [
+            ({"relation_in": ("a-b",), "relation_out": ("c",)}, "# IN a-b OUT c"),
+            ({"relation_in": ("a-b",), "relation_out": ("c",), "enforced": True}, "# IN a-b OUT c ENFORCED"),
+            ({"relation_in": ("a",), "relation_out": ("b", "1c")}, "# IN a OUT b | 1c"),
+            ({"relation_in": (" a",)}, "# IN  a OUT any"),
+            ({"relation_in": ("a ",), "relation_out": ("b",)}, "# IN a  OUT b"),
+        ],
+        ids=["dash", "dash-enforced", "digit-out", "leading-space", "trailing-space"],
+    )
+    def test_a_name_that_is_not_an_identifier_keeps_the_comment(
+        self, tmp_path: Path, ends: dict[str, Any], comment: str
+    ) -> None:
+        """All or nothing: no key at all, not even the other side's valid names or ``enforced``; a name with spaces
+        around it is not the identifier it would be once stripped."""
+        state = SchemaState(tables={"e": TableState(name="e", table_type="relation", **ends)})
+        source = _quality(tmp_path, state, "fallback")
+        assert _class_block(source, "E") == (
+            f"class E(BaseSurrealEdge):\n    {comment}\n" + '    model_config = SurrealConfigDict(table_name="e")\n'
+        )
+        assert "relation_" not in source and "enforced" not in source
+        edge = _guarded_exec(source)["E"]
+        assert (edge.get_relation_in(), edge.get_relation_out(), edge.is_enforced()) == ((), (), False)
+
+    def test_a_name_stored_twice_gets_the_key(self, tmp_path: Path) -> None:
+        """M22, P1 b: SurrealDB stores ``IN a | a OUT b | B`` as written; the class statement accepts it."""
+        table = _parsed_table("DEFINE TABLE d1 TYPE RELATION IN a | a OUT b | B SCHEMAFULL PERMISSIONS NONE")
+        assert (table.relation_in, table.relation_out) == (("a", "a"), ("b", "B"))
+        source = _quality(tmp_path, SchemaState(tables={"d1": table}), "twice")
+        assert _class_block(source, "D1") == (
+            "class D1(BaseSurrealEdge):\n"
+            '    model_config = SurrealConfigDict(table_name="d1", relation_in=["a", "a"], relation_out=["b", "B"])\n'
+        )
+        edge = _guarded_exec(source)["D1"]
+        assert edge.get_relation_in() == ("a", "a")
+        assert edge.get_relation_out() == ("b", "B")
+        assert edge.relation_ddl() == "DEFINE TABLE OVERWRITE `d1` TYPE RELATION IN `a` | `a` OUT `b` | `B`;"
+
+    def test_relation_out_with_two_spellings_alone(self) -> None:
+        source = _generate(name="e", table_type="relation", relation_out=("b", "B"))
+        assert _model_config(source) == '    model_config = SurrealConfigDict(table_name="e", relation_out=["b", "B"])'
+
+    def test_keyword_order(self, tmp_path: Path) -> None:
+        """After ``table_name=`` and before ``connection=``; wider than 128 columns, one keyword per line."""
+        table = TableState(
+            name="e",
+            table_type="relation",
+            schema_mode="SCHEMALESS",
+            relation_in=("a",),
+            relation_out=("b", "c"),
+            enforced=True,
+            fields={"at": _server_field("at")},
+        )
+        source = _quality(tmp_path, SchemaState(tables={"e": table}, connection="c"), "order")
+        assert _model_config(source) == (
+            "    model_config = SurrealConfigDict(\n"
+            '        table_name="e",\n'
+            '        relation_in="a",\n'
+            '        relation_out=["b", "c"],\n'
+            "        enforced=True,\n"
+            '        connection="c",\n'
+            '        server_fields=["at"],\n'
+            '        extra="allow",\n'
+            "    )"
+        )
+
+    def test_one_line_boundary(self, tmp_path: Path) -> None:
+        at_128 = _model_config(_generate(name="e", table_type="relation", relation_in=("a" * 45,), enforced=True))
+        assert at_128 == '    model_config = SurrealConfigDict(table_name="e", relation_in="' + "a" * 45 + '", enforced=True)'
+        assert _width(at_128) == 128
+        at_129 = _model_config(_generate(name="e", table_type="relation", relation_in=("a" * 46,), enforced=True))
+        assert at_129 == (
+            '    model_config = SurrealConfigDict(\n        table_name="e",\n        relation_in="'
+            + "a" * 46
+            + '",\n        enforced=True,\n    )'
+        )
+        for length in (45, 46):
+            table = TableState(name="e", table_type="relation", relation_in=("a" * length,), enforced=True)
+            _quality(tmp_path, SchemaState(tables={"e": table}), f"in{length}")
+
+    def test_a_single_long_name_stays_on_its_line(self, tmp_path: Path) -> None:
+        """A one-name ``str`` keyword is never split, as ``table_name=`` is not."""
+        table = TableState(name="e", table_type="relation", relation_out=("o" * 130,))
+        source = _quality(tmp_path, SchemaState(tables={"e": table}), "long_name")
+        assert _model_config(source).splitlines()[2] == '        relation_out="' + "o" * 130 + '",'
+
+    def test_list_line_boundary(self, tmp_path: Path) -> None:
+        """A ``relation_out=[…]`` line of 128 columns stays; at 129 it is exploded one name per line, as
+        ``server_fields``."""
+        at_128 = _model_config(_generate(name="e", table_type="relation", relation_out=("a" * 49, "b" * 49)))
+        assert at_128.splitlines()[2] == '        relation_out=["' + "a" * 49 + '", "' + "b" * 49 + '"],'
+        assert _width(at_128.splitlines()[2]) == 128
+        at_129 = _model_config(_generate(name="e", table_type="relation", relation_out=("a" * 49, "b" * 50)))
+        assert at_129.splitlines()[2:6] == [
+            "        relation_out=[",
+            '            "' + "a" * 49 + '",',
+            '            "' + "b" * 50 + '",',
+            "        ],",
+        ]
+        for name, ends in (("out128", ("a" * 49, "b" * 49)), ("out129", ("a" * 49, "b" * 50))):
+            table = TableState(name="e", table_type="relation", relation_out=ends)
+            _quality(tmp_path, SchemaState(tables={"e": table}), name)
+
+    def test_a_long_list_is_exploded(self, tmp_path: Path) -> None:
+        table = TableState(name="e", table_type="relation", relation_in=_LONG_ENDS, relation_out=_LONG_ENDS, enforced=True)
+        source = _quality(tmp_path, SchemaState(tables={"e": table}), "long_list")
+        exploded = [f'            "{name}",' for name in _LONG_ENDS]
+        assert _model_config(source) == "\n".join(
+            [
+                "    model_config = SurrealConfigDict(",
+                '        table_name="e",',
+                "        relation_in=[",
+                *exploded,
+                "        ],",
+                "        relation_out=[",
+                *exploded,
+                "        ],",
+                "        enforced=True,",
+                "    )",
+            ]
+        )
+        edge = _guarded_exec(source)["E"]
+        assert edge.get_relation_in() == _LONG_ENDS == edge.get_relation_out()
+
+    def test_comment_order_of_the_fallback(self) -> None:
+        """v0.30.0's ``# IN … OUT …`` comment keeps its place, after the table's comment."""
+        source = _generate(
+            _f("at", "set<datetime>", readonly=True),
+            name="r",
+            table_type="relation",
+            comment="c",
+            relation_in=("a-b",),
+            changefeed="1d",
+        )
+        assert _class_block(source, "R").splitlines()[1:6] == [
+            "    # Comment: c",
+            "    # IN a-b OUT any",
+            "    # Changefeed: 1d",
+            UPDATE_NOTE,
+            '    model_config = SurrealConfigDict(table_name="r")',
+        ]
+
+    def test_a_node_gets_no_key(self) -> None:
+        """Ends stored on a table that is not a relation (a hand-built state) give no key: the class is not an edge."""
+        source = _generate(name="t", relation_in=("a",), enforced=True)
+        assert _model_config(source) == '    model_config = SurrealConfigDict(table_name="t")'
 
 
 #: v0.32.0: a grouped view query and a ``GROUP ALL`` one, as ``INFO FOR DB`` renders them.
@@ -2078,10 +2289,7 @@ class TestViewModels:
     def test_an_edge_view_keeps_the_v0_30_output(self) -> None:
         source = _generate(name="e", table_type="relation", view_query=_TOTALS_VIEW)
         assert _class_block(source, "E") == (
-            "class E(BaseSurrealEdge):\n"
-            "    # IN any OUT any\n"
-            f"    # View: AS {_TOTALS_VIEW}\n"
-            '    model_config = SurrealConfigDict(table_name="e")\n'
+            f'class E(BaseSurrealEdge):\n    # View: AS {_TOTALS_VIEW}\n    model_config = SurrealConfigDict(table_name="e")\n'
         )
         assert "RecordID" not in source
 

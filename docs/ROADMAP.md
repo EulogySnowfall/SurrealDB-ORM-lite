@@ -41,7 +41,8 @@
 | v0.30.0           | Tier 3 — Schema introspection                       | Done    |
 | v0.31.0           | Tier 3 — Server-side events & DDL helpers           | Done    |
 | v0.32.0           | Tier 3 — Materialized views                         | Done    |
-| v0.33.0 – v0.39.0 | Tier 3 — Advanced (search/DDL/migrations), 7 minors | Planned |
+| v0.33.0           | Tier 3 — `TYPE RELATION` enforcement                | Done    |
+| v0.34.0 – v0.39.0 | Tier 3 — Advanced (search/migrations/CLI), 6 minors | Planned |
 | v0.40.0           | Beta Phase (API freeze, hardening)                  | Planned |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)              | Planned |
 | v2.1.0+           | Future (post-GA)                                    | Future  |
@@ -100,7 +101,7 @@ pieces stay out.
 | `DEFINE EVENT` (triggers)              | DDL via `query()`                                     | ✅ v0.31.0     |
 | `define_function()` DDL helper         | `DEFINE FUNCTION` via `query()` (`schema.py`)         | ✅ v0.31.0     |
 | Materialized views                     | `DEFINE TABLE … AS SELECT`                            | ✅ v0.32.0     |
-| `TYPE RELATION` enforcement            | `DEFINE TABLE … TYPE RELATION`                        | v0.33.0        |
+| `TYPE RELATION` enforcement            | `DEFINE TABLE … TYPE RELATION`                        | ✅ v0.33.0     |
 | Full-Text Search (BM25)                | `DEFINE ANALYZER` + `SEARCH` index + `search::*`      | v0.34.0        |
 | Vector Search (KNN, HNSW/MTREE)        | `DEFINE INDEX … HNSW/MTREE` + KNN operator            | v0.35.0        |
 | Hybrid Search (RRF)                    | vector + FTS fusion                                   | v0.36.0        |
@@ -163,7 +164,7 @@ moves it to the `surrealdb[embedded]` extra.
 | Schema introspection          | yes        | ✅ v0.30.0                  |
 | DEFINE EVENT                  | yes        | ✅ v0.31.0                  |
 | Materialized views            | yes        | ✅ v0.32.0                  |
-| TYPE RELATION enforcement     | yes        | v0.33.0                     |
+| TYPE RELATION enforcement     | yes        | ✅ v0.33.0                  |
 | Full-Text Search (BM25)       | yes        | v0.34.0                     |
 | Vector Search (KNN/HNSW)      | yes        | v0.35.0                     |
 | Hybrid Search (RRF)           | yes        | v0.36.0                     |
@@ -426,7 +427,9 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   error on both lines: the ORM raises. Endpoint rewrites (ignored by the server) and `upsert()`
   on an edge (a plain record no traversal sees) are refused
 - Native idempotency documented: a deterministic array id or a `UNIQUE` index on `in, out`.
-  Relation DDL (`TYPE RELATION IN … OUT …`) stays hand-written until v0.33.0
+  Relation DDL (`TYPE RELATION IN … OUT …`) stays hand-written until v0.33.0, which declares it
+  on the edge model (`relation_in`, `relation_out`, `enforced`) and applies it with
+  `define_relation()`
 
 ### Version 0.23.0 — Rich field types
 
@@ -674,6 +677,39 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   table permissions for record users (a view is defined with SurrealDB's default
   `PERMISSIONS NONE`) and a view query built from a QuerySet
 
+### Version 0.33.0 — `TYPE RELATION` enforcement
+
+- An edge model declares its graph constraints with the full SurrealDB-ORM's keys:
+  `SurrealConfigDict(relation_in=…, relation_out=…, enforced=…, table_type=TableType.RELATION)`
+  on `BaseSurrealEdge` (`table_type` optional; `TableType` exported, its six members and values).
+  Ends are one name, a `|`-separated string or a list or tuple; each is an identifier, written in
+  backquotes. The keys are checked at the `class` statement (on a node model they raise
+  `TypeError`); `get_relation_in()`/`get_relation_out()` return tuples in the shape of
+  `TableState`, `is_enforced()` a bool, `get_table_type()` the table's `TableType`
+- `Model.relation_ddl()` renders ``DEFINE TABLE OVERWRITE `<table>` TYPE RELATION IN … OUT …``
+  (pure); `Model.define_relation()` applies it (idempotent; `overwrite=False` for `IF NOT EXISTS`;
+  `tx=`): one `INFO FOR DB`, then one `DEFINE TABLE OVERWRITE` that keeps the table's schema mode,
+  `DROP`, comment, change feed and permissions, and its records, fields, indexes, events, views
+  and live queries. Enforced at once on every connection; a keyless model removes the
+  constraint. Refused before any DDL: a materialized view, a definition the ORM cannot read back,
+  `overwrite=False` on a table that is not a relation table
+- Enforcement is SurrealDB's: every edge creation path (`relate()` typed or by table name, an
+  edge's `save()`, `objects().bulk_create()`) raises `SurrealDbError` for an endpoint outside
+  `IN`/`OUT` and `SurrealDbNotFoundError` for a missing endpoint with `ENFORCED`; the string
+  `relate("<edge table>", …)` now translates server errors too. `generate_models_from_db()` writes
+  `relation_in`/`relation_out`/`enforced` instead of the `# IN … OUT …` comment, so a relation
+  table round-trips through introspection
+- Measured differences: the refusal wording (`Found … but expected a record<…>` on 2.x,
+  `Couldn't coerce value for field …` on 3.x); an endpoint both outside `IN`/`OUT` and missing on
+  an `ENFORCED` table is `SurrealDbNotFoundError` on 2.x and the embedded engine,
+  `SurrealDbError` on 3.x; a raw `ALTER TABLE … TYPE RELATION …` of a table already written to is
+  not enforced on 2.x and the embedded engine until a `DEFINE TABLE OVERWRITE` (the ORM never
+  sends `ALTER TABLE`). Same code on 2.7.0, 3.3.4 and the embedded engine (3.1.5 retro identical)
+- Deferred: migrations (`CreateTable`/`AlterTable` with the relation keys) and `define_table()`
+  → v0.37.0, which will apply an edge model through `define_relation()`; until then `TableType`'s
+  other members have no effect, and the table's other clauses are kept from the database (no
+  schema-mode, permissions, change-feed or comment keys yet)
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -880,7 +916,7 @@ servers (3.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too.
 | ✅ v0.30.0 | Schema introspection (inspectdb, read-only)                                    | `INFO FOR DB` / `INFO FOR TABLE` |
 | ✅ v0.31.0 | `DEFINE EVENT` (server-side triggers)                                          | DDL via `query()`                |
 | ✅ v0.32.0 | Materialized views (read-only models)                                          | `DEFINE TABLE … AS SELECT`       |
-| v0.33.0    | `TYPE RELATION` enforcement (graph constraints), building on `BaseSurrealEdge` | `DEFINE TABLE … TYPE RELATION`   |
+| ✅ v0.33.0 | `TYPE RELATION` enforcement (graph constraints), building on `BaseSurrealEdge` | `DEFINE TABLE … TYPE RELATION`   |
 
 ### 🔎 Phase G — Advanced search
 

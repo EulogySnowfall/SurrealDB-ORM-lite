@@ -2811,6 +2811,7 @@ _TX_CALLS: dict[str, Callable[[Any, Any], Any]] = {
     "define_access": lambda m, tx: type(m).define_access(tx=tx),
     "define_computed_fields": lambda m, tx: type(m).define_computed_fields(tx=tx),
     "define_events": lambda m, tx: type(m).define_events(tx=tx),
+    "define_relation": lambda m, tx: type(m).define_relation(tx=tx),
     "define_view": lambda m, tx: type(m).define_view(tx=tx),
     "delete": lambda m, tx: m.delete(tx=tx),
     "merge": lambda m, tx: m.merge(tx=tx, n=1),
@@ -5153,8 +5154,8 @@ class TestMultiDatabaseDocs:
     C4, C7, P5, P8, P9)."""
 
     def test_section_30_follows_section_29(self) -> None:
-        """Right after section 29 (after its "Coming from" bullets), then section 31 (v0.30.0), then section 32
-        (v0.31.0), then section 33 (v0.32.0), and before the ``---`` of "Configuration Options"."""
+        """Right after section 29 (after its "Coming from" bullets), then section 31 (v0.30.0), section 32
+        (v0.31.0), section 33 (v0.32.0) and section 34 (v0.33.0), and before the ``---`` of "Configuration Options"."""
         readme = _readme()
         start_29 = readme.index(f"\n{_SECTION_29}\n")
         start_30 = readme.index(f"\n{_SECTION_30}\n")
@@ -5166,6 +5167,7 @@ class TestMultiDatabaseDocs:
             "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
             "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
             "### 33. Materialized views (`view_query`, `define_view()`)",
+            "### 34. Relation constraints (`relation_in`, `define_relation()`)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "section 30 ends before the --- of the next part"
 

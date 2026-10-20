@@ -27,6 +27,7 @@ from .routing import check_config_connection, check_same_connection, check_trans
 from .schema import (
     Event,
     check_events_config,
+    check_relation_config,
     check_view_config,
     check_view_query,
     dependent_views,
@@ -56,13 +57,14 @@ from .signals import (
     pre_update,
 )
 from .transaction import BufferedTransaction, Transaction
-from .types import Duration, _duration_from_sdk, _timedelta_from_sdk
+from .types import Duration, TableType, _duration_from_sdk, _timedelta_from_sdk
 from .utils import (
     PLAIN_CONTENT,
     VALID_ALIAS_PATTERN,
     apply_ddl_statements,
     build_set_clause,
     coerce_endpoint,
+    edge_write_error,
     format_record_id,
     merge_extra_vars,
     replace_content,
@@ -572,6 +574,22 @@ class SurrealConfigDict(ConfigDict, total=False):
             the class is defined; applied by define_view(); every write of the model raises
             TypeError. Inherited by subclasses unless they set their own (view_query=None makes a
             subclass an ordinary model).
+        table_type (TableType | None): The table's type (v0.33.0) — the full SurrealDB-ORM's
+            key and enum. TableType.RELATION on an edge model (BaseSurrealEdge), which implies it,
+            so writing it is optional there. On another model, any other member is recorded
+            and returned by get_table_type(), with no effect before the table DDL of v0.37.0.
+            Checked when the class is defined (a TableType; RELATION on an edge only).
+        relation_in (str | list[str] | tuple[str, ...] | None): The tables an edge's in may come
+            from (v0.33.0): SurrealDB's TYPE RELATION IN. Full SurrealDB-ORM key, on an edge model
+            only. One table name, several separated by "|" ("person | company"), or a list or
+            tuple of names; None, "", [] or () for any table. Checked when the class is defined
+            (identifiers, each stripped; a repeated name is kept), inherited by subclasses unless
+            they set their own (None or an empty value resets it).
+        relation_out (str | list[str] | tuple[str, ...] | None): The tables an edge's out may
+            point to (v0.33.0): TYPE RELATION OUT. Same forms and rules as relation_in.
+        enforced (bool | None): Both endpoints of an edge must exist (v0.33.0): TYPE RELATION …
+            ENFORCED. Full SurrealDB-ORM key, on an edge model only; inherited unless a subclass
+            sets its own.
     """
 
     table_name: str | None
@@ -585,6 +603,18 @@ class SurrealConfigDict(ConfigDict, total=False):
 
     view_query: str | None
     " A materialized view's SELECT (v0.32.0): the model reads a table SurrealDB computes from it; its writes raise. Full SurrealDB-ORM key. "
+
+    table_type: TableType | None
+    " The table's type (v0.33.0): TableType.RELATION on an edge model, implied by BaseSurrealEdge. Full SurrealDB-ORM key. "
+
+    relation_in: str | list[str] | tuple[str, ...] | None
+    " The tables an edge's in may come from (v0.33.0): TYPE RELATION IN. An edge model only. Full SurrealDB-ORM key. "
+
+    relation_out: str | list[str] | tuple[str, ...] | None
+    " The tables an edge's out may point to (v0.33.0): TYPE RELATION OUT. An edge model only. Full SurrealDB-ORM key. "
+
+    enforced: bool | None
+    " Both endpoints must exist (v0.33.0): TYPE RELATION … ENFORCED. An edge model only. Full SurrealDB-ORM key. "
 
     primary_key: str | None
     " The primary key field name for the model. "
@@ -718,7 +748,10 @@ class BaseSurrealModel(BaseModel):
         names — an inherited value is checked again, the messages naming the subclass. So is the
         ``view_query`` key (v0.32.0): ``None``, or one ``SELECT`` (``schema.check_view_query()``)
         on a model that is not an edge, does not mix in ``AuthenticatedUserMixin`` and declares no
-        computed field (``schema.check_view_config()``) — inherited values included.
+        computed field (``schema.check_view_config()``) — inherited values included. So are the
+        ``table_type``, ``relation_in``, ``relation_out`` and ``enforced`` keys (v0.33.0), when any
+        of them is not ``None``: a ``TableType`` (``RELATION`` on an edge only), and the relation
+        keys on an edge model only (``schema.check_relation_config()``).
 
         The deprecated ``_table_name: ClassVar[str]`` is checked the same way and warns once,
         where it is defined — a subclass inheriting it does not warn again.
@@ -745,6 +778,9 @@ class BaseSurrealModel(BaseModel):
                 user=issubclass(cls, AuthenticatedUserMixin),
                 computed=tuple(cls.__surreal_computed__),
             )
+        relation = {key: cls.model_config.get(key) for key in ("table_type", "relation_in", "relation_out", "enforced")}
+        if any(value is not None for value in relation.values()):
+            check_relation_config(cls, edge=cls.__surreal_edge__, **relation)
         legacy = cls.__dict__.get("_table_name")
         if isinstance(legacy, str):
             _check_table_name(cls, "_table_name", legacy)
@@ -961,6 +997,23 @@ class BaseSurrealModel(BaseModel):
             subjects=[event_subject(event, table)],
         )
         return statement
+
+    # ==================== Table type (v0.33.0) ====================
+
+    @classmethod
+    def get_table_type(cls) -> TableType:
+        """Return the model's table type (v0.33.0; the full SurrealDB-ORM's method).
+
+        ``TableType.RELATION`` for an edge model (``BaseSurrealEdge``), whose table is SurrealDB's ``TYPE RELATION``;
+        else ``SurrealConfigDict(table_type=…)``, else ``TableType.NORMAL``. A subclass inherits the key unless it sets
+        its own (``table_type=None`` gives ``NORMAL`` back). On a node model the value is recorded and returned, with
+        no effect before the table DDL of v0.37.0.
+        """
+        if cls.__surreal_edge__:
+            return TableType.RELATION
+        value = cls.model_config.get("table_type")
+        # Checked at the class statement: a TableType or None.
+        return value if isinstance(value, TableType) else TableType.NORMAL
 
     # ==================== Materialized views (v0.32.0) ====================
 
@@ -3247,7 +3300,9 @@ class BaseSurrealModel(BaseModel):
           declare (unless it sets ``extra="allow"``); this is checked before any call. A
           ``server_fields`` field named there is written instead of being left to the server.
         - **An edge table name** — the v0.6.0 ``RELATE`` (any target table), the edge fields
-          written with ``SET``; returns the rows the database sent back.
+          written with ``SET``; returns the rows the database sent back. Since v0.33.0 a refusal
+          by the server outside a transaction raises the ORM's errors, as the typed form does,
+          with the SDK's error as their ``__cause__`` (it raised the SDK's ``ServerError`` before).
 
         In both forms the source and the target are bound as record ids (only the edge name and
         the field names are written into the statement), so a node saved with an id such as
@@ -3283,10 +3338,14 @@ class BaseSurrealModel(BaseModel):
             ValueError: a malformed name or ``"table:id"`` string; the fields name an endpoint
                 or a computed field (typed form).
             SurrealDbError: an unsaved source or target; the fields name an undeclared field
-                (typed form); the write is refused; this record was read with ``as_of()`` (a
+                (typed form); the write is refused — an endpoint outside the table's ``TYPE
+                RELATION IN … OUT …``, a ``UNIQUE`` index duplicate, a ``TYPE NORMAL`` table (both
+                forms; the string form since v0.33.0) —; this record was read with ``as_of()`` (a
                 read-only snapshot, v0.26.0); this record, a model target or the edge model run on
                 two connections (v0.29.0: a relation is stored in one database), before any request
                 or signal.
+            SurrealDbNotFoundError: an endpoint of an ``ENFORCED`` relation does not exist (the
+                string form too, since v0.33.0). It is a ``SurrealDbError``.
             pydantic.ValidationError: the fields are invalid for the edge model (nothing
                 written).
 
@@ -3327,7 +3386,11 @@ class BaseSurrealModel(BaseModel):
             return rows if isinstance(rows, list) else []
 
         client = await type(self)._connection_manager().get_client()
-        result = await client.query(query, _encoding.encode(variables))
+        try:
+            result = await client.query(query, _encoding.encode(variables))
+        except ServerError as exc:
+            # The rule of every edge creation (v0.33.0): the ORM's error, the SDK's as its cause.
+            raise edge_write_error(exc) from exc
         return result if isinstance(result, list) else []
 
     async def _relate_typed(

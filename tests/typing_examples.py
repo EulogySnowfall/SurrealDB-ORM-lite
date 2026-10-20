@@ -50,6 +50,7 @@ from surreal_orm_lite import (
     SurrealDBConnectionManager,
     SurrealFunc,
     TableState,
+    TableType,
     Transaction,
     computed,
     function_ddl,
@@ -504,6 +505,42 @@ async def views_forms(tx: Transaction) -> None:
     assert_type(await OrderStats.define_view(overwrite=False, tx=tx), str)
     assert_type(await OrderStats.remove_view(missing_ok=False), str)
     assert_type(await OrderStats.remove_view(tx=tx), str)
+
+
+class RelationLikes(BaseSurrealEdge):
+    """v0.33.0: the full SurrealDB-ORM's relation keys — a ``TableType``, a ``str`` and a list of table names, a
+    ``bool``; every key still optional."""
+
+    model_config = SurrealConfigDict(
+        table_name="relation_likes",
+        table_type=TableType.RELATION,
+        relation_in="a",
+        relation_out=["b", "c"],
+        enforced=True,
+    )
+
+    stars: int = 1
+
+
+def relation_forms() -> None:
+    """v0.33.0: the relation getters are typed — ``tuple[str, ...]``, ``bool`` and ``TableType``."""
+    ends: tuple[str, ...] = RelationLikes.get_relation_in()
+    assert_type(ends, tuple[str, ...])
+    assert_type(RelationLikes.get_relation_out(), tuple[str, ...])
+    assert_type(RelationLikes.is_enforced(), bool)
+    assert_type(RelationLikes.get_table_type(), TableType)
+    assert_type(Player.get_table_type(), TableType)
+    assert_type(SurrealConfigDict(relation_in=("a", "b"), relation_out=None, enforced=None), SurrealConfigDict)
+    assert_type(SurrealConfigDict(table_type=TableType.USER), SurrealConfigDict)
+
+
+async def relation_appliers(tx: Transaction) -> None:
+    """v0.33.0: the relation statement's pure renderer and its applier return the statement — a ``str``."""
+    assert_type(RelationLikes.relation_ddl(), str)
+    assert_type(RelationLikes.relation_ddl(overwrite=False), str)
+    s: str = await RelationLikes.define_relation()
+    assert_type(s, str)
+    assert_type(await RelationLikes.define_relation(overwrite=False, tx=tx), str)
 
 
 @fixture

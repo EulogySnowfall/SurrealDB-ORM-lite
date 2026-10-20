@@ -1,4 +1,4 @@
-"""Server-side events and DDL helpers (v0.31.0), materialized views (v0.32.0).
+"""Server-side events and DDL helpers (v0.31.0), materialized views (v0.32.0), relation constraints (v0.33.0).
 
 ``Event`` declares a server-side event — SurrealDB's ``DEFINE EVENT`` on a table — with the full SurrealDB-ORM's call
 shape: a name, the SurrealQL the event runs (``then``), an optional condition (``when``), SurrealDB 3.x's ``ASYNC``
@@ -42,6 +42,25 @@ removal the block has already queued, ``dependents_not_removed()``) and, when th
 and the embedded engine before any DDL (``ensure_view_removable()``, G5): those engines would remove it and turn those
 views into ordinary tables that no longer update, where 3.x refuses the removal itself.
 
+**Relation constraints (v0.33.0).** An edge model (``BaseSurrealEdge``) declares its table's ``TYPE RELATION``
+constraint with the full SurrealDB-ORM's keys, ``SurrealConfigDict(table_type=TableType.RELATION, relation_in=…,
+relation_out=…, enforced=…)``. ``check_relation_config()`` checks them when the class is defined — ``table_type`` a
+``TableType`` (``RELATION`` on an edge), the three relation keys on an edge model only — and ``relation_tables()`` reads
+``relation_in``/``relation_out``: ``None``, ``""``, ``[]`` or ``()`` for any table, else table names given as one
+``str`` (several separated by ``|``) or a ``list``/``tuple``, each stripped and an identifier, kept in order (a repeated
+name too, as SurrealDB stores it). ``relation_type_clause()`` writes those names as ``TYPE RELATION[ IN `a` | `b`][ OUT
+`c`][ ENFORCED]`` and ``relation_statement()`` the bare statement an edge model's ``relation_ddl()`` returns,
+``DEFINE TABLE {OVERWRITE | IF NOT EXISTS} `<table>` <clause>;`` — both pure, the names in backticks. An
+``OVERWRITE`` resets every clause it does not write, so for a table that exists ``relation_statement_keeping()`` writes
+the stored definition's other clauses back after the type clause, re-rendered from its ``TableState``: ``DROP``,
+``SCHEMAFULL``, the comment re-quoted, the change feed, the permissions through ``table_permissions_text()`` (the
+model generator's renderer, moved here). The carried clauses are re-checked — no NUL in the comment, each permissions
+rule ``FULL``, ``NONE`` or ``WHERE`` with one expression ``scan_fragment()`` accepts — and a value that fails gives
+``None``, which ``define_relation()`` refuses. These checks catch a definition the ORM would misread; they are not an
+injection defence: the source is the database itself. ``define_relation()``'s guard reads the stored definitions with
+the views' ``read_table_definitions()`` (``what="relation"`` names it in a refusal) and ``table_kind()``;
+``relation_table_refused()`` gives the texts of its refusals.
+
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
 it.
 """
@@ -62,8 +81,10 @@ from .define_parser import (
 )
 from .exceptions import SurrealDbError
 from .functions import normalize_function_name
+from .schema_state import TableState
 from .surql_literal import _SERVER_PARAMETERS, _identifier, _quoted
 from .time_travel import line_major
+from .types import TableType
 from .utils import VALID_ALIAS_PATTERN, _ddl_refusal_class
 
 __all__ = ["Event", "function_ddl"]
@@ -920,28 +941,30 @@ _INFO_FOR_DB = "INFO FOR DB;"
 _TableKind = Literal["view", "table", "unreadable"]
 
 
-def _guard_read_refused(statement: str, error: BaseException, *, kind: str, table: str) -> SurrealDbError:
+def _guard_read_refused(statement: str, error: BaseException, *, kind: str, table: str, what: str = "view") -> SurrealDbError:
     """The refusal of one of the guard's reads (*statement*): S1 when the session may not read, else S3 — the text of
-    a refused view DDL, ``Can't apply view {kind}: '<table>' -> <the server's message>``."""
+    a refused DDL of *what*, ``Can't apply {what} {kind}: '<table>' -> <the server's message>`` (``view`` for
+    v0.32.0's guard, ``relation`` for ``define_relation()``'s, v0.33.0)."""
     refusal = _ddl_refusal_class(statement, error)
-    return refusal(f"Can't apply view {kind}: {table!r} -> {error}")
+    return refusal(f"Can't apply {what} {kind}: {table!r} -> {error}")
 
 
-async def read_table_definitions(client: Any, table: str, *, kind: str) -> dict[str, Any]:
+async def read_table_definitions(client: Any, table: str, *, kind: str, what: str = "view") -> dict[str, Any]:
     """The ``tables`` map of ``INFO FOR DB`` — table name → its ``DEFINE TABLE`` statement — read once by the table
-    guard of ``define_view()`` and ``remove_view()`` (v0.32.0).
+    guard of ``define_view()`` and ``remove_view()`` (v0.32.0) and of ``define_relation()`` (v0.33.0).
 
     A copy; ``{}`` when the answer is not a mapping or holds no ``tables`` mapping (a database never defined answers
     ``tables: {}``). It reads committed state, on *client* outside any transaction.
 
-    :param kind: ``"definition"`` or ``"removal"``, for the message of a refusal; *table* only names the view there.
+    :param kind: ``"definition"`` or ``"removal"``, for the message of a refusal; *table* only names the table there.
+    :param what: what is applied, for the message of a refusal: ``"view"`` (the default) or ``"relation"``.
     :raises SurrealDbAuthenticationError: the session may not read the database's definitions (a record user).
     :raises SurrealDbError: any other refusal of the ``INFO``.
     """
     try:
         info = await client.query(_INFO_FOR_DB, {})
     except (ServerError, SurrealDbError, RuntimeError) as error:
-        raise _guard_read_refused(_INFO_FOR_DB, error, kind=kind, table=table) from error
+        raise _guard_read_refused(_INFO_FOR_DB, error, kind=kind, table=table, what=what) from error
     tables = info.get("tables") if isinstance(info, dict) else None
     return dict(tables) if isinstance(tables, dict) else {}
 
@@ -1200,4 +1223,239 @@ async def ensure_view_removable(client: Any, table: str, dependents: Sequence[st
         f"and this connection runs {_engine_name(major, embedded)}, which would remove it and turn those views into "
         "ordinary tables that keep their last records and no longer update. Remove those views first. Nothing was "
         "removed."
+    )
+
+
+# --- relation constraints (v0.33.0) ----------------------------------------------------------------------------------
+
+
+def relation_tables(value: object, *, model: str, key: str) -> tuple[str, ...]:
+    """The table names of a model's ``relation_in`` or ``relation_out`` (*key*), checked (v0.33.0).
+
+    ``None``, ``""``, ``[]`` and ``()`` mean any table: ``()``, no ``IN`` (or ``OUT``) clause. Otherwise *value* is a
+    ``str`` naming one table or several separated by ``|`` (SurrealQL's spelling, the full SurrealDB-ORM's pipe-joined
+    string: ``"person | company"``), or a ``list`` or ``tuple`` of table names. Each name is stripped and returned in
+    order; a repeated name is kept, as SurrealDB stores it (``IN a | a``), so the result compares with
+    ``TableState.relation_in``/``relation_out``. In order, each refusal naming *model* (the class name) and *key*:
+
+    - R2, ``TypeError``: *value* is neither a ``str``, a ``list``, a ``tuple`` nor ``None``;
+    - R3, ``TypeError``: an item of the ``list`` or ``tuple`` is not a ``str``;
+    - R4, ``ValueError``: a non-empty string that is blank (``"  "``);
+    - R5, ``ValueError``: a name, after stripping, is not an identifier (letters, digits, underscores; not starting
+      with a digit) — ``''`` for a part or an item blank after stripping (``"a||b"``, ``[""]``), ``'a | b'`` for the
+      item ``"a | b"`` (an item is one name).
+
+    Pure: no connection.
+    """
+    subject = f"{model}: model_config['{key}']"
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        if not value:
+            return ()
+        if not value.strip():
+            raise ValueError(f"{subject} names no table; leave it out (None) to accept any table.")
+        names = tuple(part.strip() for part in value.split("|"))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            if not isinstance(item, str):
+                raise TypeError(f"{subject} holds a {type(item).__name__}, not a table name.")
+        names = tuple(item.strip() for item in value)
+    else:
+        raise TypeError(
+            f"{subject} must be a table name, several separated by '|', or a list or tuple of table names, got "
+            f"{type(value).__name__}."
+        )
+    for name in names:
+        if VALID_ALIAS_PATTERN.fullmatch(name) is None:
+            raise ValueError(
+                f"{subject} names {name!r}, which is not a table name the ORM can write: an identifier is expected "
+                "(letters, digits, underscores; not starting with a digit)."
+            )
+    return names
+
+
+def check_relation_config(
+    model: type,
+    *,
+    edge: bool,
+    table_type: object,
+    relation_in: object,
+    relation_out: object,
+    enforced: object,
+) -> None:
+    """The ``table_type``, ``relation_in``, ``relation_out`` and ``enforced`` keys of a model's ``SurrealConfigDict``,
+    checked when the class is defined (v0.33.0).
+
+    Called when any of the four is not ``None`` (an empty value and ``enforced=False`` included), inherited values
+    included. *edge* tells an edge model (``BaseSurrealEdge``) from a node. In order — the first failure raises, the
+    messages naming *model*:
+
+    - T1, ``TypeError``: *table_type* is not a ``TableType`` (a plain ``"relation"`` string included);
+    - T2, ``TypeError``: an edge model with a *table_type* other than ``TableType.RELATION``;
+    - T3, ``TypeError``: ``TableType.RELATION`` on a model that is not an edge (the lite's relation model is
+      ``BaseSurrealEdge``);
+    - R1, ``TypeError``: *relation_in*, *relation_out* or *enforced* not ``None`` on a model that is not an edge;
+    - R2–R5: :func:`relation_tables` of *relation_in*, then of *relation_out*;
+    - R7, ``TypeError``: *enforced* is not a ``bool`` (and not ``None``).
+
+    On a node model, the other ``TableType`` members are accepted: recorded, returned by ``get_table_type()``, with
+    no effect before the table DDL of v0.37.0.
+
+    :raises TypeError: T1–T3, R1, R2, R3, R7.
+    :raises ValueError: R4, R5.
+    """
+    name = model.__name__
+    if table_type is not None:
+        if not isinstance(table_type, TableType):
+            raise TypeError(
+                f"{name}: model_config['table_type'] must be a surreal_orm_lite.TableType, got {type(table_type).__name__}."
+            )
+        if edge and table_type is not TableType.RELATION:
+            raise TypeError(
+                f"{name}: an edge model's table is TYPE RELATION; leave table_type out or set TableType.RELATION, "
+                f"got TableType.{table_type.name}."
+            )
+        if not edge and table_type is TableType.RELATION:
+            raise TypeError(
+                f"{name}: table_type=TableType.RELATION needs an edge model: derive {name} from BaseSurrealEdge, "
+                "which declares the endpoints in_ and out."
+            )
+    if not edge:
+        relation = {"relation_in": relation_in, "relation_out": relation_out, "enforced": enforced}
+        keys = [key for key, value in relation.items() if value is not None]
+        if keys:
+            raise TypeError(
+                f"{name}: relation constraints ({', '.join(keys)}) apply to an edge model only: derive {name} from "
+                "BaseSurrealEdge."
+            )
+    relation_tables(relation_in, model=name, key="relation_in")
+    relation_tables(relation_out, model=name, key="relation_out")
+    if enforced is not None and not isinstance(enforced, bool):
+        raise TypeError(f"{name}: model_config['enforced'] must be a bool or None, got {type(enforced).__name__}.")
+
+
+def relation_type_clause(relation_in: Sequence[str], relation_out: Sequence[str], enforced: bool) -> str:
+    """``TYPE RELATION[ IN `a` | `b`][ OUT `c`][ ENFORCED]`` — the type clause of a relation table (v0.33.0).
+
+    *relation_in* and *relation_out* are names :func:`relation_tables` returned: each written in backticks, joined
+    with `` | `` in order (a repeated name written twice, as SurrealDB stores ``IN a | a``); an empty sequence writes no
+    ``IN`` (or ``OUT``) clause — any table. ``ENFORCED`` follows the ends: SurrealDB 2.x, 3.1 and the embedded engine
+    refuse it before them. ``enforced=False`` writes nothing. Pure.
+    """
+    clause = "TYPE RELATION"
+    if relation_in:
+        clause += " IN " + " | ".join(_identifier(name) for name in relation_in)
+    if relation_out:
+        clause += " OUT " + " | ".join(_identifier(name) for name in relation_out)
+    if enforced:
+        clause += " ENFORCED"
+    return clause
+
+
+def relation_statement(table: str, clause: str, overwrite: object) -> str:
+    """``DEFINE TABLE {OVERWRITE | IF NOT EXISTS} `<table>` <clause>;`` — a relation table's bare statement (v0.33.0).
+
+    *clause* is a text :func:`relation_type_clause` returned; *table* is checked as an identifier and written in
+    backticks. ``overwrite=True`` redefines an existing table (``OVERWRITE``, which resets the clauses the statement
+    does not write: schema mode, permissions, change feed, comment, ``DROP``), ``False`` keeps it (``IF NOT EXISTS``);
+    a non-``bool`` is a ``TypeError``. Pure.
+    """
+    return f"DEFINE TABLE {_overwrite_clause(overwrite)} {_identifier(_identifier_name(table, what='Table'))} {clause};"
+
+
+#: The operations of a table's ``PERMISSIONS``, in the order SurrealDB renders them.
+_TABLE_OPERATIONS = ("select", "create", "update", "delete")
+
+
+def table_permissions_text(permissions: Mapping[str, str]) -> str | None:
+    """A table's ``PERMISSIONS`` as SurrealDB renders them: ``FULL`` when ``FULL`` covers the four operations, else
+    ``FOR select WHERE …, FOR create, update FULL`` — operations in SurrealQL's order, grouped by rule in the order the
+    rules first appear, so one ``WHERE`` rule for all four reads ``FOR select, create, update, delete WHERE …``.
+    ``None`` when there is none, or every rule is ``NONE`` (a table's default)."""
+    if all(rule == "NONE" for rule in permissions.values()):
+        return None
+    order = {operation: position for position, operation in enumerate(_TABLE_OPERATIONS)}
+    groups: dict[str, list[str]] = {}
+    for operation in sorted(permissions, key=lambda operation: (order.get(operation, len(order)), operation)):
+        groups.setdefault(permissions[operation], []).append(operation)
+    if set(groups) == {"FULL"} and permissions.keys() == order.keys():
+        return "FULL"
+    return ", ".join("FOR " + ", ".join(operations) + " " + rule for rule, operations in groups.items())
+
+
+def _carried_rule(rule: str) -> bool:
+    """Whether the stored permissions rule *rule* can be written back as it is: ``FULL``, ``NONE`` or ``WHERE <expr>``
+    whose ``<expr>`` ``scan_fragment()`` accepts with no ``;`` outside brackets."""
+    if rule in ("FULL", "NONE"):
+        return True
+    where = _PERMISSIONS_WHERE.fullmatch(rule)
+    if where is None:
+        return False
+    try:
+        return not scan_fragment(where.group(1))
+    except DefineParseError:
+        return False
+
+
+def relation_statement_keeping(table: str, clause: str, state: TableState) -> str | None:
+    """``DEFINE TABLE OVERWRITE `<table>` <clause>…;`` keeping the other clauses of the table's stored definition
+    *state* (v0.33.0) — the statement ``define_relation()`` sends for a table that exists.
+
+    A bare ``OVERWRITE`` resets every clause it does not write, so after *clause* (a text
+    :func:`relation_type_clause` returned) the statement writes back, from *state* (``parse_define_table()`` of the
+    stored definition), in this order: ``DROP``; ``SCHEMAFULL`` (``SCHEMALESS`` is the default and not written);
+    ``COMMENT`` re-quoted as a string literal; ``CHANGEFEED <duration>[ INCLUDE ORIGINAL]`` as the parser read it;
+    ``PERMISSIONS`` rendered by :func:`table_permissions_text` (left out when every rule is ``NONE``). *table* is
+    checked as an identifier and written in backticks.
+
+    ``None`` when a stored value fails its check: a comment holding a NUL, or a permissions rule that is not ``FULL``,
+    ``NONE`` or ``WHERE <expr>`` whose ``<expr>`` ``scan_fragment()`` accepts with no ``;`` outside brackets. These
+    checks catch a definition the ORM would misread; they are not an injection defence: the source is the database
+    itself. Pure.
+    """
+    parts = [clause]
+    if state.drop:
+        parts.append("DROP")
+    if state.schema_mode == "SCHEMAFULL":
+        parts.append("SCHEMAFULL")
+    if state.comment is not None:
+        if "\x00" in state.comment:
+            return None
+        parts.append(f"COMMENT {_quoted(state.comment)}")
+    if state.changefeed is not None:
+        parts.append(f"CHANGEFEED {state.changefeed}" + (" INCLUDE ORIGINAL" if state.changefeed_include_original else ""))
+    if not all(_carried_rule(rule) for rule in state.permissions.values()):
+        return None
+    permissions = table_permissions_text(state.permissions)
+    if permissions is not None:
+        parts.append(f"PERMISSIONS {permissions}")
+    return relation_statement(table, " ".join(parts), True)
+
+
+def relation_table_refused(guard: Literal["RG1", "RG2", "RG3"], model: str, table: str) -> str:
+    """The refusals of ``define_relation()``'s table guard (v0.33.0): the text of *guard* for the edge model *model*
+    on *table*. Pure.
+
+    - ``RG1``: the table is a materialized view, whose query the ``OVERWRITE`` would drop;
+    - ``RG2``: the table's definition cannot be read, or a stored value fails its check
+      (:func:`relation_statement_keeping` returned ``None``), so its other clauses cannot be kept;
+    - ``RG3``: ``define_relation(overwrite=False)`` on a table that exists and is not a relation table
+      (``IF NOT EXISTS`` would leave the constraint unapplied).
+    """
+    if guard == "RG1":
+        return (
+            f"{model}.define_relation(): the table '{table}' is a materialized view; defining it as a relation table "
+            f"would drop its query and turn it into an ordinary table that no longer updates. Give {model} another "
+            "table_name, or remove the view first. Nothing was defined."
+        )
+    if guard == "RG2":
+        return (
+            f"{model}.define_relation(): the definition of the table '{table}' could not be read, so the ORM cannot keep "
+            "its other clauses (schema mode, permissions, change feed, comment). Nothing was defined."
+        )
+    return (
+        f"{model}.define_relation(overwrite=False): the table '{table}' exists and is not a relation table; DEFINE "
+        "TABLE IF NOT EXISTS would leave it as it is, and the relation constraint would not apply. Call "
+        "define_relation() with overwrite=True, which keeps the table's other clauses. Nothing was defined."
     )

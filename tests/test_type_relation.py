@@ -1,0 +1,3567 @@
+"""``TYPE RELATION`` enforcement (v0.33.0): an edge model declares its graph constraint with the full SurrealDB-ORM's
+keys — ``SurrealConfigDict(table_type=TableType.RELATION, relation_in=…, relation_out=…, enforced=…)``.
+
+``TableType`` and the keys (spec §5.1, §6.2, §6.6; AC-1): the full ORM's enum — six members, same values — exported
+from the package root, and the four ``SurrealConfigDict`` keys.
+
+The class-time check (spec §5.2, §5.8, §6.1, §6.3; AC-2; rulings P1, P6): ``schema.relation_tables()`` reads
+``relation_in``/``relation_out`` — ``None``, ``""``, ``[]`` and ``()`` mean any table, each name stripped, a repeated
+name kept in order — with the exact texts of R2–R5; ``schema.check_relation_config()`` runs T1–T3, R1, R2–R5 for both
+keys and R7 in that order when the ``class`` statement runs, inherited values re-checked with the subclass's name.
+
+The getters (spec §5.3; AC-1): ``get_table_type()`` on every model (``RELATION`` for an edge, else the configured
+value, else ``NORMAL``), ``get_relation_in()``, ``get_relation_out()`` and ``is_enforced()`` on an edge model, with
+the tuple shape of ``TableState.relation_in``/``relation_out``; a subclass inherits them, and ``None`` or an empty
+value resets one.
+
+``relation_ddl()`` (spec §5.4, §5.5 G1–G8, §6.1; AC-3): ``schema.relation_type_clause()`` and
+``schema.relation_statement()`` render ``DEFINE TABLE {OVERWRITE | IF NOT EXISTS} `<table>` TYPE RELATION[ IN …][ OUT
+…][ ENFORCED];`` — pure, no connection, E1 for a non-``bool`` ``overwrite``. ``TestRelationDdlE2E`` applies each golden
+on ``ws``, ``http`` and ``mem`` (spec §9.2: the connection ``"rel"`` on the database ``rel_db``, reset before each
+test) and reads it back with ``parse_define_table()``: the model's getters equal the stored ``TableState`` (M2, M16,
+M22).
+
+The carried statement (spec §5.5 K1–K7, §5.8 RG1–RG3, §6.1, §8; AC-4): ``schema.relation_statement_keeping()`` writes
+the model's type clause, then the stored definition's ``DROP``, ``SCHEMAFULL``, ``COMMENT``, ``CHANGEFEED`` and
+``PERMISSIONS`` re-rendered from its ``TableState`` — K1–K5 from SurrealDB 3.3.4's renderings, K6 and K7 the
+statements the E2E classes apply —, or ``None`` when a stored value fails its check (a rule with a top-level ``;`` or a
+comment marker, a NUL in the comment). ``schema.table_permissions_text()`` is the model generator's renderer, moved;
+``schema.relation_table_refused()`` gives the guard's refusal texts.
+
+``define_relation()`` and its guard (spec §5.4, §5.6, §5.8 RG1–RG3 S1–S4 E1, §7; AC-5, AC-6, AC-9, AC-11, AC-15; D8,
+D9, D11, P2): ``TestRelationGuard`` drives it on fake clients — one ``INFO FOR DB``, then the bare, carried or ``IF NOT
+EXISTS`` statement, RG1–RG3 before any DDL, S1–S4 naming the table and never the statement, a ``tx`` of another
+connection and E1 before any request. ``TestDefineRelationE2E`` applies it on every engine: on a missing table (G1's
+form, idempotent), on AC-6's table — K6 exactly, its other clauses, fields, index, event, edges and the view that reads
+it kept, the view still counting, a wrong-table endpoint refused at once on a second connection too —, RG1 on a view,
+RG3 on a ``TYPE ANY`` table, ``overwrite=False`` leaving a relation table's ends. ``TestRelationPermissionsE2E``: a
+record user gets S1. The query cache classifies it as DDL that changes no row (``tests/test_query_cache.py``).
+
+Edge creation refusals (spec §5.7, §5.8 W1–W2, §6.3, §6.4; AC-7, AC-8; D6, D7, D15): ``utils.edge_write_error()`` is
+v0.22.0's rule of ``insert_edges()``, moved and shared — ``SurrealDbNotFoundError`` for a missing endpoint, else
+``SurrealDbError`` (``TestEdgeWriteError``) —, and the string ``relate()`` raises it outside a transaction, the SDK's
+error as its ``__cause__`` (``TestStringRelateError``). ``TestEnforcementE2E``: after ``define_relation()`` every ORM
+edge creation path — the typed and the string ``relate()``, an edge's ``save()``, ``bulk_create()`` — raises W1 or W2
+and writes nothing, the class of an endpoint both outside ``IN``/``OUT`` and missing pinned per line; a node model's
+``save()`` into the relation table keeps the SDK's error.
+
+Removing a constraint (spec §5.4, G6, D14, P1; AC-20; M18, M19): ``define_relation()`` of an edge model without keys —
+another model on the table, or a subclass resetting them to ``None`` or emptying them — sends K7, ``TYPE RELATION`` with
+no ends and the table's other clauses carried (``TestRemoveConstraint``). ``TestRemoveConstraintE2E``: on AC-6's table
+after K6, the table reads back without ends, ``in``/``out`` as ``TYPE record``, its clauses, fields, index, event, view
+and edges kept; edges from another table and to a missing record are accepted at once, on a second connection too;
+``RelLikes.define_relation()`` puts K6 back; ``overwrite=False`` removes nothing; in a transaction the removal is
+applied at commit, and not at all when the block raises.
+
+Transactions, line facts, records already in the table, change feeds and live queries (spec §5.4, §7; AC-10, AC-12,
+AC-13, AC-16; D15, D16, P4, P5): ``TestRelationTransactionsE2E`` — on every engine, the kind of transaction asserted
+from ``tx.is_interactive`` — reads ``INFO FOR DB`` before the statement joins the block, applies it with the block (at
+the commit when buffered, in the block when interactive), applies nothing when the block raises, fails the block on a
+refused edge later in it (typed and by name; the table stays ``TYPE ANY``), refuses a transaction of another
+connection before any request, and pins the documented limit: a definition of the same table queued earlier in the
+block is replaced at the commit. ``TestRelationLineFactsE2E`` pins two raw facts per line: a bare ``OVERWRITE`` resets
+the table's other clauses, and a raw ``ALTER TABLE … TYPE RELATION …`` of a table already written to is not enforced
+on SurrealDB 2.x and the embedded engine — a server defect: when it changes, the test and the README row change, not
+the ORM. ``TestExistingRecordsE2E``: the edges already in the table stay; a nonconforming one's ``merge()`` keeps the
+SDK's error, a dangling one's succeeds, the two README recipes find each. ``TestChangeFeedAndLiveE2E``:
+``changes(since=0)`` yields the edges written before and after the define and nothing else, a raw ``SHOW CHANGES``
+shows both ``define_table`` entries, and a live query registered before is still listed.
+
+The generator (spec §6.5, D10, P1; AC-14): ``TestRoundTripE2E`` defines three edge tables — ``RelLikes``' ends, none,
+a name repeated on each side —, generates their models back with ``generate_models_from_db()``, imports them and
+applies their ``relation_ddl()`` to a fresh database: the same relation definitions are read back. The generator's unit
+cases are ``tests/test_model_generator.py``'s ``TestRelationKeys``.
+
+The README (spec §11.1; AC-17; P1–P4): section 34's place and subsections, its examples run in order on ``mem://``
+(each printed line equal to its comment), the key phrases of each subsection, sections 23 and 31's new sentences, and
+the features, roadmap, comparison and both behaviour tables (``TestReadmeSection34``).
+"""
+
+import ast
+import asyncio
+import contextlib
+import importlib.util
+import inspect
+import os
+import re
+import sys
+import uuid
+from collections.abc import AsyncIterator, Callable
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
+import pytest
+from surrealdb import InternalError, NotAllowedError, NotFoundError, RecordID, ServerError
+
+import surreal_orm_lite
+from surreal_orm_lite import (
+    BaseSurrealEdge,
+    BaseSurrealModel,
+    SurrealConfigDict,
+    SurrealDbAuthenticationError,
+    SurrealDBConnectionManager,
+    SurrealDbError,
+    SurrealDbNotFoundError,
+    SurrealORMError,
+    TableType,
+    Transaction,
+    generate_models_from_db,
+    is_conflict_error,
+    model_generator,
+    schema,
+    utils,
+)
+from surreal_orm_lite.define_parser import parse_define_field, parse_define_table
+from surreal_orm_lite.edge import insert_edges
+from surreal_orm_lite.schema_state import TableState
+from surreal_orm_lite.testing import embedded_database
+from tests._readme_tables import (
+    assert_embedded_rows,
+    assert_server_header_sentence,
+    assert_server_rows,
+    assert_server_table,
+)
+from tests._readme_tables import cells as _cells
+from tests._readme_tables import normalised as _normalised
+from tests._readme_tables import readme as _readme
+from tests._readme_tables import readme_part as _readme_part
+from tests._readme_tables import subsection as _subsection
+from tests._readme_tables import table_rows as _table_rows
+from tests._readme_tables import tables as _md_tables
+
+# --- the exact texts of spec §5.8 ----------------------------------------------------------------------------------
+
+
+def _t1(name: str, type_name: str) -> str:
+    return f"{name}: model_config['table_type'] must be a surreal_orm_lite.TableType, got {type_name}."
+
+
+def _t2(name: str, member: str) -> str:
+    return (
+        f"{name}: an edge model's table is TYPE RELATION; leave table_type out or set TableType.RELATION, "
+        f"got TableType.{member}."
+    )
+
+
+def _t3(name: str) -> str:
+    return (
+        f"{name}: table_type=TableType.RELATION needs an edge model: derive {name} from BaseSurrealEdge, which "
+        "declares the endpoints in_ and out."
+    )
+
+
+def _r1(name: str, keys: str) -> str:
+    return f"{name}: relation constraints ({keys}) apply to an edge model only: derive {name} from BaseSurrealEdge."
+
+
+def _r2(name: str, key: str, type_name: str) -> str:
+    return (
+        f"{name}: model_config['{key}'] must be a table name, several separated by '|', or a list or tuple of table "
+        f"names, got {type_name}."
+    )
+
+
+def _r3(name: str, key: str, type_name: str) -> str:
+    return f"{name}: model_config['{key}'] holds a {type_name}, not a table name."
+
+
+def _r4(name: str, key: str) -> str:
+    return f"{name}: model_config['{key}'] names no table; leave it out (None) to accept any table."
+
+
+def _r5(name: str, key: str, part: str) -> str:
+    return (
+        f"{name}: model_config['{key}'] names {part!r}, which is not a table name the ORM can write: an identifier "
+        "is expected (letters, digits, underscores; not starting with a digit)."
+    )
+
+
+def _r7(name: str, type_name: str) -> str:
+    return f"{name}: model_config['enforced'] must be a bool or None, got {type_name}."
+
+
+def _rg1(name: str, table: str) -> str:
+    return (
+        f"{name}.define_relation(): the table '{table}' is a materialized view; defining it as a relation table would "
+        f"drop its query and turn it into an ordinary table that no longer updates. Give {name} another table_name, or "
+        "remove the view first. Nothing was defined."
+    )
+
+
+def _rg2(name: str, table: str) -> str:
+    return (
+        f"{name}.define_relation(): the definition of the table '{table}' could not be read, so the ORM cannot keep "
+        "its other clauses (schema mode, permissions, change feed, comment). Nothing was defined."
+    )
+
+
+def _rg3(name: str, table: str) -> str:
+    return (
+        f"{name}.define_relation(overwrite=False): the table '{table}' exists and is not a relation table; DEFINE "
+        "TABLE IF NOT EXISTS would leave it as it is, and the relation constraint would not apply. Call "
+        "define_relation() with overwrite=True, which keeps the table's other clauses. Nothing was defined."
+    )
+
+
+# --- the value forms (P1) ------------------------------------------------------------------------------------------
+
+#: A value that means "any table": no IN (or OUT) clause, the getter returns ().
+_ANY_TABLE: list[object] = [None, "", [], ()]
+
+#: (value, the names it gives) — each name stripped, in order, a repeated name kept.
+_NAMES: list[tuple[object, tuple[str, ...]]] = [
+    ("a", ("a",)),
+    (["a"], ("a",)),
+    (("a",), ("a",)),
+    ([" a "], ("a",)),
+    ("a | b", ("a", "b")),
+    ("a|b", ("a", "b")),
+    (" a |b ", ("a", "b")),
+    (["a", "b"], ("a", "b")),
+    ((" a", "b "), ("a", "b")),
+    ([" a ", "b"], ("a", "b")),
+    ("a | a", ("a", "a")),
+    (["a", "a"], ("a", "a")),
+    (["b", "B"], ("b", "B")),
+    ("person_2 | _Company", ("person_2", "_Company")),
+]
+
+#: (value, error class, text for the model "M" and the key "relation_in") — R2–R5. No R6: a repeated name is kept.
+_REFUSED: list[tuple[object, type[Exception], str]] = [
+    (3, TypeError, _r2("M", "relation_in", "int")),
+    ({"a"}, TypeError, _r2("M", "relation_in", "set")),
+    (True, TypeError, _r2("M", "relation_in", "bool")),
+    ({"a": 1}, TypeError, _r2("M", "relation_in", "dict")),
+    (["a", 1], TypeError, _r3("M", "relation_in", "int")),
+    (("a", None), TypeError, _r3("M", "relation_in", "NoneType")),
+    ("  ", ValueError, _r4("M", "relation_in")),
+    ("\n", ValueError, _r4("M", "relation_in")),
+    ("a-b", ValueError, _r5("M", "relation_in", "a-b")),
+    ("1a", ValueError, _r5("M", "relation_in", "1a")),
+    (["a | b"], ValueError, _r5("M", "relation_in", "a | b")),
+    ("a | b-c", ValueError, _r5("M", "relation_in", "b-c")),
+    (["a", " 1a "], ValueError, _r5("M", "relation_in", "1a")),
+    ("a||b", ValueError, _r5("M", "relation_in", "")),
+    ("a |", ValueError, _r5("M", "relation_in", "")),
+    ("|", ValueError, _r5("M", "relation_in", "")),
+    ([""], ValueError, _r5("M", "relation_in", "")),
+    (["  "], ValueError, _r5("M", "relation_in", "")),
+]
+
+
+class TestTableType:
+    """AC-1: ``TableType`` is the full SurrealDB-ORM's enum — six members, same values — exported from the root."""
+
+    def test_imported_from_the_package_root(self) -> None:
+        assert surreal_orm_lite.TableType is TableType
+        assert "TableType" in surreal_orm_lite.__all__
+        assert surreal_orm_lite.__all__.index("TableType") == surreal_orm_lite.__all__.index("SurrealConfigDict") + 1
+        assert "TableType" in surreal_orm_lite.types.__all__
+
+    def test_members_and_values(self) -> None:
+        assert {member.name: member.value for member in TableType} == {
+            "NORMAL": "normal",
+            "USER": "user",
+            "STREAM": "stream",
+            "HASH": "hash",
+            "RELATION": "relation",
+            "ANY": "any",
+        }
+        assert [member.name for member in TableType] == ["NORMAL", "USER", "STREAM", "HASH", "RELATION", "ANY"]
+
+    def test_a_str_enum(self) -> None:
+        assert TableType.RELATION == "relation"
+        assert isinstance(TableType.RELATION, str)
+        assert TableType("relation") is TableType.RELATION
+        assert str(TableType.ANY) == "any"
+
+
+class TestRelationTables:
+    """AC-1, AC-2 (P1): ``schema.relation_tables()`` — the names of ``relation_in``/``relation_out`` or R2–R5."""
+
+    @pytest.mark.parametrize("value", _ANY_TABLE, ids=repr)
+    def test_any_table(self, value: object) -> None:
+        assert schema.relation_tables(value, model="M", key="relation_in") == ()
+
+    @pytest.mark.parametrize(("value", "names"), _NAMES, ids=repr)
+    def test_names(self, value: object, names: tuple[str, ...]) -> None:
+        result = schema.relation_tables(value, model="M", key="relation_in")
+        assert result == names
+        assert type(result) is tuple
+        assert all(type(name) is str for name in result)
+
+    def test_a_str_enum_value_gives_plain_strings(self) -> None:
+        result = schema.relation_tables([TableType.USER], model="M", key="relation_out")
+        assert result == ("user",)
+        assert type(result[0]) is str
+
+    @pytest.mark.parametrize(("value", "error", "text"), _REFUSED, ids=repr)
+    def test_refused(self, value: object, error: type[Exception], text: str) -> None:
+        with pytest.raises(error) as raised:
+            schema.relation_tables(value, model="M", key="relation_in")
+        assert type(raised.value) is error
+        assert str(raised.value) == text
+
+    def test_the_key_and_the_model_are_named(self) -> None:
+        with pytest.raises(ValueError) as raised:
+            schema.relation_tables("a-b", model="Likes", key="relation_out")
+        assert str(raised.value) == _r5("Likes", "relation_out", "a-b")
+
+    def test_every_item_is_a_str_before_any_name_is_read(self) -> None:
+        """R3 before R5 (spec §5.2's order): an item that is not a ``str`` is reported even after a bad name."""
+        with pytest.raises(TypeError) as raised:
+            schema.relation_tables(["a-b", 1], model="M", key="relation_in")
+        assert str(raised.value) == _r3("M", "relation_in", "int")
+
+    def test_no_r6_for_a_repeated_name(self) -> None:
+        assert schema.relation_tables("a | a | b", model="M", key="relation_in") == ("a", "a", "b")
+        assert schema.relation_tables(("a", "a"), model="M", key="relation_out") == ("a", "a")
+
+
+class TestRelationConfig:
+    """AC-2: the keys are checked at the ``class`` statement — T1–T3, R1, R2–R5 for ``relation_in`` then
+    ``relation_out``, R7, in that order (the first failure wins), inherited values re-checked with the subclass's
+    name."""
+
+    @pytest.mark.parametrize(("value", "names"), [*((value, ()) for value in _ANY_TABLE), *_NAMES], ids=repr)
+    def test_an_edge_model_with_each_value_form(self, value: object, names: tuple[str, ...]) -> None:
+        class Likes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(
+                table_name="likes",
+                table_type=TableType.RELATION,
+                relation_in=value,  # type: ignore[typeddict-item]
+                relation_out=value,  # type: ignore[typeddict-item]
+                enforced=True,
+            )
+
+        assert Likes.get_relation_in() == names
+        assert Likes.get_relation_out() == names
+        assert Likes.is_enforced() is True
+
+    def test_the_readme_example(self) -> None:
+        class Likes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(
+                table_name="likes",
+                table_type=TableType.RELATION,
+                relation_in="person",
+                relation_out=["post", "book"],
+                enforced=True,
+            )
+
+            stars: int = 1
+
+        assert Likes.get_table_type() is TableType.RELATION
+        assert Likes.get_relation_in() == ("person",)
+        assert Likes.get_relation_out() == ("post", "book")
+        assert Likes.is_enforced() is True
+
+    def test_t1_a_plain_string_on_an_edge(self) -> None:
+        with pytest.raises(TypeError) as raised:
+
+            class Likes(BaseSurrealEdge):
+                model_config = SurrealConfigDict(table_name="likes", table_type="relation")  # type: ignore[typeddict-item]
+
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _t1("Likes", "str")
+
+    def test_t1_a_plain_string_on_a_node(self) -> None:
+        with pytest.raises(TypeError) as raised:
+
+            class Person(BaseSurrealModel):
+                model_config = SurrealConfigDict(table_name="person", table_type="relation")  # type: ignore[typeddict-item]
+
+                id: RecordID | None = None
+
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _t1("Person", "str")
+
+    def test_t1_another_type(self) -> None:
+        with pytest.raises(TypeError) as raised:
+
+            class Person(BaseSurrealModel):
+                model_config = SurrealConfigDict(table_name="person", table_type=1)  # type: ignore[typeddict-item]
+
+                id: RecordID | None = None
+
+        assert str(raised.value) == _t1("Person", "int")
+
+    @pytest.mark.parametrize("member", [m for m in TableType if m is not TableType.RELATION], ids=str)
+    def test_t2_another_member_on_an_edge(self, member: TableType) -> None:
+        with pytest.raises(TypeError) as raised:
+
+            class Likes(BaseSurrealEdge):
+                model_config = SurrealConfigDict(table_name="likes", table_type=member)
+
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _t2("Likes", member.name)
+
+    def test_t3_relation_on_a_node(self) -> None:
+        with pytest.raises(TypeError) as raised:
+
+            class Likes(BaseSurrealModel):
+                model_config = SurrealConfigDict(table_name="likes", table_type=TableType.RELATION)
+
+                id: RecordID | None = None
+
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _t3("Likes")
+
+    def test_t3_before_r1(self) -> None:
+        """The full ORM's ``class Likes(BaseSurrealModel)`` form, ported as is: T3 is reported first."""
+        with pytest.raises(TypeError) as raised:
+
+            class Likes(BaseSurrealModel):
+                model_config = SurrealConfigDict(
+                    table_name="likes",
+                    table_type=TableType.RELATION,
+                    relation_in="person",
+                    relation_out="post",
+                    enforced=True,
+                )
+
+                id: RecordID | None = None
+
+        assert str(raised.value) == _t3("Likes")
+
+    @pytest.mark.parametrize(
+        ("config", "keys"),
+        [
+            ({"relation_in": "a"}, "relation_in"),
+            ({"relation_out": ["a", "b"]}, "relation_out"),
+            ({"enforced": True}, "enforced"),
+            ({"relation_in": "a", "enforced": True}, "relation_in, enforced"),
+            ({"enforced": True, "relation_out": "b", "relation_in": "a"}, "relation_in, relation_out, enforced"),
+            # P1 c: any key that is not None, an empty value and enforced=False included.
+            ({"relation_in": ""}, "relation_in"),
+            ({"relation_in": []}, "relation_in"),
+            ({"relation_out": ()}, "relation_out"),
+            ({"relation_out": []}, "relation_out"),
+            ({"enforced": False}, "enforced"),
+            ({"relation_in": "", "relation_out": [], "enforced": False}, "relation_in, relation_out, enforced"),
+            # R1 comes before the values' own checks.
+            ({"relation_in": "a-b"}, "relation_in"),
+            ({"enforced": "yes"}, "enforced"),
+        ],
+        ids=repr,
+    )
+    def test_r1_on_a_node(self, config: dict[str, Any], keys: str) -> None:
+        with pytest.raises(TypeError) as raised:
+
+            class Person(BaseSurrealModel):
+                model_config = SurrealConfigDict(table_name="person", **config)
+
+                id: RecordID | None = None
+
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _r1("Person", keys)
+
+    def test_r1_on_a_node_with_a_table_type_member(self) -> None:
+        with pytest.raises(TypeError) as raised:
+
+            class Person(BaseSurrealModel):
+                model_config = SurrealConfigDict(table_name="person", table_type=TableType.NORMAL, relation_out="b")
+
+                id: RecordID | None = None
+
+        assert str(raised.value) == _r1("Person", "relation_out")
+
+    def test_r1_on_a_view_model(self) -> None:
+        with pytest.raises(TypeError) as raised:
+
+            class LikeCounts(BaseSurrealModel):
+                model_config = SurrealConfigDict(
+                    table_name="like_counts",
+                    view_query="SELECT count() AS n, out FROM likes GROUP BY out",
+                    enforced=True,
+                )
+
+                id: RecordID | None = None
+
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _r1("LikeCounts", "enforced")
+
+    @pytest.mark.parametrize(("value", "error", "text"), _REFUSED, ids=repr)
+    def test_relation_in_refused_on_an_edge(self, value: object, error: type[Exception], text: str) -> None:
+        with pytest.raises(error) as raised:
+
+            class Likes(BaseSurrealEdge):
+                model_config = SurrealConfigDict(table_name="likes", relation_in=value)  # type: ignore[typeddict-item]
+
+        assert type(raised.value) is error
+        assert str(raised.value) == text.replace("M: ", "Likes: ", 1)
+
+    @pytest.mark.parametrize(("value", "error", "text"), _REFUSED, ids=repr)
+    def test_relation_out_refused_on_an_edge(self, value: object, error: type[Exception], text: str) -> None:
+        with pytest.raises(error) as raised:
+
+            class Likes(BaseSurrealEdge):
+                model_config = SurrealConfigDict(table_name="likes", relation_out=value)  # type: ignore[typeddict-item]
+
+        assert type(raised.value) is error
+        assert str(raised.value) == text.replace("M: ", "Likes: ", 1).replace("'relation_in'", "'relation_out'")
+
+    def test_relation_in_before_relation_out(self) -> None:
+        with pytest.raises(ValueError) as raised:
+
+            class Likes(BaseSurrealEdge):
+                model_config = SurrealConfigDict(table_name="likes", relation_in="  ", relation_out=3)  # type: ignore[typeddict-item]
+
+        assert type(raised.value) is ValueError
+        assert str(raised.value) == _r4("Likes", "relation_in")
+
+    @pytest.mark.parametrize(("value", "type_name"), [("yes", "str"), (1, "int"), (0, "int"), ([], "list")], ids=repr)
+    def test_r7_enforced_not_a_bool(self, value: object, type_name: str) -> None:
+        with pytest.raises(TypeError) as raised:
+
+            class Likes(BaseSurrealEdge):
+                model_config = SurrealConfigDict(table_name="likes", relation_in="a", enforced=value)  # type: ignore[typeddict-item]
+
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _r7("Likes", type_name)
+
+    def test_r7_after_both_keys(self) -> None:
+        with pytest.raises(ValueError) as raised:
+
+            class Likes(BaseSurrealEdge):
+                model_config = SurrealConfigDict(table_name="likes", relation_out="a-b", enforced="yes")  # type: ignore[typeddict-item]
+
+        assert str(raised.value) == _r5("Likes", "relation_out", "a-b")
+
+    def test_the_first_failure_wins(self) -> None:
+        """``table_type=TableType.ANY`` and an R5 value on an edge: T2 is reported."""
+        with pytest.raises(TypeError) as raised:
+
+            class Likes(BaseSurrealEdge):
+                model_config = SurrealConfigDict(table_name="likes", table_type=TableType.ANY, relation_in="a-b")
+
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _t2("Likes", "ANY")
+
+    def test_t1_before_t2(self) -> None:
+        with pytest.raises(TypeError) as raised:
+
+            class Likes(BaseSurrealEdge):
+                model_config = SurrealConfigDict(table_name="likes", table_type="any", enforced="yes")  # type: ignore[typeddict-item]
+
+        assert str(raised.value) == _t1("Likes", "str")
+
+    def test_a_subclass_value_is_checked_with_the_subclass_name(self) -> None:
+        class Likes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="likes", relation_in="a")
+
+        with pytest.raises(ValueError) as raised:
+
+            class Loves(Likes):
+                model_config = SurrealConfigDict(table_name="loves", relation_in="b-c")
+
+        assert type(raised.value) is ValueError
+        assert str(raised.value) == _r5("Loves", "relation_in", "b-c")
+
+    def test_an_inherited_value_is_checked_again_with_the_subclass_name(self) -> None:
+        """The parent's ``relation_in`` is inherited and checked with the subclass's other keys."""
+
+        class Likes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="likes", relation_in="a")
+
+        with pytest.raises(TypeError) as raised:
+
+            class Loves(Likes):
+                model_config = SurrealConfigDict(table_name="loves", table_type=TableType.HASH)
+
+        assert str(raised.value) == _t2("Loves", "HASH")
+
+    def test_an_inherited_enforced_is_kept(self) -> None:
+        class Likes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="likes", enforced=True)
+
+        class Loves(Likes):
+            pass
+
+        assert Loves.is_enforced() is True
+        assert Loves.get_relation_in() == ()
+
+    def test_a_repeated_name_is_accepted(self) -> None:
+        """R6 is withdrawn (P1 b): a repeated name is kept, in order, as SurrealDB stores it."""
+
+        class Likes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="likes", relation_in=["a", "a"], relation_out="b | B")
+
+        assert Likes.get_relation_in() == ("a", "a")
+        assert Likes.get_relation_out() == ("b", "B")
+
+    @pytest.mark.parametrize("member", [m for m in TableType if m is not TableType.RELATION], ids=str)
+    def test_every_other_member_on_a_node(self, member: TableType) -> None:
+        """D4: recorded and returned, no effect before the table DDL."""
+
+        class Person(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="person", table_type=member)
+
+            id: RecordID | None = None
+
+        assert Person.get_table_type() is member
+
+    def test_a_model_without_the_keys_is_unaffected(self) -> None:
+        class Person(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="person")
+
+            id: RecordID | None = None
+
+        class Likes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="likes")
+
+        assert Person.get_table_type() is TableType.NORMAL
+        assert Likes.get_table_type() is TableType.RELATION
+        assert Likes.get_relation_in() == ()
+        assert Likes.get_relation_out() == ()
+        assert Likes.is_enforced() is False
+
+
+class TestGetters:
+    """AC-1: ``get_table_type()``, ``get_relation_in()``, ``get_relation_out()``, ``is_enforced()``; inheritance and
+    the reset of a subclass (``None`` or an empty value, P1 a)."""
+
+    def test_get_table_type_of_the_bases(self) -> None:
+        assert BaseSurrealModel.get_table_type() is TableType.NORMAL
+        assert BaseSurrealEdge.get_table_type() is TableType.RELATION
+
+    def test_get_table_type_of_an_edge_with_and_without_the_key(self) -> None:
+        class Likes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="likes")
+
+        class Loves(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="loves", table_type=TableType.RELATION)
+
+        class Hates(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="hates", table_type=None)
+
+        for model in (Likes, Loves, Hates):
+            assert model.get_table_type() is TableType.RELATION, model.__name__
+
+    def test_get_table_type_of_a_node(self) -> None:
+        class Person(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="person")
+
+            id: RecordID | None = None
+
+        class Member(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="member", table_type=TableType.USER)
+
+            id: RecordID | None = None
+
+        class Guest(Member):
+            model_config = SurrealConfigDict(table_name="guest")
+
+        class Visitor(Member):
+            model_config = SurrealConfigDict(table_name="visitor", table_type=None)
+
+        assert Person.get_table_type() is TableType.NORMAL
+        assert Member.get_table_type() is TableType.USER
+        assert Guest.get_table_type() is TableType.USER
+        assert Visitor.get_table_type() is TableType.NORMAL
+
+    def test_the_getters_of_the_base_edge(self) -> None:
+        assert BaseSurrealEdge.get_relation_in() == ()
+        assert BaseSurrealEdge.get_relation_out() == ()
+        assert BaseSurrealEdge.is_enforced() is False
+
+    @pytest.mark.parametrize(("value", "names"), [*((value, ()) for value in _ANY_TABLE), *_NAMES], ids=repr)
+    def test_each_value_form(self, value: object, names: tuple[str, ...]) -> None:
+        class Likes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="likes", relation_in=value, relation_out=value)  # type: ignore[typeddict-item]
+
+        assert Likes.get_relation_in() == names
+        assert Likes.get_relation_out() == names
+        assert type(Likes.get_relation_in()) is tuple
+        assert Likes.is_enforced() is False
+
+    @pytest.mark.parametrize(("value", "expected"), [(None, False), (False, False), (True, True)], ids=repr)
+    def test_is_enforced(self, value: bool | None, expected: bool) -> None:
+        class Likes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="likes", enforced=value)
+
+        assert Likes.is_enforced() is expected
+
+    def test_the_getters_compare_with_a_table_state(self) -> None:
+        """The tuple shape of ``TableState.relation_in``/``relation_out`` (spec §5.3)."""
+
+        class Likes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="likes", relation_in=" person ", relation_out="post|book")
+
+        state = surreal_orm_lite.TableState(
+            name="likes", table_type="relation", relation_in="person", relation_out=("post", "book")
+        )
+        assert Likes.get_relation_in() == state.relation_in
+        assert Likes.get_relation_out() == state.relation_out
+        assert Likes.is_enforced() is state.enforced
+
+    def test_a_subclass_inherits_the_three_keys(self) -> None:
+        class Likes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(
+                table_name="likes", relation_in="person", relation_out=["post", "book"], enforced=True
+            )
+
+        class Loves(Likes):
+            model_config = SurrealConfigDict(table_name="loves")
+
+        class LovesAgain(Loves):
+            pass
+
+        for model in (Loves, LovesAgain):
+            assert model.get_relation_in() == ("person",), model.__name__
+            assert model.get_relation_out() == ("post", "book"), model.__name__
+            assert model.is_enforced() is True, model.__name__
+            assert model.get_table_type() is TableType.RELATION, model.__name__
+
+    def test_a_subclass_overrides_one_key(self) -> None:
+        class Likes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="likes", relation_in="person", relation_out="post")
+
+        class Loves(Likes):
+            model_config = SurrealConfigDict(table_name="loves", relation_out=["book"], enforced=True)
+
+        assert Loves.get_relation_in() == ("person",)
+        assert Loves.get_relation_out() == ("book",)
+        assert Loves.is_enforced() is True
+        # The parent is unchanged.
+        assert Likes.get_relation_out() == ("post",)
+        assert Likes.is_enforced() is False
+
+    @pytest.mark.parametrize("reset", [None, [], (), ""], ids=repr)
+    def test_none_or_an_empty_value_resets_a_key_in_a_subclass(self, reset: object) -> None:
+        class Likes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(
+                table_name="likes", relation_in="person", relation_out=["post", "book"], enforced=True
+            )
+
+        class LikesAny(Likes):
+            model_config = SurrealConfigDict(relation_in=reset, relation_out=reset)  # type: ignore[typeddict-item]
+
+        assert LikesAny.get_relation_in() == ()
+        assert LikesAny.get_relation_out() == ()
+        assert LikesAny.is_enforced() is True
+        # The parent is unchanged.
+        assert Likes.get_relation_in() == ("person",)
+
+    @pytest.mark.parametrize("reset", [None, False], ids=repr)
+    def test_enforced_reset_in_a_subclass(self, reset: bool | None) -> None:
+        class Likes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="likes", enforced=True)
+
+        class LikesLoose(Likes):
+            model_config = SurrealConfigDict(enforced=reset)
+
+        assert LikesLoose.is_enforced() is False
+        assert Likes.is_enforced() is True
+
+
+# === relation_ddl() (spec §5.4, §5.5 G1–G8; AC-3) =================================================================
+
+
+class G1Likes(BaseSurrealEdge):
+    """G1: both ends and ``ENFORCED``."""
+
+    model_config = SurrealConfigDict(table_name="likes", relation_in="person", relation_out=["post", "book"], enforced=True)
+
+
+class G2Follows(BaseSurrealEdge):
+    """G2: no key — any table on both sides."""
+
+    model_config = SurrealConfigDict(table_name="follows")
+
+
+class G3Enforced(BaseSurrealEdge):
+    """G3: ``enforced=True`` only."""
+
+    model_config = SurrealConfigDict(table_name="e3", enforced=True)
+
+
+class G4Out(BaseSurrealEdge):
+    """G4: ``relation_out`` only."""
+
+    model_config = SurrealConfigDict(table_name="e4", relation_out="post")
+
+
+class G5Piped(BaseSurrealEdge):
+    """G5: two tables in one pipe-joined string."""
+
+    model_config = SurrealConfigDict(table_name="e5", relation_in="person | company")
+
+
+class G5Bare(BaseSurrealEdge):
+    """G5, written without spaces."""
+
+    model_config = SurrealConfigDict(table_name="e5", relation_in="person|company")
+
+
+class G5Tuple(BaseSurrealEdge):
+    """G5, as a tuple."""
+
+    model_config = SurrealConfigDict(table_name="e5", relation_in=("person", "company"))
+
+
+class G6Keywords(BaseSurrealEdge):
+    """G6: keyword names, the table's included."""
+
+    model_config = SurrealConfigDict(table_name="select", relation_in="order", relation_out="select")
+
+
+class G7Loose(BaseSurrealEdge):
+    """G7: ``enforced=False`` writes nothing."""
+
+    model_config = SurrealConfigDict(table_name="e7", enforced=False)
+
+
+class G7EmptyStr(BaseSurrealEdge):
+    """G7: an empty string means any table (P1 a)."""
+
+    model_config = SurrealConfigDict(table_name="e7", relation_in="")
+
+
+class G7EmptyList(BaseSurrealEdge):
+    """G7: an empty list means any table (P1 a)."""
+
+    model_config = SurrealConfigDict(table_name="e7", relation_in=[])
+
+
+class G7EmptyTuple(BaseSurrealEdge):
+    """G7: an empty tuple means any table (P1 a)."""
+
+    model_config = SurrealConfigDict(table_name="e7", relation_out=())
+
+
+class G8Twice(BaseSurrealEdge):
+    """G8: a repeated name is kept, in order (P1 b, M22)."""
+
+    model_config = SurrealConfigDict(table_name="e8", relation_in=["a", "a"])
+
+
+_G1 = "DEFINE TABLE OVERWRITE `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;"
+_G1_KEEP = "DEFINE TABLE IF NOT EXISTS `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;"
+_G5 = "DEFINE TABLE OVERWRITE `e5` TYPE RELATION IN `person` | `company`;"
+_G7 = "DEFINE TABLE OVERWRITE `e7` TYPE RELATION;"
+
+#: (model, overwrite, the exact statement of spec §5.5).
+_GOLDENS: list[tuple[type[BaseSurrealEdge], bool, str]] = [
+    (G1Likes, True, _G1),
+    (G1Likes, False, _G1_KEEP),
+    (G2Follows, True, "DEFINE TABLE OVERWRITE `follows` TYPE RELATION;"),
+    (G3Enforced, True, "DEFINE TABLE OVERWRITE `e3` TYPE RELATION ENFORCED;"),
+    (G4Out, True, "DEFINE TABLE OVERWRITE `e4` TYPE RELATION OUT `post`;"),
+    (G5Piped, True, _G5),
+    (G5Bare, True, _G5),
+    (G5Tuple, True, _G5),
+    (G6Keywords, True, "DEFINE TABLE OVERWRITE `select` TYPE RELATION IN `order` OUT `select`;"),
+    (G7Loose, True, _G7),
+    (G7EmptyStr, True, _G7),
+    (G7EmptyList, True, _G7),
+    (G7EmptyTuple, True, _G7),
+    (G8Twice, True, "DEFINE TABLE OVERWRITE `e8` TYPE RELATION IN `a` | `a`;"),
+]
+
+_GOLDEN_IDS = [f"{model.__name__}-{'overwrite' if overwrite else 'if-not-exists'}" for model, overwrite, _ in _GOLDENS]
+
+#: (relation_in, relation_out, enforced, the type clause) — the ends of each G-case.
+_CLAUSES: list[tuple[tuple[str, ...], tuple[str, ...], bool, str]] = [
+    (("person",), ("post", "book"), True, "TYPE RELATION IN `person` OUT `post` | `book` ENFORCED"),
+    ((), (), False, "TYPE RELATION"),
+    ((), (), True, "TYPE RELATION ENFORCED"),
+    ((), ("post",), False, "TYPE RELATION OUT `post`"),
+    (("person", "company"), (), False, "TYPE RELATION IN `person` | `company`"),
+    (("order",), ("select",), False, "TYPE RELATION IN `order` OUT `select`"),
+    (("a", "a"), (), False, "TYPE RELATION IN `a` | `a`"),
+]
+
+
+class TestRelationDdl:
+    """AC-3: ``relation_ddl()`` renders G1–G8 exactly — pure, the same text every time, no connection needed; E1 for a
+    non-``bool`` ``overwrite``."""
+
+    @pytest.mark.parametrize(("relation_in", "relation_out", "enforced", "clause"), _CLAUSES, ids=repr)
+    def test_relation_type_clause(
+        self, relation_in: tuple[str, ...], relation_out: tuple[str, ...], enforced: bool, clause: str
+    ) -> None:
+        assert schema.relation_type_clause(relation_in, relation_out, enforced) == clause
+        assert schema.relation_type_clause(list(relation_in), list(relation_out), enforced) == clause
+
+    @pytest.mark.parametrize(
+        ("overwrite", "statement"),
+        [
+            (True, "DEFINE TABLE OVERWRITE `likes` TYPE RELATION ENFORCED;"),
+            (False, "DEFINE TABLE IF NOT EXISTS `likes` TYPE RELATION ENFORCED;"),
+        ],
+    )
+    def test_relation_statement(self, overwrite: bool, statement: str) -> None:
+        assert schema.relation_statement("likes", "TYPE RELATION ENFORCED", overwrite) == statement
+
+    @pytest.mark.parametrize(("table", "error"), [("a-b", ValueError), ("1a", ValueError), (3, TypeError)], ids=repr)
+    def test_relation_statement_checks_the_table_name(self, table: Any, error: type[Exception]) -> None:
+        with pytest.raises(error):
+            schema.relation_statement(table, "TYPE RELATION", True)
+
+    @pytest.mark.parametrize(("model", "overwrite", "statement"), _GOLDENS, ids=_GOLDEN_IDS)
+    def test_golden_statements(self, model: type[BaseSurrealEdge], overwrite: bool, statement: str) -> None:
+        assert model.relation_ddl(overwrite=overwrite) == statement
+
+    def test_overwrite_by_default(self) -> None:
+        assert G1Likes.relation_ddl() == G1Likes.relation_ddl(overwrite=True) == _G1
+
+    def test_deterministic(self) -> None:
+        assert [G1Likes.relation_ddl() for _ in range(3)] == [_G1] * 3
+
+    def test_signature(self) -> None:
+        signature = inspect.signature(BaseSurrealEdge.relation_ddl)
+        assert list(signature.parameters) == ["overwrite"]
+        parameter = signature.parameters["overwrite"]
+        assert (parameter.kind, parameter.default) == (inspect.Parameter.KEYWORD_ONLY, True)
+        assert signature.return_annotation is str
+        assert isinstance(inspect.getattr_static(BaseSurrealEdge, "relation_ddl"), classmethod)
+        assert not hasattr(BaseSurrealModel, "relation_ddl")
+
+    def test_a_subclass_renders_its_own_table(self) -> None:
+        class Loves(G1Likes):
+            model_config = SurrealConfigDict(table_name="loves")
+
+        assert Loves.relation_ddl() == "DEFINE TABLE OVERWRITE `loves` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;"
+        assert G1Likes.relation_ddl() == _G1
+
+    @pytest.mark.parametrize(("overwrite", "type_name"), [("yes", "str"), (1, "int"), (None, "NoneType")], ids=repr)
+    def test_e1_overwrite_must_be_a_bool(self, overwrite: Any, type_name: str) -> None:
+        with pytest.raises(TypeError) as raised:
+            G1Likes.relation_ddl(overwrite=overwrite)
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == f"overwrite= must be a bool, got {type_name}."
+
+    async def test_works_with_no_connection_configured(self) -> None:
+        await SurrealDBConnectionManager.unset_connection()
+        assert SurrealDBConnectionManager.is_connection_set() is False
+        assert G1Likes.relation_ddl() == _G1
+        assert G8Twice.relation_ddl(overwrite=False) == "DEFINE TABLE IF NOT EXISTS `e8` TYPE RELATION IN `a` | `a`;"
+
+
+# === the carried statement (spec §5.5 K1–K7, §5.8 RG1–RG3, §6.1, §8; AC-4) ======================================
+
+
+class RelLikes(BaseSurrealEdge):
+    """The edge model of the E2E classes on ``rel_likes`` (spec AC-6): the constraint of K6."""
+
+    model_config = SurrealConfigDict(
+        table_name="rel_likes",
+        connection="rel",
+        relation_in="rel_person",
+        relation_out=["rel_post", "rel_book"],
+        enforced=True,
+    )
+
+    stars: int = 1
+
+
+#: G1's type clause, the clause of K1–K5.
+_G1_CLAUSE = "TYPE RELATION IN `person` OUT `post` | `book` ENFORCED"
+
+#: The stored definitions of K1–K5 as SurrealDB 3.3.4 renders them in ``INFO FOR DB`` (the same text on 2.7.0, 3.1.5
+#: and the embedded engine, M10). K1's comment holds a quote, a backslash and double quotes: the server writes it
+#: between double quotes.
+_K1_STORED = (
+    'DEFINE TABLE t TYPE NORMAL SCHEMAFULL COMMENT "it\'s \\\\ a \\"c\\" line" CHANGEFEED 1h INCLUDE ORIGINAL '
+    "PERMISSIONS FOR select WHERE in = $auth.id OR out = $auth.id, FOR create FULL, FOR update, delete NONE"
+)
+_K2_STORED = "DEFINE TABLE t TYPE ANY DROP SCHEMALESS PERMISSIONS NONE"
+_K3_STORED = "DEFINE TABLE t TYPE ANY SCHEMALESS PERMISSIONS FULL"
+_K4_STORED = "DEFINE TABLE t TYPE ANY SCHEMALESS PERMISSIONS NONE"
+_K5_STORED = (
+    "DEFINE TABLE t TYPE RELATION IN company OUT post ENFORCED SCHEMAFULL PERMISSIONS FOR select FULL, FOR create, "
+    "update, delete NONE"
+)
+
+#: K1–K5: the stored definition, then the carried statement of G1's clause on the table ``t`` (spec §5.5).
+_K_CASES: list[tuple[str, str, str]] = [
+    (
+        "K1",
+        _K1_STORED,
+        "DEFINE TABLE OVERWRITE `t` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED SCHEMAFULL COMMENT "
+        "'it\\'s \\\\ a \"c\" line' CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS FOR select WHERE in = $auth.id OR "
+        "out = $auth.id, FOR create FULL, FOR update, delete NONE;",
+    ),
+    ("K2", _K2_STORED, "DEFINE TABLE OVERWRITE `t` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED DROP;"),
+    (
+        "K3",
+        _K3_STORED,
+        "DEFINE TABLE OVERWRITE `t` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED PERMISSIONS FULL;",
+    ),
+    ("K4", _K4_STORED, "DEFINE TABLE OVERWRITE `t` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;"),
+    (
+        "K5",
+        _K5_STORED,
+        "DEFINE TABLE OVERWRITE `t` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED SCHEMAFULL PERMISSIONS FOR "
+        "select FULL, FOR create, update, delete NONE;",
+    ),
+]
+
+#: K6 (spec §5.5, AC-6, M17): ``rel_likes`` as AC-6's fixture stores it, ``RelLikes``'s carried statement, and the
+#: definition SurrealDB stores after it — the same text on the four engines. Tasks 4 and 6 assert them end to end.
+_K6_STORED = (
+    "DEFINE TABLE rel_likes TYPE ANY SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS FOR select "
+    "WHERE in = $auth.id, FOR create FULL, FOR update, delete NONE"
+)
+_K6 = (
+    "DEFINE TABLE OVERWRITE `rel_likes` TYPE RELATION IN `rel_person` OUT `rel_post` | `rel_book` ENFORCED SCHEMAFULL "
+    "COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS FOR select WHERE in = $auth.id, FOR create FULL, FOR "
+    "update, delete NONE;"
+)
+_K6_READ_BACK = (
+    "DEFINE TABLE rel_likes TYPE RELATION IN rel_person OUT rel_post | rel_book ENFORCED SCHEMAFULL COMMENT 'keep' "
+    "CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS FOR select WHERE in = $auth.id, FOR create FULL, FOR update, delete NONE"
+)
+
+#: K7 (spec §5.5, M19): K6's read-back carried with the keyless clause — the statement that removes the constraint.
+_K7 = (
+    "DEFINE TABLE OVERWRITE `rel_likes` TYPE RELATION SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL "
+    "PERMISSIONS FOR select WHERE in = $auth.id, FOR create FULL, FOR update, delete NONE;"
+)
+
+_TABLE_OPERATIONS = ("select", "create", "update", "delete")
+
+#: (permissions, text) — the generator's cases (``tests/test_model_generator.py``) and K1's rules: SurrealDB's
+#: rendering, operations in SurrealQL's order, grouped by rule.
+_PERMISSIONS_TEXTS: list[tuple[dict[str, str], str | None]] = [
+    (dict.fromkeys(_TABLE_OPERATIONS, "NONE"), None),
+    ({}, None),
+    (dict.fromkeys(_TABLE_OPERATIONS, "FULL"), "FULL"),
+    (
+        {"select": "WHERE in = $auth.id OR out = $auth.id", "create": "FULL", "update": "NONE", "delete": "NONE"},
+        "FOR select WHERE in = $auth.id OR out = $auth.id, FOR create FULL, FOR update, delete NONE",
+    ),
+    (dict.fromkeys(_TABLE_OPERATIONS, "WHERE a > 1"), "FOR select, create, update, delete WHERE a > 1"),
+    ({"select": "FULL"}, "FOR select FULL"),
+    (
+        {"delete": "FULL", "update": "NONE", "create": "WHERE a, b", "select": "WHERE a, b"},
+        "FOR select, create WHERE a, b, FOR update NONE, FOR delete FULL",
+    ),
+]
+
+#: A stored value that fails its check (spec §6.1, §8): the carried statement is ``None`` (RG2). Plain malformed values.
+_UNCARRIABLE: list[tuple[str, TableState]] = [
+    ("top-level-semicolon", TableState(name="t", permissions={"select": "WHERE a; b"})),
+    ("comment-marker", TableState(name="t", permissions={"select": "WHERE a -- c"})),
+    ("nul-in-comment", TableState(name="t", comment="a\x00b")),
+    ("unterminated-literal", TableState(name="t", permissions={"update": "WHERE a = 'b"})),
+    ("unbalanced-bracket", TableState(name="t", permissions={"create": "WHERE (a"})),
+    ("not-a-rule", TableState(name="t", permissions={"delete": "SOMETIMES"})),
+]
+
+
+class TestCarriedStatement:
+    """AC-4: ``relation_statement_keeping()`` re-renders a stored definition's other clauses after the model's type
+    clause — K1–K7 exactly —, ``None`` when a stored value fails its check; ``table_permissions_text()`` is the
+    generator's renderer, moved; the guard's refusal texts RG1–RG3."""
+
+    @pytest.mark.parametrize(("permissions", "text"), _PERMISSIONS_TEXTS, ids=repr)
+    def test_table_permissions_text(self, permissions: dict[str, str], text: str | None) -> None:
+        assert schema.table_permissions_text(permissions) == text
+
+    def test_the_generator_uses_the_moved_renderer(self) -> None:
+        assert not hasattr(model_generator, "_permissions_text")
+        assert not hasattr(model_generator, "_OPERATIONS")
+        assert model_generator.table_permissions_text is schema.table_permissions_text
+
+    @pytest.mark.parametrize(("stored", "statement"), [case[1:] for case in _K_CASES], ids=[case[0] for case in _K_CASES])
+    def test_k1_to_k5(self, stored: str, statement: str) -> None:
+        assert schema.relation_statement_keeping("t", _G1_CLAUSE, parse_define_table(stored)) == statement
+
+    def test_k1_comment_is_requoted(self) -> None:
+        """The server's double-quoted comment is read back unquoted, then written as a single-quoted literal."""
+        state = parse_define_table(_K1_STORED)
+        assert state.comment == 'it\'s \\ a "c" line'
+        statement = schema.relation_statement_keeping("t", _G1_CLAUSE, state)
+        assert statement is not None
+        assert " COMMENT 'it\\'s \\\\ a \"c\" line' " in statement
+
+    def test_k4_defaults_only_is_the_bare_statement(self) -> None:
+        state = parse_define_table(_K4_STORED)
+        assert schema.relation_statement_keeping("t", _G1_CLAUSE, state) == schema.relation_statement("t", _G1_CLAUSE, True)
+        assert schema.relation_statement_keeping("likes", _G1_CLAUSE, state) == G1Likes.relation_ddl() == _G1
+
+    def test_k6(self) -> None:
+        clause = schema.relation_type_clause(RelLikes.get_relation_in(), RelLikes.get_relation_out(), RelLikes.is_enforced())
+        assert schema.relation_statement_keeping("rel_likes", clause, parse_define_table(_K6_STORED)) == _K6
+
+    def test_k6_again_on_its_read_back(self) -> None:
+        """Applied twice, the carried statement is the same: K6's read-back carries the same clauses."""
+        clause = schema.relation_type_clause(RelLikes.get_relation_in(), RelLikes.get_relation_out(), RelLikes.is_enforced())
+        assert schema.relation_statement_keeping("rel_likes", clause, parse_define_table(_K6_READ_BACK)) == _K6
+
+    def test_k7_the_keyless_clause_removes_the_constraint(self) -> None:
+        assert schema.relation_statement_keeping("rel_likes", "TYPE RELATION", parse_define_table(_K6_READ_BACK)) == _K7
+
+    def test_clause_order(self) -> None:
+        """The type clause, ``DROP``, ``SCHEMAFULL``, ``COMMENT``, ``CHANGEFEED``, ``PERMISSIONS`` (spec §5.5)."""
+        state = TableState(
+            name="t",
+            schema_mode="SCHEMAFULL",
+            changefeed="2d",
+            permissions={"select": "FULL", "create": "FULL", "update": "FULL", "delete": "FULL"},
+            comment="c",
+            drop=True,
+        )
+        assert schema.relation_statement_keeping("t", "TYPE RELATION", state) == (
+            "DEFINE TABLE OVERWRITE `t` TYPE RELATION DROP SCHEMAFULL COMMENT 'c' CHANGEFEED 2d PERMISSIONS FULL;"
+        )
+
+    def test_a_rule_holding_literals_and_brackets_is_carried(self) -> None:
+        """String literals are data and brackets balance: a ``WHERE`` rule holding ``, FOR`` in a literal and an array
+        (M10) is carried as stored."""
+        rule = "WHERE name = 'a, FOR b' AND tags CONTAINSANY [1, 2]"
+        state = TableState(name="t", schema_mode="SCHEMALESS", permissions={"select": rule, "create": "NONE"})
+        assert schema.relation_statement_keeping("t", "TYPE RELATION", state) == (
+            f"DEFINE TABLE OVERWRITE `t` TYPE RELATION PERMISSIONS FOR select {rule}, FOR create NONE;"
+        )
+
+    @pytest.mark.parametrize("state", [case[1] for case in _UNCARRIABLE], ids=[case[0] for case in _UNCARRIABLE])
+    def test_none_for_a_stored_value_that_fails_its_check(self, state: TableState) -> None:
+        assert schema.relation_statement_keeping("t", _G1_CLAUSE, state) is None
+
+    @pytest.mark.parametrize(("table", "error"), [("a-b", ValueError), (3, TypeError)], ids=repr)
+    def test_the_table_name_is_checked(self, table: Any, error: type[Exception]) -> None:
+        with pytest.raises(error):
+            schema.relation_statement_keeping(table, _G1_CLAUSE, parse_define_table(_K4_STORED))
+
+    @pytest.mark.parametrize(("guard", "text"), [("RG1", _rg1), ("RG2", _rg2), ("RG3", _rg3)])
+    def test_guard_texts(self, guard: Any, text: Any) -> None:
+        assert schema.relation_table_refused(guard, "Likes", "likes") == text("Likes", "likes")
+
+    def test_guard_texts_exactly(self) -> None:
+        """RG1–RG3 of spec §5.8, word for word."""
+        assert schema.relation_table_refused("RG1", "Likes", "likes") == (
+            "Likes.define_relation(): the table 'likes' is a materialized view; defining it as a relation table would "
+            "drop its query and turn it into an ordinary table that no longer updates. Give Likes another table_name, "
+            "or remove the view first. Nothing was defined."
+        )
+        assert schema.relation_table_refused("RG2", "Likes", "likes") == (
+            "Likes.define_relation(): the definition of the table 'likes' could not be read, so the ORM cannot keep its "
+            "other clauses (schema mode, permissions, change feed, comment). Nothing was defined."
+        )
+        assert schema.relation_table_refused("RG3", "Likes", "likes") == (
+            "Likes.define_relation(overwrite=False): the table 'likes' exists and is not a relation table; DEFINE TABLE "
+            "IF NOT EXISTS would leave it as it is, and the relation constraint would not apply. Call define_relation() "
+            "with overwrite=True, which keeps the table's other clauses. Nothing was defined."
+        )
+
+
+# === define_relation() and its table guard (spec §5.4, §5.6, §5.8 RG1–RG3 S1–S4 E1; AC-9, AC-11) =================
+
+#: The guard's one read.
+_INFO = "INFO FOR DB;"
+
+#: A record user's refusal, as the servers word it.
+_PERMISSIONS = "IAM error: Not enough permissions to perform this action"
+
+#: Stored definitions of ``likes`` as ``INFO FOR DB`` renders them: a table the first write created, a ``TYPE
+#: NORMAL`` table, a ``SCHEMAFULL`` table with other clauses, a view, a definition the parser cannot read, a rule
+#: that fails its check (a top-level ``;``), a relation table with other ends.
+_STORED_DEFAULT = "DEFINE TABLE likes TYPE ANY SCHEMALESS PERMISSIONS NONE"
+_STORED_NORMAL = "DEFINE TABLE likes TYPE NORMAL SCHEMALESS PERMISSIONS NONE"
+_STORED_SCHEMAFULL = (
+    "DEFINE TABLE likes TYPE NORMAL SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h PERMISSIONS FOR select FULL, FOR create, "
+    "update, delete NONE"
+)
+_STORED_VIEW = "DEFINE TABLE likes TYPE ANY SCHEMALESS AS SELECT count() AS n FROM person GROUP ALL PERMISSIONS NONE"
+_STORED_UNREADABLE = "DEFINE TABLE likes TYPE ???"
+_STORED_BAD_RULE = "DEFINE TABLE likes TYPE ANY SCHEMALESS PERMISSIONS FOR select WHERE a; b, FOR create, update, delete NONE"
+_STORED_OTHER_ENDS = "DEFINE TABLE likes TYPE RELATION IN company OUT post SCHEMALESS PERMISSIONS NONE"
+
+#: ``G1Likes``' carried statement on :data:`_STORED_SCHEMAFULL` (the K-form).
+_SCHEMAFULL_KEPT = (
+    "DEFINE TABLE OVERWRITE `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED SCHEMAFULL COMMENT 'keep' "
+    "CHANGEFEED 1h PERMISSIONS FOR select FULL, FOR create, update, delete NONE;"
+)
+
+#: ``G1Likes.define_relation()`` on each stored ``likes``: (case, stored definition, overwrite, the statements
+#: sent, the guard that refuses or ``None``). Every call reads ``INFO FOR DB`` once; a refusal sends nothing else.
+_RELATION_GUARD: list[tuple[str, str | None, bool, list[str], str | None]] = [
+    ("missing", None, True, [_INFO, _G1], None),
+    ("missing", None, False, [_INFO, _G1_KEEP], None),
+    ("default", _STORED_DEFAULT, True, [_INFO, _G1], None),
+    ("default", _STORED_DEFAULT, False, [_INFO], "RG3"),
+    ("normal", _STORED_NORMAL, True, [_INFO, _G1], None),
+    ("normal", _STORED_NORMAL, False, [_INFO], "RG3"),
+    ("schemafull", _STORED_SCHEMAFULL, True, [_INFO, _SCHEMAFULL_KEPT], None),
+    ("schemafull", _STORED_SCHEMAFULL, False, [_INFO], "RG3"),
+    ("view", _STORED_VIEW, True, [_INFO], "RG1"),
+    ("view", _STORED_VIEW, False, [_INFO], "RG1"),
+    ("unreadable", _STORED_UNREADABLE, True, [_INFO], "RG2"),
+    ("unreadable", _STORED_UNREADABLE, False, [_INFO], "RG2"),
+    ("bad-rule", _STORED_BAD_RULE, True, [_INFO], "RG2"),
+    ("bad-rule", _STORED_BAD_RULE, False, [_INFO], "RG3"),
+    ("other-ends", _STORED_OTHER_ENDS, True, [_INFO, _G1], None),
+    ("other-ends", _STORED_OTHER_ENDS, False, [_INFO, _G1_KEEP], None),
+]
+
+_GUARD_TEXTS = {"RG1": _rg1, "RG2": _rg2, "RG3": _rg3}
+
+
+class _GuardClient:
+    """A client answering ``INFO FOR DB;`` with ``{"tables": tables}`` and every other statement with ``[]``; it
+    records each statement and raises the error given for the ``INFO`` or the DDL (``tests/test_views.py``'s
+    pattern). ``version()`` is counted: the guard never reads it."""
+
+    def __init__(
+        self,
+        tables: dict[str, object] | None = None,
+        *,
+        info_error: BaseException | None = None,
+        ddl_error: BaseException | None = None,
+    ) -> None:
+        self.info = {"tables": dict(tables or {}), "functions": {}}
+        self.info_error = info_error
+        self.ddl_error = ddl_error
+        self.queries: list[str] = []
+        self.version_calls = 0
+
+    async def query(self, statement: str, variables: object) -> object:
+        assert variables == {}
+        self.queries.append(statement)
+        if statement == _INFO:
+            if self.info_error is not None:
+                raise self.info_error
+            return self.info
+        if self.ddl_error is not None:
+            raise self.ddl_error
+        return []
+
+    async def version(self) -> str:
+        self.version_calls += 1
+        return "surrealdb-3.3.4"
+
+
+class _QueuingTx:
+    """A transaction of the connection *name* whose ``add()`` records each statement."""
+
+    def __init__(self, name: str = "default") -> None:
+        self._connection_name = name
+        self.added: list[tuple[str, object]] = []
+
+    async def add(self, statement: str, variables: object) -> None:
+        self.added.append((statement, variables))
+
+
+def _guard_client(stored: str | None, **errors: Any) -> _GuardClient:
+    """A fake client whose database holds ``person`` and, unless *stored* is ``None``, ``likes`` stored as *stored*."""
+    tables: dict[str, object] = {"person": _STORED_DEFAULT.replace("likes", "person")}
+    if stored is not None:
+        tables["likes"] = stored
+    return _GuardClient(tables, **errors)
+
+
+@pytest.fixture
+def use_client(monkeypatch: pytest.MonkeyPatch) -> Callable[[Any], None]:
+    """Make ``SurrealDBConnectionManager.get_client()`` answer the client given."""
+
+    def use(client: Any) -> None:
+        async def get_client(*args: Any, **kwargs: Any) -> Any:
+            return client
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+
+    return use
+
+
+class TestRelationGuard:
+    """AC-9, AC-11 (unit): ``define_relation()`` on fake clients — one ``INFO FOR DB`` per call, then one statement:
+    the bare one for a missing table, the carried one for a table that exists, ``IF NOT EXISTS`` for
+    ``overwrite=False`` on a missing table or a relation table; RG1–RG3 before any DDL; S1/S2 for a refused ``INFO``,
+    S3/S4 for a refused DDL, naming the table and never the statement; a ``tx`` of another connection and E1 before
+    any request."""
+
+    def test_signature(self) -> None:
+        function = inspect.getattr_static(BaseSurrealEdge, "define_relation")
+        assert isinstance(function, classmethod)
+        assert inspect.iscoroutinefunction(function.__func__)
+        assert not getattr(function.__func__, "__surreal_cache_writes__", False)
+        assert inspect.signature(BaseSurrealEdge.define_relation) == inspect.Signature(
+            [
+                inspect.Parameter("overwrite", inspect.Parameter.KEYWORD_ONLY, default=True, annotation=bool),
+                inspect.Parameter("tx", inspect.Parameter.KEYWORD_ONLY, default=None, annotation=Transaction | None),
+            ],
+            return_annotation=str,
+        )
+
+    @pytest.mark.parametrize(
+        ("stored", "overwrite", "sent", "guard"),
+        [case[1:] for case in _RELATION_GUARD],
+        ids=[f"{case[0]}-{'overwrite' if case[2] else 'if-not-exists'}" for case in _RELATION_GUARD],
+    )
+    async def test_the_requests_sent(
+        self,
+        use_client: Callable[[Any], None],
+        stored: str | None,
+        overwrite: bool,
+        sent: list[str],
+        guard: str | None,
+    ) -> None:
+        client = _guard_client(stored)
+        use_client(client)
+        if guard is None:
+            assert await G1Likes.define_relation(overwrite=overwrite) == sent[-1]
+        else:
+            with pytest.raises(SurrealDbError) as raised:
+                await G1Likes.define_relation(overwrite=overwrite)
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value) == _GUARD_TEXTS[guard]("G1Likes", "likes")
+        assert client.queries == sent
+        assert client.version_calls == 0
+
+    async def test_a_transaction_gets_the_ddl_only(self, use_client: Callable[[Any], None]) -> None:
+        """Spec §5.4, §7: the guard reads committed state on the client, before anything is queued; the DDL — the
+        carried statement — is queued in the transaction."""
+        client = _guard_client(_STORED_SCHEMAFULL)
+        use_client(client)
+        tx = _QueuingTx()
+        assert await G1Likes.define_relation(tx=tx) == _SCHEMAFULL_KEPT  # type: ignore[arg-type]
+        assert client.queries == [_INFO]
+        assert tx.added == [(_SCHEMAFULL_KEPT, None)]
+
+    async def test_a_transaction_of_another_connection(self, use_client: Callable[[Any], None]) -> None:
+        client = _guard_client(None)
+        use_client(client)
+        tx = _QueuingTx("other")
+        with pytest.raises(SurrealDbError) as raised:
+            await G1Likes.define_relation(tx=tx)  # type: ignore[arg-type]
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value).startswith("G1Likes.define_relation() cannot run in this transaction: ")
+        assert client.queries == []
+        assert tx.added == []
+
+    @pytest.mark.parametrize("overwrite", ["yes", 1, None], ids=repr)
+    async def test_e1_before_any_request(self, use_client: Callable[[Any], None], overwrite: Any) -> None:
+        client = _guard_client(None)
+        use_client(client)
+        with pytest.raises(TypeError) as raised:
+            await G1Likes.define_relation(overwrite=overwrite)
+        assert str(raised.value) == f"overwrite= must be a bool, got {type(overwrite).__name__}."
+        assert client.queries == []
+
+    @pytest.mark.parametrize(
+        ("error", "refusal"),
+        [
+            (InternalError("Internal", _PERMISSIONS), SurrealDbAuthenticationError),
+            (NotAllowedError("NotAllowed", _PERMISSIONS), SurrealDbAuthenticationError),
+            (InternalError("Internal", "There was a problem with the database"), SurrealDbError),
+            (RuntimeError("the engine is closed"), SurrealDbError),
+        ],
+        ids=["s1-internal", "s1-not-allowed", "s2-internal", "s2-runtime"],
+    )
+    async def test_s1_s2_a_refused_info(
+        self, use_client: Callable[[Any], None], error: BaseException, refusal: type[SurrealDbError]
+    ) -> None:
+        client = _GuardClient(info_error=error)
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await G1Likes.define_relation()
+        assert type(raised.value) is refusal
+        assert str(raised.value) == f"Can't apply relation definition: 'likes' -> {error}"
+        assert raised.value.__cause__ is error
+        assert client.queries == [_INFO]
+
+    async def test_s3_a_refused_ddl(self, use_client: Callable[[Any], None]) -> None:
+        error = NotAllowedError("NotAllowed", _PERMISSIONS)
+        client = _guard_client(_STORED_SCHEMAFULL, ddl_error=error)
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await G1Likes.define_relation()
+        assert type(raised.value) is SurrealDbAuthenticationError
+        assert str(raised.value) == f"Can't apply relation definition: 'likes' -> {_PERMISSIONS}"
+        assert raised.value.__cause__ is error
+        assert client.queries == [_INFO, _SCHEMAFULL_KEPT]
+
+    @pytest.mark.parametrize(
+        ("reason", "text"),
+        [
+            ("The table 'likes' is locked", "The table 'likes' is locked"),
+            (
+                "Parse error: Unexpected token `ENFORCED`\n --> [1:72]\n  |\n1 | DEFINE TABLE OVERWRITE `likes` TYPE "
+                "RELATION IN `person` OUT `post` | `book` ENFORCED SCHEMAFULL",
+                "Parse error: Unexpected token `ENFORCED` (at line 1, column 72 of the statement)",
+            ),
+            (
+                "Found a problem in TYPE RELATION IN `person` OUT `post` | `book` ENFORCED SCHEMAFULL COMMENT 'keep'",
+                "the server's message quotes the statement, so it is left out",
+            ),
+        ],
+        ids=["whole", "parse-excerpt", "quoting"],
+    )
+    async def test_s4_never_quotes_the_statement(self, use_client: Callable[[Any], None], reason: str, text: str) -> None:
+        error = InternalError("Internal", reason)
+        client = _guard_client(_STORED_SCHEMAFULL, ddl_error=error)
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await G1Likes.define_relation()
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == f"Can't apply relation definition: 'likes' -> {text}"
+        assert "PERMISSIONS FOR select" not in str(raised.value)
+        assert client.queries == [_INFO, _SCHEMAFULL_KEPT]
+
+    async def test_the_view_guard_texts_are_unchanged(self) -> None:
+        """``read_table_definitions()``'s new ``what=`` keyword keeps v0.32.0's texts by default."""
+        client = _GuardClient(info_error=InternalError("Internal", _PERMISSIONS))
+        with pytest.raises(SurrealDbAuthenticationError) as view:
+            await schema.read_table_definitions(client, "order_stats", kind="definition")
+        assert str(view.value) == f"Can't apply view definition: 'order_stats' -> {_PERMISSIONS}"
+        with pytest.raises(SurrealDbAuthenticationError) as relation:
+            await schema.read_table_definitions(client, "likes", kind="definition", what="relation")
+        assert str(relation.value) == f"Can't apply relation definition: 'likes' -> {_PERMISSIONS}"
+
+
+# === E2E (spec §9.2): the connection "rel" on the database rel_db, over WebSocket and HTTP, and mem:// ===========
+
+#: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
+_KINDS = ["ws", "http", "mem"]
+
+#: The reset of spec §9.2, in one query.
+_REL_RESET = "REMOVE DATABASE IF EXISTS rel_db; DEFINE DATABASE rel_db;"
+
+
+def _url(kind: str) -> str:
+    """The URL of *kind*: ``ws`` or ``http`` on the line under test (``SURREALDB_PORT``), or ``mem``."""
+    if kind == "mem":
+        return "mem://"
+    host = os.environ.get("SURREALDB_HOST", "localhost")
+    port = os.environ.get("SURREALDB_PORT", "8000")
+    return f"ws://{host}:{port}/rpc" if kind == "ws" else f"http://{host}:{port}"
+
+
+def _register_rel(kind: str, name: str = "rel") -> None:
+    if kind == "mem":
+        SurrealDBConnectionManager.add_connection(name, url="mem://", namespace="ns", database="rel_db")
+    else:
+        SurrealDBConnectionManager.add_connection(
+            name, url=_url(kind), user="root", password="root", namespace="ns", database="rel_db"
+        )
+
+
+async def _apply_ddl(client: Any, ddl: str) -> None:
+    """Run *ddl* and check every statement: ``query()`` checks only the first one."""
+    response = await client.query_raw(ddl, {})
+    assert "error" not in response, response["error"]
+    refused = [result for result in response["result"] if result["status"] != "OK"]
+    assert response["result"] and not refused, refused
+
+
+@contextlib.asynccontextmanager
+async def _rel(kind: str) -> AsyncIterator[Any]:
+    """The connection ``"rel"`` on *kind*, its database ``rel_db`` reset in one query; removed, then unregistered, on
+    exit (spec §9.2)."""
+    _register_rel(kind)
+    client = await SurrealDBConnectionManager.get_client("rel")
+    await _apply_ddl(client, _REL_RESET)
+    try:
+        yield client
+    finally:
+        with contextlib.suppress(Exception):
+            cleanup = await SurrealDBConnectionManager.get_client("rel")
+            await cleanup.query("REMOVE DATABASE IF EXISTS rel_db;", {})
+        await SurrealDBConnectionManager.remove_connection("rel")
+
+
+async def _tables(client: Any) -> dict[str, Any]:
+    """The ``tables`` of ``INFO FOR DB`` on *client*'s database."""
+    return dict((await client.query("INFO FOR DB;", {}))["tables"])
+
+
+class TestRelationDdlE2E:
+    """AC-3 (E2E): each golden applied raw on every engine of both lines is accepted and read back by
+    ``parse_define_table()`` as a relation table whose ends and ``ENFORCED`` equal the model's getters (M1, M2, M16),
+    the keyword names of G6 and the repeated name of G8 included (M22)."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize(("model", "overwrite", "statement"), _GOLDENS, ids=_GOLDEN_IDS)
+    async def test_each_golden_is_applied_and_read_back(
+        self, kind: str, model: type[BaseSurrealEdge], overwrite: bool, statement: str
+    ) -> None:
+        async with _rel(kind) as client:
+            ddl = model.relation_ddl(overwrite=overwrite)
+            assert ddl == statement
+            await _apply_ddl(client, ddl)
+            table = model.get_table_name()
+            state = parse_define_table((await _tables(client))[table])
+            assert state.name == table
+            assert state.table_type == "relation"
+            assert state.relation_in == model.get_relation_in()
+            assert state.relation_out == model.get_relation_out()
+            assert state.enforced is model.is_enforced()
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_g8_keeps_the_repeated_name(self, kind: str) -> None:
+        """M22: ``IN `a` | `a``` is stored and read back with the name twice, as ``get_relation_in()`` returns it."""
+        async with _rel(kind) as client:
+            await _apply_ddl(client, G8Twice.relation_ddl())
+            state = parse_define_table((await _tables(client))["e8"])
+            assert state.relation_in == ("a", "a") == G8Twice.get_relation_in()
+            assert state.relation_out == ()
+            assert state.enforced is False
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_reapplying_a_golden_changes_nothing(self, kind: str) -> None:
+        """The statement is the same text every time; applied twice (``OVERWRITE``, then ``IF NOT EXISTS``), the table
+        reads back the same definition."""
+        async with _rel(kind) as client:
+            await _apply_ddl(client, G1Likes.relation_ddl())
+            first = (await _tables(client))["likes"]
+            await _apply_ddl(client, G1Likes.relation_ddl())
+            await _apply_ddl(client, G1Likes.relation_ddl(overwrite=False))
+            assert (await _tables(client))["likes"] == first
+
+
+# --- define_relation() on the engines (spec §5.4, §5.6; AC-5, AC-6, AC-9, AC-11; M4, M6, M9, M17, M23) -------------
+
+
+class RelPerson(BaseSurrealModel):
+    """A node of the E2E classes: ``rel_likes``' ``IN`` table."""
+
+    model_config = SurrealConfigDict(table_name="rel_person", connection="rel")
+
+    id: str | None = None
+
+
+class RelPost(BaseSurrealModel):
+    """A node of the E2E classes: one of ``rel_likes``' ``OUT`` tables."""
+
+    model_config = SurrealConfigDict(table_name="rel_post", connection="rel")
+
+    id: str | None = None
+
+
+class RelBook(BaseSurrealModel):
+    """A node of the E2E classes: the other ``OUT`` table of ``rel_likes``."""
+
+    model_config = SurrealConfigDict(table_name="rel_book", connection="rel")
+
+    id: str | None = None
+
+
+class RelCompany(BaseSurrealModel):
+    """A node of the E2E classes, outside ``rel_likes``' ends."""
+
+    model_config = SurrealConfigDict(table_name="rel_company", connection="rel")
+
+    id: str | None = None
+
+
+class RelStats(BaseSurrealEdge):
+    """An edge model whose table is a view (AC-9, RG1)."""
+
+    model_config = SurrealConfigDict(table_name="rel_stats", connection="rel", relation_in="rel_person")
+
+
+#: ``RelLikes``' bare statement (G1's form on the ``rel_`` tables) and SurrealDB's rendering of it (M2).
+_REL_G1 = "DEFINE TABLE OVERWRITE `rel_likes` TYPE RELATION IN `rel_person` OUT `rel_post` | `rel_book` ENFORCED;"
+_REL_G1_READ_BACK = (
+    "DEFINE TABLE rel_likes TYPE RELATION IN rel_person OUT rel_post | rel_book ENFORCED SCHEMALESS PERMISSIONS NONE"
+)
+
+#: AC-6's fixture, as written in spec AC-6 (M17): ``TYPE ANY`` spelled out — a ``SCHEMAFULL`` table without ``TYPE``
+#: is stored ``TYPE NORMAL`` and refuses the edges —, and ``in``/``out`` defined before the ``UNIQUE`` index — a
+#: ``SCHEMAFULL`` table refuses an index on undefined fields.
+_AC6_FIXTURE = (
+    "DEFINE TABLE rel_likes TYPE ANY SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL "
+    "PERMISSIONS FOR select WHERE in = $auth.id, FOR create FULL; "
+    "DEFINE FIELD in ON rel_likes TYPE record; "
+    "DEFINE FIELD out ON rel_likes TYPE record; "
+    "DEFINE FIELD stars ON rel_likes TYPE int DEFAULT 1; "
+    "DEFINE INDEX rel_likes_pair ON rel_likes FIELDS in, out UNIQUE; "
+    "DEFINE EVENT rel_likes_ev ON rel_likes WHEN $event = 'CREATE' THEN {};"
+)
+
+#: AC-6's two raw edges, with explicit ids.
+_AC6_EDGES = (
+    "INSERT RELATION INTO rel_likes [{id: 'e1', in: rel_person:ada, out: rel_post:p1, stars: 3}, "
+    "{id: 'e2', in: rel_person:ada, out: rel_book:b1}];"
+)
+
+#: The view of P2 (M23): it reads ``rel_likes``.
+_AC6_VIEW = "DEFINE TABLE rel_like_counts AS SELECT count() AS n, out FROM rel_likes GROUP BY out;"
+
+#: A record access on ``rel_db``: a user signed up through it is a record user, who may not define (AC-11).
+_REL_ACCESS = (
+    "DEFINE ACCESS rel_acc ON DATABASE TYPE RECORD SIGNUP (CREATE rel_user SET name = $name) "
+    "SIGNIN (SELECT * FROM rel_user WHERE name = $name);"
+)
+
+
+async def _line(client: Any) -> tuple[int, int]:
+    """``(major, minor)`` of the engine *client* talks to: ``"surrealdb-3.1.5"`` → ``(3, 1)``; ``mem://`` →
+    ``(2, 0)`` (the SDK's version, whose core is 2.x)."""
+    match = re.search(r"(\d+)\.(\d+)", await client.version())
+    assert match is not None
+    return int(match.group(1)), int(match.group(2))
+
+
+async def _major(client: Any) -> int:
+    """The major version of the engine *client* talks to: ``"surrealdb-3.3.4"`` → 3; ``mem://`` → 2."""
+    return (await _line(client))[0]
+
+
+def _spy(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[tuple[str, tuple[object, ...]]]:
+    """Record every ``query``, ``query_raw`` and ``version`` call *client* receives, with its arguments (and let it
+    through) — v0.31.0's spy."""
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def recording(method: str) -> Any:
+        real = getattr(client, method)
+
+        async def call(*args: object, **kwargs: object) -> object:
+            calls.append((method, args))
+            return await real(*args, **kwargs)
+
+        return call
+
+    for method in ("query", "query_raw", "version"):
+        monkeypatch.setattr(client, method, recording(method))
+    return calls
+
+
+def _sent(calls: list[tuple[str, tuple[object, ...]]]) -> list[object]:
+    """The statements *calls* (:func:`_spy`'s) sent through ``query()``, after checking that nothing else was sent: no
+    ``version()``, and a ``query_raw()`` only for those statements (the SDK's ``query()`` runs it itself)."""
+    statements = [args[0] for method, args in calls if method == "query"]
+    assert [method for method, _ in calls if method == "version"] == []
+    assert [args[0] for method, args in calls if method == "query_raw"] == statements
+    return statements
+
+
+async def _table_info(client: Any, table: str) -> dict[str, Any]:
+    """``INFO FOR TABLE`` *table* (a constant name of these tests)."""
+    info: dict[str, Any] = await client.query(f"INFO FOR TABLE {table};", {})
+    return info
+
+
+async def _edge_ids(client: Any) -> list[str]:
+    """The ids of ``rel_likes``' edges, ordered, as ``table:id`` texts."""
+    return [str(edge) for edge in await client.query("SELECT VALUE id FROM rel_likes ORDER BY id;", {})]
+
+
+async def _like_counts(client: Any) -> dict[str, int]:
+    """The view ``rel_like_counts``: ``out`` (as a ``table:id`` text) → ``n``."""
+    return {str(row["out"]): row["n"] for row in await client.query("SELECT n, out FROM rel_like_counts;", {})}
+
+
+async def _ac6(client: Any) -> dict[str, BaseSurrealModel]:
+    """Spec AC-6's fixture on ``rel_db``: the table, its fields, index and event (each statement checked), the five
+    nodes saved through the ORM, the edges ``e1`` and ``e2`` written raw, then the view of P2 — and the stored
+    definition is K6's stored text. Returns the nodes by name."""
+    await _apply_ddl(client, _AC6_FIXTURE)
+    nodes: dict[str, BaseSurrealModel] = {
+        "ada": await RelPerson(id="ada").save(),
+        "bob": await RelPerson(id="bob").save(),
+        "p1": await RelPost(id="p1").save(),
+        "b1": await RelBook(id="b1").save(),
+        "c": await RelCompany(id="c").save(),
+    }
+    await _apply_ddl(client, _AC6_EDGES)
+    await _apply_ddl(client, _AC6_VIEW)
+    assert await _like_counts(client) == {"rel_post:p1": 1, "rel_book:b1": 1}
+    assert (await _tables(client))["rel_likes"] == _K6_STORED
+    return nodes
+
+
+class TestDefineRelationE2E:
+    """AC-5, AC-6, AC-9 (E2E, every engine of both lines): ``define_relation()`` reads ``INFO FOR DB`` once, then
+    sends the bare statement on a missing table and the carried one (K6) on an existing table — whose other clauses,
+    fields, indexes, events, edges and the views that read it are kept, and which refuses a wrong-table endpoint at
+    once, on every connection —; RG1 on a view, RG3 for ``overwrite=False`` on a ``TYPE ANY`` table, and
+    ``overwrite=False`` leaves a relation table's stored ends."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_ac5_on_a_missing_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _rel(kind) as client:
+            calls = _spy(monkeypatch, client)
+            assert await RelLikes.define_relation() == _REL_G1 == RelLikes.relation_ddl()
+            assert _sent(calls) == [_INFO, _REL_G1]
+            stored = (await _tables(client))["rel_likes"]
+            assert stored == _REL_G1_READ_BACK
+            state = parse_define_table(stored)
+            assert state.table_type == "relation"
+            assert state.relation_in == ("rel_person",)
+            assert state.relation_out == ("rel_post", "rel_book")
+            assert state.enforced is True
+            calls.clear()
+            assert await RelLikes.define_relation() == _REL_G1
+            assert _sent(calls) == [_INFO, _REL_G1]
+            assert (await _tables(client))["rel_likes"] == stored
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_ac6_on_an_existing_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _rel(kind) as client:
+            nodes = await _ac6(client)
+            if kind != "mem":
+                _register_rel(kind, "rel2")
+            try:
+                if kind != "mem":
+                    # The second connection's session is open before the define (M9).
+                    second = await SurrealDBConnectionManager.get_client("rel2")
+                    assert await second.query("SELECT VALUE id FROM rel_likes ORDER BY id;", {}) == [
+                        RecordID("rel_likes", "e1"),
+                        RecordID("rel_likes", "e2"),
+                    ]
+                calls = _spy(monkeypatch, client)
+                assert await RelLikes.define_relation() == _K6
+                assert _sent(calls) == [_INFO, _K6]
+                tables = await _tables(client)
+                assert tables["rel_likes"] == _K6_READ_BACK
+                assert parse_define_table(tables["rel_like_counts"]).view_query is not None
+                info = await _table_info(client, "rel_likes")
+                assert {"in", "out", "stars"} <= set(info["fields"])
+                assert "TYPE record<rel_person>" in info["fields"]["in"]
+                assert "TYPE record<rel_post | rel_book>" in info["fields"]["out"]
+                assert list(info["indexes"]) == ["rel_likes_pair"]
+                assert list(info["events"]) == ["rel_likes_ev"]
+                assert list(info["tables"]) == ["rel_like_counts"]
+                assert await _edge_ids(client) == ["rel_likes:e1", "rel_likes:e2"]
+
+                # P2, M23: the view that reads the table keeps updating.
+                edge = await nodes["bob"].relate(RelLikes, nodes["p1"])
+                assert (edge.in_, edge.out, edge.stars) == (RecordID("rel_person", "bob"), RecordID("rel_post", "p1"), 1)
+                assert await _like_counts(client) == {"rel_post:p1": 2, "rel_book:b1": 1}
+
+                # The UNIQUE index is kept.
+                with pytest.raises(SurrealDbError) as duplicate:
+                    await nodes["ada"].relate(RelLikes, nodes["p1"])
+                assert type(duplicate.value) is SurrealDbError
+                assert "rel_likes_pair" in str(duplicate.value)
+
+                # A wrong-table endpoint is refused at once (M9), also on the second connection.
+                with pytest.raises(SurrealDbError) as company:
+                    await nodes["c"].relate(RelLikes, nodes["p1"])
+                assert type(company.value) is SurrealDbError
+                if kind != "mem":
+                    async with SurrealDBConnectionManager.using("rel2"):
+                        with pytest.raises(SurrealDbError) as other:
+                            await nodes["c"].relate(RelLikes, nodes["b1"])
+                    assert type(other.value) is SurrealDbError
+                # e1, e2 and bob's edge (an auto id: compared as a set), nothing else.
+                ids = await _edge_ids(client)
+                assert len(ids) == 3
+                assert {"rel_likes:e1", "rel_likes:e2", str(edge.id)} == set(ids)
+                assert await _like_counts(client) == {"rel_post:p1": 2, "rel_book:b1": 1}
+            finally:
+                if kind != "mem":
+                    await SurrealDBConnectionManager.remove_connection("rel2")
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_ac6_a_second_call_converges(self, kind: str) -> None:
+        """Applied again, the carried statement is the same K6 and the table reads back the same."""
+        async with _rel(kind) as client:
+            await _ac6(client)
+            assert await RelLikes.define_relation() == _K6
+            assert await RelLikes.define_relation() == _K6
+            assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "if-not-exists"])
+    async def test_rg1_a_view(self, kind: str, overwrite: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _rel(kind) as client:
+            await RelPerson(id="ada").save()
+            await _apply_ddl(client, "DEFINE TABLE rel_stats AS SELECT count() AS n FROM rel_person GROUP ALL;")
+            before = (await _tables(client))["rel_stats"]
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await RelStats.define_relation(overwrite=overwrite)
+            assert _sent(calls) == [_INFO]
+            assert (type(raised.value), str(raised.value)) == (SurrealDbError, _rg1("RelStats", "rel_stats"))
+            after = (await _tables(client))["rel_stats"]
+            assert after == before
+            assert parse_define_table(after).view_query is not None
+            assert await client.query("SELECT VALUE n FROM rel_stats;", {}) == [1]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_rg3_a_type_any_table_holding_an_edge(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _rel(kind) as client:
+            await _apply_ddl(client, "INSERT RELATION INTO rel_likes {id: 'e1', in: rel_person:ada, out: rel_post:p1};")
+            before = (await _tables(client))["rel_likes"]
+            assert parse_define_table(before).table_type == "any"
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await RelLikes.define_relation(overwrite=False)
+            assert _sent(calls) == [_INFO]
+            assert (type(raised.value), str(raised.value)) == (SurrealDbError, _rg3("RelLikes", "rel_likes"))
+            assert (await _tables(client))["rel_likes"] == before
+            assert await _edge_ids(client) == ["rel_likes:e1"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_overwrite_false_on_a_missing_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _rel(kind) as client:
+            statement = RelLikes.relation_ddl(overwrite=False)
+            calls = _spy(monkeypatch, client)
+            assert await RelLikes.define_relation(overwrite=False) == statement
+            assert _sent(calls) == [_INFO, statement]
+            assert (await _tables(client))["rel_likes"] == _REL_G1_READ_BACK
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_overwrite_false_leaves_a_relation_tables_ends(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """D8: ``IF NOT EXISTS`` on a relation table with other ends is sent, and changes nothing."""
+        async with _rel(kind) as client:
+            await _apply_ddl(client, "DEFINE TABLE rel_likes TYPE RELATION IN rel_company OUT rel_post;")
+            before = (await _tables(client))["rel_likes"]
+            statement = RelLikes.relation_ddl(overwrite=False)
+            calls = _spy(monkeypatch, client)
+            assert await RelLikes.define_relation(overwrite=False) == statement
+            assert _sent(calls) == [_INFO, statement]
+            assert (await _tables(client))["rel_likes"] == before
+            state = parse_define_table(before)
+            assert (state.relation_in, state.relation_out, state.enforced) == (("rel_company",), ("rel_post",), False)
+
+
+class TestRelationPermissionsE2E:
+    """AC-11 (servers): a record user may not define a relation constraint — S1 from the guard's ``INFO FOR DB``, and
+    nothing else is sent. The embedded engine's session is its owner, which may always define."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_s1_a_record_user(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        if kind == "mem":
+            pytest.skip("the embedded engine's session is its owner: it may always define")
+        async with _rel(kind) as client, SurrealDBConnectionManager.using("rel"):
+            await _apply_ddl(client, _REL_ACCESS)
+            await SurrealDBConnectionManager.signup(access="rel_acc", variables={"name": "rel-user"})
+            try:
+                calls = _spy(monkeypatch, client)
+                with pytest.raises(SurrealDbError) as raised:
+                    await RelLikes.define_relation()
+                assert _sent(calls) == [_INFO]
+            finally:
+                await SurrealDBConnectionManager.invalidate()
+            assert "rel_likes" not in await _tables(client)
+        assert type(raised.value) is SurrealDbAuthenticationError
+        assert str(raised.value).startswith("Can't apply relation definition: 'rel_likes' -> ")
+        assert "not enough permissions" in str(raised.value).lower()
+
+
+# === edge creation refusals (spec §5.7, §5.8 W1–W2, §6.3, §6.4; AC-7, AC-8; D6, D7, D15; M11, M12, M20) ============
+
+
+def _w(message: str) -> str:
+    """W1/W2's text (spec §5.8) for the server message *message*."""
+    return f"There was a problem with the database: {message}"
+
+
+def _sdk_error(kind: str, message: str) -> Exception:
+    """A fresh SDK error of *kind* (``"NotFound"`` or ``"Internal"``), as the SDK raises it for a refused statement."""
+    return NotFoundError(kind, message) if kind == "NotFound" else InternalError(kind, message)
+
+
+#: (id, SDK error kind, server message, the ORM class it becomes): the refusals of an edge creation measured on the
+#: four engines (M11), with the class ``edge_write_error()`` gives them — W2 for a missing endpoint (the SDK's
+#: ``NotFoundError``, or "does not exist" in any case), W1 for anything else.
+_EDGE_REFUSALS: list[tuple[str, str, str, type[SurrealDbError]]] = [
+    ("3x-missing", "NotFound", "The record 'person:ghost' does not exist", SurrealDbNotFoundError),
+    ("not-found-class", "NotFound", "The record is gone", SurrealDbNotFoundError),
+    ("2x-missing", "Internal", "The record 'person:ghost' does not exist", SurrealDbNotFoundError),
+    ("upper-case", "Internal", "The record 'person:ghost' DOES NOT EXIST", SurrealDbNotFoundError),
+    (
+        "2x-wrong-table",
+        "Internal",
+        "Found company:c for field `in`, with record `likes:e1`, but expected a record<person>",
+        SurrealDbError,
+    ),
+    (
+        "3x-wrong-table",
+        "Internal",
+        "Couldn't coerce value for field `in` of `likes:e1`: Expected `record<person>` but found `company:c`",
+        SurrealDbError,
+    ),
+    (
+        "unique-duplicate",
+        "Internal",
+        "Database index `likes_pair` already contains [person:ada, post:p1], with record `likes:e2`",
+        SurrealDbError,
+    ),
+    ("type-normal", "Internal", "Found record: `likes:e1` which is a relation, but expected a NORMAL", SurrealDbError),
+]
+_EDGE_REFUSAL_IDS = [case[0] for case in _EDGE_REFUSALS]
+
+
+class WriteNode(BaseSurrealModel):
+    """A node on the default connection: the source of the string ``relate()``'s unit tests."""
+
+    model_config = SurrealConfigDict(table_name="person")
+
+    id: str | None = None
+
+
+class _RefusingClient:
+    """A client whose ``query()`` and ``insert_relation()`` record the call and raise *error*."""
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+        self.calls: list[str] = []
+
+    async def query(self, statement: str, variables: object) -> object:
+        self.calls.append(statement)
+        raise self.error
+
+    async def insert_relation(self, table: str, data: object) -> object:
+        self.calls.append(f"insert_relation({table!r})")
+        raise self.error
+
+
+class _RefusingTx:
+    """A transaction of the default connection whose ``add()`` records the statement and raises *error*."""
+
+    def __init__(self, error: BaseException) -> None:
+        self._connection_name = "default"
+        self.error = error
+        self.added: list[str] = []
+
+    async def add(self, statement: str, variables: object) -> object:
+        self.added.append(statement)
+        raise self.error
+
+
+class TestEdgeWriteError:
+    """AC-8 (unit): ``utils.edge_write_error()`` is v0.22.0's rule of ``insert_edges()``, moved and shared —
+    ``SurrealDbNotFoundError`` for the SDK's ``NotFoundError`` or a "does not exist" message in any case, exactly
+    ``SurrealDbError`` otherwise, the text ``There was a problem with the database: {error}`` (W1, W2) —, and
+    ``insert_edges()`` raises it with the SDK's error as ``__cause__``, its classes and texts unchanged."""
+
+    @pytest.mark.parametrize(("kind", "message", "expected"), [case[1:] for case in _EDGE_REFUSALS], ids=_EDGE_REFUSAL_IDS)
+    def test_the_class_and_the_text(self, kind: str, message: str, expected: type[SurrealDbError]) -> None:
+        error = _sdk_error(kind, message)
+        result = utils.edge_write_error(error)
+        assert type(result) is expected
+        assert str(result) == _w(message)
+        assert result.__cause__ is None  # the caller chains it: raise edge_write_error(exc) from exc
+
+    def test_a_conflict_is_still_recognised(self) -> None:
+        """``retry_on_conflict`` reads the text: a conflict refused the same way stays a conflict."""
+        error = InternalError("Internal", "Transaction conflict: Resource busy. This transaction can be retried")
+        result = utils.edge_write_error(error)
+        assert type(result) is SurrealDbError
+        assert is_conflict_error(result)
+
+    @pytest.mark.parametrize("with_id", [False, True], ids=["insert_relation", "guarded-statement"])
+    @pytest.mark.parametrize(("kind", "message", "expected"), [case[1:] for case in _EDGE_REFUSALS], ids=_EDGE_REFUSAL_IDS)
+    async def test_insert_edges_raises_it(self, kind: str, message: str, expected: type[SurrealDbError], with_id: bool) -> None:
+        """The typed paths' one write (``relate(EdgeModel, …)``, an edge's ``save()``, ``bulk_create()``)."""
+        error = _sdk_error(kind, message)
+        client = _RefusingClient(error)
+
+        class _Manager:
+            @classmethod
+            async def get_client(cls) -> Any:
+                return client
+
+        row: dict[str, Any] = {"in": RecordID("person", "ada"), "out": RecordID("post", "p1")}
+        if with_id:
+            row["id"] = "e1"
+        with pytest.raises(SurrealDbError) as raised:
+            await insert_edges("likes", [row], tx=None, manager=_Manager)  # type: ignore[arg-type]
+        assert type(raised.value) is expected
+        assert str(raised.value) == _w(message)
+        assert raised.value.__cause__ is error
+        assert len(client.calls) == 1
+
+
+class TestStringRelateError:
+    """AC-8 (unit, D7): outside a transaction, ``relate("<edge table>", …)`` raises ``edge_write_error()`` of the SDK's
+    error, which stays its ``__cause__`` — ``SurrealDbNotFoundError`` for a missing endpoint, ``SurrealDbError``
+    otherwise; with ``tx=`` nothing changes: the transaction's own error propagates as it is."""
+
+    @pytest.mark.parametrize(("kind", "message", "expected"), [case[1:] for case in _EDGE_REFUSALS], ids=_EDGE_REFUSAL_IDS)
+    async def test_a_refusal_becomes_the_orms_error(
+        self, use_client: Callable[[Any], None], kind: str, message: str, expected: type[SurrealDbError]
+    ) -> None:
+        error = _sdk_error(kind, message)
+        client = _RefusingClient(error)
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await WriteNode(id="ada").relate("likes", RecordID("post", "p1"))
+        assert type(raised.value) is expected
+        assert str(raised.value) == _w(message)
+        assert raised.value.__cause__ is error
+        assert client.calls == ["RELATE $src->likes->$dst;"]
+
+    async def test_reverse_and_fields_go_the_same_way(self, use_client: Callable[[Any], None]) -> None:
+        error = _sdk_error("NotFound", "The record 'post:ghost' does not exist")
+        client = _RefusingClient(error)
+        use_client(client)
+        with pytest.raises(SurrealDbNotFoundError) as raised:
+            await WriteNode(id="ada").relate("likes", "post:ghost", reverse=True, data={"stars": 2})
+        assert raised.value.__cause__ is error
+        assert client.calls == ["RELATE $dst->likes->$src SET stars = $_rd0;"]
+
+    async def test_a_conflict_is_still_recognised(self, use_client: Callable[[Any], None]) -> None:
+        error = InternalError("Internal", "Transaction conflict: Resource busy. This transaction can be retried")
+        use_client(_RefusingClient(error))
+        with pytest.raises(SurrealDbError) as raised:
+            await WriteNode(id="ada").relate("likes", RecordID("post", "p1"))
+        assert is_conflict_error(raised.value)
+
+    async def test_another_error_is_not_translated(self, use_client: Callable[[Any], None]) -> None:
+        """Only the server's refusals (``ServerError``) are translated: a lost connection propagates as it is."""
+        error = ConnectionError("connection lost")
+        use_client(_RefusingClient(error))
+        with pytest.raises(ConnectionError) as raised:
+            await WriteNode(id="ada").relate("likes", RecordID("post", "p1"))
+        assert raised.value is error
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            SurrealDbError("Transaction failed and rolled back: Found company:c for field `in`"),
+            InternalError("Internal", "The record 'post:ghost' does not exist"),
+        ],
+        ids=["transaction-error", "sdk-error"],
+    )
+    async def test_in_a_transaction_nothing_changes(self, use_client: Callable[[Any], None], error: Exception) -> None:
+        client = _RefusingClient(AssertionError("the client is not used in a transaction"))
+        use_client(client)
+        tx = _RefusingTx(error)
+        with pytest.raises(type(error)) as raised:
+            await WriteNode(id="ada").relate("likes", RecordID("post", "p1"), tx=tx)  # type: ignore[arg-type]
+        assert raised.value is error
+        assert tx.added == ["RELATE $src->likes->$dst;"]
+        assert client.calls == []
+
+
+class RelPlain(BaseSurrealModel):
+    """A node model declared on the relation table ``rel_likes`` (AC-7, M20, D15): its ``save()`` is refused by the
+    server, and keeps the SDK's error."""
+
+    model_config = SurrealConfigDict(table_name="rel_likes", connection="rel")
+
+    id: str | None = None
+    stars: int = 1
+
+
+#: The node models of the E2E classes by table: the source of a ``relate()`` from a ``RecordID``.
+_REL_NODES: dict[str, type[BaseSurrealModel]] = {
+    "rel_person": RelPerson,
+    "rel_post": RelPost,
+    "rel_book": RelBook,
+    "rel_company": RelCompany,
+}
+
+_ADA = RecordID("rel_person", "ada")
+_P1 = RecordID("rel_post", "p1")
+
+#: Every ORM path that creates an edge (spec §5.7): the typed ``relate()``, an edge's ``save()`` without and with an
+#: id (``insert_relation()``, then the guarded statement), ``bulk_create()`` of a batch whose second edge is the one
+#: refused, and the string ``relate()`` (D7).
+_CREATION_PATHS = ["relate", "save", "save-with-id", "bulk_create", "relate-by-name"]
+
+
+async def _create_edge(path: str, start: RecordID, end: RecordID) -> None:
+    """Create the ``rel_likes`` edge ``start → end`` through *path* (outside a transaction)."""
+    if path == "relate":
+        await _REL_NODES[start.table_name](id=start.id).relate(RelLikes, end)
+    elif path == "save":
+        await RelLikes(in_=start, out=end).save()
+    elif path == "save-with-id":
+        await RelLikes(id="x1", in_=start, out=end).save()
+    elif path == "bulk_create":
+        await RelLikes.objects().bulk_create([RelLikes(in_=_ADA, out=_P1), RelLikes(in_=start, out=end)])
+    else:
+        await _REL_NODES[start.table_name](id=start.id).relate("rel_likes", end)
+
+
+async def _enforced(client: Any) -> None:
+    """``rel_likes`` defined by ``RelLikes.define_relation()`` on a missing table (``IN rel_person OUT rel_post |
+    rel_book ENFORCED``), then the nodes ``ada``, ``bob``, ``p1``, ``b1`` and ``c`` saved."""
+    assert await RelLikes.define_relation() == _REL_G1
+    await RelPerson(id="ada").save()
+    await RelPerson(id="bob").save()
+    await RelPost(id="p1").save()
+    await RelBook(id="b1").save()
+    await RelCompany(id="c").save()
+
+
+def _assert_refusal(raised: pytest.ExceptionInfo[SurrealDbError], expected: type[SurrealDbError]) -> None:
+    """*raised* is exactly *expected* with W1/W2's text, the SDK's error as its ``__cause__``."""
+    cause = raised.value.__cause__
+    assert type(raised.value) is expected, f"{type(raised.value).__name__}: {raised.value}"
+    assert isinstance(cause, ServerError), repr(cause)
+    assert str(raised.value) == _w(str(cause))
+
+
+class TestEnforcementE2E:
+    """AC-7, AC-8 (E2E, every engine of both lines): after ``define_relation()``, SurrealDB refuses every edge creation
+    the constraint forbids, and every ORM creation path raises the ORM's error with the SDK's as its ``__cause__`` — W1
+    (``SurrealDbError``) for an endpoint outside ``IN``/``OUT``, W2 (``SurrealDbNotFoundError``) for a missing
+    ``ENFORCED`` endpoint —, nothing written. The class of an endpoint both outside ``IN``/``OUT`` and missing depends
+    on the line (D6). The string ``relate()`` translates too (D7): a ``UNIQUE`` duplicate and a ``TYPE NORMAL`` table
+    as well; inside a transaction the transaction's error is unchanged. A node model's ``save()`` into the relation
+    table keeps the SDK's error (D15, M20)."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("path", _CREATION_PATHS)
+    async def test_a_wrong_table_endpoint(self, kind: str, path: str) -> None:
+        async with _rel(kind) as client:
+            await _enforced(client)
+            with pytest.raises(SurrealDbError) as raised:
+                await _create_edge(path, RecordID("rel_company", "c"), _P1)
+            _assert_refusal(raised, SurrealDbError)
+            assert await _edge_ids(client) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("path", _CREATION_PATHS)
+    async def test_a_missing_endpoint(self, kind: str, path: str) -> None:
+        async with _rel(kind) as client:
+            await _enforced(client)
+            with pytest.raises(SurrealDbNotFoundError) as raised:
+                await _create_edge(path, RecordID("rel_person", "ghost"), _P1)
+            _assert_refusal(raised, SurrealDbNotFoundError)
+            assert "does not exist" in str(raised.value)
+            assert await _edge_ids(client) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("path", _CREATION_PATHS)
+    async def test_an_endpoint_outside_the_ends_and_missing_is_pinned_by_line(self, kind: str, path: str) -> None:
+        """D6: SurrealDB 2.x and the embedded engine report the missing record (``SurrealDbNotFoundError``), 3.x the
+        table mismatch (``SurrealDbError``); the ORM does not even them out."""
+        async with _rel(kind) as client:
+            await _enforced(client)
+            expected = SurrealDbError if await _major(client) >= 3 else SurrealDbNotFoundError
+            with pytest.raises(SurrealDbError) as raised:
+                await _create_edge(path, RecordID("rel_company", "ghost"), _P1)
+            _assert_refusal(raised, expected)
+            assert await _edge_ids(client) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("path", _CREATION_PATHS)
+    async def test_the_declared_ends_are_accepted(self, kind: str, path: str) -> None:
+        async with _rel(kind) as client:
+            await _enforced(client)
+            await _create_edge(path, _ADA, RecordID("rel_book", "b1"))
+            ends = await client.query("SELECT VALUE [in, out] FROM rel_likes;", {})
+            expected = [[_ADA, RecordID("rel_book", "b1")]]
+            if path == "bulk_create":
+                expected.append([_ADA, _P1])
+            assert sorted(ends, key=str) == sorted(expected, key=str)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_endpoint_saved_earlier_in_the_transaction(self, kind: str) -> None:
+        """M11: ``ENFORCED`` sees a node created earlier in the same transaction (buffered or interactive)."""
+        async with _rel(kind) as client:
+            await _enforced(client)
+            async with SurrealDBConnectionManager.transaction("rel") as tx:
+                eve = await RelPerson(id="eve").save(tx=tx)
+                await eve.relate(RelLikes, _P1, tx=tx)
+                await eve.relate("rel_likes", RecordID("rel_book", "b1"), tx=tx)
+            ends = await client.query("SELECT VALUE [in, out] FROM rel_likes;", {})
+            eve_id = RecordID("rel_person", "eve")
+            assert sorted(ends, key=str) == sorted([[eve_id, _P1], [eve_id, RecordID("rel_book", "b1")]], key=str)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("with_id", [True, False], ids=["with-id", "without-id"])
+    async def test_a_node_models_save_keeps_the_sdks_error(self, kind: str, with_id: bool) -> None:
+        """D15, M20: a refused write that is not an edge creation keeps the SDK's error (``InternalError``)."""
+        async with _rel(kind) as client:
+            await _enforced(client)
+            plain = RelPlain(id="plain") if with_id else RelPlain()
+            with pytest.raises(ServerError) as raised:
+                await plain.save()
+            assert "RELATION" in str(raised.value)
+            assert not isinstance(raised.value, SurrealORMError)
+            assert await _edge_ids(client) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_by_name_a_unique_duplicate(self, kind: str) -> None:
+        """README section 23's idempotent edges: a ``UNIQUE`` index on ``(in, out)`` refuses the second pair."""
+        async with _rel(kind) as client:
+            await _enforced(client)
+            await _apply_ddl(client, "DEFINE INDEX rel_follows_pair ON rel_follows FIELDS in, out UNIQUE;")
+            ada, bob = RelPerson(id="ada"), RelPerson(id="bob")
+            await ada.relate("rel_follows", bob)
+            with pytest.raises(SurrealDbError) as raised:
+                await ada.relate("rel_follows", bob)
+            _assert_refusal(raised, SurrealDbError)
+            assert "rel_follows_pair" in str(raised.value)
+            assert len(await client.query("SELECT VALUE id FROM rel_follows;", {})) == 1
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_by_name_a_type_normal_table(self, kind: str) -> None:
+        async with _rel(kind) as client:
+            await _enforced(client)
+            await _apply_ddl(client, "DEFINE TABLE rel_normal TYPE NORMAL;")
+            with pytest.raises(SurrealDbError) as raised:
+                await RelPerson(id="ada").relate("rel_normal", _P1)
+            _assert_refusal(raised, SurrealDbError)
+            assert await client.query("SELECT VALUE id FROM rel_normal;", {}) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_by_name_in_a_transaction(self, kind: str) -> None:
+        """Inside a transaction the transaction layer's error is unchanged (interactive: at the ``relate()``;
+        buffered: at the block's exit)."""
+        async with _rel(kind) as client:
+            await _enforced(client)
+            with pytest.raises(SurrealDbError, match="Transaction failed and rolled back") as raised:
+                async with SurrealDBConnectionManager.transaction("rel") as tx:
+                    await RelPerson(id="bob").relate("rel_likes", _P1, tx=tx)
+                    await RelCompany(id="c").relate("rel_likes", _P1, tx=tx)
+            assert not str(raised.value).startswith(_w(""))
+            assert await _edge_ids(client) == []
+
+
+# === removing a constraint (spec §5.4 "Removing a constraint", G6, D14, P1; AC-20; M18, M19) ======================
+
+
+class RelLikesAny(BaseSurrealEdge):
+    """Another edge model on ``rel_likes``, without relation keys (AC-20): its ``define_relation()`` removes the
+    constraint."""
+
+    model_config = SurrealConfigDict(table_name="rel_likes", connection="rel")
+
+    stars: int = 1
+
+
+class RelLikesReset(RelLikes):
+    """``RelLikes`` with its three keys reset to ``None`` in a subclass (AC-20)."""
+
+    model_config = SurrealConfigDict(relation_in=None, relation_out=None, enforced=None)
+
+
+class RelLikesEmpty(RelLikes):
+    """``RelLikes`` with its ends emptied and ``enforced=False`` in a subclass (AC-20, P1 a): empty means any table."""
+
+    model_config = SurrealConfigDict(relation_in=[], relation_out=(), enforced=False)
+
+
+#: The three forms of an edge model without keys on ``rel_likes`` (spec §5.4).
+_KEYLESS_MODELS: list[type[BaseSurrealEdge]] = [RelLikesAny, RelLikesReset, RelLikesEmpty]
+
+#: Their bare statements (G2's form, G7's text): ``TYPE RELATION`` with no ends.
+_REL_KEYLESS = "DEFINE TABLE OVERWRITE `rel_likes` TYPE RELATION;"
+_REL_KEYLESS_IF_NOT_EXISTS = "DEFINE TABLE IF NOT EXISTS `rel_likes` TYPE RELATION;"
+
+#: The ``TableState`` attributes of the clauses ``define_relation()`` carries (spec §5.5's clause order).
+_CARRIED = ("drop", "schema_mode", "comment", "changefeed", "changefeed_include_original", "permissions")
+
+_GHOST_BOOK = RecordID("rel_book", "ghost")
+
+
+def _carried(state: TableState) -> dict[str, object]:
+    """The carried clauses of *state*, by attribute."""
+    return {name: getattr(state, name) for name in _CARRIED}
+
+
+def _field_type(info: dict[str, Any], name: str) -> str:
+    """The ``TYPE`` of the field *name* in ``INFO FOR TABLE``'s *info*, as ``parse_define_field()`` reads it."""
+    return parse_define_field(info["fields"][name]).state.field_type
+
+
+async def _ends(client: Any) -> list[list[RecordID]]:
+    """``[in, out]`` of every ``rel_likes`` edge, sorted."""
+    return sorted(await client.query("SELECT VALUE [in, out] FROM rel_likes;", {}), key=str)
+
+
+async def _k6(client: Any) -> dict[str, BaseSurrealModel]:
+    """AC-6's fixture, then ``RelLikes.define_relation()`` (K6): the table holds the constraint, its other clauses and
+    ``e1``, ``e2``. Returns the nodes by name."""
+    nodes = await _ac6(client)
+    assert await RelLikes.define_relation() == _K6
+    assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+    return nodes
+
+
+async def _assert_removed(client: Any) -> None:
+    """``rel_likes`` reads back K7's form: a relation table without ``IN``, ``OUT`` or ``ENFORCED``, K6's other clauses,
+    ``in``/``out`` rewritten ``TYPE record``, its field ``stars``, index, event and view kept."""
+    state = parse_define_table((await _tables(client))["rel_likes"])
+    assert (state.table_type, state.relation_in, state.relation_out, state.enforced) == ("relation", (), (), False)
+    assert _carried(state) == _carried(parse_define_table(_K6_READ_BACK))
+    info = await _table_info(client, "rel_likes")
+    assert (_field_type(info, "in"), _field_type(info, "out")) == ("record", "record")
+    assert {"in", "out", "stars"} <= set(info["fields"])
+    assert list(info["indexes"]) == ["rel_likes_pair"]
+    assert list(info["events"]) == ["rel_likes_ev"]
+    assert list(info["tables"]) == ["rel_like_counts"]
+
+
+class _Rollback(Exception):
+    """Raised inside a ``transaction()`` block to roll it back."""
+
+
+class TestRemoveConstraint:
+    """AC-20 (unit, P1 a): an edge model without keys — another model on the table, or a subclass resetting them to
+    ``None`` or emptying them — renders ``TYPE RELATION`` with no ends, says any table on both sides and not enforced,
+    and carries K6's read-back into K7."""
+
+    @pytest.mark.parametrize("model", _KEYLESS_MODELS, ids=lambda model: model.__name__)
+    def test_the_keyless_statement(self, model: type[BaseSurrealEdge]) -> None:
+        assert model.get_table_name() == "rel_likes"
+        assert model.relation_ddl() == _REL_KEYLESS
+        assert model.relation_ddl(overwrite=False) == _REL_KEYLESS_IF_NOT_EXISTS
+        assert model.get_relation_in() == ()
+        assert model.get_relation_out() == ()
+        assert model.is_enforced() is False
+        assert model.get_table_type() is TableType.RELATION
+
+    @pytest.mark.parametrize("model", _KEYLESS_MODELS, ids=lambda model: model.__name__)
+    def test_k7_from_k6s_read_back(self, model: type[BaseSurrealEdge]) -> None:
+        clause = schema.relation_type_clause(model.get_relation_in(), model.get_relation_out(), model.is_enforced())
+        assert clause == "TYPE RELATION"
+        assert schema.relation_statement_keeping("rel_likes", clause, parse_define_table(_K6_READ_BACK)) == _K7
+
+    def test_the_parent_keeps_its_keys(self) -> None:
+        assert RelLikes.relation_ddl() == _REL_G1
+        assert (RelLikes.get_relation_in(), RelLikes.get_relation_out()) == (("rel_person",), ("rel_post", "rel_book"))
+        assert RelLikes.is_enforced() is True
+
+
+class TestRemoveConstraintE2E:
+    """AC-20 (E2E, every engine of both lines; G6, D14, M19): ``define_relation()`` of an edge model without keys on
+    the constrained table (K6) sends K7 — ``TYPE RELATION`` with no ends, the table's other clauses carried. The table
+    reads back without ``IN``/``OUT``/``ENFORCED``, ``in``/``out`` as ``TYPE record``, its fields, index, event, view and
+    edges kept; edges from or to any table, and to a missing record, are accepted at once, on every connection; and
+    ``RelLikes.define_relation()`` puts K6 back. ``overwrite=False`` removes nothing (D8). In a transaction the removal
+    is applied at commit, and not at all when the block raises."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_removal_out_of_a_transaction(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _rel(kind) as client:
+            nodes = await _k6(client)
+            if kind != "mem":
+                _register_rel(kind, "rel2")
+            try:
+                if kind != "mem":
+                    # The second connection's session is open before the removal (M9).
+                    second = await SurrealDBConnectionManager.get_client("rel2")
+                    assert await second.query("SELECT VALUE id FROM rel_likes ORDER BY id;", {}) == [
+                        RecordID("rel_likes", "e1"),
+                        RecordID("rel_likes", "e2"),
+                    ]
+                calls = _spy(monkeypatch, client)
+                assert await RelLikesAny.define_relation() == _K7
+                assert _sent(calls) == [_INFO, _K7]
+                await _assert_removed(client)
+                assert await _edge_ids(client) == ["rel_likes:e1", "rel_likes:e2"]
+
+                # At once: an endpoint outside the old ends, and a missing one (no ENFORCED any more).
+                company = await nodes["c"].relate(RelLikesAny, nodes["p1"])
+                ghost = await nodes["ada"].relate(RelLikesAny, _GHOST_BOOK)
+                assert (company.in_, company.out) == (RecordID("rel_company", "c"), RecordID("rel_post", "p1"))
+                assert (ghost.in_, ghost.out) == (RecordID("rel_person", "ada"), _GHOST_BOOK)
+                expected = [
+                    [RecordID("rel_company", "c"), RecordID("rel_post", "p1")],
+                    [RecordID("rel_person", "ada"), _GHOST_BOOK],
+                    [RecordID("rel_person", "ada"), RecordID("rel_post", "p1")],
+                    [RecordID("rel_person", "ada"), RecordID("rel_book", "b1")],
+                ]
+                if kind != "mem":
+                    async with SurrealDBConnectionManager.using("rel2"):
+                        other = await nodes["c"].relate(RelLikesAny, nodes["b1"])
+                    assert (other.in_, other.out) == (RecordID("rel_company", "c"), RecordID("rel_book", "b1"))
+                    expected.append([RecordID("rel_company", "c"), RecordID("rel_book", "b1")])
+                assert await _ends(client) == sorted(expected, key=str)
+
+                # The round trip: the constraint back, the edges written meanwhile kept (not checked, M5).
+                calls.clear()
+                assert await RelLikes.define_relation() == _K6
+                assert _sent(calls) == [_INFO, _K6]
+                assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+                info = await _table_info(client, "rel_likes")
+                assert (_field_type(info, "in"), _field_type(info, "out")) == (
+                    "record<rel_person>",
+                    "record<rel_post | rel_book>",
+                )
+                with pytest.raises(SurrealDbError) as refused:
+                    await nodes["bob"].relate(RelLikes, nodes["c"])
+                assert type(refused.value) is SurrealDbError
+                assert await _ends(client) == sorted(expected, key=str)
+            finally:
+                if kind != "mem":
+                    await SurrealDBConnectionManager.remove_connection("rel2")
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_each_keyless_form_returns_k7(self, kind: str) -> None:
+        """The other model, the subclass resetting the keys to ``None`` and the one emptying them: each removes the
+        constraint with K7 (the table re-defined with K6 before each)."""
+        async with _rel(kind) as client:
+            await _k6(client)
+            for model in _KEYLESS_MODELS:
+                assert await model.define_relation() == _K7, model.__name__
+                await _assert_removed(client)
+                assert await RelLikes.define_relation() == _K6, model.__name__
+                assert (await _tables(client))["rel_likes"] == _K6_READ_BACK, model.__name__
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_overwrite_false_removes_nothing(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """D8: ``IF NOT EXISTS`` on the constrained table is sent, and its ends stay."""
+        async with _rel(kind) as client:
+            nodes = await _k6(client)
+            calls = _spy(monkeypatch, client)
+            assert await RelLikesAny.define_relation(overwrite=False) == _REL_KEYLESS_IF_NOT_EXISTS
+            assert _sent(calls) == [_INFO, _REL_KEYLESS_IF_NOT_EXISTS]
+            assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+            with pytest.raises(SurrealDbError) as refused:
+                await nodes["c"].relate(RelLikesAny, nodes["p1"])
+            assert type(refused.value) is SurrealDbError
+            assert await _edge_ids(client) == ["rel_likes:e1", "rel_likes:e2"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_in_a_transaction_the_removal_is_applied_at_commit(self, kind: str) -> None:
+        """Buffered (HTTP, SurrealDB 2.x, the embedded engine) or interactive (3.x over WebSocket): outside the block the
+        constraint holds until the commit; after it, the table reads back without ends."""
+        async with _rel(kind) as client:
+            nodes = await _k6(client)
+            interactive = kind == "ws" and await _major(client) >= 3
+            async with SurrealDBConnectionManager.transaction("rel") as tx:
+                assert tx.is_interactive is interactive
+                assert await RelLikesAny.define_relation(tx=tx) == _K7
+                assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+            await _assert_removed(client)
+            await nodes["c"].relate(RelLikesAny, nodes["p1"])
+            assert [RecordID("rel_company", "c"), RecordID("rel_post", "p1")] in await _ends(client)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_block_that_raises_removes_nothing(self, kind: str) -> None:
+        async with _rel(kind) as client:
+            nodes = await _k6(client)
+            interactive = kind == "ws" and await _major(client) >= 3
+            with pytest.raises(_Rollback):
+                async with SurrealDBConnectionManager.transaction("rel") as tx:
+                    assert tx.is_interactive is interactive
+                    assert await RelLikesAny.define_relation(tx=tx) == _K7
+                    raise _Rollback
+            assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+            with pytest.raises(SurrealDbError) as refused:
+                await nodes["c"].relate(RelLikesAny, nodes["p1"])
+            assert type(refused.value) is SurrealDbError
+            assert await _edge_ids(client) == ["rel_likes:e1", "rel_likes:e2"]
+
+
+# === transactions, line facts, records already in the table, change feeds, live queries (AC-10, AC-12, AC-13, AC-16) ===
+
+
+#: ``rel_likes`` defined by hand as SurrealDB's default table (``TYPE ANY``), and how SurrealDB stores it.
+_REL_ANY = "DEFINE TABLE rel_likes TYPE ANY;"
+_REL_ANY_STORED = "DEFINE TABLE rel_likes TYPE ANY SCHEMALESS PERMISSIONS NONE"
+
+#: A definition of ``rel_likes`` queued in a transaction before ``define_relation(tx=tx)``: not seen by its read.
+_QUEUED = "DEFINE TABLE OVERWRITE rel_likes TYPE ANY SCHEMAFULL COMMENT 'queued';"
+
+#: The failure of the queued-definition test once ``define_relation(tx=…)`` sees a definition queued in its block.
+_QUEUED_SEEN = (
+    "define_relation(tx=…) now keeps a definition of the same table queued earlier in the block: rewrite the "
+    "README section 34 paragraph 'Transactions, connections and the query cache', define_relation()'s docstring and "
+    "this test"
+)
+
+
+async def _plain_likes(client: Any) -> dict[str, BaseSurrealModel]:
+    """``rel_likes`` defined ``TYPE ANY`` by hand, then the nodes ``ada``, ``p1``, ``b1`` and ``c`` saved. Returns the
+    nodes by name."""
+    await _apply_ddl(client, _REL_ANY)
+    assert (await _tables(client))["rel_likes"] == _REL_ANY_STORED
+    return {
+        "ada": await RelPerson(id="ada").save(),
+        "p1": await RelPost(id="p1").save(),
+        "b1": await RelBook(id="b1").save(),
+        "c": await RelCompany(id="c").save(),
+    }
+
+
+def _x1(model: str, call: str, tx_connection: str, connection: str) -> str:
+    """``routing.check_transaction()``'s text for *call* of *model* (on *connection*) given a transaction of
+    *tx_connection*."""
+    return (
+        f"{model}.{call} cannot run in this transaction: the transaction belongs to connection {tx_connection!r} and "
+        f"{model} runs on connection {connection!r}. A transaction is one connection's (one database): open it on "
+        f"{connection!r} — SurrealDBConnectionManager.transaction({connection!r}) — or run the block inside "
+        f"using({tx_connection!r})."
+    )
+
+
+class TestRelationTransactionsE2E:
+    """``define_relation(tx=tx)`` on every engine of both lines, in a buffered transaction (HTTP, SurrealDB 2.x, the
+    embedded engine) or an interactive one (3.x over WebSocket): its read of ``INFO FOR DB`` runs on the committed
+    state before its statement joins the block; the statement applies with the block — at the commit when buffered,
+    in the block when interactive — and not at all when the block raises; a write the new constraint refuses later in
+    the same block fails the whole block (inside it when interactive, at its exit when buffered), the table keeping its
+    type; a transaction of another connection is refused before any request. A definition of the same table queued
+    earlier in the block is not seen by the read, a documented limit."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_read_comes_first_and_the_block_applies_the_statement(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with _rel(kind) as client:
+            nodes = await _plain_likes(client)
+            interactive = kind == "ws" and await _major(client) >= 3
+            async with SurrealDBConnectionManager.transaction("rel") as tx:
+                assert tx.is_interactive is interactive
+                calls = _spy(monkeypatch, client)
+                assert await RelLikes.define_relation(tx=tx) == _REL_G1
+                sent = [(method, args[0]) for method, args in calls]
+                if interactive:
+                    # Sent at once, through the transaction, after the read of the committed state.
+                    assert sent == [("query", _INFO), ("query_raw", _INFO), ("query_raw", _REL_G1)]
+                    assert parse_define_table((await tx.run_read("INFO FOR DB;"))["tables"]["rel_likes"]).enforced
+                else:
+                    # Queued, after the read: nothing but the read has reached the server.
+                    assert sent == [("query", _INFO), ("query_raw", _INFO)]
+                    assert getattr(tx, "statements", None) == [_REL_G1]
+                monkeypatch.undo()
+                # Outside the block, until the commit, the table is as it was.
+                assert (await _tables(client))["rel_likes"] == _REL_ANY_STORED
+                await nodes["ada"].relate(RelLikes, nodes["p1"], tx=tx)
+            assert (await _tables(client))["rel_likes"] == _REL_G1_READ_BACK
+            assert await _ends(client) == [[_ADA, _P1]]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_block_that_raises_applies_nothing(self, kind: str) -> None:
+        async with _rel(kind) as client:
+            await _plain_likes(client)
+            interactive = kind == "ws" and await _major(client) >= 3
+            with pytest.raises(_Rollback):
+                async with SurrealDBConnectionManager.transaction("rel") as tx:
+                    assert tx.is_interactive is interactive
+                    assert await RelLikes.define_relation(tx=tx) == _REL_G1
+                    raise _Rollback
+            assert (await _tables(client))["rel_likes"] == _REL_ANY_STORED
+            assert parse_define_table((await _tables(client))["rel_likes"]).table_type == "any"
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("form", ["typed", "by-name"])
+    async def test_a_violating_relate_fails_the_block(self, kind: str, form: str) -> None:
+        """The edge ``rel_company:c → rel_post:p1``, refused by the constraint defined earlier in the same block,
+        fails the block: interactive, the ``relate()`` raises; buffered, the block's exit does."""
+        async with _rel(kind) as client:
+            nodes = await _plain_likes(client)
+            company, post = nodes["c"], nodes["p1"]
+            interactive = kind == "ws" and await _major(client) >= 3
+            reached = False
+            with pytest.raises(SurrealDbError, match="Transaction failed and rolled back"):
+                async with SurrealDBConnectionManager.transaction("rel") as tx:
+                    assert tx.is_interactive is interactive
+                    await RelLikes.define_relation(tx=tx)
+                    if form == "typed":
+                        await company.relate(RelLikes, post, tx=tx)
+                    else:
+                        await company.relate("rel_likes", post, tx=tx)
+                    reached = True
+            assert reached is not interactive
+            assert parse_define_table((await _tables(client))["rel_likes"]).table_type == "any"
+            assert await _edge_ids(client) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_transaction_of_another_connection(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _rel(kind) as client:
+            await _plain_likes(client)
+            _register_rel(kind, "rel2")
+            try:
+                async with SurrealDBConnectionManager.transaction("rel2") as tx:
+                    other = await SurrealDBConnectionManager.get_client("rel2")
+                    calls = _spy(monkeypatch, client)
+                    other_calls = _spy(monkeypatch, other)
+                    with pytest.raises(SurrealDbError) as raised:
+                        await RelLikes.define_relation(tx=tx)
+                    assert (calls, other_calls) == ([], [])
+                    if not tx.is_interactive:
+                        assert getattr(tx, "statements", None) == []
+                    monkeypatch.undo()
+            finally:
+                await SurrealDBConnectionManager.remove_connection("rel2")
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value) == _x1("RelLikes", "define_relation()", "rel2", "rel")
+            assert (await _tables(client))["rel_likes"] == _REL_ANY_STORED
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_definition_queued_earlier_in_the_block_is_replaced(self, kind: str) -> None:
+        """A documented limit, to be lifted: ``define_relation(tx=…)`` reads the table's committed definition, so a
+        definition of the same table queued earlier in the block is not seen, and the statement it queues replaces
+        that definition at the commit — here the queued ``SCHEMAFULL`` and comment are gone, the table is stored
+        ``SCHEMALESS`` without a comment. README section 34, "Transactions, connections and the query cache", says so:
+        define the table's other clauses before the block. The same on a buffered and an interactive transaction."""
+        async with _rel(kind) as client:
+            await _apply_ddl(client, _REL_ANY)
+            assert (await _tables(client))["rel_likes"] == _REL_ANY_STORED
+            interactive = kind == "ws" and await _major(client) >= 3
+            async with SurrealDBConnectionManager.transaction("rel") as tx:
+                assert tx.is_interactive is interactive
+                await tx.add(_QUEUED, None)
+                assert await RelLikes.define_relation(tx=tx) == _REL_G1, _QUEUED_SEEN
+            assert (await _tables(client))["rel_likes"] == _REL_G1_READ_BACK, _QUEUED_SEEN
+
+
+class RelAlter(BaseSurrealEdge):
+    """The edge model of the raw ``ALTER TABLE`` pin: ``rel_alter``'s new ends."""
+
+    model_config = SurrealConfigDict(
+        table_name="rel_alter", connection="rel", relation_in="rel_person", relation_out="rel_post"
+    )
+
+
+#: ``rel_alter`` defined with its old ends and written once, then the raw ``ALTER TABLE`` to its new ends.
+_ALTER_TABLE = "DEFINE TABLE rel_alter TYPE RELATION IN rel_company OUT rel_post;"
+_ALTER_WRITE = "INSERT RELATION INTO rel_alter {id: 'a1', in: rel_company:c, out: rel_post:p1};"
+_ALTER = "ALTER TABLE rel_alter TYPE RELATION IN rel_person OUT rel_post;"
+
+#: The README 2.x/3.x row the raw ``ALTER TABLE`` pin backs, by its first cell.
+_ALTER_ROW = "A raw `ALTER TABLE … TYPE RELATION …` of a table already written to"
+
+#: The failure of the raw ``ALTER TABLE`` pin once a SurrealDB line changes.
+_ALTER_CHANGED = (
+    "SurrealDB changed how this line enforces a raw ALTER TABLE … TYPE RELATION … of a table already written to: "
+    f"re-measure it, then update this test's expectation and the README 2.x/3.x row '{_ALTER_ROW}' — not the ORM's "
+    "code (define_relation() sends DEFINE TABLE OVERWRITE on every line)"
+)
+
+
+async def _refusal(client: Any, statement: str) -> str | None:
+    """Run the one *statement* raw: ``None`` when SurrealDB accepts it, else its error text."""
+    response = await client.query_raw(statement, {})
+    assert "error" not in response, response["error"]
+    [result] = response["result"]
+    return None if result["status"] == "OK" else str(result["result"])
+
+
+def _alter_edge(key: str, start: str) -> str:
+    """``INSERT RELATION`` of the ``rel_alter`` edge *key* from *start* (a constant record of these tests) to
+    ``rel_post:p1``."""
+    return f"INSERT RELATION INTO rel_alter {{id: '{key}', in: {start}, out: rel_post:p1}};"
+
+
+class TestRelationLineFactsE2E:
+    """Raw SurrealQL facts ``define_relation()`` is built around, on every engine of both lines: a bare ``DEFINE TABLE
+    OVERWRITE … TYPE RELATION`` resets the table's other clauses, and a raw ``ALTER TABLE … TYPE RELATION …`` of a
+    table already written to is enforced at once on SurrealDB 3.x only."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_bare_overwrite_resets_the_other_clauses(self, kind: str) -> None:
+        """``relation_ddl()``'s text applied by hand resets the schema mode, comment, change feed and permissions
+        (and ``DROP``) to SurrealDB's defaults; the records, fields, index and event stay. ``define_relation()`` carries
+        those clauses instead."""
+        async with _rel(kind) as client:
+            await _ac6(client)
+            await _apply_ddl(client, "DEFINE TABLE rel_dropped TYPE ANY DROP;")
+            await _apply_ddl(client, RelLikes.relation_ddl())
+            await _apply_ddl(client, "DEFINE TABLE OVERWRITE rel_dropped TYPE RELATION;")
+            tables = await _tables(client)
+            assert tables["rel_likes"] == _REL_G1_READ_BACK
+            state = parse_define_table(tables["rel_likes"])
+            assert (state.schema_mode, state.comment, state.changefeed, state.permissions) == (
+                "SCHEMALESS",
+                None,
+                None,
+                dict.fromkeys(_TABLE_OPERATIONS, "NONE"),
+            )
+            stored = parse_define_table(_K6_STORED)
+            assert (stored.schema_mode, stored.comment, stored.changefeed) == ("SCHEMAFULL", "keep", "1h")
+            assert tables["rel_dropped"] == "DEFINE TABLE rel_dropped TYPE RELATION SCHEMALESS PERMISSIONS NONE"
+            assert await _edge_ids(client) == ["rel_likes:e1", "rel_likes:e2"]
+            info = await _table_info(client, "rel_likes")
+            assert {"in", "out", "stars"} <= set(info["fields"])
+            assert list(info["indexes"]) == ["rel_likes_pair"]
+            assert list(info["events"]) == ["rel_likes_ev"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_raw_alter_of_a_table_already_written_to(self, kind: str) -> None:
+        """Pins a SurrealDB defect. On SurrealDB 2.x and the embedded engine, a raw ``ALTER TABLE … TYPE RELATION …``
+        of a table already written to shows the new type in ``INFO`` but is not enforced: writes keep the old
+        constraint until a ``DEFINE TABLE OVERWRITE`` of the table. SurrealDB 3.x (3.1 included) enforces it at once.
+        ``define_relation()`` never sends ``ALTER TABLE``: its ``DEFINE TABLE OVERWRITE`` is enforced at once on every
+        line.
+
+        When this test fails — a 2.7.x release that fixes it, or an SDK embedding another core, seen first by the 2.x
+        monitor or a Dependabot run —, re-measure, then update this expectation and the README 2.x/3.x row "A raw
+        `ALTER TABLE … TYPE RELATION …` of a table already written to"; never the ORM's code."""
+        async with _rel(kind) as client:
+            await _apply_ddl(client, _ALTER_TABLE)
+            await _apply_ddl(client, _ALTER_WRITE)
+            await _apply_ddl(client, _ALTER)
+            state = parse_define_table((await _tables(client))["rel_alter"])
+            assert (state.relation_in, state.relation_out) == (("rel_person",), ("rel_post",))
+
+            refusal = await _refusal(client, _alter_edge("a2", "rel_person:ada"))
+            if await _major(client) >= 3:
+                assert refusal is None, f"{_ALTER_CHANGED}; refused: {refusal}"
+            else:
+                assert refusal is not None, _ALTER_CHANGED
+                assert "rel_company" in refusal, f"{_ALTER_CHANGED}; refused: {refusal}"
+
+            assert (
+                await RelAlter.define_relation()
+                == "DEFINE TABLE OVERWRITE `rel_alter` TYPE RELATION IN `rel_person` OUT `rel_post`;"
+            )
+            assert await _refusal(client, _alter_edge("a3", "rel_person:ada")) is None
+            refused = await _refusal(client, _alter_edge("a4", "rel_company:c"))
+            assert refused is not None
+            assert "rel_person" in refused
+            written = await client.query("SELECT VALUE id FROM rel_alter;", {})
+            expected = ["a1", "a2", "a3"] if await _major(client) >= 3 else ["a1", "a3"]
+            assert sorted(str(record.id) for record in written) == expected
+
+
+#: Two edges written raw before the constraint: ``odd`` joins a company to a post (outside ``IN``), ``dangling`` starts
+#: at a person that does not exist.
+_EXISTING_EDGES = (
+    "INSERT RELATION INTO rel_likes [{id: 'odd', in: rel_company:c, out: rel_post:p1, stars: 1}, "
+    "{id: 'dangling', in: rel_person:ghost, out: rel_post:p1, stars: 1}];"
+)
+
+#: README section 34's two recipes on ``rel_likes``: the edges outside ``RelLikes``' ends, and the edges whose endpoint
+#: no longer exists.
+_NONCONFORMING_EDGES = (
+    "SELECT VALUE id FROM rel_likes WHERE record::tb(in) NOT IN ['rel_person'] "
+    "OR record::tb(out) NOT IN ['rel_post', 'rel_book']"
+)
+_DANGLING_EDGES = "SELECT VALUE id FROM rel_likes WHERE in.id IS NONE OR out.id IS NONE"
+
+
+class TestExistingRecordsE2E:
+    """AC-13 (E2E, every engine of both lines; M5, M15, M20, D15): SurrealDB checks the writes made after
+    ``define_relation()``, not the records already in the table. A nonconforming edge and a dangling one stay; the
+    nonconforming one can no longer be updated — ``merge()`` raises the SDK's error, unchanged, and the edge stays as
+    it was —, the dangling one can; the two recipes find each of them; ``delete()`` removes the nonconforming one."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_records_already_in_the_table(self, kind: str) -> None:
+        async with _rel(kind) as client:
+            await _plain_likes(client)
+            await _apply_ddl(client, _EXISTING_EDGES)
+            assert await RelLikes.define_relation() == _REL_G1
+            assert await _edge_ids(client) == ["rel_likes:dangling", "rel_likes:odd"]
+
+            odd = await RelLikes.objects().get("odd")
+            stored = await client.query("SELECT * FROM rel_likes:odd;", {})
+            with pytest.raises(ServerError) as raised:
+                await odd.merge(stars=5)
+            assert not isinstance(raised.value, SurrealORMError)
+            assert "`in`" in str(raised.value)
+            assert "rel_person" in str(raised.value)
+            assert await client.query("SELECT * FROM rel_likes:odd;", {}) == stored
+
+            dangling = await RelLikes.objects().get("dangling")
+            await dangling.merge(stars=4)
+            assert await client.query("SELECT VALUE stars FROM rel_likes:dangling;", {}) == [4]
+
+            assert await RelLikes.raw_query(_NONCONFORMING_EDGES) == [RecordID("rel_likes", "odd")]
+            assert await RelLikes.raw_query(_DANGLING_EDGES) == [RecordID("rel_likes", "dangling")]
+
+            await odd.delete()
+            assert await _edge_ids(client) == ["rel_likes:dangling"]
+
+
+#: ``rel_likes`` with a change feed, defined by hand (``TYPE ANY`` spelled out), and its two first edges, one statement
+#: each.
+_FEED_TABLE = "DEFINE TABLE rel_likes TYPE ANY CHANGEFEED 1h;"
+_FEED_EDGES = (
+    "INSERT RELATION INTO rel_likes {id: 'e1', in: rel_person:ada, out: rel_post:p1}; "
+    "INSERT RELATION INTO rel_likes {id: 'e2', in: rel_person:ada, out: rel_book:b1};"
+)
+
+#: ``RelLikes.define_relation()`` on ``_FEED_TABLE``: the change feed carried.
+_FEED_DEFINE = (
+    "DEFINE TABLE OVERWRITE `rel_likes` TYPE RELATION IN `rel_person` OUT `rel_post` | `rel_book` ENFORCED CHANGEFEED 1h;"
+)
+
+
+async def _take(stream: Any, count: int) -> list[Any]:
+    """The *count* next events of *stream*; the timeout is a safety net against a hang, not a timing assertion."""
+    events: list[Any] = []
+    async with asyncio.timeout(5):
+        while len(events) < count:
+            events.append(await anext(stream))
+    return events
+
+
+async def _feed(client: Any) -> None:
+    """``_FEED_TABLE``, the nodes ``ada``, ``bob``, ``p1`` and ``b1``, then the edges ``e1`` and ``e2``."""
+    await _apply_ddl(client, _FEED_TABLE)
+    for node in (RelPerson(id="ada"), RelPerson(id="bob"), RelPost(id="p1"), RelBook(id="b1")):
+        await node.save()
+    await _apply_ddl(client, _FEED_EDGES)
+
+
+class TestChangeFeedAndLiveE2E:
+    """AC-16 (E2E, every engine of both lines; M4, M24, P4): ``define_relation()`` keeps a table's change feed and its
+    history, and its live queries. Each ``DEFINE TABLE`` of a table with a change feed — the one written by hand, then
+    ``define_relation()``'s — adds a ``define_table`` entry to it, on every line; ``changes()`` skips them and yields
+    the edges only, a raw ``SHOW CHANGES`` shows them."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_changes_yields_the_edges_around_the_define(self, kind: str) -> None:
+        async with _rel(kind) as client:
+            await _feed(client)
+            assert await RelLikes.define_relation() == _FEED_DEFINE
+            e3 = await RelPerson(id="bob").relate(RelLikes, _P1)
+
+            stream = RelLikes.objects().changes(since=0)
+            try:
+                events = await _take(stream, 3)
+            finally:
+                stream.stop()
+            assert [event.record_id for event in events] == ["rel_likes:e1", "rel_likes:e2", str(e3.id)]
+            assert all(isinstance(event.instance, RelLikes) for event in events)
+
+            entries = await client.query("SHOW CHANGES FOR TABLE rel_likes SINCE 0 LIMIT 100;", {})
+            kinds = [change_kind for entry in entries for change in entry["changes"] for change_kind in change]
+            assert kinds == ["define_table", "update", "update", "define_table", "update"]
+
+    async def test_a_live_query_registered_before_is_kept(self) -> None:
+        """Over WebSocket (a live query needs one): a raw ``LIVE SELECT`` on the table, registered before
+        ``define_relation()``, is still listed by ``INFO FOR TABLE`` after it."""
+        async with _rel("ws") as client:
+            await _feed(client)
+            response = await client.query_raw("LIVE SELECT * FROM rel_likes;", {})
+            [result] = response["result"]
+            assert result["status"] == "OK", result
+            live_id = result["result"]
+            try:
+                lives = {str(live_id): "LIVE SELECT * FROM rel_likes"}
+                assert (await _table_info(client, "rel_likes"))["lives"] == lives
+                assert await RelLikes.define_relation() == _FEED_DEFINE
+                assert (await _table_info(client, "rel_likes"))["lives"] == lives
+            finally:
+                with contextlib.suppress(Exception):
+                    await client.kill(live_id)
+
+
+# === introspection: the generator writes the keys back (spec §6.5, D10, P1; AC-14; M22) =============================
+
+
+class RelLoose(BaseSurrealEdge):
+    """No key: an unconstrained relation table, generated with neither key nor comment."""
+
+    model_config = SurrealConfigDict(table_name="rel_loose", connection="rel")
+
+
+class RelTwice(BaseSurrealEdge):
+    """A name repeated on each side, as SurrealDB stores it (P1 b, M22): the generator writes it back."""
+
+    model_config = SurrealConfigDict(
+        table_name="rel_twice",
+        connection="rel",
+        relation_in=["rel_person", "rel_person"],
+        relation_out=["rel_post", "rel_Post"],
+    )
+
+
+#: Table → the edge model the round trip defines, then generates back.
+_ROUND_TRIP: dict[str, type[BaseSurrealEdge]] = {"rel_likes": RelLikes, "rel_loose": RelLoose, "rel_twice": RelTwice}
+
+#: The classes ``generate_models_from_db()`` writes for :data:`_ROUND_TRIP`, exactly (the same on every engine).
+_GENERATED_EDGES = """\
+class RelLikes(BaseSurrealEdge):
+    # SCHEMALESS: fields not declared here are kept (extra="allow")
+    model_config = SurrealConfigDict(
+        table_name="rel_likes",
+        relation_in="rel_person",
+        relation_out=["rel_post", "rel_book"],
+        enforced=True,
+        connection="rel",
+        extra="allow",
+    )
+
+
+class RelLoose(BaseSurrealEdge):
+    # SCHEMALESS: fields not declared here are kept (extra="allow")
+    model_config = SurrealConfigDict(table_name="rel_loose", connection="rel", extra="allow")
+
+
+class RelTwice(BaseSurrealEdge):
+    # SCHEMALESS: fields not declared here are kept (extra="allow")
+    model_config = SurrealConfigDict(
+        table_name="rel_twice",
+        relation_in=["rel_person", "rel_person"],
+        relation_out=["rel_post", "rel_Post"],
+        connection="rel",
+        extra="allow",
+    )
+"""
+
+
+def _import_generated(path: Path) -> ModuleType:
+    """Import the module written at *path* (removed from ``sys.modules`` afterwards)."""
+    name = f"generated_relations_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        del sys.modules[name]
+    return module
+
+
+def _relation_fields(state: TableState) -> tuple[str, tuple[str, ...], tuple[str, ...], bool]:
+    """The relation part of a stored definition: its type, ends and ``ENFORCED``."""
+    return state.table_type, tuple(state.relation_in), tuple(state.relation_out), state.enforced
+
+
+class TestRoundTripE2E:
+    """AC-14 (E2E, every engine of both lines): after ``define_relation()``, ``generate_models_from_db()`` writes each
+    edge class with the table's keys — none for an unconstrained table, a repeated name kept —; the module imports, the
+    generated classes' getters and ``relation_ddl()`` equal the models', and each ``relation_ddl()`` applied to a fresh
+    database reads back the same relation definition."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_generated_edges_define_the_same_relations(self, kind: str, tmp_path: Path) -> None:
+        async with _rel(kind) as client:
+            for model in _ROUND_TRIP.values():
+                assert await model.define_relation() == model.relation_ddl()
+            tables = await _tables(client)
+            stored = {table: _relation_fields(parse_define_table(tables[table])) for table in _ROUND_TRIP}
+
+            path = tmp_path / "rel_models.py"
+            source = await generate_models_from_db(path, "rel", tables=sorted(_ROUND_TRIP))
+            assert path.read_text(encoding="utf-8") == source
+            assert source.endswith("\n\n" + _GENERATED_EDGES)
+            assert "# IN " not in source
+            module = _import_generated(path)
+            generated = {table: getattr(module, model.__name__) for table, model in _ROUND_TRIP.items()}
+            for table, model in _ROUND_TRIP.items():
+                edge = generated[table]
+                assert issubclass(edge, BaseSurrealEdge) and edge is not model
+                assert edge.get_table_name() == table
+                assert edge.get_relation_in() == model.get_relation_in() == stored[table][1]
+                assert edge.get_relation_out() == model.get_relation_out() == stored[table][2]
+                assert edge.is_enforced() is model.is_enforced() is stored[table][3]
+                assert edge.relation_ddl() == model.relation_ddl()
+
+            await _apply_ddl(client, _REL_RESET)
+            assert await _tables(client) == {}
+            for edge in generated.values():
+                await _apply_ddl(client, edge.relation_ddl())
+            tables = await _tables(client)
+            assert {table: _relation_fields(parse_define_table(tables[table])) for table in _ROUND_TRIP} == stored
+
+
+# === README: section 34, sections 23 and 31, the tables (spec §11.1; AC-17; P1–P4) ==================================
+
+_SECTION_23 = "### 23. Typed edges (`BaseSurrealEdge`)"
+_SECTION_31 = "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
+_SECTION_33 = "### 33. Materialized views (`view_query`, `define_view()`)"
+_SECTION_34 = "### 34. Relation constraints (`relation_in`, `define_relation()`)"
+_SERVER_BEHAVIOUR = "### ORM behaviour: SurrealDB 2.x vs 3.x"
+_EMBEDDED_BEHAVIOUR = "### ORM behaviour: the embedded engine"
+#: Spec §11.1 item 1: section 34's subsections, in order, after an untitled intro paragraph that holds example A.
+_SUBSECTIONS_34 = [
+    "Declaring the constraint",
+    "Applying it",
+    "What SurrealDB refuses",
+    "Records already in the table",
+    "Removing the constraint",
+    "Transactions, connections and the query cache",
+    "SurrealDB 2.x and 3.x",
+    "Security",
+    "Coming from the full SurrealDB-ORM",
+]
+#: Spec §11.1 item 1, example A, exactly: the intro's block.
+_README_EXAMPLE_A = """\
+from surrealdb import RecordID
+
+from surreal_orm_lite import (
+    BaseSurrealEdge,
+    BaseSurrealModel,
+    SurrealConfigDict,
+    SurrealDbError,
+    SurrealDbNotFoundError,
+    TableType,
+)
+
+
+class Person(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="person")
+
+    id: str | None = None
+    name: str
+
+
+class Company(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="company")
+
+    id: str | None = None
+    name: str
+
+
+class Post(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="post")
+
+    id: str | None = None
+    title: str
+
+
+class Likes(BaseSurrealEdge):
+    model_config = SurrealConfigDict(
+        table_name="likes",
+        table_type=TableType.RELATION,  # optional: an edge model's table is TYPE RELATION
+        relation_in="person",
+        relation_out=["post", "book"],
+        enforced=True,
+    )
+
+    stars: int = 1
+
+
+print(Likes.relation_ddl())
+# DEFINE TABLE OVERWRITE `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;
+print(await Likes.define_relation())
+# DEFINE TABLE OVERWRITE `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;
+
+ada = await Person(id="ada", name="Ada").save()
+acme = await Company(id="acme", name="Acme").save()
+graphs = await Post(id="graphs", title="Graphs").save()
+
+edge = await ada.relate(Likes, graphs, stars=5)
+print(edge.in_, edge.out)
+# person:ada post:graphs
+try:
+    await acme.relate(Likes, graphs)  # a company is not a person
+except SurrealDbError as exc:
+    print(type(exc).__name__)
+# SurrealDbError
+try:
+    await ada.relate(Likes, RecordID("book", "missing"))  # ENFORCED: the book must exist
+except SurrealDbNotFoundError as exc:
+    print(exc)
+# There was a problem with the database: The record 'book:missing' does not exist
+"""
+#: The getters, closing "Declaring the constraint".
+_README_GETTERS = """\
+print(Likes.get_relation_in(), Likes.get_relation_out(), Likes.is_enforced(), Likes.get_table_type())
+# ('person',) ('post', 'book') True relation
+"""
+#: Spec §11.1 item 1, example B, exactly: it opens "Applying it".
+_README_EXAMPLE_B = """\
+from surreal_orm_lite import SurrealDBConnectionManager
+
+
+class Follows(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="follows", relation_in="person", relation_out="person")
+
+
+client = await SurrealDBConnectionManager.get_client()
+await client.query("DEFINE TABLE follows SCHEMAFULL CHANGEFEED 1d PERMISSIONS FOR select FULL;", {})
+print(Follows.relation_ddl())
+# DEFINE TABLE OVERWRITE `follows` TYPE RELATION IN `person` OUT `person`;
+print(await Follows.define_relation())
+# DEFINE TABLE OVERWRITE `follows` TYPE RELATION IN `person` OUT `person` SCHEMAFULL CHANGEFEED 1d PERMISSIONS FOR select FULL, FOR create, update, delete NONE;
+"""
+#: Spec §11.1 item 1 (M5, M15, M20): an edge stored before the constraint, its refused update, the two recipes and its
+#: deletion — "Records already in the table".
+_README_RECORDS = """\
+from surrealdb import ServerError
+
+await ada.relate("knows", acme)  # written before any constraint: acme is a company
+
+
+class Knows(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="knows", relation_in="person", relation_out="person")
+
+    since: int | None = None
+
+
+await Knows.define_relation()
+[old] = await Knows.objects().exec()  # the edge stays
+try:
+    await old.merge(since=2020)
+except ServerError as exc:
+    print(type(exc).__name__)
+# InternalError
+
+outside = await Knows.raw_query(
+    "SELECT VALUE id FROM knows WHERE record::tb(in) NOT IN ['person'] OR record::tb(out) NOT IN ['person']"
+)
+dangling = await Knows.raw_query("SELECT VALUE id FROM knows WHERE in.id IS NONE OR out.id IS NONE")
+print(outside == [old.id], dangling)
+# True []
+await old.delete()
+"""
+#: Spec §11.1 item 1 (G6, D14, K7's form): a model without keys removes the constraint — "Removing the constraint".
+_README_REMOVAL = """\
+class LikesAny(BaseSurrealEdge):
+    model_config = SurrealConfigDict(table_name="likes")  # no relation key: any table, not enforced
+
+
+print(await LikesAny.define_relation())
+# DEFINE TABLE OVERWRITE `likes` TYPE RELATION;
+edge = await acme.relate(LikesAny, graphs)  # accepted now
+print(edge.in_, edge.out)
+# company:acme post:graphs
+"""
+_README_EXAMPLES_34 = [_README_EXAMPLE_A, _README_GETTERS, _README_EXAMPLE_B, _README_RECORDS, _README_REMOVAL]
+#: The ``python`` blocks of each part of section 34 (the intro is the text before the first subsection).
+_BLOCKS_BY_PART_34 = {
+    "": [_README_EXAMPLE_A],
+    "Declaring the constraint": [_README_GETTERS],
+    "Applying it": [_README_EXAMPLE_B],
+    "What SurrealDB refuses": [],
+    "Records already in the table": [_README_RECORDS],
+    "Removing the constraint": [_README_REMOVAL],
+    "Transactions, connections and the query cache": [],
+    "SurrealDB 2.x and 3.x": [],
+    "Security": [],
+    "Coming from the full SurrealDB-ORM": [],
+}
+#: P3, exactly (whitespace normalised): in "What SurrealDB refuses" and in "SurrealDB 2.x and 3.x".
+_P3_SENTENCE = (
+    "`SurrealDbNotFoundError` is a `SurrealDbError`, so `except SurrealDbError` handles every refused edge creation the "
+    "same way on both lines."
+)
+#: P4, exactly (whitespace normalised): in "Applying it".
+_P4_SENTENCE = (
+    "Each `define_relation()` on a table with a change feed adds a `define_table` entry to it; `changes()` skips it, a "
+    "raw `SHOW CHANGES` shows it."
+)
+#: Spec §11.1 item 1: what the intro and each subsection say (key phrases, whitespace normalised).
+_INTRO_NEEDLES_34 = (
+    "Since v0.33.0",
+    "(#23-typed-edges-basesurrealedge)",
+    "`TYPE RELATION IN … OUT … ENFORCED`",
+    "the full SurrealDB-ORM's keys",
+    "`relation_in`, `relation_out`, `enforced` and `table_type=TableType.RELATION`",
+    "`define_relation()` applies the constraint",
+    "SurrealDB enforces it",
+    "SurrealDB 2.x, 3.x and the embedded engine",
+    "(#orm-behaviour-surrealdb-2x-vs-3x)",
+    "`mem://`",
+)
+_PART_NEEDLES_34 = {
+    "Declaring the constraint": (
+        '`None`, `""`, `[]` and `()` mean any table',
+        "several separated by `|`",
+        "a list or tuple of names",
+        "Each name is stripped and must be an identifier",
+        "written in backquotes, in the order given",
+        "a repeated name is kept, as SurrealDB keeps it",
+        "`enforced=True` makes SurrealDB refuse an edge whose endpoint record does not exist",
+        "`table_type=TableType.RELATION` is optional",
+        "`NORMAL`, `USER`, `STREAM`, `HASH`, `RELATION`, `ANY`",
+        "recorded for the table DDL of v0.37.0",
+        "checked when the class is defined",
+        'a plain `"relation"` string included',
+        "`TypeError`",
+        "`ValueError`",
+        "even empty or `False`",
+        "derive the model from `BaseSurrealEdge`",
+        "A subclass inherits the keys",
+        "`get_relation_in()` and `get_relation_out()` return tuples (`()` for any table)",
+        "`TableState.relation_in`",
+        "`is_enforced()`",
+        "`get_table_type()`",
+        "else `TableType.NORMAL`",
+    ),
+    "Applying it": (
+        "reads the table's definition once (`INFO FOR DB`)",
+        "one `DEFINE TABLE OVERWRITE`",
+        "keeps the table's schema mode, `DROP`, comment, change feed and permissions",
+        "`relation_ddl()` returns the bare statement",
+        "`PERMISSIONS NONE`, which hides every edge from record users",
+        "the views that read it ([section 33](#33-materialized-views-view_query-define_view))",
+        "the views keep counting the edges written afterwards",
+        "its live queries and its change feed's history are kept",
+        _P4_SENTENCE,
+        "enforced at once, on every connection",
+        "idempotent: run it at start-up",
+        "`overwrite=False` writes `DEFINE TABLE IF NOT EXISTS`",
+        "whatever its ends",
+        "not a relation table it raises `SurrealDbError` before any DDL",
+        "on a materialized view",
+        "a definition the ORM cannot read back",
+        "an `ASSERT` written on them by hand is lost",
+        "Why not `ALTER TABLE`",
+        "is not enforced until a `DEFINE TABLE OVERWRITE`",
+    ),
+    "What SurrealDB refuses": (
+        "through every creation path",
+        "`relate()` with an edge model or by table name (the string form since v0.33.0), an edge's `save()`, "
+        "`objects().bulk_create()`",
+        "outside `IN`/`OUT` raises `SurrealDbError`",
+        "with `ENFORCED`, an endpoint record that does not exist raises `SurrealDbNotFoundError`",
+        "`__cause__`",
+        "A batch with one refused edge writes nothing",
+        '"Transaction failed and rolled back: …"',
+        "**Writing a plain record**",
+        'the SDK\'s `InternalError` ("Found record: … but expected a RELATION …")',
+        "**Updating** an edge the constraint refuses",
+        "`InternalError` too",
+        "`surrealdb.ServerError`s",
+        "an event's `THROW`",
+        "a failed `patch()` test",
+        _P3_SENTENCE,
+    ),
+    "Records already in the table": (
+        "not the records already in the table",
+        "a nonconforming edge",
+        "is still traversed",
+        "`merge()`, `update()`, `patch()`, `atomic_*()` and `objects().bulk_update()`",
+        "the SDK's `InternalError`",
+        "a dangling edge",
+        "can still be updated",
+        "plain records stay",
+        "`delete()` always works",
+        "`raw_query()`",
+        "`record::tb(in) NOT IN [...]`",
+        "`in.id IS NONE OR out.id IS NONE`",
+    ),
+    "Removing the constraint": (
+        "The model is the source of truth",
+        "leave `relation_in`, `relation_out` and `enforced` out (or set them to `None`",
+        'empty ends — `""`, `[]`, `()` — and `enforced=False` do the same',
+        "`TYPE RELATION` with no ends, at once on every connection",
+        "keeps its other clauses, records, fields, indexes and events",
+        "`overwrite=False` removes nothing",
+        "`TYPE ANY` is not offered, and it does not lift the constraint",
+        "`TYPE record<person>`",
+        "`ALTER TABLE … TYPE ANY`",
+        "`DEFINE TABLE OVERWRITE … TYPE ANY`",
+        "`REMOVE FIELD in ON likes; REMOVE FIELD out ON likes;`",
+        "`REMOVE TABLE likes` removes the table and its edges",
+        "`remove_relation()` deletes edges, not the constraint",
+    ),
+    "Transactions, connections and the query cache": (
+        "`tx=`",
+        "buffered",
+        "interactive",
+        "A block that raises applies nothing",
+        "later in the same block fails it",
+        "before anything is queued, on committed state",
+        "a definition of the same table queued earlier in the block",
+        "is not seen by `define_relation()` and is replaced at commit",
+        "define the table's other clauses before the block",
+        "not a lock",
+        "`connection`",
+        "`using()`",
+        "another connection raises `SurrealDbError` before any request",
+        "(#29-query-cache-cache-querycache)",
+        "drops no cached read",
+        "`OWNER` or `EDITOR`",
+        "`SurrealDbAuthenticationError`",
+        "signal",
+    ),
+    "SurrealDB 2.x and 3.x": (
+        "the same on every line and on the embedded engine",
+        "The wording of the server's refusals differs",
+        "`Found … but expected a record<…>`",
+        "`Couldn't coerce value for field …`",
+        "both outside `IN`/`OUT` and missing",
+        "`SurrealDbNotFoundError` on 2.x and the embedded engine",
+        "`SurrealDbError` on 3.x",
+        _P3_SENTENCE,
+        "A raw `ALTER TABLE … TYPE RELATION …` of a table already written to is not enforced on 2.x",
+        "The ORM never sends `ALTER TABLE`",
+        "(#orm-behaviour-surrealdb-2x-vs-3x)",
+        "(#orm-behaviour-the-embedded-engine)",
+    ),
+    "Security": (
+        "checked as identifiers",
+        "written in backquotes",
+        "the database's own definition sent back to it",
+        "re-checked",
+        "they are not an injection defence",
+        "names the table, never the statement",
+        "not an access control",
+        "privileged session",
+    ),
+}
+#: Spec §11.1 item 1: one key phrase per "Coming from the full SurrealDB-ORM" bullet, in order (the product owner's
+#: list of accepted differences, epic #287).
+_COMING_FROM_PHRASES_34 = (
+    "**The keys and `TableType` are the same**",
+    "**The relation model is `BaseSurrealEdge`**",
+    "**`relation_ddl()` and `define_relation()` on the edge model**",
+    "**The table's other clauses are kept from the database**",
+    "**Names are identifiers, written in backquotes, and a pipe-joined string is parsed**",
+    "**A `table_type` that is not a `TableType` and an `enforced` that is not a bool raise `TypeError`**",
+    "**`get_table_type()` is `TableType.RELATION` for every edge model**",
+    "**A refused edge creation raises the ORM's `SurrealDbError` or `SurrealDbNotFoundError`, a refused update the "
+    "official SDK's `InternalError`**",
+    "**Generated edge models carry the keys but no `table_type=`**",
+    "**`TableType`'s other members have no effect until v0.37.0.**",
+    "**`remove_relation()` deletes edges, not a constraint**",
+    "**Upgrading from 0.32 or earlier**",
+)
+#: Spec §11.1 item 2: section 23's "defined by hand" sentence and the end of item 3 of its migration list.
+_SECTION_23_DEFINED_BY_HAND = (
+    "Since v0.33.0 the model declares it (`relation_in`, `relation_out`, `enforced`) and `define_relation()` applies "
+    "it: see [section 34](#34-relation-constraints-relation_in-define_relation)."
+)
+_SECTION_23_MIGRATING_3 = "lite gets those keys, with those names, on `BaseSurrealEdge` (section 34)."
+#: Spec §11.1 item 3: section 23's "Idempotent edges" sentence (D7: the string form translates server errors).
+_SECTION_23_IDEMPOTENT = (
+    'A second string `relate("likes", …)` for the same pair fails as well, with `SurrealDbError` (the string form '
+    "translates server errors since v0.33.0)."
+)
+#: Spec §11.1 item 6: section 31's generated-models bullet, exactly (whitespace normalised). The same constant is
+#: pinned by tests/test_introspection.py and tests/test_views.py.
+_GENERATED_MODELS_BULLET_31 = (
+    "- **Generated models use comments** where the full ORM writes `SurrealConfigDict(permissions=…, changefeed=…)` "
+    "(`# Permissions: …`, `# Changefeed: …`): those keys arrive in the lite's `SurrealConfigDict` with later minors. A "
+    "view is generated with `view_query=…` since v0.32.0, and a relation table's ends with `relation_in=…`, "
+    "`relation_out=…` and `enforced=True` since v0.33.0, as in the full ORM (a `# View: AS …` comment when the lite "
+    "cannot declare the view: an edge, a computed field, a query it refuses; an `# IN … OUT …` comment when a table "
+    "name is not an identifier). The base class says what the full ORM's `table_type=` says (`BaseSurrealEdge` for a "
+    "relation table). `READONLY` is a comment too (full ORM: `Field(readonly=True)`)."
+)
+#: Spec §11.1 item 6: section 31's "One class per table" bullet names the relation keys.
+_ONE_CLASS_PER_TABLE_31 = (
+    "`relation_in`/`relation_out`/`enforced` for a relation table (since v0.33.0, "
+    "[section 34](#34-relation-constraints-relation_in-define_relation))"
+)
+#: Spec §11.1 items 7–9: the features row, the roadmap rows and the comparison rows.
+_FEATURES_ROW_34 = ["Relation constraints (`relation_in`, `define_relation()`, `TYPE RELATION`)", "✅"]
+_ROADMAP_ROWS_34 = [
+    ["v0.32.0", "Tier 3 — Materialized views", "✅ Released"],
+    ["v0.33.0", "Tier 3 — `TYPE RELATION` constraints", "✅ Released"],
+    ["v0.34.0 – v0.39.0", "Tier 3 — Advanced (search, migrations, CLI)", "📋 Planned"],
+    ["v0.40.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+]
+_COMPARISON_TYPED_RELATIONS = ["Native typed relations", "✅ v0.22.0 (typed edge models)", "✅ DDL only (TableType.RELATION)"]
+_COMPARISON_ROWS_34 = [
+    ["Materialized views", "✅ v0.32.0 (`view_query`, `define_view()`)", "✅"],
+    [
+        "TYPE RELATION enforcement",
+        "✅ v0.33.0 (`relation_in`, `define_relation()`)",
+        "✅ DDL (`TableType.RELATION`, migrations)",
+    ],
+    ["Full-Text Search", "v0.34.0", "✅"],
+]
+#: Spec §11.1 item 4 (§3 measured): exactly three rows v0.33.0 adds to the 2.x/3.x table, cell by cell.
+_RELATION_ROWS = [
+    [
+        "Relation constraints from an edge model (`define_relation()`: `TYPE RELATION IN … OUT … ENFORCED`)",
+        "same on both lines: one `DEFINE TABLE OVERWRITE` that keeps the table's other clauses, records, fields, indexes "
+        "and events, enforced at once",
+        "the same",
+        "v0.33.0",
+    ],
+    [
+        _ALTER_ROW,
+        "`INFO` shows the new type, but writes keep the old constraint until a `DEFINE TABLE OVERWRITE`; the ORM never "
+        "sends `ALTER TABLE`",
+        "enforced at once; the ORM still sends `DEFINE TABLE OVERWRITE`",
+        "v0.33.0",
+    ],
+    [
+        "An edge endpoint outside `IN`/`OUT` (`relate()`, typed or by table name, edge `save()`, `bulk_create()`)",
+        "`SurrealDbError` (`Found … but expected a record<…>`); with `ENFORCED` and no such record, "
+        "`SurrealDbNotFoundError` (`does not exist`)",
+        "`SurrealDbError` (`Couldn't coerce value for field …`), whether the record exists or not",
+        "v0.33.0",
+    ],
+]
+_HEADER_SENTENCE_33 = "Rows added in v0.33.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4."
+#: Spec §11.1 item 5: the row v0.33.0 adds to the embedded-engine table, cell by cell.
+_EMBEDDED_RELATION_ROW = [
+    "TYPE RELATION constraints (v0.33.0)",
+    "as on a 2.x server: a raw `ALTER TABLE … TYPE` of a table already written to is not enforced (`define_relation()` "
+    "sends `DEFINE TABLE OVERWRITE`); an endpoint outside `IN`/`OUT` whose record does not exist raises "
+    "`SurrealDbNotFoundError`",
+    "`SurrealDbError` for that endpoint on 3.x",
+    "v0.33.0",
+]
+
+
+def _section_34() -> str:
+    return _readme_part(_SECTION_34)
+
+
+def _part_34(heading: str) -> str:
+    """One ``####`` subsection of section 34, as written (the intro for ``""``)."""
+    if not heading:
+        return _section_34().split("\n#### ", 1)[0]
+    return _subsection(f"#### {heading}", _section_34())
+
+
+def _readme_blocks(text: str) -> list[str]:
+    """The ``python`` blocks of *text*, in order."""
+    blocks: list[str] = re.findall(r"^```python\n(.*?)^```$", text, re.MULTILINE | re.DOTALL)
+    return blocks
+
+
+def _readme_printed(block: str) -> list[str]:
+    """What a README example prints: its comment lines that start a line (``# <printed line>``), in order."""
+    return re.findall(r"^# (.*)$", block, re.MULTILINE)
+
+
+def _readme_bullets(text: str) -> list[str]:
+    """The ``- `` bullets of *text*, each with its continuation lines, whitespace normalised."""
+    return [_normalised(bullet) for bullet in re.findall(r"^- .*?(?=^- |^\s*$|\Z)", text, re.MULTILINE | re.DOTALL)]
+
+
+def _anchor(heading: str) -> str:
+    """GitHub's anchor of a README heading: lower case, punctuation but ``-`` and ``_`` dropped, spaces as ``-``."""
+    return re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-")
+
+
+class TestReadmeSection34:
+    """AC-17: README section 34 — its place, subsections, examples (run on ``mem://`` as written, each printed line
+    equal to its comment), the key phrases of each subsection (P1–P4 included) —, sections 23 and 31's new sentences,
+    and the features, roadmap, comparison and both behaviour tables (spec §11.1)."""
+
+    def test_section_34_follows_section_33(self) -> None:
+        """Right after section 33 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        text = _readme()
+        start_33 = text.index(f"\n{_SECTION_33}\n")
+        start_34 = text.index(f"\n{_SECTION_34}\n")
+        configuration = text.index("\n## Configuration Options\n")
+        assert start_33 < start_34 < configuration
+        assert re.findall(r"^#{2,3} .*$", text[start_33 + 1 : configuration], re.MULTILINE) == [
+            _SECTION_33,
+            _SECTION_34,
+        ]
+        assert text[:configuration].rstrip().endswith("\n---"), "section 34 ends before the --- of the next part"
+
+    def test_subsections_in_order(self) -> None:
+        assert re.findall(r"^#### (.*)$", _section_34(), re.MULTILINE) == _SUBSECTIONS_34
+
+    def test_the_examples_and_where_they_stand(self) -> None:
+        """Example A exactly, the block of the untitled intro; example B exactly, the first thing of "Applying it";
+        the getters, the records and the removal blocks in their parts; no other block; ``python`` fences only."""
+        section = _section_34()
+        assert _readme_blocks(section) == _README_EXAMPLES_34
+        for heading, blocks in _BLOCKS_BY_PART_34.items():
+            assert _readme_blocks(_part_34(heading)) == blocks, heading
+        part = _part_34("Applying it")
+        assert part.split("\n\n", 1)[1].startswith(f"```python\n{_README_EXAMPLE_B}```"), part
+        fences = re.findall(r"^```(\S*)$", section, re.MULTILINE)
+        assert fences == ["python", ""] * len(_README_EXAMPLES_34), fences
+
+    def test_intro_paragraph(self) -> None:
+        intro = _normalised(_section_34().split("\n```python\n", 1)[0])
+        missing = [needle for needle in _INTRO_NEEDLES_34 if needle not in intro]
+        assert not missing, missing
+
+    @pytest.mark.parametrize("heading", list(_PART_NEEDLES_34))
+    def test_what_each_subsection_says(self, heading: str) -> None:
+        text = _normalised(_part_34(heading))
+        missing = [needle for needle in _PART_NEEDLES_34[heading] if needle not in text]
+        assert not missing, missing
+
+    def test_p3_sentence_in_both_subsections(self) -> None:
+        """P3: the exact sentence, once in "What SurrealDB refuses" and once in "SurrealDB 2.x and 3.x"."""
+        for heading in ("What SurrealDB refuses", "SurrealDB 2.x and 3.x"):
+            assert _normalised(_part_34(heading)).count(_P3_SENTENCE) == 1, heading
+
+    def test_no_claim_about_every_path(self) -> None:
+        """D15: the ORM's errors cover every edge creation path, not every write path (a refused update keeps the
+        SDK's error), so section 34 never says "every path" or "every write path"."""
+        section = _normalised(_section_34()).lower()
+        for claim in ("every path", "every write path"):
+            assert claim not in section, claim
+
+    def test_coming_from_the_full_orm(self) -> None:
+        """One key phrase per bullet, in order; the upgrade bullet says what turns into a ``TypeError`` at import."""
+        bullets = _readme_bullets(_part_34("Coming from the full SurrealDB-ORM"))
+        assert len(bullets) == len(_COMING_FROM_PHRASES_34), bullets
+        for bullet, phrase in zip(bullets, _COMING_FROM_PHRASES_34, strict=True):
+            assert phrase in bullet, (phrase, bullet)
+        upgrade = bullets[-1]
+        for needle in (
+            "accepted and ignored before 0.33.0",
+            "checked at the `class` statement",
+            "a node model carrying `relation_in`, `relation_out` or `enforced`",
+            "`table_type=TableType.RELATION`",
+            '(`"relation"`)',
+            "raises `TypeError` at import",
+            "derive the model from `BaseSurrealEdge`, import `TableType`",
+        ):
+            assert needle in upgrade, needle
+        assert "v0.37.0" in bullets[2] and "through `define_relation()`" in bullets[2], bullets[2]
+        assert "`QueryError` for both" in bullets[7], bullets[7]
+
+    def test_links_resolve(self) -> None:
+        """Every in-page link of section 34, and of section 23's new sentence, names a heading of the README."""
+        anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
+        links = re.findall(r"\]\(#([^)]+)\)", _section_34() + _SECTION_23_DEFINED_BY_HAND + _ONE_CLASS_PER_TABLE_31)
+        assert len(links) >= 10, links
+        assert [link for link in links if link not in anchors] == []
+
+    def test_section_23_sentences(self) -> None:
+        """Spec §11.1 items 2 and 3: section 23 points to section 34 and says that the string ``relate()`` translates
+        server errors since v0.33.0; the v0.33.0 announcements and the SDK's ``ServerError`` sentence are gone."""
+        section_23 = _normalised(_readme_part(_SECTION_23))
+        for sentence in (_SECTION_23_DEFINED_BY_HAND, _SECTION_23_MIGRATING_3, _SECTION_23_IDEMPOTENT):
+            assert section_23.count(sentence) == 1, sentence
+        for stale in (
+            "is planned for v0.33.0",
+            "`BaseSurrealEdge` in v0.33.0",
+            "the string form does not translate server errors",
+            "with the SDK's `ServerError`",
+        ):
+            assert stale not in section_23, stale
+
+    def test_section_31_generated_models(self) -> None:
+        """Spec §11.1 item 6: section 31's generated-models bullet exactly, its "One class per table" bullet names the
+        relation keys, and its class-comments sentence no longer lists the relation ends."""
+        section_31 = _readme_part(_SECTION_31)
+        bullets = _readme_bullets(_subsection("#### Coming from the full SurrealDB-ORM", section_31))
+        assert _GENERATED_MODELS_BULLET_31 in bullets, [bullet for bullet in bullets if "Generated models" in bullet]
+        generating = _normalised(_subsection("#### Generating models", section_31))
+        assert _ONE_CLASS_PER_TABLE_31 in generating
+        assert "relation ends" not in generating
+        assert "`# IN … OUT …` comment" in generating
+
+    def test_features_row(self) -> None:
+        features = [row for _, row in _table_rows(_readme_part("## Features"))]
+        firsts = [row[0] for row in features]
+        assert _FEATURES_ROW_34 in features, features
+        views = "Materialized views (`view_query`, `define_view()`, read-only)"
+        assert firsts.index(_FEATURES_ROW_34[0]) == firsts.index(views) + 1
+
+    def test_roadmap_rows(self) -> None:
+        roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
+        start = [row[0] for row in roadmap].index("v0.32.0")
+        assert roadmap[start : start + 4] == _ROADMAP_ROWS_34, roadmap
+        assert "v0.33.0 – v0.39.0" not in [row[0] for row in roadmap]
+
+    def test_comparison_rows(self) -> None:
+        """The "Native typed relations" row no longer announces v0.33.0; the ``TYPE RELATION`` row comes right after
+        the materialized views, before full-text search."""
+        comparison = [row for _, row in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        assert _COMPARISON_TYPED_RELATIONS in comparison, comparison
+        start = [row[0] for row in comparison].index("Materialized views")
+        assert comparison[start : start + 3] == _COMPARISON_ROWS_34, comparison
+
+    def test_server_behaviour_rows(self) -> None:
+        """Exactly three rows, Since v0.33.0, together and in version order: earlier releases above them, later ones
+        below them, then the table's last row (v0.19.1's re-run)."""
+        assert_server_rows(_RELATION_ROWS)
+
+    def test_server_behaviour_table_keeps_its_widths(self) -> None:
+        """Every line 535 characters, the columns 136, 175, 181 and 38 wide: the new rows are padded to them."""
+        assert_server_table()
+
+    def test_server_behaviour_header_sentence(self) -> None:
+        """The sentence v0.33.0 adds to the table's intro paragraph, once, among sentences naming their releases in
+        increasing version order."""
+        assert_server_header_sentence(_HEADER_SENTENCE_33)
+
+    def test_embedded_table_row(self) -> None:
+        """All four cells, in version order before the catch-all "Everything else" row; widths kept (69, 343, 113,
+        9)."""
+        assert_embedded_rows([_EMBEDDED_RELATION_ROW])
+
+    def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
+        """Every table v0.33.0 touches keeps one cell count per line and no escaped pipe; section 34 has no table."""
+        parts = [
+            _readme_part("## Features"),
+            _readme_part(_SERVER_BEHAVIOUR),
+            _readme_part(_EMBEDDED_BEHAVIOUR),
+            _readme_part("## Roadmap"),
+            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+        ]
+        found = [lines for part in parts for lines in _md_tables(part)]
+        assert len(found) == len(parts)
+        assert _md_tables(_section_34()) == [], "section 34 has no table"
+        for lines in found:
+            assert len({len(_cells(line)) for line in lines}) == 1 and "\\|" not in "".join(lines), lines
+
+    async def test_section_34_examples(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """AC-17: every ``python`` block runs as written, in order and in one namespace, on ``mem://`` (inside
+        ``embedded_database()``); what each block prints is, line by line, its ``# `` comment lines."""
+        capsys.readouterr()
+        namespace: dict[str, Any] = {"__name__": "readme_section_34"}
+        try:
+            async with embedded_database():
+                for code in _readme_blocks(_section_34()):
+                    compiled = compile(code, "<README section 34>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                    # A doctest of this repository's own README (trusted text), top-level awaits included.
+                    outcome = eval(compiled, namespace)
+                    if inspect.iscoroutine(outcome):
+                        await outcome
+                    assert capsys.readouterr().out.splitlines() == _readme_printed(code), code
+        finally:
+            namespace.clear()

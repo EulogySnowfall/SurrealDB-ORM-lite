@@ -1,4 +1,4 @@
-__version__ = "0.32.1"
+__version__ = "0.33.0"
 
 from ._sdk import BoundExcluded, BoundIncluded
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
@@ -91,7 +91,7 @@ from .signals import (
 )
 from .subquery import Subquery
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
-from .types import Duration, Range
+from .types import Duration, Range, TableType
 
 __all__ = [
     "__version__",
@@ -105,6 +105,7 @@ __all__ = [
     "BaseSurrealModel",
     "BaseSurrealEdge",
     "SurrealConfigDict",
+    "TableType",
     # QuerySet
     "QuerySet",
     "Q",

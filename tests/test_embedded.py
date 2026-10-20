@@ -2542,8 +2542,8 @@ class TestReadmeEmbeddedWording:
 
     def test_section_26_follows_section_25(self) -> None:
         """Section 26 comes right after section 25, then section 27 (v0.26.0), section 28 (v0.27.0), section 29
-        (v0.28.0), section 30 (v0.29.0), section 31 (v0.30.0), section 32 (v0.31.0) and section 33 (v0.32.0), up to
-        "Configuration Options"."""
+        (v0.28.0), section 30 (v0.29.0), section 31 (v0.30.0), section 32 (v0.31.0), section 33 (v0.32.0) and section
+        34 (v0.33.0), up to "Configuration Options"."""
         readme = _readme()
         start_25 = readme.index("\n### 25. Geospatial fields\n")
         start_26 = readme.index(f"\n{_SECTION_26}\n")
@@ -2558,6 +2558,7 @@ class TestReadmeEmbeddedWording:
             "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)",
             "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
             "### 33. Materialized views (`view_query`, `define_view()`)",
+            "### 34. Relation constraints (`relation_in`, `define_relation()`)",
         ]
 
     def test_subsections_in_order(self) -> None:

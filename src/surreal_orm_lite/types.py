@@ -9,6 +9,8 @@ signature, converts from it and compares equal to it.
 ``Range[T]`` is a SurrealDB ``range`` (``9..17``, ``d'2026-01-01T00:00:00Z'..``): two bounds, each
 the SDK's ``BoundIncluded``/``BoundExcluded`` or ``None`` for an open side. As a Pydantic field it
 validates each bound value as ``T`` and reads back the SurrealQL text it writes in JSON mode.
+
+``TableType`` (v0.33.0): the full SurrealDB-ORM's table classification.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import functools
 import re
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from enum import StrEnum
 from types import UnionType
 from typing import Annotated, Any, ClassVar, Generic, Self, TypeVar, Union, get_args, get_origin
 
@@ -27,7 +30,7 @@ from pydantic_core import PydanticSerializationUnexpectedValue, core_schema
 from ._sdk import Bound, BoundExcluded, BoundIncluded, CBORSimpleValue, SdkDuration, SdkRange, undefined
 from .exceptions import InvalidDurationError
 
-__all__ = ["Duration", "Range"]
+__all__ = ["Duration", "Range", "TableType"]
 
 T = TypeVar("T")
 
@@ -729,3 +732,19 @@ def _parse_range_text(text: str) -> Range[Any]:
     if position != len(text):
         raise ValueError(f"{text!r} is not a SurrealQL range: unexpected text at position {position}")
     return Range(begin, end)
+
+
+class TableType(StrEnum):
+    """A table's classification — the full SurrealDB-ORM's enum, same members and values (v0.33.0).
+
+    ``RELATION`` is the type of an edge model's table (``BaseSurrealEdge``): SurrealDB's ``TYPE RELATION``. The other
+    members are recorded by ``SurrealConfigDict(table_type=…)`` and returned by ``get_table_type()``; the lite gives
+    them no effect before the table DDL of v0.37.0 (the full ORM gives them none outside its migrations either).
+    """
+
+    NORMAL = "normal"
+    USER = "user"
+    STREAM = "stream"
+    HASH = "hash"
+    RELATION = "relation"
+    ANY = "any"

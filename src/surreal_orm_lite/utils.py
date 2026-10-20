@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal, SupportsIndex, TypeAlias, cast
 import pydantic
 
 from . import geo as _geo
-from ._sdk import RecordID, SdkRange, ServerError
+from ._sdk import NotFoundError, RecordID, SdkRange, ServerError
 from .constants import GEOMETRY_LOOKUP_OPERATORS, LOOKUP_OPERATORS, SESSION_PARAMETERS, TEXT_LOOKUP_FUNCTIONS
 from .exceptions import SurrealDbAuthenticationError, SurrealDbConflictError, SurrealDbError, SurrealDbNotFoundError
 from .functions import SurrealFunc, Var
@@ -1263,3 +1263,25 @@ async def apply_ddl_statements(
                 raise refusal(message) from e
             raise refusal(message) from None
     return statements
+
+
+def edge_write_error(error: BaseException) -> SurrealDbError:
+    """The ORM error for a server's refusal of an edge creation: v0.22.0's rule, shared since v0.33.0.
+
+    Every ORM path that creates an edge raises it outside a transaction — ``relate()`` with an edge model or an edge
+    table name, an edge's ``save()``, ``objects().bulk_create()`` —, as ``raise edge_write_error(exc) from exc``, so the
+    SDK's error stays its ``__cause__``:
+
+    - :class:`SurrealDbNotFoundError` for a missing endpoint of an ``ENFORCED`` relation: the SDK's ``NotFoundError``
+      (SurrealDB 3.x), or a message saying it "does not exist", in any case (2.x and the embedded engine);
+    - :class:`SurrealDbError` for anything else: an endpoint outside the table's ``TYPE RELATION IN … OUT …``, a
+      ``UNIQUE`` index duplicate, an id that already exists, a ``TYPE NORMAL`` table.
+
+    The message is ``There was a problem with the database: {error}``, so
+    :func:`~surreal_orm_lite.concurrency.is_conflict_error` still reads a conflict in it. Inside a transaction the
+    transaction layer's own errors apply, and a refused update of a stored record keeps the SDK's error.
+    """
+    message = f"There was a problem with the database: {error}"
+    if isinstance(error, NotFoundError) or "does not exist" in str(error).lower():
+        return SurrealDbNotFoundError(message)
+    return SurrealDbError(message)
