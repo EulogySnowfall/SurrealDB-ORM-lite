@@ -43,10 +43,11 @@ until the commit; a transaction of another connection is refused (X1) before any
 Array ids, reads and live queries (spec §5.5, §6.6; AC-13, AC-14; M4, M12, M17): ``utils.coerce_record_id()`` reads a
 ``list`` or a ``tuple`` as an array record id, so ``get(["paid"])`` and ``filter(id=["paid"])`` address a grouped
 view's record; E2E on both lines, a view model read by array id, re-read by ``refresh()``, counted, summed and read by
-a ``Subquery``, ``id__in`` pinned per line (SurrealDB 3.x answers no record to ``id IN`` on a view table) and an
-``id: str`` declaration pinned (``"['paid']"``); over WebSocket, ``watch()`` and ``live()`` notify a group emptied by
-a delete as one ``DELETE`` on 3.x, an ``UPDATE`` to a count of 0 then a ``DELETE`` on 2.x, and a 3.x notification's
-record carries no ``id``.
+a ``Subquery``, ``id__in`` sent as ``$_f0 CONTAINS id`` on a view model (SurrealDB 3.x answers no record to
+``id IN`` on a view table, pinned raw) and an ``id: str`` declaration pinned (``"['paid']"``); over WebSocket,
+``watch()`` and ``live()`` notify a group emptied by a delete as one ``DELETE`` on 3.x, an ``UPDATE`` to a count of 0
+then a ``DELETE`` on 2.x; a 3.x notification's record carries no ``id``, which ``live()`` takes from the
+notification's record id.
 """
 
 import asyncio
@@ -70,6 +71,7 @@ from surreal_orm_lite import (
     Computed,
     Event,
     LiveAction,
+    Q,
     Subquery,
     SurrealConfigDict,
     SurrealDbAuthenticationError,
@@ -79,6 +81,7 @@ from surreal_orm_lite import (
     Transaction,
     computed,
     define_parser,
+    live,
     pre_delete,
     pre_save,
     pre_update,
@@ -2360,6 +2363,172 @@ class TestCoerceArrayIds:
         assert utils.build_filter_condition("id", lookup, value, 0, record_table="t") == (sql, {"_f0": bound}, 1)
 
 
+#: ``MvStats``' two array ids, as ``id__in`` binds them on its table.
+_PAID_NEW = [RecordID("mv_order_stats", ["paid"]), RecordID("mv_order_stats", ["new"])]
+
+
+class TestViewIdIn:
+    """AC-13 (unit, ruling A1): on a view model's ``id`` column, ``in`` compiles ``$_f0 CONTAINS id`` — through
+    ``filter()``, a ``Q`` (nested or negated) and a ``Subquery`` —, since SurrealDB 3.x answers no record to ``id IN``
+    on a view table; ``not_in``, every other column, every ordinary model and a ``Q`` compiled on its own are
+    unchanged."""
+
+    def test_a_list(self) -> None:
+        assert MvStats.objects().filter(id__in=[["paid"], ("new",)])._compile_query() == (
+            "SELECT * FROM mv_order_stats WHERE $_f0 CONTAINS id;",
+            {"_f0": _PAID_NEW},
+        )
+
+    def test_a_tuple_and_a_set(self) -> None:
+        assert MvPaid.objects().filter(id__in=("o1", "o2"))._compile_query() == (
+            "SELECT * FROM mv_paid_orders WHERE $_f0 CONTAINS id;",
+            {"_f0": [RecordID("mv_paid_orders", "o1"), RecordID("mv_paid_orders", "o2")]},
+        )
+        assert MvPaid.objects().filter(id__in={"o1"})._compile_query() == (
+            "SELECT * FROM mv_paid_orders WHERE $_f0 CONTAINS id;",
+            {"_f0": [RecordID("mv_paid_orders", "o1")]},
+        )
+
+    def test_a_q(self) -> None:
+        assert MvStats.objects().filter(Q(id__in=[["paid"], ["new"]]))._compile_query() == (
+            "SELECT * FROM mv_order_stats WHERE $_f0 CONTAINS id;",
+            {"_f0": _PAID_NEW},
+        )
+
+    def test_a_negated_q(self) -> None:
+        assert MvStats.objects().filter(~Q(id__in=[["paid"]]))._compile_query() == (
+            "SELECT * FROM mv_order_stats WHERE NOT ($_f0 CONTAINS id);",
+            {"_f0": [_PAID_NEW[0]]},
+        )
+
+    def test_a_nested_q(self) -> None:
+        nested = Q(total__gte=1) & (Q(status="new") | Q(id__in=[["paid"]]))
+        assert MvStats.objects().filter(nested)._compile_query() == (
+            "SELECT * FROM mv_order_stats WHERE (total >= $_f0 AND (status = $_f1 OR $_f2 CONTAINS id));",
+            {"_f0": 1, "_f1": "new", "_f2": [_PAID_NEW[0]]},
+        )
+
+    def test_a_subquery(self) -> None:
+        busy = Subquery(MvStats.objects().filter(total__gte=2).select("id"))
+        assert MvStats.objects().filter(id__in=busy)._compile_query() == (
+            "{ LET $_sq0 = (SELECT VALUE id FROM mv_order_stats WHERE total >= $_f0); "
+            "(SELECT * FROM mv_order_stats WHERE $_sq0 CONTAINS id) };",
+            {"_f0": 2},
+        )
+
+    def test_a_subquery_in_a_q(self) -> None:
+        busy = Subquery(MvStats.objects().filter(total__gte=2).select("id"))
+        assert MvStats.objects().filter(Q(status="new") | Q(id__in=busy))._compile_query() == (
+            "{ LET $_sq0 = (SELECT VALUE id FROM mv_order_stats WHERE total >= $_f1); "
+            "(SELECT * FROM mv_order_stats WHERE (status = $_f0 OR $_sq0 CONTAINS id)) };",
+            {"_f0": "new", "_f1": 2},
+        )
+
+    def test_count(self) -> None:
+        text, variables = MvStats.objects().filter(id__in=[["paid"], ["new"]])._compile_aggregation_query("count()")
+        assert " WHERE $_f0 CONTAINS id " in text, text
+        assert variables == {"_f0": _PAID_NEW}
+
+    def test_not_in_is_unchanged(self) -> None:
+        assert MvStats.objects().filter(id__not_in=[["paid"]])._compile_query() == (
+            "SELECT * FROM mv_order_stats WHERE id NOT IN $_f0;",
+            {"_f0": [_PAID_NEW[0]]},
+        )
+        assert MvStats.objects().filter(~Q(id__not_in=[["paid"]]))._compile_query() == (
+            "SELECT * FROM mv_order_stats WHERE NOT (id NOT IN $_f0);",
+            {"_f0": [_PAID_NEW[0]]},
+        )
+
+    def test_another_column_is_unchanged(self) -> None:
+        assert MvStats.objects().filter(status__in=["paid"])._compile_query() == (
+            "SELECT * FROM mv_order_stats WHERE status IN $_f0;",
+            {"_f0": ["paid"]},
+        )
+
+    def test_an_ordinary_model_is_unchanged(self) -> None:
+        assert MvOrder.objects().filter(id__in=["o1"])._compile_query() == (
+            "SELECT * FROM mv_orders WHERE id IN $_f0;",
+            {"_f0": [RecordID("mv_orders", "o1")]},
+        )
+        busy = Subquery(MvStats.objects().filter(total__gte=2).select("status"))
+        assert MvOrder.objects().filter(Q(id__in=["o1"]) | Q(status__in=busy))._compile_query() == (
+            "{ LET $_sq0 = (SELECT VALUE status FROM mv_order_stats WHERE total >= $_f1); "
+            "(SELECT * FROM mv_orders WHERE (id IN $_f0 OR status IN $_sq0)) };",
+            {"_f0": [RecordID("mv_orders", "o1")], "_f1": 2},
+        )
+
+    def test_a_q_on_its_own_is_unchanged(self) -> None:
+        assert Q(id__in=[["paid"]]).to_sql() == ("id IN $_f0", {"_f0": [["paid"]]}, 1)
+
+    def test_the_view_keyword(self) -> None:
+        """``view=True`` changes ``in`` on the ``id`` column only, and only when the table is known."""
+        condition = utils.build_filter_condition
+        assert condition("id", "in", [["paid"]], 0, record_table="t", view=True) == (
+            "$_f0 CONTAINS id",
+            {"_f0": [RecordID("t", ["paid"])]},
+            1,
+        )
+        assert condition("id", "in", [["paid"]], 0, record_table="t") == ("id IN $_f0", {"_f0": [RecordID("t", ["paid"])]}, 1)
+        assert condition("id", "not_in", ["a"], 0, record_table="t", view=True) == (
+            "id NOT IN $_f0",
+            {"_f0": [RecordID("t", "a")]},
+            1,
+        )
+        assert condition("id", "exact", ["paid"], 0, record_table="t", view=True) == (
+            "id = $_f0",
+            {"_f0": RecordID("t", ["paid"])},
+            1,
+        )
+        assert condition("status", "in", ["a"], 0, record_table="t", view=True) == ("status IN $_f0", {"_f0": ["a"]}, 1)
+        assert condition("id", "in", ["a"], 0, view=True) == ("id IN $_f0", {"_f0": ["a"]}, 1)
+
+
+def _view_envelope(action: str, record: Any, result: Any) -> dict[str, Any]:
+    """A live notification as the SDK yields it."""
+    return {"action": action, "record": record, "result": result, "id": "lq"}
+
+
+class TestViewLiveIds:
+    """AC-14 (unit, ruling A2): SurrealDB 3.x's notifications of a view carry no ``id``; ``live()``'s instance of a
+    view model takes the notification's record id, ``raw`` stays as received; an ordinary model is unchanged."""
+
+    def test_a_view_payload_without_an_id_takes_the_record(self) -> None:
+        result = {"status": "paid", "total": 2, "revenue": 15.5}
+        event = live.to_change_event(MvStats, _view_envelope("UPDATE", _PAID, result), diff=False)
+        assert (event.instance.id, event.instance.status, event.validation_error) == (_PAID, "paid", None)
+        assert event.raw is result
+        assert result == {"status": "paid", "total": 2, "revenue": 15.5}
+
+    def test_a_view_payload_with_an_id_keeps_it(self) -> None:
+        result = {"id": _NEW, "status": "paid", "total": 2, "revenue": 15.5}
+        event = live.to_change_event(MvStats, _view_envelope("UPDATE", _PAID, result), diff=False)
+        assert event.instance.id == _NEW
+        assert event.raw is result
+
+    def test_a_plain_view_payload_takes_the_record(self) -> None:
+        record = RecordID("mv_paid_orders", "o1")
+        event = live.to_change_event(MvPaid, _view_envelope("CREATE", record, {"customer": "ann", "amount": 10.0}), diff=False)
+        assert (event.instance.id, event.instance.customer) == (record, "ann")
+
+    def test_a_diff_create_without_an_id_takes_the_record(self) -> None:
+        patches = [{"op": "replace", "path": "", "value": {"status": "gone", "total": 1, "revenue": 3.0}}]
+        event = live.to_change_event(MvStats, _view_envelope("CREATE", _GONE, patches), diff=True)
+        assert (event.instance.id, event.instance.total) == (_GONE, 1)
+        assert event.raw is patches
+        assert patches[0]["value"] == {"status": "gone", "total": 1, "revenue": 3.0}
+
+    def test_without_a_record_the_payload_is_hydrated_as_received(self) -> None:
+        event = live.to_change_event(
+            MvStats, _view_envelope("UPDATE", None, {"status": "paid", "total": 2, "revenue": 1.0}), diff=False
+        )
+        assert event.instance.id is None
+
+    def test_an_ordinary_model_is_unchanged(self) -> None:
+        record = RecordID("mv_orders", "o1")
+        event = live.to_change_event(MvOrder, _view_envelope("UPDATE", record, {"status": "paid"}), diff=False)
+        assert (event.instance.id, event.instance.status) == (None, "paid")
+
+
 # === E2E (spec §9.2): the connection "mv" on the database mv_db, over WebSocket and HTTP, and mem:// ================
 
 #: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
@@ -3550,6 +3719,14 @@ _NEW = RecordID("mv_order_stats", ["new"])
 _GONE = RecordID("mv_order_stats", ["gone"])
 
 
+#: The failure of :meth:`TestViewReadsE2E.test_raw_id_in_on_a_view_per_line` once SurrealDB 3.x answers ``id IN`` on
+#: a view table again.
+_ID_IN_FIXED = (
+    "SurrealDB 3.x answers `id IN` on a view table again: narrow the README paragraph on `CONTAINS` (section 33, "
+    "'Reading') to the affected versions, and this test's version range with it"
+)
+
+
 def _stat(row: MvStats | None) -> tuple[RecordID | None, str, int, float]:
     """*row*'s id and columns."""
     assert row is not None
@@ -3563,9 +3740,10 @@ def _busy() -> Subquery:
 
 class TestViewReadsE2E:
     """AC-13 (E2E, both lines, WebSocket, HTTP and ``mem://``): a grouped view's records looked up by their array id —
-    ``get(["paid"])``, ``filter(id=["paid"])``, ``id__not_in`` —, re-read by ``refresh()`` after a source write,
-    counted, summed and read by a ``Subquery``; ``id__in`` pinned per line (SurrealDB 3.x answers no record on a view
-    table); declared ``id: str``, the id reads as the text of the array (M4 pin)."""
+    ``get(["paid"])``, ``filter(id=["paid"])``, ``id__in`` (a list, a ``Q``, a ``Subquery``), ``id__not_in`` —,
+    re-read by ``refresh()`` after a source write, counted, summed and read by a ``Subquery``; the raw ``id IN`` the
+    ORM avoids pinned per line (SurrealDB 3.x answers no record on a view table); declared ``id: str``, the id reads
+    as the text of the array (M4 pin)."""
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_get_by_array_id(self, kind: str) -> None:
@@ -3592,20 +3770,50 @@ class TestViewReadsE2E:
             assert await MvStats.objects().filter(id=["gone"]).exec() == []
 
     @pytest.mark.parametrize("kind", _KINDS)
-    async def test_id_in_per_line(self, kind: str) -> None:
-        """``id__in`` binds the array ids (``TestCoerceArrayIds``). Measured on 3.3.4 and 3.1.5: SurrealDB 3.x answers
-        no record to ``id IN $ids`` on a view table — any view, any id: ``MvPaid`` keeps the source's string ids —,
-        while ``id = …``, ``id NOT IN …`` and the comparisons answer right; 2.x and the embedded engine answer the
-        records. Pinned per line: a SurrealDB 3.x defect."""
+    async def test_filter_by_array_ids_in(self, kind: str) -> None:
+        """AC-13 as written: ``filter(id__in=[["paid"], ["new"]])`` gives both groups on every line — sent as
+        ``$_f0 CONTAINS id`` (ruling A1) —, counted the same, and ``~Q(id__in=…)`` gives the other group."""
+        async with _mv(kind):
+            await _save_orders()
+            await MvStats.define_view()
+            both = await MvStats.objects().filter(id__in=[["paid"], ["new"]]).order_by("status").exec()
+            assert [_stat(row) for row in both] == [(_NEW, "new", 1, 1.0), (_PAID, "paid", 2, 15.5)]
+            assert await MvStats.objects().filter(id__in=[["paid"], ["new"]]).count() == 2
+            assert await MvStats.objects().filter(id__in=[["paid"], ["gone"]]).count() == 1
+            assert [_stat(row) for row in await MvStats.objects().filter(~Q(id__in=[["paid"]])).exec()] == [
+                (_NEW, "new", 1, 1.0)
+            ]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_id_in_on_a_plain_view(self, kind: str) -> None:
+        """A plain view keeps the source's string ids (M4): ``id__in=["o1"]`` gives that record on every line."""
+        async with _mv(kind):
+            await _save_orders()
+            await MvPaid.define_view()
+            paid = await MvPaid.objects().filter(id__in=["o1"]).exec()
+            assert [(row.id, row.customer) for row in paid] == [(RecordID("mv_paid_orders", "o1"), "ann")]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_id_in_a_subquery_over_the_view(self, kind: str) -> None:
+        async with _mv(kind):
+            await _save_orders()
+            await MvStats.define_view()
+            busy = Subquery(MvStats.objects().filter(total__gte=2).select("id"))
+            assert [_stat(row) for row in await MvStats.objects().filter(id__in=busy).exec()] == [(_PAID, "paid", 2, 15.5)]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_raw_id_in_on_a_view_per_line(self, kind: str) -> None:
+        """The raw ``id IN`` the ORM avoids on a view table: no record on SurrealDB 3.x (3.1 and 3.3 measured), both
+        on 2.x and the embedded engine. Fails on purpose when a 3.x release answers it again."""
         async with _mv(kind) as client:
             await _save_orders()
             await MvStats.define_view()
-            await MvPaid.define_view()
-            answered = await _major(client) < 3
-            both = await MvStats.objects().filter(id__in=[["paid"], ["new"]]).order_by("status").exec()
-            assert [_stat(row) for row in both] == ([(_NEW, "new", 1, 1.0), (_PAID, "paid", 2, 15.5)] if answered else [])
-            paid = await MvPaid.objects().filter(id__in=["o1"]).exec()
-            assert [(row.id, row.customer) for row in paid] == ([(RecordID("mv_paid_orders", "o1"), "ann")] if answered else [])
+            answer = await client.query("SELECT VALUE id FROM mv_order_stats WHERE id IN $ids", {"ids": [_PAID, _NEW]})
+            if await _major(client) >= 3:
+                if answer != []:
+                    pytest.fail(_ID_IN_FIXED)
+            else:
+                assert sorted(answer, key=str) == [_NEW, _PAID]
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_refresh_after_a_source_write(self, kind: str) -> None:
@@ -3691,15 +3899,15 @@ def _notified(major: int) -> list[tuple[str, RecordID, tuple[str, int, float]]]:
 
 def _payload_ids(major: int) -> list[RecordID | None]:
     """The ``id`` each notification's record holds on *major* (measured on 3.3.4, 3.1.5 and 2.7.0): none on 3.x — the
-    envelope's ``record`` and the event's ``record_id`` name the view record —, the record's own on 2.x."""
+    envelope's ``record`` names the view record —, the record's own on 2.x. ``watch()`` yields it as received."""
     return [None, None, None] if major >= 3 else [_NEW, _GONE, _GONE, _GONE]
 
 
 class TestViewLiveE2E:
     """AC-14 (E2E, both lines, WebSocket only: the embedded engine has no live queries): ``watch()`` on a view model
     notifies the records SurrealDB recomputes when the source changes — a group emptied by a delete is one ``DELETE``
-    on 3.x, an ``UPDATE`` with a count of 0 then a ``DELETE`` on 2.x (M12) —, and ``live()`` yields ``MvStats``
-    instances."""
+    on 3.x, an ``UPDATE`` with a count of 0 then a ``DELETE`` on 2.x (M12) —, its envelopes as received (no ``id`` in
+    a 3.x ``result``), and ``live()`` yields ``MvStats`` instances carrying the record id on both lines."""
 
     async def test_watch_notifies_the_view_changes_per_line(self) -> None:
         async with _mv("ws") as client:
@@ -3731,4 +3939,4 @@ class TestViewLiveE2E:
             for event in events
         ]
         assert seen == [(LiveAction(action), str(record), row) for action, record, row in _notified(major)]
-        assert [event.instance.id for event in events] == _payload_ids(major)
+        assert [event.instance.id for event in events] == [record for _, record, _ in _notified(major)]

@@ -83,9 +83,13 @@ class Q:
         endpoint_columns: Collection[str] = (),
         *,
         subqueries: SubqueryCompiler | None = None,
+        view: bool = False,
     ) -> tuple[str, dict[str, Any], int]:
         """
         Generate a parameterized SQL WHERE fragment.
+
+        On a view model's id column, ``in`` compiles ``$_f0 CONTAINS id``: SurrealDB 3.x answers no record to
+        ``id IN`` on a view table (v0.32.0).
 
         Args:
             counter: The starting variable counter for unique naming.
@@ -106,6 +110,9 @@ class Q:
             subqueries: The compiler of the statement the QuerySet sends (v0.27.0), propagated to child nodes,
                 which binds a ``Subquery`` value. ``None`` — a ``Q`` compiled on its own — raises ``ValueError``
                 for a subquery value: only the QuerySet that uses the ``Q`` can bind it.
+            view: The queried model is a materialized view (v0.32.0), propagated by the QuerySet and passed down to
+                child nodes (:func:`build_filter_condition`). ``False`` — an ordinary model, or a ``Q`` compiled on
+                its own — leaves every condition as before.
 
         Returns:
             A tuple of (sql_fragment, variables_dict, next_counter).
@@ -121,7 +128,14 @@ class Q:
                 if to_column is not None:
                     field = to_column(field)
                 sql, vars_, counter = build_filter_condition(
-                    field, lookup, value, counter, record_table, endpoint_columns=endpoint_columns, subqueries=subqueries
+                    field,
+                    lookup,
+                    value,
+                    counter,
+                    record_table,
+                    endpoint_columns=endpoint_columns,
+                    subqueries=subqueries,
+                    view=view,
                 )
                 filter_parts.append(sql)
                 all_variables.update(vars_)
@@ -132,7 +146,9 @@ class Q:
 
         # Child Q objects
         for child in self.children:
-            sql, vars_, counter = child.to_sql(counter, record_table, to_column, endpoint_columns, subqueries=subqueries)
+            sql, vars_, counter = child.to_sql(
+                counter, record_table, to_column, endpoint_columns, subqueries=subqueries, view=view
+            )
             if sql:
                 all_parts.append(sql)
                 all_variables.update(vars_)

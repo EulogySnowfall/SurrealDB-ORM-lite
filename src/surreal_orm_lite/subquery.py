@@ -315,7 +315,14 @@ class _MissingSubqueryTable(Exception):
 
 
 def subquery_condition(
-    field: str, lookup: str, op: str, sub: Subquery, counter: int, compiler: SubqueryCompiler | None
+    field: str,
+    lookup: str,
+    op: str,
+    sub: Subquery,
+    counter: int,
+    compiler: SubqueryCompiler | None,
+    *,
+    view: bool = False,
 ) -> tuple[str, dict[str, Any], int]:
     """The condition of a filter whose whole value is a subquery: ``(sql, values, next_counter)``.
 
@@ -324,6 +331,9 @@ def subquery_condition(
     ``not_contains`` (:data:`FIRST_VALUE_LOOKUPS`) with its first value, guarded so an empty subquery matches no
     record: ``($_sq0 != [] AND score > array::first($_sq0))``.
 
+    On a view model's id column, ``in`` compiles ``$_sq0 CONTAINS id``: SurrealDB 3.x answers no record to ``id IN``
+    on a view table (v0.32.0).
+
     Args:
         field: the column, already validated and translated.
         lookup: the lookup name.
@@ -331,6 +341,8 @@ def subquery_condition(
         sub: the subquery.
         counter: the next ``$_f<N>`` number.
         compiler: the statement's compiler; ``None`` for a ``Q`` compiled on its own.
+        view: *field* is the ``id`` column of a materialized view model (v0.32.0), set by
+            :func:`utils.build_filter_condition`: ``in`` compiles ``<ref> CONTAINS <field>``.
 
     Raises:
         ValueError: any other lookup; no compiler; and what :meth:`SubqueryCompiler.reference` raises.
@@ -340,6 +352,8 @@ def subquery_condition(
     if compiler is None:
         raise ValueError(outside_a_queryset())
     ref, values, counter = compiler.reference(sub, counter)
+    if view and lookup == "in":
+        return f"{ref} CONTAINS {field}", values, counter
     if lookup in COLLECTION_LOOKUPS:
         return f"{field} {op} {ref}", values, counter
     return f"({ref} != [] AND {field} {op} array::first({ref}))", values, counter

@@ -787,6 +787,8 @@ class QuerySet:
         parts: list[str] = []
         variables: dict[str, Any] = {}
         endpoint_columns = self.model._endpoint_columns()
+        # A view model's id__in compiles "$_f0 CONTAINS id" (v0.32.0): SurrealDB 3.x answers no record to "id IN".
+        view = self.model._is_view()
 
         # Regular keyword filters (AND-joined)
         for field_name, lookup_name, value in self._filters:
@@ -798,13 +800,16 @@ class QuerySet:
                 self._model_table,
                 endpoint_columns=endpoint_columns,
                 subqueries=subqueries,
+                view=view,
             )
             parts.append(sql)
             variables.update(vars_)
 
         # Q object filters
         for q in self._q_filters:
-            sql, vars_, counter = q.to_sql(counter, self._model_table, self._column, endpoint_columns, subqueries=subqueries)
+            sql, vars_, counter = q.to_sql(
+                counter, self._model_table, self._column, endpoint_columns, subqueries=subqueries, view=view
+            )
             if sql:
                 parts.append(sql)
                 variables.update(vars_)

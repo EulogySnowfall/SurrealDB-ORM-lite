@@ -898,6 +898,7 @@ def build_filter_condition(
     *,
     endpoint_columns: Collection[str] = (),
     subqueries: SubqueryCompiler | None = None,
+    view: bool = False,
 ) -> tuple[str, dict[str, Any], int]:
     """
     Build a single parameterized filter condition.
@@ -937,6 +938,9 @@ def build_filter_condition(
     ``contains`` and ``not_contains`` with its first value (no record when it is empty). Its values are compared
     as stored: no record-id or endpoint coercion. The ``id`` and endpoint columns keep their refusals.
 
+    On a view model's id column, ``in`` compiles ``$_f0 CONTAINS id``: SurrealDB 3.x answers no record to ``id IN``
+    on a view table (v0.32.0).
+
     Args:
         field: The field name.
         lookup: The lookup type (e.g. ``"exact"``, ``"gt"``, ``"in"``).
@@ -953,6 +957,9 @@ def build_filter_condition(
         subqueries: The compiler of the statement the condition goes into (v0.27.0), which binds a subquery
             value in a ``LET`` (or inline, for a live query). ``None`` — a ``Q`` compiled on its own — refuses a
             subquery.
+        view: The queried model is a materialized view (v0.32.0), set by the QuerySet: ``in`` on the ``id``
+            column compiles ``<values> CONTAINS id``, the same values bound. ``False`` leaves every condition as
+            before.
 
     Returns:
         A tuple of (sql_fragment, variables_dict, next_counter).
@@ -1000,7 +1007,7 @@ def build_filter_condition(
     op = LOOKUP_OPERATORS[lookup]
     var_name = f"_f{counter}"
     if sub is not None:
-        return subquery_condition(field, lookup, op, sub, counter, subqueries)
+        return subquery_condition(field, lookup, op, sub, counter, subqueries, view=view and is_record_id_column)
 
     if lookup == "isnull":
         if not isinstance(value, bool):
@@ -1033,6 +1040,8 @@ def build_filter_condition(
         items = [as_record_value(_list_item(item, field, lookup)) for item in value]
         if is_record_id_column and lookup in _RECORD_ID_SEQUENCE_LOOKUPS:
             items = [coerce_record_id(item, cast(str, record_table)) for item in items]
+            if view and lookup == "in":
+                return f"${var_name} CONTAINS {field}", {var_name: items}, counter + 1
         elif is_endpoint_column and lookup in _RECORD_ID_SEQUENCE_LOOKUPS:
             items = [coerce_endpoint(item) for item in items]
         return f"{field} {op} ${var_name}", {var_name: items}, counter + 1
