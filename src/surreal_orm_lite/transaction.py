@@ -103,10 +103,11 @@ def _refusal(message: str, statement_spans: Sequence[tuple[int, int]] = ()) -> S
     :func:`_server_reason`'s, never the query's text. With *statement_spans* (a buffered batch: the first and last
     line of each queued statement in the query), the position names the queued statement, ``statement 2 of 3``, and
     the line within it; without them, the position is the statement's (an interactive transaction runs one at a
-    time). ``SurrealDbConflictError`` when *message* reports a retryable conflict.
+    time). ``SurrealDbConflictError`` when the reason reports a retryable conflict: the excerpt, which may quote
+    conflict words, is not read.
     """
     reason, position = _server_reason(message)
-    error_type = _error_type(message)
+    error_type = _error_type(reason)
     if position is None:
         return error_type(f"Transaction failed: the server refused the query: {reason}")
     line, column = position
@@ -170,8 +171,9 @@ def _raise_for_status(raw: Any, statement_spans: Sequence[tuple[int, int]] = ())
     )
     message = str(root.get("result") or "transaction failed")
     reason, position = _server_reason(message)
-    # Type retryable conflicts so callers / retry_on_conflict can catch them.
-    error = _error_type(message)(f"Transaction failed and rolled back: {reason}")
+    # Type retryable conflicts so callers / retry_on_conflict can catch them, from the reason alone (#278): a real
+    # conflict has no excerpt, and an excerpt may quote conflict words.
+    error = _error_type(reason)(f"Transaction failed and rolled back: {reason}")
     if position is None:
         raise error
     _raise_hiding(error, message)

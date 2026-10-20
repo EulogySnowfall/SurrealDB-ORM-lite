@@ -12,6 +12,7 @@ from surreal_orm_lite import (
     SurrealConfigDict,
     SurrealDBConnectionManager,
 )
+from surreal_orm_lite.concurrency import is_conflict_error
 from surreal_orm_lite.exceptions import SurrealDbConflictError, SurrealDbError
 from surreal_orm_lite.signals import post_delete, post_save
 from surreal_orm_lite.transaction import (
@@ -1452,6 +1453,8 @@ class TestInteractiveFailedStatementE2E:
 _LITERAL = "tx-literal-5f1e9a"
 #: A statement no SurrealDB line can parse (``SELEC``), holding ``_LITERAL``. The server reports it at column 7.
 _UNPARSABLE = f"SELEC '{_LITERAL}' FRM tx_fail_row;"
+#: A statement no SurrealDB line can parse, whose literal holds a retryable conflict's words.
+_CONFLICT_WORDS = "SELEC 'write conflict' FRM tx_fail_row;"
 
 
 def _shown(exc: BaseException, text: str) -> list[str]:
@@ -1507,6 +1510,18 @@ class TestRaiseForStatusStatementTextUnits:
         message = "Transaction conflict: Write conflict, retry the transaction. This transaction can be retried"
         with pytest.raises(SurrealDbConflictError, match="can be retried"):
             Transaction.raise_for_status({"error": {"code": -32000, "message": message}})
+
+    @pytest.mark.parametrize("envelope", [True, False], ids=["error-envelope", "statement-error"])
+    def test_a_parse_error_quoting_conflict_words_is_not_a_conflict(self, envelope: bool) -> None:
+        """The conflict typing reads the server's reason, not its excerpt of the statement."""
+        message = _parse_error("1:7", f"1 | {_CONFLICT_WORDS}")
+        raw = (
+            {"error": {"code": -32000, "message": message}} if envelope else {"result": [{"status": "ERR", "result": message}]}
+        )
+        with pytest.raises(SurrealDbError) as info:
+            Transaction.raise_for_status(raw)
+        assert type(info.value) is SurrealDbError
+        assert not is_conflict_error(info.value)
 
     @pytest.mark.parametrize("raw", [{"result": None}, {"error": {"message": None}}, None, [_LITERAL]])
     def test_an_unrecognized_shape_is_not_quoted(self, raw: Any) -> None:
@@ -1613,6 +1628,19 @@ class TestBufferedCommitErrorTextE2E:
             assert _LITERAL in str(info.value.__context__)  # the server's error stays reachable
             assert await _stored_ages(client) == {}
 
+    @pytest.mark.asyncio
+    async def test_a_parse_error_quoting_conflict_words_is_not_a_conflict(self, transport: str) -> None:
+        async with _tx_fail_db(transport) as client:
+            if transport == "ws" and await _native_txn_supported():
+                pytest.skip("WebSocket on SurrealDB 3.x runs interactive transactions")
+            with pytest.raises(SurrealDbError) as info:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    await tx.add(_CONFLICT_WORDS)
+            assert type(info.value) is SurrealDbError
+            assert not is_conflict_error(info.value)
+            assert await _stored_ages(client) == {}
+
 
 class TestInteractiveErrorTextE2E:
     """SurrealDB 3.x over WebSocket: a statement the server cannot parse fails inside the block, the block catches its
@@ -1655,6 +1683,22 @@ class TestInteractiveErrorTextE2E:
             assert str(info.value) == f"{_CANCELLED_AFTER_FAILURE} (SurrealDbError)"
             assert info.value.__cause__ is failed.value
             assert _shown(info.value, _LITERAL) == []
+            assert await _stored_ages(client) == {}
+
+    @pytest.mark.asyncio
+    async def test_a_parse_error_quoting_conflict_words_is_not_a_conflict(self) -> None:
+        async with _tx_fail_db("ws") as client:
+            if not await _native_txn_supported():
+                pytest.skip("requires SurrealDB 3.x")
+            with pytest.raises(SurrealDbError) as info:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    with pytest.raises(SurrealDbError) as failed:
+                        await tx.add(_CONFLICT_WORDS)
+            assert type(failed.value) is SurrealDbError
+            assert type(info.value) is SurrealDbError
+            assert str(info.value) == f"{_CANCELLED_AFTER_FAILURE} (SurrealDbError)"
+            assert not is_conflict_error(info.value)
             assert await _stored_ages(client) == {}
 
 

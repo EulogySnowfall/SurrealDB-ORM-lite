@@ -42,7 +42,9 @@ def is_conflict_error(error: BaseException) -> bool:
     A :class:`SurrealDbConflictError` always qualifies. Otherwise the exception
     and its ``__cause__`` / ``__context__`` chain are scanned for one of the
     conflict signal phrases (so a conflict wrapped in another exception is still
-    recognised).
+    recognised). The chain is the one a traceback prints: a context suppressed with
+    ``raise … from None`` is not part of it (#278) — the ORM keeps a server's full
+    text there, and a statement it quotes may hold conflict words.
     """
     if isinstance(error, SurrealDbConflictError):
         return True
@@ -53,7 +55,10 @@ def is_conflict_error(error: BaseException) -> bool:
         text = str(current).lower()
         if any(signal in text for signal in _CONFLICT_SIGNALS):
             return True
-        current = current.__cause__ or current.__context__
+        if current.__cause__ is not None:
+            current = current.__cause__
+        else:
+            current = None if current.__suppress_context__ else current.__context__
     return False
 
 
