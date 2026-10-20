@@ -6,8 +6,8 @@ The following versions of Surreal-ORM-Lite are currently supported with security
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.32.x  | :white_check_mark: |
-| < 0.32  | :x:                |
+| 0.33.x  | :white_check_mark: |
+| < 0.33  | :x:                |
 
 ## Embedded Engine
 
@@ -58,6 +58,19 @@ that other views read, which would turn them into stale ordinary tables); the OR
 write to a view guards against mistakes in application code and is not an access control
 (SurrealDB 2.x and 3.1 accept writes to a view from any session allowed to write it). A view is
 defined with SurrealDB's default permissions (`NONE`); applying needs a privileged system user.
+
+## Relation constraints
+
+Since 0.33.0, an edge model's table name and every `relation_in`/`relation_out` name are validated
+as identifiers when the class is defined and written in backquotes; no other application value
+reaches the `DEFINE TABLE … TYPE RELATION` statement, which takes no bound parameter. The clauses
+`define_relation()` keeps from the table's stored definition (comment, change feed, permissions)
+are the database's own definition sent back to it: the comment is re-quoted and each permission
+rule re-checked, and a value that fails is not written (`define_relation()` raises before any
+DDL). These checks catch a definition the ORM would misread; they are not an injection defence. A
+refusal names the table, never the statement, which may carry permission rules. The constraint is
+SurrealDB's, not an access control: a session allowed to write the table writes any edge the
+constraint accepts. Applying needs a privileged system user.
 
 ## Reporting a Vulnerability
 

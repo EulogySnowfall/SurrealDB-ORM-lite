@@ -5,6 +5,126 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.0] - 2026-10-20
+
+`TYPE RELATION` enforcement: an edge model declares which tables its edges may join and whether
+both ends must exist, with the full SurrealDB-ORM's keys, and `define_relation()` applies the
+constraint to its table while keeping the table's other clauses. SurrealDB enforces it on every
+write, and every edge creation path raises the same ORM errors on SurrealDB 2.x, 3.x and the
+embedded engine. The last minor of Tier 3's schema and DDL phase.
+
+### Added
+
+- **`SurrealConfigDict(relation_in=…, relation_out=…, enforced=…)` on `BaseSurrealEdge`**, the
+  full SurrealDB-ORM's keys for SurrealDB's `TYPE RELATION IN … OUT … ENFORCED`: `relation_in`
+  names the tables an edge's `in` may come from, `relation_out` those its `out` may point to (one
+  name, several separated by `|`, or a list or tuple; `None` or an empty value means any table),
+  and `enforced=True` makes SurrealDB refuse an edge whose endpoint record does not exist. The keys
+  are checked when the class is defined; a subclass inherits them and `None` resets one.
+  `get_relation_in()` and `get_relation_out()` return tuples, in the shape of introspection's
+  `TableState.relation_in`/`relation_out`, and `is_enforced()` a bool.
+- **`TableType`**, the full SurrealDB-ORM's enum (`NORMAL`, `USER`, `STREAM`, `HASH`, `RELATION`,
+  `ANY`, same values), exported from the package root, and `Model.get_table_type()` on every
+  model: `TableType.RELATION` for an edge model, else the configured `table_type`, else
+  `TableType.NORMAL`. `table_type=TableType.RELATION` is optional on an edge model; the other
+  members are recorded for v0.37.0 and have no effect before it.
+- **`Model.relation_ddl()` and `await Model.define_relation()`**: `relation_ddl()` renders
+  ``DEFINE TABLE OVERWRITE `<table>` TYPE RELATION IN … OUT … ENFORCED;`` without a connection
+  (pure, deterministic; `overwrite=False` writes `IF NOT EXISTS`). `define_relation()` reads the
+  table's definition once (`INFO FOR DB`), then sends one `DEFINE TABLE OVERWRITE` that writes the
+  model's `TYPE RELATION` clause and keeps the table's schema mode, `DROP`, comment, change feed
+  and permissions, as well as its records, fields, indexes, events, the views that read it and
+  its live queries. It returns the statement applied, is idempotent (run it at start-up), takes
+  `tx=`, runs on the model's connection and is enforced at once on every connection. A model
+  without the keys removes the constraint the same way.
+
+  ```python
+  class Likes(BaseSurrealEdge):
+      model_config = SurrealConfigDict(
+          table_name="likes", relation_in="person", relation_out=["post", "book"], enforced=True
+      )
+
+
+  await Likes.define_relation()
+  await ada.relate(Likes, graphs)                        # accepted
+  await acme.relate(Likes, graphs)                       # SurrealDbError: a company is not a person
+  await ada.relate(Likes, RecordID("book", "missing"))   # SurrealDbNotFoundError (ENFORCED)
+  ```
+
+- README section 34, "Relation constraints (`relation_in`, `define_relation()`)" (declaring the
+  constraint, applying it, what SurrealDB refuses, records already in the table, removing it,
+  transactions, connections and the query cache, SurrealDB 2.x and 3.x, security, a note for users
+  of the full SurrealDB-ORM), a features row, three rows in the 2.x/3.x behaviour table and one in
+  the embedded-engine table, the comparison and roadmap rows, and the example notebook
+  `examples/v0.33.0_type_relation_enforcement.ipynb`.
+
+### Changed
+
+- **`relation_in`, `relation_out`, `enforced` and `table_type` are checked at the `class`
+  statement** (they were accepted and ignored before 0.33.0). On a node model
+  (`BaseSurrealModel`), `relation_in`, `relation_out` and `enforced` (even empty or `False`) and
+  `table_type=TableType.RELATION` raise `TypeError`: derive the model from `BaseSurrealEdge`. A
+  `table_type` that is not a `TableType` (a plain `"relation"` string included) or an `enforced`
+  that is not a bool raises `TypeError`; a table name that is not an identifier raises
+  `ValueError`.
+- **The string form `relate("<edge table>", …)` translates server errors**, as the typed form does
+  since v0.22.0: an endpoint the table's constraint refuses raises `SurrealDbError`, a missing
+  endpoint of an `ENFORCED` table `SurrealDbNotFoundError`, a duplicate pair on a `UNIQUE` index
+  `SurrealDbError`, instead of the SDK's `ServerError` (kept as the `__cause__`). Inside a
+  transaction nothing changes.
+- **`generate_models_from_db()` writes a relation table's ends as keys**: `relation_in=`,
+  `relation_out=` (a string for one name, a list for several, in the server's order) and
+  `enforced=True` right after `table_name=`, instead of the `# IN … OUT … ENFORCED` comment, so a
+  relation table round-trips (define → introspect → generate → define gives the same
+  `TableState`). A table name that is not an identifier keeps the comment. README section 31 says
+  so; the v0.30.0 introspection notebook is re-executed for it.
+
+### Notes
+
+- **Enforcement is SurrealDB's**: the ORM adds no check of its own before a write. An edge refused
+  by the constraint, through any creation path (`relate()` typed or by table name, an edge's
+  `save()`, `objects().bulk_create()`), raises `SurrealDbError` for an endpoint from a table
+  outside `IN`/`OUT` and `SurrealDbNotFoundError` (a `SurrealDbError`) for a missing endpoint with
+  `ENFORCED`; a batch with one refused edge writes nothing; inside a transaction the refusal is the
+  transaction's `SurrealDbError`. A plain record written into the relation table, and an update of
+  an edge stored before the constraint that it refuses, raise the SDK's `InternalError`.
+- **Records already in the table are not checked**: a nonconforming edge stays (its updates are
+  refused), a dangling edge stays and can be updated (`ENFORCED` is checked at creation), and
+  `delete()` always works. README section 34 gives the two queries that find them.
+- **`define_relation()` refuses before any DDL** a materialized view (the `OVERWRITE` would drop
+  its query), a definition the ORM cannot read back, and `overwrite=False` on a table that exists
+  and is not a relation table (`IF NOT EXISTS` would leave the constraint unapplied). The read and
+  the definition are a check, then the DDL, not a lock. In a transaction the read runs on committed
+  state before anything is queued: define the table's other clauses before the block.
+- **SurrealDB rewrites the `in` and `out` field definitions** from `IN` and `OUT`: an `ASSERT`
+  written on them by hand is lost. Turning the table back into `TYPE ANY` is not offered and does
+  not lift the constraint on any line; a keyless `define_relation()` does.
+- **SurrealDB 2.x and 3.x**: `define_relation()` is the same on every line and on the embedded
+  engine. The refusal's wording differs (`Found … but expected a record<…>` on 2.x and the
+  embedded engine, `Couldn't coerce value for field …` on 3.x), and an endpoint both outside
+  `IN`/`OUT` and missing, on an `ENFORCED` table, raises `SurrealDbNotFoundError` on 2.x and the
+  embedded engine and `SurrealDbError` on 3.x; `except SurrealDbError` handles both. A raw
+  `ALTER TABLE … TYPE RELATION …` of a table already written to is not enforced on 2.x and the
+  embedded engine until a `DEFINE TABLE OVERWRITE` of the table; the ORM never sends
+  `ALTER TABLE`.
+- **Security**: the table name and every `relation_in`/`relation_out` name are checked as
+  identifiers and written in backquotes; no other application value reaches the statement. The
+  clauses `define_relation()` keeps are the database's own definition, the comment re-quoted and
+  each permission rule re-checked; a value that fails is not written. A refusal names the table,
+  never the statement. The constraint is not an access control, and applying it needs a privileged
+  system user (root, or a namespace or database `OWNER` or `EDITOR`).
+- **Differences from the full SurrealDB-ORM**: the same keys and `TableType`, on `BaseSurrealEdge`
+  (a `BaseSurrealModel` with `table_type=TableType.RELATION` raises `TypeError`);
+  `relation_ddl()` and `define_relation()` where the full ORM applies the DDL through migrations or
+  `define_table()`; names are identifiers in backquotes and a pipe-joined string is parsed;
+  `get_relation_in()`, `get_relation_out()` and `is_enforced()` are lite additions.
+- **Deferred**: migrations (`CreateTable`/`AlterTable` with the relation keys) and
+  `define_table()`, which will apply an edge model through `define_relation()`, come with v0.37.0;
+  `TableType`'s other members have no effect until then. The lite has no schema-mode, permissions,
+  change-feed or comment keys yet, so `define_relation()` keeps those clauses from the database.
+- **Server pins unchanged**: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine,
+  plus 3.1.5 for backward compatibility.
+
 ## [0.32.1] - 2026-10-20
 
 Two follow-ups to the materialized views of v0.32.0 (#286): a function SurrealDB lists as unusable

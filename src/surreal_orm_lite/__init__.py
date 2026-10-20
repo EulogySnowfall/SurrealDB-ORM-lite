@@ -1,4 +1,4 @@
-__version__ = "0.32.1"
+__version__ = "0.33.0"
 
 from ._sdk import BoundExcluded, BoundIncluded
 from .aggregations import Aggregation, Avg, Count, Max, Min, Sum
