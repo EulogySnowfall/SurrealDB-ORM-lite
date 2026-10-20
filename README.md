@@ -854,7 +854,8 @@ except SurrealDbConflictError:
 - Detection anchors on SurrealDB's own retryable marker ("This transaction can be retried"), so
   a non-retryable failure (e.g. a duplicate-key error) is **not** retried. `is_conflict_error()`
   reads the exception and its chain as a traceback prints it: a context suppressed with
-  `raise … from None` is not read (v0.31.1).
+  `raise … from None` is not read (v0.31.2), so a conflict you re-raise as another exception stays
+  retryable only when chained with `raise … from exc`.
 - The exception type is identical on 2.6.x and 3.x; conflicts simply arise more often on 3.x
   (optimistic MVCC) than on 2.6.x (see the behaviour table), except on change-feed tables, where
   2.x refuses concurrent writes that 3.x accepts (see [section 22](#22-change-feeds-changes)).

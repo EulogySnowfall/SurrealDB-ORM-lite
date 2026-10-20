@@ -14,9 +14,11 @@ engine too (#278). No new public API.
 ### Fixed
 
 - **Transaction errors give the server's reason and the statement's position, without the
-  server's excerpt of the statement** (#278). When the server refused the query as a whole (a statement it cannot parse), the error read "Transaction failed: unrecognized
-  query_raw() response shape: {…}" and quoted the server's raw response, its excerpt of the
-  statement included. It now gives the server's reason and the position:
+  server's excerpt of the statement** (#278). When the server refused the query as a whole (a
+  statement it cannot parse), the error read "Transaction failed: unrecognized query_raw()
+  response shape: {…}" and quoted the server's raw response, its excerpt of the statement
+  included. It now gives the server's reason and the position:
+
   - at a buffered commit (SurrealDB 2.x, HTTP, the embedded engine), "Transaction failed: the
     server refused statement 2 of 3: … (at line 1, column 7 of the statement)", the line and column
     of the statement as written, before the ORM renames its `$name` parameters for the batch; when
@@ -33,14 +35,16 @@ engine too (#278). No new public API.
   The server's full text stays reachable as the error's `__context__`, which a formatted traceback
   does not print. A read in a transaction still raises the SDK's own error, as it does outside a
   transaction.
+
 - **A buffered commit on the embedded engine raises `SurrealDbError`** (#278). The engine reports a
   query it cannot parse as a bare `RuntimeError`, which propagated out of the `transaction()` block;
   the commit now raises `SurrealDbError`, or `SurrealDbConflictError` for a retryable conflict, as
   on a server.
-- **A statement holding conflict words is not taken for a conflict** (#278). A query the server
-  could not parse, whose statement held words such as "write conflict", was typed
-  `SurrealDbConflictError`, so `retry_on_conflict` retried it. The typing now reads the server's
-  reason, not its excerpt of the statement.
+- **A statement holding conflict words is not taken for a conflict** (#278). When the server could
+  not parse a statement holding words such as "write conflict", `is_conflict_error()` recognised
+  the transaction's error as a retryable conflict, so `retry_on_conflict` retried it, and an
+  interactive transaction's cancellation error was a `SurrealDbConflictError`. Conflicts are now
+  recognised from the server's reason, not from its excerpt of the statement.
 
 ### Changed
 
@@ -52,8 +56,11 @@ engine too (#278). No new public API.
   as `__cause__`, and a retryable conflict still raises `SurrealDbConflictError`, so
   `retry_on_conflict` behaves as before.
 - **`is_conflict_error()` follows the chain a traceback prints** (#278): a context suppressed with
-  `raise … from None` is no longer read. The ORM keeps the server's full text there, which may
-  quote the statement.
+  `raise … from None` is no longer read, since the ORM keeps the server's full text there, which
+  may quote the statement; `__cause__` and an implicit `__context__` are still followed. A conflict
+  your code re-raises as another exception with `raise … from None` is therefore no longer
+  recognised, nor retried by `retry_on_conflict`: chain it with `raise … from exc`, or raise a
+  `SurrealDbConflictError`, to keep it retryable.
 
 ### Notes
 
