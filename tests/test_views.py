@@ -5017,8 +5017,9 @@ _VIEW_ROWS = [
     ],
     [
         "Removing a materialized view, or a source table, that another view reads (`remove_view()`, `REMOVE TABLE`)",
-        "`remove_view()` raises `SurrealDbError` before any DDL; a raw `REMOVE TABLE` succeeds and turns each view "
-        "reading the table into an ordinary table keeping its last records",
+        # Issue #286 (v0.32.1): a chain removed outer view first in one buffered block is accepted.
+        "`remove_view()` raises `SurrealDbError` before any DDL, unless its transaction removes those views first; a "
+        "raw `REMOVE TABLE` makes them ordinary tables, last records kept",
         "`SurrealDbError` from the server (`Cannot delete table … on which a view is defined`): remove the views that "
         "read it first",
         "v0.32.0",
@@ -5159,6 +5160,23 @@ class TestReadmeSection33:
         links = re.findall(r"\]\(#([^)]+)\)", _section_33())
         assert links, "section 33 links to the behaviour tables and to section 29"
         assert [link for link in links if link not in anchors] == []
+
+    def test_issue_286_follow_ups(self) -> None:
+        """Issue #286 (v0.32.1): section 33 says that V7 allows a listed function inside the argument of each of several
+        aggregates (still refused beside one), and that a chain of views removed outer view first in one buffered
+        block is accepted (and when it is not)."""
+        declaring = _normalised(_part_33("Declaring a view"))
+        transactions = _normalised(_part_33("Transactions, connections and the query cache"))
+        needles = [
+            (declaring, "Since v0.32.1 that holds when an expression combines several aggregates too"),
+            (declaring, "(`math::sum(amount) + math::sum(array::len(array::distinct(tags)))`)"),
+            (declaring, "beside an aggregate (`math::sum(amount) + array::len(array::distinct(tags))`) they are still"),
+            (transactions, "A chain of views can be removed in one buffered block, outer view first (since v0.32.1)"),
+            (transactions, "the same block has already queued"),
+            (transactions, "unless the block names it again afterwards (a `define_view(tx=tx)` of it)"),
+            (transactions, "A view removed in another transaction, or by a `REMOVE TABLE` you add to the block yourself, is"),
+        ]
+        assert [needle for text, needle in needles if needle not in text] == []
 
     def test_features_row(self) -> None:
         features = [row for _, row in _table_rows(_readme_part("## Features"))]
