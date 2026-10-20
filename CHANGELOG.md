@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.31.1] - 2026-10-19
+
+A datetime outside years 1-9999 no longer fails the response it is in (#279). SurrealDB stores
+datetimes far beyond the years a Python `datetime` holds, and the ORM now reads them back as the
+server's own text. No new public API.
+
+### Fixed
+
+- **Reading a datetime before year 1 or after year 9999** (#279). SurrealDB stores datetimes from
+  year -262143 to +262142, on 2.x and 3.x, but the surrealdb SDK 2.0.0 decodes a datetime into a
+  Python `datetime`, which holds years 1-9999 only: one such value failed the whole response it
+  was in, whether it came from `get()`, `filter()`, `raw_query()` or a live notification. The
+  ORM's clients now read it as its RFC 3339 text, the one SurrealDB gives it with `<string>`:
+  `"0000-06-01T00:00:00Z"`, `"-0001-01-01T00:00:00Z"`, `"+10000-01-01T00:00:00.500Z"` (a sign and
+  at least four digits outside years 0000-9999, every nanosecond kept). An untyped field holds
+  that string; a `datetime` field refuses it with a `ValidationError` naming the field, so `get()`
+  raises it and `filter().exec()` and `raw_query()` return such rows as dicts, as for any row
+  that does not validate. Written back through the ORM, the value is stored as that string. A
+  datetime within years 1-9999, before 1970 included, reads as the SDK's `datetime`, as before.
+
+### Notes
+
+- As for zero durations, native sets and degenerate geometries, only the clients the ORM opens
+  (`SurrealDBConnectionManager.get_client()`, `ephemeral_client()`, the embedded engine's
+  included) read these values; an `AsyncSurreal` client the application builds itself keeps the
+  SDK's behaviour. The ORM leaves them to the SDK as soon as an installed SDK decodes them itself.
+  README: "Values the SDK cannot read" and a new row of the 2.x/3.x behaviour table.
+- The function catalogue test (`TestFunctionEnumsE2E`) calls `rand::time()` between 2000 and 2030
+  and checks the result. Unbounded, it drew a year-0 datetime in about one call in 7,400 (27 in
+  200,000 on each line), which made the test fail at random.
+- Same behaviour on SurrealDB 2.x, 3.x and the embedded engine. Server pins unchanged: tested
+  against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine, plus 3.1.5 for backward
+  compatibility.
+
 ## [0.31.0] - 2026-10-19
 
 Server-side events and DDL helpers: the ORM writes and applies `DEFINE EVENT` and

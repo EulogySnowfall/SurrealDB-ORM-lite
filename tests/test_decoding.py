@@ -1,11 +1,12 @@
 """Reading what the surrealdb SDK 2.0.0 cannot decode (#235): the CBOR tag hook of ``decoding.py``.
 
-SDK 2.0.0 raises on four kinds of values SurrealDB returns: a zero duration, a SurrealDB 3.x native
-set, a 1-point (or empty) ``LineString`` and a ``Polygon`` ring of fewer than 4 points. The unit
-tests drive the hook with hand-built CBOR and an embedded client (no server); the classes suffixed
-``E2E`` write each value with raw SurrealQL and read it back through the ORM, on both server lines.
-The native set is a 3.x value: 2.x stores ``<set>[…]`` as an array, so those cases skip there
-(capability probe). Tables are prefixed ``dc_`` and dropped before and after each test.
+SDK 2.0.0 raises on five kinds of values SurrealDB returns: a zero duration, a SurrealDB 3.x native
+set, a 1-point (or empty) ``LineString``, a ``Polygon`` ring of fewer than 4 points and a datetime
+outside years 1-9999 (#279). The unit tests drive the hook with hand-built CBOR and an embedded
+client (no server); the classes suffixed ``E2E`` write each value with raw SurrealQL and read it back
+through the ORM, on both server lines. The native set is a 3.x value: 2.x stores ``<set>[…]`` as an
+array, so those cases skip there (capability probe). Tables are prefixed ``dc_`` and dropped before
+and after each test.
 """
 
 import asyncio
@@ -63,6 +64,25 @@ _SQUARE = ((0, 0), (1, 0), (1, 1), (0, 0))  # a valid closed ring
 _THIN = ((0, 0), (1, 0), (0, 0))  # 3 points once closed: SurrealDB stores it, SDK 2.0.0 refuses it
 
 
+def _datetime(seconds: int, nanoseconds: int = 0) -> CBORTag:
+    """The server's compact datetime (tag 12): ``[seconds, nanoseconds]`` since 1970-01-01T00:00:00Z."""
+    return CBORTag(12, [seconds, nanoseconds])
+
+
+#: Unix seconds of datetimes outside years 1-9999, as SurrealDB 2.7.0 and 3.3.4 compute them
+#: (``time::unix()``); ``-262143-01-01`` and ``+262142-12-31`` bound what the server stores.
+_YEAR_0 = -62_154_086_400  # 0000-06-01T00:00:00Z
+_BEFORE_YEAR_1 = -62_135_596_801  # 0000-12-31T23:59:59Z, the second before 0001-01-01
+_YEAR_MINUS_1 = -62_198_755_200  # -0001-01-01T00:00:00Z
+_LEAP_DAY_MINUS_2000 = -125_275_980_304  # -2000-02-29T12:34:56Z
+_YEAR_10000 = 253_402_300_800  # +10000-01-01T00:00:00Z, the second after 9999-12-31T23:59:59Z
+_SERVER_MIN = -8_334_601_228_800  # -262143-01-01T00:00:00Z
+_SERVER_MAX = 8_210_266_876_799  # +262142-12-31T23:59:59Z
+#: The first and the last second a Python ``datetime`` holds.
+_YEAR_1 = -62_135_596_800  # 0001-01-01T00:00:00Z
+_YEAR_9999_END = 253_402_300_799  # 9999-12-31T23:59:59Z
+
+
 def _hooked(value: Any) -> Any:
     """*value* encoded by the SDK's codec, then decoded the way the ORM's clients decode it."""
     decode = decoding._hooked_decode()
@@ -77,6 +97,7 @@ def fresh_caches() -> Iterator[None]:
         decoding.sdk_decodes_zero_duration,
         decoding.sdk_decodes_native_sets,
         decoding.sdk_decodes_degenerate_geometries,
+        decoding.sdk_decodes_out_of_range_datetimes,
         decoding._hooked_decode,
         decoding._hooked_methods,
     )
@@ -95,11 +116,13 @@ _SDK_FAILURES: dict[str, tuple[Any, type[BaseException]]] = {
     "native-set": (CBORTag(56, [1, 2]), BufferError),
     "line-1-point": (_line((1, 2)), TypeError),
     "polygon-3-point-ring": (_polygon(_THIN), surrealdb.InvalidGeometryError),
+    "datetime-year-0": (_datetime(_YEAR_0), ValueError),
+    "datetime-year-10000": (_datetime(_YEAR_10000), ValueError),
 }
 
 
 class TestReadTagHook:
-    """Every tag goes to the SDK's ``tag_decoder`` first; only its four failures get a value instead."""
+    """Every tag goes to the SDK's ``tag_decoder`` first; only its five failures get a value instead."""
 
     @pytest.mark.parametrize("case", list(_SDK_FAILURES))
     def test_the_sdk_still_fails_on_each_value(self, case: str) -> None:
@@ -218,6 +241,62 @@ class TestReadTagHook:
         # Plain lists all the way down, as in GeoJSON (the SDK's ``get_coordinates()`` gives tuples).
         assert "(" not in repr(out)
 
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            pytest.param(_datetime(_YEAR_0), "0000-06-01T00:00:00Z", id="year-0"),
+            pytest.param(_datetime(_BEFORE_YEAR_1), "0000-12-31T23:59:59Z", id="second-before-year-1"),
+            pytest.param(_datetime(_YEAR_MINUS_1), "-0001-01-01T00:00:00Z", id="year-minus-1"),
+            pytest.param(_datetime(_LEAP_DAY_MINUS_2000), "-2000-02-29T12:34:56Z", id="leap-day-of-year-minus-2000"),
+            pytest.param(_datetime(_YEAR_10000), "+10000-01-01T00:00:00Z", id="year-10000"),
+            pytest.param(_datetime(_SERVER_MIN), "-262143-01-01T00:00:00Z", id="server-minimum"),
+            pytest.param(_datetime(_SERVER_MAX, 999_999_999), "+262142-12-31T23:59:59.999999999Z", id="server-maximum"),
+            # The fraction keeps every nanosecond, in 3, 6 or 9 digits, as the server writes it.
+            pytest.param(_datetime(_BEFORE_YEAR_1, 999_999_999), "0000-12-31T23:59:59.999999999Z", id="nanoseconds"),
+            pytest.param(_datetime(_YEAR_10000, 120_000), "+10000-01-01T00:00:00.000120Z", id="microseconds"),
+            pytest.param(_datetime(_YEAR_10000, 500_000_000), "+10000-01-01T00:00:00.500Z", id="milliseconds"),
+            pytest.param(_datetime(_YEAR_MINUS_1, 1), "-0001-01-01T00:00:00.000000001Z", id="one-nanosecond"),
+        ],
+    )
+    def test_out_of_range_datetime_reads_as_its_rfc3339_string(self, value: CBORTag, expected: str) -> None:
+        """A datetime before year 1 or after year 9999 reads as the text SurrealDB gives it (``<string>``)."""
+        for out in (_hooked(value), _hooked({"v": [value]})["v"][0]):
+            assert type(out) is str and out == expected
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            pytest.param(_datetime(_YEAR_1), datetime(1, 1, 1, tzinfo=UTC), id="first-second-of-year-1"),
+            pytest.param(
+                _datetime(_YEAR_9999_END, 999_999_999),
+                datetime(9999, 12, 31, 23, 59, 59, 999_999, tzinfo=UTC),
+                id="last-nanosecond-of-year-9999",
+            ),
+            pytest.param(_datetime(-1, 500_000_000), datetime(1969, 12, 31, 23, 59, 59, 500_000, tzinfo=UTC), id="pre-1970"),
+        ],
+    )
+    def test_in_range_datetime_reads_as_the_sdks_datetime(self, value: CBORTag, expected: datetime) -> None:
+        """The two boundaries of Python's range, and a datetime before 1970, decode exactly as the SDK decodes them."""
+        data = _sdk.cbor_encode(value)
+        out = decoding._hooked_decode()(data)  # type: ignore[misc]
+        sdk = _sdk.cbor_decode(data)
+        assert type(out) is datetime and out == expected == sdk and out.tzinfo == sdk.tzinfo
+
+    def test_datetime_text_matches_python_in_its_range(self) -> None:
+        """The hook's calendar arithmetic gives the text of Python's own ``datetime`` wherever Python has one."""
+        moments = [datetime(1, 1, 1, tzinfo=UTC), datetime(9999, 12, 31, 23, 59, 59, tzinfo=UTC)]
+        for year in (1, 4, 99, 100, 400, 1582, 1600, 1700, 1900, 1969, 1970, 2000, 2024, 2100, 9996, 9999):
+            for month, day in ((1, 1), (2, 28), (3, 1), (12, 31)):
+                moments.append(datetime(year, month, day, 23, 59, 59, tzinfo=UTC))
+            if year % 4 == 0 and (year % 100 or year % 400 == 0):
+                moments.append(datetime(year, 2, 29, 12, 0, 0, tzinfo=UTC))
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        for moment in moments:
+            seconds = (moment - epoch) // timedelta(seconds=1)
+            for nanoseconds, fraction in ((0, ""), (1, ".000000001"), (7_000, ".000007"), (120_000_000, ".120")):
+                text = moment.replace(tzinfo=None).isoformat(timespec="seconds") + fraction + "Z"
+                assert decoding._datetime_text(seconds, nanoseconds) == text, moment
+
     def test_values_the_sdk_decodes_come_back_unchanged(self) -> None:
         corpus: list[Any] = [
             None,
@@ -232,6 +311,9 @@ class TestReadTagHook:
             CBORTag(14, [7, 9]),
             datetime(2026, 1, 2, 3, 4, 5, 123456, tzinfo=UTC),
             CBORTag(12, [1_700_000_000, 123_456_789]),
+            _datetime(_YEAR_1),
+            _datetime(_YEAR_9999_END, 999_999_999),
+            _datetime(-1, 500_000_000),
             Decimal("12.50"),
             UUID("0190c3d1-5c3b-7cc6-8f8a-2d2b1f0e9a11"),
             surrealdb.Range(_sdk.BoundIncluded(1), _sdk.BoundExcluded(5)),
@@ -258,6 +340,15 @@ class TestReadTagHook:
             pytest.param(CBORTag(56, 5), BufferError, id="set-tag-without-an-array"),
             pytest.param(CBORTag(14, ["x"]), surrealdb.InvalidDurationError, id="duration-in-another-form"),
             pytest.param(CBORTag(12, []), IndexError, id="empty-compact-datetime"),
+            # A datetime outside years 1-9999 reads as text only in the server's form: two integers,
+            # the nanoseconds within a second. SurrealDB never sends another.
+            pytest.param(CBORTag(12, [_YEAR_0]), IndexError, id="out-of-range-datetime-without-nanoseconds"),
+            pytest.param(CBORTag(12, [_YEAR_0, 0, 0]), ValueError, id="out-of-range-datetime-with-three-parts"),
+            pytest.param(_datetime(_YEAR_0, 1_000_000_000), ValueError, id="out-of-range-datetime-with-a-second-of-ns"),
+            pytest.param(_datetime(_YEAR_0, -1), ValueError, id="out-of-range-datetime-with-negative-ns"),
+            pytest.param(CBORTag(12, [float(_YEAR_0), 0]), ValueError, id="out-of-range-datetime-in-float-seconds"),
+            pytest.param(CBORTag(12, [_YEAR_0, 0.5]), ValueError, id="out-of-range-datetime-with-float-ns"),
+            pytest.param(CBORTag(12, "0000-06-01T00:00:00Z"), TypeError, id="datetime-tag-holding-text"),
             pytest.param(CBORTag(8, []), IndexError, id="record-id-without-parts"),
             # A point is never degenerate, and a geometry's members are geometries, never bare numbers.
             pytest.param(CBORTag(88, [1.0]), IndexError, id="point-with-one-coordinate"),
@@ -336,19 +427,22 @@ def _http_url() -> str:
     return f"http://{os.environ.get('SURREALDB_HOST', 'localhost')}:{os.environ.get('SURREALDB_PORT', '8000')}"
 
 
+#: The capability probes of ``decoding.py``, by the name after ``sdk_decodes_``.
+_PROBES = ("zero_duration", "native_sets", "degenerate_geometries", "out_of_range_datetimes")
+
+
 class TestProbes:
     """The hook is installed only when the installed SDK cannot decode these values (no version check)."""
 
     def test_sdk_2_0_0_needs_the_hook(self) -> None:
-        assert not decoding.sdk_decodes_zero_duration()
-        assert not decoding.sdk_decodes_native_sets()
-        assert not decoding.sdk_decodes_degenerate_geometries()
+        for name in _PROBES:
+            assert not getattr(decoding, f"sdk_decodes_{name}")(), name
         assert decoding.needed() and decoding.available() and decoding.active()
         assert encoding.reads_zero_duration()
 
-    @pytest.mark.parametrize("readable", ["zero-duration", "native-sets", "degenerate-geometries"])
+    @pytest.mark.parametrize("readable", [name.replace("_", "-") for name in _PROBES])
     def test_needed_while_one_value_is_unreadable(self, readable: str, monkeypatch: pytest.MonkeyPatch) -> None:
-        for name in ("zero_duration", "native_sets", "degenerate_geometries"):
+        for name in _PROBES:
             monkeypatch.setattr(decoding, f"sdk_decodes_{name}", lambda: True)
         assert not decoding.needed()
         monkeypatch.setattr(decoding, f"sdk_decodes_{readable.replace('-', '_')}", lambda: False)
@@ -358,23 +452,35 @@ class TestProbes:
     @pytest.mark.parametrize("name", ["cbor_decode", "cbor_encode"])
     def test_probes_answer_false_without_a_codec(self, name: str, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(_sdk, name, None)
-        assert not decoding.sdk_decodes_zero_duration()
-        assert not decoding.sdk_decodes_native_sets()
-        assert not decoding.sdk_decodes_degenerate_geometries()
+        for probe in _PROBES:
+            assert not getattr(decoding, f"sdk_decodes_{probe}")(), probe
 
     @pytest.mark.usefixtures("fresh_caches")
     def test_probes_answer_true_when_the_codec_reads_each_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
         hooked = decoding._hooked_decode()  # built from the SDK's decode before the codec is swapped
         assert hooked is not None
         monkeypatch.setattr(_sdk, "cbor_decode", hooked)
-        assert decoding.sdk_decodes_zero_duration()
-        assert decoding.sdk_decodes_native_sets()
-        assert decoding.sdk_decodes_degenerate_geometries()
+        for probe in _PROBES:
+            assert getattr(decoding, f"sdk_decodes_{probe}")(), probe
 
     @pytest.mark.usefixtures("fresh_caches")
     def test_zero_probe_answers_false_on_another_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(_sdk, "cbor_decode", lambda data: surrealdb.Duration(1))
         assert not decoding.sdk_decodes_zero_duration()
+
+    @pytest.mark.usefixtures("fresh_caches")
+    @pytest.mark.parametrize("unreadable", [_BEFORE_YEAR_1, _YEAR_10000], ids=["year-0", "year-10000"])
+    def test_datetime_probe_answers_false_unless_both_ends_read(self, unreadable: int, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A codec that reads a datetime before year 1 but not one after year 9999 (or the reverse) still needs the hook."""
+
+        def reads_one_end(data: bytes) -> Any:
+            tag = surrealdb.cbor.loads(data)  # no tag hook: the datetime stays a ``CBORTag``
+            if tag.value[0] == unreadable:
+                raise ValueError("year is out of range")
+            return "a datetime"
+
+        monkeypatch.setattr(_sdk, "cbor_decode", reads_one_end)
+        assert not decoding.sdk_decodes_out_of_range_datetimes()
 
 
 class TestSdkLayout:
@@ -416,6 +522,7 @@ class TestSdkLayout:
         assert sdk_tags == decoding._GEOMETRY_TYPES
         assert decoding.TAG_SET == 56
         assert decoding.TAG_SET not in vars(surrealdb.data.types.constants).values()  # SDK 2.0.0 has none
+        assert _sdk.TAG_DATETIME_COMPACT == surrealdb.TAG_DATETIME_COMPACT == 12
 
 
 class TestInstall:
@@ -443,7 +550,7 @@ class TestInstall:
         assert not expected & set(vars(AsyncSurreal(url)))
 
     def test_not_installed_when_the_sdk_decodes_every_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        for name in ("zero_duration", "native_sets", "degenerate_geometries"):
+        for name in _PROBES:
             monkeypatch.setattr(decoding, f"sdk_decodes_{name}", lambda: True)
         client = AsyncSurreal("http://localhost:1")
         assert not decoding.active()
@@ -481,6 +588,8 @@ _VALUES: dict[str, tuple[str, bool]] = {
     "line-1-point": ("{type: 'LineString', coordinates: [[1, 2]]}", True),
     "multiline-with-a-1-point-line": ("{type: 'MultiLineString', coordinates: [[[1, 2]], [[3, 4], [5, 6]]]}", True),
     "polygon-3-point-ring": ("{type: 'Polygon', coordinates: [[[0, 0], [1, 0], [0, 0]]]}", True),
+    "datetime-year-0": ("d'0000-06-01T00:00:00Z'", True),
+    "datetime-year-10000": ("d'9999-12-31T23:59:59Z' + 1s", True),  # 2.x does not parse d'+10000-…'
 }
 
 #: What an untyped field reads for each value.
@@ -491,6 +600,8 @@ _UNTYPED: dict[str, Callable[[Any], bool]] = {
     "line-1-point": lambda v: v == {"type": "LineString", "coordinates": [[1, 2]]},
     "multiline-with-a-1-point-line": lambda v: v == {"type": "MultiLineString", "coordinates": [[[1, 2]], [[3, 4], [5, 6]]]},
     "polygon-3-point-ring": lambda v: v == {"type": "Polygon", "coordinates": [[[0, 0], [1, 0], [0, 0]]]},
+    "datetime-year-0": lambda v: type(v) is str and v == "0000-06-01T00:00:00Z",
+    "datetime-year-10000": lambda v: type(v) is str and v == "+10000-01-01T00:00:00Z",
 }
 
 
@@ -577,8 +688,17 @@ class DcPolygon(BaseSurrealModel):
     v: GeometryPolygon | None = None
 
 
+class DcDatetime(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="dc_value")
+
+    id: str | None = None
+    name: str = ""
+    v: datetime | None = None
+
+
 #: The typed models of each value and what they read: the value, or ``ValidationError`` for a
-#: degenerate geometry (the ORM's geometry classes refuse those by design).
+#: degenerate geometry (the ORM's geometry classes refuse those by design) and for a datetime outside
+#: years 1-9999 (a Python ``datetime`` cannot hold it).
 _TYPED: dict[str, list[tuple[type[BaseSurrealModel], Any]]] = {
     "zero-0s": [(DcDelta, timedelta(0)), (DcDuration, Duration(0))],
     "zero-0ns": [(DcDelta, timedelta(0)), (DcDuration, Duration(0))],
@@ -586,6 +706,8 @@ _TYPED: dict[str, list[tuple[type[BaseSurrealModel], Any]]] = {
     "line-1-point": [(DcLine, ValidationError)],
     "multiline-with-a-1-point-line": [(DcMultiLine, ValidationError)],
     "polygon-3-point-ring": [(DcPolygon, ValidationError)],
+    "datetime-year-0": [(DcDatetime, ValidationError)],
+    "datetime-year-10000": [(DcDatetime, ValidationError)],
 }
 
 
@@ -724,8 +846,36 @@ class TestUndecodableReadsE2E:
                 assert not anonymous.recv_task.done()
 
 
+#: Datetimes outside years 1-9999 in SurrealQL that both lines parse (2.x has no ``d'+10000-…'``).
+_OUT_OF_RANGE_DATETIMES = (
+    "d'0000-06-01T00:00:00Z'",
+    "d'0001-01-01T00:00:00Z' - 1ns",
+    "d'0001-01-01T00:00:00Z' - 500ms",
+    "d'-0001-01-01T00:00:00.000001Z'",
+    "d'-2000-02-29T12:34:56Z'",
+    "d'9999-12-31T23:59:59.999999999Z' + 1ns",
+    "d'9999-12-31T23:59:59Z' + 1000y + 120us",
+)
+
+
+class TestOutOfRangeDatetimeTextE2E:
+    """A datetime outside years 1-9999 reads as the text the server itself gives it (``<string>``)."""
+
+    @pytest.mark.asyncio
+    async def test_the_text_is_the_servers(self) -> None:
+        async with _orm("ws") as client:
+            for literal in _OUT_OF_RANGE_DATETIMES:
+                value, text = await client.query(f"RETURN [{literal}, <string> ({literal})];", {})
+                assert type(value) is str and value == text, (literal, value, text)
+            # In range, the SDK's datetime as before: the first and the last second Python holds.
+            first, last = await client.query("RETURN [d'0001-01-01T00:00:00Z', d'9999-12-31T23:59:59.999999999Z'];", {})
+            assert first == datetime(1, 1, 1, tzinfo=UTC)
+            assert last == datetime(9999, 12, 31, 23, 59, 59, 999_999, tzinfo=UTC)
+            await _assert_client_keeps_working(client)
+
+
 async def _stored_is(client: Any, kind: str) -> bool:
-    """Whether ``dc_value:one.v`` is stored as a value of *kind* (``geometry``, ``object``, ``array``).
+    """Whether ``dc_value:one.v`` is stored as a value of *kind* (``geometry``, ``object``, ``array``, ``string``).
 
     SurrealDB 3.x names the check ``type::is_<kind>``, 2.x ``type::is::<kind>``.
     """
@@ -740,13 +890,16 @@ _WRITTEN_BACK_AS: dict[str, str] = {
     "multiline-with-a-1-point-line": "object",
     "polygon-3-point-ring": "object",
     "native-set": "array",
+    "datetime-year-0": "string",
+    "datetime-year-10000": "string",
 }
 
 
 class TestWriteBackE2E:
     """Written back through the ORM, a value the hook read is stored the way the ORM writes it: a
-    degenerate geometry's GeoJSON dict as a plain object, a native set as an array (the ORM never
-    writes a degenerate geometry or a native set)."""
+    degenerate geometry's GeoJSON dict as a plain object, a native set as an array, a datetime outside
+    years 1-9999 as its text (the ORM never writes a degenerate geometry, a native set or such a
+    datetime)."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("write", ["merge", "update"])

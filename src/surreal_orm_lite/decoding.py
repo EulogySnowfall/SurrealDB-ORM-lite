@@ -3,21 +3,26 @@
 Not part of the public API — nothing here is exported by ``surreal_orm_lite``.
 
 The surrealdb SDK 2.0.0 decodes every response in its connection modules with its CBOR
-``tag_decoder``, which raises on four kinds of values SurrealDB returns:
+``tag_decoder``, which raises on five kinds of values SurrealDB returns:
 
 * a zero duration (CBOR tag 14 with an empty compact form): ``IndexError``;
 * a SurrealDB 3.x native set (tag 56): ``BufferError``;
 * a ``LineString`` of fewer than 2 points, alone or inside another geometry: ``TypeError``;
-* a ``Polygon`` ring of fewer than 4 points: ``InvalidGeometryError``.
+* a ``Polygon`` ring of fewer than 4 points: ``InvalidGeometryError``;
+* a datetime before ``0001-01-01T00:00:00Z`` or after ``9999-12-31T23:59:59.999999999Z`` (tag 12, the
+  years a Python ``datetime`` holds), which SurrealDB stores from year -262143 to +262142 (#279):
+  ``ValueError``.
 
 One such value fails the whole response it is in. ``read_tag_hook`` wraps the SDK's ``tag_decoder``:
-every tag goes to it first, and only these four failures get a value instead of the error — the SDK's
+every tag goes to it first, and only these five failures get a value instead of the error — the SDK's
 ``Duration(0)``, a Python ``set`` (a ``list`` when an item is unhashable or two items are equal in
-Python, like ``1`` and ``true``) and the geometry's GeoJSON ``dict`` (``{"type": …, "coordinates":
-…}``, or ``"geometries"`` for a collection), which a geometry field validates or refuses clearly.
-Any other failure is raised as the SDK raises it (a degenerate member beside a member of another
-kind, which SurrealDB never sends, raises ``TypeError``), and every value the SDK decodes comes back
-unchanged.
+Python, like ``1`` and ``true``), the geometry's GeoJSON ``dict`` (``{"type": …, "coordinates":
+…}``, or ``"geometries"`` for a collection), which a geometry field validates or refuses clearly, and
+the datetime's RFC 3339 text as SurrealDB writes it (``"0000-06-01T00:00:00Z"``,
+``"+10000-01-01T00:00:00.500Z"``), which a ``datetime`` field refuses clearly. Any other failure is
+raised as the SDK raises it (a degenerate member beside a member of another kind, or a datetime not
+in the server's ``[seconds, nanoseconds]`` form, which SurrealDB never sends, raises), and every value
+the SDK decodes comes back unchanged: a datetime within years 1-9999 is the SDK's ``datetime``.
 
 ``install(client)`` gives the hook to one client, the one ``ConnectionManager._open_client`` has just
 built. SDK 2.0.0 has no per-client hook: each connection module binds ``decode`` at module level and
@@ -51,6 +56,7 @@ __all__ = [
     "read_tag_hook",
     "sdk_decodes_degenerate_geometries",
     "sdk_decodes_native_sets",
+    "sdk_decodes_out_of_range_datetimes",
     "sdk_decodes_zero_duration",
 ]
 
@@ -86,18 +92,29 @@ _DECODING_METHODS: Final = ("_recv_task", "_send")
 
 _UNHANDLED: Final = object()
 
+_NS_PER_SECOND: Final = 1_000_000_000
+_SECONDS_PER_DAY: Final = 86_400
+#: The first and the last second a Python ``datetime`` holds: 0001-01-01T00:00:00Z and
+#: 9999-12-31T23:59:59Z, in seconds since 1970-01-01T00:00:00Z.
+_FIRST_SECOND: Final = -62_135_596_800
+_LAST_SECOND: Final = 253_402_300_799
+#: Days from 0000-03-01 to 1970-01-01, and in a 400-year cycle of the proleptic Gregorian calendar.
+_DAYS_TO_EPOCH: Final = 719_468
+_DAYS_PER_ERA: Final = 146_097
+
 
 # --- the tag hook --------------------------------------------------------------------------------
 
 
 def read_tag_hook(decoder: Any, tag: Any) -> Any:
-    """The SDK's ``tag_decoder``, except that the four values SDK 2.0.0 refuses are read.
+    """The SDK's ``tag_decoder``, except that the five values SDK 2.0.0 refuses are read.
 
-    *tag* goes to the SDK's ``tag_decoder`` first. When that raises, a zero duration, a native set
-    or a degenerate geometry is read (see the module docstring); anything else re-raises the SDK's
-    error. A geometry the SDK built around a member read as GeoJSON (a collection or a multi-line
-    holding a degenerate line) is returned as GeoJSON too, since an SDK geometry cannot hold it; one
-    whose members are of another kind, a value SurrealDB never sends, raises ``TypeError``.
+    *tag* goes to the SDK's ``tag_decoder`` first. When that raises, a zero duration, a native set,
+    a degenerate geometry or a datetime outside years 1-9999 is read (see the module docstring);
+    anything else re-raises the SDK's error. A geometry the SDK built around a member read as
+    GeoJSON (a collection or a multi-line holding a degenerate line) is returned as GeoJSON too,
+    since an SDK geometry cannot hold it; one whose members are of another kind, a value SurrealDB
+    never sends, raises ``TypeError``.
     """
     sdk_tag_decoder: Callable[[Any, Any], Any] = _sdk.cbor_tag_decoder
     try:
@@ -133,7 +150,65 @@ def _fallback(tag: Any) -> Any:
             return _geojson(tag)
         except TypeError:  # a malformed value, or a point: the SDK's error stands
             return _UNHANDLED
+    if number == _sdk.TAG_DATETIME_COMPACT and _is_compact_datetime(value):
+        # #279: keep while the SDK reads tag 12 into a Python ``datetime`` (SDK 2.0.0 and 3.0.0b10 do),
+        # which holds years 1-9999 only. Within them, the SDK's error stands.
+        seconds, nanoseconds = value
+        if not _FIRST_SECOND <= seconds <= _LAST_SECOND:
+            return _datetime_text(seconds, nanoseconds)
     return _UNHANDLED
+
+
+def _is_compact_datetime(value: Any) -> bool:
+    """Whether *value* is the server's compact datetime: ``[seconds, nanoseconds]``, two integers, the
+    nanoseconds within a second."""
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return False
+    if not all(isinstance(part, int) and not isinstance(part, bool) for part in value):
+        return False
+    return bool(0 <= value[1] < _NS_PER_SECOND)
+
+
+def _datetime_text(seconds: int, nanoseconds: int) -> str:
+    """The RFC 3339 text SurrealDB writes for the UTC datetime ``seconds`` + ``nanoseconds`` after 1970.
+
+    Integer arithmetic on the proleptic Gregorian calendar, year 0 included (a Python ``datetime`` holds
+    years 1-9999 only). The server's own form (``<string>``): a year within 0000-9999 has four digits,
+    any other a sign and at least four (``-0001``, ``+10000``); the fraction has 3, 6 or 9 digits, the
+    fewest that keep every nanosecond, and is left out when zero.
+    """
+    days, second_of_day = divmod(seconds, _SECONDS_PER_DAY)
+    year, month, day = _civil_date(days)
+    hour, rest = divmod(second_of_day, 3600)
+    minute, second = divmod(rest, 60)
+    year_text = f"{year:04d}" if 0 <= year <= 9999 else f"{year:+05d}"
+    if nanoseconds == 0:
+        fraction = ""
+    elif nanoseconds % 1_000_000 == 0:
+        fraction = f".{nanoseconds // 1_000_000:03d}"
+    elif nanoseconds % 1_000 == 0:
+        fraction = f".{nanoseconds // 1_000:06d}"
+    else:
+        fraction = f".{nanoseconds:09d}"
+    return f"{year_text}-{month:02d}-{day:02d}T{hour:02d}:{minute:02d}:{second:02d}{fraction}Z"
+
+
+def _civil_date(days: int) -> tuple[int, int, int]:
+    """The proleptic Gregorian ``(year, month, day)`` *days* after 1970-01-01, for any integer.
+
+    Howard Hinnant's ``civil_from_days``: the year starts on March 1st, so the leap day ends it, and
+    a 400-year cycle (an era) always holds 146097 days. Python's floor division keeps it exact before
+    year 0.
+    """
+    shifted = days + _DAYS_TO_EPOCH
+    era, day_of_era = divmod(shifted, _DAYS_PER_ERA)  # day_of_era: 0 … 146096
+    year_of_era = (day_of_era - day_of_era // 1460 + day_of_era // 36524 - day_of_era // 146096) // 365  # 0 … 399
+    day_of_year = day_of_era - (365 * year_of_era + year_of_era // 4 - year_of_era // 100)  # 0 … 365, from March 1st
+    shifted_month = (5 * day_of_year + 2) // 153  # 0 … 11, March first
+    day = day_of_year - (153 * shifted_month + 2) // 5 + 1
+    month = shifted_month + 3 if shifted_month < 10 else shifted_month - 9
+    year = year_of_era + era * 400 + (1 if month <= 2 else 0)
+    return year, month, day
 
 
 def _set_of(items: list[Any] | tuple[Any, ...]) -> set[Any] | list[Any]:
@@ -263,9 +338,30 @@ def sdk_decodes_degenerate_geometries() -> bool:
     return True
 
 
+@functools.cache
+def sdk_decodes_out_of_range_datetimes() -> bool:
+    """Whether the installed SDK reads a datetime before year 1 and one after year 9999; same rules.
+
+    Round-trips ``0000-12-31T23:59:59Z`` and ``+10000-01-01T00:00:00Z`` (CBOR tag 12, the server's
+    ``[seconds, nanoseconds]``), the two seconds just outside a Python ``datetime``, and answers ``True``
+    only when the SDK decodes both.
+    """
+    try:
+        _sdk_round_trip(_sdk.CBORTag(_sdk.TAG_DATETIME_COMPACT, [_FIRST_SECOND - 1, 0]))
+        _sdk_round_trip(_sdk.CBORTag(_sdk.TAG_DATETIME_COMPACT, [_LAST_SECOND + 1, 0]))
+    except Exception:
+        return False
+    return True
+
+
 def needed() -> bool:
     """Whether the installed SDK fails to decode at least one of the values the hook reads."""
-    return not (sdk_decodes_zero_duration() and sdk_decodes_native_sets() and sdk_decodes_degenerate_geometries())
+    return not (
+        sdk_decodes_zero_duration()
+        and sdk_decodes_native_sets()
+        and sdk_decodes_degenerate_geometries()
+        and sdk_decodes_out_of_range_datetimes()
+    )
 
 
 # --- installation ----------------------------------------------------------------------------------
