@@ -1602,6 +1602,19 @@ class TestBufferedPositionUnits:
         message = await self._commit_error(queued, _parse_error(position, "…"))
         assert message.startswith("Transaction failed: the server refused " + expected.format(r=_REASON)), message
 
+    @pytest.mark.asyncio
+    async def test_a_position_on_the_commit_line_falls_back_to_one_in_a_statement(self) -> None:
+        """An unclosed delimiter in the last statement is reported on the ``COMMIT`` line first, then where it opens."""
+        message = (
+            "Parse error: Unexpected token `COMMIT` expected delimiter `}`\n --> [4:1]\n  |\n4 | COMMIT TRANSACTION;\n"
+            "  | ^^^^^^\n --> [3:8]\n  |\n3 | RETURN { a: 1\n  |        ^ expected this delimiter to close\n"
+        )
+        error = await self._commit_error([("CREATE a:1;", None), ("RETURN { a: 1", None)], message)
+        assert error == (
+            "Transaction failed: the server refused statement 2 of 2: Parse error: Unexpected token `COMMIT` expected "
+            "delimiter `}` (at line 1, column 8 of the statement)"
+        )
+
 
 class _RaisingClient:
     """A client whose ``query_raw()`` raises *error* (not the embedded engine)."""
@@ -1689,6 +1702,21 @@ class TestBufferedCommitErrorTextE2E:
                     await tx.add(statement, {"v": 2})
             column = statement.index("oops") + 1
             assert str(info.value).endswith(f"(at line 1, column {column} of the statement)"), str(info.value)
+
+    @pytest.mark.asyncio
+    async def test_an_unclosed_last_statement_is_named(self, transport: str) -> None:
+        """The server reports the unclosed delimiter on the ``COMMIT`` line first: the statement is still named."""
+        async with _tx_fail_db(transport):
+            if transport == "ws" and await _native_txn_supported():
+                pytest.skip("WebSocket on SurrealDB 3.x runs interactive transactions")
+            with pytest.raises(SurrealDbError) as info:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    await tx.add("RETURN { a: 1")
+                    queued = len(tx.statements)
+            message = str(info.value)
+            assert message.startswith(f"Transaction failed: the server refused statement {queued} of {queued}: "), message
+            assert message.endswith("(at line 1, column 8 of the statement)"), message
 
     @pytest.mark.asyncio
     async def test_a_parse_error_quoting_conflict_words_is_not_a_conflict(self, transport: str) -> None:

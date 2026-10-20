@@ -88,17 +88,18 @@ def _error_type(server_text: str) -> type[SurrealDbError]:
     return SurrealDbConflictError if is_conflict_error(SurrealDbError(server_text)) else SurrealDbError
 
 
-def _server_reason(message: str) -> tuple[str, tuple[int, int] | None]:
-    """The server's reason in *message*, without any of the query's text, and the position it gives (issue #278).
+def _server_reason(message: str) -> tuple[str, list[tuple[int, int]]]:
+    """The server's reason in *message*, without any of the query's text, and the positions it gives (issue #278).
 
     A message that quotes the query — a parse error, from `` --> [line:column]`` on, and on some errors in the lines
-    before it too (a regex's) — is cut to its first line, and its line and column are returned. Any other message is
-    the reason as it is, with no position.
+    before it too (a regex's) — is cut to its first line, and every line and column it gives is returned, in order
+    (an unclosed delimiter gives where the parser stopped, then where the delimiter opens). Any other message is the
+    reason as it is, with no position.
     """
-    excerpt = _QUERY_EXCERPT.search(message)
-    if excerpt is None:
-        return message, None
-    return message.partition("\n")[0].rstrip(), (int(excerpt[1]), int(excerpt[2]))
+    positions = [(int(found[1]), int(found[2])) for found in _QUERY_EXCERPT.finditer(message)]
+    if not positions:
+        return message, []
+    return message.partition("\n")[0].rstrip(), positions
 
 
 def _refusal(message: str, locate: _Locate | None = None) -> SurrealDbError:
@@ -107,17 +108,19 @@ def _refusal(message: str, locate: _Locate | None = None) -> SurrealDbError:
     ``Transaction failed: the server refused <what>: <reason> (at line <l>, column <c> of <where>)``: the reason is
     :func:`_server_reason`'s, never the query's text. With *locate* (a buffered batch), the position names the queued
     statement, ``statement 2 of 3``, with the line and column in the text the caller queued; without it, the position
-    is the statement's (an interactive transaction runs one at a time). ``SurrealDbConflictError`` when the reason
-    reports a retryable conflict: the excerpt, which may quote conflict words, is not read.
+    is the statement's (an interactive transaction runs one at a time). Of the positions the server gives, the first
+    that falls in a queued statement is used (a statement left unclosed is reported on the ``COMMIT`` line first),
+    else the first. ``SurrealDbConflictError`` when the reason reports a retryable conflict: the excerpt, which may
+    quote conflict words, is not read.
     """
-    reason, position = _server_reason(message)
+    reason, positions = _server_reason(message)
     error_type = _error_type(reason)
-    if position is None:
+    if not positions:
         return error_type(f"Transaction failed: the server refused the query: {reason}")
-    line, column = position
+    line, column = positions[0]
     what, where = "the statement", "the statement"
     if locate is not None:
-        found = locate(line, column)
+        found = next((place for place in (locate(*position) for position in positions) if place is not None), None)
         if found is None:
             what, where = "the query", "the query"
         else:
@@ -172,11 +175,11 @@ def _raise_for_status(raw: Any, locate: _Locate | None = None) -> None:
         or errors[0]
     )
     message = str(root.get("result") or "transaction failed")
-    reason, position = _server_reason(message)
+    reason, positions = _server_reason(message)
     # Type retryable conflicts so callers / retry_on_conflict can catch them, from the reason alone (#278): a real
     # conflict has no excerpt, and an excerpt may quote conflict words.
     error = _error_type(reason)(f"Transaction failed and rolled back: {reason}")
-    if position is None:
+    if not positions:
         raise error
     _raise_hiding(error, message)
 
