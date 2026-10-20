@@ -27,9 +27,12 @@ from .routing import check_config_connection, check_same_connection, check_trans
 from .schema import (
     Event,
     check_events_config,
+    check_view_config,
+    check_view_query,
     ensure_async_events_supported,
     event_subject,
     remove_event_statement,
+    view_statement,
 )
 from .signals import (
     around_delete,
@@ -553,6 +556,12 @@ class SurrealConfigDict(ConfigDict, total=False):
             every model option. Checked when the class is defined (a ``list`` or ``tuple`` of
             ``Event`` with distinct names), inherited by subclasses unless they set their own — a
             subclass with another table defines the same events on its own table.
+        view_query (str | None): The SELECT of a materialized view (v0.32.0) — SurrealDB's
+            DEFINE TABLE … AS SELECT: the model's table is computed by the server from this query
+            and kept up to date as its source tables change. Full SurrealDB-ORM key. Checked when
+            the class is defined; applied by define_view(); every write of the model raises
+            TypeError. Inherited by subclasses unless they set their own (view_query=None makes a
+            subclass an ordinary model).
     """
 
     table_name: str | None
@@ -563,6 +572,9 @@ class SurrealConfigDict(ConfigDict, total=False):
 
     events: Sequence[Event] | None
     " Server-side events of the model's table (v0.31.0): Event(...) objects, applied by define_events(). "
+
+    view_query: str | None
+    " A materialized view's SELECT (v0.32.0): the model reads a table SurrealDB computes from it; its writes raise. Full SurrealDB-ORM key. "
 
     primary_key: str | None
     " The primary key field name for the model. "
@@ -692,7 +704,10 @@ class BaseSurrealModel(BaseModel):
         ``get_table_name()`` is interpolated into SurrealQL. The ``connection`` key (v0.29.0) is
         checked here too: a non-empty ``str``, or ``None`` for the default connection. So is the
         ``events`` key (v0.31.0): ``None``, or a ``list`` or ``tuple`` of ``Event`` with distinct
-        names — an inherited value is checked again, the messages naming the subclass.
+        names — an inherited value is checked again, the messages naming the subclass. So is the
+        ``view_query`` key (v0.32.0): ``None``, or one ``SELECT`` (``schema.check_view_query()``)
+        on a model that is not an edge, does not mix in ``AuthenticatedUserMixin`` and declares no
+        computed field (``schema.check_view_config()``) — inherited values included.
 
         The deprecated ``_table_name: ClassVar[str]`` is checked the same way and warns once,
         where it is defined — a subclass inheriting it does not warn again.
@@ -707,6 +722,18 @@ class BaseSurrealModel(BaseModel):
         events = cls.model_config.get("events")
         if events is not None:
             check_events_config(cls, events)
+        view_query = cls.model_config.get("view_query")
+        if view_query is not None:
+            # Imported here, only for a view model: model_auth sits above this module.
+            from .model_auth import AuthenticatedUserMixin
+
+            check_view_config(
+                cls,
+                view_query,
+                edge=cls.__surreal_edge__,
+                user=issubclass(cls, AuthenticatedUserMixin),
+                computed=tuple(cls.__surreal_computed__),
+            )
         legacy = cls.__dict__.get("_table_name")
         if isinstance(legacy, str):
             _check_table_name(cls, "_table_name", legacy)
@@ -923,6 +950,79 @@ class BaseSurrealModel(BaseModel):
             subjects=[event_subject(event, table)],
         )
         return statement
+
+    # ==================== Materialized views (v0.32.0) ====================
+
+    @classmethod
+    def get_view_query(cls) -> str | None:
+        """Return the ``SELECT`` of this model's materialized view, or ``None`` for an ordinary model (v0.32.0).
+
+        A model with ``model_config = SurrealConfigDict(view_query="SELECT …")`` reads a table SurrealDB computes
+        from that query (``DEFINE TABLE … AS SELECT``) and keeps up to date as the tables it selects from change;
+        every write of the model raises ``TypeError`` — write to those tables instead. The query is returned
+        stripped, one final ``;`` dropped: the text :meth:`view_ddl` embeds. A subclass inherits it unless it sets
+        its own (``view_query=None`` makes the subclass an ordinary model).
+        """
+        value = cls.model_config.get("view_query")
+        if value is None:
+            return None
+        # Checked at the class statement, so this only strips the text.
+        return check_view_query(value, model=cls.__name__)
+
+    @classmethod
+    def _is_view(cls) -> bool:
+        """``True`` when the model is a materialized view — ``view_query`` is set (v0.32.0; the full ORM's name).
+
+        The same answer as ``get_view_query() is not None``, without reading the query again: ``view_query`` was
+        checked when the class was defined.
+        """
+        return cls.model_config.get("view_query") is not None
+
+    @classmethod
+    def _require_view(cls, method: str) -> str:
+        """The model's view query (:meth:`get_view_query`), or V11 naming *method* (``"view_ddl()"``) (v0.32.0).
+
+        Raises:
+            TypeError: the model is not a materialized view (no ``view_query``).
+        """
+        query = cls.get_view_query()
+        if query is None:
+            raise TypeError(
+                f'{cls.__name__} is not a materialized view: set model_config = SurrealConfigDict(view_query="SELECT …") '
+                f"to use {method}."
+            )
+        return query
+
+    @classmethod
+    def view_ddl(cls, *, overwrite: bool = True) -> str:
+        """Render the ``DEFINE TABLE … AS (…)`` statement of this materialized view (v0.32.0).
+
+        Pure: builds the SurrealQL without touching the database (no connection needed), the same text every time,
+        so it can be printed, diffed or fed into a migration. ``DEFINE TABLE {OVERWRITE | IF NOT EXISTS} `<table>`
+        AS (<query>);`` — the table of :meth:`get_table_name` in backticks, :meth:`get_view_query` inside one pair
+        of parentheses (the full SurrealDB-ORM's form). SurrealDB computes the view's records from the query and
+        keeps them up to date as the tables it selects from change; every write of the model raises ``TypeError``.
+
+        The query is written into the DDL as declared: a view's query is trusted application code, never user
+        input. The check made when the class was defined catches mistakes — unbalanced brackets, a comment that
+        would swallow the parenthesis the ORM appends, a second statement where one SELECT is expected — and is not
+        an injection defence. To filter on a value, store it in a record or a ``DEFINE PARAM`` and read it from the
+        query; never format it into the text.
+
+        Args:
+            overwrite: ``True`` (default) emits ``DEFINE TABLE OVERWRITE …``, which recomputes the view from the
+                query — the model is the source of truth, so re-running converges the database onto the code.
+                ``False`` emits ``DEFINE TABLE IF NOT EXISTS …``, which leaves an existing table as it is.
+
+        Raises:
+            TypeError: the model is not a materialized view (no ``view_query``); *overwrite* is not a ``bool``.
+
+        Example:
+            >>> OrderStats.view_ddl()
+            'DEFINE TABLE OVERWRITE `order_stats` AS (SELECT status, count() AS total FROM orders GROUP BY status);'
+        """
+        query = cls._require_view("view_ddl()")
+        return view_statement(cls.get_table_name(), query, overwrite)
 
     # ==================== Field aliases & server-owned fields (v0.18.0) ====================
 

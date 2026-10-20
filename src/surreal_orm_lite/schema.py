@@ -35,7 +35,7 @@ it.
 """
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import KW_ONLY, dataclass, field
 from typing import Any, Literal
 
@@ -632,6 +632,40 @@ def check_view_query(value: object, *, model: str) -> str:
                 "use count(), math::sum(), math::mean(), math::min(), math::max(), time::min() or time::max()."
             )
     return text
+
+
+def check_view_config(model: type, value: object, *, edge: bool, user: bool, computed: Sequence[str]) -> None:
+    """The ``view_query`` key of a model's ``SurrealConfigDict``, checked when the class is defined (v0.32.0).
+
+    ``None`` (an ordinary model) is not passed here. *value* goes through :func:`check_view_query` (V1–V7), then the
+    model itself, the messages naming *model*:
+
+    - V8: *edge* — an edge model (``BaseSurrealEdge``): SurrealDB computes a view's records, the ORM never relates them;
+    - V9: *user* — the model mixes in ``AuthenticatedUserMixin``: signing up writes a record;
+    - V10: *computed* — the model's computed field names, in declaration order: a view's columns come from its
+      ``SELECT``.
+
+    :raises TypeError: V1, V8, V9, V10.
+    :raises ValueError: V2–V7.
+    """
+    name = model.__name__
+    check_view_query(value, model=name)
+    if edge:
+        raise TypeError(
+            f"{name}: view_query is not supported on an edge model (BaseSurrealEdge): SurrealDB computes a view's "
+            "records, the ORM never relates them."
+        )
+    if user:
+        raise TypeError(
+            f"{name}: view_query is not supported with AuthenticatedUserMixin: signing up writes a record, and "
+            "SurrealDB computes a view's records."
+        )
+    if computed:
+        names = ", ".join(repr(field_name) for field_name in computed)
+        raise TypeError(
+            f"{name}: view_query is not supported with computed fields ({names}): a view's columns come from its "
+            "SELECT, so compute them there."
+        )
 
 
 def _top_level(text: str) -> tuple[str, str]:

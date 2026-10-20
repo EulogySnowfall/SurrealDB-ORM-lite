@@ -5,18 +5,36 @@ with the exact texts of V1–V7 (spec §5.6; AC-2), the reading of a projection 
 element and ``view_query_hazards()`` on the grouped projections spec §3 measured (spec §6.1) — and the pure statements
 ``view_statement()`` / ``remove_view_statement()`` against the goldens of spec §5.3 (AC-4). The check catches mistakes
 and is not an injection defence: every refused query below is a plain malformed query.
+
+On the model (spec §5.1, §5.2; AC-1, AC-3, AC-4): ``SurrealConfigDict(view_query=…)`` checked at the ``class``
+statement (V1–V10, ``schema.check_view_config()``), ``get_view_query()``, ``_is_view()``, inheritance and
+``view_query=None``, and ``view_ddl()`` — pure, the goldens of spec §5.3, V11, E13, no connection needed.
 """
 
+import inspect
 from typing import Any
 
 import pytest
+from surrealdb import RecordID
 
-from surreal_orm_lite import define_parser
+import surreal_orm_lite
+from surreal_orm_lite import (
+    AuthenticatedUserMixin,
+    BaseSurrealEdge,
+    BaseSurrealModel,
+    Computed,
+    SurrealConfigDict,
+    SurrealDBConnectionManager,
+    computed,
+    define_parser,
+    schema,
+)
 from surreal_orm_lite.define_parser import blank_literals
 from surreal_orm_lite.schema import (
     ViewElement,
     ViewHazard,
     ViewOutline,
+    check_view_config,
     check_view_query,
     remove_view_statement,
     view_query_hazards,
@@ -609,3 +627,383 @@ class TestViewStatements:
             with pytest.raises(error) as raised:
                 render()
             assert str(raised.value) == text
+
+
+# --- the model: SurrealConfigDict(view_query=…) (spec §5.1, §5.2; AC-1, AC-3, AC-4) ---------------------------------
+
+
+class OrderStats(BaseSurrealModel):
+    """The grouped golden of spec §5.3."""
+
+    model_config = SurrealConfigDict(table_name="order_stats", view_query=_STATS_QUERY)
+
+    id: RecordID | None = None
+    status: str
+    total: int
+    revenue: float
+
+
+class PaidOrder(BaseSurrealModel):
+    """The ``WHERE`` golden of spec §5.3: a plain view keeps the source ids."""
+
+    model_config = SurrealConfigDict(table_name="paid_orders", view_query=_PAID_QUERY)
+
+    id: RecordID | None = None
+    customer: str | None = None
+    amount: float
+
+
+class OrderTotals(BaseSurrealModel):
+    """The ``GROUP ALL`` golden of spec §5.3."""
+
+    model_config = SurrealConfigDict(table_name="order_totals", view_query=_TOTALS_QUERY)
+
+    id: RecordID | None = None
+    orders: int
+    revenue: float
+
+
+class SelectView(BaseSurrealModel):
+    """A keyword table name and a query on several lines with a final ``;`` (spec §5.3: rendering only, M20)."""
+
+    model_config = SurrealConfigDict(table_name="select", view_query=_SELECT_QUERY)
+
+    id: RecordID | None = None
+
+
+class PlainOrder(BaseSurrealModel):
+    """An ordinary model: not a view."""
+
+    model_config = SurrealConfigDict(table_name="plain_orders")
+
+    id: str | None = None
+    status: str
+
+
+_STATS_DDL = (
+    "DEFINE TABLE OVERWRITE `order_stats` AS (SELECT status, count() AS total, math::sum(amount) AS revenue FROM orders "
+    "GROUP BY status);"
+)
+
+
+def _v11(model: str, method: str) -> str:
+    return f'{model} is not a materialized view: set model_config = SurrealConfigDict(view_query="SELECT …") to use {method}.'
+
+
+def _v8(model: str) -> str:
+    return (
+        f"{model}: view_query is not supported on an edge model (BaseSurrealEdge): SurrealDB computes a view's records, "
+        "the ORM never relates them."
+    )
+
+
+def _v9(model: str) -> str:
+    return (
+        f"{model}: view_query is not supported with AuthenticatedUserMixin: signing up writes a record, and SurrealDB "
+        "computes a view's records."
+    )
+
+
+def _v10(model: str, names: str) -> str:
+    return (
+        f"{model}: view_query is not supported with computed fields ({names}): a view's columns come from its SELECT, "
+        "so compute them there."
+    )
+
+
+#: ``(value, exception class, text for the model M)`` — one case per query refusal V1–V7, raised at the ``class``
+#: statement (AC-2, AC-3).
+_CLASS_QUERY_ERRORS = [
+    pytest.param(1, TypeError, f"{_KEY} must be a str, got int.", id="V1"),
+    pytest.param("  ", ValueError, _V2, id="V2"),
+    pytest.param("UPDATE t SET a = 1", ValueError, _V3, id="V3"),
+    pytest.param("SELECT * FROM t WHERE (a", ValueError, _v4("its brackets are not balanced"), id="V4"),
+    pytest.param("SELECT 1; SELECT 2", ValueError, _V5, id="V5"),
+    pytest.param("select value a from t", ValueError, _V6, id="V6"),
+    pytest.param("SELECT g, math::median(v) AS m FROM t GROUP BY g", ValueError, _v7("math::median"), id="V7"),
+]
+
+
+class TestViewConfig:
+    """AC-2, AC-3: ``SurrealConfigDict(view_query=…)`` is checked at the ``class`` statement — V1–V7 on the query, then
+    V8 (edge), V9 (``AuthenticatedUserMixin``), V10 (computed fields) — and inherited by subclasses."""
+
+    @pytest.mark.parametrize(("value", "error", "text"), _CLASS_QUERY_ERRORS)
+    def test_query_refused_at_the_class_statement(self, value: object, error: type[Exception], text: str) -> None:
+        with pytest.raises(error) as raised:
+
+            class BadView(BaseSurrealModel):
+                model_config = SurrealConfigDict(table_name="bad_view", view_query=value)  # type: ignore[typeddict-item]
+
+                id: RecordID | None = None
+
+        assert type(raised.value) is error
+        assert str(raised.value) == text.replace("M: ", "BadView: ", 1)
+
+    def test_v8_on_an_edge_model(self) -> None:
+        with pytest.raises(TypeError) as raised:
+
+            class WatchesView(BaseSurrealEdge):
+                model_config = SurrealConfigDict(table_name="watches_view", view_query="SELECT * FROM watches")
+
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _v8("WatchesView")
+
+    def test_the_query_is_checked_before_the_model(self) -> None:
+        """``check_view_query()`` first, then V8–V10 (spec §6.1): an edge with an empty query gets V2."""
+        with pytest.raises(ValueError) as raised:
+
+            class EmptyEdgeView(BaseSurrealEdge):
+                model_config = SurrealConfigDict(table_name="empty_edge_view", view_query=" ; ")
+
+        assert str(raised.value) == _V2.replace("M: ", "EmptyEdgeView: ", 1)
+
+    def test_v9_with_the_mixin_first(self) -> None:
+        with pytest.raises(TypeError) as raised:
+
+            class MemberView(AuthenticatedUserMixin, BaseSurrealModel):
+                model_config = SurrealConfigDict(table_name="member_view", view_query="SELECT * FROM member")
+
+                id: str | None = None
+
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _v9("MemberView")
+
+    def test_v9_with_the_mixin_second(self) -> None:
+        with pytest.raises(TypeError) as raised:
+
+            class MemberView(BaseSurrealModel, AuthenticatedUserMixin):
+                model_config = SurrealConfigDict(table_name="member_view", view_query="SELECT * FROM member")
+
+                id: str | None = None
+
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _v9("MemberView")
+
+    def test_v10_lists_the_computed_fields_in_declaration_order(self) -> None:
+        with pytest.raises(TypeError) as raised:
+
+            class ScoredView(BaseSurrealModel):
+                model_config = SurrealConfigDict(table_name="scored_view", view_query="SELECT * FROM t")
+
+                id: RecordID | None = None
+                a: Computed[int] = computed("1")
+                b: Computed[str] = computed("'x'")
+
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _v10("ScoredView", "'a', 'b'")
+
+    def test_v10_on_a_subclass_adding_a_computed_field(self) -> None:
+        with pytest.raises(TypeError) as raised:
+
+            class ScoredStats(OrderStats):
+                model_config = SurrealConfigDict(table_name="scored_stats")
+
+                score: Computed[float] = computed("revenue / total")
+
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _v10("ScoredStats", "'score'")
+
+    def test_a_c1_hazard_is_accepted_at_the_class_statement(self) -> None:
+        """C1 depends on the connection's line: ``define_view()`` checks it, never the ``class`` statement (D8)."""
+
+        class AverageView(BaseSurrealModel):
+            model_config = SurrealConfigDict(
+                table_name="average_view", view_query="SELECT g, math::sum(v) / count() AS a FROM src GROUP BY g"
+            )
+
+            id: RecordID | None = None
+
+        assert AverageView._is_view() is True
+        assert AverageView.get_view_query() == "SELECT g, math::sum(v) / count() AS a FROM src GROUP BY g"
+
+    def test_get_view_query(self) -> None:
+        assert OrderStats.get_view_query() == _STATS_QUERY
+        assert PaidOrder.get_view_query() == _PAID_QUERY
+        assert OrderTotals.get_view_query() == _TOTALS_QUERY
+        # Stripped, one final ";" dropped, the inner text kept as written.
+        assert SelectView.get_view_query() == "select * from orders\n  where amount > 1"
+        assert PlainOrder.get_view_query() is None
+        assert BaseSurrealModel.get_view_query() is None
+
+    def test_is_view(self) -> None:
+        for model in (OrderStats, PaidOrder, OrderTotals, SelectView):
+            assert model._is_view() is True, model.__name__
+        for ordinary in (PlainOrder, BaseSurrealModel, BaseSurrealEdge):
+            assert ordinary._is_view() is False, ordinary.__name__
+
+    def test_a_subclass_inherits_view_query(self) -> None:
+        class ArchivedStats(OrderStats):
+            model_config = SurrealConfigDict(table_name="archived_stats")
+
+        assert ArchivedStats._is_view() is True
+        assert ArchivedStats.get_view_query() == _STATS_QUERY
+        assert ArchivedStats.view_ddl() == _STATS_DDL.replace("`order_stats`", "`archived_stats`")
+        # The parent is unchanged.
+        assert OrderStats.view_ddl() == _STATS_DDL
+
+    def test_a_subclass_without_its_own_table_reads_the_same_view(self) -> None:
+        class StatsAgain(OrderStats):
+            pass
+
+        assert StatsAgain._is_view() is True
+        assert StatsAgain.view_ddl() == _STATS_DDL
+
+    def test_view_query_none_makes_a_subclass_ordinary(self) -> None:
+        class OrdinaryStats(OrderStats):
+            model_config = SurrealConfigDict(table_name="ordinary_stats", view_query=None)
+
+            score: Computed[float] = computed("revenue / total")
+
+        assert OrdinaryStats._is_view() is False
+        assert OrdinaryStats.get_view_query() is None
+        with pytest.raises(TypeError) as raised:
+            OrdinaryStats.view_ddl()
+        assert str(raised.value) == _v11("OrdinaryStats", "view_ddl()")
+        # Its subclass may set a view again.
+        assert OrderStats._is_view() is True
+
+    def test_an_ordinary_model_is_unaffected(self) -> None:
+        class ComputedOrder(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="computed_orders")
+
+            id: str | None = None
+            amount: float
+            doubled: Computed[float] = computed("amount * 2")
+
+        assert ComputedOrder._is_view() is False
+        assert ComputedOrder.get_computed_fields() == {"doubled": "amount * 2"}
+
+
+class _Probe:
+    """A stand-in model class for :func:`check_view_config` called directly."""
+
+
+class TestCheckViewConfig:
+    """Spec §6.1: ``check_view_config()`` — the query, then V8, V9, V10, each naming the model."""
+
+    def test_returns_none_for_an_accepted_view(self) -> None:
+        assert check_view_config(_Probe, _STATS_QUERY, edge=False, user=False, computed=()) is None
+
+    @pytest.mark.parametrize(
+        ("options", "text"),
+        [
+            ({"edge": True, "user": False, "computed": ()}, _v8("_Probe")),
+            ({"edge": False, "user": True, "computed": ()}, _v9("_Probe")),
+            ({"edge": False, "user": False, "computed": ("x", "y")}, _v10("_Probe", "'x', 'y'")),
+            # The first refusal wins: V8, then V9, then V10.
+            ({"edge": True, "user": True, "computed": ("x",)}, _v8("_Probe")),
+            ({"edge": False, "user": True, "computed": ("x",)}, _v9("_Probe")),
+        ],
+    )
+    def test_model_refusals(self, options: dict[str, Any], text: str) -> None:
+        with pytest.raises(TypeError) as raised:
+            check_view_config(_Probe, _STATS_QUERY, **options)
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == text
+
+    def test_the_query_first(self) -> None:
+        with pytest.raises(TypeError) as raised:
+            check_view_config(_Probe, 1, edge=True, user=True, computed=("x",))
+        assert str(raised.value) == "_Probe: model_config['view_query'] must be a str, got int."
+
+
+#: ``(model, overwrite, statement)`` — the goldens of spec §5.3 through ``view_ddl()``.
+_MODEL_GOLDENS = [
+    pytest.param(OrderStats, True, _STATS_DDL, id="grouped"),
+    pytest.param(
+        OrderStats,
+        False,
+        "DEFINE TABLE IF NOT EXISTS `order_stats` AS (SELECT status, count() AS total, math::sum(amount) AS revenue FROM "
+        "orders GROUP BY status);",
+        id="grouped-if-not-exists",
+    ),
+    pytest.param(
+        PaidOrder,
+        True,
+        "DEFINE TABLE OVERWRITE `paid_orders` AS (SELECT customer, amount FROM orders WHERE status = 'paid');",
+        id="where",
+    ),
+    pytest.param(
+        OrderTotals,
+        True,
+        "DEFINE TABLE OVERWRITE `order_totals` AS (SELECT count() AS orders, math::sum(amount) AS revenue FROM orders "
+        "GROUP ALL);",
+        id="group-all",
+    ),
+    pytest.param(
+        SelectView, True, "DEFINE TABLE OVERWRITE `select` AS (select * from orders\n  where amount > 1);", id="select"
+    ),
+]
+
+
+def _keyword(name: str, annotation: Any, default: Any) -> inspect.Parameter:
+    return inspect.Parameter(name, inspect.Parameter.KEYWORD_ONLY, default=default, annotation=annotation)
+
+
+class TestViewDdl:
+    """AC-1, AC-4: ``view_ddl()`` is pure — the goldens of spec §5.3, deterministic, no connection — with V11 on an
+    ordinary model and E13 for a non-``bool`` ``overwrite``; the signatures of spec §5.2."""
+
+    @pytest.mark.parametrize(("model", "overwrite", "statement"), _MODEL_GOLDENS)
+    def test_golden_statements(self, model: type[BaseSurrealModel], overwrite: bool, statement: str) -> None:
+        assert model.view_ddl(overwrite=overwrite) == statement
+
+    def test_overwrite_by_default(self) -> None:
+        assert OrderStats.view_ddl() == OrderStats.view_ddl(overwrite=True) == _STATS_DDL
+
+    def test_deterministic(self) -> None:
+        assert [OrderStats.view_ddl() for _ in range(3)] == [_STATS_DDL] * 3
+
+    async def test_works_with_no_connection_configured(self) -> None:
+        await SurrealDBConnectionManager.unset_connection()
+        assert SurrealDBConnectionManager.is_connection_set() is False
+        assert OrderStats.view_ddl() == _STATS_DDL
+        assert OrderTotals.view_ddl(overwrite=False).startswith("DEFINE TABLE IF NOT EXISTS `order_totals` AS (")
+
+    def test_v11_on_an_ordinary_model(self) -> None:
+        with pytest.raises(TypeError) as raised:
+            PlainOrder.view_ddl()
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _v11("PlainOrder", "view_ddl()")
+
+    def test_v11_before_e13(self) -> None:
+        with pytest.raises(TypeError) as raised:
+            PlainOrder.view_ddl(overwrite=1)  # type: ignore[arg-type]
+        assert str(raised.value) == _v11("PlainOrder", "view_ddl()")
+
+    @pytest.mark.parametrize(
+        ("overwrite", "text"),
+        [
+            (1, "overwrite= must be a bool, got int."),
+            ("yes", "overwrite= must be a bool, got str."),
+            (None, "overwrite= must be a bool, got NoneType."),
+        ],
+    )
+    def test_e13(self, overwrite: object, text: str) -> None:
+        with pytest.raises(TypeError) as raised:
+            OrderStats.view_ddl(overwrite=overwrite)  # type: ignore[arg-type]
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == text
+
+    @pytest.mark.parametrize(
+        ("method", "signature"),
+        [
+            ("get_view_query", inspect.Signature([], return_annotation=str | None)),
+            ("_is_view", inspect.Signature([], return_annotation=bool)),
+            ("view_ddl", inspect.Signature([_keyword("overwrite", bool, True)], return_annotation=str)),
+        ],
+    )
+    def test_signatures(self, method: str, signature: inspect.Signature) -> None:
+        function = getattr(BaseSurrealModel, method)
+        assert inspect.iscoroutinefunction(function) is False
+        assert inspect.signature(function) == signature
+        assert inspect.signature(getattr(OrderStats, method)) == signature
+
+    def test_the_config_key(self) -> None:
+        assert "view_query" in SurrealConfigDict.__annotations__
+
+    def test_no_new_export(self) -> None:
+        """No new top-level name (spec §5.7): the view helpers are private to the package."""
+        assert [name for name in surreal_orm_lite.__all__ if "view" in name.lower()] == []
+        assert schema.__all__ == ["Event", "function_ddl"]

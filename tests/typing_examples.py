@@ -475,6 +475,31 @@ async def events_forms(tx: Transaction) -> None:
     assert_type(function_ddl("greet", "RETURN 1;", permissions="WHERE $auth.admin = true", overwrite=False), str)
 
 
+class OrderStats(BaseSurrealModel):
+    """v0.32.0: ``SurrealConfigDict(view_query=…)`` — a ``str``, every key still optional."""
+
+    model_config = SurrealConfigDict(
+        table_name="order_stats",
+        view_query="SELECT status, count() AS total, math::sum(amount) AS revenue FROM orders GROUP BY status",
+    )
+
+    id: RecordID | None = None
+    status: str
+    total: int
+    revenue: float
+
+
+def views_forms() -> None:
+    """v0.32.0: a materialized view's query and its pure renderer are typed — ``str | None`` and ``str``."""
+    q: str | None = OrderStats.get_view_query()
+    d: str = OrderStats.view_ddl()
+    assert_type(q, str | None)
+    assert_type(d, str)
+    assert_type(OrderStats.view_ddl(overwrite=False), str)
+    assert_type(OrderStats._is_view(), bool)
+    assert_type(SurrealConfigDict(view_query=None), SurrealConfigDict)
+
+
 @fixture
 class Typed(SurrealFixture):
     """``@fixture`` gives the class back unchanged: ``Typed.load()`` stays typed ``Typed``."""
