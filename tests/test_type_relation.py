@@ -44,6 +44,14 @@ error as its ``__cause__`` (``TestStringRelateError``). ``TestEnforcementE2E``: 
 edge creation path — the typed and the string ``relate()``, an edge's ``save()``, ``bulk_create()`` — raises W1 or W2
 and writes nothing, the class of an endpoint both outside ``IN``/``OUT`` and missing pinned per line; a node model's
 ``save()`` into the relation table keeps the SDK's error.
+
+Removing a constraint (spec §5.4, G6, D14, P1; AC-20; M18, M19): ``define_relation()`` of an edge model without keys —
+another model on the table, or a subclass resetting them to ``None`` or emptying them — sends K7, ``TYPE RELATION`` with
+no ends and the table's other clauses carried (``TestRemoveConstraint``). ``TestRemoveConstraintE2E``: on AC-6's table
+after K6, the table reads back without ends, ``in``/``out`` as ``TYPE record``, its clauses, fields, index, event, view
+and edges kept; edges from another table and to a missing record are accepted at once, on a second connection too;
+``RelLikes.define_relation()`` puts K6 back; ``overwrite=False`` removes nothing; in a transaction the removal is
+applied at commit, and not at all when the block raises.
 """
 
 import contextlib
@@ -73,7 +81,7 @@ from surreal_orm_lite import (
     schema,
     utils,
 )
-from surreal_orm_lite.define_parser import parse_define_table
+from surreal_orm_lite.define_parser import parse_define_field, parse_define_table
 from surreal_orm_lite.edge import insert_edges
 from surreal_orm_lite.schema_state import TableState
 
@@ -2146,3 +2154,231 @@ class TestEnforcementE2E:
                     await RelCompany(id="c").relate("rel_likes", _P1, tx=tx)
             assert not str(raised.value).startswith(_w(""))
             assert await _edge_ids(client) == []
+
+
+# === removing a constraint (spec §5.4 "Removing a constraint", G6, D14, P1; AC-20; M18, M19) ======================
+
+
+class RelLikesAny(BaseSurrealEdge):
+    """Another edge model on ``rel_likes``, without relation keys (AC-20): its ``define_relation()`` removes the
+    constraint."""
+
+    model_config = SurrealConfigDict(table_name="rel_likes", connection="rel")
+
+    stars: int = 1
+
+
+class RelLikesReset(RelLikes):
+    """``RelLikes`` with its three keys reset to ``None`` in a subclass (AC-20)."""
+
+    model_config = SurrealConfigDict(relation_in=None, relation_out=None, enforced=None)
+
+
+class RelLikesEmpty(RelLikes):
+    """``RelLikes`` with its ends emptied and ``enforced=False`` in a subclass (AC-20, P1 a): empty means any table."""
+
+    model_config = SurrealConfigDict(relation_in=[], relation_out=(), enforced=False)
+
+
+#: The three forms of an edge model without keys on ``rel_likes`` (spec §5.4).
+_KEYLESS_MODELS: list[type[BaseSurrealEdge]] = [RelLikesAny, RelLikesReset, RelLikesEmpty]
+
+#: Their bare statements (G2's form, G7's text): ``TYPE RELATION`` with no ends.
+_REL_KEYLESS = "DEFINE TABLE OVERWRITE `rel_likes` TYPE RELATION;"
+_REL_KEYLESS_IF_NOT_EXISTS = "DEFINE TABLE IF NOT EXISTS `rel_likes` TYPE RELATION;"
+
+#: The ``TableState`` attributes of the clauses ``define_relation()`` carries (spec §5.5's clause order).
+_CARRIED = ("drop", "schema_mode", "comment", "changefeed", "changefeed_include_original", "permissions")
+
+_GHOST_BOOK = RecordID("rel_book", "ghost")
+
+
+def _carried(state: TableState) -> dict[str, object]:
+    """The carried clauses of *state*, by attribute."""
+    return {name: getattr(state, name) for name in _CARRIED}
+
+
+def _field_type(info: dict[str, Any], name: str) -> str:
+    """The ``TYPE`` of the field *name* in ``INFO FOR TABLE``'s *info*, as ``parse_define_field()`` reads it."""
+    return parse_define_field(info["fields"][name]).state.field_type
+
+
+async def _ends(client: Any) -> list[list[RecordID]]:
+    """``[in, out]`` of every ``rel_likes`` edge, sorted."""
+    return sorted(await client.query("SELECT VALUE [in, out] FROM rel_likes;", {}), key=str)
+
+
+async def _k6(client: Any) -> dict[str, BaseSurrealModel]:
+    """AC-6's fixture, then ``RelLikes.define_relation()`` (K6): the table holds the constraint, its other clauses and
+    ``e1``, ``e2``. Returns the nodes by name."""
+    nodes = await _ac6(client)
+    assert await RelLikes.define_relation() == _K6
+    assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+    return nodes
+
+
+async def _assert_removed(client: Any) -> None:
+    """``rel_likes`` reads back K7's form: a relation table without ``IN``, ``OUT`` or ``ENFORCED``, K6's other clauses,
+    ``in``/``out`` rewritten ``TYPE record``, its field ``stars``, index, event and view kept."""
+    state = parse_define_table((await _tables(client))["rel_likes"])
+    assert (state.table_type, state.relation_in, state.relation_out, state.enforced) == ("relation", (), (), False)
+    assert _carried(state) == _carried(parse_define_table(_K6_READ_BACK))
+    info = await _table_info(client, "rel_likes")
+    assert (_field_type(info, "in"), _field_type(info, "out")) == ("record", "record")
+    assert {"in", "out", "stars"} <= set(info["fields"])
+    assert list(info["indexes"]) == ["rel_likes_pair"]
+    assert list(info["events"]) == ["rel_likes_ev"]
+    assert list(info["tables"]) == ["rel_like_counts"]
+
+
+class _Rollback(Exception):
+    """Raised inside a ``transaction()`` block to roll it back."""
+
+
+class TestRemoveConstraint:
+    """AC-20 (unit, P1 a): an edge model without keys — another model on the table, or a subclass resetting them to
+    ``None`` or emptying them — renders ``TYPE RELATION`` with no ends, says any table on both sides and not enforced,
+    and carries K6's read-back into K7."""
+
+    @pytest.mark.parametrize("model", _KEYLESS_MODELS, ids=lambda model: model.__name__)
+    def test_the_keyless_statement(self, model: type[BaseSurrealEdge]) -> None:
+        assert model.get_table_name() == "rel_likes"
+        assert model.relation_ddl() == _REL_KEYLESS
+        assert model.relation_ddl(overwrite=False) == _REL_KEYLESS_IF_NOT_EXISTS
+        assert model.get_relation_in() == ()
+        assert model.get_relation_out() == ()
+        assert model.is_enforced() is False
+        assert model.get_table_type() is TableType.RELATION
+
+    @pytest.mark.parametrize("model", _KEYLESS_MODELS, ids=lambda model: model.__name__)
+    def test_k7_from_k6s_read_back(self, model: type[BaseSurrealEdge]) -> None:
+        clause = schema.relation_type_clause(model.get_relation_in(), model.get_relation_out(), model.is_enforced())
+        assert clause == "TYPE RELATION"
+        assert schema.relation_statement_keeping("rel_likes", clause, parse_define_table(_K6_READ_BACK)) == _K7
+
+    def test_the_parent_keeps_its_keys(self) -> None:
+        assert RelLikes.relation_ddl() == _REL_G1
+        assert (RelLikes.get_relation_in(), RelLikes.get_relation_out()) == (("rel_person",), ("rel_post", "rel_book"))
+        assert RelLikes.is_enforced() is True
+
+
+class TestRemoveConstraintE2E:
+    """AC-20 (E2E, every engine of both lines; G6, D14, M19): ``define_relation()`` of an edge model without keys on
+    the constrained table (K6) sends K7 — ``TYPE RELATION`` with no ends, the table's other clauses carried. The table
+    reads back without ``IN``/``OUT``/``ENFORCED``, ``in``/``out`` as ``TYPE record``, its fields, index, event, view and
+    edges kept; edges from or to any table, and to a missing record, are accepted at once, on every connection; and
+    ``RelLikes.define_relation()`` puts K6 back. ``overwrite=False`` removes nothing (D8). In a transaction the removal
+    is applied at commit, and not at all when the block raises."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_removal_out_of_a_transaction(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _rel(kind) as client:
+            nodes = await _k6(client)
+            if kind != "mem":
+                _register_rel(kind, "rel2")
+            try:
+                if kind != "mem":
+                    # The second connection's session is open before the removal (M9).
+                    second = await SurrealDBConnectionManager.get_client("rel2")
+                    assert await second.query("SELECT VALUE id FROM rel_likes ORDER BY id;", {}) == [
+                        RecordID("rel_likes", "e1"),
+                        RecordID("rel_likes", "e2"),
+                    ]
+                calls = _spy(monkeypatch, client)
+                assert await RelLikesAny.define_relation() == _K7
+                assert _sent(calls) == [_INFO, _K7]
+                await _assert_removed(client)
+                assert await _edge_ids(client) == ["rel_likes:e1", "rel_likes:e2"]
+
+                # At once: an endpoint outside the old ends, and a missing one (no ENFORCED any more).
+                company = await nodes["c"].relate(RelLikesAny, nodes["p1"])
+                ghost = await nodes["ada"].relate(RelLikesAny, _GHOST_BOOK)
+                assert (company.in_, company.out) == (RecordID("rel_company", "c"), RecordID("rel_post", "p1"))
+                assert (ghost.in_, ghost.out) == (RecordID("rel_person", "ada"), _GHOST_BOOK)
+                expected = [
+                    [RecordID("rel_company", "c"), RecordID("rel_post", "p1")],
+                    [RecordID("rel_person", "ada"), _GHOST_BOOK],
+                    [RecordID("rel_person", "ada"), RecordID("rel_post", "p1")],
+                    [RecordID("rel_person", "ada"), RecordID("rel_book", "b1")],
+                ]
+                if kind != "mem":
+                    async with SurrealDBConnectionManager.using("rel2"):
+                        other = await nodes["c"].relate(RelLikesAny, nodes["b1"])
+                    assert (other.in_, other.out) == (RecordID("rel_company", "c"), RecordID("rel_book", "b1"))
+                    expected.append([RecordID("rel_company", "c"), RecordID("rel_book", "b1")])
+                assert await _ends(client) == sorted(expected, key=str)
+
+                # The round trip: the constraint back, the edges written meanwhile kept (not checked, M5).
+                calls.clear()
+                assert await RelLikes.define_relation() == _K6
+                assert _sent(calls) == [_INFO, _K6]
+                assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+                info = await _table_info(client, "rel_likes")
+                assert (_field_type(info, "in"), _field_type(info, "out")) == (
+                    "record<rel_person>",
+                    "record<rel_post | rel_book>",
+                )
+                with pytest.raises(SurrealDbError) as refused:
+                    await nodes["bob"].relate(RelLikes, nodes["c"])
+                assert type(refused.value) is SurrealDbError
+                assert await _ends(client) == sorted(expected, key=str)
+            finally:
+                if kind != "mem":
+                    await SurrealDBConnectionManager.remove_connection("rel2")
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_each_keyless_form_returns_k7(self, kind: str) -> None:
+        """The other model, the subclass resetting the keys to ``None`` and the one emptying them: each removes the
+        constraint with K7 (the table re-defined with K6 before each)."""
+        async with _rel(kind) as client:
+            await _k6(client)
+            for model in _KEYLESS_MODELS:
+                assert await model.define_relation() == _K7, model.__name__
+                await _assert_removed(client)
+                assert await RelLikes.define_relation() == _K6, model.__name__
+                assert (await _tables(client))["rel_likes"] == _K6_READ_BACK, model.__name__
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_overwrite_false_removes_nothing(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """D8: ``IF NOT EXISTS`` on the constrained table is sent, and its ends stay."""
+        async with _rel(kind) as client:
+            nodes = await _k6(client)
+            calls = _spy(monkeypatch, client)
+            assert await RelLikesAny.define_relation(overwrite=False) == _REL_KEYLESS_IF_NOT_EXISTS
+            assert _sent(calls) == [_INFO, _REL_KEYLESS_IF_NOT_EXISTS]
+            assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+            with pytest.raises(SurrealDbError) as refused:
+                await nodes["c"].relate(RelLikesAny, nodes["p1"])
+            assert type(refused.value) is SurrealDbError
+            assert await _edge_ids(client) == ["rel_likes:e1", "rel_likes:e2"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_in_a_transaction_the_removal_is_applied_at_commit(self, kind: str) -> None:
+        """Buffered (HTTP, SurrealDB 2.x, the embedded engine) or interactive (3.x over WebSocket): outside the block the
+        constraint holds until the commit; after it, the table reads back without ends."""
+        async with _rel(kind) as client:
+            nodes = await _k6(client)
+            interactive = kind == "ws" and await _major(client) >= 3
+            async with SurrealDBConnectionManager.transaction("rel") as tx:
+                assert tx.is_interactive is interactive
+                assert await RelLikesAny.define_relation(tx=tx) == _K7
+                assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+            await _assert_removed(client)
+            await nodes["c"].relate(RelLikesAny, nodes["p1"])
+            assert [RecordID("rel_company", "c"), RecordID("rel_post", "p1")] in await _ends(client)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_block_that_raises_removes_nothing(self, kind: str) -> None:
+        async with _rel(kind) as client:
+            nodes = await _k6(client)
+            interactive = kind == "ws" and await _major(client) >= 3
+            with pytest.raises(_Rollback):
+                async with SurrealDBConnectionManager.transaction("rel") as tx:
+                    assert tx.is_interactive is interactive
+                    assert await RelLikesAny.define_relation(tx=tx) == _K7
+                    raise _Rollback
+            assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+            with pytest.raises(SurrealDbError) as refused:
+                await nodes["c"].relate(RelLikesAny, nodes["p1"])
+            assert type(refused.value) is SurrealDbError
+            assert await _edge_ids(client) == ["rel_likes:e1", "rel_likes:e2"]
