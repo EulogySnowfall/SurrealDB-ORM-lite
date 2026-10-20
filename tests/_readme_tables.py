@@ -140,10 +140,20 @@ def assert_release_rows_in_order(
 def assert_header_sentence(header: str, sentence: str) -> None:
     """*sentence*, the one sentence of a release (it names it once, as ``added in vX.Y.Z``), is in *header* once with
     its exact text, and the releases *header* names that way are strictly increasing. Which sentence comes right
-    before or after it is not checked."""
+    before or after it is not checked.
+
+    Its exact text includes its bounds: it starts right after ``. `` or ``; ``, and ends right before a space or the
+    end of *header* when it is a sentence (its own full stop ends it), right before ``;`` or ``.`` then a space or the
+    end when it is a clause. A character changed just outside it (``3.1.5;`` becoming ``3.1.50;``, ``;`` becoming
+    ``,``, ``rows`` becoming ``arrows``) fails as one changed inside it does."""
     named = _ADDED_IN.findall(sentence)
     assert len(named) == 1, f"a sentence names one release with 'added in vX.Y.Z': {sentence!r}"
     assert header.count(sentence) == 1, f"{header.count(sentence)} copies of {sentence!r} in {header!r}"
+    end = r"(?= |\Z)" if sentence.endswith(".") else r"(?=[.;](?: |\Z))"
+    bounded = re.findall(rf"(?<=[.;] ){re.escape(sentence)}{end}", header)
+    assert len(bounded) == 1, (
+        f"{sentence!r} does not start right after '. ' or '; ' and end right before ';', '.' or a space in {header!r}"
+    )
     releases = [release(name) for name in _ADDED_IN.findall(header)]
     disorder = [(above, below) for above, below in zip(releases, releases[1:], strict=False) if above >= below]
     assert not disorder, f"sentences out of version order: {disorder}"
