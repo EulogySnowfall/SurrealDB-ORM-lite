@@ -61,6 +61,12 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
 from tests._proxy import CuttableProxy
+from tests._readme_tables import (
+    assert_embedded_rows,
+    assert_server_header_sentence,
+    assert_server_rows,
+    assert_server_table,
+)
 from tests.conftest import default_connection_class
 from tests.test_embedded import (
     _EMBEDDED_BEHAVIOUR,
@@ -72,9 +78,8 @@ from tests.test_embedded import (
     _table_rows,
     _tables,
 )
-from tests.test_paging import _PAGING_ROW
-from tests.test_query_cache import _QUERY_CACHE_ROW, _bullets
-from tests.test_time_travel import _SERVER_BEHAVIOUR, _SERVER_TABLE_WIDTHS, _forbidden_client
+from tests.test_query_cache import _bullets
+from tests.test_time_travel import _SERVER_BEHAVIOUR, _forbidden_client
 
 #: The prefix of the manager's name-mangled private attributes.
 _P = "_SurrealDBConnectionManager__"
@@ -5027,10 +5032,7 @@ _MULTI_DATABASE_ROW = [
     "each 3.x WebSocket connection gets interactive transactions, beside 2.x connections in the same process",
     "v0.29.0",
 ]
-_HEADER_CLAUSE_29 = (
-    "rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, "
-    "identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5"
-)
+_HEADER_CLAUSE_29 = "rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5"
 #: Spec §11 item 6 (P8): all four cells of the embedded table's "Clients" row and of its new row.
 _EMBEDDED_CLIENTS_ROW = [
     "Clients",
@@ -5300,37 +5302,23 @@ class TestMultiDatabaseDocs:
         assert comparison[start + 1][0] == "Schema Introspection", comparison
 
     def test_server_behaviour_row(self) -> None:
-        """One row, Since v0.29.0, after the query-cache row and v0.28.1's rows, before the table's last row (later
-        versions add their rows after it)."""
-        rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
-        index = rows.index(_MULTI_DATABASE_ROW)
-        assert rows[index - 1] == _PAGING_ROW, rows[index - 1]
-        between = rows[rows.index(_QUERY_CACHE_ROW) + 1 : index]
-        assert between and all("v0.28.1" in cells[3] for cells in between), between
-        assert index < len(rows) - 1 and rows[-1][3] == "v0.19.1", rows[-1]
-        assert [cells for cells in rows if cells[3] == "v0.29.0"] == [_MULTI_DATABASE_ROW]
+        """One row, Since v0.29.0, in version order before the table's last row (later releases add their rows in
+        version order)."""
+        assert_server_rows([_MULTI_DATABASE_ROW])
 
     def test_server_behaviour_table_keeps_its_widths(self) -> None:
         """Every line 535 characters, the columns 136, 175, 181 and 38 wide: no line re-padded."""
-        [lines] = _tables(_readme_part(_SERVER_BEHAVIOUR))
-        assert {len(line) for line in lines} == {535}
-        for line in lines:
-            assert [len(cell) for cell in line.split("|")[1:-1]] == _SERVER_TABLE_WIDTHS, line
+        assert_server_table()
 
     def test_server_behaviour_header_clause(self) -> None:
-        """v0.29.0's clause follows v0.28.0's and v0.28.1's (later versions append theirs after it)."""
-        header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
-        assert _HEADER_CLAUSE_29 in header, header
+        """v0.29.0's clause, in version order among the other releases' sentences."""
+        assert_server_header_sentence(_HEADER_CLAUSE_29)
 
     def test_embedded_table_rows(self) -> None:
-        """P8: all four cells of the "Clients" row and of the new row, which comes after the Clients row and before
-        the catch-all last row (later versions add their rows after it)."""
-        rows = [cells for _, cells in _table_rows(_readme_part(_EMBEDDED_BEHAVIOUR))]
-        [clients] = [cells for cells in rows if cells[0] == "Clients"]
-        assert clients == _EMBEDDED_CLIENTS_ROW, clients
-        clients_index = rows.index(clients)
-        assert clients_index < rows.index(_EMBEDDED_CONNECTIONS_ROW) < len(rows) - 1, rows
-        assert rows[-1][0] == "Everything else", rows[-1]
+        """P8: all four cells of the "Clients" row (among v0.25.0's rows) and of the new row, in version order before
+        the catch-all last row (later releases add their rows in version order)."""
+        assert_embedded_rows([_EMBEDDED_CLIENTS_ROW], shared=True)
+        assert_embedded_rows([_EMBEDDED_CONNECTIONS_ROW])
 
     def test_connections_and_event_loops(self) -> None:
         """Spec §11 item 7: the two bullets rewritten exactly, the third kept, a paragraph pointing to section 30."""

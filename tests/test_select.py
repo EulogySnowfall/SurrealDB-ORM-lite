@@ -17,10 +17,10 @@ from surrealdb import RecordID
 from surreal_orm_lite import BaseSurrealEdge, BaseSurrealModel, SurrealConfigDict, SurrealDBConnectionManager
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.time_travel import line_major
+from tests._readme_tables import assert_server_header_sentence, assert_server_rows
 from tests.conftest import orm_client
-from tests.test_embedded import _normalised, _readme_part, _subsection, _table_rows
-from tests.test_query_cache import _QUERY_CACHE_ROW, _SECTION_29
-from tests.test_time_travel import _SERVER_BEHAVIOUR
+from tests.test_embedded import _normalised, _readme_part, _subsection
+from tests.test_query_cache import _SECTION_29
 
 
 class SelAuthor(BaseSurrealModel):
@@ -295,6 +295,8 @@ _SELECT_ROW = [
     "the object; through a link, the linked record",
     "pre-existing (documented in v0.28.1)",
 ]
+#: The clause v0.28.1 adds to the 2.x/3.x table's intro paragraph.
+_HEADER_CLAUSE_281 = "the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5"
 
 
 class TestSelectDocs:
@@ -316,14 +318,10 @@ class TestSelectDocs:
             assert needle in text, needle
 
     def test_server_behaviour_row(self) -> None:
-        """Right after v0.28.0's query cache row, before v0.28.1's other rows and the table's last row; the header
-        names its lines."""
-        rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
-        index = rows.index(_SELECT_ROW)
-        assert rows[index - 1] == _QUERY_CACHE_ROW, rows[index - 1]
-        assert index < len(rows) - 1 and rows[-1][3] == "v0.19.1", rows[-1]
-        header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
-        assert "; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5" in header, header
+        """Among v0.28.1's rows (the filter value and paging tests own the others), in version order before the
+        table's last row; the header names its lines."""
+        assert_server_rows([_SELECT_ROW], shared=True)
+        assert_server_header_sentence(_HEADER_CLAUSE_281)
 
     def test_the_cache_section_names_select_paths_only(self) -> None:
         text = _normalised(_readme_part(_SECTION_29))

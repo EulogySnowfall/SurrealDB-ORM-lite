@@ -62,6 +62,7 @@ from surreal_orm_lite import (
 from surreal_orm_lite.model_base import _read_kind
 from surreal_orm_lite.surql_literal import inline_variables
 from surreal_orm_lite.utils import build_filter_condition
+from tests._readme_tables import assert_server_header_sentence, assert_server_rows
 from tests._retry import retry_write
 from tests.conftest import change_feed_database, orm_client
 from tests.test_geo_types import (
@@ -1777,8 +1778,10 @@ class TestReadmeGeoWording:
             assert not re.search(r"\bconnections?\b", text, re.IGNORECASE), f"D16: {where} uses a banned word"
 
     def test_behaviour_table_rows(self) -> None:
+        """v0.24.0's rows (two added, one documented), together and in version order before the table's last row."""
         rows = _v0_24_0_rows()
         assert all(len(cells) == 4 and "\\|" not in line for line, cells in rows), rows
+        assert_server_rows([cells for _, cells in rows])
         added = [cells for _, cells in rows if cells[-1] == "v0.24.0"]
         assert len(added) == 2, added
         assert any(cells[0].startswith("Geometry fields") for cells in added), added
@@ -1787,9 +1790,8 @@ class TestReadmeGeoWording:
         assert "GeoJSON" in untyped[0] and "untyped" in untyped[0], untyped
 
     def test_behaviour_table_header_names_the_versions(self) -> None:
-        header = _normalised(_readme_part("### ORM behaviour: SurrealDB 2.x vs 3.x").split("\n|", 1)[0])
-        assert "rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs" in header
-        assert "rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5" in header
+        assert_server_header_sentence("rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs")
+        assert_server_header_sentence("rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5")
 
     def test_filter_lookups_list_names_the_spatial_lookups(self) -> None:
         bullets = [line for line in _readme_part("### Supported Filter Lookups").splitlines() if line.startswith("- ")]

@@ -71,6 +71,7 @@ from surreal_orm_lite.live import hydrate
 from surreal_orm_lite.signals import post_save
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import _KEEP_LIMIT, _KEEP_MAX_DEPTH, PLAIN_CONTENT, build_filter_condition, replace_content
+from tests._readme_tables import assert_server_header_sentence, assert_server_rows
 from tests._retry import retry_write
 from tests.conftest import change_feed_database, orm_client
 from tests.test_model_auth import AUTH_PASSWORD, _connect, _unique_email
@@ -4016,8 +4017,10 @@ class TestReadmeWording:
         ), sql
 
     def test_behaviour_table_rows(self) -> None:
+        """v0.23.0's rows (two added, one documented), together and in version order before the table's last row."""
         rows = _v0_23_0_rows()
         assert all(len(cells) == 4 and "\\|" not in line for line, cells in rows), rows
+        assert_server_rows([cells for _, cells in rows])
         added = [cells for _, cells in rows if cells[-1] == "v0.23.0"]
         assert len(added) == 2, added
         assert any(cells[0].startswith("Rich field types") for cells in added), added
@@ -4034,5 +4037,4 @@ class TestReadmeWording:
             assert len(widths) == 1 and "\\|" not in table, table
 
     def test_behaviour_table_header_names_the_v0_23_0_versions(self) -> None:
-        header = _normalised(_readme_part("### ORM behaviour: SurrealDB 2.x vs 3.x").split("\n|", 1)[0])
-        assert "rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs" in header
+        assert_server_header_sentence("rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs")

@@ -48,10 +48,9 @@ from surreal_orm_lite.exceptions import SurrealDbError
 from surreal_orm_lite.query_set import QuerySet
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import build_filter_condition
+from tests._readme_tables import assert_server_rows
 from tests.conftest import orm_client
-from tests.test_embedded import _normalised, _readme_part, _subsection, _table_rows
-from tests.test_select import _SELECT_ROW
-from tests.test_time_travel import _SERVER_BEHAVIOUR
+from tests.test_embedded import _normalised, _readme_part, _subsection
 
 
 class FvItem(BaseSurrealModel):
@@ -1427,8 +1426,6 @@ class TestFilterValueDocs:
             assert needle in text, needle
 
     def test_server_behaviour_row(self) -> None:
-        """Right after the ``select("meta.*")`` row of v0.28.1, before the table's last row."""
-        rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
-        index = rows.index(_FILTER_VALUE_ROW)
-        assert rows[index - 1] == _SELECT_ROW, rows[index - 1]
-        assert index < len(rows) - 1 and rows[-1][3] == "v0.19.1", rows[-1]
+        """Among v0.28.1's rows (the select and paging tests own the others), in version order before the table's
+        last row."""
+        assert_server_rows([_FILTER_VALUE_ROW], shared=True)

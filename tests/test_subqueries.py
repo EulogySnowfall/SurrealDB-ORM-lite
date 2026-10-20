@@ -55,12 +55,11 @@ from surreal_orm_lite.subquery import (
 )
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import build_filter_condition
+from tests._readme_tables import assert_server_header_sentence, assert_server_rows, assert_server_table
 from tests.conftest import _ws_url
 from tests.test_embedded import _cells, _normalised, _readme, _readme_part, _subsection, _table_rows, _tables
 from tests.test_time_travel import (
     _SERVER_BEHAVIOUR,
-    _SERVER_TABLE_WIDTHS,
-    _TIME_TRAVEL_ROWS,
     _assert_refused_by_the_server,
     _http_url,
     _line,
@@ -2781,11 +2780,8 @@ _LOOKUPS_BULLET = (
     "`containsany` (all its values) or `exact`, `gt`, `gte`, `lt`, `lte`, `contains`, `not_contains` (its first "
     "value): see [section 28](#28-subqueries-subquery)"
 )
-#: No final period: v0.28.0 appends its own clause after this one (spec §11 of v0.28.0, D16).
-_HEADER_CLAUSE = (
-    "rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in "
-    "v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs"
-)
+#: The clause v0.27.0 adds to the 2.x/3.x table's intro paragraph.
+_HEADER_CLAUSE = "rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs"
 #: P4: each "Coming from" bullet the product owner added, as the names it must hold together.
 _P4_BULLETS = {
     "a missing table reads as empty": ("does not exist", "empty", "`TableNotFoundError`"),
@@ -2894,28 +2890,19 @@ class TestSubqueryDocs:
         assert firsts.index(row[0]) == firsts.index("Time travel (`as_of()`, versioned storage)") + 1
 
     def test_server_behaviour_rows(self) -> None:
-        """The four rows, Since v0.27.0, right after the five v0.26.0 rows and before the table's last row (later
-        versions add their rows after them: v0.28.0's query cache row)."""
-        rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
-        starts = [index for index in range(len(rows)) if rows[index : index + 4] == _SUBQUERY_ROWS]
-        assert len(starts) == 1 and starts[0] + 4 < len(rows), rows
-        assert rows[starts[0] - 5 : starts[0]] == _TIME_TRAVEL_ROWS, rows[starts[0] - 5 : starts[0]]
-        assert rows[-1][3] == "v0.19.1", rows[-1]
-        assert [cells for cells in rows if cells[3] == "v0.27.0"] == _SUBQUERY_ROWS
+        """The four rows, Since v0.27.0, together and in version order, before the table's last row (later
+        releases add their rows in version order)."""
+        assert_server_rows(_SUBQUERY_ROWS)
 
     def test_server_behaviour_table_keeps_its_widths(self) -> None:
         """Every line 535 characters, the columns 136, 175, 181 and 38 wide: no line re-padded."""
-        [lines] = _tables(_readme_part(_SERVER_BEHAVIOUR))
-        assert {len(line) for line in lines} == {535}
-        for line in lines:
-            assert [len(cell) for cell in line.split("|")[1:-1]] == _SERVER_TABLE_WIDTHS, line
+        assert_server_table()
 
     def test_row_4_backs_the_header_s_3_1_5_clause(self) -> None:
         """The header says "with 3.1.5 where it differs": row 4's 3.x cell is where (D15)."""
         cell = _SUBQUERY_ROWS[3][2]
         assert len(cell) == 171 and "3.1.5" in cell and "`ThrownError`" in cell
-        header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
-        assert _HEADER_CLAUSE in header, header
+        assert_server_header_sentence(_HEADER_CLAUSE)
 
     def test_comparison_rows(self) -> None:
         comparison = [cells for _, cells in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]

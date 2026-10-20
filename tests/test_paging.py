@@ -20,10 +20,9 @@ from surreal_orm_lite import BaseSurrealModel, Count, QueryCache, Subquery, Surr
 from surreal_orm_lite._sdk import ServerError
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.time_travel import line_major
+from tests._readme_tables import assert_server_rows
 from tests.conftest import orm_client
-from tests.test_embedded import _normalised, _readme_part, _subsection, _table_rows
-from tests.test_filter_values import _FILTER_VALUE_ROW
-from tests.test_time_travel import _SERVER_BEHAVIOUR
+from tests.test_embedded import _normalised, _readme_part, _subsection
 
 
 class PgItem(BaseSurrealModel):
@@ -305,9 +304,6 @@ class TestPagingDocs:
             assert needle in text, needle
 
     def test_server_behaviour_row(self) -> None:
-        """Right after the filter value row of v0.28.1, before the table's last row (later versions add their rows
-        after it)."""
-        rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
-        index = rows.index(_PAGING_ROW)
-        assert rows[index - 1] == _FILTER_VALUE_ROW, rows[index - 1]
-        assert index < len(rows) - 1 and rows[-1][3] == "v0.19.1", rows[-1]
+        """Among v0.28.1's rows (the select and filter value tests own the others), in version order before the
+        table's last row (later releases add their rows in version order)."""
+        assert_server_rows([_PAGING_ROW], shared=True)

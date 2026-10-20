@@ -59,6 +59,14 @@ from surreal_orm_lite.model_base import _snapshot_moment
 from surreal_orm_lite.query_set import QuerySet
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.time_travel import MAX_MOMENT, MIN_MOMENT, AsOf, in_range, line_major, normalise_as_of
+from tests._readme_tables import EMBEDDED_BEHAVIOUR as _EMBEDDED_BEHAVIOUR
+from tests._readme_tables import SERVER_BEHAVIOUR as _SERVER_BEHAVIOUR
+from tests._readme_tables import (
+    assert_embedded_rows,
+    assert_server_header_sentence,
+    assert_server_rows,
+    assert_server_table,
+)
 from tests.conftest import orm_client
 from tests.test_embedded import _cells, _normalised, _readme_part, _subsection, _table_rows, _tables
 
@@ -2266,8 +2274,6 @@ class TestVersionedServerE2E:
 
 _REPO = Path(__file__).resolve().parents[1]
 _SECTION_27 = "### 27. Time travel (`as_of()`)"
-_SERVER_BEHAVIOUR = "### ORM behaviour: SurrealDB 2.x vs 3.x"
-_EMBEDDED_BEHAVIOUR = "### ORM behaviour: the embedded engine"
 _COMING_FROM = "#### Coming from the full SurrealDB-ORM"
 
 #: P5: the five rows v0.26.0 adds to the 2.x/3.x table, cell by cell, exactly as spec §11 writes them.
@@ -2306,8 +2312,16 @@ _TIME_TRAVEL_ROWS = [
         "v0.26.0",
     ],
 ]
-#: The widths between the pipes of the 2.x/3.x table (535 characters a line): the new rows keep them (P5).
-_SERVER_TABLE_WIDTHS = [136, 175, 181, 38]
+#: The sentence v0.26.0 adds to the 2.x/3.x table's intro paragraph.
+_HEADER_CLAUSE_26 = "rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5"
+#: The row v0.26.0 adds to the embedded table, cell by cell.
+_EMBEDDED_TIME_TRAVEL_ROW = [
+    "Time travel (`as_of()`)",
+    "`surrealkv+versioned://` only (`?versioned=true` is ignored by SDK 2.0.0); any other URL → "
+    "`SurrealDbError` before any request; `fetch()` refused (2.x core)",
+    "versioned storage required (see the 2.x/3.x table)",
+    "v0.26.0",
+]
 
 
 def _section_27() -> str:
@@ -2377,38 +2391,20 @@ class TestTimeTravelDocs:
             assert name in section, name
 
     def test_server_behaviour_rows(self) -> None:
-        """P5: the five rows hold spec §11's texts, one after the other, before the table's last row (later
-        versions add their rows after them: v0.27.0's subquery rows)."""
-        rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
-        starts = [index for index in range(len(rows)) if rows[index : index + 5] == _TIME_TRAVEL_ROWS]
-        assert len(starts) == 1 and starts[0] + 5 < len(rows), rows
-        assert rows[-1][0].startswith("Full suite and every divergence") and rows[-1][3] == "v0.19.1", rows[-1]
-        assert [cells for cells in rows if cells[3] == "v0.26.0"] == _TIME_TRAVEL_ROWS
+        """P5: the five rows hold spec §11's texts, together and in version order, before the table's last row
+        (later releases add their rows in version order)."""
+        assert_server_rows(_TIME_TRAVEL_ROWS)
 
     def test_server_behaviour_table_keeps_its_widths(self) -> None:
         """P5: no line of the table is re-padded; the new rows fit the existing columns."""
-        [lines] = _tables(_readme_part(_SERVER_BEHAVIOUR))
-        assert {len(line) for line in lines} == {535}
-        for line in lines:
-            assert [len(cell) for cell in line.split("|")[1:-1]] == _SERVER_TABLE_WIDTHS, line
+        assert_server_table()
 
     def test_server_behaviour_header_names_v0_26_0(self) -> None:
-        header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
-        assert "rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5" in header, (
-            header
-        )
+        assert_server_header_sentence(_HEADER_CLAUSE_26)
 
     def test_embedded_behaviour_row(self) -> None:
-        rows = [cells for _, cells in _table_rows(_readme_part(_EMBEDDED_BEHAVIOUR))]
-        [row] = [cells for cells in rows if cells[0] == "Time travel (`as_of()`)"]
-        assert row == [
-            "Time travel (`as_of()`)",
-            "`surrealkv+versioned://` only (`?versioned=true` is ignored by SDK 2.0.0); any other URL → "
-            "`SurrealDbError` before any request; `fetch()` refused (2.x core)",
-            "versioned storage required (see the 2.x/3.x table)",
-            "v0.26.0",
-        ], row
-        assert rows[-1][0] == "Everything else", "the catch-all row stays last"
+        """All four cells, in version order before the catch-all last row."""
+        assert_embedded_rows([_EMBEDDED_TIME_TRAVEL_ROW])
 
     def test_section_26_url_row_points_to_section_27(self) -> None:
         rows = _table_rows(_readme_part("### 26. Embedded engine and test fixtures"), "Embedded URL")
