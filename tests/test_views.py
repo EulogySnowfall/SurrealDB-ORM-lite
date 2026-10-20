@@ -1676,14 +1676,21 @@ class _QueuingTx:
 
 
 @pytest.fixture
-def use_client(monkeypatch: pytest.MonkeyPatch) -> Callable[[Any], None]:
-    """Make ``SurrealDBConnectionManager.get_client()`` answer the client given."""
+def use_client(monkeypatch: pytest.MonkeyPatch) -> Callable[..., None]:
+    """Make ``SurrealDBConnectionManager.get_client()`` answer the client given, as a server's or, with
+    ``embedded=True``, as the embedded engine's.
 
-    def use(client: Any) -> None:
+    ``is_embedded()`` is faked with the client, as ``use_mv_client`` does (#282): the real one reads the URL configured,
+    which is the one an earlier test left. Some forty tests leave ``mem://`` there, and after one of them the C1 refusal
+    of a test that runs on a server named the embedded engine.
+    """
+
+    def use(client: Any, *, embedded: bool = False) -> None:
         async def get_client(*args: Any, **kwargs: Any) -> Any:
             return client
 
         monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+        monkeypatch.setattr(default_connection_class(), "is_embedded", classmethod(lambda cls: embedded))
 
     return use
 
@@ -2206,12 +2213,9 @@ class TestC1:
         assert client.version_calls == 2
         assert tx.added == []
 
-    async def test_define_view_names_the_embedded_engine(
-        self, use_client: Callable[[Any], None], monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_define_view_names_the_embedded_engine(self, use_client: Callable[..., None]) -> None:
         client = _guard_client("none", False, version="surrealdb-2.0.0")
-        use_client(client)
-        monkeypatch.setattr(RoundedStats._connection_manager(), "is_embedded", classmethod(lambda cls: True))
+        use_client(client, embedded=True)
         with pytest.raises(SurrealDbError) as raised:
             await RoundedStats.define_view()
         assert str(raised.value) == _c1b("RoundedStats", "math::round(math::sum(amount))", "math::sum", _ENGINE_EMBEDDED)

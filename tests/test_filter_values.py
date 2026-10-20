@@ -181,9 +181,12 @@ def _variable_warning(name: str) -> str:
 
 @contextlib.contextmanager
 def _recorded() -> Iterator[list[warnings.WarningMessage]]:
-    """Every warning raised in the block, none filtered out."""
+    """Every warning raised in the block, none filtered out, except a ``ResourceWarning`` (see ``_no_warning``)."""
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
+        # A socket another test left open can be finalised by the garbage collector during the block: its
+        # ResourceWarning is not this test's, and recording it would shift caught[0] and the list compared.
+        warnings.simplefilter("ignore", ResourceWarning)
         yield caught
 
 

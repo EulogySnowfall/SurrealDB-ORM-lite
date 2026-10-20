@@ -344,10 +344,16 @@ class TestMomentBounds:
 
 
 @pytest.fixture
-def _fresh_url_cache() -> Iterator[None]:
-    """``url_kind`` is cached: a test that fakes the SDK's parser starts and ends with an empty cache."""
+def _fresh_url_cache(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """``url_kind`` is cached: a test that fakes the SDK's parser starts and ends with an empty cache.
+
+    Teardown order (#282): conftest's async autouse fixtures are torn down after this one and before the test's
+    ``monkeypatch`` is undone, and their ``close_connection()`` classifies the configured URL. So the fake parser is
+    undone first, then the cache is cleared: a URL classified in between would stay cached with the fake's answer.
+    """
     url_kind.cache_clear()
     yield
+    monkeypatch.undo()
     url_kind.cache_clear()
 
 

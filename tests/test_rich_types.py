@@ -4,6 +4,7 @@ Unit tests first (no database); the raw-SDK E2E classes that pin what the server
 value are suffixed ``E2E``.
 """
 
+import contextlib
 import inspect
 import json
 import math
@@ -11,7 +12,7 @@ import os
 import random
 import re
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Annotated, Any, Optional
@@ -103,10 +104,22 @@ def _assert_type_error(call: Callable[[], Any]) -> None:
     assert not isinstance(info.value, surrealdb.InvalidDurationError)
 
 
-def _dump_without_warnings(model: BaseModel) -> tuple[dict[str, Any], str]:
-    """``model_dump()`` and ``model_dump_json()`` of ``model``, asserting that neither emits a warning."""
+@contextlib.contextmanager
+def _recorded() -> Iterator[list[warnings.WarningMessage]]:
+    """Every warning raised in the block, none filtered out, except a ``ResourceWarning`` (#282).
+
+    A socket another test left open can be finalised by the garbage collector during the block: its
+    ``ResourceWarning`` is not this test's, and recording it would fail the ``== []`` that follows.
+    """
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
+        warnings.simplefilter("ignore", ResourceWarning)
+        yield caught
+
+
+def _dump_without_warnings(model: BaseModel) -> tuple[dict[str, Any], str]:
+    """``model_dump()`` and ``model_dump_json()`` of ``model``, asserting that neither emits a warning."""
+    with _recorded() as caught:
         dumped = model.model_dump()
         text = model.model_dump_json()
     assert [str(w.message) for w in caught] == []
@@ -357,8 +370,7 @@ class TestDuration:
         m = M(d=Duration(5))
         object.__setattr__(m, "d", surrealdb.Duration(9))
         object.__setattr__(m, "ds", [surrealdb.Duration(1)])
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        with _recorded() as caught:
             dumped = m.model_dump()
             text = m.model_dump_json()
             json_dumped = m.model_dump(mode="json")
@@ -373,8 +385,7 @@ class TestDuration:
         # Out of range: the python-mode serializer builds the ORM value unchecked and never raises
         # (``encode`` refuses it later); JSON mode checks it and Pydantic reports the refusal.
         object.__setattr__(m, "d", surrealdb.Duration(-5))
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        with _recorded() as caught:
             dumped = m.model_dump()
         assert [str(w.message) for w in caught] == []
         assert type(dumped["d"]) is Duration
@@ -918,8 +929,7 @@ class TestRange:
 
         m = M()
         object.__setattr__(m, "r", SdkRange(BoundIncluded(9), BoundExcluded(17)))
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        with _recorded() as caught:
             dumped = m.model_dump()
             text = m.model_dump_json()
         assert [str(w.message) for w in caught] == []
@@ -929,8 +939,7 @@ class TestRange:
 
         # A side that is no bound is kept as is (``encode`` refuses it later); never an exception.
         object.__setattr__(m, "ra", SdkRange("x", undefined))  # type: ignore[arg-type]
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        with _recorded() as caught:
             dumped = m.model_dump()
         assert [str(w.message) for w in caught] == []
         assert type(dumped["ra"]) is Range
@@ -1059,8 +1068,7 @@ class TestOpenSides:
 
         m = M()
         object.__setattr__(m, "r", SdkRange(marker, BoundExcluded(5)))
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        with _recorded() as caught:
             dumped = m.model_dump()
             text = m.model_dump_json()
         assert [str(w.message) for w in caught] == []

@@ -91,8 +91,13 @@ def _hooked(value: Any) -> Any:
 
 
 @pytest.fixture
-def fresh_caches() -> Iterator[None]:
-    """Clear the hook's cached probes and clones before and after a test that changes what they read."""
+def fresh_caches(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Clear the hook's cached probes and clones before and after a test that changes what they read.
+
+    Teardown order (#282): conftest's async autouse fixtures are torn down after this one and before the test's
+    ``monkeypatch`` is undone. So the codec the test swapped is restored first, then the caches are cleared: a probe
+    run in between would stay cached with the fake codec's answer.
+    """
     caches = (
         decoding.sdk_decodes_zero_duration,
         decoding.sdk_decodes_native_sets,
@@ -104,6 +109,7 @@ def fresh_caches() -> Iterator[None]:
     for cache in caches:
         cache.cache_clear()
     yield
+    monkeypatch.undo()
     for cache in caches:
         cache.cache_clear()
 
