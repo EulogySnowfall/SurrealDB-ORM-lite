@@ -589,7 +589,10 @@ def coerce_record_id(value: Any, table: str) -> RecordID:
     ``"`5`"``           ``RecordID(table, "5")`` — backticks stripped, as ``get()`` does
     ``"table:d"``       ``RecordID(table, "d")`` — only when the prefix is *this* table
     ``"Other:d"``       ``RecordID(table, "Other:d")`` — may genuinely be the string id
+    ``["paid"]``        ``RecordID(table, ["paid"])`` — an array id, a grouped view's (v0.32.0)
     ==================  ==========================
+
+    A ``tuple`` is an array id too (``("paid",)``), copied into a ``list``.
     """
     if isinstance(value, RecordID):
         return value
@@ -597,6 +600,8 @@ def coerce_record_id(value: Any, table: str) -> RecordID:
         raise ValueError("a record id cannot be a boolean")
     if isinstance(value, int):
         return RecordID(table, value)
+    if isinstance(value, (list, tuple)):
+        return RecordID(table, list(value))
 
     raw = str(value)
     prefix = f"{table}:"

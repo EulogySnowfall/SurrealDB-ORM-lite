@@ -39,8 +39,17 @@ view's events and ``define_events()`` restores them (3.1 refusing ``OVERWRITE`` 
 ``define_view(tx=tx)`` and ``remove_view(tx=tx)`` apply with the block's source writes, buffered or interactive, and a
 block that raises applies neither; on 3.x over WebSocket the block reads its own view and writes, unseen outside it
 until the commit; a transaction of another connection is refused (X1) before any request.
+
+Array ids, reads and live queries (spec §5.5, §6.6; AC-13, AC-14; M4, M12, M17): ``utils.coerce_record_id()`` reads a
+``list`` or a ``tuple`` as an array record id, so ``get(["paid"])`` and ``filter(id=["paid"])`` address a grouped
+view's record; E2E on both lines, a view model read by array id, re-read by ``refresh()``, counted, summed and read by
+a ``Subquery``, ``id__in`` pinned per line (SurrealDB 3.x answers no record to ``id IN`` on a view table) and an
+``id: str`` declaration pinned (``"['paid']"``); over WebSocket, ``watch()`` and ``live()`` notify a group emptied by
+a delete as one ``DELETE`` on 3.x, an ``UPDATE`` to a count of 0 then a ``DELETE`` on 2.x, and a 3.x notification's
+record carries no ``id``.
 """
 
+import asyncio
 import contextlib
 import inspect
 import os
@@ -60,6 +69,8 @@ from surreal_orm_lite import (
     BaseSurrealModel,
     Computed,
     Event,
+    LiveAction,
+    Subquery,
     SurrealConfigDict,
     SurrealDbAuthenticationError,
     SurrealDBConnectionManager,
@@ -2290,6 +2301,65 @@ class TestRemovalGuard:
         assert client.version_calls == 0
 
 
+class TestCoerceArrayIds:
+    """AC-13 (unit): ``utils.coerce_record_id()`` reads a ``list`` or a ``tuple`` as an array record id — a grouped
+    view's (M4) — and every row of its table before v0.32.0 is unchanged."""
+
+    @pytest.mark.parametrize("value", [["a", 1], ("a", 1)], ids=["list", "tuple"])
+    def test_a_sequence_is_an_array_id(self, value: Any) -> None:
+        record_id = utils.coerce_record_id(value, "t")
+        assert record_id == RecordID("t", ["a", 1])
+        assert type(record_id.id) is list
+
+    def test_an_empty_list_is_the_group_all_id(self) -> None:
+        record_id = utils.coerce_record_id([], "t")
+        assert (record_id, type(record_id.id)) == (RecordID("t", []), list)
+
+    def test_the_sequence_is_copied(self) -> None:
+        value = ["paid"]
+        record_id = utils.coerce_record_id(value, "t")
+        value.append("eu")
+        assert record_id == RecordID("t", ["paid"])
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (5, RecordID("t", 5)),
+            ("5", RecordID("t", "5")),
+            ("`5`", RecordID("t", "5")),
+            ("t:d", RecordID("t", "d")),
+            ("Other:d", RecordID("t", "Other:d")),
+            ("['paid']", RecordID("t", "['paid']")),
+        ],
+        ids=["int", "str", "backticks", "own-prefix", "other-prefix", "array-text"],
+    )
+    def test_the_earlier_rows_are_unchanged(self, value: Any, expected: RecordID) -> None:
+        record_id = utils.coerce_record_id(value, "t")
+        assert (record_id, type(record_id.id)) == (expected, type(expected.id))
+
+    def test_a_record_id_is_returned_unchanged(self) -> None:
+        record_id = RecordID("t", ["paid"])
+        assert utils.coerce_record_id(record_id, "t") is record_id
+
+    def test_a_boolean_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="^a record id cannot be a boolean$"):
+            utils.coerce_record_id(True, "t")
+
+    @pytest.mark.parametrize(
+        ("lookup", "value", "sql", "bound"),
+        [
+            ("exact", ["paid"], "id = $_f0", RecordID("t", ["paid"])),
+            ("in", [["paid"], ("new",)], "id IN $_f0", [RecordID("t", ["paid"]), RecordID("t", ["new"])]),
+            ("not_in", [["paid"]], "id NOT IN $_f0", [RecordID("t", ["paid"])]),
+        ],
+        ids=["exact", "in", "not_in"],
+    )
+    def test_the_id_filter_binds_the_array_id(self, lookup: str, value: Any, sql: str, bound: Any) -> None:
+        """``filter(id=[…])`` and ``id__in=[[…], …]`` go through the same rule: the bound value addresses the array
+        record, never the text of its ``repr()``."""
+        assert utils.build_filter_condition("id", lookup, value, 0, record_table="t") == (sql, {"_f0": bound}, 1)
+
+
 # === E2E (spec §9.2): the connection "mv" on the database mv_db, over WebSocket and HTTP, and mem:// ================
 
 #: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
@@ -3461,3 +3531,204 @@ class TestViewConnectionsE2E:
             assert await _groups() == {"new": (1, 1.0), "paid": (2, 15.5)}
         assert type(raised.value) is SurrealDbError
         assert str(raised.value) == _x1("MvStats", f"{method}()", "default", "mv")
+
+
+class MvStatsStr(BaseSurrealModel):
+    """``MvStats``' view read with ``id: str | None``: the id reads as the text of the array id (M4 pin, AC-13)."""
+
+    model_config = SurrealConfigDict(table_name="mv_order_stats", connection="mv", view_query=_MV_STATS_QUERY)
+
+    id: str | None = None
+    status: str
+    total: int
+    revenue: float
+
+
+#: The array record ids of ``MvStats``' groups (M4).
+_PAID = RecordID("mv_order_stats", ["paid"])
+_NEW = RecordID("mv_order_stats", ["new"])
+_GONE = RecordID("mv_order_stats", ["gone"])
+
+
+def _stat(row: MvStats | None) -> tuple[RecordID | None, str, int, float]:
+    """*row*'s id and columns."""
+    assert row is not None
+    return row.id, row.status, row.total, row.revenue
+
+
+def _busy() -> Subquery:
+    """The statuses of ``MvStats``' groups holding two orders or more, as a ``Subquery`` (AC-13)."""
+    return Subquery(MvStats.objects().filter(total__gte=2).select("status"))
+
+
+class TestViewReadsE2E:
+    """AC-13 (E2E, both lines, WebSocket, HTTP and ``mem://``): a grouped view's records looked up by their array id —
+    ``get(["paid"])``, ``filter(id=["paid"])``, ``id__not_in`` —, re-read by ``refresh()`` after a source write,
+    counted, summed and read by a ``Subquery``; ``id__in`` pinned per line (SurrealDB 3.x answers no record on a view
+    table); declared ``id: str``, the id reads as the text of the array (M4 pin)."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_get_by_array_id(self, kind: str) -> None:
+        async with _mv(kind):
+            await _save_orders()
+            await MvStats.define_view()
+            stats = await MvStats.objects().get(["paid"])
+            assert type(stats) is MvStats
+            assert _stat(stats) == (_PAID, "paid", 2, 15.5)
+            assert _stat(await MvStats.objects().get(("new",))) == (_NEW, "new", 1, 1.0)
+            with pytest.raises(SurrealDbNotFoundError):
+                await MvStats.objects().get(["gone"])
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_filter_by_array_id(self, kind: str) -> None:
+        async with _mv(kind):
+            await _save_orders()
+            await MvStats.define_view()
+            assert _stat(await MvStats.objects().filter(id=["paid"]).first()) == (_PAID, "paid", 2, 15.5)
+            assert [_stat(row) for row in await MvStats.objects().filter(id=("new",)).exec()] == [(_NEW, "new", 1, 1.0)]
+            assert [_stat(row) for row in await MvStats.objects().filter(id__not_in=[["paid"]]).exec()] == [
+                (_NEW, "new", 1, 1.0)
+            ]
+            assert await MvStats.objects().filter(id=["gone"]).exec() == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_id_in_per_line(self, kind: str) -> None:
+        """``id__in`` binds the array ids (``TestCoerceArrayIds``). Measured on 3.3.4 and 3.1.5: SurrealDB 3.x answers
+        no record to ``id IN $ids`` on a view table — any view, any id: ``MvPaid`` keeps the source's string ids —,
+        while ``id = …``, ``id NOT IN …`` and the comparisons answer right; 2.x and the embedded engine answer the
+        records. Pinned per line: a SurrealDB 3.x defect."""
+        async with _mv(kind) as client:
+            await _save_orders()
+            await MvStats.define_view()
+            await MvPaid.define_view()
+            answered = await _major(client) < 3
+            both = await MvStats.objects().filter(id__in=[["paid"], ["new"]]).order_by("status").exec()
+            assert [_stat(row) for row in both] == ([(_NEW, "new", 1, 1.0), (_PAID, "paid", 2, 15.5)] if answered else [])
+            paid = await MvPaid.objects().filter(id__in=["o1"]).exec()
+            assert [(row.id, row.customer) for row in paid] == ([(RecordID("mv_paid_orders", "o1"), "ann")] if answered else [])
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_refresh_after_a_source_write(self, kind: str) -> None:
+        async with _mv(kind):
+            await _save_orders()
+            await MvStats.define_view()
+            stats = await MvStats.objects().get(["paid"])
+            await MvOrder(id="o4", status="paid", amount=4.5).save()
+            await stats.refresh()
+            assert _stat(stats) == (_PAID, "paid", 3, 20.0)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_id_declared_str_reads_the_array_as_text(self, kind: str) -> None:
+        """M4 pin (documented): declared ``id: str | None``, a grouped view's id reads as the text of its array —
+        ``"['paid']"`` —, which addresses no record; ``id: RecordID | None`` is the declaration of a grouped view."""
+        async with _mv(kind):
+            await _save_orders()
+            await MvStats.define_view()
+            rows = await MvStatsStr.objects().order_by("status").exec()
+            assert [(row.id, row.status, row.total, row.revenue) for row in rows] == [
+                ("['new']", "new", 1, 1.0),
+                ("['paid']", "paid", 2, 15.5),
+            ]
+            with pytest.raises(SurrealDbError, match=r"^Can't refresh data, no record found\.$"):
+                await rows[1].refresh()
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_count_and_sum(self, kind: str) -> None:
+        async with _mv(kind):
+            await _save_orders()
+            await MvStats.define_view()
+            assert await MvStats.objects().count() == 2
+            assert await MvStats.objects().filter(total__gte=2).count() == 1
+            assert await MvStats.objects().sum("revenue") == 16.5
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_subquery_over_the_view(self, kind: str) -> None:
+        async with _mv(kind):
+            await _save_orders()
+            await MvStats.define_view()
+            orders = await MvOrder.objects().filter(status__in=_busy()).order_by("id").exec()
+            assert [order.id for order in orders] == ["o1", "o2"]
+            await MvOrder(id="o4", status="new", amount=2.0).save()
+            orders = await MvOrder.objects().filter(status__in=_busy()).order_by("id").exec()
+            assert [order.id for order in orders] == ["o1", "o2", "o3", "o4"]
+
+
+async def _take(stream: Any, count: int) -> list[Any]:
+    """The next *count* items of *stream* — the envelopes of ``watch()``, the events of ``live()`` —, read within the
+    5 s deadline of spec §9.3."""
+
+    async def read() -> list[Any]:
+        seen: list[Any] = []
+        async for item in stream:
+            seen.append(item)
+            if len(seen) == count:
+                break
+        return seen
+
+    return await asyncio.wait_for(read(), timeout=5)
+
+
+async def _churn_groups() -> None:
+    """M12's source writes, after the stream started: a second ``new`` order (its group updated), a ``gone`` order
+    (a group created), then its delete (that group emptied)."""
+    await asyncio.sleep(0.3)
+    await MvOrder(id="o4", status="new", amount=2.0).save()
+    await MvOrder(id="o5", status="gone", amount=3.0).save()
+    await (await MvOrder.objects().get("o5")).delete()
+
+
+def _notified(major: int) -> list[tuple[str, RecordID, tuple[str, int, float]]]:
+    """What the view notifies for :func:`_churn_groups` on *major*, in order — action, record, ``(status, total,
+    revenue)``: the emptied group is one ``DELETE`` (its last state) on 3.x, an ``UPDATE`` to a count of 0 then a
+    ``DELETE`` on 2.x (M12)."""
+    emptied = (
+        [("DELETE", _GONE, ("gone", 1, 3.0))]
+        if major >= 3
+        else [("UPDATE", _GONE, ("gone", 0, 0.0)), ("DELETE", _GONE, ("gone", 0, 0.0))]
+    )
+    return [("UPDATE", _NEW, ("new", 2, 3.0)), ("CREATE", _GONE, ("gone", 1, 3.0)), *emptied]
+
+
+def _payload_ids(major: int) -> list[RecordID | None]:
+    """The ``id`` each notification's record holds on *major* (measured on 3.3.4, 3.1.5 and 2.7.0): none on 3.x — the
+    envelope's ``record`` and the event's ``record_id`` name the view record —, the record's own on 2.x."""
+    return [None, None, None] if major >= 3 else [_NEW, _GONE, _GONE, _GONE]
+
+
+class TestViewLiveE2E:
+    """AC-14 (E2E, both lines, WebSocket only: the embedded engine has no live queries): ``watch()`` on a view model
+    notifies the records SurrealDB recomputes when the source changes — a group emptied by a delete is one ``DELETE``
+    on 3.x, an ``UPDATE`` with a count of 0 then a ``DELETE`` on 2.x (M12) —, and ``live()`` yields ``MvStats``
+    instances."""
+
+    async def test_watch_notifies_the_view_changes_per_line(self) -> None:
+        async with _mv("ws") as client:
+            await _save_orders()
+            await MvStats.define_view()
+            major = await _major(client)
+            async with MvStats.objects().watch() as stream:
+                await _churn_groups()
+                envelopes = await _take(stream, len(_notified(major)))
+        results = [envelope["result"] for envelope in envelopes]
+        seen = [
+            (envelope["action"], envelope["record"], (result["status"], result["total"], result["revenue"]))
+            for envelope, result in zip(envelopes, results, strict=True)
+        ]
+        assert seen == _notified(major)
+        assert [result.get("id") for result in results] == _payload_ids(major)
+
+    async def test_live_yields_typed_instances(self) -> None:
+        async with _mv("ws") as client:
+            await _save_orders()
+            await MvStats.define_view()
+            major = await _major(client)
+            async with MvStats.objects().live() as stream:
+                await _churn_groups()
+                events = await _take(stream, len(_notified(major)))
+        assert [(type(event.instance), event.validation_error) for event in events] == [(MvStats, None)] * len(events)
+        seen = [
+            (event.action, event.record_id, (event.instance.status, event.instance.total, event.instance.revenue))
+            for event in events
+        ]
+        assert seen == [(LiveAction(action), str(record), row) for action, record, row in _notified(major)]
+        assert [event.instance.id for event in events] == _payload_ids(major)
