@@ -704,9 +704,10 @@ failed: the server refused statement 2 of 3: … (at line 1, column 7 of the sta
 embedded engine included, and a write or a definition in an interactive transaction raises
 "Transaction failed: the server refused the statement: … (at line 1, column 7 of the statement)".
 The line and column are those of the statement as written, before the ORM renames its `$name`
-parameters for the batch. The server's full text stays reachable as the error's `__context__`,
-which a traceback does not print. A read in a transaction is not affected: it raises the SDK's own
-error, as it does outside a transaction.
+parameters for the batch, and a delimiter left unclosed names the statement it opens in, even when
+the server stops in a later statement. The server's full text stays reachable as the error's
+`__context__`, which a traceback does not print. A read in a transaction is not affected: it raises
+the SDK's own error, as it does outside a transaction.
 
 ### 12. Upsert & get_or_create / update_or_create
 
@@ -854,8 +855,9 @@ except SurrealDbConflictError:
 - Detection anchors on SurrealDB's own retryable marker ("This transaction can be retried"), so
   a non-retryable failure (e.g. a duplicate-key error) is **not** retried. `is_conflict_error()`
   reads the exception and its chain as a traceback prints it: a context suppressed with
-  `raise … from None` is not read (v0.31.2), so a conflict you re-raise as another exception stays
-  retryable only when chained with `raise … from exc`.
+  `raise … from None` is not read (v0.31.2), so a conflict you re-raise as another exception with
+  `raise … from None` is no longer recognised: chain it (`raise … from exc`, or `raise …` without
+  `from` inside the `except` block), or raise a `SurrealDbConflictError`.
 - The exception type is identical on 2.6.x and 3.x; conflicts simply arise more often on 3.x
   (optimistic MVCC) than on 2.6.x (see the behaviour table), except on change-feed tables, where
   2.x refuses concurrent writes that 3.x accepts (see [section 22](#22-change-feeds-changes)).

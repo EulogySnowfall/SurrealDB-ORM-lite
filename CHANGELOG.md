@@ -21,9 +21,9 @@ engine too (#278). No new public API.
 
   - at a buffered commit (SurrealDB 2.x, HTTP, the embedded engine), "Transaction failed: the
     server refused statement 2 of 3: … (at line 1, column 7 of the statement)", the line and column
-    of the statement as written, before the ORM renames its `$name` parameters for the batch; when
-    the server first reports a statement left unclosed on the batch's `COMMIT` line, the statement
-    is still named;
+    of the statement as written, before the ORM renames its `$name` parameters for the batch; a
+    delimiter left unclosed names the statement it opens in, even when the server first reports it
+    in a later statement or on the batch's `COMMIT` line;
   - for a write or a definition in an interactive transaction (SurrealDB 3.x over WebSocket),
     "Transaction failed: the server refused the statement: … (at line 1, column 7 of the
     statement)";
@@ -59,15 +59,16 @@ engine too (#278). No new public API.
   `raise … from None` is no longer read, since the ORM keeps the server's full text there, which
   may quote the statement; `__cause__` and an implicit `__context__` are still followed. A conflict
   your code re-raises as another exception with `raise … from None` is therefore no longer
-  recognised, nor retried by `retry_on_conflict`: chain it with `raise … from exc`, or raise a
-  `SurrealDbConflictError`, to keep it retryable.
+  recognised, nor retried by `retry_on_conflict`: chain it (`raise … from exc`, or `raise …`
+  without `from` inside the `except` block), or raise a `SurrealDbConflictError`, to keep it
+  retryable.
 
 ### Notes
 
-- The v0.31.0 note on the DDL appliers with `tx=` (#278) no longer applies: an error raised when
-  the transaction ends gives the server's reason and the statement's position, without the
-  server's excerpt of the statement. README sections 11 and 32 and the embedded-engine table say
-  so.
+- The v0.31.0 caution on the DDL appliers with `tx=` (#278), that an error raised when the
+  transaction ends can carry the server's excerpt of the statement, no longer applies: that error
+  now gives the server's reason and the statement's position instead. README sections 11 and 32
+  and the embedded-engine table say so.
 - Same behaviour on SurrealDB 2.x, 3.x and the embedded engine. Server pins unchanged: tested
   against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine, plus 3.1.5 for backward
   compatibility.
