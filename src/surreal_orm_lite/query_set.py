@@ -618,7 +618,8 @@ class QuerySet:
         connection, with the same identity, less than ``ttl`` seconds ago, and no ORM write that can change its result
         has completed since: a write to a table it reads; any write, when it follows links (``fetch()``, a dotted path
         such as ``filter(**{"author.name": …})``, a ``select()`` item that is not a plain field, such as
-        ``"author.*"``); any delete, when it reads an edge model (a deleted record's edges go with it).
+        ``"author.*"``) or a materialized view model (``view_query``, v0.32.0), directly or through a ``Subquery``;
+        any delete, when it reads an edge model (a deleted record's edges go with it).
         Each hit builds new instances from a copy of the cached rows: changing one never changes the cache.
 
         ``ttl`` is the oldest result this read accepts, in seconds (an ``int`` or a ``float`` >= 0) or a ``timedelta``;
@@ -640,10 +641,10 @@ class QuerySet:
         another process or client, raw SurrealQL (``raw_query()``, ``QuerySet.query()``, ``call_function()``,
         ``Transaction.add()``), a write cancelled or failed client-side after its request was sent, writes made by an
         access method's own ``SIGNIN``/``SIGNUP`` clauses, what the server derives on its own (``DEFINE EVENT``,
-        ``REFERENCE … ON DELETE``, views over other tables), values computed when the read runs (``Var()`` of a
-        ``DEFINE PARAM``, ``<future>``/``COMPUTED`` fields, time functions in a ``select()`` expression): the TTL bounds
-        them; call ``QueryCache.invalidate(Model)`` after such a write, ``QueryCache.clear()`` after changing the session
-        behind the ORM's back.
+        ``REFERENCE … ON DELETE``, views over other tables read by a model without ``view_query``), values computed
+        when the read runs (``Var()`` of a ``DEFINE PARAM``, ``<future>``/``COMPUTED`` fields, time functions in a
+        ``select()`` expression): the TTL bounds them; call ``QueryCache.invalidate(Model)`` after such a write,
+        ``QueryCache.clear()`` after changing the session behind the ORM's back.
 
         Returns:
             Self: the queryset, for chaining.
@@ -903,6 +904,8 @@ class QuerySet:
         compiler.tables.add(table)
         if self.model.__surreal_edge__:
             compiler.edge_tables.add(table)
+        if self.model._is_view():
+            compiler.view_tables.add(table)
         compiler.merge_variables(self._variables)
         if table in compiler.empty_tables:
             return "[]", {}, counter
@@ -1260,7 +1263,8 @@ class QuerySet:
         table and every table a subquery reads; ``EDGES`` when one of them is an edge model's (every delete
         invalidates it); "any table" when the statement follows links (``FETCH``, a dotted path, a graph arrow) or
         a ``select()`` item is neither ``*`` nor a plain field path (``author.*``: projection semantics read the
-        linked table). On a miss :meth:`_run_uncached` sends it, compiling it again
+        linked table), or it reads a materialized view model (v0.32.0), its own or a subquery's: SurrealDB recomputes
+        the view from tables the ORM does not track. On a miss :meth:`_run_uncached` sends it, compiling it again
         (compilation is pure), so the missing-subquery-table re-send happens inside the read; only the first
         compilation gives the filter values' warnings, once per read.
         """
@@ -1274,6 +1278,8 @@ class QuerySet:
             " FETCH " in query
             or follows_links(query)
             or any(item != "*" and not VALID_FIELD_PATTERN.match(item) for item in self.select_item)
+            or self.model._is_view()
+            or bool(compiler.view_tables)
         )
         return await self._cached_read(
             "query",
@@ -1533,7 +1539,8 @@ class QuerySet:
 
     async def _cached_select(self, target: RecordID | str, tables: frozenset[str], missing: Any) -> Any:
         """The SDK's ``select(target)`` through :meth:`_cached_read` (v0.28.0): keyed on the target,
-        tagged with its table (and ``EDGES`` on an edge model); *missing* when the server says it does not exist."""
+        tagged with its table (and ``EDGES`` on an edge model; "any table" on a materialized view model, v0.32.0);
+        *missing* when the server says it does not exist."""
         if self.model.__surreal_edge__:
             tables |= {EDGES}
 
@@ -1544,7 +1551,7 @@ class QuerySet:
             except NotFoundError:
                 return missing
 
-        return await self._cached_read("select", "", {"target": target}, tables, False, run)
+        return await self._cached_read("select", "", {"target": target}, tables, self.model._is_view(), run)
 
     @_cache.invalidates("table", deletes=True)
     async def delete_table(self) -> bool:

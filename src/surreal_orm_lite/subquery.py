@@ -219,6 +219,8 @@ class SubqueryCompiler:
         lets: the ``LET $_sq<N> = …;`` of the block, innermost first.
         tables: the tables the subqueries read.
         edge_tables: the tables of edge models the subqueries read: the query cache tags such a read (v0.28.0).
+        view_tables: the tables of view models the subqueries read: the query cache tags such a read "any table"
+            (v0.32.0).
         warn: emit the warnings of the statement's filter values (the ``"$$"`` escape, a string naming a variable):
             ``False`` when the statement is compiled again for a read that compiled it once (a ``cache()`` miss, a
             re-send for a missing subquery table), so each read warns once (v0.28.1).
@@ -238,6 +240,7 @@ class SubqueryCompiler:
     lets: list[str] = field(default_factory=list)
     tables: set[str] = field(default_factory=set)
     edge_tables: set[str] = field(default_factory=set)
+    view_tables: set[str] = field(default_factory=set)
     warn: bool = True
     variable_like: list[str] = field(default_factory=list)
     _stack: list[int] = field(default_factory=list)

@@ -48,6 +48,11 @@ a ``Subquery``, ``id__in`` sent as ``$_f0 CONTAINS id`` on a view model (Surreal
 ``watch()`` and ``live()`` notify a group emptied by a delete as one ``DELETE`` on 3.x, an ``UPDATE`` to a count of 0
 then a ``DELETE`` on 2.x; a 3.x notification's record carries no ``id``, which ``live()`` takes from the
 notification's record id.
+
+The query cache (spec §6.4, §6.5, D11; AC-15): a read of a view model — ``exec()``, ``all()``, ``get(["paid"])`` — and
+a read whose ``Subquery`` reads one (``SubqueryCompiler.view_tables``) are tagged "any table" (``_cached_read`` spied,
+no client); E2E on both lines, such a cached read is read again after an ORM write to the view's source table, with no
+``QueryCache.invalidate()``, and after ``define_view()``/``remove_view()``.
 """
 
 import asyncio
@@ -72,6 +77,8 @@ from surreal_orm_lite import (
     Event,
     LiveAction,
     Q,
+    QueryCache,
+    QuerySet,
     Subquery,
     SurrealConfigDict,
     SurrealDbAuthenticationError,
@@ -100,6 +107,7 @@ from surreal_orm_lite.schema import (
     view_query_outline,
     view_statement,
 )
+from surreal_orm_lite.subquery import SubqueryCompiler
 from surreal_orm_lite.utils import apply_ddl_statements
 from tests.conftest import default_connection_class
 
@@ -3940,3 +3948,194 @@ class TestViewLiveE2E:
         ]
         assert seen == [(LiveAction(action), str(record), row) for action, record, row in _notified(major)]
         assert [event.instance.id for event in events] == [record for _, record, _ in _notified(major)]
+
+
+#: A cached read as ``QuerySet._cached_read`` is called with it: ``(kind, tables, any_table)``.
+_CachedRead = tuple[str, frozenset[str], bool]
+
+
+@pytest.fixture
+def cached_reads(monkeypatch: pytest.MonkeyPatch) -> list[_CachedRead]:
+    """Spy on ``QuerySet._cached_read`` (AC-15, unit): record each cached read's ``(kind, tables, any_table)`` and
+    answer it without a client — a record read by id gets a row of ``MvStats``' ``paid`` group, any other read no row."""
+    reads: list[_CachedRead] = []
+
+    async def spy(
+        self: QuerySet,
+        kind: str,
+        statement: str,
+        variables: dict[str, Any],
+        tables: frozenset[str],
+        any_table: bool,
+        run: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        reads.append((kind, tables, any_table))
+        target = variables.get("target")
+        if kind == "select" and isinstance(target, RecordID):
+            return {"id": target, "status": "paid", "total": 2, "revenue": 15.5}
+        return []
+
+    monkeypatch.setattr(QuerySet, "_cached_read", spy)
+    return reads
+
+
+class TestViewCacheTags:
+    """AC-15 (unit): the two call sites of ``_cached_read()`` — ``_run_cached()`` (``exec()``) and ``_cached_select()``
+    (``all()``, ``get(<id>)``) — tag a read of a view model "any table", and leave an ordinary model's read as it was;
+    a ``Subquery`` over a view model fills ``SubqueryCompiler.view_tables``, which tags the outer read."""
+
+    async def test_exec_of_a_view_model_reads_any_table(self, cached_reads: list[_CachedRead]) -> None:
+        assert await MvStats.objects().cache(60).exec() == []
+        assert cached_reads == [("query", frozenset({"mv_order_stats"}), True)]
+
+    async def test_all_of_a_view_model_reads_any_table(self, cached_reads: list[_CachedRead]) -> None:
+        assert await MvStats.objects().cache(60).all() == []
+        assert cached_reads == [("select", frozenset({"mv_order_stats"}), True)]
+
+    async def test_get_by_array_id_of_a_view_model_reads_any_table(self, cached_reads: list[_CachedRead]) -> None:
+        assert _stat(await MvStats.objects().cache(60).get(["paid"])) == (_PAID, "paid", 2, 15.5)
+        assert cached_reads == [("select", frozenset({"mv_order_stats"}), True)]
+
+    async def test_an_ordinary_model_is_unchanged(self, cached_reads: list[_CachedRead]) -> None:
+        assert await MvOrder.objects().cache(60).exec() == []
+        assert await MvOrder.objects().cache(60).all() == []
+        order = await MvOrder.objects().cache(60).get("o1")
+        assert (type(order), order.status) == (MvOrder, "paid")
+        assert await MvOrder.objects().cache(60).filter(status__in=Subquery(MvOrder.objects().select("status"))).exec() == []
+        assert cached_reads == [
+            ("query", frozenset({"mv_orders"}), False),
+            ("select", frozenset({"mv_orders"}), False),
+            ("select", frozenset({"mv_orders"}), False),
+            ("query", frozenset({"mv_orders"}), False),
+        ]
+
+    async def test_a_subquery_over_a_view_model_reads_any_table(self, cached_reads: list[_CachedRead]) -> None:
+        assert await MvOrder.objects().cache(60).filter(status__in=_busy()).exec() == []
+        assert cached_reads == [("query", frozenset({"mv_orders", "mv_order_stats"}), True)]
+
+    def test_a_subquery_over_a_view_model_fills_view_tables(self) -> None:
+        compiler = SubqueryCompiler()
+        MvOrder.objects().filter(status__in=_busy())._compile_query(subqueries=compiler)
+        assert (compiler.tables, compiler.view_tables) == ({"mv_order_stats"}, {"mv_order_stats"})
+
+    def test_a_subquery_over_an_ordinary_model_leaves_view_tables_empty(self) -> None:
+        compiler = SubqueryCompiler()
+        MvStats.objects().filter(status__in=Subquery(MvOrder.objects().select("status")))._compile_query(subqueries=compiler)
+        assert (compiler.tables, compiler.view_tables) == ({"mv_orders"}, set())
+        assert SubqueryCompiler().view_tables == set()
+
+
+class MvWatch(BaseSurrealModel):
+    """A status someone watches (AC-15): an ordinary table outside the view's ``FROM``, read through a ``Subquery`` over
+    ``MvStats`` — only the view tag drops such a cached read on a write to ``mv_orders``."""
+
+    model_config = SurrealConfigDict(table_name="mv_watches", connection="mv")
+
+    id: str | None = None
+    status: str
+
+
+@pytest.fixture
+def empty_cache() -> Iterator[None]:
+    """An empty query cache around the test (AC-15, E2E)."""
+    QueryCache.clear()
+    yield
+    QueryCache.clear()
+
+
+def _hits() -> int:
+    """The query cache's hits so far."""
+    return int(QueryCache.stats()["hits"])
+
+
+def _cached_stats() -> QuerySet:
+    """``MvStats``' groups by status, with ``cache(60)``."""
+    return MvStats.objects().cache(60).order_by("status")
+
+
+def _by_status(rows: list[MvStats]) -> list[tuple[RecordID | None, str, int, float]]:
+    """*rows* as :func:`_stat` reads them, by status (``all()`` keeps the server's order)."""
+    return sorted((_stat(row) for row in rows), key=lambda stat: stat[1])
+
+
+#: ``MvStats``' groups after :func:`_save_orders`, as :func:`_stat` reads them.
+_STATS_BEFORE = [(_NEW, "new", 1, 1.0), (_PAID, "paid", 2, 15.5)]
+
+
+@pytest.mark.usefixtures("empty_cache")
+class TestViewCacheE2E:
+    """AC-15 (E2E, both lines, WebSocket, HTTP and ``mem://``): a cached read of a view model — ``exec()``,
+    ``get(["paid"])``, ``all()`` — and a cached read filtered by a ``Subquery`` over one are read again after an ORM
+    write to the view's source table, with no ``QueryCache.invalidate()``; ``define_view()`` and ``remove_view()``
+    drop the cached read too. Each read is first answered by the cache (one more hit), so a stale answer would show."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_exec_after_a_source_write(self, kind: str) -> None:
+        async with _mv(kind):
+            await _save_orders()
+            await MvStats.define_view()
+            assert [_stat(row) for row in await _cached_stats().exec()] == _STATS_BEFORE
+            hits = _hits()
+            assert [_stat(row) for row in await _cached_stats().exec()] == _STATS_BEFORE
+            assert _hits() == hits + 1
+            await MvOrder(id="o4", status="paid", amount=4.5).save()
+            assert [_stat(row) for row in await _cached_stats().exec()] == [(_NEW, "new", 1, 1.0), (_PAID, "paid", 3, 20.0)]
+            assert _hits() == hits + 1
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_get_by_array_id_and_all_after_a_source_write(self, kind: str) -> None:
+        async with _mv(kind):
+            await _save_orders()
+            await MvStats.define_view()
+            assert _stat(await MvStats.objects().cache(60).get(["paid"])) == (_PAID, "paid", 2, 15.5)
+            assert _by_status(await MvStats.objects().cache(60).all()) == _STATS_BEFORE
+            hits = _hits()
+            assert _stat(await MvStats.objects().cache(60).get(["paid"])) == (_PAID, "paid", 2, 15.5)
+            assert _by_status(await MvStats.objects().cache(60).all()) == _STATS_BEFORE
+            assert _hits() == hits + 2
+            await MvOrder(id="o4", status="paid", amount=4.5).save()
+            assert _stat(await MvStats.objects().cache(60).get(["paid"])) == (_PAID, "paid", 3, 20.0)
+            assert _by_status(await MvStats.objects().cache(60).all()) == [
+                (_NEW, "new", 1, 1.0),
+                (_PAID, "paid", 3, 20.0),
+            ]
+            assert _hits() == hits + 2
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_subquery_over_the_view_after_a_source_write(self, kind: str) -> None:
+        """The ``MvOrder`` read of AC-15, and an ``MvWatch`` read: its own table is not the view's source, so only the
+        view tag (``SubqueryCompiler.view_tables``) drops it when an order is saved."""
+        async with _mv(kind):
+            await _save_orders()
+            await MvStats.define_view()
+            await MvWatch(id="w1", status="paid").save()
+            await MvWatch(id="w2", status="new").save()
+
+            async def busy() -> tuple[list[str | None], list[str | None]]:
+                orders = await MvOrder.objects().cache(60).filter(status__in=_busy()).order_by("id").exec()
+                watches = await MvWatch.objects().cache(60).filter(status__in=_busy()).order_by("id").exec()
+                return [order.id for order in orders], [watch.id for watch in watches]
+
+            assert await busy() == (["o1", "o2"], ["w1"])
+            hits = _hits()
+            assert await busy() == (["o1", "o2"], ["w1"])
+            assert _hits() == hits + 2
+            await MvOrder(id="o4", status="new", amount=2.0).save()
+            assert await busy() == (["o1", "o2", "o3", "o4"], ["w1", "w2"])
+            assert _hits() == hits + 2
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_define_view_and_remove_view_drop_the_cached_read(self, kind: str) -> None:
+        async with _mv(kind):
+            await _save_orders()
+            assert await _cached_stats().exec() == []
+            hits = _hits()
+            assert await _cached_stats().exec() == []
+            assert _hits() == hits + 1
+            await MvStats.define_view()
+            assert [_stat(row) for row in await _cached_stats().exec()] == _STATS_BEFORE
+            assert [_stat(row) for row in await _cached_stats().exec()] == _STATS_BEFORE
+            assert _hits() == hits + 2
+            await MvStats.remove_view()
+            assert await _cached_stats().exec() == []
+            assert _hits() == hits + 2
