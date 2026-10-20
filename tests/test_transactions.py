@@ -14,6 +14,7 @@ from surreal_orm_lite import (
 from surreal_orm_lite.exceptions import SurrealDbConflictError, SurrealDbError
 from surreal_orm_lite.signals import post_delete, post_save
 from surreal_orm_lite.transaction import BufferedTransaction, InteractiveTransaction, Transaction
+from tests._readme_tables import assert_server_header_sentence
 
 
 def test_transaction_is_exported() -> None:
@@ -1271,16 +1272,11 @@ class TestFailedStatementReadme:
     """The README's 2.x vs 3.x table says where the v0.30.3 row was measured."""
 
     def test_server_behaviour_header_sentence(self) -> None:
-        from tests.test_embedded import _normalised, _readme_part
-        from tests.test_time_travel import _SERVER_BEHAVIOUR
-
-        header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
-        v0300 = "Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs."
-        v0303 = (
+        """Its exact text, in version order among the other releases' sentences."""
+        assert_server_header_sentence(
             "The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded "
             "engine, identical on 3.1.5."
         )
-        assert f"{v0300} {v0303}" in header, header
 
 
 class TxFailRow(BaseSurrealModel):

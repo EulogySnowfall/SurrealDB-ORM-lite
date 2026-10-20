@@ -62,12 +62,11 @@ from surreal_orm_lite._sdk import AsyncSurreal, cbor_encode
 from surreal_orm_lite.cache import EDGES, CacheRequest, follows_links
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.transaction import BufferedTransaction, InteractiveTransaction
+from tests._readme_tables import assert_server_header_sentence, assert_server_rows, assert_server_table
 from tests.conftest import _ws_url, default_connection_class
 from tests.test_embedded import _cells, _normalised, _readme, _readme_part, _subsection, _table_rows, _tables
-from tests.test_subqueries import _SUBQUERY_ROWS
 from tests.test_time_travel import (
     _SERVER_BEHAVIOUR,
-    _SERVER_TABLE_WIDTHS,
     _forbidden_client,
     _http_url,
     _line,
@@ -3817,11 +3816,8 @@ _QUERY_CACHE_ROW = [
     "the same; reads inside an interactive transaction are never cached (they see its uncommitted writes)",
     "v0.28.0",
 ]
-#: No final period: v0.29.0 appends its own clause after this one.
-_HEADER_CLAUSE_28 = (
-    "rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and "
-    "3.3.4, identical on 3.1.5"
-)
+#: The clause v0.28.0 adds to the 2.x/3.x table's intro paragraph.
+_HEADER_CLAUSE_28 = "rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5"
 #: Spec §11 (revision 3, P5): what the cache cannot see, one bullet of "Invalidation" holding each group of names.
 _CANNOT_SEE = {
     "another process or client": ("another process",),
@@ -3851,10 +3847,6 @@ def _part_29(heading: str) -> str:
 def _bullets(text: str) -> list[str]:
     """The ``- `` bullets of *text*, each with its continuation lines, whitespace normalised."""
     return [_normalised(bullet) for bullet in re.findall(r"^- .*?(?=^- |^\s*$|\Z)", text, re.MULTILINE | re.DOTALL)]
-
-
-def _behaviour_rows() -> list[list[str]]:
-    return [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
 
 
 class TestQueryCacheDocs:
@@ -4004,27 +3996,18 @@ class TestQueryCacheDocs:
         assert firsts.index(row[0]) == firsts.index("Subqueries (`Subquery`, a QuerySet as a filter value)") + 1
 
     def test_server_behaviour_row(self) -> None:
-        """One row, Since v0.28.0, right after the four v0.27.0 rows and before the table's last row (later
-        versions add their rows after it: v0.28.1's, v0.29.0's)."""
-        rows = _behaviour_rows()
+        """One row, Since v0.28.0, in version order before the table's last row (later releases add their rows in
+        version order)."""
         assert [len(cell) for cell in _QUERY_CACHE_ROW] == [37, 167, 100, 7]
-        index = rows.index(_QUERY_CACHE_ROW)
-        assert index < len(rows) - 1, rows
-        assert rows[index - 4 : index] == _SUBQUERY_ROWS, rows[index - 4 : index]
-        assert rows[-1][3] == "v0.19.1", rows[-1]
-        assert [cells for cells in rows if cells[3] == "v0.28.0"] == [_QUERY_CACHE_ROW]
+        assert_server_rows([_QUERY_CACHE_ROW])
 
     def test_server_behaviour_table_keeps_its_widths(self) -> None:
         """Every line 535 characters, the columns 136, 175, 181 and 38 wide: no line re-padded."""
-        [lines] = _tables(_readme_part(_SERVER_BEHAVIOUR))
-        assert {len(line) for line in lines} == {535}
-        for line in lines:
-            assert [len(cell) for cell in line.split("|")[1:-1]] == _SERVER_TABLE_WIDTHS, line
+        assert_server_table()
 
     def test_server_behaviour_header_clause(self) -> None:
-        """The header's clause names v0.28.0's lines (v0.28.1 and v0.29.0 append theirs after it)."""
-        header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
-        assert _HEADER_CLAUSE_28 in header, header
+        """The header's clause names v0.28.0's lines, in version order among the other releases' sentences."""
+        assert_server_header_sentence(_HEADER_CLAUSE_28)
 
     def test_comparison_row(self) -> None:
         comparison = [cells for _, cells in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]

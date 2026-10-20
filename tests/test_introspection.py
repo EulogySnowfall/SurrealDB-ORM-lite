@@ -79,6 +79,12 @@ from surreal_orm_lite.define_parser import (
 from surreal_orm_lite.live import is_connection_failure, is_dead
 from surreal_orm_lite.testing import embedded_database
 from tests._proxy import CuttableProxy
+from tests._readme_tables import (
+    assert_embedded_rows,
+    assert_server_header_sentence,
+    assert_server_rows,
+    assert_server_table,
+)
 from tests.conftest import orm_client
 from tests.test_embedded import (
     _EMBEDDED_BEHAVIOUR,
@@ -92,7 +98,7 @@ from tests.test_embedded import (
 )
 from tests.test_model_generator import DOCSTRING, GOLDEN
 from tests.test_query_cache import _bullets
-from tests.test_time_travel import _SERVER_BEHAVIOUR, _SERVER_TABLE_WIDTHS
+from tests.test_time_travel import _SERVER_BEHAVIOUR
 
 #: The 13 names spec §5.8 exports (AC-1).
 _EXPORTS = (
@@ -2661,43 +2667,22 @@ class TestReadmeSection31:
         assert comparison[firsts.index("Multi-database") + 1] == _COMPARISON_ROW_31, comparison
 
     def test_server_behaviour_rows(self) -> None:
-        """Spec §11.1 item 5: seven rows, Since v0.30.0, right after the v0.29.2 row; only rows of later versions
-        (v0.30.x follow-ups, v0.31.0 and after) between them and the table's last row."""
-        rows = [cells for _, cells in _table_rows(_readme_part(_SERVER_BEHAVIOUR))]
-        start = rows.index(_INTROSPECTION_ROWS[0])
-        count = len(_INTROSPECTION_ROWS)
-        assert rows[start : start + count] == _INTROSPECTION_ROWS, rows[start : start + count]
-        assert rows[start - 1][3] == "v0.29.2", rows[start - 1]
-        assert rows[-1][3] == "v0.19.1", rows[-1]
-        later = rows[start + count : -1]
-        assert all(tuple(int(n) for n in cells[3][1:].split(".")) > (0, 30, 0) for cells in later), later
-        assert [cells for cells in rows if cells[3] == "v0.30.0"] == _INTROSPECTION_ROWS
+        """Spec §11.1 item 5: seven rows, Since v0.30.0, together and in version order before the table's last row
+        (later releases, v0.30.x follow-ups among them, add their rows in version order)."""
+        assert_server_rows(_INTROSPECTION_ROWS)
 
     def test_server_behaviour_table_keeps_its_widths(self) -> None:
         """Every line 535 characters, the columns 136, 175, 181 and 38 wide: the new rows are padded to them."""
-        [lines] = _tables(_readme_part(_SERVER_BEHAVIOUR))
-        assert {len(line) for line in lines} == {535}
-        for line in lines:
-            assert [len(cell) for cell in line.split("|")[1:-1]] == _SERVER_TABLE_WIDTHS, line
+        assert_server_table()
 
     def test_server_behaviour_header_sentence(self) -> None:
-        """The sentence v0.30.0 appends to the table's intro paragraph, after v0.29.2's."""
-        header = _normalised(_readme_part(_SERVER_BEHAVIOUR).split("\n|", 1)[0])
-        v0292 = "The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5."
-        assert f"{v0292} {_HEADER_SENTENCE_30}" in header, header
+        """The sentence v0.30.0 adds to the table's intro paragraph, in version order among the others."""
+        assert_server_header_sentence(_HEADER_SENTENCE_30)
 
     def test_embedded_table_row(self) -> None:
-        """Spec §11.1 item 6: all four cells, before the v0.31.0 row and the catch-all "Everything else" row; widths
-        kept."""
-        part = _readme_part(_EMBEDDED_BEHAVIOUR)
-        rows = [cells for _, cells in _table_rows(part)]
-        assert _EMBEDDED_INTROSPECTION_ROW in rows, rows
-        assert rows.index(_EMBEDDED_INTROSPECTION_ROW) < len(rows) - 2, rows
-        assert rows[-1][0] == "Everything else", rows[-1]
-        [lines] = _tables(part)
-        assert {len(line) for line in lines} == {539}
-        for line in lines:
-            assert [len(cell) for cell in line.split("|")[1:-1]] == [69, 343, 113, 9], line
+        """Spec §11.1 item 6: all four cells, in version order before the catch-all "Everything else" row; widths
+        kept (69, 343, 113, 9)."""
+        assert_embedded_rows([_EMBEDDED_INTROSPECTION_ROW])
 
     def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
         """Every table v0.30.0 touches keeps one cell count per line and no escaped pipe."""

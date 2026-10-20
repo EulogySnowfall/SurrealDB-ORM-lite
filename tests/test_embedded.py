@@ -63,6 +63,15 @@ from surreal_orm_lite.exceptions import SurrealDbAuthenticationError, SurrealDbC
 from surreal_orm_lite.live import require_websocket
 from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.transaction import BufferedTransaction
+from tests._readme_tables import EMBEDDED_BEHAVIOUR as _EMBEDDED_BEHAVIOUR
+from tests._readme_tables import assert_embedded_rows, release
+from tests._readme_tables import cells as _cells
+from tests._readme_tables import normalised as _normalised
+from tests._readme_tables import readme as _readme
+from tests._readme_tables import readme_part as _readme_part
+from tests._readme_tables import subsection as _subsection
+from tests._readme_tables import table_rows as _table_rows
+from tests._readme_tables import tables as _tables
 from tests.conftest import _REWRITE_MODULES, _ws_url, default_connection_class, orm_client
 
 _T = TypeVar("_T")
@@ -2468,53 +2477,12 @@ class TestConcurrentBindEmbeddedE2E:
 
 # README section 26, the comparison tables and the ROADMAP parity notes (spec §11, AC-14; P1, P2, P3, P5)
 
-_REPO = Path(__file__).resolve().parents[1]
-_README = _REPO / "README.md"
-_ROADMAP = _REPO / "docs" / "ROADMAP.md"
+_ROADMAP = Path(__file__).resolve().parents[1] / "docs" / "ROADMAP.md"
 _SECTION_26 = "### 26. Embedded engine and test fixtures"
-_EMBEDDED_BEHAVIOUR = "### ORM behaviour: the embedded engine"
-
-
-def _readme() -> str:
-    return _README.read_text(encoding="utf-8")
-
-
-def _readme_part(heading: str) -> str:
-    """The README text from the ``heading`` line up to the next ``##``/``###`` heading."""
-    match = re.search(rf"^{re.escape(heading)}\n.*?(?=^#{{2,3}} )", _readme(), re.MULTILINE | re.DOTALL)
-    assert match, f"README has no {heading!r} section"
-    return match.group(0)
 
 
 def _section_26() -> str:
     return _readme_part(_SECTION_26)
-
-
-def _subsection(heading: str, text: str) -> str:
-    """The ``heading`` line of ``text`` up to the next heading of level 2 to 4, or the end."""
-    match = re.search(rf"^{re.escape(heading)}\n.*?(?=^#{{2,4}} |\Z)", text, re.MULTILINE | re.DOTALL)
-    assert match, f"no {heading!r} part"
-    return match.group(0)
-
-
-def _normalised(text: str) -> str:
-    return " ".join(text.split())
-
-
-def _cells(line: str) -> list[str]:
-    return [cell.strip() for cell in re.split(r"(?<!\\)\|", line.strip().strip("|"))]
-
-
-def _tables(text: str) -> list[list[str]]:
-    """Every table of ``text``: its lines, header and separator included."""
-    return [block.splitlines() for block in re.findall(r"(?:^\|.*\n)+", text, re.MULTILINE)]
-
-
-def _table_rows(text: str, header: str | None = None) -> list[tuple[str, list[str]]]:
-    """The body rows of the first table of ``text`` (whose header line contains ``header``, when given)."""
-    tables = [lines for lines in _tables(text) if header is None or header in lines[0]]
-    assert tables, f"no table with {header!r} in its header"
-    return [(line, _cells(line)) for line in tables[0][2:]]
 
 
 def _section_26_examples() -> list[str]:
@@ -2664,13 +2632,15 @@ class TestReadmeEmbeddedWording:
             assert word in text, word
 
     def test_embedded_behaviour_table(self) -> None:
+        """Four cells a row, each "Since" a release; v0.25.0's rows first and together, in a table in version order
+        that keeps its widths and its catch-all last row (later releases add their rows in version order)."""
         part = _readme_part(_EMBEDDED_BEHAVIOUR)
         [lines] = _tables(part)
         assert _cells(lines[0]) == ["ORM capability", "Embedded engine (SDK 2.0.0)", "Servers (2.x and 3.x)", "Since"]
         rows = [cells for _, cells in _table_rows(part)]
-        assert all(len(cells) == 4 and cells[3] in {"v0.25.0", "v0.26.0", "v0.29.0", "v0.30.0", "v0.31.0"} for cells in rows), (
-            rows
-        )
+        assert all(len(cells) == 4 for cells in rows), rows
+        assert release(rows[0][3]) == (0, 25, 0), rows[0]
+        assert_embedded_rows([cells for cells in rows[:-1] if release(cells[3]) == (0, 25, 0)])
         firsts = " ".join(cells[0] for cells in rows).lower()
         for row in (
             "live queries",
