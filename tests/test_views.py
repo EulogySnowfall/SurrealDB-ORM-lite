@@ -480,6 +480,26 @@ class TestViewOutline:
         element = view_query_outline("SELECT g, { k: t:1, n: a.b } AS o FROM src GROUP BY g").elements[1]
         assert element.fields == ("a.b",)
 
+    def test_typed_literal_prefixes_are_not_fields(self) -> None:
+        """The prefix of ``d'…'``, ``r"…"``, ``u'…'``, ``s'…'`` (both lines) and ``b"…"`` (3.x) is part of the literal,
+        never a field; the fields around such a literal are still read."""
+        outline = view_query_outline(
+            "SELECT g, d'2026-01-01T00:00:00Z' AS a, r\"src:1\" AS b, u'0190d2b6-0000-7000-8000-000000000000' AS c, "
+            "s'x' AS e, b\"00ff\" AS f, amount AS h, status + 'x' AS i, c.country AS j, v + s'x' AS k FROM src"
+        )
+        assert [element.fields for element in outline.elements] == [
+            ("g",),
+            (),
+            (),
+            (),
+            (),
+            (),
+            ("amount",),
+            ("status",),
+            ("c.country",),
+            ("v",),
+        ]
+
     def test_graph_paths_are_opaque(self) -> None:
         element = view_query_outline("SELECT g, ->knows->person AS p FROM src GROUP BY g").elements[1]
         assert element == _element("->knows->person", "p", opaque=True)
@@ -524,6 +544,13 @@ _HAZARD_ELEMENTS: list[tuple[str, tuple[str, str] | None]] = [
             "COUNT()",
             "`v`",
             "count()",
+            # A typed literal: its prefix is no field.
+            "d'2026-01-01T00:00:00Z'",
+            'r"src:1"',
+            "u'0190d2b6-0000-7000-8000-000000000000'",
+            "s'x'",
+            'b"00ff"',
+            "g + s'x'",
         ]
     ],
     # An expression around an aggregate.
@@ -554,6 +581,7 @@ _HAZARD_ELEMENTS: list[tuple[str, tuple[str, str] | None]] = [
     ("v", ("field", "v")),
     ("v * 2", ("field", "v")),
     ("time::from::unix(v)", ("field", "v")),
+    ("v + s'x'", ("field", "v")),
 ]
 
 #: ``(query, expected hazards)`` — whole queries.
@@ -589,6 +617,7 @@ _HAZARD_QUERIES: list[tuple[str, tuple[ViewHazard, ...]]] = [
     ("SELECT g, count() AS n, $value AS p FROM src GROUP BY g", ()),
     ("SELECT g, c.country.code AS cc, count() AS n FROM src GROUP BY g, c.country", ()),
     ("SELECT g, gx AS x, count() AS n FROM src GROUP BY g", (ViewHazard("field", "gx", "gx"),)),
+    ("SELECT g, count() AS n, d'2026-01-01T00:00:00Z' AS since FROM src GROUP BY g", ()),
     # Every element yields one hazard at most, in projection order.
     (
         "SELECT g, count() * 2 AS a, v AS b FROM src GROUP BY g",
@@ -3311,6 +3340,25 @@ class MvSafeSum(BaseSurrealModel):
     revenue: float
 
 
+#: The ``d'…'`` literal of :class:`MvSince`, as the ORM reads it back.
+_MV_SINCE = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+class MvSince(BaseSurrealModel):
+    """A typed literal (``d'…'``) in a grouped projection: a constant, no C1 hazard (its prefix is no field)."""
+
+    model_config = SurrealConfigDict(
+        table_name="mv_since",
+        connection="mv",
+        view_query="SELECT status, count() AS total, d'2026-01-01T00:00:00Z' AS since FROM mv_orders GROUP BY status",
+    )
+
+    id: RecordID | None = None
+    status: str
+    total: int
+    since: datetime
+
+
 #: AC-7 (b): each C1 kind from a model, and its refusal on SurrealDB 2.x (*engine*).
 _C1_MODELS: list[tuple[type[BaseSurrealModel], Callable[[str], str]]] = [
     (MvSpread, lambda engine: _c1a("MvSpread", "math::stddev", engine)),
@@ -3420,6 +3468,20 @@ class TestViewLinesE2E:
             await MvOrder(id="x", status="paid").save()
             assert [row["id"] for row in await _rows(client, "mv_orders")] == [RecordID("mv_orders", "x")]
             assert [(row.status, row.revenue) for row in await MvSafeSum.objects().exec()] == [("paid", 0.0)]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_typed_literal_is_no_hazard(self, monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+        """A ``d'…'`` literal in a grouped projection reads no field: C1 finds no hazard and sends no ``version()``,
+        and every line — SurrealDB 2.x and the embedded engine included — defines the view and keeps it up to date."""
+        async with _mv(kind) as client:
+            calls = _spy(monkeypatch, client)
+            assert await MvSince.define_view() == MvSince.view_ddl()
+            assert [method for method, _ in calls if method == "version"] == []
+            await _save_orders()
+            rows = {row.status: (row.total, row.since) for row in await MvSince.objects().exec()}
+            assert rows == {"new": (1, _MV_SINCE), "paid": (2, _MV_SINCE)}
+            await (await MvOrder.objects().get("o2")).delete()
+            assert {row.status: row.total for row in await MvSince.objects().exec()} == {"new": 1, "paid": 1}
 
 
 # --- removing a view that another view reads (spec §1.4, §4, §7, §5.6 G5 and S3; AC-20; M11) -------------------------

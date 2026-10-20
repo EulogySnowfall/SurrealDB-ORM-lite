@@ -535,7 +535,10 @@ _VIEW_ALIAS = re.compile(r"\s+AS\s+(`[^`]*`|⟨[^⟩]*⟩|[^\s`⟨]+)\s*$", re.I
 #: A sub-select or a graph path: an element the reading leaves to the server.
 _VIEW_OPAQUE = re.compile(r"\bSELECT\b|->|<-", re.IGNORECASE)
 _VIEW_CALL = re.compile(r"(?<![\w$.:])([A-Za-z_]\w*(?:::[A-Za-z_]\w*)*)\s*\(")
-_VIEW_FIELD = re.compile(r"(?<![\w$.:])([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)(?![\w.])(?!\s*[(:])")
+#: A name or an ``a.b`` path a projection element reads — not one followed by ``(`` or ``:`` (a call, an object key,
+#: a record id's table), nor by a quote: the prefix of a typed literal (``d'…'``, ``r"…"``, ``u'…'``, ``s'…'``,
+#: ``b"…"``), whose delimiters ``blank_literals()`` keeps.
+_VIEW_FIELD = re.compile(r"(?<![\w$.:])([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)(?![\w.'\"])(?!\s*[(:])")
 _VIEW_CAST = re.compile(r"<\s*[A-Za-z_][\w:]*(?:\s*<[^<>]*>)?\s*>")
 _VIEW_PARAMETER = re.compile(r"\$[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")
 
@@ -749,7 +752,8 @@ def _spaces(match: re.Match[str]) -> str:
 
 def _view_fields(blanked: str) -> tuple[str, ...]:
     """The fields the blanked expression *blanked* reads: casts and parameters first blanked, then every name or
-    ``a.b`` path that is not a function, a ``::`` path, an object key, a record id's table or a keyword."""
+    ``a.b`` path that is not a function, a ``::`` path, an object key, a record id's table, a typed literal's prefix
+    (``d'…'``) or a keyword."""
     if blanked == "*":
         return ("*",)
     plain = _VIEW_PARAMETER.sub(_spaces, _VIEW_CAST.sub(_spaces, blanked))
