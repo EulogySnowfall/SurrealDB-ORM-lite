@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.32.1] - 2026-10-20
+
+Two follow-ups to the materialized views of v0.32.0 (#286): a function SurrealDB lists as unusable
+in a view is allowed inside the argument of each of several aggregates, and a chain of views can
+be removed outer view first in one buffered transaction. No new public API.
+
+### Fixed
+
+- **A listed function inside the argument of each of several aggregates passes the
+  `view_query` check** (#286). Since v0.32.0, a grouped view whose projection calls
+  `array::distinct()`, `array::group()`, `array::join()`, `math::median()` or `vector::sum()`
+  outside an aggregate's argument raises `ValueError` at the `class` statement, but only an element
+  that is one whole aggregate had its calls skipped: an expression combining several aggregates,
+  such as `math::sum(amount) + math::sum(array::len(array::distinct(tags)))`, was refused on every
+  line. Such an expression now passes the check; a listed function beside or around an aggregate
+  (`math::sum(amount) + array::len(array::distinct(tags))`) is still refused, with the same
+  message. SurrealDB 3.x keeps such a view up to date; on 2.x and the embedded engine
+  `define_view()` still refuses an expression around aggregates before any DDL, as in v0.32.0.
+  `generate_models_from_db()` follows the check: such a view table is now generated as a view
+  model instead of a class carrying a `# View: AS …` comment.
+- **`remove_view()` accepts a chain of views removed outer view first in one buffered
+  transaction** (#286). On SurrealDB 2.x and the embedded engine, `remove_view()` refuses with
+  `SurrealDbError`, before any DDL, to remove a view that another view reads, and it read committed
+  state only, so this block was refused although the server accepts both statements at commit:
+
+  ```python
+  async with SurrealDBConnectionManager.transaction() as tx:
+      await OrderStatsTotals.remove_view(tx=tx)  # the outer view, queued
+      await OrderStats.remove_view(tx=tx)        # refused: the outer view was still counted
+  ```
+
+  In a buffered transaction (SurrealDB 2.x, HTTP, the embedded engine), a view whose
+  `remove_view(tx=tx)` the same block has already queued is no longer counted, unless the block
+  names it again afterwards (a `define_view(tx=tx)` of it). A view removed in another transaction,
+  or by a `REMOVE TABLE` you add to the block yourself (`tx.add(…)`), is still counted: the check
+  errs on the side of the refusal. SurrealDB 3.x decides by itself, as before.
+
+### Notes
+
+- README section 33 and the "ORM behaviour: SurrealDB 2.x vs 3.x" row on removing a view that
+  another view reads say so.
+- Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine,
+  plus 3.1.5 for backward compatibility.
+
 ## [0.32.0] - 2026-10-20
 
 Materialized views as read-only models: a model declares the `SELECT` that SurrealDB computes a

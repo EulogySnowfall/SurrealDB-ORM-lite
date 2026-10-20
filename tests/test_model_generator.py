@@ -2020,8 +2020,14 @@ _REFUSED_VIEW_QUERIES = [
     "SELECT VALUE a FROM t",
     "SELECT a FROM t; SELECT b FROM t",
     "SELECT g, math::median(v) AS m FROM t GROUP BY g",
+    "SELECT g, math::sum(a) + array::len(array::distinct(tags)) AS x FROM t GROUP BY g",
     "RETURN 1",
 ]
+
+#: Issue #286: two aggregates in one element, a function V7 lists inside the second's argument — a view model.
+_SEVERAL_AGGREGATES_VIEW = (
+    "SELECT status, math::sum(amount) + math::sum(array::len(array::distinct(tags))) AS x FROM orders GROUP BY status"
+)
 
 #: A view query of 160 characters: its ``view_query="…"`` line is longer than 128 columns.
 _LONG_VIEW = "SELECT status, count() AS total FROM orders WHERE note != '" + "x" * 84 + "' GROUP BY status"
@@ -2136,6 +2142,20 @@ class TestViewModels:
         assert _model_config(source) == f'    model_config = SurrealConfigDict(table_name="v", view_query="{query}")'
         assert _line_of(source, "id") == "id: RecordID | None = None"
         assert _guarded_exec(source)["V"]._is_view()
+
+    def test_calls_inside_the_arguments_of_several_aggregates_are_a_view(self) -> None:
+        """Issue #286: V7 reads the calls outside every aggregate's argument, so the issue's query passes the class's
+        check and its table becomes a view model; SurrealDB 2.x refuses it at ``define_view()`` (C1 ``wrapped``)."""
+        assert check_view_query(_SEVERAL_AGGREGATES_VIEW, model="V") == _SEVERAL_AGGREGATES_VIEW
+        source = _generate(name="v", view_query=_SEVERAL_AGGREGATES_VIEW)
+        assert _model_config(source) == (
+            f'    model_config = SurrealConfigDict(\n        table_name="v",\n        view_query="{_SEVERAL_AGGREGATES_VIEW}",\n    )'
+        )
+        assert "# View: AS" not in source
+        assert _line_of(source, "id") == "id: RecordID | None = None"
+        model = _guarded_exec(source)["V"]
+        assert model._is_view()
+        assert model.get_view_query() == _SEVERAL_AGGREGATES_VIEW
 
     def test_a_long_view_query_stays_on_one_line(self, tmp_path: Path) -> None:
         """Spec §6.7: the generator never splits a string, so a long view query's line is longer than 128 columns (the

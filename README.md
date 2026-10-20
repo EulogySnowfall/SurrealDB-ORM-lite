@@ -4797,9 +4797,11 @@ print([(str(order.id), order.amount) for order in await PaidOrder.objects().orde
   date: `count()`, `math::sum()`, `math::mean()`, `math::min()`, `math::max()`, `time::min()`, `time::max()` (and
   `math::stddev()`, `math::variance()` on 3.x), whatever their argument (`math::sum(amount ?? 0)`). `math::median()`,
   `array::group()`, `array::distinct()`, `array::join()` and `vector::sum()` are refused (inside an aggregate's
-  argument they are allowed). On SurrealDB 3.x an expression around an aggregate (`math::sum(amount) / count()`) and
-  a `GROUP BY` on an alias work; on 2.x and the embedded engine `define_view()` refuses them (see "SurrealDB 2.x and
-  3.x" below).
+  argument they are allowed). Since v0.32.1 that holds when an expression combines several aggregates too
+  (`math::sum(amount) + math::sum(array::len(array::distinct(tags)))`); beside an aggregate
+  (`math::sum(amount) + array::len(array::distinct(tags))`) they are still refused. On SurrealDB 3.x an expression
+  around an aggregate (`math::sum(amount) / count()`) and a `GROUP BY` on an alias work; on 2.x and the embedded
+  engine `define_view()` refuses them (see "SurrealDB 2.x and 3.x" below).
 - Every source write runs the view's query for that record: when it fails — a function given a value of the wrong
   type, an aggregated field missing
   ([surrealdb/surrealdb#7447](https://github.com/surrealdb/surrealdb/issues/7447)) — SurrealDB refuses the write, on
@@ -4877,6 +4879,10 @@ print([(str(order.id), order.amount) for order in await PaidOrder.objects().orde
   (`objects(tx=tx)`), unseen outside the block until it commits. Either way, a block that raises leaves no view. The
   table guard and the 2.x checks run before anything is queued, on committed state; a refusal of a queued statement
   comes back when the block commits, as the transaction's own error.
+- A chain of views can be removed in one buffered block, outer view first (since v0.32.1): on 2.x and the embedded
+  engine `remove_view(tx=tx)` does not count a view whose `remove_view(tx=tx)` the same block has already queued,
+  unless the block names it again afterwards (a `define_view(tx=tx)` of it). A view removed in another transaction,
+  or by a `REMOVE TABLE` you add to the block yourself, is still counted.
 - Both run on the model's connection (its `connection` key, or the `using()` block's); a `tx=` of another connection
   raises `SurrealDbError` before any request. A view and its source tables live in one database: give a view model
   its sources' connection.
@@ -5202,7 +5208,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | A grouped view whose `GROUP BY` names the alias of a computed field (`time::month(at) AS month` … `GROUP BY month`)                    | `SurrealDbError` before any DDL: the server would put every source record in one group                                                                                        | one group per computed value                                                                                                                                                        | v0.32.0                              |
 | Values a view computes (`math::sum()`, `math::mean()`, `count()` of an array)                                                          | a sum of integers is an `int`, a mean a `Decimal`; `count(tags)` of an array field adds the arrays' lengths                                                                   | both are `float`; `count(tags)` counts the records whose array is not empty                                                                                                         | v0.32.0                              |
 | Live queries and events on a view (a group emptied by a delete; a live query filtered on `id`)                                         | an emptied group: an `UPDATE` with the emptied values (a `count()` of 0), then a `DELETE`; a filter on `id` notifies                                                          | an emptied group: a `DELETE`; a filter on `id` never notifies (the view's notifications carry no `id`): filter on the view's fields                                                 | v0.32.0                              |
-| Removing a materialized view, or a source table, that another view reads (`remove_view()`, `REMOVE TABLE`)                             | `remove_view()` raises `SurrealDbError` before any DDL; a raw `REMOVE TABLE` succeeds and turns each view reading the table into an ordinary table keeping its last records   | `SurrealDbError` from the server (`Cannot delete table … on which a view is defined`): remove the views that read it first                                                          | v0.32.0                              |
+| Removing a materialized view, or a source table, that another view reads (`remove_view()`, `REMOVE TABLE`)                             | `remove_view()` raises `SurrealDbError` before any DDL, unless its transaction removes those views first; a raw `REMOVE TABLE` makes them ordinary tables, last records kept  | `SurrealDbError` from the server (`Cannot delete table … on which a view is defined`): remove the views that read it first                                                          | v0.32.0                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.

@@ -89,6 +89,7 @@ from surreal_orm_lite import (
     AuthenticatedUserMixin,
     BaseSurrealEdge,
     BaseSurrealModel,
+    BufferedTransaction,
     Computed,
     DatabaseIntrospector,
     Event,
@@ -269,7 +270,37 @@ _QUERY_ERRORS = [
         id="V7-nested",
     ),
     pytest.param("SELECT g, vector::sum(v) AS s FROM t GROUP BY g", ValueError, _v7("vector::sum"), id="V7-vector"),
+    # V7, issue #286: the calls beside an aggregate, or around one, are outside its argument.
+    pytest.param(
+        "SELECT g, math::sum(a) + array::len(array::distinct(tags)) AS x FROM t GROUP BY g",
+        ValueError,
+        _v7("array::distinct"),
+        id="V7-beside-an-aggregate",
+    ),
+    pytest.param(
+        "SELECT g, math::sum(v) + math::median(v) AS x FROM t GROUP BY g",
+        ValueError,
+        _v7("math::median"),
+        id="V7-after-an-aggregate",
+    ),
+    pytest.param(
+        "SELECT g, array::distinct(math::sum(v)) AS x FROM t GROUP BY g",
+        ValueError,
+        _v7("array::distinct"),
+        id="V7-around-an-aggregate",
+    ),
+    pytest.param(
+        "SELECT g, math::max(string::len(')')) + array::join(v, ',') AS x FROM t GROUP BY g",
+        ValueError,
+        _v7("array::join"),
+        id="V7-bracket-in-a-literal",
+    ),
 ]
+
+#: Issue #286: the issue's query — two aggregates in one element, a listed function inside the second's argument.
+_SEVERAL_AGGREGATES = (
+    "SELECT status, math::sum(amount) + math::sum(array::len(array::distinct(tags))) AS x FROM orders GROUP BY status"
+)
 
 #: ``(value, returned text)`` — accepted as AC-2 lists them.
 _QUERY_ACCEPTED = [
@@ -286,6 +317,22 @@ _QUERY_ACCEPTED = [
         "SELECT g, math::max(array::len(array::distinct(tags))) AS m FROM t GROUP BY g",
         "SELECT g, math::max(array::len(array::distinct(tags))) AS m FROM t GROUP BY g",
         id="inside-an-aggregate",
+    ),
+    pytest.param(_SEVERAL_AGGREGATES, _SEVERAL_AGGREGATES, id="inside-one-of-several-aggregates"),
+    pytest.param(
+        "SELECT math::max(array::len(array::distinct(tags))) - math::min(array::len(array::group(v))) AS d FROM t GROUP ALL",
+        "SELECT math::max(array::len(array::distinct(tags))) - math::min(array::len(array::group(v))) AS d FROM t GROUP ALL",
+        id="inside-each-of-two-aggregates",
+    ),
+    pytest.param(
+        "SELECT g, count(array::distinct(tags)) * 2 AS n FROM t GROUP BY g",
+        "SELECT g, count(array::distinct(tags)) * 2 AS n FROM t GROUP BY g",
+        id="inside-count-in-an-expression",
+    ),
+    pytest.param(
+        "SELECT g, math::sum(math::max(array::distinct(v))) AS s FROM t GROUP BY g",
+        "SELECT g, math::sum(math::max(array::distinct(v))) AS s FROM t GROUP BY g",
+        id="inside-nested-aggregates",
     ),
     pytest.param(
         "SELECT g, count() AS n FROM t WHERE x = 'math::median(' GROUP BY g",
@@ -354,8 +401,10 @@ def _element(
     calls: tuple[str, ...] = (),
     fields: tuple[str, ...] = (),
     opaque: bool = False,
+    free_calls: tuple[str, ...] | None = None,
 ) -> ViewElement:
-    return ViewElement(text, alias, aggregate, calls, fields, opaque)
+    """A :class:`ViewElement` built by keyword; its ``free_calls`` are its ``calls`` unless given (issue #286)."""
+    return ViewElement(text, alias, aggregate, calls, calls if free_calls is None else free_calls, fields, opaque)
 
 
 class TestViewOutline:
@@ -366,9 +415,9 @@ class TestViewOutline:
             grouped=True,
             group=("status",),
             elements=(
-                ViewElement("status", None, None, (), ("status",), False),
-                ViewElement("count()", "total", "count", ("count",), (), False),
-                ViewElement("math::sum(amount)", "revenue", "math::sum", ("math::sum",), (), False),
+                ViewElement("status", None, None, (), (), ("status",), False),
+                ViewElement("count()", "total", "count", ("count",), ("count",), (), False),
+                ViewElement("math::sum(amount)", "revenue", "math::sum", ("math::sum",), ("math::sum",), (), False),
             ),
         )
 
@@ -396,10 +445,10 @@ class TestViewOutline:
         assert outline.grouped is True
         assert outline.group == ("cc",)
         assert outline.elements == (
-            ViewElement("c.country", "cc", None, (), ("c.country",), False),
-            ViewElement("count()", "n", "count", ("count",), (), False),
-            ViewElement("(SELECT count() FROM other GROUP ALL)", "o", None, (), (), True),
-            ViewElement("`my f`", "f", None, (), (), False),
+            ViewElement("c.country", "cc", None, (), (), ("c.country",), False),
+            ViewElement("count()", "n", "count", ("count",), ("count",), (), False),
+            ViewElement("(SELECT count() FROM other GROUP ALL)", "o", None, (), (), (), True),
+            ViewElement("`my f`", "f", None, (), (), (), False),
         )
 
     def test_objects_casts_parameters_and_if(self) -> None:
@@ -431,11 +480,61 @@ class TestViewOutline:
             "m",
             "math::max",
             ("math::max", "array::len", "array::distinct"),
+            free_calls=("math::max",),
         )
 
     def test_an_expression_around_an_aggregate_is_not_an_aggregate(self) -> None:
         element = view_query_outline("SELECT g, math::max(v) - math::min(v) AS d FROM t GROUP BY g").elements[1]
         assert element == _element("math::max(v) - math::min(v)", "d", None, ("math::max", "math::min"), ("v", "v"))
+
+    @pytest.mark.parametrize(
+        ("element", "calls", "free_calls"),
+        [
+            pytest.param(
+                "math::sum(amount) + math::sum(array::len(array::distinct(tags)))",
+                ("math::sum", "math::sum", "array::len", "array::distinct"),
+                ("math::sum", "math::sum"),
+                id="two-aggregates",
+            ),
+            pytest.param(
+                "math::sum(a) + array::len(array::distinct(tags))",
+                ("math::sum", "array::len", "array::distinct"),
+                ("math::sum", "array::len", "array::distinct"),
+                id="beside-an-aggregate",
+            ),
+            pytest.param(
+                "array::distinct(math::sum(array::len(v)))",
+                ("array::distinct", "math::sum", "array::len"),
+                ("array::distinct", "math::sum"),
+                id="around-an-aggregate",
+            ),
+            pytest.param(
+                "math::max(string::len(')')) + math::median(v)",
+                ("math::max", "string::len", "math::median"),
+                ("math::max", "math::median"),
+                id="bracket-in-a-literal",
+            ),
+            pytest.param(
+                "COUNT(ARRAY::DISTINCT(tags)) * MATH::STDDEV(array::len(v))",
+                ("count", "array::distinct", "math::stddev", "array::len"),
+                ("count", "math::stddev"),
+                id="upper-case",
+            ),
+            pytest.param(
+                "math::sum(math::max(array::distinct(v)))",
+                ("math::sum", "math::max", "array::distinct"),
+                ("math::sum",),
+                id="nested-aggregates",
+            ),
+        ],
+    )
+    def test_free_calls_skip_the_arguments_of_aggregates(
+        self, element: str, calls: tuple[str, ...], free_calls: tuple[str, ...]
+    ) -> None:
+        """Issue #286: ``free_calls`` are the calls outside the argument of every aggregate call, in order — those V7
+        reads — while ``calls`` keeps every call (C1 reads it)."""
+        [_, read] = view_query_outline(_element_query(element)).elements
+        assert (read.calls, read.free_calls) == (calls, free_calls)
 
     def test_a_quoted_group_by_does_not_group(self) -> None:
         outline = view_query_outline("SELECT `group by` AS x FROM t")
@@ -571,6 +670,8 @@ _HAZARD_ELEMENTS: list[tuple[str, tuple[str, str] | None]] = [
     ("{ s: math::sum(v) }", ("wrapped", "math::sum")),
     ("MATH::SUM(v) * 2", ("wrapped", "math::sum")),
     ("math::round(math::stddev(v))", ("wrapped", "math::stddev")),
+    # Issue #286: V7 accepts it (the listed function is inside an aggregate's argument); C1 reads it as before.
+    ("math::sum(amount) + math::sum(array::len(array::distinct(tags)))", ("wrapped", "math::sum")),
     # A whole SurrealDB 3.x-only aggregate.
     ("math::stddev(v)", ("aggregate", "math::stddev")),
     ("math::variance(v)", ("aggregate", "math::variance")),
@@ -2375,6 +2476,162 @@ class TestRemovalGuard:
         assert client.version_calls == 0
 
 
+#: ``mv_stats_totals``' removal, as ``remove_view()`` queues it (``missing_ok`` True, then False).
+_REMOVE_MV_TOTALS = "REMOVE TABLE IF EXISTS `mv_stats_totals`;"
+_REMOVE_MV_TOTALS_STRICT = "REMOVE TABLE `mv_stats_totals`;"
+
+
+def _buffered(connection: str = "mv") -> BufferedTransaction:
+    """A buffered transaction of *connection*, as ``transaction()`` opens one on SurrealDB 2.x (nothing is sent before
+    its commit)."""
+    tx = BufferedTransaction(client=None)
+    tx._connection_name = connection
+    return tx
+
+
+#: ``(queued statements, dependents left)`` for the dependents ``("mv_b", "mv_stats_totals")`` (issue #286).
+_QUEUED_REMOVALS = [
+    pytest.param([], ("mv_b", "mv_stats_totals"), id="nothing-queued"),
+    pytest.param([_REMOVE_MV_TOTALS], ("mv_b",), id="removed-if-exists"),
+    pytest.param([_REMOVE_MV_TOTALS_STRICT], ("mv_b",), id="removed-strict"),
+    pytest.param([_REMOVE_MV_TOTALS, "REMOVE TABLE IF EXISTS `mv_b`;"], (), id="both-removed"),
+    pytest.param(
+        ["CREATE mv_orders:o9 SET status = 'new';", _REMOVE_MV_TOTALS, "REMOVE TABLE IF EXISTS `mv_other`;"],
+        ("mv_b",),
+        id="other-statements-around",
+    ),
+    pytest.param(
+        [_REMOVE_MV_TOTALS, "DEFINE TABLE OVERWRITE `mv_stats_totals` AS (SELECT total FROM mv_order_stats);"],
+        ("mv_b", "mv_stats_totals"),
+        id="defined-again-after",
+    ),
+    pytest.param(
+        [_REMOVE_MV_TOTALS, "DEFINE TABLE mv_stats_totals AS SELECT total FROM mv_order_stats;"],
+        ("mv_b", "mv_stats_totals"),
+        id="hand-written-define-after",
+    ),
+    pytest.param(
+        [_REMOVE_MV_TOTALS, "CREATE MV_STATS_TOTALS SET total = 1;"],
+        ("mv_b", "mv_stats_totals"),
+        id="named-again-after-in-any-case",
+    ),
+    pytest.param(
+        ["DEFINE TABLE OVERWRITE `mv_stats_totals` AS (SELECT total FROM mv_order_stats);", _REMOVE_MV_TOTALS],
+        ("mv_b",),
+        id="defined-then-removed",
+    ),
+    pytest.param(["REMOVE TABLE mv_stats_totals;"], ("mv_b", "mv_stats_totals"), id="hand-written-removal"),
+    pytest.param(["REMOVE TABLE IF EXISTS `mv_stats_totals`; "], ("mv_b", "mv_stats_totals"), id="not-the-exact-text"),
+    pytest.param(["REMOVE TABLE IF EXISTS `mv_stats_totals_2`;"], ("mv_b", "mv_stats_totals"), id="a-longer-name"),
+    pytest.param(["REMOVE TABLE IF EXISTS `mv_stats`;"], ("mv_b", "mv_stats_totals"), id="a-shorter-name"),
+]
+
+
+class TestQueuedRemovals:
+    """Issue #286 (G5 in a buffered transaction): ``dependents_not_removed()`` leaves out a dependent view only when
+    the last queued statement that names it is ``remove_view()``'s exact removal of it; ``remove_view(tx=tx)`` applies
+    it to a :class:`BufferedTransaction` before G5, so a chain removed outer view first in one block is accepted, and
+    every other case is still refused."""
+
+    @pytest.mark.parametrize(("statements", "left"), _QUEUED_REMOVALS)
+    def test_dependents_not_removed(self, statements: list[str], left: tuple[str, ...]) -> None:
+        assert schema.dependents_not_removed(("mv_b", "mv_stats_totals"), statements) == left
+
+    def test_the_order_of_the_dependents_is_kept(self) -> None:
+        assert schema.dependents_not_removed(["zeta", "alpha"], []) == ("zeta", "alpha")
+        assert schema.dependents_not_removed(("zeta", "mid", "alpha"), ["REMOVE TABLE IF EXISTS `mid`;"]) == (
+            "zeta",
+            "alpha",
+        )
+
+    def test_a_name_that_is_no_identifier_is_kept(self) -> None:
+        """``remove_view()`` never removes such a table (a model's table name is an identifier): it stays counted."""
+        assert schema.dependents_not_removed(("my-view",), ["REMOVE TABLE IF EXISTS `my-view`;"]) == ("my-view",)
+
+    async def test_the_chain_outer_view_first_in_one_block(self, use_mv_client: Callable[..., None]) -> None:
+        """The issue's block on SurrealDB 2.x: both removals queued, G5 not raised, ``version()`` never read."""
+        client = _removal_client("mv_stats_totals", version="surrealdb-2.7.0")
+        use_mv_client(client)
+        tx = _buffered()
+        assert await MvStatsTotals.remove_view(tx=tx) == _REMOVE_MV_TOTALS
+        assert await MvStats.remove_view(tx=tx) == _REMOVE_MV_STATS
+        assert tx.statements == [_REMOVE_MV_TOTALS, _REMOVE_MV_STATS]
+        assert client.queries == [_INFO, _INFO]
+        assert client.version_calls == 0
+
+    @pytest.mark.parametrize("embedded", [False, True], ids=["server", "embedded"])
+    async def test_missing_ok_false_and_the_embedded_engine(self, use_mv_client: Callable[..., None], embedded: bool) -> None:
+        client = _removal_client("mv_stats_totals", version="surrealdb-2.0.0" if embedded else "surrealdb-2.7.0")
+        use_mv_client(client, embedded=embedded)
+        tx = _buffered()
+        assert await MvStatsTotals.remove_view(missing_ok=False, tx=tx) == _REMOVE_MV_TOTALS_STRICT
+        assert await MvStats.remove_view(missing_ok=False, tx=tx) == "REMOVE TABLE `mv_order_stats`;"
+        assert tx.statements == [_REMOVE_MV_TOTALS_STRICT, "REMOVE TABLE `mv_order_stats`;"]
+        assert client.version_calls == 0
+
+    async def test_only_the_dependents_removed_are_left_out(self, use_mv_client: Callable[..., None]) -> None:
+        client = _removal_client("mv_stats_totals", "mv_b", version="surrealdb-2.7.0")
+        use_mv_client(client)
+        tx = _buffered()
+        await MvStatsTotals.remove_view(tx=tx)
+        with pytest.raises(SurrealDbError) as raised:
+            await MvStats.remove_view(tx=tx)
+        assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_b'", _ENGINE_2X)
+        assert tx.statements == [_REMOVE_MV_TOTALS]
+
+    async def test_the_inner_view_first_is_still_refused(self, use_mv_client: Callable[..., None]) -> None:
+        client = _removal_client("mv_stats_totals", version="surrealdb-2.7.0")
+        use_mv_client(client)
+        tx = _buffered()
+        with pytest.raises(SurrealDbError) as raised:
+            await MvStats.remove_view(tx=tx)
+        assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_stats_totals'", _ENGINE_2X)
+        assert tx.statements == []
+        assert client.version_calls == 1
+
+    async def test_removed_in_another_transaction_is_still_refused(self, use_mv_client: Callable[..., None]) -> None:
+        client = _removal_client("mv_stats_totals", version="surrealdb-2.7.0")
+        use_mv_client(client)
+        other, tx = _buffered(), _buffered()
+        await MvStatsTotals.remove_view(tx=other)
+        with pytest.raises(SurrealDbError) as raised:
+            await MvStats.remove_view(tx=tx)
+        assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_stats_totals'", _ENGINE_2X)
+        assert (other.statements, tx.statements) == ([_REMOVE_MV_TOTALS], [])
+
+    async def test_defined_again_after_its_removal_is_still_refused(self, use_mv_client: Callable[..., None]) -> None:
+        client = _removal_client("mv_stats_totals", version="surrealdb-2.7.0")
+        use_mv_client(client)
+        tx = _buffered()
+        await MvStatsTotals.remove_view(tx=tx)
+        await MvStatsTotals.define_view(tx=tx)
+        with pytest.raises(SurrealDbError) as raised:
+            await MvStats.remove_view(tx=tx)
+        assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_stats_totals'", _ENGINE_2X)
+        assert tx.statements == [_REMOVE_MV_TOTALS, MvStatsTotals.view_ddl()]
+
+    async def test_a_hand_written_removal_is_still_refused(self, use_mv_client: Callable[..., None]) -> None:
+        """Only the ORM's exact statement is read: a removal added by hand leaves the refusal on the safe side."""
+        client = _removal_client("mv_stats_totals", version="surrealdb-2.7.0")
+        use_mv_client(client)
+        tx = _buffered()
+        await tx.add("REMOVE TABLE mv_stats_totals;")
+        with pytest.raises(SurrealDbError) as raised:
+            await MvStats.remove_view(tx=tx)
+        assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_stats_totals'", _ENGINE_2X)
+
+    async def test_an_interactive_transaction_is_unchanged(self, use_mv_client: Callable[..., None]) -> None:
+        """Not a buffered transaction (SurrealDB 3.x over WebSocket): its statements are not read, and 3.x decides."""
+        client = _removal_client("mv_stats_totals", version="surrealdb-3.3.4")
+        use_mv_client(client)
+        tx = _QueuingTx()
+        tx._connection_name = "mv"
+        await MvStatsTotals.remove_view(tx=tx)  # type: ignore[arg-type]
+        assert await MvStats.remove_view(tx=tx) == _REMOVE_MV_STATS  # type: ignore[arg-type]
+        assert client.version_calls == 1
+        assert tx.added == [(_REMOVE_MV_TOTALS, None), (_REMOVE_MV_STATS, None)]
+
+
 class TestCoerceArrayIds:
     """AC-13 (unit): ``utils.coerce_record_id()`` reads a ``list`` or a ``tuple`` as an array record id — a grouped
     view's (M4) — and every row of its table before v0.32.0 is unchanged."""
@@ -3359,6 +3616,40 @@ class MvSince(BaseSurrealModel):
     since: datetime
 
 
+class MvTaggedOrder(BaseSurrealModel):
+    """``mv_orders`` with tags (issue #286): the source of :class:`MvTagged`."""
+
+    model_config = SurrealConfigDict(table_name="mv_orders", connection="mv")
+
+    id: str | None = None
+    status: str
+    amount: float
+    tags: list[str]
+
+
+#: Issue #286: two aggregates in one element, ``array::distinct()`` inside the second's argument.
+_MV_TAGGED_ELEMENT = "math::sum(amount) + math::sum(array::len(array::distinct(tags)))"
+
+
+class MvTagged(BaseSurrealModel):
+    """Issue #286: V7 accepts it at the class statement; kept up to date on 3.x, C1b on 2.x (kind ``wrapped``)."""
+
+    model_config = SurrealConfigDict(
+        table_name="mv_tagged",
+        connection="mv",
+        view_query=f"SELECT status, {_MV_TAGGED_ELEMENT} AS score FROM mv_orders GROUP BY status",
+    )
+
+    id: RecordID | None = None
+    status: str
+    score: float
+
+
+async def _scores() -> dict[str, float]:
+    """``MvTagged``'s groups, read through the ORM: status → score."""
+    return {row.status: row.score for row in await MvTagged.objects().exec()}
+
+
 #: AC-7 (b): each C1 kind from a model, and its refusal on SurrealDB 2.x (*engine*).
 _C1_MODELS: list[tuple[type[BaseSurrealModel], Callable[[str], str]]] = [
     (MvSpread, lambda engine: _c1a("MvSpread", "math::stddev", engine)),
@@ -3483,6 +3774,41 @@ class TestViewLinesE2E:
             await (await MvOrder.objects().get("o2")).delete()
             assert {row.status: row.total for row in await MvSince.objects().exec()} == {"new": 1, "paid": 1}
 
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_3x_keeps_several_aggregates_up_to_date(self, kind: str) -> None:
+        """Issue #286: the class statement accepted the query (V7 reads no call inside an aggregate's argument);
+        SurrealDB 3.x defines the view and keeps each group's score up to date through saves, updates and deletes."""
+        async with _mv(kind) as client:
+            await _require_line(client, 3, "an expression around aggregates is kept up to date on SurrealDB 3.x")
+            await MvTaggedOrder(id="o1", status="paid", amount=10.0, tags=["a", "b", "a"]).save()
+            assert await MvTagged.define_view() == MvTagged.view_ddl()
+            assert await _scores() == {"paid": 12.0}
+            await MvTaggedOrder(id="o2", status="paid", amount=5.5, tags=["c"]).save()
+            await MvTaggedOrder(id="o3", status="new", amount=1.0, tags=[]).save()
+            assert await _scores() == {"new": 1.0, "paid": 18.5}
+            second = await MvTaggedOrder.objects().get("o2")
+            await second.merge(tags=["c", "d", "c"])
+            assert await _scores() == {"new": 1.0, "paid": 19.5}
+            await (await MvTaggedOrder.objects().get("o1")).delete()
+            assert await _scores() == {"new": 1.0, "paid": 7.5}
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_several_aggregates_c1_on_2x(self, monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+        """Issue #286: on SurrealDB 2.x and the embedded engine the same view is refused by C1 (``wrapped``, naming
+        the first aggregate), not by V7, with ``version()`` as the only request; the source stays writable."""
+        async with _mv(kind) as client:
+            await _require_line(client, 2, "SurrealDB 2.x computes an expression around aggregates once per record")
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await MvTagged.define_view()
+            assert calls == [("version", ())]
+            engine = _ENGINE_EMBEDDED if kind == "mem" else _ENGINE_2X
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value) == _c1b("MvTagged", _MV_TAGGED_ELEMENT, "math::sum", engine)
+            assert "mv_tagged" not in await _tables(client)
+            await MvTaggedOrder(id="o1", status="paid", amount=10.0, tags=["a"]).save()
+            assert [row["id"] for row in await _rows(client, "mv_orders")] == [RecordID("mv_orders", "o1")]
+
 
 # --- removing a view that another view reads (spec §1.4, §4, §7, §5.6 G5 and S3; AC-20; M11) -------------------------
 
@@ -3557,6 +3883,43 @@ class TestViewRemovalE2E:
             assert "mv_stats_totals" not in tables
             assert "mv_order_stats" not in tables
             assert len(await _rows(client, "mv_orders")) == 3
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_chain_in_one_transaction_block(self, kind: str) -> None:
+        """Issue #286: the outer view, then the inner one, in one ``transaction()`` block — buffered on SurrealDB 2.x,
+        HTTP and the embedded engine, where G5 leaves out the outer view the block already removes; interactive on 3.x
+        over WebSocket, where the server decides — commits on every line, and both views are gone."""
+        async with _mv(kind) as client:
+            await _save_orders()
+            await MvStats.define_view()
+            await MvStatsTotals.define_view()
+            async with SurrealDBConnectionManager.transaction("mv") as tx:
+                assert await MvStatsTotals.remove_view(tx=tx) == "REMOVE TABLE IF EXISTS `mv_stats_totals`;"
+                assert await MvStats.remove_view(tx=tx) == _REMOVE_MV_STATS
+            tables = await _tables(client)
+            assert "mv_stats_totals" not in tables
+            assert "mv_order_stats" not in tables
+            assert len(await _rows(client, "mv_orders")) == 3
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_g5_when_the_block_defines_the_outer_view_again(self, kind: str) -> None:
+        """Issue #286: a ``define_view()`` of the outer view queued after its removal puts it back: G5 refuses the
+        inner view's removal, the block commits nothing, both views stay."""
+        async with _mv(kind) as client:
+            await _require_line(client, 2, "SurrealDB 2.x and the embedded engine would remove a view another view reads")
+            await _save_orders()
+            await MvStats.define_view()
+            await MvStatsTotals.define_view()
+            with pytest.raises(SurrealDbError) as raised:
+                async with SurrealDBConnectionManager.transaction("mv") as tx:
+                    await MvStatsTotals.remove_view(tx=tx)
+                    await MvStatsTotals.define_view(tx=tx)
+                    await MvStats.remove_view(tx=tx)
+            tables = await _tables(client)
+            assert (tables["mv_order_stats"], tables["mv_stats_totals"]) == (_MV_STATS_RENDERED, _MV_TOTALS_RENDERED)
+            assert await _totals() == {"new": 1, "paid": 2}
+        engine = _ENGINE_EMBEDDED if kind == "mem" else _ENGINE_2X
+        assert str(raised.value) == _g5("MvStats", "mv_order_stats", "'mv_stats_totals'", engine)
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_g5_before_anything_is_queued(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4654,8 +5017,9 @@ _VIEW_ROWS = [
     ],
     [
         "Removing a materialized view, or a source table, that another view reads (`remove_view()`, `REMOVE TABLE`)",
-        "`remove_view()` raises `SurrealDbError` before any DDL; a raw `REMOVE TABLE` succeeds and turns each view "
-        "reading the table into an ordinary table keeping its last records",
+        # Issue #286 (v0.32.1): a chain removed outer view first in one buffered block is accepted.
+        "`remove_view()` raises `SurrealDbError` before any DDL, unless its transaction removes those views first; a "
+        "raw `REMOVE TABLE` makes them ordinary tables, last records kept",
         "`SurrealDbError` from the server (`Cannot delete table … on which a view is defined`): remove the views that "
         "read it first",
         "v0.32.0",
@@ -4796,6 +5160,23 @@ class TestReadmeSection33:
         links = re.findall(r"\]\(#([^)]+)\)", _section_33())
         assert links, "section 33 links to the behaviour tables and to section 29"
         assert [link for link in links if link not in anchors] == []
+
+    def test_issue_286_follow_ups(self) -> None:
+        """Issue #286 (v0.32.1): section 33 says that V7 allows a listed function inside the argument of each of several
+        aggregates (still refused beside one), and that a chain of views removed outer view first in one buffered
+        block is accepted (and when it is not)."""
+        declaring = _normalised(_part_33("Declaring a view"))
+        transactions = _normalised(_part_33("Transactions, connections and the query cache"))
+        needles = [
+            (declaring, "Since v0.32.1 that holds when an expression combines several aggregates too"),
+            (declaring, "(`math::sum(amount) + math::sum(array::len(array::distinct(tags)))`)"),
+            (declaring, "beside an aggregate (`math::sum(amount) + array::len(array::distinct(tags))`) they are still"),
+            (transactions, "A chain of views can be removed in one buffered block, outer view first (since v0.32.1)"),
+            (transactions, "the same block has already queued"),
+            (transactions, "unless the block names it again afterwards (a `define_view(tx=tx)` of it)"),
+            (transactions, "A view removed in another transaction, or by a `REMOVE TABLE` you add to the block yourself, is"),
+        ]
+        assert [needle for text, needle in needles if needle not in text] == []
 
     def test_features_row(self) -> None:
         features = [row for _, row in _table_rows(_readme_part("## Features"))]

@@ -30,6 +30,7 @@ from .schema import (
     check_view_config,
     check_view_query,
     dependent_views,
+    dependents_not_removed,
     ensure_async_events_supported,
     ensure_view_query_supported,
     ensure_view_removable,
@@ -54,7 +55,7 @@ from .signals import (
     pre_save,
     pre_update,
 )
-from .transaction import Transaction
+from .transaction import BufferedTransaction, Transaction
 from .types import Duration, _duration_from_sdk, _timedelta_from_sdk
 from .utils import (
     PLAIN_CONTENT,
@@ -1145,6 +1146,13 @@ class BaseSurrealModel(BaseModel):
         their queries only (a view reading the table through a graph path or a sub-select is left to the server), and
         the line is read from ``client.version()`` only when one is found.
 
+        A chain of views can be removed in one buffered transaction (SurrealDB 2.x, HTTP, the embedded engine), outer
+        view first (v0.32.1): a view whose removal the same *tx* has already queued with ``remove_view()`` — the last
+        statement of the block naming it — is not counted, though the committed ``INFO FOR DB`` still lists it. It is
+        counted again when the block names it after that removal (a ``define_view()`` of it), when it is removed in
+        another transaction or by a ``tx.add("REMOVE TABLE …")`` written by hand. On SurrealDB 3.x the server decides,
+        as before.
+
         Args:
             missing_ok: ``True`` (default) emits ``REMOVE TABLE IF EXISTS …``, so a missing view is not an error;
                 ``False`` raises ``SurrealDbNotFoundError`` for it.
@@ -1178,9 +1186,11 @@ class BaseSurrealModel(BaseModel):
         if existing == "unreadable":
             raise SurrealDbError(view_table_refused("G3", cls.__name__, table, removal=True))
         if existing == "view":
-            await ensure_view_removable(
-                client, table, dependent_views(tables, table), model=cls.__name__, embedded=manager.is_embedded()
-            )
+            dependents = dependent_views(tables, table)
+            if isinstance(tx, BufferedTransaction):
+                # Issue #286: the views this block has already queued for removal are gone when it commits.
+                dependents = dependents_not_removed(dependents, tx.statements)
+            await ensure_view_removable(client, table, dependents, model=cls.__name__, embedded=manager.is_embedded())
         await apply_ddl_statements(
             [statement],
             client=client,

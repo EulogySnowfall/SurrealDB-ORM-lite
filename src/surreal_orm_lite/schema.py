@@ -37,8 +37,9 @@ the DDL, not a lock. Before the guard, ``define_view()`` refuses on SurrealDB 2.
 projection those engines compute once per source record (``ensure_view_query_supported()``, C1), reading the line
 from ``client.version()`` only when the query holds one; 3.x keeps such a view up to date or refuses it itself. On the
 guard's one ``INFO FOR DB``, ``remove_view()`` finds the views that read the view it removes (``dependent_views()``,
-through the plain ``FROM`` targets ``view_reads_table()`` reads) and, when there is one, refuses on SurrealDB 2.x and
-the embedded engine before any DDL (``ensure_view_removable()``, G5): those engines would remove it and turn those
+through the plain ``FROM`` targets ``view_reads_table()`` reads; in a buffered transaction, without those whose
+removal the block has already queued, ``dependents_not_removed()``) and, when there is one, refuses on SurrealDB 2.x
+and the embedded engine before any DDL (``ensure_view_removable()``, G5): those engines would remove it and turn those
 views into ordinary tables that no longer update, where 3.x refuses the removal itself.
 
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
@@ -556,16 +557,21 @@ class ViewElement:
       (``math::sum(amount)``), else ``None``.
     - ``calls``: the lower-cased names of the functions it calls (a ``::`` path, or ``count``), in order, nested calls
       included.
+    - ``free_calls``: the calls of ``calls`` that stand outside the argument of every call of an aggregate SurrealDB
+      keeps up to date (``count``, ``math::sum`` … ``math::variance``), in order — the aggregate calls themselves
+      included, the calls inside their arguments left out (v0.32.1, issue #286): ``("math::sum", "math::sum")`` for
+      ``math::sum(a) + math::sum(array::len(array::distinct(tags)))``.
     - ``fields``: the fields it reads, in order, a repeated one repeated (``("*",)`` for ``*``); ``()`` when
       ``aggregate`` is set — the aggregate's argument is read per record, as SurrealDB intends.
-    - ``opaque``: it holds a sub-select or a graph path, which the reading does not analyse (``calls`` and ``fields``
-      are then empty).
+    - ``opaque``: it holds a sub-select or a graph path, which the reading does not analyse (``calls``,
+      ``free_calls`` and ``fields`` are then empty).
     """
 
     text: str
     alias: str | None
     aggregate: str | None
     calls: tuple[str, ...]
+    free_calls: tuple[str, ...]
     fields: tuple[str, ...]
     opaque: bool
 
@@ -613,8 +619,12 @@ def check_view_query(value: object, *, model: str) -> str:
     - V6: it is a ``SELECT VALUE``: a view stores records;
     - V7: it groups its records (a top-level ``GROUP BY`` or ``GROUP ALL``) and its projection calls one of
       ``array::distinct``, ``array::group``, ``array::join``, ``math::median``, ``vector::sum`` (in any case) outside
-      an element that is one whole aggregate call: SurrealDB documents them as unusable in a view. Inside an
-      aggregate's argument (``math::max(array::len(array::distinct(tags)))``) they work on every line.
+      the argument of every aggregate call (``ViewElement.free_calls``): SurrealDB documents them as unusable in a
+      view. Inside an aggregate's argument (``math::max(array::len(array::distinct(tags)))``) they work on every line,
+      also when an element combines several aggregates (``math::sum(amount) +
+      math::sum(array::len(array::distinct(tags)))``, since v0.32.1): such an expression around aggregates passes V7,
+      and ``define_view()`` refuses it on SurrealDB 2.x and the embedded engine (C1). Beside or around an aggregate
+      (``math::sum(a) + array::len(array::distinct(tags))``) they are still refused.
 
     The check catches mistakes — unbalanced brackets, a comment that would swallow the parenthesis the ORM appends, a
     second statement where one SELECT is expected — and is not an injection defence: a view's query is trusted
@@ -643,13 +653,7 @@ def check_view_query(value: object, *, model: str) -> str:
     outline = view_query_outline(text)
     if outline.grouped:
         unusable = next(
-            (
-                call
-                for element in outline.elements
-                if element.aggregate is None
-                for call in element.calls
-                if call in _NOT_VIEW_AGGREGATES
-            ),
+            (call for element in outline.elements for call in element.free_calls if call in _NOT_VIEW_AGGREGATES),
             None,
         )
         if unusable is not None:
@@ -760,6 +764,29 @@ def _view_fields(blanked: str) -> tuple[str, ...]:
     return tuple(name for name in _VIEW_FIELD.findall(plain) if name.upper() not in _PROJECTION_KEYWORDS)
 
 
+def _view_calls(blanked: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """``(calls, free_calls)`` of the blanked expression *blanked*, as :class:`ViewElement` describes them.
+
+    Each call is read in order; one that starts inside the argument of an aggregate call read before it (up to that
+    call's closing bracket, found on the blanked text, so a bracket inside a literal is never one) is a call, not a free
+    call (issue #286)."""
+    calls: list[str] = []
+    free_calls: list[str] = []
+    argument_end = -1
+    for match in _VIEW_CALL.finditer(blanked):
+        name = match.group(1).lower()
+        if "::" not in name and name != "count":
+            continue
+        calls.append(name)
+        if match.start() < argument_end:
+            continue
+        free_calls.append(name)
+        if name in _ALL_VIEW_AGGREGATES:
+            closing = _closing_bracket(blanked, match.end() - 1)
+            argument_end = len(blanked) if closing is None else closing
+    return tuple(calls), tuple(free_calls)
+
+
 def _view_element(text: str, blanked: str, top: str) -> ViewElement:
     """One projection element from its three slices (*text*, *blanked*, *top*, of the same length)."""
     alias: str | None = None
@@ -774,8 +801,8 @@ def _view_element(text: str, blanked: str, top: str) -> ViewElement:
     written = expression[left:right]
     plain = blanked[left:right] if right > left else ""
     if _VIEW_OPAQUE.search(plain) is not None:
-        return ViewElement(written, alias, None, (), (), True)
-    calls = tuple(name.lower() for name in _VIEW_CALL.findall(plain) if "::" in name or name.lower() == "count")
+        return ViewElement(written, alias, None, (), (), (), True)
+    calls, free_calls = _view_calls(plain)
     aggregate: str | None = None
     first = _VIEW_CALL.match(plain)
     if (
@@ -785,7 +812,7 @@ def _view_element(text: str, blanked: str, top: str) -> ViewElement:
     ):
         aggregate = first.group(1).lower()
     fields = () if aggregate is not None else _view_fields(plain)
-    return ViewElement(written, alias, aggregate, calls, fields, False)
+    return ViewElement(written, alias, aggregate, calls, free_calls, fields, False)
 
 
 def view_query_outline(text: str) -> ViewOutline:
@@ -795,9 +822,9 @@ def view_query_outline(text: str) -> ViewOutline:
     the server. Literals are blanked first (``define_parser.blank_literals()``), so a keyword, a call or a comma inside
     a string or a quoted name is never read. ``grouped`` is a top-level ``GROUP BY``/``GROUP ALL``; the projection
     runs from ``SELECT`` to the top-level ``FROM`` (or the end) and is split at its top-level commas; each element's
-    alias, calls, whole aggregate and fields are read as :class:`ViewElement` describes. A sub-select or a graph path
-    (``->``, ``<-``) makes the element opaque, and a backquoted or ``⟨⟩`` field name is invisible: both are left to
-    the server. Pure.
+    alias, calls, free calls, whole aggregate and fields are read as :class:`ViewElement` describes. A sub-select or a
+    graph path (``->``, ``<-``) makes the element opaque, and a backquoted or ``⟨⟩`` field name is invisible: both are
+    left to the server. Pure.
     """
     blanked, top = _top_level(text)
     grouping = _VIEW_GROUP.search(top)
@@ -1116,6 +1143,33 @@ def dependent_views(tables: Mapping[str, Any], table: str) -> tuple[str, ...]:
     return tuple(sorted(names))
 
 
+def dependents_not_removed(dependents: Sequence[str], statements: Sequence[str]) -> tuple[str, ...]:
+    """The views of *dependents* that the *statements* queued in a buffered transaction do not remove, in order
+    (v0.32.1, issue #286).
+
+    G5 (:func:`ensure_view_removable`) reads committed state, where a view whose removal the same buffered block has
+    already queued is still listed: removing a chain of views outer view first in one block would be refused. A
+    dependent is left out when the last of *statements* that names it — as a whole name, in any case, quoted or not —
+    is exactly the removal ``remove_view()`` queues for it (:func:`remove_view_statement`, with ``missing_ok`` ``True``
+    or ``False``). It is kept when no statement names it, when a statement names it after its removal (a
+    ``DEFINE TABLE … AS`` that defines it again, or any other), when its removal was written by hand
+    (``tx.add("REMOVE TABLE …")``), and when its name is not an identifier: a reading of the text, not a parser, that
+    errs on the side of the refusal. Pure.
+    """
+    left: list[str] = []
+    for name in dependents:
+        try:
+            removals = {remove_view_statement(name, True), remove_view_statement(name, False)}
+        except (TypeError, ValueError):
+            left.append(name)
+            continue
+        naming = re.compile(rf"(?<!\w){re.escape(name)}(?!\w)", re.IGNORECASE)
+        last = next((statement for statement in reversed(statements) if naming.search(statement)), None)
+        if last not in removals:
+            left.append(name)
+    return tuple(left)
+
+
 async def ensure_view_removable(client: Any, table: str, dependents: Sequence[str], *, model: str, embedded: bool) -> None:
     """Refuse, on a connection before SurrealDB 3.x, to remove the view *table* that other views read — before any
     DDL (G5, v0.32.0).
@@ -1123,7 +1177,9 @@ async def ensure_view_removable(client: Any, table: str, dependents: Sequence[st
     While a view reads a table — a source table or an inner view —, SurrealDB 3.x refuses to remove it (``Cannot
     delete table … on which a view is defined``). SurrealDB 2.x and the embedded engine remove it, and every view that
     read it loses its ``AS`` clause: an ordinary table that keeps its last records and no longer updates. *dependents*
-    are those views (:func:`dependent_views`, over the table guard's one ``INFO FOR DB``): none, and nothing is read.
+    are those views (:func:`dependent_views`, over the table guard's one ``INFO FOR DB``; in a buffered transaction,
+    without those whose removal the block has already queued, :func:`dependents_not_removed`): none, and nothing is
+    read.
     Else the line is read from ``client.version()`` with the lite's rule (``time_travel.line_major()``): on 3.x — or a
     version that cannot be read — the removal goes on and the server refuses it; before 3.x, G5 names the dependent
     views, sorted. On the embedded engine ``version()`` answers the SDK's version (``surrealdb-2.0.0``), whose bundled
