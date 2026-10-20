@@ -110,10 +110,12 @@ def _refusal(message: str, locate: _Locate | None = None) -> SurrealDbError:
     ``Transaction failed: the server refused <what>: <reason> (at line <l>, column <c> of <where>)``: the reason is
     :func:`_server_reason`'s, never the query's text. With *locate* (a buffered batch), the position names the queued
     statement, ``statement 2 of 3``, with the line and column in the text the caller queued; without it, the position
-    is the statement's (an interactive transaction runs one at a time). Of the positions the server gives, the first
-    that falls in a queued statement is used (a statement left unclosed is reported on the ``COMMIT`` line first),
-    else the first. ``SurrealDbConflictError`` when the reason reports a retryable conflict: the excerpt, which may
-    quote conflict words, is not read.
+    is the statement's (an interactive transaction runs one at a time). The server gives an unclosed delimiter two
+    positions, where it stopped and then where the delimiter opens: the stop can fall in a later statement or on the
+    ``COMMIT`` line. So the statement named is the one that holds the last position falling in a queued statement,
+    and the position given is the first the server gives in that statement (where it stopped, when that is in it
+    too); outside every statement, the query's first position. ``SurrealDbConflictError`` when the reason reports a
+    retryable conflict: the excerpt, which may quote conflict words, is not read.
     """
     reason, positions = _server_reason(message)
     error_type = _error_type(reason)
@@ -122,11 +124,11 @@ def _refusal(message: str, locate: _Locate | None = None) -> SurrealDbError:
     line, column = positions[0]
     what, where = "the statement", "the statement"
     if locate is not None:
-        found = next((place for place in (locate(*position) for position in positions) if place is not None), None)
-        if found is None:
+        places = [place for place in (locate(*position) for position in positions) if place is not None]
+        if not places:
             what, where = "the query", "the query"
         else:
-            number, count, line, column = found
+            number, count, line, column = next(place for place in places if place[0] == places[-1][0])
             what = f"statement {number} of {count}"
     at = f"at line {line}, column {column} of {where}"
     return error_type(f"Transaction failed: the server refused {what}: {reason} ({at})")

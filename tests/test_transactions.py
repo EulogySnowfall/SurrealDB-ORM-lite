@@ -1625,6 +1625,37 @@ class TestBufferedPositionUnits:
             "delimiter `}` (at line 1, column 8 of the statement)"
         )
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("queued", "stop", "opened", "expected"),
+        [
+            (
+                [("RETURN { a: 1", None), ("CREATE a:1;", None)],
+                "3:1",
+                "2:8",
+                "statement 1 of 2: Parse error: Unexpected token `CREATE` expected delimiter `}` (at line 1, column 8 of",
+            ),
+            (
+                [("CREATE a:1;", None), ("RETURN { a: 1 ;", None)],
+                "3:15",
+                "3:8",
+                "statement 2 of 2: Parse error: Unexpected token `CREATE` expected delimiter `}` (at line 1, column 15 of",
+            ),
+        ],
+        ids=["the-delimiter-opens-in-an-earlier-statement", "both-positions-in-one-statement"],
+    )
+    async def test_an_unclosed_delimiter_names_the_statement_it_opens_in(
+        self, queued: list[tuple[str, dict[str, Any] | None]], stop: str, opened: str, expected: str
+    ) -> None:
+        """The server reports where it stopped, then where the delimiter opens: the statement named is the one the
+        delimiter opens in, at the first position the server gives in it (where it stopped, when that is in it too)."""
+        message = (
+            f"Parse error: Unexpected token `CREATE` expected delimiter `}}`\n --> [{stop}]\n  |\n3 | …\n  | ^\n"
+            f" --> [{opened}]\n  |\n2 | …\n  |        ^ expected this delimiter to close\n"
+        )
+        error = await self._commit_error(queued, message)
+        assert error.startswith("Transaction failed: the server refused " + expected), error
+
 
 class _RaisingClient:
     """A client whose ``query_raw()`` raises *error* (not the embedded engine)."""
@@ -1726,6 +1757,23 @@ class TestBufferedCommitErrorTextE2E:
                     queued = len(tx.statements)
             message = str(info.value)
             assert message.startswith(f"Transaction failed: the server refused statement {queued} of {queued}: "), message
+            assert message.endswith("(at line 1, column 8 of the statement)"), message
+
+    @pytest.mark.asyncio
+    async def test_an_unclosed_statement_followed_by_another_is_named(self, transport: str) -> None:
+        """The server stops in the next statement, then points back to where the delimiter opens."""
+        async with _tx_fail_db(transport):
+            if transport == "ws" and await _native_txn_supported():
+                pytest.skip("WebSocket on SurrealDB 3.x runs interactive transactions")
+            with pytest.raises(SurrealDbError) as info:
+                async with SurrealDBConnectionManager.transaction() as tx:
+                    await TxFailRow(id="ok", age=1).save(tx=tx)
+                    await tx.add("RETURN { a: 1")
+                    unclosed = len(tx.statements)
+                    await tx.add("CREATE a:1;")
+                    queued = len(tx.statements)
+            message = str(info.value)
+            assert message.startswith(f"Transaction failed: the server refused statement {unclosed} of {queued}: "), message
             assert message.endswith("(at line 1, column 8 of the statement)"), message
 
     @pytest.mark.asyncio
