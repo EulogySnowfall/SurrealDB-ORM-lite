@@ -57,8 +57,9 @@ the stored definition's other clauses back after the type clause, re-rendered fr
 model generator's renderer, moved here). The carried clauses are re-checked — no NUL in the comment, each permissions
 rule ``FULL``, ``NONE`` or ``WHERE`` with one expression ``scan_fragment()`` accepts — and a value that fails gives
 ``None``, which ``define_relation()`` refuses. These checks catch a definition the ORM would misread; they are not an
-injection defence: the source is the database itself. ``relation_table_refused()`` gives the texts of that guard's
-refusals.
+injection defence: the source is the database itself. ``define_relation()``'s guard reads the stored definitions with
+the views' ``read_table_definitions()`` (``what="relation"`` names it in a refusal) and ``table_kind()``;
+``relation_table_refused()`` gives the texts of its refusals.
 
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
 it.
@@ -940,28 +941,30 @@ _INFO_FOR_DB = "INFO FOR DB;"
 _TableKind = Literal["view", "table", "unreadable"]
 
 
-def _guard_read_refused(statement: str, error: BaseException, *, kind: str, table: str) -> SurrealDbError:
+def _guard_read_refused(statement: str, error: BaseException, *, kind: str, table: str, what: str = "view") -> SurrealDbError:
     """The refusal of one of the guard's reads (*statement*): S1 when the session may not read, else S3 — the text of
-    a refused view DDL, ``Can't apply view {kind}: '<table>' -> <the server's message>``."""
+    a refused DDL of *what*, ``Can't apply {what} {kind}: '<table>' -> <the server's message>`` (``view`` for
+    v0.32.0's guard, ``relation`` for ``define_relation()``'s, v0.33.0)."""
     refusal = _ddl_refusal_class(statement, error)
-    return refusal(f"Can't apply view {kind}: {table!r} -> {error}")
+    return refusal(f"Can't apply {what} {kind}: {table!r} -> {error}")
 
 
-async def read_table_definitions(client: Any, table: str, *, kind: str) -> dict[str, Any]:
+async def read_table_definitions(client: Any, table: str, *, kind: str, what: str = "view") -> dict[str, Any]:
     """The ``tables`` map of ``INFO FOR DB`` — table name → its ``DEFINE TABLE`` statement — read once by the table
-    guard of ``define_view()`` and ``remove_view()`` (v0.32.0).
+    guard of ``define_view()`` and ``remove_view()`` (v0.32.0) and of ``define_relation()`` (v0.33.0).
 
     A copy; ``{}`` when the answer is not a mapping or holds no ``tables`` mapping (a database never defined answers
     ``tables: {}``). It reads committed state, on *client* outside any transaction.
 
-    :param kind: ``"definition"`` or ``"removal"``, for the message of a refusal; *table* only names the view there.
+    :param kind: ``"definition"`` or ``"removal"``, for the message of a refusal; *table* only names the table there.
+    :param what: what is applied, for the message of a refusal: ``"view"`` (the default) or ``"relation"``.
     :raises SurrealDbAuthenticationError: the session may not read the database's definitions (a record user).
     :raises SurrealDbError: any other refusal of the ``INFO``.
     """
     try:
         info = await client.query(_INFO_FOR_DB, {})
     except (ServerError, SurrealDbError, RuntimeError) as error:
-        raise _guard_read_refused(_INFO_FOR_DB, error, kind=kind, table=table) from error
+        raise _guard_read_refused(_INFO_FOR_DB, error, kind=kind, table=table, what=what) from error
     tables = info.get("tables") if isinstance(info, dict) else None
     return dict(tables) if isinstance(tables, dict) else {}
 

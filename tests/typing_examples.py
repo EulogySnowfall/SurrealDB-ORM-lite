@@ -534,6 +534,15 @@ def relation_forms() -> None:
     assert_type(SurrealConfigDict(table_type=TableType.USER), SurrealConfigDict)
 
 
+async def relation_appliers(tx: Transaction) -> None:
+    """v0.33.0: the relation statement's pure renderer and its applier return the statement — a ``str``."""
+    assert_type(RelationLikes.relation_ddl(), str)
+    assert_type(RelationLikes.relation_ddl(overwrite=False), str)
+    s: str = await RelationLikes.define_relation()
+    assert_type(s, str)
+    assert_type(await RelationLikes.define_relation(overwrite=False, tx=tx), str)
+
+
 @fixture
 class Typed(SurrealFixture):
     """``@fixture`` gives the class back unchanged: ``Typed.load()`` stays typed ``Typed``."""

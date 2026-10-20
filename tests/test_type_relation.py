@@ -27,24 +27,37 @@ the model's type clause, then the stored definition's ``DROP``, ``SCHEMAFULL``, 
 statements the E2E classes apply —, or ``None`` when a stored value fails its check (a rule with a top-level ``;`` or a
 comment marker, a NUL in the comment). ``schema.table_permissions_text()`` is the model generator's renderer, moved;
 ``schema.relation_table_refused()`` gives the guard's refusal texts.
+
+``define_relation()`` and its guard (spec §5.4, §5.6, §5.8 RG1–RG3 S1–S4 E1, §7; AC-5, AC-6, AC-9, AC-11, AC-15; D8,
+D9, D11, P2): ``TestRelationGuard`` drives it on fake clients — one ``INFO FOR DB``, then the bare, carried or ``IF NOT
+EXISTS`` statement, RG1–RG3 before any DDL, S1–S4 naming the table and never the statement, a ``tx`` of another
+connection and E1 before any request. ``TestDefineRelationE2E`` applies it on every engine: on a missing table (G1's
+form, idempotent), on AC-6's table — K6 exactly, its other clauses, fields, index, event, edges and the view that reads
+it kept, the view still counting, a wrong-table endpoint refused at once on a second connection too —, RG1 on a view,
+RG3 on a ``TYPE ANY`` table, ``overwrite=False`` leaving a relation table's ends. ``TestRelationPermissionsE2E``: a
+record user gets S1. The query cache classifies it as DDL that changes no row (``tests/test_query_cache.py``).
 """
 
 import contextlib
 import inspect
 import os
-from collections.abc import AsyncIterator
+import re
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import pytest
-from surrealdb import RecordID
+from surrealdb import InternalError, NotAllowedError, RecordID
 
 import surreal_orm_lite
 from surreal_orm_lite import (
     BaseSurrealEdge,
     BaseSurrealModel,
     SurrealConfigDict,
+    SurrealDbAuthenticationError,
     SurrealDBConnectionManager,
+    SurrealDbError,
     TableType,
+    Transaction,
     model_generator,
     schema,
 )
@@ -1069,6 +1082,270 @@ class TestCarriedStatement:
         )
 
 
+# === define_relation() and its table guard (spec §5.4, §5.6, §5.8 RG1–RG3 S1–S4 E1; AC-9, AC-11) =================
+
+#: The guard's one read.
+_INFO = "INFO FOR DB;"
+
+#: A record user's refusal, as the servers word it.
+_PERMISSIONS = "IAM error: Not enough permissions to perform this action"
+
+#: Stored definitions of ``likes`` as ``INFO FOR DB`` renders them: a table the first write created, a ``TYPE
+#: NORMAL`` table, a ``SCHEMAFULL`` table with other clauses, a view, a definition the parser cannot read, a rule
+#: that fails its check (a top-level ``;``), a relation table with other ends.
+_STORED_DEFAULT = "DEFINE TABLE likes TYPE ANY SCHEMALESS PERMISSIONS NONE"
+_STORED_NORMAL = "DEFINE TABLE likes TYPE NORMAL SCHEMALESS PERMISSIONS NONE"
+_STORED_SCHEMAFULL = (
+    "DEFINE TABLE likes TYPE NORMAL SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h PERMISSIONS FOR select FULL, FOR create, "
+    "update, delete NONE"
+)
+_STORED_VIEW = "DEFINE TABLE likes TYPE ANY SCHEMALESS AS SELECT count() AS n FROM person GROUP ALL PERMISSIONS NONE"
+_STORED_UNREADABLE = "DEFINE TABLE likes TYPE ???"
+_STORED_BAD_RULE = "DEFINE TABLE likes TYPE ANY SCHEMALESS PERMISSIONS FOR select WHERE a; b, FOR create, update, delete NONE"
+_STORED_OTHER_ENDS = "DEFINE TABLE likes TYPE RELATION IN company OUT post SCHEMALESS PERMISSIONS NONE"
+
+#: ``G1Likes``' carried statement on :data:`_STORED_SCHEMAFULL` (the K-form).
+_SCHEMAFULL_KEPT = (
+    "DEFINE TABLE OVERWRITE `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED SCHEMAFULL COMMENT 'keep' "
+    "CHANGEFEED 1h PERMISSIONS FOR select FULL, FOR create, update, delete NONE;"
+)
+
+#: ``G1Likes.define_relation()`` on each stored ``likes``: (case, stored definition, overwrite, the statements
+#: sent, the guard that refuses or ``None``). Every call reads ``INFO FOR DB`` once; a refusal sends nothing else.
+_RELATION_GUARD: list[tuple[str, str | None, bool, list[str], str | None]] = [
+    ("missing", None, True, [_INFO, _G1], None),
+    ("missing", None, False, [_INFO, _G1_KEEP], None),
+    ("default", _STORED_DEFAULT, True, [_INFO, _G1], None),
+    ("default", _STORED_DEFAULT, False, [_INFO], "RG3"),
+    ("normal", _STORED_NORMAL, True, [_INFO, _G1], None),
+    ("normal", _STORED_NORMAL, False, [_INFO], "RG3"),
+    ("schemafull", _STORED_SCHEMAFULL, True, [_INFO, _SCHEMAFULL_KEPT], None),
+    ("schemafull", _STORED_SCHEMAFULL, False, [_INFO], "RG3"),
+    ("view", _STORED_VIEW, True, [_INFO], "RG1"),
+    ("view", _STORED_VIEW, False, [_INFO], "RG1"),
+    ("unreadable", _STORED_UNREADABLE, True, [_INFO], "RG2"),
+    ("unreadable", _STORED_UNREADABLE, False, [_INFO], "RG2"),
+    ("bad-rule", _STORED_BAD_RULE, True, [_INFO], "RG2"),
+    ("bad-rule", _STORED_BAD_RULE, False, [_INFO], "RG3"),
+    ("other-ends", _STORED_OTHER_ENDS, True, [_INFO, _G1], None),
+    ("other-ends", _STORED_OTHER_ENDS, False, [_INFO, _G1_KEEP], None),
+]
+
+_GUARD_TEXTS = {"RG1": _rg1, "RG2": _rg2, "RG3": _rg3}
+
+
+class _GuardClient:
+    """A client answering ``INFO FOR DB;`` with ``{"tables": tables}`` and every other statement with ``[]``; it
+    records each statement and raises the error given for the ``INFO`` or the DDL (``tests/test_views.py``'s
+    pattern). ``version()`` is counted: the guard never reads it."""
+
+    def __init__(
+        self,
+        tables: dict[str, object] | None = None,
+        *,
+        info_error: BaseException | None = None,
+        ddl_error: BaseException | None = None,
+    ) -> None:
+        self.info = {"tables": dict(tables or {}), "functions": {}}
+        self.info_error = info_error
+        self.ddl_error = ddl_error
+        self.queries: list[str] = []
+        self.version_calls = 0
+
+    async def query(self, statement: str, variables: object) -> object:
+        assert variables == {}
+        self.queries.append(statement)
+        if statement == _INFO:
+            if self.info_error is not None:
+                raise self.info_error
+            return self.info
+        if self.ddl_error is not None:
+            raise self.ddl_error
+        return []
+
+    async def version(self) -> str:
+        self.version_calls += 1
+        return "surrealdb-3.3.4"
+
+
+class _QueuingTx:
+    """A transaction of the connection *name* whose ``add()`` records each statement."""
+
+    def __init__(self, name: str = "default") -> None:
+        self._connection_name = name
+        self.added: list[tuple[str, object]] = []
+
+    async def add(self, statement: str, variables: object) -> None:
+        self.added.append((statement, variables))
+
+
+def _guard_client(stored: str | None, **errors: Any) -> _GuardClient:
+    """A fake client whose database holds ``person`` and, unless *stored* is ``None``, ``likes`` stored as *stored*."""
+    tables: dict[str, object] = {"person": _STORED_DEFAULT.replace("likes", "person")}
+    if stored is not None:
+        tables["likes"] = stored
+    return _GuardClient(tables, **errors)
+
+
+@pytest.fixture
+def use_client(monkeypatch: pytest.MonkeyPatch) -> Callable[[Any], None]:
+    """Make ``SurrealDBConnectionManager.get_client()`` answer the client given."""
+
+    def use(client: Any) -> None:
+        async def get_client(*args: Any, **kwargs: Any) -> Any:
+            return client
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+
+    return use
+
+
+class TestRelationGuard:
+    """AC-9, AC-11 (unit): ``define_relation()`` on fake clients — one ``INFO FOR DB`` per call, then one statement:
+    the bare one for a missing table, the carried one for a table that exists, ``IF NOT EXISTS`` for
+    ``overwrite=False`` on a missing table or a relation table; RG1–RG3 before any DDL; S1/S2 for a refused ``INFO``,
+    S3/S4 for a refused DDL, naming the table and never the statement; a ``tx`` of another connection and E1 before
+    any request."""
+
+    def test_signature(self) -> None:
+        function = inspect.getattr_static(BaseSurrealEdge, "define_relation")
+        assert isinstance(function, classmethod)
+        assert inspect.iscoroutinefunction(function.__func__)
+        assert not getattr(function.__func__, "__surreal_cache_writes__", False)
+        assert inspect.signature(BaseSurrealEdge.define_relation) == inspect.Signature(
+            [
+                inspect.Parameter("overwrite", inspect.Parameter.KEYWORD_ONLY, default=True, annotation=bool),
+                inspect.Parameter("tx", inspect.Parameter.KEYWORD_ONLY, default=None, annotation=Transaction | None),
+            ],
+            return_annotation=str,
+        )
+
+    @pytest.mark.parametrize(
+        ("stored", "overwrite", "sent", "guard"),
+        [case[1:] for case in _RELATION_GUARD],
+        ids=[f"{case[0]}-{'overwrite' if case[2] else 'if-not-exists'}" for case in _RELATION_GUARD],
+    )
+    async def test_the_requests_sent(
+        self,
+        use_client: Callable[[Any], None],
+        stored: str | None,
+        overwrite: bool,
+        sent: list[str],
+        guard: str | None,
+    ) -> None:
+        client = _guard_client(stored)
+        use_client(client)
+        if guard is None:
+            assert await G1Likes.define_relation(overwrite=overwrite) == sent[-1]
+        else:
+            with pytest.raises(SurrealDbError) as raised:
+                await G1Likes.define_relation(overwrite=overwrite)
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value) == _GUARD_TEXTS[guard]("G1Likes", "likes")
+        assert client.queries == sent
+        assert client.version_calls == 0
+
+    async def test_a_transaction_gets_the_ddl_only(self, use_client: Callable[[Any], None]) -> None:
+        """Spec §5.4, §7: the guard reads committed state on the client, before anything is queued; the DDL — the
+        carried statement — is queued in the transaction."""
+        client = _guard_client(_STORED_SCHEMAFULL)
+        use_client(client)
+        tx = _QueuingTx()
+        assert await G1Likes.define_relation(tx=tx) == _SCHEMAFULL_KEPT  # type: ignore[arg-type]
+        assert client.queries == [_INFO]
+        assert tx.added == [(_SCHEMAFULL_KEPT, None)]
+
+    async def test_a_transaction_of_another_connection(self, use_client: Callable[[Any], None]) -> None:
+        client = _guard_client(None)
+        use_client(client)
+        tx = _QueuingTx("other")
+        with pytest.raises(SurrealDbError) as raised:
+            await G1Likes.define_relation(tx=tx)  # type: ignore[arg-type]
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value).startswith("G1Likes.define_relation() cannot run in this transaction: ")
+        assert client.queries == []
+        assert tx.added == []
+
+    @pytest.mark.parametrize("overwrite", ["yes", 1, None], ids=repr)
+    async def test_e1_before_any_request(self, use_client: Callable[[Any], None], overwrite: Any) -> None:
+        client = _guard_client(None)
+        use_client(client)
+        with pytest.raises(TypeError) as raised:
+            await G1Likes.define_relation(overwrite=overwrite)
+        assert str(raised.value) == f"overwrite= must be a bool, got {type(overwrite).__name__}."
+        assert client.queries == []
+
+    @pytest.mark.parametrize(
+        ("error", "refusal"),
+        [
+            (InternalError("Internal", _PERMISSIONS), SurrealDbAuthenticationError),
+            (NotAllowedError("NotAllowed", _PERMISSIONS), SurrealDbAuthenticationError),
+            (InternalError("Internal", "There was a problem with the database"), SurrealDbError),
+            (RuntimeError("the engine is closed"), SurrealDbError),
+        ],
+        ids=["s1-internal", "s1-not-allowed", "s2-internal", "s2-runtime"],
+    )
+    async def test_s1_s2_a_refused_info(
+        self, use_client: Callable[[Any], None], error: BaseException, refusal: type[SurrealDbError]
+    ) -> None:
+        client = _GuardClient(info_error=error)
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await G1Likes.define_relation()
+        assert type(raised.value) is refusal
+        assert str(raised.value) == f"Can't apply relation definition: 'likes' -> {error}"
+        assert raised.value.__cause__ is error
+        assert client.queries == [_INFO]
+
+    async def test_s3_a_refused_ddl(self, use_client: Callable[[Any], None]) -> None:
+        error = NotAllowedError("NotAllowed", _PERMISSIONS)
+        client = _guard_client(_STORED_SCHEMAFULL, ddl_error=error)
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await G1Likes.define_relation()
+        assert type(raised.value) is SurrealDbAuthenticationError
+        assert str(raised.value) == f"Can't apply relation definition: 'likes' -> {_PERMISSIONS}"
+        assert raised.value.__cause__ is error
+        assert client.queries == [_INFO, _SCHEMAFULL_KEPT]
+
+    @pytest.mark.parametrize(
+        ("reason", "text"),
+        [
+            ("The table 'likes' is locked", "The table 'likes' is locked"),
+            (
+                "Parse error: Unexpected token `ENFORCED`\n --> [1:72]\n  |\n1 | DEFINE TABLE OVERWRITE `likes` TYPE "
+                "RELATION IN `person` OUT `post` | `book` ENFORCED SCHEMAFULL",
+                "Parse error: Unexpected token `ENFORCED` (at line 1, column 72 of the statement)",
+            ),
+            (
+                "Found a problem in TYPE RELATION IN `person` OUT `post` | `book` ENFORCED SCHEMAFULL COMMENT 'keep'",
+                "the server's message quotes the statement, so it is left out",
+            ),
+        ],
+        ids=["whole", "parse-excerpt", "quoting"],
+    )
+    async def test_s4_never_quotes_the_statement(self, use_client: Callable[[Any], None], reason: str, text: str) -> None:
+        error = InternalError("Internal", reason)
+        client = _guard_client(_STORED_SCHEMAFULL, ddl_error=error)
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await G1Likes.define_relation()
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == f"Can't apply relation definition: 'likes' -> {text}"
+        assert "PERMISSIONS FOR select" not in str(raised.value)
+        assert client.queries == [_INFO, _SCHEMAFULL_KEPT]
+
+    async def test_the_view_guard_texts_are_unchanged(self) -> None:
+        """``read_table_definitions()``'s new ``what=`` keyword keeps v0.32.0's texts by default."""
+        client = _GuardClient(info_error=InternalError("Internal", _PERMISSIONS))
+        with pytest.raises(SurrealDbAuthenticationError) as view:
+            await schema.read_table_definitions(client, "order_stats", kind="definition")
+        assert str(view.value) == f"Can't apply view definition: 'order_stats' -> {_PERMISSIONS}"
+        with pytest.raises(SurrealDbAuthenticationError) as relation:
+            await schema.read_table_definitions(client, "likes", kind="definition", what="relation")
+        assert str(relation.value) == f"Can't apply relation definition: 'likes' -> {_PERMISSIONS}"
+
+
 # === E2E (spec §9.2): the connection "rel" on the database rel_db, over WebSocket and HTTP, and mem:// ===========
 
 #: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
@@ -1167,3 +1444,326 @@ class TestRelationDdlE2E:
             await _apply_ddl(client, G1Likes.relation_ddl())
             await _apply_ddl(client, G1Likes.relation_ddl(overwrite=False))
             assert (await _tables(client))["likes"] == first
+
+
+# --- define_relation() on the engines (spec §5.4, §5.6; AC-5, AC-6, AC-9, AC-11; M4, M6, M9, M17, M23) -------------
+
+
+class RelPerson(BaseSurrealModel):
+    """A node of the E2E classes: ``rel_likes``' ``IN`` table."""
+
+    model_config = SurrealConfigDict(table_name="rel_person", connection="rel")
+
+    id: str | None = None
+
+
+class RelPost(BaseSurrealModel):
+    """A node of the E2E classes: one of ``rel_likes``' ``OUT`` tables."""
+
+    model_config = SurrealConfigDict(table_name="rel_post", connection="rel")
+
+    id: str | None = None
+
+
+class RelBook(BaseSurrealModel):
+    """A node of the E2E classes: the other ``OUT`` table of ``rel_likes``."""
+
+    model_config = SurrealConfigDict(table_name="rel_book", connection="rel")
+
+    id: str | None = None
+
+
+class RelCompany(BaseSurrealModel):
+    """A node of the E2E classes, outside ``rel_likes``' ends."""
+
+    model_config = SurrealConfigDict(table_name="rel_company", connection="rel")
+
+    id: str | None = None
+
+
+class RelStats(BaseSurrealEdge):
+    """An edge model whose table is a view (AC-9, RG1)."""
+
+    model_config = SurrealConfigDict(table_name="rel_stats", connection="rel", relation_in="rel_person")
+
+
+#: ``RelLikes``' bare statement (G1's form on the ``rel_`` tables) and SurrealDB's rendering of it (M2).
+_REL_G1 = "DEFINE TABLE OVERWRITE `rel_likes` TYPE RELATION IN `rel_person` OUT `rel_post` | `rel_book` ENFORCED;"
+_REL_G1_READ_BACK = (
+    "DEFINE TABLE rel_likes TYPE RELATION IN rel_person OUT rel_post | rel_book ENFORCED SCHEMALESS PERMISSIONS NONE"
+)
+
+#: AC-6's fixture, as written in spec AC-6 (M17): ``TYPE ANY`` spelled out — a ``SCHEMAFULL`` table without ``TYPE``
+#: is stored ``TYPE NORMAL`` and refuses the edges —, and ``in``/``out`` defined before the ``UNIQUE`` index — a
+#: ``SCHEMAFULL`` table refuses an index on undefined fields.
+_AC6_FIXTURE = (
+    "DEFINE TABLE rel_likes TYPE ANY SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL "
+    "PERMISSIONS FOR select WHERE in = $auth.id, FOR create FULL; "
+    "DEFINE FIELD in ON rel_likes TYPE record; "
+    "DEFINE FIELD out ON rel_likes TYPE record; "
+    "DEFINE FIELD stars ON rel_likes TYPE int DEFAULT 1; "
+    "DEFINE INDEX rel_likes_pair ON rel_likes FIELDS in, out UNIQUE; "
+    "DEFINE EVENT rel_likes_ev ON rel_likes WHEN $event = 'CREATE' THEN {};"
+)
+
+#: AC-6's two raw edges, with explicit ids.
+_AC6_EDGES = (
+    "INSERT RELATION INTO rel_likes [{id: 'e1', in: rel_person:ada, out: rel_post:p1, stars: 3}, "
+    "{id: 'e2', in: rel_person:ada, out: rel_book:b1}];"
+)
+
+#: The view of P2 (M23): it reads ``rel_likes``.
+_AC6_VIEW = "DEFINE TABLE rel_like_counts AS SELECT count() AS n, out FROM rel_likes GROUP BY out;"
+
+#: A record access on ``rel_db``: a user signed up through it is a record user, who may not define (AC-11).
+_REL_ACCESS = (
+    "DEFINE ACCESS rel_acc ON DATABASE TYPE RECORD SIGNUP (CREATE rel_user SET name = $name) "
+    "SIGNIN (SELECT * FROM rel_user WHERE name = $name);"
+)
+
+
+async def _line(client: Any) -> tuple[int, int]:
+    """``(major, minor)`` of the engine *client* talks to: ``"surrealdb-3.1.5"`` → ``(3, 1)``; ``mem://`` →
+    ``(2, 0)`` (the SDK's version, whose core is 2.x)."""
+    match = re.search(r"(\d+)\.(\d+)", await client.version())
+    assert match is not None
+    return int(match.group(1)), int(match.group(2))
+
+
+async def _major(client: Any) -> int:
+    """The major version of the engine *client* talks to: ``"surrealdb-3.3.4"`` → 3; ``mem://`` → 2."""
+    return (await _line(client))[0]
+
+
+def _spy(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[tuple[str, tuple[object, ...]]]:
+    """Record every ``query``, ``query_raw`` and ``version`` call *client* receives, with its arguments (and let it
+    through) — v0.31.0's spy."""
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def recording(method: str) -> Any:
+        real = getattr(client, method)
+
+        async def call(*args: object, **kwargs: object) -> object:
+            calls.append((method, args))
+            return await real(*args, **kwargs)
+
+        return call
+
+    for method in ("query", "query_raw", "version"):
+        monkeypatch.setattr(client, method, recording(method))
+    return calls
+
+
+def _sent(calls: list[tuple[str, tuple[object, ...]]]) -> list[object]:
+    """The statements *calls* (:func:`_spy`'s) sent through ``query()``, after checking that nothing else was sent: no
+    ``version()``, and a ``query_raw()`` only for those statements (the SDK's ``query()`` runs it itself)."""
+    statements = [args[0] for method, args in calls if method == "query"]
+    assert [method for method, _ in calls if method == "version"] == []
+    assert [args[0] for method, args in calls if method == "query_raw"] == statements
+    return statements
+
+
+async def _table_info(client: Any, table: str) -> dict[str, Any]:
+    """``INFO FOR TABLE`` *table* (a constant name of these tests)."""
+    info: dict[str, Any] = await client.query(f"INFO FOR TABLE {table};", {})
+    return info
+
+
+async def _edge_ids(client: Any) -> list[str]:
+    """The ids of ``rel_likes``' edges, ordered, as ``table:id`` texts."""
+    return [str(edge) for edge in await client.query("SELECT VALUE id FROM rel_likes ORDER BY id;", {})]
+
+
+async def _like_counts(client: Any) -> dict[str, int]:
+    """The view ``rel_like_counts``: ``out`` (as a ``table:id`` text) → ``n``."""
+    return {str(row["out"]): row["n"] for row in await client.query("SELECT n, out FROM rel_like_counts;", {})}
+
+
+async def _ac6(client: Any) -> dict[str, BaseSurrealModel]:
+    """Spec AC-6's fixture on ``rel_db``: the table, its fields, index and event (each statement checked), the five
+    nodes saved through the ORM, the edges ``e1`` and ``e2`` written raw, then the view of P2 — and the stored
+    definition is K6's stored text. Returns the nodes by name."""
+    await _apply_ddl(client, _AC6_FIXTURE)
+    nodes: dict[str, BaseSurrealModel] = {
+        "ada": await RelPerson(id="ada").save(),
+        "bob": await RelPerson(id="bob").save(),
+        "p1": await RelPost(id="p1").save(),
+        "b1": await RelBook(id="b1").save(),
+        "c": await RelCompany(id="c").save(),
+    }
+    await _apply_ddl(client, _AC6_EDGES)
+    await _apply_ddl(client, _AC6_VIEW)
+    assert await _like_counts(client) == {"rel_post:p1": 1, "rel_book:b1": 1}
+    assert (await _tables(client))["rel_likes"] == _K6_STORED
+    return nodes
+
+
+class TestDefineRelationE2E:
+    """AC-5, AC-6, AC-9 (E2E, every engine of both lines): ``define_relation()`` reads ``INFO FOR DB`` once, then
+    sends the bare statement on a missing table and the carried one (K6) on an existing table — whose other clauses,
+    fields, indexes, events, edges and the views that read it are kept, and which refuses a wrong-table endpoint at
+    once, on every connection —; RG1 on a view, RG3 for ``overwrite=False`` on a ``TYPE ANY`` table, and
+    ``overwrite=False`` leaves a relation table's stored ends."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_ac5_on_a_missing_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _rel(kind) as client:
+            calls = _spy(monkeypatch, client)
+            assert await RelLikes.define_relation() == _REL_G1 == RelLikes.relation_ddl()
+            assert _sent(calls) == [_INFO, _REL_G1]
+            stored = (await _tables(client))["rel_likes"]
+            assert stored == _REL_G1_READ_BACK
+            state = parse_define_table(stored)
+            assert state.table_type == "relation"
+            assert state.relation_in == ("rel_person",)
+            assert state.relation_out == ("rel_post", "rel_book")
+            assert state.enforced is True
+            calls.clear()
+            assert await RelLikes.define_relation() == _REL_G1
+            assert _sent(calls) == [_INFO, _REL_G1]
+            assert (await _tables(client))["rel_likes"] == stored
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_ac6_on_an_existing_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _rel(kind) as client:
+            nodes = await _ac6(client)
+            if kind != "mem":
+                _register_rel(kind, "rel2")
+            try:
+                if kind != "mem":
+                    # The second connection's session is open before the define (M9).
+                    second = await SurrealDBConnectionManager.get_client("rel2")
+                    assert await second.query("SELECT VALUE id FROM rel_likes ORDER BY id;", {}) == [
+                        RecordID("rel_likes", "e1"),
+                        RecordID("rel_likes", "e2"),
+                    ]
+                calls = _spy(monkeypatch, client)
+                assert await RelLikes.define_relation() == _K6
+                assert _sent(calls) == [_INFO, _K6]
+                tables = await _tables(client)
+                assert tables["rel_likes"] == _K6_READ_BACK
+                assert parse_define_table(tables["rel_like_counts"]).view_query is not None
+                info = await _table_info(client, "rel_likes")
+                assert {"in", "out", "stars"} <= set(info["fields"])
+                assert "TYPE record<rel_person>" in info["fields"]["in"]
+                assert "TYPE record<rel_post | rel_book>" in info["fields"]["out"]
+                assert list(info["indexes"]) == ["rel_likes_pair"]
+                assert list(info["events"]) == ["rel_likes_ev"]
+                assert list(info["tables"]) == ["rel_like_counts"]
+                assert await _edge_ids(client) == ["rel_likes:e1", "rel_likes:e2"]
+
+                # P2, M23: the view that reads the table keeps updating.
+                edge = await nodes["bob"].relate(RelLikes, nodes["p1"])
+                assert (edge.in_, edge.out, edge.stars) == (RecordID("rel_person", "bob"), RecordID("rel_post", "p1"), 1)
+                assert await _like_counts(client) == {"rel_post:p1": 2, "rel_book:b1": 1}
+
+                # The UNIQUE index is kept.
+                with pytest.raises(SurrealDbError) as duplicate:
+                    await nodes["ada"].relate(RelLikes, nodes["p1"])
+                assert type(duplicate.value) is SurrealDbError
+                assert "rel_likes_pair" in str(duplicate.value)
+
+                # A wrong-table endpoint is refused at once (M9), also on the second connection.
+                with pytest.raises(SurrealDbError) as company:
+                    await nodes["c"].relate(RelLikes, nodes["p1"])
+                assert type(company.value) is SurrealDbError
+                if kind != "mem":
+                    async with SurrealDBConnectionManager.using("rel2"):
+                        with pytest.raises(SurrealDbError) as other:
+                            await nodes["c"].relate(RelLikes, nodes["b1"])
+                    assert type(other.value) is SurrealDbError
+                # e1, e2 and bob's edge (an auto id: compared as a set), nothing else.
+                ids = await _edge_ids(client)
+                assert len(ids) == 3
+                assert {"rel_likes:e1", "rel_likes:e2", str(edge.id)} == set(ids)
+                assert await _like_counts(client) == {"rel_post:p1": 2, "rel_book:b1": 1}
+            finally:
+                if kind != "mem":
+                    await SurrealDBConnectionManager.remove_connection("rel2")
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_ac6_a_second_call_converges(self, kind: str) -> None:
+        """Applied again, the carried statement is the same K6 and the table reads back the same."""
+        async with _rel(kind) as client:
+            await _ac6(client)
+            assert await RelLikes.define_relation() == _K6
+            assert await RelLikes.define_relation() == _K6
+            assert (await _tables(client))["rel_likes"] == _K6_READ_BACK
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "if-not-exists"])
+    async def test_rg1_a_view(self, kind: str, overwrite: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _rel(kind) as client:
+            await RelPerson(id="ada").save()
+            await _apply_ddl(client, "DEFINE TABLE rel_stats AS SELECT count() AS n FROM rel_person GROUP ALL;")
+            before = (await _tables(client))["rel_stats"]
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await RelStats.define_relation(overwrite=overwrite)
+            assert _sent(calls) == [_INFO]
+            assert (type(raised.value), str(raised.value)) == (SurrealDbError, _rg1("RelStats", "rel_stats"))
+            after = (await _tables(client))["rel_stats"]
+            assert after == before
+            assert parse_define_table(after).view_query is not None
+            assert await client.query("SELECT VALUE n FROM rel_stats;", {}) == [1]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_rg3_a_type_any_table_holding_an_edge(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _rel(kind) as client:
+            await _apply_ddl(client, "INSERT RELATION INTO rel_likes {id: 'e1', in: rel_person:ada, out: rel_post:p1};")
+            before = (await _tables(client))["rel_likes"]
+            assert parse_define_table(before).table_type == "any"
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await RelLikes.define_relation(overwrite=False)
+            assert _sent(calls) == [_INFO]
+            assert (type(raised.value), str(raised.value)) == (SurrealDbError, _rg3("RelLikes", "rel_likes"))
+            assert (await _tables(client))["rel_likes"] == before
+            assert await _edge_ids(client) == ["rel_likes:e1"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_overwrite_false_on_a_missing_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _rel(kind) as client:
+            statement = RelLikes.relation_ddl(overwrite=False)
+            calls = _spy(monkeypatch, client)
+            assert await RelLikes.define_relation(overwrite=False) == statement
+            assert _sent(calls) == [_INFO, statement]
+            assert (await _tables(client))["rel_likes"] == _REL_G1_READ_BACK
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_overwrite_false_leaves_a_relation_tables_ends(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """D8: ``IF NOT EXISTS`` on a relation table with other ends is sent, and changes nothing."""
+        async with _rel(kind) as client:
+            await _apply_ddl(client, "DEFINE TABLE rel_likes TYPE RELATION IN rel_company OUT rel_post;")
+            before = (await _tables(client))["rel_likes"]
+            statement = RelLikes.relation_ddl(overwrite=False)
+            calls = _spy(monkeypatch, client)
+            assert await RelLikes.define_relation(overwrite=False) == statement
+            assert _sent(calls) == [_INFO, statement]
+            assert (await _tables(client))["rel_likes"] == before
+            state = parse_define_table(before)
+            assert (state.relation_in, state.relation_out, state.enforced) == (("rel_company",), ("rel_post",), False)
+
+
+class TestRelationPermissionsE2E:
+    """AC-11 (servers): a record user may not define a relation constraint — S1 from the guard's ``INFO FOR DB``, and
+    nothing else is sent. The embedded engine's session is its owner, which may always define."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_s1_a_record_user(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        if kind == "mem":
+            pytest.skip("the embedded engine's session is its owner: it may always define")
+        async with _rel(kind) as client, SurrealDBConnectionManager.using("rel"):
+            await _apply_ddl(client, _REL_ACCESS)
+            await SurrealDBConnectionManager.signup(access="rel_acc", variables={"name": "rel-user"})
+            try:
+                calls = _spy(monkeypatch, client)
+                with pytest.raises(SurrealDbError) as raised:
+                    await RelLikes.define_relation()
+                assert _sent(calls) == [_INFO]
+            finally:
+                await SurrealDBConnectionManager.invalidate()
+            assert "rel_likes" not in await _tables(client)
+        assert type(raised.value) is SurrealDbAuthenticationError
+        assert str(raised.value).startswith("Can't apply relation definition: 'rel_likes' -> ")
+        assert "not enough permissions" in str(raised.value).lower()

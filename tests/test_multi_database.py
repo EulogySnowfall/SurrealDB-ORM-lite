@@ -2811,6 +2811,7 @@ _TX_CALLS: dict[str, Callable[[Any, Any], Any]] = {
     "define_access": lambda m, tx: type(m).define_access(tx=tx),
     "define_computed_fields": lambda m, tx: type(m).define_computed_fields(tx=tx),
     "define_events": lambda m, tx: type(m).define_events(tx=tx),
+    "define_relation": lambda m, tx: type(m).define_relation(tx=tx),
     "define_view": lambda m, tx: type(m).define_view(tx=tx),
     "delete": lambda m, tx: m.delete(tx=tx),
     "merge": lambda m, tx: m.merge(tx=tx, n=1),

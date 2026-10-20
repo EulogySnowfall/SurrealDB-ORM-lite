@@ -24,12 +24,21 @@ from . import encoding as _encoding
 from . import routing as _routing
 from ._sdk import NotFoundError, RecordID, ServerError
 from .connection_manager import SurrealDBConnectionManager
+from .define_parser import parse_define_table
 from .exceptions import SurrealDbError, SurrealDbNotFoundError
 from .functions import SurrealFunc
 from .model_base import BaseSurrealModel, _own_annotation_names
-from .schema import relation_statement, relation_tables, relation_type_clause
+from .schema import (
+    read_table_definitions,
+    relation_statement,
+    relation_statement_keeping,
+    relation_table_refused,
+    relation_tables,
+    relation_type_clause,
+    table_kind,
+)
 from .transaction import Transaction
-from .utils import coerce_endpoint
+from .utils import apply_ddl_statements, coerce_endpoint
 
 _ENDPOINT_FIELDS = frozenset({"in_", "out"})
 _ENDPOINT_COLUMNS = frozenset({"in", "out"})
@@ -193,7 +202,10 @@ class BaseSurrealEdge(BaseSurrealModel):
     They are checked at the ``class`` statement and read back by :meth:`get_relation_in`,
     :meth:`get_relation_out` and :meth:`is_enforced`; ``table_type=TableType.RELATION`` may be
     written, and any other ``table_type`` is refused on an edge. :meth:`relation_ddl` renders the
-    table's ``DEFINE TABLE … TYPE RELATION`` statement.
+    table's ``DEFINE TABLE … TYPE RELATION`` statement and :meth:`define_relation` applies it,
+    keeping the table's other clauses; SurrealDB then refuses every edge that breaks it. A model
+    without the keys applies an unconstrained ``TYPE RELATION``, which removes a constraint.
+    README section 34.
     """
 
     __surreal_edge__: ClassVar[bool] = True
@@ -283,6 +295,95 @@ class BaseSurrealEdge(BaseSurrealModel):
         """
         clause = relation_type_clause(cls.get_relation_in(), cls.get_relation_out(), cls.is_enforced())
         return relation_statement(cls.get_table_name(), clause, overwrite)
+
+    @classmethod
+    async def define_relation(cls, *, overwrite: bool = True, tx: Transaction | None = None) -> str:
+        """Apply this edge model's ``TYPE RELATION`` constraint to its table (v0.33.0) and return the statement applied.
+
+        On the model's connection (the ``using()`` block's, else ``SurrealConfigDict(connection=…)``, else
+        ``"default"``), sends ``INFO FOR DB`` once — committed state, outside any transaction — then one ``DEFINE
+        TABLE`` statement:
+
+        - no such table: :meth:`relation_ddl` (``DEFINE TABLE OVERWRITE `<table>` TYPE RELATION …;``);
+        - a table that exists: ``DEFINE TABLE OVERWRITE`` with the model's type clause followed by the table's other
+          stored clauses — ``DROP``, ``SCHEMAFULL``, its comment, its change feed, its permissions —, re-rendered from
+          ``INFO FOR DB``. A bare ``OVERWRITE`` would reset them to SurrealDB's defaults (``PERMISSIONS NONE`` among
+          them); ``ALTER TABLE … TYPE`` is not enforced on SurrealDB 2.x and the embedded engine once the table has
+          been written to. This statement is enforced at once, on every connection, the same on every line;
+        - ``overwrite=False``: :meth:`relation_ddl` with ``IF NOT EXISTS``, which defines a missing table and leaves a
+          relation table as it is, its stored ends included.
+
+        Safe to call at application start-up: with the default ``overwrite=True`` each call converges the table onto
+        the model. The table keeps its records, fields, indexes, events, the views that read it (README section 33:
+        they keep updating with the edges written afterwards), its registered live queries and its change-feed
+        history. On a table with a change feed, each call adds a ``define_table`` entry to the feed: ``changes()``
+        skips it, a raw ``SHOW CHANGES`` shows it. SurrealDB rewrites the ``in``/``out`` field definitions from the
+        ends (``TYPE record<person>``); an ``ASSERT`` written on them by hand is lost — declare the ends with
+        ``relation_in``/``relation_out`` instead.
+
+        **Records already in the table are not checked** — SurrealDB checks only later writes: an edge stored before
+        the constraint keeps its endpoints, and updating one that breaks it (``merge()``, ``update()``, …) raises the
+        SDK's ``InternalError``. README section 34 gives the queries that find them. A model without keys
+        (``relation_in`` and ``relation_out`` left out, ``None`` or empty, ``enforced`` left out, ``None`` or
+        ``False``) applies ``TYPE RELATION`` with no ends: this is how a constraint is removed — edges from or to any
+        table, and to missing records, are accepted at once, the other clauses kept.
+
+        Before any DDL the guard refuses (nothing is sent but the ``INFO``): a materialized view (an ``OVERWRITE``
+        would drop its query); a definition the ORM cannot read back, or a stored value that fails its check (it could
+        not keep the other clauses); ``overwrite=False`` on a table that exists and is not a relation table (``IF NOT
+        EXISTS`` would leave the constraint unapplied). The guard is a check, then the DDL, not a lock: a clause
+        another process changes in between is overwritten with the value read.
+
+        With *tx* the guard still reads committed state before anything is queued, and the statement joins the
+        transaction: applied at once in an interactive one (WebSocket, SurrealDB 3.x), at commit in a buffered one
+        (HTTP, SurrealDB 2.x, the embedded engine) — where a refusal comes back as the transaction's own error. A
+        block that raises applies nothing; an edge that breaks the constraint later in the same block fails the
+        block. **Limit:** a definition of the same table queued earlier in the block (``tx.add("DEFINE TABLE …")``)
+        is not seen, and is replaced at commit by the statement built from the committed definition — define the
+        table's other clauses before the block.
+
+        A refusal names the table and keeps the server's reason, never the statement, which may carry permission
+        rules: ``Can't apply relation definition: 'likes' -> <reason>``. Applying needs a session allowed to read the
+        definitions and to define (a system user such as root, or a namespace or database ``OWNER``/``EDITOR``).
+
+        Args:
+            overwrite: see :meth:`relation_ddl`.
+            tx: optional transaction the statement is applied with; the guard reads before anything is queued.
+
+        Raises:
+            TypeError: *overwrite* is not a ``bool`` — before any request.
+            SurrealDbError: *tx* belongs to another connection — before any request; the table is a materialized view,
+                its definition cannot be read back, or ``overwrite=False`` meets a table that is not a relation table —
+                before any DDL; the server refused the statement (``Can't apply relation definition: …``).
+            SurrealDbAuthenticationError: the session may not read the database's definitions or define the table.
+
+        Example:
+            >>> await Likes.define_relation()
+            'DEFINE TABLE OVERWRITE `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;'
+        """
+        _routing.check_transaction(cls, tx, f"{cls.__name__}.define_relation()")
+        statement = cls.relation_ddl(overwrite=overwrite)
+        table = cls.get_table_name()
+        # Cheap even inside a transaction: get_client() returns the already-connected client.
+        client = await cls._connection_manager().get_client()
+        tables = await read_table_definitions(client, table, kind="definition", what="relation")
+        existing = table_kind(tables, table)
+        if existing == "view":
+            raise SurrealDbError(relation_table_refused("RG1", cls.__name__, table))
+        if existing == "unreadable":
+            raise SurrealDbError(relation_table_refused("RG2", cls.__name__, table))
+        if existing == "table":
+            state = parse_define_table(tables[table])
+            if overwrite:
+                clause = relation_type_clause(cls.get_relation_in(), cls.get_relation_out(), cls.is_enforced())
+                kept = relation_statement_keeping(table, clause, state)
+                if kept is None:
+                    raise SurrealDbError(relation_table_refused("RG2", cls.__name__, table))
+                statement = kept
+            elif state.table_type != "relation":
+                raise SurrealDbError(relation_table_refused("RG3", cls.__name__, table))
+        await apply_ddl_statements([statement], client=client, tx=tx, what="relation", classify=True, subjects=[repr(table)])
+        return statement
 
     @classmethod
     def _implicit_aliases(cls) -> dict[str, str]:

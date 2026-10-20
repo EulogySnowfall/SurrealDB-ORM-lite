@@ -2266,6 +2266,7 @@ _CLASSIFIED: dict[type, dict[str, frozenset[str]]] = {
     BaseSurrealEdge: {
         "invalidating writes": _INVALIDATING_WRITES[BaseSurrealEdge],
         "refused": frozenset({"upsert"}),
+        "DDL that changes no row": frozenset({"define_relation"}),
     },
     AuthenticatedUserMixin: {
         "invalidating writes": _INVALIDATING_WRITES[AuthenticatedUserMixin],
