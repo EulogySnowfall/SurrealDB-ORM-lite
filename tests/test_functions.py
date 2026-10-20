@@ -126,7 +126,9 @@ ENUM_SAMPLE_ARGS: dict[SurrealFunction, tuple[str, ...]] = {
     SurrealRandFunction.FLOAT: (),
     SurrealRandFunction.INT: (),
     SurrealRandFunction.STRING: ("5",),
-    SurrealRandFunction.TIME: (),
+    # Bounded (#279): unbounded, rand::time() draws from years 0-9999 on both lines, and about one
+    # call in 10,000 lands in year 0, which a Python datetime cannot hold.
+    SurrealRandFunction.TIME: ("d'2000-01-01T00:00:00Z'", "d'2030-01-01T00:00:00Z'"),
     SurrealRandFunction.ENUM: ("'a'", "'b'"),
 }
 
@@ -309,7 +311,9 @@ class TestFunctionEnumsE2E:
             for member, args in ENUM_SAMPLE_ARGS.items():
                 expr = SurrealFunc.call(member, *args).expression
                 # Raises if the server does not know the function / signature.
-                await client.query(f"RETURN {expr};", {})
+                result = await client.query(f"RETURN {expr};", {})
+                if member is SurrealRandFunction.TIME:
+                    assert isinstance(result, datetime) and 2000 <= result.year <= 2030, result
         finally:
             await SurrealDBConnectionManager.close_connection()
 
