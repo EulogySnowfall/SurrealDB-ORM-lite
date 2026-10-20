@@ -269,7 +269,37 @@ _QUERY_ERRORS = [
         id="V7-nested",
     ),
     pytest.param("SELECT g, vector::sum(v) AS s FROM t GROUP BY g", ValueError, _v7("vector::sum"), id="V7-vector"),
+    # V7, issue #286: the calls beside an aggregate, or around one, are outside its argument.
+    pytest.param(
+        "SELECT g, math::sum(a) + array::len(array::distinct(tags)) AS x FROM t GROUP BY g",
+        ValueError,
+        _v7("array::distinct"),
+        id="V7-beside-an-aggregate",
+    ),
+    pytest.param(
+        "SELECT g, math::sum(v) + math::median(v) AS x FROM t GROUP BY g",
+        ValueError,
+        _v7("math::median"),
+        id="V7-after-an-aggregate",
+    ),
+    pytest.param(
+        "SELECT g, array::distinct(math::sum(v)) AS x FROM t GROUP BY g",
+        ValueError,
+        _v7("array::distinct"),
+        id="V7-around-an-aggregate",
+    ),
+    pytest.param(
+        "SELECT g, math::max(string::len(')')) + array::join(v, ',') AS x FROM t GROUP BY g",
+        ValueError,
+        _v7("array::join"),
+        id="V7-bracket-in-a-literal",
+    ),
 ]
+
+#: Issue #286: the issue's query — two aggregates in one element, a listed function inside the second's argument.
+_SEVERAL_AGGREGATES = (
+    "SELECT status, math::sum(amount) + math::sum(array::len(array::distinct(tags))) AS x FROM orders GROUP BY status"
+)
 
 #: ``(value, returned text)`` — accepted as AC-2 lists them.
 _QUERY_ACCEPTED = [
@@ -286,6 +316,22 @@ _QUERY_ACCEPTED = [
         "SELECT g, math::max(array::len(array::distinct(tags))) AS m FROM t GROUP BY g",
         "SELECT g, math::max(array::len(array::distinct(tags))) AS m FROM t GROUP BY g",
         id="inside-an-aggregate",
+    ),
+    pytest.param(_SEVERAL_AGGREGATES, _SEVERAL_AGGREGATES, id="inside-one-of-several-aggregates"),
+    pytest.param(
+        "SELECT math::max(array::len(array::distinct(tags))) - math::min(array::len(array::group(v))) AS d FROM t GROUP ALL",
+        "SELECT math::max(array::len(array::distinct(tags))) - math::min(array::len(array::group(v))) AS d FROM t GROUP ALL",
+        id="inside-each-of-two-aggregates",
+    ),
+    pytest.param(
+        "SELECT g, count(array::distinct(tags)) * 2 AS n FROM t GROUP BY g",
+        "SELECT g, count(array::distinct(tags)) * 2 AS n FROM t GROUP BY g",
+        id="inside-count-in-an-expression",
+    ),
+    pytest.param(
+        "SELECT g, math::sum(math::max(array::distinct(v))) AS s FROM t GROUP BY g",
+        "SELECT g, math::sum(math::max(array::distinct(v))) AS s FROM t GROUP BY g",
+        id="inside-nested-aggregates",
     ),
     pytest.param(
         "SELECT g, count() AS n FROM t WHERE x = 'math::median(' GROUP BY g",
@@ -354,8 +400,10 @@ def _element(
     calls: tuple[str, ...] = (),
     fields: tuple[str, ...] = (),
     opaque: bool = False,
+    free_calls: tuple[str, ...] | None = None,
 ) -> ViewElement:
-    return ViewElement(text, alias, aggregate, calls, fields, opaque)
+    """A :class:`ViewElement` built by keyword; its ``free_calls`` are its ``calls`` unless given (issue #286)."""
+    return ViewElement(text, alias, aggregate, calls, calls if free_calls is None else free_calls, fields, opaque)
 
 
 class TestViewOutline:
@@ -366,9 +414,9 @@ class TestViewOutline:
             grouped=True,
             group=("status",),
             elements=(
-                ViewElement("status", None, None, (), ("status",), False),
-                ViewElement("count()", "total", "count", ("count",), (), False),
-                ViewElement("math::sum(amount)", "revenue", "math::sum", ("math::sum",), (), False),
+                ViewElement("status", None, None, (), (), ("status",), False),
+                ViewElement("count()", "total", "count", ("count",), ("count",), (), False),
+                ViewElement("math::sum(amount)", "revenue", "math::sum", ("math::sum",), ("math::sum",), (), False),
             ),
         )
 
@@ -396,10 +444,10 @@ class TestViewOutline:
         assert outline.grouped is True
         assert outline.group == ("cc",)
         assert outline.elements == (
-            ViewElement("c.country", "cc", None, (), ("c.country",), False),
-            ViewElement("count()", "n", "count", ("count",), (), False),
-            ViewElement("(SELECT count() FROM other GROUP ALL)", "o", None, (), (), True),
-            ViewElement("`my f`", "f", None, (), (), False),
+            ViewElement("c.country", "cc", None, (), (), ("c.country",), False),
+            ViewElement("count()", "n", "count", ("count",), ("count",), (), False),
+            ViewElement("(SELECT count() FROM other GROUP ALL)", "o", None, (), (), (), True),
+            ViewElement("`my f`", "f", None, (), (), (), False),
         )
 
     def test_objects_casts_parameters_and_if(self) -> None:
@@ -431,11 +479,61 @@ class TestViewOutline:
             "m",
             "math::max",
             ("math::max", "array::len", "array::distinct"),
+            free_calls=("math::max",),
         )
 
     def test_an_expression_around_an_aggregate_is_not_an_aggregate(self) -> None:
         element = view_query_outline("SELECT g, math::max(v) - math::min(v) AS d FROM t GROUP BY g").elements[1]
         assert element == _element("math::max(v) - math::min(v)", "d", None, ("math::max", "math::min"), ("v", "v"))
+
+    @pytest.mark.parametrize(
+        ("element", "calls", "free_calls"),
+        [
+            pytest.param(
+                "math::sum(amount) + math::sum(array::len(array::distinct(tags)))",
+                ("math::sum", "math::sum", "array::len", "array::distinct"),
+                ("math::sum", "math::sum"),
+                id="two-aggregates",
+            ),
+            pytest.param(
+                "math::sum(a) + array::len(array::distinct(tags))",
+                ("math::sum", "array::len", "array::distinct"),
+                ("math::sum", "array::len", "array::distinct"),
+                id="beside-an-aggregate",
+            ),
+            pytest.param(
+                "array::distinct(math::sum(array::len(v)))",
+                ("array::distinct", "math::sum", "array::len"),
+                ("array::distinct", "math::sum"),
+                id="around-an-aggregate",
+            ),
+            pytest.param(
+                "math::max(string::len(')')) + math::median(v)",
+                ("math::max", "string::len", "math::median"),
+                ("math::max", "math::median"),
+                id="bracket-in-a-literal",
+            ),
+            pytest.param(
+                "COUNT(ARRAY::DISTINCT(tags)) * MATH::STDDEV(array::len(v))",
+                ("count", "array::distinct", "math::stddev", "array::len"),
+                ("count", "math::stddev"),
+                id="upper-case",
+            ),
+            pytest.param(
+                "math::sum(math::max(array::distinct(v)))",
+                ("math::sum", "math::max", "array::distinct"),
+                ("math::sum",),
+                id="nested-aggregates",
+            ),
+        ],
+    )
+    def test_free_calls_skip_the_arguments_of_aggregates(
+        self, element: str, calls: tuple[str, ...], free_calls: tuple[str, ...]
+    ) -> None:
+        """Issue #286: ``free_calls`` are the calls outside the argument of every aggregate call, in order — those V7
+        reads — while ``calls`` keeps every call (C1 reads it)."""
+        [_, read] = view_query_outline(_element_query(element)).elements
+        assert (read.calls, read.free_calls) == (calls, free_calls)
 
     def test_a_quoted_group_by_does_not_group(self) -> None:
         outline = view_query_outline("SELECT `group by` AS x FROM t")
@@ -571,6 +669,8 @@ _HAZARD_ELEMENTS: list[tuple[str, tuple[str, str] | None]] = [
     ("{ s: math::sum(v) }", ("wrapped", "math::sum")),
     ("MATH::SUM(v) * 2", ("wrapped", "math::sum")),
     ("math::round(math::stddev(v))", ("wrapped", "math::stddev")),
+    # Issue #286: V7 accepts it (the listed function is inside an aggregate's argument); C1 reads it as before.
+    ("math::sum(amount) + math::sum(array::len(array::distinct(tags)))", ("wrapped", "math::sum")),
     # A whole SurrealDB 3.x-only aggregate.
     ("math::stddev(v)", ("aggregate", "math::stddev")),
     ("math::variance(v)", ("aggregate", "math::variance")),
@@ -3359,6 +3459,40 @@ class MvSince(BaseSurrealModel):
     since: datetime
 
 
+class MvTaggedOrder(BaseSurrealModel):
+    """``mv_orders`` with tags (issue #286): the source of :class:`MvTagged`."""
+
+    model_config = SurrealConfigDict(table_name="mv_orders", connection="mv")
+
+    id: str | None = None
+    status: str
+    amount: float
+    tags: list[str]
+
+
+#: Issue #286: two aggregates in one element, ``array::distinct()`` inside the second's argument.
+_MV_TAGGED_ELEMENT = "math::sum(amount) + math::sum(array::len(array::distinct(tags)))"
+
+
+class MvTagged(BaseSurrealModel):
+    """Issue #286: V7 accepts it at the class statement; kept up to date on 3.x, C1b on 2.x (kind ``wrapped``)."""
+
+    model_config = SurrealConfigDict(
+        table_name="mv_tagged",
+        connection="mv",
+        view_query=f"SELECT status, {_MV_TAGGED_ELEMENT} AS score FROM mv_orders GROUP BY status",
+    )
+
+    id: RecordID | None = None
+    status: str
+    score: float
+
+
+async def _scores() -> dict[str, float]:
+    """``MvTagged``'s groups, read through the ORM: status → score."""
+    return {row.status: row.score for row in await MvTagged.objects().exec()}
+
+
 #: AC-7 (b): each C1 kind from a model, and its refusal on SurrealDB 2.x (*engine*).
 _C1_MODELS: list[tuple[type[BaseSurrealModel], Callable[[str], str]]] = [
     (MvSpread, lambda engine: _c1a("MvSpread", "math::stddev", engine)),
@@ -3482,6 +3616,41 @@ class TestViewLinesE2E:
             assert rows == {"new": (1, _MV_SINCE), "paid": (2, _MV_SINCE)}
             await (await MvOrder.objects().get("o2")).delete()
             assert {row.status: row.total for row in await MvSince.objects().exec()} == {"new": 1, "paid": 1}
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_3x_keeps_several_aggregates_up_to_date(self, kind: str) -> None:
+        """Issue #286: the class statement accepted the query (V7 reads no call inside an aggregate's argument);
+        SurrealDB 3.x defines the view and keeps each group's score up to date through saves, updates and deletes."""
+        async with _mv(kind) as client:
+            await _require_line(client, 3, "an expression around aggregates is kept up to date on SurrealDB 3.x")
+            await MvTaggedOrder(id="o1", status="paid", amount=10.0, tags=["a", "b", "a"]).save()
+            assert await MvTagged.define_view() == MvTagged.view_ddl()
+            assert await _scores() == {"paid": 12.0}
+            await MvTaggedOrder(id="o2", status="paid", amount=5.5, tags=["c"]).save()
+            await MvTaggedOrder(id="o3", status="new", amount=1.0, tags=[]).save()
+            assert await _scores() == {"new": 1.0, "paid": 18.5}
+            second = await MvTaggedOrder.objects().get("o2")
+            await second.merge(tags=["c", "d", "c"])
+            assert await _scores() == {"new": 1.0, "paid": 19.5}
+            await (await MvTaggedOrder.objects().get("o1")).delete()
+            assert await _scores() == {"new": 1.0, "paid": 7.5}
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_several_aggregates_c1_on_2x(self, monkeypatch: pytest.MonkeyPatch, kind: str) -> None:
+        """Issue #286: on SurrealDB 2.x and the embedded engine the same view is refused by C1 (``wrapped``, naming
+        the first aggregate), not by V7, with ``version()`` as the only request; the source stays writable."""
+        async with _mv(kind) as client:
+            await _require_line(client, 2, "SurrealDB 2.x computes an expression around aggregates once per record")
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await MvTagged.define_view()
+            assert calls == [("version", ())]
+            engine = _ENGINE_EMBEDDED if kind == "mem" else _ENGINE_2X
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value) == _c1b("MvTagged", _MV_TAGGED_ELEMENT, "math::sum", engine)
+            assert "mv_tagged" not in await _tables(client)
+            await MvTaggedOrder(id="o1", status="paid", amount=10.0, tags=["a"]).save()
+            assert [row["id"] for row in await _rows(client, "mv_orders")] == [RecordID("mv_orders", "o1")]
 
 
 # --- removing a view that another view reads (spec §1.4, §4, §7, §5.6 G5 and S3; AC-20; M11) -------------------------
