@@ -2448,31 +2448,42 @@ an `IntEnum` gives the value), so use `.value` to build a key, a URL or a log li
 #### Values the SDK cannot read
 
 The surrealdb SDK 2.0.0 cannot decode a zero duration, a SurrealDB 3.x native set (a
-`TYPE set<…>` column on SurrealDB 3.3, see [Sets](#sets)) or a degenerate geometry (see
-[Geometries the SDK cannot read](#geometries-the-sdk-cannot-read)): one such value fails the whole
-response it is in. The clients the ORM opens read them anyway, through a hook around the SDK's own
-CBOR decoder that handles only these values; everything else reads exactly as the SDK reads it:
+`TYPE set<…>` column on SurrealDB 3.3, see [Sets](#sets)), a degenerate geometry (see
+[Geometries the SDK cannot read](#geometries-the-sdk-cannot-read)) or a datetime outside years
+1-9999, the years a Python `datetime` holds (SurrealDB stores years -262143 to +262142, on both
+lines): one such value fails the whole response it is in. The clients the ORM opens read them
+anyway, through a hook around the SDK's own CBOR decoder that handles only these values; everything
+else reads exactly as the SDK reads it:
 
 - a zero duration reads as zero: `timedelta(0)` or `Duration(0)` in a typed field, the SDK's
   `Duration(0)` in an untyped one;
 - a native set reads as a Python `set`, which `set[X]` and `frozenset[X]` fields validate, or as a
   `list` when its items are unhashable (record ids, objects, nested sets) or two of them are equal
-  in Python, like `1` and `true`: every item the server holds comes back.
+  in Python, like `1` and `true`: every item the server holds comes back;
+- a datetime before `0001-01-01T00:00:00Z` or after `9999-12-31T23:59:59.999999999Z` reads as its
+  RFC 3339 text, the one SurrealDB gives it (`<string>`): `"0000-06-01T00:00:00Z"`,
+  `"-0001-01-01T00:00:00Z"`, `"+10000-01-01T00:00:00.500Z"` (a sign and at least four digits outside
+  years 0000-9999, every nanosecond kept). An untyped field, `raw_query()` and live notifications
+  give that string; a `datetime` field refuses it with a `ValidationError` naming the field: `get()`
+  raises it, and `filter().exec()` and `raw_query()` return such rows as dicts, as for any row that
+  does not validate. A datetime within years 1-9999, before 1970 included, reads as the SDK's
+  `datetime`, as before.
 
 Written back through the ORM (`merge(v=row.v)`, or `update()`, which rewrites the whole row, the
 untouched fields included), a zero duration stays a duration, but a native set is stored as an
-array, like every set the ORM writes, unless its column is `TYPE set<…>` (see [Sets](#sets)), and
-a degenerate geometry as a plain object (see
-[Geometries the SDK cannot read](#geometries-the-sdk-cannot-read)). In an untyped field, `update()`
-flattens the SDK's `Duration(0)` into an object, like any SDK value there
+array, like every set the ORM writes, unless its column is `TYPE set<…>` (see [Sets](#sets)), a
+degenerate geometry as a plain object (see
+[Geometries the SDK cannot read](#geometries-the-sdk-cannot-read)), and a datetime outside years
+1-9999 as its text, a string. In an untyped field, `update()` flattens the SDK's `Duration(0)` into
+an object, like any SDK value there
 ([#222](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/222)).
 
 The hook is installed only while the installed SDK cannot decode these values, and only on the
 ORM's own clients (`SurrealDBConnectionManager.get_client()`, `ephemeral_client()`), the embedded
 engine's included (see [Embedded engine and test fixtures](#26-embedded-engine-and-test-fixtures)):
-there a zero duration and a degenerate geometry read as on a server, and `<set>[…]` is stored as an
-array, as on 2.x. An `AsyncSurreal` client the application builds itself keeps the SDK's behaviour
-and fails on them.
+there a zero duration, a degenerate geometry and a datetime outside years 1-9999 read as on a
+server, and `<set>[…]` is stored as an array, as on 2.x. An `AsyncSurreal` client the application
+builds itself keeps the SDK's behaviour and fails on them.
 A later SDK reads zero durations and native sets itself
 ([#205](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/205)), and the hook then
 leaves them to it.
@@ -4798,7 +4809,7 @@ features introduced in SurrealDB 3.x. On 2.x the ORM degrades gracefully. Capabi
 listed behave the same on both lines. The 2.x column was measured on 2.6.5 and holds unchanged
 on 2.7.0. The 3.x column was measured on 3.2.4 and holds on 3.3.0, except where a row says
 otherwise. The full suite and every divergence below were re-verified on both new versions.
-Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.7 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four. Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5.
+Rows added in v0.20.0 were measured directly on 2.7.0 and 3.3.0; rows added in v0.21.0 on 2.7.0 and 3.3.2, re-verified on 3.3.3, with 3.1.5 where it differs; rows added in v0.22.0 on 2.7.0 and 3.3.3, with 3.1.5 where it differs; rows added in v0.23.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.24.0 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.26.0 on 2.7.0 and 3.3.4, in memory and on versioned storage, identical on 3.1.5; rows added in v0.27.0 on 2.7.0 and 3.3.4, with 3.1.5 where it differs; rows added in v0.28.0 on 2.7.0 and 3.3.4, identical on 3.1.5; the rows added in v0.28.1 on 2.7.0 and 3.3.4, identical on 3.1.5; rows added in v0.29.0 on 2.7.0 and 3.3.4 in one process, identical on 3.1.5. The row added in v0.29.2 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. Rows added in v0.30.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs. The row added in v0.30.3 was measured on 2.7.0 and 3.3.4, over WebSocket and HTTP, and on the embedded engine, identical on 3.1.5. The row added in v0.30.7 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5: its parser refuses a statement that nests six objects, and `update()` nests at most four. Rows added in v0.31.0 were measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5. The row added in v0.31.1 was measured on 2.7.0, 3.3.4 and the embedded engine, identical on 3.1.5.
 The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded engine](#orm-behaviour-the-embedded-engine).
 
 | ORM capability                                                                                                                         | SurrealDB 2.6.x / 2.7.x                                                                                                                                                       | SurrealDB 3.2.x / 3.3.x                                                                                                                                                             | Since                                |
@@ -4925,6 +4936,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | An event whose `THEN` fails (a `THROW`, an error)                                                                                      | the write is refused; the SDK's `InternalError` (`An error occurred: …` for a `THROW`, the bare cause otherwise)                                                              | the write is refused; the SDK's `InternalError` (`Error while processing event <name>: …`)                                                                                          | v0.31.0                              |
 | Event and function definitions read back (`EventState`, `FunctionState`)                                                               | a block on several lines, each statement ending with `;`; `option<T>` parameters as written                                                                                   | a block on one line, no `;` after a single statement; optional parameters rendered with `none` first                                                                                | v0.31.0                              |
 | `define_function()`, `remove_function()` and `call_function()`                                                                         | same on both lines: the next `call_function()` sees a redefinition on every connection of this process to the same namespace and database, whatever its URL                   | the same                                                                                                                                                                            | v0.31.0                              |
+| Reading a datetime before year 1 or after year 9999 (SurrealDB stores years -262143 to +262142)                                        | its RFC 3339 text, as `<string>` gives it (`"+10000-01-01T00:00:00Z"`): an untyped field holds it, a `datetime` field refuses it (`ValidationError`)                          | same on both lines                                                                                                                                                                  | v0.31.1                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
 > **Note on record IDs**: A record loaded from the database has its `id` field set to a native `surrealdb.RecordID` object, not a plain string. Use `model.get_raw_id()` to obtain the bare identifier string (e.g. `"alice"`), or compare directly with `model.id == RecordID("User", "alice")`. In-memory instances you construct yourself retain whatever value you assign.
