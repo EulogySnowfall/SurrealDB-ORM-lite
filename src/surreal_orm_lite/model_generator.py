@@ -93,7 +93,7 @@ from .define_parser import (
 from .edge import BaseSurrealEdge
 from .functions import SurrealFunc
 from .model_base import BaseSurrealModel
-from .schema import check_view_query
+from .schema import check_view_query, table_permissions_text
 from .schema_state import FieldState, IndexState, SchemaIssue, SchemaState, TableState
 from .types import Duration
 from .utils import _KEEP_LIMIT, VALID_ALIAS_PATTERN
@@ -508,8 +508,6 @@ _UPDATE_NOTE = (
 _SCHEMALESS_NOTE = 'SCHEMALESS: fields not declared here are kept (extra="allow")'
 #: The class comment of a materialized view model (v0.32.0), the full SurrealDB-ORM's, in the place of ``View: AS …``.
 _VIEW_NOTE = "Read-only materialized view"
-#: The operations of a table's ``PERMISSIONS``, in the order SurrealDB renders them.
-_OPERATIONS = ("select", "create", "update", "delete")
 
 #: Where each importable name comes from; the blocks in isort order.
 _STANDARD_MODULES = ("datetime", "decimal", "typing", "uuid")
@@ -992,7 +990,7 @@ class _ClassWriter:
             texts.append(_VIEW_NOTE if view else "View: AS " + table.view_query)
         if table.changefeed is not None:
             texts.append("Changefeed: " + table.changefeed + (" INCLUDE ORIGINAL" if table.changefeed_include_original else ""))
-        permissions = _permissions_text(table.permissions)
+        permissions = table_permissions_text(table.permissions)
         if permissions is not None:
             texts.append("Permissions: " + permissions)
         if self.schemaless:
@@ -1242,22 +1240,6 @@ def _assigned(declaration: str, default: _Default | None, alias: str | None) -> 
 def _readonly(line: str, field: FieldState) -> str:
     """``line`` with the trailing ``# READONLY`` comment of a ``READONLY`` field (no ``Field`` option exists)."""
     return line + "  # READONLY" if field.readonly else line
-
-
-def _permissions_text(permissions: Mapping[str, str]) -> str | None:
-    """A table's ``PERMISSIONS`` as SurrealDB renders them: ``FULL`` when ``FULL`` covers the four operations, else
-    ``FOR select WHERE …, FOR create, update FULL`` — operations in SurrealQL's order, grouped by rule in the order the
-    rules first appear, so one ``WHERE`` rule for all four reads ``FOR select, create, update, delete WHERE …``.
-    ``None`` when there is none, or every rule is ``NONE`` (a table's default)."""
-    if all(rule == "NONE" for rule in permissions.values()):
-        return None
-    order = {operation: position for position, operation in enumerate(_OPERATIONS)}
-    groups: dict[str, list[str]] = {}
-    for operation in sorted(permissions, key=lambda operation: (order.get(operation, len(order)), operation)):
-        groups.setdefault(permissions[operation], []).append(operation)
-    if set(groups) == {"FULL"} and permissions.keys() == order.keys():
-        return "FULL"
-    return ", ".join("FOR " + ", ".join(operations) + " " + rule for rule, operations in groups.items())
 
 
 def _index_label(index: IndexState) -> str:

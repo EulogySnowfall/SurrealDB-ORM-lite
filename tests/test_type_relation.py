@@ -20,6 +20,13 @@ value resets one.
 on ``ws``, ``http`` and ``mem`` (spec §9.2: the connection ``"rel"`` on the database ``rel_db``, reset before each
 test) and reads it back with ``parse_define_table()``: the model's getters equal the stored ``TableState`` (M2, M16,
 M22).
+
+The carried statement (spec §5.5 K1–K7, §5.8 RG1–RG3, §6.1, §8; AC-4): ``schema.relation_statement_keeping()`` writes
+the model's type clause, then the stored definition's ``DROP``, ``SCHEMAFULL``, ``COMMENT``, ``CHANGEFEED`` and
+``PERMISSIONS`` re-rendered from its ``TableState`` — K1–K5 from SurrealDB 3.3.4's renderings, K6 and K7 the
+statements the E2E classes apply —, or ``None`` when a stored value fails its check (a rule with a top-level ``;`` or a
+comment marker, a NUL in the comment). ``schema.table_permissions_text()`` is the model generator's renderer, moved;
+``schema.relation_table_refused()`` gives the guard's refusal texts.
 """
 
 import contextlib
@@ -38,9 +45,11 @@ from surreal_orm_lite import (
     SurrealConfigDict,
     SurrealDBConnectionManager,
     TableType,
+    model_generator,
     schema,
 )
 from surreal_orm_lite.define_parser import parse_define_table
+from surreal_orm_lite.schema_state import TableState
 
 # --- the exact texts of spec §5.8 ----------------------------------------------------------------------------------
 
@@ -91,6 +100,29 @@ def _r5(name: str, key: str, part: str) -> str:
 
 def _r7(name: str, type_name: str) -> str:
     return f"{name}: model_config['enforced'] must be a bool or None, got {type_name}."
+
+
+def _rg1(name: str, table: str) -> str:
+    return (
+        f"{name}.define_relation(): the table '{table}' is a materialized view; defining it as a relation table would "
+        f"drop its query and turn it into an ordinary table that no longer updates. Give {name} another table_name, or "
+        "remove the view first. Nothing was defined."
+    )
+
+
+def _rg2(name: str, table: str) -> str:
+    return (
+        f"{name}.define_relation(): the definition of the table '{table}' could not be read, so the ORM cannot keep "
+        "its other clauses (schema mode, permissions, change feed, comment). Nothing was defined."
+    )
+
+
+def _rg3(name: str, table: str) -> str:
+    return (
+        f"{name}.define_relation(overwrite=False): the table '{table}' exists and is not a relation table; DEFINE "
+        "TABLE IF NOT EXISTS would leave it as it is, and the relation constraint would not apply. Call "
+        "define_relation() with overwrite=True, which keeps the table's other clauses. Nothing was defined."
+    )
 
 
 # --- the value forms (P1) ------------------------------------------------------------------------------------------
@@ -826,6 +858,215 @@ class TestRelationDdl:
         assert SurrealDBConnectionManager.is_connection_set() is False
         assert G1Likes.relation_ddl() == _G1
         assert G8Twice.relation_ddl(overwrite=False) == "DEFINE TABLE IF NOT EXISTS `e8` TYPE RELATION IN `a` | `a`;"
+
+
+# === the carried statement (spec §5.5 K1–K7, §5.8 RG1–RG3, §6.1, §8; AC-4) ======================================
+
+
+class RelLikes(BaseSurrealEdge):
+    """The edge model of the E2E classes on ``rel_likes`` (spec AC-6): the constraint of K6."""
+
+    model_config = SurrealConfigDict(
+        table_name="rel_likes",
+        connection="rel",
+        relation_in="rel_person",
+        relation_out=["rel_post", "rel_book"],
+        enforced=True,
+    )
+
+    stars: int = 1
+
+
+#: G1's type clause, the clause of K1–K5.
+_G1_CLAUSE = "TYPE RELATION IN `person` OUT `post` | `book` ENFORCED"
+
+#: The stored definitions of K1–K5 as SurrealDB 3.3.4 renders them in ``INFO FOR DB`` (the same text on 2.7.0, 3.1.5
+#: and the embedded engine, M10). K1's comment holds a quote, a backslash and double quotes: the server writes it
+#: between double quotes.
+_K1_STORED = (
+    'DEFINE TABLE t TYPE NORMAL SCHEMAFULL COMMENT "it\'s \\\\ a \\"c\\" line" CHANGEFEED 1h INCLUDE ORIGINAL '
+    "PERMISSIONS FOR select WHERE in = $auth.id OR out = $auth.id, FOR create FULL, FOR update, delete NONE"
+)
+_K2_STORED = "DEFINE TABLE t TYPE ANY DROP SCHEMALESS PERMISSIONS NONE"
+_K3_STORED = "DEFINE TABLE t TYPE ANY SCHEMALESS PERMISSIONS FULL"
+_K4_STORED = "DEFINE TABLE t TYPE ANY SCHEMALESS PERMISSIONS NONE"
+_K5_STORED = (
+    "DEFINE TABLE t TYPE RELATION IN company OUT post ENFORCED SCHEMAFULL PERMISSIONS FOR select FULL, FOR create, "
+    "update, delete NONE"
+)
+
+#: K1–K5: the stored definition, then the carried statement of G1's clause on the table ``t`` (spec §5.5).
+_K_CASES: list[tuple[str, str, str]] = [
+    (
+        "K1",
+        _K1_STORED,
+        "DEFINE TABLE OVERWRITE `t` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED SCHEMAFULL COMMENT "
+        "'it\\'s \\\\ a \"c\" line' CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS FOR select WHERE in = $auth.id OR "
+        "out = $auth.id, FOR create FULL, FOR update, delete NONE;",
+    ),
+    ("K2", _K2_STORED, "DEFINE TABLE OVERWRITE `t` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED DROP;"),
+    (
+        "K3",
+        _K3_STORED,
+        "DEFINE TABLE OVERWRITE `t` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED PERMISSIONS FULL;",
+    ),
+    ("K4", _K4_STORED, "DEFINE TABLE OVERWRITE `t` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;"),
+    (
+        "K5",
+        _K5_STORED,
+        "DEFINE TABLE OVERWRITE `t` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED SCHEMAFULL PERMISSIONS FOR "
+        "select FULL, FOR create, update, delete NONE;",
+    ),
+]
+
+#: K6 (spec §5.5, AC-6, M17): ``rel_likes`` as AC-6's fixture stores it, ``RelLikes``'s carried statement, and the
+#: definition SurrealDB stores after it — the same text on the four engines. Tasks 4 and 6 assert them end to end.
+_K6_STORED = (
+    "DEFINE TABLE rel_likes TYPE ANY SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS FOR select "
+    "WHERE in = $auth.id, FOR create FULL, FOR update, delete NONE"
+)
+_K6 = (
+    "DEFINE TABLE OVERWRITE `rel_likes` TYPE RELATION IN `rel_person` OUT `rel_post` | `rel_book` ENFORCED SCHEMAFULL "
+    "COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS FOR select WHERE in = $auth.id, FOR create FULL, FOR "
+    "update, delete NONE;"
+)
+_K6_READ_BACK = (
+    "DEFINE TABLE rel_likes TYPE RELATION IN rel_person OUT rel_post | rel_book ENFORCED SCHEMAFULL COMMENT 'keep' "
+    "CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS FOR select WHERE in = $auth.id, FOR create FULL, FOR update, delete NONE"
+)
+
+#: K7 (spec §5.5, M19): K6's read-back carried with the keyless clause — the statement that removes the constraint.
+_K7 = (
+    "DEFINE TABLE OVERWRITE `rel_likes` TYPE RELATION SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL "
+    "PERMISSIONS FOR select WHERE in = $auth.id, FOR create FULL, FOR update, delete NONE;"
+)
+
+_TABLE_OPERATIONS = ("select", "create", "update", "delete")
+
+#: (permissions, text) — the generator's cases (``tests/test_model_generator.py``) and K1's rules: SurrealDB's
+#: rendering, operations in SurrealQL's order, grouped by rule.
+_PERMISSIONS_TEXTS: list[tuple[dict[str, str], str | None]] = [
+    (dict.fromkeys(_TABLE_OPERATIONS, "NONE"), None),
+    ({}, None),
+    (dict.fromkeys(_TABLE_OPERATIONS, "FULL"), "FULL"),
+    (
+        {"select": "WHERE in = $auth.id OR out = $auth.id", "create": "FULL", "update": "NONE", "delete": "NONE"},
+        "FOR select WHERE in = $auth.id OR out = $auth.id, FOR create FULL, FOR update, delete NONE",
+    ),
+    (dict.fromkeys(_TABLE_OPERATIONS, "WHERE a > 1"), "FOR select, create, update, delete WHERE a > 1"),
+    ({"select": "FULL"}, "FOR select FULL"),
+    (
+        {"delete": "FULL", "update": "NONE", "create": "WHERE a, b", "select": "WHERE a, b"},
+        "FOR select, create WHERE a, b, FOR update NONE, FOR delete FULL",
+    ),
+]
+
+#: A stored value that fails its check (spec §6.1, §8): the carried statement is ``None`` (RG2). Plain malformed values.
+_UNCARRIABLE: list[tuple[str, TableState]] = [
+    ("top-level-semicolon", TableState(name="t", permissions={"select": "WHERE a; b"})),
+    ("comment-marker", TableState(name="t", permissions={"select": "WHERE a -- c"})),
+    ("nul-in-comment", TableState(name="t", comment="a\x00b")),
+    ("unterminated-literal", TableState(name="t", permissions={"update": "WHERE a = 'b"})),
+    ("unbalanced-bracket", TableState(name="t", permissions={"create": "WHERE (a"})),
+    ("not-a-rule", TableState(name="t", permissions={"delete": "SOMETIMES"})),
+]
+
+
+class TestCarriedStatement:
+    """AC-4: ``relation_statement_keeping()`` re-renders a stored definition's other clauses after the model's type
+    clause — K1–K7 exactly —, ``None`` when a stored value fails its check; ``table_permissions_text()`` is the
+    generator's renderer, moved; the guard's refusal texts RG1–RG3."""
+
+    @pytest.mark.parametrize(("permissions", "text"), _PERMISSIONS_TEXTS, ids=repr)
+    def test_table_permissions_text(self, permissions: dict[str, str], text: str | None) -> None:
+        assert schema.table_permissions_text(permissions) == text
+
+    def test_the_generator_uses_the_moved_renderer(self) -> None:
+        assert not hasattr(model_generator, "_permissions_text")
+        assert not hasattr(model_generator, "_OPERATIONS")
+        assert model_generator.table_permissions_text is schema.table_permissions_text
+
+    @pytest.mark.parametrize(("stored", "statement"), [case[1:] for case in _K_CASES], ids=[case[0] for case in _K_CASES])
+    def test_k1_to_k5(self, stored: str, statement: str) -> None:
+        assert schema.relation_statement_keeping("t", _G1_CLAUSE, parse_define_table(stored)) == statement
+
+    def test_k1_comment_is_requoted(self) -> None:
+        """The server's double-quoted comment is read back unquoted, then written as a single-quoted literal."""
+        state = parse_define_table(_K1_STORED)
+        assert state.comment == 'it\'s \\ a "c" line'
+        statement = schema.relation_statement_keeping("t", _G1_CLAUSE, state)
+        assert statement is not None
+        assert " COMMENT 'it\\'s \\\\ a \"c\" line' " in statement
+
+    def test_k4_defaults_only_is_the_bare_statement(self) -> None:
+        state = parse_define_table(_K4_STORED)
+        assert schema.relation_statement_keeping("t", _G1_CLAUSE, state) == schema.relation_statement("t", _G1_CLAUSE, True)
+        assert schema.relation_statement_keeping("likes", _G1_CLAUSE, state) == G1Likes.relation_ddl() == _G1
+
+    def test_k6(self) -> None:
+        clause = schema.relation_type_clause(RelLikes.get_relation_in(), RelLikes.get_relation_out(), RelLikes.is_enforced())
+        assert schema.relation_statement_keeping("rel_likes", clause, parse_define_table(_K6_STORED)) == _K6
+
+    def test_k6_again_on_its_read_back(self) -> None:
+        """Applied twice, the carried statement is the same: K6's read-back carries the same clauses."""
+        clause = schema.relation_type_clause(RelLikes.get_relation_in(), RelLikes.get_relation_out(), RelLikes.is_enforced())
+        assert schema.relation_statement_keeping("rel_likes", clause, parse_define_table(_K6_READ_BACK)) == _K6
+
+    def test_k7_the_keyless_clause_removes_the_constraint(self) -> None:
+        assert schema.relation_statement_keeping("rel_likes", "TYPE RELATION", parse_define_table(_K6_READ_BACK)) == _K7
+
+    def test_clause_order(self) -> None:
+        """The type clause, ``DROP``, ``SCHEMAFULL``, ``COMMENT``, ``CHANGEFEED``, ``PERMISSIONS`` (spec §5.5)."""
+        state = TableState(
+            name="t",
+            schema_mode="SCHEMAFULL",
+            changefeed="2d",
+            permissions={"select": "FULL", "create": "FULL", "update": "FULL", "delete": "FULL"},
+            comment="c",
+            drop=True,
+        )
+        assert schema.relation_statement_keeping("t", "TYPE RELATION", state) == (
+            "DEFINE TABLE OVERWRITE `t` TYPE RELATION DROP SCHEMAFULL COMMENT 'c' CHANGEFEED 2d PERMISSIONS FULL;"
+        )
+
+    def test_a_rule_holding_literals_and_brackets_is_carried(self) -> None:
+        """String literals are data and brackets balance: a ``WHERE`` rule holding ``, FOR`` in a literal and an array
+        (M10) is carried as stored."""
+        rule = "WHERE name = 'a, FOR b' AND tags CONTAINSANY [1, 2]"
+        state = TableState(name="t", schema_mode="SCHEMALESS", permissions={"select": rule, "create": "NONE"})
+        assert schema.relation_statement_keeping("t", "TYPE RELATION", state) == (
+            f"DEFINE TABLE OVERWRITE `t` TYPE RELATION PERMISSIONS FOR select {rule}, FOR create NONE;"
+        )
+
+    @pytest.mark.parametrize("state", [case[1] for case in _UNCARRIABLE], ids=[case[0] for case in _UNCARRIABLE])
+    def test_none_for_a_stored_value_that_fails_its_check(self, state: TableState) -> None:
+        assert schema.relation_statement_keeping("t", _G1_CLAUSE, state) is None
+
+    @pytest.mark.parametrize(("table", "error"), [("a-b", ValueError), (3, TypeError)], ids=repr)
+    def test_the_table_name_is_checked(self, table: Any, error: type[Exception]) -> None:
+        with pytest.raises(error):
+            schema.relation_statement_keeping(table, _G1_CLAUSE, parse_define_table(_K4_STORED))
+
+    @pytest.mark.parametrize(("guard", "text"), [("RG1", _rg1), ("RG2", _rg2), ("RG3", _rg3)])
+    def test_guard_texts(self, guard: Any, text: Any) -> None:
+        assert schema.relation_table_refused(guard, "Likes", "likes") == text("Likes", "likes")
+
+    def test_guard_texts_exactly(self) -> None:
+        """RG1–RG3 of spec §5.8, word for word."""
+        assert schema.relation_table_refused("RG1", "Likes", "likes") == (
+            "Likes.define_relation(): the table 'likes' is a materialized view; defining it as a relation table would "
+            "drop its query and turn it into an ordinary table that no longer updates. Give Likes another table_name, "
+            "or remove the view first. Nothing was defined."
+        )
+        assert schema.relation_table_refused("RG2", "Likes", "likes") == (
+            "Likes.define_relation(): the definition of the table 'likes' could not be read, so the ORM cannot keep its "
+            "other clauses (schema mode, permissions, change feed, comment). Nothing was defined."
+        )
+        assert schema.relation_table_refused("RG3", "Likes", "likes") == (
+            "Likes.define_relation(overwrite=False): the table 'likes' exists and is not a relation table; DEFINE TABLE "
+            "IF NOT EXISTS would leave it as it is, and the relation constraint would not apply. Call define_relation() "
+            "with overwrite=True, which keeps the table's other clauses. Nothing was defined."
+        )
 
 
 # === E2E (spec §9.2): the connection "rel" on the database rel_db, over WebSocket and HTTP, and mem:// ===========
