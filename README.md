@@ -681,10 +681,20 @@ cancelled when the block ends, nothing of the block is committed, and leaving th
 `SurrealDbError` (`SurrealDbConflictError` for a retryable conflict, so `retry_on_conflict` still
 retries the block). A buffered transaction fails as a whole at commit; an interactive one raises
 the failed statement's error at once, then, when the block ends, "The transaction was cancelled: a
-statement in it failed; nothing was committed (…)", chained to that error. An explicit
-`tx.commit()` after a failure raises the same error. When the block's own exception propagates,
-that exception wins, as before. Reads the ORM answers itself are not failed statements: a table
-that does not exist reads as no rows, and `get()` raises `SurrealDbNotFoundError`.
+statement in it failed; nothing was committed (SurrealDbError)", which names the type of that
+error and is chained to it. An explicit `tx.commit()` after a failure raises the same error. When
+the block's own exception propagates, that exception wins, as before. Reads the ORM answers itself
+are not failed statements: a table that does not exist reads as no rows, and `get()` raises
+`SurrealDbNotFoundError`.
+
+**Transaction errors name the failed statement, not its text** (v0.31.1). When the server refuses
+the query as a whole (a statement it cannot parse), the error gives the server's reason and the
+position, without the server's excerpt of the statement: a buffered commit raises "Transaction
+failed: the server refused statement 2 of 3: Parse error: … (at line 1, column 7 of the
+statement)", the embedded engine included, and a statement of an interactive transaction raises
+"Transaction failed: the server refused the statement: … (at line 1, column 7 of the statement)".
+The server's full text stays reachable as the error's `__context__`, which a traceback does not
+print.
 
 ```python
 async with SurrealDBConnectionManager.transaction() as tx:
@@ -4634,7 +4644,8 @@ await SurrealDBConnectionManager.remove_function("fn::greet")
   (SurrealDB 2.x, HTTP, the embedded engine) only queues the statement, so a refusal comes back when the block
   commits, as the transaction's own error, never as `SurrealDbAuthenticationError` or `SurrealDbNotFoundError`,
   `missing_ok=False` included. When a definition is applied in a transaction (`tx=`), an error raised when the
-  transaction ends can still carry the server's message, statement excerpt included ([#278](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/278)).
+  transaction ends gives the server's reason and the statement's position, without the server's excerpt of the
+  statement (v0.31.1, [#278](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/278)).
 - Live queries see the rows an event writes (`watch()` on their table). The query cache
   ([section 29](#29-query-cache-cache-querycache)) does not: it forgets the tables the ORM itself writes, so a cached
   read of a table that events write stays as it was until its time to live runs out. Do not cache such reads, or call
@@ -4668,9 +4679,10 @@ swallow the clauses the ORM appends, a second statement where one expression is 
 defence: expressions are trusted application code, never user input. To use a value, read it from the record
 (`$after.email`) or from a `DEFINE PARAM`, never format it into the text. Kinds are parsed and written in canonical
 form. An `Event`'s `repr()` leaves out its expressions, and a refusal raised without `tx=` names the event or the
-function, never its statement; with `tx=`, an error raised when the transaction ends can still carry the server's
-message, statement excerpt included ([#278](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/278)). Applying a definition needs a privileged system user: run
-`define_events()` and `define_function()` at start-up or deployment, not on a record user's session.
+function, never its statement; with `tx=`, an error raised when the transaction ends gives the server's reason and
+the statement's position, without the server's excerpt of the statement (v0.31.1,
+[#278](https://github.com/EulogySnowfall/SurrealDB-ORM-lite/issues/278)). Applying a definition needs a privileged
+system user: run `define_events()` and `define_function()` at start-up or deployment, not on a record user's session.
 
 #### Coming from the full SurrealDB-ORM
 
@@ -4965,7 +4977,7 @@ Capabilities not listed behave as on a 2.x server.
 | Anonymous session                                                   | the in-process owner (full access); `info()` returns `None`                                                                                                                                                                                                                                                                                           | not used by the ORM (the configured user signs in); an anonymous `info()` raises `SurrealDbAuthenticationError` | v0.25.0 |
 | `invalidate()`                                                      | back to the in-process owner                                                                                                                                                                                                                                                                                                                          | signs in again as the configured user                                                                           | v0.25.0 |
 | Reading a table that does not exist                                 | `[]`, raw queries included (as on 2.x)                                                                                                                                                                                                                                                                                                                | the ORM reads `[]`; a raw query on 3.x raises `NotFoundError`                                                   | v0.25.0 |
-| Parse errors                                                        | bare `RuntimeError` (the DDL helpers raise `SurrealDbError`)                                                                                                                                                                                                                                                                                          | the SDK's error classes                                                                                         | v0.25.0 |
+| Parse errors                                                        | bare `RuntimeError` (the DDL helpers and the commit of `transaction()` raise `SurrealDbError`)                                                                                                                                                                                                                                                        | the SDK's error classes                                                                                         | v0.25.0 |
 | Time travel (`as_of()`)                                             | `surrealkv+versioned://` only (`?versioned=true` is ignored by SDK 2.0.0); any other URL → `SurrealDbError` before any request; `fetch()` refused (2.x core)                                                                                                                                                                                          | versioned storage required (see the 2.x/3.x table)                                                              | v0.26.0 |
 | Several connections (`add_connection()`)                            | `mem://`: each name is a database of its own; an on-disk store (`surrealkv://`, `file://`) is open under one name at a time — a second name raises `SurrealDbConnectionError`                                                                                                                                                                         | each name opens its own clients; two databases on one server are isolated                                       | v0.29.0 |
 | Schema introspection (`DatabaseIntrospector`)                       | reads like a 2.x server (core 2.3.10): same state and same generated model types as on the servers; the anonymous owner session may run `INFO`; `COUNT` indexes cannot be defined                                                                                                                                                                     | need a system user (root, namespace or database user)                                                           | v0.30.0 |

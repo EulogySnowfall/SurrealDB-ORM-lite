@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.31.1] - 2026-10-19
 
+Transaction errors give the server's reason and the failed statement's position instead of quoting
+the statement, and a buffered commit raises `SurrealDbError` on the embedded engine too (#278). No
+new public API.
+
+### Fixed
+
+- **Transaction errors keep the statement's text out** (#278). When the server refused the query
+  as a whole (a statement it cannot parse), the error read "Transaction failed: unrecognized
+  query_raw() response shape: {…}" and quoted the server's raw response, its excerpt of the
+  statement included. It now gives the server's reason and the position:
+  - at a buffered commit (SurrealDB 2.x, HTTP, the embedded engine), "Transaction failed: the
+    server refused statement 2 of 3: Parse error: … (at line 1, column 7 of the statement)";
+  - for a statement of an interactive transaction (SurrealDB 3.x over WebSocket), "Transaction
+    failed: the server refused the statement: … (at line 1, column 7 of the statement)";
+  - a failed statement's error, "Transaction failed and rolled back: …", keeps only the first line
+    of a reason that quotes the query;
+  - a response of any other shape raises "Transaction failed: unrecognized query_raw() response
+    shape (<type>)", without the response.
+
+  The server's full text stays reachable as the error's `__context__`, which a formatted traceback
+  does not print.
+- **A buffered commit on the embedded engine raises `SurrealDbError`** (#278). The engine reports a
+  query it cannot parse as a bare `RuntimeError`, which propagated out of the `transaction()` block;
+  the commit now raises `SurrealDbError`, or `SurrealDbConflictError` for a retryable conflict, as
+  on a server.
+
+### Changed
+
+- **The cancellation error names the failed statement's error type** (#278). Since v0.30.3,
+  leaving an interactive `transaction()` block after a failed statement, or an explicit
+  `tx.commit()`, raises "The transaction was cancelled: a statement in it failed; nothing was
+  committed (…)", whose parenthesis repeated the failed statement's error text. The parenthesis now
+  holds that error's type name, for example `(SurrealDbError)`. The error itself is still chained
+  as `__cause__`, and a retryable conflict still raises `SurrealDbConflictError`, so
+  `retry_on_conflict` behaves as before.
+
+### Notes
+
+- The v0.31.0 note on the DDL appliers with `tx=` (#278) no longer applies: an error raised when
+  the transaction ends gives the server's reason and the statement's position, without the
+  server's excerpt of the statement. README sections 11 and 32 and the embedded-engine table say
+  so.
+- Same behaviour on SurrealDB 2.x, 3.x and the embedded engine. Server pins unchanged: tested
+  against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine, plus 3.1.5 for backward
+  compatibility.
+
+## [0.31.1] - 2026-10-19
+
 A datetime outside years 1-9999 no longer fails the response it is in (#279). SurrealDB stores
 datetimes far beyond the years a Python `datetime` holds, and the ORM now reads them back as the
 server's own text. No new public API.

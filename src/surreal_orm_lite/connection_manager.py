@@ -1682,9 +1682,15 @@ class SurrealDBConnectionManager:
         raises ``SurrealDbError`` (``SurrealDbConflictError`` for a retryable conflict, so
         ``retry_on_conflict`` still retries). A buffered batch fails as a whole at commit; an
         interactive transaction raises "The transaction was cancelled: a statement in it failed;
-        nothing was committed (…)", chained to the failed statement's error. When the body's own
-        exception propagates, that exception wins. A read the ORM answers itself (a missing table
-        read as no rows, ``get()`` raising ``SurrealDbNotFoundError``) is not a failed statement.
+        nothing was committed (SurrealDbError)", which names the type of the failed statement's
+        error and is chained to it. When the body's own exception propagates, that exception wins.
+        A read the ORM answers itself (a missing table read as no rows, ``get()`` raising
+        ``SurrealDbNotFoundError``) is not a failed statement.
+
+        A query the server refuses as a whole (a statement it cannot parse) raises ``SurrealDbError``
+        with the server's reason and the position, without the server's excerpt of the statement
+        (issue #278): "Transaction failed: the server refused statement 2 of 3: … (at line 1, column 7
+        of the statement)" at a buffered commit, the embedded engine included.
 
         SurrealDB has no savepoints/nested transactions; nested ``transaction()`` calls
         open INDEPENDENT transactions, not savepoints.
@@ -2488,7 +2494,7 @@ class SurrealDBConnectionManager:
             without *tx*, a refusal names the event and its table, never its statement, whose ``when`` and
             ``then`` may hold a secret). In a buffered transaction (*tx* over HTTP, on SurrealDB 2.x or the
             embedded engine) the statement is only queued: a refusal comes back when the block commits, as the
-            transaction's own error, never as ``SurrealDbAuthenticationError``. With *tx*, an error raised when the transaction ends can still carry the server's message, statement excerpt included (#278).
+            transaction's own error, never as ``SurrealDbAuthenticationError``. With *tx*, an error raised when the transaction ends gives the server's reason and the statement's position, without the server's excerpt of the statement (#278).
         :raises SurrealDbAuthenticationError: the session may not define events.
         """
         check_call_transaction(cls._connection_name or "default", tx, operation="define_event()")
@@ -2610,7 +2616,7 @@ class SurrealDBConnectionManager:
             statement (``Can't apply function definition: 'fn::greet' -> …``: without *tx*, a refusal names the
             function, never its statement, whose body may hold a secret). In a buffered transaction (*tx* over HTTP,
             on SurrealDB 2.x or the embedded engine) the statement is only queued: a refusal comes back when the
-            block commits, as the transaction's own error, never as ``SurrealDbAuthenticationError``. With *tx*, an error raised when the transaction ends can still carry the server's message, statement excerpt included (#278).
+            block commits, as the transaction's own error, never as ``SurrealDbAuthenticationError``. With *tx*, an error raised when the transaction ends gives the server's reason and the statement's position, without the server's excerpt of the statement (#278).
         """
         check_call_transaction(cls._connection_name or "default", tx, operation="define_function()")
         statement = function_ddl(
