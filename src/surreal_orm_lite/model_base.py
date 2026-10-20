@@ -30,6 +30,7 @@ from .schema import (
     check_view_config,
     check_view_query,
     ensure_async_events_supported,
+    ensure_view_query_supported,
     event_subject,
     read_table_definitions,
     remove_event_statement,
@@ -1063,6 +1064,15 @@ class BaseSurrealModel(BaseModel):
         :meth:`define_events` **after** ``define_view()``. ``overwrite=False`` (``IF NOT EXISTS``) leaves an existing
         view as it is, whatever its query.
 
+        On SurrealDB 2.x and the embedded engine, a grouped view is refused before any DDL when its projection holds
+        an element those engines compute once per source record instead of keeping it up to date —
+        ``math::stddev()``/``math::variance()``, an expression around an aggregate (``math::sum(amount) / count()``),
+        a field outside ``GROUP BY`` and outside an aggregate, a ``GROUP BY`` on an alias: the view would hold a wrong
+        value or one group, or every write to its source table would be refused. SurrealDB 3.x keeps such a view up
+        to date (or refuses a field outside ``GROUP BY`` itself). The line is read from ``client.version()`` only when
+        the query holds such an element; what a reading of the text cannot see (a sub-select, a graph path, a
+        backquoted field, a field's type) is left to the server.
+
         Before the DDL, a table guard reads ``INFO FOR DB`` once (and, for an ordinary table, ``SELECT id … LIMIT
         1``), on committed state, outside any transaction: the view never replaces an ordinary table that holds
         records — ``OVERWRITE`` would delete them —, an empty ordinary table (one an event or a 2.x live query
@@ -1083,24 +1093,26 @@ class BaseSurrealModel(BaseModel):
 
         Raises:
             TypeError: the model is not a materialized view; *overwrite* is not a ``bool`` — before any request.
-            SurrealDbError: *tx* belongs to another connection — before any request; the table exists, is not a view
-                and holds records, or ``overwrite=False`` meets an ordinary table, or its definition cannot be read —
-                before any DDL; the server refused the statement (``Can't apply view definition: …``). In a buffered
-                transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the statement is only queued:
-                a refusal comes back when the block commits, as the transaction's own error, never as
-                ``SurrealDbAuthenticationError``.
+            SurrealDbError: *tx* belongs to another connection — before any request; the connection runs SurrealDB
+                2.x or the embedded engine and the grouped projection holds an element they compute once per source
+                record — before any request but ``version()``; the table exists, is not a view and holds records, or
+                ``overwrite=False`` meets an ordinary table, or its definition cannot be read — before any DDL; the
+                server refused the statement (``Can't apply view definition: …``). In a buffered transaction (*tx*
+                over HTTP, on SurrealDB 2.x or the embedded engine) the statement is only queued: a refusal comes back
+                when the block commits, as the transaction's own error, never as ``SurrealDbAuthenticationError``.
             SurrealDbAuthenticationError: the session may not read the database's definitions or define the view.
 
         Example:
             >>> await OrderStats.define_view()
             'DEFINE TABLE OVERWRITE `order_stats` AS (SELECT status, count() AS total FROM orders GROUP BY status);'
         """
-        cls._require_view("define_view()")
+        query = cls._require_view("define_view()")
         statement = cls.view_ddl(overwrite=overwrite)
         table = cls.get_table_name()
         manager = cls._connection_manager()
         # Cheap even inside a transaction: get_client() returns the already-connected client.
         client = await manager.get_client()
+        await ensure_view_query_supported(client, query, model=cls.__name__, embedded=manager.is_embedded())
         tables = await read_table_definitions(client, table, kind="definition")
         existing = table_kind(tables, table)
         if existing is not None and existing != "view":

@@ -20,6 +20,12 @@ DDL kept whole (``redact=False``, D16), the table guard — ``read_table_definit
 ``table_holds_records()`` on fake clients, then through ``define_view()``/``remove_view()``, one ``INFO FOR DB`` per
 call —, and E2E on both lines: the view defined, read and kept up to date, removed, refused on a table that holds
 records, named in every refusal, defined on the model's connection, and refused to a record user.
+
+The line facts (spec §1.4, §4, §5.6 C1a–C1d; AC-7): C1 — ``ensure_view_query_supported()`` with a fake ``version()``,
+read only when the grouped projection holds a hazard, the exact texts, then from ``define_view()`` before the table
+guard — and E2E: on SurrealDB 2.x and the embedded engine each C1 kind refused with ``version()`` as the only request,
+on 3.x the same views kept up to date or refused by the server (``Found idiom``), ``math::sum()``/``math::mean()``
+value types per line (M5), and a source write missing an aggregated field refused on every line (M8).
 """
 
 import contextlib
@@ -28,6 +34,7 @@ import os
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -1791,6 +1798,234 @@ class TestViewAppliers:
         assert client_requests == []
 
 
+# --- C1: the grouped projections SurrealDB 2.x computes once per source record (spec §4, §5.6 C1a–C1d, §6.1) ---------
+
+_ENGINE_2X = "SurrealDB 2.x"
+_ENGINE_EMBEDDED = "the embedded engine (a SurrealDB 2.x core)"
+
+
+def _c1a(model: str, function: str, engine: str) -> str:
+    return (
+        f"{model}.define_view(): {function}() keeps a grouped view up to date on SurrealDB 3.x only, and this "
+        f"connection runs {engine}, which accepts such a view over an empty table and then refuses every write to that "
+        "table. Drop it from view_query, or connect to a SurrealDB 3.x server. Nothing was defined."
+    )
+
+
+def _c1b(model: str, element: str, function: str, engine: str) -> str:
+    return (
+        f"{model}.define_view(): view_query selects {element!r}, an expression around the aggregate {function}(), in "
+        f"a grouped view; SurrealDB 3.x keeps it up to date, and this connection runs {engine}, which computes it once "
+        "per source record: the view would hold a wrong value, or every write to the source table would be refused. "
+        f"Select {function}() alone, as its own field, and compute the rest when you read the model; or connect to a "
+        "SurrealDB 3.x server. Nothing was defined."
+    )
+
+
+def _c1c(model: str, element: str, field: str, engine: str) -> str:
+    if field == "*":
+        reading, remedy = "every field", "Select the GROUP BY fields and the aggregates by name instead of '*'."
+    else:
+        reading = f"the field {field!r}"
+        remedy = f"Use {field!r} inside an aggregate (math::max(), math::sum(), …) or add it to GROUP BY."
+    return (
+        f"{model}.define_view(): view_query selects {element!r} in a grouped view, which reads {reading} outside an "
+        f"aggregate and outside its GROUP BY; SurrealDB 3.x refuses such a view, and this connection runs {engine}, "
+        "which computes it once per source record: the view would keep the last record's value, or every write to the "
+        f"source table would be refused. {remedy} Nothing was defined."
+    )
+
+
+def _c1d(model: str, alias: str, element: str, engine: str) -> str:
+    return (
+        f"{model}.define_view(): view_query groups by {alias!r}, the alias of {element!r}; SurrealDB 3.x groups by its "
+        f"value, and this connection runs {engine}, which groups by the source records' own fields, so every record "
+        "would fall into one group. Group by a field of the source table (store the computed value in the source "
+        "records if needed), or connect to a SurrealDB 3.x server. Nothing was defined."
+    )
+
+
+#: The three worked examples of spec §5.6, verbatim: (query, ``version()``, embedded, the refusal) — ``OrderStats``.
+_C1_EXAMPLES = [
+    (
+        "SELECT status, math::round(math::sum(amount)) AS revenue FROM orders GROUP BY status",
+        "surrealdb-2.7.0",
+        False,
+        "OrderStats.define_view(): view_query selects 'math::round(math::sum(amount))', an expression around the "
+        "aggregate math::sum(), in a grouped view; SurrealDB 3.x keeps it up to date, and this connection runs "
+        "SurrealDB 2.x, which computes it once per source record: the view would hold a wrong value, or every write to "
+        "the source table would be refused. Select math::sum() alone, as its own field, and compute the rest when you "
+        "read the model; or connect to a SurrealDB 3.x server. Nothing was defined.",
+    ),
+    (
+        "SELECT status, math::percentile(amount, 50) AS p FROM orders GROUP BY status",
+        "surrealdb-2.7.0",
+        False,
+        "OrderStats.define_view(): view_query selects 'math::percentile(amount, 50)' in a grouped view, which reads the "
+        "field 'amount' outside an aggregate and outside its GROUP BY; SurrealDB 3.x refuses such a view, and this "
+        "connection runs SurrealDB 2.x, which computes it once per source record: the view would keep the last "
+        "record's value, or every write to the source table would be refused. Use 'amount' inside an aggregate "
+        "(math::max(), math::sum(), …) or add it to GROUP BY. Nothing was defined.",
+    ),
+    (
+        "SELECT string::lowercase(status) AS state, count() AS n FROM orders GROUP BY state",
+        "surrealdb-2.0.0",
+        True,
+        "OrderStats.define_view(): view_query groups by 'state', the alias of 'string::lowercase(status)'; SurrealDB "
+        "3.x groups by its value, and this connection runs the embedded engine (a SurrealDB 2.x core), which groups by "
+        "the source records' own fields, so every record would fall into one group. Group by a field of the source "
+        "table (store the computed value in the source records if needed), or connect to a SurrealDB 3.x server. "
+        "Nothing was defined.",
+    ),
+]
+
+#: One query per C1 kind and variant on a 2.7.0 server (model ``M``): (query, the refusal).
+_C1_KINDS = [
+    ("SELECT g, MATH::STDDEV(v) AS s FROM src GROUP BY g", _c1a("M", "math::stddev", _ENGINE_2X)),
+    ("SELECT math::variance(v) AS s FROM src GROUP ALL", _c1a("M", "math::variance", _ENGINE_2X)),
+    ("SELECT g, math::sum(v) / count() AS x FROM src GROUP BY g", _c1b("M", "math::sum(v) / count()", "math::sum", _ENGINE_2X)),
+    ("SELECT count() * 2 AS x FROM src GROUP ALL", _c1b("M", "count() * 2", "count", _ENGINE_2X)),
+    ("SELECT g, v AS x FROM src GROUP BY g", _c1c("M", "v", "v", _ENGINE_2X)),
+    (
+        "SELECT g, math::percentile(c.v, 50) AS x FROM src GROUP BY g",
+        _c1c("M", "math::percentile(c.v, 50)", "c.v", _ENGINE_2X),
+    ),
+    ("SELECT *, count() AS n FROM src GROUP BY g", _c1c("M", "*", "*", _ENGINE_2X)),
+    ("SELECT g AS h, count() AS n FROM src GROUP BY h", _c1d("M", "h", "g", _ENGINE_2X)),
+    (
+        "SELECT string::lowercase(s) AS `my state`, count() AS n FROM src GROUP BY `my state`",
+        _c1d("M", "my state", "string::lowercase(s)", _ENGINE_2X),
+    ),
+    # Two hazards: the first in projection order is reported.
+    ("SELECT g, count() * 2 AS a, v AS b FROM src GROUP BY g", _c1b("M", "count() * 2", "count", _ENGINE_2X)),
+]
+
+_C1_KIND_IDS = [
+    "aggregate",
+    "aggregate-group-all",
+    "wrapped",
+    "wrapped-count",
+    "field",
+    "field-path",
+    "field-star",
+    "alias",
+    "alias-quoted",
+    "first-of-two",
+]
+
+#: Queries without hazard: no ``version()``, no request (the goldens, a non-grouped aggregate, a group alias that
+#: names its own field, a backquoted field the reading leaves to the server).
+_C1_NONE = [
+    *_GOLDEN_QUERIES,
+    "SELECT g, math::stddev(scores) AS s FROM t",
+    "SELECT g AS h, count() AS n FROM src GROUP BY g",
+    "SELECT g, `v` AS x FROM src GROUP BY g",
+]
+
+
+class RoundedStats(BaseSurrealModel):
+    """A grouped view with an expression around an aggregate (C1 kind ``wrapped``)."""
+
+    model_config = SurrealConfigDict(
+        table_name="order_stats",
+        view_query="SELECT status, math::round(math::sum(amount)) AS revenue FROM orders GROUP BY status",
+    )
+
+    id: RecordID | None = None
+    status: str
+    revenue: float
+
+
+class TestC1:
+    """Spec §4, §5.6 C1a–C1d, §6.1 (unit, fake ``version()``): ``ensure_view_query_supported()`` reads the line only
+    when the view's grouped projection holds a hazard, refuses it on SurrealDB 2.x and the embedded engine with the
+    exact texts, and lets 3.x (and an unreadable version) decide; ``define_view()`` runs it before the table guard."""
+
+    def test_engine_name(self) -> None:
+        assert schema._engine_name(2, False) == _ENGINE_2X
+        assert schema._engine_name(1, False) == "SurrealDB 1.x"
+        assert schema._engine_name(2, True) == _ENGINE_EMBEDDED
+
+    @pytest.mark.parametrize("query", _C1_NONE, ids=["stats", "paid", "totals", "not-grouped", "own-field", "quoted"])
+    @pytest.mark.parametrize("embedded", [False, True], ids=["server", "embedded"])
+    async def test_no_hazard_no_request(self, query: str, embedded: bool) -> None:
+        client = _GuardClient(version="surrealdb-2.7.0")
+        assert await schema.ensure_view_query_supported(client, query, model="M", embedded=embedded) is None
+        assert client.queries == []
+        assert client.version_calls == 0
+
+    @pytest.mark.parametrize(("query", "version", "embedded", "text"), _C1_EXAMPLES, ids=["wrapped", "field", "alias"])
+    async def test_the_worked_examples(self, query: str, version: str, embedded: bool, text: str) -> None:
+        client = _GuardClient(version=version)
+        with pytest.raises(SurrealDbError) as raised:
+            await schema.ensure_view_query_supported(client, query, model="OrderStats", embedded=embedded)
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == text
+        assert client.queries == []
+        assert client.version_calls == 1
+
+    @pytest.mark.parametrize(("query", "text"), _C1_KINDS, ids=_C1_KIND_IDS)
+    async def test_each_kind_on_2x(self, query: str, text: str) -> None:
+        client = _GuardClient(version="surrealdb-2.7.0")
+        with pytest.raises(SurrealDbError) as raised:
+            await schema.ensure_view_query_supported(client, query, model="M", embedded=False)
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == text
+        assert client.queries == []
+        assert client.version_calls == 1
+
+    async def test_the_embedded_wording(self) -> None:
+        client = _GuardClient(version="surrealdb-2.0.0")
+        with pytest.raises(SurrealDbError) as raised:
+            await schema.ensure_view_query_supported(client, _C1_KINDS[0][0], model="M", embedded=True)
+        assert str(raised.value) == _c1a("M", "math::stddev", _ENGINE_EMBEDDED)
+
+    @pytest.mark.parametrize("version", ["surrealdb-3.3.4", "surrealdb-3.1.5", "surrealdb", ""])
+    @pytest.mark.parametrize("query", [_C1_KINDS[0][0], _C1_KINDS[4][0]], ids=["aggregate", "field"])
+    async def test_3x_and_an_unreadable_version_leave_it_to_the_server(self, version: str, query: str) -> None:
+        client = _GuardClient(version=version)
+        assert await schema.ensure_view_query_supported(client, query, model="M", embedded=False) is None
+        assert client.queries == []
+        assert client.version_calls == 1
+
+    async def test_define_view_checks_before_the_table_guard(self, use_client: Callable[[Any], None]) -> None:
+        """Spec §5.2 step (e): C1 comes before the guard's ``INFO FOR DB`` — even over a table that holds records —
+        and before anything is queued in a transaction."""
+        client = _guard_client("table", True, version="surrealdb-2.7.0")
+        use_client(client)
+        tx = _QueuingTx()
+        calls: list[Callable[[], Awaitable[str]]] = [
+            lambda: RoundedStats.define_view(),
+            lambda: RoundedStats.define_view(overwrite=False, tx=tx),  # type: ignore[arg-type]
+        ]
+        for call in calls:
+            with pytest.raises(SurrealDbError) as raised:
+                await call()
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value) == _c1b("RoundedStats", "math::round(math::sum(amount))", "math::sum", _ENGINE_2X)
+        assert client.queries == []
+        assert client.version_calls == 2
+        assert tx.added == []
+
+    async def test_define_view_names_the_embedded_engine(
+        self, use_client: Callable[[Any], None], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _guard_client("none", False, version="surrealdb-2.0.0")
+        use_client(client)
+        monkeypatch.setattr(RoundedStats._connection_manager(), "is_embedded", classmethod(lambda cls: True))
+        with pytest.raises(SurrealDbError) as raised:
+            await RoundedStats.define_view()
+        assert str(raised.value) == _c1b("RoundedStats", "math::round(math::sum(amount))", "math::sum", _ENGINE_EMBEDDED)
+        assert client.queries == []
+
+    async def test_define_view_on_3x_goes_on(self, use_client: Callable[[Any], None]) -> None:
+        client = _guard_client("none", False, version="surrealdb-3.3.4")
+        use_client(client)
+        assert await RoundedStats.define_view() == RoundedStats.view_ddl()
+        assert client.queries == [_INFO, RoundedStats.view_ddl()]
+        assert client.version_calls == 1
+
+
 # === E2E (spec §9.2): the connection "mv" on the database mv_db, over WebSocket and HTTP, and mem:// ================
 
 #: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
@@ -2418,3 +2653,202 @@ class TestViewPermissionsE2E:
             assert type(raised.value) is SurrealDbAuthenticationError
             assert str(raised.value).startswith(f"Can't apply view {kind_}: 'mv_order_stats' -> ")
             assert "not enough permissions" in str(raised.value).lower()
+
+
+# --- the line facts and C1 on the engines (spec §1.4, §4, §5.6 C1a–C1d; AC-7; M5, M7, M8) ----------------------------
+
+
+class MvSpread(BaseSurrealModel):
+    """A whole ``math::stddev()`` in a grouped view: kept up to date on 3.x, C1a on 2.x (kind ``aggregate``)."""
+
+    model_config = SurrealConfigDict(
+        table_name="mv_order_spread",
+        connection="mv",
+        view_query="SELECT status, math::stddev(amount) AS spread FROM mv_orders GROUP BY status",
+    )
+
+    id: RecordID | None = None
+    status: str
+    spread: float
+
+
+class MvRounded(BaseSurrealModel):
+    """An expression around ``math::sum()``: kept up to date on 3.x, C1b on 2.x (kind ``wrapped``)."""
+
+    model_config = SurrealConfigDict(
+        table_name="mv_rounded",
+        connection="mv",
+        view_query="SELECT status, math::round(math::sum(amount)) AS revenue FROM mv_orders GROUP BY status",
+    )
+
+    id: RecordID | None = None
+    status: str
+    revenue: float
+
+
+class MvAverage(BaseSurrealModel):
+    """Two aggregates in one expression: kept up to date on 3.x, C1b naming the first on 2.x (kind ``wrapped``)."""
+
+    model_config = SurrealConfigDict(
+        table_name="mv_average",
+        connection="mv",
+        view_query="SELECT status, math::sum(amount) / count() AS average FROM mv_orders GROUP BY status",
+    )
+
+    id: RecordID | None = None
+    status: str
+    average: float
+
+
+class MvPercentile(BaseSurrealModel):
+    """A field read outside an aggregate and outside ``GROUP BY``: refused by 3.x at define (S3), C1c on 2.x (kind
+    ``field``)."""
+
+    model_config = SurrealConfigDict(
+        table_name="mv_percentile",
+        connection="mv",
+        view_query="SELECT status, math::percentile(amount, 50) AS p50 FROM mv_orders GROUP BY status",
+    )
+
+    id: RecordID | None = None
+    status: str
+    p50: float
+
+
+class MvByState(BaseSurrealModel):
+    """A ``GROUP BY`` on an alias: one group per value on 3.x, C1d on 2.x (kind ``alias``)."""
+
+    model_config = SurrealConfigDict(
+        table_name="mv_by_state",
+        connection="mv",
+        view_query="SELECT string::lowercase(status) AS state, count() AS total FROM mv_orders GROUP BY state",
+    )
+
+    id: RecordID | None = None
+    state: str
+    total: int
+
+
+class MvSafeSum(BaseSurrealModel):
+    """``math::sum(amount ?? 0)``: a source write without ``amount`` passes (M8's workaround, surrealdb#7447)."""
+
+    model_config = SurrealConfigDict(
+        table_name="mv_safe_sums",
+        connection="mv",
+        view_query="SELECT status, math::sum(amount ?? 0) AS revenue FROM mv_orders GROUP BY status",
+    )
+
+    id: RecordID | None = None
+    status: str
+    revenue: float
+
+
+#: AC-7 (b): each C1 kind from a model, and its refusal on SurrealDB 2.x (*engine*).
+_C1_MODELS: list[tuple[type[BaseSurrealModel], Callable[[str], str]]] = [
+    (MvSpread, lambda engine: _c1a("MvSpread", "math::stddev", engine)),
+    (MvRounded, lambda engine: _c1b("MvRounded", "math::round(math::sum(amount))", "math::sum", engine)),
+    (MvAverage, lambda engine: _c1b("MvAverage", "math::sum(amount) / count()", "math::sum", engine)),
+    (MvPercentile, lambda engine: _c1c("MvPercentile", "math::percentile(amount, 50)", "amount", engine)),
+    (MvByState, lambda engine: _c1d("MvByState", "state", "string::lowercase(status)", engine)),
+]
+
+#: Two integer orders of 10 (AC-7 a): ``math::sum()`` of integers is a float on 3.x and an int on 2.x (M5).
+_MV_INTEGER_ORDERS = (
+    "CREATE mv_orders:i1 SET status = 'paid', amount = 10; CREATE mv_orders:i2 SET status = 'paid', amount = 10;"
+)
+
+
+class TestViewLinesE2E:
+    """AC-7 (E2E, both lines, WebSocket, HTTP and ``mem://``): the value types of each line (M5); C1 refusing, before
+    any request but ``version()``, on SurrealDB 2.x and the embedded engine, each grouped projection they compute once
+    per source record, while 3.x keeps them up to date or refuses at define (M7); the server's own refusal of a
+    source write that misses an aggregated field, and its ``?? 0`` workaround (M8)."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_sum_and_mean_types_per_line(self, kind: str) -> None:
+        async with _mv(kind) as client:
+            await _apply_ddl(client, _MV_INTEGER_ORDERS)
+            await MvStats.define_view()
+            major = await _major(client)
+            [raw] = await client.query("SELECT revenue FROM mv_order_stats:['paid'];", {})
+            assert (type(raw["revenue"]), raw["revenue"]) == ((float, 20.0) if major >= 3 else (int, 20))
+            stats = await MvStats.objects().get(RecordID("mv_order_stats", ["paid"]))
+            assert (type(stats.revenue), stats.revenue) == (float, 20.0)
+            await _apply_ddl(
+                client, "DEFINE TABLE mv_means AS SELECT status, math::mean(amount) AS mean FROM mv_orders GROUP BY status;"
+            )
+            [mean] = await client.query("SELECT mean FROM mv_means:['paid'];", {})
+            assert (type(mean["mean"]), mean["mean"]) == ((float, 10.0) if major >= 3 else (Decimal, Decimal("10")))
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize(("model", "refusal"), _C1_MODELS, ids=[model.__name__ for model, _ in _C1_MODELS])
+    async def test_c1_on_2x_before_any_request(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        kind: str,
+        model: type[BaseSurrealModel],
+        refusal: Callable[[str], str],
+    ) -> None:
+        """Over an empty source 2.x would accept each of these views and then compute it per source record, or refuse
+        every write to ``mv_orders``: C1 refuses it with ``version()`` as its only request."""
+        async with _mv(kind) as client:
+            await _require_line(client, 2, "SurrealDB 2.x computes these grouped projections once per source record")
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await model.define_view()
+            assert calls == [("version", ())]
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value) == refusal(_ENGINE_EMBEDDED if kind == "mem" else _ENGINE_2X)
+            assert model.get_table_name() not in await _tables(client)
+            await MvOrder(id="o1", status="paid", amount=10.0).save()
+            assert [row["id"] for row in await _rows(client, "mv_orders")] == [RecordID("mv_orders", "o1")]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_3x_keeps_them_up_to_date(self, kind: str) -> None:
+        """Defined over the empty source, then maintained by each source write (spec AC-7 b, measured on 3.3.4 and
+        3.1.5)."""
+        async with _mv(kind) as client:
+            await _require_line(client, 3, "these grouped projections are kept up to date on SurrealDB 3.x")
+            for model in (MvSpread, MvRounded, MvAverage, MvByState):
+                assert await model.define_view() == model.view_ddl()
+            await _save_orders()
+            assert {row.status: row.revenue for row in await MvRounded.objects().exec()} == {"new": 1.0, "paid": 16.0}
+            assert {row.status: row.average for row in await MvAverage.objects().exec()} == {"new": 1.0, "paid": 7.75}
+            assert {row.state: row.total for row in await MvByState.objects().exec()} == {"new": 1, "paid": 2}
+            spread = {row.status: row.spread for row in await MvSpread.objects().exec()}
+            assert spread == pytest.approx({"new": 0.0, "paid": 3.181980515339464})
+            await (await MvOrder.objects().get("o2")).delete()
+            assert {row.status: row.revenue for row in await MvRounded.objects().exec()} == {"new": 1.0, "paid": 10.0}
+            assert {row.status: row.average for row in await MvAverage.objects().exec()} == {"new": 1.0, "paid": 10.0}
+            assert {row.state: row.total for row in await MvByState.objects().exec()} == {"new": 1, "paid": 1}
+            assert {row.status: row.spread for row in await MvSpread.objects().exec()} == {"new": 0.0, "paid": 0.0}
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_3x_refuses_a_field_outside_group_by(self, kind: str) -> None:
+        """C1 lets 3.x decide: the server refuses the view at define (``Found idiom``), named by S3."""
+        async with _mv(kind) as client:
+            await _require_line(client, 3, "SurrealDB 3.x refuses a field read outside GROUP BY at define")
+            with pytest.raises(SurrealDbError) as raised:
+                await MvPercentile.define_view()
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value).startswith("Can't apply view definition: 'mv_percentile' -> ")
+            assert "Found idiom" in str(raised.value)
+            assert "mv_percentile" not in await _tables(client)
+            await MvOrder(id="o1", status="paid", amount=10.0).save()
+            assert [row["id"] for row in await _rows(client, "mv_orders")] == [RecordID("mv_orders", "o1")]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_m8_a_source_write_without_the_aggregated_field(self, kind: str) -> None:
+        """M8 (surrealdb#7447), every line: with ``math::sum(amount)`` in a view, a source write without ``amount`` is
+        refused by the server, unchanged by the ORM; ``math::sum(amount ?? 0)`` lets it through."""
+        async with _mv(kind) as client:
+            await MvStats.define_view()
+            with pytest.raises(InternalError) as raised:
+                await MvOrder(id="x", status="paid").save()
+            assert "math::sum()" in str(raised.value)
+            assert await _rows(client, "mv_orders") == []
+            await MvStats.remove_view()
+            await MvSafeSum.define_view()
+            await MvOrder(id="x", status="paid").save()
+            assert [row["id"] for row in await _rows(client, "mv_orders")] == [RecordID("mv_orders", "x")]
+            assert [(row.status, row.revenue) for row in await MvSafeSum.objects().exec()] == [("paid", 0.0)]

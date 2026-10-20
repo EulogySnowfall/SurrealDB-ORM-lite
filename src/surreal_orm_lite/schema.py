@@ -33,7 +33,9 @@ raises. The table guard of ``define_view()`` and ``remove_view()`` reads ``INFO 
 (``read_table_definitions()``), tells a view from an ordinary table (``table_kind()``) and, for an ordinary table,
 whether it holds a record (``table_holds_records()``), so a view never replaces a table that holds records and
 ``remove_view()`` never removes an ordinary table (``view_table_refused()``). It reads committed state: a check, then
-the DDL, not a lock.
+the DDL, not a lock. Before the guard, ``define_view()`` refuses on SurrealDB 2.x and the embedded engine a grouped
+projection those engines compute once per source record (``ensure_view_query_supported()``, C1), reading the line
+from ``client.version()`` only when the query holds one; 3.x keeps such a view up to date or refuses it itself.
 
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
 it.
@@ -970,3 +972,86 @@ def view_table_refused(guard: Literal["G1", "G2", "G3", "G4"], model: str, table
         f"{model}.{method}: the definition of the table '{table}' could not be read, so the ORM cannot tell whether "
         f"it is a view. Nothing was {done}."
     )
+
+
+# --- the line check of define_view(): C1 (v0.32.0) ------------------------------------------------------------------
+
+
+def _engine_name(major: int, embedded: bool) -> str:
+    """How a refusal names an engine before SurrealDB 3.x (v0.32.0's C1 and G5): ``the embedded engine (a SurrealDB 2.x
+    core)`` when *embedded*, else ``SurrealDB <major>.x`` — v0.31.0's wording for ``ASYNC`` events. Pure."""
+    return "the embedded engine (a SurrealDB 2.x core)" if embedded else f"SurrealDB {major}.x"
+
+
+def view_hazard_refused(model: str, hazard: ViewHazard, engine: str) -> str:
+    """C1's texts (C1a–C1d): *hazard* — the first of the view's grouped projection — on *engine*, before 3.x (v0.32.0).
+
+    The text quotes the projection element (``repr()``), the model's own class configuration, checked before any
+    request (ruling D9): no statement is sent. Pure.
+    """
+    element, detail = hazard.element, hazard.detail
+    if hazard.kind == "aggregate":
+        return (
+            f"{model}.define_view(): {detail}() keeps a grouped view up to date on SurrealDB 3.x only, and this "
+            f"connection runs {engine}, which accepts such a view over an empty table and then refuses every write to "
+            "that table. Drop it from view_query, or connect to a SurrealDB 3.x server. Nothing was defined."
+        )
+    if hazard.kind == "wrapped":
+        return (
+            f"{model}.define_view(): view_query selects {element!r}, an expression around the aggregate {detail}(), "
+            f"in a grouped view; SurrealDB 3.x keeps it up to date, and this connection runs {engine}, which computes "
+            "it once per source record: the view would hold a wrong value, or every write to the source table would "
+            f"be refused. Select {detail}() alone, as its own field, and compute the rest when you read the model; or "
+            "connect to a SurrealDB 3.x server. Nothing was defined."
+        )
+    if hazard.kind == "field":
+        if detail == "*":
+            reading, remedy = "every field", "Select the GROUP BY fields and the aggregates by name instead of '*'."
+        else:
+            reading = f"the field {detail!r}"
+            remedy = f"Use {detail!r} inside an aggregate (math::max(), math::sum(), …) or add it to GROUP BY."
+        return (
+            f"{model}.define_view(): view_query selects {element!r} in a grouped view, which reads {reading} outside "
+            "an aggregate and outside its GROUP BY; SurrealDB 3.x refuses such a view, and this connection runs "
+            f"{engine}, which computes it once per source record: the view would keep the last record's value, or "
+            f"every write to the source table would be refused. {remedy} Nothing was defined."
+        )
+    return (
+        f"{model}.define_view(): view_query groups by {detail!r}, the alias of {element!r}; SurrealDB 3.x groups by "
+        f"its value, and this connection runs {engine}, which groups by the source records' own fields, so every "
+        "record would fall into one group. Group by a field of the source table (store the computed value in the "
+        "source records if needed), or connect to a SurrealDB 3.x server. Nothing was defined."
+    )
+
+
+async def ensure_view_query_supported(client: Any, query: str, *, model: str, embedded: bool) -> None:
+    """Refuse, on a connection before SurrealDB 3.x, a grouped view that engine computes once per source record —
+    before any DDL (C1, v0.32.0).
+
+    SurrealDB 3.x keeps every element of a grouped projection up to date, groups by a projection alias, and refuses
+    at define a field read outside ``GROUP BY`` and outside an aggregate. SurrealDB 2.x and the embedded engine keep
+    up to date only an element that is one whole call of ``count()``, ``math::sum()``, ``math::mean()``,
+    ``math::min()``, ``math::max()``, ``time::min()`` or ``time::max()``, or an expression of the ``GROUP BY`` fields:
+    anything else — ``math::stddev()``/``math::variance()``, an expression around an aggregate, a field outside
+    ``GROUP BY``, a ``GROUP BY`` on an alias — they compute once per source record, so the view holds a wrong value or
+    one group, or every write to the source table is refused. :func:`view_query_hazards` finds those elements in
+    *query* (a text :func:`check_view_query` returned) by reading its text; only when it finds one is the line read
+    from ``client.version()`` — once, so a view without hazard costs no request — with the lite's rule
+    (``time_travel.line_major()``): a version that cannot be read counts as 3.x and the server decides. The first
+    hazard in projection order is reported (C1a–C1d, :func:`view_hazard_refused`).
+
+    What the reading cannot see — a sub-select or a graph path in an element, a backquoted field name, a field read
+    through a parameter, a field's type — is left to the server. On the embedded engine ``version()`` answers the
+    SDK's version (``surrealdb-2.0.0``), whose bundled core is 2.x too; *embedded* names it so in the message.
+
+    :param client: the SDK client of the model's connection (outside any transaction: ``version()`` takes none).
+    :param model: the class name the message starts with.
+    :raises SurrealDbError: the grouped projection holds a hazard and the connection runs SurrealDB before 3.x.
+    """
+    hazards = view_query_hazards(view_query_outline(query))
+    if not hazards:
+        return
+    major = line_major(await client.version())
+    if major >= 3:
+        return
+    raise SurrealDbError(view_hazard_refused(model, hazards[0], _engine_name(major, embedded)))
