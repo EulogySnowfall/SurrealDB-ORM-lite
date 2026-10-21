@@ -575,6 +575,9 @@ def table_clause_forms() -> None:
         SurrealConfigDict,
     )
     assert_type(SurrealConfigDict(table_type=TableType.HASH, schema_mode=SchemaMode.SCHEMALESS), SurrealConfigDict)
+    statements: list[str] = TableClauses.table_ddl()
+    assert_type(statements, list[str])
+    assert_type(TableClauses.table_ddl(overwrite=False), list[str])
 
 
 @fixture

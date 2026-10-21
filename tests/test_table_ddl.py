@@ -36,11 +36,30 @@ sub-model in a union or a container, a dict and a sub-model already on the path 
 optional when its annotation admits ``None`` or its default is ``None`` (never ``any``); the constant default of a
 column that is not optional is its ``DEFAULT`` literal. ``FLEXIBLE`` requested on a kind without an object, and a
 computed field's expression ``scan_fragment()`` refuses, raise their exact texts. ``model_ddl`` imports no model module.
+
+The statements (``TestTableDdl``): ``table_ddl()`` renders, with no connection, ``DEFINE TABLE {OVERWRITE | IF NOT
+EXISTS} `<table>` TYPE NORMAL|ANY`` and the clauses the model declares — schema mode, comment, change feed,
+permissions, in that order (``schema.declared_clauses()``) — then one ``DEFINE FIELD`` per column: ``TYPE <kind>``,
+``FLEXIBLE`` when the declared mode is ``SCHEMAFULL`` and the column holds a free-form object or asks for it, the
+``DEFAULT`` of a constant default, a computed field's ``VALUE``. A ``server_fields`` column without a constant default
+gets no ``DEFAULT``. A ``TableType.USER`` model with ``extra="allow"`` is refused; an edge model renders its relation
+statement then its data fields, a view model its view statement. ``model_ddl.field_permissions_text()`` writes a
+field's permissions as SurrealDB renders them.
+
+On the engines (``TestTableDdlE2E``, every engine of both lines): each list of statements, applied raw, is accepted and
+read back — the table's type, mode, comment, change feed and permissions, each column's kind and ``FLEXIBLE``.
+
+The ORM's writes (``TestOrmWritesE2E``): on a ``SCHEMAFULL`` table defined by a model's ``table_ddl()`` — one column of
+every kind, a typed computed field ``tot`` — every write path is accepted and every field reads back equal, and the
+computed field reads ``i + 1`` after each write; SurrealDB 3.1 refuses the ORM's ``set`` value, which is pinned there.
 """
 
 import ast
+import contextlib
+import os
+import re
 from collections import defaultdict, deque
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -54,13 +73,15 @@ import pytest
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 from surrealdb import Datetime as SdkDatetime
 from surrealdb import Duration as SdkDuration
+from surrealdb import InternalError, RecordID
 from surrealdb import Range as SdkRange
-from surrealdb import RecordID
 
 import surreal_orm_lite
 from surreal_orm_lite import (
     BaseSurrealEdge,
     BaseSurrealModel,
+    BoundExcluded,
+    BoundIncluded,
     Computed,
     Duration,
     GeoField,
@@ -72,12 +93,14 @@ from surreal_orm_lite import (
     Range,
     SchemaMode,
     SurrealConfigDict,
+    SurrealDBConnectionManager,
+    SurrealDbNotFoundError,
     TableType,
     computed,
     model_ddl,
     schema,
 )
-from surreal_orm_lite.define_parser import parse_kind, render_kind
+from surreal_orm_lite.define_parser import normalise_kind, parse_define_field, parse_define_table, parse_kind, render_kind
 
 # --- the exact texts of the class-time refusals ---------------------------------------------------------------------
 
@@ -1530,3 +1553,862 @@ class TestModelDdlImports:
                 imported.update(alias.name for alias in node.names)
         for module in ("model_base", "edge", "model_auth", "connection_manager"):
             assert not any(name == module or name.endswith(f".{module}") or name.startswith(f"{module}.") for name in imported)
+
+
+# --- the statements of table_ddl() ----------------------------------------------------------------------------------
+
+
+class TdlLog(BaseSurrealModel):
+    """G3: a ``TYPE ANY`` table declared ``SCHEMALESS``: no ``FLEXIBLE`` on its free-form object."""
+
+    model_config = SurrealConfigDict(
+        table_name="tdl_log", table_type=TableType.ANY, schema_mode=SchemaMode.SCHEMALESS, connection="tdl"
+    )
+
+    id: str | None = None
+    payload: dict[str, Any]
+    extra: Any = None
+
+
+class TdlUser(BaseSurrealModel):
+    """G4: a ``TableType.USER`` table is ``SCHEMAFULL``."""
+
+    model_config = SurrealConfigDict(table_name="tdl_user", table_type=TableType.USER, connection="tdl")
+
+    id: str | None = None
+    email: str
+
+
+class TdlUserHash(BaseSurrealModel):
+    """G4: a ``TableType.HASH`` table is ``SCHEMALESS``."""
+
+    model_config = SurrealConfigDict(table_name="tdl_user", table_type=TableType.HASH, connection="tdl")
+
+    id: str | None = None
+    email: str
+
+
+class TdlUserStream(BaseSurrealModel):
+    """G4: a ``TableType.STREAM`` table with a change feed."""
+
+    model_config = SurrealConfigDict(table_name="tdl_user", table_type=TableType.STREAM, changefeed="1d", connection="tdl")
+
+    id: str | None = None
+    email: str
+
+
+class TdlPermNone(BaseSurrealModel):
+    """G5: ``permissions={}`` declares ``PERMISSIONS NONE``."""
+
+    model_config = SurrealConfigDict(table_name="tdl_g5", permissions={}, connection="tdl")
+
+    id: str | None = None
+
+
+class TdlPermFull(BaseSurrealModel):
+    """G5: ``FULL`` on the four operations, in any case."""
+
+    model_config = SurrealConfigDict(
+        table_name="tdl_g5",
+        permissions={"select": "full", "create": "full", "update": "full", "delete": "full"},
+        connection="tdl",
+    )
+
+    id: str | None = None
+
+
+class TdlPermWhere(BaseSurrealModel):
+    """G5: one ``WHERE`` rule, the other operations ``NONE``."""
+
+    model_config = SurrealConfigDict(table_name="tdl_g5", permissions={"select": "WHERE owner = $auth.id"}, connection="tdl")
+
+    id: str | None = None
+
+
+class TdlFeed(BaseSurrealModel):
+    """G5: a change feed written normalised."""
+
+    model_config = SurrealConfigDict(table_name="tdl_g5", changefeed=" 1h   include original ", connection="tdl")
+
+    id: str | None = None
+
+
+class TdlQuote(BaseSurrealModel):
+    """G5: a comment holding a quote."""
+
+    model_config = SurrealConfigDict(table_name="tdl_g5", comment="it's", connection="tdl")
+
+    id: str | None = None
+
+
+class TdlCart(BaseSurrealModel):
+    """G6: a computed field, written ``TYPE option<…> VALUE``."""
+
+    model_config = SurrealConfigDict(table_name="tdl_cart", connection="tdl")
+
+    id: str | None = None
+    items: list[str] = Field(default_factory=list)
+    total: Computed[int] = computed("count(items)")
+
+
+class TdlKeyword(BaseSurrealModel):
+    """G10: a field named after a SurrealQL keyword."""
+
+    model_config = SurrealConfigDict(table_name="tdl_kw", connection="tdl")
+
+    id: str | None = None
+    select: int = 0
+
+
+class TdlOdd(BaseSurrealModel):
+    """G10: columns that are not identifiers, one holding a dot (one segment)."""
+
+    model_config = SurrealConfigDict(table_name="tdl_odd", connection="tdl")
+
+    id: str | None = None
+    first: str = Field(alias="first-name")
+    dotted: int = Field(default=0, alias="a.b")
+
+
+class TdlNoteStatus(BaseSurrealModel):
+    """G11: a ``server_fields`` column with a constant default keeps it as its ``DEFAULT`` on a new column."""
+
+    model_config = SurrealConfigDict(table_name="tdl_note", server_fields=["status"], connection="tdl")
+
+    id: str | None = None
+    body: str
+    status: str = "draft"
+
+
+class TdlNoteStamped(BaseSurrealModel):
+    """G12: ``server_fields`` columns without a constant default get no ``DEFAULT``."""
+
+    model_config = SurrealConfigDict(table_name="tdl_note", server_fields=["stamp", "owner_ref"], connection="tdl")
+
+    id: str | None = None
+    body: str
+    stamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    owner_ref: str
+
+
+class TdlLikesBare(BaseSurrealEdge):
+    """An edge model without the table keys: its relation statement, then its data fields."""
+
+    model_config = SurrealConfigDict(
+        table_name="tdl_likes_bare",
+        relation_in="tdl_person",
+        relation_out=["tdl_post", "tdl_book"],
+        enforced=True,
+        connection="tdl",
+    )
+
+    stars: int = 1
+
+
+class TdlStatsBare(BaseSurrealModel):
+    """A view model without the table keys: its view statement."""
+
+    model_config = SurrealConfigDict(table_name="tdl_stats", view_query=_VIEW_QUERY, connection="tdl")
+
+    n: int = 0
+
+
+_G1 = [
+    "DEFINE TABLE OVERWRITE `tdl_person` TYPE NORMAL SCHEMAFULL COMMENT 'People' CHANGEFEED 7d PERMISSIONS FOR select "
+    "FULL, FOR create WHERE $auth.id != NONE, FOR update, delete NONE;",
+    "DEFINE FIELD OVERWRITE `name` ON `tdl_person` TYPE string;",
+    "DEFINE FIELD OVERWRITE `age` ON `tdl_person` TYPE int DEFAULT 18;",
+    "DEFINE FIELD OVERWRITE `nickname` ON `tdl_person` TYPE option<string>;",
+    "DEFINE FIELD OVERWRITE `tier` ON `tdl_person` TYPE 'free' | 'pro' DEFAULT 'free';",
+    "DEFINE FIELD OVERWRITE `tags` ON `tdl_person` TYPE array<string>;",
+    "DEFINE FIELD OVERWRITE `address` ON `tdl_person` TYPE option<object>;",
+    "DEFINE FIELD OVERWRITE `address`.`city` ON `tdl_person` TYPE string;",
+    "DEFINE FIELD OVERWRITE `address`.`zip` ON `tdl_person` TYPE option<string>;",
+    "DEFINE FIELD OVERWRITE `meta` ON `tdl_person` TYPE object FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `password_hash` ON `tdl_person` TYPE string;",
+]
+
+_G2 = [
+    "DEFINE TABLE OVERWRITE `tdl_note` TYPE NORMAL;",
+    "DEFINE FIELD OVERWRITE `body` ON `tdl_note` TYPE string;",
+    "DEFINE FIELD OVERWRITE `done` ON `tdl_note` TYPE bool DEFAULT false;",
+]
+
+_G3 = [
+    "DEFINE TABLE OVERWRITE `tdl_log` TYPE ANY SCHEMALESS;",
+    "DEFINE FIELD OVERWRITE `payload` ON `tdl_log` TYPE object;",
+    "DEFINE FIELD OVERWRITE `extra` ON `tdl_log` TYPE any;",
+]
+
+_G4_USER = [
+    "DEFINE TABLE OVERWRITE `tdl_user` TYPE NORMAL SCHEMAFULL;",
+    "DEFINE FIELD OVERWRITE `email` ON `tdl_user` TYPE string;",
+]
+_G4_HASH = ["DEFINE TABLE OVERWRITE `tdl_user` TYPE NORMAL SCHEMALESS;", _G4_USER[1]]
+_G4_STREAM = ["DEFINE TABLE OVERWRITE `tdl_user` TYPE NORMAL CHANGEFEED 1d;", _G4_USER[1]]
+
+_G5_NONE = ["DEFINE TABLE OVERWRITE `tdl_g5` TYPE NORMAL PERMISSIONS NONE;"]
+_G5_FULL = ["DEFINE TABLE OVERWRITE `tdl_g5` TYPE NORMAL PERMISSIONS FULL;"]
+_G5_WHERE = [
+    "DEFINE TABLE OVERWRITE `tdl_g5` TYPE NORMAL PERMISSIONS FOR select WHERE owner = $auth.id, FOR create, update, delete "
+    "NONE;"
+]
+_G5_FEED = ["DEFINE TABLE OVERWRITE `tdl_g5` TYPE NORMAL CHANGEFEED 1h INCLUDE ORIGINAL;"]
+_G5_QUOTE = ["DEFINE TABLE OVERWRITE `tdl_g5` TYPE NORMAL COMMENT 'it\\'s';"]
+
+_G6 = [
+    "DEFINE TABLE OVERWRITE `tdl_cart` TYPE NORMAL;",
+    "DEFINE FIELD OVERWRITE `items` ON `tdl_cart` TYPE array<string>;",
+    "DEFINE FIELD OVERWRITE `total` ON `tdl_cart` TYPE option<int> VALUE count(items);",
+]
+
+_G9 = [
+    "DEFINE TABLE OVERWRITE `tdl_kinds` TYPE NORMAL SCHEMAFULL;",
+    "DEFINE FIELD OVERWRITE `dt` ON `tdl_kinds` TYPE datetime;",
+    "DEFINE FIELD OVERWRITE `n` ON `tdl_kinds` TYPE number;",
+    "DEFINE FIELD OVERWRITE `pt` ON `tdl_kinds` TYPE option<geometry<point>>;",
+    "DEFINE FIELD OVERWRITE `tu` ON `tdl_kinds` TYPE [int, string];",
+    "DEFINE FIELD OVERWRITE `st` ON `tdl_kinds` TYPE set<int>;",
+    "DEFINE FIELD OVERWRITE `ie` ON `tdl_kinds` TYPE 1 | 2;",
+    "DEFINE FIELD OVERWRITE `lit` ON `tdl_kinds` TYPE 'a' | 'b';",
+    "DEFINE FIELD OVERWRITE `subs` ON `tdl_kinds` TYPE array<object>;",
+    "DEFINE FIELD OVERWRITE `subs`.*.`city` ON `tdl_kinds` TYPE string;",
+    "DEFINE FIELD OVERWRITE `subs`.*.`zip` ON `tdl_kinds` TYPE option<string>;",
+    "DEFINE FIELD OVERWRITE `bag` ON `tdl_kinds` TYPE array;",
+    "DEFINE FIELD OVERWRITE `bag`.* ON `tdl_kinds` TYPE any;",
+    "DEFINE FIELD OVERWRITE `lol` ON `tdl_kinds` TYPE array<array>;",
+    "DEFINE FIELD OVERWRITE `lol`.*.* ON `tdl_kinds` TYPE any;",
+    "DEFINE FIELD OVERWRITE `ob` ON `tdl_kinds` TYPE option<array>;",
+    "DEFINE FIELD OVERWRITE `ob`.* ON `tdl_kinds` TYPE any;",
+    "DEFINE FIELD OVERWRITE `tags` ON `tdl_kinds` TYPE array<string>;",
+    "DEFINE FIELD OVERWRITE `x` ON `tdl_kinds` TYPE option<int>;",
+    "DEFINE FIELD OVERWRITE `owner` ON `tdl_kinds` TYPE option<object> FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `u` ON `tdl_kinds` TYPE any;",
+    "DEFINE FIELD OVERWRITE `sub` ON `tdl_kinds` TYPE object;",
+    "DEFINE FIELD OVERWRITE `sub`.`a` ON `tdl_kinds` TYPE int DEFAULT 1;",
+    "DEFINE FIELD OVERWRITE `sub`.`dbl` ON `tdl_kinds` TYPE int;",
+]
+
+_G10_KEYWORD = [
+    "DEFINE TABLE OVERWRITE `tdl_kw` TYPE NORMAL;",
+    "DEFINE FIELD OVERWRITE `select` ON `tdl_kw` TYPE int DEFAULT 0;",
+]
+_G10_ODD = [
+    "DEFINE TABLE OVERWRITE `tdl_odd` TYPE NORMAL;",
+    "DEFINE FIELD OVERWRITE `first-name` ON `tdl_odd` TYPE string;",
+    "DEFINE FIELD OVERWRITE `a.b` ON `tdl_odd` TYPE int DEFAULT 0;",
+]
+
+_G11 = [
+    "DEFINE TABLE OVERWRITE `tdl_note` TYPE NORMAL;",
+    "DEFINE FIELD OVERWRITE `body` ON `tdl_note` TYPE string;",
+    "DEFINE FIELD OVERWRITE `status` ON `tdl_note` TYPE string DEFAULT 'draft';",
+]
+
+_G12 = [
+    "DEFINE TABLE OVERWRITE `tdl_note` TYPE NORMAL;",
+    "DEFINE FIELD OVERWRITE `body` ON `tdl_note` TYPE string;",
+    "DEFINE FIELD OVERWRITE `stamp` ON `tdl_note` TYPE datetime;",
+    "DEFINE FIELD OVERWRITE `owner_ref` ON `tdl_note` TYPE string;",
+]
+
+#: (model, its ``table_ddl()``) for every golden of a node model: G1–G6 and G9–G12.
+_GOLDENS: list[tuple[type[BaseSurrealModel], list[str]]] = [
+    (TdlPerson, _G1),
+    (TdlNote, _G2),
+    (TdlLog, _G3),
+    (TdlUser, _G4_USER),
+    (TdlUserHash, _G4_HASH),
+    (TdlUserStream, _G4_STREAM),
+    (TdlPermNone, _G5_NONE),
+    (TdlPermFull, _G5_FULL),
+    (TdlPermWhere, _G5_WHERE),
+    (TdlFeed, _G5_FEED),
+    (TdlQuote, _G5_QUOTE),
+    (TdlCart, _G6),
+    (TdlKinds, _G9),
+    (TdlKeyword, _G10_KEYWORD),
+    (TdlOdd, _G10_ODD),
+    (TdlNoteStatus, _G11),
+    (TdlNoteStamped, _G12),
+]
+
+_GOLDEN_IDS = [model.__name__ for model, _ in _GOLDENS]
+
+
+def _if_not_exists(statements: list[str]) -> list[str]:
+    """*statements* with ``IF NOT EXISTS`` where each says ``OVERWRITE``."""
+    return [re.sub(r"^DEFINE (TABLE|FIELD) OVERWRITE ", r"DEFINE \1 IF NOT EXISTS ", statement) for statement in statements]
+
+
+def _ux1(name: str) -> str:
+    return (
+        f'{name}: extra="allow" keeps fields the model does not declare, and a TableType.USER table is SCHEMAFULL, which '
+        f'refuses them (SurrealDB 3.x) or drops them (2.x); remove extra="allow" from {name}.'
+    )
+
+
+class TestTableDdl:
+    """``table_ddl()``: the goldens exactly, ``IF NOT EXISTS``, the refusals, edges and views, no connection needed."""
+
+    @pytest.mark.parametrize(("model", "statements"), _GOLDENS, ids=_GOLDEN_IDS)
+    def test_each_golden(self, model: type[BaseSurrealModel], statements: list[str]) -> None:
+        assert model.table_ddl() == statements
+        assert model.table_ddl(overwrite=True) == statements
+
+    @pytest.mark.parametrize(("model", "statements"), _GOLDENS, ids=_GOLDEN_IDS)
+    def test_each_golden_if_not_exists(self, model: type[BaseSurrealModel], statements: list[str]) -> None:
+        kept = model.table_ddl(overwrite=False)
+        assert kept == _if_not_exists(statements)
+        assert all(" IF NOT EXISTS " in statement and "OVERWRITE" not in statement for statement in kept)
+
+    def test_e1_overwrite_must_be_a_bool(self) -> None:
+        for value in ("yes", 1, None):
+            with pytest.raises(TypeError) as raised:
+                TdlNote.table_ddl(overwrite=value)  # type: ignore[arg-type]
+            assert str(raised.value) == f"overwrite= must be a bool, got {type(value).__name__}."
+
+    def test_ux1_a_user_table_with_extra_allow(self) -> None:
+        class TdlUserOpen(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="tdl_user", table_type=TableType.USER, extra="allow")
+
+            email: str
+
+        with pytest.raises(TypeError) as raised:
+            TdlUserOpen.table_ddl()
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _ux1("TdlUserOpen")
+
+    @pytest.mark.parametrize(
+        ("expression", "reason"),
+        [
+            ("count(items) -- n", "it holds a SurrealQL comment marker (-- , #, // or /* */)"),
+            ("count(items", "its brackets are not balanced"),
+        ],
+    )
+    def test_cv1_through_table_ddl(self, expression: str, reason: str) -> None:
+        class TdlBadTotal(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="tdl_cart")
+
+            items: list[str] = Field(default_factory=list)
+            total: Computed[int] = computed(expression)
+
+        with pytest.raises(ValueError) as raised:
+            TdlBadTotal.table_ddl()
+        assert type(raised.value) is ValueError
+        assert str(raised.value) == _cv1("TdlBadTotal", "total", reason)
+
+    def test_fx1_through_table_ddl(self) -> None:
+        class TdlFlexAge(BaseSurrealModel):
+            model_config = SurrealConfigDict(
+                table_name="tdl_flex_age", schema_mode=SchemaMode.SCHEMAFULL, flexible_fields=["age"]
+            )
+
+            age: int = 18
+
+        with pytest.raises(ValueError) as raised:
+            TdlFlexAge.table_ddl()
+        assert str(raised.value) == _fx1("TdlFlexAge", "age", "int")
+
+    async def test_no_connection_needed(self) -> None:
+        await SurrealDBConnectionManager.unset_connection()
+        assert TdlPerson.table_ddl() == _G1
+        assert TdlKinds.table_ddl() == _G9
+
+    def test_an_edge_model_without_the_keys(self) -> None:
+        stars = "DEFINE FIELD OVERWRITE `stars` ON `tdl_likes_bare` TYPE int DEFAULT 1;"
+        assert TdlLikesBare.relation_ddl() == (
+            "DEFINE TABLE OVERWRITE `tdl_likes_bare` TYPE RELATION IN `tdl_person` OUT `tdl_post` | `tdl_book` ENFORCED;"
+        )
+        assert TdlLikesBare.table_ddl() == [TdlLikesBare.relation_ddl(), stars]
+        assert TdlLikesBare.table_ddl(overwrite=False) == [
+            TdlLikesBare.relation_ddl(overwrite=False),
+            stars.replace("OVERWRITE", "IF NOT EXISTS"),
+        ]
+        assert TdlLink.table_ddl() == [
+            "DEFINE TABLE OVERWRITE `tdl_link` TYPE RELATION;",
+            "DEFINE FIELD OVERWRITE `stars` ON `tdl_link` TYPE int DEFAULT 1;",
+        ]
+
+    def test_a_view_model_without_the_keys(self) -> None:
+        assert TdlStatsBare.table_ddl() == [TdlStatsBare.view_ddl()]
+        assert TdlStatsBare.table_ddl(overwrite=False) == [TdlStatsBare.view_ddl(overwrite=False)]
+        assert TdlStatsBare.table_ddl() == [f"DEFINE TABLE OVERWRITE `tdl_stats` AS ({_VIEW_QUERY});"]
+
+    def test_flexible_only_on_a_schemafull_model(self) -> None:
+        class TdlLooseMeta(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="tdl_loose_meta", flexible_fields=["meta"])
+
+            meta: dict[str, Any] = Field(default_factory=dict)
+            owner: TdlNote | None = None
+
+        assert "FLEXIBLE" not in " ".join(TdlLog.table_ddl())
+        assert "DEFINE FIELD OVERWRITE `meta` ON `tdl_person` TYPE object FLEXIBLE;" in TdlPerson.table_ddl()
+        assert TdlLooseMeta.table_ddl() == [
+            "DEFINE TABLE OVERWRITE `tdl_loose_meta` TYPE NORMAL;",
+            "DEFINE FIELD OVERWRITE `meta` ON `tdl_loose_meta` TYPE object;",
+            "DEFINE FIELD OVERWRITE `owner` ON `tdl_loose_meta` TYPE option<object>;",
+        ]
+
+    def test_flexible_fields_on_a_schemafull_model(self) -> None:
+        class TdlFlexMeta(BaseSurrealModel):
+            model_config = SurrealConfigDict(
+                table_name="tdl_flex_meta", schema_mode=SchemaMode.SCHEMAFULL, flexible_fields=["address"]
+            )
+
+            address: TdlAddress | None = None
+            open: TdlOpen = Field(default_factory=TdlOpen)
+            extra_meta: TdlAddress | None = Field(default=None, json_schema_extra={"flexible": True})
+
+        assert TdlFlexMeta.table_ddl() == [
+            "DEFINE TABLE OVERWRITE `tdl_flex_meta` TYPE NORMAL SCHEMAFULL;",
+            "DEFINE FIELD OVERWRITE `address` ON `tdl_flex_meta` TYPE option<object> FLEXIBLE;",
+            "DEFINE FIELD OVERWRITE `address`.`city` ON `tdl_flex_meta` TYPE string;",
+            "DEFINE FIELD OVERWRITE `address`.`zip` ON `tdl_flex_meta` TYPE option<string>;",
+            "DEFINE FIELD OVERWRITE `open` ON `tdl_flex_meta` TYPE object FLEXIBLE;",
+            "DEFINE FIELD OVERWRITE `open`.`k` ON `tdl_flex_meta` TYPE int DEFAULT 0;",
+            "DEFINE FIELD OVERWRITE `extra_meta` ON `tdl_flex_meta` TYPE option<object> FLEXIBLE;",
+            "DEFINE FIELD OVERWRITE `extra_meta`.`city` ON `tdl_flex_meta` TYPE string;",
+            "DEFINE FIELD OVERWRITE `extra_meta`.`zip` ON `tdl_flex_meta` TYPE option<string>;",
+        ]
+
+    def test_the_kitchen_computed_field(self) -> None:
+        """The typed computed field of the rich model: ``TYPE option<int> VALUE``, inherited from its base."""
+        tot = "DEFINE FIELD OVERWRITE `tot` ON `tdl_kitchen` TYPE option<int> VALUE i + 1;"
+        assert tot in TdlKitchen.table_ddl()
+        assert tot in TdlKitchenBase.table_ddl()
+        assert TdlKitchen.get_computed_fields() == {"tot": "i + 1"}
+        assert TdlKitchen.table_ddl()[-1] == "DEFINE FIELD OVERWRITE `st` ON `tdl_kitchen` TYPE set<int>;"
+        assert not any("`st`" in statement for statement in TdlKitchenBase.table_ddl())
+
+    def test_the_kitchen_statements(self) -> None:
+        assert TdlKitchenBase.table_ddl() == _KITCHEN_BASE
+
+    def test_declared_clauses_order(self) -> None:
+        clauses = schema.TableClauses(
+            schema_mode="SCHEMAFULL",
+            comment="c",
+            changefeed="1d INCLUDE ORIGINAL",
+            permissions={"select": "FULL", "create": "NONE", "update": "NONE", "delete": "NONE"},
+        )
+        assert schema.declared_clauses(clauses) == [
+            "SCHEMAFULL",
+            "COMMENT 'c'",
+            "CHANGEFEED 1d INCLUDE ORIGINAL",
+            "PERMISSIONS FOR select FULL, FOR create, update, delete NONE",
+        ]
+        assert schema.declared_clauses(schema.TableClauses()) == []
+        assert schema.declared_clauses(schema.TableClauses(schema_mode="SCHEMALESS")) == ["SCHEMALESS"]
+        none = dict.fromkeys(("select", "create", "update", "delete"), "NONE")
+        assert schema.declared_clauses(schema.TableClauses(permissions=none)) == ["PERMISSIONS NONE"]
+
+    def test_table_statement(self) -> None:
+        assert schema.table_statement("tdl_x", "TYPE NORMAL", schema.TableClauses(), True) == (
+            "DEFINE TABLE OVERWRITE `tdl_x` TYPE NORMAL;"
+        )
+        assert schema.table_statement("tdl_x", "TYPE ANY", schema.TableClauses(comment="c"), False) == (
+            "DEFINE TABLE IF NOT EXISTS `tdl_x` TYPE ANY COMMENT 'c';"
+        )
+        with pytest.raises(ValueError):
+            schema.table_statement("tdl x", "TYPE NORMAL", schema.TableClauses(), True)
+
+    def test_the_declared_clauses_of_a_model(self) -> None:
+        assert TdlPerson._declared_table_clauses() == schema.TableClauses(
+            schema_mode="SCHEMAFULL",
+            comment="People",
+            changefeed="7d",
+            permissions={"select": "FULL", "create": "WHERE $auth.id != NONE", "update": "NONE", "delete": "NONE"},
+        )
+        assert TdlNote._declared_table_clauses() == schema.TableClauses()
+        assert TdlUserHash._declared_table_clauses() == schema.TableClauses(schema_mode="SCHEMALESS")
+        assert TdlFeed._declared_table_clauses() == schema.TableClauses(changefeed="1h INCLUDE ORIGINAL")
+
+    @pytest.mark.parametrize(
+        ("permissions", "text"),
+        [
+            ({"select": "FULL", "create": "FULL", "update": "FULL"}, None),
+            ({}, None),
+            ({"select": "NONE", "create": "NONE", "update": "NONE"}, "NONE"),
+            (
+                {"select": "WHERE $auth.id = id", "create": "FULL", "update": "FULL"},
+                "FOR select WHERE $auth.id = id, FOR create, update FULL",
+            ),
+            ({"select": "FULL", "create": "NONE", "update": "FULL"}, "FOR select, update FULL, FOR create NONE"),
+            ({"update": "NONE", "select": "WHERE true"}, "FOR select WHERE true, FOR create FULL, FOR update NONE"),
+        ],
+    )
+    def test_field_permissions_text(self, permissions: dict[str, str], text: str | None) -> None:
+        assert model_ddl.field_permissions_text(permissions) == text
+
+    def test_field_statement(self) -> None:
+        column = model_ddl.Column(path=("subs", "*", "city"), field="subs", kind=parse_kind("string"))
+        assert model_ddl.field_statement("tdl_x", column, overwrite=True, schemafull=True) == (
+            "DEFINE FIELD OVERWRITE `subs`.*.`city` ON `tdl_x` TYPE string;"
+        )
+        item = model_ddl.Column(path=("bag", "*"), field="bag", kind=parse_kind("any"), holds_any=True, item=True)
+        assert model_ddl.field_statement("tdl_x", item, overwrite=False, schemafull=True) == (
+            "DEFINE FIELD IF NOT EXISTS `bag`.* ON `tdl_x` TYPE any;"
+        )
+        with pytest.raises(TypeError):
+            model_ddl.field_statement("tdl_x", column, overwrite="yes", schemafull=True)  # type: ignore[arg-type]
+
+
+# --- the rich model of the ORM writes -------------------------------------------------------------------------------
+
+
+class TdlKitchenBase(BaseSurrealModel):
+    """Every kind the ORM writes, on a ``SCHEMAFULL`` table, with a typed computed field; ``set[int]`` is on
+    :class:`TdlKitchen` (SurrealDB 3.1 refuses the ORM's ``set`` value)."""
+
+    model_config = SurrealConfigDict(table_name="tdl_kitchen", schema_mode=SchemaMode.SCHEMAFULL, connection="tdl")
+
+    id: str | None = None
+    s: str
+    i: int
+    f: float
+    b: bool
+    d: Decimal
+    dt: datetime
+    da: date
+    td: timedelta
+    du: Duration
+    u: UUID
+    by: bytes
+    r: RecordID
+    ls: list[str]
+    tu: tuple[int, str]
+    dc: dict[str, Any]
+    sub: TdlAddress
+    subs: list[TdlAddress]
+    osub: TdlAddress | None = None
+    lit: Literal["a", "b"]
+    en: TdlTier
+    ie: TdlLevel
+    opt: int | None = None
+    un: int | str
+    anyv: Any = None
+    geo: PointField = None
+    rng: Range[int] | None = None
+    al: str = Field(alias="aliased_col")
+    tot: Computed[int] = computed("i + 1")
+
+
+class TdlKitchen(TdlKitchenBase):
+    """:class:`TdlKitchenBase` with a ``set[int]`` column."""
+
+    st: set[int]
+
+
+_KITCHEN_BASE = [
+    "DEFINE TABLE OVERWRITE `tdl_kitchen` TYPE NORMAL SCHEMAFULL;",
+    "DEFINE FIELD OVERWRITE `s` ON `tdl_kitchen` TYPE string;",
+    "DEFINE FIELD OVERWRITE `i` ON `tdl_kitchen` TYPE int;",
+    "DEFINE FIELD OVERWRITE `f` ON `tdl_kitchen` TYPE float;",
+    "DEFINE FIELD OVERWRITE `b` ON `tdl_kitchen` TYPE bool;",
+    "DEFINE FIELD OVERWRITE `d` ON `tdl_kitchen` TYPE decimal;",
+    "DEFINE FIELD OVERWRITE `dt` ON `tdl_kitchen` TYPE datetime;",
+    "DEFINE FIELD OVERWRITE `da` ON `tdl_kitchen` TYPE datetime;",
+    "DEFINE FIELD OVERWRITE `td` ON `tdl_kitchen` TYPE duration;",
+    "DEFINE FIELD OVERWRITE `du` ON `tdl_kitchen` TYPE duration;",
+    "DEFINE FIELD OVERWRITE `u` ON `tdl_kitchen` TYPE uuid;",
+    "DEFINE FIELD OVERWRITE `by` ON `tdl_kitchen` TYPE bytes;",
+    "DEFINE FIELD OVERWRITE `r` ON `tdl_kitchen` TYPE record;",
+    "DEFINE FIELD OVERWRITE `ls` ON `tdl_kitchen` TYPE array<string>;",
+    "DEFINE FIELD OVERWRITE `tu` ON `tdl_kitchen` TYPE [int, string];",
+    "DEFINE FIELD OVERWRITE `dc` ON `tdl_kitchen` TYPE object FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `sub` ON `tdl_kitchen` TYPE object;",
+    "DEFINE FIELD OVERWRITE `sub`.`city` ON `tdl_kitchen` TYPE string;",
+    "DEFINE FIELD OVERWRITE `sub`.`zip` ON `tdl_kitchen` TYPE option<string>;",
+    "DEFINE FIELD OVERWRITE `subs` ON `tdl_kitchen` TYPE array<object>;",
+    "DEFINE FIELD OVERWRITE `subs`.*.`city` ON `tdl_kitchen` TYPE string;",
+    "DEFINE FIELD OVERWRITE `subs`.*.`zip` ON `tdl_kitchen` TYPE option<string>;",
+    "DEFINE FIELD OVERWRITE `osub` ON `tdl_kitchen` TYPE option<object>;",
+    "DEFINE FIELD OVERWRITE `osub`.`city` ON `tdl_kitchen` TYPE string;",
+    "DEFINE FIELD OVERWRITE `osub`.`zip` ON `tdl_kitchen` TYPE option<string>;",
+    "DEFINE FIELD OVERWRITE `lit` ON `tdl_kitchen` TYPE 'a' | 'b';",
+    "DEFINE FIELD OVERWRITE `en` ON `tdl_kitchen` TYPE 'free' | 'pro';",
+    "DEFINE FIELD OVERWRITE `ie` ON `tdl_kitchen` TYPE 1 | 2;",
+    "DEFINE FIELD OVERWRITE `opt` ON `tdl_kitchen` TYPE option<int>;",
+    "DEFINE FIELD OVERWRITE `un` ON `tdl_kitchen` TYPE int | string;",
+    "DEFINE FIELD OVERWRITE `anyv` ON `tdl_kitchen` TYPE any;",
+    "DEFINE FIELD OVERWRITE `geo` ON `tdl_kitchen` TYPE option<geometry<point>>;",
+    "DEFINE FIELD OVERWRITE `rng` ON `tdl_kitchen` TYPE option<range>;",
+    "DEFINE FIELD OVERWRITE `aliased_col` ON `tdl_kitchen` TYPE string;",
+    "DEFINE FIELD OVERWRITE `tot` ON `tdl_kitchen` TYPE option<int> VALUE i + 1;",
+]
+
+
+# === E2E: the connection "tdl" on the database tdl_db, over WebSocket and HTTP, and mem:// =========================
+
+#: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
+_KINDS = ["ws", "http", "mem"]
+
+#: The reset before each E2E test, in one query.
+_TDL_RESET = "REMOVE DATABASE IF EXISTS tdl_db; DEFINE DATABASE tdl_db;"
+
+#: The skip reason of the keyword-named fields on SurrealDB 3.1.
+_KEYWORD_SKIP = "SurrealDB 3.1 stores a keyword field name it cannot read back"
+
+
+def _url(kind: str) -> str:
+    """The URL of *kind*: ``ws`` or ``http`` on the line under test (``SURREALDB_PORT``), or ``mem``."""
+    if kind == "mem":
+        return "mem://"
+    host = os.environ.get("SURREALDB_HOST", "localhost")
+    port = os.environ.get("SURREALDB_PORT", "8000")
+    return f"ws://{host}:{port}/rpc" if kind == "ws" else f"http://{host}:{port}"
+
+
+def _register_tdl(kind: str, name: str = "tdl") -> None:
+    if kind == "mem":
+        SurrealDBConnectionManager.add_connection(name, url="mem://", namespace="ns", database="tdl_db")
+    else:
+        SurrealDBConnectionManager.add_connection(
+            name, url=_url(kind), user="root", password="root", namespace="ns", database="tdl_db"
+        )
+
+
+async def _apply_ddl(client: Any, ddl: str) -> None:
+    """Run *ddl* and check every statement: ``query()`` checks only the first one."""
+    response = await client.query_raw(ddl, {})
+    assert "error" not in response, response["error"]
+    refused = [result for result in response["result"] if result["status"] != "OK"]
+    assert response["result"] and not refused, refused
+
+
+@contextlib.asynccontextmanager
+async def _tdl(kind: str) -> AsyncIterator[Any]:
+    """The connection ``"tdl"`` on *kind*, its database ``tdl_db`` reset in one query; removed, then unregistered, on
+    exit."""
+    _register_tdl(kind)
+    client = await SurrealDBConnectionManager.get_client("tdl")
+    await _apply_ddl(client, _TDL_RESET)
+    try:
+        yield client
+    finally:
+        with contextlib.suppress(Exception):
+            cleanup = await SurrealDBConnectionManager.get_client("tdl")
+            await cleanup.query("REMOVE DATABASE IF EXISTS tdl_db;", {})
+        await SurrealDBConnectionManager.remove_connection("tdl")
+
+
+async def _tables(client: Any) -> dict[str, Any]:
+    """The ``tables`` of ``INFO FOR DB`` on *client*'s database."""
+    return dict((await client.query("INFO FOR DB;", {}))["tables"])
+
+
+async def _line(client: Any) -> tuple[int, int]:
+    """``(major, minor)`` of the engine *client* talks to: ``"surrealdb-3.1.5"`` → ``(3, 1)``; ``mem://`` →
+    ``(2, 0)`` (the SDK's version, whose core is 2.x)."""
+    match = re.search(r"(\d+)\.(\d+)", await client.version())
+    assert match is not None
+    return int(match.group(1)), int(match.group(2))
+
+
+async def _major(client: Any) -> int:
+    """The major version of the engine *client* talks to: ``"surrealdb-3.3.4"`` → 3; ``mem://`` → 2."""
+    return (await _line(client))[0]
+
+
+async def _table_info(client: Any, table: str) -> dict[str, Any]:
+    """``INFO FOR TABLE`` *table* (a constant name of these tests)."""
+    info: dict[str, Any] = await client.query(f"INFO FOR TABLE {table};", {})
+    return info
+
+
+def _feed(text: str | None) -> tuple[Duration | None, bool]:
+    """A change feed as ``(duration, include original)``: SurrealDB renders ``7d`` as ``1w``."""
+    if text is None:
+        return None, False
+    duration, _, rest = text.partition(" ")
+    return Duration.parse(duration), rest == "INCLUDE ORIGINAL"
+
+
+class TestTableDdlE2E:
+    """Each golden of a node model, applied raw on every engine of both lines, is accepted and read back: the table's
+    type, mode, comment, change feed and permissions, and each written column's kind, ``option<…>`` and ``FLEXIBLE``
+    (an item definition keyed ``("bag", "*")`` on both renderings)."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize(("model", "statements"), _GOLDENS, ids=_GOLDEN_IDS)
+    async def test_each_golden_is_applied_and_read_back(
+        self, kind: str, model: type[BaseSurrealModel], statements: list[str]
+    ) -> None:
+        async with _tdl(kind) as client:
+            if model is TdlKeyword and await _line(client) == (3, 1):
+                pytest.skip(_KEYWORD_SKIP)
+            assert model.table_ddl() == statements
+            await _apply_ddl(client, " ".join(statements))
+            table = model.get_table_name()
+            state = parse_define_table((await _tables(client))[table])
+            assert state.table_type == ("any" if model.get_table_type() is TableType.ANY else "normal")
+            assert state.schema_mode == (model.get_schema_mode() or SchemaMode.SCHEMALESS).value
+            assert state.comment == model.model_config.get("comment")
+            feed = state.changefeed
+            if feed is not None and state.changefeed_include_original:
+                feed += " INCLUDE ORIGINAL"
+            assert _feed(feed) == _feed(model.get_changefeed())
+            declared = model.model_config.get("permissions")
+            if declared is not None:
+                assert state.permissions == schema.permissions_rules(declared, model=model)
+            fields = [parse_define_field(text).state for text in (await _table_info(client, table))["fields"].values()]
+            stored = {field.path: field for field in fields}
+            columns = _columns(model)
+            assert len(statements) == 1 + len(columns)
+            for column, statement in zip(columns, statements[1:], strict=True):
+                field = stored[column.path]
+                assert (field.field_type, field.nullable) == normalise_kind(render_kind(column.kind)), statement
+                assert field.flexible is (" FLEXIBLE" in statement), statement
+                assert field.value == column.value, statement
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_kitchen_is_applied(self, kind: str) -> None:
+        async with _tdl(kind) as client:
+            model = TdlKitchenBase if await _line(client) == (3, 1) else TdlKitchen
+            await _apply_ddl(client, " ".join(model.table_ddl()))
+            fields = (await _table_info(client, "tdl_kitchen"))["fields"]
+            stored = {parse_define_field(text).state.path for text in fields.values()}
+            assert {column.path for column in _columns(model)} <= stored
+
+
+# --- the ORM's writes into a table table_ddl() defines --------------------------------------------------------------
+
+
+def _kitchen_fields(model: type[TdlKitchenBase], record: str | None, **values: Any) -> dict[str, Any]:
+    """The fields of an instance of *model* with id *record* (none when ``None``): one value of each kind, ``anyv`` a
+    scalar; *values* override."""
+    fields: dict[str, Any] = {
+        "s": "x",
+        "i": 3,
+        "f": 2.0,
+        "b": True,
+        "d": Decimal("1.50"),
+        "dt": datetime(2024, 1, 2, 3, 4, 5, 123456, tzinfo=UTC),
+        "da": date(2024, 1, 2),
+        "td": timedelta(seconds=90),
+        "du": Duration.parse("1h30m"),
+        "u": UUID("12345678-1234-5678-1234-567812345678"),
+        "by": b"\x00\x01",
+        "r": RecordID("tdl_note", "ada"),
+        "ls": ["a", "b"],
+        "tu": (1, "x"),
+        "dc": {"nested": {"deep": [1, 2]}, "k": "v"},
+        "sub": TdlAddress(city="Paris"),
+        "subs": [TdlAddress(city="A", zip="1"), TdlAddress(city="B")],
+        "osub": None,
+        "lit": "a",
+        "en": TdlTier.PRO,
+        "ie": TdlLevel.TWO,
+        "opt": None,
+        "un": "s",
+        "anyv": 5,
+        "geo": GeometryPoint(1.0, 2.0),
+        "rng": Range(BoundIncluded(1), BoundExcluded(5)),
+        "al": "al",
+    }
+    if record is not None:
+        fields["id"] = record
+    if "st" in model.model_fields:
+        fields["st"] = {3, 1, 2}
+    fields.update(values)
+    return fields
+
+
+def _kitchen(model: type[TdlKitchenBase], record: str, **values: Any) -> TdlKitchenBase:
+    """An instance of *model* with id *record*: :func:`_kitchen_fields`."""
+    return model(**_kitchen_fields(model, record, **values))
+
+
+async def _read_back(model: type[TdlKitchenBase], record: Any, expected: TdlKitchenBase) -> TdlKitchenBase:
+    """The record *record* read with ``get()``: every field equal to *expected*'s (the id is the one read; ``tot``
+    aside, the server computes it) and ``tot`` equal to ``i + 1``."""
+    got = await model.objects().get(record)
+    assert got.model_dump(exclude={"id", "tot"}) == expected.model_dump(exclude={"id", "tot"})
+    assert got.tot == got.i + 1
+    return got
+
+
+class TestOrmWritesE2E:
+    """Every ORM write into the table ``table_ddl()`` defines for the rich model (``TdlKitchenBase`` on SurrealDB 3.1,
+    which refuses the ORM's ``set`` value; ``TdlKitchen`` elsewhere), ``anyv`` holding scalars: accepted, every field
+    read back equal, and the typed computed field ``tot`` read ``i + 1`` after each write, on every engine."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_writes_round_trip(self, kind: str) -> None:
+        async with _tdl(kind) as client:
+            model = TdlKitchenBase if await _line(client) == (3, 1) else TdlKitchen
+            await _apply_ddl(client, " ".join(model.table_ddl()))
+
+            k1 = _kitchen(model, "k1")
+            await k1.save()
+            await _read_back(model, "k1", k1)
+
+            k1.s = "changed"
+            k1.i = 4
+            k1.opt = 5
+            k1.osub = TdlAddress(city="Rome", zip="00100")
+            k1.anyv = "s"
+            await k1.update()
+            await _read_back(model, "k1", k1)
+
+            await k1.merge(i=9, opt=None, dc={"z": {"w": 1}})
+            merged = k1.model_copy(update={"i": 9, "opt": None, "dc": {"nested": {"deep": [1, 2]}, "k": "v", "z": {"w": 1}}})
+            k1 = await _read_back(model, "k1", merged)
+            assert k1.tot == 10
+
+            k2 = _kitchen(model, "k2", i=2)
+            await k2.upsert()
+            await _read_back(model, "k2", k2)
+            k2.i = 7
+            await k2.upsert()
+            assert (await _read_back(model, "k2", k2)).tot == 8
+
+            await k1.patch([{"op": "replace", "path": "/s", "value": "p"}])
+            assert (await _read_back(model, "k1", k1)).s == "p"
+            await k1.atomic_append("ls", "c")
+            assert (await _read_back(model, "k1", k1)).ls == ["a", "b", "c"]
+            await k1.atomic_increment("i", 2)
+            assert (await _read_back(model, "k1", k1)).tot == 12
+
+            k3 = _kitchen(model, "k3", s="c", i=30)
+            k4 = _kitchen(model, "k4", s="c", i=40)
+            await model.objects().bulk_create([k3, k4])
+            await _read_back(model, "k3", k3)
+            await _read_back(model, "k4", k4)
+            assert await model.objects().filter(s="c").bulk_update(s="bu") == 2
+            k3.s = k4.s = "bu"
+            assert (await _read_back(model, "k3", k3)).tot == 31
+            assert (await _read_back(model, "k4", k4)).tot == 41
+
+            defaults = _kitchen_fields(model, None, i=50)
+            del defaults["s"]
+            made, created = await model.objects().get_or_create(defaults=defaults, s="g")
+            assert created is True
+            assert (await _read_back(model, made.id, made)).tot == 51
+            again, created = await model.objects().get_or_create(defaults=defaults, s="g")
+            assert created is False
+            assert again.get_raw_id() == made.get_raw_id()
+
+            k6 = _kitchen(model, "k6", osub=None, opt=None, anyv=None, geo=None, rng=None)
+            await k6.save()
+            await _read_back(model, "k6", k6)
+
+            await k1.delete()
+            with pytest.raises(SurrealDbNotFoundError):
+                await model.objects().get("k1")
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_set_field(self, kind: str) -> None:
+        """A ``set[int]`` field reads back equal on every engine but SurrealDB 3.1, which refuses the ORM's ``set``
+        value (README behaviour row "`TYPE set<…>` columns": "3.1: writing the array is refused")."""
+        async with _tdl(kind) as client:
+            await _apply_ddl(client, " ".join(TdlKitchen.table_ddl()))
+            kitchen = _kitchen(TdlKitchen, "k1")
+            if await _line(client) == (3, 1):
+                with pytest.raises(InternalError, match="Expected `set` but found") as refused:
+                    await kitchen.save()
+                assert type(refused.value) is InternalError, "SurrealDB 3.1 refuses the ORM's set value with the SDK's error"
+                assert await TdlKitchen.objects().count() == 0
+                return
+            await kitchen.save()
+            assert (await _read_back(TdlKitchen, "k1", kitchen)).st == {1, 2, 3}

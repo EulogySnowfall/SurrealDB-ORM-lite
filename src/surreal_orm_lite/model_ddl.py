@@ -18,6 +18,11 @@ SurrealQL takes no bound parameter in DDL — after the structural check of ``de
 quoted identifiers terminated, brackets balanced, no comment marker and no NUL. A comment marker would swallow the
 clauses written after the expression (``ASSERT``, ``PERMISSIONS``, ``COMMENT``). The check catches mistakes; it is not
 an injection defence: an expression is trusted application code, never user input.
+
+**The statements.** ``field_statement()`` writes one column's ``DEFINE FIELD``: its path segment by segment, each name
+in backticks and an array's items ``*`` (`` `subs`.*.`city` ``), the table in backticks, then ``TYPE <kind>``,
+``FLEXIBLE`` on a ``SCHEMAFULL`` table when the column holds a free-form object or asks for it, its ``DEFAULT`` and a
+computed field's ``VALUE``. ``field_permissions_text()`` writes a field's ``PERMISSIONS`` as SurrealDB renders them.
 """
 
 from collections.abc import Collection, Iterable, Mapping, MutableSequence, MutableSet, Sequence
@@ -37,15 +42,28 @@ from pydantic_core import PydanticUndefined
 from ._sdk import RecordID, SdkDuration, SdkRange
 from .define_parser import DefineParseError, Kind, KLiteral, KName, KObject, KTuple, KUnion, render_kind, scan_fragment
 from .geo import _ALL_KINDS, _geo_kinds, _GeoMarker, _ordered
-from .surql_literal import to_surql_literal
+from .schema import _identifier_name, _overwrite_clause
+from .surql_literal import _identifier, to_surql_literal
 from .types import Duration, Range
 
-__all__ = ["Column", "field_kind", "holds_any", "holds_object", "model_columns", "untyped_arrays"]
+__all__ = [
+    "Column",
+    "field_kind",
+    "field_path",
+    "field_permissions_text",
+    "field_statement",
+    "holds_any",
+    "holds_object",
+    "model_columns",
+    "untyped_arrays",
+]
 
 _ANY = KName("any")
 _NONE = KLiteral("none")
 _OBJECT = KName("object")
 _NUMBER_MEMBERS = frozenset({"int", "float", "decimal"})
+#: The operations of a field's ``PERMISSIONS``, in the order SurrealDB renders them.
+_FIELD_OPERATIONS = ("select", "create", "update")
 #: The generic origins of an array: ``list[T]``, ``Sequence[T]``, ``MutableSequence[T]`` (``tuple`` apart).
 _ARRAY_ORIGINS: tuple[Any, ...] = (list, Sequence, MutableSequence)
 #: The generic origins of a set: ``set[T]``, ``frozenset[T]``, ``AbstractSet[T]``, ``MutableSet[T]``.
@@ -585,3 +603,60 @@ def model_columns(
         )
         result.extend(_field_columns(spec, trail))
     return tuple(result)
+
+
+# --- statements ------------------------------------------------------------------------------------------------------
+
+
+def field_path(path: Sequence[str]) -> str:
+    """A column's path as a ``DEFINE FIELD`` writes it: each segment an identifier in backticks, an array's items ``*``
+    bare, joined with ``.`` (`` `address`.`city` ``, `` `subs`.*.`city` ``, `` `a.b` `` for one segment holding a dot).
+    Pure.
+    """
+    return ".".join("*" if segment == "*" else _identifier(segment) for segment in path)
+
+
+def field_statement(table: str, column: Column, *, overwrite: bool, schemafull: bool, before_3: bool = False) -> str:
+    """``DEFINE FIELD {OVERWRITE | IF NOT EXISTS} <path> ON `<table>` TYPE <kind>[ FLEXIBLE][ DEFAULT <literal>][ VALUE
+    <expression>];`` — the statement of a new column (v0.34.0).
+
+    The path through :func:`field_path`, *table* checked as an identifier and written in backticks, the kind through
+    ``render_kind()``. ``FLEXIBLE`` (written after ``TYPE``, which both lines accept) only when *schemafull* — the
+    table's mode once its statement is applied is ``SCHEMAFULL``: SurrealDB 3.x refuses ``FLEXIBLE`` elsewhere — and the
+    column holds a free-form object (``free_object``), asks for it (``flexible_requested``) or, with *before_3* (a
+    SurrealDB 2.x server or the embedded engine), holds ``any``. ``DEFAULT`` writes the column's constant default (a
+    ``server_fields`` column's too: a new column has no rule of the database's to keep), ``VALUE`` a computed field's
+    expression, checked when the columns were listed. ``overwrite=True`` redefines an existing field, ``False`` keeps it
+    (``IF NOT EXISTS``); a non-``bool`` is a ``TypeError``. Pure.
+    """
+    parts = [
+        f"DEFINE FIELD {_overwrite_clause(overwrite)} {field_path(column.path)} ON "
+        f"{_identifier(_identifier_name(table, what='Table'))} TYPE {render_kind(column.kind)}"
+    ]
+    if schemafull and (column.free_object or column.flexible_requested or (before_3 and column.holds_any)):
+        parts.append("FLEXIBLE")
+    if column.default is not None:
+        parts.append(f"DEFAULT {column.default}")
+    if column.value is not None:
+        parts.append(f"VALUE {column.value}")
+    return " ".join(parts) + ";"
+
+
+def field_permissions_text(permissions: Mapping[str, str]) -> str | None:
+    """A field's ``PERMISSIONS`` as SurrealDB renders them, without the keyword (v0.34.0).
+
+    *permissions* maps ``select``, ``create`` and ``update`` to ``"FULL"``, ``"NONE"`` or ``"WHERE <expr>"`` (a stored
+    field's ``FieldState.permissions``); an operation left out is ``FULL``, a field's default. ``None`` when the three
+    are ``FULL`` — nothing to write —, ``"NONE"`` when the three are ``NONE``, else the ``FOR`` groups in the order the
+    rules first appear, ``FULL`` groups included, each listing its operations in the order select, create, update:
+    ``FOR select WHERE $auth.id = id, FOR create, update FULL``. Pure.
+    """
+    rules = {operation: permissions.get(operation, "FULL") for operation in _FIELD_OPERATIONS}
+    if all(rule == "FULL" for rule in rules.values()):
+        return None
+    if all(rule == "NONE" for rule in rules.values()):
+        return "NONE"
+    groups: dict[str, list[str]] = {}
+    for operation, rule in rules.items():
+        groups.setdefault(rule, []).append(operation)
+    return ", ".join("FOR " + ", ".join(operations) + " " + rule for rule, operations in groups.items())

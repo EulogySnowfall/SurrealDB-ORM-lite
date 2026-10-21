@@ -73,7 +73,10 @@ the permissions through ``permissions_rules()`` (a mapping of ``select``, ``crea
 ``NONE``); the comment through ``comment_text()`` (no NUL); ``flexible_fields`` a ``list`` or ``tuple`` of the model's
 field names. A permissions condition is one expression ``scan_fragment()`` accepts, with no ``;`` outside brackets: a
 check against mistakes, not an injection defence — a rule is trusted application code. The checks validate and never
-rewrite: the model keeps every key as declared.
+rewrite: the model keeps every key as declared. ``TableClauses`` holds the clauses a model declares, normalised;
+``declared_clauses()`` writes them in SurrealDB's order (schema mode, ``COMMENT``, ``CHANGEFEED``, ``PERMISSIONS``) and
+``table_statement()`` the table statement of ``table_ddl()``: the type clause, then those clauses, the table name in
+backticks.
 
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
 it.
@@ -1678,3 +1681,61 @@ def check_table_config(
     comment_text(comment, model=model)
     if flexible_fields is not None:
         _flexible_fields(flexible_fields, name=name, fields=fields)
+
+
+@dataclass(frozen=True, slots=True)
+class TableClauses:
+    """The table clauses a model declares, as a table statement writes them (v0.34.0).
+
+    ``schema_mode``: ``"SCHEMAFULL"``, ``"SCHEMALESS"`` or ``None``; ``comment``: the comment's text or ``None``;
+    ``changefeed``: the normalised change feed (``"7d"``, ``"1h INCLUDE ORIGINAL"``) or ``None``; ``permissions``: the
+    four-operation map of :func:`permissions_rules` or ``None``. ``None`` means not declared: the statement writes
+    nothing for it. ``TableClauses()`` declares nothing.
+    """
+
+    schema_mode: str | None = None
+    comment: str | None = None
+    changefeed: str | None = None
+    permissions: Mapping[str, str] | None = None
+
+
+def declared_clauses(clauses: TableClauses) -> list[str]:
+    """The clauses of *clauses* a table statement writes after its type clause, in order: the schema mode
+    (``SCHEMAFULL`` or ``SCHEMALESS``), ``COMMENT '<text>'`` (a string literal), ``CHANGEFEED <duration>[ INCLUDE
+    ORIGINAL]``, ``PERMISSIONS <rules>`` rendered by :func:`table_permissions_text` — ``PERMISSIONS NONE`` when every
+    rule is ``NONE`` (v0.34.0). A clause left ``None`` is not written. Pure.
+
+    The values come from a model's keys, checked when its class was defined (:func:`check_table_config`): a comment
+    without a NUL, a change feed :func:`changefeed_text` normalised, rules :func:`permissions_rules` normalised.
+    """
+    parts: list[str] = []
+    if clauses.schema_mode is not None:
+        parts.append(clauses.schema_mode)
+    if clauses.comment is not None:
+        parts.append(f"COMMENT {_quoted(clauses.comment)}")
+    if clauses.changefeed is not None:
+        parts.append(f"CHANGEFEED {clauses.changefeed}")
+    if clauses.permissions is not None:
+        parts.append(f"PERMISSIONS {table_permissions_text(clauses.permissions) or 'NONE'}")
+    return parts
+
+
+def table_statement(table: str, head: str, clauses: TableClauses, overwrite: object) -> str:
+    """``DEFINE TABLE {OVERWRITE | IF NOT EXISTS} `<table>` <head>[ <declared clauses>];`` — a model's table statement
+    (v0.34.0).
+
+    *head* is the table's type clause — ``TYPE NORMAL`` or ``TYPE ANY`` for a node model, :func:`relation_type_clause`'s
+    text for an edge model —, followed by :func:`declared_clauses` of *clauses*. *table* is checked as an identifier and
+    written in backticks. ``overwrite=True`` redefines an existing table (``OVERWRITE``, which resets the clauses the
+    statement does not write), ``False`` keeps it (``IF NOT EXISTS``); a non-``bool`` is a ``TypeError``. Pure.
+    """
+    return relation_statement(table, " ".join([head, *declared_clauses(clauses)]), overwrite)
+
+
+def user_extra_refused(model: str) -> str:
+    """The refusal of a ``TableType.USER`` model with ``extra="allow"`` and no declared schema mode (v0.34.0): its
+    table is ``SCHEMAFULL``, which refuses (SurrealDB 3.x) or drops (2.x) the fields the model does not declare. Pure."""
+    return (
+        f'{model}: extra="allow" keeps fields the model does not declare, and a TableType.USER table is SCHEMAFULL, which '
+        f'refuses them (SurrealDB 3.x) or drops them (2.x); remove extra="allow" from {model}.'
+    )

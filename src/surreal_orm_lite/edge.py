@@ -265,6 +265,12 @@ class BaseSurrealEdge(BaseSurrealModel):
         return cls.model_config.get("enforced") is True
 
     @classmethod
+    def _table_head(cls) -> str:
+        """The type clause of the edge's table statement (v0.34.0): ``TYPE RELATION[ IN …][ OUT …][ ENFORCED]``, from
+        :meth:`get_relation_in`, :meth:`get_relation_out` and :meth:`is_enforced` — what :meth:`relation_ddl` writes."""
+        return relation_type_clause(cls.get_relation_in(), cls.get_relation_out(), cls.is_enforced())
+
+    @classmethod
     def relation_ddl(cls, *, overwrite: bool = True) -> str:
         """Render the ``DEFINE TABLE … TYPE RELATION`` statement of this edge model's table (v0.33.0).
 

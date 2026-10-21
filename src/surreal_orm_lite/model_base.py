@@ -23,26 +23,32 @@ from ._sdk import NotFoundError, RecordID, SdkDuration, ServerError
 from .connection_manager import SurrealDBConnectionManager
 from .exceptions import SurrealDbError
 from .functions import SurrealFunc, _ComputedDefault
+from .model_ddl import Column, field_statement, model_columns
 from .routing import check_config_connection, check_same_connection, check_transaction
 from .schema import (
     Event,
+    TableClauses,
     changefeed_text,
     check_events_config,
     check_relation_config,
     check_table_config,
     check_view_config,
     check_view_query,
+    comment_text,
     dependent_views,
     dependents_not_removed,
     ensure_async_events_supported,
     ensure_view_query_supported,
     ensure_view_removable,
     event_subject,
+    permissions_rules,
     read_table_definitions,
     remove_event_statement,
     remove_view_statement,
     table_holds_records,
     table_kind,
+    table_statement,
+    user_extra_refused,
     view_statement,
     view_table_refused,
     view_write_refused,
@@ -1361,6 +1367,124 @@ class BaseSurrealModel(BaseModel):
             redact=False,
         )
         return statement
+
+    # ==================== Model table DDL (v0.34.0) ====================
+
+    @classmethod
+    def _declared_table_clauses(cls) -> TableClauses:
+        """The table clauses the model declares, normalised (v0.34.0): :meth:`get_schema_mode`, the ``comment`` key,
+        :meth:`get_changefeed` and the ``permissions`` key as ``schema.permissions_rules()`` normalises it (the four
+        operations), each ``None`` when not declared. The keys were checked when the class was defined."""
+        mode = cls.get_schema_mode()
+        permissions = cls.model_config.get("permissions")
+        return TableClauses(
+            schema_mode=None if mode is None else mode.value,
+            comment=comment_text(cls.model_config.get("comment"), model=cls),
+            changefeed=cls.get_changefeed(),
+            permissions=None if permissions is None else permissions_rules(permissions, model=cls),
+        )
+
+    @classmethod
+    def _table_head(cls) -> str:
+        """The type clause of the model's table statement (v0.34.0): ``TYPE ANY`` for ``TableType.ANY``, ``TYPE
+        NORMAL`` for ``NORMAL``, ``USER``, ``STREAM`` and ``HASH``. ``BaseSurrealEdge`` writes its ``TYPE RELATION``
+        clause instead."""
+        return "TYPE ANY" if cls.get_table_type() is TableType.ANY else "TYPE NORMAL"
+
+    @classmethod
+    def _table_columns(cls) -> tuple[Column, ...]:
+        """The columns the model's table DDL defines (v0.34.0): ``model_ddl.model_columns()`` of the model — every field
+        but ``id`` and an edge's endpoints, under its column (an alias), its computed fields' expressions, its
+        ``flexible_fields`` and its ``server_fields``.
+
+        Raises:
+            ValueError: a ``FLEXIBLE`` request on a kind without an object; a computed field's expression that is not
+                SurrealQL the ORM can embed; ``server_fields`` names a field the model does not declare.
+        """
+        computed = cls.get_computed_fields()
+        endpoints = {cls.to_py_field(column) for column in cls._endpoint_columns()}
+        flexible = cls.model_config.get("flexible_fields")
+        return model_columns(
+            cls,
+            columns=cls.get_field_aliases(),
+            computed=computed,
+            # Checked at the class statement: a list or tuple of field names, or None.
+            flexible=tuple(flexible) if isinstance(flexible, (list, tuple)) else (),
+            exclude={"id", *endpoints},
+            server=cls.get_server_fields() - computed.keys(),
+        )
+
+    @classmethod
+    def _table_ddl(cls, overwrite: bool, clauses: TableClauses) -> list[str]:
+        """The statements of :meth:`table_ddl` with the table clauses *clauses* (v0.34.0): a view model's view
+        statement; else the table statement (:meth:`_table_head` and *clauses*), then one ``DEFINE FIELD`` per column,
+        ``FLEXIBLE`` following *clauses*' schema mode. Pure.
+
+        Raises:
+            TypeError: *overwrite* is not a ``bool``; a ``TableType.USER`` model with ``extra="allow"``.
+            ValueError: see :meth:`_table_columns`.
+        """
+        if cls._is_view():
+            return [cls.view_ddl(overwrite=overwrite)]
+        table = cls.get_table_name()
+        statement = table_statement(table, cls._table_head(), clauses, overwrite)
+        if cls.get_table_type() is TableType.USER and cls.model_config.get("extra") == "allow":
+            raise TypeError(user_extra_refused(cls.__name__))
+        schemafull = clauses.schema_mode == SchemaMode.SCHEMAFULL.value
+        fields = [field_statement(table, column, overwrite=overwrite, schemafull=schemafull) for column in cls._table_columns()]
+        return [statement, *fields]
+
+    @classmethod
+    def table_ddl(cls, *, overwrite: bool = True) -> list[str]:
+        """The ``DEFINE TABLE`` and ``DEFINE FIELD`` statements of this model's table (v0.34.0) — pure, the same text
+        every time.
+
+        Builds the SurrealQL without touching the database (no connection needed), so it can be printed, diffed or fed
+        into a migration. A view model: ``[view_ddl(overwrite=…)]``. An edge model: its relation statement
+        (:meth:`~surreal_orm_lite.edge.BaseSurrealEdge.relation_ddl`), then its data fields (never ``in``/``out``,
+        which SurrealDB defines from the relation). Any other model: ``DEFINE TABLE {OVERWRITE | IF NOT EXISTS}
+        `<table>` TYPE NORMAL|ANY`` (``TYPE ANY`` for ``TableType.ANY``) with the clauses it declares — schema mode
+        (:meth:`get_schema_mode`), ``COMMENT``, ``CHANGEFEED``, ``PERMISSIONS`` —, then one ``DEFINE FIELD {OVERWRITE |
+        IF NOT EXISTS}`` per column, parents before children: every field but ``id``, under its column (an alias),
+        its sub-model's fields (``address.city``, ``subs.*.city``), the items of an untyped list (``bag.*``, kind
+        ``any``) and the Pydantic computed fields.
+
+        Each column's ``TYPE`` comes from its annotation (README section 35, "Field types"; anything else is
+        ``any``), ``option<…>`` when it admits ``None``. A constant default of a column that is not optional is its
+        ``DEFAULT``; a ``server_fields`` column without one — a ``default_factory``, or no default — gets none, so a
+        create that leaves it out is refused until the database gives the column a ``DEFAULT`` or ``VALUE``. A computed
+        field is written ``TYPE option<…> VALUE <expression>`` (``define_table()`` writes ``COMPUTED`` over a stored
+        ``COMPUTED`` definition).
+
+        Only what the model declares: applied by hand, ``OVERWRITE`` resets every clause it does not write;
+        ``define_table()`` keeps them. ``FLEXIBLE`` (written after ``TYPE``) follows the declared mode — on a
+        ``SCHEMAFULL`` model, the columns holding a free-form object (a ``dict``, a record model, a sub-model with
+        ``extra="allow"``) and those of ``flexible_fields``; none when the model declares no mode. On SurrealDB 2.x
+        ``define_table()`` also writes it on the columns that hold ``any``. On a new table,
+        ``"\\n".join(Model.table_ddl())`` is what ``define_table()`` returns, except on SurrealDB 2.x where
+        ``define_table()`` adds ``FLEXIBLE`` to those columns.
+
+        Names are written in backticks; literal kinds and defaults through the ORM's closed SurrealQL encoder; a
+        computed field's expression, a permissions rule and the comment are trusted application code, checked against
+        mistakes (balanced brackets, terminated literals, no comment marker), not an injection defence.
+
+        Args:
+            overwrite: ``True`` (default) emits ``OVERWRITE`` in each statement, which redefines what exists.
+                ``False`` emits ``IF NOT EXISTS``, which leaves an existing table or field as it is.
+
+        Raises:
+            TypeError: *overwrite* is not a ``bool``; a ``TableType.USER`` model with ``extra="allow"`` (its table is
+                ``SCHEMAFULL``, which refuses or drops the fields the model does not declare).
+            ValueError: a ``FLEXIBLE`` request on a kind without an object; a computed field's expression that is not
+                SurrealQL the ORM can embed.
+
+        Example:
+            >>> print("\\n".join(Person.table_ddl()))
+            DEFINE TABLE OVERWRITE `person` TYPE NORMAL SCHEMAFULL COMMENT 'People';
+            DEFINE FIELD OVERWRITE `name` ON `person` TYPE string;
+            DEFINE FIELD OVERWRITE `age` ON `person` TYPE int DEFAULT 18;
+        """
+        return cls._table_ddl(overwrite, cls._declared_table_clauses())
 
     # ==================== Field aliases & server-owned fields (v0.18.0) ====================
 
