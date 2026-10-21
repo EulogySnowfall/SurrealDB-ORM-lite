@@ -269,7 +269,7 @@ await User.objects().filter(name__regex=r"^\d{3}").exec()          # SurrealDB's
 - **`match` and `regex`.** Both take a regular expression in SurrealDB's syntax (the Rust
   `regex` crate) and match anywhere in the value unless it is anchored (`^…$`). Prefix it
   with `(?i)` to ignore case. Here `match` is a regex lookup, not the full SurrealDB-ORM's
-  full-text `@@` operator: full-text search is planned for v0.34.0, as a separate API.
+  full-text `@@` operator: full-text search is planned for v0.35.0, as a separate API.
 - **Values.** The value must be a `str`, otherwise `ValueError`. A string starting with `$`
   is data, as for every lookup ([String filter values and `Var()`](#string-filter-values-and-var)).
   `startswith`, `endswith`, `match` and `regex` also take a `Var`. `like` and `ilike` do not:
@@ -1581,7 +1581,7 @@ async with Order.objects().filter(status="open").live(on_reconnect=catch_up) as 
 The connection manager benefits too: `get_client()` now replaces a dropped WebSocket client
 instead of handing back a dead one, and concurrent callers share one new connection. A request
 that was already in flight when the socket dropped still fails — with the SDK's own `KeyError` —
-because retrying arbitrary queries is planned for v0.40.0.
+because retrying arbitrary queries is planned for v0.41.0.
 
 **One exception: an identity the manager does not store.** `signin()`, `signup()` and
 `authenticate()` with `store=False` change the connection's own identity (that is the SDK's
@@ -3168,7 +3168,7 @@ async with embedded_database() as client:
 - **`load()` is typed** to yield the fixture class, so `fixtures.alice` has its model's type
   (the full ORM yields `Any`).
 - **Lite additions**: `SurrealDBConnectionManager.is_embedded()` and `embedded_database()`.
-- **`ModelFactory` and `Faker`** come in v0.39.0.
+- **`ModelFactory` and `Faker`** come in v0.40.0.
 
 ### 27. Time travel (`as_of()`)
 
@@ -4430,8 +4430,8 @@ reads, stores, logs or writes them.
   (`crypto::argon2::generate($value)`) stays in `FieldState.value` and the field is generated as a writable field.
 - **APIs and the GraphQL config are not typed**: their definitions are in `SchemaState.other["apis"]` and
   `SchemaState.other["configs"]`, as SurrealDB returns them (full ORM: `ApiState`, `GraphQLConfigState`).
-- **`SchemaState.diff()` and `schema_diff()` come with v0.37.0** (migrations), as does `applied_migrations`; the
-  `inspectdb` command comes with v0.38.0.
+- **`SchemaState.diff()` and `schema_diff()` come with v0.38.0** (migrations), as does `applied_migrations`; the
+  `inspectdb` command comes with v0.39.0.
 - **A refused or failed `INFO FOR DB` raises** `SurrealDbAuthenticationError` or `SurrealDbError`, and a
   definition that cannot be read or parsed becomes a `SchemaIssue` in `schema.issues` and a logged warning (full
   ORM: an empty state, and definitions dropped with a debug log).
@@ -4538,7 +4538,7 @@ except ServerError as exc:  # the event refused the write: nothing changed
 - `Account.remove_event("email_audit")` removes one event (`REMOVE EVENT IF EXISTS`; with `missing_ok=False` an
   event that does not exist raises `SurrealDbNotFoundError`). An event the model no longer declares stays defined
   until it is removed: `define_events()` does not compare the database with the model (that comes with migrations,
-  v0.37.0).
+  v0.38.0).
 - A subclass inherits `events` and defines them on its own table, unless it sets its own (`events=[]` for none).
   Typed edges (`BaseSurrealEdge`) take events too: they fire on the edge table. Defining an event on a table that
   does not exist creates the table, `SCHEMALESS`.
@@ -4715,7 +4715,7 @@ system user: run `define_events()` and `define_function()` at start-up or deploy
   `''`, which SurrealDB refuses).
 - **`define_function()` has no full-ORM equivalent**: the full ORM declares a function with `RawSQL`.
 - **The migration operations** (`DefineEvent`, `RemoveEvent`, `RawSQL`) and the removal of the events a model no
-  longer declares **come with migrations (v0.37.0)**.
+  longer declares **come with migrations (v0.38.0)**.
 
 ### 33. Materialized views (`view_query`, `define_view()`)
 
@@ -4856,12 +4856,15 @@ print([(str(order.id), order.amount) for order in await PaidOrder.objects().orde
   on WebSocket `live()`/`watch()`, which receive the records SurrealDB recomputes. `relate()` and `remove_relation()`
   from or to a view record write the edge table and are allowed.
 - On a view model, `filter(id__in=...)` is sent as `$ids CONTAINS id`: SurrealDB 3.x (3.1 and 3.3 measured) answers
-  no record to `id IN` on a view table, while `CONTAINS` is right on every line; write raw SurrealQL over a view the
-  same way.
+  no record to `id IN` on a view table
+  ([surrealdb/surrealdb#7608](https://github.com/surrealdb/surrealdb/issues/7608)), while `CONTAINS` is right on every
+  line; write raw SurrealQL over a view the same way.
 - `live()` instances carry the record id on both lines; `watch()` yields the server's envelopes as received: on 3.x
-  their `result` has no `id`, read `record`.
+  their `result` has no `id` ([surrealdb/surrealdb#7607](https://github.com/surrealdb/surrealdb/issues/7607)), read
+  `record`.
 - On SurrealDB 3.x a live query on a view filtered on `id` never notifies (the server's view notifications carry no
-  id); filter on the view's fields, e.g. `filter(status="paid")`.
+  id, [surrealdb/surrealdb#7607](https://github.com/surrealdb/surrealdb/issues/7607)); filter on the view's fields,
+  e.g. `filter(status="paid")`.
 
 #### Writes are refused
 
@@ -4948,9 +4951,9 @@ record user's session.
 - **`TypeError` with the same first words** (`Cannot modify materialized view '<table>'`), on every write path above
   (full ORM: `save()`, `update()`, `merge()`, `delete()` only).
 - **`define_view()`/`remove_view()`/`view_ddl()`** apply, remove and render the view, where the full ORM applies one
-  through migrations (`CreateTable`/`AlterTable`) or `define_table()`. Those come with v0.37.0, whose
-  `define_table()` accepts a view model and applies it through `view_ddl()`, so full-ORM code calling
-  `define_table()` on a view works from then on.
+  through migrations (`CreateTable`/`AlterTable`) or `define_table()`. `define_table()` comes with v0.34.0: it accepts
+  a view model and applies it through `view_ddl()`, so full-ORM code calling `define_table()` on a view works from
+  then on. Migrations come with v0.38.0.
 - **`AS (…)` as in the full ORM, the table name quoted** (``DEFINE TABLE OVERWRITE `order_stats` AS (…)``).
 - **Generated models write `view_query=`**, as the full ORM's do
   ([section 31](#31-schema-introspection-databaseintrospector-generate_models_from_db)).
@@ -5047,7 +5050,7 @@ except SurrealDbNotFoundError as exc:
   write nothing.
 - `table_type=TableType.RELATION` is optional: an edge model's table is always `TYPE RELATION`, and an edge model
   with another `TableType` raises `TypeError`. `TableType` is the full ORM's enum (`NORMAL`, `USER`, `STREAM`, `HASH`,
-  `RELATION`, `ANY`); its other members are recorded for the table DDL of v0.37.0 and have no effect before it.
+  `RELATION`, `ANY`); its other members are recorded for the table DDL of v0.34.0 and have no effect before it.
 - The keys are checked when the class is defined: a `table_type` that is not a `TableType` (a plain `"relation"`
   string included), an `enforced` that is not a bool, or a value that is not a string, a list or a tuple raises
   `TypeError`; a name that is not an identifier, or a string of spaces only, raises `ValueError`. On a node model
@@ -5251,8 +5254,8 @@ session.
 - **The relation model is `BaseSurrealEdge`**: a `BaseSurrealModel` with `table_type=TableType.RELATION` (the full
   ORM's `class Likes(BaseSurrealModel)` form) raises `TypeError`; derive it from `BaseSurrealEdge`.
 - **`relation_ddl()` and `define_relation()` on the edge model** render and apply the constraint, where the full ORM
-  applies the DDL through migrations or `define_table()`. Those come with v0.37.0, which will apply an edge model
-  through `define_relation()`.
+  applies the DDL through migrations or `define_table()`. `define_table()` comes with v0.34.0 and will apply an edge
+  model through the statement `define_relation()` carries; migrations come with v0.38.0.
 - **The table's other clauses are kept from the database** rather than rendered from the model: the lite has no
   schema-mode, permissions, change-feed or comment keys yet.
 - **Names are identifiers, written in backquotes, and a pipe-joined string is parsed** (the full ORM writes the value
@@ -5266,7 +5269,7 @@ session.
 - **Generated edge models carry the keys but no `table_type=`**
   ([section 31](#31-schema-introspection-databaseintrospector-generate_models_from_db)): their base class,
   `BaseSurrealEdge`, says it.
-- **`TableType`'s other members have no effect until v0.37.0.**
+- **`TableType`'s other members have no effect until v0.34.0.**
 - **`remove_relation()` deletes edges, not a constraint**: the name is the graph API's (section 7); a keyless
   `define_relation()` removes the constraint.
 - **Upgrading from 0.32 or earlier**: these keys were accepted and ignored before 0.33.0. They are now checked at the
@@ -5530,7 +5533,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | A grouped view selecting a field outside `GROUP BY` and outside an aggregate (`amount`, `math::percentile(amount, 50)`, `*`)           | `SurrealDbError` before any DDL: the server would keep the last source record's value, or refuse every source write                                                           | `SurrealDbError` when the view is defined (the server refuses it)                                                                                                                   | v0.32.0                              |
 | A grouped view whose `GROUP BY` names the alias of a computed field (`time::month(at) AS month` … `GROUP BY month`)                    | `SurrealDbError` before any DDL: the server would put every source record in one group                                                                                        | one group per computed value                                                                                                                                                        | v0.32.0                              |
 | Values a view computes (`math::sum()`, `math::mean()`, `count()` of an array)                                                          | a sum of integers is an `int`, a mean a `Decimal`; `count(tags)` of an array field adds the arrays' lengths                                                                   | both are `float`; `count(tags)` counts the records whose array is not empty                                                                                                         | v0.32.0                              |
-| Live queries and events on a view (a group emptied by a delete; a live query filtered on `id`)                                         | an emptied group: an `UPDATE` with the emptied values (a `count()` of 0), then a `DELETE`; a filter on `id` notifies                                                          | an emptied group: a `DELETE`; a filter on `id` never notifies (the view's notifications carry no `id`): filter on the view's fields                                                 | v0.32.0                              |
+| Live queries and events on a view (a group emptied by a delete; a live query filtered on `id`)                                         | an emptied group: an `UPDATE` with the emptied values (a `count()` of 0), then a `DELETE`; a filter on `id` notifies                                                          | an emptied group: a `DELETE`; a filter on `id` never notifies ([surrealdb#7607](https://github.com/surrealdb/surrealdb/issues/7607)): filter on the view's fields                   | v0.32.0                              |
 | Removing a materialized view, or a source table, that another view reads (`remove_view()`, `REMOVE TABLE`)                             | `remove_view()` raises `SurrealDbError` before any DDL, unless its transaction removes those views first; a raw `REMOVE TABLE` makes them ordinary tables, last records kept  | `SurrealDbError` from the server (`Cannot delete table … on which a view is defined`): remove the views that read it first                                                          | v0.32.0                              |
 | Relation constraints from an edge model (`define_relation()`: `TYPE RELATION IN … OUT … ENFORCED`)                                     | same on both lines: one `DEFINE TABLE OVERWRITE` that keeps the table's other clauses, records, fields, indexes and events, enforced at once                                  | the same                                                                                                                                                                            | v0.33.0                              |
 | A raw `ALTER TABLE … TYPE RELATION …` of a table already written to                                                                    | `INFO` shows the new type, but writes keep the old constraint until a `DEFINE TABLE OVERWRITE`; the ORM never sends `ALTER TABLE`                                             | enforced at once; the ORM still sends `DEFINE TABLE OVERWRITE`                                                                                                                      | v0.33.0                              |
@@ -5618,8 +5621,8 @@ Contributions are welcome! Please:
 | v0.31.0           | Tier 3 — Server-side events and DDL helpers          | ✅ Released |
 | v0.32.0           | Tier 3 — Materialized views                          | ✅ Released |
 | v0.33.0           | Tier 3 — `TYPE RELATION` constraints                 | ✅ Released |
-| v0.34.0 – v0.39.0 | Tier 3 — Advanced (search, migrations, CLI)          | 📋 Planned  |
-| v0.40.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
+| v0.34.0 – v0.40.0 | Tier 3 — Advanced (DDL, search, migrations, CLI)     | 📋 Planned  |
+| v0.41.0           | Beta Phase (API freeze, hardening)                   | 📋 Planned  |
 | v2.0.0            | Production / GA (aligned with SDK 2.0)               | 📋 Planned  |
 
 > Every roadmap feature is implementable with the **official SDK 2.0** (native methods or
@@ -5676,12 +5679,13 @@ SDK) and **server support**. Everything below is on the lite roadmap via the off
 | `define_function()` (DDL)     | ✅ v0.31.0                                                            | ❌                                        |
 | Materialized views            | ✅ v0.32.0 (`view_query`, `define_view()`)                            | ✅                                        |
 | TYPE RELATION enforcement     | ✅ v0.33.0 (`relation_in`, `define_relation()`)                       | ✅ DDL (`TableType.RELATION`, migrations) |
-| Full-Text Search              | v0.34.0                                                               | ✅                                        |
-| Vector Search (KNN/HNSW)      | v0.35.0                                                               | ✅                                        |
-| Hybrid Search (RRF)           | v0.36.0                                                               | ✅                                        |
-| Migrations & CLI              | v0.37 – v0.38                                                         | ✅                                        |
-| Test Fixtures & Factories     | ✅ v0.25.0 SurrealFixture; factories v0.39.0                          | ✅                                        |
-| Retry, Logging, Metrics       | v0.40.0                                                               | ✅                                        |
+| Model table DDL               | v0.34.0 (`define_table()`)                                            | ✅                                        |
+| Full-Text Search              | v0.35.0                                                               | ✅                                        |
+| Vector Search (KNN/HNSW)      | v0.36.0                                                               | ✅                                        |
+| Hybrid Search (RRF)           | v0.37.0                                                               | ✅                                        |
+| Migrations & CLI              | v0.38 – v0.39                                                         | ✅                                        |
+| Test Fixtures & Factories     | ✅ v0.25.0 SurrealFixture; factories v0.40.0                          | ✅                                        |
+| Retry, Logging, Metrics       | v0.41.0                                                               | ✅                                        |
 | Connection Pool               | post-GA (tentative)                                                   | ✅                                        |
 | Custom SDK / CBOR Protocol    | ❌ never                                                              | ✅                                        |
 

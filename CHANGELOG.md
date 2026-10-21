@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Roadmap: the model table DDL comes next, as v0.34.0.** `Model.define_table()`, as close as
+  possible to the full SurrealDB-ORM's, will generate a model's `DEFINE TABLE` and `DEFINE FIELD`
+  statements and apply them with `query()`. It was planned with the migrations; it now comes
+  before the search versions, whose index and analyzer DDL build on it. The later versions move up
+  one: full-text search v0.35.0, vector search v0.36.0, hybrid search v0.37.0, migrations v0.38.0,
+  the CLI v0.39.0, test factories v0.40.0 and the Beta phase v0.41.0. `docs/ROADMAP.md` records
+  the constraints the released versions leave v0.34.0, and the README uses the new numbers.
+- **Reading the released entries below**: they keep the numbers they were written with. Full-text
+  search v0.34.0 is now v0.35.0; `define_table()` and `TableType`'s other members v0.37.0 are now
+  v0.34.0; migrations, `schema_diff()`/`SchemaState.diff()` and the removal of events v0.37.0 are
+  now v0.38.0; the `inspectdb` command v0.38.0 is now v0.39.0; `ModelFactory` and `Faker` v0.39.0
+  are now v0.40.0; retrying arbitrary queries v0.40.0 is now v0.41.0 (Beta).
+- **README section 33 links the upstream SurrealDB issues** behind its two view workarounds on
+  3.x: `id IN` on a view table answers no record
+  ([surrealdb/surrealdb#7608](https://github.com/surrealdb/surrealdb/issues/7608)), and a view's
+  live notifications carry no `id`
+  ([surrealdb/surrealdb#7607](https://github.com/surrealdb/surrealdb/issues/7607)). The v0.32.0
+  row "Live queries and events on a view" of "ORM behaviour: SurrealDB 2.x vs 3.x" links #7607
+  too, next to its 3.x workaround (filter on the view's fields, not on `id`).
+
+### Fixed
+
+- **The 0.33.0 notes: `relation_ddl()` and `define_relation()` are edge-model methods.** The
+  [0.33.0] entry below writes `Model.relation_ddl()` and `await Model.define_relation()`. Both are
+  class methods of `BaseSurrealEdge` only, `Edge.relation_ddl()` and
+  `await Edge.define_relation()`; a node model has neither (`AttributeError`).
+  `Model.get_table_type()` is on every model, as written. The ROADMAP's 0.33.0 entry now says so.
+
 ## [0.33.0] - 2026-10-20
 
 `TYPE RELATION` enforcement: an edge model declares which tables its edges may join and whether
