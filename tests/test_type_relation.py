@@ -75,6 +75,10 @@ cases are ``tests/test_model_generator.py``'s ``TestRelationKeys``.
 The README (spec §11.1; AC-17; P1–P4): section 34's place and subsections, its examples run in order on ``mem://``
 (each printed line equal to its comment), the key phrases of each subsection, sections 23 and 31's new sentences, and
 the features, roadmap, comparison and both behaviour tables (``TestReadmeSection34``).
+
+The roadmap (issues #291, #292): ``docs/ROADMAP.md`` plans the model table DDL (``define_table()``) as v0.34.0, before
+search, with the constraints this release and v0.32.0 leave it, moves the later versions up one, and writes
+``relation_ddl()``/``define_relation()`` as edge-model methods in the 0.33.0 entry (``TestRoadmapTableDdl``).
 """
 
 import ast
@@ -3129,7 +3133,7 @@ _PART_NEEDLES_34 = {
         "`enforced=True` makes SurrealDB refuse an edge whose endpoint record does not exist",
         "`table_type=TableType.RELATION` is optional",
         "`NORMAL`, `USER`, `STREAM`, `HASH`, `RELATION`, `ANY`",
-        "recorded for the table DDL of v0.37.0",
+        "recorded for the table DDL of v0.34.0",
         "checked when the class is defined",
         'a plain `"relation"` string included',
         "`TypeError`",
@@ -3269,9 +3273,13 @@ _COMING_FROM_PHRASES_34 = (
     "**A refused edge creation raises the ORM's `SurrealDbError` or `SurrealDbNotFoundError`, a refused update the "
     "official SDK's `InternalError`**",
     "**Generated edge models carry the keys but no `table_type=`**",
-    "**`TableType`'s other members have no effect until v0.37.0.**",
+    "**`TableType`'s other members have no effect until v0.34.0.**",
     "**`remove_relation()` deletes edges, not a constraint**",
     "**Upgrading from 0.32 or earlier**",
+)
+#: Issue #292: the third "Coming from" bullet names the version of ``define_table()`` and how it applies an edge model.
+_DEFINE_TABLE_ON_AN_EDGE_34 = (
+    "`define_table()` comes with v0.34.0 and will apply an edge model through the statement `define_relation()` carries"
 )
 #: Spec §11.1 item 2: section 23's "defined by hand" sentence and the end of item 3 of its migration list.
 _SECTION_23_DEFINED_BY_HAND = (
@@ -3305,8 +3313,8 @@ _FEATURES_ROW_34 = ["Relation constraints (`relation_in`, `define_relation()`, `
 _ROADMAP_ROWS_34 = [
     ["v0.32.0", "Tier 3 — Materialized views", "✅ Released"],
     ["v0.33.0", "Tier 3 — `TYPE RELATION` constraints", "✅ Released"],
-    ["v0.34.0 – v0.39.0", "Tier 3 — Advanced (search, migrations, CLI)", "📋 Planned"],
-    ["v0.40.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+    ["v0.34.0 – v0.40.0", "Tier 3 — Advanced (DDL, search, migrations, CLI)", "📋 Planned"],
+    ["v0.41.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
 ]
 _COMPARISON_TYPED_RELATIONS = ["Native typed relations", "✅ v0.22.0 (typed edge models)", "✅ DDL only (TableType.RELATION)"]
 _COMPARISON_ROWS_34 = [
@@ -3316,7 +3324,8 @@ _COMPARISON_ROWS_34 = [
         "✅ v0.33.0 (`relation_in`, `define_relation()`)",
         "✅ DDL (`TableType.RELATION`, migrations)",
     ],
-    ["Full-Text Search", "v0.34.0", "✅"],
+    ["Model table DDL", "v0.34.0 (`define_table()`)", "✅"],
+    ["Full-Text Search", "v0.35.0", "✅"],
 ]
 #: Spec §11.1 item 4 (§3 measured): exactly three rows v0.33.0 adds to the 2.x/3.x table, cell by cell.
 _RELATION_ROWS = [
@@ -3459,7 +3468,9 @@ class TestReadmeSection34:
             "derive the model from `BaseSurrealEdge`, import `TableType`",
         ):
             assert needle in upgrade, needle
-        assert "v0.37.0" in bullets[2] and "through `define_relation()`" in bullets[2], bullets[2]
+        # Issue #292: `define_table()` is v0.34.0's and goes through the carried statement; migrations are v0.38.0's.
+        assert _DEFINE_TABLE_ON_AN_EDGE_34 in bullets[2], bullets[2]
+        assert "migrations come with v0.38.0" in bullets[2], bullets[2]
         assert "`QueryError` for both" in bullets[7], bullets[7]
 
     def test_links_resolve(self) -> None:
@@ -3505,15 +3516,16 @@ class TestReadmeSection34:
         roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
         start = [row[0] for row in roadmap].index("v0.32.0")
         assert roadmap[start : start + 4] == _ROADMAP_ROWS_34, roadmap
-        assert "v0.33.0 – v0.39.0" not in [row[0] for row in roadmap]
+        firsts = [row[0] for row in roadmap]
+        assert "v0.33.0 – v0.39.0" not in firsts and "v0.34.0 – v0.39.0" not in firsts and "v0.40.0" not in firsts
 
     def test_comparison_rows(self) -> None:
         """The "Native typed relations" row no longer announces v0.33.0; the ``TYPE RELATION`` row comes right after
-        the materialized views, before full-text search."""
+        the materialized views, then the model table DDL of v0.34.0, before full-text search (issue #292)."""
         comparison = [row for _, row in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
         assert _COMPARISON_TYPED_RELATIONS in comparison, comparison
         start = [row[0] for row in comparison].index("Materialized views")
-        assert comparison[start : start + 3] == _COMPARISON_ROWS_34, comparison
+        assert comparison[start : start + 4] == _COMPARISON_ROWS_34, comparison
 
     def test_server_behaviour_rows(self) -> None:
         """Exactly three rows, Since v0.33.0, together and in version order: earlier releases above them, later ones
@@ -3565,3 +3577,142 @@ class TestReadmeSection34:
                     assert capsys.readouterr().out.splitlines() == _readme_printed(code), code
         finally:
             namespace.clear()
+
+
+# --- docs/ROADMAP.md: the model table DDL of v0.34.0 (issues #291, #292) -------------------------------------------
+
+_ROADMAP = Path(__file__).resolve().parents[1] / "docs" / "ROADMAP.md"
+_PHASE_F = "### 🔴 Phase F — Schema & DDL"
+_ENTRY_34 = "#### Version 0.34.0 — Model table DDL"
+#: Every version row of the "## Planned" tiers that carries no ✅, in order: the first is the next version to build
+#: (the maintainer's automation reads it the same way). v0.34.0 comes before search; Phases G and H move up one.
+_PLANNED_ROWS = [
+    ("v0.34.0", "Model table DDL (`define_table()`)"),
+    ("v0.35.0", "Full-Text Search (`search()`, BM25 score/highlight)"),
+    ("v0.36.0", "Vector Search (`similar_to()`, KNN)"),
+    ("v0.37.0", "Hybrid Search (RRF)"),
+    ("v0.38.0", "Migration system (makemigrations / migrate / rollback)"),
+    ("v0.39.0", "CLI `surreal-orm-lite` (shell, migrate, inspectdb)"),
+    ("v0.40.0", "Test fixtures & factories (`ModelFactory`, pytest)"),
+]
+_PHASE_F_ROW_34 = ["v0.34.0", "Model table DDL (`define_table()`)", "`DEFINE TABLE` + `DEFINE FIELD`"]
+#: What the planned "Version 0.34.0" entry says, whitespace normalised: the API, and the constraints the released
+#: versions leave it (issue #291 point 2 among them).
+_ENTRY_NEEDLES_34 = (
+    "`Model.define_table()`, as close as possible to the full SurrealDB-ORM's",
+    "`DEFINE TABLE` and `DEFINE FIELD`",
+    "(schema mode, field types, permissions, change feed, comment), applied with `query()`",
+    "before the search versions",
+    "A view model (`view_query`, v0.32.0) is applied through `view_ddl()`",
+    "An edge model (`BaseSurrealEdge`, v0.33.0) is applied through the statement `define_relation()` carries, never a "
+    "bare `DEFINE TABLE OVERWRITE`, which resets the permissions to `NONE` and drops the schema mode, the change feed "
+    "and the comment (README section 34)",
+    "`TableType`'s other members (`NORMAL`, `USER`, `STREAM`, `HASH`, `ANY`) take effect",
+    "Generated node models get `table_type=`",
+)
+#: The deferral notes of the released versions, whitespace normalised, by entry heading: each names the new number
+#: of what it defers (``define_table()`` v0.34.0, migrations v0.38.0, the CLI v0.39.0, factories v0.40.0).
+_DEFERRED_34 = {
+    "### Version 0.16.0 — Connection-level authentication": ("`DefineAccess` operation comes with migrations (v0.38.0)",),
+    "### Version 0.25.0 — Embedded test engine": ("`ModelFactory` and `Faker` stay in v0.40.0",),
+    "### Version 0.30.0 — Schema introspection": (
+        "`SchemaState.diff()` → v0.38.0 (migrations), the `inspectdb` command → v0.39.0 (CLI)",
+    ),
+    "### Version 0.31.0 — Server-side events and DDL helpers": (
+        "the removal of events a model no longer declares → v0.38.0 (migrations)",
+    ),
+    "### Version 0.32.0 — Materialized views": (
+        "`define_table()` → v0.34.0, which will accept a view model and apply it through `view_ddl()`",
+        "migrations (`CreateTable`/`AlterTable` with `view_query`) → v0.38.0",
+    ),
+    "### Version 0.33.0 — `TYPE RELATION` enforcement": (
+        "`define_table()` → v0.34.0, which will apply an edge model through the statement `define_relation()` carries",
+        "migrations (`CreateTable`/`AlterTable` with the relation keys) → v0.38.0",
+    ),
+}
+
+
+def _roadmap() -> str:
+    return _ROADMAP.read_text(encoding="utf-8")
+
+
+class TestRoadmapTableDdl:
+    """Issue #292: ``docs/ROADMAP.md`` inserts the model table DDL (``define_table()``) as v0.34.0, before search, and
+    moves the later versions up one (search v0.35.0–v0.37.0, tooling v0.38.0–v0.40.0, Beta v0.41.0). Issue #291: the
+    0.33.0 entry writes ``relation_ddl()``/``define_relation()`` as edge-model methods."""
+
+    def test_next_planned_version_is_the_model_table_ddl(self) -> None:
+        planned = "\n".join(part for part in _roadmap().split("\n## ") if part.startswith("Planned"))
+        rows = re.findall(r"^\|\s*(v\d+\.\d+\.\d+)\s*\|\s*([^|]+?)\s*\|", planned, re.MULTILINE)
+        assert [row for row in rows if "✅" not in row[1]] == _PLANNED_ROWS, rows
+
+    def test_phase_f_ends_with_v0_34_0(self) -> None:
+        rows = [cells for _, cells in _table_rows(_subsection(_PHASE_F, _roadmap()))]
+        assert [cells[0] for cells in rows] == ["✅ v0.30.0", "✅ v0.31.0", "✅ v0.32.0", "✅ v0.33.0", "v0.34.0"], rows
+        assert rows[-1] == _PHASE_F_ROW_34, rows[-1]
+
+    def test_version_0_34_0_entry(self) -> None:
+        """Right after the Phase F table, before Phase G; the API and its four constraints."""
+        roadmap = _roadmap()
+        assert roadmap.index(f"\n{_PHASE_F}\n") < roadmap.index(f"\n{_ENTRY_34}\n") < roadmap.index("\n### 🔎 Phase G")
+        entry = _normalised(_subsection(_ENTRY_34, roadmap))
+        missing = [needle for needle in _ENTRY_NEEDLES_34 if needle not in entry]
+        assert not missing, missing
+
+    def test_overview_beta_and_ga(self) -> None:
+        roadmap = _roadmap()
+        overview = [cells for _, cells in _table_rows(_subsection("## Overview", roadmap))]
+        start = [cells[0] for cells in overview].index("v0.33.0")
+        assert overview[start + 1 : start + 3] == [
+            ["v0.34.0 – v0.40.0", "Tier 3 — Advanced (DDL/search/migrations/CLI), 7 minors", "Planned"],
+            ["v0.41.0", "Beta Phase (API freeze, hardening)", "Planned"],
+        ], overview
+        beta = _normalised(_subsection("### Version 0.41.0 — Beta Phase (API freeze)", roadmap))
+        assert "no regression since v0.40.0" in beta, beta
+        ga = _normalised(_subsection("### Version 2.0.0 — Production / GA", roadmap))
+        assert "No breaking change since v0.41.0 (the Beta-frozen API is honored)" in ga, ga
+
+    def test_sdk_and_comparison_tables(self) -> None:
+        """The two tables that date every feature: the model table DDL gets its row, the later rows their new number."""
+        roadmap = _roadmap()
+        unlocked = [
+            cells for _, cells in _table_rows(_subsection("## 🆕 Everything unlocked by the official SDK 2.0", roadmap))
+        ]
+        start = [cells[0] for cells in unlocked].index("`TYPE RELATION` enforcement")
+        assert [(cells[0], cells[2]) for cells in unlocked[start + 1 :]] == [
+            ("Model table DDL (`define_table()`)", "v0.34.0"),
+            ("Full-Text Search (BM25)", "v0.35.0"),
+            ("Vector Search (KNN, HNSW/MTREE)", "v0.36.0"),
+            ("Hybrid Search (RRF)", "v0.37.0"),
+            ("Migrations (makemigrations/migrate)", "v0.38.0"),
+            ("CLI `surreal-orm-lite`", "v0.39.0"),
+            ("Test fixtures & factories", "v0.40.0"),
+            ("QueryLogger / profiling", "v0.41.0 (Beta)"),
+        ], unlocked
+        comparison = [
+            cells for _, cells in _table_rows(_subsection("## SurrealDB-ORM vs SurrealDB-ORM-lite Comparison", roadmap))
+        ]
+        start = [cells[0] for cells in comparison].index("TYPE RELATION enforcement")
+        assert comparison[start + 1 : start + 8] == [
+            ["Model table DDL", "yes", "v0.34.0 (`define_table()`)"],
+            ["Full-Text Search (BM25)", "yes", "v0.35.0"],
+            ["Vector Search (KNN/HNSW)", "yes", "v0.36.0"],
+            ["Hybrid Search (RRF)", "yes", "v0.37.0"],
+            ["Migrations & CLI", "yes", "v0.38 – v0.39"],
+            ["Test fixtures & factories", "yes", "v0.25.0 + v0.40.0"],
+            ["QueryLogger / profiling", "yes", "v0.41.0"],
+        ], comparison
+
+    @pytest.mark.parametrize("heading", list(_DEFERRED_34))
+    def test_released_entries_name_the_new_numbers(self, heading: str) -> None:
+        entry = _normalised(_subsection(heading, _roadmap()))
+        missing = [needle for needle in _DEFERRED_34[heading] if needle not in entry]
+        assert not missing, missing
+
+    def test_version_0_33_0_writes_edge_methods(self) -> None:
+        """Issue #291 point 1: ``relation_ddl()`` and ``define_relation()`` are class methods of ``BaseSurrealEdge``
+        only; ``get_table_type()`` is on every model."""
+        entry = _normalised(_subsection("### Version 0.33.0 — `TYPE RELATION` enforcement", _roadmap()))
+        assert "`Edge.relation_ddl()`" in entry and "`await Edge.define_relation()`" in entry, entry
+        assert "`Model.relation_ddl()`" not in entry and "`Model.define_relation()`" not in entry, entry
+        assert "On an edge model (`BaseSurrealEdge` only), `Edge.relation_ddl()` renders" in entry, entry

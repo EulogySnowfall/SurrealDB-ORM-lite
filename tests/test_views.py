@@ -4193,8 +4193,8 @@ _GONE = RecordID("mv_order_stats", ["gone"])
 #: The failure of :meth:`TestViewReadsE2E.test_raw_id_in_on_a_view_per_line` once SurrealDB 3.x answers ``id IN`` on
 #: a view table again.
 _ID_IN_FIXED = (
-    "SurrealDB 3.x answers `id IN` on a view table again: narrow the README paragraph on `CONTAINS` (section 33, "
-    "'Reading') to the affected versions, and this test's version range with it"
+    "SurrealDB 3.x answers `id IN` on a view table again (surrealdb/surrealdb#7608): narrow the README paragraph on "
+    "`CONTAINS` (section 33, 'Reading') to the affected versions, and this test's version range with it"
 )
 
 
@@ -4875,12 +4875,15 @@ _PART_NEEDLES_33 = {
         "`relate()` and `remove_relation()`",
         "write the edge table and are allowed",
         "On a view model, `filter(id__in=...)` is sent as `$ids CONTAINS id`: SurrealDB 3.x (3.1 and 3.3 measured) "
-        "answers no record to `id IN` on a view table, while `CONTAINS` is right on every line; write raw SurrealQL "
-        "over a view the same way.",
+        "answers no record to `id IN` on a view table "
+        "([surrealdb/surrealdb#7608](https://github.com/surrealdb/surrealdb/issues/7608)), while `CONTAINS` is right on "
+        "every line; write raw SurrealQL over a view the same way.",
         "`live()` instances carry the record id on both lines; `watch()` yields the server's envelopes as received: on "
-        "3.x their `result` has no `id`, read `record`.",
+        "3.x their `result` has no `id` ([surrealdb/surrealdb#7607](https://github.com/surrealdb/surrealdb/issues/7607)), "
+        "read `record`.",
         "On SurrealDB 3.x a live query on a view filtered on `id` never notifies (the server's view notifications carry "
-        'no id); filter on the view\'s fields, e.g. `filter(status="paid")`.',
+        "no id, [surrealdb/surrealdb#7607](https://github.com/surrealdb/surrealdb/issues/7607)); filter on the view's "
+        'fields, e.g. `filter(status="paid")`.',
     ),
     "Writes are refused": (
         "`TypeError`",
@@ -4967,9 +4970,14 @@ _ROADMAP_ROWS_33 = [
     ["v0.31.0", "Tier 3 — Server-side events and DDL helpers", "✅ Released"],
     ["v0.32.0", "Tier 3 — Materialized views", "✅ Released"],
     ["v0.33.0", "Tier 3 — `TYPE RELATION` constraints", "✅ Released"],
-    ["v0.34.0 – v0.39.0", "Tier 3 — Advanced (search, migrations, CLI)", "📋 Planned"],
+    ["v0.34.0 – v0.40.0", "Tier 3 — Advanced (DDL, search, migrations, CLI)", "📋 Planned"],
 ]
 _COMPARISON_ROW_33 = ["Materialized views", "✅ v0.32.0 (`view_query`, `define_view()`)", "✅"]
+#: Issue #292: the third "Coming from" bullet dates ``define_table()``, which accepts a view model, to v0.34.0.
+_DEFINE_TABLE_ON_A_VIEW_33 = (
+    "`define_table()` comes with v0.34.0: it accepts a view model and applies it through `view_ddl()`, so full-ORM "
+    "code calling `define_table()` on a view works from then on."
+)
 #: Spec §11.1 item 5 (P4, A3): exactly eight rows v0.32.0 adds to the 2.x/3.x table, cell by cell.
 _VIEW_ROWS = [
     [
@@ -5152,12 +5160,14 @@ class TestReadmeSection33:
             assert claim not in section, claim
 
     def test_coming_from_the_full_orm(self) -> None:
-        """One key phrase per bullet, in order; D2: ``define_table()`` of v0.37.0 accepts a view model."""
+        """One key phrase per bullet, in order; D2: ``define_table()`` accepts a view model, in v0.34.0 (issue #292),
+        and the migrations come with v0.38.0."""
         bullets = _readme_bullets(_part_33("Coming from the full SurrealDB-ORM"))
         assert len(bullets) == len(_COMING_FROM_PHRASES_33), bullets
         for bullet, phrase in zip(bullets, _COMING_FROM_PHRASES_33, strict=True):
             assert phrase.lower() in bullet.lower(), (phrase, bullet)
-        assert "v0.37.0" in bullets[2] and "`define_table()` accepts a view model" in bullets[2], bullets[2]
+        assert _DEFINE_TABLE_ON_A_VIEW_33 in bullets[2], bullets[2]
+        assert "Migrations come with v0.38.0." in bullets[2], bullets[2]
         assert "`CreateTable`/`AlterTable`" in bullets[2], bullets[2]
         assert "`get_view_query()`" in bullets[0] and "`_is_view()`" in bullets[0], bullets[0]
         assert "`save()`, `update()`, `merge()`, `delete()` only" in bullets[1], bullets[1]

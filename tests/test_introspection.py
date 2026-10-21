@@ -2279,8 +2279,8 @@ _COMING_FROM_31 = [
     "(`crypto::argon2::generate($value)`) stays in `FieldState.value` and the field is generated as a writable field.",
     '- **APIs and the GraphQL config are not typed**: their definitions are in `SchemaState.other["apis"]` and '
     '`SchemaState.other["configs"]`, as SurrealDB returns them (full ORM: `ApiState`, `GraphQLConfigState`).',
-    "- **`SchemaState.diff()` and `schema_diff()` come with v0.37.0** (migrations), as does `applied_migrations`; the "
-    "`inspectdb` command comes with v0.38.0.",
+    "- **`SchemaState.diff()` and `schema_diff()` come with v0.38.0** (migrations), as does `applied_migrations`; the "
+    "`inspectdb` command comes with v0.39.0.",
     "- **A refused or failed `INFO FOR DB` raises** `SurrealDbAuthenticationError` or `SurrealDbError`, and a "
     "definition that cannot be read or parsed becomes a `SchemaIssue` in `schema.issues` and a logged warning (full "
     "ORM: an empty state, and definitions dropped with a debug log).",
@@ -2326,7 +2326,7 @@ _COMING_FROM_PHRASES_31 = (
     "Accesses are database-level",
     "`encrypted` is not provided",
     "APIs and the GraphQL config are not typed",
-    "come with v0.37.0",
+    "come with v0.38.0",
     "`INFO FOR DB` raises",
     "`on_delete` keeps",
     "`connection=` is a name",

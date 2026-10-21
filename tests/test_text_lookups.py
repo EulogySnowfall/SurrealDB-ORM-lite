@@ -316,8 +316,9 @@ _HEADER_SENTENCE_292 = "The row added in v0.29.2 was measured on 2.7.0, 3.3.4 an
 class TestReadme:
     def test_the_lookup_list_says_what_each_text_lookup_compiles_to(self) -> None:
         section = _normalised(_readme_part("### Supported Filter Lookups"))
-        for text in ("string::starts_with", "string::ends_with", "string::matches", "is_string()", "(?i)", "v0.34.0"):
+        for text in ("string::starts_with", "string::ends_with", "string::matches", "is_string()", "(?i)"):
             assert text in section, text
+        assert "full-text search is planned for v0.35.0, as a separate API" in section, section
 
     def test_server_behaviour_row(self) -> None:
         """In version order before the table's last row (later releases add their rows in version order)."""

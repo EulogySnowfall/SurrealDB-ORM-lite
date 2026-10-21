@@ -2637,8 +2637,9 @@ class TestReadmeEmbeddedWording:
     def test_coming_from_the_full_orm(self) -> None:
         """P5 and spec §11: the bullets of a full SurrealDB-ORM user."""
         text = _normalised(_subsection("#### Coming from the full SurrealDB-ORM", _section_26()))
-        for word in ("resets", "id", "TypeError", "is_embedded()", "embedded_database()", "v0.39.0"):
+        for word in ("resets", "id", "TypeError", "is_embedded()", "embedded_database()"):
             assert word in text, word
+        assert "**`ModelFactory` and `Faker`** come in v0.40.0." in text, text
 
     def test_embedded_behaviour_table(self) -> None:
         """Four cells a row, each "Since" a release; v0.25.0's rows first and together, in a table in version order
@@ -2694,15 +2695,16 @@ class TestReadmeEmbeddedWording:
         assert "v0.25.0" in embedded[1] and "❌" in embedded[2], embedded
         assert embedded == ["Embedded engine", "✅ v0.25.0 (mem://, surrealkv://; rocksdb:// #233)", "❌ (HTTP/WebSocket only)"]
         [fixtures] = [cells for cells in rows if cells[0] == "Test Fixtures & Factories"]
-        assert "v0.25.0" in fixtures[1] and "v0.39.0" in fixtures[1], fixtures
-        assert fixtures == ["Test Fixtures & Factories", "✅ v0.25.0 SurrealFixture; factories v0.39.0", "✅"]
+        assert "v0.25.0" in fixtures[1] and "v0.40.0" in fixtures[1], fixtures
+        assert fixtures == ["Test Fixtures & Factories", "✅ v0.25.0 SurrealFixture; factories v0.40.0", "✅"]
         assert [cells[0] for cells in rows].index("Embedded engine") == [cells[0] for cells in rows].index(
             "Geospatial Fields"
         ) + 1
         assert "; the official SDK's in-process engine (section 26) is lite-only." in _readme()
 
     def test_roadmap_parity_notes(self) -> None:
-        """P2: the full SurrealDB-ORM has no embedded engine; fixtures ship in v0.25.0, factories in v0.39.0."""
+        """P2: the full SurrealDB-ORM has no embedded engine; fixtures ship in v0.25.0, factories in v0.40.0 (moved up
+        one by the model table DDL of v0.34.0, issue #292)."""
         roadmap = _ROADMAP.read_text(encoding="utf-8")
         comparison = roadmap.split("\n## SurrealDB-ORM vs SurrealDB-ORM-lite Comparison\n", 1)[1].split("\n#", 1)[0]
         [lines] = _tables(comparison)
@@ -2715,7 +2717,7 @@ class TestReadmeEmbeddedWording:
             ["Embedded / versioned engine", "no", "✅ v0.25 – v0.26"],
         ), row
         [fixtures] = [line for line in lines if line.startswith("| Test fixtures & factories")]
-        assert _cells(fixtures) == ["Test fixtures & factories", "yes", "v0.25.0 + v0.39.0"], fixtures
+        assert _cells(fixtures) == ["Test fixtures & factories", "yes", "v0.25.0 + v0.40.0"], fixtures
         for name in ("rocksdb://", "#233", "2.3.10", "surrealdb[embedded]"):
             assert name in roadmap, name
         assert "To confirm" not in roadmap, "footnotes ¹/² are resolved"
@@ -2726,7 +2728,7 @@ class TestReadmeEmbeddedWording:
         assert "SurrealDB core 2.3.10 with SDK 2.0.0" in note
         assert (
             "Base test fixtures (`SurrealFixture`, `@fixture`, `embedded_database()`) ship in v0.25.0; "
-            "factories (`ModelFactory`, `Faker`) in v0.39.0." in note
+            "factories (`ModelFactory`, `Faker`) in v0.40.0." in note
         )
         rows = _table_rows(raw_note, "Embedded URL")
         firsts = [cells[0] for _, cells in rows]

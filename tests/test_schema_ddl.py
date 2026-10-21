@@ -3455,7 +3455,7 @@ _PART_NEEDLES_32 = {
         '`Account.remove_event("email_audit")`',
         "`missing_ok=False`",
         "`SurrealDbNotFoundError`",
-        "v0.37.0",
+        "(that comes with migrations, v0.38.0)",
         "`BaseSurrealEdge`",
         "`SCHEMALESS`",
         "`InternalError`",
@@ -3559,7 +3559,7 @@ _COMING_FROM_PHRASES_32 = (
     "`then` is a block",
     "comments escaped with a backslash",
     "`define_function()` has no full-ORM equivalent",
-    "come with migrations (v0.37.0)",
+    "come with migrations (v0.38.0)",
 )
 #: Spec §11.1 items 3–5: the features row, the roadmap split and the comparison rows.
 _FEATURES_ROW_32 = ["Server-side events & function DDL (`Event`, `define_function()`)", "✅"]
