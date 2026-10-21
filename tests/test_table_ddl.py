@@ -1047,6 +1047,9 @@ class TdlKinds(BaseSurrealModel):
     owner: TdlNote | None = None
     u: int | Any
     sub: TdlCalc
+    dl: dict[str, Any] | list[str]
+    two: list[int] | list[str]
+    c: list[int] | dict[str, Any] | None = None
 
 
 def _columns(model: type[BaseSurrealModel]) -> tuple[model_ddl.Column, ...]:
@@ -1137,6 +1140,26 @@ _KIND_ROWS: list[tuple[str, Any, str]] = [
     ("union", int | str, "int | string"),
     ("union-repeated", int | int, "int"),
     ("union-with-any", int | Any, "any"),
+    # A union holding a list or a set with an object or another list, set or tuple: each of those written ``array``
+    # (its items then get ``TYPE any``), since SurrealDB derives one item type for all of them.
+    ("union-dict-and-list", dict[str, Any] | list[str], "object | array"),
+    ("union-optional-list-and-dict", list[int] | dict[str, Any] | None, "option<array | object>"),
+    ("union-two-lists", list[int] | list[str], "array"),
+    ("union-typed-and-untyped-list", list[int] | list, "array"),  # type: ignore[type-arg]
+    ("union-list-of-dicts-and-dict", list[dict[str, Any]] | dict[str, Any], "array | object"),
+    ("union-list-of-models-and-model", list[TdlAddress] | TdlAddress, "array | object"),
+    ("union-set-and-dict", set[int] | dict[str, Any], "array | object"),
+    ("union-set-and-list", set[int] | list[str], "array"),
+    ("union-two-sets", set[int] | frozenset[str], "array"),
+    ("union-tuple-and-list", tuple[int, str] | list[str], "array"),
+    ("union-two-tuple-ellipsis", tuple[int, ...] | tuple[str, ...], "array"),
+    ("list-of-union-list-and-dict", list[list[int] | dict[str, Any]], "array<array | object>"),
+    # … and the unions SurrealDB takes as written.
+    ("union-untyped-list-and-dict", list | dict[str, Any], "array | object"),  # type: ignore[type-arg]
+    ("union-tuple-and-dict", tuple[int, str] | dict[str, Any], "[int, string] | object"),
+    ("union-two-tuples", tuple[int, str] | tuple[str, int], "[int, string] | [string, int]"),
+    ("union-list-and-int", list[int] | int, "array<int> | int"),
+    ("union-list-and-geometry", list[str] | GeometryPoint, "array<string> | geometry<point>"),
     ("optional-any", Any | None, "any"),
     ("any", Any, "any"),
     ("object", object, "any"),
@@ -1325,6 +1348,12 @@ class TestColumns:
             (("sub",), "object", False, None),
             (("sub", "a"), "int", False, "1"),
             (("sub", "dbl"), "int", False, None),
+            (("dl",), "object | array", True, None),
+            (("dl", "*"), "any", False, None),
+            (("two",), "array", False, None),
+            (("two", "*"), "any", False, None),
+            (("c",), "option<array | object>", True, None),
+            (("c", "*"), "any", False, None),
         ]
 
     def test_item_definitions(self) -> None:
@@ -1905,6 +1934,12 @@ _G9 = [
     "DEFINE FIELD OVERWRITE `sub` ON `tdl_kinds` TYPE object;",
     "DEFINE FIELD OVERWRITE `sub`.`a` ON `tdl_kinds` TYPE int DEFAULT 1;",
     "DEFINE FIELD OVERWRITE `sub`.`dbl` ON `tdl_kinds` TYPE int;",
+    "DEFINE FIELD OVERWRITE `dl` ON `tdl_kinds` TYPE object | array FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `dl`.* ON `tdl_kinds` TYPE any;",
+    "DEFINE FIELD OVERWRITE `two` ON `tdl_kinds` TYPE array;",
+    "DEFINE FIELD OVERWRITE `two`.* ON `tdl_kinds` TYPE any;",
+    "DEFINE FIELD OVERWRITE `c` ON `tdl_kinds` TYPE option<array | object> FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `c`.* ON `tdl_kinds` TYPE any;",
 ]
 
 _G10_KEYWORD = [
@@ -4060,6 +4095,88 @@ class TestOrmWritesE2E:
                 return
             await kitchen.save()
             assert (await _read_back(TdlKitchen, "k1", kitchen)).st == {1, 2, 3}
+
+
+class TdlUnions(BaseSurrealModel):
+    """Unions holding several containers, on a table in SurrealDB's default mode (``SCHEMALESS``)."""
+
+    model_config = SurrealConfigDict(table_name="tdl_unions", connection="tdl")
+
+    id: str | None = None
+    dl: dict[str, Any] | list[str] = Field(default_factory=list)
+    two: list[int] | list[str] = Field(default_factory=list)
+    c: list[int] | dict[str, Any] | None = None
+    sd: set[int] | dict[str, Any] = Field(default_factory=set)
+    tl: tuple[int, str] | list[str] = Field(default_factory=list)
+    nl: list[list[int] | dict[str, Any]] = Field(default_factory=list)
+
+
+class TdlUnionsStrict(TdlUnions):
+    """``TdlUnions`` on a ``SCHEMAFULL`` table."""
+
+    model_config = SurrealConfigDict(table_name="tdl_unions", schema_mode=SchemaMode.SCHEMAFULL, connection="tdl")
+
+
+#: ``TdlUnions.table_ddl()``'s column statements: each union holding a list or a set with an object or another
+#: container is written with untyped ``array`` members, whose items get ``TYPE any``.
+_UNION_COLUMNS = [
+    "DEFINE FIELD OVERWRITE `dl` ON `tdl_unions` TYPE object | array;",
+    "DEFINE FIELD OVERWRITE `dl`.* ON `tdl_unions` TYPE any;",
+    "DEFINE FIELD OVERWRITE `two` ON `tdl_unions` TYPE array;",
+    "DEFINE FIELD OVERWRITE `two`.* ON `tdl_unions` TYPE any;",
+    "DEFINE FIELD OVERWRITE `c` ON `tdl_unions` TYPE option<array | object>;",
+    "DEFINE FIELD OVERWRITE `c`.* ON `tdl_unions` TYPE any;",
+    "DEFINE FIELD OVERWRITE `sd` ON `tdl_unions` TYPE array | object;",
+    "DEFINE FIELD OVERWRITE `sd`.* ON `tdl_unions` TYPE any;",
+    "DEFINE FIELD OVERWRITE `tl` ON `tdl_unions` TYPE array;",
+    "DEFINE FIELD OVERWRITE `tl`.* ON `tdl_unions` TYPE any;",
+    "DEFINE FIELD OVERWRITE `nl` ON `tdl_unions` TYPE array<array | object>;",
+    "DEFINE FIELD OVERWRITE `nl`.*.* ON `tdl_unions` TYPE any;",
+]
+
+
+class TestUnionContainersE2E:
+    """A union holding a list or a set with an object or another list, set or tuple (``dict[str, Any] | list[str]``,
+    ``list[int] | list[str]``): every ORM write is accepted after ``define_table()`` and reads back equal, on every engine
+    of both lines and in both table modes. Written as SurrealDB reads it, ``object | array<string>`` would make it
+    derive the item definition ``dl.*`` ``TYPE string`` and refuse ``{"k": 1}``; 2.x and the embedded engine would
+    refuse ``["a"]`` in ``array<int> | array<string>``."""
+
+    def test_the_statements(self) -> None:
+        assert TdlUnions.table_ddl() == ["DEFINE TABLE OVERWRITE `tdl_unions` TYPE NORMAL;", *_UNION_COLUMNS]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("model", [TdlUnions, TdlUnionsStrict], ids=["schemaless", "schemafull"])
+    async def test_writes_round_trip(self, kind: str, model: type[TdlUnions]) -> None:
+        async with _tdl(kind):
+            await model.define_table()
+            first = model(
+                id="u1",
+                dl={"k": 1, "n": {"r": [1, "x"]}},
+                two=["a", "b"],
+                c={"q": [1], "w": "s"},
+                sd={"q": {"r": 1}},
+                tl=(1, "s"),
+                nl=[{"k": "s"}, [1, 2]],
+            )
+            sent = first.model_dump()
+            await first.save()
+            assert (await model.objects().get("u1")).model_dump() == sent
+
+            second = model(id="u2", dl=["a"], two=[1, 2], c=[1, 2], sd={1, 2}, tl=["a", "b"], nl=[[3], {"q": [1]}])
+            sent = second.model_dump()
+            await second.save()
+            assert (await model.objects().get("u2")).model_dump() == sent
+
+            first.dl = ["z"]
+            first.two = [3]
+            first.c = None
+            first.sd = {3}
+            first.tl = ["c"]
+            first.nl = [{"m": {"o": 1}}]
+            sent = first.model_dump()
+            await first.update()
+            assert (await model.objects().get("u1")).model_dump() == sent
 
 
 # --- define_table() on the engines ----------------------------------------------------------------------------------
@@ -6350,6 +6467,9 @@ _PART_NEEDLES_35 = {
         "`ValueError`",
         "`TYPE any` (`bag.*`, `lol.*.*`), on every line",
         "required untyped array (`no such field exists`)",
+        "writes each of its lists, sets and tuples as an untyped `array`, which gets its item definition",
+        "`dict[str, Any] | list[str]` is `object | array` with `dl.*` `TYPE any`, `list[int] | list[str]` is `array`",
+        'so `object | array<string>` would refuse `{"k": 1}`',
         "written after `TYPE`, only on a table that is `SCHEMAFULL`",
         "on SurrealDB 2.x and the embedded engine, on the columns that hold `any`",
         "A stored `FLEXIBLE` on an object column is kept",
@@ -6675,7 +6795,10 @@ class TestReadmeSection35:
         assert rows["`list`, `list[Any]`"] == "`array`, and an item definition (below)", rows
         assert rows["`dict`, `dict[K, V]`, `Mapping[K, V]`"] == "`object`, free-form", rows
         assert rows["`Optional[X]`, a union with `None`"] == "`option<X>`", rows
-        assert rows["any other union"] == "the union of its members' kinds; `any` when one of them is `any`", rows
+        assert rows["any other union"] == (
+            "the union of its members' kinds, `any` when one is `any`; a list or a set with an object or another "
+            "container: `array` (below)"
+        ), rows
         assert rows["`Any`, `object`, the SDK's `Datetime`"] == "`any`", rows
 
     def test_source_rule_tables(self) -> None:

@@ -71,6 +71,7 @@ __all__ = [
 _ANY = KName("any")
 _NONE = KLiteral("none")
 _OBJECT = KName("object")
+_ARRAY = KName("array")
 _NUMBER_MEMBERS = frozenset({"int", "float", "decimal"})
 #: The operations of a field's ``PERMISSIONS``, in the order SurrealDB renders them.
 _FIELD_OPERATIONS = ("select", "create", "update")
@@ -166,9 +167,32 @@ def _join(members: Iterable[Kind]) -> Kind:
     return unique[0] if len(unique) == 1 else KUnion(tuple(unique))
 
 
+def _is_collection(kind: Kind) -> bool:
+    """An ``array`` or a ``set``, typed or not."""
+    return isinstance(kind, KName) and kind.name in ("array", "set")
+
+
+def _untyped_containers(members: tuple[Kind, ...]) -> tuple[Kind, ...]:
+    """A union's *members*, each ``array``, ``set`` and tuple written ``array`` when the union holds an array or a set
+    together with an ``object`` or another array, set or tuple; as they are otherwise.
+
+    SurrealDB derives one item definition (``col.*``) from such a union and applies it to every member: to an object's
+    values (``object | array<string>`` refuses ``{k: 1}``, ``array<int> | object`` refuses ``{k: 's'}``) and to the
+    other arrays' items (``[int, string] | array<string>`` refuses ``[1, 's']``); before 3.x it also checks each array
+    against the first one (``array<int> | array<string>`` refuses ``['a']``), and SurrealDB 3.3 cannot parse the item
+    definition it derives from ``set | array`` or ``array<int> | array``. An untyped ``array`` takes every list, tuple
+    and set the ORM writes (a set is written as an array), and its items get the item definition ``TYPE any``
+    (:func:`untyped_arrays`)."""
+    containers = [member for member in members if _is_collection(member) or isinstance(member, KTuple)]
+    if not any(_is_collection(member) for member in containers) or (len(containers) < 2 and _OBJECT not in members):
+        return members
+    return tuple(_ARRAY if member in containers else member for member in members)
+
+
 def _union(mapped: Iterable[tuple[Kind, bool]]) -> tuple[Kind, bool]:
     """The kind of a union: its members' kinds joined, ``any`` when one is ``any`` (``option<any>`` and ``object | any``
-    are parse errors), ``number`` for exactly ``int``, ``float`` and ``decimal``."""
+    are parse errors), ``number`` for exactly ``int``, ``float`` and ``decimal``; an array or a set with an ``object`` or
+    another array, set or tuple makes each of those ``array`` (:func:`_untyped_containers`)."""
     kinds: list[Kind] = []
     free = False
     for kind, member_free in mapped:
@@ -176,7 +200,7 @@ def _union(mapped: Iterable[tuple[Kind, bool]]) -> tuple[Kind, bool]:
             return _ANY, False
         kinds.append(kind)
         free = free or member_free
-    joined = _join(kinds)
+    joined = _join(_untyped_containers(_members(_join(kinds))))
     rest = [member for member in _members(joined) if member != _NONE]
     if len(rest) == len(_NUMBER_MEMBERS) and {render_kind(member) for member in rest} == _NUMBER_MEMBERS:
         number = KName("number")
@@ -326,7 +350,11 @@ def field_kind(annotation: Any, metadata: Iterable[Any] = ()) -> Kind:
     values; ``list[T]``, ``Sequence[T]``, ``tuple[T, ...]`` ``array<T>``; ``tuple[A, B]`` ``[A, B]``; ``set[T]``,
     ``frozenset[T]`` ``set<T>``; ``array`` and ``set`` when ``T`` is absent or ``any``; a mapping, a Pydantic model and
     a record model ``object``; ``X | None`` ``option<X>``; a union its members de-duplicated, ``any`` when one is
-    ``any``; ``Any``, ``object`` and every other type (the SDK's ``Datetime`` included) ``any``. Pure.
+    ``any``, and each array, set and tuple ``array`` when it holds an array or a set together with an ``object`` or
+    another array, set or tuple (``dict[str, Any] | list[str]`` ``object | array``, ``list[int] | list[str]``
+    ``array``: SurrealDB would derive one item kind for all of them and refuse a value the model accepts; the
+    ``array``'s items get ``TYPE any`` in ``model_columns()``); ``Any``, ``object`` and every other type (the SDK's
+    ``Datetime`` included) ``any``. Pure.
     """
     return _map(annotation, tuple(metadata))[0]
 

@@ -5423,7 +5423,7 @@ Each column's `TYPE` comes from its annotation (`Annotated` unwrapped):
 | a Pydantic model `M`, or a list of them, optional or not                                                                                     | `object`, `array<object>` (`option<…>` when optional), then one column per field of `M`                                               |
 | `M` in a union with another type, a `dict` or a `tuple`; a record model (`BaseSurrealModel`, `BaseSurrealEdge`); a model already on the path | `object`, free-form                                                                                                                   |
 | `Optional[X]`, a union with `None`                                                                                                           | `option<X>`                                                                                                                           |
-| any other union                                                                                                                              | the union of its members' kinds; `any` when one of them is `any`                                                                      |
+| any other union                                                                                                                              | the union of its members' kinds, `any` when one is `any`; a list or a set with an object or another container: `array` (below)        |
 | `Any`, `object`, the SDK's `Datetime`                                                                                                        | `any`                                                                                                                                 |
 
 Anything else is `any`.
@@ -5457,6 +5457,12 @@ Anything else is `any`.
   for its items, `TYPE any` (`bag.*`, `lol.*.*`), on every line: without it SurrealDB 3.x refuses an object item of a
   required untyped array (`no such field exists`). A typed list (`list[str]`, `list[dict]`, `list[M]`) and a set get
   none.
+- **Unions of containers**: a union holding a list or a set together with an object (a `dict`, a model) or another
+  list, set or tuple writes each of its lists, sets and tuples as an untyped `array`, which gets its item definition:
+  `dict[str, Any] | list[str]` is `object | array` with `dl.*` `TYPE any`, `list[int] | list[str]` is `array`.
+  SurrealDB derives a single item type from such a union and applies it to every member, so `object | array<string>`
+  would refuse `{"k": 1}`, and SurrealDB 2.x `array<int> | array<string>` would refuse `["a"]`. A set in such a union is
+  stored as the array the ORM writes, and reads back as the declared set.
 - **`FLEXIBLE`**, written after `TYPE`, only on a table that is `SCHEMAFULL`: on a free-form object column (a `dict`,
   a record model, a sub-model with `extra="allow"`), on the fields of `flexible_fields` or
   `json_schema_extra={"flexible": True}`, and, on SurrealDB 2.x and the embedded engine, on the columns that hold `any`
