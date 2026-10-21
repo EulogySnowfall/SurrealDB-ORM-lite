@@ -18,14 +18,16 @@ anything fails — except, as on a server, a ``signup``/``signin`` that succeede
 not fit the model: the session stays signed in as that record, and the error says so. (A ``refresh``
 cannot succeed there: the engine's SurrealQL does not parse ``WITH REFRESH``.)
 
-This is a leaf module: it imports ``connection_manager`` and ``auth`` at runtime and
-``model_base`` only for typing, which keeps the package acyclic (``connection_manager`` already
-imports ``auth``, so the mixin could not live there).
+This is a leaf module: it imports ``connection_manager`` and ``auth`` at runtime (and, for the
+access table, ``schema`` and ``types``, v0.34.0) and ``model_base`` only for typing, which keeps
+the package acyclic (``connection_manager`` already imports ``auth``, so the mixin could not live
+there).
 """
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from pydantic import AliasChoices, AliasPath, ValidationError
@@ -36,7 +38,9 @@ from .auth import AuthTokens, build_auth_payload, wrap_auth_error
 from .connection_manager import SurrealDBConnectionManager
 from .embedded import model_auth_unsupported
 from .exceptions import SurrealDbAuthenticationError, SurrealDbError
+from .schema import TableClauses, declared_clauses
 from .transaction import Transaction
+from .types import SchemaMode
 from .utils import apply_ddl_statements, validate_alias_name, validate_field_name
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -58,6 +62,15 @@ _HASH_ALGORITHMS = frozenset({"argon2", "bcrypt", "pbkdf2", "scrypt"})
 #: client — so, like every other interpolated value here, they are validated rather than trusted.
 #: A model config assembled from settings or environment is not an exotic pattern.
 _DURATION_RE = re.compile(r"^\d+(ns|us|ms|s|m|h|d|w|y)$")
+
+#: The table permissions of v0.17.0's access table, for a model that declares none: a record user selects and updates
+#: its own record (without ``select`` a signin succeeds but ``info()`` returns nothing); SIGNUP creates it, so
+#: ``create`` and ``delete`` are ``NONE``. ``_ACCESS_RULES`` is v0.17.0's text, ``_ACCESS_PERMISSIONS`` the same rules
+#: as the four-operation map the model table DDL writes (v0.34.0).
+_ACCESS_RULES = "FOR select, update WHERE id = $auth.id"
+_ACCESS_PERMISSIONS = MappingProxyType(
+    {"select": "WHERE id = $auth.id", "create": "NONE", "update": "WHERE id = $auth.id", "delete": "NONE"}
+)
 
 
 def _alias_keys(alias: str | AliasPath | AliasChoices | None) -> set[str]:
@@ -281,28 +294,82 @@ class AuthenticatedUserMixin:
         return str(primary_key)
 
     @classmethod
+    def _schemafull_access(cls) -> bool:
+        """Whether the access table goes through the model table DDL (v0.34.0): the model's schema mode is
+        ``SCHEMAFULL`` — declared, or ``TableType.USER`` —, read by ``get_schema_mode()`` as ``define_table()`` reads
+        it. Such a table refuses (SurrealDB 3.x) or empties (2.x, the embedded engine) the record SIGNUP creates unless
+        its fields are defined."""
+        return cls.get_schema_mode() is SchemaMode.SCHEMAFULL  # type: ignore[attr-defined]
+
+    @classmethod
+    def _access_table_clauses(cls) -> TableClauses:
+        """The table clauses of a ``SCHEMAFULL`` access table (v0.34.0): those the model declares, with the access's
+        permissions when it declares none — written even over stored ones, as v0.17.0 always did."""
+        clauses: TableClauses = cls._declared_table_clauses()  # type: ignore[attr-defined]
+        return clauses if clauses.permissions is not None else replace(clauses, permissions=_ACCESS_PERMISSIONS)
+
+    @classmethod
+    def _access_table_statement(cls, table: str, clause: str) -> str:
+        """v0.17.0's table statement with the clauses the model declares, for a model whose schema mode is not
+        ``SCHEMAFULL`` (v0.34.0): ``DEFINE TABLE <clause> <table>[ TYPE NORMAL | TYPE ANY] SCHEMALESS[ COMMENT
+        '…'][ CHANGEFEED …] PERMISSIONS <rules>;`` — the table name unquoted, the type clause only when ``table_type``
+        is declared, the declared permissions else v0.17.0's. A model declaring none of these keys gets v0.17.0's text
+        byte for byte. The values were checked when the class was defined. Pure."""
+        declared: TableClauses = cls._declared_table_clauses()  # type: ignore[attr-defined]
+        parts: list[str] = []
+        if cls._auth_setting("table_type", None) is not None:
+            parts.append(cls._table_head())  # type: ignore[attr-defined]
+        parts += declared_clauses(replace(declared, schema_mode=SchemaMode.SCHEMALESS.value))
+        if declared.permissions is None:
+            parts.append(f"PERMISSIONS {_ACCESS_RULES}")
+        return f"DEFINE TABLE {clause} {table} {' '.join(parts)};"
+
+    @classmethod
     def access_ddl(cls, *, overwrite: bool = True, with_table: bool = True) -> list[str]:
         """Render this model's authentication DDL. Pure — it touches no database.
 
-        Returns the ``DEFINE TABLE`` statement followed by the ``DEFINE ACCESS`` one, so the
-        result can be printed, diffed, or fed to a migration before anything is applied.
+        Returns the table's statements followed by the ``DEFINE ACCESS`` one, so the result can
+        be printed, diffed, or fed to a migration before anything is applied.
 
-        The table statement is included **by default**, and deliberately so. Without
+        The table is included **by default**, and deliberately so. Without
         ``PERMISSIONS FOR select WHERE id = $auth.id`` a signin succeeds and ``$auth`` is set,
         yet ``info()`` quietly returns nothing — the sharpest gotcha of connection-level auth
         (v0.16.0). A model-level API that promises an instance cannot walk into it, so the
         permission ships with the access method.
 
+        The table follows the model's schema mode, as ``define_table()`` reads it (v0.34.0). A
+        model whose schema mode is ``SCHEMAFULL`` — ``schema_mode=SchemaMode.SCHEMAFULL`` or
+        ``table_type=TableType.USER`` — gets a ``SCHEMAFULL`` table with one ``DEFINE FIELD`` per
+        field (``table_ddl()``'s statements, with the access's permissions unless it declares its
+        own), since such a table refuses or empties the record SIGNUP creates unless its fields
+        are defined; every other model gets v0.17.0's ``SCHEMALESS`` table statement, with the
+        comment, change feed, permissions and ``TYPE`` clause it declares — v0.17.0's text when it
+        declares none. Any call order with ``define_table()`` converges: both write the same
+        schema mode and fields.
+
         Args:
             overwrite: ``True`` (default) emits ``OVERWRITE`` — the model is the source of
                 truth, so re-running converges the database onto the code. ``False`` emits
                 ``IF NOT EXISTS``, which never disturbs an existing definition.
-            with_table: emit the ``DEFINE TABLE … PERMISSIONS`` statement. Pass ``False`` when
-                you manage the table yourself (a ``SCHEMAFULL`` table, or wider permissions) —
-                then make sure the record can still select itself.
+            with_table: emit the table's statements. Pass ``False`` when you manage the table
+                yourself (wider permissions, say) — then make sure the record can still select
+                itself; a model whose schema mode is ``SCHEMAFULL`` gets its fields from
+                ``define_access()``.
 
         Returns:
-            One or two SurrealQL statements, table first.
+            The table's statements — the table statement, then, for a model whose schema mode
+            is ``SCHEMAFULL``, one ``DEFINE FIELD`` per field — and the access statement last;
+            the access statement alone with ``with_table=False``.
+
+        Raises:
+            TypeError: with ``with_table=True``, a ``TableType.USER`` model with
+                ``extra="allow"`` (its ``SCHEMAFULL`` table refuses or drops the fields the
+                model does not declare), or, for a model whose schema mode is ``SCHEMAFULL``,
+                an *overwrite* that is not a ``bool``.
+            ValueError: an auth key naming no field of the model, an unknown hashing family or
+                duration, a primary key SIGNUP cannot bind; with ``with_table=True`` and a
+                ``SCHEMAFULL`` schema mode, a ``FLEXIBLE`` request on a kind without an object
+                or a computed field's expression that is not SurrealQL the ORM can embed.
 
         Note:
             ``WITH REFRESH`` is rendered on both DB lines because this is a pure string
@@ -322,8 +389,11 @@ class AuthenticatedUserMixin:
         clause = "OVERWRITE" if overwrite else "IF NOT EXISTS"
 
         statements: list[str] = []
-        if with_table:
-            statements.append(f"DEFINE TABLE {clause} {table} SCHEMALESS PERMISSIONS FOR select, update WHERE id = $auth.id;")
+        if with_table and cls._schemafull_access():
+            table_ddl: list[str] = cls._table_ddl(overwrite, cls._access_table_clauses())  # type: ignore[attr-defined]
+            statements.extend(table_ddl)
+        elif with_table:
+            statements.append(cls._access_table_statement(table, clause))
 
         # The record id follows the model's primary key, because the rest of the ORM does: a
         # random id here would leave User.objects().get(email=…) addressing a record the
@@ -390,18 +460,41 @@ class AuthenticatedUserMixin:
         lines raise different SDK exceptions for the same bad DDL, so both are normalised to
         :class:`SurrealDbError`.
 
+        The table follows the model's schema mode (v0.34.0, see :meth:`access_ddl`). A model
+        whose schema mode is ``SCHEMAFULL`` gets its table as ``define_table()`` applies it —
+        ``INFO FOR DB`` once and, for a table that exists, ``INFO FOR TABLE`` once, before any
+        DDL; its guards, naming ``define_access()``; the clauses and field clauses it does not
+        declare kept — with the access's permissions unless it declares its own, then the access
+        statement. Every other model applies v0.17.0's two statements, whose ``OVERWRITE``
+        resets the table clauses it does not write; when it declares ``permissions``, the table
+        statement is applied on its own first, and a refusal names the table, never the rules.
+        Any call order with ``define_table()`` converges, so neither needs the other first.
+
         Args:
             overwrite: see :meth:`access_ddl`.
             with_table: see :meth:`access_ddl`.
             tx: optional transaction to run the DDL in. On a buffered transaction (HTTP or
                 SurrealDB 2.6.x) the statements are deferred to commit, so a rejected clause
-                surfaces there rather than here.
+                surfaces there rather than here. For a model whose schema mode is
+                ``SCHEMAFULL`` the reads still see committed state, before anything is queued.
+
+        Returns:
+            The statements applied (or queued): the table's — for a model whose schema mode is
+            ``SCHEMAFULL``, the table and its fields as written over what exists — then the
+            access statement.
 
         Raises:
+            TypeError: see :meth:`access_ddl` — before any request.
+            ValueError: see :meth:`access_ddl` — before any request.
             SurrealDbError: if the server rejects a statement. The most likely cause on
                 **SurrealDB 2.6.x** is ``with_refresh=True``: that line cannot parse
-                ``WITH REFRESH`` at all, and the message says so.
+                ``WITH REFRESH`` at all, and the message says so. For a model whose schema
+                mode is ``SCHEMAFULL``, also ``define_table()``'s refusals, naming
+                ``define_access()``: *tx* belongs to another connection — before any request;
+                the table is a materialized view or a relation table, or a table or field
+                definition cannot be read back or carried — before any DDL.
         """
+        # Pure, and first: every refusal of the model itself (UX1 included) comes before any request.
         statements = cls.access_ddl(overwrite=overwrite, with_table=with_table)
         # Gated on the model's own flag, not on the rendered text: a model with a field named
         # `refresh_token` puts "refresh" in the SIGNUP clause without asking for the feature,
@@ -412,8 +505,29 @@ class AuthenticatedUserMixin:
                 " Note: WITH REFRESH requires SurrealDB 3.x; 2.6.x cannot parse it. "
                 "Set with_refresh=False to support both lines."
             )
+        if with_table and cls._schemafull_access():
+            # The model table DDL: its reads, guards and carried clauses, then the access statement.
+            applied: list[str] = await cls._define_table(  # type: ignore[attr-defined]
+                overwrite=overwrite, tx=tx, method="define_access", clauses=cls._access_table_clauses()
+            )
+            client = await cls._connection_manager().get_client()  # type: ignore[attr-defined]
+            access = await apply_ddl_statements(statements[-1:], client=client, tx=tx, what="access", hint=hint)
+            return [*applied, *access]
         # Cheap even inside a transaction: get_client() returns the already-connected client.
         client = await cls._connection_manager().get_client()  # type: ignore[attr-defined]
+        if with_table and cls._auth_setting("permissions", None) is not None:
+            # Declared rules are never quoted in a refusal: the table statement on its own, named by its table.
+            table = statements[0]
+            await apply_ddl_statements(
+                [table],
+                client=client,
+                tx=tx,
+                what="table",
+                classify=True,
+                subjects=[repr(cls.get_table_name())],  # type: ignore[attr-defined]
+            )
+            access = await apply_ddl_statements(statements[1:], client=client, tx=tx, what="access", hint=hint)
+            return [table, *access]
         return await apply_ddl_statements(statements, client=client, tx=tx, what="access", hint=hint)
 
     # ------------------------------------------------------------------

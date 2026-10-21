@@ -118,6 +118,21 @@ Transactions (``TestTableTransactionsE2E``, every engine of both lines): the rea
 anything is queued; the statements apply with the block — at once when interactive, at the commit when buffered — and
 not at all when it raises; a transaction of another connection is refused before any request; a definition of the same
 table or field queued earlier in the block is replaced at commit, a limit to lift.
+
+The access (``TestAccessDdl``, on fake clients): ``access_ddl()`` and ``define_access()`` read the model's schema mode as
+``define_table()`` does. A model whose schema mode is ``SCHEMAFULL`` — ``TableType.USER``, or a declared
+``SchemaMode.SCHEMAFULL`` — gets its table through the model table DDL: the table statement, with the access's
+permissions unless it declares its own, one ``DEFINE FIELD`` per field, then the access statement; ``define_access()``
+reads and carries as ``define_table()`` does, its guards and its transaction check naming ``define_access()``. Every
+other model keeps v0.17.0's ``SCHEMALESS`` table statement with the clauses it declares — v0.17.0's text byte for byte
+when it declares none —, applied on its own when it declares permissions, whose refusal never quotes them.
+``TableType.USER`` with ``extra="allow"``, a non-``bool`` ``overwrite`` and a computed field's faulty expression are
+refused before any request, unless ``with_table=False``, which renders and applies the access statement alone.
+
+On the servers (``TestAccessE2E``, over WebSocket, both lines): a ``TableType.USER`` model's ``define_access()`` defines
+a ``SCHEMAFULL`` table with its fields and the access's permissions, and signup and signin work there; ``define_table()``
+afterwards, or a second ``define_access()``, sends the carried statements and changes nothing; a view under the table is
+refused, naming ``define_access()``.
 """
 
 import ast
@@ -146,6 +161,7 @@ from surrealdb import Range as SdkRange
 
 import surreal_orm_lite
 from surreal_orm_lite import (
+    AuthenticatedUserMixin,
     BaseSurrealEdge,
     BaseSurrealModel,
     BoundExcluded,
@@ -5329,3 +5345,487 @@ class TestTableTransactionsE2E:
                 assert await TdlNote.define_table(tx=tx) == "\n".join(_G2), _QUEUED_SEEN
             body = parse_define_field((await _table_info(client, "tdl_note"))["fields"]["body"]).state
             assert (body.field_type, body.assertion) == ("string", None), _QUEUED_SEEN
+
+
+# --- access_ddl() and define_access(): the model's schema mode, the declared clauses --------------------------------
+
+
+class TdlAuthPlain(AuthenticatedUserMixin, BaseSurrealModel):
+    """A0: an auth model with none of the new keys — v0.17.0's statements byte for byte."""
+
+    model_config = SurrealConfigDict(table_name="tdl_user", connection="tdl")
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+class TdlAuthUser(AuthenticatedUserMixin, BaseSurrealModel):
+    """A1: ``TableType.USER`` without ``schema_mode`` — a ``SCHEMAFULL`` table with its fields."""
+
+    model_config = SurrealConfigDict(table_name="tdl_user", table_type=TableType.USER, connection="tdl")
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+class TdlAuthReset(TdlAuthUser):
+    """A0 again: a subclass resetting ``table_type`` declares nothing."""
+
+    model_config = SurrealConfigDict(table_type=None)
+
+
+class TdlAuthRules(AuthenticatedUserMixin, BaseSurrealModel):
+    """A2: declared permissions replace v0.17.0's."""
+
+    model_config = SurrealConfigDict(
+        table_name="tdl_user",
+        permissions={"select": "WHERE id = $auth.id", "update": "WHERE id = $auth.id", "create": "FULL"},
+        connection="tdl",
+    )
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+class TdlAuthFeed(AuthenticatedUserMixin, BaseSurrealModel):
+    """A3: a comment and a change feed in v0.17.0's statement."""
+
+    model_config = SurrealConfigDict(table_name="tdl_user", comment="Users", changefeed="1d", connection="tdl")
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+class TdlAuthFull(AuthenticatedUserMixin, BaseSurrealModel):
+    """A4: a declared ``SchemaMode.SCHEMAFULL`` without ``table_type`` — A1's statements."""
+
+    model_config = SurrealConfigDict(table_name="tdl_user", schema_mode=SchemaMode.SCHEMAFULL, connection="tdl")
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+class TdlAuthUserFull(AuthenticatedUserMixin, BaseSurrealModel):
+    """A4: ``TableType.USER`` and a declared ``SchemaMode.SCHEMAFULL`` — A1's statements."""
+
+    model_config = SurrealConfigDict(
+        table_name="tdl_user", table_type=TableType.USER, schema_mode=SchemaMode.SCHEMAFULL, connection="tdl"
+    )
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+class TdlAuthHash(AuthenticatedUserMixin, BaseSurrealModel):
+    """A5: ``TableType.HASH`` — v0.17.0's ``SCHEMALESS`` statement with ``TYPE NORMAL``."""
+
+    model_config = SurrealConfigDict(table_name="tdl_user", table_type=TableType.HASH, connection="tdl")
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+class TdlAuthAny(AuthenticatedUserMixin, BaseSurrealModel):
+    """A5: ``TableType.ANY`` — ``TYPE ANY SCHEMALESS``."""
+
+    model_config = SurrealConfigDict(table_name="tdl_user", table_type=TableType.ANY, connection="tdl")
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+class TdlAuthLess(AuthenticatedUserMixin, BaseSurrealModel):
+    """A declared ``SchemaMode.SCHEMALESS`` writes v0.17.0's ``SCHEMALESS``."""
+
+    model_config = SurrealConfigDict(table_name="tdl_user", schema_mode=SchemaMode.SCHEMALESS, connection="tdl")
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+class TdlAuthOpen(AuthenticatedUserMixin, BaseSurrealModel):
+    """UX1: ``TableType.USER`` with ``extra="allow"`` imports, and is refused when its table is defined."""
+
+    model_config = SurrealConfigDict(table_name="tdl_user", table_type=TableType.USER, extra="allow", connection="tdl")
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+#: v0.17.0's access statement of the ``tdl_user`` models.
+_A_ACCESS = (
+    "DEFINE ACCESS OVERWRITE tdl_user_access ON DATABASE TYPE RECORD "
+    "SIGNUP ( CREATE tdl_user SET email = $email, password = crypto::argon2::generate($password) ) "
+    "SIGNIN ( SELECT * FROM tdl_user WHERE email = $email AND crypto::argon2::compare(password, $password) ) "
+    "DURATION FOR TOKEN 15m, FOR SESSION 12h;"
+)
+_A_ACCESS_KEPT = (
+    "DEFINE ACCESS IF NOT EXISTS tdl_user_access ON DATABASE TYPE RECORD "
+    "SIGNUP ( CREATE tdl_user SET email = $email, password = crypto::argon2::generate($password) ) "
+    "SIGNIN ( SELECT * FROM tdl_user WHERE email = $email AND crypto::argon2::compare(password, $password) ) "
+    "DURATION FOR TOKEN 15m, FOR SESSION 12h;"
+)
+
+_A0 = "DEFINE TABLE OVERWRITE tdl_user SCHEMALESS PERMISSIONS FOR select, update WHERE id = $auth.id;"
+_A0_KEPT = "DEFINE TABLE IF NOT EXISTS tdl_user SCHEMALESS PERMISSIONS FOR select, update WHERE id = $auth.id;"
+
+_A1 = [
+    "DEFINE TABLE OVERWRITE `tdl_user` TYPE NORMAL SCHEMAFULL PERMISSIONS FOR select, update WHERE id = $auth.id, FOR "
+    "create, delete NONE;",
+    "DEFINE FIELD OVERWRITE `email` ON `tdl_user` TYPE string;",
+    "DEFINE FIELD OVERWRITE `password` ON `tdl_user` TYPE string;",
+]
+
+_A2 = (
+    "DEFINE TABLE OVERWRITE tdl_user SCHEMALESS PERMISSIONS FOR select, update WHERE id = $auth.id, FOR create FULL, FOR "
+    "delete NONE;"
+)
+_A3 = (
+    "DEFINE TABLE OVERWRITE tdl_user SCHEMALESS COMMENT 'Users' CHANGEFEED 1d PERMISSIONS FOR select, update WHERE id = "
+    "$auth.id;"
+)
+_A5_HASH = "DEFINE TABLE OVERWRITE tdl_user TYPE NORMAL SCHEMALESS PERMISSIONS FOR select, update WHERE id = $auth.id;"
+_A5_ANY = "DEFINE TABLE OVERWRITE tdl_user TYPE ANY SCHEMALESS PERMISSIONS FOR select, update WHERE id = $auth.id;"
+
+#: The access's permissions as SurrealDB reads them back from A1's table statement.
+_A1_PERMISSIONS = {"select": "WHERE id = $auth.id", "create": "NONE", "update": "WHERE id = $auth.id", "delete": "NONE"}
+
+_INFO_USER = "INFO FOR TABLE `tdl_user`;"
+
+#: The ``tdl_user`` table as A1's statements store it, and its fields.
+_STORED_USER = (
+    "DEFINE TABLE tdl_user TYPE NORMAL SCHEMAFULL COMMENT 'keep' PERMISSIONS FOR select WHERE owner = $auth.id, FOR "
+    "create, update, delete FULL"
+)
+_STORED_USER_FIELDS = {
+    "email": "DEFINE FIELD email ON tdl_user TYPE string ASSERT $value != '' PERMISSIONS FULL",
+    "password": "DEFINE FIELD password ON tdl_user TYPE string PERMISSIONS FULL",
+}
+_STORED_USER_VIEW = "DEFINE TABLE tdl_user TYPE ANY SCHEMALESS AS SELECT count() AS n FROM tdl_note GROUP ALL PERMISSIONS NONE"
+
+
+class TdlAuthTotal(AuthenticatedUserMixin, BaseSurrealModel):
+    """CV1 through ``access_ddl()``: a ``TableType.USER`` model whose computed field's expression is not balanced."""
+
+    model_config = SurrealConfigDict(table_name="tdl_user", table_type=TableType.USER, connection="tdl")
+
+    id: str | None = None
+    email: str
+    password: str
+    total: Computed[int] = computed("count(items")
+
+
+class TestAccessDdl:
+    """``access_ddl()``/``define_access()``: the schema mode decides — ``SCHEMAFULL`` (``TableType.USER`` or declared)
+    through the model table DDL, every other model v0.17.0's ``SCHEMALESS`` statement with its declared clauses; the
+    refusals before any request; the declared permissions never quoted."""
+
+    def test_a0_a_model_without_the_new_keys_is_v0170_byte_for_byte(self) -> None:
+        assert TdlAuthPlain.access_ddl() == [
+            "DEFINE TABLE OVERWRITE tdl_user SCHEMALESS PERMISSIONS FOR select, update WHERE id = $auth.id;",
+            "DEFINE ACCESS OVERWRITE tdl_user_access ON DATABASE TYPE RECORD SIGNUP ( CREATE tdl_user SET email = $email, "
+            "password = crypto::argon2::generate($password) ) SIGNIN ( SELECT * FROM tdl_user WHERE email = $email AND "
+            "crypto::argon2::compare(password, $password) ) DURATION FOR TOKEN 15m, FOR SESSION 12h;",
+        ]
+        assert TdlAuthPlain.access_ddl(overwrite=False) == [
+            "DEFINE TABLE IF NOT EXISTS tdl_user SCHEMALESS PERMISSIONS FOR select, update WHERE id = $auth.id;",
+            "DEFINE ACCESS IF NOT EXISTS tdl_user_access ON DATABASE TYPE RECORD SIGNUP ( CREATE tdl_user SET email = "
+            "$email, password = crypto::argon2::generate($password) ) SIGNIN ( SELECT * FROM tdl_user WHERE email = $email "
+            "AND crypto::argon2::compare(password, $password) ) DURATION FOR TOKEN 15m, FOR SESSION 12h;",
+        ]
+        assert TdlAuthPlain.get_schema_mode() is None
+        assert TdlAuthReset.access_ddl() == [_A0, _A_ACCESS]
+
+    def test_a1_a_user_table_is_schemafull_with_its_fields(self) -> None:
+        assert TdlAuthUser.access_ddl() == [*_A1, _A_ACCESS]
+        assert TdlAuthUser.access_ddl(overwrite=False) == [*_if_not_exists(_A1), _A_ACCESS_KEPT]
+        assert all("IF NOT EXISTS" in statement for statement in TdlAuthUser.access_ddl(overwrite=False))
+
+    def test_a2_declared_permissions(self) -> None:
+        assert TdlAuthRules.access_ddl() == [_A2, _A_ACCESS]
+
+    def test_a3_a_comment_and_a_change_feed(self) -> None:
+        assert TdlAuthFeed.access_ddl() == [_A3, _A_ACCESS]
+
+    @pytest.mark.parametrize("model", [TdlAuthFull, TdlAuthUserFull], ids=lambda model: model.__name__)
+    def test_a4_a_declared_schemafull_is_a1(self, model: type[TdlAuthFull]) -> None:
+        assert model.access_ddl() == [*_A1, _A_ACCESS]
+        assert model.access_ddl(overwrite=False) == [*_if_not_exists(_A1), _A_ACCESS_KEPT]
+
+    @pytest.mark.parametrize(
+        ("model", "statement"),
+        [(TdlAuthHash, _A5_HASH), (TdlAuthAny, _A5_ANY), (TdlAuthLess, _A0)],
+        ids=["hash", "any", "declared-schemaless"],
+    )
+    def test_a5_the_type_clause_only_when_table_type_is_declared(self, model: type[TdlAuthHash], statement: str) -> None:
+        assert model.access_ddl() == [statement, _A_ACCESS]
+        assert model.access_ddl(overwrite=False)[0] == statement.replace("OVERWRITE", "IF NOT EXISTS")
+
+    @pytest.mark.parametrize("model", [TdlAuthPlain, TdlAuthRules, TdlAuthUser, TdlAuthFull, TdlAuthOpen, TdlAuthTotal])
+    def test_with_table_false_is_unchanged(self, model: type[TdlAuthPlain]) -> None:
+        assert model.access_ddl(with_table=False) == [_A_ACCESS]
+        assert model.access_ddl(overwrite=False, with_table=False) == [_A_ACCESS_KEPT]
+
+    def test_ux1_from_access_ddl(self) -> None:
+        with pytest.raises(TypeError) as raised:
+            TdlAuthOpen.access_ddl()
+        assert type(raised.value) is TypeError
+        assert str(raised.value) == _ux1("TdlAuthOpen")
+
+    def test_cv1_through_access_ddl(self) -> None:
+        with pytest.raises(ValueError) as raised:
+            TdlAuthTotal.access_ddl()
+        assert type(raised.value) is ValueError
+        assert str(raised.value) == _cv1("TdlAuthTotal", "total", _R_BRACKETS)
+
+    @pytest.mark.parametrize("overwrite", ["yes", 1], ids=repr)
+    def test_e1_through_access_ddl(self, overwrite: Any) -> None:
+        with pytest.raises(TypeError) as raised:
+            TdlAuthUser.access_ddl(overwrite=overwrite)
+        assert str(raised.value) == f"overwrite= must be a bool, got {type(overwrite).__name__}."
+
+    async def test_ux1_from_define_access_before_any_request(self, use_client: Callable[[Any], None]) -> None:
+        client = _TableClient()
+        use_client(client)
+        with pytest.raises(TypeError) as raised:
+            await TdlAuthOpen.define_access()
+        assert str(raised.value) == _ux1("TdlAuthOpen")
+        assert client.queries == []
+        assert client.version_calls == 0
+
+    async def test_e1_and_cv1_from_define_access_before_any_request(self, use_client: Callable[[Any], None]) -> None:
+        client = _TableClient()
+        use_client(client)
+        with pytest.raises(TypeError):
+            await TdlAuthUser.define_access(overwrite="yes")  # type: ignore[arg-type]
+        with pytest.raises(ValueError):
+            await TdlAuthTotal.define_access()
+        assert client.queries == []
+
+    async def test_with_table_false_applies_the_access_alone(self, use_client: Callable[[Any], None]) -> None:
+        """No UX1, no read: the access statement only, as in v0.17.0."""
+        for model in (TdlAuthOpen, TdlAuthUser, TdlAuthPlain):
+            client = _TableClient()
+            use_client(client)
+            assert await model.define_access(with_table=False) == [_A_ACCESS]
+            assert client.queries == [_A_ACCESS]
+
+    async def test_case_1_applies_v0170_statements(self, use_client: Callable[[Any], None]) -> None:
+        """No read: v0.17.0's two statements, one per call — and so for a declared clause other than permissions."""
+        for model, statement in ((TdlAuthPlain, _A0), (TdlAuthFeed, _A3), (TdlAuthHash, _A5_HASH)):
+            client = _TableClient()
+            use_client(client)
+            assert await model.define_access() == [statement, _A_ACCESS]
+            assert client.queries == [statement, _A_ACCESS]
+
+    async def test_case_1_declared_permissions(self, use_client: Callable[[Any], None]) -> None:
+        client = _TableClient()
+        use_client(client)
+        assert await TdlAuthRules.define_access() == [_A2, _A_ACCESS]
+        assert client.queries == [_A2, _A_ACCESS]
+
+    @pytest.mark.parametrize(
+        ("reason", "text"),
+        [
+            ("The table is locked", "The table is locked"),
+            (
+                "Found a problem in PERMISSIONS FOR select, update WHERE id = $auth.id",
+                "the server's message quotes the statement, so it is left out",
+            ),
+        ],
+        ids=["whole", "quoting"],
+    )
+    async def test_case_1_a_refusal_never_quotes_the_declared_permissions(
+        self, use_client: Callable[[Any], None], reason: str, text: str
+    ) -> None:
+        """The table statement on its own, named by its table; the access statement is not sent."""
+        error = InternalError("Internal", reason)
+        client = _TableClient(ddl_error=error, refuse="DEFINE TABLE ")
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlAuthRules.define_access()
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == f"Can't apply table definition: 'tdl_user' -> {text}"
+        assert "$auth.id" not in str(raised.value)
+        assert client.queries == [_A2]
+
+    async def test_case_2_a_missing_table(self, use_client: Callable[[Any], None]) -> None:
+        """``INFO FOR DB`` once, then A1's statements one per call, then the access statement."""
+        for model in (TdlAuthUser, TdlAuthFull, TdlAuthUserFull):
+            client = _TableClient()
+            use_client(client)
+            result = await model.define_access()
+            assert result == [*_A1, _A_ACCESS] == model.access_ddl()
+            assert client.queries == [_INFO, *_A1, _A_ACCESS]
+            assert client.version_calls == 0
+
+    async def test_case_2_overwrite_false(self, use_client: Callable[[Any], None]) -> None:
+        client = _TableClient()
+        use_client(client)
+        assert await TdlAuthUser.define_access(overwrite=False) == [*_if_not_exists(_A1), _A_ACCESS_KEPT]
+        assert client.queries == [_INFO, *_if_not_exists(_A1), _A_ACCESS_KEPT]
+
+    async def test_case_2_an_existing_table(self, use_client: Callable[[Any], None]) -> None:
+        """The carried statements: the access's permissions written over the stored ones, the stored comment and the
+        fields' ``ASSERT`` kept."""
+        client = _TableClient({"tdl_user": _STORED_USER}, _STORED_USER_FIELDS)
+        use_client(client)
+        carried = [
+            "DEFINE TABLE OVERWRITE `tdl_user` TYPE NORMAL SCHEMAFULL COMMENT 'keep' PERMISSIONS FOR select, update WHERE "
+            "id = $auth.id, FOR create, delete NONE;",
+            "DEFINE FIELD OVERWRITE `email` ON `tdl_user` TYPE string ASSERT $value != '';",
+            _A1[2],
+        ]
+        assert await TdlAuthUser.define_access() == [*carried, _A_ACCESS]
+        assert client.queries == [_INFO, _INFO_USER, *carried, _A_ACCESS]
+
+        client = _TableClient({"tdl_user": _STORED_USER}, _STORED_USER_FIELDS)
+        use_client(client)
+        assert (await TdlAuthUser.define_table()).split("\n") == [
+            "DEFINE TABLE OVERWRITE `tdl_user` TYPE NORMAL SCHEMAFULL COMMENT 'keep' PERMISSIONS FOR select WHERE owner "
+            "= $auth.id, FOR create, update, delete FULL;",
+            *carried[1:],
+        ]
+
+    @pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "if-not-exists"])
+    async def test_case_2_tg1_names_define_access(self, use_client: Callable[[Any], None], overwrite: bool) -> None:
+        client = _TableClient({"tdl_user": _STORED_USER_VIEW})
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlAuthUser.define_access(overwrite=overwrite)
+        assert (type(raised.value), str(raised.value)) == (
+            SurrealDbError,
+            _tg1("TdlAuthUser", "define_access", "tdl_user"),
+        )
+        assert client.queries == [_INFO]
+
+    async def test_case_2_a_transaction(self, use_client: Callable[[Any], None]) -> None:
+        """The read on the client before anything is queued; the table, field and access statements in the block."""
+        client = _TableClient()
+        use_client(client)
+        tx = _QueuingTx()
+        assert await TdlAuthUser.define_access(tx=tx) == [*_A1, _A_ACCESS]  # type: ignore[arg-type]
+        assert client.queries == [_INFO]
+        assert tx.added == [(statement, None) for statement in [*_A1, _A_ACCESS]]
+
+    async def test_case_2_a_transaction_of_another_connection(self, use_client: Callable[[Any], None]) -> None:
+        client = _TableClient()
+        use_client(client)
+        tx = _QueuingTx("other")
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlAuthUser.define_access(tx=tx)  # type: ignore[arg-type]
+        assert str(raised.value).startswith("TdlAuthUser.define_access() cannot run in this transaction: ")
+        assert client.queries == []
+        assert tx.added == []
+
+    def test_define_access_keeps_its_signature(self) -> None:
+        """v0.17.0's keywords and its ``list[str]`` return."""
+        assert inspect.signature(AuthenticatedUserMixin.define_access) == inspect.Signature(
+            [
+                inspect.Parameter("overwrite", inspect.Parameter.KEYWORD_ONLY, default=True, annotation=bool),
+                inspect.Parameter("with_table", inspect.Parameter.KEYWORD_ONLY, default=True, annotation=bool),
+                inspect.Parameter("tx", inspect.Parameter.KEYWORD_ONLY, default=None, annotation=Transaction | None),
+            ],
+            return_annotation=list[str],
+        )
+
+
+#: The identity the E2E signups use, and its password.
+_TDL_EMAIL = "ada@example.test"
+_TDL_PASSWORD = "s3cret-passphrase"
+
+
+async def _signup_and_signin(model: type[TdlAuthUser], client: Any) -> None:
+    """``signup()`` then ``signin()`` of *model* succeed, and the record reads back its email."""
+    created = await model.signup(email=_TDL_EMAIL, password=_TDL_PASSWORD)
+    assert created.tokens.access
+    assert created.user.email == _TDL_EMAIL
+    assert created.user.password != _TDL_PASSWORD
+    signed_in = await model.signin(email=_TDL_EMAIL, password=_TDL_PASSWORD)
+    assert signed_in.user.get_id() == created.user.get_id()
+    assert signed_in.user.email == _TDL_EMAIL
+    assert await client.query("SELECT VALUE email FROM tdl_user;", {}) == [_TDL_EMAIL]
+
+
+async def _user_table(client: Any) -> tuple[Any, dict[str, Any]]:
+    """The ``tdl_user`` entry of ``INFO FOR DB`` and ``INFO FOR TABLE tdl_user``."""
+    return (await _tables(client))["tdl_user"], await _table_info(client, "tdl_user")
+
+
+class TestAccessE2E:
+    """Over WebSocket on both lines (and 3.1.5): a ``SCHEMAFULL`` access table — ``TableType.USER`` or declared — is
+    defined with its fields by ``define_access()``, and signup and signin work there; ``define_table()`` afterwards, or
+    a second ``define_access()``, sends the carried statements and changes nothing; a view under it is refused, naming
+    ``define_access()``."""
+
+    async def test_a_user_model_without_schema_mode(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl("ws") as client:
+            calls = _spy(monkeypatch, client)
+            assert await TdlAuthUser.define_access() == [*_A1, _A_ACCESS]
+            assert _sent(calls) == [_INFO, *_A1, _A_ACCESS]
+            monkeypatch.undo()
+
+            stored, info = await _user_table(client)
+            state = parse_define_table(stored)
+            assert (state.table_type, state.schema_mode) == ("normal", "SCHEMAFULL")
+            assert state.permissions == _A1_PERMISSIONS
+            fields = _field_states(info)
+            assert {path: (field.field_type, field.nullable) for path, field in fields.items()} == {
+                ("email",): ("string", False),
+                ("password",): ("string", False),
+            }
+            assert "tdl_user_access" in (await client.query("INFO FOR DB;", {}))["accesses"]
+            await _signup_and_signin(TdlAuthUser, client)
+
+    async def test_define_access_then_define_table_changes_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl("ws") as client:
+            await TdlAuthUser.define_access()
+            before = await _user_table(client)
+            calls = _spy(monkeypatch, client)
+            assert await TdlAuthUser.define_table() == "\n".join(_A1)
+            assert _sent(calls) == [_INFO, _INFO_USER, *_A1]
+            monkeypatch.undo()
+            assert await _user_table(client) == before
+            await _signup_and_signin(TdlAuthUser, client)
+
+    async def test_a_declared_schemafull_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl("ws") as client:
+            assert await TdlAuthFull.define_access() == [*_A1, _A_ACCESS]
+            stored, info = await _user_table(client)
+            assert parse_define_table(stored).schema_mode == "SCHEMAFULL"
+            assert set(_field_states(info)) == {("email",), ("password",)}
+            await _signup_and_signin(TdlAuthFull, client)
+
+            before = await _user_table(client)
+            calls = _spy(monkeypatch, client)
+            assert await TdlAuthFull.define_access() == [*_A1, _A_ACCESS]
+            assert _sent(calls) == [_INFO, _INFO_USER, *_A1, _A_ACCESS]
+            monkeypatch.undo()
+            assert await _user_table(client) == before
+            assert (await TdlAuthFull.signin(email=_TDL_EMAIL, password=_TDL_PASSWORD)).user.email == _TDL_EMAIL
+
+    async def test_tg1_names_define_access(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl("ws") as client:
+            await _apply_ddl(client, f"CREATE tdl_note:n1 SET body = 'x'; DEFINE TABLE tdl_user AS {_VIEW_QUERY};")
+            before = (await _tables(client))["tdl_user"]
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await TdlAuthUser.define_access()
+            assert _sent(calls) == [_INFO]
+            monkeypatch.undo()
+            assert (type(raised.value), str(raised.value)) == (
+                SurrealDbError,
+                _tg1("TdlAuthUser", "define_access", "tdl_user"),
+            )
+            assert (await _tables(client))["tdl_user"] == before
+            assert "tdl_user_access" not in (await client.query("INFO FOR DB;", {}))["accesses"]
