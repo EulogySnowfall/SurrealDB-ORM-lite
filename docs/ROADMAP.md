@@ -751,13 +751,15 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
     `schema_mode=`, `changefeed=`, `permissions=` and `comment=`
 - Measured differences: on a `SCHEMAFULL` table, 2.x and the embedded engine empty the objects and
   arrays of an `any` column and of an untyped array or set unless it is `FLEXIBLE`, which 3.x
-  refuses there: `define_table()` reads `client.version()` and adds `FLEXIBLE` before 3.x. An
-  untyped `list` gets an item definition `TYPE any` on every line (3.x refuses an object item of
-  a required untyped array without it). A write naming a field the table does not define is
-  refused on 3.x and dropped on 2.x and the embedded engine. `COMPUTED` is 3.x's and is kept.
-  Same code on 2.7.0, 3.3.4 and the embedded engine (3.1.5 retro: refuses a Python `set` written
-  to a `set` field and an object item of an optional untyped `list`; a keyword field name breaks
-  its table — server defects)
+  refuses there: `define_table()` reads `client.version()` and adds `FLEXIBLE` before 3.x. It also
+  writes `FLEXIBLE` before 3.x on a list of sub-models (`list[M]`, at any depth) holding a `dict`,
+  `Any` or untyped `list` column, whose values 2.x and the embedded engine otherwise drop from
+  every item before refusing the record's next write. An untyped `list` gets an item definition
+  `TYPE any` on every line (3.x refuses an object item of a required untyped array without it). A
+  write naming a field the table does not define is refused on 3.x and dropped on 2.x and the
+  embedded engine. `COMPUTED` is 3.x's and is kept. Same code on 2.7.0, 3.3.4 and the embedded
+  engine (3.1.5 retro: refuses a Python `set` written to a `set` field and an object item of an
+  optional untyped `list`; a keyword field name breaks its table — server defects)
 - Deferred: field clauses declared on the model (`ASSERT`, `READONLY`, field permissions,
   comment), typed record links (`record<table>`), refusing undeclared field names before a write,
   `define_table(tx=…)` seeing a definition queued earlier in the block. For v0.38.0

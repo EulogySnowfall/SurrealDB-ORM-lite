@@ -68,7 +68,7 @@ of Tier 3's schema and DDL phase; this release also completes the roadmap renumb
 - README section 35, "Model table DDL (`define_table()`, `schema_mode`, `permissions`)" (declaring
   the table, field types, applying it, views and edges, user models, what SurrealDB checks,
   SurrealDB 2.x and 3.x, transactions, connections and the cache, security, a note for users of the
-  full SurrealDB-ORM), updates to sections 16, 19, 31, 33 and 34, a features row, three rows in the
+  full SurrealDB-ORM), updates to sections 16, 19, 31, 33 and 34, a features row, four rows in the
   2.x/3.x behaviour table and one in the embedded-engine table, the comparison and roadmap rows,
   and the example notebook `examples/v0.34.0_model_table_ddl.ipynb`.
 
@@ -146,14 +146,17 @@ of Tier 3's schema and DDL phase; this release also completes the roadmap renumb
   table (derive the model from `BaseSurrealEdge`) and a definition it cannot read back or carry.
 - **SurrealDB 2.x and the embedded engine empty the objects and arrays of an `any` column and of
   an untyped array or set on a `SCHEMAFULL` table**, optional or not; `FLEXIBLE` keeps them, and
-  3.x keeps them without it but refuses `FLEXIBLE` there. `define_table()` reads the line
-  (`client.version()`, once, only for a `SCHEMAFULL` table with such a column) and writes
-  `FLEXIBLE` on those columns before 3.x; `table_ddl()`, which needs no connection, writes the 3.x
-  form. An untyped `list` gets an item definition `TYPE any` (`bag.*`) on every line, without
-  which 3.x refuses an object item of a required untyped array. A union holding a list or a set
-  together with an object or another container writes its lists, sets and tuples as an untyped
-  `array` with that item definition, since SurrealDB derives one item type for every member of
-  such a union.
+  3.x keeps them without it but refuses `FLEXIBLE` there. They also drop the `dict`, `Any` or
+  untyped `list` of a sub-model in a list of sub-models (`list[M]`, at any depth: `items.*.meta`)
+  from every item, then refuse the record's next write (`Found NONE for field`), unless the list is
+  `FLEXIBLE` too; 3.x keeps those values without it. `define_table()` reads the line
+  (`client.version()`, once, only for a `SCHEMAFULL` table with such a column or such a list) and
+  writes `FLEXIBLE` on those columns and lists before 3.x, the items' typed fields still checked;
+  `table_ddl()`, which needs no connection, writes the 3.x form. An untyped `list` gets an item
+  definition `TYPE any` (`bag.*`) on every line, without which 3.x refuses an object item of a
+  required untyped array. A union holding a list or a set together with an object or another
+  container writes its lists, sets and tuples as an untyped `array` with that item definition,
+  since SurrealDB derives one item type for every member of such a union.
 - **A write naming a field a `SCHEMAFULL` table does not define** (a `merge()` key the model does
   not declare, `bulk_update()`, a raw query, a record stored before the table became `SCHEMAFULL`)
   is refused on SurrealDB 3.x (`no such field exists`) and the field dropped, silently, on 2.x and

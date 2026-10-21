@@ -148,7 +148,7 @@ stays ``COMPUTED`` and every ``DEFAULT``, ``VALUE`` and ``ASSERT`` stays.
 
 The README (``TestReadmeSection35``): section 35 — its place, its subsections, its examples (run on ``mem://`` as
 written, each printed line equal to its comment), the sentences each subsection says, its kinds and source-rule tables
-and its "Coming from the full SurrealDB-ORM" bullets —, the sentences sections 16, 19, 31, 33 and 34 change, the three
+and its "Coming from the full SurrealDB-ORM" bullets —, the sentences sections 16, 19, 31, 33 and 34 change, the four
 rows of the 2.x/3.x table and its intro sentence, the embedded engine's row, and the features, roadmap and comparison
 rows.
 """
