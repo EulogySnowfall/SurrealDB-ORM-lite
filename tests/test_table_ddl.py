@@ -46,6 +46,25 @@ gets no ``DEFAULT``. A ``TableType.USER`` model with ``extra="allow"`` is refuse
 statement then its data fields, a view model its view statement. ``model_ddl.field_permissions_text()`` writes a
 field's permissions as SurrealDB renders them.
 
+The carried statements (``TestCarriedTable``, ``TestCarriedFields``), from the definitions as the servers render them:
+over a table that exists, ``schema.table_statement_keeping()`` writes the model's type clause, then the ``DROP``, schema
+mode, comment, change feed and permissions — each declared one, else the stored one —, and ``relation_statement_keeping()``
+gives v0.33.0's statements through it; ``schema.view_statement()`` writes a view's declared comment, change feed and
+permissions after ``AS (…)`` and ``schema.view_statement_keeping()`` keeps a stored view's clauses around it. Over a field
+that exists, ``model_ddl.field_statement_keeping()`` writes the column's ``TYPE``, ``FLEXIBLE``, ``DEFAULT`` and
+``VALUE`` and keeps the stored ``REFERENCE``, ``DEFAULT``/``VALUE`` the model does not write, ``READONLY``, ``ASSERT``,
+``PERMISSIONS`` and ``COMMENT``: a stored ``COMPUTED`` stays ``COMPUTED`` (the model's expression, no ``DEFAULT``), a
+``server_fields`` column keeps the database's ``DEFAULT``, ``VALUE`` or ``COMPUTED``. A carried value that fails its
+check gives ``None``; a value the model replaces is not checked.
+
+The guards' texts (``TestGuardTexts``): ``schema.table_refused()`` names ``define_table()`` or ``define_access()``;
+``schema.relation_table_refused()`` keeps v0.33.0's texts and names ``define_table()`` when it is the caller;
+``schema.relation_schemafull_refused()`` names the data fields of an edge model declared ``SCHEMAFULL``.
+
+The field read (``TestReadTableFields``): ``schema.read_table_fields()`` sends ``INFO FOR TABLE`` once and keys each
+field's definition by its path on both lines' renderings (``bag.*`` and ``bag[*]``, a keyword key bare or quoted); a
+definition the parser cannot read is ``None`` under the path of its key; a refusal is the table definition's.
+
 On the engines (``TestTableDdlE2E``, every engine of both lines): each list of statements, applied raw, is accepted and
 read back — the table's type, mode, comment, change feed and permissions, each column's kind and ``FLEXIBLE``.
 
@@ -73,7 +92,7 @@ import pytest
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 from surrealdb import Datetime as SdkDatetime
 from surrealdb import Duration as SdkDuration
-from surrealdb import InternalError, RecordID
+from surrealdb import InternalError, NotAllowedError, RecordID
 from surrealdb import Range as SdkRange
 
 import surreal_orm_lite
@@ -93,7 +112,9 @@ from surreal_orm_lite import (
     Range,
     SchemaMode,
     SurrealConfigDict,
+    SurrealDbAuthenticationError,
     SurrealDBConnectionManager,
+    SurrealDbError,
     SurrealDbNotFoundError,
     TableType,
     computed,
@@ -101,6 +122,7 @@ from surreal_orm_lite import (
     schema,
 )
 from surreal_orm_lite.define_parser import normalise_kind, parse_define_field, parse_define_table, parse_kind, render_kind
+from surreal_orm_lite.schema_state import FieldState, TableState
 
 # --- the exact texts of the class-time refusals ---------------------------------------------------------------------
 
@@ -2051,6 +2073,891 @@ class TestTableDdl:
         )
         with pytest.raises(TypeError):
             model_ddl.field_statement("tdl_x", column, overwrite="yes", schemafull=True)  # type: ignore[arg-type]
+
+
+# --- the carried statements: a table and fields that exist ----------------------------------------------------------
+
+
+class TdlNoteTuned(BaseSurrealModel):
+    """The model of the table tuned by hand: ``TdlNote``'s fields, ``email`` and ``created`` (a server field)."""
+
+    model_config = SurrealConfigDict(table_name="tdl_note", server_fields=["created"], connection="tdl")
+
+    id: str | None = None
+    body: str
+    done: bool = False
+    email: str | None = None
+    created: datetime | None = None
+
+
+class TdlNoteMine(BaseSurrealModel):
+    """The same table with its own schema mode, comment and permissions: those win over the stored ones."""
+
+    model_config = SurrealConfigDict(
+        table_name="tdl_note",
+        schema_mode=SchemaMode.SCHEMALESS,
+        comment="mine",
+        permissions={"select": "FULL"},
+        server_fields=["created"],
+        connection="tdl",
+    )
+
+    id: str | None = None
+    body: str
+    done: bool = False
+    email: str | None = None
+    created: datetime | None = None
+
+
+class TdlDrop(BaseSurrealModel):
+    """A model without the table keys on a ``DROP`` table."""
+
+    model_config = SurrealConfigDict(table_name="tdl_drop", connection="tdl")
+
+    id: str | None = None
+    body: str
+
+
+class TdlNoteShapes(BaseSurrealModel):
+    """Columns over stored fields: a constant default, a free-form object, a sub-model's object, ``Any``."""
+
+    model_config = SurrealConfigDict(table_name="tdl_note", connection="tdl")
+
+    id: str | None = None
+    age: int = 18
+    meta: dict[str, Any] = Field(default_factory=dict)
+    address: TdlAddress | None = None
+    tags: list[str] = Field(default_factory=list)
+    anything: Any = None
+
+
+#: The stored tables as SurrealDB renders them in ``INFO FOR DB`` — the same text on 3.3.4, 2.7.0 and 3.1.5: with
+#: ``DROP``; without it (the table the end-to-end tests tune by hand: a ``DROP`` table stores no record); a ``DROP``
+#: table of its own.
+_STORED_NOTE_DROP = (
+    "DEFINE TABLE tdl_note TYPE ANY DROP SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS FOR select "
+    "WHERE owner = $auth.id, FOR create FULL, FOR update, delete NONE"
+)
+_STORED_NOTE = (
+    "DEFINE TABLE tdl_note TYPE ANY SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS FOR select "
+    "WHERE owner = $auth.id, FOR create FULL, FOR update, delete NONE"
+)
+_STORED_DROP = "DEFINE TABLE tdl_drop TYPE ANY DROP SCHEMALESS COMMENT 'd' PERMISSIONS NONE"
+
+_K1 = (
+    "DEFINE TABLE OVERWRITE `tdl_note` TYPE NORMAL DROP SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL "
+    "PERMISSIONS FOR select WHERE owner = $auth.id, FOR create FULL, FOR update, delete NONE;"
+)
+_K2 = (
+    "DEFINE TABLE OVERWRITE `tdl_note` TYPE NORMAL DROP SCHEMALESS COMMENT 'mine' CHANGEFEED 1h INCLUDE ORIGINAL "
+    "PERMISSIONS FOR select FULL, FOR create, update, delete NONE;"
+)
+_K1E = (
+    "DEFINE TABLE OVERWRITE `tdl_note` TYPE NORMAL SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS "
+    "FOR select WHERE owner = $auth.id, FOR create FULL, FOR update, delete NONE;"
+)
+_K2E = (
+    "DEFINE TABLE OVERWRITE `tdl_note` TYPE NORMAL SCHEMALESS COMMENT 'mine' CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS "
+    "FOR select FULL, FOR create, update, delete NONE;"
+)
+_K1D = [
+    "DEFINE TABLE OVERWRITE `tdl_drop` TYPE NORMAL DROP COMMENT 'd';",
+    "DEFINE FIELD OVERWRITE `body` ON `tdl_drop` TYPE string;",
+]
+
+#: (case, model, stored table, carried statement).
+_CARRIED_TABLES: list[tuple[str, type[BaseSurrealModel], str, str]] = [
+    ("K1", TdlNote, _STORED_NOTE_DROP, _K1),
+    ("K2", TdlNoteMine, _STORED_NOTE_DROP, _K2),
+    ("K1E", TdlNoteTuned, _STORED_NOTE, _K1E),
+    ("K2E", TdlNoteMine, _STORED_NOTE, _K2E),
+]
+
+#: A stored view with a hand-set mode, comment, change feed and permissions (the same text on every line), and its
+#: carried statement for a view model without the table keys.
+_STORED_VIEW = (
+    'DEFINE TABLE tdl_stats TYPE ANY DROP SCHEMAFULL COMMENT "it\'s" AS SELECT count() AS n FROM tdl_note GROUP ALL '
+    "CHANGEFEED 1h PERMISSIONS FOR select WHERE true, FOR create, update, delete NONE"
+)
+_K8 = (
+    f"DEFINE TABLE OVERWRITE `tdl_stats` DROP SCHEMAFULL AS ({_VIEW_QUERY}) COMMENT 'it\\'s' CHANGEFEED 1h PERMISSIONS "
+    "FOR select WHERE true, FOR create, update, delete NONE;"
+)
+
+#: v0.33.0's carried relation statements: the stored definitions, the type clause and what it sent (copied).
+_RELATION_CLAUSE = "TYPE RELATION IN `person` OUT `post` | `book` ENFORCED"
+_LIKES_CLAUSE = "TYPE RELATION IN `rel_person` OUT `rel_post` | `rel_book` ENFORCED"
+_LIKES_STORED = (
+    "DEFINE TABLE rel_likes TYPE ANY SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS FOR select "
+    "WHERE in = $auth.id, FOR create FULL, FOR update, delete NONE"
+)
+_LIKES_READ_BACK = (
+    "DEFINE TABLE rel_likes TYPE RELATION IN rel_person OUT rel_post | rel_book ENFORCED SCHEMAFULL COMMENT 'keep' "
+    "CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS FOR select WHERE in = $auth.id, FOR create FULL, FOR update, delete NONE"
+)
+_RELATION_CARRIED: list[tuple[str, str, str, str, str]] = [
+    (
+        "K1",
+        "t",
+        _RELATION_CLAUSE,
+        'DEFINE TABLE t TYPE NORMAL SCHEMAFULL COMMENT "it\'s \\\\ a \\"c\\" line" CHANGEFEED 1h INCLUDE ORIGINAL '
+        "PERMISSIONS FOR select WHERE in = $auth.id OR out = $auth.id, FOR create FULL, FOR update, delete NONE",
+        "DEFINE TABLE OVERWRITE `t` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED SCHEMAFULL COMMENT "
+        "'it\\'s \\\\ a \"c\" line' CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS FOR select WHERE in = $auth.id OR "
+        "out = $auth.id, FOR create FULL, FOR update, delete NONE;",
+    ),
+    (
+        "K2",
+        "t",
+        _RELATION_CLAUSE,
+        "DEFINE TABLE t TYPE ANY DROP SCHEMALESS PERMISSIONS NONE",
+        "DEFINE TABLE OVERWRITE `t` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED DROP;",
+    ),
+    (
+        "K3",
+        "t",
+        _RELATION_CLAUSE,
+        "DEFINE TABLE t TYPE ANY SCHEMALESS PERMISSIONS FULL",
+        "DEFINE TABLE OVERWRITE `t` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED PERMISSIONS FULL;",
+    ),
+    (
+        "K4",
+        "t",
+        _RELATION_CLAUSE,
+        "DEFINE TABLE t TYPE ANY SCHEMALESS PERMISSIONS NONE",
+        "DEFINE TABLE OVERWRITE `t` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;",
+    ),
+    (
+        "K5",
+        "t",
+        _RELATION_CLAUSE,
+        "DEFINE TABLE t TYPE RELATION IN company OUT post ENFORCED SCHEMAFULL PERMISSIONS FOR select FULL, FOR create, "
+        "update, delete NONE",
+        "DEFINE TABLE OVERWRITE `t` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED SCHEMAFULL PERMISSIONS FOR "
+        "select FULL, FOR create, update, delete NONE;",
+    ),
+    (
+        "K6",
+        "rel_likes",
+        _LIKES_CLAUSE,
+        _LIKES_STORED,
+        "DEFINE TABLE OVERWRITE `rel_likes` TYPE RELATION IN `rel_person` OUT `rel_post` | `rel_book` ENFORCED "
+        "SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS FOR select WHERE in = $auth.id, FOR "
+        "create FULL, FOR update, delete NONE;",
+    ),
+    (
+        "K6-read-back",
+        "rel_likes",
+        _LIKES_CLAUSE,
+        _LIKES_READ_BACK,
+        "DEFINE TABLE OVERWRITE `rel_likes` TYPE RELATION IN `rel_person` OUT `rel_post` | `rel_book` ENFORCED "
+        "SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL PERMISSIONS FOR select WHERE in = $auth.id, FOR "
+        "create FULL, FOR update, delete NONE;",
+    ),
+    (
+        "K7",
+        "rel_likes",
+        "TYPE RELATION",
+        _LIKES_READ_BACK,
+        "DEFINE TABLE OVERWRITE `rel_likes` TYPE RELATION SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL "
+        "PERMISSIONS FOR select WHERE in = $auth.id, FOR create FULL, FOR update, delete NONE;",
+    ),
+]
+
+
+def _kept_table(model: type[BaseSurrealModel], stored: str | TableState) -> str | None:
+    """``table_statement_keeping()`` of *model*'s type clause and declared clauses over the stored table *stored*."""
+    state = parse_define_table(stored) if isinstance(stored, str) else stored
+    return schema.table_statement_keeping(model.get_table_name(), model._table_head(), model._declared_table_clauses(), state)
+
+
+class TestCarriedTable:
+    """Over a table that exists, ``table_statement_keeping()`` writes the model's type clause, then the ``DROP``, schema
+    mode, comment, change feed and permissions — each declared one, else the stored one —, ``None`` when a carried
+    value fails its check; ``relation_statement_keeping()`` gives v0.33.0's statements through it. Views carry the same
+    clauses around ``AS``. The guards' texts."""
+
+    @pytest.mark.parametrize(
+        ("model", "stored", "statement"), [case[1:] for case in _CARRIED_TABLES], ids=[case[0] for case in _CARRIED_TABLES]
+    )
+    def test_each_carried_table(self, model: type[BaseSurrealModel], stored: str, statement: str) -> None:
+        assert _kept_table(model, stored) == statement
+
+    def test_a_drop_table_of_its_own(self) -> None:
+        """``SCHEMALESS``, the default, is not written; the new column is written as on a new table."""
+        state = parse_define_table(_STORED_DROP)
+        statements = [
+            _kept_table(TdlDrop, state),
+            *(
+                model_ddl.field_statement("tdl_drop", column, overwrite=True, schemafull=False)
+                for column in TdlDrop._table_columns()
+            ),
+        ]
+        assert statements == _K1D
+
+    def test_a_declared_mode_is_written_either_way(self) -> None:
+        """A declared ``SCHEMALESS`` turns a ``SCHEMAFULL`` table back; a declared ``SCHEMAFULL`` is written over a
+        ``SCHEMALESS`` one; ``PERMISSIONS NONE`` when the declared permissions are all ``NONE``."""
+        clauses = schema.TableClauses(schema_mode="SCHEMAFULL", permissions=schema.permissions_rules({}, model="M"))
+        assert schema.table_statement_keeping("tdl_drop", "TYPE NORMAL", clauses, parse_define_table(_STORED_DROP)) == (
+            "DEFINE TABLE OVERWRITE `tdl_drop` TYPE NORMAL DROP SCHEMAFULL COMMENT 'd' PERMISSIONS NONE;"
+        )
+
+    def test_a_declared_change_feed_wins(self) -> None:
+        clauses = schema.TableClauses(changefeed="7d")
+        assert schema.table_statement_keeping("tdl_note", "TYPE ANY", clauses, parse_define_table(_STORED_NOTE)) == (
+            "DEFINE TABLE OVERWRITE `tdl_note` TYPE ANY SCHEMAFULL COMMENT 'keep' CHANGEFEED 7d PERMISSIONS FOR select "
+            "WHERE owner = $auth.id, FOR create FULL, FOR update, delete NONE;"
+        )
+
+    @pytest.mark.parametrize(
+        ("table", "clause", "stored", "statement"),
+        [case[1:] for case in _RELATION_CARRIED],
+        ids=[case[0] for case in _RELATION_CARRIED],
+    )
+    def test_v033_relation_statements_unchanged(self, table: str, clause: str, stored: str, statement: str) -> None:
+        state = parse_define_table(stored)
+        assert schema.table_statement_keeping(table, clause, schema.TableClauses(), state) == statement
+        assert schema.relation_statement_keeping(table, clause, state) == statement
+
+    @pytest.mark.parametrize(
+        "state",
+        [
+            TableState(name="tdl_note", comment="a\x00b"),
+            TableState(name="tdl_note", permissions={"select": "WHERE a; b"}),
+            TableState(name="tdl_note", permissions={"update": "WHERE a = 'b"}),
+            TableState(name="tdl_note", permissions={"delete": "SOMETIMES"}),
+        ],
+        ids=["nul-in-comment", "top-level-semicolon", "unterminated-literal", "not-a-rule"],
+    )
+    def test_none_for_a_carried_value_that_fails_its_check(self, state: TableState) -> None:
+        assert _kept_table(TdlNote, state) is None
+        assert schema.relation_statement_keeping("tdl_note", "TYPE RELATION", state) is None
+
+    def test_a_declared_clause_is_not_checked_as_carried(self) -> None:
+        """Only what is carried is checked: a declared comment or declared permissions replace a faulty stored one."""
+        bad_comment = TableState(name="tdl_note", comment="a\x00b")
+        bad_rule = TableState(name="tdl_note", permissions={"select": "WHERE a; b"})
+        assert _kept_table(TdlNoteMine, bad_comment) == (
+            "DEFINE TABLE OVERWRITE `tdl_note` TYPE NORMAL SCHEMALESS COMMENT 'mine' PERMISSIONS FOR select FULL, FOR "
+            "create, update, delete NONE;"
+        )
+        assert _kept_table(TdlNoteMine, bad_rule) == _kept_table(TdlNoteMine, bad_comment)
+
+    @pytest.mark.parametrize(("table", "error"), [("a-b", ValueError), (3, TypeError)], ids=repr)
+    def test_the_table_name_is_checked(self, table: Any, error: type[Exception]) -> None:
+        state = parse_define_table(_STORED_DROP)
+        with pytest.raises(error):
+            schema.table_statement_keeping(table, "TYPE NORMAL", schema.TableClauses(), state)
+        with pytest.raises(error):
+            schema.view_statement_keeping(table, _VIEW_QUERY, schema.TableClauses(), state)
+
+    # --- views ---------------------------------------------------------------------------------------------------
+
+    def test_view_statement_without_clauses_is_unchanged(self) -> None:
+        bare = f"DEFINE TABLE OVERWRITE `tdl_stats` AS ({_VIEW_QUERY});"
+        assert schema.view_statement("tdl_stats", _VIEW_QUERY, True) == bare
+        assert schema.view_statement("tdl_stats", _VIEW_QUERY, True, clauses=schema.TableClauses()) == bare
+
+    def test_view_statement_with_declared_clauses(self) -> None:
+        """The comment, change feed and permissions after ``AS (…)``."""
+        clauses = schema.TableClauses(
+            comment="Counts",
+            changefeed="1h INCLUDE ORIGINAL",
+            permissions=schema.permissions_rules({"select": "FULL"}, model="TdlStats"),
+        )
+        assert schema.view_statement("tdl_stats", _VIEW_QUERY, False, clauses=clauses) == (
+            f"DEFINE TABLE IF NOT EXISTS `tdl_stats` AS ({_VIEW_QUERY}) COMMENT 'Counts' CHANGEFEED 1h INCLUDE ORIGINAL "
+            "PERMISSIONS FOR select FULL, FOR create, update, delete NONE;"
+        )
+
+    def test_k8_a_stored_view(self) -> None:
+        state = parse_define_table(_STORED_VIEW)
+        assert schema.view_statement_keeping("tdl_stats", _VIEW_QUERY, TdlStatsBare._declared_table_clauses(), state) == _K8
+
+    def test_k8_the_declared_clauses_replace_the_stored_ones(self) -> None:
+        clauses = schema.TableClauses(
+            comment="Counts", permissions=schema.permissions_rules({"select": "FULL"}, model="TdlStats")
+        )
+        assert schema.view_statement_keeping("tdl_stats", _VIEW_QUERY, clauses, parse_define_table(_STORED_VIEW)) == (
+            f"DEFINE TABLE OVERWRITE `tdl_stats` DROP SCHEMAFULL AS ({_VIEW_QUERY}) COMMENT 'Counts' CHANGEFEED 1h "
+            "PERMISSIONS FOR select FULL, FOR create, update, delete NONE;"
+        )
+
+    def test_a_stored_view_with_defaults_only_is_the_bare_statement(self) -> None:
+        state = parse_define_table(f"DEFINE TABLE tdl_stats TYPE ANY SCHEMALESS AS {_VIEW_QUERY} PERMISSIONS NONE")
+        assert schema.view_statement_keeping("tdl_stats", _VIEW_QUERY, schema.TableClauses(), state) == (
+            schema.view_statement("tdl_stats", _VIEW_QUERY, True)
+        )
+
+    def test_none_for_a_stored_view_comment_holding_nul(self) -> None:
+        state = TableState(name="tdl_stats", schema_mode="SCHEMALESS", comment="a\x00b", view_query=_VIEW_QUERY)
+        assert schema.view_statement_keeping("tdl_stats", _VIEW_QUERY, schema.TableClauses(), state) is None
+        declared = schema.TableClauses(comment="Counts")
+        assert schema.view_statement_keeping("tdl_stats", _VIEW_QUERY, declared, state) == (
+            f"DEFINE TABLE OVERWRITE `tdl_stats` AS ({_VIEW_QUERY}) COMMENT 'Counts';"
+        )
+
+
+# --- the guards' texts ----------------------------------------------------------------------------------------------
+
+
+def _tg1(name: str, method: str, table: str) -> str:
+    return (
+        f"{name}.{method}(): the table '{table}' is a materialized view; defining it as an ordinary table would drop its "
+        f"query. Declare view_query on {name}, give it another table_name, or remove the view first. Nothing was "
+        "defined."
+    )
+
+
+def _tg2(name: str, method: str, table: str) -> str:
+    return (
+        f"{name}.{method}(): the definition of the table '{table}' could not be read, so the ORM cannot keep the clauses "
+        f"{name} does not declare (schema mode, permissions, change feed, comment). Nothing was defined."
+    )
+
+
+def _tg3(name: str, method: str, table: str) -> str:
+    return (
+        f"{name}.{method}(): the table '{table}' is a relation table (TYPE RELATION) and {name} is not an edge model; "
+        "defining it as an ordinary table would drop its relation constraint and refuse every edge. Derive "
+        f"{name} from BaseSurrealEdge, or give it another table_name. Nothing was defined."
+    )
+
+
+def _tg4(name: str, method: str, table: str, field: str) -> str:
+    return (
+        f"{name}.{method}(): the definition of the field '{field}' on the table '{table}' could not be read, so the ORM "
+        f"cannot keep the clauses {name} does not write (ASSERT, PERMISSIONS, READONLY, DEFAULT, VALUE, COMPUTED, "
+        "COMMENT). Nothing was defined."
+    )
+
+
+#: RG1–RG3 as v0.33.0's ``define_relation()`` raises them, and as ``define_table()`` of an edge model does.
+_RG_DEFINE_RELATION = {
+    "RG1": (
+        "TdlLikes.define_relation(): the table 'tdl_likes' is a materialized view; defining it as a relation table would "
+        "drop its query and turn it into an ordinary table that no longer updates. Give TdlLikes another table_name, or "
+        "remove the view first. Nothing was defined."
+    ),
+    "RG2": (
+        "TdlLikes.define_relation(): the definition of the table 'tdl_likes' could not be read, so the ORM cannot keep "
+        "its other clauses (schema mode, permissions, change feed, comment). Nothing was defined."
+    ),
+    "RG3": (
+        "TdlLikes.define_relation(overwrite=False): the table 'tdl_likes' exists and is not a relation table; DEFINE "
+        "TABLE IF NOT EXISTS would leave it as it is, and the relation constraint would not apply. Call "
+        "define_relation() with overwrite=True, which keeps the table's other clauses. Nothing was defined."
+    ),
+}
+_RG_DEFINE_TABLE = {
+    "RG1": (
+        "TdlLikes.define_table(): the table 'tdl_likes' is a materialized view; defining it as a relation table would "
+        "drop its query and turn it into an ordinary table that no longer updates. Give TdlLikes another table_name, or "
+        "remove the view first. Nothing was defined."
+    ),
+    "RG2": (
+        "TdlLikes.define_table(): the definition of the table 'tdl_likes' could not be read, so the ORM cannot keep its "
+        "other clauses (schema mode, permissions, change feed, comment). Nothing was defined."
+    ),
+    "RG3": (
+        "TdlLikes.define_table(overwrite=False): the table 'tdl_likes' exists and is not a relation table; DEFINE TABLE "
+        "IF NOT EXISTS would leave it as it is, and the relation constraint would not apply. Call define_table() with "
+        "overwrite=True, which keeps the table's other clauses. Nothing was defined."
+    ),
+}
+
+
+class TestGuardTexts:
+    """``table_refused()`` TG1–TG4 naming ``define_table()`` or ``define_access()``; ``relation_table_refused()``
+    RG1–RG3 — v0.33.0's texts by default, naming ``define_table()`` when it is the caller; RG4."""
+
+    @pytest.mark.parametrize("method", ["define_table", "define_access"])
+    def test_tg1_to_tg4(self, method: Any) -> None:
+        assert schema.table_refused("TG1", "TdlNote", "tdl_note", method=method) == _tg1("TdlNote", method, "tdl_note")
+        assert schema.table_refused("TG2", "TdlNote", "tdl_note", method=method) == _tg2("TdlNote", method, "tdl_note")
+        assert schema.table_refused("TG3", "TdlNote", "tdl_note", method=method) == _tg3("TdlNote", method, "tdl_note")
+        assert schema.table_refused("TG4", "TdlNote", "tdl_note", method=method, field="address.city") == _tg4(
+            "TdlNote", method, "tdl_note", "address.city"
+        )
+
+    def test_tg_texts_exactly(self) -> None:
+        """Word for word, ``define_table`` the default."""
+        assert schema.table_refused("TG1", "TdlNote", "tdl_note") == (
+            "TdlNote.define_table(): the table 'tdl_note' is a materialized view; defining it as an ordinary table would "
+            "drop its query. Declare view_query on TdlNote, give it another table_name, or remove the view first. "
+            "Nothing was defined."
+        )
+        assert schema.table_refused("TG2", "TdlNote", "tdl_note") == (
+            "TdlNote.define_table(): the definition of the table 'tdl_note' could not be read, so the ORM cannot keep "
+            "the clauses TdlNote does not declare (schema mode, permissions, change feed, comment). Nothing was defined."
+        )
+        assert schema.table_refused("TG3", "TdlNote", "tdl_note") == (
+            "TdlNote.define_table(): the table 'tdl_note' is a relation table (TYPE RELATION) and TdlNote is not an edge "
+            "model; defining it as an ordinary table would drop its relation constraint and refuse every edge. Derive "
+            "TdlNote from BaseSurrealEdge, or give it another table_name. Nothing was defined."
+        )
+        assert schema.table_refused("TG4", "TdlNote", "tdl_note", field="tags.*") == (
+            "TdlNote.define_table(): the definition of the field 'tags.*' on the table 'tdl_note' could not be read, so "
+            "the ORM cannot keep the clauses TdlNote does not write (ASSERT, PERMISSIONS, READONLY, DEFAULT, VALUE, "
+            "COMPUTED, COMMENT). Nothing was defined."
+        )
+
+    def test_tg4_names_a_field(self) -> None:
+        with pytest.raises(ValueError, match="field="):
+            schema.table_refused("TG4", "TdlNote", "tdl_note")
+
+    @pytest.mark.parametrize("guard", ["RG1", "RG2", "RG3"])
+    def test_rg1_to_rg3(self, guard: Any) -> None:
+        assert schema.relation_table_refused(guard, "TdlLikes", "tdl_likes") == _RG_DEFINE_RELATION[guard]
+        assert (
+            schema.relation_table_refused(guard, "TdlLikes", "tdl_likes", method="define_relation")
+            == _RG_DEFINE_RELATION[guard]
+        )
+        assert schema.relation_table_refused(guard, "TdlLikes", "tdl_likes", method="define_table") == _RG_DEFINE_TABLE[guard]
+
+    def test_rg4(self) -> None:
+        assert schema.relation_schemafull_refused("TdlLikes", ["stars"]) == (
+            "TdlLikes.define_relation(): TdlLikes declares SchemaMode.SCHEMAFULL and has data fields ('stars'); "
+            "define_relation() defines no field, and a SCHEMAFULL table refuses (SurrealDB 3.x) or drops (2.x and the "
+            "embedded engine) the fields it does not define. Call TdlLikes.define_table(), which applies the same "
+            "relation statement and defines them. Nothing was defined."
+        )
+        assert "data fields ('stars', 'note');" in schema.relation_schemafull_refused("TdlLikes", ("stars", "note"))
+
+
+# --- the carried fields ---------------------------------------------------------------------------------------------
+
+
+def _column(model: type[BaseSurrealModel], *path: str) -> model_ddl.Column:
+    """The column *path* of *model*'s table DDL."""
+    return next(column for column in model._table_columns() if column.path == path)
+
+
+def _kept_field(
+    model: type[BaseSurrealModel], stored: str | FieldState, *, schemafull: bool = False, before_3: bool = False
+) -> str | None:
+    """``field_statement_keeping()`` of *model*'s column over the stored field *stored* (the column of its path)."""
+    state = parse_define_field(stored).state if isinstance(stored, str) else stored
+    column = _column(model, *state.path)
+    return model_ddl.field_statement_keeping(
+        model.get_table_name(), column, schemafull=schemafull, before_3=before_3, stored=state
+    )
+
+
+_K3 = (
+    "DEFINE FIELD OVERWRITE `email` ON `tdl_note` TYPE option<string> ASSERT $value != '' PERMISSIONS FOR select WHERE "
+    "$auth.id = id, FOR create, update FULL COMMENT 'mail';"
+)
+_K4 = "DEFINE FIELD OVERWRITE `created` ON `tdl_note` TYPE option<datetime> DEFAULT time::now() READONLY;"
+_K5 = "DEFINE FIELD OVERWRITE `done` ON `tdl_note` TYPE bool DEFAULT false COMMENT 'd';"
+_K6 = "DEFINE FIELD OVERWRITE `total` ON `tdl_cart` TYPE option<int> VALUE count(items) COMMENT 'c';"
+_K7 = "DEFINE FIELD OVERWRITE `meta` ON `tdl_note` TYPE object;"
+_K9 = (
+    "DEFINE FIELD OVERWRITE `total` ON `tdl_cart` TYPE option<int> COMPUTED count(items) PERMISSIONS FOR select WHERE "
+    "true, FOR create, update FULL COMMENT 'c';"
+)
+_K10 = "DEFINE FIELD OVERWRITE `age` ON `tdl_note` TYPE int COMPUTED 18;"
+_K11 = "DEFINE FIELD OVERWRITE `status` ON `tdl_note` TYPE string DEFAULT 'new';"
+
+#: (case, model, the stored field as a line renders it in ``INFO FOR TABLE``, the table's mode is ``SCHEMAFULL``, the
+#: carried statement). Each server renders a field's ``COMMENT`` before its ``PERMISSIONS``, whatever order the
+#: definition was written in; 3.x writes ``none | T`` and ``TYPE object FLEXIBLE``, 2.x ``option<T>`` and ``FLEXIBLE
+#: TYPE object``; ``COMPUTED`` is 3.x's.
+_CARRIED_FIELDS: list[tuple[str, type[BaseSurrealModel], str, bool, str]] = [
+    (
+        "K3",
+        TdlNoteTuned,
+        "DEFINE FIELD email ON tdl_note TYPE string ASSERT $value != '' COMMENT 'mail' PERMISSIONS FOR select WHERE "
+        "$auth.id = id, FOR create, update FULL",
+        True,
+        _K3,
+    ),
+    (
+        "K4-3x",
+        TdlNoteTuned,
+        "DEFINE FIELD created ON tdl_note TYPE none | datetime DEFAULT time::now() READONLY PERMISSIONS FULL",
+        True,
+        _K4,
+    ),
+    (
+        "K4-2x",
+        TdlNoteTuned,
+        "DEFINE FIELD created ON tdl_note TYPE option<datetime> DEFAULT time::now() READONLY PERMISSIONS FULL",
+        True,
+        _K4,
+    ),
+    ("K5", TdlNoteTuned, "DEFINE FIELD done ON tdl_note TYPE bool DEFAULT true COMMENT 'd' PERMISSIONS FULL", True, _K5),
+    ("K6", TdlCart, "DEFINE FIELD total ON tdl_cart VALUE 1 COMMENT 'c' PERMISSIONS FULL", False, _K6),
+    ("K7-2x", TdlNoteShapes, "DEFINE FIELD meta ON tdl_note FLEXIBLE TYPE object PERMISSIONS FULL", False, _K7),
+    ("K7-3x", TdlNoteShapes, "DEFINE FIELD meta ON tdl_note TYPE object FLEXIBLE PERMISSIONS FULL", False, _K7),
+    (
+        "K9",
+        TdlCart,
+        "DEFINE FIELD total ON tdl_cart TYPE none | int COMPUTED count(items) COMMENT 'c' PERMISSIONS FOR select WHERE "
+        "true, FOR create, update FULL",
+        False,
+        _K9,
+    ),
+    ("K10", TdlNoteShapes, "DEFINE FIELD age ON tdl_note TYPE int COMPUTED 18 PERMISSIONS FULL", False, _K10),
+    ("K11", TdlNoteStatus, "DEFINE FIELD status ON tdl_note TYPE string DEFAULT 'new' PERMISSIONS FULL", False, _K11),
+]
+
+
+class TestCarriedFields:
+    """Over a field that exists, ``field_statement_keeping()`` writes the column's ``TYPE``, ``FLEXIBLE``, ``DEFAULT``
+    and ``VALUE`` and keeps the stored ``REFERENCE``, ``DEFAULT``/``VALUE`` the model does not write, ``READONLY``,
+    ``ASSERT``, ``PERMISSIONS`` and ``COMMENT``: a stored ``COMPUTED`` stays ``COMPUTED``, without ``DEFAULT``; a
+    ``server_fields`` column keeps the database's ``DEFAULT``, ``VALUE`` or ``COMPUTED``. ``None`` when a carried value
+    fails its check."""
+
+    @pytest.mark.parametrize(
+        ("model", "stored", "schemafull", "statement"),
+        [case[1:] for case in _CARRIED_FIELDS],
+        ids=[case[0] for case in _CARRIED_FIELDS],
+    )
+    def test_each_carried_field(self, model: type[BaseSurrealModel], stored: str, schemafull: bool, statement: str) -> None:
+        assert _kept_field(model, stored, schemafull=schemafull) == statement
+
+    def test_k3_is_read_clause_by_clause(self) -> None:
+        """The stored ``ASSERT``, permissions and comment are three clauses, each carried in its place."""
+        state = parse_define_field(_CARRIED_FIELDS[0][2]).state
+        assert state.assertion == "$value != ''"
+        assert state.comment == "mail"
+        assert dict(state.permissions) == {"select": "WHERE $auth.id = id", "create": "FULL", "update": "FULL"}
+
+    def test_k7_on_a_schemafull_table(self) -> None:
+        """A free-form object is ``FLEXIBLE`` on a ``SCHEMAFULL`` table, whatever was stored."""
+        for stored in ("DEFINE FIELD meta ON tdl_note TYPE object PERMISSIONS FULL", _CARRIED_FIELDS[6][2]):
+            assert _kept_field(TdlNoteShapes, stored, schemafull=True) == (
+                "DEFINE FIELD OVERWRITE `meta` ON `tdl_note` TYPE object FLEXIBLE;"
+            )
+
+    def test_a_stored_flexible_is_kept_on_an_object_kind(self) -> None:
+        """A sub-model's object is not free-form: a stored ``FLEXIBLE`` is kept on a ``SCHEMAFULL`` table only."""
+        flexible = "DEFINE FIELD address ON tdl_note TYPE none | object FLEXIBLE PERMISSIONS FULL"
+        plain = "DEFINE FIELD address ON tdl_note TYPE none | object PERMISSIONS FULL"
+        statement = "DEFINE FIELD OVERWRITE `address` ON `tdl_note` TYPE option<object>"
+        assert _kept_field(TdlNoteShapes, flexible, schemafull=True) == f"{statement} FLEXIBLE;"
+        assert _kept_field(TdlNoteShapes, plain, schemafull=True) == f"{statement};"
+        assert _kept_field(TdlNoteShapes, flexible, schemafull=False) == f"{statement};"
+
+    def test_a_stored_flexible_is_dropped_on_a_kind_without_object(self) -> None:
+        stored = "DEFINE FIELD tags ON tdl_note TYPE object FLEXIBLE PERMISSIONS FULL"
+        assert _kept_field(TdlNoteShapes, stored, schemafull=True) == (
+            "DEFINE FIELD OVERWRITE `tags` ON `tdl_note` TYPE array<string>;"
+        )
+
+    def test_flexible_on_any_before_3(self) -> None:
+        stored = "DEFINE FIELD anything ON tdl_note TYPE any PERMISSIONS FULL"
+        assert _kept_field(TdlNoteShapes, stored, schemafull=True, before_3=True) == (
+            "DEFINE FIELD OVERWRITE `anything` ON `tdl_note` TYPE any FLEXIBLE;"
+        )
+        assert _kept_field(TdlNoteShapes, stored, schemafull=True) == (
+            "DEFINE FIELD OVERWRITE `anything` ON `tdl_note` TYPE any;"
+        )
+        assert _kept_field(TdlNoteShapes, stored, schemafull=False, before_3=True) == (
+            "DEFINE FIELD OVERWRITE `anything` ON `tdl_note` TYPE any;"
+        )
+
+    def test_nested_and_item_paths(self) -> None:
+        """A nested column and an item definition, from either line's rendering of their path."""
+        assert _kept_field(TdlPerson, "DEFINE FIELD address.city ON tdl_person TYPE string COMMENT 'c' PERMISSIONS FULL") == (
+            "DEFINE FIELD OVERWRITE `address`.`city` ON `tdl_person` TYPE string COMMENT 'c';"
+        )
+        for path in ("bag[*]", "bag.*"):
+            stored = f"DEFINE FIELD {path} ON tdl_kinds TYPE any PERMISSIONS FULL"
+            assert _kept_field(TdlKinds, stored, schemafull=True) == "DEFINE FIELD OVERWRITE `bag`.* ON `tdl_kinds` TYPE any;"
+            assert _kept_field(TdlKinds, stored, schemafull=True, before_3=True) == (
+                "DEFINE FIELD OVERWRITE `bag`.* ON `tdl_kinds` TYPE any FLEXIBLE;"
+            )
+
+    # --- the server_fields rule ----------------------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("stored", "statement"),
+        [
+            ("DEFINE FIELD status ON tdl_note TYPE string DEFAULT 'new' PERMISSIONS FULL", _K11),
+            (
+                "DEFINE FIELD status ON tdl_note TYPE string DEFAULT ALWAYS 'new' PERMISSIONS FULL",
+                "DEFINE FIELD OVERWRITE `status` ON `tdl_note` TYPE string DEFAULT ALWAYS 'new';",
+            ),
+            (
+                "DEFINE FIELD status ON tdl_note TYPE string VALUE 'new' PERMISSIONS FULL",
+                "DEFINE FIELD OVERWRITE `status` ON `tdl_note` TYPE string VALUE 'new';",
+            ),
+            (
+                "DEFINE FIELD status ON tdl_note TYPE string COMPUTED 'new' PERMISSIONS FULL",
+                "DEFINE FIELD OVERWRITE `status` ON `tdl_note` TYPE string COMPUTED 'new';",
+            ),
+            (
+                "DEFINE FIELD status ON tdl_note TYPE string PERMISSIONS FULL",
+                "DEFINE FIELD OVERWRITE `status` ON `tdl_note` TYPE string DEFAULT 'draft';",
+            ),
+            (
+                "DEFINE FIELD status ON tdl_note TYPE string READONLY COMMENT 's' PERMISSIONS FULL",
+                "DEFINE FIELD OVERWRITE `status` ON `tdl_note` TYPE string DEFAULT 'draft' READONLY COMMENT 's';",
+            ),
+        ],
+        ids=["default", "default-always", "value", "computed", "no-rule", "no-rule-other-clauses"],
+    )
+    def test_a_server_column_keeps_the_database_rule(self, stored: str, statement: str) -> None:
+        """The model's ``DEFAULT`` only where the database has no ``DEFAULT``, ``VALUE`` or ``COMPUTED``."""
+        assert _kept_field(TdlNoteStatus, stored) == statement
+
+    def test_a_server_column_without_constant_default(self) -> None:
+        """No ``DEFAULT`` of the model's to write: the stored one is kept, and none is added where there is none."""
+        stored = "DEFINE FIELD stamp ON tdl_note TYPE datetime DEFAULT time::now() PERMISSIONS FULL"
+        assert _kept_field(TdlNoteStamped, stored) == (
+            "DEFINE FIELD OVERWRITE `stamp` ON `tdl_note` TYPE datetime DEFAULT time::now();"
+        )
+        assert _kept_field(TdlNoteStamped, "DEFINE FIELD owner_ref ON tdl_note TYPE string PERMISSIONS FULL") == (
+            "DEFINE FIELD OVERWRITE `owner_ref` ON `tdl_note` TYPE string;"
+        )
+
+    def test_an_ordinary_column_writes_its_default(self) -> None:
+        """The model's ``DEFAULT`` wins over a stored ``DEFAULT ALWAYS``, written without ``ALWAYS``."""
+        stored = "DEFINE FIELD done ON tdl_note TYPE bool DEFAULT ALWAYS true PERMISSIONS FULL"
+        assert _kept_field(TdlNoteTuned, stored) == "DEFINE FIELD OVERWRITE `done` ON `tdl_note` TYPE bool DEFAULT false;"
+
+    # --- the COMPUTED rule ---------------------------------------------------------------------------------------
+
+    def test_a_stored_value_is_kept_when_the_model_writes_none(self) -> None:
+        stored = "DEFINE FIELD body ON tdl_note TYPE string VALUE string::trim($value) PERMISSIONS FULL"
+        assert _kept_field(TdlNoteTuned, stored) == (
+            "DEFINE FIELD OVERWRITE `body` ON `tdl_note` TYPE string VALUE string::trim($value);"
+        )
+
+    def test_a_computed_field_writes_computed_over_a_stored_computed(self) -> None:
+        """The model's expression, never ``VALUE``; no stored ``DEFAULT`` or ``VALUE`` next to ``COMPUTED``."""
+        stored = FieldState(name="total", field_type="int", computed="1", default="0", value="2", readonly=True)
+        assert (
+            _kept_field(TdlCart, stored)
+            == "DEFINE FIELD OVERWRITE `total` ON `tdl_cart` TYPE option<int> COMPUTED count(items);"
+        )
+
+    def test_a_stored_computed_keeps_flexible_permissions_and_comment(self) -> None:
+        stored = "DEFINE FIELD meta ON tdl_note TYPE object COMPUTED {} COMMENT 'm' PERMISSIONS FOR select NONE, FOR create, update FULL"
+        assert _kept_field(TdlNoteShapes, stored, schemafull=True) == (
+            "DEFINE FIELD OVERWRITE `meta` ON `tdl_note` TYPE object FLEXIBLE COMPUTED {} PERMISSIONS FOR select NONE, FOR "
+            "create, update FULL COMMENT 'm';"
+        )
+
+    # --- order and checks ----------------------------------------------------------------------------------------
+
+    def test_clause_order(self) -> None:
+        """``TYPE``, ``FLEXIBLE``, ``REFERENCE``, ``DEFAULT``, ``READONLY``, ``VALUE``, ``ASSERT``, ``PERMISSIONS``,
+        ``COMMENT``."""
+        column = model_ddl.Column(path=("owner",), field="owner", kind=parse_kind("option<record<tdl_person>>"))
+        stored = FieldState(
+            name="owner",
+            field_type="record<tdl_person>",
+            default="NONE",
+            default_always=True,
+            assertion="$value != NONE",
+            readonly=True,
+            value="$value",
+            reference=True,
+            on_delete="CASCADE",
+            comment="o",
+            permissions={"select": "FULL", "create": "NONE", "update": "NONE"},
+        )
+        assert model_ddl.field_statement_keeping("tdl_note", column, schemafull=True, stored=stored) == (
+            "DEFINE FIELD OVERWRITE `owner` ON `tdl_note` TYPE option<record<tdl_person>> REFERENCE ON DELETE CASCADE "
+            "DEFAULT ALWAYS NONE READONLY VALUE $value ASSERT $value != NONE PERMISSIONS FOR select FULL, FOR create, "
+            "update NONE COMMENT 'o';"
+        )
+
+    def test_a_reference_is_kept(self) -> None:
+        column = model_ddl.Column(path=("owner",), field="owner", kind=parse_kind("option<record<tdl_person>>"))
+        for on_delete, clause in [(None, "REFERENCE"), ("THEN NONE", "REFERENCE ON DELETE THEN NONE")]:
+            stored = FieldState(name="owner", field_type="record<tdl_person>", reference=True, on_delete=on_delete)
+            assert model_ddl.field_statement_keeping("tdl_note", column, schemafull=False, stored=stored) == (
+                f"DEFINE FIELD OVERWRITE `owner` ON `tdl_note` TYPE option<record<tdl_person>> {clause};"
+            )
+
+    @pytest.mark.parametrize(
+        "stored",
+        [
+            FieldState(name="email", field_type="string", assertion="$value != '' -- n"),
+            FieldState(name="email", field_type="string", default="'a'; 'b'"),
+            FieldState(name="email", field_type="string", computed="count(items) -- n"),
+            FieldState(name="email", field_type="string", value="string::trim($value"),
+            FieldState(name="email", field_type="string", permissions={"select": "WHERE a; b"}),
+            FieldState(name="email", field_type="string", permissions={"update": "SOMETIMES"}),
+            FieldState(name="email", field_type="string", reference=True, on_delete="THEN 'a"),
+            FieldState(name="email", field_type="string", comment="a\x00b"),
+        ],
+        ids=[
+            "assert-comment-marker",
+            "default-top-level-semicolon",
+            "computed-comment-marker",
+            "value-unbalanced-bracket",
+            "rule-top-level-semicolon",
+            "not-a-rule",
+            "on-delete-unterminated-literal",
+            "nul-in-comment",
+        ],
+    )
+    def test_none_for_a_carried_value_that_fails_its_check(self, stored: FieldState) -> None:
+        assert _kept_field(TdlNoteTuned, stored) is None
+
+    def test_a_value_the_model_replaces_is_not_checked(self) -> None:
+        """The model's ``DEFAULT`` or computed expression replaces a faulty stored one, which is not carried."""
+        assert _kept_field(TdlNoteTuned, FieldState(name="done", field_type="bool", default="'a'; 'b'")) == (
+            "DEFINE FIELD OVERWRITE `done` ON `tdl_note` TYPE bool DEFAULT false;"
+        )
+        assert _kept_field(TdlCart, FieldState(name="total", field_type="int", computed="count(items) -- n")) == (
+            "DEFINE FIELD OVERWRITE `total` ON `tdl_cart` TYPE option<int> COMPUTED count(items);"
+        )
+        assert _kept_field(TdlCart, FieldState(name="total", field_type="int", value="(1")) == (
+            "DEFINE FIELD OVERWRITE `total` ON `tdl_cart` TYPE option<int> VALUE count(items);"
+        )
+
+    def test_the_table_name_is_checked(self) -> None:
+        stored = FieldState(name="email", field_type="string")
+        with pytest.raises(ValueError):
+            model_ddl.field_statement_keeping("a-b", _column(TdlNoteTuned, "email"), schemafull=False, stored=stored)
+
+
+# --- the field read ----------------------------------------------------------------------------------------------------
+
+#: The ``fields`` of ``INFO FOR TABLE`` for one table as SurrealDB 3.3.4 and 2.7.0 render them: 3.x keys a keyword
+#: field bare and writes array items ``.*``, 2.x quotes the keyword and writes ``[*]``; both add the item field of a
+#: typed array of objects (``subs.*``).
+_FIELDS_3X = {
+    "`a.b`": "DEFINE FIELD `a.b` ON tdl_kinds TYPE int DEFAULT 0 PERMISSIONS FULL",
+    "`first-name`": "DEFINE FIELD `first-name` ON tdl_kinds TYPE string PERMISSIONS FULL",
+    "address": "DEFINE FIELD address ON tdl_kinds TYPE none | object PERMISSIONS FULL",
+    "address.city": "DEFINE FIELD address.city ON tdl_kinds TYPE string PERMISSIONS FULL",
+    "bag": "DEFINE FIELD bag ON tdl_kinds TYPE array PERMISSIONS FULL",
+    "bag.*": "DEFINE FIELD bag.* ON tdl_kinds TYPE any PERMISSIONS FULL",
+    "select": "DEFINE FIELD `select` ON tdl_kinds TYPE int DEFAULT 0 PERMISSIONS FULL",
+    "subs": "DEFINE FIELD subs ON tdl_kinds TYPE array<object> PERMISSIONS FULL",
+    "subs.*": "DEFINE FIELD subs.* ON tdl_kinds TYPE object PERMISSIONS FULL",
+    "subs.*.city": "DEFINE FIELD subs.*.city ON tdl_kinds TYPE string PERMISSIONS FULL",
+}
+_FIELDS_2X = {
+    "`a.b`": "DEFINE FIELD `a.b` ON tdl_kinds TYPE int DEFAULT 0 PERMISSIONS FULL",
+    "`first-name`": "DEFINE FIELD `first-name` ON tdl_kinds TYPE string PERMISSIONS FULL",
+    "`select`": "DEFINE FIELD `select` ON tdl_kinds TYPE int DEFAULT 0 PERMISSIONS FULL",
+    "address": "DEFINE FIELD address ON tdl_kinds TYPE option<object> PERMISSIONS FULL",
+    "address.city": "DEFINE FIELD address.city ON tdl_kinds TYPE string PERMISSIONS FULL",
+    "bag": "DEFINE FIELD bag ON tdl_kinds TYPE array PERMISSIONS FULL",
+    "bag[*]": "DEFINE FIELD bag[*] ON tdl_kinds TYPE any PERMISSIONS FULL",
+    "subs": "DEFINE FIELD subs ON tdl_kinds TYPE array<object> PERMISSIONS FULL",
+    "subs[*]": "DEFINE FIELD subs[*] ON tdl_kinds TYPE object PERMISSIONS FULL",
+    "subs[*].city": "DEFINE FIELD subs[*].city ON tdl_kinds TYPE string PERMISSIONS FULL",
+}
+_FIELD_PATHS = {
+    ("a.b",),
+    ("first-name",),
+    ("address",),
+    ("address", "city"),
+    ("bag",),
+    ("bag", "*"),
+    ("select",),
+    ("subs",),
+    ("subs", "*"),
+    ("subs", "*", "city"),
+}
+
+#: A record user's refusal, as the servers word it.
+_NOT_ENOUGH_PERMISSIONS = "IAM error: Not enough permissions to perform this action"
+
+
+class _InfoClient:
+    """A client answering every statement with *answer*, or raising *error*; it records each statement."""
+
+    def __init__(self, answer: object = None, *, error: BaseException | None = None) -> None:
+        self.answer = answer
+        self.error = error
+        self.queries: list[str] = []
+
+    async def query(self, statement: str, variables: object) -> object:
+        assert variables == {}
+        self.queries.append(statement)
+        if self.error is not None:
+            raise self.error
+        return self.answer
+
+
+def _table_answer(fields: object) -> dict[str, object]:
+    """``INFO FOR TABLE``'s answer holding *fields*."""
+    return {"events": {}, "fields": fields, "indexes": {}, "lives": {}, "tables": {}}
+
+
+class TestReadTableFields:
+    """``read_table_fields()`` sends ``INFO FOR TABLE`` once and keys each field's ``FieldState`` by its path, on both
+    lines' renderings; a definition the parser cannot read is ``None`` under the path of its key; a refusal is the
+    table definition's S1/S2."""
+
+    @pytest.mark.parametrize("fields", [_FIELDS_3X, _FIELDS_2X], ids=["3x", "2x"])
+    async def test_keys_are_paths(self, fields: dict[str, str]) -> None:
+        client = _InfoClient(_table_answer(fields))
+        read = await schema.read_table_fields(client, "tdl_kinds", kind="definition")
+        assert set(read) == _FIELD_PATHS
+        for definition in fields.values():
+            state = parse_define_field(definition).state
+            assert read[tuple(state.path)] == state
+        assert client.queries == ["INFO FOR TABLE `tdl_kinds`;"]
+
+    async def test_both_renderings_read_the_same(self) -> None:
+        three = await schema.read_table_fields(_InfoClient(_table_answer(_FIELDS_3X)), "tdl_kinds", kind="definition")
+        two = await schema.read_table_fields(_InfoClient(_table_answer(_FIELDS_2X)), "tdl_kinds", kind="definition")
+        assert {path: (state.field_type, state.default) for path, state in three.items() if state is not None} == {
+            path: (state.field_type, state.default) for path, state in two.items() if state is not None
+        }
+
+    async def test_an_unreadable_definition_is_none_under_its_path(self) -> None:
+        """Keyed by its ``INFO`` key read as a path; a key that is not one is left out."""
+        done = "DEFINE FIELD done ON tdl_note TYPE bool DEFAULT false PERMISSIONS FULL"
+        fields: dict[str, object] = {
+            "done": done,
+            "email": "DEFINE FIELD email ON tdl_note TYPE string ASSERT (a",
+            "subs[*].city": 3,
+            "`first-name`": "DEFINE FIELD",
+            "a..b": "DEFINE FIELD",
+            "x y": "DEFINE FIELD",
+            "": "DEFINE FIELD",
+        }
+        read = await schema.read_table_fields(_InfoClient(_table_answer(fields)), "tdl_note", kind="definition")
+        assert read == {
+            ("done",): parse_define_field(done).state,
+            ("email",): None,
+            ("subs", "*", "city"): None,
+            ("first-name",): None,
+        }
+
+    @pytest.mark.parametrize("answer", [_table_answer({}), _table_answer(None), {"events": {}}, [], None])
+    async def test_no_fields(self, answer: object) -> None:
+        assert await schema.read_table_fields(_InfoClient(answer), "tdl_note", kind="definition") == {}
+
+    @pytest.mark.parametrize(
+        ("error", "refusal"),
+        [
+            (InternalError("Internal", _NOT_ENOUGH_PERMISSIONS), SurrealDbAuthenticationError),
+            (NotAllowedError("NotAllowed", _NOT_ENOUGH_PERMISSIONS), SurrealDbAuthenticationError),
+            (InternalError("Internal", "There was a problem with the database"), SurrealDbError),
+            (RuntimeError("the engine is closed"), SurrealDbError),
+        ],
+        ids=["s1-internal", "s1-not-allowed", "s2-internal", "s2-runtime"],
+    )
+    async def test_s1_s2_a_refused_info(self, error: BaseException, refusal: type[SurrealDbError]) -> None:
+        client = _InfoClient(error=error)
+        with pytest.raises(SurrealDbError) as raised:
+            await schema.read_table_fields(client, "tdl_note", kind="definition")
+        assert type(raised.value) is refusal
+        assert str(raised.value) == f"Can't apply table definition: 'tdl_note' -> {error}"
+        assert raised.value.__cause__ is error
+        assert client.queries == ["INFO FOR TABLE `tdl_note`;"]
+
+    @pytest.mark.parametrize(("table", "error"), [("a-b", ValueError), (3, TypeError)], ids=repr)
+    async def test_the_table_name_is_checked(self, table: Any, error: type[Exception]) -> None:
+        client = _InfoClient(_table_answer({}))
+        with pytest.raises(error):
+            await schema.read_table_fields(client, table, kind="definition")
+        assert client.queries == []
 
 
 # --- the rich model of the ORM writes -------------------------------------------------------------------------------

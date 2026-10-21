@@ -23,6 +23,12 @@ an injection defence: an expression is trusted application code, never user inpu
 in backticks and an array's items ``*`` (`` `subs`.*.`city` ``), the table in backticks, then ``TYPE <kind>``,
 ``FLEXIBLE`` on a ``SCHEMAFULL`` table when the column holds a free-form object or asks for it, its ``DEFAULT`` and a
 computed field's ``VALUE``. ``field_permissions_text()`` writes a field's ``PERMISSIONS`` as SurrealDB renders them.
+For a field that exists, ``field_statement_keeping()`` writes the column's ``TYPE``, ``FLEXIBLE``, ``DEFAULT`` and
+``VALUE`` and keeps from the stored definition what the model does not write — ``REFERENCE``, a ``DEFAULT`` or
+``VALUE``, ``READONLY``, ``ASSERT``, ``PERMISSIONS``, ``COMMENT``, a ``FLEXIBLE`` object —; a stored ``COMPUTED`` stays
+``COMPUTED``, and a ``server_fields`` column keeps the database's ``DEFAULT``, ``VALUE`` or ``COMPUTED``. Each carried
+expression is re-checked with ``scan_fragment()``, and a value that fails gives ``None``: a check of what the database
+returned, not an injection defence.
 """
 
 from collections.abc import Collection, Iterable, Mapping, MutableSequence, MutableSet, Sequence
@@ -42,8 +48,9 @@ from pydantic_core import PydanticUndefined
 from ._sdk import RecordID, SdkDuration, SdkRange
 from .define_parser import DefineParseError, Kind, KLiteral, KName, KObject, KTuple, KUnion, render_kind, scan_fragment
 from .geo import _ALL_KINDS, _geo_kinds, _GeoMarker, _ordered
-from .schema import _identifier_name, _overwrite_clause
-from .surql_literal import _identifier, to_surql_literal
+from .schema import _carried_expression, _carried_rule, _identifier_name, _overwrite_clause
+from .schema_state import FieldState
+from .surql_literal import _identifier, _quoted, to_surql_literal
 from .types import Duration, Range
 
 __all__ = [
@@ -52,6 +59,7 @@ __all__ = [
     "field_path",
     "field_permissions_text",
     "field_statement",
+    "field_statement_keeping",
     "holds_any",
     "holds_object",
     "model_columns",
@@ -616,6 +624,25 @@ def field_path(path: Sequence[str]) -> str:
     return ".".join("*" if segment == "*" else _identifier(segment) for segment in path)
 
 
+def _field_head(table: str, column: Column, overwrite: object) -> str:
+    """``DEFINE FIELD {OVERWRITE | IF NOT EXISTS} <path> ON `<table>` TYPE <kind>``."""
+    return (
+        f"DEFINE FIELD {_overwrite_clause(overwrite)} {field_path(column.path)} ON "
+        f"{_identifier(_identifier_name(table, what='Table'))} TYPE {render_kind(column.kind)}"
+    )
+
+
+def _flexible(column: Column, *, schemafull: bool, before_3: bool, stored: bool = False) -> bool:
+    """Whether the column is written ``FLEXIBLE``: only on a ``SCHEMAFULL`` table, when it holds a free-form object,
+    asks for it, holds ``any`` before SurrealDB 3.x, or its stored definition is ``FLEXIBLE`` and its kind holds an
+    object."""
+    if not schemafull:
+        return False
+    if column.free_object or column.flexible_requested or (before_3 and column.holds_any):
+        return True
+    return stored and holds_object(column.kind)
+
+
 def field_statement(table: str, column: Column, *, overwrite: bool, schemafull: bool, before_3: bool = False) -> str:
     """``DEFINE FIELD {OVERWRITE | IF NOT EXISTS} <path> ON `<table>` TYPE <kind>[ FLEXIBLE][ DEFAULT <literal>][ VALUE
     <expression>];`` — the statement of a new column (v0.34.0).
@@ -629,16 +656,94 @@ def field_statement(table: str, column: Column, *, overwrite: bool, schemafull: 
     expression, checked when the columns were listed. ``overwrite=True`` redefines an existing field, ``False`` keeps it
     (``IF NOT EXISTS``); a non-``bool`` is a ``TypeError``. Pure.
     """
-    parts = [
-        f"DEFINE FIELD {_overwrite_clause(overwrite)} {field_path(column.path)} ON "
-        f"{_identifier(_identifier_name(table, what='Table'))} TYPE {render_kind(column.kind)}"
-    ]
-    if schemafull and (column.free_object or column.flexible_requested or (before_3 and column.holds_any)):
+    parts = [_field_head(table, column, overwrite)]
+    if _flexible(column, schemafull=schemafull, before_3=before_3):
         parts.append("FLEXIBLE")
     if column.default is not None:
         parts.append(f"DEFAULT {column.default}")
     if column.value is not None:
         parts.append(f"VALUE {column.value}")
+    return " ".join(parts) + ";"
+
+
+def _has_value_rule(stored: FieldState) -> bool:
+    """Whether the stored field gives its value itself: a ``DEFAULT``, a ``VALUE`` or a ``COMPUTED``."""
+    return stored.default is not None or stored.value is not None or stored.computed is not None
+
+
+def field_statement_keeping(
+    table: str, column: Column, *, schemafull: bool, stored: FieldState, before_3: bool = False
+) -> str | None:
+    """``DEFINE FIELD OVERWRITE <path> ON `<table>` TYPE <kind>…;`` for a column whose field exists, keeping the
+    clauses of its stored definition *stored* the model does not write (v0.34.0) — the statement ``define_table()``
+    sends for it.
+
+    A bare ``OVERWRITE`` resets every clause it does not write, so the statement writes, in this order:
+
+    - ``TYPE <kind>``: always the model's;
+    - ``FLEXIBLE``: as :func:`field_statement` decides it, and also when the stored field is ``FLEXIBLE`` and the kind
+      holds an object — on a ``SCHEMAFULL`` table only (*schemafull*);
+    - ``REFERENCE[ ON DELETE …]``: the stored one;
+    - ``DEFAULT[ ALWAYS] <expr>``: the column's constant default — for a ``server_fields`` column only when the stored
+      field has no ``DEFAULT``, ``VALUE`` or ``COMPUTED``, so the database's own rule is never replaced —, else the
+      stored one;
+    - ``READONLY``: the stored one;
+    - ``VALUE <expr>``: a computed field's expression, else the stored one;
+    - ``ASSERT <expr>``, ``PERMISSIONS <rules>`` (as :func:`field_permissions_text` renders them), ``COMMENT
+      '<text>'``: the stored ones.
+
+    A stored ``COMPUTED`` field stays ``COMPUTED`` (SurrealDB 3.x): the statement writes ``TYPE <kind>[ FLEXIBLE]
+    COMPUTED <expr>[ PERMISSIONS …][ COMMENT …]`` — the computed field's expression, else the stored one; never
+    ``VALUE``, which would leave the stored records without the field until their next write, and no ``DEFAULT``,
+    ``READONLY``, ``ASSERT`` or ``REFERENCE``, which SurrealDB refuses with ``COMPUTED``.
+
+    ``None`` when a carried value fails its check: a comment holding a NUL; a ``DEFAULT``, ``VALUE``, ``COMPUTED``,
+    ``ASSERT``, ``ON DELETE THEN`` expression or ``WHERE`` rule that ``scan_fragment()`` refuses or that holds a ``;``
+    outside brackets; a rule that is not ``FULL``, ``NONE`` or ``WHERE``. These checks catch a definition the ORM would
+    misread — a comment marker would swallow the clauses written after it —; they are not an injection defence: the
+    source is the database itself. A stored value the model replaces is not carried, so not checked. *table* is checked
+    as an identifier and written in backticks. Pure.
+    """
+    parts = [_field_head(table, column, True)]
+    if _flexible(column, schemafull=schemafull, before_3=before_3, stored=stored.flexible):
+        parts.append("FLEXIBLE")
+    carried: list[str] = []  # the stored expressions written back, each checked below
+    if stored.computed is not None:
+        if column.value is None:
+            carried.append(stored.computed)
+        parts.append(f"COMPUTED {column.value if column.value is not None else stored.computed}")
+    else:
+        if stored.reference:
+            on_delete = stored.on_delete
+            if on_delete is not None and on_delete.startswith("THEN"):
+                carried.append(on_delete.removeprefix("THEN"))
+            parts.append("REFERENCE" if on_delete is None else f"REFERENCE ON DELETE {on_delete}")
+        if column.default is not None and not (column.server and _has_value_rule(stored)):
+            parts.append(f"DEFAULT {column.default}")
+        elif stored.default is not None:
+            carried.append(stored.default)
+            parts.append(f"DEFAULT ALWAYS {stored.default}" if stored.default_always else f"DEFAULT {stored.default}")
+        if stored.readonly:
+            parts.append("READONLY")
+        if column.value is not None:
+            parts.append(f"VALUE {column.value}")
+        elif stored.value is not None:
+            carried.append(stored.value)
+            parts.append(f"VALUE {stored.value}")
+        if stored.assertion is not None:
+            carried.append(stored.assertion)
+            parts.append(f"ASSERT {stored.assertion}")
+    if not all(_carried_expression(text) for text in carried):
+        return None
+    if not all(_carried_rule(rule) for rule in stored.permissions.values()):
+        return None
+    permissions = field_permissions_text(stored.permissions)
+    if permissions is not None:
+        parts.append(f"PERMISSIONS {permissions}")
+    if stored.comment is not None:
+        if "\x00" in stored.comment:
+            return None
+        parts.append(f"COMMENT {_quoted(stored.comment)}")
     return " ".join(parts) + ";"
 
 

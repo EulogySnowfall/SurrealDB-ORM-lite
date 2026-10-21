@@ -76,7 +76,15 @@ check against mistakes, not an injection defence — a rule is trusted applicati
 rewrite: the model keeps every key as declared. ``TableClauses`` holds the clauses a model declares, normalised;
 ``declared_clauses()`` writes them in SurrealDB's order (schema mode, ``COMMENT``, ``CHANGEFEED``, ``PERMISSIONS``) and
 ``table_statement()`` the table statement of ``table_ddl()``: the type clause, then those clauses, the table name in
-backticks.
+backticks; ``view_statement()`` writes a view's after its ``AS (…)``. For a table that exists,
+``table_statement_keeping()`` writes each clause the model declares and keeps each one it does not from the stored
+definition (``DROP``, ``SCHEMAFULL``, the comment, the change feed, the permissions) — ``relation_statement_keeping()``
+is it with nothing declared — and ``view_statement_keeping()`` does the same around a stored view's ``AS (…)``; a
+carried value is re-checked as v0.33.0's are, and one that fails gives ``None``. ``read_table_fields()`` reads a
+table's field definitions with one ``INFO FOR TABLE``, keyed by path whichever rendering the line uses, ``None`` for a
+definition the parser cannot read. ``table_refused()`` gives the texts of the node models' table guard (TG1–TG4),
+``relation_table_refused()`` names ``define_table()`` when it is the caller, and ``relation_schemafull_refused()``
+refuses ``define_relation()`` of an edge model declared ``SCHEMAFULL`` with data fields, which it would not define.
 
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
 it.
@@ -84,7 +92,7 @@ it.
 
 import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
-from dataclasses import KW_ONLY, dataclass, field
+from dataclasses import KW_ONLY, dataclass, field, replace
 from typing import Any, Literal
 
 from ._sdk import ServerError
@@ -92,14 +100,16 @@ from .define_parser import (
     _DURATION,
     DefineParseError,
     blank_literals,
+    parse_define_field,
     parse_define_table,
     parse_kind,
+    read_idiom,
     render_kind,
     scan_fragment,
 )
 from .exceptions import SurrealDbError
 from .functions import normalize_function_name
-from .schema_state import TableState
+from .schema_state import FieldState, TableState
 from .surql_literal import _SERVER_PARAMETERS, _identifier, _quoted
 from .time_travel import line_major
 from .types import SchemaMode, TableType
@@ -917,15 +927,17 @@ def view_query_hazards(outline: ViewOutline) -> tuple[ViewHazard, ...]:
     return tuple(hazard for hazard in hazards if hazard is not None)
 
 
-def view_statement(table: str, query: str, overwrite: object) -> str:
-    """``DEFINE TABLE {OVERWRITE | IF NOT EXISTS} `<table>` AS (<query>);`` — the full SurrealDB-ORM's form (v0.32.0).
+def view_statement(table: str, query: str, overwrite: object, clauses: "TableClauses | None" = None) -> str:
+    """``DEFINE TABLE {OVERWRITE | IF NOT EXISTS} `<table>` AS (<query>)[ COMMENT '…'][ CHANGEFEED …][ PERMISSIONS
+    …];`` — the full SurrealDB-ORM's form (v0.32.0), with the clauses a view model declares (v0.34.0).
 
     *table* is checked as an identifier and written in backticks; *query* is a text :func:`check_view_query` returned,
-    embedded as it is inside one pair of parentheses. ``overwrite=True`` recomputes an existing view (``OVERWRITE``),
-    ``False`` keeps it (``IF NOT EXISTS``); a non-``bool`` is a ``TypeError``. Pure.
+    embedded as it is inside one pair of parentheses. *clauses* (``None``: ``TableClauses()``, nothing declared) are
+    written as :func:`declared_clauses` writes them, after ``AS (…)`` — a schema mode, which a view model cannot
+    declare, before it. ``overwrite=True`` recomputes an existing view (``OVERWRITE``), ``False`` keeps it (``IF NOT
+    EXISTS``); a non-``bool`` is a ``TypeError``. Pure.
     """
-    table = _identifier_name(table, what="Table")
-    return f"DEFINE TABLE {_overwrite_clause(overwrite)} {_identifier(table)} AS ({query});"
+    return _view_statement(table, query, overwrite, TableClauses() if clauses is None else clauses, drop=False)
 
 
 def remove_view_statement(table: str, missing_ok: object) -> str:
@@ -1403,18 +1415,24 @@ def table_permissions_text(permissions: Mapping[str, str]) -> str | None:
     return ", ".join("FOR " + ", ".join(operations) + " " + rule for rule, operations in groups.items())
 
 
+def _carried_expression(text: str) -> bool:
+    """Whether the stored expression *text* can be written back as it is: ``scan_fragment()`` accepts it — literals
+    and quoted identifiers terminated, brackets balanced, no comment marker, no NUL — with no ``;`` outside brackets
+    (v0.34.0). A check of a definition read from the database, which the ORM would otherwise misread; not an injection
+    defence. Pure."""
+    try:
+        return not scan_fragment(text)
+    except DefineParseError:
+        return False
+
+
 def _carried_rule(rule: str) -> bool:
     """Whether the stored permissions rule *rule* can be written back as it is: ``FULL``, ``NONE`` or ``WHERE <expr>``
-    whose ``<expr>`` ``scan_fragment()`` accepts with no ``;`` outside brackets."""
+    whose ``<expr>`` :func:`_carried_expression` accepts. Pure."""
     if rule in ("FULL", "NONE"):
         return True
     where = _PERMISSIONS_WHERE.fullmatch(rule)
-    if where is None:
-        return False
-    try:
-        return not scan_fragment(where.group(1))
-    except DefineParseError:
-        return False
+    return where is not None and _carried_expression(where.group(1))
 
 
 def relation_statement_keeping(table: str, clause: str, state: TableState) -> str | None:
@@ -1426,57 +1444,48 @@ def relation_statement_keeping(table: str, clause: str, state: TableState) -> st
     stored definition), in this order: ``DROP``; ``SCHEMAFULL`` (``SCHEMALESS`` is the default and not written);
     ``COMMENT`` re-quoted as a string literal; ``CHANGEFEED <duration>[ INCLUDE ORIGINAL]`` as the parser read it;
     ``PERMISSIONS`` rendered by :func:`table_permissions_text` (left out when every rule is ``NONE``). *table* is
-    checked as an identifier and written in backticks.
+    checked as an identifier and written in backticks. It is :func:`table_statement_keeping` with no declared clause
+    (v0.34.0).
 
     ``None`` when a stored value fails its check: a comment holding a NUL, or a permissions rule that is not ``FULL``,
     ``NONE`` or ``WHERE <expr>`` whose ``<expr>`` ``scan_fragment()`` accepts with no ``;`` outside brackets. These
     checks catch a definition the ORM would misread; they are not an injection defence: the source is the database
     itself. Pure.
     """
-    parts = [clause]
-    if state.drop:
-        parts.append("DROP")
-    if state.schema_mode == "SCHEMAFULL":
-        parts.append("SCHEMAFULL")
-    if state.comment is not None:
-        if "\x00" in state.comment:
-            return None
-        parts.append(f"COMMENT {_quoted(state.comment)}")
-    if state.changefeed is not None:
-        parts.append(f"CHANGEFEED {state.changefeed}" + (" INCLUDE ORIGINAL" if state.changefeed_include_original else ""))
-    if not all(_carried_rule(rule) for rule in state.permissions.values()):
-        return None
-    permissions = table_permissions_text(state.permissions)
-    if permissions is not None:
-        parts.append(f"PERMISSIONS {permissions}")
-    return relation_statement(table, " ".join(parts), True)
+    return table_statement_keeping(table, clause, TableClauses(), state)
 
 
-def relation_table_refused(guard: Literal["RG1", "RG2", "RG3"], model: str, table: str) -> str:
-    """The refusals of ``define_relation()``'s table guard (v0.33.0): the text of *guard* for the edge model *model*
-    on *table*. Pure.
+def relation_table_refused(
+    guard: Literal["RG1", "RG2", "RG3"],
+    model: str,
+    table: str,
+    *,
+    method: Literal["define_relation", "define_table"] = "define_relation",
+) -> str:
+    """The refusals of an edge model's table guard (v0.33.0): the text of *guard* for the edge model *model* on
+    *table*, naming *method* — ``define_relation()``, or ``define_table()`` when it is the caller (v0.34.0). Pure.
 
     - ``RG1``: the table is a materialized view, whose query the ``OVERWRITE`` would drop;
     - ``RG2``: the table's definition cannot be read, or a stored value fails its check
       (:func:`relation_statement_keeping` returned ``None``), so its other clauses cannot be kept;
-    - ``RG3``: ``define_relation(overwrite=False)`` on a table that exists and is not a relation table
-      (``IF NOT EXISTS`` would leave the constraint unapplied).
+    - ``RG3``: ``overwrite=False`` on a table that exists and is not a relation table (``IF NOT EXISTS`` would leave
+      the constraint unapplied).
     """
     if guard == "RG1":
         return (
-            f"{model}.define_relation(): the table '{table}' is a materialized view; defining it as a relation table "
+            f"{model}.{method}(): the table '{table}' is a materialized view; defining it as a relation table "
             f"would drop its query and turn it into an ordinary table that no longer updates. Give {model} another "
             "table_name, or remove the view first. Nothing was defined."
         )
     if guard == "RG2":
         return (
-            f"{model}.define_relation(): the definition of the table '{table}' could not be read, so the ORM cannot keep "
+            f"{model}.{method}(): the definition of the table '{table}' could not be read, so the ORM cannot keep "
             "its other clauses (schema mode, permissions, change feed, comment). Nothing was defined."
         )
     return (
-        f"{model}.define_relation(overwrite=False): the table '{table}' exists and is not a relation table; DEFINE "
+        f"{model}.{method}(overwrite=False): the table '{table}' exists and is not a relation table; DEFINE "
         "TABLE IF NOT EXISTS would leave it as it is, and the relation constraint would not apply. Call "
-        "define_relation() with overwrite=True, which keeps the table's other clauses. Nothing was defined."
+        f"{method}() with overwrite=True, which keeps the table's other clauses. Nothing was defined."
     )
 
 
@@ -1730,6 +1739,201 @@ def table_statement(table: str, head: str, clauses: TableClauses, overwrite: obj
     statement does not write), ``False`` keeps it (``IF NOT EXISTS``); a non-``bool`` is a ``TypeError``. Pure.
     """
     return relation_statement(table, " ".join([head, *declared_clauses(clauses)]), overwrite)
+
+
+def _kept_clauses(clauses: TableClauses, state: TableState) -> TableClauses | None:
+    """*clauses* with each clause they leave out taken from the stored definition *state* (v0.34.0): ``SCHEMAFULL``
+    (``SCHEMALESS`` is the default and not written), the comment, the change feed as the parser read it, the
+    permissions unless every rule is ``NONE`` (a table's default). A declared clause replaces the stored one whole.
+
+    ``None`` when a carried value fails its check: a comment holding a NUL, or a rule that is not ``FULL``, ``NONE`` or
+    ``WHERE <expr>`` whose ``<expr>`` ``scan_fragment()`` accepts with no ``;`` outside brackets. A declared value is not
+    checked here (``check_table_config()`` checked it when the class was defined), nor is a stored one it replaces.
+    """
+    comment = clauses.comment
+    if comment is None and state.comment is not None:
+        if "\x00" in state.comment:
+            return None
+        comment = state.comment
+    permissions = clauses.permissions
+    if permissions is None:
+        if not all(_carried_rule(rule) for rule in state.permissions.values()):
+            return None
+        if table_permissions_text(state.permissions) is not None:
+            permissions = state.permissions
+    changefeed = clauses.changefeed
+    if changefeed is None and state.changefeed is not None:
+        changefeed = state.changefeed + (" INCLUDE ORIGINAL" if state.changefeed_include_original else "")
+    schema_mode = clauses.schema_mode
+    if schema_mode is None and state.schema_mode == "SCHEMAFULL":
+        schema_mode = "SCHEMAFULL"
+    return TableClauses(schema_mode=schema_mode, comment=comment, changefeed=changefeed, permissions=permissions)
+
+
+def table_statement_keeping(table: str, head: str, clauses: TableClauses, state: TableState) -> str | None:
+    """``DEFINE TABLE OVERWRITE `<table>` <head>…;`` for a table that exists, keeping the clauses of its stored
+    definition *state* that *clauses* do not declare (v0.34.0) — the statement ``define_table()`` and
+    ``define_relation()`` send for a table that exists.
+
+    A bare ``OVERWRITE`` resets every clause it does not write, so after *head* (``TYPE NORMAL``, ``TYPE ANY`` or a
+    relation's type clause) the statement writes, in this order: ``DROP`` when stored (no key declares it); the schema
+    mode, ``COMMENT``, ``CHANGEFEED`` and ``PERMISSIONS`` — each the declared one (as :func:`declared_clauses` writes
+    it: ``PERMISSIONS NONE`` when every declared rule is ``NONE``), else the stored one: ``SCHEMAFULL`` (``SCHEMALESS``
+    is the default and not written), the comment re-quoted as a string literal, the change feed as the parser read it,
+    the permissions rendered by :func:`table_permissions_text` (left out when every rule is ``NONE``). *state* is
+    ``parse_define_table()`` of the stored definition; *table* is checked as an identifier and written in backticks.
+
+    ``None`` when a carried value fails its check: a comment holding a NUL, or a permissions rule that is not ``FULL``,
+    ``NONE`` or ``WHERE <expr>`` whose ``<expr>`` ``scan_fragment()`` accepts with no ``;`` outside brackets. These
+    checks catch a definition the ORM would misread; they are not an injection defence: the source is the database
+    itself. A value the model declares replaces the stored one, which is then not checked. Pure.
+    """
+    kept = _kept_clauses(clauses, state)
+    if kept is None:
+        return None
+    return table_statement(table, f"{head} DROP" if state.drop else head, kept, True)
+
+
+def _view_statement(table: str, query: str, overwrite: object, clauses: TableClauses, *, drop: bool) -> str:
+    """A view's statement: ``DROP`` and the schema mode before ``AS (<query>)``, the other clauses after it."""
+    table = _identifier_name(table, what="Table")
+    before = ["DROP"] if drop else []
+    if clauses.schema_mode is not None:
+        before.append(clauses.schema_mode)
+    body = " ".join([*before, f"AS ({query})", *declared_clauses(replace(clauses, schema_mode=None))])
+    return f"DEFINE TABLE {_overwrite_clause(overwrite)} {_identifier(table)} {body};"
+
+
+def view_statement_keeping(table: str, query: str, clauses: TableClauses, state: TableState) -> str | None:
+    """``DEFINE TABLE OVERWRITE `<table>`[ DROP][ SCHEMAFULL] AS (<query>)[ COMMENT '…'][ CHANGEFEED …][ PERMISSIONS
+    …];`` for a view that exists, keeping the clauses of its stored definition *state* that *clauses* do not declare
+    (v0.34.0) — the statement ``define_view()`` sends over a stored view.
+
+    The rule of :func:`table_statement_keeping`, around the view's ``AS (<query>)`` instead of after a type clause:
+    ``DROP`` and the schema mode before it, the comment, the change feed and the permissions after it, each the declared
+    one, else the stored one. *query* is a text :func:`check_view_query` returned; *table* is checked as an identifier
+    and written in backticks. ``None`` when a carried value fails its check (a comment holding a NUL, a rule that is not
+    ``FULL``, ``NONE`` or one ``WHERE`` expression ``scan_fragment()`` accepts). Pure.
+    """
+    kept = _kept_clauses(clauses, state)
+    if kept is None:
+        return None
+    return _view_statement(table, query, True, kept, drop=state.drop)
+
+
+def _field_definition(definition: object) -> FieldState | None:
+    """``parse_define_field()``'s state of one ``INFO FOR TABLE`` definition, ``None`` when it cannot read it."""
+    if not isinstance(definition, str):
+        return None
+    try:
+        return parse_define_field(definition).state
+    except DefineParseError:
+        return None
+
+
+def _info_path(key: object) -> tuple[str, ...] | None:
+    """The path an ``INFO FOR TABLE`` key reads as in full (``subs[*].city``, `` `select` ``), or ``None``."""
+    if not isinstance(key, str):
+        return None
+    try:
+        path, end = read_idiom(key, 0)
+    except DefineParseError:
+        return None
+    return path if end == len(key) else None
+
+
+async def read_table_fields(client: Any, table: str, *, kind: str) -> dict[tuple[str, ...], FieldState | None]:
+    """The field definitions of *table*, read once with ``INFO FOR TABLE `<table>`;`` and keyed by path (v0.34.0).
+
+    Each definition is read by ``parse_define_field()`` and keyed by its ``state.path``, the unescaped segments
+    (``("address", "city")``, ``("subs", "*", "city")``, ``("a.b",)`` for one segment holding a dot), whichever
+    rendering the line uses (``bag.*`` on 3.x, ``bag[*]`` on 2.x; a keyword's key bare or in backticks). A definition
+    the parser cannot read, or that is not a ``str``, is ``None`` under the path its key reads as
+    (``define_parser.read_idiom()`` of the whole key), so the caller can refuse to redefine that field without its
+    clauses; one whose key is not a path is left out. ``{}`` when the answer holds no ``fields`` mapping. *table* is
+    checked as an identifier and written in backticks; the read is on *client* outside any transaction (committed
+    state).
+
+    :param kind: ``"definition"``, for the message of a refusal.
+    :raises SurrealDbAuthenticationError: the session may not read the table's definitions (a record user).
+    :raises SurrealDbError: any other refusal of the ``INFO``.
+    """
+    statement = f"INFO FOR TABLE {_identifier(_identifier_name(table, what='Table'))};"
+    try:
+        info = await client.query(statement, {})
+    except (ServerError, SurrealDbError, RuntimeError) as error:
+        raise _guard_read_refused(statement, error, kind=kind, table=table, what="table") from error
+    fields = info.get("fields") if isinstance(info, dict) else None
+    read: dict[tuple[str, ...], FieldState | None] = {}
+    if not isinstance(fields, dict):
+        return read
+    for key, definition in fields.items():
+        state = _field_definition(definition)
+        path = _info_path(key) if state is None else tuple(state.path)
+        # Two definitions of one path: an unreadable one wins, so the field is never redefined without its clauses.
+        if path is not None and (state is None or path not in read):
+            read[path] = state
+    return read
+
+
+def table_refused(
+    guard: Literal["TG1", "TG2", "TG3", "TG4"],
+    model: str,
+    table: str,
+    *,
+    method: Literal["define_table", "define_access"] = "define_table",
+    field: str | None = None,
+) -> str:
+    """The refusals of a node model's table guard (v0.34.0): the text of *guard* for the model *model* on *table*,
+    naming *method* — ``define_table()``, or ``define_access()`` when it defines the table. Pure.
+
+    - ``TG1``: the table is a materialized view, whose query the statement would drop;
+    - ``TG2``: the table's definition cannot be read, or a carried clause fails its check
+      (:func:`table_statement_keeping` returned ``None``), so the clauses the model does not declare cannot be kept;
+    - ``TG3``: the table is a relation table, whose constraint an ordinary table statement would drop;
+    - ``TG4``: the definition of the field *field* (its canonical name: ``address.city``, ``tags.*``) cannot be read,
+      or one of its carried clauses fails its check, so the clauses the model does not write cannot be kept.
+
+    :raises ValueError: ``TG4`` without *field*.
+    """
+    call = f"{model}.{method}()"
+    if guard == "TG1":
+        return (
+            f"{call}: the table '{table}' is a materialized view; defining it as an ordinary table would drop its query. "
+            f"Declare view_query on {model}, give it another table_name, or remove the view first. Nothing was defined."
+        )
+    if guard == "TG2":
+        return (
+            f"{call}: the definition of the table '{table}' could not be read, so the ORM cannot keep the clauses {model} "
+            "does not declare (schema mode, permissions, change feed, comment). Nothing was defined."
+        )
+    if guard == "TG3":
+        return (
+            f"{call}: the table '{table}' is a relation table (TYPE RELATION) and {model} is not an edge model; defining "
+            f"it as an ordinary table would drop its relation constraint and refuse every edge. Derive {model} from "
+            "BaseSurrealEdge, or give it another table_name. Nothing was defined."
+        )
+    if field is None:
+        raise ValueError("TG4 names the field whose definition could not be read: pass field=.")
+    return (
+        f"{call}: the definition of the field '{field}' on the table '{table}' could not be read, so the ORM cannot keep "
+        f"the clauses {model} does not write (ASSERT, PERMISSIONS, READONLY, DEFAULT, VALUE, COMPUTED, COMMENT). Nothing "
+        "was defined."
+    )
+
+
+def relation_schemafull_refused(model: str, columns: Sequence[str]) -> str:
+    """RG4 (v0.34.0): ``define_relation()`` of the edge model *model*, which declares ``SchemaMode.SCHEMAFULL`` and has
+    the data columns *columns* (top level, in declaration order). ``define_relation()`` defines no field, so a
+    ``SCHEMAFULL`` table would refuse (SurrealDB 3.x) or drop (2.x, the embedded engine) every edge's data;
+    ``define_table()`` applies the same relation statement and defines them. Pure."""
+    names = ", ".join(repr(column) for column in columns)
+    return (
+        f"{model}.define_relation(): {model} declares SchemaMode.SCHEMAFULL and has data fields ({names}); "
+        "define_relation() defines no field, and a SCHEMAFULL table refuses (SurrealDB 3.x) or drops (2.x and the "
+        f"embedded engine) the fields it does not define. Call {model}.define_table(), which applies the same relation "
+        "statement and defines them. Nothing was defined."
+    )
 
 
 def user_extra_refused(model: str) -> str:
