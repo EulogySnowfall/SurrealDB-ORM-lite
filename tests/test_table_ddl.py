@@ -133,13 +133,22 @@ On the servers (``TestAccessE2E``, over WebSocket, both lines): a ``TableType.US
 a ``SCHEMAFULL`` table with its fields and the access's permissions, and signup and signin work there; ``define_table()``
 afterwards, or a second ``define_access()``, sends the carried statements and changes nothing; a view under the table is
 refused, naming ``define_access()``.
+
+The round trip (``TestRoundTripE2E``, every engine of both lines): ``generate_models_from_db()`` writes a table's
+clauses as keys, and each generated model's ``define_table()`` on a fresh database reads back the same table clauses
+and field kinds, except what a model does not hold — a typed record link, a ``DEFAULT`` on an optional or server-filled
+field, an ``ASSERT``, a ``COMPUTED`` field written ``VALUE``; over the database it was read from, a ``COMPUTED`` field
+stays ``COMPUTED`` and every ``DEFAULT``, ``VALUE`` and ``ASSERT`` stays.
 """
 
 import ast
 import contextlib
+import importlib.util
 import inspect
 import os
 import re
+import sys
+import uuid
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
@@ -148,7 +157,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum, IntEnum, StrEnum
 from pathlib import Path
-from types import MappingProxyType
+from types import MappingProxyType, ModuleType
 from typing import Annotated, Any, ClassVar, Literal, TypeVar
 from uuid import UUID
 
@@ -184,6 +193,7 @@ from surreal_orm_lite import (
     TableType,
     Transaction,
     computed,
+    generate_models_from_db,
     model_ddl,
     schema,
 )
@@ -3736,12 +3746,12 @@ def _url(kind: str) -> str:
     return f"ws://{host}:{port}/rpc" if kind == "ws" else f"http://{host}:{port}"
 
 
-def _register_tdl(kind: str, name: str = "tdl") -> None:
+def _register_tdl(kind: str, name: str = "tdl", *, database: str = "tdl_db") -> None:
     if kind == "mem":
-        SurrealDBConnectionManager.add_connection(name, url="mem://", namespace="ns", database="tdl_db")
+        SurrealDBConnectionManager.add_connection(name, url="mem://", namespace="ns", database=database)
     else:
         SurrealDBConnectionManager.add_connection(
-            name, url=_url(kind), user="root", password="root", namespace="ns", database="tdl_db"
+            name, url=_url(kind), user="root", password="root", namespace="ns", database=database
         )
 
 
@@ -5829,3 +5839,195 @@ class TestAccessE2E:
             )
             assert (await _tables(client))["tdl_user"] == before
             assert "tdl_user_access" not in (await client.query("INFO FOR DB;", {}))["accesses"]
+
+
+# === the generator writes the keys back: the round trip ==============================================================
+
+#: A schema written by hand on ``tdl_db``: a ``TYPE ANY`` table; a ``SCHEMAFULL`` table with a comment, a change feed,
+#: permissions, an ``ASSERT``, a computed ``VALUE`` field, constant and server ``DEFAULT``s and a typed record link,
+#: holding the record ``tdl_rt:1``; and a ``SCHEMAFULL`` table with every kind the ORM writes — a sub-object, an
+#: array of sub-objects, literals, a column that is not a Python name.
+_RT_SCHEMA = (
+    "DEFINE TABLE tdl_rt_any SCHEMALESS; "
+    "DEFINE FIELD n ON tdl_rt_any TYPE option<int>; "
+    "DEFINE TABLE tdl_rt TYPE NORMAL SCHEMAFULL COMMENT 'round trip' CHANGEFEED 1d INCLUDE ORIGINAL "
+    "PERMISSIONS FOR select WHERE $auth.id != NONE, FOR create, update FULL; "
+    "DEFINE FIELD a ON tdl_rt TYPE int ASSERT $value > 0; "
+    "DEFINE FIELD v ON tdl_rt TYPE option<int> VALUE a + 1; "
+    "DEFINE FIELD age ON tdl_rt TYPE option<int> DEFAULT 18; "
+    "DEFINE FIELD lvl ON tdl_rt TYPE int DEFAULT 1; "
+    "DEFINE FIELD created ON tdl_rt TYPE datetime DEFAULT time::now(); "
+    "DEFINE FIELD rec ON tdl_rt TYPE option<record<tdl_rt_any>>; "
+    "DEFINE TABLE tdl_rt_kinds TYPE NORMAL SCHEMAFULL; "
+    "DEFINE FIELD s ON tdl_rt_kinds TYPE string; "
+    "DEFINE FIELD i ON tdl_rt_kinds TYPE int; "
+    "DEFINE FIELD f ON tdl_rt_kinds TYPE float; "
+    "DEFINE FIELD b ON tdl_rt_kinds TYPE bool; "
+    "DEFINE FIELD d ON tdl_rt_kinds TYPE decimal; "
+    "DEFINE FIELD dt ON tdl_rt_kinds TYPE datetime; "
+    "DEFINE FIELD du ON tdl_rt_kinds TYPE duration; "
+    "DEFINE FIELD u ON tdl_rt_kinds TYPE uuid; "
+    "DEFINE FIELD bt ON tdl_rt_kinds TYPE bytes; "
+    "DEFINE FIELD r ON tdl_rt_kinds TYPE record; "
+    "DEFINE FIELD ls ON tdl_rt_kinds TYPE array<string>; "
+    "DEFINE FIELD st ON tdl_rt_kinds TYPE set<int>; "
+    "DEFINE FIELD tu ON tdl_rt_kinds TYPE [int, string]; "
+    "DEFINE FIELD dc ON tdl_rt_kinds TYPE object; "
+    "DEFINE FIELD sub ON tdl_rt_kinds TYPE object; "
+    "DEFINE FIELD sub.city ON tdl_rt_kinds TYPE string; "
+    "DEFINE FIELD sub.zip ON tdl_rt_kinds TYPE option<string>; "
+    "DEFINE FIELD subs ON tdl_rt_kinds TYPE array<object>; "
+    "DEFINE FIELD subs.*.city ON tdl_rt_kinds TYPE string; "
+    "DEFINE FIELD subs.*.zip ON tdl_rt_kinds TYPE option<string>; "
+    "DEFINE FIELD osub ON tdl_rt_kinds TYPE option<object>; "
+    "DEFINE FIELD osub.city ON tdl_rt_kinds TYPE string; "
+    "DEFINE FIELD osub.zip ON tdl_rt_kinds TYPE option<string>; "
+    "DEFINE FIELD lit ON tdl_rt_kinds TYPE 'a' | 'b'; "
+    "DEFINE FIELD ie ON tdl_rt_kinds TYPE 1 | 2; "
+    "DEFINE FIELD opt ON tdl_rt_kinds TYPE option<int>; "
+    "DEFINE FIELD un ON tdl_rt_kinds TYPE int | string; "
+    "DEFINE FIELD anyv ON tdl_rt_kinds TYPE any; "
+    "DEFINE FIELD geo ON tdl_rt_kinds TYPE option<geometry<point>>; "
+    "DEFINE FIELD rng ON tdl_rt_kinds TYPE option<range>; "
+    "DEFINE FIELD `first-name` ON tdl_rt_kinds TYPE string; "
+)
+
+#: SurrealDB 3.x: a ``COMPUTED`` field beside the ``VALUE`` one.
+_RT_COMPUTED = "DEFINE FIELD c ON tdl_rt TYPE option<int> COMPUTED a + 1; "
+
+#: The record the source database holds.
+_RT_RECORD = "CREATE tdl_rt:1 SET a = 1 RETURN NONE;"
+
+#: The tables of the round trip, in codepoint order.
+_RT_TABLES = ["tdl_rt", "tdl_rt_any", "tdl_rt_kinds"]
+
+#: What a field's definition is compared on.
+_RT_FIELD_ATTRIBUTES = ("field_type", "nullable", "default", "value", "computed", "assertion")
+
+
+def _import_generated(path: Path) -> ModuleType:
+    """Import the module written at *path* (removed from ``sys.modules`` afterwards)."""
+    name = f"generated_tables_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        del sys.modules[name]
+    return module
+
+
+def _rt_clauses(state: TableState) -> tuple[object, ...]:
+    """A stored table's type, mode, comment, change feed and permissions."""
+    return (
+        state.table_type,
+        state.schema_mode,
+        state.comment,
+        state.changefeed,
+        state.changefeed_include_original,
+        dict(state.permissions),
+    )
+
+
+async def _rt_schema(client: Any) -> dict[str, tuple[TableState, dict[tuple[str, ...], FieldState]]]:
+    """Each round-trip table's stored definition and fields, keyed by path."""
+    tables = await _tables(client)
+    return {table: (parse_define_table(tables[table]), _field_states(await _table_info(client, table))) for table in _RT_TABLES}
+
+
+@contextlib.asynccontextmanager
+async def _tdl2(kind: str) -> AsyncIterator[Any]:
+    """The connection ``"tdl2"`` on *kind*, on a fresh database ``tdl_db2``; removed, then unregistered, on exit."""
+    _register_tdl(kind, "tdl2", database="tdl_db2")
+    client = await SurrealDBConnectionManager.get_client("tdl2")
+    await _apply_ddl(client, "REMOVE DATABASE IF EXISTS tdl_db2; DEFINE DATABASE tdl_db2;")
+    try:
+        yield client
+    finally:
+        with contextlib.suppress(Exception):
+            cleanup = await SurrealDBConnectionManager.get_client("tdl2")
+            await cleanup.query("REMOVE DATABASE IF EXISTS tdl_db2;", {})
+        await SurrealDBConnectionManager.remove_connection("tdl2")
+
+
+class TestRoundTripE2E:
+    """On every engine of both lines: ``generate_models_from_db()`` writes the table clauses as keys —
+    ``table_type=TableType.ANY``, ``schema_mode=SchemaMode.SCHEMAFULL``, ``changefeed=``, ``permissions=``,
+    ``comment=`` — and each generated model's ``define_table()`` on a fresh database defines its table with the same
+    type, mode, comment, change feed and permissions, and every field with the same kind, except what a model does
+    not hold: a typed record link is written ``record``, a ``DEFAULT`` on an optional field or a server ``DEFAULT`` is
+    not written (the field is optional in the model), an ``ASSERT`` is not written, and a ``COMPUTED`` field
+    (SurrealDB 3.x) is written ``VALUE`` on a database that does not define it. Over the database it was read from,
+    ``define_table()`` keeps the ``COMPUTED`` field ``COMPUTED`` and the record keeps its value; the ``VALUE`` field,
+    every ``DEFAULT`` and the ``ASSERT`` stay."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_generated_models_define_the_same_tables(self, kind: str, tmp_path: Path) -> None:
+        async with _tdl(kind) as client:
+            has_computed = await _major(client) >= 3
+            await _apply_ddl(client, _RT_SCHEMA + (_RT_COMPUTED if has_computed else "") + _RT_RECORD)
+            source = await _rt_schema(client)
+
+            path = tmp_path / "tdl_rt_models.py"
+            text = await generate_models_from_db(path, "tdl", tables=_RT_TABLES)
+            for comment in ("# Comment:", "# Changefeed:", "# Permissions:"):
+                assert comment not in text, comment
+            module = _import_generated(path)
+            models: list[type[BaseSurrealModel]] = [module.TdlRt, module.TdlRtAny, module.TdlRtKinds]
+            rt, rt_any, rt_kinds = models
+            assert (rt.get_table_type(), rt.get_schema_mode()) == (TableType.NORMAL, SchemaMode.SCHEMAFULL)
+            assert (rt_any.get_table_type(), rt_any.get_schema_mode()) == (TableType.ANY, None)
+            assert (rt_kinds.get_table_type(), rt_kinds.get_schema_mode()) == (TableType.NORMAL, SchemaMode.SCHEMAFULL)
+            assert rt.get_changefeed() == "1d INCLUDE ORIGINAL"
+            assert rt.model_config["comment"] == "round trip"
+            assert schema.permissions_rules(rt.get_permissions(), model=rt) == source["tdl_rt"][0].permissions
+            assert rt.get_computed_fields() == ({"c": "a + 1", "v": "a + 1"} if has_computed else {"v": "a + 1"})
+
+            # (1) On a fresh database.
+            async with _tdl2(kind) as fresh_client:
+                async with SurrealDBConnectionManager.using("tdl2"):
+                    for model in models:
+                        assert isinstance(await model.define_table(), str)
+                fresh = await _rt_schema(fresh_client)
+            for table in _RT_TABLES:
+                assert _rt_clauses(fresh[table][0]) == _rt_clauses(source[table][0]), table
+            differences: dict[tuple[str, tuple[str, ...], str], tuple[object, object]] = {}
+            for table in _RT_TABLES:
+                before, after = source[table][1], fresh[table][1]
+                assert set(after) == set(before), (table, set(after) ^ set(before))
+                for field_path, field in before.items():
+                    for attribute in _RT_FIELD_ATTRIBUTES:
+                        pair = getattr(field, attribute), getattr(after[field_path], attribute)
+                        if pair[0] != pair[1]:
+                            differences[(table, field_path, attribute)] = pair
+            expected = {
+                ("tdl_rt", ("rec",), "field_type"): ("record<tdl_rt_any>", "record"),
+                ("tdl_rt", ("age",), "default"): ("18", None),
+                ("tdl_rt", ("created",), "nullable"): (False, True),
+                ("tdl_rt", ("created",), "default"): (source["tdl_rt"][1][("created",)].default, None),
+                ("tdl_rt", ("a",), "assertion"): (source["tdl_rt"][1][("a",)].assertion, None),
+            }
+            if has_computed:
+                expected[("tdl_rt", ("c",), "computed")] = ("a + 1", None)
+                expected[("tdl_rt", ("c",), "value")] = (None, "a + 1")
+            assert differences == expected
+
+            # (2) Over the database the models were read from.
+            before = source["tdl_rt"][1]
+            for model in models:
+                assert isinstance(await model.define_table(), str)
+            after = _field_states(await _table_info(client, "tdl_rt"))
+            for field_path, field in before.items():
+                kept = (field.default, field.value, field.computed, field.assertion)
+                assert (
+                    after[field_path].default,
+                    after[field_path].value,
+                    after[field_path].computed,
+                    after[field_path].assertion,
+                ) == kept, field_path
+            assert await client.query("SELECT VALUE v FROM tdl_rt:1;", {}) == [2]
+            if has_computed:
+                assert (after[("c",)].computed, after[("c",)].value) == ("a + 1", None)
+                assert await client.query("SELECT VALUE c FROM tdl_rt:1;", {}) == [2]

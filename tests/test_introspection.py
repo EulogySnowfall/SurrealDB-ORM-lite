@@ -1256,31 +1256,49 @@ _FEED_SOURCE = (
     DOCSTRING
     + """
 
-from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict
+from surreal_orm_lite import BaseSurrealModel, SchemaMode, SurrealConfigDict, TableType
 from surrealdb import RecordID
 
 
 class IspFeed(BaseSurrealModel):
-    # Changefeed: 1d INCLUDE ORIGINAL
-    # Permissions: FOR select WHERE $auth.id = owner, FOR create, update FULL, FOR delete NONE
-    model_config = SurrealConfigDict(table_name="isp_feed", connection="isp")
+    model_config = SurrealConfigDict(
+        table_name="isp_feed",
+        schema_mode=SchemaMode.SCHEMAFULL,
+        changefeed="1d INCLUDE ORIGINAL",
+        permissions={"select": "WHERE $auth.id = owner", "create": "FULL", "update": "FULL"},
+        connection="isp",
+    )
 
     id: str | None = None
     owner: RecordID | None = None
 
 
 class IspOpen(BaseSurrealModel):
-    # Changefeed: 3h
-    # Permissions: FULL
     # SCHEMALESS: fields not declared here are kept (extra="allow")
-    model_config = SurrealConfigDict(table_name="isp_open", connection="isp", extra="allow")
+    model_config = SurrealConfigDict(
+        table_name="isp_open",
+        table_type=TableType.ANY,
+        changefeed="3h",
+        permissions={"select": "FULL", "create": "FULL", "update": "FULL", "delete": "FULL"},
+        connection="isp",
+        extra="allow",
+    )
 
     id: str | None = None
 
 
 class IspOwned(BaseSurrealModel):
-    # Permissions: FOR select, create, update, delete WHERE $auth.id = owner
-    model_config = SurrealConfigDict(table_name="isp_owned", connection="isp")
+    model_config = SurrealConfigDict(
+        table_name="isp_owned",
+        schema_mode=SchemaMode.SCHEMAFULL,
+        permissions={
+            "select": "WHERE $auth.id = owner",
+            "create": "WHERE $auth.id = owner",
+            "update": "WHERE $auth.id = owner",
+            "delete": "WHERE $auth.id = owner",
+        },
+        connection="isp",
+    )
 
     id: str | None = None
 """

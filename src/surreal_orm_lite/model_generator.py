@@ -3,8 +3,9 @@ r"""Generate ``BaseSurrealModel`` source from a ``SchemaState`` (v0.30.0) — pr
 ``ModelCodeGenerator`` (re-exported by :mod:`surreal_orm_lite.introspection`) is implemented here:
 ``ModelCodeGenerator().generate(state)`` returns the source of one module — a ``BaseSurrealModel`` class per table
 (``BaseSurrealEdge`` for a relation table), with ``model_config = SurrealConfigDict(table_name=…)``, ``view_query``
-for a view table, ``relation_in``, ``relation_out`` and ``enforced`` for a relation table, the connection's name when it
-is not ``"default"``, ``server_fields`` and ``extra="allow"`` for a ``SCHEMALESS`` table. Pure and deterministic: the
+for a view table, ``relation_in``, ``relation_out`` and ``enforced`` for a relation table, the table's clauses
+(``table_type``, ``schema_mode``, ``changefeed``, ``permissions``, ``comment``), the connection's name when it is not
+``"default"``, ``server_fields`` and ``extra="allow"`` for a ``SCHEMALESS`` table. Pure and deterministic: the
 same state always gives the same string. The schema it reads came from the server: table and field names, comments and
 expressions are server text, and the generated module is source code someone will import. So server text reaches that
 source in exactly three ways, and through no format placeholder of the generator's own:
@@ -33,20 +34,26 @@ types (``Duration``, ``Decimal``, ``UUID``, ``RecordID``, ``Range``, the geometr
 hashable ``T`` …); an optional kind adds ``| None = None``. An ``object`` with declared children becomes a
 ``BaseModel`` sub-model written before its class; other objects are ``dict[str, Any]``. ``COMPUTED e``, and a
 ``VALUE e`` that reads neither ``$value`` nor ``$input``, become ``Computed[T] = computed("e")`` when ``computed()``
-accepts ``e`` and the column needs no alias. A constant ``DEFAULT`` the model holds exactly becomes its Python default:
+accepts ``e`` and the column needs no alias; ``define_table()`` keeps such a field ``COMPUTED`` over the database it was
+read from. A constant ``DEFAULT`` the model holds exactly becomes its Python default:
 the literals that match the annotation, ``[]`` and arrays of such constants, ``{  }`` (a ``dict``, or the sub-model
 when it can be built without arguments — else the field is required), durations, datetimes with at most 6 fractional
 digits and UUIDs; mutable values (``list``, ``set``, ``dict``, a sub-model,
 ``Duration``) through ``default_factory``. So the server stores the same row whether the caller sets the field or not.
 Every other ``DEFAULT`` or computed expression gives the **server form** — ``T | None = None``, the attribute listed
-in ``server_fields`` so the server's value applies on create and is read back. ``ASSERT``, ``PERMISSIONS``,
-``REFERENCE`` and field comments are not generated; ``READONLY`` is a trailing comment, and a class with a ``READONLY``
+in ``server_fields`` so the server's value applies on create and is read back. A field's ``ASSERT``, ``PERMISSIONS``,
+``REFERENCE`` and comment are not generated; ``READONLY`` is a trailing comment, and a class with a ``READONLY``
 field holding a datetime below the top level (in a sub-object, a tuple, an array or a set), or with more than 32
 top-level fields that may hold a datetime, says that ``update()`` may fail on it (narrowed by #261).
 
-**Classes.** A ``BaseSurrealModel``, or a ``BaseSurrealEdge`` for a relation table (``table_type`` in any case). The
-table's comment, view query, change feed, permissions (unless all four are ``NONE``, the default), indexes and events
-are comments of its class. Since v0.33.0 a relation table's ends are keys of its edge class, right after
+**Classes.** A ``BaseSurrealModel``, or a ``BaseSurrealEdge`` for a relation table (``table_type`` in any case). Since
+v0.34.0 the table's clauses are keys of its class (``_ClassWriter._table_keys()``), each written only when the class
+statement accepts it: ``table_type=TableType.ANY`` for a node table of type ``any``, ``schema_mode=SchemaMode.SCHEMAFULL``
+for a ``SCHEMAFULL`` node or edge table (neither on a view), ``changefeed=``, ``permissions={…}`` (the operations whose
+rule is not ``NONE``, in SurrealQL's order; none when all four are ``NONE``, the default) and ``comment=``. A change
+feed, rules or a comment the class statement would refuse (a rule ``permissions_rules()`` refuses, a comment holding a
+NUL) keep v0.30.0's class comment instead; the indexes and events are comments of the class. Since v0.33.0 a relation
+table's ends are keys of its edge class, right after
 ``table_name=``: ``relation_in=`` and ``relation_out=`` (a string for one name, a list for several, in server order — a
 name stored twice is kept) and ``enforced=True`` — no ``table_type=``, the base class says it; an unconstrained relation
 table gets no key. A name the class statement would refuse (not an identifier: ``a-b``, which SurrealDB stores
@@ -65,6 +72,7 @@ evaluated, which is why no attribute may shadow a name they use.
 README section 31, "Schema introspection", describes the generated module for users.
 """
 
+import contextlib
 import io
 import keyword
 import math
@@ -97,7 +105,14 @@ from .define_parser import (
 from .edge import BaseSurrealEdge
 from .functions import SurrealFunc
 from .model_base import BaseSurrealModel
-from .schema import check_view_query, relation_tables, table_permissions_text
+from .schema import (
+    changefeed_text,
+    check_view_query,
+    comment_text,
+    permissions_rules,
+    relation_tables,
+    table_permissions_text,
+)
 from .schema_state import FieldState, IndexState, SchemaIssue, SchemaState, TableState
 from .types import Duration
 from .utils import _KEEP_LIMIT, VALID_ALIAS_PATTERN
@@ -140,6 +155,8 @@ _IMPORTABLE = frozenset(
         "GeometryCollectionField",
         "GeometryField",
         "RecordID",
+        "SchemaMode",
+        "TableType",
     }
 )
 
@@ -484,7 +501,9 @@ def _children(nodes: Mapping[tuple[str, ...], FieldState], path: tuple[str, ...]
 _DOCSTRING = (
     '"""Models generated by surreal_orm_lite.generate_models_from_db() from a SurrealDB schema.\n'
     "\n"
-    "Review them before use. They describe tables that already exist: do not call\n"
+    "Review them before use. They describe tables that already exist: define_table()\n"
+    "keeps the clauses of the database they do not declare (a COMPUTED field stays\n"
+    "COMPUTED, a server DEFAULT stays), so it can be called on them; do not call\n"
     "define_computed_fields() on them, it would replace the database's field definitions.\n"
     '"""'
 )
@@ -899,6 +918,32 @@ class _Annotation(NamedTuple):
     base: str
 
 
+class _TableKeys(NamedTuple):
+    """The table clauses a class declares as ``model_config`` keys (v0.34.0): ``None`` for a clause the class leaves
+    to a comment, or that the table does not have."""
+
+    #: ``table_type=TableType.ANY``.
+    type_any: bool = False
+    #: ``schema_mode=SchemaMode.SCHEMAFULL``.
+    schemafull: bool = False
+    #: ``changefeed=``: the normalised change feed.
+    changefeed: str | None = None
+    #: ``permissions=``: ``(operation, rule)`` for each operation whose rule is not ``NONE``, in SurrealQL's order;
+    #: ``()`` when every rule is ``NONE`` (no key, no comment).
+    permissions: tuple[tuple[str, str], ...] | None = None
+    #: ``comment=``.
+    comment: str | None = None
+
+
+class _Keyword(NamedTuple):
+    """One keyword of ``model_config``: its text, and for a list or a dict its items and brackets, exploded one item
+    per line when its own line is too wide."""
+
+    text: str
+    items: Sequence[str] | None = None
+    brackets: str = "[]"
+
+
 class _Line(NamedTuple):
     """A field's line (without indentation) and what the class needs to know about it."""
 
@@ -947,10 +992,12 @@ class _ClassWriter:
                 server_fields.append(attribute)
         view_query = self._view_query(computed=computed)
         relation = self._relation_keys()
+        keys = self._table_keys()
         base = "BaseSurrealEdge" if self.edge else "BaseSurrealModel"
         block = [f"class {self.names.class_name(self.table.name)}({base}):"]
-        block.extend("    " + comment for comment in self._comments(view=view_query is not None, relation=relation is not None))
-        block.extend(self._model_config(server_fields, view_query, relation))
+        comments = self._comments(view=view_query is not None, relation=relation is not None, keys=keys)
+        block.extend("    " + comment for comment in comments)
+        block.extend(self._model_config(server_fields, view_query, relation, keys))
         identifier = "id: str | None = None" if view_query is None else "id: RecordID | None = None"
         body = lines if self.edge else [identifier, *lines]
         if body:
@@ -1008,22 +1055,63 @@ class _ClassWriter:
             return None
         return ends[0], ends[1], bool(table.enforced)
 
-    def _comments(self, *, view: bool, relation: bool) -> list[str]:
+    def _table_keys(self) -> _TableKeys:
+        """The table's clauses the class declares as ``model_config`` keys (v0.34.0), each only when the ``class``
+        statement accepts it — checked by the class statement's own functions, as ``view_query`` and the relation keys
+        are:
+
+        - ``table_type=TableType.ANY`` for a node table of type ``any``, whatever its case (none for ``normal``; an
+          edge's base class says ``RELATION``; a view takes none);
+        - ``schema_mode=SchemaMode.SCHEMAFULL`` for a ``SCHEMAFULL`` node or edge table (a ``SCHEMALESS`` table keeps
+          ``extra="allow"`` and needs no key: a new table is ``SCHEMALESS``); none on a view;
+        - ``changefeed=`` — the duration, then `` INCLUDE ORIGINAL`` when set — when ``changefeed_text()`` accepts it;
+        - ``permissions=`` — the operations whose rule is not ``NONE``, in SurrealQL's order — when
+          ``permissions_rules()`` accepts every rule; nothing when all four are ``NONE``, a table's default;
+        - ``comment=`` when ``comment_text()`` accepts it (it holds no NUL).
+
+        A change feed, rules or a comment the class statement would refuse stay comments (:meth:`_comments`).
+        """
+        table = self.table
+        model = self.names.class_name(table.name)
+        view = table.view_query is not None
+        changefeed: str | None = None
+        if table.changefeed is not None:
+            feed = table.changefeed + (" INCLUDE ORIGINAL" if table.changefeed_include_original else "")
+            with contextlib.suppress(TypeError, ValueError):
+                changefeed = changefeed_text(feed, model=model)
+        permissions: tuple[tuple[str, str], ...] | None = None
+        with contextlib.suppress(TypeError, ValueError):
+            rules = permissions_rules(table.permissions, model=model)
+            permissions = tuple((operation, rule) for operation, rule in rules.items() if rule != "NONE")
+        comment: str | None = None
+        if table.comment is not None:
+            with contextlib.suppress(TypeError, ValueError):
+                comment = comment_text(table.comment, model=model)
+        return _TableKeys(
+            type_any=not self.edge and not view and table.table_type.lower() == "any",
+            schemafull=not view and table.schema_mode.upper() == "SCHEMAFULL",
+            changefeed=changefeed,
+            permissions=permissions,
+            comment=comment,
+        )
+
+    def _comments(self, *, view: bool, relation: bool, keys: _TableKeys) -> list[str]:
         """The class comments, each through ``_comment()``; *view* for a materialized view model, *relation* for an
-        edge whose ends are ``model_config`` keys (no ``# IN … OUT …`` comment then)."""
+        edge whose ends are ``model_config`` keys (no ``# IN … OUT …`` comment then); *keys* the table clauses that are
+        keys (no comment for them)."""
         table = self.table
         texts = []
-        if table.comment is not None:
+        if table.comment is not None and keys.comment is None:
             texts.append("Comment: " + table.comment)
         if self.edge and not relation:
             ends = " | ".join(table.relation_in) or "any", " | ".join(table.relation_out) or "any"
             texts.append("IN " + ends[0] + " OUT " + ends[1] + (" ENFORCED" if table.enforced else ""))
         if table.view_query is not None:
             texts.append(_VIEW_NOTE if view else "View: AS " + table.view_query)
-        if table.changefeed is not None:
+        if table.changefeed is not None and keys.changefeed is None:
             texts.append("Changefeed: " + table.changefeed + (" INCLUDE ORIGINAL" if table.changefeed_include_original else ""))
         permissions = table_permissions_text(table.permissions)
-        if permissions is not None:
+        if permissions is not None and keys.permissions is None:
             texts.append("Permissions: " + permissions)
         if self.schemaless:
             texts.append(_SCHEMALESS_NOTE)
@@ -1058,45 +1146,59 @@ class _ClassWriter:
         server_fields: Sequence[str],
         view_query: str | None,
         relation: tuple[tuple[str, ...], tuple[str, ...], bool] | None,
+        keys: _TableKeys,
     ) -> list[str]:
         """The ``model_config`` line, wrapped as ``ruff format`` keeps it above 128 columns; ``view_query=`` after
         ``table_name=`` for a materialized view model (one string literal on one line, however long); an edge's
         *relation* keys (``_relation_keys()``) after ``table_name=`` — ``relation_in=`` and ``relation_out=`` a string
-        for one name, a list for several, ``enforced=True`` when set (v0.33.0).
+        for one name, a list for several, ``enforced=True`` when set (v0.33.0); then the table clauses of *keys*
+        (``_table_keys()``, v0.34.0): ``table_type=``, ``schema_mode=``, ``changefeed=``, ``permissions={…}`` and
+        ``comment=``; then ``connection=``, ``server_fields=`` and ``extra="allow"``.
 
-        Above 128 columns, one keyword per line; a list keyword (``relation_in=``, ``relation_out=``,
-        ``server_fields=``) whose own line is still wider is exploded one item per line, as ruff format writes it.
+        Above 128 columns, one keyword per line; a list or dict keyword (``relation_in=``, ``relation_out=``,
+        ``permissions=``, ``server_fields=``) whose own line is still wider is exploded one item per line, as ruff
+        format writes it.
         """
-        #: Each keyword's text, with its items when it is a list (exploded when its own line is too wide).
-        keywords: list[tuple[str, list[str] | None]] = [("table_name=" + _py_str(self.table.name), None)]
+        keywords = [_Keyword("table_name=" + _py_str(self.table.name))]
         if view_query is not None:
-            keywords.append(("view_query=" + _py_str(view_query), None))
+            keywords.append(_Keyword("view_query=" + _py_str(view_query)))
         if relation is not None:
             for key, names in (("relation_in", relation[0]), ("relation_out", relation[1])):
                 if len(names) == 1:
-                    keywords.append((key + "=" + _py_str(names[0]), None))
+                    keywords.append(_Keyword(key + "=" + _py_str(names[0])))
                 elif names:
                     quoted = [_py_str(name) for name in names]
-                    keywords.append((key + "=[" + ", ".join(quoted) + "]", quoted))
+                    keywords.append(_Keyword(key + "=[" + ", ".join(quoted) + "]", quoted))
             if relation[2]:
-                keywords.append(("enforced=True", None))
+                keywords.append(_Keyword("enforced=True"))
+        if keys.type_any:
+            keywords.append(_Keyword("table_type=TableType.ANY"))
+        if keys.schemafull:
+            keywords.append(_Keyword("schema_mode=SchemaMode.SCHEMAFULL"))
+        if keys.changefeed is not None:
+            keywords.append(_Keyword("changefeed=" + _py_str(keys.changefeed)))
+        if keys.permissions:
+            rules = [_py_str(operation) + ": " + _py_str(rule) for operation, rule in keys.permissions]
+            keywords.append(_Keyword("permissions={" + ", ".join(rules) + "}", rules, "{}"))
+        if keys.comment is not None:
+            keywords.append(_Keyword("comment=" + _py_str(keys.comment)))
         if self.connection != "default":
-            keywords.append(("connection=" + _py_str(self.connection), None))
+            keywords.append(_Keyword("connection=" + _py_str(self.connection)))
         listed = [_py_str(attribute) for attribute in server_fields]
         if listed:
-            keywords.append(("server_fields=[" + ", ".join(listed) + "]", listed))
+            keywords.append(_Keyword("server_fields=[" + ", ".join(listed) + "]", listed))
         if self.schemaless:
-            keywords.append(('extra="allow"', None))
-        one_line = "    model_config = SurrealConfigDict(" + ", ".join(text for text, _ in keywords) + ")"
+            keywords.append(_Keyword('extra="allow"'))
+        one_line = "    model_config = SurrealConfigDict(" + ", ".join(entry.text for entry in keywords) + ")"
         if _width(one_line) <= _MAX_WIDTH:
             return [one_line]
         lines = ["    model_config = SurrealConfigDict("]
-        for keyword_text, items in keywords:
-            line = "        " + keyword_text + ","
-            if items is not None and _width(line) > _MAX_WIDTH:
-                lines.append("        " + keyword_text.partition("=")[0] + "=[")
-                lines.extend("            " + item + "," for item in items)
-                lines.append("        ],")
+        for entry in keywords:
+            line = "        " + entry.text + ","
+            if entry.items is not None and _width(line) > _MAX_WIDTH:
+                lines.append("        " + entry.text.partition("=")[0] + "=" + entry.brackets[0])
+                lines.extend("            " + item + "," for item in entry.items)
+                lines.append("        " + entry.brackets[1] + ",")
             else:
                 lines.append(line)
         lines.append("    )")
@@ -1343,15 +1445,16 @@ class ModelCodeGenerator:
 
     One ``BaseSurrealModel`` class per table (``BaseSurrealEdge`` for a relation table) whose name is an identifier the
     ORM can query, in codepoint order of the table names, each preceded by its sub-models; a view table becomes a
-    materialized view model (``view_query="…"``, v0.32.0). The module imports and passes ``ruff check`` and
-    ``ruff format`` (line length 128) as long as its lines fit: comments are cut to 128 columns and ``model_config``
-    is wrapped, but a long name, a long ``Literal`` union or a long view query (``view_query="…"``) stays on one
-    line. Tables and fields that are not generated are listed, with the reason, in the module's ``# Not generated:``
-    comment.
+    materialized view model (``view_query="…"``, v0.32.0); the table's type, schema mode, change feed, permissions
+    and comment are keys of its class (v0.34.0). The module imports and passes ``ruff check`` and ``ruff format``
+    (line length 128) as long as its lines fit: comments are cut to 128 columns and ``model_config`` is wrapped, but
+    a long name, a long ``Literal`` union, a long view query (``view_query="…"``), permission rule or table comment
+    stays on one line. Tables and fields that are not generated are listed, with the reason, in the module's ``# Not
+    generated:`` comment.
 
-    Review the result before use: ``ASSERT``, ``PERMISSIONS`` and ``REFERENCE`` clauses are not generated,
-    ``READONLY`` is a comment, and the models describe tables that exist — never call ``define_computed_fields()`` on
-    them.
+    Review the result before use: a field's ``ASSERT``, ``PERMISSIONS`` and ``REFERENCE`` clauses are not generated,
+    ``READONLY`` is a comment, and the models describe tables that exist: ``define_table()`` keeps the database's
+    clauses they do not declare, but never call ``define_computed_fields()`` on them.
     """
 
     __slots__ = ()
