@@ -1300,7 +1300,7 @@ def check_relation_config(
     - R7, ``TypeError``: *enforced* is not a ``bool`` (and not ``None``).
 
     On a node model, the other ``TableType`` members are accepted: recorded, returned by ``get_table_type()``, with
-    no effect before the table DDL of v0.34.0.
+    no effect before the table DDL of v0.37.0.
 
     :raises TypeError: T1–T3, R1, R2, R3, R7.
     :raises ValueError: R4, R5.

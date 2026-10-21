@@ -577,7 +577,7 @@ class SurrealConfigDict(ConfigDict, total=False):
         table_type (TableType | None): The table's type (v0.33.0) — the full SurrealDB-ORM's
             key and enum. TableType.RELATION on an edge model (BaseSurrealEdge), which implies it,
             so writing it is optional there. On another model, any other member is recorded
-            and returned by get_table_type(), with no effect before the table DDL of v0.34.0.
+            and returned by get_table_type(), with no effect before the table DDL of v0.37.0.
             Checked when the class is defined (a TableType; RELATION on an edge only).
         relation_in (str | list[str] | tuple[str, ...] | None): The tables an edge's in may come
             from (v0.33.0): SurrealDB's TYPE RELATION IN. Full SurrealDB-ORM key, on an edge model
@@ -1007,7 +1007,7 @@ class BaseSurrealModel(BaseModel):
         ``TableType.RELATION`` for an edge model (``BaseSurrealEdge``), whose table is SurrealDB's ``TYPE RELATION``;
         else ``SurrealConfigDict(table_type=…)``, else ``TableType.NORMAL``. A subclass inherits the key unless it sets
         its own (``table_type=None`` gives ``NORMAL`` back). On a node model the value is recorded and returned, with
-        no effect before the table DDL of v0.34.0.
+        no effect before the table DDL of v0.37.0.
         """
         if cls.__surreal_edge__:
             return TableType.RELATION

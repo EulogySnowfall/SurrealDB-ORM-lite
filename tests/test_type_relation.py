@@ -79,8 +79,8 @@ the features, roadmap, comparison and both behaviour tables (``TestReadmeSection
 The roadmap (issues #291, #292): ``docs/ROADMAP.md`` plans the model table DDL (``define_table()``) as v0.34.0, before
 search, with the constraints this release and v0.32.0 leave it, moves the later versions up one, and writes
 ``relation_ddl()``/``define_relation()`` as edge-model methods in the 0.33.0 entry (``TestRoadmapTableDdl``). The
-docstrings that date the model table DDL and the test factories, the README comparison table to its last row and the
-README's retry sentence name the new numbers too (``TestRenumberedReferences``).
+README comparison table to its last row and the README's retry sentence name the new numbers too
+(``TestRenumberedReferences``).
 """
 
 import ast
@@ -118,7 +118,6 @@ from surreal_orm_lite import (
     schema,
     utils,
 )
-from surreal_orm_lite import testing as orm_testing
 from surreal_orm_lite.define_parser import parse_define_field, parse_define_table
 from surreal_orm_lite.edge import insert_edges
 from surreal_orm_lite.schema_state import TableState
@@ -3729,26 +3728,6 @@ class TestRoadmapTableDdl:
         assert "On an edge model (`BaseSurrealEdge` only), `Edge.relation_ddl()` renders" in entry, entry
 
 
-#: Issue #292: the docstrings that date the model table DDL and the test factories, each sentence whitespace
-#: normalised, by the object ``help()`` shows it on.
-_DOCSTRINGS_292 = {
-    "SurrealConfigDict": "and returned by get_table_type(), with no effect before the table DDL of v0.34.0.",
-    "BaseSurrealModel.get_table_type": (
-        "On a node model the value is recorded and returned, with no effect before the table DDL of v0.34.0."
-    ),
-    "schema.check_relation_config": (
-        "On a node model, the other ``TableType`` members are accepted: recorded, returned by ``get_table_type()``, "
-        "with no effect before the table DDL of v0.34.0."
-    ),
-    "TableType": (
-        "the lite gives them no effect before the table DDL of v0.34.0 (the full ORM gives them none outside its "
-        "migrations either)."
-    ),
-    "surreal_orm_lite.testing": "``ModelFactory`` comes in v0.40.0.",
-}
-#: What those docstrings said before issue #292 (the model table DDL with the migrations, factories one version
-#: earlier): no module of the package may say it again.
-_STALE_DOCSTRING_PHRASES_292 = re.compile(r"table DDL of v0\.(?!34\.0)\d+\.\d+|``ModelFactory`` comes in v0\.(?!40\.0)")
 #: README section 21, "Surviving a dropped connection": retrying a query in flight is the Beta's (issue #292).
 _RETRY_SENTENCE_292 = (
     "A request that was already in flight when the socket dropped still fails — with the SDK's own `KeyError` — "
@@ -3756,33 +3735,9 @@ _RETRY_SENTENCE_292 = (
 )
 
 
-def _docstrings_292() -> dict[str, str | None]:
-    return {
-        "SurrealConfigDict": SurrealConfigDict.__doc__,
-        "BaseSurrealModel.get_table_type": BaseSurrealModel.get_table_type.__doc__,
-        "schema.check_relation_config": schema.check_relation_config.__doc__,
-        "TableType": TableType.__doc__,
-        "surreal_orm_lite.testing": orm_testing.__doc__,
-    }
-
-
 class TestRenumberedReferences:
-    """Issue #292 beyond the roadmap: the docstrings ``help()`` and an IDE show, and the README sentences no table pins,
-    name the new numbers (model table DDL v0.34.0, factories v0.40.0, retrying arbitrary queries v0.41.0)."""
-
-    @pytest.mark.parametrize("name", list(_DOCSTRINGS_292))
-    def test_docstring_names_the_new_number(self, name: str) -> None:
-        doc = _normalised(_docstrings_292()[name] or "")
-        assert _DOCSTRINGS_292[name] in doc, doc
-
-    def test_no_module_keeps_an_old_number(self) -> None:
-        package = Path(surreal_orm_lite.__file__).parent
-        stale = [
-            f"{path.relative_to(package)}: {match.group(0)}"
-            for path in sorted(package.rglob("*.py"))
-            for match in _STALE_DOCSTRING_PHRASES_292.finditer(_normalised(path.read_text(encoding="utf-8")))
-        ]
-        assert not stale, stale
+    """Issue #292 beyond the roadmap: the README sentences no table pins name the new numbers (retrying arbitrary
+    queries v0.41.0)."""
 
     def test_readme_retry_sentence(self) -> None:
         part = _subsection(

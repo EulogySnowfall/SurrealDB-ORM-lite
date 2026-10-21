@@ -16,10 +16,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one: full-text search v0.35.0, vector search v0.36.0, hybrid search v0.37.0, migrations v0.38.0,
   the CLI v0.39.0, test factories v0.40.0 and the Beta phase v0.41.0. `docs/ROADMAP.md` records
   the constraints the released versions leave v0.34.0, and the README uses the new numbers.
-- **Docstrings use the new numbers too** (wording only). The `table_type` key of
-  `SurrealConfigDict`, `get_table_type()`, `TableType` and `schema.check_relation_config()` say
-  `TableType`'s members other than `RELATION` have no effect before the table DDL of v0.34.0 (was
-  v0.37.0); `surreal_orm_lite.testing` says `ModelFactory` comes in v0.40.0 (was v0.39.0).
 - **Reading the released entries below**: they keep the numbers they were written with. Full-text
   search v0.34.0 is now v0.35.0; `define_table()` and `TableType`'s other members v0.37.0 are now
   v0.34.0; migrations, `schema_diff()`/`SchemaState.diff()` and the removal of events v0.37.0 are

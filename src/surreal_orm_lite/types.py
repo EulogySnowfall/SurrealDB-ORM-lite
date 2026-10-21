@@ -739,7 +739,7 @@ class TableType(StrEnum):
 
     ``RELATION`` is the type of an edge model's table (``BaseSurrealEdge``): SurrealDB's ``TYPE RELATION``. The other
     members are recorded by ``SurrealConfigDict(table_type=…)`` and returned by ``get_table_type()``; the lite gives
-    them no effect before the table DDL of v0.34.0 (the full ORM gives them none outside its migrations either).
+    them no effect before the table DDL of v0.37.0 (the full ORM gives them none outside its migrations either).
     """
 
     NORMAL = "normal"

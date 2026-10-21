@@ -19,7 +19,7 @@ Example::
             assert fixtures.alice.get_id() is not None
             assert await User.objects().count() == 1
 
-``ModelFactory`` comes in v0.40.0. Nothing here imports pytest: the helpers work with any test runner.
+``ModelFactory`` comes in v0.39.0. Nothing here imports pytest: the helpers work with any test runner.
 """
 
 from .database import embedded_database
