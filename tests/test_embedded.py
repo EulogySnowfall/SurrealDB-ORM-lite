@@ -1201,8 +1201,8 @@ _PARIS = (2.35, 48.85)
 def test_the_boundary_guard_still_covers_every_pre_existing_module() -> None:
     """The encoding-boundary guard of ``conftest.py`` is lifted for this new module only (v0.25.0), beside the
     modules of v0.23.0, v0.24.0 and v0.24.3 (#235), and for ``tests/test_time_travel.py`` (v0.26.0),
-    ``tests/test_subqueries.py`` (v0.27.0), ``tests/test_query_cache.py`` (v0.28.0) and
-    ``tests/test_introspection.py`` (v0.30.0), new too."""
+    ``tests/test_subqueries.py`` (v0.27.0), ``tests/test_query_cache.py`` (v0.28.0),
+    ``tests/test_introspection.py`` (v0.30.0) and ``tests/test_table_ddl.py`` (v0.34.0), new too."""
     assert (
         frozenset(
             {
@@ -1217,6 +1217,7 @@ def test_the_boundary_guard_still_covers_every_pre_existing_module() -> None:
                 "tests.test_subqueries",
                 "tests.test_query_cache",
                 "tests.test_introspection",
+                "tests.test_table_ddl",
             }
         )
         == _REWRITE_MODULES
@@ -2549,8 +2550,8 @@ class TestReadmeEmbeddedWording:
 
     def test_section_26_follows_section_25(self) -> None:
         """Section 26 comes right after section 25, then section 27 (v0.26.0), section 28 (v0.27.0), section 29
-        (v0.28.0), section 30 (v0.29.0), section 31 (v0.30.0), section 32 (v0.31.0), section 33 (v0.32.0) and section
-        34 (v0.33.0), up to "Configuration Options"."""
+        (v0.28.0), section 30 (v0.29.0), section 31 (v0.30.0), section 32 (v0.31.0), section 33 (v0.32.0), section 34
+        (v0.33.0) and section 35 (v0.34.0), up to "Configuration Options"."""
         readme = _readme()
         start_25 = readme.index("\n### 25. Geospatial fields\n")
         start_26 = readme.index(f"\n{_SECTION_26}\n")
@@ -2566,6 +2567,7 @@ class TestReadmeEmbeddedWording:
             "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
             "### 33. Materialized views (`view_query`, `define_view()`)",
             "### 34. Relation constraints (`relation_in`, `define_relation()`)",
+            "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
         ]
 
     def test_subsections_in_order(self) -> None:

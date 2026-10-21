@@ -44,6 +44,7 @@ from surreal_orm_lite import (
     QueryCache,
     QuerySet,
     Range,
+    SchemaMode,
     SchemaState,
     Subquery,
     SurrealConfigDict,
@@ -541,6 +542,49 @@ async def relation_appliers(tx: Transaction) -> None:
     s: str = await RelationLikes.define_relation()
     assert_type(s, str)
     assert_type(await RelationLikes.define_relation(overwrite=False, tx=tx), str)
+
+
+class TableClauses(BaseSurrealModel):
+    """v0.34.0: the full SurrealDB-ORM's table keys — a ``SchemaMode``, a change feed, a mapping of permissions, a
+    comment and a list of field names; every key still optional."""
+
+    model_config = SurrealConfigDict(
+        table_name="table_clauses",
+        schema_mode=SchemaMode.SCHEMAFULL,
+        changefeed="7d",
+        permissions={"select": "FULL"},
+        comment="c",
+        flexible_fields=["meta"],
+    )
+
+    id: RecordID | None = None
+    meta: dict[str, Any] | None = None
+
+
+def table_clause_forms() -> None:
+    """v0.34.0: the table getters are typed — ``SchemaMode | None``, ``str | None`` and ``dict[str, str]``."""
+    mode: SchemaMode | None = TableClauses.get_schema_mode()
+    assert_type(mode, SchemaMode | None)
+    assert_type(TableClauses.get_changefeed(), str | None)
+    permissions: dict[str, str] = TableClauses.get_permissions()
+    assert_type(permissions, dict[str, str])
+    rules: Mapping[str, str] = {"select": "FULL", "create": "$auth.id != NONE"}
+    assert_type(SurrealConfigDict(permissions=rules, flexible_fields=("meta",)), SurrealConfigDict)
+    assert_type(
+        SurrealConfigDict(schema_mode=None, changefeed=None, permissions=None, comment=None, flexible_fields=None),
+        SurrealConfigDict,
+    )
+    assert_type(SurrealConfigDict(table_type=TableType.HASH, schema_mode=SchemaMode.SCHEMALESS), SurrealConfigDict)
+    statements: list[str] = TableClauses.table_ddl()
+    assert_type(statements, list[str])
+    assert_type(TableClauses.table_ddl(overwrite=False), list[str])
+
+
+async def table_define_forms(tx: Transaction) -> None:
+    """v0.34.0: ``define_table()`` returns the statements joined with a newline — a ``str``, the full ORM's return."""
+    y: str = await TableClauses.define_table()
+    assert_type(y, str)
+    assert_type(await TableClauses.define_table(overwrite=False, tx=tx), str)
 
 
 @fixture

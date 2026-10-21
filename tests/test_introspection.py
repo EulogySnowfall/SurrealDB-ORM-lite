@@ -1256,31 +1256,49 @@ _FEED_SOURCE = (
     DOCSTRING
     + """
 
-from surreal_orm_lite import BaseSurrealModel, SurrealConfigDict
+from surreal_orm_lite import BaseSurrealModel, SchemaMode, SurrealConfigDict, TableType
 from surrealdb import RecordID
 
 
 class IspFeed(BaseSurrealModel):
-    # Changefeed: 1d INCLUDE ORIGINAL
-    # Permissions: FOR select WHERE $auth.id = owner, FOR create, update FULL, FOR delete NONE
-    model_config = SurrealConfigDict(table_name="isp_feed", connection="isp")
+    model_config = SurrealConfigDict(
+        table_name="isp_feed",
+        schema_mode=SchemaMode.SCHEMAFULL,
+        changefeed="1d INCLUDE ORIGINAL",
+        permissions={"select": "WHERE $auth.id = owner", "create": "FULL", "update": "FULL"},
+        connection="isp",
+    )
 
     id: str | None = None
     owner: RecordID | None = None
 
 
 class IspOpen(BaseSurrealModel):
-    # Changefeed: 3h
-    # Permissions: FULL
     # SCHEMALESS: fields not declared here are kept (extra="allow")
-    model_config = SurrealConfigDict(table_name="isp_open", connection="isp", extra="allow")
+    model_config = SurrealConfigDict(
+        table_name="isp_open",
+        table_type=TableType.ANY,
+        changefeed="3h",
+        permissions={"select": "FULL", "create": "FULL", "update": "FULL", "delete": "FULL"},
+        connection="isp",
+        extra="allow",
+    )
 
     id: str | None = None
 
 
 class IspOwned(BaseSurrealModel):
-    # Permissions: FOR select, create, update, delete WHERE $auth.id = owner
-    model_config = SurrealConfigDict(table_name="isp_owned", connection="isp")
+    model_config = SurrealConfigDict(
+        table_name="isp_owned",
+        schema_mode=SchemaMode.SCHEMAFULL,
+        permissions={
+            "select": "WHERE $auth.id = owner",
+            "create": "WHERE $auth.id = owner",
+            "update": "WHERE $auth.id = owner",
+            "delete": "WHERE $auth.id = owner",
+        },
+        connection="isp",
+    )
 
     id: str | None = None
 """
@@ -1663,7 +1681,8 @@ class TestIntrospectionE2E:
 
     @pytest.mark.parametrize("kind", ["ws", "http", "mem"])
     async def test_changefeed_and_permissions_comments(self, kind: str) -> None:
-        """A table's change feed and permissions are comments of its class, the same text on every line."""
+        """A table's change feed and permissions are keys of its class (comments before v0.34.0), the same text on
+        every line."""
         async with _isp(kind, _FEED_DDL):
             source = await generate_models_from_db(None, "isp")
         assert source == _FEED_SOURCE
@@ -2289,13 +2308,13 @@ _COMING_FROM_31 = [
     '(`using()`, then `"default"`). A client object is refused with a `TypeError`, because a client does not carry '
     "the ORM's connection name, which routing, reconnects and the generated models' `connection=` key need (full ORM: "
     "an `HTTPConnection`).",
-    "- **Generated models use comments** where the full ORM writes `SurrealConfigDict(permissions=…, changefeed=…)` "
-    "(`# Permissions: …`, `# Changefeed: …`): those keys arrive in the lite's `SurrealConfigDict` with later minors. A "
-    "view is generated with `view_query=…` since v0.32.0, and a relation table's ends with `relation_in=…`, "
-    "`relation_out=…` and `enforced=True` since v0.33.0, as in the full ORM (a `# View: AS …` comment when the lite "
-    "cannot declare the view: an edge, a computed field, a query it refuses; an `# IN … OUT …` comment when a table "
-    "name is not an identifier). The base class says what the full ORM's `table_type=` says (`BaseSurrealEdge` for a "
-    "relation table). `READONLY` is a comment too (full ORM: `Field(readonly=True)`).",
+    # v0.34.0: the table's clauses are keys of the generated class.
+    "- **Generated models use the full ORM's keys** (since v0.34.0): `table_type=TableType.ANY` for a `TYPE ANY` table, "
+    "`schema_mode=SchemaMode.SCHEMAFULL`, `changefeed=…`, `permissions={…}` and `comment=…`, as the full ORM writes "
+    "them (it writes no `schema_mode` or `comment`); a view with `view_query=…` since v0.32.0 and a relation table's "
+    "ends with `relation_in=…`, `relation_out=…` and `enforced=True` since v0.33.0. A comment stays where the class "
+    "statement would refuse the key (`# View: AS …`, `# IN … OUT …`, `# Permissions: …` for a rule it cannot embed). "
+    "The base class says `RELATION` (`BaseSurrealEdge`). `READONLY` is a comment (full ORM: `Field(readonly=True)`).",
     "- **`RecordID` instead of `ForeignKey`/`ReferencesField`**; no `VectorField` or `Encrypted`; `computed()` "
     "instead of `Computed()`; `Duration`, `UUID`, `Decimal` and the geometry classes instead of `str`, `dict` and "
     "`float`; nested fields become sub-models (full ORM: dotted attribute lines).",
@@ -2330,7 +2349,7 @@ _COMING_FROM_PHRASES_31 = (
     "`INFO FOR DB` raises",
     "`on_delete` keeps",
     "`connection=` is a name",
-    "Generated models use comments",
+    "Generated models use the full ORM's keys",
     "instead of `ForeignKey`/`ReferencesField`",
     "No singularisation",
     "`overwrite=False` added",
@@ -2564,7 +2583,7 @@ class TestReadmeSection31:
 
     def test_section_31_follows_section_30(self) -> None:
         """Right after section 30 (after its "Coming from" bullets), then section 32 (v0.31.0), section 33
-        (v0.32.0) and section 34 (v0.33.0), and before the ``---`` of "Configuration Options"."""
+        (v0.32.0), section 34 (v0.33.0) and section 35 (v0.34.0), and before the ``---`` of "Configuration Options"."""
         readme = _readme()
         start_30 = readme.index(f"\n{_SECTION_30}\n")
         start_31 = readme.index(f"\n{_SECTION_31}\n")
@@ -2576,6 +2595,7 @@ class TestReadmeSection31:
             "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
             "### 33. Materialized views (`view_query`, `define_view()`)",
             "### 34. Relation constraints (`relation_in`, `define_relation()`)",
+            "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 

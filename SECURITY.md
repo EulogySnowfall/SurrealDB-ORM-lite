@@ -6,8 +6,8 @@ The following versions of Surreal-ORM-Lite are currently supported with security
 
 | Version | Supported          |
 | ------- | ------------------ |
-| 0.33.x  | :white_check_mark: |
-| < 0.33  | :x:                |
+| 0.34.x  | :white_check_mark: |
+| < 0.34  | :x:                |
 
 ## Embedded Engine
 
@@ -57,7 +57,8 @@ since SurrealDB would delete its records (and, on SurrealDB 2.x and the embedded
 that other views read, which would turn them into stale ordinary tables); the ORM's refusal to
 write to a view guards against mistakes in application code and is not an access control
 (SurrealDB 2.x and 3.1 accept writes to a view from any session allowed to write it). A view is
-defined with SurrealDB's default permissions (`NONE`); applying needs a privileged system user.
+defined with the permissions its model declares (since 0.34.0), else with those set by hand on it,
+else with SurrealDB's default (`NONE`); applying needs a privileged system user.
 
 ## Relation constraints
 
@@ -71,6 +72,17 @@ DDL). These checks catch a definition the ORM would misread; they are not an inj
 refusal names the table, never the statement, which may carry permission rules. The constraint is
 SurrealDB's, not an access control: a session allowed to write the table writes any edge the
 constraint accepts. Applying needs a privileged system user.
+
+## Model table DDL
+
+Since 0.34.0, `define_table()` writes table and field definitions from the model: names are
+written in backquotes, kinds are built from Python types and defaults through the ORM's closed
+literal encoder, and the declared permission rules, the comment and each computed field's
+expression are checked for mistakes (they are trusted application code; a comment marker, which
+would swallow the clauses after it, is refused). A clause the model does not declare is kept from
+the database, so applying a model never widens or resets a table's or a field's permissions; a
+refusal names the table and the field, never the statement, and a view's refusal is redacted when
+its statement carries permissions. Applying needs a privileged session.
 
 ## Reporting a Vulnerability
 

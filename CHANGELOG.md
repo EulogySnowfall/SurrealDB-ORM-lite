@@ -5,17 +5,114 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.34.0] - 2026-10-21
+
+Model table DDL: a model declares its table's schema mode, change feed, permissions and comment
+with the full SurrealDB-ORM's keys, and `define_table()` writes the table's `DEFINE TABLE` and one
+`DEFINE FIELD` per column from the model's annotations and applies them, keeping what the model
+does not declare. The same code runs on SurrealDB 2.x, 3.x and the embedded engine. The last minor
+of Tier 3's schema and DDL phase; this release also completes the roadmap renumbering below.
+
+### Added
+
+- **`SchemaMode`** (`SCHEMAFULL`, `SCHEMALESS`), the full SurrealDB-ORM's enum, exported from the
+  package root, and the full ORM's five table keys on `SurrealConfigDict`: `schema_mode`,
+  `changefeed` (a duration, optionally followed by `INCLUDE ORIGINAL`), `permissions` (a mapping of
+  `select`/`create`/`update`/`delete` to `FULL`, `NONE`, `WHERE <condition>` or a bare condition;
+  an operation left out is `NONE`), `comment` and `flexible_fields`. They are checked when the
+  class is defined; a subclass inherits them and `None` resets one. `get_schema_mode()` (`None`
+  when not declared), `get_changefeed()` (the normalised text, `"1h INCLUDE ORIGINAL"`) and
+  `get_permissions()` (the declared mapping, a copy, as the full ORM's) read them back.
+- **`Model.table_ddl()` and `await Model.define_table()`**: `table_ddl()` renders the model's
+  `DEFINE TABLE OVERWRITE` and one `DEFINE FIELD OVERWRITE` per column as a `list[str]`, without a
+  connection. `define_table()` reads the table's definition (one `INFO FOR DB`, and one
+  `INFO FOR TABLE` for a table that exists), sends the statements one by one, table first and
+  parents before children, and returns those applied joined with `"\n"` — the full ORM's return.
+  It takes `overwrite=` (`False` writes `IF NOT EXISTS`) and `tx=`, runs on the model's connection,
+  is idempotent (run it at start-up) and removes nothing. Each column's kind comes from its
+  annotation (strings, numbers, `Decimal`, datetimes, durations, `UUID`, `RecordID`, geometries,
+  ranges, enums, literals, lists, tuples, sets, dictionaries and sub-models, one column per
+  sub-model field), `option<…>` for a nullable column; a constant default is written `DEFAULT` on a
+  column that is not nullable, a computed field `VALUE`, and `FLEXIBLE` on the free-form object
+  columns of a `SCHEMAFULL` table. A view model's `define_table()` applies `define_view()`; an edge
+  model's applies the relation statement `define_relation()` carries, then the edge's data fields.
+
+  ```python
+  class Person(BaseSurrealModel):
+      model_config = SurrealConfigDict(
+          table_name="person",
+          schema_mode=SchemaMode.SCHEMAFULL,
+          changefeed="7d",
+          permissions={"select": "FULL", "create": "$auth.id != NONE"},
+          comment="People",
+      )
+
+      id: str | None = None
+      name: str
+      age: int = 18
+      nickname: str | None = None
+
+
+  print(*Person.table_ddl(), sep="\n")
+  # DEFINE TABLE OVERWRITE `person` TYPE NORMAL SCHEMAFULL COMMENT 'People' CHANGEFEED 7d PERMISSIONS FOR select FULL, FOR create WHERE $auth.id != NONE, FOR update, delete NONE;
+  # DEFINE FIELD OVERWRITE `name` ON `person` TYPE string;
+  # DEFINE FIELD OVERWRITE `age` ON `person` TYPE int DEFAULT 18;
+  # DEFINE FIELD OVERWRITE `nickname` ON `person` TYPE option<string>;
+  sql = await Person.define_table()  # the same statements, applied; idempotent
+  ```
+
+- **`TableType`'s other members take effect** (v0.33.0 recorded them): `TYPE NORMAL` for
+  `NORMAL`, `USER`, `STREAM` and `HASH` and for a model without `table_type`, `TYPE ANY` for `ANY`
+  (a table that holds records and edges). `USER` makes the table `SCHEMAFULL` and `HASH`
+  `SCHEMALESS` when `schema_mode` is left out; `STREAM` adds nothing (declare `changefeed`).
+- README section 35, "Model table DDL (`define_table()`, `schema_mode`, `permissions`)" (declaring
+  the table, field types, applying it, views and edges, user models, what SurrealDB checks,
+  SurrealDB 2.x and 3.x, transactions, connections and the cache, security, a note for users of the
+  full SurrealDB-ORM), updates to sections 16, 19, 31, 33 and 34, a features row, four rows in the
+  2.x/3.x behaviour table and one in the embedded-engine table, the comparison and roadmap rows,
+  and the example notebook `examples/v0.34.0_model_table_ddl.ipynb`.
 
 ### Changed
 
-- **Roadmap: the model table DDL comes next, as v0.34.0.** `Model.define_table()`, as close as
-  possible to the full SurrealDB-ORM's, will generate a model's `DEFINE TABLE` and `DEFINE FIELD`
-  statements and apply them with `query()`. It was planned with the migrations; it now comes
-  before the search versions, whose index and analyzer DDL build on it. The later versions move up
-  one: full-text search v0.35.0, vector search v0.36.0, hybrid search v0.37.0, migrations v0.38.0,
-  the CLI v0.39.0, test factories v0.40.0 and the Beta phase v0.41.0. `docs/ROADMAP.md` records
-  the constraints the released versions leave v0.34.0, and the README uses the new numbers.
+- **`schema_mode`, `changefeed`, `permissions`, `comment` and `flexible_fields` are checked at the
+  `class` statement** (they were accepted and ignored before 0.34.0): a value of the wrong type
+  raises `TypeError` and one of the wrong form `ValueError` when the module is imported — a
+  plain-string `schema_mode` such as `"SCHEMAFULL"` included: use `SchemaMode.SCHEMAFULL`.
+  `schema_mode=SchemaMode.SCHEMAFULL` with `extra="allow"`, and `TableType.USER` with
+  `SchemaMode.SCHEMALESS`, raise `TypeError`.
+- **A materialized view model with `table_type`** (accepted and ignored in 0.33.0),
+  `schema_mode` or `flexible_fields` raises `TypeError` at the `class` statement. A view takes
+  `permissions`, `changefeed` and `comment`.
+- **`define_view()` keeps the permissions, comment, change feed, `DROP` and `SCHEMAFULL` set by
+  hand on a stored view** unless the model declares them (it reset them). When its statement
+  writes permissions, a refusal that quotes the statement is reported without it.
+- **`view_ddl()`, `Edge.relation_ddl()` and `Edge.define_relation()` write the clauses the model
+  declares** (unchanged for a model without the keys). `define_relation()` of an edge model that
+  declares `schema_mode=SchemaMode.SCHEMAFULL` and has data fields raises `SurrealDbError` before
+  any request: it defines no field, so apply that edge with `define_table()`.
+- **`access_ddl()` and `define_access()` follow the model's table keys**: the declared clauses
+  replace v0.17.0's defaults, and a model with `table_type` gets `TYPE NORMAL` (or `TYPE ANY`) in
+  its table statement. A model whose schema mode is `SCHEMAFULL` — declared, or `TableType.USER` as
+  in the full ORM — gets a `SCHEMAFULL` table with one `DEFINE FIELD` per field, so signup and
+  signin work on SurrealDB 2.x and 3.x and `define_table()` gives the same table in any call order;
+  `TableType.USER` with `extra="allow"` raises `TypeError` there (with `with_table=True`). A 0.33.0
+  `TableType.USER` model's table therefore turns `SCHEMAFULL` at its next `define_access()`: a
+  record stored before is checked at its next write, where a field the model does not declare is
+  refused (SurrealDB 3.x) or dropped (2.x). A model with `AuthenticatedUserMixin` and none of the
+  new keys renders v0.17.0's statements unchanged.
+- **`generate_models_from_db()` writes the table's clauses as keys**: `table_type=TableType.ANY`
+  for a `TYPE ANY` table, `schema_mode=SchemaMode.SCHEMAFULL`, `changefeed=`, `permissions={…}`
+  and `comment=` instead of comments (a comment stays where the `class` statement would refuse the
+  key), and the generated module's docstring says `define_table()` may be called on its models.
+  README section 31 says so; the v0.30.0, v0.32.0 and v0.33.0 notebooks are re-executed for it.
+- **Docstrings that named v0.37.0 for the table DDL and v0.39.0 for `ModelFactory`** name v0.34.0
+  and v0.40.0.
+- **Roadmap: the model table DDL is v0.34.0.** `Model.define_table()`, as close as possible to
+  the full SurrealDB-ORM's, was planned with the migrations; it now comes before the search
+  versions, whose index and analyzer DDL build on it. The later versions move up one: full-text
+  search v0.35.0, vector search v0.36.0, hybrid search v0.37.0, migrations v0.38.0, the CLI
+  v0.39.0, test factories v0.40.0 and the Beta phase v0.41.0. `docs/ROADMAP.md` records the
+  constraints the earlier versions left v0.34.0, and the README uses the new numbers.
 - **Reading the released entries below**: they keep the numbers they were written with. Full-text
   search v0.34.0 is now v0.35.0; `define_table()` and `TableType`'s other members v0.37.0 are now
   v0.34.0; migrations, `schema_diff()`/`SchemaState.diff()` and the removal of events v0.37.0 are
@@ -36,6 +133,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   class methods of `BaseSurrealEdge` only, `Edge.relation_ddl()` and
   `await Edge.define_relation()`; a node model has neither (`AttributeError`).
   `Model.get_table_type()` is on every model, as written. The ROADMAP's 0.33.0 entry now says so.
+
+### Notes
+
+- **What the model declares wins; the rest is kept from the database**: the table's schema mode,
+  comment, change feed, permissions and `DROP`, and each field's `ASSERT`, `READONLY`,
+  `REFERENCE`, permissions, comment and a stored `DEFAULT`, `VALUE` or `COMPUTED` the model does
+  not write. Nothing is removed: records, other fields, indexes, events, the views that read the
+  table and its live queries stay; a key left out never removes a stored clause.
+  `schema_mode=SchemaMode.SCHEMALESS` turns a `SCHEMAFULL` table back and `permissions={}` writes
+  `PERMISSIONS NONE`. Before any DDL, `define_table()` refuses a materialized view, a relation
+  table (derive the model from `BaseSurrealEdge`) and a definition it cannot read back or carry.
+- **SurrealDB 2.x and the embedded engine empty the objects and arrays of an `any` column and of
+  an untyped array or set on a `SCHEMAFULL` table**, optional or not; `FLEXIBLE` keeps them, and
+  3.x keeps them without it but refuses `FLEXIBLE` there. They also drop the `dict`, `Any` or
+  untyped `list` of a sub-model in a list of sub-models (`list[M]`, at any depth: `items.*.meta`)
+  from every item, then refuse the record's next write (`Found NONE for field`), unless the list is
+  `FLEXIBLE` too; 3.x keeps those values without it. `define_table()` reads the line
+  (`client.version()`, once, only for a `SCHEMAFULL` table with such a column or such a list) and
+  writes `FLEXIBLE` on those columns and lists before 3.x, the items' typed fields still checked;
+  `table_ddl()`, which needs no connection, writes the 3.x form. An untyped `list` gets an item
+  definition `TYPE any` (`bag.*`) on every line, without which 3.x refuses an object item of a
+  required untyped array. A union holding a list or a set together with an object or another
+  container writes its lists, sets and tuples as an untyped `array` with that item definition,
+  since SurrealDB derives one item type for every member of such a union.
+- **A write naming a field a `SCHEMAFULL` table does not define** (a `merge()` key the model does
+  not declare, `bulk_update()`, a raw query, a record stored before the table became `SCHEMAFULL`)
+  is refused on SurrealDB 3.x (`no such field exists`) and the field dropped, silently, on 2.x and
+  the embedded engine: declare the field on the model. SurrealDB checks the records already in the
+  table at their next write, not when `define_table()` changes a kind or the schema mode.
+- **`COMPUTED` fields are SurrealDB 3.x's**: `define_table()` keeps a stored `COMPUTED` field
+  `COMPUTED` (replacing it by `VALUE` would leave the stored records without the field until their
+  next write) and writes a new computed field `VALUE` on both lines; `define_computed_fields()`
+  still writes `VALUE` alone. A computed field's expression is checked before any request.
+- **No `DEFAULT` on a nullable column**: SurrealDB applies `DEFAULT` to a `NONE` on every create,
+  so the `None` the ORM writes would become the default. A `server_fields` column keeps the
+  database's `DEFAULT`, `VALUE` or `COMPUTED`, and the model's constant default is written only
+  where the database has none; one that is not nullable and has no constant default is written
+  without `DEFAULT`, so every create leaves it out and SurrealDB refuses it until the database
+  gives the column a `DEFAULT` or `VALUE` (or annotate it `T | None`).
+- **Each call on a table with a change feed adds one `define_table` entry** to it; `changes()`
+  skips it, a raw `SHOW CHANGES` shows it.
+- **Transactions**: with `tx=`, the reads run on committed state before anything is queued and
+  the statements join the transaction (a refusal in a buffered one is the transaction's
+  `SurrealDbError`). A definition of the same table queued earlier in the block is not seen: define
+  it before the block. The reads and the definitions are a check, then the DDL, not a lock.
+- **Security**: names are written in backquotes, kinds built from Python types and `DEFAULT`
+  values through the ORM's closed SurrealQL encoder. The declared permission rules, the comment and
+  each computed field's expression are checked for mistakes (a comment marker, which would swallow
+  the clauses after it, is refused); they are trusted application code, and the checks are not an
+  injection defence. A clause the model does not declare is kept from the database, re-checked, so
+  applying a model never resets a table's or a field's permissions; a refusal names the table or
+  the field, never the statement. Applying needs a privileged session (root, or a namespace or
+  database `OWNER` or `EDITOR`).
+- **Differences from the full SurrealDB-ORM** (README section 35 lists them): a model that declares
+  no schema mode keeps the stored one and a new table is `SCHEMALESS`; clauses the model does not
+  declare are kept; one statement per call, a refusal raising `SurrealDbError` naming the table or
+  the field (the full ORM raises `MigrationStatementError` quoting the SQL); `TYPE NORMAL` written
+  for a model without `table_type`; `FLEXIBLE` written after `TYPE`; kinds for the rich field
+  types; no `DEFAULT` on a nullable field; a view model's `define_table()` defines no field.
+- **SurrealDB 3.1.5 (informative)** behaves as 3.3.4 except that it refuses a Python `set`
+  written to a `set` field and an object item of an optional untyped `list`, and that a field
+  named after a SurrealQL keyword (`` `select` ``) breaks every later statement on its table — 3.1
+  server defects.
+- **Deferred**: declaring field clauses on the model (`ASSERT`, `READONLY`, field permissions and
+  comment), typed record links (`record<table>`; `RecordID` is written `record`), refusing
+  undeclared field names before a write, and `define_table(tx=…)` seeing a definition queued
+  earlier in the block. Migrations (v0.38.0) bring the removal of fields and clauses a model no
+  longer declares, and decide whether the lite gains `MigrationStatementError`.
+- **Server pins unchanged**: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine,
+  plus 3.1.5 for backward compatibility.
 
 ## [0.33.0] - 2026-10-20
 

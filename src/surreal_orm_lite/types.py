@@ -10,7 +10,8 @@ signature, converts from it and compares equal to it.
 the SDK's ``BoundIncluded``/``BoundExcluded`` or ``None`` for an open side. As a Pydantic field it
 validates each bound value as ``T`` and reads back the SurrealQL text it writes in JSON mode.
 
-``TableType`` (v0.33.0): the full SurrealDB-ORM's table classification.
+``TableType`` (v0.33.0): the full SurrealDB-ORM's table classification. ``SchemaMode`` (v0.34.0): the full
+SurrealDB-ORM's table schema enforcement, declared with ``SurrealConfigDict(schema_mode=…)``.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ from pydantic_core import PydanticSerializationUnexpectedValue, core_schema
 from ._sdk import Bound, BoundExcluded, BoundIncluded, CBORSimpleValue, SdkDuration, SdkRange, undefined
 from .exceptions import InvalidDurationError
 
-__all__ = ["Duration", "Range", "TableType"]
+__all__ = ["Duration", "Range", "SchemaMode", "TableType"]
 
 T = TypeVar("T")
 
@@ -738,8 +739,10 @@ class TableType(StrEnum):
     """A table's classification — the full SurrealDB-ORM's enum, same members and values (v0.33.0).
 
     ``RELATION`` is the type of an edge model's table (``BaseSurrealEdge``): SurrealDB's ``TYPE RELATION``. The other
-    members are recorded by ``SurrealConfigDict(table_type=…)`` and returned by ``get_table_type()``; the lite gives
-    them no effect before the table DDL of v0.37.0 (the full ORM gives them none outside its migrations either).
+    members are declared with ``SurrealConfigDict(table_type=…)``, returned by ``get_table_type()``, and
+    take effect in define_table() (v0.34.0): ``TYPE NORMAL`` for ``NORMAL``, ``USER``, ``STREAM`` and ``HASH``;
+    ``TYPE ANY`` for ``ANY``; ``USER`` tables are ``SCHEMAFULL`` and ``HASH`` tables ``SCHEMALESS`` unless declared, in
+    ``define_table()`` and in ``define_access()``, which then defines a ``USER`` table's fields too.
     """
 
     NORMAL = "normal"
@@ -748,3 +751,14 @@ class TableType(StrEnum):
     HASH = "hash"
     RELATION = "relation"
     ANY = "any"
+
+
+class SchemaMode(StrEnum):
+    """A table's schema enforcement — the full SurrealDB-ORM's enum, same members and values (v0.34.0).
+
+    ``SCHEMAFULL``: only the fields the table defines are stored. ``SCHEMALESS``: any field is stored (SurrealDB's
+    default). Declared with ``SurrealConfigDict(schema_mode=…)``, applied by ``define_table()``.
+    """
+
+    SCHEMAFULL = "SCHEMAFULL"
+    SCHEMALESS = "SCHEMALESS"

@@ -15,7 +15,7 @@ plain record no graph traversal sees — by one helper, :func:`insert_edges`.
 """
 
 from collections.abc import Collection, Mapping
-from typing import Any, ClassVar, Self
+from typing import Any, ClassVar, Literal, Self
 
 from pydantic import AliasChoices, Field, field_validator
 
@@ -29,15 +29,19 @@ from .exceptions import SurrealDbError
 from .functions import SurrealFunc
 from .model_base import BaseSurrealModel, _own_annotation_names
 from .schema import (
+    TableClauses,
     read_table_definitions,
-    relation_statement,
-    relation_statement_keeping,
+    relation_schemafull_refused,
     relation_table_refused,
     relation_tables,
     relation_type_clause,
     table_kind,
+    table_statement,
+    table_statement_keeping,
 )
+from .schema_state import TableState
 from .transaction import Transaction
+from .types import SchemaMode
 from .utils import apply_ddl_statements, coerce_endpoint, edge_write_error
 
 _ENDPOINT_FIELDS = frozenset({"in_", "out"})
@@ -204,7 +208,9 @@ class BaseSurrealEdge(BaseSurrealModel):
     table's ``DEFINE TABLE … TYPE RELATION`` statement and :meth:`define_relation` applies it,
     keeping the table's other clauses; SurrealDB then refuses every edge that breaks it. A model
     without the keys applies an unconstrained ``TYPE RELATION``, which removes a constraint.
-    README section 34.
+    README section 34. The table clauses an edge model declares (v0.34.0: ``schema_mode``,
+    ``comment``, ``changefeed``, ``permissions``) follow the type clause in both statements, and
+    ``define_table()`` applies the relation statement then the data fields.
     """
 
     __surreal_edge__: ClassVar[bool] = True
@@ -265,21 +271,71 @@ class BaseSurrealEdge(BaseSurrealModel):
         return cls.model_config.get("enforced") is True
 
     @classmethod
+    def _table_head(cls) -> str:
+        """The type clause of the edge's table statement (v0.34.0): ``TYPE RELATION[ IN …][ OUT …][ ENFORCED]``, from
+        :meth:`get_relation_in`, :meth:`get_relation_out` and :meth:`is_enforced` — what :meth:`relation_ddl` writes."""
+        return relation_type_clause(cls.get_relation_in(), cls.get_relation_out(), cls.is_enforced())
+
+    @classmethod
+    def _guarded_table_statement(
+        cls,
+        tables: Mapping[str, Any],
+        statement: str,
+        *,
+        overwrite: bool,
+        clauses: TableClauses,
+        method: Literal["define_table", "define_access", "define_relation"],
+    ) -> tuple[str, TableState | None]:
+        """The table guard of :meth:`define_relation` and of ``define_table()`` (v0.33.0, shared in v0.34.0): the
+        relation statement to apply over what *tables* (``INFO FOR DB``'s map) holds, and the stored definition
+        (``None`` for a new table). Pure.
+
+        A new table, or ``overwrite=False`` over a relation table: *statement* (:meth:`relation_ddl`'s with
+        *overwrite*). A table that exists with ``overwrite=True``: ``schema.table_statement_keeping()`` of the
+        relation's type clause and *clauses* — the clauses the model declares, the stored ones for the rest.
+
+        Raises:
+            SurrealDbError: RG1 the table is a materialized view; RG2 its definition cannot be read, or a carried
+                clause fails its check; RG3 ``overwrite=False`` over a table that is not a relation table — each
+                naming *method*.
+        """
+        name, table = cls.__name__, cls.get_table_name()
+        existing = table_kind(tables, table)
+        if existing == "view":
+            raise SurrealDbError(relation_table_refused("RG1", name, table, method=method))
+        if existing == "unreadable":
+            raise SurrealDbError(relation_table_refused("RG2", name, table, method=method))
+        if existing is None:
+            return statement, None
+        state = parse_define_table(tables[table])
+        if not overwrite:
+            if state.table_type != "relation":
+                raise SurrealDbError(relation_table_refused("RG3", name, table, method=method))
+            return statement, state
+        kept = table_statement_keeping(table, cls._table_head(), clauses, state)
+        if kept is None:
+            raise SurrealDbError(relation_table_refused("RG2", name, table, method=method))
+        return kept, state
+
+    @classmethod
     def relation_ddl(cls, *, overwrite: bool = True) -> str:
         """Render the ``DEFINE TABLE … TYPE RELATION`` statement of this edge model's table (v0.33.0).
 
         Pure: builds the SurrealQL without touching the database (no connection needed), the same text every time,
         so it can be printed, diffed or fed into a migration::
 
-            DEFINE TABLE {OVERWRITE | IF NOT EXISTS} `<table>` TYPE RELATION[ IN `a` | `b`][ OUT `c`][ ENFORCED];
+            DEFINE TABLE {OVERWRITE | IF NOT EXISTS} `<table>` TYPE RELATION[ IN `a` | `b`][ OUT `c`][ ENFORCED]
+                [ SCHEMAFULL | SCHEMALESS][ COMMENT '…'][ CHANGEFEED …][ PERMISSIONS …];
 
         The table of :meth:`get_table_name` and the names of :meth:`get_relation_in` and :meth:`get_relation_out`
         are written in backticks, several joined with ``|`` in declared order; ``IN`` (or ``OUT``) is left out for
         any table, and ``ENFORCED`` when :meth:`is_enforced` is false. A model without keys renders
-        ``TYPE RELATION`` alone: a relation table whose edges may come from and point to any table.
+        ``TYPE RELATION`` alone: a relation table whose edges may come from and point to any table. The table clauses
+        the model declares follow (v0.34.0): ``schema_mode`` (:meth:`get_schema_mode`), ``comment``, ``changefeed`` and
+        ``permissions`` — none for a model without them.
 
         Applied by hand, ``OVERWRITE`` resets the table's other clauses — schema mode, permissions, change feed,
-        comment, ``DROP`` — to SurrealDB's defaults: ``define_relation()`` keeps them.
+        comment, ``DROP`` — to SurrealDB's defaults: ``define_relation()`` keeps those the model does not declare.
 
         Args:
             overwrite: ``True`` (default) emits ``DEFINE TABLE OVERWRITE …``, which redefines an existing table.
@@ -292,8 +348,7 @@ class BaseSurrealEdge(BaseSurrealModel):
             >>> Likes.relation_ddl()
             'DEFINE TABLE OVERWRITE `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;'
         """
-        clause = relation_type_clause(cls.get_relation_in(), cls.get_relation_out(), cls.is_enforced())
-        return relation_statement(cls.get_table_name(), clause, overwrite)
+        return table_statement(cls.get_table_name(), cls._table_head(), cls._declared_table_clauses(), overwrite)
 
     @classmethod
     async def define_relation(cls, *, overwrite: bool = True, tx: Transaction | None = None) -> str:
@@ -305,10 +360,11 @@ class BaseSurrealEdge(BaseSurrealModel):
 
         - no such table: :meth:`relation_ddl` (``DEFINE TABLE OVERWRITE `<table>` TYPE RELATION …;``);
         - a table that exists: ``DEFINE TABLE OVERWRITE`` with the model's type clause followed by the table's other
-          stored clauses — ``DROP``, ``SCHEMAFULL``, its comment, its change feed, its permissions —, re-rendered from
-          ``INFO FOR DB``. A bare ``OVERWRITE`` would reset them to SurrealDB's defaults (``PERMISSIONS NONE`` among
-          them); ``ALTER TABLE … TYPE`` is not enforced on SurrealDB 2.x and the embedded engine once the table has
-          been written to. This statement is enforced at once, on every connection, the same on every line;
+          clauses — ``DROP``, ``SCHEMAFULL``, its comment, its change feed, its permissions —, each the one the model
+          declares (v0.34.0: ``schema_mode``, ``comment``, ``changefeed``, ``permissions``), else the stored one,
+          re-rendered from ``INFO FOR DB``. A bare ``OVERWRITE`` would reset them to SurrealDB's defaults (``PERMISSIONS
+          NONE`` among them); ``ALTER TABLE … TYPE`` is not enforced on SurrealDB 2.x and the embedded engine once the
+          table has been written to. This statement is enforced at once, on every connection, the same on every line;
         - ``overwrite=False``: :meth:`relation_ddl` with ``IF NOT EXISTS``, which defines a missing table and leaves a
           relation table as it is, its stored ends included.
 
@@ -326,6 +382,10 @@ class BaseSurrealEdge(BaseSurrealModel):
         (``relation_in`` and ``relation_out`` left out, ``None`` or empty, ``enforced`` left out, ``None`` or
         ``False``) applies ``TYPE RELATION`` with no ends: this is how a constraint is removed — edges from or to any
         table, and to missing records, are accepted at once, the other clauses kept.
+
+        ``define_relation()`` defines no field. An edge model that declares ``schema_mode=SchemaMode.SCHEMAFULL`` and
+        has data fields is refused before any request: its table would refuse (SurrealDB 3.x) or drop (2.x, the
+        embedded engine) every edge's data. ``define_table()`` applies the same relation statement, then defines them.
 
         Before any DDL the guard refuses (nothing is sent but the ``INFO``): a materialized view (an ``OVERWRITE``
         would drop its query); a definition the ORM cannot read back, or a stored value that fails its check (it could
@@ -351,9 +411,11 @@ class BaseSurrealEdge(BaseSurrealModel):
 
         Raises:
             TypeError: *overwrite* is not a ``bool`` — before any request.
-            SurrealDbError: *tx* belongs to another connection — before any request; the table is a materialized view,
-                its definition cannot be read back, or ``overwrite=False`` meets a table that is not a relation table —
-                before any DDL; the server refused the statement (``Can't apply relation definition: …``).
+            SurrealDbError: *tx* belongs to another connection, or the model declares
+                ``schema_mode=SchemaMode.SCHEMAFULL`` and has data fields — before any request; the table is a
+                materialized view, its definition cannot be read back, or ``overwrite=False`` meets a table that is not
+                a relation table — before any DDL; the server refused the statement (``Can't apply relation definition:
+                …``).
             SurrealDbAuthenticationError: the session may not read the database's definitions or define the table.
 
         Example:
@@ -361,26 +423,19 @@ class BaseSurrealEdge(BaseSurrealModel):
             'DEFINE TABLE OVERWRITE `likes` TYPE RELATION IN `person` OUT `post` | `book` ENFORCED;'
         """
         _routing.check_transaction(cls, tx, f"{cls.__name__}.define_relation()")
+        if cls.model_config.get("schema_mode") is SchemaMode.SCHEMAFULL:
+            # RG4: a SCHEMAFULL table without the data fields refuses (3.x) or drops (2.x) every edge's data.
+            columns = [column.path[0] for column in cls._table_columns() if len(column.path) == 1]
+            if columns:
+                raise SurrealDbError(relation_schemafull_refused(cls.__name__, columns))
         statement = cls.relation_ddl(overwrite=overwrite)
         table = cls.get_table_name()
         # Cheap even inside a transaction: get_client() returns the already-connected client.
         client = await cls._connection_manager().get_client()
         tables = await read_table_definitions(client, table, kind="definition", what="relation")
-        existing = table_kind(tables, table)
-        if existing == "view":
-            raise SurrealDbError(relation_table_refused("RG1", cls.__name__, table))
-        if existing == "unreadable":
-            raise SurrealDbError(relation_table_refused("RG2", cls.__name__, table))
-        if existing == "table":
-            state = parse_define_table(tables[table])
-            if overwrite:
-                clause = relation_type_clause(cls.get_relation_in(), cls.get_relation_out(), cls.is_enforced())
-                kept = relation_statement_keeping(table, clause, state)
-                if kept is None:
-                    raise SurrealDbError(relation_table_refused("RG2", cls.__name__, table))
-                statement = kept
-            elif state.table_type != "relation":
-                raise SurrealDbError(relation_table_refused("RG3", cls.__name__, table))
+        statement, _ = cls._guarded_table_statement(
+            tables, statement, overwrite=overwrite, clauses=cls._declared_table_clauses(), method="define_relation"
+        )
         await apply_ddl_statements([statement], client=client, tx=tx, what="relation", classify=True, subjects=[repr(table)])
         return statement
 
