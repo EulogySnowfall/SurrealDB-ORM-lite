@@ -5468,8 +5468,8 @@ Anything else is `any`.
 - **`FLEXIBLE`**, written after `TYPE`, only on a table that is `SCHEMAFULL`: on a free-form object column (a `dict`,
   a record model, a sub-model with `extra="allow"`), on the fields of `flexible_fields` or
   `json_schema_extra={"flexible": True}`, and, on SurrealDB 2.x and the embedded engine, on the columns that hold `any`
-  (see "SurrealDB 2.x and 3.x" below). Such a column keeps the keys the model does not declare. A stored `FLEXIBLE` on
-  an object column is kept.
+  and on each list of sub-models (`list[M]`, at any depth) holding a `FLEXIBLE` column (see "SurrealDB 2.x and 3.x"
+  below). Such a column keeps the keys the model does not declare. A stored `FLEXIBLE` on an object column is kept.
 
 #### Applying it
 
@@ -5511,8 +5511,9 @@ print(note.created is not None, note.done)
 — then sends one statement per call: the `DEFINE TABLE`, then one `DEFINE FIELD` per column, parents before children.
 It returns the statements applied (queued, with a buffered `tx`), table first, joined with `"\n"` — the full ORM's
 return. On a new table that is `"\n".join(Model.table_ddl())`, except on SurrealDB 2.x, where `define_table()` adds
-`FLEXIBLE` to the `Any`/untyped columns of a `SCHEMAFULL` table. `table_ddl()` renders the model's statements as a
-list, without a connection: applied by hand, their `OVERWRITE` resets every clause the model does not write.
+`FLEXIBLE` to the `Any`/untyped columns of a `SCHEMAFULL` table and to its lists of sub-models holding a `FLEXIBLE`
+column. `table_ddl()` renders the model's statements as a list, without a connection: applied by hand, their `OVERWRITE`
+resets every clause the model does not write.
 
 What the model declares wins; the rest is kept from the database:
 
@@ -5660,8 +5661,14 @@ print(*table, sep="\n")
 - On a `SCHEMAFULL` table, SurrealDB 2.x and the embedded engine empty the objects and arrays of an `any` column and of
   an untyped array or set, optional or not, silently (`{x: {y: 1}}` is stored `{}`); `FLEXIBLE` keeps them. 3.x keeps
   them without it, and refuses `FLEXIBLE` on such a column. So `define_table()` reads the line (`client.version()`,
-  once, outside any transaction, and only when the table is `SCHEMAFULL` and a column holds `any`) and writes
-  `FLEXIBLE` on those columns before 3.x; `table_ddl()`, which needs no connection, writes the 3.x form.
+  once, outside any transaction, and only when the table is `SCHEMAFULL` and a column holds `any` or is a list of
+  sub-models as below) and writes `FLEXIBLE` on those columns before 3.x; `table_ddl()`, which needs no connection,
+  writes the 3.x form.
+- On a `SCHEMAFULL` table, SurrealDB 2.x and the embedded engine also drop the value of a `FLEXIBLE` column under a list
+  of objects from every item — the `dict`, `Any` or untyped `list` of a sub-model in a `list[M]`, at any depth
+  (`items.*.meta`) — unless the list is `FLEXIBLE` too, then refuse the record's next write (`Found NONE for field`).
+  `define_table()` writes such a list `FLEXIBLE` before 3.x; the item's typed fields are still checked. 3.x keeps those
+  values without it.
 - On SurrealDB 3.x a required untyped array refuses an object item unless its items are defined
   (`no such field exists`): `define_table()` writes the item definition `TYPE any` (`bag.*`) on every line.
 - A write naming a field a `SCHEMAFULL` table does not define is refused on 3.x and dropped on 2.x and the embedded
@@ -6015,6 +6022,7 @@ The SDK's in-process engine has a table of its own: [ORM behaviour: the embedded
 | An edge endpoint outside `IN`/`OUT` (`relate()`, typed or by table name, edge `save()`, `bulk_create()`)                               | `SurrealDbError` (`Found … but expected a record<…>`); with `ENFORCED` and no such record, `SurrealDbNotFoundError` (`does not exist`)                                        | `SurrealDbError` (`Couldn't coerce value for field …`), whether the record exists or not                                                                                            | v0.33.0                              |
 | Model table DDL (`define_table()`: `DEFINE TABLE` + `DEFINE FIELD`)                                                                    | same on both lines: one `DEFINE TABLE OVERWRITE` and one `DEFINE FIELD OVERWRITE` per column, keeping what the model does not declare                                         | the same                                                                                                                                                                            | v0.34.0                              |
 | An `Any` or untyped `list`/`set` field of a `SCHEMAFULL` model                                                                         | `define_table()` adds `FLEXIBLE` (read from `client.version()`): without it these engines empty such values, optional or not; the item definitions as on 3.x                  | kept without `FLEXIBLE` (refused there); an untyped `list` gets an item definition `TYPE any`, without which 3.x refuses an object item of a required one (`no such field exists`)  | v0.34.0                              |
+| A `list` of sub-models (`list[M]`, at any depth) holding a `dict`, an `Any` or an untyped `list`, in a `SCHEMAFULL` model              | `define_table()` also writes the `list` `FLEXIBLE`: without it these engines drop such a value from every item, then refuse the record's next write (`Found NONE for field`)  | kept without `FLEXIBLE` on the `list`, which `define_table()` does not write there                                                                                                  | v0.34.0                              |
 | A write naming a field a `SCHEMAFULL` table does not define (an undeclared `merge()` key, a raw query, records predating `SCHEMAFULL`) | the field is dropped, silently                                                                                                                                                | the write is refused (`no such field exists`)                                                                                                                                       | v0.34.0                              |
 | Full suite and every divergence in this table, re-run on SurrealDB 2.7.0 and 3.3.0                                                     | 2.7.0 identical to 2.6.5 (same passes, same 3.x-only skips)                                                                                                                   | 3.3.0 identical to 3.2.4, except the system-user signin row                                                                                                                         | v0.19.1                              |
 
@@ -6051,7 +6059,7 @@ Capabilities not listed behave as on a 2.x server.
 | Server-side events and stored functions (v0.31.0)                   | as on a 2.x server: `$input` is `NONE`; `Event(async_mode=True)` raises `SurrealDbError` before any DDL                                                                                                                                                                                                                                               | `ASYNC` events on 3.x                                                                                           | v0.31.0 |
 | Materialized views (v0.32.0)                                        | as on a 2.x server: `int` sums and `Decimal` means; in a grouped view, `math::stddev()`/`math::variance()`, an expression around an aggregate, a field outside `GROUP BY` and a `GROUP BY` on an alias raise `SurrealDbError` before any DDL; writes to a view refused by the ORM (the engine would accept them); no live queries                     | `float` sums and means on 3.x                                                                                   | v0.32.0 |
 | TYPE RELATION constraints (v0.33.0)                                 | as on a 2.x server: a raw `ALTER TABLE … TYPE` of a table already written to is not enforced (`define_relation()` sends `DEFINE TABLE OVERWRITE`); an endpoint outside `IN`/`OUT` whose record does not exist raises `SurrealDbNotFoundError`                                                                                                         | `SurrealDbError` for that endpoint on 3.x                                                                       | v0.33.0 |
-| Model table DDL (v0.34.0)                                           | as on a 2.x server: `define_table()` adds `FLEXIBLE` to the `Any` and untyped columns of a `SCHEMAFULL` table; a write naming a field the table does not define drops that field                                                                                                                                                                      | 3.x keeps those values without `FLEXIBLE` and refuses that write                                                | v0.34.0 |
+| Model table DDL (v0.34.0)                                           | as on a 2.x server: `define_table()` adds `FLEXIBLE` to the `Any` and untyped columns of a `SCHEMAFULL` table and to its lists of sub-models holding a `FLEXIBLE` column; a write naming a field the table does not define drops that field                                                                                                           | 3.x keeps those values without `FLEXIBLE` and refuses that write                                                | v0.34.0 |
 | Everything else                                                     | CRUD, QuerySet, aggregations, relations, typed edges, rich and geo fields, upsert/patch, server values, computed fields, stored functions, signals: the same as on a 2.x server                                                                                                                                                                       | unchanged                                                                                                       | v0.25.0 |
 
 ---

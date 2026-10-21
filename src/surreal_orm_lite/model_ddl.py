@@ -22,9 +22,11 @@ an injection defence: an expression is trusted application code, never user inpu
 **The statements.** ``field_statement()`` writes one column's ``DEFINE FIELD``: its path segment by segment, each name
 in backticks and an array's items ``*`` (`` `subs`.*.`city` ``), the table in backticks, then ``TYPE <kind>``,
 ``FLEXIBLE`` on a ``SCHEMAFULL`` table when the column holds a free-form object or asks for it — and, before SurrealDB
-3.x (``before_3``: a 2.x server or the embedded engine, which empty an object or an array held by ``any`` otherwise),
-when it holds ``any`` —, its ``DEFAULT`` and a computed field's ``VALUE``. The caller reads the line; this module
-never does. ``field_permissions_text()`` writes a field's ``PERMISSIONS`` as SurrealDB renders them.
+3.x (``before_3``: a 2.x server or the embedded engine, which empty an object or an array held by ``any`` otherwise,
+and drop a ``FLEXIBLE`` column's value under an array of objects unless the array is ``FLEXIBLE`` too), when it holds
+``any`` or is a list of sub-models holding such a column —, its ``DEFAULT`` and a computed field's ``VALUE``. The caller
+reads the line; this module never does. ``field_permissions_text()`` writes a field's ``PERMISSIONS`` as SurrealDB
+renders them.
 For a field that exists, ``field_statement_keeping()`` writes the column's ``TYPE``, ``FLEXIBLE``, ``DEFAULT`` and
 ``VALUE`` and keeps from the stored definition what the model does not write — ``REFERENCE``, a ``DEFAULT`` or
 ``VALUE``, ``READONLY``, ``ASSERT``, ``PERMISSIONS``, ``COMMENT``, a ``FLEXIBLE`` object —; a stored ``COMPUTED`` stays
@@ -35,7 +37,7 @@ returned, not an injection defence.
 
 from collections.abc import Collection, Iterable, Mapping, MutableSequence, MutableSet, Sequence
 from collections.abc import Set as AbstractSet
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from enum import Enum
@@ -96,8 +98,12 @@ class Column:
     a sub-model where its fields are not defined — or is a sub-model with ``extra="allow"``, so a ``SCHEMAFULL`` table
     writes it ``FLEXIBLE``. ``flexible_requested``: the field is in ``flexible_fields`` or has
     ``json_schema_extra={"flexible": True}``. ``holds_any``: the kind holds ``any`` (an untyped array or set included).
-    ``default``: the SurrealQL literal of its ``DEFAULT``, or ``None``. ``value``: a computed field's checked expression.
-    ``server``: a top-level ``server_fields`` column. ``item``: the item definition of an untyped array (``bag.*``).
+    ``flexible_items``: the column is a list of sub-models (``list[M]``, ``list[M] | None``, at any depth) and a column
+    under it is written ``FLEXIBLE`` before SurrealDB 3.x — it holds a free-form object, asks for ``FLEXIBLE`` or holds
+    ``any``: on a ``SCHEMAFULL`` table, SurrealDB 2.x and the embedded engine drop such a column's value from every item
+    unless the list is ``FLEXIBLE`` too. ``default``: the SurrealQL literal of its ``DEFAULT``, or ``None``. ``value``: a
+    computed field's checked expression. ``server``: a top-level ``server_fields`` column. ``item``: the item definition
+    of an untyped array (``bag.*``).
     """
 
     path: tuple[str, ...]
@@ -106,6 +112,7 @@ class Column:
     free_object: bool = False
     flexible_requested: bool = False
     holds_any: bool = False
+    flexible_items: bool = False
     default: str | None = None
     value: str | None = None
     server: bool = False
@@ -583,8 +590,14 @@ def _field_columns(spec: _Field, trail: tuple[type, ...]) -> list[Column]:
     if shape is not None:
         sub, star = shape
         base = (*spec.path, "*") if star else spec.path
+        children: list[Column] = []
         for child in _sub_fields(spec.model, spec.field, base, sub):
-            columns.extend(_field_columns(child, (*trail, sub)))
+            children.extend(_field_columns(child, (*trail, sub)))
+        # Before 3.x, a SCHEMAFULL table drops the value of a FLEXIBLE column under an array of objects from every item
+        # unless the array is FLEXIBLE too: the list is marked when a column under it is FLEXIBLE there.
+        if star and any(_flexible(column, schemafull=True, before_3=True) for column in children):
+            columns[0] = replace(columns[0], flexible_items=True)
+        columns.extend(children)
     return columns
 
 
@@ -606,7 +619,8 @@ def model_columns(
     ``lol.*.*``: kind ``any``, ``item=True``) and, for a sub-model ``M`` annotated ``M``, ``M | None``, ``list[M]`` or
     ``list[M] | None``, by the columns of its fields and computed fields (``address.city``, ``subs.*.city``) by the
     same rules, depth first. ``M`` anywhere else, a record model and a sub-model already on the path are free-form
-    objects without nested columns.
+    objects without nested columns. A ``list[M]`` column is ``flexible_items`` when a column under it is written
+    ``FLEXIBLE`` before SurrealDB 3.x (a free-form object, a ``FLEXIBLE`` request, a kind holding ``any``).
 
     A column is ``option<…>`` when its annotation admits ``None`` or it is not required and defaults to ``None``, never
     when its kind is ``any``. Its ``default`` is the ``to_surql_literal()`` text of a constant default (a ``bool``,
@@ -666,11 +680,11 @@ def _field_head(table: str, column: Column, overwrite: object) -> str:
 
 def _flexible(column: Column, *, schemafull: bool, before_3: bool, stored: bool = False) -> bool:
     """Whether the column is written ``FLEXIBLE``: only on a ``SCHEMAFULL`` table, when it holds a free-form object,
-    asks for it, holds ``any`` before SurrealDB 3.x, or its stored definition is ``FLEXIBLE`` and its kind holds an
-    object."""
+    asks for it, holds ``any`` or is ``flexible_items`` before SurrealDB 3.x, or its stored definition is ``FLEXIBLE``
+    and its kind holds an object."""
     if not schemafull:
         return False
-    if column.free_object or column.flexible_requested or (before_3 and column.holds_any):
+    if column.free_object or column.flexible_requested or (before_3 and (column.holds_any or column.flexible_items)):
         return True
     return stored and holds_object(column.kind)
 
@@ -683,10 +697,11 @@ def field_statement(table: str, column: Column, *, overwrite: bool, schemafull: 
     ``render_kind()``. ``FLEXIBLE`` (written after ``TYPE``, which both lines accept) only when *schemafull* — the
     table's mode once its statement is applied is ``SCHEMAFULL``: SurrealDB 3.x refuses ``FLEXIBLE`` elsewhere — and the
     column holds a free-form object (``free_object``), asks for it (``flexible_requested``) or, with *before_3* (a
-    SurrealDB 2.x server or the embedded engine), holds ``any``. ``DEFAULT`` writes the column's constant default (a
-    ``server_fields`` column's too: a new column has no rule of the database's to keep), ``VALUE`` a computed field's
-    expression, checked when the columns were listed. ``overwrite=True`` redefines an existing field, ``False`` keeps it
-    (``IF NOT EXISTS``); a non-``bool`` is a ``TypeError``. Pure.
+    SurrealDB 2.x server or the embedded engine), holds ``any`` or is a list of sub-models holding such a column
+    (``flexible_items``). ``DEFAULT`` writes the column's constant default (a ``server_fields`` column's too: a new
+    column has no rule of the database's to keep), ``VALUE`` a computed field's expression, checked when the columns
+    were listed. ``overwrite=True`` redefines an existing field, ``False`` keeps it (``IF NOT EXISTS``); a non-``bool``
+    is a ``TypeError``. Pure.
     """
     parts = [_field_head(table, column, overwrite)]
     if _flexible(column, schemafull=schemafull, before_3=before_3):

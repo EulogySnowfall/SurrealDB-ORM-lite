@@ -79,9 +79,9 @@ and ``INFO FOR TABLE`` once for a table that exists, with ``overwrite=True`` —
 table, then each column. A missing table gets ``table_ddl()``'s statements; a table that exists gets the carried ones,
 whose ``FLEXIBLE`` follows the mode the table will have (the declared one, else the stored one); ``overwrite=False``
 sends ``IF NOT EXISTS`` and reads no field. The line (``client.version()``) is read once, outside any transaction, and
-only for a table that is ``SCHEMAFULL`` once its statement is applied with a column holding ``any``: before SurrealDB
-3.x those columns are written ``FLEXIBLE``. It returns the statements joined with a newline (a ``str``, the full ORM's
-return). Before any DDL the guard refuses a view, a relation table, a table or a field definition it cannot read or
+only for a table that is ``SCHEMAFULL`` once its statement is applied with a column holding ``any`` or a list of
+sub-models holding a ``FLEXIBLE`` column: before SurrealDB 3.x those columns are written ``FLEXIBLE``. It returns the
+statements joined with a newline (a ``str``, the full ORM's return). Before any DDL the guard refuses a view, a relation table, a table or a field definition it cannot read or
 carry; a transaction of another connection, a non-``bool`` ``overwrite`` and the model's own faults are refused before
 any request; a refused read or statement names the table or the field, never the statement.
 
@@ -113,6 +113,12 @@ sub-model's ``Any`` round-trip objects and arrays on every engine; raw, on a ``S
 engine empty such values without ``FLEXIBLE``, which 3.x refuses there, and 3.x refuses an object item of an untyped
 list without its item definition. A write naming a field a ``SCHEMAFULL`` table does not define is refused on 3.x and
 the field dropped before 3; a record stored before the table became ``SCHEMAFULL`` reads back unchanged.
+
+Lists of sub-models (``TestSubModelListsE2E``, every engine of both lines): a ``list[M]`` holding a ``dict``, an ``Any``
+or an untyped list, at any depth, is written ``FLEXIBLE`` by ``define_table()`` before SurrealDB 3.x, so those values
+round-trip through ``save()``, ``merge()`` and ``update()`` on every engine and the items' typed fields are still
+checked; raw, 2.x and the embedded engine drop a ``FLEXIBLE`` column's value under an array of objects from every item
+unless the array is ``FLEXIBLE`` too, then refuse the record's next write; 3.x keeps it.
 
 Transactions (``TestTableTransactionsE2E``, every engine of both lines): the reads run on the committed state before
 anything is queued; the statements apply with the block — at once when interactive, at the commit when buffered — and
@@ -1405,6 +1411,14 @@ class TestColumns:
             (("mm",), "array | object", True, None),
             (("mm", "*"), "any", False, None),
         ]
+
+    def test_lists_of_sub_models_holding_a_flexible_column(self) -> None:
+        """``flexible_items``: a list of sub-models (``list[M]``, ``list[M] | None``), at any depth, under which a
+        column holds a free-form object or ``any`` — written ``FLEXIBLE`` before SurrealDB 3.x. Not a sub-model that is
+        not a list, nor a list of sub-models whose columns are all typed."""
+        assert [column.path for column in _columns(TdlOrder) if column.flexible_items] == _ORDER_LISTS
+        assert [column.path for column in _columns(TdlOrderPlain) if column.flexible_items] == [("tags",)]
+        assert not any(column.flexible_items for column in _columns(TdlKitchen))
 
     def test_item_definitions(self) -> None:
         class TdlItems(BaseSurrealModel):
@@ -2841,6 +2855,16 @@ class TestCarriedFields:
             "DEFINE FIELD OVERWRITE `anything` ON `tdl_note` TYPE any;"
         )
 
+    def test_flexible_on_a_list_of_sub_models_before_3(self) -> None:
+        """A list of sub-models holding a ``FLEXIBLE`` column, carried over its stored field: ``FLEXIBLE`` before
+        SurrealDB 3.x on a ``SCHEMAFULL`` table only."""
+        for path in ("bundles[*].parts", "bundles.*.parts"):
+            stored = f"DEFINE FIELD {path} ON tdl_order TYPE array<object> PERMISSIONS FULL"
+            statement = "DEFINE FIELD OVERWRITE `bundles`.*.`parts` ON `tdl_order` TYPE array<object>"
+            assert _kept_field(TdlOrder, stored, schemafull=True, before_3=True) == f"{statement} FLEXIBLE;"
+            assert _kept_field(TdlOrder, stored, schemafull=True) == f"{statement};"
+            assert _kept_field(TdlOrder, stored, schemafull=False, before_3=True) == f"{statement};"
+
     def test_nested_and_item_paths(self) -> None:
         """A nested column and an item definition, from either line's rendering of their path."""
         assert _kept_field(TdlPerson, "DEFINE FIELD address.city ON tdl_person TYPE string COMMENT 'c' PERMISSIONS FULL") == (
@@ -3224,6 +3248,140 @@ _LOOSE_BEFORE_3 = [
 ]
 
 
+class TdlTagged(BaseModel):
+    """A sub-model whose only free-form value is a ``dict``: none of its columns holds ``any``."""
+
+    label: str
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class TdlLine(BaseModel):
+    """An order line: typed fields, then a ``dict``, an ``Any`` and an untyped list."""
+
+    sku: str
+    qty: int
+    meta: dict[str, Any] = Field(default_factory=dict)
+    anyv: Any = None
+    bag: list = Field(default_factory=list)  # type: ignore[type-arg]
+
+
+class TdlBundle(BaseModel):
+    """A sub-model whose free-form values are one level down: in a sub-model and in a list of sub-models."""
+
+    name: str
+    inner: TdlTagged
+    parts: list[TdlTagged] = Field(default_factory=list)
+
+
+class TdlOrder(BaseSurrealModel):
+    """A ``SCHEMAFULL`` model whose lists of sub-models hold free-form values, at every depth: ``items`` (a ``dict``, an
+    ``Any``, an untyped list), ``maybe`` (optional; a ``dict`` only), ``bundles`` (a list of sub-models holding a
+    sub-model and a list of sub-models) and ``head`` (a sub-model holding a list of sub-models)."""
+
+    model_config = SurrealConfigDict(table_name="tdl_order", schema_mode=SchemaMode.SCHEMAFULL, connection="tdl")
+
+    id: str | None = None
+    note: str = ""
+    items: list[TdlLine] = Field(default_factory=list)
+    maybe: list[TdlTagged] | None = None
+    bundles: list[TdlBundle] = Field(default_factory=list)
+    head: TdlBundle | None = None
+
+
+class TdlOrderPlain(BaseSurrealModel):
+    """A ``SCHEMAFULL`` model with a list of sub-models holding a ``dict``: no column holds ``any``."""
+
+    model_config = SurrealConfigDict(table_name="tdl_order", schema_mode=SchemaMode.SCHEMAFULL, connection="tdl")
+
+    id: str | None = None
+    tags: list[TdlTagged] = Field(default_factory=list)
+
+
+#: The paths of ``TdlOrder``'s lists of sub-models holding a column written ``FLEXIBLE`` before SurrealDB 3.x.
+_ORDER_LISTS = [("items",), ("maybe",), ("bundles",), ("bundles", "*", "parts"), ("head", "parts")]
+
+#: ``TdlOrder.table_ddl()`` — what ``define_table()`` applies on a new table on SurrealDB 3.x: ``FLEXIBLE`` on the
+#: free-form objects only.
+_ORDER = [
+    "DEFINE TABLE OVERWRITE `tdl_order` TYPE NORMAL SCHEMAFULL;",
+    "DEFINE FIELD OVERWRITE `note` ON `tdl_order` TYPE string DEFAULT '';",
+    "DEFINE FIELD OVERWRITE `items` ON `tdl_order` TYPE array<object>;",
+    "DEFINE FIELD OVERWRITE `items`.*.`sku` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `items`.*.`qty` ON `tdl_order` TYPE int;",
+    "DEFINE FIELD OVERWRITE `items`.*.`meta` ON `tdl_order` TYPE object FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `items`.*.`anyv` ON `tdl_order` TYPE any;",
+    "DEFINE FIELD OVERWRITE `items`.*.`bag` ON `tdl_order` TYPE array;",
+    "DEFINE FIELD OVERWRITE `items`.*.`bag`.* ON `tdl_order` TYPE any;",
+    "DEFINE FIELD OVERWRITE `maybe` ON `tdl_order` TYPE option<array<object>>;",
+    "DEFINE FIELD OVERWRITE `maybe`.*.`label` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `maybe`.*.`meta` ON `tdl_order` TYPE object FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `bundles` ON `tdl_order` TYPE array<object>;",
+    "DEFINE FIELD OVERWRITE `bundles`.*.`name` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `bundles`.*.`inner` ON `tdl_order` TYPE object;",
+    "DEFINE FIELD OVERWRITE `bundles`.*.`inner`.`label` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `bundles`.*.`inner`.`meta` ON `tdl_order` TYPE object FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `bundles`.*.`parts` ON `tdl_order` TYPE array<object>;",
+    "DEFINE FIELD OVERWRITE `bundles`.*.`parts`.*.`label` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `bundles`.*.`parts`.*.`meta` ON `tdl_order` TYPE object FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `head` ON `tdl_order` TYPE option<object>;",
+    "DEFINE FIELD OVERWRITE `head`.`name` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `head`.`inner` ON `tdl_order` TYPE object;",
+    "DEFINE FIELD OVERWRITE `head`.`inner`.`label` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `head`.`inner`.`meta` ON `tdl_order` TYPE object FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `head`.`parts` ON `tdl_order` TYPE array<object>;",
+    "DEFINE FIELD OVERWRITE `head`.`parts`.*.`label` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `head`.`parts`.*.`meta` ON `tdl_order` TYPE object FLEXIBLE;",
+]
+
+#: What ``define_table()`` applies on a new table before SurrealDB 3.x: ``FLEXIBLE`` also on the columns holding
+#: ``any`` and on every list of sub-models holding a ``FLEXIBLE`` column — without it those engines drop that column's
+#: value from every item. A sub-model that is not a list (``bundles.*.inner``, ``head``) needs none.
+_ORDER_BEFORE_3 = [
+    "DEFINE TABLE OVERWRITE `tdl_order` TYPE NORMAL SCHEMAFULL;",
+    "DEFINE FIELD OVERWRITE `note` ON `tdl_order` TYPE string DEFAULT '';",
+    "DEFINE FIELD OVERWRITE `items` ON `tdl_order` TYPE array<object> FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `items`.*.`sku` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `items`.*.`qty` ON `tdl_order` TYPE int;",
+    "DEFINE FIELD OVERWRITE `items`.*.`meta` ON `tdl_order` TYPE object FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `items`.*.`anyv` ON `tdl_order` TYPE any FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `items`.*.`bag` ON `tdl_order` TYPE array FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `items`.*.`bag`.* ON `tdl_order` TYPE any FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `maybe` ON `tdl_order` TYPE option<array<object>> FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `maybe`.*.`label` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `maybe`.*.`meta` ON `tdl_order` TYPE object FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `bundles` ON `tdl_order` TYPE array<object> FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `bundles`.*.`name` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `bundles`.*.`inner` ON `tdl_order` TYPE object;",
+    "DEFINE FIELD OVERWRITE `bundles`.*.`inner`.`label` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `bundles`.*.`inner`.`meta` ON `tdl_order` TYPE object FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `bundles`.*.`parts` ON `tdl_order` TYPE array<object> FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `bundles`.*.`parts`.*.`label` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `bundles`.*.`parts`.*.`meta` ON `tdl_order` TYPE object FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `head` ON `tdl_order` TYPE option<object>;",
+    "DEFINE FIELD OVERWRITE `head`.`name` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `head`.`inner` ON `tdl_order` TYPE object;",
+    "DEFINE FIELD OVERWRITE `head`.`inner`.`label` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `head`.`inner`.`meta` ON `tdl_order` TYPE object FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `head`.`parts` ON `tdl_order` TYPE array<object> FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `head`.`parts`.*.`label` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `head`.`parts`.*.`meta` ON `tdl_order` TYPE object FLEXIBLE;",
+]
+
+#: ``TdlOrderPlain.table_ddl()``, then what ``define_table()`` applies before SurrealDB 3.x.
+_ORDER_PLAIN = [
+    "DEFINE TABLE OVERWRITE `tdl_order` TYPE NORMAL SCHEMAFULL;",
+    "DEFINE FIELD OVERWRITE `tags` ON `tdl_order` TYPE array<object>;",
+    "DEFINE FIELD OVERWRITE `tags`.*.`label` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `tags`.*.`meta` ON `tdl_order` TYPE object FLEXIBLE;",
+]
+_ORDER_PLAIN_BEFORE_3 = [
+    "DEFINE TABLE OVERWRITE `tdl_order` TYPE NORMAL SCHEMAFULL;",
+    "DEFINE FIELD OVERWRITE `tags` ON `tdl_order` TYPE array<object> FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `tags`.*.`label` ON `tdl_order` TYPE string;",
+    "DEFINE FIELD OVERWRITE `tags`.*.`meta` ON `tdl_order` TYPE object FLEXIBLE;",
+]
+
+
 _INFO = "INFO FOR DB;"
 _INFO_NOTE = "INFO FOR TABLE `tdl_note`;"
 _INFO_PERSON = "INFO FOR TABLE `tdl_person`;"
@@ -3470,6 +3628,34 @@ class TestDefineTable:
         assert (client.version_calls, client.version_at) == (1, 1)
 
     @pytest.mark.parametrize(
+        ("version", "order", "plain"),
+        [
+            ("surrealdb-3.3.4", _ORDER, _ORDER_PLAIN),
+            ("surrealdb-2.7.0", _ORDER_BEFORE_3, _ORDER_PLAIN_BEFORE_3),
+            ("surrealdb-2.0.0", _ORDER_BEFORE_3, _ORDER_PLAIN_BEFORE_3),
+        ],
+        ids=["3.x", "2.x", "embedded"],
+    )
+    async def test_lists_of_sub_models_holding_a_flexible_column(
+        self, use_client: Callable[[Any], None], version: str, order: list[str], plain: list[str]
+    ) -> None:
+        """A list of sub-models holding a column written ``FLEXIBLE`` (a ``dict``, an ``Any``, an untyped list), at
+        any depth, is written ``FLEXIBLE`` before SurrealDB 3.x: those engines drop such a value from every item
+        otherwise. The line is read for it even when no column holds ``any`` (``TdlOrderPlain``: a ``dict`` only)."""
+        client = _TableClient(version=version)
+        use_client(client)
+        assert await TdlOrder.define_table() == "\n".join(order)
+        assert TdlOrder.table_ddl() == _ORDER
+        assert (client.version_calls, client.version_at) == (1, 1)
+
+        client = _TableClient(version=version)
+        use_client(client)
+        assert await TdlOrderPlain.define_table() == "\n".join(plain)
+        assert TdlOrderPlain.table_ddl() == _ORDER_PLAIN
+        assert client.queries == [_INFO, *plain]
+        assert (client.version_calls, client.version_at) == (1, 1)
+
+    @pytest.mark.parametrize(
         ("model", "stored"),
         [(TdlNote, None), (TdlNote, _STORED_NOTE_FULL), (TdlPerson, None)],
         ids=["no-mode", "schemafull-kept", "schemafull-declared"],
@@ -3477,7 +3663,8 @@ class TestDefineTable:
     async def test_no_line_read_without_a_column_holding_any(
         self, use_client: Callable[[Any], None], model: type[BaseSurrealModel], stored: str | None
     ) -> None:
-        """No column holds ``any``: no ``version()``, whatever the table's mode."""
+        """No column holds ``any`` and no list of sub-models holds a free-form object: no ``version()``, whatever the
+        table's mode."""
         client = _TableClient({} if stored is None else {model.get_table_name(): stored}, version="surrealdb-2.7.0")
         use_client(client)
         statements = (await model.define_table()).split("\n")
@@ -5294,6 +5481,9 @@ class _Refused:
 
 #: The README 2.x/3.x rows the line facts back, by their first cell.
 _UNTYPED_ROW = "An `Any` or untyped `list`/`set` field of a `SCHEMAFULL` model"
+_LISTS_ROW = (
+    "A `list` of sub-models (`list[M]`, at any depth) holding a `dict`, an `Any` or an untyped `list`, in a `SCHEMAFULL` model"
+)
 _UNDECLARED_ROW = "A write naming a field a `SCHEMAFULL` table does not define"
 
 #: The failures of the line-fact pins once a SurrealDB line changes.
@@ -5490,6 +5680,142 @@ class TestLineFactsE2E:
                 await fresh.merge(nope=1)
             n2 = [{"id": RecordID("tdl_note", "n2"), "body": "x"}]
             assert await client.query("SELECT * FROM tdl_note:n2;", {}) == n2, _UNDECLARED_CHANGED
+
+
+#: The failure of the list-of-sub-models pins once a SurrealDB line changes.
+_LISTS_CHANGED = (
+    "SurrealDB changed how this line stores a FLEXIBLE column under an array of objects in a SCHEMAFULL table: "
+    "re-measure it, then update this test's expectation, define_table()'s FLEXIBLE rule (Column.flexible_items) and the "
+    f"README 2.x/3.x row '{_LISTS_ROW}'"
+)
+
+
+def _order(record: str) -> TdlOrder:
+    """An order holding free-form values at every depth: objects and arrays in each list item's ``dict``, ``Any`` and
+    untyped list, in an optional list, in a list nested in a list, and in a list nested in a sub-model."""
+    return TdlOrder(
+        id=record,
+        note="n",
+        items=[
+            TdlLine(sku="a", qty=1, meta={"k": 1, "n": {"d": [1, {"e": 2}]}}, anyv={"x": {"y": 1}}, bag=[{"q": 1}, [2]]),
+            TdlLine(sku="b", qty=2, anyv=[{"z": 1}]),
+        ],
+        maybe=[TdlTagged(label="m", meta={"k": "v"})],
+        bundles=[TdlBundle(name="b", inner=TdlTagged(label="i", meta={"i": 1}), parts=[TdlTagged(label="p", meta={"p": [1]})])],
+        head=TdlBundle(
+            name="h", inner=TdlTagged(label="hi", meta={"h": 1}), parts=[TdlTagged(label="hp", meta={"x": {"y": 1}})]
+        ),
+    )
+
+
+async def _order_back(model: type[TdlOrder | TdlOrderPlain], record: str) -> dict[str, Any]:
+    """The record *record* of *model* read with ``get()``, dumped without its id."""
+    return (await model.objects().get(record)).model_dump(exclude={"id"})
+
+
+class TestSubModelListsE2E:
+    """On every engine of both lines: a list of sub-models holding a ``dict``, an ``Any`` or an untyped list — at any
+    depth — keeps those values through ``save()``, ``merge()`` and ``update()`` after ``define_table()``, which writes
+    the list ``FLEXIBLE`` before SurrealDB 3.x; its typed columns are still checked. The raw fact this is built around:
+    on a ``SCHEMAFULL`` table, 2.x and the embedded engine drop a ``FLEXIBLE`` column's value under an array of objects
+    from every item unless the array is ``FLEXIBLE`` too, then refuse the record's next write; 3.x keeps it."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_define_table_writes_the_lists_flexible_before_3(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The line read once; before 3, each list ``FLEXIBLE`` — and the item definition SurrealDB adds itself for an
+        ``array<object>`` (``items[*] TYPE object``) is ``FLEXIBLE`` with it."""
+        async with _tdl(kind) as client:
+            major = await _major(client)
+            calls = _spy(monkeypatch, client)
+            assert await TdlOrder.define_table() == "\n".join(_ORDER if major >= 3 else _ORDER_BEFORE_3)
+            assert [method for method, _ in calls if method == "version"] == ["version"]
+            fields = _field_states(await _table_info(client, "tdl_order"))
+            columns = _columns(TdlOrder)
+            assert {column.path for column in columns} <= fields.keys()
+            flexible = {path for path, field in fields.items() if field.flexible}
+            free = {column.path for column in columns if column.free_object}
+            loose = {column.path for column in columns if column.holds_any}
+            items = {(*path, "*") for path in _ORDER_LISTS}
+            assert flexible == (free if major >= 3 else free | loose | set(_ORDER_LISTS) | items)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_free_values_in_lists_round_trip(self, kind: str) -> None:
+        """``save()``, ``merge()`` of another field, ``update()`` and ``merge()`` of the list: each accepted, every
+        value read back equal. An item whose typed column has the wrong type is refused, the record unchanged."""
+        async with _tdl(kind) as client:
+            await TdlOrder.define_table()
+            order = _order("o1")
+            sent = order.model_dump(exclude={"id"})
+            await order.save()
+            assert await _order_back(TdlOrder, "o1") == sent
+
+            await order.merge(note="merged")
+            sent = {**sent, "note": "merged"}
+            assert await _order_back(TdlOrder, "o1") == sent
+
+            # A fresh instance: a write syncs its instance from the row the server returns.
+            changed = _order("o1")
+            changed.note = "merged"
+            changed.items.append(TdlLine(sku="c", qty=3, meta={"c": [1]}, anyv="s", bag=[{"t": 1}]))
+            changed.head = None
+            sent = changed.model_dump(exclude={"id"})
+            await changed.update()
+            assert await _order_back(TdlOrder, "o1") == sent
+
+            items = [TdlLine(sku="d", qty=4, meta={"d": {"e": 1}}, anyv={"a": 1}, bag=[[{"b": 1}]]).model_dump()]
+            await changed.merge(items=items)
+            sent = {**sent, "items": items}
+            assert await _order_back(TdlOrder, "o1") == sent
+
+            wrong = "UPDATE tdl_order:o1 MERGE {items: [{sku: 1, qty: 1, meta: {}, bag: []}]} RETURN NONE;"
+            refused = await _refusal(client, wrong)
+            assert refused is not None and "sku" in refused, refused
+            assert await _order_back(TdlOrder, "o1") == sent
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_dict_alone_round_trips(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No column holds ``any``: ``define_table()`` still reads the line once, and the ``dict`` of each item reads
+        back equal after ``save()`` and ``merge()``."""
+        async with _tdl(kind) as client:
+            major = await _major(client)
+            calls = _spy(monkeypatch, client)
+            assert await TdlOrderPlain.define_table() == "\n".join(_ORDER_PLAIN if major >= 3 else _ORDER_PLAIN_BEFORE_3)
+            assert [method for method, _ in calls if method == "version"] == ["version"]
+            plain = TdlOrderPlain(id="p1", tags=[TdlTagged(label="a", meta={"k": {"j": [1]}}), TdlTagged(label="b")])
+            sent = plain.model_dump(exclude={"id"})
+            await plain.save()
+            assert await _order_back(TdlOrderPlain, "p1") == sent
+            tags = [TdlTagged(label="c", meta={"c": 1}).model_dump()]
+            await TdlOrderPlain(id="p1").merge(tags=tags)
+            assert await _order_back(TdlOrderPlain, "p1") == {**sent, "tags": tags}
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("flexible", [False, True], ids=["array", "array-flexible"])
+    async def test_a_flexible_column_under_an_array_raw(self, kind: str, flexible: bool) -> None:
+        """What a ``SCHEMAFULL`` table stores for a ``FLEXIBLE`` object under an array of objects, with and without
+        ``FLEXIBLE`` on the array — the facts of the README 2.x/3.x row. Before 3, without it, the object is dropped
+        from every item and the next write of the record refused; with it, kept, the typed column still checked."""
+        async with _tdl(kind) as client:
+            major = await _major(client)
+            await _apply_ddl(
+                client,
+                "DEFINE TABLE tdl_raw SCHEMAFULL; "
+                f"DEFINE FIELD v ON tdl_raw TYPE array<object>{' FLEXIBLE' if flexible else ''}; "
+                "DEFINE FIELD v.*.n ON tdl_raw TYPE string; "
+                "DEFINE FIELD v.*.m ON tdl_raw TYPE object FLEXIBLE;",
+            )
+            await _apply_ddl(client, "CREATE tdl_raw:1 SET v = [{n: 'a', m: {k: {j: [1]}}}] RETURN NONE;")
+            kept = flexible or major >= 3
+            stored = [{"n": "a", "m": {"k": {"j": [1]}}}] if kept else [{"n": "a"}]
+            assert await client.query("SELECT VALUE v FROM tdl_raw:1;", {}) == [stored], _LISTS_CHANGED
+            refused = await _refusal(client, "UPDATE tdl_raw:1 MERGE {} RETURN NONE;")
+            if kept:
+                assert refused is None, f"{_LISTS_CHANGED}: {refused}"
+            else:
+                assert refused is not None and "Found NONE for field" in refused, _LISTS_CHANGED
+            refused = await _refusal(client, "UPDATE tdl_raw:1 SET v = [{n: 1, m: {}}] RETURN NONE;")
+            assert refused is not None and "n`" in refused, _LISTS_CHANGED
+            assert await client.query("SELECT VALUE v FROM tdl_raw:1;", {}) == [stored], _LISTS_CHANGED
 
 
 # --- define_table(tx=…) ----------------------------------------------------------------------------------------------
@@ -6493,7 +6819,8 @@ _SENTENCES_35 = {
     "Applying it": (
         'It returns the statements applied (queued, with a buffered `tx`), table first, joined with `"\\n"` — the full '
         'ORM\'s return. On a new table that is `"\\n".join(Model.table_ddl())`, except on SurrealDB 2.x, where '
-        "`define_table()` adds `FLEXIBLE` to the `Any`/untyped columns of a `SCHEMAFULL` table.",
+        "`define_table()` adds `FLEXIBLE` to the `Any`/untyped columns of a `SCHEMAFULL` table and to its lists of "
+        "sub-models holding a `FLEXIBLE` column.",
         "Each call on a table with a change feed adds one `define_table` entry to it; `changes()` skips it, a raw "
         "`SHOW CHANGES` shows it.",
     ),
@@ -6577,6 +6904,7 @@ _PART_NEEDLES_35 = {
         'so `object | array<string>` would refuse `{"k": 1}`',
         "written after `TYPE`, only on a table that is `SCHEMAFULL`",
         "on SurrealDB 2.x and the embedded engine, on the columns that hold `any`",
+        "and on each list of sub-models (`list[M]`, at any depth) holding a `FLEXIBLE` column",
         "A stored `FLEXIBLE` on an object column is kept",
     ),
     "Applying it": (
@@ -6636,7 +6964,10 @@ _PART_NEEDLES_35 = {
         "`FLEXIBLE` keeps them",
         "3.x keeps them without it, and refuses `FLEXIBLE` on such a column",
         "`client.version()`",
-        "only when the table is `SCHEMAFULL` and a column holds `any`",
+        "only when the table is `SCHEMAFULL` and a column holds `any` or is a list of sub-models as below",
+        "also drop the value of a `FLEXIBLE` column under a list of objects from every item",
+        "unless the list is `FLEXIBLE` too, then refuse the record's next write (`Found NONE for field`)",
+        "the item's typed fields are still checked",
         "`table_ddl()`, which needs no connection, writes the 3.x form",
         "the item definition `TYPE any` (`bag.*`) on every line",
         "refused on 3.x and dropped on 2.x and the embedded engine",
@@ -6741,7 +7072,7 @@ _SECTION_34_DEFINE_TABLE = (
     "`define_table()` (since v0.34.0) applies an edge model through the statement `define_relation()` carries, then its "
     "data fields; migrations come with v0.38.0."
 )
-#: Exactly the three rows v0.34.0 adds to the 2.x/3.x table, cell by cell, within the table's column widths.
+#: Exactly the four rows v0.34.0 adds to the 2.x/3.x table, cell by cell, within the table's column widths.
 _TABLE_DDL_ROWS = [
     [
         "Model table DDL (`define_table()`: `DEFINE TABLE` + `DEFINE FIELD`)",
@@ -6759,6 +7090,13 @@ _TABLE_DDL_ROWS = [
         "v0.34.0",
     ],
     [
+        _LISTS_ROW,
+        "`define_table()` also writes the `list` `FLEXIBLE`: without it these engines drop such a value from every item, "
+        "then refuse the record's next write (`Found NONE for field`)",
+        "kept without `FLEXIBLE` on the `list`, which `define_table()` does not write there",
+        "v0.34.0",
+    ],
+    [
         "A write naming a field a `SCHEMAFULL` table does not define (an undeclared `merge()` key, a raw query, records "
         "predating `SCHEMAFULL`)",
         "the field is dropped, silently",
@@ -6773,8 +7111,9 @@ _HEADER_SENTENCE_34 = (
 #: The row v0.34.0 adds to the embedded engine's table, cell by cell.
 _EMBEDDED_TABLE_DDL_ROW = [
     "Model table DDL (v0.34.0)",
-    "as on a 2.x server: `define_table()` adds `FLEXIBLE` to the `Any` and untyped columns of a `SCHEMAFULL` table; a "
-    "write naming a field the table does not define drops that field",
+    "as on a 2.x server: `define_table()` adds `FLEXIBLE` to the `Any` and untyped columns of a `SCHEMAFULL` table and "
+    "to its lists of sub-models holding a `FLEXIBLE` column; a write naming a field the table does not define drops "
+    "that field",
     "3.x keeps those values without `FLEXIBLE` and refuses that write",
     "v0.34.0",
 ]
@@ -7017,7 +7356,7 @@ class TestReadmeSection35:
             assert stale not in text, stale
 
     def test_server_behaviour_rows(self) -> None:
-        """Exactly three rows, Since v0.34.0, together and in version order before the table's last row."""
+        """Exactly four rows, Since v0.34.0, together and in version order before the table's last row."""
         assert_server_rows(_TABLE_DDL_ROWS)
 
     def test_server_behaviour_table_keeps_its_widths(self) -> None:
