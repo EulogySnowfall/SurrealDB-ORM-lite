@@ -21,8 +21,10 @@ an injection defence: an expression is trusted application code, never user inpu
 
 **The statements.** ``field_statement()`` writes one column's ``DEFINE FIELD``: its path segment by segment, each name
 in backticks and an array's items ``*`` (`` `subs`.*.`city` ``), the table in backticks, then ``TYPE <kind>``,
-``FLEXIBLE`` on a ``SCHEMAFULL`` table when the column holds a free-form object or asks for it, its ``DEFAULT`` and a
-computed field's ``VALUE``. ``field_permissions_text()`` writes a field's ``PERMISSIONS`` as SurrealDB renders them.
+``FLEXIBLE`` on a ``SCHEMAFULL`` table when the column holds a free-form object or asks for it — and, before SurrealDB
+3.x (``before_3``: a 2.x server or the embedded engine, which empty an object or an array held by ``any`` otherwise),
+when it holds ``any`` —, its ``DEFAULT`` and a computed field's ``VALUE``. The caller reads the line; this module
+never does. ``field_permissions_text()`` writes a field's ``PERMISSIONS`` as SurrealDB renders them.
 For a field that exists, ``field_statement_keeping()`` writes the column's ``TYPE``, ``FLEXIBLE``, ``DEFAULT`` and
 ``VALUE`` and keeps from the stored definition what the model does not write — ``REFERENCE``, a ``DEFAULT`` or
 ``VALUE``, ``READONLY``, ``ASSERT``, ``PERMISSIONS``, ``COMMENT``, a ``FLEXIBLE`` object —; a stored ``COMPUTED`` stays

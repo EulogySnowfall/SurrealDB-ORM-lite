@@ -69,14 +69,18 @@ On the engines (``TestTableDdlE2E``, every engine of both lines): each list of s
 read back — the table's type, mode, comment, change feed and permissions, each column's kind and ``FLEXIBLE``.
 
 The ORM's writes (``TestOrmWritesE2E``): on a ``SCHEMAFULL`` table defined by a model's ``table_ddl()`` — one column of
-every kind, a typed computed field ``tot`` — every write path is accepted and every field reads back equal, and the
-computed field reads ``i + 1`` after each write; SurrealDB 3.1 refuses the ORM's ``set`` value, which is pinned there.
+every kind, a typed computed field ``tot`` — every write path is accepted and every field reads back equal to what
+the write sent, and the computed field reads ``i + 1`` after each write; the same on the table its ``define_table()``
+defines, with an object and an array in its ``Any`` column; SurrealDB 3.1 refuses the ORM's ``set`` value, which is
+pinned there.
 
 Applying (``TestDefineTable``, ``TestTableGuard``, on fake clients): ``define_table()`` reads ``INFO FOR DB`` once —
 and ``INFO FOR TABLE`` once for a table that exists, with ``overwrite=True`` — then sends one statement per call: the
 table, then each column. A missing table gets ``table_ddl()``'s statements; a table that exists gets the carried ones,
 whose ``FLEXIBLE`` follows the mode the table will have (the declared one, else the stored one); ``overwrite=False``
-sends ``IF NOT EXISTS`` and reads no field. It returns the statements joined with a newline (a ``str``, the full ORM's
+sends ``IF NOT EXISTS`` and reads no field. The line (``client.version()``) is read once, outside any transaction, and
+only for a table that is ``SCHEMAFULL`` once its statement is applied with a column holding ``any``: before SurrealDB
+3.x those columns are written ``FLEXIBLE``. It returns the statements joined with a newline (a ``str``, the full ORM's
 return). Before any DDL the guard refuses a view, a relation table, a table or a field definition it cannot read or
 carry; a transaction of another connection, a non-``bool`` ``overwrite`` and the model's own faults are refused before
 any request; a refused read or statement names the table or the field, never the statement.
@@ -102,6 +106,18 @@ writes the declared comment and permissions and keeps the change feed; ``define_
 field, which an edge then carries, and refuses a view or, with ``overwrite=False``, an ordinary table; ``define_view()``
 keeps a view's clauses set by hand unless declared; ``define_table()`` of a view model equals ``define_view()`` and keeps
 its guard over a table holding records.
+
+The line facts (``TestLineFactsE2E``, every engine of both lines): ``define_table()`` reads the line only when needed
+and writes ``FLEXIBLE`` on the columns holding ``any`` before SurrealDB 3.x, so an ``Any``, an untyped list and a
+sub-model's ``Any`` round-trip objects and arrays on every engine; raw, on a ``SCHEMAFULL`` table, 2.x and the embedded
+engine empty such values without ``FLEXIBLE``, which 3.x refuses there, and 3.x refuses an object item of an untyped
+list without its item definition. A write naming a field a ``SCHEMAFULL`` table does not define is refused on 3.x and
+the field dropped before 3; a record stored before the table became ``SCHEMAFULL`` reads back unchanged.
+
+Transactions (``TestTableTransactionsE2E``, every engine of both lines): the reads run on the committed state before
+anything is queued; the statements apply with the block — at once when interactive, at the commit when buffered — and
+not at all when it raises; a transaction of another connection is refused before any request; a definition of the same
+table or field queued earlier in the block is replaced at commit, a limit to lift.
 """
 
 import ast
@@ -112,6 +128,7 @@ import re
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from enum import Enum, IntEnum, StrEnum
@@ -3025,6 +3042,57 @@ class TdlNoteAge(BaseSurrealModel):
     age: int = 18
 
 
+class TdlLooseSub(BaseModel):
+    """A sub-model holding ``Any``."""
+
+    meta: Any = None
+
+
+class TdlLoose(BaseSurrealModel):
+    """A ``SCHEMAFULL`` model whose columns hold ``any``: ``Any``, untyped lists (required, ``list[Any]``, optional) and
+    a sub-model's ``Any``."""
+
+    model_config = SurrealConfigDict(table_name="tdl_loose", schema_mode=SchemaMode.SCHEMAFULL, connection="tdl")
+
+    id: str | None = None
+    anything: Any = None
+    items: list = Field(default_factory=list)  # type: ignore[type-arg]
+    bag: list[Any] = Field(default_factory=list)
+    maybe: list | None = None  # type: ignore[type-arg]
+    sub: TdlLooseSub = Field(default_factory=TdlLooseSub)
+
+
+#: ``TdlLoose.table_ddl()`` — what ``define_table()`` applies on a new table on SurrealDB 3.x: an item definition for
+#: each untyped list, no ``FLEXIBLE`` (3.x refuses it on a kind without an object).
+_LOOSE = [
+    "DEFINE TABLE OVERWRITE `tdl_loose` TYPE NORMAL SCHEMAFULL;",
+    "DEFINE FIELD OVERWRITE `anything` ON `tdl_loose` TYPE any;",
+    "DEFINE FIELD OVERWRITE `items` ON `tdl_loose` TYPE array;",
+    "DEFINE FIELD OVERWRITE `items`.* ON `tdl_loose` TYPE any;",
+    "DEFINE FIELD OVERWRITE `bag` ON `tdl_loose` TYPE array;",
+    "DEFINE FIELD OVERWRITE `bag`.* ON `tdl_loose` TYPE any;",
+    "DEFINE FIELD OVERWRITE `maybe` ON `tdl_loose` TYPE option<array>;",
+    "DEFINE FIELD OVERWRITE `maybe`.* ON `tdl_loose` TYPE any;",
+    "DEFINE FIELD OVERWRITE `sub` ON `tdl_loose` TYPE object;",
+    "DEFINE FIELD OVERWRITE `sub`.`meta` ON `tdl_loose` TYPE any;",
+]
+
+#: What ``define_table()`` applies on a new table before SurrealDB 3.x (2.x servers, the embedded engine): the same,
+#: with ``FLEXIBLE`` on every column holding ``any`` — without it those engines empty an object or an array there.
+_LOOSE_BEFORE_3 = [
+    "DEFINE TABLE OVERWRITE `tdl_loose` TYPE NORMAL SCHEMAFULL;",
+    "DEFINE FIELD OVERWRITE `anything` ON `tdl_loose` TYPE any FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `items` ON `tdl_loose` TYPE array FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `items`.* ON `tdl_loose` TYPE any FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `bag` ON `tdl_loose` TYPE array FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `bag`.* ON `tdl_loose` TYPE any FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `maybe` ON `tdl_loose` TYPE option<array> FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `maybe`.* ON `tdl_loose` TYPE any FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `sub` ON `tdl_loose` TYPE object;",
+    "DEFINE FIELD OVERWRITE `sub`.`meta` ON `tdl_loose` TYPE any FLEXIBLE;",
+]
+
+
 _INFO = "INFO FOR DB;"
 _INFO_NOTE = "INFO FOR TABLE `tdl_note`;"
 _INFO_PERSON = "INFO FOR TABLE `tdl_person`;"
@@ -3051,13 +3119,15 @@ _STORED_NOTE_BAD_RULE = (
 )
 _STORED_NOTE_FULL = "DEFINE TABLE tdl_note TYPE NORMAL SCHEMAFULL PERMISSIONS NONE"
 _STORED_NOTE_LESS = "DEFINE TABLE tdl_note TYPE ANY SCHEMALESS PERMISSIONS NONE"
+_STORED_LOG_FULL = "DEFINE TABLE tdl_log TYPE ANY SCHEMAFULL PERMISSIONS NONE"
 
 
 class _TableClient:
     """A client answering ``INFO FOR DB;`` with ``{"tables": tables}``, ``INFO FOR TABLE …;`` with ``{"fields":
     fields}`` and every other statement with ``[]``. It records each statement, raises *info_error* for the first
     read, *fields_error* for the second and *ddl_error* for the statements starting with *refuse* (every one when
-    *refuse* is ``None``), and counts ``version()``."""
+    *refuse* is ``None``), answers ``version()`` with *version*, counts those calls and records how many statements
+    preceded the last one (``version_at``)."""
 
     def __init__(
         self,
@@ -3068,6 +3138,7 @@ class _TableClient:
         fields_error: BaseException | None = None,
         ddl_error: BaseException | None = None,
         refuse: str | None = None,
+        version: str = "surrealdb-3.3.4",
     ) -> None:
         self.tables = dict(tables or {})
         self.fields = dict(fields or {})
@@ -3075,8 +3146,10 @@ class _TableClient:
         self.fields_error = fields_error
         self.ddl_error = ddl_error
         self.refuse = refuse
+        self.version_text = version
         self.queries: list[str] = []
         self.version_calls = 0
+        self.version_at: int | None = None
 
     async def query(self, statement: str, variables: object) -> object:
         assert variables == {}
@@ -3095,7 +3168,8 @@ class _TableClient:
 
     async def version(self) -> str:
         self.version_calls += 1
-        return "surrealdb-3.3.4"
+        self.version_at = len(self.queries)
+        return self.version_text
 
 
 class _QueuingTx:
@@ -3245,6 +3319,96 @@ class TestDefineTable:
         assert await TdlNoteTuned.define_table(tx=tx) == "\n".join(_TUNED)  # type: ignore[arg-type]
         assert client.queries == [_INFO, _INFO_NOTE]
         assert tx.added == [(statement, None) for statement in _TUNED]
+
+    @pytest.mark.parametrize(
+        ("version", "statements"),
+        [("surrealdb-3.3.4", _LOOSE), ("surrealdb-2.7.0", _LOOSE_BEFORE_3), ("surrealdb-2.0.0", _LOOSE_BEFORE_3)],
+        ids=["3.x", "2.x", "embedded"],
+    )
+    async def test_the_line_is_read_once_when_a_column_holds_any(
+        self, use_client: Callable[[Any], None], version: str, statements: list[str]
+    ) -> None:
+        """A ``SCHEMAFULL`` table with columns holding ``any`` (item definitions included): ``version()`` once, after
+        the reads and before any DDL. Before 3 — a 2.x server, or the embedded engine, which answers the SDK's
+        ``surrealdb-2.0.0`` — those columns are written ``FLEXIBLE``; on 3.x the statements are ``table_ddl()``'s."""
+        client = _TableClient(version=version)
+        use_client(client)
+        assert await TdlLoose.define_table() == "\n".join(statements)
+        assert TdlLoose.table_ddl() == _LOOSE
+        assert client.queries == [_INFO, *statements]
+        assert (client.version_calls, client.version_at) == (1, 1)
+
+    @pytest.mark.parametrize(
+        ("model", "stored"),
+        [(TdlNote, None), (TdlNote, _STORED_NOTE_FULL), (TdlPerson, None)],
+        ids=["no-mode", "schemafull-kept", "schemafull-declared"],
+    )
+    async def test_no_line_read_without_a_column_holding_any(
+        self, use_client: Callable[[Any], None], model: type[BaseSurrealModel], stored: str | None
+    ) -> None:
+        """No column holds ``any``: no ``version()``, whatever the table's mode."""
+        client = _TableClient({} if stored is None else {model.get_table_name(): stored}, version="surrealdb-2.7.0")
+        use_client(client)
+        statements = (await model.define_table()).split("\n")
+        assert client.queries[-len(statements) :] == statements
+        assert client.version_calls == 0
+
+    @pytest.mark.parametrize(
+        ("model", "stored", "overwrite", "reads"),
+        [
+            (TdlNoteShapes, None, True, False),
+            (TdlNoteShapes, _STORED_NOTE_LESS, True, False),
+            (TdlNoteShapes, _STORED_NOTE_FULL, True, True),
+            (TdlNoteShapes, None, False, False),
+            (TdlNoteShapes, _STORED_NOTE_FULL, False, True),
+            (TdlLog, None, True, False),
+            (TdlLog, _STORED_LOG_FULL, True, False),
+            (TdlLog, _STORED_LOG_FULL, False, True),
+        ],
+        ids=[
+            "new-no-mode",
+            "schemaless-kept",
+            "schemafull-kept",
+            "if-not-exists-new",
+            "if-not-exists-schemafull",
+            "schemaless-declared",
+            "schemaless-declared-over-schemafull",
+            "if-not-exists-schemafull-declared-schemaless",
+        ],
+    )
+    async def test_the_tables_mode_decides_the_line_read(
+        self,
+        use_client: Callable[[Any], None],
+        model: type[BaseSurrealModel],
+        stored: str | None,
+        overwrite: bool,
+        reads: bool,
+    ) -> None:
+        """The line is read only when the table is ``SCHEMAFULL`` once its statement is applied (the declared mode,
+        else the stored one; with ``overwrite=False`` the stored one first); then, before 3, the column holding ``any``
+        is written ``FLEXIBLE`` — a new one, or one carried over its stored field."""
+        table = model.get_table_name()
+        stored_field = f"DEFINE FIELD {'anything' if model is TdlNoteShapes else 'extra'} ON {table} TYPE any PERMISSIONS FULL"
+        client = _TableClient(
+            {} if stored is None else {table: stored},
+            {} if stored is None else {"anything" if model is TdlNoteShapes else "extra": stored_field},
+            version="surrealdb-2.7.0",
+        )
+        use_client(client)
+        statements = (await model.define_table(overwrite=overwrite)).split("\n")
+        assert client.version_calls == (1 if reads else 0)
+        [column] = [statement for statement in statements if " TYPE any" in statement]
+        assert column.endswith(" TYPE any FLEXIBLE;" if reads else " TYPE any;"), column
+
+    async def test_the_line_is_read_outside_the_transaction(self, use_client: Callable[[Any], None]) -> None:
+        """``version()`` on the client, like the reads, before anything is queued; the statements in the block."""
+        client = _TableClient(version="surrealdb-2.7.0")
+        use_client(client)
+        tx = _QueuingTx()
+        assert await TdlLoose.define_table(tx=tx) == "\n".join(_LOOSE_BEFORE_3)  # type: ignore[arg-type]
+        assert client.queries == [_INFO]
+        assert (client.version_calls, client.version_at) == (1, 1)
+        assert tx.added == [(statement, None) for statement in _LOOSE_BEFORE_3]
 
     async def test_a_transaction_of_another_connection(self, use_client: Callable[[Any], None]) -> None:
         client = _TableClient()
@@ -3725,74 +3889,115 @@ async def _read_back(model: type[TdlKitchenBase], record: Any, expected: TdlKitc
     return got
 
 
+def _intent(instance: TdlKitchenBase, **changes: Any) -> TdlKitchenBase:
+    """A deep copy of *instance* with *changes*: what a write is meant to store, taken before the write (a write
+    syncs its instance from the row the server returns, so the instance itself proves nothing)."""
+    return instance.model_copy(update=changes, deep=True)
+
+
+async def _write_everything(model: type[TdlKitchenBase], first: Any, second: Any) -> None:
+    """Every ORM write into *model*'s table, ``anyv`` holding *first* (then *second* after ``update()``): each accepted,
+    every field read back equal to what the write sent, and ``tot`` read ``i + 1`` after ``save()``, ``update()``,
+    ``upsert()``, ``merge()``, ``bulk_create()``, ``bulk_update()`` and ``get_or_create()``."""
+    k1 = _kitchen(model, "k1", anyv=first)
+    sent = _intent(k1)
+    await k1.save()
+    await _read_back(model, "k1", sent)
+
+    k1.s = "changed"
+    k1.i = 4
+    k1.opt = 5
+    k1.osub = TdlAddress(city="Rome", zip="00100")
+    k1.anyv = second
+    sent = _intent(k1)
+    await k1.update()
+    await _read_back(model, "k1", sent)
+
+    await k1.merge(i=9, opt=None, dc={"z": {"w": 1}})
+    k1 = await _read_back(model, "k1", _intent(sent, i=9, opt=None, dc={"nested": {"deep": [1, 2]}, "k": "v", "z": {"w": 1}}))
+    assert k1.tot == 10
+
+    k2 = _kitchen(model, "k2", i=2, anyv=first)
+    sent = _intent(k2)
+    await k2.upsert()
+    await _read_back(model, "k2", sent)
+    k2.i = 7
+    sent = _intent(k2)
+    await k2.upsert()
+    assert (await _read_back(model, "k2", sent)).tot == 8
+
+    sent = _intent(k1, s="p")
+    await k1.patch([{"op": "replace", "path": "/s", "value": "p"}])
+    await _read_back(model, "k1", sent)
+    sent = _intent(sent, ls=["a", "b", "c"])
+    await k1.atomic_append("ls", "c")
+    await _read_back(model, "k1", sent)
+    sent = _intent(sent, i=11)
+    await k1.atomic_increment("i", 2)
+    assert (await _read_back(model, "k1", sent)).tot == 12
+
+    k3 = _kitchen(model, "k3", s="c", i=30, anyv=first)
+    k4 = _kitchen(model, "k4", s="c", i=40, anyv=second)
+    sent3, sent4 = _intent(k3), _intent(k4)
+    await model.objects().bulk_create([k3, k4])
+    await _read_back(model, "k3", sent3)
+    await _read_back(model, "k4", sent4)
+    assert await model.objects().filter(s="c").bulk_update(s="bu") == 2
+    assert (await _read_back(model, "k3", _intent(sent3, s="bu"))).tot == 31
+    assert (await _read_back(model, "k4", _intent(sent4, s="bu"))).tot == 41
+
+    defaults = _kitchen_fields(model, None, i=50, anyv=first)
+    del defaults["s"]
+    sent = model(**defaults, s="g")
+    made, created = await model.objects().get_or_create(defaults=defaults, s="g")
+    assert created is True
+    assert (await _read_back(model, made.id, sent)).tot == 51
+    again, created = await model.objects().get_or_create(defaults=defaults, s="g")
+    assert created is False
+    assert again.get_raw_id() == made.get_raw_id()
+
+    k6 = _kitchen(model, "k6", osub=None, opt=None, anyv=None, geo=None, rng=None)
+    sent = _intent(k6)
+    await k6.save()
+    await _read_back(model, "k6", sent)
+
+    await k1.delete()
+    with pytest.raises(SurrealDbNotFoundError):
+        await model.objects().get("k1")
+
+
+#: ``TdlKitchen``'s typed computed field, as ``table_ddl()`` and ``define_table()`` write it.
+_KITCHEN_TOT = "DEFINE FIELD OVERWRITE `tot` ON `tdl_kitchen` TYPE option<int> VALUE i + 1;"
+
+
 class TestOrmWritesE2E:
-    """Every ORM write into the table ``table_ddl()`` defines for the rich model (``TdlKitchenBase`` on SurrealDB 3.1,
-    which refuses the ORM's ``set`` value; ``TdlKitchen`` elsewhere), ``anyv`` holding scalars: accepted, every field
-    read back equal, and the typed computed field ``tot`` read ``i + 1`` after each write, on every engine."""
+    """Every ORM write into the rich model's table (``TdlKitchenBase`` on SurrealDB 3.1, which refuses the ORM's ``set``
+    value; ``TdlKitchen`` elsewhere): accepted, every field read back equal, and the typed computed field ``tot`` read
+    ``i + 1`` after each write, on every engine — over ``table_ddl()``'s statements applied by hand with ``anyv``
+    holding scalars, and over ``define_table()``'s with ``anyv`` holding an object and an array (kept on SurrealDB 2.x
+    and the embedded engine by the ``FLEXIBLE`` ``define_table()`` adds there)."""
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_writes_round_trip(self, kind: str) -> None:
         async with _tdl(kind) as client:
             model = TdlKitchenBase if await _line(client) == (3, 1) else TdlKitchen
             await _apply_ddl(client, " ".join(model.table_ddl()))
+            await _write_everything(model, 5, "s")
 
-            k1 = _kitchen(model, "k1")
-            await k1.save()
-            await _read_back(model, "k1", k1)
-
-            k1.s = "changed"
-            k1.i = 4
-            k1.opt = 5
-            k1.osub = TdlAddress(city="Rome", zip="00100")
-            k1.anyv = "s"
-            await k1.update()
-            await _read_back(model, "k1", k1)
-
-            await k1.merge(i=9, opt=None, dc={"z": {"w": 1}})
-            merged = k1.model_copy(update={"i": 9, "opt": None, "dc": {"nested": {"deep": [1, 2]}, "k": "v", "z": {"w": 1}}})
-            k1 = await _read_back(model, "k1", merged)
-            assert k1.tot == 10
-
-            k2 = _kitchen(model, "k2", i=2)
-            await k2.upsert()
-            await _read_back(model, "k2", k2)
-            k2.i = 7
-            await k2.upsert()
-            assert (await _read_back(model, "k2", k2)).tot == 8
-
-            await k1.patch([{"op": "replace", "path": "/s", "value": "p"}])
-            assert (await _read_back(model, "k1", k1)).s == "p"
-            await k1.atomic_append("ls", "c")
-            assert (await _read_back(model, "k1", k1)).ls == ["a", "b", "c"]
-            await k1.atomic_increment("i", 2)
-            assert (await _read_back(model, "k1", k1)).tot == 12
-
-            k3 = _kitchen(model, "k3", s="c", i=30)
-            k4 = _kitchen(model, "k4", s="c", i=40)
-            await model.objects().bulk_create([k3, k4])
-            await _read_back(model, "k3", k3)
-            await _read_back(model, "k4", k4)
-            assert await model.objects().filter(s="c").bulk_update(s="bu") == 2
-            k3.s = k4.s = "bu"
-            assert (await _read_back(model, "k3", k3)).tot == 31
-            assert (await _read_back(model, "k4", k4)).tot == 41
-
-            defaults = _kitchen_fields(model, None, i=50)
-            del defaults["s"]
-            made, created = await model.objects().get_or_create(defaults=defaults, s="g")
-            assert created is True
-            assert (await _read_back(model, made.id, made)).tot == 51
-            again, created = await model.objects().get_or_create(defaults=defaults, s="g")
-            assert created is False
-            assert again.get_raw_id() == made.get_raw_id()
-
-            k6 = _kitchen(model, "k6", osub=None, opt=None, anyv=None, geo=None, rng=None)
-            await k6.save()
-            await _read_back(model, "k6", k6)
-
-            await k1.delete()
-            with pytest.raises(SurrealDbNotFoundError):
-                await model.objects().get("k1")
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_writes_round_trip_after_define_table(self, kind: str) -> None:
+        """``define_table()`` returns ``table_ddl()``'s statements, ``anyv`` written ``FLEXIBLE`` before SurrealDB 3.x;
+        then an object and an array in ``anyv`` read back equal on every engine."""
+        async with _tdl(kind) as client:
+            line = await _line(client)
+            model = TdlKitchenBase if line == (3, 1) else TdlKitchen
+            applied = (await model.define_table()).split("\n")
+            assert _KITCHEN_TOT in applied
+            anyv = "DEFINE FIELD OVERWRITE `anyv` ON `tdl_kitchen` TYPE any;"
+            flexible = "DEFINE FIELD OVERWRITE `anyv` ON `tdl_kitchen` TYPE any FLEXIBLE;"
+            expected = [flexible if line[0] < 3 and statement == anyv else statement for statement in model.table_ddl()]
+            assert applied == expected
+            await _write_everything(model, {"x": {"y": [1, {"z": 2}]}}, [1, {"k": "v"}])
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_a_set_field(self, kind: str) -> None:
@@ -4797,3 +5002,330 @@ class TestEdgeAndViewE2E:
             assert _sent(calls) == [_INFO, "SELECT id FROM `tdl_stats` LIMIT 1;"]
             assert (await _tables(client))["tdl_stats"] == before
             assert await client.query("SELECT VALUE a FROM tdl_stats;", {}) == [1]
+
+
+# --- the line facts define_table() is built around -------------------------------------------------------------------
+
+
+class TdlNoteStrict(BaseSurrealModel):
+    """``tdl_note`` declared ``SCHEMAFULL``, with one column, ``body``."""
+
+    model_config = SurrealConfigDict(table_name="tdl_note", schema_mode=SchemaMode.SCHEMAFULL, connection="tdl")
+
+    id: str | None = None
+    body: str
+
+
+@dataclass(frozen=True)
+class _Refused:
+    """A refusal whose text holds *reason*: of the write, or, when *ddl*, of the definitions themselves."""
+
+    reason: str
+    ddl: bool = False
+
+
+#: The README 2.x/3.x rows the line facts back, by their first cell.
+_UNTYPED_ROW = "An `Any` or untyped `list`/`set` field of a `SCHEMAFULL` model"
+_UNDECLARED_ROW = "A write naming a field a `SCHEMAFULL` table does not define"
+
+#: The failures of the line-fact pins once a SurrealDB line changes.
+_UNTYPED_CHANGED = (
+    "SurrealDB changed how this line stores an untyped value in a SCHEMAFULL table: re-measure it, then update this "
+    f"test's expectation, define_table()'s FLEXIBLE rule and the README 2.x/3.x row '{_UNTYPED_ROW}'"
+)
+_UNDECLARED_CHANGED = (
+    "SurrealDB changed how this line treats a write naming a field a SCHEMAFULL table does not define: re-measure it, "
+    f"then update this test's expectation and the README 2.x/3.x row '{_UNDECLARED_ROW}'"
+)
+
+_NO_SUCH_FIELD = _Refused("no such field exists")
+_NOT_FLEXIBLE = _Refused("FLEXIBLE can only be used with types containing object", ddl=True)
+
+#: Raw facts on a SCHEMAFULL table: (the field definitions as (path, clauses), each ``DEFINE FIELD OVERWRITE`` in that
+#: order, the value written, what reads back — or the refusal — before SurrealDB 3, on 3.1, on 3.2 and later). An
+#: optional array gets an implicit item definition ``v.* TYPE any`` from SurrealDB 3.x, which on 3.1 still refuses an
+#: object item; the item definition written after the array, as ``define_table()`` does, lifts it.
+_UNTYPED_CASES: list[tuple[tuple[tuple[str, str], ...], str, object, object, object]] = [
+    ((("v", "TYPE any"),), "{x: {y: 1}}", {}, {"x": {"y": 1}}, {"x": {"y": 1}}),
+    ((("v", "TYPE any"),), "[{k: 1}]", [], [{"k": 1}], [{"k": 1}]),
+    ((("v", "TYPE array"),), "[{k: 1}]", [], _NO_SUCH_FIELD, _NO_SUCH_FIELD),
+    ((("v", "TYPE array"), ("v.*", "TYPE any")), "[{k: 1}]", [{}], [{"k": 1}], [{"k": 1}]),
+    ((("v", "TYPE option<array>"),), "[{k: 1}]", [], _NO_SUCH_FIELD, [{"k": 1}]),
+    ((("v", "TYPE option<array>"), ("v.*", "TYPE any")), "[{k: 1}]", [{}], [{"k": 1}], [{"k": 1}]),
+    ((("v", "TYPE any FLEXIBLE"),), "{x: {y: 1}}", {"x": {"y": 1}}, _NOT_FLEXIBLE, _NOT_FLEXIBLE),
+    (
+        (("v", "TYPE array FLEXIBLE"), ("v.*", "TYPE any FLEXIBLE")),
+        "[{k: 1}, [{m: 1}]]",
+        [{"k": 1}, [{"m": 1}]],
+        _NOT_FLEXIBLE,
+        _NOT_FLEXIBLE,
+    ),
+    (
+        (("v", "TYPE option<array> FLEXIBLE"), ("v.*", "TYPE any FLEXIBLE")),
+        "[{k: 1}]",
+        [{"k": 1}],
+        _NOT_FLEXIBLE,
+        _NOT_FLEXIBLE,
+    ),
+]
+_UNTYPED_IDS = [
+    "any-object",
+    "any-array",
+    "array",
+    "array-items",
+    "option-array",
+    "option-array-items",
+    "any-flexible",
+    "array-flexible",
+    "option-array-flexible",
+]
+
+#: The columns ``define_table()`` writes ``FLEXIBLE`` before SurrealDB 3.x for ``TdlLoose``: every one holding ``any``.
+_LOOSE_FLEXIBLE = {
+    ("anything",),
+    ("items",),
+    ("items", "*"),
+    ("bag",),
+    ("bag", "*"),
+    ("maybe",),
+    ("maybe", "*"),
+    ("sub", "meta"),
+}
+
+
+async def _refusal(client: Any, query: str) -> str | None:
+    """Run *query* raw: ``None`` when SurrealDB accepts every statement, else the first refusal's text (a parse error
+    refuses the whole query)."""
+    response = await client.query_raw(query, {})
+    if "error" in response:
+        return str(response["error"])
+    refused = [str(result["result"]) for result in response["result"] if result["status"] != "OK"]
+    return refused[0] if refused else None
+
+
+class TestLineFactsE2E:
+    """On every engine of both lines. ``define_table()`` reads the line (``client.version()``, once) only for a
+    ``SCHEMAFULL`` table with a column holding ``any``, and before SurrealDB 3.x writes those columns ``FLEXIBLE``: the
+    untyped values then round-trip on every engine. The raw facts this is built around: on a ``SCHEMAFULL`` table, 2.x
+    and the embedded engine empty an object or an array in an ``any`` or untyped array column unless it is
+    ``FLEXIBLE``, which 3.x refuses there; 3.x keeps them, but refuses an object item of a required untyped array
+    without its item definition (3.1 also of an optional one, despite the item definition SurrealDB adds itself). A
+    write naming a field a ``SCHEMAFULL`` table does not define — a ``merge()`` key, a field of a record stored before
+    — is refused on 3.x and the field dropped before."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_define_table_reads_the_line_once(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl(kind) as client:
+            major = await _major(client)
+            expected = _LOOSE if major >= 3 else _LOOSE_BEFORE_3
+            calls = _spy(monkeypatch, client)
+            assert await TdlLoose.define_table() == "\n".join(expected)
+            assert [method for method, _ in calls if method == "version"] == ["version"]
+            assert [args[0] for method, args in calls if method == "query"] == [_INFO, *expected]
+            fields = _field_states(await _table_info(client, "tdl_loose"))
+            assert {column.path for column in _columns(TdlLoose)} <= fields.keys()
+            flexible = {path for path, field in fields.items() if field.flexible}
+            assert flexible == (set() if major >= 3 else _LOOSE_FLEXIBLE)
+
+            calls.clear()
+            assert await TdlNote.define_table() == "\n".join(_G2)
+            assert await TdlLog.define_table() == "\n".join(_G3)
+            assert _sent(calls) == [_INFO, *_G2, _INFO, *_G3]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_untyped_values_round_trip(self, kind: str) -> None:
+        """An object or an array in an ``Any``, an untyped list (with objects and nested arrays), a sub-model's ``Any``
+        and an optional untyped list read back equal on every engine, SurrealDB 3.1 included: ``define_table()`` writes
+        each list's item definition after it."""
+        async with _tdl(kind):
+            await TdlLoose.define_table()
+            loose = TdlLoose(
+                id="l1",
+                anything={"x": {"y": 1}},
+                items=[1, "b", {"k": 1}, [{"m": 1}]],
+                bag=[{"k": 1}],
+                sub=TdlLooseSub(meta={"q": 1}),
+            )
+            sent = loose.model_dump()
+            await loose.save()
+            assert (await TdlLoose.objects().get("l1")).model_dump() == sent
+
+            maybe = TdlLoose(id="l2", maybe=[{"k": 1}])
+            sent = maybe.model_dump()
+            await maybe.save()
+            assert (await TdlLoose.objects().get("l2")).model_dump() == sent
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize(("definitions", "value", "before_3", "line_3_1", "line_3"), _UNTYPED_CASES, ids=_UNTYPED_IDS)
+    async def test_an_untyped_value_raw(
+        self,
+        kind: str,
+        definitions: tuple[tuple[str, str], ...],
+        value: str,
+        before_3: object,
+        line_3_1: object,
+        line_3: object,
+    ) -> None:
+        """What a ``SCHEMAFULL`` table stores for an object or an array in an ``any`` or untyped array column, with and
+        without ``FLEXIBLE`` and the item definition — the facts of the README 2.x/3.x row on ``Any`` and untyped
+        ``list``/``set`` fields. Reads through the ORM's client."""
+        async with _tdl(kind) as client:
+            line = await _line(client)
+            expected = before_3 if line[0] < 3 else line_3_1 if line == (3, 1) else line_3
+            ddl = "DEFINE TABLE tdl_raw SCHEMAFULL; " + " ".join(
+                f"DEFINE FIELD OVERWRITE {path} ON tdl_raw {clauses};" for path, clauses in definitions
+            )
+            refused = await _refusal(client, ddl)
+            if isinstance(expected, _Refused) and expected.ddl:
+                assert refused is not None and expected.reason in refused, _UNTYPED_CHANGED
+                return
+            assert refused is None, f"{_UNTYPED_CHANGED}: {refused}"
+            refused = await _refusal(client, f"CREATE tdl_raw:1 SET v = {value} RETURN NONE;")
+            if isinstance(expected, _Refused):
+                assert refused is not None and expected.reason in refused, _UNTYPED_CHANGED
+                assert await client.query("SELECT VALUE v FROM tdl_raw;", {}) == [], _UNTYPED_CHANGED
+                return
+            assert refused is None, f"{_UNTYPED_CHANGED}: {refused}"
+            assert await client.query("SELECT VALUE v FROM tdl_raw:1;", {}) == [expected], _UNTYPED_CHANGED
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_write_naming_an_undeclared_field(self, kind: str) -> None:
+        """A record stored before the table became ``SCHEMAFULL`` reads back unchanged after ``define_table()``; its
+        next ``merge()`` is refused on SurrealDB 3.x (the field it holds is not defined) and drops that field before 3.
+        A ``merge()`` naming a key the model does not declare: refused on 3.x, dropped before 3 — the README 2.x/3.x row
+        on a write naming a field a ``SCHEMAFULL`` table does not define."""
+        async with _tdl(kind) as client:
+            major = await _major(client)
+            await _apply_ddl(client, "CREATE tdl_note:n1 SET body = 'b', extra = {k: 1}, gone = 'g' RETURN NONE;")
+            before = await client.query("SELECT * FROM tdl_note:n1;", {})
+            await TdlNoteStrict.define_table()
+            assert await client.query("SELECT * FROM tdl_note:n1;", {}) == before
+
+            note = await TdlNoteStrict.objects().get("n1")
+            if major >= 3:
+                with pytest.raises(InternalError, match="no such field exists") as refused:
+                    await note.merge(body="c")
+                assert type(refused.value) is InternalError, _UNDECLARED_CHANGED
+                assert await client.query("SELECT * FROM tdl_note:n1;", {}) == before, _UNDECLARED_CHANGED
+            else:
+                await note.merge(body="c")
+                n1 = [{"id": RecordID("tdl_note", "n1"), "body": "c"}]
+                assert await client.query("SELECT * FROM tdl_note:n1;", {}) == n1, _UNDECLARED_CHANGED
+
+            fresh = TdlNoteStrict(id="n2", body="x")
+            await fresh.save()
+            if major >= 3:
+                with pytest.raises(InternalError, match="no such field exists") as refused:
+                    await fresh.merge(nope=1)
+                assert type(refused.value) is InternalError, _UNDECLARED_CHANGED
+            else:
+                await fresh.merge(nope=1)
+            n2 = [{"id": RecordID("tdl_note", "n2"), "body": "x"}]
+            assert await client.query("SELECT * FROM tdl_note:n2;", {}) == n2, _UNDECLARED_CHANGED
+
+
+# --- define_table(tx=…) ----------------------------------------------------------------------------------------------
+
+
+class _Rollback(Exception):
+    """Raised inside a ``transaction()`` block to roll it back."""
+
+
+#: A definition of ``body`` queued by hand before ``define_table(tx=…)`` in the same block.
+_QUEUED_BODY = "DEFINE FIELD OVERWRITE `body` ON `tdl_note` TYPE string ASSERT $value != '';"
+
+#: The failure of the queued-definition test once ``define_table(tx=…)`` sees a definition queued in its block.
+_QUEUED_SEEN = (
+    "define_table(tx=…) now keeps a definition of the same table or field queued earlier in the block: rewrite the "
+    "README section 35 paragraph 'Transactions, connections and the cache', define_table()'s docstring and this test"
+)
+
+
+class TestTableTransactionsE2E:
+    """``define_table(tx=tx)`` on every engine of both lines, in a buffered transaction (HTTP, SurrealDB 2.x, the
+    embedded engine) or an interactive one (3.x over WebSocket): its reads — ``INFO FOR DB`` and the line — run on the
+    committed state before its statements join the block; the statements apply with the block — at the commit when
+    buffered, in the block when interactive — and not at all when the block raises; a transaction of another
+    connection is refused before any request. A definition of the same table or field queued earlier in the block is
+    not seen by the reads, a documented limit."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_reads_come_first_and_the_block_applies_the_statements(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with _tdl(kind) as client:
+            major = await _major(client)
+            statements = _LOOSE if major >= 3 else _LOOSE_BEFORE_3
+            interactive = kind == "ws" and major >= 3
+            async with SurrealDBConnectionManager.transaction("tdl") as tx:
+                assert tx.is_interactive is interactive
+                calls = _spy(monkeypatch, client)
+                assert await TdlLoose.define_table(tx=tx) == "\n".join(statements)
+                sent = [(method, args[0] if args else None) for method, args in calls]
+                reads = [("query", _INFO), ("query_raw", _INFO), ("version", None)]
+                if interactive:
+                    # Sent at once, through the transaction, after the reads of the committed state.
+                    assert sent == [*reads, *(("query_raw", statement) for statement in statements)]
+                else:
+                    # Queued, after the reads: nothing but the reads has reached the server.
+                    assert sent == reads
+                    assert getattr(tx, "statements", None) == statements
+                monkeypatch.undo()
+                # Outside the block, until the commit, the table does not exist.
+                assert "tdl_loose" not in await _tables(client)
+                await TdlLoose(id="l1", items=[{"k": 1}]).save(tx=tx)
+            fields = _field_states(await _table_info(client, "tdl_loose"))
+            assert {path for path, field in fields.items() if field.flexible} == (set() if major >= 3 else _LOOSE_FLEXIBLE)
+            assert (await TdlLoose.objects().get("l1")).items == [{"k": 1}]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_block_that_raises_applies_nothing(self, kind: str) -> None:
+        async with _tdl(kind) as client:
+            interactive = kind == "ws" and await _major(client) >= 3
+            with pytest.raises(_Rollback):
+                async with SurrealDBConnectionManager.transaction("tdl") as tx:
+                    assert tx.is_interactive is interactive
+                    await TdlLoose.define_table(tx=tx)
+                    raise _Rollback
+            assert "tdl_loose" not in await _tables(client)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_transaction_of_another_connection(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl(kind) as client:
+            _register_tdl(kind, "tdl2")
+            try:
+                async with SurrealDBConnectionManager.transaction("tdl2") as tx:
+                    other = await SurrealDBConnectionManager.get_client("tdl2")
+                    calls = _spy(monkeypatch, client)
+                    other_calls = _spy(monkeypatch, other)
+                    with pytest.raises(SurrealDbError) as raised:
+                        await TdlLoose.define_table(tx=tx)
+                    assert (calls, other_calls) == ([], [])
+                    if not tx.is_interactive:
+                        assert getattr(tx, "statements", None) == []
+                    monkeypatch.undo()
+            finally:
+                await SurrealDBConnectionManager.remove_connection("tdl2")
+            assert type(raised.value) is SurrealDbError
+            assert str(raised.value).startswith(
+                "TdlLoose.define_table() cannot run in this transaction: the transaction belongs to connection 'tdl2' "
+                "and TdlLoose runs on connection 'tdl'."
+            )
+            assert "tdl_loose" not in await _tables(client)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_definition_queued_earlier_in_the_block_is_replaced(self, kind: str) -> None:
+        """A documented limit: ``define_table(tx=…)`` reads the committed definitions, so a definition of the same table
+        or field queued earlier in the block is replaced at commit; a limit to lift. Here the queued ``ASSERT`` on
+        ``body`` is gone once the block commits: the statement built from the committed definition replaced it. README
+        section 35, "Transactions, connections and the cache", says so: define those clauses before the block. The
+        same on a buffered and an interactive transaction."""
+        async with _tdl(kind) as client:
+            await _apply_ddl(client, "DEFINE TABLE tdl_note; DEFINE FIELD body ON tdl_note TYPE string;")
+            interactive = kind == "ws" and await _major(client) >= 3
+            async with SurrealDBConnectionManager.transaction("tdl") as tx:
+                assert tx.is_interactive is interactive
+                await tx.add(_QUEUED_BODY, None)
+                assert await TdlNote.define_table(tx=tx) == "\n".join(_G2), _QUEUED_SEEN
+            body = parse_define_field((await _table_info(client, "tdl_note"))["fields"]["body"]).state
+            assert (body.field_type, body.assertion) == ("string", None), _QUEUED_SEEN

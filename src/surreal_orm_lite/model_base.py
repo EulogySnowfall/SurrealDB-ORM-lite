@@ -1577,7 +1577,9 @@ class BaseSurrealModel(BaseModel):
         ``INFO FOR DB`` and the table guard (:meth:`_guarded_table_statement`) — for a node model TG1 a view, TG2 a
         definition the parser cannot read, TG3 a relation table, and, for a table that exists with ``overwrite=True``,
         TG2 a carried table clause that fails its check; for an edge model ``define_relation()``'s RG1–RG3 —; for a
-        table that exists with ``overwrite=True``, ``INFO FOR TABLE`` and the carried field statements (TG4); then the
+        table that exists with ``overwrite=True``, ``INFO FOR TABLE``; when the table is ``SCHEMAFULL`` once its
+        statement is applied and a column holds ``any``, the line (``client.version()``, once: before SurrealDB 3.x
+        those columns are written ``FLEXIBLE``); the field statements, carried over the stored fields (TG4); then the
         DDL, one statement per call, the table's first — an edge's relation statement, then its data fields, never
         ``in``/``out``.
         """
@@ -1601,17 +1603,25 @@ class BaseSurrealModel(BaseModel):
         declared, kept_mode = clauses.schema_mode, None if state is None else state.schema_mode
         mode = (declared or kept_mode) if overwrite else (kept_mode or declared)
         schemafull = mode == SchemaMode.SCHEMAFULL.value
+        # On a SCHEMAFULL table, SurrealDB 2.x and the embedded engine (whose version() answers the SDK's 2.x version)
+        # empty an object or an array held by an ``any`` column unless it is FLEXIBLE, which 3.x refuses there: the
+        # line is read once, outside any transaction, and only when such a column exists.
+        before_3 = (
+            schemafull and any(column.holds_any for column in columns) and _time_travel.line_major(await client.version()) < 3
+        )
         field_statements: list[str] = []
         for column in columns:
             if column.path in stored:
                 field = stored[column.path]
                 statement = (
-                    None if field is None else field_statement_keeping(table, column, schemafull=schemafull, stored=field)
+                    None
+                    if field is None
+                    else field_statement_keeping(table, column, schemafull=schemafull, stored=field, before_3=before_3)
                 )
                 if statement is None:
                     raise SurrealDbError(table_refused("TG4", name, table, method=method, field=".".join(column.path)))
             else:
-                statement = field_statement(table, column, overwrite=overwrite, schemafull=schemafull)
+                statement = field_statement(table, column, overwrite=overwrite, schemafull=schemafull, before_3=before_3)
             field_statements.append(statement)
         await apply_ddl_statements([table_statement], client=client, tx=tx, what="table", classify=True, subjects=[repr(table)])
         await apply_ddl_statements(
@@ -1633,8 +1643,9 @@ class BaseSurrealModel(BaseModel):
 
         On the model's connection (the ``using()`` block's, else ``SurrealConfigDict(connection=…)``, else
         ``"default"``), sends ``INFO FOR DB`` once and, for a table that exists, ``INFO FOR TABLE`` once — committed
-        state, outside any transaction —, then one statement per call: the ``DEFINE TABLE`` statement, then one
-        ``DEFINE FIELD`` per column (:meth:`table_ddl`), parents before children. On a new table it sends
+        state, outside any transaction —, ``client.version()`` once when ``FLEXIBLE`` depends on the line (below), then
+        one statement per call: the ``DEFINE TABLE`` statement, then one ``DEFINE FIELD`` per column
+        (:meth:`table_ddl`), parents before children. On a new table it sends
         :meth:`table_ddl`'s statements, and ``"\\n".join(Model.table_ddl())`` is what it returns (on SurrealDB 2.x and
         the embedded engine it may add ``FLEXIBLE``, below). Safe to call at application start-up: each call converges
         the table onto the model.
@@ -1666,7 +1677,11 @@ class BaseSurrealModel(BaseModel):
         declared mode, else the stored one (with ``overwrite=False``, the stored one first) —: on the columns holding a
         free-form object (a ``dict``, a record model, a sub-model with ``extra="allow"``), those of
         ``flexible_fields``, those stored ``FLEXIBLE`` whose kind holds an object, and, on SurrealDB 2.x and the
-        embedded engine, those holding ``any``, whose values those engines would otherwise empty.
+        embedded engine, those holding ``any`` — an ``Any``, an untyped ``list`` or ``set`` and its item definition
+        (``bag.*``), at any depth —, whose objects and arrays those engines would otherwise empty. SurrealDB 3.x keeps
+        those values without it and refuses ``FLEXIBLE`` on such a column, so the line is read from
+        ``client.version()`` — once, outside any transaction, and only when the table is ``SCHEMAFULL`` and a column
+        holds ``any``; a version that cannot be read counts as 3.x.
 
         A view model applies :meth:`define_view` (its guards included) and returns its statement. An edge model
         applies its relation statement — the table guard of ``define_relation()``, naming ``define_table()`` — then
