@@ -1154,6 +1154,13 @@ _KIND_ROWS: list[tuple[str, Any, str]] = [
     ("union-tuple-and-list", tuple[int, str] | list[str], "array"),
     ("union-two-tuple-ellipsis", tuple[int, ...] | tuple[str, ...], "array"),
     ("list-of-union-list-and-dict", list[list[int] | dict[str, Any]], "array<array | object>"),
+    # … an object item of such a container becomes an ``any`` item: the kind holds no object any more.
+    ("union-list-of-dicts-and-list", list[dict[str, Any]] | list[str], "array"),
+    ("union-list-of-models-and-list", list[TdlAddress] | list[int], "array"),
+    ("union-tuple-with-dict-and-list", tuple[dict[str, Any], int] | list[str], "array"),
+    ("union-set-and-list-of-dicts", set[int] | list[dict[str, Any]], "array"),
+    ("list-of-union-list-of-dicts-and-list", list[list[dict[str, Any]] | list[str]], "array<array>"),
+    ("tuple-of-union-list-of-dicts-and-list", tuple[list[dict[str, Any]] | list[str], int], "[array, int]"),
     # … and the unions SurrealDB takes as written.
     ("union-untyped-list-and-dict", list | dict[str, Any], "array | object"),  # type: ignore[type-arg]
     ("union-tuple-and-dict", tuple[int, str] | dict[str, Any], "[int, string] | object"),
@@ -1354,6 +1361,49 @@ class TestColumns:
             (("two", "*"), "any", False, None),
             (("c",), "option<array | object>", True, None),
             (("c", "*"), "any", False, None),
+        ]
+
+    def test_the_union_columns(self) -> None:
+        """A union keeps ``free_object`` only while its kind holds an object: ``list[dict[str, Any]] | list[str]`` is
+        written ``array`` (its items ``any``), which holds none, so a ``SCHEMAFULL`` table does not write it
+        ``FLEXIBLE`` — SurrealDB 3.x refuses ``FLEXIBLE`` on a kind without an object."""
+        assert _rows(TdlUnions) == [
+            (("dl",), "object | array", True, None),
+            (("dl", "*"), "any", False, None),
+            (("two",), "array", False, None),
+            (("two", "*"), "any", False, None),
+            (("c",), "option<array | object>", True, None),
+            (("c", "*"), "any", False, None),
+            (("sd",), "array | object", True, None),
+            (("sd", "*"), "any", False, None),
+            (("tl",), "array", False, None),
+            (("tl", "*"), "any", False, None),
+            (("nl",), "array<array | object>", True, None),
+            (("nl", "*", "*"), "any", False, None),
+            (("lds",), "array", False, None),
+            (("lds", "*"), "any", False, None),
+            (("nls",), "array<array>", False, None),
+            (("nls", "*", "*"), "any", False, None),
+            (("tdl",), "option<[array, int]>", False, None),
+        ]
+
+        class TdlUnionItems(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="tdl_union_items")
+
+            lms: list[TdlAddress] | list[int]
+            sdl: set[int] | list[dict[str, Any]]
+            tds: tuple[dict[str, Any], int] | list[str]
+            mm: list[TdlAddress] | TdlAddress
+
+        assert _rows(TdlUnionItems) == [
+            (("lms",), "array", False, None),
+            (("lms", "*"), "any", False, None),
+            (("sdl",), "array", False, None),
+            (("sdl", "*"), "any", False, None),
+            (("tds",), "array", False, None),
+            (("tds", "*"), "any", False, None),
+            (("mm",), "array | object", True, None),
+            (("mm", "*"), "any", False, None),
         ]
 
     def test_item_definitions(self) -> None:
@@ -4109,6 +4159,9 @@ class TdlUnions(BaseSurrealModel):
     sd: set[int] | dict[str, Any] = Field(default_factory=set)
     tl: tuple[int, str] | list[str] = Field(default_factory=list)
     nl: list[list[int] | dict[str, Any]] = Field(default_factory=list)
+    lds: list[dict[str, Any]] | list[str] = Field(default_factory=list)
+    nls: list[list[dict[str, Any]] | list[str]] = Field(default_factory=list)
+    tdl: tuple[list[dict[str, Any]] | list[str], int] | None = None
 
 
 class TdlUnionsStrict(TdlUnions):
@@ -4132,6 +4185,33 @@ _UNION_COLUMNS = [
     "DEFINE FIELD OVERWRITE `tl`.* ON `tdl_unions` TYPE any;",
     "DEFINE FIELD OVERWRITE `nl` ON `tdl_unions` TYPE array<array | object>;",
     "DEFINE FIELD OVERWRITE `nl`.*.* ON `tdl_unions` TYPE any;",
+    "DEFINE FIELD OVERWRITE `lds` ON `tdl_unions` TYPE array;",
+    "DEFINE FIELD OVERWRITE `lds`.* ON `tdl_unions` TYPE any;",
+    "DEFINE FIELD OVERWRITE `nls` ON `tdl_unions` TYPE array<array>;",
+    "DEFINE FIELD OVERWRITE `nls`.*.* ON `tdl_unions` TYPE any;",
+    "DEFINE FIELD OVERWRITE `tdl` ON `tdl_unions` TYPE option<[array, int]>;",
+]
+
+#: ``TdlUnionsStrict.table_ddl()``'s column statements: ``FLEXIBLE`` only where the kind still holds an object —
+#: SurrealDB 3.x refuses it on ``array``, ``array<array>`` and ``[array, int]``.
+_UNION_COLUMNS_STRICT = [
+    "DEFINE FIELD OVERWRITE `dl` ON `tdl_unions` TYPE object | array FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `dl`.* ON `tdl_unions` TYPE any;",
+    "DEFINE FIELD OVERWRITE `two` ON `tdl_unions` TYPE array;",
+    "DEFINE FIELD OVERWRITE `two`.* ON `tdl_unions` TYPE any;",
+    "DEFINE FIELD OVERWRITE `c` ON `tdl_unions` TYPE option<array | object> FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `c`.* ON `tdl_unions` TYPE any;",
+    "DEFINE FIELD OVERWRITE `sd` ON `tdl_unions` TYPE array | object FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `sd`.* ON `tdl_unions` TYPE any;",
+    "DEFINE FIELD OVERWRITE `tl` ON `tdl_unions` TYPE array;",
+    "DEFINE FIELD OVERWRITE `tl`.* ON `tdl_unions` TYPE any;",
+    "DEFINE FIELD OVERWRITE `nl` ON `tdl_unions` TYPE array<array | object> FLEXIBLE;",
+    "DEFINE FIELD OVERWRITE `nl`.*.* ON `tdl_unions` TYPE any;",
+    "DEFINE FIELD OVERWRITE `lds` ON `tdl_unions` TYPE array;",
+    "DEFINE FIELD OVERWRITE `lds`.* ON `tdl_unions` TYPE any;",
+    "DEFINE FIELD OVERWRITE `nls` ON `tdl_unions` TYPE array<array>;",
+    "DEFINE FIELD OVERWRITE `nls`.*.* ON `tdl_unions` TYPE any;",
+    "DEFINE FIELD OVERWRITE `tdl` ON `tdl_unions` TYPE option<[array, int]>;",
 ]
 
 
@@ -4140,10 +4220,18 @@ class TestUnionContainersE2E:
     ``list[int] | list[str]``): every ORM write is accepted after ``define_table()`` and reads back equal, on every engine
     of both lines and in both table modes. Written as SurrealDB reads it, ``object | array<string>`` would make it
     derive the item definition ``dl.*`` ``TYPE string`` and refuse ``{"k": 1}``; 2.x and the embedded engine would
-    refuse ``["a"]`` in ``array<int> | array<string>``."""
+    refuse ``["a"]`` in ``array<int> | array<string>``. A list of objects in such a union (``lds``, ``nls``, ``tdl``)
+    becomes an ``array`` holding no object: no ``FLEXIBLE`` on 3.x, which refuses it there, and its nested objects
+    are kept."""
 
     def test_the_statements(self) -> None:
         assert TdlUnions.table_ddl() == ["DEFINE TABLE OVERWRITE `tdl_unions` TYPE NORMAL;", *_UNION_COLUMNS]
+
+    def test_the_schemafull_statements(self) -> None:
+        assert TdlUnionsStrict.table_ddl() == [
+            "DEFINE TABLE OVERWRITE `tdl_unions` TYPE NORMAL SCHEMAFULL;",
+            *_UNION_COLUMNS_STRICT,
+        ]
 
     @pytest.mark.parametrize("kind", _KINDS)
     @pytest.mark.parametrize("model", [TdlUnions, TdlUnionsStrict], ids=["schemaless", "schemafull"])
@@ -4158,12 +4246,26 @@ class TestUnionContainersE2E:
                 sd={"q": {"r": 1}},
                 tl=(1, "s"),
                 nl=[{"k": "s"}, [1, 2]],
+                lds=[{"a": {"b": 1}}, {"c": [{"d": "e"}]}],
+                nls=[[{"k": {"m": 1}}], ["s"]],
+                tdl=([{"a": {"b": 1}}], 2),
             )
             sent = first.model_dump()
             await first.save()
             assert (await model.objects().get("u1")).model_dump() == sent
 
-            second = model(id="u2", dl=["a"], two=[1, 2], c=[1, 2], sd={1, 2}, tl=["a", "b"], nl=[[3], {"q": [1]}])
+            second = model(
+                id="u2",
+                dl=["a"],
+                two=[1, 2],
+                c=[1, 2],
+                sd={1, 2},
+                tl=["a", "b"],
+                nl=[[3], {"q": [1]}],
+                lds=["a"],
+                nls=[["x", "y"]],
+                tdl=(["s"], 1),
+            )
             sent = second.model_dump()
             await second.save()
             assert (await model.objects().get("u2")).model_dump() == sent
@@ -4174,6 +4276,9 @@ class TestUnionContainersE2E:
             first.sd = {3}
             first.tl = ["c"]
             first.nl = [{"m": {"o": 1}}]
+            first.lds = [{"x": 1}]
+            first.nls = [[{"q": {"r": [1]}}]]
+            first.tdl = None
             sent = first.model_dump()
             await first.update()
             assert (await model.objects().get("u1")).model_dump() == sent

@@ -192,7 +192,9 @@ def _untyped_containers(members: tuple[Kind, ...]) -> tuple[Kind, ...]:
 def _union(mapped: Iterable[tuple[Kind, bool]]) -> tuple[Kind, bool]:
     """The kind of a union: its members' kinds joined, ``any`` when one is ``any`` (``option<any>`` and ``object | any``
     are parse errors), ``number`` for exactly ``int``, ``float`` and ``decimal``; an array or a set with an ``object`` or
-    another array, set or tuple makes each of those ``array`` (:func:`_untyped_containers`)."""
+    another array, set or tuple makes each of those ``array`` (:func:`_untyped_containers`). Free-form when a member
+    is and the joined kind still holds an object: ``list[dict[str, Any]] | list[str]`` is ``array``, whose ``object``
+    items became ``any``, and SurrealDB 3.x refuses ``FLEXIBLE`` on a kind without one."""
     kinds: list[Kind] = []
     free = False
     for kind, member_free in mapped:
@@ -205,7 +207,7 @@ def _union(mapped: Iterable[tuple[Kind, bool]]) -> tuple[Kind, bool]:
     if len(rest) == len(_NUMBER_MEMBERS) and {render_kind(member) for member in rest} == _NUMBER_MEMBERS:
         number = KName("number")
         joined = KUnion((_NONE, number)) if len(rest) < len(_members(joined)) else number
-    return joined, free
+    return joined, free and holds_object(joined)
 
 
 def _literal_kind(value: Any) -> Kind | None:

@@ -5462,7 +5462,9 @@ Anything else is `any`.
   `dict[str, Any] | list[str]` is `object | array` with `dl.*` `TYPE any`, `list[int] | list[str]` is `array`.
   SurrealDB derives a single item type from such a union and applies it to every member, so `object | array<string>`
   would refuse `{"k": 1}`, and SurrealDB 2.x `array<int> | array<string>` would refuse `["a"]`. A set in such a union is
-  stored as the array the ORM writes, and reads back as the declared set.
+  stored as the array the ORM writes, and reads back as the declared set. The objects of such a list become `any`
+  items: `list[dict[str, Any]] | list[str]` is `array`, which holds no object, so it is not a free-form object column
+  (SurrealDB 3.x refuses `FLEXIBLE` on it) and its item definition keeps the nested objects.
 - **`FLEXIBLE`**, written after `TYPE`, only on a table that is `SCHEMAFULL`: on a free-form object column (a `dict`,
   a record model, a sub-model with `extra="allow"`), on the fields of `flexible_fields` or
   `json_schema_extra={"flexible": True}`, and, on SurrealDB 2.x and the embedded engine, on the columns that hold `any`
