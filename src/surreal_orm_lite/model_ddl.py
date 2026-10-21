@@ -40,7 +40,7 @@ from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from enum import Enum
+from enum import Enum, Flag
 from types import NoneType, UnionType
 from typing import Annotated, Any, Literal, Union, get_args, get_origin
 from uuid import UUID
@@ -260,10 +260,22 @@ def _enum(cls: type[Enum]) -> Kind:
     return _ANY if any(member is None for member in members) else _join(member for member in members if member is not None)
 
 
+def _flag(cls: type[Flag]) -> Kind:
+    """An ``enum.Flag`` (``IntFlag`` included): ``int``, since Pydantic accepts any combination of its members and zero,
+    which a union of the members' literals would refuse; ``any`` when a member's value — aliases and multi-bit members
+    included, which iterating the class skips — is not an ``int`` or is a ``bool``. A flag without members is ``int``."""
+    values = [member.value for member in cls.__members__.values()]
+    if any(isinstance(value, bool) or not isinstance(value, int) for value in values):
+        return _ANY
+    return KName("int")
+
+
 def _class(cls: type) -> tuple[Kind, bool]:
     """A class used as a whole annotation (``list``, ``dict`` and ``set`` bare)."""
     if _is_record_model(cls) or issubclass(cls, BaseModel) or issubclass(cls, Mapping):
         return _OBJECT, True
+    if issubclass(cls, Flag):  # before ``Enum``, of which a flag is one (and ``IntFlag`` an ``int`` too)
+        return _flag(cls), False
     if issubclass(cls, Enum):
         return _enum(cls), False
     named: tuple[tuple[type | tuple[type, ...], str], ...] = (
@@ -354,16 +366,17 @@ def field_kind(annotation: Any, metadata: Iterable[Any] = ()) -> Kind:
     exactly ``int``, ``float`` and ``Decimal`` ``number``; ``datetime`` and ``date`` ``datetime``; ``timedelta``, the
     ORM's and the SDK's ``Duration`` ``duration``; ``UUID`` ``uuid``; ``bytes``; ``RecordID`` ``record``; a geometry
     field or class ``geometry<…>`` (its kinds in SurrealDB's order, bare ``geometry`` for every kind); ``Range``
-    ``range``; ``Literal[…]`` the union of its ``str`` and ``int`` values (``bool`` as ``bool``, ``None`` as
-    ``none``, any other value ``any``); an enum whose values are all ``str``, or all ``int``, the union of its
-    values; ``list[T]``, ``Sequence[T]``, ``tuple[T, ...]`` ``array<T>``; ``tuple[A, B]`` ``[A, B]``; ``set[T]``,
-    ``frozenset[T]`` ``set<T>``; ``array`` and ``set`` when ``T`` is absent or ``any``; a mapping, a Pydantic model and
-    a record model ``object``; ``X | None`` ``option<X>``; a union its members de-duplicated, ``any`` when one is
-    ``any``, and each array, set and tuple ``array`` when it holds an array or a set together with an ``object`` or
-    another array, set or tuple (``dict[str, Any] | list[str]`` ``object | array``, ``list[int] | list[str]``
-    ``array``: SurrealDB would derive one item kind for all of them and refuse a value the model accepts; the
-    ``array``'s items get ``TYPE any`` in ``model_columns()``); ``Any``, ``object`` and every other type (the SDK's
-    ``Datetime`` included) ``any``. Pure.
+    ``range``; ``Literal[…]`` the union of its ``str`` and ``int`` values (``bool`` as ``bool``, ``None`` as ``none``,
+    any other value ``any``); an ``enum.Flag`` (``IntFlag`` included) ``int``, since Pydantic accepts any combination of
+    its members and zero (``any`` when a member's value is not an ``int``); an enum whose values are all ``str``, or all
+    ``int``, the union of its values; ``list[T]``, ``Sequence[T]``, ``tuple[T, ...]`` ``array<T>``; ``tuple[A, B]``
+    ``[A, B]``; ``set[T]``, ``frozenset[T]`` ``set<T>``; ``array`` and ``set`` when ``T`` is absent or ``any``; a
+    mapping, a Pydantic model and a record model ``object``; ``X | None`` ``option<X>``; a union its members
+    de-duplicated, ``any`` when one is ``any``, and each array, set and tuple ``array`` when it holds an array or a set
+    together with an ``object`` or another array, set or tuple (``dict[str, Any] | list[str]`` ``object | array``,
+    ``list[int] | list[str]`` ``array``: SurrealDB would derive one item kind for all of them and refuse a value the
+    model accepts; the ``array``'s items get ``TYPE any`` in ``model_columns()``); ``Any``, ``object`` and every other
+    type (the SDK's ``Datetime`` included) ``any``. Pure.
     """
     return _map(annotation, tuple(metadata))[0]
 

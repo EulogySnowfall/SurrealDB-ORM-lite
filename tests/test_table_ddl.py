@@ -24,9 +24,9 @@ effect in ``define_table()`` (v0.34.0), ``ModelFactory`` comes in v0.40.0.
 
 The kinds (``TestKinds``): ``model_ddl.field_kind()`` maps each annotation to the SurrealQL kind its column is defined
 with, written by ``render_kind()`` — the scalar types, ``int | float | Decimal`` as ``number``, geometry fields,
-literals and ``str`` or ``int`` enums as literal unions, arrays, tuples, sets, free-form objects, ``option<…>`` for
-``None``, ``any`` for ``Any`` and every type without a SurrealQL counterpart. ``holds_object()``, ``holds_any()`` and
-``untyped_arrays()`` read a kind.
+literals and ``str`` or ``int`` enums as literal unions, flags as ``int``, arrays, tuples, sets, free-form objects,
+``option<…>`` for ``None``, ``any`` for ``Any`` and every type without a SurrealQL counterpart. ``holds_object()``,
+``holds_any()`` and ``untyped_arrays()`` read a kind.
 
 The columns (``TestColumns``): ``model_ddl.model_columns()`` lists, in declaration order, every column an ORM write
 may send — the fields but ``id``, an edge's ``in_``/``out`` and ``Field(exclude=True)``, then the Pydantic computed
@@ -72,7 +72,8 @@ The ORM's writes (``TestOrmWritesE2E``): on a ``SCHEMAFULL`` table defined by a 
 every kind, a typed computed field ``tot`` — every write path is accepted and every field reads back equal to what
 the write sent, and the computed field reads ``i + 1`` after each write; the same on the table its ``define_table()``
 defines, with an object and an array in its ``Any`` column; SurrealDB 3.1 refuses the ORM's ``set`` value, which is
-pinned there.
+pinned there. An ``IntFlag`` column (``TestFlagsE2E``) is ``int``: after ``define_table()``, a combination of its
+members and zero read back equal on every engine of both lines, in both table modes.
 
 Applying (``TestDefineTable``, ``TestTableGuard``, on fake clients): ``define_table()`` reads ``INFO FOR DB`` once —
 and ``INFO FOR TABLE`` once for a table that exists, with ``overwrite=True`` — then sends one statement per call: the
@@ -167,7 +168,7 @@ from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
-from enum import Enum, IntEnum, StrEnum
+from enum import Enum, Flag, IntEnum, IntFlag, StrEnum, auto
 from pathlib import Path
 from types import MappingProxyType, ModuleType
 from typing import Annotated, Any, ClassVar, Literal, TypeVar
@@ -953,6 +954,37 @@ class TdlNoMembers(Enum):
     """An enum without members: no literal union, ``any``."""
 
 
+class TdlPerm(IntFlag):
+    """An ``IntFlag``: Pydantic accepts any combination of its members, and zero, so ``int``."""
+
+    READ = 1
+    WRITE = 2
+    EXEC = 4
+
+
+class TdlFlag(Flag):
+    """A plain ``enum.Flag`` with ``auto()`` values: ``int``."""
+
+    A = auto()
+    B = auto()
+
+
+class TdlStrFlag(Flag):
+    """A ``Flag`` holding a ``str`` value: ``any``."""
+
+    A = "a"
+
+
+class TdlBoolFlag(Flag):
+    """A ``Flag`` holding a ``bool`` value: ``any``."""
+
+    A = True
+
+
+class TdlNoFlags(Flag):
+    """A ``Flag`` without members: Pydantic accepts zero and any ``int``, so ``int``."""
+
+
 class TdlStr(str):
     """A ``str`` subclass that is not an enum."""
 
@@ -1125,6 +1157,12 @@ _KIND_ROWS: list[tuple[str, Any, str]] = [
     ("int-enum", TdlLevel, "1 | 2"),
     ("mixed-enum", TdlMixed, "any"),
     ("float-enum", TdlRatio, "any"),
+    ("int-flag", TdlPerm, "int"),
+    ("flag", TdlFlag, "int"),
+    ("optional-int-flag", TdlPerm | None, "option<int>"),
+    ("str-flag", TdlStrFlag, "any"),
+    ("bool-flag", TdlBoolFlag, "any"),
+    ("empty-flag", TdlNoFlags, "int"),
     ("list-of-str", list[str], "array<string>"),
     ("list", list, "array"),
     ("list-of-any", list[Any], "array"),
@@ -2126,6 +2164,28 @@ class TestTableDdl:
         with pytest.raises(ValueError) as raised:
             TdlFlexAge.table_ddl()
         assert str(raised.value) == _fx1("TdlFlexAge", "age", "int")
+
+    def test_a_flag_column_is_int(self) -> None:
+        """An ``enum.Flag`` or ``IntFlag`` column is ``int``, its ``DEFAULT`` the member's value: a single member, a
+        combination or zero."""
+
+        class TdlFlagDefaults(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="tdl_flag_defaults")
+
+            perm: TdlPerm = TdlPerm.READ
+            both: TdlPerm = TdlPerm.READ | TdlPerm.WRITE
+            nothing: TdlPerm = TdlPerm(0)
+            maybe: TdlPerm | None = None
+            plain: TdlFlag = TdlFlag.B
+
+        assert TdlFlagDefaults.table_ddl() == [
+            "DEFINE TABLE OVERWRITE `tdl_flag_defaults` TYPE NORMAL;",
+            "DEFINE FIELD OVERWRITE `perm` ON `tdl_flag_defaults` TYPE int DEFAULT 1;",
+            "DEFINE FIELD OVERWRITE `both` ON `tdl_flag_defaults` TYPE int DEFAULT 3;",
+            "DEFINE FIELD OVERWRITE `nothing` ON `tdl_flag_defaults` TYPE int DEFAULT 0;",
+            "DEFINE FIELD OVERWRITE `maybe` ON `tdl_flag_defaults` TYPE option<int>;",
+            "DEFINE FIELD OVERWRITE `plain` ON `tdl_flag_defaults` TYPE int DEFAULT 2;",
+        ]
 
     async def test_no_connection_needed(self) -> None:
         await SurrealDBConnectionManager.unset_connection()
@@ -4332,6 +4392,40 @@ class TestOrmWritesE2E:
                 return
             await kitchen.save()
             assert (await _read_back(TdlKitchen, "k1", kitchen)).st == {1, 2, 3}
+
+
+class TdlFlags(BaseSurrealModel):
+    """An ``IntFlag`` column, on a table in SurrealDB's default mode (``SCHEMALESS``)."""
+
+    model_config = SurrealConfigDict(table_name="tdl_flags", connection="tdl")
+
+    id: str | None = None
+    perm: TdlPerm = TdlPerm.READ
+
+
+class TdlFlagsStrict(TdlFlags):
+    """``TdlFlags`` on a ``SCHEMAFULL`` table."""
+
+    model_config = SurrealConfigDict(table_name="tdl_flags", schema_mode=SchemaMode.SCHEMAFULL, connection="tdl")
+
+
+class TestFlagsE2E:
+    """An ``IntFlag`` column is ``TYPE int``: after ``define_table()``, a combination of members and zero — values
+    Pydantic accepts and the ORM sends — are accepted and read back equal, on every engine of both lines and in both
+    table modes (a literal union of the members would refuse them). A plain ``enum.Flag`` has no round trip here: its
+    members are neither ``str`` nor ``int`` instances, which the SDK cannot encode, with or without DDL."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("model", [TdlFlags, TdlFlagsStrict], ids=["schemaless", "schemafull"])
+    async def test_combinations_and_zero_round_trip(self, kind: str, model: type[TdlFlags]) -> None:
+        async with _tdl(kind):
+            applied = (await model.define_table()).split("\n")
+            assert "DEFINE FIELD OVERWRITE `perm` ON `tdl_flags` TYPE int DEFAULT 1;" in applied
+            for record, perm, value in (("both", TdlPerm.READ | TdlPerm.WRITE, 3), ("zero", TdlPerm(0), 0)):
+                await model(id=record, perm=perm).save()
+                got = await model.objects().get(record)
+                assert type(got.perm) is TdlPerm, record
+                assert got.perm == perm and int(got.perm) == value, record
 
 
 class TdlUnions(BaseSurrealModel):
