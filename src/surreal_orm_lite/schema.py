@@ -1460,10 +1460,11 @@ def relation_table_refused(
     model: str,
     table: str,
     *,
-    method: Literal["define_relation", "define_table"] = "define_relation",
+    method: Literal["define_relation", "define_table", "define_access"] = "define_relation",
 ) -> str:
     """The refusals of an edge model's table guard (v0.33.0): the text of *guard* for the edge model *model* on
-    *table*, naming *method* — ``define_relation()``, or ``define_table()`` when it is the caller (v0.34.0). Pure.
+    *table*, naming *method* — ``define_relation()``, or ``define_table()`` (``define_access()``) when it is the caller
+    (v0.34.0). Pure.
 
     - ``RG1``: the table is a materialized view, whose query the ``OVERWRITE`` would drop;
     - ``RG2``: the table's definition cannot be read, or a stored value fails its check

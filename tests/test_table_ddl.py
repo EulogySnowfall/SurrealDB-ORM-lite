@@ -87,6 +87,21 @@ every clause, field clause, index, event, view, record, live query and change-fe
 ``DROP`` table its ``DROP``, a ``server_fields`` column the database's ``DEFAULT``; a ``COMPUTED`` field (SurrealDB
 3.x) stays ``COMPUTED`` and its records keep their value; a view or a relation table under a node model is left as it
 is; a record user gets the refusal of the first read and nothing else is sent.
+
+Edge and view models (``TestEdgeAndViewDdl``, ``TestViewRefusal``, on fake clients): ``relation_ddl()`` and
+``view_ddl()`` write the clauses the model declares, as its ``table_ddl()`` does, and nothing more for a model without
+them. ``define_relation()`` of an edge model declaring ``SCHEMAFULL`` with data fields is refused before any request —
+it defines no field —, and otherwise writes the declared clauses and keeps the stored ones. ``define_table()`` of an
+edge model applies its relation statement, under ``define_relation()``'s guard naming ``define_table()``, then its data
+fields over their stored definitions, never ``in``/``out``; of a view model, ``define_view()``'s statement, a ``str``.
+``define_view()`` over a stored view keeps the clauses the model does not declare, and a refusal quoting its statement
+is left out exactly when the statement writes ``PERMISSIONS`` (declared, ``permissions={}`` included, or kept).
+
+On the engines (``TestEdgeAndViewE2E``): the edge and view statements applied raw are read back; ``define_relation()``
+writes the declared comment and permissions and keeps the change feed; ``define_table()`` of an edge defines its data
+field, which an edge then carries, and refuses a view or, with ``overwrite=False``, an ordinary table; ``define_view()``
+keeps a view's clauses set by hand unless declared; ``define_table()`` of a view model equals ``define_view()`` and keeps
+its guard over a table holding records.
 """
 
 import ast
@@ -4194,3 +4209,591 @@ class TestTablePermissionsE2E:
         assert type(raised.value) is SurrealDbAuthenticationError
         assert str(raised.value).startswith("Can't apply table definition: 'tdl_note' -> ")
         assert "not enough permissions" in str(raised.value).lower()
+
+
+# --- edge and view models: the clauses they declare -----------------------------------------------------------------
+
+
+class TdlLikes(BaseSurrealEdge):
+    """G7: an edge model declaring ``SCHEMAFULL`` and permissions, with a data field."""
+
+    model_config = SurrealConfigDict(
+        table_name="tdl_likes",
+        relation_in="tdl_person",
+        relation_out="tdl_note",
+        schema_mode=SchemaMode.SCHEMAFULL,
+        permissions={"select": "FULL"},
+        connection="tdl",
+    )
+
+    stars: int = 1
+
+
+class TdlFollows(BaseSurrealEdge):
+    """G7b: an edge model declaring a comment and permissions, and no schema mode."""
+
+    model_config = SurrealConfigDict(
+        table_name="tdl_follows",
+        relation_in="tdl_person",
+        relation_out="tdl_person",
+        comment="Follows",
+        permissions={"select": "FULL"},
+        connection="tdl",
+    )
+
+    since: int = 0
+
+
+class TdlStats(BaseSurrealModel):
+    """G8: a view model declaring a comment and permissions."""
+
+    model_config = SurrealConfigDict(
+        table_name="tdl_stats", view_query=_VIEW_QUERY, comment="Counts", permissions={"select": "FULL"}, connection="tdl"
+    )
+
+    n: int = 0
+
+
+class TdlStatsOwned(BaseSurrealModel):
+    """A view model whose permission rule the refusal of its statement may quote."""
+
+    model_config = SurrealConfigDict(
+        table_name="tdl_stats",
+        view_query=_VIEW_QUERY,
+        permissions={"select": "WHERE $auth.id = owner_of_view"},
+        connection="tdl",
+    )
+
+    n: int = 0
+
+
+class TdlStatsClosed(BaseSurrealModel):
+    """A view model declaring ``permissions={}``: its statement writes ``PERMISSIONS NONE``."""
+
+    model_config = SurrealConfigDict(table_name="tdl_stats", view_query=_VIEW_QUERY, permissions={}, connection="tdl")
+
+    n: int = 0
+
+
+class TdlPersonNode(BaseSurrealModel):
+    """A node of ``tdl_person``, the ``IN`` table of the edge models."""
+
+    model_config = SurrealConfigDict(table_name="tdl_person", connection="tdl")
+
+    id: str | None = None
+
+
+_G7 = [
+    "DEFINE TABLE OVERWRITE `tdl_likes` TYPE RELATION IN `tdl_person` OUT `tdl_note` SCHEMAFULL PERMISSIONS FOR select "
+    "FULL, FOR create, update, delete NONE;",
+    "DEFINE FIELD OVERWRITE `stars` ON `tdl_likes` TYPE int DEFAULT 1;",
+]
+_G7B = [
+    "DEFINE TABLE OVERWRITE `tdl_follows` TYPE RELATION IN `tdl_person` OUT `tdl_person` COMMENT 'Follows' PERMISSIONS "
+    "FOR select FULL, FOR create, update, delete NONE;",
+    "DEFINE FIELD OVERWRITE `since` ON `tdl_follows` TYPE int DEFAULT 0;",
+]
+_G8 = (
+    f"DEFINE TABLE OVERWRITE `tdl_stats` AS ({_VIEW_QUERY}) COMMENT 'Counts' PERMISSIONS FOR select FULL, FOR create, "
+    "update, delete NONE;"
+)
+
+#: RG4 for ``TdlLikes``.
+_RG4 = (
+    "TdlLikes.define_relation(): TdlLikes declares SchemaMode.SCHEMAFULL and has data fields ('stars'); define_relation() "
+    "defines no field, and a SCHEMAFULL table refuses (SurrealDB 3.x) or drops (2.x and the embedded engine) the fields "
+    "it does not define. Call TdlLikes.define_table(), which applies the same relation statement and defines them. "
+    "Nothing was defined."
+)
+
+_INFO_LIKES = "INFO FOR TABLE `tdl_likes`;"
+
+#: A relation table ``tdl_likes`` as SurrealDB renders it, with a change feed and a comment; its fields; and the
+#: carried statements ``TdlLikes.define_table()`` sends over it.
+_STORED_LIKES = (
+    "DEFINE TABLE tdl_likes TYPE RELATION IN tdl_person OUT tdl_note SCHEMALESS COMMENT 'keep' CHANGEFEED 1h PERMISSIONS NONE"
+)
+_STORED_LIKES_FIELDS = {
+    "in": "DEFINE FIELD in ON tdl_likes TYPE record<tdl_person> PERMISSIONS FULL",
+    "out": "DEFINE FIELD out ON tdl_likes TYPE record<tdl_note> PERMISSIONS FULL",
+    "stars": "DEFINE FIELD stars ON tdl_likes TYPE int DEFAULT 1 COMMENT 's' PERMISSIONS FULL",
+}
+_LIKES_CARRIED = [
+    "DEFINE TABLE OVERWRITE `tdl_likes` TYPE RELATION IN `tdl_person` OUT `tdl_note` SCHEMAFULL COMMENT 'keep' CHANGEFEED "
+    "1h PERMISSIONS FOR select FULL, FOR create, update, delete NONE;",
+    "DEFINE FIELD OVERWRITE `stars` ON `tdl_likes` TYPE int DEFAULT 1 COMMENT 's';",
+]
+_STORED_LIKES_VIEW = (
+    "DEFINE TABLE tdl_likes TYPE ANY SCHEMALESS AS SELECT count() AS n FROM tdl_note GROUP ALL PERMISSIONS NONE"
+)
+
+#: A relation table ``tdl_follows`` set by hand, and what ``TdlFollows.define_relation()`` sends over it.
+_STORED_FOLLOWS = (
+    "DEFINE TABLE tdl_follows TYPE RELATION IN tdl_person OUT tdl_person SCHEMALESS COMMENT 'old' CHANGEFEED 1h "
+    "PERMISSIONS FULL"
+)
+_FOLLOWS_CARRIED = (
+    "DEFINE TABLE OVERWRITE `tdl_follows` TYPE RELATION IN `tdl_person` OUT `tdl_person` COMMENT 'Follows' CHANGEFEED 1h "
+    "PERMISSIONS FOR select FULL, FOR create, update, delete NONE;"
+)
+
+#: K8's stored view with the clauses ``TdlStats`` declares instead of the stored ones.
+_K8_DECLARED = (
+    f"DEFINE TABLE OVERWRITE `tdl_stats` DROP SCHEMAFULL AS ({_VIEW_QUERY}) COMMENT 'Counts' CHANGEFEED 1h PERMISSIONS "
+    "FOR select FULL, FOR create, update, delete NONE;"
+)
+
+
+def _g1(name: str, table: str) -> str:
+    """G1 of ``define_view()`` (v0.32.0): an ordinary table holding records under a view model."""
+    return (
+        f"{name}.define_view(): the table '{table}' exists, is not a view and holds records; defining the view would "
+        "delete them, with the table's fields, indexes and events. If they are not needed, remove the table first "
+        f'(await {name}.raw_query("REMOVE TABLE `{table}`;")); otherwise give the model another table_name. Nothing was '
+        "defined."
+    )
+
+
+class TestEdgeAndViewDdl:
+    """An edge model's ``relation_ddl()`` and a view model's ``view_ddl()`` write the clauses it declares, as its
+    ``table_ddl()`` does; ``define_relation()`` of an edge model declaring ``SCHEMAFULL`` with data fields is refused
+    before any request; ``define_table()`` of an edge applies its relation statement, guarded as ``define_relation()``'s
+    and naming ``define_table()``, then its data fields; of a view model, ``define_view()``'s statement."""
+
+    def test_g7_an_edge_declaring_schemafull(self) -> None:
+        assert TdlLikes.relation_ddl() == _G7[0]
+        assert TdlLikes.table_ddl() == _G7
+        assert TdlLikes.relation_ddl(overwrite=False) == _if_not_exists(_G7)[0]
+        assert TdlLikes.table_ddl(overwrite=False) == _if_not_exists(_G7)
+
+    def test_g7b_an_edge_without_schema_mode(self) -> None:
+        assert TdlFollows.relation_ddl() == _G7B[0]
+        assert TdlFollows.table_ddl() == _G7B
+        assert TdlFollows.table_ddl(overwrite=False) == _if_not_exists(_G7B)
+
+    def test_g8_a_view(self) -> None:
+        assert TdlStats.view_ddl() == _G8
+        assert TdlStats.table_ddl() == [_G8]
+        assert TdlStats.view_ddl(overwrite=False) == _if_not_exists([_G8])[0]
+        assert TdlStats.table_ddl(overwrite=False) == _if_not_exists([_G8])
+
+    def test_without_the_keys_unchanged(self) -> None:
+        """v0.33.0's and v0.32.0's statements for models without the keys."""
+        assert TdlLikesBare.relation_ddl() == (
+            "DEFINE TABLE OVERWRITE `tdl_likes_bare` TYPE RELATION IN `tdl_person` OUT `tdl_post` | `tdl_book` ENFORCED;"
+        )
+        assert TdlLink.relation_ddl(overwrite=False) == "DEFINE TABLE IF NOT EXISTS `tdl_link` TYPE RELATION;"
+        assert TdlStatsBare.view_ddl() == f"DEFINE TABLE OVERWRITE `tdl_stats` AS ({_VIEW_QUERY});"
+        assert TdlStatsClosed.view_ddl() == f"DEFINE TABLE OVERWRITE `tdl_stats` AS ({_VIEW_QUERY}) PERMISSIONS NONE;"
+
+    @pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "if-not-exists"])
+    async def test_rg4_before_any_request(self, use_client: Callable[[Any], None], overwrite: bool) -> None:
+        client = _TableClient()
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlLikes.define_relation(overwrite=overwrite)
+        assert (type(raised.value), str(raised.value)) == (SurrealDbError, _RG4)
+        assert client.queries == []
+
+    async def test_rg4_names_each_top_level_data_column(self, use_client: Callable[[Any], None]) -> None:
+        """In declaration order, each column under its name in the table (an alias), never a sub-model's field."""
+
+        class TdlRated(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="tdl_rated", schema_mode=SchemaMode.SCHEMAFULL, connection="tdl")
+
+            stars: int = 1
+            note: str = Field(default="", alias="the-note")
+            where: TdlAddress | None = None
+
+        client = _TableClient()
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlRated.define_relation()
+        assert "has data fields ('stars', 'the-note', 'where');" in str(raised.value)
+        assert client.queries == []
+
+    async def test_no_rg4_without_a_data_column_or_a_declared_mode(self, use_client: Callable[[Any], None]) -> None:
+        """A ``SCHEMAFULL`` edge without data columns, and an edge that does not declare its mode, reach the read."""
+
+        class TdlBareFull(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="tdl_bare_full", schema_mode=SchemaMode.SCHEMAFULL, connection="tdl")
+
+        client = _TableClient()
+        use_client(client)
+        statement = "DEFINE TABLE OVERWRITE `tdl_bare_full` TYPE RELATION SCHEMAFULL;"
+        assert await TdlBareFull.define_relation() == statement
+        assert client.queries == [_INFO, statement]
+
+        client = _TableClient()
+        use_client(client)
+        assert await TdlFollows.define_relation() == _G7B[0]
+        assert client.queries == [_INFO, _G7B[0]]
+
+    async def test_define_relation_keeps_what_the_model_does_not_declare(self, use_client: Callable[[Any], None]) -> None:
+        """The declared comment and permissions replace the stored ones; the change feed is kept."""
+        client = _TableClient({"tdl_follows": _STORED_FOLLOWS})
+        use_client(client)
+        assert await TdlFollows.define_relation() == _FOLLOWS_CARRIED
+        assert client.queries == [_INFO, _FOLLOWS_CARRIED]
+
+    async def test_define_table_of_an_edge_on_a_missing_table(self, use_client: Callable[[Any], None]) -> None:
+        """The relation statement, then the data fields — never ``in``/``out`` —, joined with a newline."""
+        client = _TableClient()
+        use_client(client)
+        result = await TdlLikes.define_table()
+        assert isinstance(result, str)
+        assert result == "\n".join(_G7) == "\n".join(TdlLikes.table_ddl())
+        assert client.queries == [_INFO, *_G7]
+        assert client.version_calls == 0
+
+    async def test_define_table_of_an_edge_on_a_relation_table(self, use_client: Callable[[Any], None]) -> None:
+        """The carried relation statement, then each data field over its stored definition; ``in``/``out`` left as
+        SurrealDB defines them."""
+        client = _TableClient({"tdl_likes": _STORED_LIKES}, _STORED_LIKES_FIELDS)
+        use_client(client)
+        assert await TdlLikes.define_table() == "\n".join(_LIKES_CARRIED)
+        assert client.queries == [_INFO, _INFO_LIKES, *_LIKES_CARRIED]
+
+    async def test_define_table_of_an_edge_if_not_exists(self, use_client: Callable[[Any], None]) -> None:
+        """``overwrite=False`` over a relation table: ``IF NOT EXISTS`` statements, no field read."""
+        client = _TableClient({"tdl_likes": _STORED_LIKES}, _STORED_LIKES_FIELDS)
+        use_client(client)
+        assert await TdlLikes.define_table(overwrite=False) == "\n".join(_if_not_exists(_G7))
+        assert client.queries == [_INFO, *_if_not_exists(_G7)]
+
+    @pytest.mark.parametrize(
+        ("stored", "overwrite", "guard"),
+        [
+            (_STORED_LIKES_VIEW, True, "RG1"),
+            (_STORED_LIKES_VIEW, False, "RG1"),
+            ("DEFINE TABLE tdl_likes TYPE", True, "RG2"),
+            (3, False, "RG2"),
+            ("DEFINE TABLE tdl_likes TYPE ANY SCHEMALESS PERMISSIONS NONE", False, "RG3"),
+        ],
+        ids=["rg1-overwrite", "rg1-if-not-exists", "rg2-unparsable", "rg2-not-a-str", "rg3"],
+    )
+    async def test_rg1_to_rg3_name_define_table(
+        self, use_client: Callable[[Any], None], stored: object, overwrite: bool, guard: str
+    ) -> None:
+        client = _TableClient({"tdl_likes": stored})
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlLikes.define_table(overwrite=overwrite)
+        assert (type(raised.value), str(raised.value)) == (SurrealDbError, _RG_DEFINE_TABLE[guard])
+        assert client.queries == [_INFO]
+
+    async def test_rg2_a_carried_rule_through_define_table(self, use_client: Callable[[Any], None]) -> None:
+        class TdlLikes(BaseSurrealEdge):
+            model_config = SurrealConfigDict(table_name="tdl_likes", connection="tdl")
+
+        client = _TableClient(
+            {
+                "tdl_likes": "DEFINE TABLE tdl_likes TYPE ANY SCHEMALESS PERMISSIONS FOR select WHERE a; b, FOR create, "
+                "update, delete NONE"
+            }
+        )
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlLikes.define_table()
+        assert str(raised.value) == _RG_DEFINE_TABLE["RG2"]
+        with pytest.raises(SurrealDbError) as relation:
+            await TdlLikes.define_relation()
+        assert str(relation.value) == _RG_DEFINE_RELATION["RG2"]
+        assert client.queries == [_INFO, _INFO]
+
+    async def test_define_table_of_a_view_model(self, use_client: Callable[[Any], None]) -> None:
+        """``define_view()``'s statement, a ``str``; over a stored view, its carried form."""
+        client = _TableClient()
+        use_client(client)
+        result = await TdlStats.define_table()
+        assert isinstance(result, str)
+        assert result == _G8
+        assert client.queries == [_INFO, _G8]
+
+        client = _TableClient({"tdl_stats": _STORED_VIEW})
+        use_client(client)
+        assert await TdlStatsBare.define_table() == _K8 == await TdlStatsBare.define_view()
+        assert client.queries == [_INFO, _K8] * 2
+
+    @pytest.mark.parametrize("model", [TdlLikes, TdlStats], ids=["edge", "view"])
+    async def test_a_transaction_of_another_connection(
+        self, use_client: Callable[[Any], None], model: type[BaseSurrealModel]
+    ) -> None:
+        client = _TableClient()
+        use_client(client)
+        tx = _QueuingTx("other")
+        with pytest.raises(SurrealDbError) as raised:
+            await model.define_table(tx=tx)  # type: ignore[arg-type]
+        assert str(raised.value).startswith(f"{model.__name__}.define_table() cannot run in this transaction: ")
+        assert client.queries == []
+        assert tx.added == []
+
+    async def test_a_transaction_gets_the_edges_ddl_only(self, use_client: Callable[[Any], None]) -> None:
+        client = _TableClient({"tdl_likes": _STORED_LIKES}, _STORED_LIKES_FIELDS)
+        use_client(client)
+        tx = _QueuingTx()
+        assert await TdlLikes.define_table(tx=tx) == "\n".join(_LIKES_CARRIED)  # type: ignore[arg-type]
+        assert client.queries == [_INFO, _INFO_LIKES]
+        assert tx.added == [(statement, None) for statement in _LIKES_CARRIED]
+
+
+#: A server's reason quoting the view's query: a run of the statement's text.
+_VIEW_REASON = f"Found a problem in {_VIEW_QUERY}"
+_LEFT_OUT = "the server's message quotes the statement, so it is left out"
+
+
+class TestViewRefusal:
+    """A refusal of ``define_view()`` quoting its statement is left out exactly when the statement writes
+    ``PERMISSIONS`` — declared (``permissions={}`` included) or kept from the stored view —, so a permission rule is
+    never quoted; otherwise v0.32.0's whole reason, which names the view's source tables."""
+
+    async def _refusal(
+        self, use_client: Callable[[Any], None], model: type[BaseSurrealModel], reason: str, stored: str | None = None
+    ) -> tuple[SurrealDbError, BaseException, list[str]]:
+        error = InternalError("Internal", reason)
+        client = _TableClient({} if stored is None else {"tdl_stats": stored}, ddl_error=error)
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await model.define_view()
+        return raised.value, error, client.queries
+
+    async def test_a_declared_rule_is_never_quoted(self, use_client: Callable[[Any], None]) -> None:
+        statement = (
+            f"DEFINE TABLE OVERWRITE `tdl_stats` AS ({_VIEW_QUERY}) PERMISSIONS FOR select WHERE $auth.id = owner_of_view, "
+            "FOR create, update, delete NONE;"
+        )
+        assert TdlStatsOwned.view_ddl() == statement
+        refusal, error, sent = await self._refusal(
+            use_client, TdlStatsOwned, "Found a problem in PERMISSIONS FOR select WHERE $auth.id = owner_of_view"
+        )
+        assert type(refusal) is SurrealDbError
+        assert str(refusal) == f"Can't apply view definition: 'tdl_stats' -> {_LEFT_OUT}"
+        assert "owner_of_view" not in str(refusal)
+        assert refusal.__context__ is error
+        assert sent == [_INFO, statement]
+
+    @pytest.mark.parametrize(
+        ("model", "stored", "redacted"),
+        [
+            (TdlStatsOwned, None, True),
+            (TdlStatsClosed, None, True),
+            (TdlStatsBare, None, False),
+            (
+                TdlStatsBare,
+                "DEFINE TABLE tdl_stats TYPE ANY SCHEMALESS AS SELECT count() AS n FROM tdl_note GROUP ALL PERMISSIONS NONE",
+                False,
+            ),
+            (TdlStatsBare, _STORED_VIEW, True),
+            (TdlStatsClosed, _STORED_VIEW, True),
+        ],
+        ids=["declared-rule", "declared-none", "none", "stored-without", "stored-with", "declared-none-over-stored"],
+    )
+    async def test_redacted_when_the_statement_writes_permissions(
+        self, use_client: Callable[[Any], None], model: type[BaseSurrealModel], stored: str | None, redacted: bool
+    ) -> None:
+        refusal, error, sent = await self._refusal(use_client, model, _VIEW_REASON, stored)
+        assert type(refusal) is SurrealDbError
+        if redacted:
+            assert str(refusal) == f"Can't apply view definition: 'tdl_stats' -> {_LEFT_OUT}"
+            assert refusal.__context__ is error
+        else:
+            assert str(refusal) == f"Can't apply view definition: 'tdl_stats' -> {_VIEW_REASON}"
+            assert refusal.__cause__ is error
+        assert sent[0] == _INFO and ("PERMISSIONS" in sent[1]) is redacted
+
+    async def test_g3_a_stored_view_whose_clause_fails_its_check(self, use_client: Callable[[Any], None]) -> None:
+        """A carried rule that fails its check: v0.32.0's G3, nothing defined; a declared rule replaces it."""
+        stored = (
+            "DEFINE TABLE tdl_stats TYPE ANY SCHEMALESS AS SELECT count() AS n FROM tdl_note GROUP ALL PERMISSIONS FOR "
+            "select WHERE a; b, FOR create, update, delete NONE"
+        )
+        client = _TableClient({"tdl_stats": stored})
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlStatsBare.define_view()
+        assert str(raised.value) == (
+            "TdlStatsBare.define_view(): the definition of the table 'tdl_stats' could not be read, so the ORM cannot "
+            "tell whether it is a view. Nothing was defined."
+        )
+        assert client.queries == [_INFO]
+        assert await TdlStats.define_view() == _G8
+        assert client.queries == [_INFO, _INFO, _G8]
+
+
+class TestEdgeAndViewE2E:
+    """On every engine of both lines: G7, G7b and G8 applied raw and read back; ``define_relation()`` writes the clauses
+    an edge model declares and keeps the others; ``define_table()`` of an edge model applies its relation statement and
+    its data fields, then an edge carries them; ``define_view()`` keeps a view's clauses set by hand unless declared;
+    ``define_table()`` of a view model is ``define_view()``."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize(
+        ("model", "statements"), [(TdlLikes, _G7), (TdlFollows, _G7B), (TdlStats, [_G8])], ids=["G7", "G7b", "G8"]
+    )
+    async def test_each_golden_is_applied_and_read_back(
+        self, kind: str, model: type[BaseSurrealModel], statements: list[str]
+    ) -> None:
+        async with _tdl(kind) as client:
+            await _apply_ddl(client, "DEFINE TABLE tdl_note;")
+            assert model.table_ddl() == statements
+            await _apply_ddl(client, " ".join(statements))
+            table = model.get_table_name()
+            state = parse_define_table((await _tables(client))[table])
+            assert state.schema_mode == (model.get_schema_mode() or SchemaMode.SCHEMALESS).value
+            assert state.comment == model.model_config.get("comment")
+            assert state.permissions == schema.permissions_rules(model.model_config["permissions"], model=model)
+            if model is TdlStats:
+                assert state.view_query == _VIEW_QUERY
+                return
+            assert issubclass(model, BaseSurrealEdge)
+            assert (state.table_type, tuple(state.relation_in), tuple(state.relation_out)) == (
+                "relation",
+                model.get_relation_in(),
+                model.get_relation_out(),
+            )
+            fields = _field_states(await _table_info(client, table))
+            for column, statement in zip(_columns(model), statements[1:], strict=True):
+                field = fields[column.path]
+                assert (field.field_type, field.nullable, field.default) == (
+                    *normalise_kind(render_kind(column.kind)),
+                    column.default,
+                ), statement
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_define_relation_writes_the_declared_clauses(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """G7b over a relation table set by hand: the declared comment and permissions written, the change feed kept."""
+        async with _tdl(kind) as client:
+            await _apply_ddl(
+                client,
+                "DEFINE TABLE tdl_follows TYPE RELATION IN tdl_person OUT tdl_person COMMENT 'old' CHANGEFEED 1h "
+                "PERMISSIONS FULL;",
+            )
+            calls = _spy(monkeypatch, client)
+            assert await TdlFollows.define_relation() == _FOLLOWS_CARRIED
+            assert _sent(calls) == [_INFO, _FOLLOWS_CARRIED]
+            state = parse_define_table((await _tables(client))["tdl_follows"])
+            assert (state.table_type, state.schema_mode, state.comment) == ("relation", "SCHEMALESS", "Follows")
+            assert (_feed(state.changefeed), state.changefeed_include_original) == (_feed("1h"), False)
+            assert state.permissions == schema.permissions_rules({"select": "FULL"}, model=TdlFollows)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_rg4_sends_nothing(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl(kind) as client:
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await TdlLikes.define_relation()
+            assert (type(raised.value), str(raised.value)) == (SurrealDbError, _RG4)
+            assert calls == []
+            assert "tdl_likes" not in await _tables(client)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_define_table_of_an_edge(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """G7's relation statement and ``stars``, never ``in``/``out``; an edge keeps its data on the ``SCHEMAFULL``
+        table; a second call sends the carried statements and changes nothing."""
+        async with _tdl(kind) as client:
+            await _apply_ddl(client, "CREATE tdl_person:p1; CREATE tdl_note:n1 SET body = 'b';")
+            calls = _spy(monkeypatch, client)
+            result = await TdlLikes.define_table()
+            assert isinstance(result, str)
+            assert result == "\n".join(_G7) == "\n".join(TdlLikes.table_ddl())
+            assert _sent(calls) == [_INFO, *_G7]
+            tables = await _tables(client)
+            info = await _table_info(client, "tdl_likes")
+            state = parse_define_table(tables["tdl_likes"])
+            assert (state.table_type, state.schema_mode) == ("relation", "SCHEMAFULL")
+            assert sorted(info["fields"]) == ["in", "out", "stars"]
+
+            calls.clear()
+            assert await TdlLikes.define_table() == result
+            assert _sent(calls) == [_INFO, _INFO_LIKES, *_G7]
+            assert await _tables(client) == tables
+            assert await _table_info(client, "tdl_likes") == info
+
+            edge = await TdlPersonNode(id="p1").relate(TdlLikes, RecordID("tdl_note", "n1"), stars=3)
+            assert edge.stars == 3
+            assert await client.query("SELECT VALUE stars FROM tdl_likes;", {}) == [3]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "if-not-exists"])
+    async def test_rg1_a_view_under_an_edge(self, kind: str, overwrite: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl(kind) as client:
+            await _apply_ddl(client, f"DEFINE TABLE tdl_note; DEFINE TABLE tdl_likes AS {_VIEW_QUERY};")
+            before = (await _tables(client))["tdl_likes"]
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await TdlLikes.define_table(overwrite=overwrite)
+            assert (type(raised.value), str(raised.value)) == (SurrealDbError, _RG_DEFINE_TABLE["RG1"])
+            assert _sent(calls) == [_INFO]
+            assert (await _tables(client))["tdl_likes"] == before
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_rg3_an_ordinary_table_with_overwrite_false(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl(kind) as client:
+            await _apply_ddl(client, "DEFINE TABLE tdl_likes TYPE ANY;")
+            before = (await _tables(client))["tdl_likes"]
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await TdlLikes.define_table(overwrite=False)
+            assert (type(raised.value), str(raised.value)) == (SurrealDbError, _RG_DEFINE_TABLE["RG3"])
+            assert _sent(calls) == [_INFO]
+            assert (await _tables(client))["tdl_likes"] == before
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_define_view_keeps_the_clauses_set_by_hand(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """K8: a view without keys keeps the ``DROP``, mode, comment, change feed and permissions set by hand; the
+        clauses a view model declares replace them, the others kept. The source table holds no record, so the view
+        holds none (SurrealDB 3.1 refuses ``OVERWRITE`` on a view that holds records)."""
+        async with _tdl(kind) as client:
+            await _apply_ddl(
+                client,
+                'DEFINE TABLE tdl_note; DEFINE TABLE tdl_stats TYPE ANY DROP SCHEMAFULL COMMENT "it\'s" CHANGEFEED 1h '
+                f"PERMISSIONS FOR select WHERE true AS {_VIEW_QUERY};",
+            )
+            before = parse_define_table((await _tables(client))["tdl_stats"])
+            assert (before.drop, before.schema_mode, before.comment, before.changefeed) == (True, "SCHEMAFULL", "it's", "1h")
+            calls = _spy(monkeypatch, client)
+            assert await TdlStatsBare.define_view() == _K8
+            assert _sent(calls) == [_INFO, _K8]
+            after = parse_define_table((await _tables(client))["tdl_stats"])
+            assert after.view_query == _VIEW_QUERY
+            assert _clauses(after) == _clauses(before)
+            assert after.permissions == {"select": "WHERE true", "create": "NONE", "update": "NONE", "delete": "NONE"}
+
+            calls.clear()
+            assert await TdlStats.define_view() == _K8_DECLARED
+            assert _sent(calls) == [_INFO, _K8_DECLARED]
+            declared = parse_define_table((await _tables(client))["tdl_stats"])
+            assert (declared.drop, declared.schema_mode, declared.comment) == (True, "SCHEMAFULL", "Counts")
+            assert (_feed(declared.changefeed), declared.changefeed_include_original) == (_feed("1h"), False)
+            assert declared.permissions == schema.permissions_rules({"select": "FULL"}, model=TdlStats)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_define_table_of_a_view_model(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``define_view()``'s statement, a ``str``, equal to ``define_view()``'s on the same state; the source table
+        holds no record (SurrealDB 3.1 refuses ``OVERWRITE`` on a view that holds records)."""
+        async with _tdl(kind) as client:
+            await _apply_ddl(client, "DEFINE TABLE tdl_note;")
+            calls = _spy(monkeypatch, client)
+            result = await TdlStats.define_table()
+            assert isinstance(result, str)
+            assert result == _G8
+            assert _sent(calls) == [_INFO, _G8]
+            tables = await _tables(client)
+            assert await TdlStats.define_view() == result == await TdlStats.define_table()
+            assert await _tables(client) == tables
+            state = parse_define_table(tables["tdl_stats"])
+            assert (state.view_query, state.comment) == (_VIEW_QUERY, "Counts")
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_g1_through_define_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """v0.32.0's guard: an ordinary table holding records is never turned into the view."""
+        async with _tdl(kind) as client:
+            await _apply_ddl(client, "DEFINE TABLE tdl_note; CREATE tdl_stats:x SET a = 1;")
+            before = (await _tables(client))["tdl_stats"]
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await TdlStats.define_table()
+            assert (type(raised.value), str(raised.value)) == (SurrealDbError, _g1("TdlStats", "tdl_stats"))
+            assert _sent(calls) == [_INFO, "SELECT id FROM `tdl_stats` LIMIT 1;"]
+            assert (await _tables(client))["tdl_stats"] == before
+            assert await client.query("SELECT VALUE a FROM tdl_stats;", {}) == [1]

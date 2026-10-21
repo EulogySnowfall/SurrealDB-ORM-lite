@@ -49,15 +49,17 @@ from .schema import (
     remove_view_statement,
     table_holds_records,
     table_kind,
+    table_permissions_text,
     table_refused,
     table_statement,
     table_statement_keeping,
     user_extra_refused,
     view_statement,
+    view_statement_keeping,
     view_table_refused,
     view_write_refused,
 )
-from .schema_state import FieldState
+from .schema_state import FieldState, TableState
 from .signals import (
     around_delete,
     around_save,
@@ -1195,15 +1197,19 @@ class BaseSurrealModel(BaseModel):
 
         Pure: builds the SurrealQL without touching the database (no connection needed), the same text every time,
         so it can be printed, diffed or fed into a migration. ``DEFINE TABLE {OVERWRITE | IF NOT EXISTS} `<table>`
-        AS (<query>);`` — the table of :meth:`get_table_name` in backticks, :meth:`get_view_query` inside one pair
-        of parentheses (the full SurrealDB-ORM's form). SurrealDB computes the view's records from the query and
-        keeps them up to date as the tables it selects from change; every write of the model raises ``TypeError``.
+        AS (<query>)[ COMMENT '…'][ CHANGEFEED …][ PERMISSIONS …];`` — the table of :meth:`get_table_name` in
+        backticks, :meth:`get_view_query` inside one pair of parentheses (the full SurrealDB-ORM's form), then the
+        clauses the model declares with ``comment``, ``changefeed`` and ``permissions`` (v0.34.0; none for a model
+        without them). SurrealDB computes the view's records from the query and keeps them up to date as the tables it
+        selects from change; every write of the model raises ``TypeError``. Applied by hand, ``OVERWRITE`` resets the
+        clauses it does not write: :meth:`define_view` keeps them.
 
         The query is written into the DDL as declared: a view's query is trusted application code, never user
         input. The check made when the class was defined catches mistakes — unbalanced brackets, a comment that
         would swallow the parenthesis the ORM appends, a second statement where one SELECT is expected — and is not
         an injection defence. To filter on a value, store it in a record or a ``DEFINE PARAM`` and read it from the
-        query; never format it into the text.
+        query; never format it into the text. The declared clauses are checked the same way when the class is
+        defined (a comment without NUL, a change feed SurrealDB reads, each permission rule one condition).
 
         Args:
             overwrite: ``True`` (default) emits ``DEFINE TABLE OVERWRITE …``, which recomputes the view from the
@@ -1218,7 +1224,7 @@ class BaseSurrealModel(BaseModel):
             'DEFINE TABLE OVERWRITE `order_stats` AS (SELECT status, count() AS total FROM orders GROUP BY status);'
         """
         query = cls._require_view("view_ddl()")
-        return view_statement(cls.get_table_name(), query, overwrite)
+        return view_statement(cls.get_table_name(), query, overwrite, clauses=cls._declared_table_clauses())
 
     @classmethod
     @_cache.invalidates("cls")
@@ -1236,6 +1242,15 @@ class BaseSurrealModel(BaseModel):
         ``OVERWRITE`` recomputes the view and drops the events, fields and indexes defined on its table: run
         :meth:`define_events` **after** ``define_view()``. ``overwrite=False`` (``IF NOT EXISTS``) leaves an existing
         view as it is, whatever its query.
+
+        **The clauses the model declares win; the others are kept (v0.34.0).** Over a view that exists, the statement
+        writes the model's query and the comment, change feed and permissions it declares (``comment``,
+        ``changefeed``, ``permissions``; ``permissions={}`` writes ``PERMISSIONS NONE``), and re-renders the others
+        from the stored definition — its ``DROP``, ``SCHEMAFULL``, comment, change feed and permissions —, as
+        :meth:`~surreal_orm_lite.edge.BaseSurrealEdge.define_relation` does for a relation table. Permissions set by
+        hand on a view are no longer reset to ``NONE``. A stored value the ORM cannot carry (a comment holding a NUL, a
+        rule that is not one condition) refuses the definition before any DDL, as an unreadable definition does. Over
+        an ordinary table, or no table, the statement is :meth:`view_ddl`'s.
 
         On SurrealDB 2.x and the embedded engine, a grouped view is refused before any DDL when its projection holds
         an element those engines compute once per source record instead of keeping it up to date —
@@ -1257,8 +1272,11 @@ class BaseSurrealModel(BaseModel):
         input. The check made when the class was defined catches mistakes — unbalanced brackets, a comment that
         would swallow the parenthesis the ORM appends, a second statement where one SELECT is expected — and is not
         an injection defence. A refusal names the view's table and keeps the server's reason (``Can't apply view
-        definition: 'order_stats' -> The table 'orders' does not exist``), never the statement. Applying needs a
-        session allowed to define (a system user such as root, or a namespace or database ``OWNER``/``EDITOR``).
+        definition: 'order_stats' -> The table 'orders' does not exist``), never the statement. When the statement
+        writes ``PERMISSIONS`` — declared, or kept from the stored view —, a reason that quotes the statement is left
+        out (``… -> the server's message quotes the statement, so it is left out``; the server's error stays the
+        exception's ``__context__``), so a permission rule is never quoted. Applying needs a session allowed to define
+        (a system user such as root, or a namespace or database ``OWNER``/``EDITOR``).
 
         Args:
             overwrite: see :meth:`view_ddl`.
@@ -1269,10 +1287,10 @@ class BaseSurrealModel(BaseModel):
             SurrealDbError: *tx* belongs to another connection — before any request; the connection runs SurrealDB
                 2.x or the embedded engine and the grouped projection holds an element they compute once per source
                 record — before any request but ``version()``; the table exists, is not a view and holds records, or
-                ``overwrite=False`` meets an ordinary table, or its definition cannot be read — before any DDL; the
-                server refused the statement (``Can't apply view definition: …``). In a buffered transaction (*tx*
-                over HTTP, on SurrealDB 2.x or the embedded engine) the statement is only queued: a refusal comes back
-                when the block commits, as the transaction's own error, never as ``SurrealDbAuthenticationError``.
+                ``overwrite=False`` meets an ordinary table, or its definition cannot be read or carried — before any
+                DDL; the server refused the statement (``Can't apply view definition: …``). In a buffered transaction
+                (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the statement is only queued: a refusal comes
+                back when the block commits, as the transaction's own error, never as ``SurrealDbAuthenticationError``.
             SurrealDbAuthenticationError: the session may not read the database's definitions or define the view.
 
         Example:
@@ -1288,13 +1306,23 @@ class BaseSurrealModel(BaseModel):
         await ensure_view_query_supported(client, query, model=cls.__name__, embedded=manager.is_embedded())
         tables = await read_table_definitions(client, table, kind="definition")
         existing = table_kind(tables, table)
-        if existing is not None and existing != "view":
+        # A statement writing PERMISSIONS — declared (permissions={} included) or carried — is refused without quoting
+        # it: its rules may hold secrets. Decided from the clauses, never from the statement's text.
+        redact = cls.model_config.get("permissions") is not None
+        if existing == "view" and overwrite:
+            state = parse_define_table(tables[table])
+            kept = view_statement_keeping(table, query, cls._declared_table_clauses(), state)
+            if kept is None:
+                raise SurrealDbError(view_table_refused("G3", cls.__name__, table))
+            statement = kept
+            redact = redact or table_permissions_text(state.permissions) is not None
+        elif existing is not None and existing != "view":
             if not overwrite:
                 raise SurrealDbError(view_table_refused("G4" if existing == "table" else "G3", cls.__name__, table))
             if await table_holds_records(client, table, kind="definition"):
                 raise SurrealDbError(view_table_refused("G1" if existing == "table" else "G3", cls.__name__, table))
         await apply_ddl_statements(
-            [statement], client=client, tx=tx, what="view", classify=True, subjects=[repr(table)], redact=False
+            [statement], client=client, tx=tx, what="view", classify=True, subjects=[repr(table)], redact=redact
         )
         return statement
 
@@ -1395,6 +1423,45 @@ class BaseSurrealModel(BaseModel):
         NORMAL`` for ``NORMAL``, ``USER``, ``STREAM`` and ``HASH``. ``BaseSurrealEdge`` writes its ``TYPE RELATION``
         clause instead."""
         return "TYPE ANY" if cls.get_table_type() is TableType.ANY else "TYPE NORMAL"
+
+    @classmethod
+    def _guarded_table_statement(
+        cls,
+        tables: Mapping[str, Any],
+        statement: str,
+        *,
+        overwrite: bool,
+        clauses: TableClauses,
+        method: Literal["define_table", "define_access"],
+    ) -> tuple[str, TableState | None]:
+        """The table guard of :meth:`_define_table` (v0.34.0): the table statement to apply over what *tables* (``INFO
+        FOR DB``'s map) holds, and the stored definition (``None`` for a new table). Pure.
+
+        A new table, or ``overwrite=False``: *statement* (``table_ddl()``'s first). A table that exists with
+        ``overwrite=True``: ``schema.table_statement_keeping()`` of the model's type clause and *clauses*.
+        ``BaseSurrealEdge`` applies ``define_relation()``'s guard instead (RG1–RG3).
+
+        Raises:
+            SurrealDbError: TG1 the table is a materialized view; TG2 its definition cannot be read, or a carried
+                clause fails its check; TG3 it is a relation table — each naming *method*.
+        """
+        name, table = cls.__name__, cls.get_table_name()
+        existing = table_kind(tables, table)
+        if existing == "view":
+            raise SurrealDbError(table_refused("TG1", name, table, method=method))
+        if existing == "unreadable":
+            raise SurrealDbError(table_refused("TG2", name, table, method=method))
+        if existing is None:
+            return statement, None
+        state = parse_define_table(tables[table])
+        if state.table_type == "relation":
+            raise SurrealDbError(table_refused("TG3", name, table, method=method))
+        if not overwrite:
+            return statement, state
+        kept = table_statement_keeping(table, cls._table_head(), clauses, state)
+        if kept is None:
+            raise SurrealDbError(table_refused("TG2", name, table, method=method))
+        return kept, state
 
     @classmethod
     def _table_columns(cls) -> tuple[Column, ...]:
@@ -1503,20 +1570,20 @@ class BaseSurrealModel(BaseModel):
         """Apply the model's table and field definitions with the table clauses *clauses* and return the statements
         applied — or queued, with a buffered *tx* — table first (v0.34.0): the one applier of the model table DDL,
         behind :meth:`define_table` (the declared clauses) and ``define_access()`` of a model whose schema mode is
-        ``SCHEMAFULL`` (its own). *method* names the caller in the transaction check and in TG1–TG4.
+        ``SCHEMAFULL`` (its own). *method* names the caller in the transaction check, TG1–TG4 and RG1–RG3.
 
-        In order, each step before any later request: the transaction check; the pure statements (E1, UX1, FX1,
-        CV1); ``INFO FOR DB`` and the table guard — TG1 a view, TG2 a definition the parser cannot read, TG3 a relation
-        table, and, for a table that exists with ``overwrite=True``, TG2 a carried table clause that fails its check —;
-        for that table, ``INFO FOR TABLE`` and the carried field statements (TG4); then the DDL, one statement per
-        call, the table's first.
-
-        Raises:
-            NotImplementedError: a view or an edge model.
+        In order, each step before any later request: the transaction check; a view model applies
+        :meth:`define_view` (its own guards) and returns its statement; the pure statements (E1, UX1, FX1, CV1);
+        ``INFO FOR DB`` and the table guard (:meth:`_guarded_table_statement`) — for a node model TG1 a view, TG2 a
+        definition the parser cannot read, TG3 a relation table, and, for a table that exists with ``overwrite=True``,
+        TG2 a carried table clause that fails its check; for an edge model ``define_relation()``'s RG1–RG3 —; for a
+        table that exists with ``overwrite=True``, ``INFO FOR TABLE`` and the carried field statements (TG4); then the
+        DDL, one statement per call, the table's first — an edge's relation statement, then its data fields, never
+        ``in``/``out``.
         """
         check_transaction(cls, tx, f"{cls.__name__}.{method}()")
-        if cls._is_view() or cls.__surreal_edge__:
-            raise NotImplementedError(f"{cls.__name__}.{method}() of a view or an edge model is not available yet.")
+        if cls._is_view():
+            return [await cls.define_view(overwrite=overwrite, tx=tx)]
         statements = cls._table_ddl(overwrite, clauses)
         columns = cls._table_columns()
         name = cls.__name__
@@ -1524,21 +1591,11 @@ class BaseSurrealModel(BaseModel):
         # Cheap even inside a transaction: get_client() returns the already-connected client.
         client = await cls._connection_manager().get_client()
         tables = await read_table_definitions(client, table, kind="definition", what="table")
-        existing = table_kind(tables, table)
-        if existing == "view":
-            raise SurrealDbError(table_refused("TG1", name, table, method=method))
-        if existing == "unreadable":
-            raise SurrealDbError(table_refused("TG2", name, table, method=method))
-        state = None if existing is None else parse_define_table(tables[table])
-        if state is not None and state.table_type == "relation":
-            raise SurrealDbError(table_refused("TG3", name, table, method=method))
-        table_statement = statements[0]
+        table_statement, state = cls._guarded_table_statement(
+            tables, statements[0], overwrite=overwrite, clauses=clauses, method=method
+        )
         stored: Mapping[tuple[str, ...], FieldState | None] = {}
         if state is not None and overwrite:
-            kept = table_statement_keeping(table, cls._table_head(), clauses, state)
-            if kept is None:
-                raise SurrealDbError(table_refused("TG2", name, table, method=method))
-            table_statement = kept
             stored = await read_table_fields(client, table, kind="definition")
         # The mode the table has once its statement is applied: IF NOT EXISTS leaves a table that exists as it is.
         declared, kept_mode = clauses.schema_mode, None if state is None else state.schema_mode
