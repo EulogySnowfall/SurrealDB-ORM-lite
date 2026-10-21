@@ -139,6 +139,12 @@ clauses as keys, and each generated model's ``define_table()`` on a fresh databa
 and field kinds, except what a model does not hold — a typed record link, a ``DEFAULT`` on an optional or server-filled
 field, an ``ASSERT``, a ``COMPUTED`` field written ``VALUE``; over the database it was read from, a ``COMPUTED`` field
 stays ``COMPUTED`` and every ``DEFAULT``, ``VALUE`` and ``ASSERT`` stays.
+
+The README (``TestReadmeSection35``): section 35 — its place, its subsections, its examples (run on ``mem://`` as
+written, each printed line equal to its comment), the sentences each subsection says, its kinds and source-rule tables
+and its "Coming from the full SurrealDB-ORM" bullets —, the sentences sections 16, 19, 31, 33 and 34 change, the three
+rows of the 2.x/3.x table and its intro sentence, the embedded engine's row, and the features, roadmap and comparison
+rows.
 """
 
 import ast
@@ -199,6 +205,20 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite.define_parser import normalise_kind, parse_define_field, parse_define_table, parse_kind, render_kind
 from surreal_orm_lite.schema_state import FieldState, TableState
+from surreal_orm_lite.testing import embedded_database
+from tests._readme_tables import (
+    assert_embedded_rows,
+    assert_server_header_sentence,
+    assert_server_rows,
+    assert_server_table,
+)
+from tests._readme_tables import cells as _cells
+from tests._readme_tables import normalised as _normalised
+from tests._readme_tables import readme as _readme
+from tests._readme_tables import readme_part as _readme_part
+from tests._readme_tables import subsection as _subsection
+from tests._readme_tables import table_rows as _table_rows
+from tests._readme_tables import tables as _md_tables
 
 # --- the exact texts of the class-time refusals ---------------------------------------------------------------------
 
@@ -6031,3 +6051,809 @@ class TestRoundTripE2E:
             if has_computed:
                 assert (after[("c",)].computed, after[("c",)].value) == ("a + 1", None)
                 assert await client.query("SELECT VALUE c FROM tdl_rt:1;", {}) == [2]
+
+
+# === README: section 35, the sections it changes, the tables ========================================================
+
+_SECTION_16 = "### 16. Computed fields: `Computed[...]` → `DEFINE FIELD … VALUE`"
+_SECTION_19 = "### 19. Model-level authentication (`AuthenticatedUserMixin`)"
+_SECTION_31 = "### 31. Schema introspection (`DatabaseIntrospector`, `generate_models_from_db()`)"
+_SECTION_33 = "### 33. Materialized views (`view_query`, `define_view()`)"
+_SECTION_34 = "### 34. Relation constraints (`relation_in`, `define_relation()`)"
+_SECTION_35 = "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)"
+_SERVER_BEHAVIOUR = "### ORM behaviour: SurrealDB 2.x vs 3.x"
+_EMBEDDED_BEHAVIOUR = "### ORM behaviour: the embedded engine"
+#: Section 35's anchor, as the sections that point to it write it.
+_LINK_35 = "(#35-model-table-ddl-define_table-schema_mode-permissions)"
+#: Section 35's subsections, in order, after an untitled intro that holds example A.
+_SUBSECTIONS_35 = [
+    "Declaring the table",
+    "Field types",
+    "Applying it",
+    "Views and edges",
+    "User models",
+    "What SurrealDB checks",
+    "SurrealDB 2.x and 3.x",
+    "Transactions, connections and the cache",
+    "Security",
+    "Coming from the full SurrealDB-ORM",
+]
+_README_EXAMPLE_A_35 = """\
+from enum import StrEnum
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+from surreal_orm_lite import BaseSurrealModel, SchemaMode, SurrealConfigDict
+
+
+class Tier(StrEnum):
+    FREE = "free"
+    PRO = "pro"
+
+
+class Address(BaseModel):
+    city: str
+    zip: str | None = None
+
+
+class Person(BaseSurrealModel):
+    model_config = SurrealConfigDict(
+        table_name="person",
+        schema_mode=SchemaMode.SCHEMAFULL,
+        changefeed="7d",
+        permissions={"select": "FULL", "create": "$auth.id != NONE"},
+        comment="People",
+    )
+
+    id: str | None = None
+    name: str
+    age: int = 18
+    nickname: str | None = None
+    tier: Tier = Tier.FREE
+    tags: list[str] = Field(default_factory=list)
+    address: Address | None = None
+    meta: dict[str, Any] = Field(default_factory=dict)
+    password: str = Field(alias="password_hash")
+
+
+print(*Person.table_ddl(), sep="\\n")
+# DEFINE TABLE OVERWRITE `person` TYPE NORMAL SCHEMAFULL COMMENT 'People' CHANGEFEED 7d PERMISSIONS FOR select FULL, FOR create WHERE $auth.id != NONE, FOR update, delete NONE;
+# DEFINE FIELD OVERWRITE `name` ON `person` TYPE string;
+# DEFINE FIELD OVERWRITE `age` ON `person` TYPE int DEFAULT 18;
+# DEFINE FIELD OVERWRITE `nickname` ON `person` TYPE option<string>;
+# DEFINE FIELD OVERWRITE `tier` ON `person` TYPE 'free' | 'pro' DEFAULT 'free';
+# DEFINE FIELD OVERWRITE `tags` ON `person` TYPE array<string>;
+# DEFINE FIELD OVERWRITE `address` ON `person` TYPE option<object>;
+# DEFINE FIELD OVERWRITE `address`.`city` ON `person` TYPE string;
+# DEFINE FIELD OVERWRITE `address`.`zip` ON `person` TYPE option<string>;
+# DEFINE FIELD OVERWRITE `meta` ON `person` TYPE object FLEXIBLE;
+# DEFINE FIELD OVERWRITE `password_hash` ON `person` TYPE string;
+sql = await Person.define_table()  # idempotent: run it at start-up
+print(sql == "\\n".join(Person.table_ddl()))
+# True
+
+await Person(id="ada", name="Ada", address=Address(city="Paris"), meta={"plan": {"seats": 3}}, password="hash").save()
+ada = await Person.objects().get("ada")
+print(ada.age, ada.tier, ada.address.city, ada.meta)
+# 18 free Paris {'plan': {'seats': 3}}
+"""
+_README_GETTERS_35 = """\
+print(Person.get_schema_mode(), Person.get_changefeed(), Person.get_permissions())
+# SCHEMAFULL 7d {'select': 'FULL', 'create': '$auth.id != NONE'}
+"""
+_README_EXAMPLE_B_35 = """\
+from datetime import datetime
+
+from surreal_orm_lite import SurrealDBConnectionManager
+
+
+class Note(BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="note", server_fields=["created"])
+
+    id: str | None = None
+    body: str
+    email: str | None = None
+    created: datetime | None = None
+    done: bool = False
+
+
+client = await SurrealDBConnectionManager.get_client()
+await client.query(  # a table tuned by hand
+    "DEFINE TABLE note SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h PERMISSIONS FOR select WHERE owner = $auth.id;"
+    "DEFINE FIELD email ON note TYPE string ASSERT $value != '' COMMENT 'mail';"
+    "DEFINE FIELD created ON note TYPE option<datetime> DEFAULT time::now() READONLY;",
+    {},
+)
+print(await Note.define_table())
+# DEFINE TABLE OVERWRITE `note` TYPE NORMAL SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h PERMISSIONS FOR select WHERE owner = $auth.id, FOR create, update, delete NONE;
+# DEFINE FIELD OVERWRITE `body` ON `note` TYPE string;
+# DEFINE FIELD OVERWRITE `email` ON `note` TYPE option<string> ASSERT $value != '' COMMENT 'mail';
+# DEFINE FIELD OVERWRITE `created` ON `note` TYPE option<datetime> DEFAULT time::now() READONLY;
+# DEFINE FIELD OVERWRITE `done` ON `note` TYPE bool DEFAULT false;
+note = await Note(id="n1", body="b").save()
+print(note.created is not None, note.done)
+# True False
+"""
+_README_VIEW_35 = """\
+from surrealdb import RecordID
+
+
+class NoteCount(BaseSurrealModel):
+    model_config = SurrealConfigDict(
+        table_name="note_count", view_query="SELECT count() AS n FROM note GROUP ALL", permissions={"select": "FULL"}
+    )
+
+    id: RecordID | None = None
+    n: int
+
+
+print(await NoteCount.define_table())
+# DEFINE TABLE OVERWRITE `note_count` AS (SELECT count() AS n FROM note GROUP ALL) PERMISSIONS FOR select FULL, FOR create, update, delete NONE;
+"""
+_README_EDGE_35 = """\
+from surreal_orm_lite import BaseSurrealEdge, SurrealDbError
+
+
+class Rates(BaseSurrealEdge):
+    model_config = SurrealConfigDict(
+        table_name="rates", relation_in="person", relation_out="note", schema_mode=SchemaMode.SCHEMAFULL
+    )
+
+    stars: int = 1
+
+
+try:
+    await Rates.define_relation()  # it defines no field, which this SCHEMAFULL table needs
+except SurrealDbError as exc:
+    print(type(exc).__name__)
+# SurrealDbError
+print(await Rates.define_table())
+# DEFINE TABLE OVERWRITE `rates` TYPE RELATION IN `person` OUT `note` SCHEMAFULL;
+# DEFINE FIELD OVERWRITE `stars` ON `rates` TYPE int DEFAULT 1;
+edge = await ada.relate(Rates, note, stars=5)
+print(edge.stars)
+# 5
+"""
+_README_USER_35 = """\
+from surreal_orm_lite import AuthenticatedUserMixin, TableType
+
+
+class Member(AuthenticatedUserMixin, BaseSurrealModel):
+    model_config = SurrealConfigDict(table_name="member", table_type=TableType.USER, access_name="member_access")
+
+    id: str | None = None
+    email: str
+    password: str
+
+
+*table, access = Member.access_ddl()
+print(*table, sep="\\n")
+# DEFINE TABLE OVERWRITE `member` TYPE NORMAL SCHEMAFULL PERMISSIONS FOR select, update WHERE id = $auth.id, FOR create, delete NONE;
+# DEFINE FIELD OVERWRITE `email` ON `member` TYPE string;
+# DEFINE FIELD OVERWRITE `password` ON `member` TYPE string;
+"""
+_README_EXAMPLES_35 = [
+    _README_EXAMPLE_A_35,
+    _README_GETTERS_35,
+    _README_EXAMPLE_B_35,
+    _README_VIEW_35,
+    _README_EDGE_35,
+    _README_USER_35,
+]
+#: The ``python`` blocks of each part of section 35 (the intro is the text before the first subsection).
+_BLOCKS_BY_PART_35 = {
+    "": [_README_EXAMPLE_A_35],
+    "Declaring the table": [_README_GETTERS_35],
+    "Field types": [],
+    "Applying it": [_README_EXAMPLE_B_35],
+    "Views and edges": [_README_VIEW_35, _README_EDGE_35],
+    "User models": [_README_USER_35],
+    "What SurrealDB checks": [],
+    "SurrealDB 2.x and 3.x": [],
+    "Transactions, connections and the cache": [],
+    "Security": [],
+    "Coming from the full SurrealDB-ORM": [],
+}
+#: The sentences section 35 says word for word (whitespace normalised), each once, by subsection.
+_SENTENCES_35 = {
+    "Field types": (
+        "Anything else is `any`.",
+        "A computed field is written `VALUE`; over a field the database defines `COMPUTED` (SurrealDB 3.x), "
+        "`define_table()` writes `COMPUTED`: replacing it by `VALUE` would leave the stored records without the field "
+        "until their next write.",
+        "A `server_fields` column that is not nullable and has no constant default (a `default_factory`, or a required "
+        "field) is written `TYPE <kind>` with no `DEFAULT`: every create — a `save()` that creates the record, "
+        "`objects().bulk_create()`, `signup()` — leaves it out, so SurrealDB refuses it until the database gives the "
+        "column a `DEFAULT` or `VALUE` (`DEFINE FIELD OVERWRITE created ON note TYPE datetime DEFAULT time::now()`), "
+        "which `define_table()` then keeps; or annotate it `T | None`.",
+    ),
+    "Applying it": (
+        'It returns the statements applied (queued, with a buffered `tx`), table first, joined with `"\\n"` — the full '
+        'ORM\'s return. On a new table that is `"\\n".join(Model.table_ddl())`, except on SurrealDB 2.x, where '
+        "`define_table()` adds `FLEXIBLE` to the `Any`/untyped columns of a `SCHEMAFULL` table.",
+        "Each call on a table with a change feed adds one `define_table` entry to it; `changes()` skips it, a raw "
+        "`SHOW CHANGES` shows it.",
+    ),
+    "Views and edges": (
+        "**Changed**: `define_view()` keeps the permissions, comment, change feed, `DROP` and `SCHEMAFULL` set by hand "
+        "on a stored view unless the model declares them (it used to reset them), and when its statement writes "
+        "permissions, a refusal that quotes the statement is reported without it.",
+        "An edge model that declares `schema_mode=SchemaMode.SCHEMAFULL` and has data fields is applied with "
+        "`define_table()`: `define_relation()` defines no field and raises before any request.",
+    ),
+    "User models": (
+        "`define_access()` ([section 19](#19-model-level-authentication-authenticatedusermixin)) and `define_table()` "
+        "read the same schema mode. A model with `table_type=TableType.USER` (the full ORM's key for an auth table) or "
+        "`schema_mode=SchemaMode.SCHEMAFULL` gets from `define_access()` a `SCHEMAFULL` table with one `DEFINE FIELD` "
+        "per field and the access's permissions, then the access: signup and signin work on SurrealDB 2.x and 3.x, "
+        "`define_table()` is optional, and any call order gives the same table. Every other model keeps v0.17.0's "
+        "`SCHEMALESS` table.",
+    ),
+    "Transactions, connections and the cache": (
+        'A definition of the same table or field queued earlier in the block (`tx.add("DEFINE FIELD …")`) is not seen '
+        "by `define_table()` and is replaced at commit by the statement it builds: define it before the block.",
+    ),
+}
+#: What the intro and each subsection of section 35 say (key phrases, whitespace normalised).
+_INTRO_NEEDLES_35 = (
+    "Since v0.34.0",
+    "the full SurrealDB-ORM's keys",
+    "`schema_mode`, `changefeed`, `permissions`, `comment` and `flexible_fields`",
+    "one `DEFINE FIELD` per column from the annotations",
+    "keeping what the model does not declare",
+    "SurrealDB 2.x, 3.x and the embedded engine",
+    "(#orm-behaviour-surrealdb-2x-vs-3x)",
+    "`mem://`",
+)
+_PART_NEEDLES_35 = {
+    "Declaring the table": (
+        "`SchemaMode.SCHEMAFULL`",
+        "`SchemaMode.SCHEMALESS`",
+        "the mode is not declared: `define_table()` keeps the stored one, and a new table is `SCHEMALESS`",
+        '`"7d"`, `"1h30m"` or `"1w2d"`',
+        "`INCLUDE ORIGINAL`",
+        '`"select"`, `"create"`, `"update"`, `"delete"`',
+        '`"WHERE <condition>"` or a bare condition',
+        "An operation left out is `NONE`",
+        "`permissions={}` declares `PERMISSIONS NONE`",
+        "`COMMENT 'it\\'s'`",
+        '`Field(json_schema_extra={"flexible": True})`',
+        "raises `ValueError`",
+        "`TYPE NORMAL` for `TableType.NORMAL`, `USER`, `STREAM` and `HASH` and for a model without `table_type`",
+        "`TYPE ANY` for `TableType.ANY`",
+        "`USER` makes the table `SCHEMAFULL` and `HASH` makes it `SCHEMALESS`",
+        "checked when the class is defined",
+        '`schema_mode`, even `"SCHEMAFULL"`, included',
+        '`schema_mode=SchemaMode.SCHEMAFULL` with `extra="allow"`',
+        "`TableType.USER` with `SchemaMode.SCHEMALESS`",
+        "A subclass inherits the keys; setting one to `None` resets it",
+        "`get_schema_mode()` returns the declared mode",
+        "else `None` (not declared)",
+        '`get_changefeed()` returns the normalised text (`"1h INCLUDE ORIGINAL"`',
+        "`get_permissions()` returns the declared mapping as given",
+        "a copy, so changing it never changes the model",
+        "`{}` when the model declares none, and for `permissions={}`, which declares `PERMISSIONS NONE`",
+    ),
+    "Field types": (
+        "`Annotated` unwrapped",
+        "every field but `id`",
+        "`@computed_field`s",
+        "`Field(exclude=True)`",
+        "(`address.city`, `subs.*.city`)",
+        "(`x: int = None`)",
+        "`DEFAULT 1.50dec`",
+        "SurrealDB applies `DEFAULT` to a `NONE` on every create",
+        "the database's `DEFAULT`, `VALUE` or `COMPUTED` on the column is kept",
+        "`Computed[T]` is `TYPE option<T>`",
+        "The expression is checked before any request",
+        "`ValueError`",
+        "`TYPE any` (`bag.*`, `lol.*.*`), on every line",
+        "required untyped array (`no such field exists`)",
+        "written after `TYPE`, only on a table that is `SCHEMAFULL`",
+        "on SurrealDB 2.x and the embedded engine, on the columns that hold `any`",
+        "A stored `FLEXIBLE` on an object column is kept",
+    ),
+    "Applying it": (
+        "one `INFO FOR DB`, and one `INFO FOR TABLE` for a table that exists",
+        "one statement per call",
+        "parents before children",
+        "applied by hand, their `OVERWRITE` resets every clause the model does not write",
+        "What the model declares wins; the rest is kept from the database",
+        "Nothing is removed",
+        "the views that read it ([section 33](#33-materialized-views-view_query-define_view))",
+        "its live queries and its change feed's history",
+        "A key left out never removes a stored clause",
+        "migrations come with v0.38.0",
+        "`schema_mode=SchemaMode.SCHEMALESS` turns a `SCHEMAFULL` table back",
+        "idempotent: run it at start-up",
+        "`overwrite=False` writes `IF NOT EXISTS`",
+        "raises `SurrealDbError` on a materialized view",
+        "on a relation table (`TYPE RELATION`",
+        "cannot read back or carry",
+        "`Can't apply field definition: 'age' on table 'person' -> …`",
+        "never the statement",
+        "`tx=` makes the call atomic",
+    ),
+    "Views and edges": (
+        "A view model's `define_table()` applies `define_view()`",
+        "`[view_ddl()]`",
+        "No field is defined on a view",
+        "the relation statement `define_relation()` carries",
+        "never `in` and `out`",
+        "The declared clauses reach `view_ddl()` and `relation_ddl()`",
+        "a model without the keys renders the same statements as before",
+        "`table_type`, `schema_mode` and `flexible_fields` raise `TypeError` there",
+    ),
+    "User models": (
+        "`define_access()` writes the access's permissions, as in v0.17.0",
+        "`define_table()` keeps them unless the model declares its own",
+        'A `TableType.USER` model with `extra="allow"` raises `TypeError` there (with `with_table=True`)',
+        "a `server_fields` column without a constant default needs a database `DEFAULT`",
+        "a 0.33 `TableType.USER` model's table turns `SCHEMAFULL` at its next `define_access()`",
+        "records already there are checked at their next write",
+    ),
+    "What SurrealDB checks": (
+        "**Records already in the table**",
+        "SurrealDB checks a record at its next write",
+        "reads back unchanged",
+        "**A write naming a field the table does not define**",
+        "`merge()` with a key the model does not declare, `bulk_update()`, a raw query",
+        "refused on SurrealDB 3.x",
+        "`Found field 'nope', but no such field exists for table 'note'`",
+        "dropped on 2.x and the embedded engine, silently: declare the field on the model",
+        "**A node model over a table that holds edges**",
+        "declare `table_type=TableType.ANY` for a table that holds records and edges",
+    ),
+    "SurrealDB 2.x and 3.x": (
+        "SurrealDB 2.x and the embedded engine empty the objects and arrays of an `any` column",
+        "optional or not, silently",
+        "`FLEXIBLE` keeps them",
+        "3.x keeps them without it, and refuses `FLEXIBLE` on such a column",
+        "`client.version()`",
+        "only when the table is `SCHEMAFULL` and a column holds `any`",
+        "`table_ddl()`, which needs no connection, writes the 3.x form",
+        "the item definition `TYPE any` (`bag.*`) on every line",
+        "refused on 3.x and dropped on 2.x and the embedded engine",
+        "`COMPUTED` fields are SurrealDB 3.x's",
+        "(#orm-behaviour-surrealdb-2x-vs-3x)",
+        "(#orm-behaviour-the-embedded-engine)",
+    ),
+    "Transactions, connections and the cache": (
+        "`tx=`",
+        "before anything is queued, on committed state",
+        "interactive",
+        "buffered",
+        "the transaction's own `SurrealDbError`",
+        "A block that raises applies nothing",
+        "not a lock",
+        "`connection`",
+        "`using()`",
+        "another connection raises `SurrealDbError` before any request",
+        "(#29-query-cache-cache-querycache)",
+        "drops the model's cached reads",
+        "`define_events()` runs before or after",
+        "`define_computed_fields()` still writes `VALUE` alone",
+        "`OWNER` or `EDITOR`",
+        "`SurrealDbAuthenticationError`",
+        "fires no signal",
+    ),
+    "Security": (
+        "written in backquotes",
+        "never from text",
+        "closed SurrealQL encoder",
+        "checked when the class is defined",
+        "A computed field's expression gets the same check before any request",
+        "would swallow the `ASSERT`, `PERMISSIONS` and `COMMENT` written after it",
+        "they are not an injection defence",
+        "trusted application code, never user input",
+        "never reset stored permissions to SurrealDB's defaults",
+        "names the table and the field, never the statement",
+        "redacted when its statement writes permissions",
+        "privileged session",
+    ),
+}
+#: One key phrase per "Coming from the full SurrealDB-ORM" bullet, in order (the accepted differences).
+_COMING_FROM_PHRASES_35 = (
+    "**The same keys, `SchemaMode` and getters**",
+    "**Not `SCHEMAFULL` by default**",
+    "**Declared wins, the rest is kept from the database**",
+    '**`define_table()` returns the statements joined with `"\\n"`**',
+    "**One statement per call**",
+    "**`TYPE NORMAL` is written for `TableType.NORMAL` and for a model without `table_type`**",
+    "**`FLEXIBLE` is written after `TYPE`**",
+    "**A view model's `define_table()` defines no field**",
+    "**Kinds for `datetime`, `Decimal`, `UUID`, durations, geometries, enums, literals and sub-models**",
+    "**No `DEFAULT` on a nullable field**",
+    "**`changefeed` may carry `INCLUDE ORIGINAL`.**",
+    "**`table_type`, `schema_mode` and `flexible_fields` are refused on a view model.**",
+    "**`TableType.USER` makes the table `SCHEMAFULL` in `define_table()`**",
+    "**Upgrading from 0.33 or earlier**",
+)
+#: Sections 16 and 19: what they say of ``define_table()``, word for word (whitespace normalised).
+_SECTION_16_SENTENCE = (
+    f"Since v0.34.0, `define_table()` ([section 35]{_LINK_35}) writes a computed field's `TYPE` too "
+    "(`TYPE option<T> VALUE …`), checks its expression, and keeps a field the database defines `COMPUTED` (SurrealDB "
+    "3.x) `COMPUTED`; `define_computed_fields()` turns such a field into `VALUE`."
+)
+_SECTION_19_SENTENCES = (
+    "Since v0.34.0, a user model whose schema mode is `SCHEMAFULL` — `table_type=TableType.USER` (the full ORM's key "
+    "for an auth table) or `schema_mode=SchemaMode.SCHEMAFULL` — gets from `define_access()` a `SCHEMAFULL` table with "
+    "one `DEFINE FIELD` per field (section 35); every other model keeps the `SCHEMALESS` table printed above. "
+    "`define_table()` gives such a model the same table, so the two can be called in any order."
+)
+#: Section 31: the generated-models bullet and the keys its "One class per table" bullet lists.
+_GENERATED_MODELS_BULLET_35 = (
+    "- **Generated models use the full ORM's keys** (since v0.34.0): `table_type=TableType.ANY` for a `TYPE ANY` table, "
+    "`schema_mode=SchemaMode.SCHEMAFULL`, `changefeed=…`, `permissions={…}` and `comment=…`, as the full ORM writes "
+    "them (it writes no `schema_mode` or `comment`); a view with `view_query=…` since v0.32.0 and a relation table's "
+    "ends with `relation_in=…`, `relation_out=…` and `enforced=True` since v0.33.0. A comment stays where the class "
+    "statement would refuse the key (`# View: AS …`, `# IN … OUT …`, `# Permissions: …` for a rule it cannot embed). "
+    "The base class says `RELATION` (`BaseSurrealEdge`). `READONLY` is a comment (full ORM: `Field(readonly=True)`)."
+)
+_ONE_CLASS_PER_TABLE_35 = (
+    "the table's clauses — `table_type=TableType.ANY` for a `TYPE ANY` node table, `schema_mode=SchemaMode.SCHEMAFULL`, "
+    f"`changefeed=`, `permissions={{…}}` and `comment=` (since v0.34.0, [section 35]{_LINK_35}) —"
+)
+#: Section 33: its Security sentences on a view's permissions, and its "Coming from" bullet on ``define_table()``.
+_SECTION_33_PERMISSIONS = (
+    "A view takes the permissions, comment and change feed its model declares (`permissions=`, `comment=`, "
+    "`changefeed=`, since v0.34.0); `define_view()` keeps those set by hand that the model does not declare. Without "
+    "either, SurrealDB applies its default `PERMISSIONS NONE`: a record user reads nothing from a view."
+)
+_SECTION_33_DEFINE_TABLE = (
+    f"`define_table()` (since v0.34.0, [section 35]{_LINK_35}) accepts a view model and applies it through "
+    "`define_view()`, so full-ORM code calling `define_table()` on a view works."
+)
+#: Section 34: the sentences on the clauses an edge model declares and on ``TableType``'s other members.
+_SECTION_34_DECLARED = (
+    "- **The clauses the model declares (`schema_mode`, `permissions`, `changefeed`, `comment`, since v0.34.0) are "
+    "written, the others kept from the database** (the full ORM renders every clause from the model and resets the "
+    "others)."
+)
+_SECTION_34_TABLE_TYPE = f"its other members take effect in `define_table()` ([section 35]{_LINK_35})"
+_SECTION_34_DEFINE_TABLE = (
+    "`define_table()` (since v0.34.0) applies an edge model through the statement `define_relation()` carries, then its "
+    "data fields; migrations come with v0.38.0."
+)
+#: Exactly the three rows v0.34.0 adds to the 2.x/3.x table, cell by cell, within the table's column widths.
+_TABLE_DDL_ROWS = [
+    [
+        "Model table DDL (`define_table()`: `DEFINE TABLE` + `DEFINE FIELD`)",
+        "same on both lines: one `DEFINE TABLE OVERWRITE` and one `DEFINE FIELD OVERWRITE` per column, keeping what the "
+        "model does not declare",
+        "the same",
+        "v0.34.0",
+    ],
+    [
+        "An `Any` or untyped `list`/`set` field of a `SCHEMAFULL` model",
+        "`define_table()` adds `FLEXIBLE` (read from `client.version()`): without it these engines empty such values, "
+        "optional or not; the item definitions as on 3.x",
+        "kept without `FLEXIBLE` (refused there); an untyped `list` gets an item definition `TYPE any`, without which 3.x "
+        "refuses an object item of a required one (`no such field exists`)",
+        "v0.34.0",
+    ],
+    [
+        "A write naming a field a `SCHEMAFULL` table does not define (an undeclared `merge()` key, a raw query, records "
+        "predating `SCHEMAFULL`)",
+        "the field is dropped, silently",
+        "the write is refused (`no such field exists`)",
+        "v0.34.0",
+    ],
+]
+_HEADER_SENTENCE_34 = (
+    "Rows added in v0.34.0 were measured on 2.7.0, 3.3.4 and the embedded engine; 3.1.5 behaves as 3.3.4 except that it "
+    "refuses a Python `set` written to a `set` field, and an object item of an optional untyped `list`."
+)
+#: The row v0.34.0 adds to the embedded engine's table, cell by cell.
+_EMBEDDED_TABLE_DDL_ROW = [
+    "Model table DDL (v0.34.0)",
+    "as on a 2.x server: `define_table()` adds `FLEXIBLE` to the `Any` and untyped columns of a `SCHEMAFULL` table; a "
+    "write naming a field the table does not define drops that field",
+    "3.x keeps those values without `FLEXIBLE` and refuses that write",
+    "v0.34.0",
+]
+_FEATURES_ROW_35 = ["Model table DDL (`define_table()`, `schema_mode`, `permissions`)", "✅"]
+_ROADMAP_ROWS_35 = [
+    ["v0.33.0", "Tier 3 — `TYPE RELATION` constraints", "✅ Released"],
+    ["v0.34.0", "Tier 3 — Model table DDL", "✅ Released"],
+    ["v0.35.0 – v0.40.0", "Tier 3 — Advanced (search, migrations, CLI)", "📋 Planned"],
+    ["v0.41.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+]
+_COMPARISON_ROW_35 = ["Model table DDL", "✅ v0.34.0 (`define_table()`)", "✅"]
+
+
+def _section_35() -> str:
+    return _readme_part(_SECTION_35)
+
+
+def _part_35(heading: str) -> str:
+    """One ``####`` subsection of section 35, as written (the intro for ``""``)."""
+    if not heading:
+        return _section_35().split("\n#### ", 1)[0]
+    return _subsection(f"#### {heading}", _section_35())
+
+
+def _readme_blocks(text: str) -> list[str]:
+    """The ``python`` blocks of *text*, in order."""
+    blocks: list[str] = re.findall(r"^```python\n(.*?)^```$", text, re.MULTILINE | re.DOTALL)
+    return blocks
+
+
+def _readme_printed(block: str) -> list[str]:
+    """What a README example prints: its comment lines that start a line (``# <printed line>``), in order."""
+    return re.findall(r"^# (.*)$", block, re.MULTILINE)
+
+
+def _readme_bullets(text: str) -> list[str]:
+    """The ``- `` bullets of *text*, each with its continuation lines, whitespace normalised."""
+    return [_normalised(bullet) for bullet in re.findall(r"^- .*?(?=^- |^\s*$|\Z)", text, re.MULTILINE | re.DOTALL)]
+
+
+def _anchor(heading: str) -> str:
+    """GitHub's anchor of a README heading: lower case, punctuation but ``-`` and ``_`` dropped, spaces as ``-``."""
+    return re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-")
+
+
+class TestReadmeSection35:
+    """README section 35 and what v0.34.0 changes elsewhere in the README: section 35's place, subsections, examples
+    (run on ``mem://`` as written, each printed line equal to its comment), sentences and tables; the sentences of
+    sections 16, 19, 31, 33 and 34; the features, roadmap, comparison and both behaviour tables."""
+
+    def test_section_35_follows_section_34(self) -> None:
+        """Right after section 34 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        text = _readme()
+        start_34 = text.index(f"\n{_SECTION_34}\n")
+        start_35 = text.index(f"\n{_SECTION_35}\n")
+        configuration = text.index("\n## Configuration Options\n")
+        assert start_34 < start_35 < configuration
+        assert re.findall(r"^#{2,3} .*$", text[start_34 + 1 : configuration], re.MULTILINE) == [
+            _SECTION_34,
+            _SECTION_35,
+        ]
+        assert text[:configuration].rstrip().endswith("\n---"), "section 35 ends before the --- of the next part"
+
+    def test_subsections_in_order(self) -> None:
+        assert re.findall(r"^#### (.*)$", _section_35(), re.MULTILINE) == _SUBSECTIONS_35
+
+    def test_the_examples_and_where_they_stand(self) -> None:
+        """Example A exactly, the block of the untitled intro; example B exactly, the first thing of "Applying it";
+        the getters, the view, the edge and the user model in their parts; no other block; ``python`` fences and the
+        tables' fences only."""
+        section = _section_35()
+        assert _readme_blocks(section) == _README_EXAMPLES_35
+        for heading, blocks in _BLOCKS_BY_PART_35.items():
+            assert _readme_blocks(_part_35(heading)) == blocks, heading
+        part = _part_35("Applying it")
+        assert part.split("\n\n", 1)[1].startswith(f"```python\n{_README_EXAMPLE_B_35}```"), part
+        fences = re.findall(r"^```(\S*)$", section, re.MULTILINE)
+        assert fences == ["python", ""] * len(_README_EXAMPLES_35), fences
+
+    def test_intro_paragraph(self) -> None:
+        intro = _normalised(_section_35().split("\n```python\n", 1)[0])
+        missing = [needle for needle in _INTRO_NEEDLES_35 if needle not in intro]
+        assert not missing, missing
+
+    @pytest.mark.parametrize("heading", list(_PART_NEEDLES_35))
+    def test_what_each_subsection_says(self, heading: str) -> None:
+        text = _normalised(_part_35(heading))
+        missing = [needle for needle in _PART_NEEDLES_35[heading] if needle not in text]
+        assert not missing, missing
+
+    @pytest.mark.parametrize("heading", list(_SENTENCES_35))
+    def test_sentences_word_for_word(self, heading: str) -> None:
+        """Each sentence exactly once in its subsection, and nowhere else in the section."""
+        section = _normalised(_section_35())
+        part = _normalised(_part_35(heading))
+        for sentence in _SENTENCES_35[heading]:
+            assert part.count(sentence) == 1, sentence
+            assert section.count(sentence) == 1, sentence
+
+    def test_no_prescribed_order_and_no_list_return(self) -> None:
+        """``define_table()`` returns a ``str`` and needs no call order with ``define_access()``: neither section 35
+        nor section 19 says otherwise."""
+        for text in (_normalised(_section_35()), _normalised(_readme_part(_SECTION_19))):
+            for claim in ("before `define_table()`", "returns a list", "after `define_access()`"):
+                assert claim not in text, claim
+
+    def test_no_local_reference(self) -> None:
+        """The transaction limit is described in words: no design reference, no issue number."""
+        section = _section_35()
+        for marker in ("§", r"\bspec\b", r"\.claude"):
+            assert re.search(marker, section) is None, marker
+        assert re.findall(r"(?<![(\w])#\d+", _part_35("Transactions, connections and the cache")) == []
+
+    def test_field_types_table(self) -> None:
+        """Two columns, no pipe in a cell (a union is written in prose); a row for each family of annotations."""
+        [lines] = _md_tables(_part_35("Field types"))
+        assert _cells(lines[0]) == ["Python annotation", "SurrealQL kind"]
+        rows = dict(cells for _, cells in _table_rows(_part_35("Field types")))
+        assert len({len(_cells(line)) for line in lines}) == 1 and "\\|" not in "".join(lines), lines
+        assert rows["a union of `int`, `float` and `Decimal`, in any order"] == "`number`", rows
+        assert rows["`datetime`, `date`"] == "`datetime`", rows
+        assert rows["`RecordID`"] == "`record`", rows
+        assert rows["`list`, `list[Any]`"] == "`array`, and an item definition (below)", rows
+        assert rows["`dict`, `dict[K, V]`, `Mapping[K, V]`"] == "`object`, free-form", rows
+        assert rows["`Optional[X]`, a union with `None`"] == "`option<X>`", rows
+        assert rows["any other union"] == "the union of its members' kinds; `any` when one of them is `any`", rows
+        assert rows["`Any`, `object`, the SDK's `Datetime`"] == "`any`", rows
+
+    def test_source_rule_tables(self) -> None:
+        """The source rule in "Applying it", as two tables: the table's clauses, then each field's."""
+        tables = _md_tables(_part_35("Applying it"))
+        assert [_cells(lines[0]) for lines in tables] == [
+            ["Table clause", "The model declares it", "The model leaves it out"],
+            ["Field clause", "Written from the model", "Kept from the database"],
+        ]
+        table_rows = [_cells(line)[0] for line in tables[0][2:]]
+        field_rows = [_cells(line)[0] for line in tables[1][2:]]
+        assert table_rows == ["type", "schema mode", "`COMMENT`, `CHANGEFEED`", "`PERMISSIONS`", "`DROP`"]
+        assert field_rows == [
+            "`TYPE`",
+            "`FLEXIBLE`",
+            "`DEFAULT`",
+            "`VALUE`, `COMPUTED`",
+            "`REFERENCE`, `READONLY`, `ASSERT`, `PERMISSIONS`, `COMMENT`",
+        ]
+        assert _cells(tables[1][-1])[1:] == ["—", "always"]
+
+    def test_coming_from_the_full_orm(self) -> None:
+        """Fourteen bullets, one key phrase each, in order; the facts of the accepted differences."""
+        bullets = _readme_bullets(_part_35("Coming from the full SurrealDB-ORM"))
+        assert len(bullets) == len(_COMING_FROM_PHRASES_35), bullets
+        for bullet, phrase in zip(bullets, _COMING_FROM_PHRASES_35, strict=True):
+            assert phrase in bullet, (phrase, bullet)
+        needles = [
+            (0, "`get_permissions()` returns the declared mapping, as the full ORM's"),
+            (0, '`get_changefeed()` returns the normalised text (`"1h INCLUDE ORIGINAL"`), equal to the declared string'),
+            (0, "`get_schema_mode()` may be `None`"),
+            (1, "the full ORM makes every table `SCHEMAFULL` unless told otherwise"),
+            (2, "the full ORM resets every clause it does not render"),
+            (3, "also takes `overwrite=` and `tx=`"),
+            (4, "raises `SurrealDbError` naming the table or the field, never the statement"),
+            (4, "`MigrationStatementError` (a `RuntimeError` from `surreal_orm.migrations`) with the SQL in its message"),
+            (5, "SurrealDB then stores `TYPE NORMAL` for a `SCHEMAFULL` table"),
+            (5, "`TYPE ANY` for a `SCHEMALESS` one"),
+            (5, "declare `TableType.ANY` for a table that holds both records and edges"),
+            (6, '("FLEXIBLE must be specified after TYPE")'),
+            (6, "on SurrealDB 2.x to the columns that hold `any`"),
+            (7, "the full ORM also writes one `DEFINE FIELD` per model field on the view's table"),
+            (8, "an item definition `TYPE any` for an untyped `list`"),
+            (8, "`record` for `RecordID`"),
+            (12, "in `define_access()` (the lite's model-level auth), which then defines the model's fields too"),
+            (13, "the five keys were accepted and ignored"),
+            (13, "a plain-string `schema_mode` included"),
+            (13, "`define_table()`, `define_relation()`, `define_view()` and `define_access()`"),
+            (13, "A view model with `table_type` raises `TypeError`"),
+            (13, "`define_view()` keeps a view's clauses set by hand"),
+            (13, 'raise `TypeError` with `extra="allow"`'),
+            (13, "generated models carry the keys"),
+        ]
+        assert [(index, needle) for index, needle in needles if needle not in bullets[index]] == []
+
+    def test_links_resolve(self) -> None:
+        """Every in-page link of section 35, and of the sentences that point to it, names a heading of the README."""
+        anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
+        pointers = _SECTION_16_SENTENCE + _ONE_CLASS_PER_TABLE_35 + _SECTION_33_DEFINE_TABLE + _SECTION_34_TABLE_TYPE
+        links = re.findall(r"\]\(#([^)]+)\)", _section_35() + pointers)
+        assert len(links) >= 12, links
+        assert [link for link in links if link not in anchors] == []
+
+    def test_section_16_sentence(self) -> None:
+        assert _normalised(_readme_part(_SECTION_16)).count(_SECTION_16_SENTENCE) == 1
+
+    def test_section_19_sentences(self) -> None:
+        """Right after the ``with_table=False`` sentence."""
+        section_19 = _normalised(_readme_part(_SECTION_19))
+        opt_out = "`define_access(with_table=False)` opts out when you manage the table yourself."
+        assert section_19.count(f"{opt_out} {_SECTION_19_SENTENCES}") == 1, section_19
+
+    def test_section_31_generated_models(self) -> None:
+        """The generated-models bullet exactly; the class prose lists the table keys and keeps the comments only where
+        the class statement would refuse a key."""
+        section_31 = _readme_part(_SECTION_31)
+        bullets = _readme_bullets(_subsection("#### Coming from the full SurrealDB-ORM", section_31))
+        assert _GENERATED_MODELS_BULLET_35 in bullets, [bullet for bullet in bullets if "Generated models" in bullet]
+        assert not any("Generated models use comments" in bullet for bullet in bullets)
+        generating = _normalised(_subsection("#### Generating models", section_31))
+        assert _ONE_CLASS_PER_TABLE_35 in generating, generating
+        assert "where the class statement would refuse the key" in generating, generating
+        for stale in ("`# Changefeed: 1d`", "are comments of its class, and the module's header"):
+            assert stale not in generating, stale
+        limits = _normalised(_subsection("#### What the generator does not do", section_31))
+        assert "only comments of its class" not in limits, limits
+        assert "`define_table()` keeps them" in limits, limits
+
+    def test_section_33_sentences(self) -> None:
+        """Its Security paragraph says what a view's permissions are now, and ``define_table()`` is in the present."""
+        section_33 = _readme_part(_SECTION_33)
+        security = _normalised(_subsection("#### Security", section_33))
+        assert security.count(_SECTION_33_PERMISSIONS) == 1, security
+        assert "resets permissions set by hand" not in security, security
+        bullets = _readme_bullets(_subsection("#### Coming from the full SurrealDB-ORM", section_33))
+        assert _SECTION_33_DEFINE_TABLE in bullets[2], bullets[2]
+        assert "comes with v0.34.0" not in _normalised(section_33)
+
+    def test_section_34_sentences(self) -> None:
+        """The declared clauses are written, ``TableType``'s other members take effect, ``define_table()`` is in the
+        present."""
+        section_34 = _readme_part(_SECTION_34)
+        declaring = _normalised(_subsection("#### Declaring the constraint", section_34))
+        assert _SECTION_34_TABLE_TYPE in declaring, declaring
+        bullets = _readme_bullets(_subsection("#### Coming from the full SurrealDB-ORM", section_34))
+        assert _SECTION_34_DECLARED in bullets, bullets
+        assert _SECTION_34_DEFINE_TABLE in bullets[2], bullets[2]
+        assert "**`TableType`'s other members take effect in `define_table()`**" in bullets[9], bullets[9]
+        text = _normalised(section_34)
+        for stale in ("no effect until v0.34.0", "comes with v0.34.0", "keys yet", "recorded for the table DDL"):
+            assert stale not in text, stale
+
+    def test_server_behaviour_rows(self) -> None:
+        """Exactly three rows, Since v0.34.0, together and in version order before the table's last row."""
+        assert_server_rows(_TABLE_DDL_ROWS)
+
+    def test_server_behaviour_table_keeps_its_widths(self) -> None:
+        """Every line 535 characters, the columns 136, 175, 181 and 38 wide: the new rows are padded to them."""
+        assert_server_table()
+
+    def test_server_behaviour_header_sentence(self) -> None:
+        assert_server_header_sentence(_HEADER_SENTENCE_34)
+
+    def test_embedded_table_row(self) -> None:
+        """All four cells, in version order before the catch-all "Everything else" row; widths kept."""
+        assert_embedded_rows([_EMBEDDED_TABLE_DDL_ROW])
+
+    def test_features_row(self) -> None:
+        features = [row for _, row in _table_rows(_readme_part("## Features"))]
+        firsts = [row[0] for row in features]
+        assert _FEATURES_ROW_35 in features, features
+        relations = "Relation constraints (`relation_in`, `define_relation()`, `TYPE RELATION`)"
+        assert firsts.index(_FEATURES_ROW_35[0]) == firsts.index(relations) + 1
+
+    def test_roadmap_rows(self) -> None:
+        roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
+        start = [row[0] for row in roadmap].index("v0.33.0")
+        assert roadmap[start : start + 4] == _ROADMAP_ROWS_35, roadmap
+
+    def test_comparison_row(self) -> None:
+        """Released, right after ``TYPE RELATION`` enforcement and before full-text search."""
+        comparison = [row for _, row in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        firsts = [row[0] for row in comparison]
+        start = firsts.index("TYPE RELATION enforcement")
+        assert comparison[start + 1] == _COMPARISON_ROW_35, comparison
+        assert firsts[start + 2] == "Full-Text Search", firsts
+
+    def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
+        """Every table v0.34.0 touches, section 35's included, keeps one cell count per line and no escaped pipe."""
+        parts = [
+            _readme_part("## Features"),
+            _readme_part(_SERVER_BEHAVIOUR),
+            _readme_part(_EMBEDDED_BEHAVIOUR),
+            _readme_part("## Roadmap"),
+            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+        ]
+        found = [lines for part in parts for lines in _md_tables(part)]
+        assert len(found) == len(parts)
+        for lines in found:
+            assert len({len(_cells(line)) for line in lines}) == 1 and "\\|" not in "".join(lines), lines
+        section = _md_tables(_section_35())
+        assert len(section) == 3, "section 35 has its kinds table and the two source-rule tables"
+        for lines in section:
+            assert len({len(_cells(line)) for line in lines}) == 1 and "\\|" not in "".join(lines), lines
+
+    async def test_section_35_examples(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Every ``python`` block runs as written, in order and in one namespace, on ``mem://`` (inside
+        ``embedded_database()``); what each block prints is, line by line, its ``# `` comment lines."""
+        capsys.readouterr()
+        namespace: dict[str, Any] = {"__name__": "readme_section_35"}
+        try:
+            async with embedded_database():
+                for code in _readme_blocks(_section_35()):
+                    compiled = compile(code, "<README section 35>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                    # A doctest of this repository's own README (trusted text), top-level awaits included.
+                    outcome = eval(compiled, namespace)
+                    if inspect.iscoroutine(outcome):
+                        await outcome
+                    assert capsys.readouterr().out.splitlines() == _readme_printed(code), code
+        finally:
+            namespace.clear()

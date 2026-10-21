@@ -4951,7 +4951,8 @@ _PART_NEEDLES_33 = {
         "not an access control",
         "`PERMISSIONS NONE`",
         "a record user reads nothing from a view",
-        "resets permissions set by hand",
+        # v0.34.0: a view takes the clauses its model declares, and define_view() keeps the others.
+        "keeps those set by hand that the model does not declare",
         "privileged system user",
     ),
 }
@@ -4970,13 +4971,14 @@ _ROADMAP_ROWS_33 = [
     ["v0.31.0", "Tier 3 — Server-side events and DDL helpers", "✅ Released"],
     ["v0.32.0", "Tier 3 — Materialized views", "✅ Released"],
     ["v0.33.0", "Tier 3 — `TYPE RELATION` constraints", "✅ Released"],
-    ["v0.34.0 – v0.40.0", "Tier 3 — Advanced (DDL, search, migrations, CLI)", "📋 Planned"],
+    ["v0.34.0", "Tier 3 — Model table DDL", "✅ Released"],
 ]
 _COMPARISON_ROW_33 = ["Materialized views", "✅ v0.32.0 (`view_query`, `define_view()`)", "✅"]
-#: Issue #292: the third "Coming from" bullet dates ``define_table()``, which accepts a view model, to v0.34.0.
+#: Issue #292: the third "Coming from" bullet dates ``define_table()``, which accepts a view model, to v0.34.0 (in the
+#: present since v0.34.0 ships it).
 _DEFINE_TABLE_ON_A_VIEW_33 = (
-    "`define_table()` comes with v0.34.0: it accepts a view model and applies it through `view_ddl()`, so full-ORM "
-    "code calling `define_table()` on a view works from then on."
+    "`define_table()` (since v0.34.0, [section 35](#35-model-table-ddl-define_table-schema_mode-permissions)) accepts "
+    "a view model and applies it through `define_view()`, so full-ORM code calling `define_table()` on a view works."
 )
 #: Spec §11.1 item 5 (P4, A3): exactly eight rows v0.32.0 adds to the 2.x/3.x table, cell by cell.
 _VIEW_ROWS = [
@@ -5051,16 +5053,15 @@ _EMBEDDED_VIEWS_ROW = [
     "`float` sums and means on 3.x",
     "v0.32.0",
 ]
-#: Spec §11.1 item 7: section 31's generated-models bullet, whitespace normalised (v0.33.0's text: the relation keys
-#: are generated since then).
+#: Spec §11.1 item 7: section 31's generated-models bullet, whitespace normalised (v0.34.0's text: the table keys are
+#: generated since then, the relation keys since v0.33.0).
 _GENERATED_MODELS_BULLET_31 = (
-    "- **Generated models use comments** where the full ORM writes `SurrealConfigDict(permissions=…, changefeed=…)` "
-    "(`# Permissions: …`, `# Changefeed: …`): those keys arrive in the lite's `SurrealConfigDict` with later minors. A "
-    "view is generated with `view_query=…` since v0.32.0, and a relation table's ends with `relation_in=…`, "
-    "`relation_out=…` and `enforced=True` since v0.33.0, as in the full ORM (a `# View: AS …` comment when the lite "
-    "cannot declare the view: an edge, a computed field, a query it refuses; an `# IN … OUT …` comment when a table "
-    "name is not an identifier). The base class says what the full ORM's `table_type=` says (`BaseSurrealEdge` for a "
-    "relation table). `READONLY` is a comment too (full ORM: `Field(readonly=True)`)."
+    "- **Generated models use the full ORM's keys** (since v0.34.0): `table_type=TableType.ANY` for a `TYPE ANY` table, "
+    "`schema_mode=SchemaMode.SCHEMAFULL`, `changefeed=…`, `permissions={…}` and `comment=…`, as the full ORM writes "
+    "them (it writes no `schema_mode` or `comment`); a view with `view_query=…` since v0.32.0 and a relation table's "
+    "ends with `relation_in=…`, `relation_out=…` and `enforced=True` since v0.33.0. A comment stays where the class "
+    "statement would refuse the key (`# View: AS …`, `# IN … OUT …`, `# Permissions: …` for a rule it cannot embed). "
+    "The base class says `RELATION` (`BaseSurrealEdge`). `READONLY` is a comment (full ORM: `Field(readonly=True)`)."
 )
 #: Spec §11.1 item 7: section 31's long-line sentence, whitespace normalised.
 _LONG_LINES_31 = (
@@ -5113,8 +5114,8 @@ class TestReadmeSection33:
     (spec §11.1)."""
 
     def test_section_33_follows_section_32(self) -> None:
-        """Right after section 32 (after its "Coming from" bullets), then section 34 (v0.33.0), and before the ``---``
-        of "Configuration Options"."""
+        """Right after section 32 (after its "Coming from" bullets), then section 34 (v0.33.0) and section 35
+        (v0.34.0), and before the ``---`` of "Configuration Options"."""
         text = _readme()
         start_32 = text.index(f"\n{_SECTION_32}\n")
         start_33 = text.index(f"\n{_SECTION_33}\n")
@@ -5124,6 +5125,7 @@ class TestReadmeSection33:
             _SECTION_32,
             _SECTION_33,
             "### 34. Relation constraints (`relation_in`, `define_relation()`)",
+            "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
         ]
         assert text[:configuration].rstrip().endswith("\n---"), "the last section ends before the --- of the next part"
 

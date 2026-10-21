@@ -5156,7 +5156,8 @@ class TestMultiDatabaseDocs:
 
     def test_section_30_follows_section_29(self) -> None:
         """Right after section 29 (after its "Coming from" bullets), then section 31 (v0.30.0), section 32
-        (v0.31.0), section 33 (v0.32.0) and section 34 (v0.33.0), and before the ``---`` of "Configuration Options"."""
+        (v0.31.0), section 33 (v0.32.0), section 34 (v0.33.0) and section 35 (v0.34.0), and before the ``---`` of
+        "Configuration Options"."""
         readme = _readme()
         start_29 = readme.index(f"\n{_SECTION_29}\n")
         start_30 = readme.index(f"\n{_SECTION_30}\n")
@@ -5169,6 +5170,7 @@ class TestMultiDatabaseDocs:
             "### 32. Server-side events and stored functions (`Event`, `define_events()`, `define_function()`)",
             "### 33. Materialized views (`view_query`, `define_view()`)",
             "### 34. Relation constraints (`relation_in`, `define_relation()`)",
+            "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)",
         ]
         assert readme[:configuration].rstrip().endswith("\n---"), "section 30 ends before the --- of the next part"
 
