@@ -71,14 +71,31 @@ read back — the table's type, mode, comment, change feed and permissions, each
 The ORM's writes (``TestOrmWritesE2E``): on a ``SCHEMAFULL`` table defined by a model's ``table_ddl()`` — one column of
 every kind, a typed computed field ``tot`` — every write path is accepted and every field reads back equal, and the
 computed field reads ``i + 1`` after each write; SurrealDB 3.1 refuses the ORM's ``set`` value, which is pinned there.
+
+Applying (``TestDefineTable``, ``TestTableGuard``, on fake clients): ``define_table()`` reads ``INFO FOR DB`` once —
+and ``INFO FOR TABLE`` once for a table that exists, with ``overwrite=True`` — then sends one statement per call: the
+table, then each column. A missing table gets ``table_ddl()``'s statements; a table that exists gets the carried ones,
+whose ``FLEXIBLE`` follows the mode the table will have (the declared one, else the stored one); ``overwrite=False``
+sends ``IF NOT EXISTS`` and reads no field. It returns the statements joined with a newline (a ``str``, the full ORM's
+return). Before any DDL the guard refuses a view, a relation table, a table or a field definition it cannot read or
+carry; a transaction of another connection, a non-``bool`` ``overwrite`` and the model's own faults are refused before
+any request; a refused read or statement names the table or the field, never the statement.
+
+On the engines (``TestDefineTableE2E``, ``TestExistingTableE2E``, ``TestComputedE2E``, ``TestTableGuardE2E``,
+``TestTablePermissionsE2E``): a missing table is defined and a second call changes nothing; a table tuned by hand keeps
+every clause, field clause, index, event, view, record, live query and change-feed entry the model does not declare, a
+``DROP`` table its ``DROP``, a ``server_fields`` column the database's ``DEFAULT``; a ``COMPUTED`` field (SurrealDB
+3.x) stays ``COMPUTED`` and its records keep their value; a view or a relation table under a node model is left as it
+is; a record user gets the refusal of the first read and nothing else is sent.
 """
 
 import ast
 import contextlib
+import inspect
 import os
 import re
 from collections import defaultdict, deque
-from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -117,6 +134,7 @@ from surreal_orm_lite import (
     SurrealDbError,
     SurrealDbNotFoundError,
     TableType,
+    Transaction,
     computed,
     model_ddl,
     schema,
@@ -2960,6 +2978,463 @@ class TestReadTableFields:
         assert client.queries == []
 
 
+# --- define_table(): the reads, the guards, the statements applied (fake clients) -----------------------------------
+
+
+class TdlNoteMeta(BaseSurrealModel):
+    """A model without a schema mode and with a free-form object: ``FLEXIBLE`` follows the table's mode."""
+
+    model_config = SurrealConfigDict(table_name="tdl_note", connection="tdl")
+
+    id: str | None = None
+    body: str
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class TdlNoteMetaLoose(BaseSurrealModel):
+    """The same columns, declared ``SCHEMALESS``: no ``FLEXIBLE``, whatever was stored."""
+
+    model_config = SurrealConfigDict(table_name="tdl_note", schema_mode=SchemaMode.SCHEMALESS, connection="tdl")
+
+    id: str | None = None
+    body: str
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class TdlNoteAge(BaseSurrealModel):
+    """An ordinary column with a constant default, over a stored ``COMPUTED`` field (K10)."""
+
+    model_config = SurrealConfigDict(table_name="tdl_note", connection="tdl")
+
+    id: str | None = None
+    age: int = 18
+
+
+_INFO = "INFO FOR DB;"
+_INFO_NOTE = "INFO FOR TABLE `tdl_note`;"
+_INFO_PERSON = "INFO FOR TABLE `tdl_person`;"
+
+#: The fields of the table tuned by hand, as SurrealDB 3.x renders them in ``INFO FOR TABLE``.
+_TUNED_FIELDS = {
+    "body": "DEFINE FIELD body ON tdl_note TYPE string PERMISSIONS FULL",
+    "created": "DEFINE FIELD created ON tdl_note TYPE none | datetime DEFAULT time::now() READONLY PERMISSIONS FULL",
+    "done": "DEFINE FIELD done ON tdl_note TYPE bool DEFAULT true COMMENT 'd' PERMISSIONS FULL",
+    "email": (
+        "DEFINE FIELD email ON tdl_note TYPE string ASSERT $value != '' COMMENT 'mail' PERMISSIONS FOR select WHERE "
+        "$auth.id = id, FOR create, update FULL"
+    ),
+}
+_BODY = "DEFINE FIELD OVERWRITE `body` ON `tdl_note` TYPE string;"
+#: What ``TdlNoteTuned.define_table()`` sends over the table tuned by hand, in the model's column order.
+_TUNED = [_K1E, _BODY, _K5, _K3, _K4]
+
+#: A stored view, a relation table, and a table the parser cannot read, on ``tdl_note``.
+_STORED_NOTE_VIEW = "DEFINE TABLE tdl_note TYPE ANY SCHEMALESS AS SELECT count() AS n FROM tdl_src GROUP ALL PERMISSIONS NONE"
+_STORED_NOTE_RELATION = "DEFINE TABLE tdl_note TYPE RELATION IN tdl_person OUT tdl_person SCHEMALESS PERMISSIONS NONE"
+_STORED_NOTE_BAD_RULE = (
+    "DEFINE TABLE tdl_note TYPE ANY SCHEMALESS PERMISSIONS FOR select WHERE a; b, FOR create, update, delete NONE"
+)
+_STORED_NOTE_FULL = "DEFINE TABLE tdl_note TYPE NORMAL SCHEMAFULL PERMISSIONS NONE"
+_STORED_NOTE_LESS = "DEFINE TABLE tdl_note TYPE ANY SCHEMALESS PERMISSIONS NONE"
+
+
+class _TableClient:
+    """A client answering ``INFO FOR DB;`` with ``{"tables": tables}``, ``INFO FOR TABLE …;`` with ``{"fields":
+    fields}`` and every other statement with ``[]``. It records each statement, raises *info_error* for the first
+    read, *fields_error* for the second and *ddl_error* for the statements starting with *refuse* (every one when
+    *refuse* is ``None``), and counts ``version()``."""
+
+    def __init__(
+        self,
+        tables: Mapping[str, object] | None = None,
+        fields: Mapping[str, object] | None = None,
+        *,
+        info_error: BaseException | None = None,
+        fields_error: BaseException | None = None,
+        ddl_error: BaseException | None = None,
+        refuse: str | None = None,
+    ) -> None:
+        self.tables = dict(tables or {})
+        self.fields = dict(fields or {})
+        self.info_error = info_error
+        self.fields_error = fields_error
+        self.ddl_error = ddl_error
+        self.refuse = refuse
+        self.queries: list[str] = []
+        self.version_calls = 0
+
+    async def query(self, statement: str, variables: object) -> object:
+        assert variables == {}
+        self.queries.append(statement)
+        if statement == _INFO:
+            if self.info_error is not None:
+                raise self.info_error
+            return {"tables": dict(self.tables), "functions": {}}
+        if statement.startswith("INFO FOR TABLE "):
+            if self.fields_error is not None:
+                raise self.fields_error
+            return _table_answer(dict(self.fields))
+        if self.ddl_error is not None and (self.refuse is None or statement.startswith(self.refuse)):
+            raise self.ddl_error
+        return []
+
+    async def version(self) -> str:
+        self.version_calls += 1
+        return "surrealdb-3.3.4"
+
+
+class _QueuingTx:
+    """A transaction of the connection *name* whose ``add()`` records each statement."""
+
+    def __init__(self, name: str = "tdl") -> None:
+        self._connection_name = name
+        self.added: list[tuple[str, object]] = []
+
+    async def add(self, statement: str, variables: object) -> None:
+        self.added.append((statement, variables))
+
+
+@pytest.fixture
+def use_client(monkeypatch: pytest.MonkeyPatch) -> Callable[[Any], None]:
+    """Register the connection ``"tdl"`` (never opened) and make ``get_client()`` answer the client given."""
+
+    def use(client: Any) -> None:
+        SurrealDBConnectionManager.add_connection("tdl", url="mem://", namespace="ns", database="tdl_db")
+
+        async def get_client(*args: Any, **kwargs: Any) -> Any:
+            return client
+
+        monkeypatch.setattr(SurrealDBConnectionManager, "get_client", get_client)
+
+    return use
+
+
+class TestDefineTable:
+    """``define_table()`` on fake clients: the reads it sends, the statements it applies one per call and returns
+    joined with a newline, ``FLEXIBLE`` following the table's mode, a transaction getting the DDL only, and the
+    refusals before any request or naming the table or the field, never the statement."""
+
+    def test_signature(self) -> None:
+        """A class method and a coroutine, wrapped as an invalidating write of the query cache; ``BaseSurrealEdge``
+        does not redefine it."""
+        function = inspect.getattr_static(BaseSurrealModel, "define_table")
+        assert isinstance(function, classmethod)
+        assert inspect.iscoroutinefunction(function.__func__)
+        assert function.__func__.__surreal_cache_writes__ is True
+        assert inspect.signature(BaseSurrealModel.define_table) == inspect.Signature(
+            [
+                inspect.Parameter("overwrite", inspect.Parameter.KEYWORD_ONLY, default=True, annotation=bool),
+                inspect.Parameter("tx", inspect.Parameter.KEYWORD_ONLY, default=None, annotation=Transaction | None),
+            ],
+            return_annotation=str,
+        )
+        assert "define_table" not in vars(BaseSurrealEdge)
+
+    async def test_a_missing_table(self, use_client: Callable[[Any], None]) -> None:
+        """``INFO FOR DB`` once, then ``table_ddl()``'s statements one per call; their text joined with a newline."""
+        client = _TableClient()
+        use_client(client)
+        result = await TdlPerson.define_table()
+        assert isinstance(result, str)
+        assert result == "\n".join(_G1) == "\n".join(TdlPerson.table_ddl())
+        assert client.queries == [_INFO, *_G1]
+        assert client.version_calls == 0
+
+    async def test_overwrite_false_on_a_missing_table(self, use_client: Callable[[Any], None]) -> None:
+        client = _TableClient()
+        use_client(client)
+        assert await TdlPerson.define_table(overwrite=False) == "\n".join(_if_not_exists(_G1))
+        assert client.queries == [_INFO, *_if_not_exists(_G1)]
+
+    async def test_an_existing_table(self, use_client: Callable[[Any], None]) -> None:
+        """``INFO FOR TABLE`` once, then the carried statements: K1E, then each column over its stored field."""
+        client = _TableClient({"tdl_note": _STORED_NOTE}, _TUNED_FIELDS)
+        use_client(client)
+        assert await TdlNoteTuned.define_table() == "\n".join(_TUNED)
+        assert client.queries == [_INFO, _INFO_NOTE, *_TUNED]
+        assert client.version_calls == 0
+
+    async def test_the_declared_clauses_win(self, use_client: Callable[[Any], None]) -> None:
+        """K2E: the declared mode, comment and permissions over the stored ones, the change feed kept."""
+        client = _TableClient({"tdl_note": _STORED_NOTE}, _TUNED_FIELDS)
+        use_client(client)
+        assert await TdlNoteMine.define_table() == "\n".join([_K2E, *_TUNED[1:]])
+        assert client.queries == [_INFO, _INFO_NOTE, _K2E, *_TUNED[1:]]
+
+    async def test_a_new_column_on_an_existing_table(self, use_client: Callable[[Any], None]) -> None:
+        """A column without a stored field gets ``field_statement()``'s; a stored field the model does not define,
+        readable or not, is left as it is."""
+        client = _TableClient(
+            {"tdl_note": _STORED_NOTE_LESS}, {"other": "DEFINE FIELD other ON tdl_note TYPE int", "odd": "DEFINE FIELD"}
+        )
+        use_client(client)
+        assert await TdlNote.define_table() == "\n".join(_G2)
+        assert client.queries == [_INFO, _INFO_NOTE, *_G2]
+
+    @pytest.mark.parametrize(
+        ("model", "stored", "overwrite", "flexible"),
+        [
+            (TdlNoteMeta, None, True, False),
+            (TdlNoteMeta, _STORED_NOTE_FULL, True, True),
+            (TdlNoteMeta, _STORED_NOTE_LESS, True, False),
+            (TdlNoteMetaLoose, _STORED_NOTE_FULL, True, False),
+            (TdlNoteMeta, None, False, False),
+            (TdlNoteMeta, _STORED_NOTE_FULL, False, True),
+            (TdlNoteMetaLoose, _STORED_NOTE_FULL, False, True),
+            (TdlNoteMetaLoose, None, False, False),
+        ],
+        ids=[
+            "new-no-mode",
+            "schemafull-kept",
+            "schemaless-kept",
+            "schemaless-declared",
+            "if-not-exists-new",
+            "if-not-exists-schemafull",
+            "if-not-exists-schemafull-declared-schemaless",
+            "if-not-exists-new-declared-schemaless",
+        ],
+    )
+    async def test_flexible_follows_the_tables_mode(
+        self,
+        use_client: Callable[[Any], None],
+        model: type[BaseSurrealModel],
+        stored: str | None,
+        overwrite: bool,
+        flexible: bool,
+    ) -> None:
+        """``overwrite=True``: the declared mode, else the stored one, else ``SCHEMALESS``; ``overwrite=False`` (``IF
+        NOT EXISTS`` leaves a table as it is): the stored mode, else the declared one, else ``SCHEMALESS``."""
+        client = _TableClient({} if stored is None else {"tdl_note": stored})
+        use_client(client)
+        statements = (await model.define_table(overwrite=overwrite)).split("\n")
+        clause = "OVERWRITE" if overwrite else "IF NOT EXISTS"
+        meta = f"DEFINE FIELD {clause} `meta` ON `tdl_note` TYPE object"
+        assert statements[-1] == (f"{meta} FLEXIBLE;" if flexible else f"{meta};")
+        reads = [_INFO, _INFO_NOTE] if stored is not None and overwrite else [_INFO]
+        assert client.queries == [*reads, *statements]
+
+    async def test_overwrite_false_reads_no_field(self, use_client: Callable[[Any], None]) -> None:
+        """``IF NOT EXISTS`` on a table that exists: no ``INFO FOR TABLE``, no field carried, none refused."""
+        client = _TableClient(
+            {"tdl_note": _STORED_NOTE_BAD_RULE}, {"done": "DEFINE FIELD done ON tdl_note TYPE bool ASSERT (a"}
+        )
+        use_client(client)
+        assert await TdlNote.define_table(overwrite=False) == "\n".join(_if_not_exists(_G2))
+        assert client.queries == [_INFO, *_if_not_exists(_G2)]
+
+    async def test_a_transaction_gets_the_ddl_only(self, use_client: Callable[[Any], None]) -> None:
+        """The reads on the client, on committed state, before anything is queued; the statements in the block."""
+        client = _TableClient({"tdl_note": _STORED_NOTE}, _TUNED_FIELDS)
+        use_client(client)
+        tx = _QueuingTx()
+        assert await TdlNoteTuned.define_table(tx=tx) == "\n".join(_TUNED)  # type: ignore[arg-type]
+        assert client.queries == [_INFO, _INFO_NOTE]
+        assert tx.added == [(statement, None) for statement in _TUNED]
+
+    async def test_a_transaction_of_another_connection(self, use_client: Callable[[Any], None]) -> None:
+        client = _TableClient()
+        use_client(client)
+        tx = _QueuingTx("other")
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlPerson.define_table(tx=tx)  # type: ignore[arg-type]
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value).startswith("TdlPerson.define_table() cannot run in this transaction: ")
+        assert client.queries == []
+        assert tx.added == []
+
+    @pytest.mark.parametrize("overwrite", ["yes", 1, None], ids=repr)
+    async def test_e1_before_any_request(self, use_client: Callable[[Any], None], overwrite: Any) -> None:
+        client = _TableClient()
+        use_client(client)
+        with pytest.raises(TypeError) as raised:
+            await TdlPerson.define_table(overwrite=overwrite)
+        assert str(raised.value) == f"overwrite= must be a bool, got {type(overwrite).__name__}."
+        assert client.queries == []
+
+    async def test_ux1_and_cv1_before_any_request(self, use_client: Callable[[Any], None]) -> None:
+        class TdlUserOpen(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="tdl_user", table_type=TableType.USER, extra="allow", connection="tdl")
+
+            email: str
+
+        class TdlBadSum(BaseSurrealModel):
+            model_config = SurrealConfigDict(table_name="tdl_cart", connection="tdl")
+
+            items: list[str] = Field(default_factory=list)
+            total: Computed[int] = computed("count(items")
+
+        client = _TableClient()
+        use_client(client)
+        with pytest.raises(TypeError) as ux1:
+            await TdlUserOpen.define_table()
+        assert (type(ux1.value), str(ux1.value)) == (TypeError, _ux1("TdlUserOpen"))
+        with pytest.raises(ValueError) as cv1:
+            await TdlBadSum.define_table()
+        assert (type(cv1.value), str(cv1.value)) == (ValueError, _cv1("TdlBadSum", "total", _R_BRACKETS))
+        assert client.queries == []
+
+    @pytest.mark.parametrize(
+        ("error", "refusal"),
+        [
+            (InternalError("Internal", _NOT_ENOUGH_PERMISSIONS), SurrealDbAuthenticationError),
+            (NotAllowedError("NotAllowed", _NOT_ENOUGH_PERMISSIONS), SurrealDbAuthenticationError),
+            (InternalError("Internal", "There was a problem with the database"), SurrealDbError),
+            (RuntimeError("the engine is closed"), SurrealDbError),
+        ],
+        ids=["s1-internal", "s1-not-allowed", "s2-internal", "s2-runtime"],
+    )
+    @pytest.mark.parametrize("read", ["db", "table"])
+    async def test_s1_s2_a_refused_read(
+        self, use_client: Callable[[Any], None], error: BaseException, refusal: type[SurrealDbError], read: str
+    ) -> None:
+        if read == "db":
+            client = _TableClient(info_error=error)
+            sent = [_INFO]
+        else:
+            client = _TableClient({"tdl_note": _STORED_NOTE}, fields_error=error)
+            sent = [_INFO, _INFO_NOTE]
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlNoteTuned.define_table()
+        assert type(raised.value) is refusal
+        assert str(raised.value) == f"Can't apply table definition: 'tdl_note' -> {error}"
+        assert raised.value.__cause__ is error
+        assert client.queries == sent
+
+    async def test_s3_the_table_statement_refused(self, use_client: Callable[[Any], None]) -> None:
+        error = NotAllowedError("NotAllowed", _NOT_ENOUGH_PERMISSIONS)
+        client = _TableClient(ddl_error=error)
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlPerson.define_table()
+        assert type(raised.value) is SurrealDbAuthenticationError
+        assert str(raised.value) == f"Can't apply table definition: 'tdl_person' -> {_NOT_ENOUGH_PERMISSIONS}"
+        assert raised.value.__cause__ is error
+        assert client.queries == [_INFO, _G1[0]]
+
+    @pytest.mark.parametrize(
+        ("reason", "text"),
+        [
+            ("The field is locked", "The field is locked"),
+            (
+                "Parse error: Unexpected token `DEFAULT`\n --> [1:47]\n  |\n1 | DEFINE FIELD OVERWRITE `age` ON `tdl_person` "
+                "TYPE int DEFAULT 18",
+                "Parse error: Unexpected token `DEFAULT` (at line 1, column 47 of the statement)",
+            ),
+            (
+                "Found a problem in DEFINE FIELD OVERWRITE `age` ON `tdl_person` TYPE int DEFAULT 18",
+                "the server's message quotes the statement, so it is left out",
+            ),
+        ],
+        ids=["whole", "parse-excerpt", "quoting"],
+    )
+    async def test_s4_a_field_statement_refused(self, use_client: Callable[[Any], None], reason: str, text: str) -> None:
+        """The field named, never its statement; the statements before it stay applied (no transaction)."""
+        client = _TableClient(ddl_error=InternalError("Internal", reason), refuse="DEFINE FIELD OVERWRITE `age` ")
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlPerson.define_table()
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == f"Can't apply field definition: 'age' on table 'tdl_person' -> {text}"
+        assert "TYPE int DEFAULT 18" not in str(raised.value)
+        assert client.queries == [_INFO, *_G1[:3]]
+
+    async def test_s4_names_a_nested_field(self, use_client: Callable[[Any], None]) -> None:
+        client = _TableClient(
+            ddl_error=InternalError("Internal", "The field is locked"), refuse="DEFINE FIELD OVERWRITE `address`.`city` "
+        )
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlPerson.define_table()
+        assert str(raised.value) == "Can't apply field definition: 'address.city' on table 'tdl_person' -> The field is locked"
+        assert client.queries == [_INFO, *_G1[:8]]
+
+
+class TestTableGuard:
+    """TG1–TG4 before any DDL, naming ``define_table()``: only the reads are sent."""
+
+    @pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "if-not-exists"])
+    async def test_tg1_a_view(self, use_client: Callable[[Any], None], overwrite: bool) -> None:
+        client = _TableClient({"tdl_note": _STORED_NOTE_VIEW})
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlNote.define_table(overwrite=overwrite)
+        assert (type(raised.value), str(raised.value)) == (SurrealDbError, _tg1("TdlNote", "define_table", "tdl_note"))
+        assert client.queries == [_INFO]
+
+    @pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "if-not-exists"])
+    @pytest.mark.parametrize("stored", ["DEFINE TABLE tdl_note TYPE", 3], ids=["unparsable", "not-a-str"])
+    async def test_tg2_an_unreadable_table(self, use_client: Callable[[Any], None], overwrite: bool, stored: object) -> None:
+        client = _TableClient({"tdl_note": stored})
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlNote.define_table(overwrite=overwrite)
+        assert (type(raised.value), str(raised.value)) == (SurrealDbError, _tg2("TdlNote", "define_table", "tdl_note"))
+        assert client.queries == [_INFO]
+
+    async def test_tg2_a_carried_rule_that_fails_its_check(self, use_client: Callable[[Any], None]) -> None:
+        """Refused before the field read; a model declaring its permissions replaces the rule, which is not checked."""
+        client = _TableClient({"tdl_note": _STORED_NOTE_BAD_RULE})
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlNote.define_table()
+        assert (type(raised.value), str(raised.value)) == (SurrealDbError, _tg2("TdlNote", "define_table", "tdl_note"))
+        assert client.queries == [_INFO]
+
+        client = _TableClient({"tdl_note": _STORED_NOTE_BAD_RULE})
+        use_client(client)
+        assert (await TdlNoteMine.define_table()).startswith(
+            "DEFINE TABLE OVERWRITE `tdl_note` TYPE NORMAL SCHEMALESS COMMENT 'mine' PERMISSIONS FOR select FULL, FOR "
+            "create, update, delete NONE;\n"
+        )
+
+    @pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "if-not-exists"])
+    async def test_tg3_a_relation_table(self, use_client: Callable[[Any], None], overwrite: bool) -> None:
+        client = _TableClient({"tdl_note": _STORED_NOTE_RELATION})
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlNote.define_table(overwrite=overwrite)
+        assert (type(raised.value), str(raised.value)) == (SurrealDbError, _tg3("TdlNote", "define_table", "tdl_note"))
+        assert client.queries == [_INFO]
+
+    @pytest.mark.parametrize(
+        ("fields", "field"),
+        [
+            ({"done": "DEFINE FIELD done ON tdl_note TYPE bool ASSERT (a"}, "done"),
+            ({"done": 3}, "done"),
+            (
+                {"done": "DEFINE FIELD done ON tdl_note TYPE bool PERMISSIONS FOR select WHERE a; b, FOR create, update FULL"},
+                "done",
+            ),
+            ({"body": "DEFINE FIELD body ON tdl_note TYPE string ASSERT $value != '' COMMENT 'a\x00b'"}, "body"),
+        ],
+        ids=["unparsable", "not-a-str", "carried-rule", "carried-comment"],
+    )
+    async def test_tg4_a_field_the_model_redefines(
+        self, use_client: Callable[[Any], None], fields: dict[str, object], field: str
+    ) -> None:
+        client = _TableClient({"tdl_note": _STORED_NOTE_LESS}, fields)
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlNote.define_table()
+        assert (type(raised.value), str(raised.value)) == (
+            SurrealDbError,
+            _tg4("TdlNote", "define_table", "tdl_note", field),
+        )
+        assert client.queries == [_INFO, _INFO_NOTE]
+
+    async def test_tg4_names_the_canonical_path(self, use_client: Callable[[Any], None]) -> None:
+        client = _TableClient(
+            {"tdl_kinds": "DEFINE TABLE tdl_kinds TYPE NORMAL SCHEMAFULL PERMISSIONS NONE"},
+            {"bag[*]": "DEFINE FIELD bag[*] ON tdl_kinds TYPE any ASSERT (a"},
+        )
+        use_client(client)
+        with pytest.raises(SurrealDbError) as raised:
+            await TdlKinds.define_table()
+        assert str(raised.value) == _tg4("TdlKinds", "define_table", "tdl_kinds", "bag.*")
+        assert client.queries == [_INFO, "INFO FOR TABLE `tdl_kinds`;"]
+
+
 # --- the rich model of the ORM writes -------------------------------------------------------------------------------
 
 
@@ -3319,3 +3794,403 @@ class TestOrmWritesE2E:
                 return
             await kitchen.save()
             assert (await _read_back(TdlKitchen, "k1", kitchen)).st == {1, 2, 3}
+
+
+# --- define_table() on the engines ----------------------------------------------------------------------------------
+
+
+def _spy(monkeypatch: pytest.MonkeyPatch, client: Any) -> list[tuple[str, tuple[object, ...]]]:
+    """Record every ``query``, ``query_raw`` and ``version`` call *client* receives, with its arguments (and let it
+    through) — v0.31.0's spy."""
+    calls: list[tuple[str, tuple[object, ...]]] = []
+
+    def recording(method: str) -> Any:
+        real = getattr(client, method)
+
+        async def call(*args: object, **kwargs: object) -> object:
+            calls.append((method, args))
+            return await real(*args, **kwargs)
+
+        return call
+
+    for method in ("query", "query_raw", "version"):
+        monkeypatch.setattr(client, method, recording(method))
+    return calls
+
+
+def _sent(calls: list[tuple[str, tuple[object, ...]]]) -> list[object]:
+    """The statements *calls* (:func:`_spy`'s) sent through ``query()``, after checking that nothing else was sent: no
+    ``version()``, and a ``query_raw()`` only for those statements (the SDK's ``query()`` runs it itself)."""
+    statements = [args[0] for method, args in calls if method == "query"]
+    assert [method for method, _ in calls if method == "version"] == []
+    assert [args[0] for method, args in calls if method == "query_raw"] == statements
+    return statements
+
+
+def _field_states(info: Mapping[str, Any]) -> dict[tuple[str, ...], FieldState]:
+    """The fields of an ``INFO FOR TABLE`` answer, each parsed, keyed by path."""
+    states = [parse_define_field(text).state for text in info["fields"].values()]
+    return {tuple(state.path): state for state in states}
+
+
+def _clauses(state: TableState) -> tuple[object, ...]:
+    """The clauses of a stored table a model without keys keeps: ``DROP``, mode, comment, change feed, permissions."""
+    return (
+        state.drop,
+        state.schema_mode,
+        state.comment,
+        state.changefeed,
+        state.changefeed_include_original,
+        state.permissions,
+    )
+
+
+async def _define_table_entries(client: Any, table: str) -> int:
+    """How many ``define_table`` entries the change feed of *table* holds."""
+    entries = await client.query(f"SHOW CHANGES FOR TABLE {table} SINCE 0 LIMIT 100;", {})
+    return [kind for entry in entries for change in entry["changes"] for kind in change].count("define_table")
+
+
+class TestDefineTableE2E:
+    """On every engine of both lines: on a missing table ``define_table()`` reads ``INFO FOR DB`` once and applies
+    ``table_ddl()``'s statements, returning them joined with a newline; a second call reads the table's fields too,
+    sends the same statements and changes nothing. ``overwrite=False`` defines a missing table and leaves one that
+    exists as it is, ``FLEXIBLE`` following its stored mode."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_missing_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl(kind) as client:
+            calls = _spy(monkeypatch, client)
+            result = await TdlPerson.define_table()
+            assert isinstance(result, str)
+            assert result == "\n".join(_G1) == "\n".join(TdlPerson.table_ddl())
+            assert _sent(calls) == [_INFO, *_G1]
+
+            tables = await _tables(client)
+            state = parse_define_table(tables["tdl_person"])
+            assert (state.table_type, state.schema_mode, state.comment) == ("normal", "SCHEMAFULL", "People")
+            assert _feed(state.changefeed) == _feed("7d")
+            assert state.permissions == schema.permissions_rules(TdlPerson.model_config["permissions"], model=TdlPerson)
+            info = await _table_info(client, "tdl_person")
+            stored = _field_states(info)
+            for column, statement in zip(_columns(TdlPerson), _G1[1:], strict=True):
+                field = stored[column.path]
+                assert (field.field_type, field.nullable) == normalise_kind(render_kind(column.kind)), statement
+                assert field.flexible is (" FLEXIBLE" in statement), statement
+
+            calls.clear()
+            assert await TdlPerson.define_table() == result
+            assert _sent(calls) == [_INFO, _INFO_PERSON, *_G1]
+            assert await _tables(client) == tables
+            assert await _table_info(client, "tdl_person") == info
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_overwrite_false_on_a_missing_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl(kind) as client:
+            calls = _spy(monkeypatch, client)
+            assert await TdlPerson.define_table(overwrite=False) == "\n".join(_if_not_exists(_G1))
+            assert _sent(calls) == [_INFO, *_if_not_exists(_G1)]
+            state = parse_define_table((await _tables(client))["tdl_person"])
+            assert (state.schema_mode, state.comment) == ("SCHEMAFULL", "People")
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_overwrite_false_leaves_an_existing_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``IF NOT EXISTS``: the table and its stored field stay as they are, a new column is defined — ``FLEXIBLE``
+        on a free-form object, since the stored table is ``SCHEMAFULL``."""
+        async with _tdl(kind) as client:
+            await _apply_ddl(
+                client,
+                "DEFINE TABLE tdl_note SCHEMAFULL COMMENT 'keep'; DEFINE FIELD body ON tdl_note TYPE string ASSERT $value != '';",
+            )
+            before = (await _tables(client))["tdl_note"]
+            body = (await _table_info(client, "tdl_note"))["fields"]["body"]
+            statements = [
+                "DEFINE TABLE IF NOT EXISTS `tdl_note` TYPE NORMAL;",
+                "DEFINE FIELD IF NOT EXISTS `body` ON `tdl_note` TYPE string;",
+                "DEFINE FIELD IF NOT EXISTS `meta` ON `tdl_note` TYPE object FLEXIBLE;",
+            ]
+            calls = _spy(monkeypatch, client)
+            assert await TdlNoteMeta.define_table(overwrite=False) == "\n".join(statements)
+            assert _sent(calls) == [_INFO, *statements]
+            assert (await _tables(client))["tdl_note"] == before
+            fields = (await _table_info(client, "tdl_note"))["fields"]
+            assert fields["body"] == body
+            meta = parse_define_field(fields["meta"]).state
+            assert (meta.field_type, meta.flexible) == ("object", True)
+
+
+#: The table tuned by hand (no ``DROP``: a ``DROP`` table stores no record): its clauses, the fields of K3, K4 and
+#: K5 and ``body``, an index, an event, a view that reads it and a record.
+_AC9_FIXTURE = (
+    "DEFINE TABLE tdl_note TYPE ANY SCHEMAFULL COMMENT 'keep' CHANGEFEED 1h INCLUDE ORIGINAL "
+    "PERMISSIONS FOR select WHERE owner = $auth.id, FOR create FULL; "
+    "DEFINE FIELD email ON tdl_note TYPE string ASSERT $value != '' "
+    "PERMISSIONS FOR select WHERE $auth.id = id, FOR create, update FULL COMMENT 'mail'; "
+    "DEFINE FIELD created ON tdl_note TYPE option<datetime> DEFAULT time::now() READONLY; "
+    "DEFINE FIELD done ON tdl_note TYPE bool DEFAULT true COMMENT 'd'; "
+    "DEFINE FIELD body ON tdl_note TYPE string; "
+    "DEFINE INDEX tdl_note_body ON tdl_note FIELDS body; "
+    "DEFINE EVENT tdl_note_ev ON tdl_note WHEN $event = 'CREATE' THEN {}; "
+    "DEFINE TABLE tdl_note_count AS SELECT count() AS n FROM tdl_note GROUP ALL; "
+    "CREATE tdl_note:n1 SET body = 'b', email = 'e@x.y';"
+)
+
+
+async def _tune_note(client: Any) -> TdlNoteTuned:
+    """The table tuned by hand on ``tdl_db`` (each statement checked); the stored table reads as ``_STORED_NOTE``. Returns the
+    record ``n1`` read through the model."""
+    await _apply_ddl(client, _AC9_FIXTURE)
+    assert (await _tables(client))["tdl_note"] == _STORED_NOTE
+    assert await client.query("SELECT VALUE n FROM tdl_note_count;", {}) == [1]
+    return await TdlNoteTuned.objects().get("n1")
+
+
+class TestExistingTableE2E:
+    """On every engine of both lines: over a table tuned by hand ``define_table()`` sends the carried statements —
+    the model's type and column kinds, every clause and field clause it does not declare kept —, and the table keeps
+    its index, event, the view that reads it, its record, its live query and its change-feed history (plus one
+    ``define_table`` entry); declared clauses win; a ``server_fields`` column keeps the database's ``DEFAULT``; a
+    ``DROP`` table keeps its ``DROP``."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_table_tuned_by_hand(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl(kind) as client:
+            n1 = await _tune_note(client)
+            live_id: Any = None
+            if kind == "ws":
+                response = await client.query_raw("LIVE SELECT * FROM tdl_note;", {})
+                [result] = response["result"]
+                assert result["status"] == "OK", result
+                live_id = result["result"]
+            try:
+                before = parse_define_table((await _tables(client))["tdl_note"])
+                info_before = await _table_info(client, "tdl_note")
+                fields_before = _field_states(info_before)
+                feed_before = await _define_table_entries(client, "tdl_note")
+
+                calls = _spy(monkeypatch, client)
+                assert await TdlNoteTuned.define_table() == "\n".join(_TUNED)
+                assert _sent(calls) == [_INFO, _INFO_NOTE, *_TUNED]
+
+                tables = await _tables(client)
+                after = parse_define_table(tables["tdl_note"])
+                assert after.table_type == "normal"
+                assert _clauses(after) == _clauses(before)
+                info = await _table_info(client, "tdl_note")
+                fields = _field_states(info)
+                for column in _columns(TdlNoteTuned):
+                    field = fields[column.path]
+                    assert (field.field_type, field.nullable) == normalise_kind(render_kind(column.kind)), column.path
+                email, email_before = fields[("email",)], fields_before[("email",)]
+                assert (email.assertion, email.permissions, email.comment) == (
+                    email_before.assertion,
+                    email_before.permissions,
+                    email_before.comment,
+                )
+                created, created_before = fields[("created",)], fields_before[("created",)]
+                assert (created.default, created.readonly) == (created_before.default, created_before.readonly)
+                assert (fields[("done",)].default, fields[("done",)].comment) == ("false", "d")
+                assert info["indexes"] == info_before["indexes"]
+                assert list(info["indexes"]) == ["tdl_note_body"]
+                assert info["events"] == info_before["events"]
+                assert list(info["events"]) == ["tdl_note_ev"]
+                assert info["lives"] == info_before["lives"]
+                assert len(info["lives"]) == (1 if kind == "ws" else 0)
+                assert await _define_table_entries(client, "tdl_note") == feed_before + 1
+
+                assert (await TdlNoteTuned.objects().get("n1")).model_dump() == n1.model_dump()
+                assert parse_define_table(tables["tdl_note_count"]).view_query is not None
+                await TdlNoteTuned(id="n2", body="c").save()
+                assert await client.query("SELECT VALUE n FROM tdl_note_count;", {}) == [2]
+            finally:
+                if live_id is not None:
+                    with contextlib.suppress(Exception):
+                        await client.kill(live_id)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_declared_clauses_win(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """K2E: the declared mode, comment and permissions replace the stored ones; the change feed is kept."""
+        async with _tdl(kind) as client:
+            await _tune_note(client)
+            calls = _spy(monkeypatch, client)
+            assert await TdlNoteMine.define_table() == "\n".join([_K2E, *_TUNED[1:]])
+            assert _sent(calls) == [_INFO, _INFO_NOTE, _K2E, *_TUNED[1:]]
+            state = parse_define_table((await _tables(client))["tdl_note"])
+            assert (state.table_type, state.schema_mode, state.comment) == ("normal", "SCHEMALESS", "mine")
+            assert (_feed(state.changefeed), state.changefeed_include_original) == (_feed("1h"), True)
+            assert state.permissions == schema.permissions_rules({"select": "FULL"}, model=TdlNoteMine)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_k11_a_server_column_keeps_the_databases_default(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl(kind) as client:
+            await _apply_ddl(client, "DEFINE TABLE tdl_note; DEFINE FIELD status ON tdl_note TYPE string DEFAULT 'new';")
+            statements = ["DEFINE TABLE OVERWRITE `tdl_note` TYPE NORMAL;", _BODY, _K11]
+            calls = _spy(monkeypatch, client)
+            assert await TdlNoteStatus.define_table() == "\n".join(statements)
+            assert _sent(calls) == [_INFO, _INFO_NOTE, *statements]
+            status = _field_states(await _table_info(client, "tdl_note"))[("status",)]
+            assert status.default == "'new'"
+            await TdlNoteStatus(id="s1", body="b").save()
+            assert await client.query("SELECT VALUE status FROM tdl_note:s1;", {}) == ["new"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_k1d_a_drop_table(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl(kind) as client:
+            await _apply_ddl(client, "DEFINE TABLE tdl_drop TYPE ANY DROP SCHEMALESS COMMENT 'd' PERMISSIONS NONE;")
+            assert (await _tables(client))["tdl_drop"] == _STORED_DROP
+            calls = _spy(monkeypatch, client)
+            assert await TdlDrop.define_table() == "\n".join(_K1D)
+            assert _sent(calls) == [_INFO, "INFO FOR TABLE `tdl_drop`;", *_K1D]
+            state = parse_define_table((await _tables(client))["tdl_drop"])
+            assert (state.table_type, state.drop, state.schema_mode, state.comment) == ("normal", True, "SCHEMALESS", "d")
+
+
+#: The skip reason of the ``COMPUTED`` tests before SurrealDB 3.
+_COMPUTED_SKIP = "SurrealDB 2.x has no COMPUTED fields"
+
+#: README section 35's sentence on ``COMPUTED`` fields, which the pin backs.
+_COMPUTED_SENTENCE = (
+    "README section 35, Field types: A computed field is written `VALUE`; over a field the database defines `COMPUTED` "
+    "(SurrealDB 3.x), `define_table()` writes `COMPUTED`: replacing it by `VALUE` would leave the stored records "
+    "without the field until their next write."
+)
+
+#: K9's stored form on ``tdl_cart``, with a record.
+_CART_FIXTURE = (
+    "DEFINE TABLE tdl_cart; "
+    "DEFINE FIELD items ON tdl_cart TYPE array<string>; "
+    "DEFINE FIELD total ON tdl_cart TYPE option<int> COMPUTED count(items) COMMENT 'c' "
+    "PERMISSIONS FOR select WHERE true, FOR create, update FULL; "
+    "CREATE tdl_cart:c1 SET items = ['a', 'b'];"
+)
+
+
+async def _total(client: Any) -> list[Any]:
+    """``total`` of the record ``tdl_cart:c1``."""
+    total: list[Any] = await client.query("SELECT VALUE total FROM tdl_cart:c1;", {})
+    return total
+
+
+class TestComputedE2E:
+    """SurrealDB 3.x (skipped before 3): a stored ``COMPUTED`` field stays ``COMPUTED`` — with the model's
+    expression, its permissions and comment kept, no ``DEFAULT`` — and its records keep their value; ``VALUE`` over it
+    would empty them (the pin)."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_computed_field_stays_computed(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl(kind) as client:
+            if await _major(client) < 3:
+                pytest.skip(_COMPUTED_SKIP)
+            await _apply_ddl(client, _CART_FIXTURE)
+            assert await _total(client) == [2]
+            statements = [
+                "DEFINE TABLE OVERWRITE `tdl_cart` TYPE NORMAL;",
+                "DEFINE FIELD OVERWRITE `items` ON `tdl_cart` TYPE array<string>;",
+                _K9,
+            ]
+            calls = _spy(monkeypatch, client)
+            assert await TdlCart.define_table() == "\n".join(statements)
+            assert _sent(calls) == [_INFO, "INFO FOR TABLE `tdl_cart`;", *statements]
+            total = _field_states(await _table_info(client, "tdl_cart"))[("total",)]
+            assert (total.computed, total.value, total.default, total.comment) == ("count(items)", None, None, "c")
+            assert total.permissions == {"select": "WHERE true", "create": "FULL", "update": "FULL"}
+            assert await _total(client) == [2]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_value_over_computed_empties_the_records(self, kind: str) -> None:
+        """A raw ``DEFINE FIELD OVERWRITE … VALUE`` over a ``COMPUTED`` field leaves the stored record without it."""
+        async with _tdl(kind) as client:
+            if await _major(client) < 3:
+                pytest.skip(_COMPUTED_SKIP)
+            await _apply_ddl(client, _CART_FIXTURE)
+            await _apply_ddl(client, "DEFINE FIELD OVERWRITE total ON tdl_cart TYPE option<int> VALUE count(items);")
+            assert await _total(client) == [None], _COMPUTED_SENTENCE
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_k10_a_stored_computed_without_default(self, kind: str) -> None:
+        """K10: the stored ``COMPUTED`` is kept and no ``DEFAULT`` is written, which SurrealDB refuses with it."""
+        async with _tdl(kind) as client:
+            if await _major(client) < 3:
+                pytest.skip(_COMPUTED_SKIP)
+            await _apply_ddl(client, "DEFINE TABLE tdl_note; DEFINE FIELD age ON tdl_note TYPE int COMPUTED 18;")
+            assert await TdlNoteAge.define_table() == "\n".join(["DEFINE TABLE OVERWRITE `tdl_note` TYPE NORMAL;", _K10])
+            age = _field_states(await _table_info(client, "tdl_note"))[("age",)]
+            assert (age.computed, age.default) == ("18", None)
+            await _apply_ddl(client, "CREATE tdl_note:a1;")
+            assert await client.query("SELECT VALUE age FROM tdl_note:a1;", {}) == [18]
+
+
+class TdlStatsNode(BaseSurrealModel):
+    """A node model on the table of a view."""
+
+    model_config = SurrealConfigDict(table_name="tdl_stats", connection="tdl")
+
+    id: str | None = None
+    n: int = 0
+
+
+class TestTableGuardE2E:
+    """On every engine of both lines: a node model refuses a view (TG1) and a relation table (TG3) with either
+    ``overwrite``, after ``INFO FOR DB`` alone; the table is left as it is."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "if-not-exists"])
+    async def test_tg1_a_view(self, kind: str, overwrite: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl(kind) as client:
+            await _apply_ddl(client, f"CREATE tdl_note:n1 SET body = 'x'; DEFINE TABLE tdl_stats AS {_VIEW_QUERY};")
+            before = (await _tables(client))["tdl_stats"]
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await TdlStatsNode.define_table(overwrite=overwrite)
+            assert _sent(calls) == [_INFO]
+            assert (type(raised.value), str(raised.value)) == (
+                SurrealDbError,
+                _tg1("TdlStatsNode", "define_table", "tdl_stats"),
+            )
+            assert (await _tables(client))["tdl_stats"] == before
+            assert await client.query("SELECT VALUE n FROM tdl_stats;", {}) == [1]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("overwrite", [True, False], ids=["overwrite", "if-not-exists"])
+    async def test_tg3_a_relation_table(self, kind: str, overwrite: bool, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _tdl(kind) as client:
+            await _apply_ddl(client, "DEFINE TABLE tdl_note TYPE RELATION IN tdl_person OUT tdl_person;")
+            before = (await _tables(client))["tdl_note"]
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await TdlNote.define_table(overwrite=overwrite)
+            assert _sent(calls) == [_INFO]
+            assert (type(raised.value), str(raised.value)) == (SurrealDbError, _tg3("TdlNote", "define_table", "tdl_note"))
+            assert (await _tables(client))["tdl_note"] == before
+            assert parse_define_table(before).table_type == "relation"
+
+
+#: A record access on ``tdl_db``: a user signed up through it is a record user, who may not define.
+_TDL_ACCESS = (
+    "DEFINE ACCESS tdl_acc ON DATABASE TYPE RECORD SIGNUP (CREATE tdl_user SET name = $name) "
+    "SIGNIN (SELECT * FROM tdl_user WHERE name = $name);"
+)
+
+
+class TestTablePermissionsE2E:
+    """On the servers: a record user may not define a table — the refusal of the first read, ``INFO FOR DB``, and
+    nothing else is sent. The embedded engine's session is its owner, which may always define."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_s1_a_record_user(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        if kind == "mem":
+            pytest.skip("the embedded engine's session is its owner: it may always define")
+        async with _tdl(kind) as client, SurrealDBConnectionManager.using("tdl"):
+            await _apply_ddl(client, _TDL_ACCESS)
+            await SurrealDBConnectionManager.signup(access="tdl_acc", variables={"name": "tdl-user"})
+            try:
+                calls = _spy(monkeypatch, client)
+                with pytest.raises(SurrealDbError) as raised:
+                    await TdlNote.define_table()
+                assert _sent(calls) == [_INFO]
+            finally:
+                await SurrealDBConnectionManager.invalidate()
+            assert "tdl_note" not in await _tables(client)
+        assert type(raised.value) is SurrealDbAuthenticationError
+        assert str(raised.value).startswith("Can't apply table definition: 'tdl_note' -> ")
+        assert "not enough permissions" in str(raised.value).lower()

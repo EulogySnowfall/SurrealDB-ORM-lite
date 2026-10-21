@@ -580,6 +580,13 @@ def table_clause_forms() -> None:
     assert_type(TableClauses.table_ddl(overwrite=False), list[str])
 
 
+async def table_define_forms(tx: Transaction) -> None:
+    """v0.34.0: ``define_table()`` returns the statements joined with a newline — a ``str``, the full ORM's return."""
+    y: str = await TableClauses.define_table()
+    assert_type(y, str)
+    assert_type(await TableClauses.define_table(overwrite=False, tx=tx), str)
+
+
 @fixture
 class Typed(SurrealFixture):
     """``@fixture`` gives the class back unchanged: ``Typed.load()`` stays typed ``Typed``."""
