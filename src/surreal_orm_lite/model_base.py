@@ -26,8 +26,10 @@ from .functions import SurrealFunc, _ComputedDefault
 from .routing import check_config_connection, check_same_connection, check_transaction
 from .schema import (
     Event,
+    changefeed_text,
     check_events_config,
     check_relation_config,
+    check_table_config,
     check_view_config,
     check_view_query,
     dependent_views,
@@ -57,7 +59,7 @@ from .signals import (
     pre_update,
 )
 from .transaction import BufferedTransaction, Transaction
-from .types import Duration, TableType, _duration_from_sdk, _timedelta_from_sdk
+from .types import Duration, SchemaMode, TableType, _duration_from_sdk, _timedelta_from_sdk
 from .utils import (
     PLAIN_CONTENT,
     VALID_ALIAS_PATTERN,
@@ -576,9 +578,11 @@ class SurrealConfigDict(ConfigDict, total=False):
             subclass an ordinary model).
         table_type (TableType | None): The table's type (v0.33.0) — the full SurrealDB-ORM's
             key and enum. TableType.RELATION on an edge model (BaseSurrealEdge), which implies it,
-            so writing it is optional there. On another model, any other member is recorded
-            and returned by get_table_type(), with no effect before the table DDL of v0.37.0.
-            Checked when the class is defined (a TableType; RELATION on an edge only).
+            so writing it is optional there. On another model, the member is returned by
+            get_table_type() and takes effect in define_table() (v0.34.0): TYPE ANY for ANY, TYPE
+            NORMAL for the others; a USER table is SCHEMAFULL and a HASH table SCHEMALESS unless
+            schema_mode is declared. Checked when the class is defined (a TableType; RELATION on an
+            edge only; none on a materialized view, v0.34.0).
         relation_in (str | list[str] | tuple[str, ...] | None): The tables an edge's in may come
             from (v0.33.0): SurrealDB's TYPE RELATION IN. Full SurrealDB-ORM key, on an edge model
             only. One table name, several separated by "|" ("person | company"), or a list or
@@ -590,6 +594,32 @@ class SurrealConfigDict(ConfigDict, total=False):
         enforced (bool | None): Both endpoints of an edge must exist (v0.33.0): TYPE RELATION …
             ENFORCED. Full SurrealDB-ORM key, on an edge model only; inherited unless a subclass
             sets its own.
+        schema_mode (SchemaMode | None): The table's schema mode (v0.34.0) — the full
+            SurrealDB-ORM's key and enum: SchemaMode.SCHEMAFULL or SchemaMode.SCHEMALESS, applied by
+            define_table(). None or left out: not declared — define_table() keeps the stored mode
+            and a new table is SCHEMALESS (SurrealDB's default), unless table_type gives one (USER:
+            SCHEMAFULL, HASH: SCHEMALESS); see get_schema_mode(). Checked when the class is
+            defined: a SchemaMode (not a plain string), not SCHEMALESS on a TableType.USER table,
+            not SCHEMAFULL with extra="allow", none on a materialized view.
+        changefeed (str | None): The table's change feed (v0.34.0) — the full SurrealDB-ORM's
+            key: a duration such as "7d" or "1h30m", optionally followed by " INCLUDE ORIGINAL" (in
+            any case). Checked when the class is defined; get_changefeed() returns it normalised.
+        permissions (Mapping[str, str] | None): The table's permissions (v0.34.0) — the full
+            SurrealDB-ORM's key: an operation ("select", "create", "update", "delete") to "FULL",
+            "NONE", "WHERE <condition>" or a bare condition; an operation left out is NONE, so {}
+            declares PERMISSIONS NONE, while None or no key keeps the stored permissions. Checked
+            when the class is defined (each condition one SurrealQL expression);
+            get_permissions() returns the mapping as declared.
+        comment (str | None): The table's COMMENT (v0.34.0) — the full SurrealDB-ORM's key.
+            Checked when the class is defined (a str without a NUL character).
+        flexible_fields (list[str] | tuple[str, ...] | None): The fields written FLEXIBLE on a
+            SCHEMAFULL table (v0.34.0) — the full SurrealDB-ORM's key: object fields that keep the
+            keys the model does not declare. The model's Python field names, checked when the
+            class is defined (none on a materialized view); Field(json_schema_extra={"flexible":
+            True}) requests it for one field.
+
+    The five table keys of v0.34.0 are inherited by subclasses unless they set their own (None
+    resets one to "not declared").
     """
 
     table_name: str | None
@@ -615,6 +645,21 @@ class SurrealConfigDict(ConfigDict, total=False):
 
     enforced: bool | None
     " Both endpoints must exist (v0.33.0): TYPE RELATION … ENFORCED. An edge model only. Full SurrealDB-ORM key. "
+
+    schema_mode: SchemaMode | None
+    " The table's schema mode (v0.34.0): SchemaMode.SCHEMAFULL or SCHEMALESS, applied by define_table(). Full SurrealDB-ORM key. "
+
+    changefeed: str | None
+    " The table's change feed (v0.34.0): a duration such as '7d', optionally ' INCLUDE ORIGINAL'. Full SurrealDB-ORM key. "
+
+    permissions: Mapping[str, str] | None
+    " The table's permissions (v0.34.0): operation -> 'FULL', 'NONE' or a condition; operations left out are NONE. Full SurrealDB-ORM key. "
+
+    comment: str | None
+    " The table's COMMENT (v0.34.0). Full SurrealDB-ORM key. "
+
+    flexible_fields: list[str] | tuple[str, ...] | None
+    " Fields written FLEXIBLE on a SCHEMAFULL table (v0.34.0): object fields that keep keys the model does not declare. Full SurrealDB-ORM key. "
 
     primary_key: str | None
     " The primary key field name for the model. "
@@ -751,7 +796,10 @@ class BaseSurrealModel(BaseModel):
         computed field (``schema.check_view_config()``) — inherited values included. So are the
         ``table_type``, ``relation_in``, ``relation_out`` and ``enforced`` keys (v0.33.0), when any
         of them is not ``None``: a ``TableType`` (``RELATION`` on an edge only), and the relation
-        keys on an edge model only (``schema.check_relation_config()``).
+        keys on an edge model only (``schema.check_relation_config()``). So are, on every model and
+        after the relation keys, the ``schema_mode``, ``changefeed``, ``permissions``, ``comment`` and
+        ``flexible_fields`` keys (v0.34.0), inherited values included (``schema.check_table_config()``):
+        validated, never rewritten.
 
         The deprecated ``_table_name: ClassVar[str]`` is checked the same way and warns once,
         where it is defined — a subclass inheriting it does not warn again.
@@ -781,6 +829,18 @@ class BaseSurrealModel(BaseModel):
         relation = {key: cls.model_config.get(key) for key in ("table_type", "relation_in", "relation_out", "enforced")}
         if any(value is not None for value in relation.values()):
             check_relation_config(cls, edge=cls.__surreal_edge__, **relation)
+        check_table_config(
+            cls,
+            view=view_query is not None,
+            extra_allow=cls.model_config.get("extra") == "allow",
+            table_type=relation["table_type"],
+            schema_mode=cls.model_config.get("schema_mode"),
+            changefeed=cls.model_config.get("changefeed"),
+            permissions=cls.model_config.get("permissions"),
+            comment=cls.model_config.get("comment"),
+            flexible_fields=cls.model_config.get("flexible_fields"),
+            fields=cls.model_fields,
+        )
         legacy = cls.__dict__.get("_table_name")
         if isinstance(legacy, str):
             _check_table_name(cls, "_table_name", legacy)
@@ -822,7 +882,7 @@ class BaseSurrealModel(BaseModel):
 
         Note:
             No ``TYPE`` clause is emitted: SurrealDB infers an optional type from the
-            expression on both 2.6.x and 3.x. Explicit field types are a later roadmap item.
+            expression on both 2.6.x and 3.x. define_table() (v0.34.0) writes the computed field's TYPE.
         """
         computed = cls.get_computed_fields()
         if not computed:
@@ -1006,14 +1066,60 @@ class BaseSurrealModel(BaseModel):
 
         ``TableType.RELATION`` for an edge model (``BaseSurrealEdge``), whose table is SurrealDB's ``TYPE RELATION``;
         else ``SurrealConfigDict(table_type=…)``, else ``TableType.NORMAL``. A subclass inherits the key unless it sets
-        its own (``table_type=None`` gives ``NORMAL`` back). On a node model the value is recorded and returned, with
-        no effect before the table DDL of v0.37.0.
+        its own (``table_type=None`` gives ``NORMAL`` back). On a node model the member takes effect in define_table()
+        (v0.34.0): ``TYPE ANY`` for ``ANY``, ``TYPE NORMAL`` for the others; a ``USER`` table is ``SCHEMAFULL`` and a
+        ``HASH`` table ``SCHEMALESS`` unless ``schema_mode`` is declared (:meth:`get_schema_mode`).
         """
         if cls.__surreal_edge__:
             return TableType.RELATION
         value = cls.model_config.get("table_type")
         # Checked at the class statement: a TableType or None.
         return value if isinstance(value, TableType) else TableType.NORMAL
+
+    # ==================== Table clauses (v0.34.0) ====================
+
+    @classmethod
+    def get_schema_mode(cls) -> SchemaMode | None:
+        """Return the model's schema mode (v0.34.0; the full SurrealDB-ORM's method).
+
+        ``SurrealConfigDict(schema_mode=…)``; else ``SchemaMode.SCHEMAFULL`` for ``TableType.USER`` and
+        ``SchemaMode.SCHEMALESS`` for ``TableType.HASH``; else ``None`` — not declared: ``define_table()`` keeps the
+        stored mode, and a new table is ``SCHEMALESS`` (SurrealDB's default). A subclass inherits the key unless it sets
+        its own (``schema_mode=None`` resets it).
+        """
+        value = cls.model_config.get("schema_mode")
+        # Checked at the class statement: a SchemaMode or None.
+        if isinstance(value, SchemaMode):
+            return value
+        table_type = cls.get_table_type()
+        if table_type is TableType.USER:
+            return SchemaMode.SCHEMAFULL
+        if table_type is TableType.HASH:
+            return SchemaMode.SCHEMALESS
+        return None
+
+    @classmethod
+    def get_changefeed(cls) -> str | None:
+        """Return the declared change feed, normalised (``'7d'``, ``'1h INCLUDE ORIGINAL'``), or ``None`` (v0.34.0; the
+        full SurrealDB-ORM's method).
+
+        For the full ORM's form, a bare duration such as ``'7d'`` written without extra spaces, it equals the declared
+        string; ``INCLUDE ORIGINAL`` is written upper-case and whitespace runs are folded to one space.
+        """
+        value = cls.model_config.get("changefeed")
+        return None if value is None else changefeed_text(value, model=cls)
+
+    @classmethod
+    def get_permissions(cls) -> dict[str, str]:
+        """Return the declared permissions as given — a ``dict`` copy of ``SurrealConfigDict(permissions=…)`` — or
+        ``{}`` when the model declares none (v0.34.0; the full SurrealDB-ORM's method and return).
+
+        ``permissions={}`` also returns ``{}``: it declares ``PERMISSIONS NONE``, while a model without the key keeps
+        the stored permissions. The result is a copy: changing it never changes the model.
+        """
+        value = cls.model_config.get("permissions")
+        # Checked at the class statement: a Mapping or None.
+        return dict(value) if isinstance(value, Mapping) else {}
 
     # ==================== Materialized views (v0.32.0) ====================
 

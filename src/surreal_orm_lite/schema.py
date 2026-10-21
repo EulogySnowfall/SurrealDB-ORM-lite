@@ -1,4 +1,5 @@
-"""Server-side events and DDL helpers (v0.31.0), materialized views (v0.32.0), relation constraints (v0.33.0).
+"""Server-side events and DDL helpers (v0.31.0), materialized views (v0.32.0), relation constraints (v0.33.0), model
+table DDL (v0.34.0).
 
 ``Event`` declares a server-side event — SurrealDB's ``DEFINE EVENT`` on a table — with the full SurrealDB-ORM's call
 shape: a name, the SurrealQL the event runs (``then``), an optional condition (``when``), SurrealDB 3.x's ``ASYNC``
@@ -61,17 +62,31 @@ injection defence: the source is the database itself. ``define_relation()``'s gu
 the views' ``read_table_definitions()`` (``what="relation"`` names it in a refusal) and ``table_kind()``;
 ``relation_table_refused()`` gives the texts of its refusals.
 
+**Model table DDL (v0.34.0).** A model declares its table's clauses with the full SurrealDB-ORM's keys,
+``SurrealConfigDict(schema_mode=SchemaMode.…, changefeed=…, permissions={…}, comment=…, flexible_fields=[…])``.
+``check_table_config()`` checks them when the class is defined, on every model: no ``schema_mode``, ``table_type`` or
+``flexible_fields`` on a materialized view (its records are computed by SurrealDB); ``schema_mode`` a ``SchemaMode``,
+``SCHEMALESS`` refused on a ``TableType.USER`` table and a declared ``SCHEMAFULL`` refused with ``extra="allow"``; the
+change feed through ``changefeed_text()`` (a duration, optionally ``INCLUDE ORIGINAL`` in any case, whitespace folded);
+the permissions through ``permissions_rules()`` (a mapping of ``select``, ``create``, ``update`` and ``delete`` to
+``FULL``, ``NONE``, ``WHERE <condition>`` or a bare condition, normalised to the four operations, those left out
+``NONE``); the comment through ``comment_text()`` (no NUL); ``flexible_fields`` a ``list`` or ``tuple`` of the model's
+field names. A permissions condition is one expression ``scan_fragment()`` accepts, with no ``;`` outside brackets: a
+check against mistakes, not an injection defence — a rule is trusted application code. The checks validate and never
+rewrite: the model keeps every key as declared.
+
 The module sits low in the package: it imports neither ``model_base`` nor ``connection_manager``, so both can import
 it.
 """
 
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import KW_ONLY, dataclass, field
 from typing import Any, Literal
 
 from ._sdk import ServerError
 from .define_parser import (
+    _DURATION,
     DefineParseError,
     blank_literals,
     parse_define_table,
@@ -84,7 +99,7 @@ from .functions import normalize_function_name
 from .schema_state import TableState
 from .surql_literal import _SERVER_PARAMETERS, _identifier, _quoted
 from .time_travel import line_major
-from .types import TableType
+from .types import SchemaMode, TableType
 from .utils import VALID_ALIAS_PATTERN, _ddl_refusal_class
 
 __all__ = ["Event", "function_ddl"]
@@ -1299,8 +1314,9 @@ def check_relation_config(
     - R2–R5: :func:`relation_tables` of *relation_in*, then of *relation_out*;
     - R7, ``TypeError``: *enforced* is not a ``bool`` (and not ``None``).
 
-    On a node model, the other ``TableType`` members are accepted: recorded, returned by ``get_table_type()``, with
-    no effect before the table DDL of v0.37.0.
+    On a node model, the other ``TableType`` members are accepted: returned by ``get_table_type()``, they take effect
+    in ``define_table()`` (v0.34.0). The table's other clauses are checked by :func:`check_table_config`, which runs
+    after this check.
 
     :raises TypeError: T1–T3, R1, R2, R3, R7.
     :raises ValueError: R4, R5.
@@ -1459,3 +1475,206 @@ def relation_table_refused(guard: Literal["RG1", "RG2", "RG3"], model: str, tabl
         "TABLE IF NOT EXISTS would leave it as it is, and the relation constraint would not apply. Call "
         "define_relation() with overwrite=True, which keeps the table's other clauses. Nothing was defined."
     )
+
+
+# --- model table DDL (v0.34.0) ---------------------------------------------------------------------------------------
+
+#: A model's ``changefeed`` once stripped and its whitespace runs folded: a duration as ``define_parser`` reads one, then
+#: optionally `` INCLUDE ORIGINAL`` in any case.
+_CHANGEFEED_FORM = re.compile(rf"({_DURATION})( (?i:INCLUDE ORIGINAL))?")
+
+
+def _model_name(model: type | str) -> str:
+    """The name the class-time messages give *model*: the class's name, or *model* itself when it is one."""
+    return model if isinstance(model, str) else model.__name__
+
+
+def changefeed_text(value: object, *, model: type | str) -> str:
+    """The change feed a model declares, checked and normalised (v0.34.0): ``'7d'``, ``'1h INCLUDE ORIGINAL'``.
+
+    *value* is stripped and its whitespace runs folded to one space; it must then read ``<duration>[ INCLUDE
+    ORIGINAL]`` — the duration as ``define_parser`` reads one (``7d``, ``1h30m``, ``1w2d``, ``0s``), ``INCLUDE
+    ORIGINAL`` in any case, written upper-case. For the full SurrealDB-ORM's form, a bare duration written without
+    extra spaces, the result is *value* itself. *model* (a class or its name) is named in the messages. Pure.
+
+    :raises TypeError: *value* is not a ``str``.
+    :raises ValueError: *value* is not a change feed SurrealDB reads.
+    """
+    name = _model_name(model)
+    if not isinstance(value, str):
+        raise TypeError(
+            f"{name}: model_config['changefeed'] must be a str such as '7d' or '7d INCLUDE ORIGINAL', got "
+            f"{type(value).__name__}."
+        )
+    match = _CHANGEFEED_FORM.fullmatch(" ".join(value.split()))
+    if match is None:
+        raise ValueError(
+            f"{name}: model_config['changefeed'] is {value!r}, not a change feed SurrealDB reads: a duration such as "
+            "'7d' or '1h30m', optionally followed by ' INCLUDE ORIGINAL'."
+        )
+    return match.group(1) + (" INCLUDE ORIGINAL" if match.group(2) else "")
+
+
+def _table_rule(value: object, *, subject: str) -> str:
+    """One rule of a model's ``permissions``, checked and normalised: ``FULL``, ``NONE`` or ``WHERE <condition>``.
+
+    ``FULL`` and ``NONE`` in any case are written upper-case; ``WHERE <condition>`` (``WHERE`` in any case) and a bare
+    condition (the full SurrealDB-ORM's form) are written ``WHERE <condition>``, the condition stripped. A condition is
+    one expression ``scan_fragment()`` accepts with no ``;`` outside brackets. *subject* names the rule in the
+    messages (``"M: model_config['permissions']['select']"``).
+    """
+    if not isinstance(value, str):
+        raise TypeError(f"{subject} must be a str, got {type(value).__name__}.")
+    rule = value.strip()
+    if rule.upper() in ("FULL", "NONE"):
+        return rule.upper()
+    where = _PERMISSIONS_WHERE.fullmatch(rule)
+    if where is not None:
+        condition = where.group(1).strip()
+    elif rule.upper() == "WHERE":
+        condition = ""
+    else:
+        condition = rule
+    if not condition:
+        raise ValueError(f"{subject} is empty; write 'FULL', 'NONE' or a condition.")
+    try:
+        top_level_semicolon = scan_fragment(condition)
+    except DefineParseError as error:
+        raise ValueError(f"{subject} is not SurrealQL the ORM can embed: {error}.") from error
+    if top_level_semicolon:
+        raise ValueError(f"{subject} is one condition; it holds a ';' outside brackets.")
+    return f"WHERE {condition}"
+
+
+def permissions_rules(value: object, *, model: type | str) -> dict[str, str]:
+    """The table permissions a model declares, checked and normalised to the four operations (v0.34.0).
+
+    *value* is a mapping of operation — ``"select"``, ``"create"``, ``"update"`` or ``"delete"``, lower-case — to a
+    rule: ``"FULL"`` or ``"NONE"`` in any case, ``"WHERE <condition>"`` or a bare condition. The result maps the four
+    operations, in SurrealQL's order, to ``"FULL"``, ``"NONE"`` or ``"WHERE <condition>"`` — the shape of
+    ``TableState.permissions`` —, an operation left out to ``"NONE"`` (SurrealDB's default), so ``{}`` gives four
+    ``"NONE"``. The operations are checked in the mapping's order, each key before its rule. Private to the ORM: a
+    model's ``get_permissions()`` returns the mapping as declared; the renderers use this form. *model* (a class or its
+    name) is named in the messages. Pure.
+
+    A condition is checked by ``scan_fragment()`` — literals terminated, brackets balanced, no comment marker, no NUL
+    — and must hold no ``;`` outside brackets: a check against mistakes, not an injection defence; a rule is trusted
+    application code.
+
+    :raises TypeError: *value* is not a mapping; a rule is not a ``str``.
+    :raises ValueError: an operation is not one of the four; a rule is blank, not embeddable, or more than one
+        condition.
+    """
+    name = _model_name(model)
+    if not isinstance(value, Mapping):
+        raise TypeError(
+            f"{name}: model_config['permissions'] must be a mapping of operation to rule, such as {{'select': 'FULL'}}, "
+            f"got {type(value).__name__}."
+        )
+    rules = dict.fromkeys(_TABLE_OPERATIONS, "NONE")
+    for operation, rule in value.items():
+        if not isinstance(operation, str) or operation not in rules:
+            raise ValueError(
+                f"{name}: model_config['permissions'] names the operation {operation!r}; a table's operations are "
+                "select, create, update and delete."
+            )
+        rules[operation] = _table_rule(rule, subject=f"{name}: model_config['permissions'][{operation!r}]")
+    return rules
+
+
+def comment_text(value: object, *, model: type | str) -> str | None:
+    """The table comment a model declares, checked (v0.34.0): ``None``, or a ``str`` without a NUL character, returned
+    as given (the literal is written when the statement is rendered). *model* (a class or its name) is named in the
+    messages. Pure.
+
+    :raises TypeError: *value* is neither a ``str`` nor ``None``.
+    :raises ValueError: *value* holds a NUL character.
+    """
+    if value is None:
+        return None
+    name = _model_name(model)
+    if not isinstance(value, str):
+        raise TypeError(f"{name}: model_config['comment'] must be a str or None, got {type(value).__name__}.")
+    if "\x00" in value:
+        raise ValueError(f"{name}: model_config['comment'] holds a NUL character (\\x00), which SurrealQL cannot carry.")
+    return value
+
+
+def _flexible_fields(value: object, *, name: str, fields: Collection[str]) -> None:
+    """``flexible_fields``, checked: a ``list`` or ``tuple`` of ``str``, each a field of the model (*fields*)."""
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(
+            f"{name}: model_config['flexible_fields'] must be a list or tuple of field names, got {type(value).__name__}."
+        )
+    for item in value:
+        if not isinstance(item, str):
+            raise TypeError(f"{name}: model_config['flexible_fields'] holds a {type(item).__name__}, not a field name.")
+    for item in value:
+        if item not in fields:
+            raise ValueError(f"{name}: model_config['flexible_fields'] names {item!r}, which is not a field of {name}.")
+
+
+def check_table_config(
+    model: type,
+    *,
+    view: bool,
+    extra_allow: bool,
+    table_type: object,
+    schema_mode: object,
+    changefeed: object,
+    permissions: object,
+    comment: object,
+    flexible_fields: object,
+    fields: Collection[str],
+) -> None:
+    """The ``schema_mode``, ``changefeed``, ``permissions``, ``comment`` and ``flexible_fields`` keys of a model's
+    ``SurrealConfigDict``, checked when the class is defined (v0.34.0).
+
+    Called on every model, after :func:`check_relation_config` (so *table_type* is ``None`` or a ``TableType``),
+    inherited values included: the messages name *model*, the class being defined. *view* tells a materialized view
+    model (``view_query`` set), *extra_allow* a model with ``extra="allow"``, *fields* the model's field names (its
+    ``model_fields``). In order — the first failure raises:
+
+    - ``TypeError``: a view model with ``schema_mode``, ``table_type`` or ``flexible_fields`` (its records are computed
+      by SurrealDB; it takes ``permissions``, ``changefeed`` and ``comment``), the keys named in that order;
+    - ``TypeError``: *schema_mode* is not a ``SchemaMode`` (a plain ``"SCHEMAFULL"`` string included);
+    - ``TypeError``: ``TableType.USER`` with ``SchemaMode.SCHEMALESS`` (a ``USER`` table is ``SCHEMAFULL``);
+    - ``TypeError``: a declared ``SchemaMode.SCHEMAFULL`` with ``extra="allow"``, whose undeclared fields such a table
+      refuses (SurrealDB 3.x) or drops (2.x). A ``TableType.USER`` model with ``extra="allow"`` and no declared mode is
+      accepted here: its table DDL refuses it;
+    - :func:`changefeed_text`, :func:`permissions_rules` and :func:`comment_text` of their keys;
+    - ``TypeError`` / ``ValueError``: *flexible_fields* is not a ``list`` or ``tuple``; an item is not a ``str``; a name
+      is not a field of the model (Python names, not columns).
+
+    The values are validated, never rewritten: the model keeps every key as declared.
+
+    :raises TypeError: see above.
+    :raises ValueError: see above.
+    """
+    name = model.__name__
+    if view:
+        declared = {"schema_mode": schema_mode, "table_type": table_type, "flexible_fields": flexible_fields}
+        keys = [key for key, value in declared.items() if value is not None]
+        if keys:
+            raise TypeError(
+                f"{name}: a materialized view's table is computed by SurrealDB; leave {', '.join(keys)} out (a view "
+                "model takes permissions, changefeed and comment)."
+            )
+    if schema_mode is not None and not isinstance(schema_mode, SchemaMode):
+        raise TypeError(
+            f"{name}: model_config['schema_mode'] must be a surreal_orm_lite.SchemaMode, got {type(schema_mode).__name__}."
+        )
+    if table_type is TableType.USER and schema_mode is SchemaMode.SCHEMALESS:
+        raise TypeError(f"{name}: a TableType.USER table is SCHEMAFULL; leave schema_mode out or set SchemaMode.SCHEMAFULL.")
+    if schema_mode is SchemaMode.SCHEMAFULL and extra_allow:
+        raise TypeError(
+            f'{name}: extra="allow" keeps fields the model does not declare, which a SCHEMAFULL table refuses '
+            '(SurrealDB 3.x) or drops (2.x); declare SchemaMode.SCHEMALESS or remove extra="allow".'
+        )
+    if changefeed is not None:
+        changefeed_text(changefeed, model=model)
+    if permissions is not None:
+        permissions_rules(permissions, model=model)
+    comment_text(comment, model=model)
+    if flexible_fields is not None:
+        _flexible_fields(flexible_fields, name=name, fields=fields)
