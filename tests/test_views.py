@@ -5023,8 +5023,9 @@ _VIEW_ROWS = [
     [
         "Live queries and events on a view (a group emptied by a delete; a live query filtered on `id`)",
         "an emptied group: an `UPDATE` with the emptied values (a `count()` of 0), then a `DELETE`; a filter on `id` notifies",
-        "an emptied group: a `DELETE`; a filter on `id` never notifies (the view's notifications carry no `id`): "
-        "filter on the view's fields",
+        # Issue #291: the 3.x defect links its upstream issue, as section 33 does.
+        "an emptied group: a `DELETE`; a filter on `id` never notifies "
+        "([surrealdb#7607](https://github.com/surrealdb/surrealdb/issues/7607)): filter on the view's fields",
         "v0.32.0",
     ],
     [

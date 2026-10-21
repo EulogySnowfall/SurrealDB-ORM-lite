@@ -25,7 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   3.x: `id IN` on a view table answers no record
   ([surrealdb/surrealdb#7608](https://github.com/surrealdb/surrealdb/issues/7608)), and a view's
   live notifications carry no `id`
-  ([surrealdb/surrealdb#7607](https://github.com/surrealdb/surrealdb/issues/7607)).
+  ([surrealdb/surrealdb#7607](https://github.com/surrealdb/surrealdb/issues/7607)). The v0.32.0
+  row "Live queries and events on a view" of "ORM behaviour: SurrealDB 2.x vs 3.x" links #7607
+  too, next to its 3.x workaround (filter on the view's fields, not on `id`).
 
 ### Fixed
 
