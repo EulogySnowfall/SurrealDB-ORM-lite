@@ -10,42 +10,42 @@
 
 ## Overview
 
-| Version           | Theme                                               | Status  |
-| ----------------- | --------------------------------------------------- | ------- |
-| v0.2.x            | Core ORM (CRUD, QuerySet, Filters)                  | Done    |
-| v0.3.0            | Aggregations & Utilities                            | Done    |
-| v0.4.0            | Model Signals                                       | Done    |
-| v0.5.0            | Bulk Operations & Q Objects                         | Done    |
-| v0.6.0            | Relations & Graph                                   | Done    |
-| v0.7.0            | SDK 2.0 / SurrealDB 3.x migration                   | Done    |
-| v0.8.0            | Transactions ORM (core, `tx=`)                      | Done    |
-| v0.9.0            | Transactions ORM (QuerySet) + interactive (3.x)     | Done    |
-| v0.10.0 – v0.12.0 | Tier 1 — Core write-path (upsert, patch, retry)     | Done    |
-| v0.13.0           | Tier 1 — SurrealFunc & server-side values           | Done    |
-| v0.14.0           | Tier 1 — Computed Fields                            | Done    |
-| v0.15.0           | Tier 1 — `call_function()` (custom `fn::`)          | Done    |
-| v0.16.0           | Tier 1 — Connection-level auth (JWT / record users) | Done    |
-| v0.17.0           | Tier 1 — Model auth (`AuthenticatedUserMixin`)      | Done    |
-| v0.18.0           | Tier 1 — Field aliases & DX                         | Done    |
-| v0.19.0           | Tier 1 — Live queries (base), raw notifications     | Done    |
-| v0.20.0           | Tier 1 — Typed live queries (`LiveModelStream`)     | Done    |
-| v0.21.0           | Tier 1 — Auto-resubscribe & change feeds (cursor)   | Done    |
-| v0.22.0           | Tier 1 — Core (native typed relations)              | Done    |
-| v0.23.0           | Tier 2 — Rich field types                           | Done    |
-| v0.24.0           | Tier 2 — Geospatial fields                          | Done    |
-| v0.25.0           | Tier 2 — Embedded test engine                       | Done    |
-| v0.26.0           | Tier 2 — Time travel (versioned storage)            | Done    |
-| v0.27.0           | Tier 2 — Subqueries                                 | Done    |
-| v0.28.0           | Tier 2 — Query cache                                | Done    |
-| v0.29.0           | Tier 2 — Multi-database                             | Done    |
-| v0.30.0           | Tier 3 — Schema introspection                       | Done    |
-| v0.31.0           | Tier 3 — Server-side events & DDL helpers           | Done    |
-| v0.32.0           | Tier 3 — Materialized views                         | Done    |
-| v0.33.0           | Tier 3 — `TYPE RELATION` enforcement                | Done    |
-| v0.34.0 – v0.39.0 | Tier 3 — Advanced (search/migrations/CLI), 6 minors | Planned |
-| v0.40.0           | Beta Phase (API freeze, hardening)                  | Planned |
-| v2.0.0            | Production / GA (aligned with SDK 2.0)              | Planned |
-| v2.1.0+           | Future (post-GA)                                    | Future  |
+| Version           | Theme                                                   | Status  |
+| ----------------- | ------------------------------------------------------- | ------- |
+| v0.2.x            | Core ORM (CRUD, QuerySet, Filters)                      | Done    |
+| v0.3.0            | Aggregations & Utilities                                | Done    |
+| v0.4.0            | Model Signals                                           | Done    |
+| v0.5.0            | Bulk Operations & Q Objects                             | Done    |
+| v0.6.0            | Relations & Graph                                       | Done    |
+| v0.7.0            | SDK 2.0 / SurrealDB 3.x migration                       | Done    |
+| v0.8.0            | Transactions ORM (core, `tx=`)                          | Done    |
+| v0.9.0            | Transactions ORM (QuerySet) + interactive (3.x)         | Done    |
+| v0.10.0 – v0.12.0 | Tier 1 — Core write-path (upsert, patch, retry)         | Done    |
+| v0.13.0           | Tier 1 — SurrealFunc & server-side values               | Done    |
+| v0.14.0           | Tier 1 — Computed Fields                                | Done    |
+| v0.15.0           | Tier 1 — `call_function()` (custom `fn::`)              | Done    |
+| v0.16.0           | Tier 1 — Connection-level auth (JWT / record users)     | Done    |
+| v0.17.0           | Tier 1 — Model auth (`AuthenticatedUserMixin`)          | Done    |
+| v0.18.0           | Tier 1 — Field aliases & DX                             | Done    |
+| v0.19.0           | Tier 1 — Live queries (base), raw notifications         | Done    |
+| v0.20.0           | Tier 1 — Typed live queries (`LiveModelStream`)         | Done    |
+| v0.21.0           | Tier 1 — Auto-resubscribe & change feeds (cursor)       | Done    |
+| v0.22.0           | Tier 1 — Core (native typed relations)                  | Done    |
+| v0.23.0           | Tier 2 — Rich field types                               | Done    |
+| v0.24.0           | Tier 2 — Geospatial fields                              | Done    |
+| v0.25.0           | Tier 2 — Embedded test engine                           | Done    |
+| v0.26.0           | Tier 2 — Time travel (versioned storage)                | Done    |
+| v0.27.0           | Tier 2 — Subqueries                                     | Done    |
+| v0.28.0           | Tier 2 — Query cache                                    | Done    |
+| v0.29.0           | Tier 2 — Multi-database                                 | Done    |
+| v0.30.0           | Tier 3 — Schema introspection                           | Done    |
+| v0.31.0           | Tier 3 — Server-side events & DDL helpers               | Done    |
+| v0.32.0           | Tier 3 — Materialized views                             | Done    |
+| v0.33.0           | Tier 3 — `TYPE RELATION` enforcement                    | Done    |
+| v0.34.0 – v0.40.0 | Tier 3 — Advanced (DDL/search/migrations/CLI), 7 minors | Planned |
+| v0.41.0           | Beta Phase (API freeze, hardening)                      | Planned |
+| v2.0.0            | Production / GA (aligned with SDK 2.0)                  | Planned |
+| v2.1.0+           | Future (post-GA)                                        | Future  |
 
 > **Versioning note**: the GA is numbered **v2.0.0** to mirror the official SurrealDB SDK 2.0
 > as a branding choice. This is **independent** of the dependency pin, which stays
@@ -102,13 +102,14 @@ pieces stay out.
 | `define_function()` DDL helper         | `DEFINE FUNCTION` via `query()` (`schema.py`)         | ✅ v0.31.0     |
 | Materialized views                     | `DEFINE TABLE … AS SELECT`                            | ✅ v0.32.0     |
 | `TYPE RELATION` enforcement            | `DEFINE TABLE … TYPE RELATION`                        | ✅ v0.33.0     |
-| Full-Text Search (BM25)                | `DEFINE ANALYZER` + `SEARCH` index + `search::*`      | v0.34.0        |
-| Vector Search (KNN, HNSW/MTREE)        | `DEFINE INDEX … HNSW/MTREE` + KNN operator            | v0.35.0        |
-| Hybrid Search (RRF)                    | vector + FTS fusion                                   | v0.36.0        |
-| Migrations (makemigrations/migrate)    | DDL orchestration + tracking table via `query()`      | v0.37.0        |
-| CLI `surreal-orm-lite`                 | shell / migrate / inspectdb                           | v0.38.0        |
-| Test fixtures & factories              | `ModelFactory`, pytest fixtures                       | v0.39.0        |
-| QueryLogger / profiling                | wraps `query()` calls                                 | v0.40.0 (Beta) |
+| Model table DDL (`define_table()`)     | `DEFINE TABLE` + `DEFINE FIELD` via `query()`         | v0.34.0        |
+| Full-Text Search (BM25)                | `DEFINE ANALYZER` + `SEARCH` index + `search::*`      | v0.35.0        |
+| Vector Search (KNN, HNSW/MTREE)        | `DEFINE INDEX … HNSW/MTREE` + KNN operator            | v0.36.0        |
+| Hybrid Search (RRF)                    | vector + FTS fusion                                   | v0.37.0        |
+| Migrations (makemigrations/migrate)    | DDL orchestration + tracking table via `query()`      | v0.38.0        |
+| CLI `surreal-orm-lite`                 | shell / migrate / inspectdb                           | v0.39.0        |
+| Test fixtures & factories              | `ModelFactory`, pytest fixtures                       | v0.40.0        |
+| QueryLogger / profiling                | wraps `query()` calls                                 | v0.41.0 (Beta) |
 
 ¹ SDK 2.0.0 exposes **no** `run()`/`call()` method, so the call goes through `query()` with
 the bare form `fn::name($args);` — never `RETURN fn::name(…)`, which silently truncates a
@@ -165,12 +166,13 @@ moves it to the `surrealdb[embedded]` extra.
 | DEFINE EVENT                  | yes        | ✅ v0.31.0                  |
 | Materialized views            | yes        | ✅ v0.32.0                  |
 | TYPE RELATION enforcement     | yes        | ✅ v0.33.0                  |
-| Full-Text Search (BM25)       | yes        | v0.34.0                     |
-| Vector Search (KNN/HNSW)      | yes        | v0.35.0                     |
-| Hybrid Search (RRF)           | yes        | v0.36.0                     |
-| Migrations & CLI              | yes        | v0.37 – v0.38               |
-| Test fixtures & factories     | yes        | v0.25.0 + v0.39.0           |
-| QueryLogger / profiling       | yes        | v0.40.0                     |
+| Model table DDL               | yes        | v0.34.0 (`define_table()`)  |
+| Full-Text Search (BM25)       | yes        | v0.35.0                     |
+| Vector Search (KNN/HNSW)      | yes        | v0.36.0                     |
+| Hybrid Search (RRF)           | yes        | v0.37.0                     |
+| Migrations & CLI              | yes        | v0.38 – v0.39               |
+| Test fixtures & factories     | yes        | v0.25.0 + v0.40.0           |
+| QueryLogger / profiling       | yes        | v0.41.0                     |
 | Custom SDK (`surreal_sdk`)    | yes        | never                       |
 | CBOR protocol internals       | yes        | never                       |
 
@@ -190,7 +192,7 @@ official SDK's in-process engine from v0.25.0.
 The embedded engine is SurrealDB core 2.3.10 with SDK 2.0.0, not the 2.x/3.x server lines the ORM
 is tested on. A bare `memory` (no `://`) is refused by SDK 2.0.0; write `memory://`. Base test
 fixtures (`SurrealFixture`, `@fixture`, `embedded_database()`) ship in v0.25.0; factories
-(`ModelFactory`, `Faker`) in v0.39.0.
+(`ModelFactory`, `Faker`) in v0.40.0.
 
 ---
 
@@ -341,7 +343,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - Model-level auth (`AuthenticatedUserMixin`, `User.signup()` returning an instance) is v0.17.0;
   a `define_access()` DDL helper belongs with `schema.py` at v0.31.0 — v0.31.0 ships none: the
   v0.17.0 model method `define_access()` stays the way to apply `DEFINE ACCESS`, and the full
-  ORM's `DefineAccess` operation comes with migrations (v0.37.0)
+  ORM's `DefineAccess` operation comes with migrations (v0.38.0)
 
 ### Version 0.19.0 — Live queries (base)
 
@@ -501,7 +503,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   the SDK refuses (`rocksdb://`, #233, quoting the SDK)
 - `surreal_orm_lite.testing`: `embedded_database()` (an isolated in-process database per block,
   nestable) and the full ORM's `SurrealFixture` / `@fixture`; `ModelFactory` and `Faker` stay in
-  v0.39.0
+  v0.40.0
 - The engine is SurrealDB core 2.3.10 (SDK 2.0.0), so it speaks 2.x SurrealQL; its behaviour is a
   table of its own in the README. Server lines unchanged (2.7.0 and 3.3.4, 3.1.5 retro). Time travel
   on `surrealkv+versioned://` is v0.26.0; the SDK 3.0 engine (3.x core, `surrealdb[embedded]`) is #205
@@ -617,7 +619,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
 - Same state and same generated types on 2.7.0, 3.3.4 and the embedded engine (3.1.5 retro
   identical); 3.x-only (`COMPUTED`, `REFERENCE`, `FULLTEXT`, sequences) and 2.x-only (`MTREE`,
   `SEARCH ANALYZER`) definitions are read on their line. Deferred: `schema_diff()` /
-  `SchemaState.diff()` → v0.37.0 (migrations), the `inspectdb` command → v0.38.0 (CLI),
+  `SchemaState.diff()` → v0.38.0 (migrations), the `inspectdb` command → v0.39.0 (CLI),
   object-literal kinds as sub-models, typed 3.x sequences, APIs and configs
 
 ### Version 0.31.0 — Server-side events and DDL helpers
@@ -642,7 +644,7 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   `EventState` gains `async_mode`, `retry` and `max_depth`, so `DatabaseIntrospector` reads
   `ASYNC` events (a `SchemaIssue` in 0.30.x)
 - Same code on 2.7.0, 3.3.4 and the embedded engine (3.1.5 retro identical). Deferred: the
-  migration operations and the removal of events a model no longer declares → v0.37.0
+  migration operations and the removal of events a model no longer declares → v0.38.0
   (migrations), declarative `events=[...]` in generated models, query-cache invalidation of the
   tables events write
 
@@ -672,10 +674,10 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   notified as `UPDATE` then `DELETE` on 2.x, `DELETE` on 3.x; on 3.x a live query on a view
   filtered on `id` never notifies; 3.1 refuses to redefine a view that holds records. Same code
   on 2.7.0, 3.3.4 and the embedded engine (3.1.5 retro)
-- Deferred: migrations (`CreateTable`/`AlterTable` with `view_query`) and `define_table()` →
-  v0.37.0, whose `define_table()` will accept a view model and apply it through `view_ddl()`;
-  table permissions for record users (a view is defined with SurrealDB's default
-  `PERMISSIONS NONE`) and a view query built from a QuerySet
+- Deferred: `define_table()` → v0.34.0, which will accept a view model and apply it through
+  `view_ddl()`; migrations (`CreateTable`/`AlterTable` with `view_query`) → v0.38.0; table
+  permissions for record users (a view is defined with SurrealDB's default `PERMISSIONS NONE`)
+  and a view query built from a QuerySet
 
 ### Version 0.33.0 — `TYPE RELATION` enforcement
 
@@ -686,8 +688,9 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   backquotes. The keys are checked at the `class` statement (on a node model they raise
   `TypeError`); `get_relation_in()`/`get_relation_out()` return tuples in the shape of
   `TableState`, `is_enforced()` a bool, `get_table_type()` the table's `TableType`
-- `Model.relation_ddl()` renders ``DEFINE TABLE OVERWRITE `<table>` TYPE RELATION IN … OUT …``
-  (pure); `Model.define_relation()` applies it (idempotent; `overwrite=False` for `IF NOT EXISTS`;
+- On an edge model (`BaseSurrealEdge` only), `Edge.relation_ddl()` renders
+  ``DEFINE TABLE OVERWRITE `<table>` TYPE RELATION IN … OUT …`` (pure);
+  `await Edge.define_relation()` applies it (idempotent; `overwrite=False` for `IF NOT EXISTS`;
   `tx=`): one `INFO FOR DB`, then one `DEFINE TABLE OVERWRITE` that keeps the table's schema mode,
   `DROP`, comment, change feed and permissions, and its records, fields, indexes, events, views
   and live queries. Enforced at once on every connection; a keyless model removes the
@@ -705,10 +708,10 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   `SurrealDbError` on 3.x; a raw `ALTER TABLE … TYPE RELATION …` of a table already written to is
   not enforced on 2.x and the embedded engine until a `DEFINE TABLE OVERWRITE` (the ORM never
   sends `ALTER TABLE`). Same code on 2.7.0, 3.3.4 and the embedded engine (3.1.5 retro identical)
-- Deferred: migrations (`CreateTable`/`AlterTable` with the relation keys) and `define_table()`
-  → v0.37.0, which will apply an edge model through `define_relation()`; until then `TableType`'s
-  other members have no effect, and the table's other clauses are kept from the database (no
-  schema-mode, permissions, change-feed or comment keys yet)
+- Deferred: `define_table()` → v0.34.0, which will apply an edge model through the statement
+  `define_relation()` carries (until then `TableType`'s other members have no effect, and the
+  table's other clauses are kept from the database: no schema-mode, permissions, change-feed or
+  comment keys yet); migrations (`CreateTable`/`AlterTable` with the relation keys) → v0.38.0
 
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
@@ -917,28 +920,45 @@ servers (3.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too.
 | ✅ v0.31.0 | `DEFINE EVENT` (server-side triggers)                                          | DDL via `query()`                |
 | ✅ v0.32.0 | Materialized views (read-only models)                                          | `DEFINE TABLE … AS SELECT`       |
 | ✅ v0.33.0 | `TYPE RELATION` enforcement (graph constraints), building on `BaseSurrealEdge` | `DEFINE TABLE … TYPE RELATION`   |
+| v0.34.0    | Model table DDL (`define_table()`)                                             | `DEFINE TABLE` + `DEFINE FIELD`  |
+
+#### Version 0.34.0 — Model table DDL
+
+`Model.define_table()`, as close as possible to the full SurrealDB-ORM's, which has it outside its
+migrations: the model's `DEFINE TABLE` and `DEFINE FIELD` statements (schema mode, field types,
+permissions, change feed, comment), applied with `query()`. It comes before the search versions,
+whose analyzer and index DDL build on it. The released versions leave it these constraints:
+
+- A view model (`view_query`, v0.32.0) is applied through `view_ddl()`
+- An edge model (`BaseSurrealEdge`, v0.33.0) is applied through the statement `define_relation()`
+  carries, never a bare `DEFINE TABLE OVERWRITE`, which resets the permissions to `NONE` and drops
+  the schema mode, the change feed and the comment (README section 34)
+- `TableType`'s other members (`NORMAL`, `USER`, `STREAM`, `HASH`, `ANY`) take effect; until then
+  they are recorded and have no effect
+- Generated node models get `table_type=`; `generate_models_from_db()` writes none today (an edge
+  model's base class, `BaseSurrealEdge`, says it)
 
 ### 🔎 Phase G — Advanced search
 
 | Version | Theme                                               | SDK 2.0 realization                              |
 | ------- | --------------------------------------------------- | ------------------------------------------------ |
-| v0.34.0 | Full-Text Search (`search()`, BM25 score/highlight) | `DEFINE ANALYZER` + `SEARCH` index + `search::*` |
-| v0.35.0 | Vector Search (`similar_to()`, KNN)                 | `DEFINE INDEX … HNSW/MTREE` + KNN operator       |
-| v0.36.0 | Hybrid Search (RRF)                                 | vector + FTS fusion                              |
+| v0.35.0 | Full-Text Search (`search()`, BM25 score/highlight) | `DEFINE ANALYZER` + `SEARCH` index + `search::*` |
+| v0.36.0 | Vector Search (`similar_to()`, KNN)                 | `DEFINE INDEX … HNSW/MTREE` + KNN operator       |
+| v0.37.0 | Hybrid Search (RRF)                                 | vector + FTS fusion                              |
 
 ### 🛠️ Phase H — Tooling
 
 | Version | Theme                                                  | SDK 2.0 realization                        |
 | ------- | ------------------------------------------------------ | ------------------------------------------ |
-| v0.37.0 | Migration system (makemigrations / migrate / rollback) | DDL orchestration + tracking via `query()` |
-| v0.38.0 | CLI `surreal-orm-lite` (shell, migrate, inspectdb)     | entry point over the ORM                   |
-| v0.39.0 | Test fixtures & factories (`ModelFactory`, pytest)     | tooling over the ORM                       |
+| v0.38.0 | Migration system (makemigrations / migrate / rollback) | DDL orchestration + tracking via `query()` |
+| v0.39.0 | CLI `surreal-orm-lite` (shell, migrate, inspectdb)     | entry point over the ORM                   |
+| v0.40.0 | Test fixtures & factories (`ModelFactory`, pytest)     | tooling over the ORM                       |
 
 ---
 
 ## Planned — Tier 4: Stabilization
 
-### Version 0.40.0 — Beta Phase (API freeze)
+### Version 0.41.0 — Beta Phase (API freeze)
 
 - Connection-level retry/reconnect (network resilience, distinct from `retry_on_conflict`)
 - Configurable logging; **QueryLogger / profiling**
@@ -948,14 +968,14 @@ servers (3.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too.
 - **Public API freeze** — no breaking changes until GA
 
 **Completion criteria**: E2E green on the pinned 2.x and 3.x lines, coverage ≥ 75 %, full API docs, API-freeze
-changelog published, no regression since v0.39.0.
+changelog published, no regression since v0.40.0.
 
 ### Version 2.0.0 — Production / GA
 
 - Production stability, coverage ≥ **80 %**
 - Complete documentation + `0.x → 2.0` migration guide
 - Published performance benchmarks
-- No breaking change since v0.40.0 (the Beta-frozen API is honored)
+- No breaking change since v0.41.0 (the Beta-frozen API is honored)
 - `v2.0.0-rcN` release candidates tagged before GA
 
 ---
