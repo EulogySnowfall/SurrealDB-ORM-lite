@@ -49,6 +49,21 @@ The table's vector columns (``TestFieldKind``, ``TestDefineTableE2E``): a vector
 ``option<array<float, d>>`` by ``table_ddl()`` and ``define_table()``, whatever its storage type; on every engine the
 column reads back as written, so a second ``define_table()`` changes nothing, integers are stored as floats, and a
 vector of another length is refused.
+
+The model's vector indexes applied (``TestDefineVectorIndexesE2E``), on every engine: ``define_indexes()`` applies the
+analyzer and every index of a fresh table, the full-text one with the line's keyword; called again it sends ``INFO FOR
+DB``, the line and ``INFO FOR TABLE`` and nothing else — an equal vector index is never rebuilt; one changed option
+redefines that index alone, and ``overwrite=False`` keeps the stored one; an index declared without ``dist`` and the
+same declaring ``dist="euclidean"`` each match the index the other defined; a model whose indexes are all vector
+indexes reads no line; an index of another kind stored under the declared name — an ``MTREE`` index on SurrealDB 2.x
+and the embedded engine, a plain one on every engine — is redefined ``HNSW``; ``remove_index()`` removes a vector index
+by name and the next ``define_indexes()`` defines only what is missing; with a transaction the vector index joins the
+block, and a block that raises applies none.
+
+The engines' own vector DDL, pinned with raw statements (``TestVectorDdlPinsE2E``): an index without ``TYPE`` stores
+``F64`` vectors on the embedded engine and ``F32`` on the servers, while the ORM's statement stores ``F32`` everywhere;
+SurrealDB 3.x refuses ``MTREE`` (a parse error), which 2.x and the embedded engine accept; ``HNSW … UNIQUE`` stores a
+plain ``UNIQUE`` index on every engine.
 """
 
 import ast
@@ -1495,3 +1510,387 @@ class TestDefineTableE2E:
             assert await _refused(client, "CREATE vec_doc:d4 SET title = 'Short', embedding = [1.0, 0.0];")
             assert await _refused(client, "CREATE vec_doc:d5 SET title = 'Short', summary = [1.0, 0.0];")
             assert await client.query("SELECT VALUE record::id(id) FROM vec_doc;", {}) == ["d1"]
+
+
+# === define_indexes() and remove_index(): the vector indexes on every engine ========================================
+
+
+class VecDocEuclidean(VecDoc):
+    """``VecDoc`` on the same table, ``vec_doc_embedding`` redeclared with another metric."""
+
+    model_config = SurrealConfigDict(
+        table_name="vec_doc",
+        indexes=[
+            Index("vec_doc_embedding", "embedding", hnsw=True, dimension=3, dist="euclidean"),
+            *VecDoc.get_indexes()[1:],
+        ],
+    )
+
+
+class VecOnly(BaseSurrealModel):
+    """Vector indexes only (no full-text index): ``define_indexes()`` reads no line. Its index declares the dimension
+    alone."""
+
+    model_config = SurrealConfigDict(
+        table_name="vec_only", indexes=[Index("vec_only_embedding", "embedding", hnsw=True, dimension=3)]
+    )
+
+    id: str | None = None
+    embedding: VectorField[3]
+
+
+class VecOnlyEuclidean(VecOnly):
+    """``VecOnly`` on the same table, its index spelling out SurrealDB's default metric."""
+
+    model_config = SurrealConfigDict(
+        table_name="vec_only",
+        indexes=[Index("vec_only_embedding", "embedding", hnsw=True, dimension=3, dist="euclidean")],
+    )
+
+
+_INFO_ONLY = "INFO FOR TABLE `vec_only`;"
+
+#: ``VecOnly``'s statement — and ``VecOnlyEuclidean``'s: every option written, SurrealDB's defaults included.
+_ONLY = (
+    "DEFINE INDEX OVERWRITE `vec_only_embedding` ON `vec_only` FIELDS `embedding` HNSW DIMENSION 3 DIST EUCLIDEAN TYPE "
+    "F32 EFC 150 M 12;"
+)
+
+#: ``VecDocEuclidean``'s ``vec_doc_embedding``.
+_H1_EUCLIDEAN = (
+    "DEFINE INDEX OVERWRITE `vec_doc_embedding` ON `vec_doc` FIELDS `embedding` HNSW DIMENSION 3 DIST EUCLIDEAN TYPE "
+    "F32 EFC 150 M 12;"
+)
+
+#: The reads of ``VecDoc.define_indexes()``: ``INFO FOR DB``, the line (a full-text index is declared), ``INFO FOR
+#: TABLE``.
+_DOC_READS = [*_query(_INFO_DB), ("version", None), *_query(_INFO_DOC)]
+
+#: The reads of ``VecOnly.define_indexes()``: no line read.
+_ONLY_READS = _sent([_INFO_DB, _INFO_ONLY])
+
+#: ``index_ddl()``'s statements by ``(overwrite, line)``.
+_INDEX_DDL = {
+    (True, 3): _H2,
+    (True, 2): _H3,
+    (False, 3): _H4,
+    (False, 2): [statement.replace("FULLTEXT", "SEARCH") for statement in _H4],
+}
+
+#: An ``MTREE`` index under ``VecOnly``'s index name (SurrealDB 2.x and the embedded engine accept it).
+_MTREE_ONLY = "DEFINE INDEX vec_only_embedding ON vec_only FIELDS embedding MTREE DIMENSION 3;"
+
+#: A plain index under ``VecOnly``'s index name.
+_PLAIN_ONLY = "DEFINE INDEX vec_only_embedding ON vec_only FIELDS embedding;"
+
+
+async def _indexes(client: Any, table: str) -> dict[str, IndexState | None]:
+    """The indexes of *table*, as ``read_table_indexes()`` reads them."""
+    return await search.read_table_indexes(client, table, what="index", kind="definition")
+
+
+async def _refusals(client: Any, query: str) -> list[str]:
+    """Run *query* raw: the text of every statement SurrealDB refused, ``[]`` when it accepts them all (a parse error
+    refuses the whole query; the embedded engine raises it)."""
+    try:
+        response = await client.query_raw(query, {})
+    except RuntimeError as error:
+        return [str(error)]
+    if "error" in response:
+        return [str(response["error"])]
+    return [str(result["result"]) for result in response["result"] if result["status"] != "OK"]
+
+
+class _Rollback(Exception):
+    """Raised inside a ``transaction()`` block to roll it back."""
+
+
+class TestDefineVectorIndexesE2E:
+    """``define_indexes()`` with vector indexes on every engine (the line under test over WebSocket and HTTP, and the
+    embedded engine): the first call applies the analyzer and every index, the full-text one with the line's keyword;
+    the second sends the reads alone and applies nothing — a vector index equal to the stored one is never rebuilt;
+    one changed option redefines that index only (``overwrite=False`` keeps it); a declaration without ``dist`` and the
+    same with ``dist="euclidean"`` each match the index the other defined; a model with vector indexes only reads no
+    line; an index of another kind stored under the name (an ``MTREE`` one on SurrealDB 2.x and the embedded engine, a
+    plain one) is redefined ``HNSW``; ``remove_index()`` removes a vector index by name; with a transaction the vector
+    index joins the block."""
+
+    @pytest.mark.parametrize("overwrite", [True, False])
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_fresh_database_then_nothing_changed(
+        self, kind: str, overwrite: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with _vec_models(kind) as client:
+            line = await _keyword_line(client)
+            await VecDoc.define_table()
+            calls = _spy(monkeypatch, client)
+            applied = await VecDoc.define_indexes(overwrite=overwrite)
+            first = _calls(calls)
+            calls.clear()
+            again = await VecDoc.define_indexes(overwrite=overwrite)
+            second = _calls(calls)
+            monkeypatch.undo()
+            stored = await _indexes(client, "vec_doc")
+        expected = _INDEX_DDL[(overwrite, line)]
+        assert applied == expected
+        assert applied == VecDoc.index_ddl(overwrite=overwrite, line=line)
+        assert first == [*_DOC_READS, *_sent(expected)]
+        assert again == []
+        assert second == _DOC_READS
+        assert sorted(stored) == ["vec_doc_embedding", "vec_doc_summary", "vec_doc_title"]
+        for index in VecDoc.get_indexes():
+            assert search.index_matches(index, _doc_columns(index), stored[index.name]), index.name
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_only_a_changed_vector_index_is_redefined(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            await VecDoc.define_table()
+            await VecDoc.define_indexes()
+            calls = _spy(monkeypatch, client)
+            kept = await VecDocEuclidean.define_indexes(overwrite=False)
+            kept_sent = _calls(calls)
+            monkeypatch.undo()
+            kept_state = (await _indexes(client, "vec_doc"))["vec_doc_embedding"]
+            calls = _spy(monkeypatch, client)
+            changed = await VecDocEuclidean.define_indexes()
+            changed_sent = _calls(calls)
+            monkeypatch.undo()
+            stored = await _indexes(client, "vec_doc")
+            # The model wins again: VecDoc redefines its own index, nothing else.
+            back = await VecDoc.define_indexes()
+            restored = (await _indexes(client, "vec_doc"))["vec_doc_embedding"]
+        assert kept == []
+        assert kept_sent == _DOC_READS
+        assert kept_state is not None and kept_state.dist == "COSINE"
+        assert changed == [_H1_EUCLIDEAN]
+        assert changed_sent == [*_DOC_READS, *_query(_H1_EUCLIDEAN)]
+        state = stored["vec_doc_embedding"]
+        assert state is not None and state.dist == "EUCLIDEAN"
+        assert search.index_matches(VecDocEuclidean.get_indexes()[0], ["embedding"], state)
+        for index in VecDoc.get_indexes()[1:]:
+            assert search.index_matches(index, _doc_columns(index), stored[index.name]), index.name
+        assert back == [_H1]
+        assert search.index_matches(VecDoc.get_indexes()[0], ["embedding"], restored)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_without_dist_and_with_the_default_dist_both_unchanged(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``Index(…, hnsw=True, dimension=3)`` and the same with ``dist="euclidean"`` are two declarations (not equal)
+        of one statement: each matches the index the other defined, so neither sends a ``DEFINE``. Neither model
+        declares a full-text index: ``define_indexes()`` reads no line."""
+        async with _vec_models(kind) as client:
+            calls = _spy(monkeypatch, client)
+            bare_first = await VecOnly.define_indexes()
+            spelled_then = await VecOnlyEuclidean.define_indexes()
+            first_round = _calls(calls)
+            monkeypatch.undo()
+            bare_state = (await _indexes(client, "vec_only"))["vec_only_embedding"]
+            removed = await VecOnly.remove_index("vec_only_embedding")
+            after_removal = await _indexes(client, "vec_only")
+            calls = _spy(monkeypatch, client)
+            spelled_first = await VecOnlyEuclidean.define_indexes()
+            bare_then = await VecOnly.define_indexes()
+            second_round = _calls(calls)
+            monkeypatch.undo()
+            spelled_state = (await _indexes(client, "vec_only"))["vec_only_embedding"]
+        assert VecOnly.get_indexes() != VecOnlyEuclidean.get_indexes()
+        assert bare_first == spelled_first == [_ONLY]
+        assert spelled_then == bare_then == []
+        assert first_round == second_round == [*_ONLY_READS, *_query(_ONLY), *_ONLY_READS]
+        assert removed == "REMOVE INDEX IF EXISTS `vec_only_embedding` ON `vec_only`;"
+        assert after_removal == {}
+        for state in (bare_state, spelled_state):
+            assert state is not None and state.hnsw is True
+            # Every engine stores the TYPE written: the embedded engine's own default would be F64.
+            assert (state.dimension, state.dist, state.vector_type, state.efc, state.m) == (3, "EUCLIDEAN", "F32", 150, 12)
+            for model in (VecOnly, VecOnlyEuclidean):
+                assert search.index_matches(model.get_indexes()[0], ["embedding"], state), model.__name__
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_stored_mtree_index_is_redefined_hnsw(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SurrealDB 2.x and the embedded engine accept an ``MTREE`` index, which ``similar_to()`` does not use: one
+        stored under the declared name is redefined ``HNSW`` (``overwrite=False`` leaves it). SurrealDB 3.x refuses
+        the ``MTREE`` statement, so the name holds nothing and the ``HNSW`` index is defined."""
+        async with _vec_models(kind) as client:
+            major = await _major(client)
+            refusals = await _refusals(client, _MTREE_ONLY)
+            before = await _indexes(client, "vec_only")
+            calls = _spy(monkeypatch, client)
+            kept = await VecOnly.define_indexes(overwrite=False)
+            kept_sent = _calls(calls)
+            monkeypatch.undo()
+            kept_state = await _indexes(client, "vec_only")
+            applied = await VecOnly.define_indexes()
+            after = await _indexes(client, "vec_only")
+            again = await VecOnly.define_indexes()
+        state = after["vec_only_embedding"]
+        assert state is not None and (state.hnsw, state.mtree) == (True, False)
+        assert search.index_matches(VecOnly.get_indexes()[0], ["embedding"], state)
+        assert again == []
+        if major >= 3:
+            assert len(refusals) == 1 and "Parse error" in refusals[0], refusals
+            assert before == {}
+            # Nothing stored: overwrite=False defines the index (IF NOT EXISTS), the next call finds it equal.
+            assert kept == [_ONLY.replace("OVERWRITE", "IF NOT EXISTS")]
+            assert applied == []
+            return
+        assert refusals == []
+        mtree = before["vec_only_embedding"]
+        assert mtree is not None and (mtree.hnsw, mtree.mtree) == (False, True)
+        assert kept == []
+        assert kept_sent == _ONLY_READS
+        assert kept_state == before
+        assert applied == [_ONLY]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_stored_plain_index_is_redefined_hnsw(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await _apply_ddl(client, _PLAIN_ONLY)
+            before = (await _indexes(client, "vec_only"))["vec_only_embedding"]
+            kept = await VecOnly.define_indexes(overwrite=False)
+            applied = await VecOnly.define_indexes()
+            state = (await _indexes(client, "vec_only"))["vec_only_embedding"]
+        assert before is not None and (before.hnsw, before.mtree, before.unique) == (False, False, False)
+        assert kept == []
+        assert applied == [_ONLY]
+        assert state is not None and state.hnsw is True
+        assert search.index_matches(VecOnly.get_indexes()[0], ["embedding"], state)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_remove_index_of_a_vector_index(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            await VecDoc.define_table()
+            await VecDoc.define_indexes()
+            removed = await VecDoc.remove_index("vec_doc_embedding")
+            strict = await VecDoc.remove_index("vec_doc_summary", missing_ok=False)
+            left = await _indexes(client, "vec_doc")
+            calls = _spy(monkeypatch, client)
+            applied = await VecDoc.define_indexes()
+            sent = _calls(calls)
+            monkeypatch.undo()
+            stored = await _indexes(client, "vec_doc")
+        assert removed == "REMOVE INDEX IF EXISTS `vec_doc_embedding` ON `vec_doc`;"
+        assert strict == "REMOVE INDEX `vec_doc_summary` ON `vec_doc`;"
+        assert sorted(left) == ["vec_doc_title"]
+        # Only the missing vector indexes are defined again.
+        assert applied == [_H1, _H_SUMMARY]
+        assert sent == [*_DOC_READS, *_sent([_H1, _H_SUMMARY])]
+        for index in VecDoc.get_indexes():
+            assert search.index_matches(index, _doc_columns(index), stored[index.name]), index.name
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_vector_index_joins_a_transaction(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No analyzer to define: the vector index statement joins the block — applied at once in an interactive
+        transaction (SurrealDB 3.x over WebSocket), queued and applied at the commit in a buffered one (HTTP, SurrealDB
+        2.x, the embedded engine); the reads see the committed state."""
+        async with _vec_models(kind) as client:
+            interactive = kind == "ws" and await _major(client) >= 3
+            async with SurrealDBConnectionManager.transaction("vec") as tx:
+                assert tx.is_interactive is interactive
+                calls = _spy(monkeypatch, client)
+                applied = await VecOnly.define_indexes(tx=tx)
+                sent = _calls(calls)
+                monkeypatch.undo()
+                queued = getattr(tx, "statements", None)
+                before = await _indexes(client, "vec_only")
+            after = await _indexes(client, "vec_only")
+        assert applied == [_ONLY]
+        if interactive:
+            assert sent == [*_ONLY_READS, ("query_raw", _ONLY)]
+        else:
+            assert sent == _ONLY_READS
+            assert queued == [_ONLY]
+        assert before == {}
+        assert sorted(after) == ["vec_only_embedding"]
+        assert search.index_matches(VecOnly.get_indexes()[0], ["embedding"], after["vec_only_embedding"])
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_block_that_raises_applies_no_vector_index(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            with pytest.raises(_Rollback):
+                async with SurrealDBConnectionManager.transaction("vec") as tx:
+                    assert await VecOnly.define_indexes(tx=tx) == [_ONLY]
+                    raise _Rollback
+            indexes = await _indexes(client, "vec_only")
+        assert indexes == {}
+
+
+# === Pinned DDL facts ===============================================================================================
+
+#: An index without ``TYPE``, and the same declared through the ORM (which writes ``TYPE F32``).
+_PIN_BARE = "DEFINE INDEX vec_pin_t ON vec_pin FIELDS embedding HNSW DIMENSION 3;"
+_PIN_ORM = Index("vec_pin_o", "embedding", hnsw=True, dimension=3)
+
+#: What ``INFO FOR TABLE`` renders for ``_PIN_BARE`` on a server, and on the embedded engine.
+_PIN_BARE_SERVER = (
+    "DEFINE INDEX vec_pin_t ON vec_pin FIELDS embedding HNSW DIMENSION 3 DIST EUCLIDEAN TYPE F32 EFC 150 M 12 M0 24 "
+    "LM 0.40242960438184466f"
+)
+_PIN_BARE_EMBEDDED = (
+    "DEFINE INDEX vec_pin_t ON vec_pin FIELDS embedding HNSW DIMENSION 3 DIST EUCLIDEAN TYPE F64 EFC 150 M 12 M0 24 "
+    "LM 0.40242960438184466f"
+)
+
+_PIN_MTREE = "DEFINE INDEX vec_pin_m ON vec_pin FIELDS embedding MTREE DIMENSION 3;"
+_PIN_MTREE_STORED = (
+    "DEFINE INDEX vec_pin_m ON vec_pin FIELDS embedding MTREE DIMENSION 3 DIST EUCLIDEAN TYPE F64 CAPACITY 40 "
+    "DOC_IDS_ORDER 100 DOC_IDS_CACHE 100 MTREE_CACHE 100"
+)
+
+_PIN_UNIQUE = "DEFINE INDEX vec_pin_u ON vec_pin FIELDS embedding HNSW DIMENSION 3 UNIQUE;"
+
+#: The README row these pins back.
+_VECTOR_INDEX_ROW = "README row 'Vector index (`Index(hnsw=True)`, `define_indexes()`)'"
+
+
+class TestVectorDdlPinsE2E:
+    """What each engine does with vector index statements the ORM never writes, pinned with raw statements on every
+    engine: an index without ``TYPE`` stores ``F64`` vectors on the embedded engine and ``F32`` on the servers — hence
+    the ORM writes every option (README section 37, ``_S37_TYPE``); SurrealDB 3.x refuses ``MTREE``, which 2.x and the
+    embedded engine accept (the README row "Vector index"); ``HNSW … UNIQUE`` stores a plain ``UNIQUE`` index, ``HNSW``
+    dropped, on every engine — hence ``Index(hnsw=True, unique=True)`` is refused."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_index_without_type_is_f64_on_the_embedded_engine(self, kind: str) -> None:
+        async with _vec(kind) as client:
+            await _apply_ddl(client, _PIN_BARE)
+            await _apply_ddl(client, _PIN_ORM.ddl("vec_pin"))
+            info = await _table_info(client, "vec_pin")
+        stored = info["indexes"]
+        if kind == "mem":
+            assert stored["vec_pin_t"] == _PIN_BARE_EMBEDDED, (
+                "README section 37, _S37_TYPE: the embedded engine stores F64 vectors for an index without TYPE"
+            )
+        else:
+            assert stored["vec_pin_t"] == _PIN_BARE_SERVER, (
+                "README section 37, _S37_TYPE: a SurrealDB server stores F32 vectors for an index without TYPE"
+            )
+        written = parse_define_index(stored["vec_pin_o"])
+        assert written.vector_type == "F32", "README section 37, _S37_TYPE: the ORM writes TYPE on every engine"
+        assert search.index_matches(_PIN_ORM, ["embedding"], written)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_mtree_is_a_parse_error_on_3x(self, kind: str) -> None:
+        async with _vec(kind) as client:
+            major = await _major(client)
+            refusals = await _refusals(client, _PIN_MTREE)
+            info = await _table_info(client, "vec_pin")
+        if major >= 3:
+            assert len(refusals) == 1 and "Parse error" in refusals[0], f"{_VECTOR_INDEX_ROW}: 3.x refuses MTREE"
+            assert info["indexes"] == {}
+        else:
+            assert refusals == [], f"{_VECTOR_INDEX_ROW}: 2.x and the embedded engine accept MTREE"
+            assert info["indexes"] == {"vec_pin_m": _PIN_MTREE_STORED}, _VECTOR_INDEX_ROW
+            state = parse_define_index(info["indexes"]["vec_pin_m"])
+            assert (state.mtree, state.hnsw) == (True, False)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_hnsw_unique_stores_a_plain_unique_index(self, kind: str) -> None:
+        async with _vec(kind) as client:
+            await _apply_ddl(client, _PIN_UNIQUE)
+            info = await _table_info(client, "vec_pin")
+        message = "Index(hnsw=True, unique=True) is refused: SurrealDB keeps a plain UNIQUE index and drops HNSW"
+        assert info["indexes"] == {"vec_pin_u": "DEFINE INDEX vec_pin_u ON vec_pin FIELDS embedding UNIQUE"}, message
+        state = parse_define_index(info["indexes"]["vec_pin_u"])
+        assert (state.unique, state.hnsw, state.dimension) == (True, False, None), message
