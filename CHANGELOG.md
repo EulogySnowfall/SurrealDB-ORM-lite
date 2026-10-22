@@ -7,22 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.34.1] - 2026-10-22
 
-Follow-ups to the review of v0.34.0's model table DDL (#296): `access_ddl()` and `define_access()`
-refuse an auth model whose `SCHEMAFULL` table would leave out a field SIGNUP writes, and the README
-describes three behaviours of v0.34.0 more precisely. No new public API.
+Follow-ups to the review of v0.34.0's model table DDL (#296): `define_access()` and
+`define_table()` refuse an auth model whose `SCHEMAFULL` table would leave out a field SIGNUP
+writes, and the README describes three behaviours of v0.34.0 more precisely. No new public API.
 
 ### Fixed
 
-- **`access_ddl()` and `define_access()` raise `TypeError` for a signup field the access table
-  would leave out** (#296). Since v0.34.0, a model whose schema mode is `SCHEMAFULL`
+- **`define_access()` and `define_table()` raise `TypeError` for a signup field the table would
+  leave out** (#296). Since v0.34.0, a model whose schema mode is `SCHEMAFULL`
   (`table_type=TableType.USER`, or a declared `schema_mode=SchemaMode.SCHEMAFULL`) gets from
-  `define_access()` a `SCHEMAFULL` table with one `DEFINE FIELD` per column `model_dump()` writes,
-  while SIGNUP writes every field of the model. A field declared with `Field(exclude=True)`
-  (`password: str = Field(exclude=True)`) therefore had no column: SurrealDB 3.x refused every
-  signup ("The record access signup query failed"), and 2.x dropped the value, a password hash, so
-  every signin failed. With `with_table=True`, both methods now raise `TypeError` before any
-  request, naming the model and the fields. Remove `exclude=True`, or pass `with_table=False` and
-  define the table yourself. `with_table=False` and a `SCHEMALESS` table behave as before.
+  `define_access()` and `define_table()` a `SCHEMAFULL` table with one `DEFINE FIELD` per column
+  `model_dump()` writes, while SIGNUP writes every field of the model. A field declared with
+  `Field(exclude=True)` (`password: str = Field(exclude=True)`) therefore had no column: SurrealDB
+  3.x refused every signup ("The record access signup query failed"), and 2.x dropped the value, a
+  password hash, so every signin failed. For such an auth model (`AuthenticatedUserMixin`),
+  `access_ddl()` and `define_access()` with `with_table=True`, and `table_ddl()` and
+  `define_table()`, now raise `TypeError` before any request, naming the model and the fields.
+  Remove `exclude=True`, or define the table by hand with a column for each field named and pass
+  `with_table=False`. `define_access(with_table=False)`, a `SCHEMALESS` table and a model that is
+  not an auth model (whose excluded field `save()` never writes) behave as before.
 
 ### Notes
 

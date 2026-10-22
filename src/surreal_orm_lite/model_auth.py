@@ -73,18 +73,6 @@ _ACCESS_PERMISSIONS = MappingProxyType(
 )
 
 
-def _signup_excluded_refused(model: str, fields: list[str]) -> str:
-    """The refusal of an auth model whose ``SCHEMAFULL`` table would leave out *fields*, which SIGNUP writes and
-    ``Field(exclude=True)`` keeps out of ``model_dump()`` (#296). Pure."""
-    names = ", ".join(repr(field) for field in fields)
-    pronoun = "it" if len(fields) == 1 else "them"
-    return (
-        f"{model}: SIGNUP writes {names}, which Field(exclude=True) keeps out of the SCHEMAFULL table defined for the "
-        f"model, and that table refuses {pronoun} (SurrealDB 3.x) or drops {pronoun} (2.x), so no signup or signin "
-        f"works. Remove exclude=True, or pass with_table=False and define the table yourself."
-    )
-
-
 def _alias_keys(alias: str | AliasPath | AliasChoices | None) -> set[str]:
     """The top-level keys of a record a ``validation_alias`` reads: the string, the first key of an
     ``AliasPath``, those of each ``AliasChoices`` choice."""
@@ -285,6 +273,8 @@ class AuthenticatedUserMixin:
         The model table DDL defines the columns ``model_dump()`` writes (``model_ddl.model_columns()`` skips the same
         fields), while SIGNUP writes every field of :meth:`_signup_fields` — so on a ``SCHEMAFULL`` table these have no
         column: SurrealDB 3.x refuses the signup, 2.x drops their values (a password hash, and every signin fails).
+        ``BaseSurrealModel._table_ddl()`` refuses such a table (SG1), behind ``table_ddl()``, ``define_table()``,
+        :meth:`access_ddl` and :meth:`define_access`.
         """
         fields = getattr(cls, "model_fields", {}) or {}
         return [name for name in cls._signup_fields() if fields[name].exclude is True]
@@ -397,8 +387,9 @@ class AuthenticatedUserMixin:
                 ``Field(exclude=True)`` keeps out of ``model_dump()`` and so out of the table
                 (SurrealDB 3.x would refuse every signup, 2.x drop the value — a password hash,
                 failing every signin); the message names the model and the fields, in
-                declaration order. Remove ``exclude=True``, or pass ``with_table=False`` and
-                define the table yourself.
+                declaration order. ``table_ddl()`` and ``define_table()`` refuse that model too,
+                so remove ``exclude=True``, or define the table by hand with a column for each
+                field named and pass ``with_table=False``.
             ValueError: an auth key naming no field of the model, an unknown hashing family or
                 duration, a primary key SIGNUP cannot bind; with ``with_table=True`` and a
                 ``SCHEMAFULL`` schema mode, a ``FLEXIBLE`` request on a kind without an object
@@ -423,11 +414,8 @@ class AuthenticatedUserMixin:
 
         statements: list[str] = []
         if with_table and cls._schemafull_access():
+            # The model table DDL's refusals, SG1 (#296) included: a column SIGNUP writes that the table would not define.
             table_ddl: list[str] = cls._table_ddl(overwrite, cls._access_table_clauses())  # type: ignore[attr-defined]
-            # SG1 (#296), after the table DDL's own refusals: a column SIGNUP writes that the table would not define.
-            hidden = cls._signup_fields_excluded()
-            if hidden:
-                raise TypeError(_signup_excluded_refused(cls.__name__, hidden))
             statements.extend(table_ddl)
         elif with_table:
             statements.append(cls._access_table_statement(table, clause))
@@ -526,7 +514,8 @@ class AuthenticatedUserMixin:
 
         Raises:
             TypeError: see :meth:`access_ddl` — before any request, a field SIGNUP writes that
-                ``Field(exclude=True)`` keeps out of a ``SCHEMAFULL`` table included.
+                ``Field(exclude=True)`` keeps out of a ``SCHEMAFULL`` table included, which
+                ``define_table()`` refuses too.
             ValueError: see :meth:`access_ddl` — before any request.
             SurrealDbError: if the server rejects a statement. The most likely cause on
                 **SurrealDB 2.6.x** is ``with_refresh=True``: that line cannot parse
