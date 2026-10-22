@@ -62,11 +62,26 @@ before any request. Pinned: an analyzer and an index using it defined in one tra
 ``define_table()`` replaces (README section 36, the order of ``define_table()`` and ``define_indexes()``); an index on a
 materialized view's table, which SurrealDB 3.x does not update with the records the view gains (README section 36, Not
 supported: surrealdb/surrealdb#7377).
+
+A changed analyzer (``TestAnalyzerScan``, ``TestAnalyzerChangeE2E``, every engine): ``define_indexes()`` redefines it,
+then rebuilds every index of the database that uses it — the other tables' (one ``INFO FOR TABLE`` each, sorted by
+table then index), then the model's table's, declared or not — and logs one warning naming them; a search tokenised the
+new way then finds the records indexed before. Pinned (README section 36, Changing an analyzer): without the rebuild,
+SurrealDB leaves those records with their old tokens. The connection manager's ``define_analyzer()`` and
+``remove_analyzer()`` (``TestAnalyzerManagerApi``, ``TestDefineAnalyzerE2E``, ``TestRemoveAnalyzerE2E``) run on the
+current connection: a new analyzer defined, an equal one left, a changed one redefined with its indexes rebuilt
+(``overwrite=False`` keeps it), a redefinition with indexes to rebuild refused in a transaction before any DDL, every
+cached read dropped; ``remove_analyzer()`` takes ``analyzer`` (never ``name``, which the manager reads as a connection
+name), removes by name with ``missing_ok``, and refuses an analyzer an index uses with SurrealDB 3.x's own text on every
+engine — the server's on 3.x, the ORM's before any DDL on 2.x and the embedded engine. Pinned (README row "Removing an
+analyzer an index uses"): 2.x and the embedded engine accept that removal, then refuse the next write to the table.
 """
 
 import ast
 import contextlib
 import dataclasses
+import inspect
+import logging
 import math
 import os
 import pickle
@@ -97,6 +112,7 @@ from surreal_orm_lite import (
     SurrealDBConnectionManager,
     SurrealDbError,
     SurrealDbNotFoundError,
+    Transaction,
     search,
 )
 from surreal_orm_lite.define_parser import DefineParseError, parse_define_analyzer, parse_define_index
@@ -1462,6 +1478,169 @@ class TestPlans:
         assert _raised(TypeError, search.checked_overwrite, None) == "overwrite= must be a bool, got NoneType."
 
 
+# --- the indexes a changed analyzer rebuilds; define_analyzer() and remove_analyzer() (no server) -------------------
+
+
+class _TablesClient:
+    """A client answering each statement from *answers* (``{}`` for any other), or raising *error*; it records each
+    statement."""
+
+    def __init__(self, answers: dict[str, object], *, error: BaseException | None = None) -> None:
+        self.answers = answers
+        self.error = error
+        self.queries: list[str] = []
+
+    async def query(self, statement: str, variables: object) -> object:
+        assert variables == {}
+        self.queries.append(statement)
+        if self.error is not None:
+            raise self.error
+        return self.answers.get(statement, {})
+
+
+#: Indexes of a table ``fts_t`` as SurrealDB 3.x renders them: two holding ``fts_english``, one ``fts_plain``, a plain
+#: one, and one the parser cannot read.
+_USING_STORED: dict[str, IndexState | None] = {
+    "fts_k": parse_define_index(_INDEXES_3X["fts_k"]),
+    "fts_k2": parse_define_index(_INDEXES_3X["fts_k2"]),
+    "fts_ab": parse_define_index(_INDEXES_3X["fts_ab"]),
+    "fts_p": parse_define_index("DEFINE INDEX fts_p ON fts_t FIELDS p FULLTEXT ANALYZER fts_plain BM25(1.2,0.75)"),
+    "fts_odd": None,
+}
+
+#: An analyzer that keeps the case: a search for ``physics`` misses ``'Physics Rocks'`` — exactly ``["ascii"]``, no
+#: ``lowercase`` and no ``snowball(…)``, which lower-cases too.
+FTS_PLAIN = Analyzer("fts_plain", ["class", "blank"], ["ascii"])
+
+#: The same analyzer lower-casing: once an index using it is rebuilt, ``physics`` finds ``'Physics Rocks'``.
+FTS_PLAIN_LOWER = Analyzer("fts_plain", ["class", "blank"], ["lowercase", "ascii"])
+
+_DA2 = (
+    "define_analyzer(tx=…) cannot redefine analyzer 'fts_plain' in a transaction: the indexes that use it "
+    "(fts_post.fts_post_title) must be rebuilt once the new definition is committed. Call define_analyzer() without "
+    "tx=."
+)
+_RA1 = (
+    "Can't apply analyzer removal: 'fts_english' -> The analyzer 'fts_english' is in use by index 'fts_article_title' "
+    "on table 'fts_article' and cannot be removed"
+)
+
+
+def _parameter(name: str, annotation: object, default: object = inspect.Parameter.empty) -> inspect.Parameter:
+    """A parameter of ``define_analyzer()``/``remove_analyzer()``: the first positional, the others keyword-only."""
+    kind = inspect.Parameter.POSITIONAL_OR_KEYWORD if default is inspect.Parameter.empty else inspect.Parameter.KEYWORD_ONLY
+    return inspect.Parameter(name, kind, default=default, annotation=annotation)
+
+
+class TestAnalyzerScan:
+    """The steps a changed analyzer adds: the indexes of the database that use it (one ``INFO FOR TABLE`` per table,
+    sorted by table then index), the warning of each redefinition, and the texts of ``define_analyzer()`` and
+    ``remove_analyzer()``."""
+
+    def test_the_stored_indexes_using_an_analyzer(self) -> None:
+        assert search.stored_indexes_using("fts_t", _USING_STORED, {"fts_english"}) == [
+            ("fts_t", "fts_k", "fts_english"),
+            ("fts_t", "fts_k2", "fts_english"),
+        ]
+        assert search.stored_indexes_using("fts_t", _USING_STORED, {"fts_english", "fts_plain"}, skip={"fts_k"}) == [
+            ("fts_t", "fts_k2", "fts_english"),
+            ("fts_t", "fts_p", "fts_plain"),
+        ]
+        assert search.stored_indexes_using("fts_t", _USING_STORED, set()) == []
+        assert search.stored_indexes_using("fts_t", {}, {"fts_english"}) == []
+
+    async def test_indexes_using_reads_each_table_once(self) -> None:
+        """The tables come from ``INFO FOR DB``: a name SurrealDB stores in backticks is read as it is."""
+        client = _TablesClient(
+            {
+                "INFO FOR TABLE `fts_t`;": _table_answer({name: _INDEXES_3X[name] for name in ("fts_k", "fts_ab")}),
+                "INFO FOR TABLE `fts-u`;": _table_answer(
+                    {"fts_u": "DEFINE INDEX fts_u ON `fts-u` FIELDS u FULLTEXT ANALYZER fts_english BM25(1.2,0.75)"}
+                ),
+                "INFO FOR TABLE `fts_a`;": _table_answer({"fts_z": _index_2x(_INDEXES_3X["fts_k"])}),
+            }
+        )
+        found = await search.indexes_using(
+            client, ["fts_t", "fts-u", "fts_a", "fts_none"], {"fts_english"}, what="analyzer", kind="definition"
+        )
+        assert found == [
+            ("fts-u", "fts_u", "fts_english"),
+            ("fts_a", "fts_z", "fts_english"),
+            ("fts_t", "fts_k", "fts_english"),
+        ]
+        assert client.queries == [
+            "INFO FOR TABLE `fts_t`;",
+            "INFO FOR TABLE `fts-u`;",
+            "INFO FOR TABLE `fts_a`;",
+            "INFO FOR TABLE `fts_none`;",
+        ]
+        assert await search.indexes_using(client, [], {"fts_english"}, what="analyzer", kind="definition") == []
+
+    @pytest.mark.parametrize(("error", "refusal"), _REFUSALS, ids=_REFUSAL_IDS)
+    async def test_a_refused_read(self, error: BaseException, refusal: type[SurrealDbError]) -> None:
+        client = _TablesClient({}, error=error)
+        with pytest.raises(SurrealDbError) as raised:
+            await search.indexes_using(client, ["fts_t"], {"fts_english"}, what="analyzer", kind="removal")
+        assert type(raised.value) is refusal
+        assert str(raised.value).startswith("Can't apply analyzer removal: table 'fts_t' -> ")
+
+    def test_the_warning_of_each_redefinition(self, caplog: pytest.LogCaptureFixture) -> None:
+        caplog.set_level(logging.WARNING, logger="surreal_orm_lite.search")
+        rebuilt = [("fts_page", "fts_page_title", "fts_plain"), ("fts_t", "fts_k", "fts_english")]
+        search.warn_redefined([FTS_PLAIN, FTS_ENGLISH, _a3()], [*rebuilt, ("fts_post", "fts_post_title", "fts_plain")])
+        search.warn_redefined([], rebuilt)
+        records = [record for record in caplog.records if record.name == "surreal_orm_lite.search"]
+        assert [record.levelno for record in records] == [logging.WARNING] * 3
+        assert [record.getMessage() for record in records] == [
+            "Analyzer 'fts_plain' redefined; 2 index(es) rebuilt: fts_page.fts_page_title, fts_post.fts_post_title",
+            "Analyzer 'fts_english' redefined; 1 index(es) rebuilt: fts_t.fts_k",
+            "Analyzer 'fts_fn' redefined; 0 index(es) rebuilt: ",
+        ]
+
+    def test_the_texts(self) -> None:
+        assert search.checked_analyzer(FTS_PLAIN) is FTS_PLAIN
+        assert _raised(TypeError, search.checked_analyzer, "fts_plain") == "define_analyzer() takes an Analyzer, got str."
+        assert _raised(TypeError, search.checked_analyzer, None) == "define_analyzer() takes an Analyzer, got NoneType."
+        assert search.analyzer_redefinition_refused("fts_plain", [("fts_post", "fts_post_title", "fts_plain")]) == _DA2
+        both = [("fts_page", "fts_page_title", "fts_plain"), ("fts_post", "fts_post_title", "fts_plain")]
+        assert search.analyzer_redefinition_refused("fts_plain", both) == _DA2.replace(
+            "(fts_post.fts_post_title)", "(fts_page.fts_page_title, fts_post.fts_post_title)"
+        )
+        assert search.analyzer_in_use_refused("fts_english", "fts_article_title", "fts_article") == _RA1
+
+
+class TestAnalyzerManagerApi:
+    """``SurrealDBConnectionManager.define_analyzer()`` and ``remove_analyzer()``: coroutines on the current connection,
+    their signatures pinned. ``remove_analyzer()`` takes ``analyzer``, never ``name``, as ``remove_event()`` takes
+    ``event``: the manager reads a first ``name`` parameter as a connection name."""
+
+    def test_the_signatures(self) -> None:
+        tx = _parameter("tx", Transaction | None, None)
+        assert inspect.signature(SurrealDBConnectionManager.define_analyzer) == inspect.Signature(
+            [_parameter("analyzer", Analyzer), _parameter("overwrite", bool, True), tx], return_annotation=list[str]
+        )
+        assert inspect.signature(SurrealDBConnectionManager.remove_analyzer) == inspect.Signature(
+            [_parameter("analyzer", str), _parameter("missing_ok", bool, True), tx], return_annotation=str
+        )
+
+    @pytest.mark.parametrize("method", ["define_analyzer", "remove_analyzer"])
+    def test_routed_to_the_current_connection(self, method: str) -> None:
+        function = vars(SurrealDBConnectionManager)[method].__func__
+        assert function.__surreal_routed__ == "current"
+        assert inspect.iscoroutinefunction(getattr(SurrealDBConnectionManager, method)) is True
+        default = SurrealDBConnectionManager._manager_for("default")
+        assert inspect.signature(getattr(default, method)) == inspect.signature(getattr(SurrealDBConnectionManager, method))
+        assert "name" not in inspect.signature(inspect.unwrap(function)).parameters
+
+    def test_define_analyzer_drops_the_cache_through_its_body(self) -> None:
+        """The public method checks its transaction and arguments first; the body it calls drops every cached read."""
+        assert not hasattr(vars(SurrealDBConnectionManager)["define_analyzer"].__func__, "__surreal_cache_writes__")
+        body = vars(SurrealDBConnectionManager)["_define_analyzer"].__func__
+        assert body.__surreal_cache_writes__ is True
+        assert body.__surreal_routed__ == "current"
+        assert not hasattr(vars(SurrealDBConnectionManager)["remove_analyzer"].__func__, "__surreal_cache_writes__")
+
+
 # === E2E: the connection "fts" on the database fts_db, over WebSocket and HTTP, and mem:// =========================
 
 #: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
@@ -2256,3 +2435,442 @@ class TestViewIndexPinE2E:
             assert found == ["Quantum physics for beginners"], _VIEW_PIN_3X
         else:
             assert sorted(found) == both, "README section 36, Not supported: 2.x and the embedded engine index them"
+
+
+# --- a changed analyzer, define_analyzer() and remove_analyzer() on the engines -------------------------------------
+
+
+class FtsPost(BaseSurrealModel):
+    """A full-text index on ``title`` holding ``FTS_PLAIN``."""
+
+    model_config = SurrealConfigDict(
+        table_name="fts_post", indexes=[Index("fts_post_title", "title", search_analyzer=FTS_PLAIN)]
+    )
+
+    id: str | None = None
+    title: str = ""
+    body: str = ""
+
+
+class FtsPage(BaseSurrealModel):
+    """Another table, its full-text index on ``title`` holding ``FTS_PLAIN`` too."""
+
+    model_config = SurrealConfigDict(
+        table_name="fts_page", indexes=[Index("fts_page_title", "title", search_analyzer=FTS_PLAIN)]
+    )
+
+    id: str | None = None
+    title: str = ""
+
+
+class FtsPostLower(FtsPost):
+    """``FtsPost`` on the same table, the same names, its analyzer redeclared lower-casing."""
+
+    model_config = SurrealConfigDict(
+        table_name="fts_post", indexes=[Index("fts_post_title", "title", search_analyzer=FTS_PLAIN_LOWER)]
+    )
+
+
+_INFO_POST = "INFO FOR TABLE `fts_post`;"
+_INFO_PAGE = "INFO FOR TABLE `fts_page`;"
+_REBUILD_POST = "REBUILD INDEX `fts_post_title` ON `fts_post`;"
+_REBUILD_PAGE = "REBUILD INDEX `fts_page_title` ON `fts_page`;"
+
+#: SurrealDB 3.x's refusal of an analyzer an index uses (measured on 3.3.4 and 3.1.5), which RA1 repeats on 2.x.
+_IN_USE = "The analyzer 'fts_english' is in use by index 'fts_article_title' on table 'fts_article' and cannot be removed"
+
+
+def _sent(statements: Sequence[str]) -> list[tuple[str, object]]:
+    """The calls of ``client.query(statement, {})`` for each of *statements*, in order."""
+    return [call for statement in statements for call in _query(statement)]
+
+
+async def _found(client: Any, table: str, field: str = "title") -> list[str]:
+    """The ids of *table*'s records a raw search for ``physics`` in *field* finds, sorted."""
+    found = await client.query(f"SELECT VALUE id FROM {table} WHERE {field} @0@ 'physics';", {})
+    return sorted(str(record_id) for record_id in found)
+
+
+async def _stored_analyzers(client: Any) -> dict[str, AnalyzerState | None]:
+    """The analyzers ``INFO FOR DB`` holds, as ``read_database_info()`` reads them."""
+    analyzers, _ = await search.read_database_info(client, what="analyzer", kind="definition", subject="'fts_plain'")
+    return analyzers
+
+
+def _redefinitions(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The warnings ``surreal_orm_lite.search`` logged."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "surreal_orm_lite.search" and record.levelno == logging.WARNING
+    ]
+
+
+def _x1m(operation: str) -> str:
+    """The refusal of a manager call on ``"fts"`` with a transaction of ``"fts2"``."""
+    return (
+        f"{operation} cannot run in this transaction: the transaction belongs to connection 'fts2' and the call runs on "
+        "connection 'fts'. A transaction is one connection's (one database): call it inside using('fts2'), or open the "
+        "transaction on 'fts'."
+    )
+
+
+class TestAnalyzerChangeE2E:
+    """An analyzer changed in code, on every engine: ``define_indexes()`` redefines it, then rebuilds every index of the
+    database that uses it — the other tables' (sorted by table then index), then the model's table's — and logs a
+    warning; a search tokenised the new way then finds the records indexed before. Pinned (README section 36, Changing
+    an analyzer): without the rebuild SurrealDB leaves them with their old tokens."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_changed_analyzer_rebuilds_every_index_using_it(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        async with _fts_models(kind) as client:
+            await FtsPost.define_indexes()
+            await FtsPage.define_indexes()
+            await _apply_ddl(client, "CREATE fts_post:p1 SET title = 'Physics Rocks';")
+            await _apply_ddl(client, "CREATE fts_page:g1 SET title = 'Physics Rocks';")
+            before = [await _found(client, "fts_post"), await _found(client, "fts_page")]
+            caplog.set_level(logging.WARNING, logger="surreal_orm_lite.search")
+            calls = _spy(monkeypatch, client)
+            applied = await FtsPostLower.define_indexes()
+            sent = _calls(calls)
+            monkeypatch.undo()
+            after = [await _found(client, "fts_post"), await _found(client, "fts_page")]
+            again = await FtsPostLower.define_indexes()
+        expected = [FTS_PLAIN_LOWER.ddl(), _REBUILD_PAGE, _REBUILD_POST]
+        assert before == [[], []]
+        assert applied == expected
+        assert sent == [*_query(_INFO_DB), ("version", None), *_query(_INFO_POST), *_query(_INFO_PAGE), *_sent(expected)]
+        assert after == [["fts_post:p1"], ["fts_page:g1"]]
+        assert again == []
+        assert _redefinitions(caplog) == [
+            "Analyzer 'fts_plain' redefined; 2 index(es) rebuilt: fts_page.fts_page_title, fts_post.fts_post_title"
+        ]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_index_of_the_table_the_model_does_not_declare_is_rebuilt_too(self, kind: str) -> None:
+        async with _fts_models(kind) as client:
+            keyword = search.fulltext_keyword(await _keyword_line(client))
+            await FtsPost.define_indexes()
+            await _apply_ddl(
+                client, f"DEFINE INDEX `fts_post_body` ON `fts_post` FIELDS `body` {keyword} ANALYZER `fts_plain`;"
+            )
+            await _apply_ddl(client, "CREATE fts_post:p1 SET title = 'Physics Rocks', body = 'Physics rules';")
+            before = await _found(client, "fts_post", "body")
+            applied = await FtsPostLower.define_indexes()
+            after = await _found(client, "fts_post", "body")
+        assert before == []
+        assert applied == [FTS_PLAIN_LOWER.ddl(), _REBUILD_POST, "REBUILD INDEX `fts_post_body` ON `fts_post`;"]
+        assert after == ["fts_post:p1"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_overwrite_false_keeps_a_changed_analyzer(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        async with _fts_models(kind) as client:
+            await FtsPost.define_indexes()
+            await FtsPage.define_indexes()
+            caplog.set_level(logging.WARNING, logger="surreal_orm_lite.search")
+            calls = _spy(monkeypatch, client)
+            applied = await FtsPostLower.define_indexes(overwrite=False)
+            sent = _calls(calls)
+            monkeypatch.undo()
+            analyzers = await _stored_analyzers(client)
+        assert applied == []
+        assert sent == [*_query(_INFO_DB), ("version", None), *_query(_INFO_POST)]
+        assert search.analyzer_matches(FTS_PLAIN, analyzers["fts_plain"])
+        assert _redefinitions(caplog) == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_redefined_analyzer_leaves_the_records_indexed_before(self, kind: str) -> None:
+        """README section 36, Changing an analyzer: SurrealDB leaves the records indexed before a ``DEFINE ANALYZER
+        OVERWRITE`` with their old tokens — a search tokenised the new way misses them — and indexes the records
+        written afterwards the new way, until ``REBUILD INDEX`` re-tokenises them all (every engine)."""
+        async with _fts(kind) as client:
+            index = Index("fts_post_title", "title", search_analyzer=FTS_PLAIN).ddl(
+                "fts_post", line=await _keyword_line(client)
+            )
+            for statement in (
+                FTS_PLAIN.ddl(),
+                index,
+                "CREATE fts_post:p1 SET title = 'Physics Rocks';",
+                FTS_PLAIN_LOWER.ddl(),
+                "CREATE fts_post:p2 SET title = 'Physics Rolls';",
+            ):
+                await _apply_ddl(client, statement)
+            found = await _found(client, "fts_post")
+            await _apply_ddl(client, _REBUILD_POST)
+            rebuilt = await _found(client, "fts_post")
+        assert found == ["fts_post:p2"], "README section 36, Changing an analyzer: the record indexed before is missed"
+        assert rebuilt == ["fts_post:p1", "fts_post:p2"], "README section 36, Changing an analyzer: a rebuild finds both"
+
+
+class TestDefineAnalyzerE2E:
+    """``SurrealDBConnectionManager.define_analyzer()`` on every engine, on the current connection: a new analyzer
+    defined, an equal one left (``INFO FOR DB`` alone sent), a changed one redefined and every index using it rebuilt
+    (``overwrite=False`` keeps it); with a transaction a new analyzer or a redefinition no index uses joins it, a
+    redefinition with indexes to rebuild is refused before any DDL; a transaction of another connection is refused
+    before any request; every cached read is dropped."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_arguments_are_checked_before_any_request(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _fts_models(kind) as client:
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(TypeError) as not_an_analyzer:
+                await SurrealDBConnectionManager.define_analyzer("fts_plain")  # type: ignore[arg-type]
+            with pytest.raises(TypeError) as overwrite:
+                await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN, overwrite=1)  # type: ignore[arg-type]
+            sent = _calls(calls)
+            monkeypatch.undo()
+        assert sent == []
+        assert str(not_an_analyzer.value) == "define_analyzer() takes an Analyzer, got str."
+        assert str(overwrite.value) == "overwrite= must be a bool, got int."
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_new_equal_changed_and_overwrite_false(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        manager = SurrealDBConnectionManager
+        async with _fts_models(kind) as client:
+            created = await manager.define_analyzer(FTS_PLAIN)
+            calls = _spy(monkeypatch, client)
+            equal = await manager.define_analyzer(FTS_PLAIN)
+            kept = await manager.define_analyzer(FTS_PLAIN_LOWER, overwrite=False)
+            unchanged_sent = _calls(calls)
+            monkeypatch.undo()
+            # The model's index holds the stored analyzer: only the index is defined.
+            indexed = await FtsPost.define_indexes()
+            await _apply_ddl(client, "CREATE fts_post:p1 SET title = 'Physics Rocks';")
+            before = await _found(client, "fts_post")
+            caplog.set_level(logging.WARNING, logger="surreal_orm_lite.search")
+            calls = _spy(monkeypatch, client)
+            changed = await manager.define_analyzer(FTS_PLAIN_LOWER)
+            changed_sent = _calls(calls)
+            monkeypatch.undo()
+            after = await _found(client, "fts_post")
+            fresh = await manager.define_analyzer(Analyzer("fts_fresh", ["blank"]), overwrite=False)
+            analyzers = await _stored_analyzers(client)
+        assert created == [FTS_PLAIN.ddl()]
+        assert equal == [] and kept == []
+        assert unchanged_sent == [*_query(_INFO_DB), *_query(_INFO_DB)]
+        assert [statement.split(" `")[0] for statement in indexed] == ["DEFINE INDEX OVERWRITE"]
+        assert before == []
+        assert changed == [FTS_PLAIN_LOWER.ddl(), _REBUILD_POST]
+        assert changed_sent == [*_query(_INFO_DB), *_query(_INFO_POST), *_sent(changed)]
+        assert after == ["fts_post:p1"]
+        assert fresh == ["DEFINE ANALYZER IF NOT EXISTS `fts_fresh` TOKENIZERS blank;"]
+        assert search.analyzer_matches(FTS_PLAIN_LOWER, analyzers["fts_plain"])
+        assert sorted(analyzers) == ["fts_fresh", "fts_plain"]
+        assert _redefinitions(caplog) == ["Analyzer 'fts_plain' redefined; 1 index(es) rebuilt: fts_post.fts_post_title"]
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_with_a_transaction(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A new analyzer joins the transaction (visible once it commits); a redefinition with an index to rebuild is
+        refused before any DDL (DA2) — the rebuild must follow the committed definition —; a redefinition no index uses
+        joins it."""
+        manager = SurrealDBConnectionManager
+        lone, lone_ascii = Analyzer("fts_lone", ["blank"]), Analyzer("fts_lone", ["blank"], ["ascii"])
+        async with _fts_models(kind) as client:
+            async with manager.transaction("fts") as tx:
+                queued = await manager.define_analyzer(FTS_PLAIN, tx=tx)
+                inside = await _stored_analyzers(client)
+            committed = await _stored_analyzers(client)
+            await FtsPost.define_indexes()
+            async with manager.transaction("fts") as tx:
+                calls = _spy(monkeypatch, client)
+                with pytest.raises(SurrealDbError) as refused:
+                    await manager.define_analyzer(FTS_PLAIN_LOWER, tx=tx)
+                sent = _calls(calls)
+                monkeypatch.undo()
+                pending = getattr(tx, "statements", None)
+            await manager.define_analyzer(lone)
+            async with manager.transaction("fts") as tx:
+                redefined = await manager.define_analyzer(lone_ascii, tx=tx)
+            analyzers = await _stored_analyzers(client)
+        assert queued == [FTS_PLAIN.ddl()]
+        assert "fts_plain" not in inside
+        assert search.analyzer_matches(FTS_PLAIN, committed["fts_plain"])
+        assert type(refused.value) is SurrealDbError
+        assert str(refused.value) == _DA2
+        assert sent == [*_query(_INFO_DB), *_query(_INFO_POST)]
+        assert pending in (None, [])
+        assert search.analyzer_matches(FTS_PLAIN, analyzers["fts_plain"])
+        assert redefined == [lone_ascii.ddl()]
+        assert search.analyzer_matches(lone_ascii, analyzers["fts_lone"])
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_it_runs_on_the_using_connection(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _fts(kind) as client:
+            calls = _spy(monkeypatch, client)
+            async with SurrealDBConnectionManager.using("fts"):
+                applied = await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN)
+                removed = await SurrealDBConnectionManager.remove_analyzer("fts_plain")
+            sent = _calls(calls)
+            monkeypatch.undo()
+            analyzers = await _stored_analyzers(client)
+        assert _sent(applied) == [call for call in sent if call[1] == applied[0]]
+        assert ("query", removed) in sent
+        assert analyzers == {}
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_transaction_of_another_connection(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _fts_models(kind) as client:
+            _register_other(kind)
+            try:
+                async with SurrealDBConnectionManager.transaction("fts2") as tx:
+                    other = await SurrealDBConnectionManager.get_client("fts2")
+                    calls = _spy(monkeypatch, client)
+                    other_calls = _spy(monkeypatch, other)
+                    stats = QueryCache.stats()
+                    with pytest.raises(SurrealDbError) as definition:
+                        await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN, tx=tx)
+                    with pytest.raises(SurrealDbError) as removal:
+                        await SurrealDBConnectionManager.remove_analyzer("fts_plain", tx=tx)
+                    sent = (_calls(calls), _calls(other_calls))
+                    after = QueryCache.stats()
+                    queued = getattr(tx, "statements", None)
+                    monkeypatch.undo()
+            finally:
+                await SurrealDBConnectionManager.remove_connection("fts2")
+        assert sent == ([], [])
+        assert after == stats
+        assert queued in (None, [])
+        assert type(definition.value) is SurrealDbError
+        assert str(definition.value) == _x1m("define_analyzer()")
+        assert type(removal.value) is SurrealDbError
+        assert str(removal.value) == _x1m("remove_analyzer()")
+
+    @pytest.mark.usefixtures("empty_cache")
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_every_cached_read_is_dropped(self, kind: str) -> None:
+        """``define_analyzer()`` drops every cached read (a rebuild may serve any table's search); ``remove_analyzer()``
+        none — it succeeds only when no index uses the analyzer."""
+        async with _fts_models(kind):
+            await FtsPage(id="g1", title="Physics Rocks").save()
+
+            async def cached() -> list[str | None]:
+                return [page.id for page in await FtsPage.objects().cache(60).exec()]
+
+            assert await cached() == ["g1"]
+            hits = _hits()
+            assert await cached() == ["g1"]
+            assert _hits() == hits + 1
+            await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN)
+            assert await cached() == ["g1"]
+            assert _hits() == hits + 1
+            assert await cached() == ["g1"]
+            assert _hits() == hits + 2
+            await SurrealDBConnectionManager.remove_analyzer("fts_plain")
+            assert await cached() == ["g1"]
+            assert _hits() == hits + 3
+
+
+class TestRemoveAnalyzerE2E:
+    """``SurrealDBConnectionManager.remove_analyzer()`` on every engine: ``REMOVE ANALYZER [IF EXISTS] `<name>`;``
+    returned; ``missing_ok=False`` raises ``SurrealDbNotFoundError`` for a missing analyzer; an analyzer an index uses is
+    refused with SurrealDB 3.x's own text on every engine — by the server on 3.x, by the ORM before any DDL on 2.x and
+    the embedded engine, which would remove it (README row "Removing an analyzer")."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_statements_and_missing_ok(self, kind: str) -> None:
+        manager = SurrealDBConnectionManager
+        async with _fts_models(kind) as client:
+            await manager.define_analyzer(FTS_PLAIN)
+            await manager.define_analyzer(FTS_ENGLISH)
+            removed = await manager.remove_analyzer("fts_plain")
+            again = await manager.remove_analyzer("fts_plain")
+            strict = await manager.remove_analyzer("fts_english", missing_ok=False)
+            with pytest.raises(SurrealDbError) as missing:
+                await manager.remove_analyzer("fts_english", missing_ok=False)
+            analyzers = await _stored_analyzers(client)
+        assert removed == again == "REMOVE ANALYZER IF EXISTS `fts_plain`;"
+        assert strict == "REMOVE ANALYZER `fts_english`;"
+        assert type(missing.value) is SurrealDbNotFoundError
+        assert str(missing.value).startswith("Can't apply analyzer removal: 'fts_english' -> ")
+        assert "REMOVE" not in str(missing.value)
+        assert analyzers == {}
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_arguments_are_checked_before_any_request(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _fts_models(kind) as client:
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(ValueError) as bad_name:
+                await SurrealDBConnectionManager.remove_analyzer("fts-plain")
+            with pytest.raises(TypeError) as not_a_name:
+                await SurrealDBConnectionManager.remove_analyzer(3)  # type: ignore[arg-type]
+            with pytest.raises(TypeError) as missing_ok:
+                await SurrealDBConnectionManager.remove_analyzer("fts_plain", missing_ok=1)  # type: ignore[arg-type]
+            sent = _calls(calls)
+            monkeypatch.undo()
+        assert sent == []
+        assert str(bad_name.value) == f"Invalid analyzer name 'fts-plain': {_IDENTIFIER}"
+        assert str(not_a_name.value) == "Analyzer name must be a str, got int."
+        assert str(missing_ok.value) == "missing_ok= must be a bool, got int."
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_analyzer_an_index_uses_is_refused_on_every_engine(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async with _fts_models(kind) as client:
+            major = await _major(client)
+            index = Index("fts_article_title", "title", search_analyzer=FTS_ENGLISH)
+            for statement in (
+                _A1,
+                index.ddl("fts_article", line=await _keyword_line(client)),
+                Index("fts_other_code", "code", unique=True).ddl("fts_other"),
+            ):
+                await _apply_ddl(client, statement)
+            calls = _spy(monkeypatch, client)
+            with pytest.raises(SurrealDbError) as raised:
+                await SurrealDBConnectionManager.remove_analyzer("fts_english")
+            sent = _calls(calls)
+            monkeypatch.undo()
+            analyzers = await _stored_analyzers(client)
+            created = await _refusals(client, "CREATE fts_article:x SET title = 'Physics';")
+        assert type(raised.value) is SurrealDbError
+        assert str(raised.value) == _RA1
+        if major >= 3:
+            assert sent == [("version", None), *_query("REMOVE ANALYZER IF EXISTS `fts_english`;")]
+        else:
+            assert sent == [
+                ("version", None),
+                *_query(_INFO_DB),
+                *_query(_INFO_ARTICLE),
+                *_query("INFO FOR TABLE `fts_other`;"),
+            ]
+        assert sorted(analyzers) == ["fts_english"]
+        assert created == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_buffered_or_interactive_removal(self, kind: str) -> None:
+        """An analyzer no index uses is removed with the transaction, once it commits."""
+        async with _fts_models(kind) as client:
+            await SurrealDBConnectionManager.define_analyzer(FTS_PLAIN)
+            async with SurrealDBConnectionManager.transaction("fts") as tx:
+                removed = await SurrealDBConnectionManager.remove_analyzer("fts_plain", tx=tx)
+            analyzers = await _stored_analyzers(client)
+        assert removed == "REMOVE ANALYZER IF EXISTS `fts_plain`;"
+        assert analyzers == {}
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_removing_an_analyzer_an_index_uses(self, kind: str) -> None:
+        """README row "Removing an analyzer an index uses": SurrealDB 3.x refuses the removal; 2.x and the embedded
+        engine accept it, and every write to the table then fails — which ``remove_analyzer()`` prevents."""
+        async with _fts(kind) as client:
+            major = await _major(client)
+            index = Index("fts_article_title", "title", search_analyzer=FTS_ENGLISH)
+            await _apply_ddl(client, _A1)
+            await _apply_ddl(client, index.ddl("fts_article", line=await _keyword_line(client)))
+            removal = await _refusals(client, "REMOVE ANALYZER `fts_english`;")
+            created = await _refusals(client, "CREATE fts_article:x SET title = 'Physics';")
+        if major >= 3:
+            assert len(removal) == 1 and _IN_USE in removal[0], (
+                f"README row 'Removing an analyzer an index uses': SurrealDB 3.x refuses it, got {removal}"
+            )
+            assert created == []
+        else:
+            assert removal == [], "README row 'Removing an analyzer an index uses': 2.x and the embedded engine accept it"
+            assert len(created) == 1 and "The analyzer 'fts_english' does not exist" in created[0], (
+                f"README row 'Removing an analyzer an index uses': the next write fails, got {created}"
+            )

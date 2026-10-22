@@ -2286,7 +2286,12 @@ _CLASSIFIED: dict[type, dict[str, frozenset[str]]] = {
         "invalidating writes": _INVALIDATING_WRITES[SurrealDBConnectionManager],
         "identity": frozenset({"signin", "authenticate", "invalidate"}),
         "raw, refused or not cached": frozenset({"call_function"}),
-        "DDL that changes no row": frozenset({"define_event", "remove_event", "define_function", "remove_function"}),
+        # v0.35.0: remove_analyzer() succeeds only when no index uses the analyzer, so no read changes.
+        "DDL that changes no row": frozenset(
+            {"define_event", "remove_event", "define_function", "remove_function", "remove_analyzer"}
+        ),
+        # v0.35.0: checks its transaction first, then runs the wrapped _define_analyzer() (every cached read dropped).
+        "writes through wrapped helpers": frozenset({"define_analyzer"}),
         "other": frozenset(
             {
                 "unset_connection",
@@ -2362,6 +2367,11 @@ class TestExhaustiveness:
     def test_define_indexes_body_is_wrapped(self) -> None:
         """v0.35.0: ``define_indexes()`` checks its transaction, then applies through the wrapped body."""
         assert BaseSurrealModel._define_indexes.__surreal_cache_writes__ is True  # type: ignore[attr-defined]
+
+    def test_define_analyzer_body_is_wrapped(self) -> None:
+        """v0.35.0: ``define_analyzer()`` checks its transaction and argument, then applies through the wrapped body."""
+        body = vars(SurrealDBConnectionManager)["_define_analyzer"].__func__
+        assert body.__surreal_cache_writes__ is True
 
     @pytest.mark.parametrize("cls", list(_INVALIDATING_WRITES), ids=_ids(_INVALIDATING_WRITES))
     def test_a_wrapped_write_keeps_its_signature_and_docs(self, cls: type) -> None:

@@ -63,20 +63,24 @@ from .schema import (
 from .schema_state import FieldState, TableState
 from .search import (
     Index,
-    analyzer_statement,
+    apply_analyzers,
+    apply_rebuilds,
     check_indexes_config,
     check_named_analyzers,
     checked_overwrite,
     declared_analyzers,
     fulltext_keyword,
     index_subject,
+    indexes_using,
     model_index_statements,
     plan_analyzers,
     plan_indexes,
     read_database_info,
     read_table_indexes,
     remove_index_statement,
+    stored_indexes_using,
     transaction_analyzer_refused,
+    warn_redefined,
 )
 from .signals import (
     around_delete,
@@ -1227,16 +1231,25 @@ class BaseSurrealModel(BaseModel):
         and the embedded engine), and ``INFO FOR TABLE`` once (the table's indexes) — committed state, outside any
         transaction. Then, one statement per call: each ``Analyzer`` the indexes hold that the database lacks
         (``DEFINE ANALYZER``) or stores differently (``DEFINE ANALYZER OVERWRITE``); each index the table lacks
-        (``DEFINE INDEX``) or holds differently (``DEFINE INDEX OVERWRITE``); then ``REBUILD INDEX`` for each unchanged
-        index of the table whose analyzer was redefined — SurrealDB leaves the records indexed before with their old
-        tokens until the index is rebuilt. An analyzer or index stored in a definition the ORM cannot read back counts
-        as different.
+        (``DEFINE INDEX``) or holds differently (``DEFINE INDEX OVERWRITE``). An analyzer or index stored in a
+        definition the ORM cannot read back counts as different.
+
+        **A changed analyzer.** SurrealDB leaves the records indexed before a redefinition with their old tokens — a
+        search tokenised the new way misses them — until the index is rebuilt. So a redefined analyzer rebuilds every
+        index of the database that uses it: ``INFO FOR TABLE`` of every other table (one request each, only then), and
+        ``REBUILD INDEX`` for each of their indexes using it (sorted by table then index) before the index definitions,
+        then for each unchanged index of this table using it after them (the declared ones in declaration order, then
+        the others). One warning per redefined analyzer names the indexes rebuilt (logger
+        ``surreal_orm_lite.search``). A rebuild re-reads the table — seconds per thousands of records on SurrealDB 2.x
+        and the embedded engine.
 
         **Safe at start-up.** On an unchanged database the call sends the reads alone and returns ``[]``: an equal
         index is never redefined, since redefining a full-text index rebuilds it — seconds per thousands of records on
         SurrealDB 2.x and the embedded engine, whose BM25 statistics each rebuild also inflates. Nothing is removed: an
         index or analyzer the model no longer declares stays (:meth:`remove_index`). An analyzer belongs to the
-        database: declare each one once (a module constant) and reference that object from every index that uses it.
+        database: declare each one once (a module constant) and reference that object from every index that uses it —
+        two models declaring two definitions of one name would redefine it in turn, each time rebuilding every index
+        that uses it (the warning shows it).
 
         **Call** :meth:`define_table` **(or** ``define_relation()`` **for an edge model) before** ``define_indexes()``:
         on a table that does not exist yet, SurrealDB's ``DEFINE INDEX`` creates it ``TYPE ANY SCHEMALESS PERMISSIONS
@@ -1268,7 +1281,8 @@ class BaseSurrealModel(BaseModel):
             TypeError: *overwrite* is not a ``bool`` — before any request.
             SurrealDbError: *tx* belongs to another connection — before any request; an analyzer named by ``str`` does
                 not exist, or *tx* is given and an analyzer must be defined or redefined — before any DDL; the server
-                refused a statement (``Can't apply analyzer definition: …``, ``Can't apply index definition: …``).
+                refused a statement (``Can't apply analyzer definition: …``, ``Can't apply index definition: …``,
+                ``Can't apply index rebuild: …``).
             SurrealDbAuthenticationError: the session may not read the definitions or define the analyzers and
                 indexes.
 
@@ -1298,9 +1312,7 @@ class BaseSurrealModel(BaseModel):
         table = cls.get_table_name()
         # Cheap even inside a transaction: get_client() returns the already-connected client.
         client = await cls._connection_manager().get_client()
-        stored_analyzers, _tables = await read_database_info(
-            client, what="index", kind="definition", subject=f"table {table!r}"
-        )
+        stored_analyzers, tables = await read_database_info(client, what="index", kind="definition", subject=f"table {table!r}")
         analyzers = declared_analyzers(indexes)
         check_named_analyzers(indexes, analyzers, stored_analyzers, table=table)
         define, redefine = plan_analyzers(analyzers, stored_analyzers, overwrite)
@@ -1311,6 +1323,7 @@ class BaseSurrealModel(BaseModel):
         if any(index.search_analyzer is not None for index in indexes):
             keyword = fulltext_keyword(_time_travel.line_major(await client.version()))
         stored_indexes = await read_table_indexes(client, table, what="index", kind="definition")
+        redefined = {analyzer.name for analyzer in redefine}
         definitions, rebuilds = plan_indexes(
             indexes,
             table,
@@ -1318,17 +1331,19 @@ class BaseSurrealModel(BaseModel):
             column=cls.to_db_field,
             overwrite=overwrite,
             keyword=keyword,
-            redefined={analyzer.name for analyzer in redefine},
+            redefined=redefined,
         )
-        applied = await apply_ddl_statements(
-            # A redefinition is planned only with overwrite=True, so the clause is OVERWRITE for it.
-            [analyzer_statement(analyzer, overwrite) for analyzer in changed],
-            client=client,
-            tx=tx,
-            what="analyzer",
-            classify=True,
-            subjects=[repr(analyzer.name) for analyzer in changed],
-        )
+        # A redefined analyzer leaves every index using it with its old tokens: the table's declared indexes (above),
+        # its other indexes (another model's, or defined by hand), and every other table's — one INFO FOR TABLE each.
+        analyzer_of = {index.name: index.analyzer_name or "" for index in indexes}
+        own_rebuilds = [(table, name, analyzer_of[name]) for name, _ in rebuilds]
+        own_rebuilds += stored_indexes_using(table, stored_indexes, redefined, skip=analyzer_of)
+        other_rebuilds: list[tuple[str, str, str]] = []
+        if redefined:
+            others = [name for name in tables if name != table]
+            other_rebuilds = await indexes_using(client, others, redefined, what="index", kind="rebuild")
+        applied = await apply_analyzers(client, tx, define, redefine, overwrite)
+        applied += await apply_rebuilds(client, tx, other_rebuilds)
         applied += await apply_ddl_statements(
             [statement for _, statement in definitions],
             client=client,
@@ -1337,15 +1352,8 @@ class BaseSurrealModel(BaseModel):
             classify=True,
             subjects=[index_subject(name, table) for name, _ in definitions],
         )
-        applied += await apply_ddl_statements(
-            [statement for _, statement in rebuilds],
-            client=client,
-            tx=tx,
-            what="index",
-            kind="rebuild",
-            classify=True,
-            subjects=[index_subject(name, table) for name, _ in rebuilds],
-        )
+        applied += await apply_rebuilds(client, tx, own_rebuilds)
+        warn_redefined(redefine, [*other_rebuilds, *own_rebuilds])
         return applied
 
     @classmethod

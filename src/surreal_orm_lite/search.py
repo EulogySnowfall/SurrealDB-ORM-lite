@@ -43,10 +43,20 @@ database lacks; ``plan_analyzers()`` sorts the model's analyzers into those to d
 definition; ``transaction_analyzer_refused()`` words the refusal of an analyzer to define in a transaction. All pure:
 the model's method reads, decides, then applies.
 
+**A changed analyzer.** SurrealDB leaves the records indexed before a ``DEFINE ANALYZER OVERWRITE`` with their old
+tokens until the index is rebuilt, so a redefinition rebuilds every index of the database that uses it:
+``indexes_using()`` reads ``INFO FOR TABLE`` of each table and lists them (``stored_indexes_using()`` for a table
+already read), ``apply_analyzers()`` and ``apply_rebuilds()`` apply the statements, ``warn_redefined()`` logs one
+warning per redefined analyzer. ``apply_analyzer()`` and ``apply_analyzer_removal()`` are the bodies of the connection
+manager's ``define_analyzer()`` and ``remove_analyzer()``; the latter refuses, below SurrealDB 3 (2.x, the embedded
+engine, which would remove it and then refuse every write to the table), an analyzer an index uses, with 3.x's own
+reason.
+
 The module sits low in the package: it imports neither ``model_base``, ``query_set`` nor ``connection_manager``, so
 each of them can import it.
 """
 
+import logging
 import math
 import re
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
@@ -61,9 +71,13 @@ from .functions import normalize_function_name
 from .schema import _comment_text, _identifier_name, _missing_clause, _overwrite_clause
 from .schema_state import AnalyzerState, IndexState
 from .surql_literal import _identifier, _quoted
-from .utils import VALID_FIELD_PATTERN, _ddl_refusal_class
+from .time_travel import line_major
+from .utils import VALID_FIELD_PATTERN, _ddl_refusal_class, apply_ddl_statements
 
 __all__ = ["SearchScore", "SearchHighlight", "SearchOffsets", "Analyzer", "Index"]
+
+#: The logger of a redefined analyzer's warning (``surreal_orm_lite.search``).
+logger = logging.getLogger(__name__)
 
 #: The largest match reference SurrealDB accepts (``@0@`` … ``@255@``).
 MAX_MATCH_REFERENCE = 255
@@ -912,7 +926,13 @@ async def read_table_indexes(client: Any, table: str, *, what: str, kind: str) -
     :raises SurrealDbAuthenticationError: the session may not read the table's definitions (a record user).
     :raises SurrealDbError: any other refusal of the ``INFO``.
     """
-    statement = f"INFO FOR TABLE {_identifier(_identifier_name(table, what='Table'))};"
+    return await _table_indexes(client, _identifier_name(table, what="Table"), what=what, kind=kind)
+
+
+async def _table_indexes(client: Any, table: str, *, what: str, kind: str) -> dict[str, IndexState | None]:
+    """:func:`read_table_indexes` without the identifier check of *table* — a name ``INFO FOR DB`` gave, which
+    SurrealDB may store in backticks (``fts-t``) —, written in backticks, escaped."""
+    statement = f"INFO FOR TABLE {_identifier(table)};"
     try:
         info = await client.query(statement, {})
     except (ServerError, SurrealDbError, RuntimeError) as error:
@@ -921,6 +941,45 @@ async def read_table_indexes(client: Any, table: str, *, what: str, kind: str) -
     if not isinstance(indexes, dict):
         return {}
     return {name: _parsed(definition, parse_define_index) for name, definition in indexes.items()}
+
+
+#: An index that uses an analyzer: ``(table, index, analyzer)``.
+IndexUse = tuple[str, str, str]
+
+
+def stored_indexes_using(
+    table: str, stored: Mapping[str, IndexState | None], analyzers: Collection[str], *, skip: Collection[str] = ()
+) -> list[IndexUse]:
+    """The indexes of *table* (*stored*: ``INFO FOR TABLE``'s, by name) whose analyzer is among *analyzers*, as
+    ``(table, index, analyzer)``, sorted by index — pure.
+
+    An index named in *skip* is left out, and so is one the parser could not read (``None``): its analyzer is unknown.
+    """
+    return sorted(
+        (table, name, state.search_analyzer)
+        for name, state in stored.items()
+        if name not in skip and state is not None and state.search_analyzer is not None and state.search_analyzer in analyzers
+    )
+
+
+async def indexes_using(
+    client: Any, tables: Iterable[str], analyzers: Collection[str], *, what: str, kind: str
+) -> list[IndexUse]:
+    """The indexes of *tables* whose analyzer is among *analyzers*, as ``(table, index, analyzer)``, sorted by table
+    then index — one ``INFO FOR TABLE`` per table, in the order of *tables*, outside any transaction (committed state).
+
+    *tables* are names ``INFO FOR DB`` gave (:func:`read_database_info`), each written in backticks, escaped. An index
+    the parser cannot read is left out (its analyzer is unknown).
+
+    :param what: what the reads are for, for the message of a refusal (``"index"``, ``"analyzer"``).
+    :param kind: ``"definition"``, ``"removal"`` or ``"rebuild"``, likewise.
+    :raises SurrealDbAuthenticationError: the session may not read a table's definitions (a record user).
+    :raises SurrealDbError: any other refusal of an ``INFO``.
+    """
+    found: list[IndexUse] = []
+    for table in tables:
+        found.extend(stored_indexes_using(table, await _table_indexes(client, table, what=what, kind=kind), analyzers))
+    return sorted(found)
 
 
 # --- the appliers' plans --------------------------------------------------------------------------------------------
@@ -1024,3 +1083,138 @@ def plan_indexes(
         elif overwrite:
             definitions.append((index.name, index_statement(index, table, columns, overwrite=True, keyword=keyword)))
     return definitions, rebuilds
+
+
+# --- the appliers' shared steps -------------------------------------------------------------------------------------
+
+
+async def apply_analyzers(
+    client: Any, tx: Any, define: Sequence[Analyzer], redefine: Sequence[Analyzer], overwrite: bool
+) -> list[str]:
+    """Apply the analyzers :func:`plan_analyzers` planned, one statement per request, and return the statements: each
+    of *define* (``DEFINE ANALYZER OVERWRITE``, or ``IF NOT EXISTS`` without *overwrite*), then each of *redefine*
+    (``DEFINE ANALYZER OVERWRITE``). With *tx*, each joins it. A refusal names the analyzer, never the statement:
+    ``Can't apply analyzer definition: '<name>' -> <reason>``.
+    """
+    analyzers = [*define, *redefine]
+    statements = [analyzer_statement(analyzer, overwrite) for analyzer in define]
+    statements.extend(analyzer_statement(analyzer, True) for analyzer in redefine)
+    return await apply_ddl_statements(
+        statements,
+        client=client,
+        tx=tx,
+        what="analyzer",
+        classify=True,
+        subjects=[repr(analyzer.name) for analyzer in analyzers],
+    )
+
+
+async def apply_rebuilds(client: Any, tx: Any, rebuilds: Sequence[IndexUse]) -> list[str]:
+    """``REBUILD INDEX `<index>` ON `<table>`;`` for each of *rebuilds* (``(table, index, analyzer)``), one per request,
+    in order; the statements returned. With *tx*, each joins it. A refusal names the index and its table: ``Can't apply
+    index rebuild: '<index>' on table '<table>' -> <reason>``."""
+    return await apply_ddl_statements(
+        [rebuild_index_statement(index, table) for table, index, _ in rebuilds],
+        client=client,
+        tx=tx,
+        what="index",
+        kind="rebuild",
+        classify=True,
+        subjects=[index_subject(index, table) for table, index, _ in rebuilds],
+    )
+
+
+def warn_redefined(redefine: Iterable[Analyzer], rebuilt: Sequence[IndexUse]) -> None:
+    """Log one warning per analyzer of *redefine*, naming the indexes of *rebuilt* (``(table, index, analyzer)``) that
+    use it, in order: ``Analyzer 'english' redefined; 2 index(es) rebuilt: page.page_title, post.post_title``.
+
+    An analyzer belongs to the database: two models declaring two definitions of one name redefine it in turn, and
+    rebuild every index using it each time — the warning makes that visible.
+    """
+    for analyzer in redefine:
+        names = [f"{table}.{index}" for table, index, name in rebuilt if name == analyzer.name]
+        logger.warning("Analyzer %r redefined; %d index(es) rebuilt: %s", analyzer.name, len(names), ", ".join(names))
+
+
+def checked_analyzer(value: object) -> Analyzer:
+    """*value*, checked as the argument of ``define_analyzer()``: an ``Analyzer``.
+
+    :raises TypeError: ``define_analyzer() takes an Analyzer, got <type>.``
+    """
+    if not isinstance(value, Analyzer):
+        raise TypeError(f"define_analyzer() takes an Analyzer, got {type(value).__name__}.")
+    return value
+
+
+def analyzer_redefinition_refused(name: str, rebuilds: Sequence[IndexUse]) -> str:
+    """The refusal of ``define_analyzer(tx=…)`` redefining the analyzer *name* that the indexes of *rebuilds* use: their
+    rebuild must follow the committed definition."""
+    indexes = ", ".join(f"{table}.{index}" for table, index, _ in rebuilds)
+    return (
+        f"define_analyzer(tx=…) cannot redefine analyzer {name!r} in a transaction: the indexes that use it ({indexes}) "
+        "must be rebuilt once the new definition is committed. Call define_analyzer() without tx=."
+    )
+
+
+def analyzer_in_use_refused(name: str, index: str, table: str) -> str:
+    """The refusal of ``remove_analyzer()`` for the analyzer *name* that *index* of *table* uses — SurrealDB 3.x's own
+    reason, in the form of a refused removal."""
+    return (
+        f"Can't apply analyzer removal: {name!r} -> The analyzer {name!r} is in use by index {index!r} on table "
+        f"{table!r} and cannot be removed"
+    )
+
+
+async def apply_analyzer(client: Any, analyzer: Analyzer, *, overwrite: bool, tx: Any) -> list[str]:
+    """The body of ``SurrealDBConnectionManager.define_analyzer()``, its arguments checked: compare *analyzer* with the
+    stored definition, then apply; the statements applied — or queued, with a buffered *tx* — returned, in order.
+
+    ``INFO FOR DB`` once. Missing: ``DEFINE ANALYZER`` (``OVERWRITE``, or ``IF NOT EXISTS`` without *overwrite*). Equal
+    (:func:`analyzer_matches`): nothing. Different or unreadable, with *overwrite*: ``INFO FOR TABLE`` of every table
+    (:func:`indexes_using`), then ``DEFINE ANALYZER OVERWRITE`` and ``REBUILD INDEX`` of each index using it — SurrealDB
+    leaves the records indexed before with their old tokens — and the warning of :func:`warn_redefined`; nothing
+    without *overwrite*. With *tx*, a redefinition with indexes to rebuild is refused before any DDL (the rebuild must
+    follow the committed definition); a new analyzer, or a redefinition no index uses, joins the transaction.
+
+    :raises SurrealDbError: *tx* is given and the redefinition has indexes to rebuild; a refused read or statement.
+    :raises SurrealDbAuthenticationError: the session may not read the definitions or define the analyzer.
+    """
+    subject = repr(analyzer.name)
+    stored, tables = await read_database_info(client, what="analyzer", kind="definition", subject=subject)
+    define, redefine = plan_analyzers([analyzer], stored, overwrite)
+    rebuilds: list[IndexUse] = []
+    if redefine:
+        rebuilds = await indexes_using(client, tables, {analyzer.name}, what="analyzer", kind="definition")
+        if tx is not None and rebuilds:
+            raise SurrealDbError(analyzer_redefinition_refused(analyzer.name, rebuilds))
+    applied = await apply_analyzers(client, tx, define, redefine, overwrite)
+    applied += await apply_rebuilds(client, tx, rebuilds)
+    warn_redefined(redefine, rebuilds)
+    return applied
+
+
+async def apply_analyzer_removal(client: Any, name: str, statement: str, *, tx: Any) -> str:
+    """The body of ``SurrealDBConnectionManager.remove_analyzer()``, *statement* rendered (its arguments checked): apply
+    it, unless an index uses the analyzer *name* on a line that would remove it; *statement* returned.
+
+    ``client.version()`` once. Below 3 (SurrealDB 2.x, the embedded engine), which accept the removal of an analyzer an
+    index uses and then refuse every write to that table: ``INFO FOR DB``, then ``INFO FOR TABLE`` of every table
+    (:func:`indexes_using`, committed state), and the first index using it, in table then index order, refused with
+    SurrealDB 3.x's own reason, before any DDL. From 3 on, the server refuses it itself, in the same words. Then the
+    statement, joining *tx* when given: ``Can't apply analyzer removal: '<name>' -> <reason>`` for a refusal.
+
+    :raises SurrealDbError: an index uses the analyzer; a refused read or statement.
+    :raises SurrealDbNotFoundError: ``REMOVE ANALYZER`` without ``IF EXISTS`` of a missing analyzer (outside a buffered
+        transaction).
+    :raises SurrealDbAuthenticationError: the session may not read the definitions or remove the analyzer.
+    """
+    if line_major(await client.version()) < 3:
+        _, tables = await read_database_info(client, what="analyzer", kind="removal", subject=repr(name))
+        using = await indexes_using(client, tables, {name}, what="analyzer", kind="removal")
+        if using:
+            table, index, _ = using[0]
+            raise SurrealDbError(analyzer_in_use_refused(name, index, table))
+    await apply_ddl_statements(
+        [statement], client=client, tx=tx, what="analyzer", kind="removal", classify=True, subjects=[repr(name)]
+    )
+    return statement

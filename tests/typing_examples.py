@@ -664,6 +664,17 @@ async def index_appliers(tx: Transaction) -> None:
     assert_type(await IndexedPost.remove_index("indexed_post_slug", missing_ok=False, tx=tx), str)
 
 
+async def analyzer_appliers(tx: Transaction) -> None:
+    """v0.35.0: the manager's ``define_analyzer()`` returns the statements applied (a ``list[str]``),
+    ``remove_analyzer()`` the one statement (a ``str``)."""
+    applied: list[str] = await SurrealDBConnectionManager.define_analyzer(_POST_ENGLISH)
+    assert_type(applied, list[str])
+    assert_type(await SurrealDBConnectionManager.define_analyzer(_POST_ENGLISH, overwrite=False, tx=tx), list[str])
+    removed: str = await SurrealDBConnectionManager.remove_analyzer("indexed_english")
+    assert_type(removed, str)
+    assert_type(await SurrealDBConnectionManager.remove_analyzer("indexed_english", missing_ok=False, tx=tx), str)
+
+
 @fixture
 class Typed(SurrealFixture):
     """``@fixture`` gives the class back unchanged: ``Typed.load()`` stays typed ``Typed``."""

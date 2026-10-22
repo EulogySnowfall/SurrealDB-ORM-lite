@@ -53,6 +53,14 @@ from .schema import (
     remove_event_statement,
     remove_function_statement,
 )
+from .search import (
+    Analyzer,
+    apply_analyzer,
+    apply_analyzer_removal,
+    checked_analyzer,
+    checked_overwrite,
+    remove_analyzer_statement,
+)
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
 from .utils import apply_ddl_statements
 
@@ -2708,6 +2716,103 @@ class SurrealDBConnectionManager:
             signatures = connection.__function_signatures
             for key in [key for key in list(signatures) if key[1:] == target]:
                 signatures.pop(key, None)
+
+    # ------------------------------------------------------------------
+    # Full-text analyzers (v0.35.0)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    @_routed("current")
+    async def define_analyzer(cls, analyzer: Analyzer, *, overwrite: bool = True, tx: Transaction | None = None) -> list[str]:
+        """Define the full-text *analyzer* in the database — SurrealDB's ``DEFINE ANALYZER`` — redefining it only when
+        it changed, and return the statements applied (``[]`` when nothing changed).
+
+        Runs on the current connection (the innermost ``using()`` block's, else the default one), like
+        :meth:`define_function`. An analyzer belongs to the database, not to a table: one any index may name with
+        ``Index(..., search_analyzer="<name>")``, which ``define_indexes()`` requires to exist::
+
+            ENGLISH = Analyzer("english", ["class", "blank"], ["lowercase", "ascii", "snowball(english)"])
+            await SurrealDBConnectionManager.define_analyzer(ENGLISH)
+            # ['DEFINE ANALYZER OVERWRITE `english` TOKENIZERS class,blank FILTERS lowercase,ascii,snowball(english);']
+            await SurrealDBConnectionManager.define_analyzer(ENGLISH)  # []
+
+        It reads ``INFO FOR DB`` once (committed state, outside any transaction): a missing analyzer is defined, an
+        equal one left as it is. A changed one — or one stored in a definition the ORM cannot read back — is redefined
+        with *overwrite*, and since SurrealDB leaves the records indexed before with their old tokens (a search tokenised
+        the new way misses them), every index of the database that uses it is rebuilt: ``INFO FOR TABLE`` of every
+        table (one request each, only then), then ``DEFINE ANALYZER OVERWRITE`` and one ``REBUILD INDEX`` per index
+        using it, sorted by table then index — seconds per thousands of records on SurrealDB 2.x and the embedded
+        engine. A warning names the indexes rebuilt (logger ``surreal_orm_lite.search``). Every cached read is dropped.
+
+        With *tx*, a new analyzer — or a redefinition no index uses — joins the transaction. A redefinition with indexes
+        to rebuild is refused before any DDL: the servers rebuild an index with the analyzers committed before the
+        transaction began, so the rebuild must follow the committed definition.
+
+        :param analyzer: the ``Analyzer`` to define.
+        :param overwrite: ``True`` (default) redefines a changed analyzer (``OVERWRITE``) and rebuilds its indexes;
+            ``False`` defines a missing one (``IF NOT EXISTS``) and leaves a stored one as it is.
+        :param tx: optional transaction the statements are applied with.
+        :return: the statements applied — or queued, with a buffered transaction — in the order sent.
+        :raises TypeError: *analyzer* is not an ``Analyzer``, *overwrite* not a ``bool`` — before any request.
+        :raises SurrealDbAuthenticationError: the session may not read the definitions or define the analyzer.
+        :raises SurrealDbError: *tx* belongs to another connection — before any request; *tx* is given and the
+            redefinition has indexes to rebuild — before any DDL; the server refused a statement (``Can't apply analyzer
+            definition: 'english' -> …``, ``Can't apply index rebuild: …``), naming the analyzer or the index, never
+            the statement.
+        """
+        # Every check comes before the cache write of _define_analyzer(): invalidates("all") checks no transaction.
+        check_call_transaction(cls._connection_name or "default", tx, operation="define_analyzer()")
+        checked_analyzer(analyzer)
+        checked_overwrite(overwrite)
+        return await cls._define_analyzer(analyzer, overwrite=overwrite, tx=tx)
+
+    @classmethod
+    @_cache.invalidates("all")
+    @_routed("current")
+    async def _define_analyzer(cls, analyzer: Analyzer, *, overwrite: bool, tx: Transaction | None) -> list[str]:
+        """The body of :meth:`define_analyzer`, its transaction and arguments checked: compare, then apply. Every cached
+        read is dropped around it — a rebuilt index may serve any table's ``search()``."""
+        client = await cls.get_client()
+        return await apply_analyzer(client, analyzer, overwrite=overwrite, tx=tx)
+
+    @classmethod
+    @_routed("current")
+    async def remove_analyzer(cls, analyzer: str, *, missing_ok: bool = True, tx: Transaction | None = None) -> str:
+        """Remove the full-text analyzer named *analyzer* from the database and return the statement applied.
+
+        Runs on the current connection (the innermost ``using()`` block's, else the default one)::
+
+            await SurrealDBConnectionManager.remove_analyzer("english")
+            # 'REMOVE ANALYZER IF EXISTS `english`;'
+
+        An analyzer an index uses is refused, on every line, with SurrealDB 3.x's own reason: ``Can't apply analyzer
+        removal: 'english' -> The analyzer 'english' is in use by index 'post_title' on table 'post' and cannot be
+        removed``. SurrealDB 3.x refuses it itself; on SurrealDB 2.x and the embedded engine, which would remove it and
+        then refuse every write to that table, the ORM reads the line (``client.version()``), then ``INFO FOR DB`` and
+        ``INFO FOR TABLE`` of every table, and refuses it before any DDL. Remove its indexes first
+        (``Model.remove_index()``). In a buffered transaction those reads see the committed state: an index queued
+        earlier in the block is not seen. No cached read is dropped: a removal succeeds only when no index uses the
+        analyzer.
+
+        :param analyzer: the analyzer's name (letters, digits, underscores; not starting with a digit).
+        :param missing_ok: ``True`` (default) emits ``REMOVE ANALYZER IF EXISTS …``, so a missing analyzer is not an
+            error; ``False`` raises ``SurrealDbNotFoundError`` for it.
+        :param tx: optional transaction the statement is applied with.
+        :return: the statement applied.
+        :raises TypeError: *analyzer* is not a ``str``, *missing_ok* not a ``bool`` — before any request.
+        :raises ValueError: *analyzer* is not an identifier — before any request.
+        :raises SurrealDbNotFoundError: ``missing_ok=False`` and the database has no such analyzer.
+        :raises SurrealDbAuthenticationError: the session may not read the definitions or remove the analyzer.
+        :raises SurrealDbError: *tx* belongs to another connection — before any request; an index uses the analyzer;
+            any other refusal. In a buffered transaction (*tx* over HTTP, on SurrealDB 2.x or the embedded engine) the
+            statement is only queued: a refusal comes back when the block commits, as the transaction's own
+            ``SurrealDbError``, never as ``SurrealDbNotFoundError`` or ``SurrealDbAuthenticationError`` —
+            ``missing_ok=False`` included.
+        """
+        check_call_transaction(cls._connection_name or "default", tx, operation="remove_analyzer()")
+        statement = remove_analyzer_statement(analyzer, missing_ok)
+        client = await cls.get_client()
+        return await apply_analyzer_removal(client, analyzer, statement, tx=tx)
 
     # ------------------------------------------------------------------
     # Live queries (v0.19.0)
