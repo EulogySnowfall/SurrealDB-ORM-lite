@@ -318,7 +318,7 @@ class TestReadme:
         section = _normalised(_readme_part("### Supported Filter Lookups"))
         for text in ("string::starts_with", "string::ends_with", "string::matches", "is_string()", "(?i)"):
             assert text in section, text
-        assert "full-text search is planned for v0.35.0, as a separate API" in section, section
+        assert "full-text search is the separate `search()` API" in section, section
 
     def test_server_behaviour_row(self) -> None:
         """In version order before the table's last row (later releases add their rows in version order)."""

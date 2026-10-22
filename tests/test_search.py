@@ -123,6 +123,13 @@ and the indexes ``define_indexes(tx=…)`` defined; in a buffered one a read rai
 indexes are applied at the commit (``TestSearchTransactionsE2E``). A model on a named connection applies its indexes
 and searches there, ``define_analyzer()`` runs on the ``using()`` connection, and a transaction of another connection
 is refused before any request (``TestSearchMultiDbE2E``).
+
+The README (``TestReadmeSection36``): section 36 right after section 35, its subsections in order, each ``python`` block
+run as written on ``mem://`` (each printed line equal to its comment), its five sentences word for word, the twelve
+"Coming from the full SurrealDB-ORM" differences in order; the seven rows of the 2.x/3.x table and the row of the
+embedded engine's, cell by cell, in version order and within the tables' column widths; the intro sentence of the
+2.x/3.x table; the features, roadmap and comparison rows; the "Supported Filter Lookups" sentence that points to
+``search()``. ``docs/ROADMAP.md`` (``TestRoadmap35``): v0.35.0 planned, or released once its Phase G row carries ✅.
 """
 
 import ast
@@ -175,7 +182,16 @@ from surreal_orm_lite import (
 )
 from surreal_orm_lite.define_parser import DefineParseError, parse_define_analyzer, parse_define_index
 from surreal_orm_lite.functions import normalize_function_name
+from surreal_orm_lite.testing import embedded_database
 from surreal_orm_lite.utils import validate_field_name
+from tests._readme_tables import assert_embedded_rows, assert_server_header_sentence, assert_server_rows
+from tests._readme_tables import cells as _cells
+from tests._readme_tables import normalised as _normalised
+from tests._readme_tables import readme as _readme
+from tests._readme_tables import readme_part as _readme_part
+from tests._readme_tables import subsection as _subsection
+from tests._readme_tables import table_rows as _table_rows
+from tests._readme_tables import tables as _md_tables
 
 FTS_ENGLISH = Analyzer("fts_english", ["class", "blank"], ["lowercase", "ascii", "snowball(english)"], comment="English text")
 
@@ -4510,3 +4526,462 @@ class TestSearchMultiDbE2E:
                 f"FtsRouted.{method}() cannot run in this transaction: the transaction belongs to connection 'default' "
                 "and FtsRouted runs on connection 'fts'."
             )
+
+
+# === README: section 36, the tables, the lookup sentence; docs/ROADMAP.md ===========================================
+
+_SECTION_35 = "### 35. Model table DDL (`define_table()`, `schema_mode`, `permissions`)"
+_SECTION_36 = "### 36. Full-text search (`search()`, `SearchScore`, `SearchHighlight`, `Analyzer`, `Index`)"
+#: Section 36's anchor, as the "Supported Filter Lookups" sentence writes it.
+_LINK_36 = "(#36-full-text-search-search-searchscore-searchhighlight-analyzer-index)"
+#: Section 36's subsections, in order, after an untitled intro.
+_SUBSECTIONS_36 = [
+    "Declare and apply",
+    "Search, score, highlight",
+    "What SurrealDB decides",
+    "Changing an analyzer",
+    "Transactions",
+    "Live queries",
+    "Not supported",
+    "Coming from the full SurrealDB-ORM",
+]
+#: The parts of section 36 whose ``python`` blocks run on ``mem://`` (the others have none).
+_PARTS_WITH_EXAMPLES_36 = ["Declare and apply", "Search, score, highlight", "What SurrealDB decides", "Changing an analyzer"]
+_S36_ORDER = (
+    "Call `define_table()` (or `define_relation()` for an edge model) before `define_indexes()`: on a table that does "
+    "not exist yet, SurrealDB's `DEFINE INDEX` creates it `TYPE ANY SCHEMALESS PERMISSIONS NONE`, which "
+    "`define_table()` replaces but `define_table(overwrite=False)` leaves as it is."
+)
+_S36_BM25 = (
+    "BM25 scores depend on the line: SurrealDB 3.x gives a term found in more than half the documents no weight (a "
+    "score of `0.0`) and keeps its statistics in step with the records, while 2.x and the embedded engine score such a "
+    "term below zero, count an index's records again each time it is rebuilt, and keep counting deleted records. "
+    "Compare scores within one query, and upgrade to SurrealDB 3.x where scores must not depend on the index's history."
+)
+_S36_TX = (
+    "In a transaction, a search on a field without a full-text index raises the same `SurrealDbError`, which the "
+    "transaction records: the block's commit then fails with it as its cause, and neither error quotes the search text."
+)
+_S36_LIVE = (
+    "Before a live query whose subquery searches, the ORM checks that each searched field has a full-text index and "
+    "raises `SurrealDbError` naming the field otherwise, before the live query starts: without the index, SurrealDB 3.x "
+    "would accept the live query and never notify. Do not remove that index while the live query runs."
+)
+_S36_VIEWS = (
+    "A materialized view model cannot declare `indexes=`: SurrealDB 3.x does not index the records a view gains after "
+    "the index is defined, and `define_view()` drops the indexes of the view's table."
+)
+#: The five sentences section 36 says word for word (whitespace normalised), by subsection.
+_SENTENCES_36 = {
+    "Declare and apply": _S36_ORDER,
+    "What SurrealDB decides": _S36_BM25,
+    "Transactions": _S36_TX,
+    "Live queries": _S36_LIVE,
+    "Not supported": _S36_VIEWS,
+}
+#: What each part of section 36 says (key phrases, whitespace normalised); the intro under ``""``.
+_PART_NEEDLES_36 = {
+    "": (
+        "Since v0.35.0",
+        "the full SurrealDB-ORM's",
+        "`SearchOffsets`",
+        "SurrealDB 2.x, 3.x and the embedded engine",
+        "(#orm-behaviour-surrealdb-2x-vs-3x)",
+        "`mem://`",
+    ),
+    "Declare and apply": (
+        "`DefineAnalyzer`",
+        "`CreateIndex`",
+        "`SurrealConfigDict(indexes=[...])`",
+        "checked when the class is defined",
+        "`FULLTEXT` on SurrealDB 3.x, `SEARCH` on 2.x and the embedded engine",
+        "`index_ddl(line=2)`",
+        "`overwrite=False`",
+        "safe at start-up",
+        "`remove_index()`",
+        "`SurrealDbNotFoundError`",
+        "`SurrealDBConnectionManager.define_analyzer()`",
+        "`remove_analyzer()`",
+        "`get_indexes()`",
+    ),
+    "Search, score, highlight": (
+        "the next match reference",
+        "never written back",
+        "dicts holding the aliases",
+        '`order_by("-relevance")`',
+        "a list of strings for an array field",
+        "`count()`",
+        "`exists()`",
+        "`values()`",
+        "`bulk_update()`",
+        "`bulk_delete()`",
+        "`patch()`",
+        "`Subquery`",
+    ),
+    "What SurrealDB decides": (
+        "The analyzer decides what matches",
+        "the terms of one text are AND-ed",
+        "an empty text matches nothing",
+        "`highlights=True`",
+        "raises `SurrealDbError` naming the field",
+    ),
+    "Changing an analyzer": (
+        "keeps the tokens",
+        "`REBUILD INDEX`",
+        "warning",
+        "seconds per thousands of records on SurrealDB 2.x and the embedded engine",
+        "one `Analyzer` per name",
+        "start-up never rebuilds",
+    ),
+    "Transactions": (
+        "`define_indexes(tx=…)`",
+        "the analyzers committed before the transaction began",
+        "`define_analyzer()` without `tx=`",
+        "`define_analyzer(tx=…)`",
+        "`remove_analyzer(tx=…)`",
+        "sees the transaction's writes",
+    ),
+    "Live queries": (
+        "`live()` and `watch()` refuse `search()`",
+        "filter(id__in=Subquery(Article.objects().search(title=",
+        "not a deletion",
+    ),
+    "Not supported": ("`as_of()`", "`changes()`", "`@AND@`/`@OR@`"),
+}
+#: One key phrase per "Coming from the full SurrealDB-ORM" bullet, in order (the accepted differences).
+_COMING_FROM_PHRASES_36 = (
+    "declares analyzers and indexes in migrations",
+    "the full ORM applies it to `exec()` only",
+    "the full ORM's `live()` ignores it",
+    "no public `to_surql()`",
+    "`SearchOffsets` is an addition",
+    "raises `SurrealDbError` naming the field",
+    "more strictly than the server",
+    "the full ORM writes `FULLTEXT` only",
+    "doubled quote is a parse error",
+    "no `concurrently` argument",
+    "not SurrealDB's `@@`",
+    "`hybrid_search()` comes in v0.37.0",
+)
+_HEADER_SENTENCE_35 = (
+    "Rows added in v0.35.0 were measured on 2.7.0, 3.3.4 and the embedded engine, with 3.1.5 where it differs."
+)
+#: Exactly the seven rows v0.35.0 adds to the 2.x/3.x table, cell by cell, within the table's column widths.
+_SEARCH_ROWS = [
+    [
+        "Full-text index (`define_indexes()`, `index_ddl(line=)`)",
+        "`SEARCH ANALYZER` (`FULLTEXT` is a parse error), read from `client.version()`; several fields accepted, the ORM "
+        "writes one",
+        "`FULLTEXT ANALYZER` (`SEARCH` is a parse error); one field per index",
+        "v0.35.0",
+    ],
+    [
+        "Removing an analyzer an index uses (`remove_analyzer()`)",
+        "the server would accept it, then refuse every write to the table: the ORM refuses it first, with 3.x's message",
+        "refused by the server",
+        "v0.35.0",
+    ],
+    [
+        "BM25 score of a term in more than half the documents (`SearchScore`)",
+        "below zero: a text holding such a term scores lower than without it, and ranks differently than on 3.x",
+        "`0.0`: the term adds nothing to the score",
+        "v0.35.0",
+    ],
+    [
+        "BM25 statistics after a rebuild, a redefinition or a deletion (`SearchScore`)",
+        "not reset: a `REBUILD INDEX`, an `OVERWRITE` or a new index of the same name counts the records again, and "
+        "deleted records stay counted; the matches are unaffected",
+        "kept in step with the records: the scores of a freshly built index",
+        "v0.35.0",
+    ],
+    [
+        "Two `search()` fields AND-ed",
+        "only the records matching every field, each field scored as if searched alone",
+        "the same on 3.3; 3.1 can also return records that match only one of the fields, scored `0.0` on the other",
+        "v0.35.0",
+    ],
+    [
+        "`search()` on a field without a full-text index",
+        "`SurrealDbError` naming the field",
+        "the same; 3.1 answers no record",
+        "v0.35.0",
+    ],
+    [
+        "`live()` with a `Subquery` that searches a field without a full-text index",
+        "`SurrealDbError` naming the field, before the live query starts",
+        "the same (the live query would never notify); 3.1 starts it",
+        "v0.35.0",
+    ],
+]
+#: The row v0.35.0 adds to the embedded engine's table, cell by cell.
+_EMBEDDED_SEARCH_ROW = [
+    "Full-text search (v0.35.0)",
+    "as on a 2.x server: `SEARCH ANALYZER`, a term in more than half the documents scores below zero, BM25 statistics "
+    "grow with each rebuild and keep deleted records, `remove_analyzer()` refuses an analyzer an index uses; an index "
+    "defined in the transaction that defines its analyzer sees it, which `define_indexes(tx=…)` refuses all the same",
+    "3.x writes `FULLTEXT ANALYZER`, scores such a term `0.0`, keeps BM25 statistics exact and refuses that removal",
+    "v0.35.0",
+]
+_FEATURES_ROW_36 = ["Full-text search (`search()`, BM25 score and highlights)", "✅"]
+_ROADMAP_ROWS_36 = [
+    ["v0.34.0", "Tier 3 — Model table DDL", "✅ Released"],
+    ["v0.35.0", "Tier 3 — Full-text search", "✅ Released"],
+    ["v0.36.0 – v0.40.0", "Tier 3 — Advanced (vector and hybrid search, migrations, CLI)", "📋 Planned"],
+    ["v0.41.0", "Beta Phase (API freeze, hardening)", "📋 Planned"],
+]
+_COMPARISON_ROW_36 = ["Full-Text Search", "✅ v0.35.0 (`search()`)", "✅"]
+#: "Supported Filter Lookups": the clause that ends the ``match``/``regex`` item.
+_LOOKUP_CLAUSE_36 = f"full-text search is the separate `search()` API ([section 36]{_LINK_36})."
+
+
+def _section_36() -> str:
+    return _readme_part(_SECTION_36)
+
+
+def _part_36(heading: str) -> str:
+    """One ``####`` subsection of section 36, as written (the intro for ``""``)."""
+    if not heading:
+        return _section_36().split("\n#### ", 1)[0]
+    return _subsection(f"#### {heading}", _section_36())
+
+
+def _readme_blocks(text: str) -> list[str]:
+    """The ``python`` blocks of *text*, in order."""
+    blocks: list[str] = re.findall(r"^```python\n(.*?)^```$", text, re.MULTILINE | re.DOTALL)
+    return blocks
+
+
+def _readme_printed(block: str) -> list[str]:
+    """What a README example prints: its comment lines that start a line (``# <printed line>``), in order."""
+    return re.findall(r"^# (.*)$", block, re.MULTILINE)
+
+
+def _readme_bullets(text: str) -> list[str]:
+    """The ``- `` bullets of *text*, each with its continuation lines, whitespace normalised."""
+    return [_normalised(bullet) for bullet in re.findall(r"^- .*?(?=^- |^\s*$|\Z)", text, re.MULTILINE | re.DOTALL)]
+
+
+def _anchor(heading: str) -> str:
+    """GitHub's anchor of a README heading: lower case, punctuation but ``-`` and ``_`` dropped, spaces as ``-``."""
+    return re.sub(r"[^\w\- ]", "", heading.lower()).replace(" ", "-")
+
+
+class TestReadmeSection36:
+    """README section 36 and what v0.35.0 changes elsewhere in the README: section 36's place, subsections, examples
+    (run on ``mem://`` as written, each printed line equal to its comment), sentences and "Coming from" bullets; the
+    "Supported Filter Lookups" sentence; the features, roadmap, comparison and both behaviour tables."""
+
+    def test_section_36_follows_section_35(self) -> None:
+        """Right after section 35 (after its "Coming from" bullets) and before the ``---`` of "Configuration Options"."""
+        text = _readme()
+        start_35 = text.index(f"\n{_SECTION_35}\n")
+        start_36 = text.index(f"\n{_SECTION_36}\n")
+        configuration = text.index("\n## Configuration Options\n")
+        assert start_35 < start_36 < configuration
+        assert re.findall(r"^#{2,3} .*$", text[start_35 + 1 : configuration], re.MULTILINE) == [_SECTION_35, _SECTION_36]
+        assert text[:configuration].rstrip().endswith("\n---"), "section 36 ends before the --- of the next part"
+
+    def test_subsections_in_order(self) -> None:
+        assert re.findall(r"^#### (.*)$", _section_36(), re.MULTILINE) == _SUBSECTIONS_36
+
+    def test_where_the_examples_stand(self) -> None:
+        """Each part that shows code opens with prose and holds ``python`` blocks; the intro and the other parts hold
+        none; the section has ``python`` fences only."""
+        for heading in ["", *_SUBSECTIONS_36]:
+            blocks = _readme_blocks(_part_36(heading))
+            assert bool(blocks) is (heading in _PARTS_WITH_EXAMPLES_36), heading
+        fences = re.findall(r"^```(\S*)$", _section_36(), re.MULTILINE)
+        assert fences and fences == ["python", ""] * (len(fences) // 2), fences
+
+    @pytest.mark.parametrize("heading", list(_PART_NEEDLES_36))
+    def test_what_each_part_says(self, heading: str) -> None:
+        text = _normalised(_part_36(heading))
+        missing = [needle for needle in _PART_NEEDLES_36[heading] if needle not in text]
+        assert not missing, missing
+
+    @pytest.mark.parametrize("heading", list(_SENTENCES_36))
+    def test_sentences_word_for_word(self, heading: str) -> None:
+        """Each sentence exactly once in its subsection, and nowhere else in the section."""
+        sentence = _SENTENCES_36[heading]
+        assert _normalised(_part_36(heading)).count(sentence) == 1, sentence
+        assert _normalised(_section_36()).count(sentence) == 1, sentence
+
+    def test_coming_from_the_full_orm(self) -> None:
+        """Twelve bullets, each a bold lead, one key phrase each, in order."""
+        bullets = _readme_bullets(_part_36("Coming from the full SurrealDB-ORM"))
+        assert len(bullets) == len(_COMING_FROM_PHRASES_36) == 12, bullets
+        for bullet, phrase in zip(bullets, _COMING_FROM_PHRASES_36, strict=True):
+            assert bullet.startswith("- **"), bullet
+            assert phrase in bullet, (phrase, bullet)
+
+    def test_no_local_reference(self) -> None:
+        """No design reference and no issue number in the section."""
+        section = _section_36()
+        for marker in ("§", r"\bspec\b", r"\.claude"):
+            assert re.search(marker, section) is None, marker
+        assert re.findall(r"(?<![(\w])#\d+", section) == []
+
+    def test_links_resolve(self) -> None:
+        """Every in-page link of section 36, and of the lookup sentence that points to it, names a heading."""
+        anchors = {_anchor(heading) for heading in re.findall(r"^#{2,4} (.*)$", _readme(), re.MULTILINE)}
+        links = re.findall(r"\]\(#([^)]+)\)", _section_36() + _LOOKUP_CLAUSE_36)
+        assert len(links) >= 3, links
+        assert [link for link in links if link not in anchors] == []
+        assert _anchor(_SECTION_36.removeprefix("### ")) == _LINK_36.strip("(#)")
+
+    def test_the_lookup_sentence_points_to_search(self) -> None:
+        """The ``match``/``regex`` item of "Supported Filter Lookups" ends on the ``search()`` API, no longer planned."""
+        lookups = _normalised(_readme_part("### Supported Filter Lookups"))
+        assert lookups.count(_LOOKUP_CLAUSE_36) == 1, lookups
+        assert "planned for v0.35.0" not in lookups, lookups
+
+    def test_server_behaviour_rows(self) -> None:
+        """Exactly seven rows, Since v0.35.0, together and in version order before the table's last row; the table
+        keeps its widths."""
+        assert_server_rows(_SEARCH_ROWS)
+
+    def test_server_behaviour_header_sentence(self) -> None:
+        assert_server_header_sentence(_HEADER_SENTENCE_35)
+
+    def test_embedded_table_row(self) -> None:
+        """All four cells, in version order before the catch-all "Everything else" row; widths kept."""
+        assert_embedded_rows([_EMBEDDED_SEARCH_ROW])
+
+    def test_features_row(self) -> None:
+        features = [row for _, row in _table_rows(_readme_part("## Features"))]
+        firsts = [row[0] for row in features]
+        assert _FEATURES_ROW_36 in features, features
+        table_ddl = "Model table DDL (`define_table()`, `schema_mode`, `permissions`)"
+        assert firsts.index(_FEATURES_ROW_36[0]) == firsts.index(table_ddl) + 1
+
+    def test_roadmap_rows(self) -> None:
+        roadmap = [row for _, row in _table_rows(_readme_part("## Roadmap"))]
+        start = [row[0] for row in roadmap].index("v0.34.0")
+        assert roadmap[start : start + 4] == _ROADMAP_ROWS_36, roadmap
+        assert "v0.35.0 – v0.40.0" not in [row[0] for row in roadmap], roadmap
+
+    def test_comparison_row(self) -> None:
+        """Released, right after the model table DDL and before vector search."""
+        comparison = [row for _, row in _table_rows(_readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"))]
+        firsts = [row[0] for row in comparison]
+        start = firsts.index("Model table DDL")
+        assert comparison[start + 1] == _COMPARISON_ROW_36, comparison
+        assert firsts[start + 2] == "Vector Search (KNN/HNSW)", firsts
+
+    def test_tables_have_no_raw_pipe_in_a_cell(self) -> None:
+        """Every table v0.35.0 touches keeps one cell count per line and no escaped pipe; section 36 has no table."""
+        parts = [
+            _readme_part("## Features"),
+            _readme_part("### ORM behaviour: SurrealDB 2.x vs 3.x"),
+            _readme_part("### ORM behaviour: the embedded engine"),
+            _readme_part("## Roadmap"),
+            _readme_part("## SurrealDB-ORM-lite vs SurrealDB-ORM"),
+        ]
+        found = [lines for part in parts for lines in _md_tables(part)]
+        assert len(found) == len(parts)
+        for lines in found:
+            assert len({len(_cells(line)) for line in lines}) == 1 and "\\|" not in "".join(lines), lines
+        assert _md_tables(_section_36()) == []
+
+    async def test_section_36_examples(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Every ``python`` block runs as written, in order and in one namespace, on ``mem://`` (inside
+        ``embedded_database()``); what each block prints is, line by line, its ``# `` comment lines. A printed score
+        comes from an index built once in that fresh database."""
+        capsys.readouterr()
+        namespace: dict[str, Any] = {"__name__": "readme_section_36"}
+        try:
+            async with embedded_database():
+                for code in _readme_blocks(_section_36()):
+                    compiled = compile(code, "<README section 36>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                    # A doctest of this repository's own README (trusted text), top-level awaits included.
+                    outcome = eval(compiled, namespace)
+                    if inspect.iscoroutine(outcome):
+                        await outcome
+                    assert capsys.readouterr().out.splitlines() == _readme_printed(code), code
+        finally:
+            namespace.clear()
+
+
+# --- docs/ROADMAP.md --------------------------------------------------------------------------------------------------
+
+_ROADMAP = Path(__file__).resolve().parents[1] / "docs" / "ROADMAP.md"
+_PHASE_G = "### 🔎 Phase G — Advanced search"
+#: The rows v0.35.0 holds while planned, by table.
+_PLANNED_OVERVIEW_35 = [["v0.35.0 – v0.40.0", "Tier 3 — Advanced (search/migrations/CLI), 6 minors", "Planned"]]
+_PLANNED_UNLOCKED_35 = ["Full-Text Search (BM25)", "`DEFINE ANALYZER` + `SEARCH` index + `search::*`", "v0.35.0"]
+_PLANNED_COMPARISON_35 = ["Full-Text Search (BM25)", "yes", "v0.35.0"]
+_PLANNED_PHASE_G_35 = [
+    "v0.35.0",
+    "Full-Text Search (`search()`, BM25 score/highlight)",
+    "`DEFINE ANALYZER` + `SEARCH` index + `search::*`",
+]
+#: The rows v0.35.0 holds once released, by table, and its "Completed versions" heading.
+_OVERVIEW_35 = [
+    ["v0.35.0", "Tier 3 — Full-text search", "Done"],
+    ["v0.36.0 – v0.40.0", "Tier 3 — Advanced (vector/hybrid search, migrations, CLI), 5 minors", "Planned"],
+]
+_UNLOCKED_35 = ["Full-Text Search (BM25)", "`DEFINE ANALYZER` + `FULLTEXT`/`SEARCH` index + `search::*`", "✅ v0.35.0"]
+_COMPARISON_35 = ["Full-Text Search (BM25)", "yes", "✅ v0.35.0"]
+_PHASE_G_35 = [
+    "✅ v0.35.0",
+    "Full-Text Search (`search()`, BM25 score/highlight)",
+    "`DEFINE ANALYZER` + `FULLTEXT`/`SEARCH` index + `search::*`",
+]
+_COMPLETED_HEADING_34 = "### Version 0.34.0 — Model table DDL (`define_table()`)"
+_COMPLETED_HEADING_35 = "### Version 0.35.0 — Full-text search (`search()`)"
+
+
+def _roadmap() -> str:
+    return _ROADMAP.read_text(encoding="utf-8")
+
+
+def _released_35() -> bool:
+    """Whether ``docs/ROADMAP.md`` records v0.35.0 as released: its Phase G row carries the ✅ the release adds."""
+    rows = [cells for _, cells in _table_rows(_subsection(_PHASE_G, _roadmap()))]
+    return rows[0][0] == "✅ v0.35.0"
+
+
+def _row(text: str, heading: str, first: str) -> list[str]:
+    """The row of the first table under *heading* whose first cell is *first*."""
+    rows = [cells for _, cells in _table_rows(_subsection(heading, text)) if cells[0] == first]
+    assert len(rows) == 1, (heading, first, rows)
+    return rows[0]
+
+
+class TestRoadmap35:
+    """``docs/ROADMAP.md`` records v0.35.0 as planned, or — once its Phase G row carries ✅ — as released: done in the
+    overview, ✅ in the SDK and comparison tables and in Phase G, its block in "Completed versions" right after
+    v0.34.0's. The Phase G row decides which state the whole file must be in."""
+
+    def test_overview(self) -> None:
+        roadmap = _roadmap()
+        overview = [cells for _, cells in _table_rows(_subsection("## Overview", roadmap))]
+        start = [cells[0] for cells in overview].index("v0.34.0") + 1
+        expected = _OVERVIEW_35 if _released_35() else _PLANNED_OVERVIEW_35
+        assert overview[start : start + len(expected)] == expected, overview
+        assert overview[start + len(expected)][0] == "v0.41.0", overview
+
+    def test_sdk_table(self) -> None:
+        expected = _UNLOCKED_35 if _released_35() else _PLANNED_UNLOCKED_35
+        row = _row(_roadmap(), "## 🆕 Everything unlocked by the official SDK 2.0", "Full-Text Search (BM25)")
+        assert row == expected, row
+
+    def test_comparison_table(self) -> None:
+        expected = _COMPARISON_35 if _released_35() else _PLANNED_COMPARISON_35
+        row = _row(_roadmap(), "## SurrealDB-ORM vs SurrealDB-ORM-lite Comparison", "Full-Text Search (BM25)")
+        assert row == expected, row
+
+    def test_phase_g(self) -> None:
+        rows = [cells for _, cells in _table_rows(_subsection(_PHASE_G, _roadmap()))]
+        assert rows[0] == (_PHASE_G_35 if _released_35() else _PLANNED_PHASE_G_35), rows
+        assert [cells[0] for cells in rows[1:]] == ["v0.36.0", "v0.37.0"], rows
+
+    def test_completed_versions(self) -> None:
+        """Released: v0.35.0's block right after v0.34.0's. Planned: no such block."""
+        roadmap = _roadmap()
+        completed = roadmap.split("\n## Completed versions\n", 1)[1].split("\n## ", 1)[0]
+        headings = re.findall(r"^### .*$", completed, re.MULTILINE)
+        if not _released_35():
+            assert _COMPLETED_HEADING_35 not in headings, headings
+            return
+        assert headings[headings.index(_COMPLETED_HEADING_35) - 1] == _COMPLETED_HEADING_34, headings
