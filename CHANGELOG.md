@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.3] - 2026-10-22
+
+Follow-ups to the review of v0.35.0's full-text search (#304): the warning of `define_indexes()`
+names every index it rebuilds, and `define_indexes(tx=…)` refuses to define an index in a
+transaction that has already written records to the model's table, which SurrealDB servers would
+leave out of the index. No new public API.
+
+### Changed
+
+- **`define_indexes(tx=…)` raises `SurrealDbError` after an ORM write to the model's table**
+  (#304). SurrealDB servers do not index the records a transaction wrote before the index was
+  defined: they stay out of it after the commit, and a search misses them. When an index must be
+  defined or redefined and the block has already written records to the model's table with the
+  ORM (`save()`, `objects(tx=…).bulk_create()`, …), `define_indexes(tx=…)` now raises before any
+  DDL, naming the model and the table; the refusal does not fail the transaction. Definitions
+  (`define_table(tx=…)`, `define_relation(tx=…)`, `remove_index(tx=…)`, …), a write to another
+  table and a call with nothing to apply do not count; a raw `tx.add()` is not tracked. Call
+  `define_indexes()` without `tx=` first, then write in the transaction. Earlier releases accepted
+  the call and the records written before it were missing from the index on SurrealDB 2.x and 3.x.
+
+### Fixed
+
+- **The analyzer warning of `define_indexes()` names the indexes the call redefines** (#304).
+  When one call redefined an analyzer and an index that uses it, the warning counted only the
+  indexes rebuilt with `REBUILD INDEX` (`Analyzer 'plain' redefined; 0 index(es) rebuilt:`,
+  naming none), although `DEFINE INDEX OVERWRITE` rebuilds the redefined index too. It now names
+  every index the call rebuilds, in the order applied.
+
+### Notes
+
+- **Reported upstream**: a SurrealDB 3.x server leaving out of an index the records the same
+  transaction wrote before `DEFINE INDEX` is a server defect,
+  [surrealdb/surrealdb#7618](https://github.com/surrealdb/surrealdb/issues/7618); 2.x behaves the
+  same, and the embedded engine indexes those records. README section 36 (Transactions), a row of
+  the "ORM behaviour: SurrealDB 2.x vs 3.x" table and one of the embedded engine's table describe
+  each engine's outcome, which tests pin.
+- **A write after `define_indexes(tx=…)` on SurrealDB 2.x**: in the same block, a write to a table
+  that held records fails the commit with a retryable `SurrealDbConflictError` that a retry meets
+  again, a 2.x limitation; SurrealDB 3.x and the embedded engine commit and index it. Prefer
+  `define_indexes()` outside the block.
+- Server pins unchanged: tested against SurrealDB 3.3.4 and 2.7.0 and on the embedded engine,
+  plus 3.1.5 for backward compatibility.
+
 ## [0.35.2] - 2026-10-22
 
 An auth model whose signup field is declared `Field(exclude=True)` is refused whatever its schema
