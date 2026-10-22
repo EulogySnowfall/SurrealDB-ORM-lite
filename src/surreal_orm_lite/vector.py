@@ -501,3 +501,29 @@ def dimension_refused(field: str, n: int, d: int, source: str) -> str:
 def zero_vector_refused() -> str:
     """The refusal of a zero query vector for a ``COSINE`` search, which has no distance to rank by."""
     return "similar_to(): a zero vector has no COSINE distance (SurrealDB answers NaN); use another vector or distance."
+
+
+def time_travel_refused() -> str:
+    """The refusal of ``similar_to()`` with ``as_of()`` — either way round, or a ``Subquery`` holding ``similar_to()``
+    under the outer ``as_of()``: the vector index holds the records' current vectors."""
+    return (
+        "similar_to() cannot be combined with as_of(): the vector index holds the records' current vectors, so a "
+        "time-travel read would pick its neighbours by their vectors now. Run it without as_of()."
+    )
+
+
+def live_refused() -> str:
+    """The refusal of ``similar_to()`` in a live query's own condition (``live()``, ``watch()``)."""
+    return (
+        "A live query cannot honour similar_to(): SurrealDB accepts a LIVE SELECT whose condition holds a KNN operator "
+        "but never notifies it."
+    )
+
+
+def live_subquery_refused() -> str:
+    """The refusal of a ``Subquery`` holding ``similar_to()`` in a live query's condition."""
+    return (
+        "A live query cannot use a Subquery that holds similar_to(): the nearest records change with every write, and "
+        "SurrealDB 2.x applies a live subquery's other conditions to a KNN wrongly. Read them with similar_to() and "
+        "watch them by id."
+    )

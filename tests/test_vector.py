@@ -79,6 +79,16 @@ scan of ``dist=``), on a field, an aliased field and a dotted path; the distance
 written back, on an ``extra="allow"`` model too; dicts holding it when a row does not validate; ``first()``, ``get()``
 without an id, ``order_by()``, ``limit()``/``offset()`` over the ``limit`` nearest; an ``ef`` below ``limit`` and the
 largest ``limit``.
+
+The clauses ``similar_to()`` cannot honour (``TestKnnRefusals``): ``as_of()`` — either way round, and a ``Subquery``
+holding ``similar_to()`` under the outer one —, ``live()`` and ``watch()`` — its own condition, or a ``Subquery``
+holding it — and ``changes()`` refuse it with exact texts before any request, the queryset left unchanged, after
+``search()``'s refusals of the same clauses; the statement's compiler records each subquery's vector field. Its
+combinations built (``TestSearchWithKnn``): ``search()``, its search annotations and a ``GeoDistance`` annotation are
+accepted in either order, nothing sent. ``TestCombinationsE2E`` reads, on every engine, ``count()``, ``exists()``,
+the other aggregations and a ``values()`` group restricted to the ``limit`` nearest; a ``Subquery`` holding
+``similar_to()`` in another queryset's filter; ``cache()`` hits, misses and ``define_indexes()``'s invalidation; a
+model of a named connection and a model inside ``using()`` of another one.
 """
 
 import ast
@@ -88,7 +98,8 @@ import math
 import os
 import pickle
 import re
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Iterator, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
@@ -109,9 +120,14 @@ from surreal_orm_lite import (
     Index,
     IndexState,
     PointField,
+    QueryCache,
+    SearchHighlight,
+    SearchOffsets,
+    SearchScore,
     Subquery,
     SurrealConfigDict,
     SurrealDBConnectionManager,
+    SurrealDbError,
     Vector,
     VectorField,
     model_ddl,
@@ -1304,8 +1320,8 @@ class TestFieldKind:
 #: The engines every E2E class runs on: the line under test over WebSocket and HTTP, and the embedded engine.
 _KINDS = ["ws", "http", "mem"]
 
-#: The reset before each E2E test, in one query.
-_VEC_RESET = "REMOVE DATABASE IF EXISTS vec_db; DEFINE DATABASE vec_db;"
+#: The reset before each E2E test, in one query, of the database ``vec_db`` (or of another database of these tests).
+_VEC_RESET = "REMOVE DATABASE IF EXISTS {0}; DEFINE DATABASE {0};"
 
 
 def _url(kind: str) -> str:
@@ -1326,24 +1342,24 @@ async def _apply_ddl(client: Any, ddl: str) -> None:
 
 
 @contextlib.asynccontextmanager
-async def _vec(kind: str) -> AsyncIterator[Any]:
-    """The connection ``"vec"`` on *kind*, its database ``vec_db`` reset in one query; removed, then unregistered, on
-    exit."""
+async def _vec(kind: str, name: str = "vec", database: str = "vec_db") -> AsyncIterator[Any]:
+    """The connection *name* (``"vec"``) on *kind*, its database *database* (``vec_db``, a constant of these tests)
+    reset in one query; removed, then unregistered, on exit."""
     if kind == "mem":
-        SurrealDBConnectionManager.add_connection("vec", url="mem://", namespace="ns", database="vec_db")
+        SurrealDBConnectionManager.add_connection(name, url="mem://", namespace="ns", database=database)
     else:
         SurrealDBConnectionManager.add_connection(
-            "vec", url=_url(kind), user="root", password="root", namespace="ns", database="vec_db"
+            name, url=_url(kind), user="root", password="root", namespace="ns", database=database
         )
-    client = await SurrealDBConnectionManager.get_client("vec")
-    await _apply_ddl(client, _VEC_RESET)
+    client = await SurrealDBConnectionManager.get_client(name)
+    await _apply_ddl(client, _VEC_RESET.format(database))
     try:
         yield client
     finally:
         with contextlib.suppress(Exception):
-            cleanup = await SurrealDBConnectionManager.get_client("vec")
-            await cleanup.query("REMOVE DATABASE IF EXISTS vec_db;", {})
-        await SurrealDBConnectionManager.remove_connection("vec")
+            cleanup = await SurrealDBConnectionManager.get_client(name)
+            await cleanup.query(f"REMOVE DATABASE IF EXISTS {database};", {})
+        await SurrealDBConnectionManager.remove_connection(name)
 
 
 async def _line(client: Any) -> tuple[int, int]:
@@ -2328,6 +2344,184 @@ class TestSimilarTo:
         assert queryset._similar is not None and queryset._similar.column == "meta.vec"
 
 
+# === similar_to() with as_of(), live(), watch(), changes(); its combinations ========================================
+
+_VT1 = (
+    "similar_to() cannot be combined with as_of(): the vector index holds the records' current vectors, so a "
+    "time-travel read would pick its neighbours by their vectors now. Run it without as_of()."
+)
+_VL1 = (
+    "A live query cannot honour similar_to(): SurrealDB accepts a LIVE SELECT whose condition holds a KNN operator but "
+    "never notifies it."
+)
+_VL2 = (
+    "A live query cannot use a Subquery that holds similar_to(): the nearest records change with every write, and "
+    "SurrealDB 2.x applies a live subquery's other conditions to a KNN wrongly. Read them with similar_to() and watch "
+    "them by id."
+)
+_VC1 = (
+    "A change feed cannot honour {}: SurrealDB's SHOW CHANGES reads the whole table's log, with no WHERE, projection, "
+    "ordering or paging, outside any transaction. Call changes() on Model.objects() and filter the events."
+)
+#: ``search()``'s refusals of the same clauses (v0.35.0), which come first.
+_TT1 = (
+    "search() cannot be combined with as_of(): a full-text match reads the index, which holds the records' current "
+    "text, so a time-travel read would select records by their text now. Run the search without as_of()."
+)
+_LV1 = (
+    "A live query cannot honour search(): SurrealDB accepts a LIVE SELECT whose condition holds a full-text match but "
+    "never notifies it. Search in a subquery instead — filter(id__in=Subquery(Model.objects().search(...))) — which "
+    "notifies the records created or updated to match, not their deletion."
+)
+_MOMENT = datetime(2026, 1, 1, tzinfo=UTC)
+
+#: The query vector of the ``search()`` combinations: the matches are not the nearest records.
+_Q2 = [0.0, 1.0, 0.0]
+
+#: ``search(title="cats")`` with ``similar_to("embedding", _Q2, 2)``, either way round, compiled.
+_SEARCH_KNN = (
+    "SELECT *, vector::distance::knn() AS _knn_distance FROM vec_doc WHERE title @0@ $_f0 AND embedding <|2,100|> $_f1 "
+    "ORDER BY _knn_distance;"
+)
+_GEO_KNN = (
+    "SELECT *, IF loc.is_point() THEN geo::distance(loc, $_gd0) END AS away, vector::distance::knn() AS _knn_distance "
+    "FROM vec_doc WHERE embedding <|2,100|> $_f0 ORDER BY _knn_distance;"
+)
+
+#: The search annotations (v0.35.0).
+_SEARCH_ANNOTATIONS = [SearchScore(0), SearchHighlight("<b>", "</b>", 0), SearchOffsets(0)]
+
+
+#: K8's statement with ``similar_to()`` on the aliased field, ``K`` 3.
+_K8_SUMMARY = (
+    "{ LET $_sq0 = (SELECT VALUE id FROM vec_doc WHERE summary <|3,100|> $_f0); (SELECT * FROM vec_doc WHERE id IN $_sq0) };"
+)
+
+
+def _knn_subquery(field: str = "embedding", k: int = 2) -> Any:
+    """``VecDoc.objects().filter(id__in=Subquery(<similar_to() on field>))`` — K8's queryset."""
+    return VecDoc.objects().filter(id__in=Subquery(VecDoc.objects().similar_to(field, _Q, k)))
+
+
+@pytest.mark.usefixtures("_no_client")
+class TestKnnRefusals:
+    """``similar_to()`` with ``as_of()`` — either way round, and in a ``Subquery`` under the outer one —, in a live
+    query (its own or a subquery's) and in a change feed: each refused with its exact text before any request, the
+    queryset left unchanged; ``search()``'s refusals of the same clauses come first. The statement's compiler records
+    each subquery's vector field."""
+
+    def test_vt1_similar_to_after_as_of(self) -> None:
+        queryset = VecDoc.objects().as_of(_MOMENT)
+        assert _raised(SurrealDbError, queryset.similar_to, "embedding", _Q, 2) == _VT1
+        assert queryset._similar is None
+        assert queryset._as_of is not None and queryset._as_of.moment == _MOMENT
+        assert queryset._link_heads == set()
+
+    def test_vt1_comes_after_the_arguments_checks(self) -> None:
+        queryset = VecDoc.objects().as_of(_MOMENT)
+        assert _raised(ValueError, queryset.similar_to, "embedding", _Q, 0) == _V7_RANGE.format(0)
+        assert _raised(ValueError, queryset.similar_to, "embedding", [0.0, 0.0, 0.0], 2) == _V12
+        assert queryset._similar is None
+
+    def test_vt1_not_after_as_of_none(self) -> None:
+        queryset = VecDoc.objects().as_of(_MOMENT).as_of(None).similar_to("embedding", _Q, 2)
+        assert queryset._compile_query() == (_K1, {"_f0": [1.0, 0.0, 0.0]})
+
+    @pytest.mark.parametrize("moment", [_MOMENT, timedelta(days=1), "2026-01-01T00:00:00Z"])
+    def test_vt1_as_of_after_similar_to(self, moment: Any) -> None:
+        queryset = VecDoc.objects().similar_to("embedding", _Q, 2)
+        assert _raised(SurrealDbError, queryset.as_of, moment) == _VT1
+        assert queryset._as_of is None
+        assert queryset.as_of(None) is queryset
+        assert queryset._compile_query() == (_K1, {"_f0": [1.0, 0.0, 0.0]})
+
+    def test_vt1_after_search_s_own_refusal(self) -> None:
+        queryset = VecDoc.objects().search(title="cats").similar_to("embedding", _Q2, 2)
+        assert _raised(SurrealDbError, queryset.as_of, _MOMENT) == _TT1
+
+    def test_vt1_a_subquery_under_the_outer_as_of(self) -> None:
+        queryset = VecDoc.objects().as_of(_MOMENT).filter(id__in=Subquery(VecDoc.objects().similar_to("embedding", _Q, 2)))
+        assert _raised(SurrealDbError, queryset._compile_query, _MOMENT) == _VT1
+        assert _raised(SurrealDbError, queryset._compile_aggregation_query, "count()", moment=_MOMENT) == _VT1
+
+    @pytest.mark.parametrize("method", ["live", "watch"])
+    def test_vl1(self, method: str) -> None:
+        assert _raised(SurrealDbError, getattr(VecDoc.objects().similar_to("embedding", _Q, 2), method)) == _VL1
+        assert _raised(SurrealDbError, getattr(VecDoc.objects().similar_to("embedding", _Q, 2, dist="cosine"), method)) == (
+            _VL1
+        )
+
+    def test_vl1_after_lv1_and_before_the_other_clauses(self) -> None:
+        searched = VecDoc.objects().search(title="cats").similar_to("embedding", _Q2, 2)
+        assert _raised(SurrealDbError, searched.live) == _LV1
+        paged = VecDoc.objects().similar_to("embedding", _Q, 2).order_by("n").limit(3)
+        assert _raised(SurrealDbError, paged.live) == _VL1
+
+    @pytest.mark.parametrize("method", ["live", "watch"])
+    def test_vl2_a_subquery_holding_similar_to(self, method: str) -> None:
+        assert _raised(SurrealDbError, getattr(_knn_subquery(), method)) == _VL2
+        assert _raised(SurrealDbError, _knn_subquery()._compile_live, False) == _VL2
+
+    def test_vc1(self) -> None:
+        assert _raised(SurrealDbError, VecDoc.objects().similar_to("embedding", _Q, 2).changes) == _VC1.format("similar_to()")
+        every = (
+            VecDoc.objects()
+            .filter(category="news")
+            .nearby("loc", (0.0, 0.0), 1.0)
+            .search(title="cats")
+            .similar_to("embedding", _Q, 2)
+        )
+        assert _raised(SurrealDbError, every.changes) == _VC1.format("filter(), nearby(), search(), similar_to()")
+
+    @pytest.mark.parametrize(("field", "column"), [("embedding", "embedding"), ("summary_vec", "summary")])
+    def test_the_compiler_records_each_subquery_s_vector_field(self, field: str, column: str) -> None:
+        queryset = _knn_subquery(field)
+        compiler = queryset._subquery_compiler()
+        queryset._compile_query(subqueries=compiler)
+        assert compiler.knn_fields == {("vec_doc", column): field}
+
+    def test_a_subquery_on_the_aliased_field(self) -> None:
+        assert _knn_subquery("summary_vec", 3)._compile_query() == (_K8_SUMMARY, {"_f0": [1.0, 0.0, 0.0]})
+
+    def test_the_statement_s_own_vector_field_is_not_a_subquery_s(self) -> None:
+        queryset = VecDoc.objects().similar_to("embedding", _Q, 2)
+        compiler = queryset._subquery_compiler()
+        queryset._compile_query(subqueries=compiler)
+        assert compiler.knn_fields == {}
+
+
+@pytest.mark.usefixtures("_no_client")
+class TestSearchWithKnn:
+    """``search()``, its search annotations (``SearchScore``, ``SearchHighlight``, ``SearchOffsets``) and a
+    ``GeoDistance`` annotation combine with ``similar_to()`` in either order: nothing is refused when the queryset is
+    built, and nothing is sent."""
+
+    @pytest.mark.parametrize("annotation", _SEARCH_ANNOTATIONS, ids=lambda a: type(a).__name__)
+    @pytest.mark.parametrize("knn_first", [True, False], ids=["similar_to-then-annotate", "annotate-then-similar_to"])
+    def test_a_search_annotation_is_accepted(self, annotation: Any, knn_first: bool) -> None:
+        searched = VecDoc.objects().search(title="programming")
+        if knn_first:
+            queryset = searched.similar_to("embedding", _Q2, 2).annotate(s=annotation)
+        else:
+            queryset = searched.annotate(s=annotation).similar_to("embedding", _Q2, 2)
+        assert queryset._similar == vector.KnnSearch("embedding", "embedding", (0.0, 1.0, 0.0), 2, None, None)
+        assert queryset._search_annotations == {"s": annotation}
+        assert queryset._annotations == {"s": annotation}
+
+    def test_search_in_either_order(self) -> None:
+        after = VecDoc.objects().search(title="cats").similar_to("embedding", _Q2, 2)
+        before = VecDoc.objects().similar_to("embedding", _Q2, 2).search(title="cats")
+        for queryset in (after, before):
+            assert queryset._compile_query() == (_SEARCH_KNN, {"_f0": "cats", "_f1": [0.0, 1.0, 0.0]})
+
+    def test_a_geo_distance_in_either_order(self) -> None:
+        away = GeoDistance("loc", (0.0, 0.0))
+        after = VecDoc.objects().similar_to("embedding", _Q, 2).annotate(away=away)
+        before = VecDoc.objects().annotate(away=away).similar_to("embedding", _Q, 2)
+        for queryset in (after, before):
+            assert queryset._compile_query()[0] == _GEO_KNN
+
+
 # The six records of the corpus: id, title, category, embedding (also the summary and the nested vector), point.
 _CORPUS = [
     ("d1", "Cats and dogs", "pets", [1.0, 0.0, 0.0], (0.0, 0.0)),
@@ -2352,11 +2546,14 @@ def _euclidean(record_id: str, query: Sequence[float] = _Q) -> float:
     return math.dist(_EMBEDDINGS[record_id], query)
 
 
-def _seed_statements(table: str, *, doc: bool = False, nested: bool = False) -> str:
-    """The ``CREATE`` of the six records in *table* (constants of these tests): ``VecDoc``'s every column with *doc*,
-    the embedding under ``meta.vec`` with *nested*, else the title, the category and the embedding."""
+def _seed_statements(table: str, *, doc: bool = False, nested: bool = False, only: Sequence[str] | None = None) -> str:
+    """The ``CREATE`` of the six records in *table* (constants of these tests) — or of those *only* names —:
+    ``VecDoc``'s every column with *doc*, the embedding under ``meta.vec`` with *nested*, else the title, the category
+    and the embedding."""
     statements = []
     for number, (record_id, title, category, embedding, (lon, lat)) in enumerate(_CORPUS, start=1):
+        if only is not None and record_id not in only:
+            continue
         if nested:
             columns = f"meta = {{ vec: {embedding} }}"
         else:
@@ -2551,3 +2748,138 @@ class TestSimilarToE2E:
         assert _ids(nearest) == ["d1", "d2", "d6"]
         assert _distances(nearest) == pytest.approx([_euclidean(i) for i in ("d1", "d2", "d6")], rel=1e-5)
         assert nearest[0].meta == {"vec": [1.0, 0.0, 0.0]}
+
+
+@pytest.fixture
+def empty_cache() -> Iterator[None]:
+    """An empty query cache around the test."""
+    QueryCache.clear()
+    yield
+    QueryCache.clear()
+
+
+class VecRouted(BaseSurrealModel):
+    """A model on the connection ``"vec"`` (``SurrealConfigDict(connection=…)``), with a vector index."""
+
+    model_config = SurrealConfigDict(
+        table_name="vec_routed",
+        connection="vec",
+        indexes=[Index("vec_routed_embedding", "embedding", hnsw=True, dimension=3, dist="cosine")],
+    )
+
+    id: str | None = None
+    title: str
+    category: str = ""
+    embedding: VectorField[3]
+
+
+class TestCombinationsE2E:
+    """``similar_to()`` without other conditions restricts every read to the ``limit`` nearest records, on every engine:
+    ``count()``, ``exists()``, ``sum()`` and the other aggregations, a ``values()`` group; a ``Subquery`` holding it
+    gives their ids to another queryset's filter (one block, the KNN in its ``LET``); ``cache()`` answers a second
+    identical read, not another vector, and ``define_indexes()`` drops it; a model of a named connection and a model
+    inside ``using()`` apply their indexes and search on that connection. None of these reads asks the line."""
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_aggregations(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+
+            def nearest() -> Any:
+                return VecDoc.objects().similar_to("embedding", _Q, 3)
+
+            calls = _spy(monkeypatch, client)
+            count = await nearest().count()
+            sent = _calls(calls)
+            exists = await nearest().exists()
+            total = await nearest().sum("n")
+            average = await nearest().avg("n")
+            lowest = await nearest().min("n")
+            highest = await nearest().max("n")
+            groups = await nearest().values("category").annotate(c=Count()).exec()
+            exact = await VecDoc.objects().similar_to("embedding", _Q, 3, dist="euclidean").sum("n")
+            every = await VecDoc.objects().similar_to("embedding", _Q, 10).count()
+            versions = [call for call in _calls(calls) if call[0] == "version"]
+        assert sent == _query("SELECT count() FROM vec_doc WHERE embedding <|3,100|> $_f0 GROUP ALL;")
+        assert (count, exists, total, lowest, highest) == (3, True, 9, 1, 6)
+        assert average == pytest.approx(3.0)
+        assert sorted(groups, key=lambda row: row["category"]) == [{"category": "news", "c": 1}, {"category": "pets", "c": 2}]
+        assert exact == 9
+        assert every == 6
+        assert versions == []
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_a_subquery(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+            calls = _spy(monkeypatch, client)
+            rows = await _knn_subquery().exec()
+            sent = _calls(calls)
+            count = await _knn_subquery().count()
+            ordered = await _knn_subquery().order_by("-n").exec()
+            summary = await _knn_subquery("summary_vec", 3).exec()
+            exact = (
+                await VecDoc.objects()
+                .filter(id__in=Subquery(VecDoc.objects().similar_to("embedding", _Q, 2, dist="cosine")))
+                .count()
+            )
+            versions = [call for call in _calls(calls) if call[0] == "version"]
+        assert sent == _query(_K8)
+        assert all(isinstance(row, VecDoc) for row in rows)
+        assert sorted(_ids(rows)) == ["d1", "d2"]
+        assert all(not hasattr(row, "_knn_distance") for row in rows)
+        assert count == 2
+        assert _ids(ordered) == ["d2", "d1"]
+        assert sorted(_ids(summary)) == ["d1", "d2", "d6"]
+        assert exact == 2
+        assert versions == []
+
+    @pytest.mark.usefixtures("empty_cache")
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_the_cache(self, kind: str) -> None:
+        async with _vec_models(kind) as client:
+            await _seed(client)
+
+            async def cached(query: list[float]) -> list[Any]:
+                docs: list[Any] = await VecDoc.objects().similar_to("embedding", query, 2).cache(ttl=30).exec()
+                return docs
+
+            before = QueryCache.stats()
+            first = await cached(_Q)
+            again = await cached(_Q)
+            other = await cached(_Q2)
+            middle = QueryCache.stats()
+            assert await VecDoc.define_indexes() == [], "unchanged: nothing applied, the cache dropped all the same"
+            dropped = await cached(_Q)
+            after = QueryCache.stats()
+        assert _ids(first) == _ids(again) == _ids(dropped) == ["d1", "d2"]
+        assert all(isinstance(doc, VecDoc) for doc in again)
+        assert again[0] is not first[0]
+        assert _distances(again) == _distances(first)
+        assert _distances(first) == pytest.approx([_cosine("d1"), _cosine("d2")], rel=1e-5)
+        assert _ids(other) == ["d3", "d4"]
+        assert (middle["hits"] - before["hits"], middle["misses"] - before["misses"]) == (1, 2)
+        assert (after["hits"] - middle["hits"], after["misses"] - middle["misses"]) == (0, 1)
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_named_connections(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with _vec(kind) as client, _vec(kind, "vec_two", "vec_db_two") as other:
+            applied = await VecRouted.define_indexes()
+            await _apply_ddl(client, _seed_statements("vec_routed"))
+            routed = await VecRouted.objects().similar_to("embedding", _Q, 2).exec()
+            calls = _spy(monkeypatch, client)
+            async with SurrealDBConnectionManager.using("vec_two"):
+                defined = await VecDoc.define_indexes()
+                await _apply_ddl(other, _seed_statements("vec_doc", doc=True, only=("d3", "d4", "d6")))
+                nearest = await VecDoc.objects().similar_to("embedding", _Q, 2).exec()
+                count = await VecDoc.objects().similar_to("embedding", _Q, 10).count()
+            sent = _calls(calls)
+            monkeypatch.undo()
+            line = await _keyword_line(other)
+        assert applied == VecRouted.index_ddl()
+        assert _ids(routed) == ["d1", "d2"]
+        assert _distances(routed) == pytest.approx([_cosine("d1"), _cosine("d2")], rel=1e-5)
+        assert defined == VecDoc.index_ddl(line=line)
+        assert _ids(nearest) == ["d6", "d4"]
+        assert count == 3
+        assert sent == [], "the reads inside using() never reach the connection 'vec'"

@@ -674,6 +674,7 @@ class QuerySet:
                 is not the field's declared dimension; ``limit`` or ``ef`` is outside 1 to 10000; both ``ef`` and
                 ``dist``; a distance the ORM does not write; a zero vector with ``COSINE`` (``dist="cosine"``, or no
                 ``dist`` and the field's vector index is ``COSINE``), which has no distance.
+            SurrealDbError: the queryset reads ``as_of()`` (checked last).
             Each raised before any request, the queryset left unchanged.
         """
         _vector.checked_knn_field(field)
@@ -703,6 +704,8 @@ class QuerySet:
         metric = distance if distance is not None or index is None else index._hnsw_options()[1]
         if metric == "COSINE" and all(item == 0.0 for item in values):
             raise ValueError(_vector.zero_vector_refused())
+        if self._as_of is not None:
+            raise SurrealDbError(_vector.time_travel_refused())
         self._similar = _vector.KnnSearch(field, self._column(field), tuple(values), k, candidates, distance)
         return self
 
@@ -768,6 +771,8 @@ class QuerySet:
         ``search()`` (v0.35.0) is refused with a moment, whichever comes first: a full-text match reads the index,
         which holds the records' current text, so the read would select records by their text now. A ``Subquery``
         holding ``search()`` is refused under an outer ``as_of()`` when the statement compiles, before any request.
+        ``similar_to()`` (v0.36.0) is refused the same ways: the vector index holds the records' current vectors, so
+        the read would pick its neighbours by their vectors now.
 
         A time-travel queryset is read-only: ``bulk_create()``, ``bulk_update()``, ``bulk_delete()``,
         ``patch()``, ``update_or_create()``, ``get_or_create()``, ``delete_table()``, ``query()``, ``live()``,
@@ -782,8 +787,8 @@ class QuerySet:
             ValueError: a string that is not ISO-8601; a negative duration; a moment outside
                 1970-01-01T00:00:00Z … 2262-04-11T23:47:16.854775Z.
             SurrealDbError: the queryset is bound to a transaction (``objects(tx=)``); a moment on a queryset
-                with ``cache()`` (v0.28.0: a time-travel read is never cached) or with ``search()`` (v0.35.0).
-                ``as_of(None)`` is accepted.
+                with ``cache()`` (v0.28.0: a time-travel read is never cached), with ``search()`` (v0.35.0) or with
+                ``similar_to()`` (v0.36.0). ``as_of(None)`` is accepted.
         """
         if self._tx is not None:
             raise SurrealDbError(_time_travel.transaction_refused())
@@ -791,6 +796,8 @@ class QuerySet:
             raise SurrealDbError(_CACHE_AS_OF)
         if at is not None and self._search:
             raise SurrealDbError(_search.time_travel_refused())
+        if at is not None and self._similar is not None:
+            raise SurrealDbError(_vector.time_travel_refused())
         self._as_of = _time_travel.normalise_as_of(at)
         return self
 
@@ -1078,8 +1085,8 @@ class QuerySet:
         rendered first (their ``LET`` s precede its own). Under the outer ``as_of()`` (``compiler.moment``) it
         carries the per-record guard and ``VERSION $_as_of``: the server never applies the outer ``VERSION`` to a
         ``LET``. A table in ``compiler.empty_tables`` compiles to ``[]``. Each of its ``search()`` conditions is
-        recorded in ``compiler.searched`` (v0.35.0). ``fetch()`` is ignored, as in the full
-        SurrealDB-ORM: a sub-SELECT gives values, never records to resolve.
+        recorded in ``compiler.searched`` (v0.35.0), its ``similar_to()`` in ``compiler.knn_fields`` (v0.36.0).
+        ``fetch()`` is ignored, as in the full SurrealDB-ORM: a sub-SELECT gives values, never records to resolve.
 
         Called by :meth:`SubqueryCompiler.reference`, which first refuses a queryset that is its own subquery.
 
@@ -1089,7 +1096,8 @@ class QuerySet:
                 ``variables()`` binding a name of the statement to another value; and its filters' own refusals.
                 Its ``limit()`` and ``offset()`` were checked when they were called (a non-negative integer).
             SurrealDbError: an ``as_of()`` of its own; a transaction that is not the outer queryset's; ``search()``
-                under the outer ``as_of()`` (v0.35.0).
+                under the outer ``as_of()`` (v0.35.0); ``similar_to()`` under the outer ``as_of()`` or in a live query
+                (v0.36.0).
         """
         offenders = {
             "annotate()": bool(self._annotations),
@@ -1105,6 +1113,10 @@ class QuerySet:
             raise SurrealDbError(_subquery.transaction_refused())
         if self._search and compiler.moment is not None:
             raise SurrealDbError(_search.time_travel_refused())
+        if self._similar is not None and compiler.moment is not None:
+            raise SurrealDbError(_vector.time_travel_refused())
+        if self._similar is not None and compiler.inline:
+            raise SurrealDbError(_vector.live_subquery_refused())
         column = self.select_item[0] if self.select_item else "id"
         validate_field_name(column, "subquery select field")
         order_columns: list[str] = []
@@ -1125,6 +1137,8 @@ class QuerySet:
             return "[]", {}, counter
         for field, search_column, _ in self._search:
             compiler.searched[(table, search_column)] = field
+        if self._similar is not None:
+            compiler.knn_fields[(table, self._similar.column)] = self._similar.field
         parts, values, counter = self._where_parts(counter, as_of=compiler.moment is not None, subqueries=compiler)
         where = " WHERE " + " AND ".join(parts) if parts else ""
         tail = ""
@@ -2861,10 +2875,14 @@ class QuerySet:
         the caller fixes them all at once.
 
         ``search()`` (v0.35.0) is refused first, on its own: SurrealDB accepts a live query whose condition holds a
-        full-text match and never notifies it; the refusal names the subquery form, which notifies.
+        full-text match and never notifies it; the refusal names the subquery form, which notifies. ``similar_to()``
+        (v0.36.0) next, on its own too: SurrealDB accepts a live query whose condition holds a KNN operator and never
+        notifies it.
         """
         if self._search:
             raise SurrealDbError(_search.live_refused())
+        if self._similar is not None:
+            raise SurrealDbError(_vector.live_refused())
         unsupported = {
             "select()": bool(self.select_item),
             "limit()": self._limit is not None,
@@ -3005,6 +3023,10 @@ class QuerySet:
         ``SurrealDbError`` naming the field otherwise: without the index, SurrealDB 3.x would accept the live query
         and never notify. Do not remove that index while the live query runs.
 
+        **Vector search (v0.36.0).** ``similar_to()`` is refused: SurrealDB accepts a live query whose condition holds
+        a KNN operator and never notifies it. So is a subquery holding ``similar_to()``: the nearest records change
+        with every write. Read them with ``similar_to()`` and watch them by id.
+
         ``await qs.live()`` — the v0.19.0 form returning the uuid — still works and is
         deprecated, and never resubscribes: the caller owns that uuid.
 
@@ -3018,8 +3040,8 @@ class QuerySet:
 
         :raises SurrealDbError: for ``select``/``values``/``annotate``/``order_by``/``limit``/
             ``offset``/``objects(tx=)``/``cache()`` (v0.28.0: a stream is never cached), for ``search()``
-            (v0.35.0), and on a queryset read ``as_of()`` (a live query streams the current changes, v0.26.0),
-            here; for a non-WebSocket connection (the embedded engine included: read its change feed with
+            (v0.35.0), for ``similar_to()`` and a subquery holding it (v0.36.0), and on a queryset read ``as_of()``
+            (a live query streams the current changes, v0.26.0), here; for a non-WebSocket connection (the embedded engine included: read its change feed with
             :meth:`changes`), or a field a subquery searches without a full-text index (v0.35.0), on start.
         :raises TypeError: for a filter value with no SurrealQL literal form, here.
         :raises ValueError, SurrealDbError: for a subquery the ORM cannot compile, here.
@@ -3055,9 +3077,10 @@ class QuerySet:
         ``filter()``, ``nearby()``, ``variables()`` and ``fetch()`` are applied by the server. With
         ``diff=True`` each ``result`` is a list of patches instead of a record. For model
         instances, use :meth:`live`. ``auto_resubscribe`` and ``on_reconnect`` behave as for
-        :meth:`live`, and so do its refusals (``as_of()``, ``cache()`` and ``search()`` included, here) and its
-        subqueries (inline, the tables they read checked on start: ``SurrealDbNotFoundError`` on SurrealDB 3.x for a
-        missing one; the fields they search checked for a full-text index: ``SurrealDbError`` naming one without).
+        :meth:`live`, and so do its refusals (``as_of()``, ``cache()``, ``search()`` and ``similar_to()`` included,
+        here) and its subqueries (inline, the tables they read checked on start: ``SurrealDbNotFoundError`` on
+        SurrealDB 3.x for a missing one; the fields they search checked for a full-text index: ``SurrealDbError``
+        naming one without).
         """
         self._reject_time_travel("watch()")
         return LiveStream(
@@ -3078,6 +3101,7 @@ class QuerySet:
             "filter()": bool(self._filters or self._q_filters),
             "nearby()": bool(self._nearby),
             "search()": bool(self._search),
+            "similar_to()": self._similar is not None,
             "variables()": bool(self._variables),
             "select()": bool(self.select_item),
             "limit()": self._limit is not None,
@@ -3123,9 +3147,9 @@ class QuerySet:
             keeps no timestamps for its feed); or ``None`` for changes made after the stream starts.
         :param poll_interval: seconds between two polls when the feed has nothing new.
         :param batch_size: entries read per poll.
-        :raises SurrealDbError: for any queryset clause (``as_of()``, ``cache()`` and ``search()`` included), here; on
-            start, for a table that does not exist or has no change feed (on the table or on its database), or for a
-            datetime ``since`` on the embedded engine of the surrealdb SDK 2.x.
+        :raises SurrealDbError: for any queryset clause (``as_of()``, ``cache()``, ``search()`` and ``similar_to()``
+            included), here; on start, for a table that does not exist or has no change feed (on the table or on its
+            database), or for a datetime ``since`` on the embedded engine of the surrealdb SDK 2.x.
         :raises TypeError, ValueError: for an unusable ``since``/``poll_interval``/``batch_size``.
         """
         self._reject_time_travel("changes()")
