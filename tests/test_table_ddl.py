@@ -119,7 +119,9 @@ Lists of sub-models (``TestSubModelListsE2E``, every engine of both lines): a ``
 or an untyped list, at any depth, is written ``FLEXIBLE`` by ``define_table()`` before SurrealDB 3.x, so those values
 round-trip through ``save()``, ``merge()`` and ``update()`` on every engine and the items' typed fields are still
 checked; raw, 2.x and the embedded engine drop a ``FLEXIBLE`` column's value under an array of objects from every item
-unless the array is ``FLEXIBLE`` too, then refuse the record's next write; 3.x keeps it.
+unless the array is ``FLEXIBLE`` too, then refuse the record's next write; 3.x keeps it. A key the table does not define,
+written raw in the items of an array of objects, is kept on 3.x and, before 3, when the array is ``FLEXIBLE``, as
+``define_table()`` writes a list of sub-models holding a ``FLEXIBLE`` column there.
 
 Transactions (``TestTableTransactionsE2E``, every engine of both lines): the reads run on the committed state before
 anything is queued; the statements apply with the block — at once when interactive, at the commit when buffered — and
@@ -5816,7 +5818,9 @@ class TestSubModelListsE2E:
     depth — keeps those values through ``save()``, ``merge()`` and ``update()`` after ``define_table()``, which writes
     the list ``FLEXIBLE`` before SurrealDB 3.x; its typed columns are still checked. The raw fact this is built around:
     on a ``SCHEMAFULL`` table, 2.x and the embedded engine drop a ``FLEXIBLE`` column's value under an array of objects
-    from every item unless the array is ``FLEXIBLE`` too, then refuse the record's next write; 3.x keeps it."""
+    from every item unless the array is ``FLEXIBLE`` too, then refuse the record's next write; 3.x keeps it. And in
+    the items of an array of objects, a key the table does not define, written raw, is kept on 3.x and, before 3, when
+    the array is ``FLEXIBLE`` — so after ``define_table()`` on every engine."""
 
     @pytest.mark.parametrize("kind", _KINDS)
     async def test_define_table_writes_the_lists_flexible_before_3(self, kind: str, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -5914,6 +5918,45 @@ class TestSubModelListsE2E:
             refused = await _refusal(client, "UPDATE tdl_raw:1 SET v = [{n: 1, m: {}}] RETURN NONE;")
             assert refused is not None and "n`" in refused, _LISTS_CHANGED
             assert await client.query("SELECT VALUE v FROM tdl_raw:1;", {}) == [stored], _LISTS_CHANGED
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    @pytest.mark.parametrize("flexible", [False, True], ids=["array", "array-flexible"])
+    async def test_an_undeclared_key_in_a_list_item_raw(self, kind: str, flexible: bool) -> None:
+        """A key the table does not define, written raw in the items of an array of objects: 3.x keeps it, ``FLEXIBLE``
+        or not, while it refuses one in a sub-object; before 3 the items keep it only when the array is ``FLEXIBLE``,
+        and a sub-object drops it — the facts of the README 2.x/3.x row on a write naming a field a ``SCHEMAFULL``
+        table does not define."""
+        async with _tdl(kind) as client:
+            major = await _major(client)
+            await _apply_ddl(
+                client,
+                "DEFINE TABLE tdl_raw SCHEMAFULL; "
+                f"DEFINE FIELD v ON tdl_raw TYPE array<object>{' FLEXIBLE' if flexible else ''}; "
+                "DEFINE FIELD v.*.n ON tdl_raw TYPE string; "
+                "DEFINE FIELD o ON tdl_raw TYPE option<object>; "
+                "DEFINE FIELD o.n ON tdl_raw TYPE string;",
+            )
+            await _apply_ddl(client, "CREATE tdl_raw:1 SET v = [{n: 'a', stray: {deep: 1}}] RETURN NONE;")
+            kept = flexible or major >= 3
+            stored = [{"n": "a", "stray": {"deep": 1}}] if kept else [{"n": "a"}]
+            assert await client.query("SELECT VALUE v FROM tdl_raw:1;", {}) == [stored], _UNDECLARED_CHANGED
+            refused = await _refusal(client, "CREATE tdl_raw:2 SET v = [], o = {n: 'a', stray: 1} RETURN NONE;")
+            if major >= 3:
+                assert refused is not None and "no such field exists" in refused, _UNDECLARED_CHANGED
+            else:
+                assert refused is None, f"{_UNDECLARED_CHANGED}: {refused}"
+                assert await client.query("SELECT VALUE o FROM tdl_raw:2;", {}) == [{"n": "a"}], _UNDECLARED_CHANGED
+
+    @pytest.mark.parametrize("kind", _KINDS)
+    async def test_an_undeclared_key_in_an_item_after_define_table(self, kind: str) -> None:
+        """After ``define_table()``, the items of a list of sub-models holding a ``FLEXIBLE`` column keep a key the
+        model does not declare, written raw, on every engine: 3.x keeps it in any array of objects, 2.x and the
+        embedded engine because ``define_table()`` writes the list ``FLEXIBLE`` there. The ORM never sends such a key."""
+        async with _tdl(kind) as client:
+            await TdlOrderPlain.define_table()
+            await _apply_ddl(client, "CREATE tdl_order:p1 SET tags = [{label: 'a', meta: {}, stray: 1}] RETURN NONE;")
+            tags = await client.query("SELECT VALUE tags FROM tdl_order:p1;", {})
+            assert tags == [[{"label": "a", "meta": {}, "stray": 1}]], _UNDECLARED_CHANGED
 
 
 # --- define_table(tx=…) ----------------------------------------------------------------------------------------------
@@ -7066,6 +7109,14 @@ _SENTENCES_35 = {
         "per field and the access's permissions, then the access: signup and signin work on SurrealDB 2.x and 3.x, "
         "`define_table()` is optional, and any call order gives the same table. Every other model keeps v0.17.0's "
         "`SCHEMALESS` table.",
+        "One that declares no `table_type` gets no `TYPE` from `define_access()`, which SurrealDB stores as `TYPE ANY`, "
+        "and `TYPE NORMAL` from `define_table()`: calling both changes the table's type each time, so declare "
+        "`table_type` to keep one. The schema mode, fields and permissions are the same in any call order.",
+        "A field SIGNUP writes that `Field(exclude=True)` keeps out of `model_dump()` (`password: str = "
+        "Field(exclude=True)`) raises `TypeError` too, naming the field, before any request (with `with_table=True` and "
+        "a `SCHEMAFULL` schema mode): the table would not define it, so SurrealDB 3.x would refuse every signup and 2.x "
+        "drop the password hash, failing every signin. Remove `exclude=True`, or pass `with_table=False` and define the "
+        "table yourself.",
     ),
     "Transactions, connections and the cache": (
         'A definition of the same table or field queued earlier in the block (`tx.add("DEFINE FIELD …")`) is not seen '
@@ -7183,6 +7234,7 @@ _PART_NEEDLES_35 = {
         "refused on SurrealDB 3.x",
         "`Found field 'nope', but no such field exists for table 'note'`",
         "dropped on 2.x and the embedded engine, silently: declare the field on the model",
+        'The items of a list of objects are the exception ("SurrealDB 2.x and 3.x" below)',
         "**A node model over a table that holds edges**",
         "declare `table_type=TableType.ANY` for a table that holds records and edges",
     ),
@@ -7196,6 +7248,11 @@ _PART_NEEDLES_35 = {
         "also drop the value of a `FLEXIBLE` column under a list of objects from every item",
         "unless the list is `FLEXIBLE` too, then refuse the record's next write (`Found NONE for field`)",
         "the item's typed fields are still checked",
+        "On 2.x and the embedded engine, the items of such a list then also keep a key the model does not declare, "
+        "written raw or by another client (the ORM never sends one), which they drop from a list that is not "
+        "`FLEXIBLE`: a 2.x limitation, since `FLEXIBLE` there covers the whole item.",
+        "3.x keeps such a key in the items of any list of objects, `FLEXIBLE` or not, and refuses it at the top level or "
+        "in a sub-model.",
         "`table_ddl()`, which needs no connection, writes the 3.x form",
         "the item definition `TYPE any` (`bag.*`) on every line",
         "refused on 3.x and dropped on 2.x and the embedded engine",
@@ -7296,6 +7353,17 @@ _SECTION_34_DECLARED = (
     "others)."
 )
 _SECTION_34_TABLE_TYPE = f"its other members take effect in `define_table()` ([section 35]{_LINK_35})"
+_SECTION_31_EDGE_SCHEMAFULL = (
+    "A `SCHEMAFULL` relation table with data fields gives an edge model with `schema_mode=SchemaMode.SCHEMAFULL` (since "
+    "v0.34.0): apply it with `define_table()`, which defines those fields, not `define_relation()`, which raises "
+    "`SurrealDbError` before any request ([section 34](#34-relation-constraints-relation_in-define_relation))."
+)
+_SECTION_34_EDGE_SCHEMAFULL = (
+    "- An edge model that declares `schema_mode=SchemaMode.SCHEMAFULL` and has data fields — the model "
+    "`generate_models_from_db()` writes for a `SCHEMAFULL` relation table with data fields, since v0.34.0 — is applied "
+    "with `define_table()`, not `define_relation()`: `define_relation()` defines no field, so it raises `SurrealDbError` "
+    f"before any request, and `define_table()` applies the same relation statement, then the data fields ([section 35]{_LINK_35})."
+)
 _SECTION_34_DEFINE_TABLE = (
     "`define_table()` (since v0.34.0) applies an edge model through the statement `define_relation()` carries, then its "
     "data fields; migrations come with v0.38.0."
@@ -7327,8 +7395,8 @@ _TABLE_DDL_ROWS = [
     [
         "A write naming a field a `SCHEMAFULL` table does not define (an undeclared `merge()` key, a raw query, records "
         "predating `SCHEMAFULL`)",
-        "the field is dropped, silently",
-        "the write is refused (`no such field exists`)",
+        "the field is dropped, silently; kept in the items of a list `define_table()` writes `FLEXIBLE` (a 2.x limitation)",
+        "the write is refused (`no such field exists`), except in the items of a list of objects, which keep it",
         "v0.34.0",
     ],
 ]
@@ -7552,6 +7620,7 @@ class TestReadmeSection35:
         assert not any("Generated models use comments" in bullet for bullet in bullets)
         generating = _normalised(_subsection("#### Generating models", section_31))
         assert _ONE_CLASS_PER_TABLE_35 in generating, generating
+        assert generating.count(_SECTION_31_EDGE_SCHEMAFULL) == 1, generating
         assert "where the class statement would refuse the key" in generating, generating
         for stale in ("`# Changefeed: 1d`", "are comments of its class, and the module's header"):
             assert stale not in generating, stale
@@ -7579,6 +7648,8 @@ class TestReadmeSection35:
         assert _SECTION_34_DECLARED in bullets, bullets
         assert _SECTION_34_DEFINE_TABLE in bullets[2], bullets[2]
         assert "**`TableType`'s other members take effect in `define_table()`**" in bullets[9], bullets[9]
+        applying = _readme_bullets(_subsection("#### Applying it", section_34))
+        assert _SECTION_34_EDGE_SCHEMAFULL in applying, applying
         text = _normalised(section_34)
         for stale in ("no effect until v0.34.0", "comes with v0.34.0", "keys yet", "recorded for the table DDL"):
             assert stale not in text, stale
