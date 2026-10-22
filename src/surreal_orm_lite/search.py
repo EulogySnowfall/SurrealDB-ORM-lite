@@ -29,6 +29,15 @@ A model declares its indexes with ``SurrealConfigDict(indexes=[Index(...)])``: `
 key at the ``class`` statement, ``declared_analyzers()`` lists the analyzers the indexes hold as ``Analyzer`` objects
 and ``model_index_statements()`` renders what ``index_ddl()`` returns.
 
+**Vector indexes (v0.36.0).** ``Index(..., hnsw=True, dimension=…)`` declares SurrealDB's HNSW index with the full ORM's
+``CreateIndex`` vector arguments (``dimension``, ``dist``, ``vector_type``, ``efc``, ``m``): one field, never
+``UNIQUE`` nor full-text. The ``Index`` holds the options as the model declared them — ``None`` for one not given —
+while its statement writes every option, SurrealDB's documented default (``EUCLIDEAN``, ``F32``, ``EFC 150``, ``M 12``)
+for each one not declared: ``INFO FOR TABLE`` renders them all, and the embedded engine's own ``TYPE`` default differs
+from the servers'. ``index_matches()`` compares those effective options (``Index._hnsw_options()``) with the stored
+ones, so a declaration that leaves an option out and one that spells out its default both match the same stored index.
+The words are written as ``vector.py``'s own constants and the numbers as checked integers, never the caller's text.
+
 **What the database stores.** ``read_database_info()`` sends ``INFO FOR DB`` once and returns the stored analyzers,
 each read by ``parse_define_analyzer()``, and the table names; ``read_table_indexes()`` sends ``INFO FOR TABLE`` once
 and returns a table's indexes, each read by ``parse_define_index()``. A definition the parser cannot read is ``None``
@@ -84,6 +93,16 @@ from .schema_state import AnalyzerState, IndexState
 from .surql_literal import _identifier, _quoted
 from .time_travel import line_major
 from .utils import VALID_FIELD_PATTERN, _ddl_refusal_class, apply_ddl_statements, validate_field_name
+from .vector import (
+    DEFAULTS,
+    M_RANGE,
+    MAX_DIMENSION,
+    MAX_EFC,
+    checked_count,
+    checked_distance,
+    checked_vector_type,
+    hnsw_clause,
+)
 
 __all__ = ["SearchScore", "SearchHighlight", "SearchOffsets", "Analyzer", "Index"]
 
@@ -498,8 +517,31 @@ class Index:
     - ``highlights`` (full-text only): writes ``HIGHLIGHTS``, which ``SearchHighlight`` needs.
     - ``comment``: SurrealDB's ``COMMENT``, any text without a NUL.
 
-    Frozen, hashable and equal by its seven attributes. Every refusal is a ``TypeError`` or a ``ValueError`` raised
-    here, before any request.
+    A vector index (v0.36.0), the full ORM's ``CreateIndex`` vector arguments, keyword-only after ``comment``::
+
+        Index("doc_embedding", "embedding", hnsw=True, dimension=1536, dist="cosine").ddl("doc")
+        # DEFINE INDEX OVERWRITE `doc_embedding` ON `doc` FIELDS `embedding` HNSW DIMENSION 1536 DIST COSINE TYPE F32
+        # EFC 150 M 12;
+
+    - ``hnsw``: makes it a vector index (SurrealDB's ``HNSW``), which ``QuerySet.similar_to()`` searches. It covers one
+      field and is never ``UNIQUE`` nor full-text.
+    - ``dimension`` (required with ``hnsw=True``): the vectors' length, an ``int`` from 1 to 65535.
+    - ``dist``: the distance, ``EUCLIDEAN``, ``COSINE``, ``MANHATTAN``, ``CHEBYSHEV`` or ``HAMMING`` in any case.
+    - ``vector_type``: the storage type, ``F64``, ``F32``, ``I64``, ``I32`` or ``I16`` in any case.
+    - ``efc``: the construction candidate list, an ``int`` from 1 to 65535; ``m``: the connections per node, an
+      ``int`` from 2 to 127.
+
+    The vector arguments are held **as declared**: ``None`` when not given, ``dist`` and ``vector_type`` upper case
+    when given; on any other index ``hnsw`` is ``False`` and the five others ``None``. The statement still writes every
+    option, SurrealDB's documented default (``EUCLIDEAN``, ``F32``, ``EFC 150``, ``M 12``) for each one not declared
+    — the effective options, which ``define_indexes()`` compares with the stored index —, so
+    ``Index("i", "e", hnsw=True, dimension=3)`` and ``Index("i", "e", hnsw=True, dimension=3, dist="euclidean")``
+    write the same statement and match the same stored index while they are not equal. SurrealDB's ``M0`` and ``LM``
+    are derived from ``M`` and not exposed.
+
+    Frozen, hashable and equal by its thirteen attributes, as declared: the seven above, then ``hnsw``,
+    ``dimension``, ``dist``, ``vector_type``, ``efc`` and ``m`` (the match arguments keep the first seven positions).
+    Every refusal is a ``TypeError`` or a ``ValueError`` raised here, before any request.
     """
 
     name: str
@@ -509,6 +551,12 @@ class Index:
     bm25: tuple[float, float] | Literal[True] | None
     highlights: bool
     comment: str | None
+    hnsw: bool
+    dimension: int | None
+    dist: str | None
+    vector_type: str | None
+    efc: int | None
+    m: int | None
 
     def __init__(
         self,
@@ -520,6 +568,12 @@ class Index:
         bm25: tuple[float, float] | bool | None = None,
         highlights: bool = False,
         comment: str | None = None,
+        hnsw: bool = False,
+        dimension: int | None = None,
+        dist: str | None = None,
+        vector_type: str | None = None,
+        efc: int | None = None,
+        m: int | None = None,
     ) -> None:
         _identifier_name(name, what="Index")
         subject = f"Index {name!r}"
@@ -541,6 +595,34 @@ class Index:
                 )
             if is_unique:
                 raise ValueError(f"{subject}: a full-text index cannot be UNIQUE (SurrealDB drops UNIQUE from it).")
+        is_vector = _index_flag(hnsw, subject=subject, what="hnsw=")
+        if not is_vector:
+            if (dimension, dist, vector_type, efc, m) != (None, None, None, None, None):
+                raise ValueError(f"{subject}: dimension=, dist=, vector_type=, efc= and m= need hnsw=True (a vector index).")
+        else:
+            if dimension is None:
+                raise ValueError(f"{subject}: hnsw=True needs dimension= (the vectors' length, 1 to {MAX_DIMENSION}).")
+            dimension = checked_count(dimension, subject=subject, arg="dimension", low=1, high=MAX_DIMENSION)
+            if efc is not None:
+                efc = checked_count(efc, subject=subject, arg="efc", low=1, high=MAX_EFC)
+            if m is not None:
+                m = checked_count(m, subject=subject, arg="m", low=M_RANGE[0], high=M_RANGE[1])
+            if dist is not None:
+                dist = checked_distance(dist, subject=subject)
+            if vector_type is not None:
+                vector_type = checked_vector_type(vector_type, subject=subject)
+            if len(columns) > 1:
+                listed = ", ".join(repr(column) for column in columns)
+                raise ValueError(
+                    f"{subject}: a vector index covers one field (SurrealDB 3.x refuses several); got {len(columns)}: "
+                    f"{listed}. Define one index per field."
+                )
+            if is_unique:
+                raise ValueError(
+                    f"{subject}: a vector index cannot be UNIQUE (SurrealDB would keep a plain UNIQUE index and drop HNSW)."
+                )
+            if analyzer is not None or weights is not None or has_highlights:
+                raise ValueError(f"{subject}: an index is either full-text (search_analyzer=) or vector (hnsw=True), not both.")
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "fields", columns)
         object.__setattr__(self, "unique", is_unique)
@@ -548,6 +630,12 @@ class Index:
         object.__setattr__(self, "bm25", weights)
         object.__setattr__(self, "highlights", has_highlights)
         object.__setattr__(self, "comment", text)
+        object.__setattr__(self, "hnsw", is_vector)
+        object.__setattr__(self, "dimension", dimension)
+        object.__setattr__(self, "dist", dist)
+        object.__setattr__(self, "vector_type", vector_type)
+        object.__setattr__(self, "efc", efc)
+        object.__setattr__(self, "m", m)
 
     def __repr__(self) -> str:
         options = (
@@ -556,9 +644,35 @@ class Index:
             ("bm25", self.bm25),
             ("highlights", self.highlights or None),
             ("comment", self.comment),
+            ("hnsw", self.hnsw or None),
+            ("dimension", self.dimension),
+            ("dist", self.dist),
+            ("vector_type", self.vector_type),
+            ("efc", self.efc),
+            ("m", self.m),
         )
         extra = "".join(f", {key}={value!r}" for key, value in options if value is not None)
         return f"Index({self.name!r}, {self.fields!r}{extra})"
+
+    def _hnsw_options(self) -> tuple[int, str, str, int, int]:
+        """The effective options of a vector index: ``(dimension, dist, vector_type, efc, m)``, SurrealDB's documented
+        default (``vector.DEFAULTS``) for each one the model did not declare.
+
+        What ``index_statement()`` writes and what ``index_matches()`` compares with the stored index: ``INFO FOR
+        TABLE`` renders every option, and the embedded engine's own ``TYPE`` default (``F64``) differs from the
+        servers' (``F32``), so the ORM writes and compares the effective values while the attributes keep what the
+        model declared. ``ValueError`` on an index that is not a vector index.
+        """
+        dimension = self.dimension
+        if not self.hnsw or dimension is None:
+            raise ValueError(f"Index {self.name!r} is not a vector index (hnsw=True).")
+        return (
+            dimension,
+            DEFAULTS["dist"] if self.dist is None else self.dist,
+            DEFAULTS["vector_type"] if self.vector_type is None else self.vector_type,
+            DEFAULTS["efc"] if self.efc is None else self.efc,
+            DEFAULTS["m"] if self.m is None else self.m,
+        )
 
     @property
     def analyzer_name(self) -> str | None:
@@ -578,8 +692,9 @@ class Index:
         ``fields`` are written as columns, each dotted segment in backticks. ``overwrite=True`` redefines an existing
         index (``OVERWRITE``), ``False`` keeps it (``IF NOT EXISTS``). ``line`` is the SurrealDB major line the
         statement is for: a full-text index is written ``FULLTEXT`` for 3 and ``SEARCH`` for 2 (and for the embedded
-        engine of the SDK's 2.x range). *table* is an identifier; ``TypeError``/``ValueError`` otherwise, when
-        *overwrite* is not a ``bool`` and when *line* is not 2 or 3.
+        engine of the SDK's 2.x range); a vector index is written the same for both, every HNSW option included.
+        *table* is an identifier; ``TypeError``/``ValueError`` otherwise, when *overwrite* is not a ``bool`` and when
+        *line* is not 2 or 3.
         """
         table = _identifier_name(table, what="Table")
         _overwrite_clause(overwrite)
@@ -648,7 +763,8 @@ def index_statement(index: Index, table: str, columns: Sequence[str], *, overwri
     full-text *keyword* (``FULLTEXT`` or ``SEARCH``, :func:`fulltext_keyword`). Pure.
 
     ``DEFINE INDEX {OVERWRITE | IF NOT EXISTS} `<name>` ON `<table>` FIELDS `<a>`.`<b>`[, …][ UNIQUE][ <keyword>
-    ANALYZER `<analyzer>`[ BM25[(k1,b)]][ HIGHLIGHTS]][ COMMENT '…'];``
+    ANALYZER `<analyzer>`[ BM25[(k1,b)]][ HIGHLIGHTS]][ HNSW DIMENSION <d> DIST <dist> TYPE <type> EFC <efc> M
+    <m>][ COMMENT '…'];`` — a vector index with every HNSW option, its effective ones (``Index._hnsw_options()``).
     """
     fields = ", ".join(_column_text(column) for column in columns)
     parts = [f"DEFINE INDEX {_overwrite_clause(overwrite)} {_identifier(index.name)} ON {_identifier(table)} FIELDS {fields}"]
@@ -664,6 +780,8 @@ def index_statement(index: Index, table: str, columns: Sequence[str], *, overwri
             parts.append(f"BM25({k1!r},{b!r})")
         if index.highlights:
             parts.append("HIGHLIGHTS")
+    if index.hnsw:
+        parts.append(hnsw_clause(*index._hnsw_options()))
     if index.comment is not None:
         parts.append(f"COMMENT {_quoted(index.comment)}")
     return " ".join(parts) + ";"
@@ -845,16 +963,36 @@ def _bm25_pair(value: object) -> tuple[float, float]:
     return DEFAULT_BM25
 
 
+def _upper(word: str | None) -> str | None:
+    """A stored ``DIST`` or ``TYPE`` word in SurrealDB's upper-case spelling; ``None`` when the parser read none."""
+    return None if word is None else word.upper()
+
+
 def index_matches(index: Index, columns: Sequence[str], state: IndexState | None) -> bool:
     """Whether the stored index *state* (``INFO FOR TABLE``'s, read by ``parse_define_index()``) is *index*'s
     definition over *columns* — its fields as the table's columns (``index_ddl()``'s translation) — pure.
 
-    ``False`` when nothing is stored (``None``: missing or unreadable) and for a vector (``HNSW``, ``MTREE``) or
-    ``COUNT`` index. Otherwise compared attribute by attribute: the fields in order, ``UNIQUE``, the analyzer, for a
-    full-text index BM25's ``k1`` and ``b`` (``None`` and ``True`` read as ``BM25(1.2,0.75)``, which every line
-    renders, each number within a relative ``1e-6``: ``1e-05`` reads back ``0.00001``) and ``HIGHLIGHTS``, and the
-    comment. 2.x's tuning options are not compared: the ORM never writes them.
+    ``False`` when nothing is stored (``None``: missing or unreadable). A vector index (``hnsw=True``) matches a stored
+    ``HNSW`` index only — never an ``MTREE`` (2.x), ``COUNT``, ``UNIQUE``, plain or full-text one — over the same field,
+    with the same comment, whose ``DIMENSION``, ``DIST``, ``TYPE``, ``EFC`` and ``M`` equal the effective options
+    (``Index._hnsw_options()``: SurrealDB's default for each one not declared, so a bare declaration and one spelling
+    out the defaults both match); the words are compared in SurrealDB's upper-case spelling, and an option the parser
+    did not read never matches. ``M0``, ``LM`` and a hand-written ``EXTEND_CANDIDATES``/``KEEP_PRUNED_CONNECTIONS``
+    are not compared: the ORM never writes them.
+
+    Any other index never matches a stored vector (``HNSW``, ``MTREE``) or ``COUNT`` index, and is otherwise compared
+    attribute by attribute: the fields in order, ``UNIQUE``, the analyzer, for a full-text index BM25's ``k1`` and
+    ``b`` (``None`` and ``True`` read as ``BM25(1.2,0.75)``, which every line renders, each number within a relative
+    ``1e-6``: ``1e-05`` reads back ``0.00001``) and ``HIGHLIGHTS``, and the comment. 2.x's tuning options are not
+    compared: the ORM never writes them.
     """
+    if index.hnsw:
+        if state is None or not state.hnsw or state.mtree or state.count or state.unique:
+            return False
+        if tuple(columns) != tuple(state.fields) or index.comment != state.comment:
+            return False
+        options = (state.dimension, _upper(state.dist), _upper(state.vector_type), state.efc, state.m)
+        return index._hnsw_options() == options
     if state is None or state.hnsw or state.mtree or state.count:
         return False
     if tuple(columns) != tuple(state.fields) or index.unique is not state.unique:

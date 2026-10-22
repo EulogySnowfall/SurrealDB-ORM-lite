@@ -721,6 +721,20 @@ def vector_field_forms() -> None:
     assert_type(is_vector_field(TypedVecDoc.model_fields["embedding"]), bool)
 
 
+def vector_index_forms() -> None:
+    """v0.36.0: ``Index`` takes the vector arguments, keyword-only after ``comment``, and holds them as declared."""
+    embedding = Index("typed_vec_doc_embedding", "embedding", hnsw=True, dimension=3, dist="cosine")
+    assert_type(embedding, Index)
+    assert_type(Index("i", "e", hnsw=True, dimension=3, vector_type="f64", efc=100, m=8, comment="c"), Index)
+    assert_type(embedding.hnsw, bool)
+    assert_type(embedding.dimension, int | None)
+    assert_type(embedding.dist, str | None)
+    assert_type(embedding.vector_type, str | None)
+    assert_type(embedding.efc, int | None)
+    assert_type(embedding.m, int | None)
+    assert_type(embedding.ddl("typed_vec_doc"), str)
+
+
 @fixture
 class Typed(SurrealFixture):
     """``@fixture`` gives the class back unchanged: ``Typed.load()`` stays typed ``Typed``."""
