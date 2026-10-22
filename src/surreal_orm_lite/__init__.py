@@ -93,6 +93,7 @@ from .signals import (
 from .subquery import Subquery
 from .transaction import BufferedTransaction, InteractiveTransaction, Transaction
 from .types import Duration, Range, SchemaMode, TableType
+from .vector import Vector, VectorField
 
 __all__ = [
     "__version__",
@@ -209,6 +210,9 @@ __all__ = [
     "SearchOffsets",
     "Analyzer",
     "Index",
+    # Vector search (v0.36.0)
+    "VectorField",
+    "Vector",
     # Exceptions
     "SurrealORMError",
     "SurrealDbError",

@@ -11,8 +11,9 @@ the assertions here are made by mypy, not at runtime.
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal, assert_type
+from typing import Annotated, Any, Literal, assert_type
 
+from pydantic import Field
 from surrealdb import RecordID
 
 from surreal_orm_lite import (
@@ -59,11 +60,13 @@ from surreal_orm_lite import (
     TableState,
     TableType,
     Transaction,
+    Vector,
     computed,
     function_ddl,
     generate_models_from_db,
 )
 from surreal_orm_lite.testing import SurrealFixture, embedded_database, fixture
+from surreal_orm_lite.vector import get_vector_info, is_vector_field
 
 
 class Player(BaseSurrealModel):
@@ -694,6 +697,28 @@ async def analyzer_appliers(tx: Transaction) -> None:
     removed: str = await SurrealDBConnectionManager.remove_analyzer("indexed_english")
     assert_type(removed, str)
     assert_type(await SurrealDBConnectionManager.remove_analyzer("indexed_english", missing_ok=False, tx=tx), str)
+
+
+class TypedVecDoc(BaseSurrealModel):
+    """v0.36.0: the typed form of a vector field — ``VectorField[...]`` is the full ORM's spelling, which type checkers
+    refuse, so it never appears here. The default is written in the class body (``= None`` or ``Field(default=None)``)."""
+
+    title: str
+    embedding: Annotated[list[float] | None, Vector(3)] = None
+    summary: Annotated[list[float] | None, Vector(3, "F64")] = Field(default=None, alias="summary_vec")
+
+
+def vector_field_forms() -> None:
+    """v0.36.0: the model is built without its vector fields; each reads ``list[float] | None``; the marker and the
+    helpers are typed."""
+    doc = TypedVecDoc(title="x")
+    assert_type(doc.embedding, list[float] | None)
+    assert_type(doc.summary, list[float] | None)
+    assert_type(Vector(3), Vector)
+    assert_type(Vector(384, "F64").dimension, int)
+    assert_type(Vector(384, "F64").vector_type, str)
+    assert_type(get_vector_info(TypedVecDoc.model_fields["embedding"]), tuple[int, str] | None)
+    assert_type(is_vector_field(TypedVecDoc.model_fields["embedding"]), bool)
 
 
 @fixture
