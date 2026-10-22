@@ -10,43 +10,44 @@
 
 ## Overview
 
-| Version           | Theme                                               | Status  |
-| ----------------- | --------------------------------------------------- | ------- |
-| v0.2.x            | Core ORM (CRUD, QuerySet, Filters)                  | Done    |
-| v0.3.0            | Aggregations & Utilities                            | Done    |
-| v0.4.0            | Model Signals                                       | Done    |
-| v0.5.0            | Bulk Operations & Q Objects                         | Done    |
-| v0.6.0            | Relations & Graph                                   | Done    |
-| v0.7.0            | SDK 2.0 / SurrealDB 3.x migration                   | Done    |
-| v0.8.0            | Transactions ORM (core, `tx=`)                      | Done    |
-| v0.9.0            | Transactions ORM (QuerySet) + interactive (3.x)     | Done    |
-| v0.10.0 – v0.12.0 | Tier 1 — Core write-path (upsert, patch, retry)     | Done    |
-| v0.13.0           | Tier 1 — SurrealFunc & server-side values           | Done    |
-| v0.14.0           | Tier 1 — Computed Fields                            | Done    |
-| v0.15.0           | Tier 1 — `call_function()` (custom `fn::`)          | Done    |
-| v0.16.0           | Tier 1 — Connection-level auth (JWT / record users) | Done    |
-| v0.17.0           | Tier 1 — Model auth (`AuthenticatedUserMixin`)      | Done    |
-| v0.18.0           | Tier 1 — Field aliases & DX                         | Done    |
-| v0.19.0           | Tier 1 — Live queries (base), raw notifications     | Done    |
-| v0.20.0           | Tier 1 — Typed live queries (`LiveModelStream`)     | Done    |
-| v0.21.0           | Tier 1 — Auto-resubscribe & change feeds (cursor)   | Done    |
-| v0.22.0           | Tier 1 — Core (native typed relations)              | Done    |
-| v0.23.0           | Tier 2 — Rich field types                           | Done    |
-| v0.24.0           | Tier 2 — Geospatial fields                          | Done    |
-| v0.25.0           | Tier 2 — Embedded test engine                       | Done    |
-| v0.26.0           | Tier 2 — Time travel (versioned storage)            | Done    |
-| v0.27.0           | Tier 2 — Subqueries                                 | Done    |
-| v0.28.0           | Tier 2 — Query cache                                | Done    |
-| v0.29.0           | Tier 2 — Multi-database                             | Done    |
-| v0.30.0           | Tier 3 — Schema introspection                       | Done    |
-| v0.31.0           | Tier 3 — Server-side events & DDL helpers           | Done    |
-| v0.32.0           | Tier 3 — Materialized views                         | Done    |
-| v0.33.0           | Tier 3 — `TYPE RELATION` enforcement                | Done    |
-| v0.34.0           | Tier 3 — Model table DDL                            | Done    |
-| v0.35.0 – v0.40.0 | Tier 3 — Advanced (search/migrations/CLI), 6 minors | Planned |
-| v0.41.0           | Beta Phase (API freeze, hardening)                  | Planned |
-| v2.0.0            | Production / GA (aligned with SDK 2.0)              | Planned |
-| v2.1.0+           | Future (post-GA)                                    | Future  |
+| Version           | Theme                                                               | Status  |
+| ----------------- | ------------------------------------------------------------------- | ------- |
+| v0.2.x            | Core ORM (CRUD, QuerySet, Filters)                                  | Done    |
+| v0.3.0            | Aggregations & Utilities                                            | Done    |
+| v0.4.0            | Model Signals                                                       | Done    |
+| v0.5.0            | Bulk Operations & Q Objects                                         | Done    |
+| v0.6.0            | Relations & Graph                                                   | Done    |
+| v0.7.0            | SDK 2.0 / SurrealDB 3.x migration                                   | Done    |
+| v0.8.0            | Transactions ORM (core, `tx=`)                                      | Done    |
+| v0.9.0            | Transactions ORM (QuerySet) + interactive (3.x)                     | Done    |
+| v0.10.0 – v0.12.0 | Tier 1 — Core write-path (upsert, patch, retry)                     | Done    |
+| v0.13.0           | Tier 1 — SurrealFunc & server-side values                           | Done    |
+| v0.14.0           | Tier 1 — Computed Fields                                            | Done    |
+| v0.15.0           | Tier 1 — `call_function()` (custom `fn::`)                          | Done    |
+| v0.16.0           | Tier 1 — Connection-level auth (JWT / record users)                 | Done    |
+| v0.17.0           | Tier 1 — Model auth (`AuthenticatedUserMixin`)                      | Done    |
+| v0.18.0           | Tier 1 — Field aliases & DX                                         | Done    |
+| v0.19.0           | Tier 1 — Live queries (base), raw notifications                     | Done    |
+| v0.20.0           | Tier 1 — Typed live queries (`LiveModelStream`)                     | Done    |
+| v0.21.0           | Tier 1 — Auto-resubscribe & change feeds (cursor)                   | Done    |
+| v0.22.0           | Tier 1 — Core (native typed relations)                              | Done    |
+| v0.23.0           | Tier 2 — Rich field types                                           | Done    |
+| v0.24.0           | Tier 2 — Geospatial fields                                          | Done    |
+| v0.25.0           | Tier 2 — Embedded test engine                                       | Done    |
+| v0.26.0           | Tier 2 — Time travel (versioned storage)                            | Done    |
+| v0.27.0           | Tier 2 — Subqueries                                                 | Done    |
+| v0.28.0           | Tier 2 — Query cache                                                | Done    |
+| v0.29.0           | Tier 2 — Multi-database                                             | Done    |
+| v0.30.0           | Tier 3 — Schema introspection                                       | Done    |
+| v0.31.0           | Tier 3 — Server-side events & DDL helpers                           | Done    |
+| v0.32.0           | Tier 3 — Materialized views                                         | Done    |
+| v0.33.0           | Tier 3 — `TYPE RELATION` enforcement                                | Done    |
+| v0.34.0           | Tier 3 — Model table DDL                                            | Done    |
+| v0.35.0           | Tier 3 — Full-text search                                           | Done    |
+| v0.36.0 – v0.40.0 | Tier 3 — Advanced (vector/hybrid search, migrations, CLI), 5 minors | Planned |
+| v0.41.0           | Beta Phase (API freeze, hardening)                                  | Planned |
+| v2.0.0            | Production / GA (aligned with SDK 2.0)                              | Planned |
+| v2.1.0+           | Future (post-GA)                                                    | Future  |
 
 > **Versioning note**: the GA is numbered **v2.0.0** to mirror the official SurrealDB SDK 2.0
 > as a branding choice. This is **independent** of the dependency pin, which stays
@@ -75,42 +76,42 @@ types unavailable in SDK 1.0.8. Crucially, `query()` runs **any SurrealQL**, inc
 As a result, **everything below is implementable in lite** — only the founding custom-SDK
 pieces stay out.
 
-| Feature                                | SDK 2.0 realization                                   | Version        |
-| -------------------------------------- | ----------------------------------------------------- | -------------- |
-| Native transactions (`tx=`)            | `BEGIN`/`COMMIT`/`CANCEL` via `query()`               | v0.8 – v0.9    |
-| `upsert()` / `update_or_create()`      | `upsert()`                                            | v0.10.0        |
-| Atomic field/array ops                 | `patch()` (JSON Patch RFC 6902)                       | v0.11.0        |
-| Retry on conflict                      | transactions + retry logic                            | v0.12.0        |
-| SurrealFunc & server values            | `query()` + native fns (`CREATE`/`UPDATE … SET`)      | ✅ v0.13.0     |
-| Computed fields                        | `DEFINE FIELD … VALUE` via `query()`                  | ✅ v0.14.0     |
-| `call_function()`                      | `query()` + `fn::name($args)` ¹                       | ✅ v0.15.0     |
-| JWT / scope auth (connection)          | `signup`/`signin`/`authenticate`/`invalidate`/`info`  | ✅ v0.16.0     |
-| JWT / scope auth (model mixin)         | idem, on a `BaseSurrealModel` subclass                | ✅ v0.17.0     |
-| Field aliases & DX                     | Pydantic `Field(alias=)` + config                     | ✅ v0.18.0     |
-| Live queries (raw notifications)       | `live()` / `subscribe_live()` / `kill()`              | ✅ v0.19.0     |
-| Typed live queries (`LiveModelStream`) | idem + deserialization + `LIVE SELECT [DIFF] … WHERE` | ✅ v0.20.0     |
-| Change Feeds / Auto-Resubscribe        | `recv_task` drop signal + `SHOW CHANGES … SINCE`      | ✅ v0.21.0     |
-| Native typed relations                 | `insert_relation()`                                   | ✅ v0.22.0     |
-| Rich field types                       | native `Datetime`/`Duration`/`Decimal`/`Range`/`Uuid` | ✅ v0.23.0     |
-| Geospatial fields (`nearby()`)         | native `Geometry` + `geo::*`                          | ✅ v0.24.0     |
-| Embedded / in-memory test engine       | `mem://` / `surrealkv://` ²                           | ✅ v0.25.0     |
-| Versioned storage (time-travel)        | `surrealkv+versioned://` ²                            | ✅ v0.26.0     |
-| Subqueries                             | nested `SELECT` via `query()`                         | ✅ v0.27.0     |
-| Query cache (TTL)                      | client-side cache (SDK-independent)                   | ✅ v0.28.0     |
-| Multi-database                         | multiple `AsyncSurreal` instances                     | ✅ v0.29.0     |
-| Schema introspection                   | `INFO FOR DB` / `INFO FOR TABLE`                      | ✅ v0.30.0     |
-| `DEFINE EVENT` (triggers)              | DDL via `query()`                                     | ✅ v0.31.0     |
-| `define_function()` DDL helper         | `DEFINE FUNCTION` via `query()` (`schema.py`)         | ✅ v0.31.0     |
-| Materialized views                     | `DEFINE TABLE … AS SELECT`                            | ✅ v0.32.0     |
-| `TYPE RELATION` enforcement            | `DEFINE TABLE … TYPE RELATION`                        | ✅ v0.33.0     |
-| Model table DDL (`define_table()`)     | `DEFINE TABLE` + `DEFINE FIELD` via `query()`         | ✅ v0.34.0     |
-| Full-Text Search (BM25)                | `DEFINE ANALYZER` + `SEARCH` index + `search::*`      | v0.35.0        |
-| Vector Search (KNN, HNSW/MTREE)        | `DEFINE INDEX … HNSW/MTREE` + KNN operator            | v0.36.0        |
-| Hybrid Search (RRF)                    | vector + FTS fusion                                   | v0.37.0        |
-| Migrations (makemigrations/migrate)    | DDL orchestration + tracking table via `query()`      | v0.38.0        |
-| CLI `surreal-orm-lite`                 | shell / migrate / inspectdb                           | v0.39.0        |
-| Test fixtures & factories              | `ModelFactory`, pytest fixtures                       | v0.40.0        |
-| QueryLogger / profiling                | wraps `query()` calls                                 | v0.41.0 (Beta) |
+| Feature                                | SDK 2.0 realization                                         | Version        |
+| -------------------------------------- | ----------------------------------------------------------- | -------------- |
+| Native transactions (`tx=`)            | `BEGIN`/`COMMIT`/`CANCEL` via `query()`                     | v0.8 – v0.9    |
+| `upsert()` / `update_or_create()`      | `upsert()`                                                  | v0.10.0        |
+| Atomic field/array ops                 | `patch()` (JSON Patch RFC 6902)                             | v0.11.0        |
+| Retry on conflict                      | transactions + retry logic                                  | v0.12.0        |
+| SurrealFunc & server values            | `query()` + native fns (`CREATE`/`UPDATE … SET`)            | ✅ v0.13.0     |
+| Computed fields                        | `DEFINE FIELD … VALUE` via `query()`                        | ✅ v0.14.0     |
+| `call_function()`                      | `query()` + `fn::name($args)` ¹                             | ✅ v0.15.0     |
+| JWT / scope auth (connection)          | `signup`/`signin`/`authenticate`/`invalidate`/`info`        | ✅ v0.16.0     |
+| JWT / scope auth (model mixin)         | idem, on a `BaseSurrealModel` subclass                      | ✅ v0.17.0     |
+| Field aliases & DX                     | Pydantic `Field(alias=)` + config                           | ✅ v0.18.0     |
+| Live queries (raw notifications)       | `live()` / `subscribe_live()` / `kill()`                    | ✅ v0.19.0     |
+| Typed live queries (`LiveModelStream`) | idem + deserialization + `LIVE SELECT [DIFF] … WHERE`       | ✅ v0.20.0     |
+| Change Feeds / Auto-Resubscribe        | `recv_task` drop signal + `SHOW CHANGES … SINCE`            | ✅ v0.21.0     |
+| Native typed relations                 | `insert_relation()`                                         | ✅ v0.22.0     |
+| Rich field types                       | native `Datetime`/`Duration`/`Decimal`/`Range`/`Uuid`       | ✅ v0.23.0     |
+| Geospatial fields (`nearby()`)         | native `Geometry` + `geo::*`                                | ✅ v0.24.0     |
+| Embedded / in-memory test engine       | `mem://` / `surrealkv://` ²                                 | ✅ v0.25.0     |
+| Versioned storage (time-travel)        | `surrealkv+versioned://` ²                                  | ✅ v0.26.0     |
+| Subqueries                             | nested `SELECT` via `query()`                               | ✅ v0.27.0     |
+| Query cache (TTL)                      | client-side cache (SDK-independent)                         | ✅ v0.28.0     |
+| Multi-database                         | multiple `AsyncSurreal` instances                           | ✅ v0.29.0     |
+| Schema introspection                   | `INFO FOR DB` / `INFO FOR TABLE`                            | ✅ v0.30.0     |
+| `DEFINE EVENT` (triggers)              | DDL via `query()`                                           | ✅ v0.31.0     |
+| `define_function()` DDL helper         | `DEFINE FUNCTION` via `query()` (`schema.py`)               | ✅ v0.31.0     |
+| Materialized views                     | `DEFINE TABLE … AS SELECT`                                  | ✅ v0.32.0     |
+| `TYPE RELATION` enforcement            | `DEFINE TABLE … TYPE RELATION`                              | ✅ v0.33.0     |
+| Model table DDL (`define_table()`)     | `DEFINE TABLE` + `DEFINE FIELD` via `query()`               | ✅ v0.34.0     |
+| Full-Text Search (BM25)                | `DEFINE ANALYZER` + `FULLTEXT`/`SEARCH` index + `search::*` | ✅ v0.35.0     |
+| Vector Search (KNN, HNSW/MTREE)        | `DEFINE INDEX … HNSW/MTREE` + KNN operator                  | v0.36.0        |
+| Hybrid Search (RRF)                    | vector + FTS fusion                                         | v0.37.0        |
+| Migrations (makemigrations/migrate)    | DDL orchestration + tracking table via `query()`            | v0.38.0        |
+| CLI `surreal-orm-lite`                 | shell / migrate / inspectdb                                 | v0.39.0        |
+| Test fixtures & factories              | `ModelFactory`, pytest fixtures                             | v0.40.0        |
+| QueryLogger / profiling                | wraps `query()` calls                                       | v0.41.0 (Beta) |
 
 ¹ SDK 2.0.0 exposes **no** `run()`/`call()` method, so the call goes through `query()` with
 the bare form `fn::name($args);` — never `RETURN fn::name(…)`, which silently truncates a
@@ -168,7 +169,7 @@ moves it to the `surrealdb[embedded]` extra.
 | Materialized views            | yes        | ✅ v0.32.0                    |
 | TYPE RELATION enforcement     | yes        | ✅ v0.33.0                    |
 | Model table DDL               | yes        | ✅ v0.34.0 (`define_table()`) |
-| Full-Text Search (BM25)       | yes        | v0.35.0                       |
+| Full-Text Search (BM25)       | yes        | ✅ v0.35.0                    |
 | Vector Search (KNN/HNSW)      | yes        | v0.36.0                       |
 | Hybrid Search (RRF)           | yes        | v0.37.0                       |
 | Migrations & CLI              | yes        | v0.38 – v0.39                 |
@@ -771,6 +772,47 @@ jitter=True)`: async decorator that re-runs a function on a retryable transactio
   statement; the migrations version chooses whether the lite gains that class (and how it relates
   to `SurrealDbError`) without quoting statements
 
+### Version 0.35.0 — Full-text search (`search()`)
+
+- A queryset searches text with the full SurrealDB-ORM's API: `QuerySet.search(**field_queries)`,
+  with `SearchScore` and `SearchHighlight` in `annotate()`, plus `SearchOffsets`
+  (`search::offsets()`), an addition. Every search text and highlight tag is bound as a query
+  variable; each field gets the next match reference (`@N@`), across calls. `search()` applies
+  wherever `filter()` does — `count()`, `exists()`, the aggregations, `values()` groups,
+  `bulk_update()`, `bulk_delete()`, `patch()` and a `Subquery` — where the full ORM applies it to
+  `exec()` only
+- A model declares its indexes: `Analyzer` and `Index` (the argument names of the full ORM's
+  `DefineAnalyzer` and `CreateIndex`; plain, `UNIQUE` and full-text indexes) in
+  `SurrealConfigDict(indexes=[...])`, read back by `get_indexes()` and rendered by `index_ddl()`
+  (pure). `await Model.define_indexes()` reads the stored definitions and applies only what is
+  missing or changed, returning the statements applied (`[]` when nothing changed); a redefined
+  analyzer rebuilds every index that uses it. `remove_index()` removes an index by name, and
+  `SurrealDBConnectionManager.define_analyzer()`/`remove_analyzer()` manage the database's
+  analyzers
+- The index keyword follows the server line, read from `client.version()`: `FULLTEXT` on
+  SurrealDB 3.x, `SEARCH` on 2.x and the embedded engine, each a parse error on the other line
+- Measured differences: the keyword; one field per full-text index, written on both lines (2.x
+  accepts several); `REMOVE ANALYZER` of an analyzer an index uses, refused by 3.x and by the ORM on
+  2.x and the embedded engine, which would accept it and then refuse every write to the table; a
+  term in more than half the documents scores `0.0` on 3.x and below zero on 2.x and the embedded
+  engine; BM25 statistics on 2.x and the embedded engine are counted again at each rebuild and keep
+  deleted records, so scores depend on the index's history (the matches do not), while 3.x keeps
+  them exact — a documented 2.x limitation. Same code on 2.7.0, 3.3.4 and the embedded engine
+  (3.1.5 retro: the AND of two fields can also return records that match only one of them, a field
+  without a full-text index answers no record instead of an error, and a live query whose subquery
+  searches such a field starts)
+- Refused before any request: `search()` with `as_of()` (the index holds the records' current
+  text); with `live()`/`watch()`, since SurrealDB accepts a live query whose condition holds a
+  full-text match but never notifies it — search in a `Subquery` instead, and before such a live
+  query starts the ORM checks that each searched field has a full-text index, without which
+  SurrealDB 3.x would never notify it; with `changes()`. Indexes on materialized views are refused
+  too: SurrealDB 3.x does not index the records a view gains
+- Deferred: `search()` with `as_of()` on a versioned SurrealDB 3.x server; indexes on views once
+  SurrealDB indexes the records a view gains; 3.x's `@AND@`/`@OR@` and `highlight_all`;
+  `indexes=[Index(...)]` in generated models; `define_index()`/`remove_index()` on the connection
+  manager for tables without a model; `Index(concurrently=True)`, with v0.36.0's vector indexes.
+  Analyzers and indexes in migrations → v0.38.0
+
 ### Version 0.18.0 — Field aliases, `server_fields` & `merge(refresh=False)`
 
 - `Field(alias="password_hash")` renames the **column**, not the attribute. The alias is
@@ -982,11 +1024,11 @@ servers (3.x `?versioned=true`, 2.x `surrealkv+versioned://`) work too.
 
 ### 🔎 Phase G — Advanced search
 
-| Version | Theme                                               | SDK 2.0 realization                              |
-| ------- | --------------------------------------------------- | ------------------------------------------------ |
-| v0.35.0 | Full-Text Search (`search()`, BM25 score/highlight) | `DEFINE ANALYZER` + `SEARCH` index + `search::*` |
-| v0.36.0 | Vector Search (`similar_to()`, KNN)                 | `DEFINE INDEX … HNSW/MTREE` + KNN operator       |
-| v0.37.0 | Hybrid Search (RRF)                                 | vector + FTS fusion                              |
+| Version    | Theme                                               | SDK 2.0 realization                                         |
+| ---------- | --------------------------------------------------- | ----------------------------------------------------------- |
+| ✅ v0.35.0 | Full-Text Search (`search()`, BM25 score/highlight) | `DEFINE ANALYZER` + `FULLTEXT`/`SEARCH` index + `search::*` |
+| v0.36.0    | Vector Search (`similar_to()`, KNN)                 | `DEFINE INDEX … HNSW/MTREE` + KNN operator                  |
+| v0.37.0    | Hybrid Search (RRF)                                 | vector + FTS fusion                                         |
 
 ### 🛠️ Phase H — Tooling
 
